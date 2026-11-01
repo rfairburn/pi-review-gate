@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync as appendFileSyncImpl, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync as appendFileSyncImpl, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
   HOST_STATE_DIRNAME,
   MAX_ROSTER_ENTRIES,
   ROSTER_FILENAME,
+  ROSTER_STORE_LEGACY_VERSION,
   ROSTER_STORE_VERSION,
   hostOwnershipPath,
   isValidRosterName,
@@ -25,12 +26,14 @@ import {
 } from "../src/session-host/roster-store";
 
 /**
- * Focused hermetic tests for the global session-host roster store (#331). Every
- * fixture root is created fresh under node_modules/.cache and verified before
- * removal; nothing here touches a real user Pi agent directory.
+ * Focused hermetic tests for the global session-host roster store (#331, and
+ * the single mixed local/remote ordered sequence of #477). Every fixture root is
+ * created fresh under an owned temporary root outside the checkout, and every
+ * store path is verified before removal; nothing here touches a real user Pi
+ * agent directory.
  */
 
-const SCRATCH_ROOT = join(process.cwd(), "node_modules", ".cache", "session-host-roster-store-tests");
+const SCRATCH_ROOT = join(realpathSync(tmpdir()), "prg-session-host-roster-store-tests");
 
 function appendFileSync(path: string, text: string): void {
   appendFileSyncImpl(path, text);
@@ -47,7 +50,7 @@ async function waitForLog(log: string, needle: string): Promise<void> {
 
 function makeRoot(prefix: string): string {
   mkdirSync(SCRATCH_ROOT, { recursive: true });
-  return mkdtempSync(join(SCRATCH_ROOT, `${prefix}-`));
+  return realpathSync(mkdtempSync(join(SCRATCH_ROOT, `${prefix}-`)));
 }
 
 function rosterOf(entries: { slotId: string; sessionId: string; workspace: string; name?: string }[]): StoredRoster {
@@ -600,6 +603,187 @@ test("a dead coordination owner is reclaimed so ownership is never gated by stal
     assert.equal(opened.status, "opened", "a dead owner never blocks ownership");
     assert.equal(existsSync(path), false, "the dead owner's entry is reclaimed");
     if (opened.status === "opened") assert.equal(opened.state.release(), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- #477: one ordered local/remote sequence, and the one-time v1 reading. ---
+
+const MIXED_DOCUMENT = {
+  version: ROSTER_STORE_VERSION,
+  entries: [
+    { kind: "remote", hostId: "host-one", owner: { kind: "slot", id: "owner-slot-b" } },
+    { slotId: "slot-a", sessionId: "conv-a", workspace: "/ws/a", name: "Alpha", persistence: "saved" },
+    { slotId: "slot-c" },
+    { kind: "remote", hostId: "host-two", owner: { kind: "runtime", id: JSON.stringify(["run-1", "row-1"]) } },
+  ],
+  activeSlotId: "slot-a",
+};
+
+test("a version-1 roster is read once and normalized into the single current ordered sequence", () => {
+  const root = makeRoot("v1-normalize");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  mkdirSync(sessionHostStateDir(agentDir), { recursive: true });
+  try {
+    const legacy = {
+      version: ROSTER_STORE_LEGACY_VERSION,
+      entries: [
+        { slotId: "slot-a", sessionId: "conv-a", workspace: "/ws/a", name: "Alpha", persistence: "saved" },
+        { slotId: "slot-b", sessionId: "conv-b", workspace: "/ws/b" },
+      ],
+      activeSlotId: "slot-b",
+    };
+    writeFileSync(rosterStorePath(agentDir), `${JSON.stringify(legacy)}\n`, "utf8");
+    const read = readRosterStore(agentDir);
+    assert.equal(read.status, "loaded");
+    if (read.status !== "loaded") return;
+    assert.equal(read.roster.version, ROSTER_STORE_VERSION, "the legacy document is normalized, not mirrored");
+    assert.deepEqual(read.roster.entries, legacy.entries, "local order and payloads are preserved exactly");
+    assert.equal(read.roster.activeSlotId, "slot-b", "the remembered active local slot is preserved");
+    assert.deepEqual(Object.keys(read.roster).sort(), ["activeSlotId", "entries", "version"],
+      "there is no second array, no legacy copy, and no order mirror");
+
+    // The next publication writes the current version only.
+    writeRosterStore(agentDir, read.roster);
+    const written = JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")) as { version: number };
+    assert.equal(written.version, ROSTER_STORE_VERSION);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one ordered sequence carries local slots and remote presentation identities interleaved", () => {
+  const root = makeRoot("mixed-entries");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    writeRosterStore(agentDir, MIXED_DOCUMENT as StoredRoster);
+    const read = readRosterStore(agentDir);
+    assert.equal(read.status, "loaded");
+    if (read.status !== "loaded") return;
+    assert.deepEqual(read.roster.entries, MIXED_DOCUMENT.entries, "the order and both entry kinds round-trip");
+    const written = JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")) as {
+      version: number;
+      entries: Array<Record<string, unknown>>;
+    };
+    assert.equal(written.version, ROSTER_STORE_VERSION);
+    assert.equal(written.entries.length, 4, "one array holds the whole mixed order");
+    assert.equal(written.entries.filter((entry) => entry.kind === "remote").length, 2);
+    assert.equal(written.entries.filter((entry) => entry.slotId !== undefined).every((entry) => entry.kind === undefined), true,
+      "a local entry keeps its existing payload shape with no identity wrapper and no duplicated slot");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed, duplicated, unknown, or legacy-with-remote presentation entries refuse the whole document", () => {
+  const longHostId = "h".repeat(129);
+  const longOwnerId = "o".repeat(647);
+  const rejected: unknown[] = [
+    { ...MIXED_DOCUMENT, version: 0 },
+    { ...MIXED_DOCUMENT, version: 3 },
+    { ...MIXED_DOCUMENT, entries: [...MIXED_DOCUMENT.entries, { kind: "remote", hostId: "host-one", owner: { kind: "slot", id: "owner-slot-b" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "host-one", owner: { kind: "elsewhere", id: "x" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "host-one", owner: { kind: "slot" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "", owner: { kind: "slot", id: "x" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: longHostId, owner: { kind: "slot", id: "x" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "host-one", owner: { kind: "slot", id: "" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "host-one", owner: { kind: "slot", id: longOwnerId } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "remote", hostId: "host\none", owner: { kind: "slot", id: "x" } }] },
+    { ...MIXED_DOCUMENT, entries: [{ kind: "other", slotId: "slot-z" }] },
+    { ...MIXED_DOCUMENT, entries: [{ slotId: "slot-a" }, { slotId: "slot-a" }] },
+    { version: ROSTER_STORE_LEGACY_VERSION, entries: [{ kind: "remote", hostId: "host-one", owner: { kind: "slot", id: "x" } }] },
+    { ...MIXED_DOCUMENT, activeSlotId: "host-one" },
+  ];
+  for (const value of rejected) {
+    assert.equal(parseStoredRoster(value), undefined, JSON.stringify(value)?.slice(0, 140));
+  }
+  // A durable slot and a legacy runtime identity for one host are distinct.
+  assert.notEqual(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { kind: "remote", hostId: "h", owner: { kind: "slot", id: "row-1" } },
+      { kind: "remote", hostId: "h", owner: { kind: "runtime", id: JSON.stringify(["run-1", "row-1"]) } },
+    ],
+  }), undefined);
+});
+
+test("a protocol-valid maximum legacy runtime tuple survives JSON escaping and round-trips", () => {
+  const root = makeRoot("legacy-tuple-bound");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    // The remote row boundary admits a 256-byte id with quotes and backslashes,
+    // and an owner run is a 64-byte roster-bridge identifier. Escaped, that
+    // tuple is larger than either part alone, so it must persist intact.
+    const maximumRowId = `${'"'.repeat(128)}${"\\".repeat(128)}`;
+    const maximumRunId = "r".repeat(64);
+    assert.equal(Buffer.byteLength(maximumRowId, "utf8"), 256);
+    const tuple = JSON.stringify([maximumRunId, maximumRowId]);
+    assert.ok(tuple.length > 512, `the escaped tuple alone is ${tuple.length} characters`);
+    const roster: StoredRoster = {
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        { kind: "remote", hostId: "host-one", owner: { kind: "runtime", id: tuple } },
+        { slotId: "slot-a", sessionId: "conv-a", workspace: "/ws/a" },
+      ],
+    };
+    assert.notEqual(parseStoredRoster(roster), undefined, "a valid maximum tuple is never refused");
+    writeRosterStore(agentDir, roster);
+    const read = readRosterStore(agentDir);
+    assert.equal(read.status, "loaded");
+    assert.deepEqual(read.status === "loaded" ? read.roster.entries : undefined, roster.entries,
+      "the legacy identity round-trips with its escaping intact");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the 64 remembered-slot allowance is local-only and independent of remote placement references", () => {
+  const root = makeRoot("local-capacity");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    const locals = Array.from({ length: MAX_ROSTER_ENTRIES }, (_unused, index) => ({
+      slotId: `slot-${index}`,
+      sessionId: `conv-${index}`,
+      workspace: "/ws",
+    }));
+    const remotes = Array.from({ length: 40 }, (_unused, index) => ({
+      kind: "remote" as const,
+      hostId: `host-${index % 4}`,
+      owner: { kind: "slot" as const, id: `owner-slot-${index}` },
+    }));
+    writeRosterStore(agentDir, { version: ROSTER_STORE_VERSION, entries: [...remotes.slice(0, 20), ...locals, ...remotes.slice(20)] });
+    const read = readRosterStore(agentDir);
+    assert.equal(read.status, "loaded", "remote placement references never consume the local allowance");
+    if (read.status !== "loaded") return;
+    assert.equal(read.roster.entries.length, MAX_ROSTER_ENTRIES + 40);
+
+    // One remembered slot beyond the bound still refuses, remote references or not.
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [...locals, { slotId: `slot-${MAX_ROSTER_ENTRIES}`, sessionId: `conv-${MAX_ROSTER_ENTRIES}`, workspace: "/ws" }, ...remotes],
+    }), undefined);
+
+    // The shared whole-document byte bound is unchanged for a mixed document.
+    mkdirSync(sessionHostStateDir(agentDir), { recursive: true });
+    const oversized = {
+      version: ROSTER_STORE_VERSION,
+      entries: Array.from({ length: 400 }, (_unused, index) => ({
+        kind: "remote" as const,
+        hostId: `host-${index}`,
+        owner: { kind: "slot" as const, id: `owner-slot-${index}-${"x".repeat(200)}` },
+      })),
+    };
+    writeFileSync(rosterStorePath(agentDir), JSON.stringify(oversized), "utf8");
+    const refused = readRosterStore(agentDir);
+    assert.equal(refused.status, "unavailable");
+    assert.match(refused.status === "unavailable" ? refused.reason : "", /exceeds the .* supported size/);
+    assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries.length, 400,
+      "an oversized document is left exactly as it was found");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -539,10 +539,12 @@ The launcher refreshes the shipped skills before host startup (above); the host 
 does not clone those files, republish skills per window, create per-window credentials,
 or require a separate login. It does not attach to existing or detached processes, adopt
 them, or reparent work. Moving the sidebar highlight does not change the active
-session. A single left-click on a displayed instance card invokes that row's existing
-Enter action: activating a live row makes it the active Main input owner and focuses
-Main, while sibling sessions continue running; exited and error rows retain their
-existing Enter behavior and guards. A successful Local New submission or
+session. A single left-click on a displayed instance card — its press and release both
+on that drawn card with no drag between them (see
+[Reordering sidebar session cards](#reordering-sidebar-session-cards)) — invokes that
+row's existing Enter action: activating a live row makes it the active Main input owner
+and focuses Main, while sibling sessions continue running; exited and error rows retain
+their existing Enter behavior and guards. A successful Local New submission or
 saved-conversation open activates the created or restored child directly, without a second
 row Enter; a successful remote New selects only the viewport of the returned owner run and
 row (see [Owner Create transport foundation](#owner-create-transport-foundation)).
@@ -917,8 +919,10 @@ the separate **Allow remote history deletion** setting is this host's owner-side
 Neither setting is changed by, or changes, Disconnect, Remove, Revoke, Hosting, or Auto.
 
 **Ownership and shutdown.** Several destinations may be connected at once. Every
-destination's rows project into the same existing left roster as typed remote cards, and
-exactly one displayed session supplies content for this host's pane: either one selected
+destination's rows project into the same existing left roster as typed remote cards, in
+any order among the local cards (see
+[Reordering sidebar session cards](#reordering-sidebar-session-cards)), and exactly one
+displayed session supplies content for this host's pane: either one selected
 local row or one deliberately selected remote row, never both. A remote card is a
 separate typed entry, not a local session row; it shows the owner-side roster facts and
 honest current or stale state, and Enter or a drawn left click on it selects that row's
@@ -1657,6 +1661,108 @@ restores the original `NODE_OPTIONS` exactly before those loaders and their desc
 run. This is process coordination, not a sandbox: trusted original Node loaders and Pi
 extensions are not restricted, and the host does not protect against malicious code
 running with your account's authority.
+
+### Reordering sidebar session cards
+
+Session cards are ordered independently of who owns them (#477). A local card, a card
+from one paired destination, and a card from another may sit in any order you choose:
+ownership is carried by each card's identity, actions, and displayed owner line, and is
+never implied by its position. Reordering is presentation only. Every card keeps its own
+identity, its Enter and drawn-click actions, its input and copy routing, its running
+work, its selection, and its lifecycle exactly as described above and under
+[Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata). The owning host
+keeps its own children and its own roster order: this viewer's order is local to this
+viewer, never reaches an owner, and never reorders another host's sidebar. Roster order
+stays the separate presentation metadata described under
+[One owning host, one session manager](#one-owning-host-one-session-manager); it is never
+a second authoritative process or status store, and it never moves a process,
+conversation, or saved state between hosts.
+
+Only session cards reorder, including exited rows and the bounded error and
+identity-unavailable placeholder rows that already hold a remembered position. The action entries (New, Saved, Network, Host shortcuts, Quit host)
+and the roster's [Terminal diagnostics](#terminal-parser-diagnostics) entry keep their
+existing relative order after the session cards, and no session card can be moved among
+them.
+
+**Mouse reorder.** Press and hold the left button on a displayed session card and drag.
+The roster shows a visible insertion marker, and that marker sits before or after a given
+card according to where the pointer is, not merely which card the pointer last hovered.
+Releasing inside the session-list area commits the move at the marker; releasing anywhere
+outside it cancels the move and the previous order stands. Blank space below the final
+session card is an end-of-list drop zone: it shows an end marker and a release there
+appends the moved card before the action entries. Action and diagnostics rows themselves
+are never drop targets. Dragging toward an edge
+scrolls a list that overflows, so a card can reach a position that is not currently on
+screen. A drag activates nothing: neither the dragged card nor the card under the pointer
+runs its ordinary Enter action, and no press, release, or motion is forwarded to a native
+child. A plain click still activates: a press and a release on the same drawn card with
+no drag between them run that card's existing Enter action once, while a press and a
+release on different cards activate nothing. Action-entry clicks and native Main pane
+clicks keep their existing behavior and guards.
+
+**Keyboard reorder.** With the roster focused, `M` or `m` on the highlighted session card
+enters move mode for that card. Up/Down moves it one position at a time through the
+session cards and never wraps past the first or the last one; the roster marks the card
+as moving and shows a key hint. Enter commits the move in place without activating the
+card, so the active Main owner and input routing do not change; Escape abandons the move
+and restores the position the card held before it started. Outside move mode, Up/Down
+selection, Enter, `d`/Delete, `q`/Q, the return-to-Main chord, and every other roster
+control behave exactly as before. `M` is a roster-focus control: inside a form field it
+stays ordinary typed text.
+
+**An unfinished move is a local draft.** A roster-membership change — a card appearing or
+being removed, a destination connecting or losing its rows — or a change of the owner
+service run cancels an in-progress move instead of committing it; live updates keep
+flowing and the roster keeps its last committed order. Ordinary status, name, activity,
+count, and error-text changes do not cancel it. A committed move changes order only: it
+does not activate a row, move input focus or Main ownership, stop or restart a child,
+release a selected remote viewport, touch a form draft, or change what any owner
+publishes.
+
+**Order persists per viewer across hosts.** The committed order is remembered for this
+viewer, including an order that mixes local cards with cards from several paired
+destinations, and is restored when this host starts again. A session this viewer observes
+for the first time is placed after the ordered cards and before the action entries, in
+first-observed order. A remote card whose owner row is currently absent keeps its
+remembered position through that absence, a reconnect, and a viewer restart, and a
+matching returned row reclaims that position. Absence adds no placeholder card and
+changes no existing stale-display rule: rows of a lost or unavailable owner still mean
+*not current*, never idle and never zero.
+
+**Restart-safe placement and older owners.** Restoring a mixed order after a restart needs
+an identity that outlives one owner service run. The durable per-row slot identity the
+owner host already uses to remember its own roster positions is published to a paired
+viewer as additional read-only roster metadata, offered as an optional capability
+alongside the existing roster projection (see
+[Remote roster metadata foundation (metadata only)](#remote-roster-metadata-foundation-metadata-only)).
+That metadata is placement information only: a viewer never writes it, and it is not a
+new permission kind. Every session operation still names its target by the current owner
+run and the row observed there, and a remembered slot authorizes nothing against a later
+run or a different row. An owner that does not offer the metadata stays fully reorderable:
+its cards are ordered by their host-qualified runtime row identity, so a new owner run or
+a new row identity appears as a new card appended in first-observed order instead of being
+matched back to an old position. The host does not infer identity from a displayed host
+label, a workspace path, or a native conversation id.
+
+**Storage compatibility.** `roster.json` version 2 stores one ordered sequence of local
+remembered records and remote placement identities, not a second roster or a copied
+remote status store. A valid local-only version-1 document is read in its existing order
+and normalized to version 2 for the next successful publication. Older hosts cannot
+read version 2; they report the unsupported roster and leave it untouched rather than
+restore a partial list. The existing limit of 64 remembered local slots is unchanged;
+remote placement references do not consume those slots, but share the existing 64 KiB
+document limit. Retained identities, including old runtime identities from legacy owners,
+continue consuming that budget; reaching the limit can prevent later roster saves. A
+refused save is reported and leaves the previous published document intact; it does not
+establish that the current order will restore after a restart.
+
+**What stays unchanged.** Existing selection, active-owner, and expansion persistence keep
+their current rules, and there is no order-reset control, no sort, group, or pin feature,
+no way to move a session between hosts, no new session-card type, and no change to an
+owner's authority over its own roster. Conversation wheel/trackpad scrolling (#332) and
+native rename behavior remain separate work, and this is not a sidebar redesign. The
+platform and physical-input limitations above are unchanged: this interaction adds no
+Windows, native-mobile, or browser input certification.
 
 ## Terminal and input limits
 

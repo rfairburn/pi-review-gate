@@ -44,6 +44,13 @@
  * being installed is retained and delivered after the install snapshot instead
  * of overwriting it.
  *
+ * Rows may additionally carry the owner's already-durable roster slot as
+ * optional presentation metadata (#477). This bridge neither stores nor derives
+ * that slot: it comes from the source snapshot's own rows, which the owning-host
+ * service reads live from the host's roster authority, and it is projected only
+ * on a channel that acknowledged the roster-slot capability. Nothing about it
+ * changes row identity, selection, subscription, or action routing.
+ *
  * A resolved `send()` means the bytes were admitted to the socket, not that the
  * peer received them, and a write admitted before a stop cannot be recalled.
  * Nothing here claims remote receipt. Every asynchronous send is owned, because
@@ -119,6 +126,7 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   buildRosterBridgeSavedWindowTransfer,
@@ -548,6 +556,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         // Implementation support only: a real view factory AND a live policy
         // callback. Delete exposure itself is decided per request, live.
         return this.#saved !== null;
+      }
+      if (capability === ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY) {
+        // Presentation metadata only. This owner honours it by projecting the
+        // slot its own roster authority already holds for a row, and by
+        // honestly omitting the field for a row with no slot. It is never
+        // authority, never a second identity, and never a routing target.
+        return true;
       }
       return false;
     }));
@@ -1679,7 +1694,10 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     try {
       // The DTO allowlist is the only way onto the wire: no spread of the owner
       // view, so no agent directory, current file, or other private field.
-      rows = snapshot.rows.map((row) => toRemoteSessionMetadata(row));
+      // The owner's durable roster slot rides only on a channel that negotiated
+      // it; every other peer receives the pre-#477 row shape unchanged.
+      const carryRosterSlots = this.#capabilities.includes(ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY);
+      rows = snapshot.rows.map((row) => toRemoteSessionMetadata(row, { rosterSlotId: carryRosterSlots }));
     } catch (error) {
       this.#terminateSubscription(isRemoteSessionMetadataError(error) ? "row_unrepresentable" : "bad_frame", "snapshot_failed");
       return;

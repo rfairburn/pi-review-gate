@@ -245,6 +245,7 @@ import {
 import {
 	isRosterBridgeIdentifier,
 	ROSTER_BRIDGE_CREATE_CAPABILITY,
+	ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
 	ROSTER_BRIDGE_SAVED_CAPABILITY,
 } from "./roster-bridge-protocol";
 import {
@@ -2910,10 +2911,18 @@ class OwnedPeerCoordinator implements
 				// changes for a caller that never asks, and the owner still acknowledges it
 				// only when it really holds a create provider. Saved is offered after it
 				// ONLY with the explicit requester opt-in; without it the offer is
-				// byte-for-byte the previous one.
-				capabilities: this.#savedViewer
-					? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
-					: [ROSTER_BRIDGE_CREATE_CAPABILITY],
+				// byte-for-byte the previous one. The roster-slot offer (#477) is
+				// read-only presentation metadata: it lets an owner state the durable
+				// roster slot it already holds for a row, so a viewer can match a
+				// remote row's placement across owners. It grants nothing, routes
+				// nothing, and changes no row identity; an owner that does not
+				// acknowledge the offer sends the unchanged pre-#477 rows.
+				capabilities: [
+					ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
+					...(this.#savedViewer
+						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
+						: [ROSTER_BRIDGE_CREATE_CAPABILITY]),
+				],
 				onProjection: (projection) => this.#onProjection(runtime, epoch, projection),
 				...(this.#savedViewer
 					? { onSavedPolicy: (): void => this.#onSavedPolicy(runtime, epoch, boundViewer) }

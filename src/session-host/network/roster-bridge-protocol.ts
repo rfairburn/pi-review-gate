@@ -29,7 +29,11 @@
  * are the display-safe {@link RemoteSessionMetadata} boundary only — no agent
  * directory, current file, prompt, transcript, question, environment,
  * configuration, token, or output byte can be expressed in this schema, and an
- * unknown key is refused rather than passed through.
+ * unknown key is refused rather than passed through. That boundary carries one
+ * optional owner-side presentation field, `rosterSlotId` (#477), and only on a
+ * channel that acknowledged {@link ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY}; it is
+ * bounded opaque metadata for placement matching, never an identity, a route,
+ * or authority, and a peer that did not negotiate it never sees it.
  *
  * The same lane, direction, and authentication also carry the optional owner
  * Close exchange (`close_request` / `close_result`) when and only when both sides
@@ -121,6 +125,16 @@ export const ROSTER_BRIDGE_CREATE_CAPABILITY = "roster-create-v1";
  */
 export const ROSTER_BRIDGE_SAVED_CAPABILITY = "roster-saved-v1";
 /**
+ * Optional capability for the owner's durable roster-slot presentation
+ * metadata (#477). It says only that rows in this channel's snapshots may carry
+ * the optional bounded `rosterSlotId` field, and that a row without a slot
+ * honestly omits it. It is presentation metadata only: it grants nothing, and
+ * the owner run plus the row's own runtime id stay the only selection, input,
+ * and action identity. A viewer that does not offer it is never sent the field,
+ * so its strict decoder keeps the pre-#477 row shape byte for byte.
+ */
+export const ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY = "roster-slot-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -129,6 +143,7 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
+  ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */

@@ -89,6 +89,7 @@ import type {
   PeerSavedUiSearchIntent,
   PeerSavedUiWindowIntent,
   PeerUiCommand,
+  PeerUiHost,
   PeerUiSnapshot,
 } from "./peer-ui-protocol";
 import { isValidNativeSessionId } from "./protocol";
@@ -126,14 +127,22 @@ import {
 import {
   MAX_ROSTER_ENTRIES,
   ROSTER_STORE_VERSION,
+  isLocalRosterEntry,
   isValidRosterName,
+  isValidRosterRemoteHostId,
+  isValidRosterRemoteOwnerId,
   isValidRosterWorkspace,
   openHostState as openProductionHostState,
   type HostStateHandle,
   type HostStateOpenResult,
-  type RosterEntry,
   type StoredRoster,
+  type StoredRosterEntry,
 } from "./roster-store";
+import {
+  PresentationRoster,
+  type PresentationIdentity,
+  type RemotePresentationIdentity,
+} from "./presentation-roster";
 import {
   isSavedSessionCatalog,
   listSavedSessions,
@@ -195,6 +204,12 @@ const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keep
 const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
 const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
 const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
+/**
+ * Fixed notice for one reorder this host could not revalidate. A refused move
+ * changes nothing: the roster keeps the order it had, every card stays live, and
+ * nothing is saved, selected, stopped, removed, or retargeted.
+ */
+const ROSTER_REORDER_REFUSED_MESSAGE = "Session order change refused; the roster order is unchanged";
 const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
 const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shutdown did not settle.";
 /** Fixed, bounded display status while a deliberately selected remote viewport is awaited. */
@@ -836,6 +851,35 @@ interface MainDependencies {
  * fields stay optional: a row that never reported native metadata, or a
  * conversation that could not be restarted, is still a remembered slot.
  */
+/**
+ * One remote card's CURRENT runtime placement binding (#477): the presentation
+ * identity this host remembers for it, plus the exact owner run and row id of
+ * the card that carries it right now. It is derived from the current peer UI
+ * snapshot on every read, never stored, and never a second roster: the runtime
+ * pair stays the selection, input, and action target, and the identity is only
+ * a position.
+ */
+type RemotePlacementBinding = {
+  readonly identity: RemotePresentationIdentity;
+  readonly hostRunId: string | null;
+  readonly rowId: string;
+};
+
+/** One projected remote roster row, typed through the peer UI DTO boundary. */
+type RemoteRosterRow = NonNullable<PeerUiHost["roster"]["rows"]>[number];
+
+/** Collision-free key of one presentation identity (never persisted). */
+function presentationIdentityKeyOf(identity: PresentationIdentity): string {
+  return identity.kind === "local"
+    ? JSON.stringify(["local", identity.slotId])
+    : JSON.stringify(["remote", identity.hostId, identity.owner.kind, identity.owner.id]);
+}
+
+/** Collision-free key of one remote runtime card identity (never persisted). */
+function remoteRuntimeKeyOf(hostId: string, hostRunId: string | null, rowId: string): string {
+  return JSON.stringify(["remote", hostId, hostRunId, rowId]);
+}
+
 interface RosterRecord {
   readonly slotId: string;
   rowId?: string;
@@ -1334,7 +1378,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // create/remove/rename/activate) and never by Quit or teardown, so a normal
   // host shutdown stops owned children without forgetting the roster.
   let hostState: HostStateHandle | undefined;
-  const rosterRecords = new Map<string, RosterRecord>();
+  /**
+   * The ONE canonical presentation sequence (#477): every remembered local slot
+   * AND every remembered remote card, in one insertion-ordered model whose
+   * iteration order IS the sidebar order. Local records are held by reference
+   * exactly as before; a remote entry holds durable presentation identity only,
+   * never a remote roster DTO, status, run, subscription, or action target.
+   * Every displayed, persisted, and sidebar-order view is DERIVED from this
+   * model plus the current local rows and current peer UI snapshot on the read
+   * itself: there is no ordered `Map` of records, no parallel key array, and no
+   * order mirror anywhere else in this host.
+   */
+  const roster = new PresentationRoster<RosterRecord>();
+  /**
+   * This run's manager row id -> remembered LOCAL slot binding. It is a runtime
+   * row binding ONLY, never an order store: the order lives in {@link roster}.
+   */
   const rowSlots = new Map<string, string>();
   // Set for exactly the synchronous stretch of one `manager.create(...)` call
   // that continues an existing slot (startup restore or exited-row restart),
@@ -1522,6 +1581,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const hostService = dependencies.createOwningHostService({
     createManager: dependencies.createManager,
     teardownRequested: () => shutdownRequested,
+    // Narrow read-only view of THIS host's existing roster authority for the
+    // inventory projection (#477): the durable slot this host holds (or will
+    // hold) for that row, derived from the SAME deterministic rule
+    // `adoptRosterViews` applies to that same row, so the FIRST negotiated
+    // observation already carries the slot this host adopts and persists. No
+    // slot state is copied, mirrored, cached, or guessed here: the accessor
+    // reads the binding and the canonical roster this host already owns, and it
+    // is only ever asked about a row the manager itself just listed. This is
+    // presentation metadata only: row selection, input, and sidebar actions keep
+    // using the manager row id.
+    rosterSlotIdFor: (rowId) => durableSlotForRow(rowId),
   });
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
@@ -1966,14 +2036,31 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function updatePeerUi(snapshot: PeerUiSnapshot): void {
     if (shutdownRequested) return;
+    // The canonical mixed order must already name every remote identity in the
+    // snapshot the sidebar is about to draw, so first observation happens before
+    // the rebuild and a matching return keeps its remembered position instead of
+    // landing at the end of the list.
+    const rememberedNewPosition = observeRemotePresentationIdentities(snapshot);
+    const previousSnapshot = peerUiSnapshot;
+    // The order view and the placement bindings the sidebar reads during that
+    // rebuild resolve against the snapshot being projected. A sidebar that
+    // refuses the snapshot leaves this host's observed network display exactly as
+    // it was, exactly as before.
+    peerUiSnapshot = snapshot;
     try {
       sidebar?.setPeerUiSnapshot(snapshot);
     } catch {
+      peerUiSnapshot = previousSnapshot;
       sidebar?.showError("Network display is unavailable; local sessions are unchanged");
       scheduleRedraw();
       return;
     }
-    peerUiSnapshot = snapshot;
+    // A first-observed remote position is a roster change exactly like a local
+    // row create or a committed reorder: it is published once through the same
+    // honest persistence path (bounded notice on failure, the previously
+    // published document untouched, and no claim that an order was saved when
+    // the write was refused). An unchanged observation writes nothing.
+    if (rememberedNewPosition) persistRoster();
     // A reminder this host can positively see no longer applies is dropped here;
     // nothing is opened, retried, or confirmed by this reconciliation.
     reconcileRemoteCloseMarkers(snapshot);
@@ -2823,21 +2910,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * The ONE deterministic durable-slot rule of this host, applied to a row the
+   * manager currently lists: the slot already bound to that row while its
+   * remembered record still exists, else the slot reserved for an in-flight
+   * `manager.create(...)` that continues an existing slot (startup restore or an
+   * exited-row restart), else the row's own id — which is exactly the new slot
+   * this host mints for that row. The read-only inventory accessor and the
+   * adoption path below share this one rule, so the first negotiated
+   * observation of a new row already carries the slot this host adopts and
+   * persists for it. Nothing is guessed by label, workspace path, or
+   * conversation, and no slot state is copied or cached to get there.
+   */
+  function durableSlotForRow(rowId: string): string {
+    const reserved = rowSlots.get(rowId) ?? adoptingSlot;
+    if (reserved !== undefined && roster.getLocal(reserved) !== undefined) return reserved;
+    return rowId;
+  }
+
+  /**
    * Adopt every current manager row into its remembered slot and refresh that
    * slot's last-observed CURRENT conversation identity from the LATEST row in
    * manager order. A slot whose current row left the roster was deliberately
    * removed and is forgotten; a slot with no row stays remembered and renders
-   * as a bounded error row at its own remembered position.
+   * as a bounded error row at its own remembered position. Only LOCAL entries of
+   * the canonical sequence are touched here: a remembered remote card is never
+   * adopted, dropped, or reordered by local manager activity.
    */
   function adoptRosterViews(currentViews: NativeInstanceView[]): void {
     const byRow = new Map(currentViews.map((view) => [view.id, view]));
     const assigned = new Map<string, NativeInstanceView>();
     for (const view of currentViews) {
-      const slotId = rowSlots.get(view.id) ?? adoptingSlot;
-      const record = slotId === undefined ? undefined : rosterRecords.get(slotId);
+      const slotId = durableSlotForRow(view.id);
+      const record = roster.getLocal(slotId);
       if (record === undefined) {
         const created: RosterRecord = { slotId: view.id };
-        rosterRecords.set(created.slotId, created);
+        roster.setLocal(created);
         rowSlots.set(view.id, created.slotId);
         assigned.set(created.slotId, view);
       } else {
@@ -2846,7 +2953,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     }
     for (const [slotId, view] of assigned) {
-      const record = rosterRecords.get(slotId);
+      const record = roster.getLocal(slotId);
       if (record === undefined) continue;
       record.rowId = view.id;
       record.unavailableReason = undefined;
@@ -2861,9 +2968,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         else delete record.name;
       }
     }
-    for (const [slotId, record] of [...rosterRecords]) {
+    for (const record of [...roster.localRecords()]) {
       if (record.rowId === undefined || byRow.has(record.rowId)) continue;
-      rosterRecords.delete(slotId);
+      roster.deleteLocal(record.slotId);
     }
     // Row mappings only exist for current rows; a replaced or removed row's
     // mapping is dropped so a stale id can never claim a slot again.
@@ -2882,7 +2989,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const byRow = new Map(views.map((view) => [view.id, view]));
     const emitted = new Set<string>();
     const items: SidebarItem[] = [];
-    for (const record of rosterRecords.values()) {
+    for (const record of roster.localRecords()) {
       const view = record.rowId === undefined ? undefined : byRow.get(record.rowId);
       if (view !== undefined) {
         if (emitted.has(view.id)) continue;
@@ -2900,19 +3007,230 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return items;
   }
 
+  /** The exact owner run of one host's last complete roster observation. */
+  function observedRosterRunId(host: PeerUiHost): string | null {
+    const value = host.roster.hostRunId;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
   /**
-   * The persisted projection of the in-memory roster: every remembered slot, in
-   * its stable remembered order, with whatever identity it actually observed.
-   * A slot with no authenticated conversation id or no known workspace is still
-   * persisted (it can only ever restore as an unavailable error entry), and a
-   * display-only name outside the native bound is dropped rather than making the
-   * whole roster unpublishable. Undefined when the roster exceeds the publishable
-   * bound, in which case the published roster is left exactly as it was.
+   * The presentation identity one currently projected remote row carries.
+   *
+   * A row whose owner negotiated the roster-slot capability names the owner's
+   * already-durable slot, which is exactly why it keeps its position across the
+   * owner's absence, reconnect, and restart. An older owner names no slot, so
+   * the identity is a JSON tuple naming BOTH the exact observed owner run and
+   * the row id: a row id reused on a new owner run is a DIFFERENT identity and
+   * is appended as a new card, never aliased onto the old one. The host part is
+   * this viewer's own saved-destination handle. Nothing is matched by label,
+   * workspace path, or conversation, and an identity outside the store's bounds
+   * is not remembered at all rather than guessed into a position.
+   */
+  function remoteIdentityForRemoteRow(
+    hostId: string,
+    hostRunId: string | null,
+    row: RemoteRosterRow,
+  ): RemotePresentationIdentity | undefined {
+    if (!isValidRosterRemoteHostId(hostId)) return undefined;
+    const durableSlot = row.rosterSlotId;
+    if (durableSlot !== undefined) {
+      if (!isValidRosterRemoteOwnerId(durableSlot)) return undefined;
+      return { kind: "remote", hostId, owner: { kind: "slot", id: durableSlot } };
+    }
+    if (typeof row.id !== "string" || row.id.length === 0) return undefined;
+    // `null` and the string "null" render differently in JSON, so the tuple is
+    // injective over (owner run or none) x row id.
+    const legacyRuntimeId = JSON.stringify([hostRunId, row.id]);
+    if (!isValidRosterRemoteOwnerId(legacyRuntimeId)) return undefined;
+    return { kind: "remote", hostId, owner: { kind: "runtime", id: legacyRuntimeId } };
+  }
+
+  /**
+   * First observation of every remote card the given snapshot shows, in arrival
+   * (source) order, called BEFORE the sidebar rebuilds its cards from that same
+   * snapshot so the canonical sequence already names it. A previously observed
+   * identity is never re-appended, moved, or reordered by a matching return, and
+   * a card this snapshot does not show keeps its remembered position: nothing
+   * here invents a placeholder, removes a stale identity, expires anything, or
+   * copies any remote session fact into this host's roster. Returns whether any
+   * NEW position entered the canonical sequence, which is a roster change like
+   * any other and is therefore published through the existing persistence path.
+   */
+  function observeRemotePresentationIdentities(snapshot: PeerUiSnapshot | undefined): boolean {
+    let rememberedAny = false;
+    for (const host of snapshot?.hosts ?? []) {
+      const rows = host.roster.rows;
+      // `null` means no complete observation: not an empty roster, and no
+      // evidence about any identity this host already remembers.
+      if (rows === null) continue;
+      const hostRunId = observedRosterRunId(host);
+      for (const row of rows) {
+        const identity = remoteIdentityForRemoteRow(host.id, hostRunId, row);
+        if (identity !== undefined && roster.rememberRemote(identity)) rememberedAny = true;
+      }
+    }
+    return rememberedAny;
+  }
+
+  /**
+   * Every unambiguous mapping between a remembered remote presentation identity
+   * and the exact runtime card carrying it right now, derived from the CURRENT
+   * snapshot on this read and never stored. Two visible rows of one owner that
+   * name the same durable slot are ambiguous: neither one is guessed, converted
+   * to the other, or used to retarget a move, so that identity simply has no
+   * runtime binding while both live cards keep behaving exactly as before.
+   */
+  function remotePlacementBindings(): {
+    readonly byIdentity: Map<string, RemotePlacementBinding>;
+    readonly byRuntime: Map<string, RemotePlacementBinding>;
+  } {
+    const byIdentity = new Map<string, RemotePlacementBinding>();
+    const ambiguous = new Set<string>();
+    for (const host of peerUiSnapshot?.hosts ?? []) {
+      const rows = host.roster.rows;
+      if (rows === null) continue;
+      const hostRunId = observedRosterRunId(host);
+      for (const row of rows) {
+        const identity = remoteIdentityForRemoteRow(host.id, hostRunId, row);
+        if (identity === undefined) continue;
+        const identityKey = presentationIdentityKeyOf(identity);
+        if (ambiguous.has(identityKey)) continue;
+        if (byIdentity.has(identityKey)) {
+          // A duplicate durable slot: refuse the placement binding entirely
+          // rather than pick one of the two rows.
+          byIdentity.delete(identityKey);
+          ambiguous.add(identityKey);
+          continue;
+        }
+        byIdentity.set(identityKey, { identity, hostRunId, rowId: row.id });
+      }
+    }
+    const byRuntime = new Map<string, RemotePlacementBinding>();
+    for (const binding of byIdentity.values()) {
+      byRuntime.set(remoteRuntimeKeyOf(binding.identity.hostId, binding.hostRunId, binding.rowId), binding);
+    }
+    return { byIdentity, byRuntime };
+  }
+
+  /**
+   * The sidebar's read-only view of the ONE canonical order: only the runtime
+   * identities this host actually holds right now, in canonical sequence. A
+   * remembered local slot contributes its current manager row, or the bounded
+   * unavailable row it actually draws; a slot still awaiting its restore attempt
+   * draws nothing and is named by nothing. A remembered remote identity
+   * contributes its current exact runtime card, or nothing while that card is
+   * absent. This derives on every call from the canonical model plus the current
+   * local rows and current snapshot: no second runtime-order map exists.
+   */
+  function currentSessionOrderView(): SidebarMainOwnerKey[] {
+    const bindings = remotePlacementBindings().byIdentity;
+    const keys: SidebarMainOwnerKey[] = [];
+    for (const entry of roster.entries()) {
+      if (entry.kind === "remote") {
+        const binding = bindings.get(presentationIdentityKeyOf(entry.identity));
+        if (binding === undefined) continue;
+        keys.push({
+          kind: "remote",
+          hostId: binding.identity.hostId,
+          hostRunId: binding.hostRunId,
+          rowId: binding.rowId,
+        });
+        continue;
+      }
+      const record = entry.record;
+      if (record.rowId !== undefined) {
+        if (views.some((view) => view.id === record.rowId)) keys.push({ kind: "local", id: record.rowId });
+        continue;
+      }
+      if (record.unavailableReason !== undefined) keys.push({ kind: "local", id: rosterErrorItemId(record.slotId) });
+    }
+    return keys;
+  }
+
+  /**
+   * The canonical presentation identity one CURRENT runtime sidebar card names,
+   * revalidated against this host's own facts: a current local row (or the
+   * bounded unavailable row this host actually draws), or a remote card of the
+   * exact current owner run and row that has an unambiguous placement binding.
+   * No source index, label, or stale identity is ever accepted, and a card this
+   * host cannot map refuses rather than retargets.
+   */
+  function presentationIdentityForRuntimeOwner(owner: SidebarMainOwnerKey): PresentationIdentity | undefined {
+    if (owner.kind === "local") {
+      const unavailableSlot = slotIdFromRosterErrorItemId(owner.id);
+      if (unavailableSlot !== undefined) {
+        const record = roster.getLocal(unavailableSlot);
+        return record !== undefined && record.rowId === undefined
+          ? { kind: "local", slotId: unavailableSlot }
+          : undefined;
+      }
+      if (!views.some((view) => view.id === owner.id) || removedExitedIds.has(owner.id)) return undefined;
+      const slotId = durableSlotForRow(owner.id);
+      return roster.getLocal(slotId) !== undefined ? { kind: "local", slotId } : undefined;
+    }
+    const binding = remotePlacementBindings().byRuntime.get(remoteRuntimeKeyOf(owner.hostId, owner.hostRunId, owner.rowId));
+    return binding === undefined ? undefined : binding.identity;
+  }
+
+  /**
+   * One committed left-roster reorder (#477): revalidate both sides against the
+   * exact CURRENT local or remote runtime identity, map them to presentation
+   * identities of the ONE canonical sequence, move, then refresh and save once.
+   *
+   * A reorder is a placement change only. It never selects, activates, stops,
+   * removes, creates, renames, quits, or reconnects anything, never writes the
+   * owner's roster, and never touches the runtime host/run/row pair that input
+   * and actions keep using. A cancelled preview never reaches this path, and a
+   * refused one leaves both the in-memory and the published order untouched.
+   */
+  function applySessionReorder(
+    source: SidebarMainOwnerKey,
+    target: SidebarMainOwnerKey,
+    placement: "before" | "after",
+  ): void {
+    const sourceIdentity = presentationIdentityForRuntimeOwner(source);
+    const targetIdentity = presentationIdentityForRuntimeOwner(target);
+    if (sourceIdentity === undefined || targetIdentity === undefined) {
+      sidebar?.showError(ROSTER_REORDER_REFUSED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    if (!roster.move(sourceIdentity, targetIdentity, placement)) {
+      sidebar?.showError(ROSTER_REORDER_REFUSED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    // One refresh, one save: the sidebar re-derives its cards from the canonical
+    // view, and the persisted projection is the canonical sequence itself.
+    syncRosterAndSchedule();
+  }
+
+  /**
+   * The persisted projection of the canonical sequence: EVERY entry of the one
+   * mixed order, in that order. A local entry keeps exactly its existing payload
+   * shape; a remote entry contributes its durable presentation identity and
+   * nothing else. A local slot with no authenticated conversation id or no known
+   * workspace is still persisted (it can only ever restore as an unavailable
+   * error entry), and a display-only name outside the native bound is dropped
+   * rather than making the whole roster unpublishable. Undefined when the local
+   * roster exceeds the publishable bound, in which case the published roster is
+   * left exactly as it was.
    */
   function buildRosterProjection(): StoredRoster | undefined {
-    const entries: RosterEntry[] = [];
-    for (const record of rosterRecords.values()) {
-      if (entries.length >= MAX_ROSTER_ENTRIES) return undefined;
+    const entries: StoredRosterEntry[] = [];
+    let localEntries = 0;
+    for (const entry of roster.entries()) {
+      if (entry.kind === "remote") {
+        entries.push({
+          kind: "remote",
+          hostId: entry.identity.hostId,
+          owner: { kind: entry.identity.owner.kind, id: entry.identity.owner.id },
+        });
+        continue;
+      }
+      if (localEntries >= MAX_ROSTER_ENTRIES) return undefined;
+      localEntries += 1;
+      const record = entry.record;
       entries.push({
         slotId: record.slotId,
         ...(record.sessionId !== undefined && isValidNativeSessionId(record.sessionId)
@@ -2924,7 +3242,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     const localId = localActiveId();
     const activeSlotId = localId !== undefined ? rowSlots.get(localId) : rememberedActiveSlot;
-    const active = activeSlotId !== undefined && entries.some((entry) => entry.slotId === activeSlotId)
+    const active = activeSlotId !== undefined && entries.some((entry) => isLocalRosterEntry(entry) && entry.slotId === activeSlotId)
       ? { activeSlotId }
       : {};
     return { version: ROSTER_STORE_VERSION, entries, ...active };
@@ -2968,12 +3286,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     lastPersistedRoster = serialized;
   }
 
-  /** Seed the remembered slots from the persisted roster observed at open. */
+  /**
+   * Seed the canonical sequence from the persisted roster observed at open:
+   * local records and remote presentation identities in the document's own
+   * order, which IS the remembered mixed order.
+   */
   function initializeRosterRecords(stored: StoredRoster | undefined): void {
     if (stored !== undefined) {
       for (const entry of stored.entries) {
-        if (rosterRecords.has(entry.slotId)) continue;
-        rosterRecords.set(entry.slotId, {
+        if (entry.kind === "remote") {
+          roster.rememberRemote({ kind: "remote", hostId: entry.hostId, owner: { kind: entry.owner.kind, id: entry.owner.id } });
+          continue;
+        }
+        if (roster.getLocal(entry.slotId) !== undefined) continue;
+        roster.setLocal({
           slotId: entry.slotId,
           ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
           ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
@@ -2994,13 +3320,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * through its own manager-owned path.
    */
   function removeRosterEntry(slotId: string): void {
-    const record = rosterRecords.get(slotId);
+    const record = roster.getLocal(slotId);
     if (record === undefined || record.rowId !== undefined) {
       sidebar?.showError(REMOVE_REFUSED_MESSAGE);
       scheduleRedraw();
       return;
     }
-    rosterRecords.delete(slotId);
+    roster.deleteLocal(slotId);
     if (rememberedActiveSlot === slotId) rememberedActiveSlot = undefined;
     syncRosterAndSchedule();
     reconcileLayout(true);
@@ -3021,7 +3347,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const stored = handle?.roster;
     if (handle === undefined || activeManager === undefined || activeSidebar === undefined) return;
     if (handle.problem !== undefined) return; // surfaced truthfully by persistRoster
-    if (stored === undefined || stored.entries.length === 0) return;
+    // Restoration is this host's LOCAL authority: a remembered remote card holds
+    // a position in the same order but is never started, adopted, or revalidated
+    // here, so it takes no part in this pass.
+    const remembered = stored === undefined ? [] : stored.entries.filter(isLocalRosterEntry);
+    if (remembered.length === 0) return;
     // Automatic activation is fenced by the deliberate-action generation, not by
     // the current content target alone: a user who activates and then clears/removes a
     // row during a slow restore must not have the remembered sibling activated
@@ -3051,7 +3381,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // each branded admission BEFORE any row is created: a later listing, a
     // catalog revision bump, or a concurrent user action can never invalidate an
     // admission half-way through restoration.
-    const decisions = stored.entries.map((entry) => {
+    const decisions = remembered.map((entry) => {
       let createOptions: CreateInstanceOptions | undefined;
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
@@ -3088,7 +3418,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     });
     for (const decision of decisions) {
       if (shutdownRequested || manager !== activeManager) return;
-      const record = rosterRecords.get(decision.entry.slotId);
+      const record = roster.getLocal(decision.entry.slotId);
       if (record === undefined) continue;
       if (decision.createOptions === undefined) {
         record.rowId = undefined;
@@ -3108,7 +3438,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       try {
         await created;
       } catch {
-        const live = rosterRecords.get(decision.entry.slotId);
+        const live = roster.getLocal(decision.entry.slotId);
         if (live !== undefined && live.rowId === undefined) {
           live.unavailableReason = "This conversation could not be started; it was not replaced";
         }
@@ -3119,8 +3449,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // and only while no deliberate user action occurred since restoration began,
     // so a slow restore can never override a user's own focus or action.
     if (deliberateActionGeneration === generationAtStart) {
-      const activeSlot = stored.activeSlotId;
-      const activeRecord = activeSlot === undefined ? undefined : rosterRecords.get(activeSlot);
+      const activeSlot = stored?.activeSlotId;
+      const activeRecord = activeSlot === undefined ? undefined : roster.getLocal(activeSlot);
       if (activeRecord?.rowId !== undefined) {
         contentTarget = { kind: "local", id: activeRecord.rowId };
         rememberedActiveSlot = activeRecord.slotId;
@@ -4524,7 +4854,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const replacementId = options?.replacementId;
     const oldSlot = rowSlots.get(id);
     const replacementSlot = replacementId === undefined ? undefined : rowSlots.get(replacementId);
-    const replacementRecord = replacementSlot === undefined ? undefined : rosterRecords.get(replacementSlot);
+    const replacementRecord = replacementSlot === undefined ? undefined : roster.getLocal(replacementSlot);
     const wasSyncing = rosterSyncInProgress;
     if (replacing) sidebar.noteRowReplacement(id);
     let removed: boolean;
@@ -4554,16 +4884,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return "retained";
     }
     removedExitedIds.add(id);
+    let slotTransferred = false;
     if (replacing && replacementId !== undefined && oldSlot !== undefined
       && replacementSlot !== undefined && replacementSlot !== oldSlot
-      && replacementRecord !== undefined && rosterRecords.has(oldSlot)) {
-      // Updating an existing Map key preserves its original remembered position;
-      // the replacement's own appended slot is dropped at the same moment.
-      rosterRecords.set(oldSlot, { ...replacementRecord, slotId: oldSlot, rowId: replacementId });
-      rosterRecords.delete(replacementSlot);
+      && replacementRecord !== undefined && roster.getLocal(oldSlot) !== undefined) {
+      // Updating an existing canonical entry keeps its original remembered
+      // position; the replacement's own appended slot is dropped at the same
+      // moment, and no remote entry moves.
+      roster.setLocal({ ...replacementRecord, slotId: oldSlot, rowId: replacementId });
+      roster.deleteLocal(replacementSlot);
       rowSlots.delete(id);
       rowSlots.set(replacementId, oldSlot);
       if (rememberedActiveSlot === replacementSlot) rememberedActiveSlot = oldSlot;
+      slotTransferred = true;
     }
     if (contentTarget?.kind === "local" && contentTarget.id === id) {
       contentTarget = undefined;
@@ -4571,6 +4904,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
+    if (slotTransferred) {
+      // The transferred slot is a fact of THIS host's roster authority, not of
+      // the manager, and the manager change that already published the rows
+      // happened before the transfer. Ask the owning-host service for one more
+      // guarded observation so a live inventory watcher never keeps the
+      // replacement's temporary slot. No slot state is copied or cached here;
+      // the service re-reads the same authority through the same accessor.
+      hostService.notifyRosterAuthorityChange();
+    }
     reconcileLayout(true);
     return "removed";
   }
@@ -6392,6 +6734,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         selectRemoteContent(action.hostId, action.hostRunId, action.rowId);
         return;
       }
+      case "reorder-session": {
+        // One committed left-roster reorder: the sidebar's transient preview is
+        // committed HERE and nowhere else.
+        applySessionReorder(action.source, action.target, action.placement);
+        return;
+      }
       case "detach-view": {
         // Explicit "display nothing" (#474): this sidebar stops displaying,
         // feeding, and sizing one session. Owned processes and their work,
@@ -7177,6 +7525,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       },
       initialVisible: true,
       onAction: handleSidebarAction,
+      // The sidebar's read-only view of this host's ONE canonical mixed order
+      // (#477): the current runtime identities of the cards it is drawing, in
+      // the sequence the canonical roster holds. The sidebar stores nothing from
+      // it and owns no order of its own; a committed move comes back to Main as
+      // one reorder action and is revalidated here.
+      getSessionOrder: currentSessionOrderView,
       onInvalidate: () => {
         invalidateSavedDeleteConfirmationDisplay();
         invalidateRemoteCloseConfirmationDisplay();

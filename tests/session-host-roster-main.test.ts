@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
@@ -27,19 +28,31 @@ import type { TerminalFrame, TerminalInputModes } from "../src/session-host/term
 import {
   ROSTER_STORE_VERSION,
   hostOwnershipPath,
+  isLocalRosterEntry,
   readRosterStore,
   writeRosterStore,
+  type RosterEntry,
+  type StoredRoster,
 } from "../src/session-host/roster-store";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
+import {
+  createLocalOwningHostService,
+  type OwningHostInventorySnapshot,
+  type OwningHostService,
+} from "../src/session-host/owning-host-service";
+import { toRemoteSessionMetadata, type RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
+import type { PeerCoordinator, PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import type { PeerCoordinatorOptions } from "../src/session-host/network/peer-coordinator";
 
 /**
- * Focused hermetic Main-level tests for the global sidebar roster (#331).
+ * Focused hermetic Main-level tests for the global sidebar roster (#331 and the
+ * mixed local/remote order of #477).
  *
  * Main is driven through the internal `__test.runWithDependencies` seam with a
  * fake manager, but the roster store, exclusive ownership record, and saved
  * conversation catalog are the REAL implementations against a fresh temporary
- * Pi agent directory under node_modules/.cache. No real user agent data, lock,
- * or saved conversation is ever read, written, or removed.
+ * Pi agent directory under an owned temporary root outside the checkout. No real
+ * user agent data, lock, or saved conversation is ever read, written, or removed.
  */
 
 const ESC = "\x1b";
@@ -49,12 +62,21 @@ const ENTER = "\r";
 const DELETE = `${ESC}[3~`;
 const UP = `${ESC}[A`;
 const DOWN = `${ESC}[B`;
-const SCRATCH_ROOT = join(process.cwd(), "node_modules", ".cache", "session-host-roster-main-tests");
+const SCRATCH_ROOT = join(realpathSync(tmpdir()), "prg-session-host-roster-main-tests");
 const SESSION_TIMESTAMP = "2025-01-01T00:00:00.000Z";
 
 function makeRoot(prefix: string): string {
   mkdirSync(SCRATCH_ROOT, { recursive: true });
   return realpathSync(mkdtempSync(join(SCRATCH_ROOT, `${prefix}-`)));
+}
+
+/**
+ * The remembered LOCAL slots of one persisted roster, in the document's one
+ * ordered sequence (#477). Remote placement entries carry presentation identity
+ * only and are deliberately excluded here.
+ */
+function rememberedSlots(roster: StoredRoster | undefined): RosterEntry[] {
+  return roster === undefined ? [] : roster.entries.filter(isLocalRosterEntry);
 }
 
 function nextTurn(): Promise<void> {
@@ -603,9 +625,9 @@ test("a restart from a different launch configuration restores the remembered ro
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
     const roster = stored.status === "loaded" ? stored.roster : undefined;
-    assert.deepEqual(roster?.entries.map((entry) => entry.sessionId), ["conv-ws-a", "conv-ws-b"]);
+    assert.deepEqual(rememberedSlots(roster).map((entry) => entry.sessionId), ["conv-ws-a", "conv-ws-b"]);
     assert.equal(roster?.activeSlotId, "row-2");
-    assert.equal(roster?.entries.some((entry) => entry.sessionId === "conv-ws-c"), false);
+    assert.equal(rememberedSlots(roster).some((entry) => entry.sessionId === "conv-ws-c"), false);
 
     // Host 2 shares the same canonical agent directory but a different transient
     // host state root and cwd-independent options; it restores A and B in order.
@@ -661,7 +683,7 @@ test("an unsaved or unavailable remembered conversation stays a bounded error ro
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
     assert.equal(
-      stored.status === "loaded" ? stored.roster.entries[1]?.persistence : undefined,
+      stored.status === "loaded" ? rememberedSlots(stored.roster)[1]?.persistence : undefined,
       "unsaved",
       "the store records the observed unsaved binding",
     );
@@ -694,7 +716,7 @@ test("an unsaved or unavailable remembered conversation stays a bounded error ro
     const afterRemoval = readRosterStore(agentDir);
     assert.equal(afterRemoval.status, "loaded");
     assert.deepEqual(
-      afterRemoval.status === "loaded" ? afterRemoval.roster.entries.map((entry) => entry.sessionId) : undefined,
+      afterRemoval.status === "loaded" ? rememberedSlots(afterRemoval.roster).map((entry) => entry.sessionId) : undefined,
       ["conv-ws-a"],
     );
     assert.equal(second.sidebar?.items.some((item) => item.id === "roster-error:row-2"), false);
@@ -722,7 +744,7 @@ test("an in-native /new conversation change updates the remembered identity that
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
     assert.deepEqual(
-      stored.status === "loaded" ? stored.roster.entries.map((entry) => entry.sessionId) : undefined,
+      stored.status === "loaded" ? rememberedSlots(stored.roster).map((entry) => entry.sessionId) : undefined,
       ["conv-ws-a-renamed"],
       "the remembered identity follows the CURRENT native conversation, not the original launch binding",
     );
@@ -848,12 +870,12 @@ test("an unavailable entry keeps its remembered position across two restarts ins
     const afterSecond = readRosterStore(agentDir);
     assert.equal(afterSecond.status, "loaded");
     assert.deepEqual(
-      afterSecond.status === "loaded" ? afterSecond.roster.entries.map((entry) => entry.slotId) : undefined,
+      afterSecond.status === "loaded" ? rememberedSlots(afterSecond.roster).map((entry) => entry.slotId) : undefined,
       ["row-1", "row-2", "row-3"],
       "the persisted order is unchanged by a mid-list unavailable entry",
     );
     assert.deepEqual(
-      afterSecond.status === "loaded" ? afterSecond.roster.entries.map((entry) => entry.sessionId) : undefined,
+      afterSecond.status === "loaded" ? rememberedSlots(afterSecond.roster).map((entry) => entry.sessionId) : undefined,
       ["conv-ws-a", "conv-ws-b", "conv-ws-c"],
     );
     assert.equal(await quit(second), 0);
@@ -898,7 +920,7 @@ test("a row that never reports a conversation stays a remembered unavailable ent
 
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
-    const entries = stored.status === "loaded" ? stored.roster.entries : [];
+    const entries = stored.status === "loaded" ? rememberedSlots(stored.roster) : [];
     assert.equal(entries.length, 2, "a live child without metadata and a failed launch are both remembered");
     assert.deepEqual(entries.map((entry) => entry.sessionId), [undefined, undefined]);
     assert.deepEqual(entries.map((entry) => entry.workspace), [realpathSync(workspaceA), realpathSync(workspaceB)]);
@@ -1071,7 +1093,7 @@ test("a failed exited-row restart keeps both the placeholder and the replacement
 
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
-    const entries = stored.status === "loaded" ? stored.roster.entries : [];
+    const entries = stored.status === "loaded" ? rememberedSlots(stored.roster) : [];
     assert.equal(entries.length, 2, "neither retained row is silently lost when the host quits");
     assert.equal(entries[0]?.sessionId, "conv-old");
 
@@ -1118,12 +1140,12 @@ test("a successful exited-row restart keeps the replaced row's roster slot and o
     const stored = readRosterStore(agentDir);
     assert.equal(stored.status, "loaded");
     assert.deepEqual(
-      stored.status === "loaded" ? stored.roster.entries.map((entry) => entry.slotId) : undefined,
+      stored.status === "loaded" ? rememberedSlots(stored.roster).map((entry) => entry.slotId) : undefined,
       ["old", "other"],
       "the stable slot id is transferred into the old position",
     );
     assert.deepEqual(
-      stored.status === "loaded" ? stored.roster.entries.map((entry) => entry.sessionId) : undefined,
+      stored.status === "loaded" ? rememberedSlots(stored.roster).map((entry) => entry.sessionId) : undefined,
       ["conv-ws-a", "conv-ws-other"],
     );
     assert.equal(
@@ -1201,6 +1223,774 @@ test("returning to Main during a slow restore is never overridden by the remembe
     );
     harness.terminal.emitInput("z");
     assert.deepEqual(manager.writes, [], "typing after the refusal reaches no child");
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The existing durable roster slot as read-only presentation metadata (#477).
+//
+// Main already owns the durable sidebar slot of every row. These tests pin the
+// substrate that lets the owning-host service project that EXISTING fact: one
+// narrow read-only accessor over Main's own maps (no second slot store, no
+// mirror), the service's inventory rows carrying it, and the remote row
+// boundary exposing it as metadata while the manager row id stays the runtime
+// identity that selection, input, and actions route by.
+// ---------------------------------------------------------------------------
+
+test("Main exposes each row's existing durable roster slot to the owning-host service read-only", async () => {
+  const root = makeRoot("slot-source");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  const workspaceB = join(root, "ws-b");
+  for (const workspace of [workspaceA, workspaceB]) mkdirSync(workspace);
+  let slotSource: ((rowId: string) => string | undefined) | undefined;
+  let service: OwningHostService | undefined;
+  try {
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createOwningHostService: (dependencies) => {
+        slotSource = dependencies.rosterSlotIdFor;
+        service = createLocalOwningHostService(dependencies);
+        return service;
+      },
+    }, {
+      seedViews: [
+        exitedView("old", realpathSync(workspaceA), "conv-old", "unsaved"),
+        aliveView("other", realpathSync(workspaceB), "conv-ws-other"),
+      ],
+    });
+    const manager = await ready(harness);
+    assert.equal(typeof slotSource, "function", "Main wires one narrow read-only slot accessor");
+    const slotOf = (rowId: string): string | undefined => slotSource?.(rowId);
+
+    assert.equal(slotOf("old"), "old");
+    assert.equal(slotOf("other"), "other");
+    // ONE deterministic rule (#477): a listed row with no binding yet answers
+    // with its own id, which is exactly the slot Main mints and persists for it,
+    // so the first negotiated observation is already coherent. The accessor is
+    // only ever asked about a row the manager itself just listed, and it never
+    // answers with a DIFFERENT row's slot.
+    assert.equal(slotOf("a-row-not-listed-yet"), "a-row-not-listed-yet");
+
+    const before = service?.readInventorySnapshot();
+    assert.ok(before, "the open manager makes the inventory observable");
+    assert.deepEqual(
+      before.rows.map((row) => [row.id, row.rosterSlotId]),
+      [["old", "old"], ["other", "other"]],
+      "the inventory carries Main's own slots, read live, with the manager's row order intact",
+    );
+
+    // Replace the exited row: the manager appends a fresh runtime row id while
+    // Main transfers the durable slot into the same remembered position.
+    harness.terminal.emitInput(UP); // New session -> Saved conversations
+    harness.terminal.emitInput(UP); // -> the live sibling
+    harness.terminal.emitInput(UP); // -> the exited placeholder
+    assert.equal(harness.sidebar?.selectedId, "old");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(manager.views.map((view) => view.id), ["other", "row-1"],
+      "the replacement row carries a regenerated runtime id");
+
+    assert.equal(slotOf("row-1"), "old", "the same durable slot survives a regenerated runtime row id");
+    // The retired runtime row left the manager's listing, so the real consumer
+    // never asks about it again; the inventory below carries no such row.
+
+    const after = service?.readInventorySnapshot();
+    assert.ok(after);
+    assert.equal(after.hostRunId, before.hostRunId, "one owner run throughout");
+    assert.ok(after.revision > before.revision, "the revision rule is unchanged");
+    assert.deepEqual(
+      after.rows.map((row) => [row.id, row.rosterSlotId]),
+      [["other", "other"], ["row-1", "old"]],
+    );
+
+    const stored = readRosterStore(agentDir);
+    assert.equal(stored.status, "loaded");
+    assert.deepEqual(
+      stored.status === "loaded" ? rememberedSlots(stored.roster).map((entry) => entry.slotId) : undefined,
+      ["old", "other"],
+      "the projected slots are Main's persisted roster slots, not a parallel set",
+    );
+
+    // The remote boundary carries the slot as metadata only: the runtime row id
+    // stays the identity selection, input, and actions use.
+    const replacement = after.rows.find((row) => row.id === "row-1");
+    assert.ok(replacement);
+    const remote = toRemoteSessionMetadata(replacement, { rosterSlotId: true });
+    assert.equal(remote.id, "row-1");
+    assert.equal(remote.rosterSlotId, "old");
+    assert.equal(toRemoteSessionMetadata(replacement).rosterSlotId, undefined,
+      "an unnegotiated projection keeps the legacy row shape");
+
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a live inventory watch is re-observed when Main transfers the durable slot to a replacement", async () => {
+  const root = makeRoot("slot-transfer-watch");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  const workspaceB = join(root, "ws-b");
+  for (const workspace of [workspaceA, workspaceB]) mkdirSync(workspace);
+  let service: OwningHostService | undefined;
+  try {
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createOwningHostService: (dependencies) => {
+        service = createLocalOwningHostService(dependencies);
+        return service;
+      },
+    }, {
+      seedViews: [
+        exitedView("old", realpathSync(workspaceA), "conv-old", "unsaved"),
+        aliveView("other", realpathSync(workspaceB), "conv-ws-other"),
+      ],
+    });
+    const manager = await ready(harness);
+    assert.ok(service, "Main wired the owning-host service");
+
+    // Count every manager change notification, so a later inventory delivery can
+    // be told apart from a manager-driven one.
+    const managerChanges: string[] = [];
+    const hostChange = manager.onChange;
+    manager.onChange = (id: string): void => {
+      managerChanges.push(id);
+      hostChange?.(id);
+    };
+
+    interface Delivery {
+      readonly revision: number;
+      readonly changes: number;
+      readonly pairs: string[];
+      readonly snapshot: OwningHostInventorySnapshot;
+    }
+    const deliveries: Delivery[] = [];
+    const watch = service.watchInventory((snapshot) => {
+      if (snapshot === undefined) return;
+      deliveries.push({
+        revision: snapshot.revision,
+        changes: managerChanges.length,
+        pairs: snapshot.rows.map((row) => `${row.id}=${row.rosterSlotId ?? "<absent>"}`),
+        snapshot,
+      });
+    });
+    assert.ok(watch, "the inventory watch installs");
+    // Installation returns its own snapshot instead of also calling the
+    // listener, so record that first observation exactly as delivered.
+    deliveries.push({
+      revision: watch.snapshot.revision,
+      changes: managerChanges.length,
+      pairs: watch.snapshot.rows.map((row) => `${row.id}=${row.rosterSlotId ?? "<absent>"}`),
+      snapshot: watch.snapshot,
+    });
+    assert.deepEqual(deliveries.at(-1)?.pairs, ["old=old", "other=other"],
+      "the install snapshot carries each row's current durable slot");
+
+    // Replace the exited row, then do NOTHING ELSE to the manager.
+    harness.terminal.emitInput(UP); // New session -> Saved conversations
+    harness.terminal.emitInput(UP); // -> the live sibling
+    harness.terminal.emitInput(UP); // -> the exited placeholder
+    assert.equal(harness.sidebar?.selectedId, "old");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(manager.views.map((view) => view.id), ["other", "row-1"],
+      "the replacement row carries a regenerated runtime id");
+
+    const created = deliveries.find((delivery) => delivery.pairs.includes("row-1=row-1"));
+    assert.ok(created, "the replacement's FIRST publication already carries the deterministic slot Main mints for a new row");
+    assert.equal(deliveries.some((delivery) => delivery.pairs.includes("row-1=<absent>")), false,
+      "the shared authority rule never publishes an invented absence for a row the manager lists");
+    const stale = [...deliveries].reverse().find((delivery) => delivery.pairs.includes("row-1=row-1"));
+    assert.ok(stale, "the manager's own change published that temporary slot before the transfer");
+
+    const latest = deliveries.at(-1);
+    assert.ok(latest);
+    assert.deepEqual(latest.pairs, ["other=other", "row-1=old"],
+      "the live watcher receives the transferred durable slot with no later manager change");
+    assert.equal(latest.changes, stale.changes,
+      "the correction came from the host's re-observation, not from a later manager change");
+    assert.equal(managerChanges.length, stale.changes,
+      "nothing else happened to the manager after that change");
+    assert.ok(latest.revision > stale.revision, "one owner run, a strictly newer revision");
+    assert.deepEqual(
+      deliveries.filter((delivery) => delivery.revision >= created.revision).map((delivery) => delivery.revision),
+      [...deliveries].filter((delivery) => delivery.revision >= created.revision)
+        .map((delivery) => delivery.revision).sort((a, b) => a - b),
+      "deliveries never hand a watcher an older revision",
+    );
+
+    // The negotiated bridge projection of that DELIVERED observation is
+    // coherent: the runtime row id routes, the durable slot only describes
+    // placement. No fresh read is needed to see the corrected slot.
+    const deliveredReplacement = latest.snapshot.rows.find((row) => row.id === "row-1");
+    assert.ok(deliveredReplacement);
+    const remote = toRemoteSessionMetadata(deliveredReplacement, { rosterSlotId: true });
+    assert.deepEqual([remote.id, remote.rosterSlotId], ["row-1", "old"]);
+
+    watch.unsubscribe();
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the first negotiated observation of a brand-new row already carries the slot Main persists, and it stays stable", async () => {
+  const root = makeRoot("first-create-slot");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  mkdirSync(workspaceA);
+  let service: OwningHostService | undefined;
+  try {
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createOwningHostService: (dependencies) => {
+        service = createLocalOwningHostService(dependencies);
+        return service;
+      },
+    });
+    const manager = await ready(harness);
+    assert.ok(service, "Main wired the owning-host service");
+    assert.equal(manager.views.length, 0, "no row exists before the deliberate create");
+
+    // The watch is installed BEFORE the create, so the very first publication of
+    // the new row is observed, before any later status change of that row.
+    const deliveries: string[][] = [];
+    const watch = service.watchInventory((snapshot) => {
+      if (snapshot === undefined) return;
+      deliveries.push(snapshot.rows.map((row) => `${row.id}=${row.rosterSlotId ?? "<absent>"}`));
+    });
+    assert.ok(watch, "the inventory watch installs");
+
+    submitFirstNew(harness, workspaceA);
+    await nextTurn();
+    const first = deliveries.find((pairs) => pairs.some((pair) => pair.startsWith("row-1=")));
+    assert.ok(first, "the watcher observed the newly created row");
+    assert.deepEqual(first, ["row-1=row-1"],
+      "the first publication already carries the deterministic durable slot this host adopts and persists");
+
+    await nextTurn();
+    const latestPairs = deliveries.at(-1);
+    assert.ok(latestPairs);
+    assert.ok(latestPairs.includes("row-1=row-1"),
+      "the same slot survives the row's later status change: no invented absence, no second position");
+
+    // The persisted roster holds that same single slot.
+    const stored = readRosterStore(agentDir);
+    assert.equal(stored.status, "loaded");
+    assert.deepEqual(
+      rememberedSlots(stored.roster).map((entry) => entry.slotId),
+      ["row-1"],
+      "the observed slot is the persisted slot, not a parallel one",
+    );
+
+    // And the negotiated bridge projection of a DELIVERED row carries it as
+    // placement metadata while the runtime row id stays the routing identity.
+    const inventory = service?.readInventorySnapshot();
+    assert.ok(inventory);
+    const deliveredRow = inventory.rows.find((row) => row.id === "row-1");
+    assert.ok(deliveredRow);
+    const remote = toRemoteSessionMetadata(deliveredRow, { rosterSlotId: true });
+    assert.deepEqual([remote.id, remote.rosterSlotId], ["row-1", "row-1"]);
+
+    watch.unsubscribe();
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #477: the ONE canonical mixed local/remote presentation order, integrated
+// into production Main. The roster store, ownership record, and saved-catalog
+// revalidation are real; the coordinator supplies only the remote DTOs an owner
+// would report. There is no physical-terminal or mouse-mode proof here.
+// ---------------------------------------------------------------------------
+
+const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
+const MOVE_KEY = "m";
+
+/** The coordinator Main owns: the snapshot it publishes is this viewer's only remote fact. */
+class FakePeerCoordinator implements PeerCoordinator {
+  options: PeerCoordinatorOptions | undefined;
+  snapshot: PeerUiSnapshot = {
+    revision: 1,
+    status: "ready",
+    identityFingerprint: null,
+    settings: {
+      hostingEnabled: false, bindHost: "", bindPort: null, autoReconnect: false, bellEnabled: true,
+      viewerNativeInputEnabled: true, remoteHistoryDeleteEnabled: true,
+    },
+    listener: { state: "off", host: null, port: null, message: null },
+    hosts: [], trustedPeers: [], consents: [], notice: null,
+  };
+  read(): PeerUiSnapshot { return this.snapshot; }
+  async start(): Promise<void> {}
+  async perform(): Promise<void> {}
+  decideConsent(): boolean { return false; }
+  async close(): Promise<void> {}
+  publish(hosts: readonly PeerUiHost[]): void {
+    this.snapshot = { ...this.snapshot, hosts, revision: this.snapshot.revision + 1 };
+    this.options?.onChange(this.snapshot);
+  }
+}
+
+/** One owner-side remote card, projected through the real owner roster boundary. */
+function remoteCard(options: {
+  rowId: string;
+  workspace: string;
+  conversation: string;
+  rosterSlotId?: string;
+}): RemoteSessionMetadata {
+  const view = {
+    ...aliveView(options.rowId, options.workspace, options.conversation),
+    ...(options.rosterSlotId === undefined ? {} : { rosterSlotId: options.rosterSlotId }),
+  };
+  return toRemoteSessionMetadata(view, { rosterSlotId: options.rosterSlotId !== undefined });
+}
+
+function peerHost(options: {
+  id: string;
+  rows: readonly RemoteSessionMetadata[] | null;
+  hostRunId: string | null;
+  rosterState?: "never" | "current" | "stale";
+}): PeerUiHost {
+  return {
+    id: options.id,
+    label: `host ${options.id}`,
+    host: "127.0.0.1",
+    port: 8443,
+    state: "connected",
+    fingerprint: null,
+    message: null,
+    reconnectSuppressed: false,
+    previouslyConnected: true,
+    roster: { state: options.rosterState ?? "current", rows: options.rows, hostRunId: options.hostRunId },
+  };
+}
+
+/** The roster pane exactly as this host draws it, with no presentation bytes. */
+function drawnRoster(sidebar: SidebarController): string[] {
+  return sidebar.renderRoster(44, 34).lines.map((line) => line.replace(SGR_PATTERN, ""));
+}
+
+/** The given card labels in the vertical order the sidebar actually draws them. */
+function drawnOrder(sidebar: SidebarController, labels: readonly string[]): string[] {
+  const lines = drawnRoster(sidebar);
+  const placed = labels
+    .map((label) => ({ label, index: lines.findIndex((line) => line.includes(label)) }))
+    .filter((entry) => entry.index >= 0)
+    .sort((left, right) => left.index - right.index);
+  assert.equal(placed.length, labels.length, `every named card must be drawn: ${JSON.stringify(lines)}`);
+  return placed.map((entry) => entry.label);
+}
+
+/** Walks the roster highlight to the card whose title line belongs to the highlighted card block. */
+function highlightCard(harness: Harness, sidebar: SidebarController, label: string): void {
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    const lines = drawnRoster(sidebar);
+    const marker = lines.findIndex((line) => line.startsWith("> ") || line.startsWith(">>"));
+    if (marker >= 0) {
+      // A card block is its title line, then (for a remote card) its owner-host
+      // line, then the status line that carries the selection marker.
+      const block = lines.slice(Math.max(0, marker - 3), marker + 1).join("\n");
+      if (block.includes(label)) return;
+    }
+    harness.terminal.emitInput(DOWN);
+  }
+  assert.fail(`the roster never highlighted ${label}: focus=${sidebar.focus} selected=${sidebar.selectedId} ${JSON.stringify(drawnRoster(sidebar))}`);
+}
+
+/** The persisted ordered sequence, one string per entry, in document order. */
+function persistedSequence(agentDir: string): string[] {
+  const read = readRosterStore(agentDir);
+  assert.equal(read.status, "loaded");
+  if (read.status !== "loaded") return [];
+  assert.equal(read.roster.version, ROSTER_STORE_VERSION, "the published document is the single current version");
+  return read.roster.entries.map((entry) => entry.kind === "remote"
+    ? `remote:${entry.hostId}:${entry.owner.kind}:${entry.owner.id}`
+    : `local:${entry.slotId}`);
+}
+
+test("a committed keyboard reorder interleaves local and remote cards, and the mixed order survives viewer and owner restarts", async () => {
+  const root = makeRoot("mixed-order");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  const workspaceC = join(root, "ws-c");
+  for (const workspace of [workspaceA, workspaceC]) mkdirSync(workspace);
+  const all = ["Name conv-b", "Name conv-ws-a", "Name conv-ws-c", "Name conv-d"];
+  const hostsFor = (hostRunId: string): PeerUiHost[] => [
+    peerHost({ id: "h1", hostRunId, rows: [remoteCard({ rowId: "rb", workspace: "/remote/ws/b", conversation: "conv-b", rosterSlotId: "slot-b" })] }),
+    peerHost({ id: "h2", hostRunId, rows: [remoteCard({ rowId: "rd", workspace: "/remote/ws/d", conversation: "conv-d", rosterSlotId: "slot-d" })] }),
+  ];
+  try {
+    const peer = new FakePeerCoordinator();
+    const first = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    const manager = await ready(first);
+    submitFirstNew(first, workspaceA);
+    await nextTurn();
+    submitAnotherNew(first, workspaceC);
+    await nextTurn();
+    assert.deepEqual(manager.views.map((view) => view.id), ["row-1", "row-2"]);
+    peer.publish(hostsFor("run-1"));
+    await nextTurn();
+    const sidebar = first.sidebar;
+    assert.ok(sidebar);
+    assert.deepEqual(
+      drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-ws-c", "Name conv-b", "Name conv-d"]),
+      ["Name conv-ws-a", "Name conv-ws-c", "Name conv-b", "Name conv-d"],
+      "new remote identities append in first-observed order and never displace a local card",
+    );
+
+    // The agreed example: A local, B host1, C local, D host2 -> B, A, C, D.
+    first.terminal.emitInput(ALT_LEFT); // focus the roster
+    highlightCard(first, sidebar, "Name conv-b");
+    first.terminal.emitInput(MOVE_KEY);
+    first.terminal.emitInput(UP);
+    first.terminal.emitInput(UP);
+    first.terminal.emitInput(ENTER); // commits the move, activates nothing
+    await nextTurn();
+    assert.deepEqual(drawnOrder(sidebar, all), all, "one committed reorder interleaves both hosts");
+    assert.equal(sidebar.activeMainOwnerID, "row-2", "the reorder activated nothing and kept the displayed owner");
+
+    // The saved document is that same single ordered sequence: remote entries
+    // carry durable presentation identity only, local entries their own payload.
+    assert.deepEqual(persistedSequence(agentDir), [
+      "remote:h1:slot:slot-b",
+      "local:row-1",
+      "local:row-2",
+      "remote:h2:slot:slot-d",
+    ]);
+    assert.equal(await quit(first), 0);
+
+    // Viewer restart AND owner restart: new host, new local rows, new owner run,
+    // the SAME durable owner slots. The mixed order is restored, not re-derived.
+    writeSavedConversation(agentDir, "conv-ws-a", realpathSync(workspaceA));
+    writeSavedConversation(agentDir, "conv-ws-c", realpathSync(workspaceC));
+    const restartedPeer = new FakePeerCoordinator();
+    restartedPeer.publish(hostsFor("run-2"));
+    const second = createHarness(agentDir, () => catalogFor(agentDir, [
+      { id: "conv-ws-c", cwd: realpathSync(workspaceC) },
+      { id: "conv-ws-a", cwd: realpathSync(workspaceA) },
+    ]), { stateRoot: "/synthetic/other-host-state" }, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        restartedPeer.options = coordinatorOptions;
+        return restartedPeer as never;
+      },
+    });
+    const secondManager = await ready(second);
+    assert.ok(second.sidebar);
+    assert.deepEqual(
+      drawnOrder(second.sidebar, all),
+      all,
+      "the mixed order survives a viewer restart and a new owner run over the same durable slots",
+    );
+    assert.equal(secondManager.views.length, 2, "restoration started exactly the two remembered local conversations");
+    assert.equal(await quit(second), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a remote card that disappears keeps its remembered position and returns to it without a duplicate card", async () => {
+  const root = makeRoot("mixed-absence");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  const workspaceC = join(root, "ws-c");
+  for (const workspace of [workspaceA, workspaceC]) mkdirSync(workspace);
+  const interleaved = ["Name conv-b", "Name conv-ws-a", "Name conv-ws-c", "Name conv-d"];
+  try {
+    const peer = new FakePeerCoordinator();
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    await ready(harness);
+    submitFirstNew(harness, workspaceA);
+    await nextTurn();
+    submitAnotherNew(harness, workspaceC);
+    await nextTurn();
+    peer.publish([
+      peerHost({ id: "h1", hostRunId: "run-1", rows: [remoteCard({ rowId: "rb", workspace: "/remote/ws/b", conversation: "conv-b", rosterSlotId: "slot-b" })] }),
+      peerHost({ id: "h2", hostRunId: "run-1", rows: [remoteCard({ rowId: "rd", workspace: "/remote/ws/d", conversation: "conv-d", rosterSlotId: "slot-d" })] }),
+    ]);
+    await nextTurn();
+    const sidebar = harness.sidebar;
+    assert.ok(sidebar);
+    harness.terminal.emitInput(ALT_LEFT);
+    highlightCard(harness, sidebar, "Name conv-b");
+    harness.terminal.emitInput(MOVE_KEY);
+    harness.terminal.emitInput(UP);
+    harness.terminal.emitInput(UP);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(drawnOrder(sidebar, interleaved), interleaved);
+
+    // Positive loss: no complete roster names those cards any more. Nothing is
+    // invented for them, no extra card appears, and the local cards stay put.
+    peer.publish([peerHost({ id: "h1", hostRunId: "run-1", rows: [] }), peerHost({ id: "h2", hostRunId: "run-1", rows: [] })]);
+    await nextTurn();
+    const lines = drawnRoster(sidebar).join("\n");
+    assert.equal(lines.includes("Name conv-b"), false, "an unobserved remote card draws no placeholder");
+    assert.equal(lines.includes("Name conv-d"), false, "an unobserved remote card draws no placeholder");
+    assert.deepEqual(
+      drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-ws-c"]),
+      ["Name conv-ws-a", "Name conv-ws-c"],
+      "the local cards keep their own relative order through the owner's absence",
+    );
+
+    // Reconnect over the SAME durable slots: each card reclaims its position.
+    peer.publish([
+      peerHost({ id: "h1", hostRunId: "run-9", rows: [remoteCard({ rowId: "rb2", workspace: "/remote/ws/b", conversation: "conv-b", rosterSlotId: "slot-b" })] }),
+      peerHost({ id: "h2", hostRunId: "run-9", rows: [remoteCard({ rowId: "rd2", workspace: "/remote/ws/d", conversation: "conv-d", rosterSlotId: "slot-d" })] }),
+    ]);
+    await nextTurn();
+    assert.deepEqual(drawnOrder(sidebar, interleaved), interleaved,
+      "a matching durable identity reclaims its remembered position instead of appending");
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an owner without a negotiated slot is identified by its exact run and row, so a new owner run appends instead of aliasing", async () => {
+  const root = makeRoot("mixed-legacy-run");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  mkdirSync(workspaceA);
+  try {
+    const peer = new FakePeerCoordinator();
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    await ready(harness);
+    submitFirstNew(harness, workspaceA);
+    await nextTurn();
+    peer.publish([peerHost({
+      id: "h1",
+      hostRunId: "run-1",
+      rows: [remoteCard({ rowId: "r1", workspace: "/remote/ws/old", conversation: "conv-old-run" })],
+    })]);
+    await nextTurn();
+    const sidebar = harness.sidebar;
+    assert.ok(sidebar);
+    assert.deepEqual(drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-old-run"]), ["Name conv-ws-a", "Name conv-old-run"]);
+
+    // Move the legacy card above the local one.
+    harness.terminal.emitInput(ALT_LEFT);
+    highlightCard(harness, sidebar, "Name conv-old-run");
+    harness.terminal.emitInput(MOVE_KEY);
+    harness.terminal.emitInput(UP);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(drawnOrder(sidebar, ["Name conv-old-run", "Name conv-ws-a"]), ["Name conv-old-run", "Name conv-ws-a"]);
+    assert.deepEqual(persistedSequence(agentDir), [
+      `remote:h1:runtime:${JSON.stringify(["run-1", "r1"])}`,
+      "local:row-1",
+    ], "the legacy identity names BOTH the observed owner run and the row id");
+
+    // A new owner run reuses the same row id. It is a NEW identity: it appends,
+    // and the old position is never guessed at or reused.
+    peer.publish([peerHost({
+      id: "h1",
+      hostRunId: "run-2",
+      rows: [remoteCard({ rowId: "r1", workspace: "/remote/ws/new", conversation: "conv-new-run" })],
+    })]);
+    await nextTurn();
+    assert.deepEqual(
+      drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-new-run"]),
+      ["Name conv-ws-a", "Name conv-new-run"],
+      "a reused row id on a new owner run is a different card and appends",
+    );
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("first-observed remote positions are saved with no reorder and no local change, and survive a viewer restart with reversed arrival", async () => {
+  const root = makeRoot("mixed-observe-persist");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  mkdirSync(workspaceA);
+  const cardB = () => remoteCard({ rowId: "rb", workspace: "/remote/ws/b", conversation: "conv-b", rosterSlotId: "slot-b" });
+  const cardD = () => remoteCard({ rowId: "rd", workspace: "/remote/ws/d", conversation: "conv-d", rosterSlotId: "slot-d" });
+  const remembered = ["local:row-1", "remote:h1:slot:slot-b", "remote:h2:slot:slot-d"];
+  try {
+    const peer = new FakePeerCoordinator();
+    const first = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    await ready(first);
+    submitFirstNew(first, workspaceA);
+    await nextTurn();
+    peer.publish([
+      peerHost({ id: "h1", hostRunId: "run-1", rows: [cardB()] }),
+      peerHost({ id: "h2", hostRunId: "run-1", rows: [cardD()] }),
+    ]);
+    await nextTurn();
+    assert.deepEqual(persistedSequence(agentDir), remembered,
+      "a first observation is published at once, with no reorder and no later local roster change");
+
+    // Positive loss changes nothing in the saved sequence: the positions are
+    // retained, not dropped, and an empty-roster observation rewrites nothing.
+    peer.publish([
+      peerHost({ id: "h1", hostRunId: "run-1", rows: [] }),
+      peerHost({ id: "h2", hostRunId: "run-1", rows: [] }),
+    ]);
+    await nextTurn();
+    assert.deepEqual(persistedSequence(agentDir), remembered, "absence never prunes a remembered position");
+    assert.equal(await quit(first), 0);
+
+    // Viewer restart: the same durable slots arrive in the OPPOSITE host order.
+    // The remembered mixed sequence, not this arrival order, is what draws.
+    writeSavedConversation(agentDir, "conv-ws-a", realpathSync(workspaceA));
+    const restartedPeer = new FakePeerCoordinator();
+    restartedPeer.publish([
+      peerHost({ id: "h2", hostRunId: "run-2", rows: [cardD()] }),
+      peerHost({ id: "h1", hostRunId: "run-2", rows: [cardB()] }),
+    ]);
+    const second = createHarness(agentDir, () => catalogFor(agentDir, [
+      { id: "conv-ws-a", cwd: realpathSync(workspaceA) },
+    ]), { stateRoot: "/synthetic/other-host-state" }, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        restartedPeer.options = coordinatorOptions;
+        return restartedPeer as never;
+      },
+    });
+    await ready(second);
+    assert.ok(second.sidebar);
+    assert.deepEqual(
+      drawnOrder(second.sidebar, ["Name conv-ws-a", "Name conv-b", "Name conv-d"]),
+      ["Name conv-ws-a", "Name conv-b", "Name conv-d"],
+      "a reversed arrival order cannot re-derive the remembered mixed order",
+    );
+    assert.deepEqual(persistedSequence(agentDir), remembered, "the restarted host republishes the same sequence");
+    assert.equal(await quit(second), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a maximum-length legacy row id with quotes and backslashes still gets a placement binding and reorders", async () => {
+  const root = makeRoot("mixed-legacy-max-id");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  mkdirSync(workspaceA);
+  // The protocol-valid maximum: 256 bytes of quote and backslash characters
+  // beside a 64-byte owner run, which escaped is far larger than either part.
+  const maximumRowId = `${'"'.repeat(128)}${"\\".repeat(128)}`;
+  const maximumRunId = "r".repeat(64);
+  try {
+    const peer = new FakePeerCoordinator();
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    await ready(harness);
+    submitFirstNew(harness, workspaceA);
+    await nextTurn();
+    peer.publish([peerHost({
+      id: "h1",
+      hostRunId: maximumRunId,
+      rows: [remoteCard({ rowId: maximumRowId, workspace: "/remote/ws/max", conversation: "conv-max" })],
+    })]);
+    await nextTurn();
+    const sidebar = harness.sidebar;
+    assert.ok(sidebar);
+    assert.deepEqual(drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-max"]), ["Name conv-ws-a", "Name conv-max"]);
+
+    harness.terminal.emitInput(ALT_LEFT);
+    highlightCard(harness, sidebar, "Name conv-max");
+    harness.terminal.emitInput(MOVE_KEY);
+    harness.terminal.emitInput(UP);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(
+      drawnOrder(sidebar, ["Name conv-max", "Name conv-ws-a"]),
+      ["Name conv-max", "Name conv-ws-a"],
+      "a maximum-length escaped legacy identity keeps an unambiguous placement binding",
+    );
+    assert.deepEqual(persistedSequence(agentDir), [
+      `remote:h1:runtime:${JSON.stringify([maximumRunId, maximumRowId])}`,
+      "local:row-1",
+    ], "and its exact identity is what persists");
+    assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("two visible rows naming the same durable slot refuse an ambiguous placement binding while both live cards keep working", async () => {
+  const root = makeRoot("mixed-ambiguous");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspaceA = join(root, "ws-a");
+  mkdirSync(workspaceA);
+  try {
+    const peer = new FakePeerCoordinator();
+    const harness = createHarness(agentDir, () => emptyCatalog(agentDir), {}, {
+      createPeerCoordinator: (coordinatorOptions) => {
+        peer.options = coordinatorOptions;
+        return peer as never;
+      },
+    });
+    const manager = await ready(harness);
+    submitFirstNew(harness, workspaceA);
+    await nextTurn();
+    peer.publish([peerHost({
+      id: "h1",
+      hostRunId: "run-1",
+      rows: [
+        remoteCard({ rowId: "r1", workspace: "/remote/ws/one", conversation: "conv-dup-one", rosterSlotId: "dup-slot" }),
+        remoteCard({ rowId: "r2", workspace: "/remote/ws/two", conversation: "conv-dup-two", rosterSlotId: "dup-slot" }),
+      ],
+    })]);
+    await nextTurn();
+    const sidebar = harness.sidebar;
+    assert.ok(sidebar);
+    const before = drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-dup-one", "Name conv-dup-two"]);
+    harness.terminal.emitInput(ALT_LEFT);
+    highlightCard(harness, sidebar, "Name conv-dup-one");
+    harness.terminal.emitInput(MOVE_KEY);
+    harness.terminal.emitInput(UP);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(
+      drawnOrder(sidebar, ["Name conv-ws-a", "Name conv-dup-one", "Name conv-dup-two"]),
+      before,
+      "an ambiguous durable slot is never guessed, converted, or used to retarget a move",
+    );
+    assert.ok(drawnRoster(sidebar).join(" ").includes("Session order change refused"),
+      "the refusal is surfaced instead of silently doing something else");
+    assert.deepEqual(manager.views.map((view) => view.id), ["row-1"], "the local session is untouched");
+    assert.equal(sidebar.activeMainOwnerID, "row-1", "the displayed local owner is untouched");
     assert.equal(await quit(harness), 0);
   } finally {
     rmSync(root, { recursive: true, force: true });

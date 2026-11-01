@@ -336,6 +336,26 @@ export type SidebarAction =
       readonly hostRunId: string | null;
       readonly rowId: string;
     }
+  /**
+   * One COMMITTED left-roster session reorder: the exact runtime identity of the
+   * moved card, the exact runtime identity of the destination card, and which
+   * side of that destination the moved card lands on. It is the only order
+   * action this module can emit, it is emitted exactly once per deliberate
+   * commit, and it names no select, activation, stop, removal, creation, quit,
+   * or lifecycle intent — the displayed Main owner, work/live status, and every
+   * session's ownership are untouched by a reorder.
+   *
+   * Identities are runtime keys (local item id, or owner host + exact owner run +
+   * owner row), never roster slots: the sidebar keeps no order store of its own,
+   * never re-derives a target from a row index, and Main owns revalidation,
+   * mapping to its canonical roster, and persistence.
+   */
+  | {
+      readonly type: "reorder-session";
+      readonly source: SidebarMainOwnerKey;
+      readonly target: SidebarMainOwnerKey;
+      readonly placement: "before" | "after";
+    }
   | { readonly type: "remove"; readonly id: string }
   /**
    * Ordinary `d`/Delete on the remote card the left roster actually drew as its
@@ -553,6 +573,18 @@ export interface SidebarControllerOptions {
    */
   readonly now?: () => number;
   readonly onAction?: (action: SidebarAction) => void;
+  /**
+   * Read-only view of Main's ONE canonical presentation roster: the ordered
+   * runtime identities it actually holds. The sidebar calls it ONLY while
+   * rebuilding entries and uses the returned keys purely as a projection input;
+   * it never stores the list, never copies it into a second order store, and
+   * never treats it as authority over membership. Entries the callback does not
+   * name keep their existing source order after the named ones, identities the
+   * callback names that have no card add nothing, and a missing, throwing, or
+   * malformed value simply leaves the existing source order alone. Host action
+   * and diagnostic rows always stay after every session card.
+   */
+  readonly getSessionOrder?: () => readonly SidebarMainOwnerKey[];
 }
 
 export interface SidebarMousePresentation {
@@ -595,6 +627,63 @@ export interface SidebarMousePresentation {
    * list refuses, so an invisible or since-changed control can never act.
    */
   activateFormHostAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Begins ONE session-card pointer interaction against the roster this render
+   * actually drew. True only when the coordinate is a completely drawn session
+   * card that still names the same runtime identity: nothing is activated and no
+   * action is emitted, so Main holds the press pending for either a click or a
+   * drag. A session card of a roster that is still DRAWN beside a right-hand
+   * host UI (a form, picker, Network review, or right-pane confirmation) holds
+   * the press exactly like a bare roster: the click's existing cancel-then-act
+   * route runs on release, and a drag never cancels or touches that UI.
+   * False for every other target — a host action/diagnostic row, a blank
+   * or clipped row, a too-small pane, a hidden roster, a roster an overlay
+   * replaced (no drawn map at this geometry), geometry that is not this
+   * render's, or a map whose order/projection is no longer current — where
+   * Main keeps its unchanged ordinary activation path.
+   */
+  beginSessionPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Applies one motion packet of that pending interaction to the same captured
+   * maps. Any motion turns the pending press into a DRAG, so no release can
+   * later activate the source or destination card; the drag previews one
+   * transient move position (never a commit) and scrolls an overflowing list at
+   * its edges so offscreen positions stay reachable. Blank space inside the
+   * list window previews the END of the session list when the session cards this
+   * map drew already include the last session card of the list: the append lands
+   * after that card and before the unchanged host action rows. Every row an entry
+   * itself occupies (a host action or diagnostic row), and a blank remainder
+   * under a clipped non-final card of an overflowing window, are not end
+   * positions. True while the interaction is live, false when nothing is pending
+   * for this token.
+   */
+  updateSessionPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Ends that interaction exactly once. A press-and-release with no motion in
+   * between runs the ordinary captured activation ONLY when the release is over
+   * the same card the press hit and that card is still drawn whole; a drag
+   * commits exactly one `reorder-session` action when the release is over the
+   * previewed destination card, or over the moved card once a captured redraw
+   * has placed it at that previewed drop slot, or — for a previewed end-of-list
+   * drop — still inside that same captured end position, and cancels with no
+   * action and no activation otherwise. Nothing is replayed: the interaction is
+   * retired either way.
+   * The return value is true only when THIS release performed its ordinary
+   * activation or committed a reorder. A gesture that began here and returns
+   * false ended with no action, so Main must not fall back to ordinary
+   * activation for a release it already handed to this interaction.
+   */
+  finishSessionPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * One pointer-edge step for Main's optional stationary-hold scheduling,
+   * bound to THIS captured written map. It is safe only when Main calls it on
+   * the presentation whose frame the writer actually wrote; a tick never reads
+   * the latest render implicitly, so an unwritten frame cannot advance the
+   * window. This module starts no timer, interval, or polling of its own.
+   * Returns true only when the list actually scrolled and a redraw was
+   * requested.
+   */
+  tickSessionPointerEdge(): boolean;
 }
 
 /**
@@ -825,6 +914,130 @@ function sidebarActivationIdentity(entry: SidebarEntry): readonly unknown[] {
         : null];
 }
 
+/**
+ * Collision-safe identity of one left-roster session card as a canonical owner
+ * key. Every part is length-prefixed, so a local item id, an owner host id, an
+ * owner row id, and the exact owner run can never be confused with one another
+ * (host `a` + row `bc` and host `ab` + row `c` are different identities, and one
+ * local id cannot impersonate a remote pair). A different owner run is a
+ * different identity: a reconnected owner's card is the same card only while its
+ * run matches exactly, `null` included.
+ */
+function sessionOrderKey(owner: SidebarMainOwnerKey): string {
+  if (owner.kind === "local") return `l${owner.id.length}:${owner.id}`;
+  const run = owner.hostRunId ?? "";
+  return `r${owner.hostId.length}:${owner.hostId}:${owner.rowId.length}:${owner.rowId}`
+    + `${owner.hostRunId === null ? "n" : "r"}${run.length}:${run}`;
+}
+
+/** The canonical owner key one session card names; undefined for a non-session row. */
+function ownerKeyForSessionEntry(entry: SidebarEntry | undefined): SidebarMainOwnerKey | undefined {
+  if (entry === undefined) return undefined;
+  if (entry.kind === "item" && entry.item !== undefined) return { kind: "local", id: entry.item.id };
+  if (entry.kind === "remote" && entry.remote !== undefined) {
+    return {
+      kind: "remote",
+      hostId: entry.remote.hostId,
+      hostRunId: entry.remote.hostRunId,
+      rowId: entry.remote.row.id,
+    };
+  }
+  return undefined;
+}
+
+/** True only for a left-roster SESSION card (a local row or a projected remote card). */
+function isSessionRosterEntry(entry: SidebarEntry | undefined): boolean {
+  return entry !== undefined && (entry.kind === "item" || entry.kind === "remote");
+}
+
+/**
+ * The key of the LAST session card of one roster projection, or undefined when
+ * it holds none. Host action, Network, and diagnostic rows never participate:
+ * they keep their own relative order after every session card, so the end of
+ * the session list is never the end of the drawn list.
+ */
+function sessionListTailKey(entries: readonly SidebarEntry[]): string | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (isSessionRosterEntry(entries[index])) return entries[index].key;
+  }
+  return undefined;
+}
+
+/**
+ * Validates one element of Main's read-only order view. Anything malformed is
+ * ignored rather than guessed: a missing or wrong-typed part can never be
+ * defaulted into an identity that reorders a real card.
+ */
+function normalizeSessionOrderKey(value: unknown): SidebarMainOwnerKey | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const owner = value as Record<string, unknown>;
+  if (owner.kind === "local") {
+    return typeof owner.id === "string" && owner.id.length > 0
+      ? { kind: "local", id: owner.id }
+      : undefined;
+  }
+  if (owner.kind === "remote") {
+    if (typeof owner.hostId !== "string" || owner.hostId.length === 0) return undefined;
+    if (typeof owner.rowId !== "string" || owner.rowId.length === 0) return undefined;
+    if (owner.hostRunId !== null && typeof owner.hostRunId !== "string") return undefined;
+    return {
+      kind: "remote",
+      hostId: owner.hostId,
+      hostRunId: owner.hostRunId as string | null,
+      rowId: owner.rowId,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * One unfinished session move: the moved card, the destination card, and which
+ * side of the destination the moved card lands on, plus the runtime identity
+ * each side named when the move started. This is the ONLY move state the sidebar
+ * keeps — no copy of the roster order, no second store, nothing persisted, and
+ * no durable slot authorization. Any session membership or owner-run change
+ * retires it; display-only changes (status, label, activity) deliberately do not.
+ */
+interface SessionMoveState {
+  readonly via: "keyboard" | "pointer";
+  readonly sourceKey: string;
+  readonly sourceOrderKey: string;
+  /**
+   * Collision-safe signature of every session card's runtime identity when this
+   * move started. It is a transient membership/run baseline only: adding,
+   * removing, or replacing any session card (including an unrelated owner run)
+   * retires the unfinished move so a stale destination is never committed. It
+   * is never an order, a copy of Main's roster, or a second store.
+   */
+  readonly membershipBaseline: string;
+  targetKey: string | undefined;
+  targetOrderKey: string | undefined;
+  placement: "before" | "after" | undefined;
+  /**
+   * True only for a pointer drop in the blank end position of the session list:
+   * the destination is still the last session card and the placement is still
+   * `after`, so the committed action is unchanged, and this flag only selects
+   * the honest END marker instead of a destination-card marker. It is transient
+   * render state: no action, DTO, or stored order carries it.
+   */
+  endDrop: boolean;
+}
+
+/**
+ * One in-flight session-card pointer interaction, frozen to the card the press
+ * actually hit. Motion turns it into a drag (never a click), and the last
+ * pointer row is what the edge-scroll seam uses. It names no action and grants
+ * no authority beyond this interaction.
+ */
+interface SessionPointerState {
+  readonly sourceKey: string;
+  readonly sourceOrderKey: string;
+  /** The same transient membership/run baseline as the move this press may start. */
+  readonly membershipBaseline: string;
+  dragging: boolean;
+  row: number;
+}
+
 interface DisplayedRosterRegion {
   readonly row: number;
   readonly height: number;
@@ -967,6 +1180,16 @@ interface DisplayedRoster {
   readonly rows: number;
   readonly focus: SidebarFocus;
   readonly selectedKey: string | undefined;
+  /**
+   * The list window this render actually drew: the pane row the window starts
+   * at, its row budget, and the entry index it begins from. A session drag may
+   * only move the window of a map that still describes the window currently
+   * drawn, so a held, refused, or superseded frame can never scroll against
+   * geometry that was never written.
+   */
+  readonly listStart: number;
+  readonly listRows: number;
+  readonly listTop: number;
 }
 
 /**
@@ -1496,6 +1719,20 @@ const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
 const ERROR_TEXT_MAX_CODEPOINTS = 300;
 const ROSTER_MIN_COLS = 12;
 const ROSTER_MIN_ROWS = 4;
+
+/**
+ * Insertion markers of an unfinished move, drawn in rows the roster already
+ * draws. `^`/`v` sit in the destination card's OWN marker column (the same two
+ * cells the selection marker uses), so they are never clipped or ellipsized at
+ * any pane width and add no row, no column, and no permanent layout. `^`
+ * means the moved card lands above that card, `v` below it. The end-of-list
+ * marker occupies one row the list window already leaves blank below the drawn
+ * cards, so it marks the real session-list end while the unchanged host action
+ * rows keep their own rows above it.
+ */
+const INSERTION_MARKER_BEFORE = "^ ";
+const INSERTION_MARKER_AFTER = "v ";
+const INSERTION_MARKER_END = "v>> end of sessions";
 const FORM_MIN_COLS = 24;
 const FORM_MIN_ROWS = 6;
 const PANE_MAX_COLS = 1000;
@@ -2712,6 +2949,20 @@ export class SidebarController {
   private nextRequestId = 1;
   private listTop = 0;
   /**
+   * Main's read-only canonical order view. It is called only while rebuilding
+   * entries and its result is used only as a projection input; this module keeps
+   * no copy of it and no order store of its own.
+   */
+  private readonly getSessionOrder?: () => readonly SidebarMainOwnerKey[];
+  /** True only while the keyboard move mode owns the roster's own keys. */
+  private sessionMoveMode = false;
+  /** The one unfinished move preview (keyboard or pointer), never a second roster. */
+  private sessionMove: SessionMoveState | undefined;
+  /** One in-flight session-card pointer press/drag. */
+  private sessionPointer: SessionPointerState | undefined;
+  /** True while a session drag owns the list's scroll window. */
+  private sessionPointerScroll = false;
+  /**
    * Item ids whose cards the user collapsed with Space. Cards default to
    * expanded; each card's state persists independently of the highlight.
    */
@@ -2760,6 +3011,9 @@ export class SidebarController {
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
     this.now = options.now ?? (() => Date.now());
+    this.getSessionOrder = typeof options.getSessionOrder === "function"
+      ? options.getSessionOrder
+      : undefined;
 
     const suggestedWorkspace = sanitizeCellText(options.initialWorkspace ?? "");
     if (countCodePoints(suggestedWorkspace) > PATH_FIELD_MAX_CODEPOINTS) {
@@ -2788,6 +3042,7 @@ export class SidebarController {
   /** Return from the roster to Main without changing its selection or visibility. */
   focusMainFromNativeClick(): boolean {
     if (!this._visible || this._focus !== "sidebar") return false;
+    this.endSessionMoveMode();
     this._focus = "main";
     this.onInvalidate?.();
     return true;
@@ -4142,6 +4397,17 @@ export class SidebarController {
         this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
       activateFormHostAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows),
+      // Session-card pointer reorder. Each callback stays bound to the roster
+      // maps THIS render drew, so Main drives them with the presentation whose
+      // frame it actually wrote and no packet can resolve against a newer order.
+      beginSessionPointerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.beginSessionPointerFrom(displayedRoster, column, row, cols, rows),
+      updateSessionPointerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.updateSessionPointerFrom(displayedRoster, column, row, cols, rows),
+      finishSessionPointerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.finishSessionPointerFrom(displayedRoster, column, row, cols, rows),
+      tickSessionPointerEdge: (): boolean =>
+        this.tickSessionPointerEdgeFrom(displayedRoster),
       // Only one form-slot pane is ever drawn by one render, so the captured
       // maps dispatch to exactly the surface the operator saw (or to neither).
       activateFormRowAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -4287,6 +4553,433 @@ export class SidebarController {
     }
     this.activateEntry(clicked);
     return true;
+  }
+
+  // --- Session-card pointer interaction (press, drag, drop). ---
+
+  /** True while a session-card press/drag is in flight. */
+  get sessionPointerActive(): boolean {
+    return this.sessionPointer !== undefined;
+  }
+
+  /** True while the keyboard move mode or any unfinished move preview is live. */
+  get sessionMoveActive(): boolean {
+    return this.sessionMoveMode || this.sessionMove !== undefined;
+  }
+
+  /**
+   * Abandons the in-flight session-card pointer interaction (pane resize, TTY
+   * handoff, hide, shutdown). Nothing is committed, activated, or emitted; an
+   * unfinished pointer preview is dropped, and the list window returns to the
+   * ordinary selection-driven scrolling.
+   */
+  cancelSessionPointer(): void {
+    if (this.sessionPointer === undefined && !this.sessionPointerScroll) return;
+    this.sessionPointer = undefined;
+    this.sessionPointerScroll = false;
+    this.clearPointerPreview();
+    this.onInvalidate?.();
+  }
+
+  /**
+   * One pointer-edge step bound to the captured map Main presented as written.
+   * It never falls back to the latest render, so an unwritten frame cannot
+   * advance the window.
+   */
+  private tickSessionPointerEdgeFrom(shown: DisplayedRoster | undefined): boolean {
+    const pointer = this.sessionPointer;
+    if (pointer === undefined || !pointer.dragging) return false;
+    if (shown === undefined || !this._visible) return false;
+    if (shown.signature !== this.rosterSignature() || shown.focus !== this._focus) return false;
+    return this.scrollRosterForPointerEdge(shown, pointer.row);
+  }
+
+  /**
+   * Holds one press that landed on a completely drawn session card. Nothing is
+   * activated or emitted: Main keeps the gesture pending for a click or a drag,
+   * and returns false for every other target so its unchanged activation path
+   * keeps acting on host action rows exactly as before.
+   *
+   * The gate is exactly the gate of the drawn-roster click it will end as: a
+   * roster that is still drawn beside a right-hand form, picker, Network review,
+   * or right-pane confirmation holds the press, because that visible left
+   * column keeps its ordinary click-on-release semantics (the UI's own
+   * cancellation route first, then the clicked row's own action once, and a pure
+   * no-op on the already-highlighted row). Falling back to a press-time
+   * activation for those cards would replace that approved release semantics.
+   * A confirmation that REPLACES the roster, an overlay that draws no roster at
+   * this geometry, a hidden roster, a tiny or clipped map with no complete card,
+   * and any map that no longer matches this pane's geometry or projection all
+   * still refuse.
+   */
+  private beginSessionPointerFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    // One interaction at a time, and never while the roster is hidden, covered
+    // by an overlay that does not draw it, or owned by a pane that replaces it.
+    if (this.sessionPointer !== undefined) return false;
+    // The same right-hand-UI test the ordinary roster click uses: only a UI that
+    // actually owns the wide layout's right pane slot counts, and the written
+    // roster proof below is what shows the roster is really on screen beside it.
+    const rightPaneOpen = this.rightHandPaneIsOpen();
+    if (!this._visible
+      || (this._focus !== "main" && this._focus !== "sidebar" && !rightPaneOpen)) return false;
+    if (!this.sessionPointerMapCurrent(shown, column, row, cols, rows)) return false;
+    const region = this.sessionRegionAt(shown, row);
+    if (region === undefined) return false;
+    const owner = ownerKeyForSessionEntry(region.entry);
+    if (owner === undefined) return false;
+    if (this.liveSessionEntryForKey(region.entry.key, sessionOrderKey(owner)) === undefined) return false;
+    // A pointer press abandons an unfinished keyboard move instead of stacking
+    // two interactions on one card; nothing is emitted for the abandoned one.
+    this.endSessionMoveMode();
+    this.sessionPointer = {
+      sourceKey: region.entry.key,
+      sourceOrderKey: sessionOrderKey(owner),
+      membershipBaseline: this.sessionMembershipSignature(),
+      dragging: false,
+      row,
+    };
+    return true;
+  }
+
+  /**
+   * Applies one motion packet: any motion makes this a DRAG (a later release can
+   * then never activate a card), previews the drop position over the drawn card
+   * under the pointer, and scrolls an overflowing list at its edges. Nothing is
+   * committed here.
+   */
+  private updateSessionPointerFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const pointer = this.sessionPointer;
+    if (pointer === undefined) return false;
+    // Any update packet is motion, even one that cannot be resolved against the
+    // currently drawn map. It must therefore retire click semantics permanently
+    // for this gesture: a later release can never activate a card.
+    pointer.dragging = true;
+    if (!this.sessionPointerMapCurrent(shown, column, row, cols, rows)) {
+      // Motion against a map that no longer describes the drawn roster keeps the
+      // drag alive but retargets nothing: it can neither commit nor activate.
+      return true;
+    }
+    pointer.row = row;
+    if (this.scrollRosterForPointerEdge(shown, row)) {
+      // The window moved; the drop position is re-previewed against the frame
+      // Main writes next, never against the map that just went stale.
+      return true;
+    }
+    if (shown.listTop !== this.listTop) {
+      // A previous edge step already advanced the pending window. Until Main
+      // writes and presents that frame, this map cannot retarget a drop.
+      return true;
+    }
+    const region = this.sessionRegionAt(shown, row);
+    const owner = region === undefined ? undefined : ownerKeyForSessionEntry(region.entry);
+    if (region === undefined || owner === undefined
+      || this.liveSessionEntryForKey(region.entry.key, sessionOrderKey(owner)) === undefined) {
+      // Blank space inside the list window previews the END of the session list
+      // when the session cards this map drew already include the list's last
+      // session card: the append lands after that card and therefore before the
+      // unchanged host action rows. Every row an entry itself occupies — a host
+      // action or diagnostic row — stays a no-drop position, and so does a blank
+      // remainder under a clipped non-final card of an overflowing window.
+      const end = region === undefined ? this.sessionPointerEndTarget(shown, row) : undefined;
+      // An established end drop has already moved the source card to the session
+      // list's tail, so on the next captured frame the tail this map draws IS
+      // the source. Keep that move's frozen target/placement while the pointer
+      // stays inside the same valid blank end position, instead of cancelling
+      // the append the operator is still pointing at.
+      const established = this.sessionMove;
+      if (end !== undefined && established !== undefined
+        && established.via === "pointer" && established.endDrop
+        && established.sourceKey === pointer.sourceKey
+        && established.targetKey !== undefined && established.placement === "after"
+        && (end.key === established.targetKey || end.key === pointer.sourceKey)) {
+        return true;
+      }
+      const endOwner = end === undefined ? undefined : ownerKeyForSessionEntry(end);
+      if (end !== undefined && endOwner !== undefined && end.key !== pointer.sourceKey) {
+        this.sessionMove = {
+          via: "pointer",
+          sourceKey: pointer.sourceKey,
+          sourceOrderKey: pointer.sourceOrderKey,
+          membershipBaseline: pointer.membershipBaseline,
+          targetKey: end.key,
+          targetOrderKey: sessionOrderKey(endOwner),
+          placement: "after",
+          endDrop: true,
+        };
+        this.onInvalidate?.();
+        return true;
+      }
+      // Nothing droppable under the pointer right now: the preview is dropped,
+      // the drag stays alive, and a later packet over a real card re-previews it.
+      this.clearPointerPreview();
+      this.onInvalidate?.();
+      return true;
+    }
+    if (region.entry.key === pointer.sourceKey) {
+      // Once a preview has moved the source card under the pointer, the captured
+      // map draws that source at its previewed drop slot. Keep the established
+      // target/placement stable across that redraw instead of cancelling merely
+      // because the source is now what the unchanged pointer coordinate hits.
+      const current = this.sessionMove;
+      if (current !== undefined && current.via === "pointer"
+        && current.targetKey !== undefined
+        && this.displayedRosterMatchesEntries(shown, this.previewRosterEntries())) {
+        return true;
+      }
+      // Over the source in the committed order: there is no drop intent to keep.
+      this.clearPointerPreview();
+      this.onInvalidate?.();
+      return true;
+    }
+    const previousProjection = this.previewRosterEntries();
+    const sourceIndex = previousProjection.findIndex((entry) => entry.key === pointer.sourceKey);
+    // Removing an offscreen source from above a scrolled window shifts a
+    // different card to the old numeric top, which would move the destination
+    // out from under the pointer. Anchor the first visible written entry so the
+    // preview preserves the operator's viewport and drop coordinate.
+    const viewportAnchor = this.sessionPointerScroll
+      && sourceIndex >= 0 && sourceIndex < shown.listTop
+      ? [...shown.regions.values()][0]?.entry.key
+      : undefined;
+    this.sessionMove = {
+      via: "pointer",
+      sourceKey: pointer.sourceKey,
+      sourceOrderKey: pointer.sourceOrderKey,
+      membershipBaseline: pointer.membershipBaseline,
+      targetKey: region.entry.key,
+      targetOrderKey: sessionOrderKey(owner),
+      // The pointer's position INSIDE the destination card chooses the side.
+      placement: row < region.row + region.height / 2 ? "before" : "after",
+      endDrop: false,
+    };
+    if (viewportAnchor !== undefined) {
+      const top = this.previewRosterEntries().findIndex((entry) => entry.key === viewportAnchor);
+      if (top >= 0) this.listTop = top;
+    }
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Ends the interaction exactly once. A press-and-release with no motion in
+   * between runs the ordinary captured activation only for the very card the
+   * press hit, still drawn whole on this map; a drag commits exactly one
+   * `reorder-session` action when the release lands on the previewed
+   * destination, and otherwise cancels with no action, no activation, and no
+   * replay.
+   */
+  private finishSessionPointerFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const pointer = this.sessionPointer;
+    if (pointer === undefined) return false;
+    const move = this.sessionMove?.via === "pointer" ? this.sessionMove : undefined;
+    const hadScrolled = this.sessionPointerScroll;
+    this.sessionPointer = undefined;
+    this.sessionPointerScroll = false;
+    if (!pointer.dragging) {
+      this.clearPointerPreview();
+      if (!this.sessionPointerMapCurrent(shown, column, row, cols, rows)) return false;
+      const region = this.sessionRegionAt(shown, row);
+      if (region === undefined || region.entry.key !== pointer.sourceKey) return false;
+      if (this.liveSessionEntryForKey(region.entry.key, pointer.sourceOrderKey) === undefined) return false;
+      return this.activateRosterAtFrom(shown, column, row, cols, rows, true);
+    }
+    if (move === undefined || move.targetKey === undefined) {
+      // A drag that scrolled the list but ended without a preview still needs
+      // the ordinary selection-driven window redrawn.
+      if (hadScrolled) this.onInvalidate?.();
+      return false;
+    }
+    if (!this.sessionPointerMapCurrent(shown, column, row, cols, rows)) {
+      this.clearPointerPreview();
+      this.onInvalidate?.();
+      return false;
+    }
+    const region = this.sessionRegionAt(shown, row);
+    const overTarget = region !== undefined && region.entry.key === move.targetKey;
+    const overPreviewedSource = region !== undefined
+      && region.entry.key === move.sourceKey
+      && this.displayedRosterMatchesEntries(shown, this.previewRosterEntries());
+    // A previewed end-of-list drop stays a drop while the release is still in
+    // the same captured end position: the blank rows directly below the last
+    // drawn session card of the preview, where the moved card now sits. The
+    // committed action is the ordinary `after`-the-last-session-card reorder.
+    const overEndPosition = move.endDrop
+      && this.sessionPointerEndTarget(shown, row) !== undefined;
+    if (!overTarget && !overPreviewedSource && !overEndPosition) {
+      // Released outside the session cards and outside the session list's end
+      // position (a host action row, a blank remainder under a clipped
+      // non-final card, a clipped/tiny map), or over the source before a preview
+      // redraw: cancel, with no reorder and no activation.
+      this.clearPointerPreview();
+      this.onInvalidate?.();
+      return false;
+    }
+    const committed = this.commitSessionMove(move);
+    if (!committed) {
+      this.clearPointerPreview();
+      this.onInvalidate?.();
+    }
+    return committed;
+  }
+
+  /**
+   * The SESSION card whose end-of-list drop position this captured map drew
+   * under this blank row, or undefined when the row is not one.
+   *
+   * The position is bounded to the real session-list end: the row must be blank
+   * (no drawn entry covers it, so a host action or diagnostic row is never one),
+   * inside the list window this render drew, and the LAST session card that
+   * render drew must be the last session card of the projection the map drew. A
+   * blank remainder under a clipped non-final card of an overflowing window, a
+   * too-small map with no drawn entry, a card drawn at a height that no longer
+   * matches its entry, and any map that did not draw the current projection are
+   * all refused, so an unfinished or scrolled window is never read as an end.
+   */
+  private sessionPointerEndTarget(
+    shown: DisplayedRoster,
+    row: number,
+  ): SidebarEntry | undefined {
+    if (shown.listRows < 1 || shown.regions.size === 0) return undefined;
+    const windowEnd = shown.listStart + shown.listRows - 1;
+    if (row < shown.listStart || row > windowEnd) return undefined;
+    let lastSession: DisplayedRosterRegion | undefined;
+    for (const region of shown.regions.values()) {
+      // A row an entry occupies is that entry's own target, never blank space:
+      // a host action or diagnostic row cancels instead of ending the list.
+      if (row >= region.row && row < region.row + region.height) return undefined;
+      // A card drawn at a height that no longer matches its entry is a stale or
+      // clipped map: it authorizes no drop position at all.
+      if (region.height !== this.entryHeight(region.entry)) return undefined;
+      if (isSessionRosterEntry(region.entry)
+        && (lastSession === undefined || region.row > lastSession.row)) {
+        lastSession = region;
+      }
+    }
+    if (lastSession === undefined || row < lastSession.row + lastSession.height) return undefined;
+    // The map must have drawn exactly the projection this controller draws now,
+    // from its own window, so a preview cannot be committed against a frame of
+    // a different one.
+    if (!this.displayedRosterMatchesEntries(shown, this.previewRosterEntries())) return undefined;
+    // The real session-list end, not a blank remainder under a clipped
+    // non-final card of an overflowing window.
+    const tailKey = sessionListTailKey(this.previewRosterEntries());
+    if (tailKey === undefined || tailKey !== lastSession.entry.key) return undefined;
+    return lastSession.entry;
+  }
+
+  /** True only when the captured map still describes the roster being drawn. */
+  private sessionPointerMapCurrent(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): shown is DisplayedRoster {
+    if (shown === undefined || !this._visible) return false;
+    if (!validHitGeometry(column, row, cols, rows)) return false;
+    // The packet's pane geometry is this map's geometry or nothing applies.
+    if (shown.cols !== cols || shown.rows !== rows) return false;
+    // And the map still describes the roster the controller draws: a reordered,
+    // replaced, hidden, or re-focused roster refuses rather than resolving a
+    // coordinate against a newer order. Tiny/clipped maps hold no regions at all.
+    if (shown.signature !== this.rosterSignature() || shown.focus !== this._focus) return false;
+    return true;
+  }
+
+  /** The completely drawn SESSION card covering this drawn row, or undefined. */
+  private sessionRegionAt(shown: DisplayedRoster, row: number): DisplayedRosterRegion | undefined {
+    const region = [...shown.regions.values()].find((candidate) => row >= candidate.row
+      && row < candidate.row + candidate.height);
+    if (region === undefined) return undefined;
+    // A clipped card, a card whose expansion changed since the draw, a blank
+    // row, and every host action/diagnostic row are never reorder targets.
+    if (region.height !== this.entryHeight(region.entry)) return undefined;
+    if (!isSessionRosterEntry(region.entry)) return undefined;
+    return region;
+  }
+
+  /**
+   * True only when this captured map drew exactly the given projection from its
+   * own list window. It is how a pointer gesture recognizes that a frame already
+   * shows its transient preview (the moved card now occupies the drop slot), so
+   * a release or motion can keep that drop intent stable. It never reads or
+   * changes the committed roster order.
+   */
+  private displayedRosterMatchesEntries(
+    shown: DisplayedRoster,
+    entries: readonly SidebarEntry[],
+  ): boolean {
+    const regions = [...shown.regions.values()];
+    if (regions.length === 0 || shown.listRows < 1) return false;
+    for (let index = 0; index < regions.length; index += 1) {
+      const expected = entries[shown.listTop + index];
+      if (expected === undefined || expected.key !== regions[index].entry.key) return false;
+    }
+    return true;
+  }
+
+  /**
+   * One entry of edge scrolling for a session drag, so a position that is
+   * currently offscreen becomes reachable. Only a map that still describes the
+   * window the controller draws may move it, so a held, refused, or superseded
+   * frame can never scroll against geometry that was never written. This is
+   * motion-driven; a stationary hold is Main's scheduling decision through the
+   * captured presentation's `tickSessionPointerEdge`, because this module owns
+   * no timer.
+   */
+  private scrollRosterForPointerEdge(shown: DisplayedRoster, row: number): boolean {
+    const current = this.displayedRoster;
+    if (current === undefined
+      || shown.cols !== current.cols
+      || shown.rows !== current.rows
+      || shown.listTop !== this.listTop
+      || shown.listTop !== current.listTop
+      || shown.listRows !== current.listRows
+      || shown.listStart !== current.listStart) {
+      return false;
+    }
+    if (shown.listRows < 1) return false;
+    const maxTop = Math.max(0, this.previewRosterEntries().length - 1);
+    // The very last row of the list window (usually the blank remainder under a
+    // clipped card) scrolls the window down; the very first row scrolls it up.
+    // Every interior row stays a drop target, so edge scrolling cannot steal a
+    // deliberate drop on a drawn card.
+    if (row >= shown.listStart + shown.listRows - 1 && shown.listTop < maxTop) {
+      this.sessionPointerScroll = true;
+      this.listTop = shown.listTop + 1;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (row <= shown.listStart && shown.listTop > 0) {
+      this.sessionPointerScroll = true;
+      this.listTop = shown.listTop - 1;
+      this.onInvalidate?.();
+      return true;
+    }
+    return false;
+  }
+
+  /** Drops an unfinished pointer preview only; the interaction itself is untouched. */
+  private clearPointerPreview(): void {
+    if (this.sessionMove?.via === "pointer") this.sessionMove = undefined;
   }
 
   /**
@@ -4835,12 +5528,20 @@ export class SidebarController {
       // A roster-only return never activates a row and is fenced by the exact
       // complete draw just like the existing Alt+Right action.
       if (!this.selectionFitsLastRoster()) return;
+      this.endSessionMoveMode();
       this._focus = "main";
       this.onInvalidate?.();
       return;
     }
     if (this.consumeSavedActionClaim(data)) return;
     if (isKeyRelease(data)) {
+      return;
+    }
+    // While the move mode owns the roster its own keys act and every other key
+    // is consumed: a mid-move `d`, `e`, `q`, Space, or Enter-on-a-row can never
+    // stop, edit, quit, re-flow, or activate the card being moved.
+    if (this.sessionMoveMode) {
+      this.handleSessionMoveInput(data);
       return;
     }
     if (matchesKey(data, "up")) {
@@ -4892,6 +5593,15 @@ export class SidebarController {
       this.editSelectedEntry();
       return;
     }
+    if (printable === "m" || printable === "M") {
+      // `m`/`M` starts a session reorder of the highlighted card. A held key
+      // never re-fires, and the start is fenced by the same complete draw every
+      // other selection-targeted key uses.
+      if (isKeyRepeat(data)) return;
+      if (!this.selectionFitsLastRoster()) return;
+      this.beginSessionMoveMode();
+      return;
+    }
     if (printable === "n" || printable === "N") {
       // Explicit "no session displayed": a fresh press only, and it targets no
       // highlighted row, so it needs no draw fence. A held n never re-fires.
@@ -4924,6 +5634,170 @@ export class SidebarController {
 
   private currentEntry(): SidebarEntry | undefined {
     return this.entries.find((entry) => entry.key === this.selectedEntryKey);
+  }
+
+  // --- Session reorder: transient preview, one committed action. ---
+
+  /**
+   * `m`/`M` on the highlighted card. Only a SESSION card can move (host action,
+   * Network, and diagnostic rows never do), and an unavailable/exited/error
+   * placeholder moves exactly like a live card. No preview exists yet at this
+   * point, so nothing has changed beyond the pane's own hints.
+   */
+  private beginSessionMoveMode(): void {
+    if (this.sessionPointer !== undefined) return;
+    const entry = this.currentEntry();
+    const owner = ownerKeyForSessionEntry(entry);
+    if (entry === undefined || owner === undefined) {
+      this.noticeError = "Select a session row to move it";
+      return;
+    }
+    this.sessionMoveMode = true;
+    this.sessionMove = {
+      via: "keyboard",
+      sourceKey: entry.key,
+      sourceOrderKey: sessionOrderKey(owner),
+      membershipBaseline: this.sessionMembershipSignature(),
+      targetKey: undefined,
+      targetOrderKey: undefined,
+      placement: undefined,
+      endDrop: false,
+    };
+    this.noticeError = undefined;
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Keys owned by the move mode: Up/Down preview one adjacent session position
+   * (no wrap, and a non-session row is never a destination), Enter commits the
+   * preview WITHOUT activating anything, and Escape cancels and restores the
+   * committed order. Every other key is a no-op while the mode is active.
+   */
+  private handleSessionMoveInput(data: string): void {
+    if (matchesKey(data, "up")) {
+      this.stepSessionMove(-1);
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.stepSessionMove(1);
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      // A held Enter never commits twice; a fresh press with nothing previewed
+      // is a deliberate no-op that simply leaves the mode.
+      if (!isKeyRepeat(data)) this.commitKeyboardSessionMove();
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      this.endSessionMoveMode();
+      return;
+    }
+  }
+
+  /**
+   * Previews one position of the move. The preview is recomputed from the
+   * committed order on every render from this single source/target/placement
+   * record, so stepping repeatedly walks the card one position at a time and no
+   * second order list ever exists. The highlight stays on the moved card.
+   */
+  private stepSessionMove(delta: -1 | 1): void {
+    const move = this.sessionMove;
+    if (move === undefined) return;
+    const entries = this.previewRosterEntries();
+    const index = entries.findIndex((entry) => entry.key === move.sourceKey);
+    if (index < 0) return;
+    const nextIndex = index + delta;
+    // No wrap: the first and last positions are the first and last positions.
+    if (nextIndex < 0 || nextIndex >= entries.length) return;
+    const neighbour = entries[nextIndex];
+    const neighbourOwner = ownerKeyForSessionEntry(neighbour);
+    if (neighbourOwner === undefined) return;
+    move.targetKey = neighbour.key;
+    move.targetOrderKey = sessionOrderKey(neighbourOwner);
+    move.placement = delta < 0 ? "before" : "after";
+    // A keyboard step always names its destination card explicitly; the blank
+    // end position is a pointer affordance only.
+    move.endDrop = false;
+    this.noticeError = undefined;
+    this.onInvalidate?.();
+  }
+
+  /** Enter in move mode: commit exactly one reorder, or abandon with nothing emitted. */
+  private commitKeyboardSessionMove(): void {
+    const move = this.sessionMove;
+    const committed = move !== undefined && this.commitSessionMove(move);
+    this.endSessionMoveMode();
+    if (!committed) this.onInvalidate?.();
+  }
+
+  /**
+   * Leaves move mode and drops any unfinished keyboard preview. Nothing is
+   * emitted, no selection or focus changes, and the committed order (re-derived
+   * from Main's read-only view) stands exactly as it was.
+   */
+  private endSessionMoveMode(): void {
+    if (!this.sessionMoveMode && this.sessionMove?.via !== "keyboard") return;
+    this.sessionMoveMode = false;
+    if (this.sessionMove?.via === "keyboard") this.sessionMove = undefined;
+    this.onInvalidate?.();
+  }
+
+  /** Drops every unfinished move state without emitting anything. */
+  private clearSessionMoveState(): void {
+    this.sessionMove = undefined;
+    this.sessionMoveMode = false;
+  }
+
+  /**
+   * Commits one finished preview as exactly one `reorder-session` DTO naming
+   * both frozen runtime identities. The preview is dropped first so no unfinished
+   * state can survive the host's own refresh, the highlight stays on the moved
+   * card, and nothing else is emitted: no select, activation, stop, removal,
+   * lifecycle, or IO of any kind.
+   */
+  private commitSessionMove(move: SessionMoveState): boolean {
+    const placement = move.placement;
+    if (placement === undefined || move.sourceKey === move.targetKey) return false;
+    const source = this.liveSessionEntryForKey(move.sourceKey, move.sourceOrderKey);
+    const target = this.liveSessionEntryForKey(move.targetKey, move.targetOrderKey);
+    if (source === undefined || target === undefined) return false;
+    const sourceOwner = ownerKeyForSessionEntry(source);
+    const targetOwner = ownerKeyForSessionEntry(target);
+    if (sourceOwner === undefined || targetOwner === undefined) return false;
+    this.sessionMove = undefined;
+    this.selectedEntryKey = source.key;
+    this.desiredSelectionId = undefined;
+    this.emit({ type: "reorder-session", source: sourceOwner, target: targetOwner, placement });
+    return true;
+  }
+
+  /**
+   * The session cards in the order THIS render draws: the committed entries with
+   * at most one unfinished move applied as a pure projection. It is derived on
+   * every call, never stored, and never touches the committed list, so a cancel
+   * or a retired preview restores the committed order unchanged.
+   */
+  private previewRosterEntries(): SidebarEntry[] {
+    const move = this.sessionMove;
+    if (move === undefined || move.targetKey === undefined || move.placement === undefined) {
+      return this.entries;
+    }
+    const sourceIndex = this.entries.findIndex((entry) => entry.key === move.sourceKey);
+    const targetIndex = this.entries.findIndex((entry) => entry.key === move.targetKey);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return this.entries;
+    // A destination outside the session cards is never drawn: host action,
+    // Network, and diagnostic rows always keep their own relative order after
+    // every session card.
+    if (!isSessionRosterEntry(this.entries[sourceIndex])
+      || !isSessionRosterEntry(this.entries[targetIndex])) {
+      return this.entries;
+    }
+    const ordered = this.entries.filter((_, index) => index !== sourceIndex);
+    let insertAt = move.placement === "before" ? targetIndex : targetIndex + 1;
+    if (sourceIndex < targetIndex) insertAt -= 1;
+    insertAt = Math.max(0, Math.min(ordered.length, insertAt));
+    ordered.splice(insertAt, 0, this.entries[sourceIndex]);
+    return ordered;
   }
 
   /** Flips the highlighted card between 5-line expanded and 3-line collapsed. */
@@ -4992,6 +5866,10 @@ export class SidebarController {
   /** The roster is no longer on screen (hidden or replaced by another pane). */
   private forgetDisplayedRoster(): void {
     this.cancelRowResume();
+    // The roster is not on screen: no unfinished move, press, or drag may
+    // survive it, and none of them is committed or emitted on the way out.
+    this.cancelSessionPointer();
+    this.endSessionMoveMode();
     this.displayedRoster = undefined;
   }
 
@@ -9001,14 +9879,19 @@ export class SidebarController {
 
   private rebuildEntries(): void {
     this.entries = [
-      ...this.rowStore.map(
-        (item): SidebarEntry => ({ key: ITEM_KEY_PREFIX + item.id, kind: "item", item }),
-      ),
-      // Remote cards are a display projection of the SAME attached peer
-      // snapshot the Network pane renders. Local rows keep their existing order
-      // and the projection preserves the DTO's host order and each host's own
-      // row order: no sorting, deduplication, cache, or new authority.
-      ...this.projectRemoteEntries(),
+      ...this.applySessionOrder([
+        ...this.rowStore.map(
+          (item): SidebarEntry => ({ key: ITEM_KEY_PREFIX + item.id, kind: "item", item }),
+        ),
+        // Remote cards are a display projection of the SAME attached peer
+        // snapshot the Network pane renders. Local rows keep their existing order
+        // and the projection preserves the DTO's host order and each host's own
+        // row order: no sorting, deduplication, cache, or new authority.
+        ...this.projectRemoteEntries(),
+      ]),
+      // Non-session rows keep their existing relative order AFTER every session
+      // card, whatever the session order is: they are never reordered, grouped,
+      // or moved by a move mode, a drag, or Main's order view.
       ...(this.diagnosticsWarning === undefined
         ? []
         : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
@@ -9022,6 +9905,132 @@ export class SidebarController {
     ];
     this.pruneVanishedRemoteSelection();
     this.pruneRemoteExpansionMemory();
+    this.reconcileSessionMove();
+  }
+
+  /**
+   * Projects Main's read-only order view onto the session cards this rebuild
+   * already derived. The callback names runtime identities, never slots: named
+   * identities that have a card are placed in the callback's order, identities
+   * it names without a card add nothing (a card is never invented), and cards it
+   * does not name — a first-observed row, a card whose owner run changed — keep
+   * their existing source order after the named ones. Nothing is stored, so a
+   * later rebuild re-derives the same order from the same callback.
+   */
+  private applySessionOrder(sessions: SidebarEntry[]): SidebarEntry[] {
+    const view = this.readSessionOrderView();
+    if (view.length === 0) return sessions;
+    const byOwner = new Map<string, SidebarEntry>();
+    for (const entry of sessions) {
+      const owner = ownerKeyForSessionEntry(entry);
+      if (owner === undefined) continue;
+      const key = sessionOrderKey(owner);
+      if (!byOwner.has(key)) byOwner.set(key, entry);
+    }
+    const ordered: SidebarEntry[] = [];
+    const placed = new Set<string>();
+    for (const owner of view) {
+      const entry = byOwner.get(sessionOrderKey(owner));
+      if (entry === undefined || placed.has(entry.key)) continue;
+      placed.add(entry.key);
+      ordered.push(entry);
+    }
+    for (const entry of sessions) {
+      if (!placed.has(entry.key)) ordered.push(entry);
+    }
+    return ordered;
+  }
+
+  /** One defensive read of Main's order view; anything unusable means "no reordering". */
+  private readSessionOrderView(): readonly SidebarMainOwnerKey[] {
+    const getter = this.getSessionOrder;
+    if (getter === undefined) return [];
+    let value: unknown;
+    try {
+      value = getter();
+    } catch {
+      // A failing host view is not permission to invent an order: the existing
+      // source order stands, and no state is written.
+      return [];
+    }
+    if (!Array.isArray(value)) return [];
+    const keys: SidebarMainOwnerKey[] = [];
+    try {
+      for (const candidate of value) {
+        const owner = normalizeSessionOrderKey(candidate);
+        if (owner !== undefined) keys.push(owner);
+      }
+    } catch {
+      // The view must never be able to break a rebuild or partially reorder it.
+      return [];
+    }
+    return keys;
+  }
+
+  /**
+   * A live move preview survives display-only roster updates and retires the
+   * moment the roster's session membership or any owner run changes: a card was
+   * added, removed, or replaced anywhere, not only on either move side. The
+   * committed order (re-derived from Main's view) is never touched by this, and
+   * nothing is emitted. A pending press that has not started a preview is
+   * retired by the same baseline check.
+   */
+  private reconcileSessionMove(): void {
+    const move = this.sessionMove;
+    const pointer = this.sessionPointer;
+    if (move !== undefined && !this.sessionMembershipMatches(move.membershipBaseline)) {
+      this.clearSessionMoveState();
+      this.cancelSessionPointer();
+      return;
+    }
+    if (pointer !== undefined && !this.sessionMembershipMatches(pointer.membershipBaseline)) {
+      this.cancelSessionPointer();
+      return;
+    }
+    if (move === undefined) return;
+    if (this.liveSessionEntryForKey(move.sourceKey, move.sourceOrderKey) === undefined) {
+      this.clearSessionMoveState();
+      return;
+    }
+    if (move.targetKey !== undefined
+      && this.liveSessionEntryForKey(move.targetKey, move.targetOrderKey) === undefined) {
+      // Only the previewed position is retired; the interaction itself stays, so
+      // the operator picks a new destination instead of losing the move.
+      move.targetKey = undefined;
+      move.targetOrderKey = undefined;
+      move.placement = undefined;
+      move.endDrop = false;
+    }
+  }
+
+  /**
+   * Collision-safe signature of the session cards this rebuild produced. It is
+   * only compared with a transient move baseline; it never stores an order and
+   * never becomes a second roster.
+   */
+  private sessionMembershipSignature(): string {
+    const keys: string[] = [];
+    for (const entry of this.entries) {
+      const owner = ownerKeyForSessionEntry(entry);
+      if (owner !== undefined) keys.push(sessionOrderKey(owner));
+    }
+    keys.sort();
+    return keys.map((key) => `${key.length}:${key}`).join("");
+  }
+
+  /** True only while the roster still has exactly the baseline members and runs. */
+  private sessionMembershipMatches(baseline: string): boolean {
+    return this.sessionMembershipSignature() === baseline;
+  }
+
+  /** The live session card one frozen move side still names, or undefined. */
+  private liveSessionEntryForKey(key: string | undefined, orderKey: string | undefined): SidebarEntry | undefined {
+    if (key === undefined || orderKey === undefined) return undefined;
+    const entry = this.entries.find((candidate) => candidate.key === key);
+    if (!isSessionRosterEntry(entry)) return undefined;
+    const owner = ownerKeyForSessionEntry(entry);
+    if (owner === undefined || sessionOrderKey(owner) !== orderKey) return undefined;
+    return entry;
   }
 
   /**
@@ -9100,24 +10109,10 @@ export class SidebarController {
 
   private renderRosterPane(cols: number, rows: number): { lines: string[] } {
     const header = ` Sessions (${this.rowStore.length}) `;
-    const footerLines = wrapHintLines(
-      [
-        `${this.toggleLabel} toggle`,
-        "enter open",
-        ...(this._focus === "sidebar" ? ["e edit name"] : []),
-        ...(this._focus === "sidebar"
-          ? ["d stop/remove"]
-          : []),
-        "esc hide",
-        "q quit",
-        ...(this._focus === "sidebar" && this.hasExpandableCards() ? ["space expand"] : []),
-        // The configured return chord focuses the existing Main owner (roster-only);
-        // it never activates the highlighted row. Shown only while the roster
-        // owns focus, where the key actually acts.
-        ...(this._focus === "sidebar" ? [`${this.returnToMainLabel.toLowerCase()} main`] : []),
-      ],
-      cols,
-    );
+    // While the keyboard move mode owns the roster its hints replace the row
+    // actions it deliberately does not act on, so the operator always sees what
+    // the keys in front of them do. Nothing else about the pane changes.
+    const moveHints = this.sessionMoveMode;
     const noticeLines = this.noticeError === undefined
       ? []
       : wrapHintLines([`! ${this.noticeError}`], cols);
@@ -9126,12 +10121,88 @@ export class SidebarController {
     // notification-only presentation as renderPeerAlert: no confirmation
     // control, no authority, and no focus/selection change.
     const alertLines = this.renderPeerAlert(cols, PEER_CONSENT_ALERT_ROWS).lines;
+    // One wrapped hint line, with the move key advertised in its own segment
+    // when that is affordable (below). The move segment sits with the other
+    // row-target actions so it never reorders or displaces another hint.
+    const ordinaryFooter = (withMoveKey: boolean) => [
+      `${this.toggleLabel} toggle`,
+      "enter open",
+      ...(this._focus === "sidebar" ? ["e edit name"] : []),
+      ...(this._focus === "sidebar"
+        ? ["d stop/remove"]
+        : []),
+      ...(withMoveKey ? ["m move"] : []),
+      "esc hide",
+      "q quit",
+      ...(this._focus === "sidebar" && this.hasExpandableCards() ? ["space expand"] : []),
+      // The configured return chord focuses the existing Main owner (roster-only);
+      // it never activates the highlighted row. Shown only while the roster
+      // owns focus, where the key actually acts.
+      ...(this._focus === "sidebar" ? [`${this.returnToMainLabel.toLowerCase()} main`] : []),
+    ];
+    let footerLines = wrapHintLines(
+      moveHints
+        ? [
+            `${this.toggleLabel} toggle`,
+            "up/down place",
+            "enter drop",
+            "esc cancel",
+            ...(this._focus === "sidebar" ? [`${this.returnToMainLabel.toLowerCase()} main`] : []),
+          ]
+        : ordinaryFooter(false),
+      cols,
+    );
+    // `m`/`M` is advertised while the roster owns focus and the list really
+    // holds a movable session card, exactly like the edit, stop/remove, and
+    // expansion hints are. It is width- and height-safe on drawn geometry, not
+    // on roster size: when the extra segment wraps into no additional row the
+    // footer costs nothing at all, so an overflowing roster keeps its
+    // affordance; when it does add rows, they are taken only while the smaller
+    // list window still shows the highlighted entry COMPLETELY and still holds
+    // at least one entry row. The hint therefore never clips the card the
+    // operator is looking at, never drops the highlighted entry below the
+    // complete-card requirement, and never turns a showing pane into the
+    // truthful too-small message (which a pane too narrow for the wrapped hints
+    // still uses instead of a partial one).
+    if (!moveHints && footerLines !== undefined && noticeLines !== undefined
+      && this._focus === "sidebar" && this.hasMovableSessions()) {
+      const withMoveKey = wrapHintLines(ordinaryFooter(true), cols);
+      if (withMoveKey !== undefined) {
+        const listRowsWithMoveKey = rows - 1 - alertLines.length - noticeLines.length
+          - withMoveKey.length;
+        const highlightedHeight = this.entryHeight(this.currentEntry());
+        if (withMoveKey.length <= footerLines.length
+          || (listRowsWithMoveKey >= 1 && listRowsWithMoveKey >= highlightedHeight)) {
+          footerLines = withMoveKey;
+        }
+      }
+    }
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols) {
       return this.renderRosterTooSmall(cols, rows);
     }
     const listRows = rows - 1 - alertLines.length - noticeLines.length - footerLines.length;
-    const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
-    const selectedHeight = selectedIndex >= 0 ? this.entryHeight(this.entries[selectedIndex]) : 1;
+    // The entries THIS render draws: the committed order with at most one
+    // unfinished move applied as a pure projection. The committed list, Main's
+    // order view, and every action identity stay untouched by it.
+    const rosterEntries = this.previewRosterEntries();
+    const move = this.sessionMove;
+    // The card being moved is marked as soon as a move exists, so entering the
+    // keyboard move mode names its source BEFORE any destination is previewed.
+    // A pointer press alone (no motion, no preview) is still an ordinary click
+    // and marks nothing.
+    const movingKey = move !== undefined && (this.sessionMoveMode || move.targetKey !== undefined)
+      ? move.sourceKey
+      : undefined;
+    // The destination card marks which side of IT the moved card lands on. An
+    // end-of-list drop has no destination-card marker: it marks its own blank
+    // row instead (below), and a move onto itself marks nothing.
+    const insertionTargetKey = move !== undefined && !move.endDrop
+      && move.targetKey !== undefined && move.placement !== undefined
+      && move.targetKey !== move.sourceKey
+      ? move.targetKey
+      : undefined;
+    const selectedIndex = rosterEntries.findIndex((entry) => entry.key === this.selectedEntryKey);
+    const selectedHeight = selectedIndex >= 0 ? this.entryHeight(rosterEntries[selectedIndex]) : 1;
     // At least one entry row is required, and the highlighted entry (a local
     // card is 3 or 5 rows, a remote card 4 or 6) must fit completely: a picker whose selected target is
     // invisible or clipped would let Enter act on something not shown.
@@ -9140,13 +10211,20 @@ export class SidebarController {
     }
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
     lines.push(...alertLines);
-    const top = this.scrollWindow(selectedIndex, listRows);
+    const top = this.scrollWindow(selectedIndex, listRows, rosterEntries);
     const displayed = new Map<string, number>();
     const regions = new Map<string, DisplayedRosterRegion>();
     let y = 0;
-    for (let index = top; index < this.entries.length; index += 1) {
-      const entry = this.entries[index];
-      const entryLines = this.renderEntryLines(entry, index === selectedIndex, cols);
+    let lastDrawnSession: SidebarEntry | undefined;
+    for (let index = top; index < rosterEntries.length; index += 1) {
+      const entry = rosterEntries[index];
+      const entryLines = this.renderEntryLines(
+        entry,
+        index === selectedIndex,
+        cols,
+        entry.key === movingKey,
+        entry.key === insertionTargetKey ? move?.placement : undefined,
+      );
       // Only complete entries are drawn; a partially clipped card would
       // misrepresent its status.
       if (y + entryLines.length > listRows) {
@@ -9155,7 +10233,22 @@ export class SidebarController {
       lines.push(...entryLines);
       displayed.set(entry.key, entryLines.length);
       regions.set(entry.key, { row: lines.length - entryLines.length, height: entryLines.length, entry });
+      if (isSessionRosterEntry(entry)) lastDrawnSession = entry;
       y += entryLines.length;
+    }
+    // A previewed end-of-list drop marks its own position in one row the window
+    // already leaves blank, directly under the drawn session cards. It is drawn
+    // only when the last drawn session card really is the end of the session
+    // list this render draws, so a remainder under a clipped non-final card of
+    // an overflowing window never claims to be the end. No row is added: the
+    // marker replaces blank padding, and the hit map keeps reporting that row
+    // as blank space rather than as an entry.
+    if (move !== undefined && move.endDrop && move.targetKey !== undefined
+      && move.sourceKey !== move.targetKey && lastDrawnSession !== undefined
+      && y < listRows
+      && sessionListTailKey(rosterEntries) === lastDrawnSession.key) {
+      lines.push(wrapRow(INSERTION_MARKER_END, cols));
+      y += 1;
     }
     this.displayedRoster = {
       signature: this.rosterSignature(),
@@ -9165,6 +10258,9 @@ export class SidebarController {
       rows,
       focus: this._focus,
       selectedKey: this.selectedEntryKey,
+      listStart: 1 + alertLines.length,
+      listRows,
+      listTop: top,
     };
     for (const noticeLine of noticeLines) {
       lines.push(wrapRow(noticeLine, cols));
@@ -9191,6 +10287,9 @@ export class SidebarController {
       rows,
       focus: this._focus,
       selectedKey: undefined,
+      listStart: 0,
+      listRows: 0,
+      listTop: 0,
     };
     const alert = this.renderPeerAlert(cols, rows);
     return alert.lines.length === 0 ? this.renderTooSmall(cols, rows) : { lines: alert.lines };
@@ -9201,10 +10300,22 @@ export class SidebarController {
    * list window, moves the top only when needed, and pulls the window back
    * up when the whole tail fits (e.g. after a card collapses).
    */
-  private scrollWindow(selectedIndex: number, listRows: number): number {
-    const heights = this.entries.map((entry) => this.entryHeight(entry));
-    const maxTop = Math.max(0, this.entries.length - 1);
+  private scrollWindow(
+    selectedIndex: number,
+    listRows: number,
+    entries: readonly SidebarEntry[] = this.entries,
+  ): number {
+    const heights = entries.map((entry) => this.entryHeight(entry));
+    const maxTop = Math.max(0, entries.length - 1);
     let top = Math.min(Math.max(this.listTop, 0), maxTop);
+    if (this.sessionPointerScroll) {
+      // A session drag owns the window while it scrolls an overflowing list, so
+      // the moving card may deliberately leave the window and an offscreen
+      // position stays reachable. Bounds stay enforced and nothing else changes;
+      // the ordinary selection-driven behaviour returns with the interaction.
+      this.listTop = top;
+      return top;
+    }
     if (selectedIndex >= 0) {
       if (selectedIndex < top) {
         top = selectedIndex;
@@ -9237,8 +10348,20 @@ export class SidebarController {
    * line, and — when expanded — two generic sanitized activity rows. A remote
    * card inserts exactly one indented owner-host line directly under the title.
    */
-  private renderEntryLines(entry: SidebarEntry, selected: boolean, cols: number): string[] {
-    const marker = selected ? "> " : "  ";
+  private renderEntryLines(
+    entry: SidebarEntry,
+    selected: boolean,
+    cols: number,
+    moving = false,
+    insertion?: "before" | "after",
+  ): string[] {
+    const marker = moving ? ">>" : selected ? "> " : "  ";
+    // The insertion marker of a previewed move reuses the destination card's own
+    // marker column (the same two cells as the selection marker), so it states
+    // which side the moved card lands on without adding a row, a column, or any
+    // permanent layout, and it can never be clipped or ellipsized away.
+    const insertionMarker = insertion === undefined ? undefined
+      : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
       // One focus-domain title highlight: white identifies the ACTUAL active
@@ -9255,7 +10378,7 @@ export class SidebarController {
       }
       const lines = [
         wrapRow(cardTitle(item), cols, titleSgr),
-        wrapRow(`${marker}${cardStatusText(item)}`, cols),
+        wrapRow(`${insertionMarker ?? marker}${cardStatusText(item)}`, cols),
         wrapRow(`  ${cardBackgroundText(item)}`, cols),
       ];
       if (!this.collapsedItemIds.has(item.id)) {
@@ -9274,7 +10397,7 @@ export class SidebarController {
       if (entry.remote === undefined) {
         return [wrapRow(`${marker}Remote session unavailable`, cols)];
       }
-      return this.renderRemoteEntryLines(entry, entry.remote, selected, cols);
+      return this.renderRemoteEntryLines(entry, entry.remote, selected, cols, moving, insertion);
     }
     if (entry.kind === "diagnostics" && entry.warning !== undefined) {
       const warning = entry.warning;
@@ -9322,8 +10445,12 @@ export class SidebarController {
     remote: SidebarRemoteEntry,
     selected: boolean,
     cols: number,
+    moving = false,
+    insertion?: "before" | "after",
   ): string[] {
-    const marker = selected ? "> " : "  ";
+    const marker = moving ? ">>" : selected ? "> " : "  ";
+    const insertionMarker = insertion === undefined ? undefined
+      : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     const facts = remoteSessionStatusFacts(remote.row);
     // Same one focus-domain title highlight as local cards; the white mark is
     // Main's actual content owner, which is always a structured identity and
@@ -9343,7 +10470,7 @@ export class SidebarController {
     const lines = [
       wrapRow(cardTitle(remote.row), cols, titleSgr),
       wrapRow(`  host ${stale}${hostLabel}`, cols),
-      wrapRow(`${marker}${cardStatusText(facts)}`, cols),
+      wrapRow(`${insertionMarker ?? marker}${cardStatusText(facts)}`, cols),
       wrapRow(`  ${cardBackgroundText(facts)}`, cols),
     ];
     if (!this.collapsedRemoteEntryKeys.has(entry.key)) {
@@ -9363,6 +10490,12 @@ export class SidebarController {
       && owner.hostId === remote.hostId
       && owner.hostRunId === remote.hostRunId
       && owner.rowId === remote.row.id;
+  }
+
+  /** True when at least one left-roster card can be moved with `m`/`M`. */
+  private hasMovableSessions(): boolean {
+    return this.entries.some((entry) => isSessionRosterEntry(entry)
+      && ownerKeyForSessionEntry(entry) !== undefined);
   }
 
   /** True when at least one left-roster card can be expanded/collapsed with Space. */

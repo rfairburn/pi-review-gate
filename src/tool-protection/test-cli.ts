@@ -6,8 +6,8 @@
  * proposal per selected case/level to the saved Pi auditor through the shared
  * runner, parses the reply with the shared decision parser, and compares it with
  * fixed fixture expectations. It never executes a proposal, reads a proposal
- * target, registers a tool, starts an agent loop, writes a session, or changes the
- * saved configuration or fixture data.
+ * target, registers a tool, starts an agent loop, or changes saved configuration
+ * or fixture data. Saved auditor records honor the existing retention setting.
  *
  * The test level and scope are independent of the live gate, including when the
  * saved Protection level is Off or its scope covers a different set of tool names.
@@ -24,8 +24,11 @@ import { effectiveToolProtectionSettings } from "./config";
 import { buildProtectionContext } from "./context";
 import { parseProtectionDecision } from "./decision";
 import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
+import { writeAuditorSessionRecord, type HostAuditorSessionManagerConstructor } from "./session-record";
 import {
+  protectionAuditorCacheKey,
   runProtectionAuditor,
+  type ProtectionAuditorObservation,
   type ProtectionAuditorPiModelRegistry,
 } from "./runner";
 import {
@@ -64,8 +67,9 @@ and works while the saved level is Off. Pi-backed auditors only; an
 external auditor is refused before any program is launched.
 
 Each selected case and level runs once, sequentially. There is no retry, fallback,
-cache, replay, tool execution, proposal-target read, agent loop, or auditor-session
-retention. A setup or transport error is reported separately from a policy FAIL.
+verdict cache, replay, tool execution, proposal-target read, or agent loop.
+Save auditor sessions is honored: one fresh record per invoked case/level when enabled.
+A setup or transport error is reported separately from a policy FAIL.
 Requests may incur provider charges. Human output includes the raw reply; --json keeps
 it in each result's raw field.
 Exit: 0 all match; 1 verdict mismatch; 2 setup/transport/format error; 130 interrupted.
@@ -94,6 +98,15 @@ interface TestResultRecord {
   durationMs?: number;
   error?: string;
   match?: boolean;
+  /**
+   * The terminal message's own usage object, kept exactly as the installed SDK
+   * reported it (#590): one representation, no normalized copy, no invented
+   * zeros. Absent when the reply never arrived or reported no usage, so a
+   * reported `cacheRead: 0` is a real zero rather than an unavailable count.
+   */
+  usage?: Record<string, unknown>;
+  /** A recording failure never changes the test verdict or exit status. */
+  sessionWarning?: string;
 }
 
 interface TestReport {
@@ -136,6 +149,13 @@ type OutputWriter = (line: string) => void;
 
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const MAX_PACKAGE_ROOT_DEPTH = 16;
+/**
+ * Namespace for the tester's auditor cache scope (#590). It is derived from
+ * the already-resolved saved-configuration path plus the saved model and test
+ * level, so repeat tester runs over the same profile reuse one stable identity
+ * without a persisted session, a fork, a config write, or a new option.
+ */
+const TESTER_CACHE_SCOPE_PREFIX = "pi-tool-protection-tester:";
 
 // tsc rewrites `await import(x)` in CommonJS output to require(x), which cannot
 // load Pi's ESM entry on every supported Node version. Keep a native dynamic
@@ -463,6 +483,7 @@ export async function runToolProtectionTestCli(
   const controller = new AbortController();
   const stop = (): void => controller.abort();
   process.once("SIGINT", stop);
+  const testerCacheScope = `${TESTER_CACHE_SCOPE_PREFIX}${loaded.path ?? "unsaved-configuration"}`;
   try {
     for (const testCase of testCases) {
       for (const level of levels) {
@@ -484,16 +505,24 @@ export async function runToolProtectionTestCli(
         if (!built.ok) {
           record.error = `${built.category}: ${built.message}`;
         } else {
+          // Capture actual transport data for usage and optional write-only
+          // retention. No saved session is ever read or reused as input.
+          let observation: ProtectionAuditorObservation | undefined;
+          let terminalUsage: Record<string, unknown> | undefined;
           const result = await runProtectionAuditor({
             selection,
             config: loaded.config,
             prompt: built.prompt,
+            fixedInstructionChars: built.fixedChars,
             input: undefined,
             cwd: testCase.proposedCall.cwd,
             timeoutMs: settings.timeoutMs,
+            cacheKey: protectionAuditorCacheKey(testerCacheScope, selection.model, level),
             modelRegistry: registry,
             signal: controller.signal,
+            observe: (value) => { observation = value; terminalUsage = terminalUsageOf(value); },
           });
+          if (terminalUsage !== undefined) record.usage = terminalUsage;
           record.durationMs = result.durationMs;
           if (result.error !== undefined) {
             record.kind = "auditor_error";
@@ -509,6 +538,34 @@ export async function runToolProtectionTestCli(
             } catch (error) {
               record.kind = "malformed";
               record.error = errorMessage(error);
+            }
+          }
+          if (settings.retainAuditorSessions) {
+            const saved = await writeAuditorSessionRecord({
+              identity: {
+                invocationId: testCase.proposedCall.invocationId,
+                toolName: testCase.proposedCall.toolName,
+                role: "auditor-test-only",
+                taskId: testCase.id,
+                cwd: testCase.proposedCall.cwd ?? process.cwd(),
+                level,
+                policyVersion: TOOL_PROTECTION_POLICY_VERSION,
+                auditor: { source: "pi", label: selection.model },
+                durationMs: result.durationMs,
+              },
+              prompt: built.prompt,
+              observation,
+              outcome: record.kind === "decision"
+                ? { status: "decision", decision: record.actual, ...(record.reason === undefined ? {} : { reason: record.reason }) }
+                : { status: controller.signal.aborted ? "cancelled" : result.timedOut ? "timeout" : record.kind === "malformed" ? "malformed" : "transport-error", error: record.error },
+            }, {
+              loadSessionManager: async () => typeof sdk.SessionManager === "function"
+                ? sdk.SessionManager as unknown as HostAuditorSessionManagerConstructor
+                : undefined,
+            });
+            if (saved.warning !== undefined) {
+              record.sessionWarning = saved.warning;
+              if (!options.json) write(`  ${saved.warning}`);
             }
           }
         }
@@ -546,6 +603,17 @@ export async function runToolProtectionTestCli(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The usage object the terminal provider message actually carried, passed
+ * through untouched. A stream that produced no terminal message, or one that
+ * reported no usage, yields nothing rather than a zeroed stand-in.
+ */
+function terminalUsageOf(observation: ProtectionAuditorObservation | undefined): Record<string, unknown> | undefined {
+  const assistant = observation?.pi?.assistant;
+  if (!isRecord(assistant) || !isRecord(assistant.usage)) return undefined;
+  return assistant.usage;
 }
 
 if (require.main === module) {

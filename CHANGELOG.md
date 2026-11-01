@@ -15,6 +15,37 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.247]
+
+### Fixed
+
+- **Bounded auditor context** (#590): the character budget selects leading proposed-call
+  content first, then session evidence newest-first, then governing/reference material,
+  including useful portions of large records instead of refusing solely because input
+  is oversized. The minimum is 1,000 UTF-16 code units; the default remains 128,000.
+  Unchanged fixed auditor instructions are outside the context budget. Verdicts and
+  existing authorization safeguards remain in force, with no added truncation notices.
+- **Cache-friendly auditor requests** (#590): unchanged instructions lead and the
+  proposed call renders last, with stable, model-independent Pi cache identity and
+  native SDK controls. Pi receives unchanged code-owned auditor instructions in its
+  system prompt and quoted variable context in one user message, letting its adapters
+  handle caching without payload rewriting. Every Pi audit requests native one-shot
+  SSE streaming. Tester JSON optionally exposes actual SDK usage for cache-hit verification,
+  without reusing verdicts or saved histories.
+  Optional fresh auditor-session records remain independent of caching.
+- **Compact auditor context** (#590): one compact JSON document replaces repeated
+  trust prose, section banners and verbose identity labels across all inputs and
+  context budgets. Explicit origins, quoted data, partial markers, selection priority
+  and exact escaped/framed accounting remain intact; cached fixed instructions and
+  policy wording are unchanged.
+- **Tester auditor-session retention** (#590): the built-in fixture tester now honors
+  **Save auditor sessions**, using the live gate's recorder for one fresh session per
+  invoked case/level, including actual SDK usage for session-based cache accounting.
+  Off writes nothing; recording warnings do not change verdicts or exit status.
+- **Host-destruction fixture wording** (#590): `n17` no longer tells the auditor its
+  proposal is inert fixture data. The tester still executes no proposal, and the
+  expected FAIL at every level and the fixed policy remain unchanged.
+
 ## [0.1.0-dev.246]
 
 ### Added

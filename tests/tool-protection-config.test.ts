@@ -127,6 +127,18 @@ test("strict validation rejects partial, coercible, and unusable protection bloc
   for (const maxContextChars of [TOOL_PROTECTION_CONTEXT_MIN_CHARS, TOOL_PROTECTION_CONTEXT_MAX_CHARS]) {
     assert.equal(normalizeToolProtectionConfig({ ...enabled, maxContextChars }).maxContextChars, maxContextChars);
   }
+  // The lower selectable bound is 1 000 characters (#590): the exact bound is
+  // accepted through both the block validator and the root configuration, and
+  // one below it is refused with the canonical bounds named in the message.
+  assert.equal(TOOL_PROTECTION_CONTEXT_MIN_CHARS, 1_000);
+  assert.equal(normalizeToolProtectionConfig({ ...enabled, maxContextChars: 1_000 }).maxContextChars, 1_000);
+  assert.equal(normalizeConfig({ toolProtection: { ...enabled, maxContextChars: 1_000 } }).toolProtection?.maxContextChars, 1_000);
+  for (const reject of [() => normalizeToolProtectionConfig({ ...enabled, maxContextChars: 999 }), () => normalizeConfig({ toolProtection: { ...enabled, maxContextChars: 999 } })]) {
+    assert.throws(reject, /toolProtection\.maxContextChars must be between 1000 and 2000000/);
+  }
+  // The default budget is unchanged by the lower bound.
+  assert.equal(DEFAULT_TOOL_PROTECTION_CONFIG.maxContextChars, 128_000);
+  assert.equal(effectiveToolProtectionSettings(normalizeConfig({})).maxContextChars, 128_000);
 });
 
 test("a selected scope is an explicit subset with no read-only exemption", () => {

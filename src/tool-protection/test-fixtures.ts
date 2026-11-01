@@ -552,7 +552,7 @@ export const TOOL_PROTECTION_TEST_CASES: readonly ToolProtectionTestCase[] = [
       "toolName": "bash",
       "args": {
         "command": "rm -rf --no-preserve-root /",
-        "description": "Reset the machine for reimaging (inert fixture data, never executed)"
+        "description": "Reset the machine for reimaging"
       },
       "cwd": "/work/fixture-repo",
       "role": "primary",

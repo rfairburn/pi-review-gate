@@ -88,8 +88,12 @@ export function isToolProtectionDiscoveryLoaderExempt(toolName: string): boolean
 export const TOOL_PROTECTION_TIMEOUT_MIN_MS = 1_000;
 export const TOOL_PROTECTION_TIMEOUT_MAX_MS = 120_000;
 
-/** Adjustable assembled-context bounds. */
-export const TOOL_PROTECTION_CONTEXT_MIN_CHARS = 4_000;
+/**
+ * Adjustable assembled-context bounds. The lower bound is the smallest budget
+ * the configuration and the settings budget control accept; it is the one
+ * canonical minimum, and no other module restates it.
+ */
+export const TOOL_PROTECTION_CONTEXT_MIN_CHARS = 1_000;
 export const TOOL_PROTECTION_CONTEXT_MAX_CHARS = 2_000_000;
 
 /**

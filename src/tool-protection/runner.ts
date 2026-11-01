@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   ActiveReviewerSelection,
   ExternalAgentConfig,
@@ -5,6 +6,8 @@ import type {
   ReviewGateConfig,
 } from "../config";
 import { resolvedExternalAgent } from "../config";
+import type { ProtectionLevel } from "./config";
+import { TOOL_PROTECTION_POLICY_VERSION } from "./policy";
 import { isRecord } from "../record-guard";
 import {
   reviewerEnv,
@@ -42,8 +45,8 @@ import {
 export const PROTECTION_AUDITOR_PROTOCOL = "pi-tool-protection-json-v1";
 
 /**
- * Route-level system instruction only. The decision instructions and all
- * governing/proposal/evidence context belong to the caller-generated prompt.
+ * Route-level instruction, followed by the caller's unchanged code-owned
+ * auditor instructions. Quoted governing/proposal/evidence data stays user-role.
  */
 const DECISION_ONLY_SYSTEM_PROMPT = [
   "You are an isolated decision-only tool-protection auditor.",
@@ -56,6 +59,15 @@ export interface ProtectionAuditorRequest {
   config: ReviewGateConfig;
   /** Code-generated decision prompt. It is the complete supplied context. */
   prompt: string;
+  /**
+   * Exact code-owned instruction-prefix length from buildProtectionContext.fixedChars.
+   * Pi places that prefix in systemPrompt and the remainder in one user message,
+   * letting native adapters own caching. Omitted means no supplied fixed prefix;
+   * an unusable supplied length is refused before any provider dispatch and is
+   * never resized. External transports still receive the complete canonical
+   * prompt unchanged.
+   */
+  fixedInstructionChars?: number;
   /** Model-neutral structured context for the external binary transport. */
   input: unknown;
   cwd: string;
@@ -68,6 +80,18 @@ export interface ProtectionAuditorRequest {
    * the CLI cannot currently guarantee invocation-local retry disabling.
    */
   modelRegistry?: ProtectionAuditorPiModelRegistry;
+  /**
+   * Optional stable prompt-cache identity for this auditor profile (#590), as
+   * produced by {@link protectionAuditorCacheKey}. On the in-process Pi route
+   * the runner forwards it as the installed SDK's provider-neutral `sessionId`
+   * stream option, which each provider maps to whatever session-scoped caching
+   * it actually supports and otherwise ignores. It always accompanies the full
+   * self-contained request context the runner already sends: a cache key never
+   * carries previous responses, transcript material, or a previous verdict,
+   * and it is not proof that any provider hit its cache. Its absence changes
+   * nothing about the request's controls, the decision, or a refusal.
+   */
+  cacheKey?: string;
   /**
    * Optional retention sink (#536). When present the runner reports the exact
    * transport data this invocation produced. It is called after the decision
@@ -102,13 +126,33 @@ interface ProtectionAuditorEnvelope {
   version: typeof PROTECTION_AUDITOR_PROTOCOL;
   prompt: string;
   input: unknown;
-  cwd: string;
+}
+
+/**
+ * The exact text written to the auditor's stdin. The envelope carries the
+ * generated request text and the bounded host metadata only: the working
+ * directory is set on the child process itself, and repeating it here would
+ * transmit host text that the context budget never accounted for.
+ */
+export function serializeProtectionAuditorEnvelope(prompt: string, input: unknown): string {
+  const envelope: ProtectionAuditorEnvelope = {
+    version: PROTECTION_AUDITOR_PROTOCOL,
+    prompt,
+    // JSON has no undefined value; keep the field present for a stable wire shape.
+    input: input === undefined ? null : input,
+  };
+  return JSON.stringify(envelope);
 }
 
 /** Structural subset of the installed Pi `Model`/`ModelRegistry` contract. */
 export interface ProtectionAuditorPiModel {
   id: string;
   provider: string;
+  /**
+   * The stream API the live registry resolved for this model, when exposed. It is
+   * host metadata only: this runner never selects a control from it.
+   */
+  api?: string;
 }
 
 /** User message shape accepted by the Pi `Context` request envelope. */
@@ -131,6 +175,51 @@ export interface ProtectionAuditorPiStreamOptions {
   toolChoice?: "none";
   maxRetries?: number;
   timeoutMs?: number;
+  /**
+   * Session-scoped cache identity from {@link ProtectionAuditorRequest.cacheKey}.
+   * The installed SDK's provider-neutral session option: a provider maps it to
+   * the session-aware cache or routing signal it supports and ignores it
+   * otherwise.
+   */
+  sessionId?: string;
+  /**
+   * Published SDK transport option, requested the same way for every in-process
+   * Pi audit: `"sse"` asks for the full body to be posted per request instead of
+   * a pooled connection or a continued previous response. It is not selected per
+   * model, provider, resolved api, or cache identity, and whether a given API
+   * supports it or translates it is the installed SDK's decision, never this
+   * runner's.
+   */
+  transport?: "sse";
+}
+
+/** Namespaced tag so a policy revision or profile change rotates the identity. */
+export const PROTECTION_AUDITOR_CACHE_KEY_TAG = "pi-tool-protection-auditor-cache-v1";
+
+/**
+ * Deterministic prompt-cache identity for one auditor profile (#590): the
+ * versioned tag, the code-owned policy revision, the enabled level, the
+ * configured Pi model selector, and a caller-supplied namespaced scope.
+ *
+ * It is a pure derivation with no cache, counter, persisted identity, or new
+ * configuration: the same inputs always give the same 64-hex key, and the
+ * scope text itself is hashed rather than transmitted. Callers must supply a
+ * scope that is stable across the audits that are meant to share a provider
+ * cache (an acting conversation, or one tester configuration), never an
+ * invocation id or a per-audit record id.
+ */
+export function protectionAuditorCacheKey(
+  scope: string,
+  model: string,
+  level: Exclude<ProtectionLevel, "off">,
+): string {
+  return createHash("sha256")
+    .update(PROTECTION_AUDITOR_CACHE_KEY_TAG)
+    .update("\0").update(TOOL_PROTECTION_POLICY_VERSION)
+    .update("\0").update(level)
+    .update("\0").update(model)
+    .update("\0").update(scope)
+    .digest("hex");
 }
 
 /**
@@ -189,9 +278,19 @@ export interface ProtectionAuditorObservation {
    */
   launchFailure?: { syscall: string; code: string };
   pi?: {
-    /** The route-level system instruction actually sent. */
+    /**
+     * The system text actually sent: the route-level instruction followed, when a
+     * boundary was supplied, by the caller's unchanged code-owned instruction
+     * prefix. Quoted governing instructions, evidence, and the proposed call are
+     * never part of it.
+     */
     systemPrompt: string;
-    /** The one user message actually sent — the complete generated prompt. */
+    /**
+     * The one user message actually sent: the generated prompt from the supplied
+     * boundary onward, or the complete generated prompt when no boundary was
+     * supplied. It is stored exactly, including the separator that attaches it to
+     * the fixed blocks.
+     */
     prompt: string;
     /** The effective reasoning request for this call. */
     thinkingLevel: string;
@@ -369,10 +468,14 @@ function validateRequest(request: ProtectionAuditorRequest): string | undefined 
 
 /**
  * In-process transport through the coordinator's live model registry. The
- * context contains only the route system instruction and generated prompt, so
- * there are no tools or session/project resources. The deadline bounds this
- * decision wait; aborting the provider request is best-effort and is not
- * process-teardown evidence, so this route reports no process settlement.
+ * context contains only the route system instruction, the caller's unchanged
+ * code-owned instruction prefix (up to the supplied boundary), and the remaining
+ * generated prompt as one user message, so there are no tools or session/project
+ * resources. The same shape is sent for every model and provider: the runner
+ * never rewrites a provider payload or selects a control from a model name. The
+ * deadline bounds this decision wait; aborting the provider request is
+ * best-effort and is not process-teardown evidence, so this route reports no
+ * process settlement.
  */
 async function runPiInProcessDecision(
   request: ProtectionAuditorRequest,
@@ -386,18 +489,41 @@ async function runPiInProcessDecision(
   const resolved = resolvePiModel(registry, selection.model);
   if ("error" in resolved) return refused(failure(resolved.error, startedAt), resolved.error);
 
+  // The boundary is host-supplied, so an unusable one is refused here, before
+  // any provider dispatch: only an absent boundary means "no supplied fixed
+  // text", and a boundary at or past the end of the prompt is refused rather
+  // than resized, because that would move quoted data into the system role.
+  const suppliedBoundary = request.fixedInstructionChars;
+  if (suppliedBoundary !== undefined
+    && (!Number.isInteger(suppliedBoundary) || suppliedBoundary < 0 || suppliedBoundary >= request.prompt.length)) {
+    const message = "Pi auditor received an invalid fixed-instruction boundary.";
+    return refused(failure(message, startedAt), message);
+  }
+  const fixedInstructionChars = suppliedBoundary ?? 0;
+
   const controller = new AbortController();
   const onAbort = (): void => controller.abort();
   request.signal?.addEventListener("abort", onAbort, { once: true });
   if (request.signal?.aborted) controller.abort();
 
   const context = {
-    // Complete supplied context: one route-level system instruction and the
-    // code-generated prompt. No tools, transcript, project resources, or
-    // session history are part of this request.
-    systemPrompt: DECISION_ONLY_SYSTEM_PROMPT,
-    messages: [{ role: "user" as const, content: request.prompt, timestamp: Date.now() }],
+    // One native system/user shape for every model. Only the code-owned fixed
+    // prefix is system-role; all quoted governing instructions, evidence and
+    // proposal data remain user-role. No tools, transcript or session history.
+    systemPrompt: [DECISION_ONLY_SYSTEM_PROMPT, request.prompt.slice(0, fixedInstructionChars)].filter(Boolean).join("\n\n"),
+    messages: [{ role: "user" as const, content: request.prompt.slice(fixedInstructionChars), timestamp: Date.now() }],
   };
+  // A cache identity is provider-neutral: `sessionId` is the installed SDK's
+  // session option, which providers map to their own supported cache/routing
+  // signal and ignore otherwise. It is only ever sent with the self-contained
+  // context above, so it can never select a previous response, transcript, or
+  // verdict. Its presence or absence never changes the other controls: every
+  // audit asks for the SDK's per-request streaming transport and no retries, and
+  // no raw payload, header, retention/TTL flag, or provider-specific option is
+  // supplied for any model.
+  const cacheKey = typeof request.cacheKey === "string" && request.cacheKey.length > 0
+    ? request.cacheKey
+    : undefined;
   let stream: AsyncIterable<unknown>;
   try {
     stream = registry.streamSimple(resolved.model, context, {
@@ -406,9 +532,17 @@ async function runPiInProcessDecision(
       // No runner-orchestrated or provider-SDK client retry attempts.
       maxRetries: 0,
       timeoutMs: request.timeoutMs,
+      // One transport safeguard for the common native request shape, applied to
+      // every audit regardless of model, provider, resolved api, or cache
+      // identity: the published SDK option asks for the full body to be posted
+      // per request instead of a pooled or continuing connection, and the SDK
+      // decides what a given API supports. This runner never inspects the
+      // resolved model to choose a transport.
+      transport: "sse",
       ...(thinkingLevel !== "off"
         ? { reasoning: thinkingLevel }
         : {}),
+      ...(cacheKey === undefined ? {} : { sessionId: cacheKey }),
     });
   } catch (error) {
     request.signal?.removeEventListener("abort", onAbort);
@@ -428,7 +562,7 @@ async function runPiInProcessDecision(
       transport: "pi-in-process",
       pi: {
         systemPrompt: context.systemPrompt,
-        prompt: request.prompt,
+        prompt: context.messages[0]!.content,
         thinkingLevel,
         model: { provider: resolved.model.provider, id: resolved.model.id },
         ...(assistant === undefined ? {} : { assistant }),
@@ -641,19 +775,12 @@ async function runBinaryDecision(
   dependencies: ProtectionAuditorDependencies,
   startedAt: number,
 ): Promise<RouteOutcome> {
-  const envelope: ProtectionAuditorEnvelope = {
-    version: PROTECTION_AUDITOR_PROTOCOL,
-    prompt: request.prompt,
-    // JSON has no undefined value; keep the field present for a stable wire shape.
-    input: request.input === undefined ? null : request.input,
-    cwd: request.cwd,
-  };
   const merged = mergedRole(agent, role);
   return await runProcessDecision({
     command: agent.command ?? "",
     args: merged.args,
     cwd: request.cwd,
-    prompt: JSON.stringify(envelope),
+    prompt: serializeProtectionAuditorEnvelope(request.prompt, request.input),
     timeoutMs: request.timeoutMs,
     env: reviewerEnv({
       ...process.env,

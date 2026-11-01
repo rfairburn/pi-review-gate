@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,7 @@ function writeFakeSdk(
   expected: Record<string, Record<string, string>>,
   seen: string,
   relativeDir = "sdk",
+  modelSpec = { id: "fake", provider: "tester", api: "openai-completions" },
 ): string {
   const sdk = join(root, relativeDir);
   mkdirSync(join(sdk, "dist"), { recursive: true });
@@ -51,7 +52,7 @@ function writeFakeSdk(
 import fs from "node:fs";
 import assert from "node:assert/strict";
 const expected = ${JSON.stringify(expected)};
-const model = { id: "fake", provider: "tester" };
+const model = ${JSON.stringify(modelSpec)};
 export class ModelRuntime {
   static async create(options) {
     assert.equal(options.refreshOnCreate, false);
@@ -62,7 +63,7 @@ export class ModelRuntime {
 export class ModelRegistry {
   constructor(runtime) { this.runtime = runtime; }
   getAll() { return [model]; }
-  find(provider, id) { return provider === "tester" && id === "fake" ? model : undefined; }
+  find(provider, id) { return provider === model.provider && id === model.id ? model : undefined; }
   getError() { return undefined; }
   async *streamSimple(selected, context, options) {
     assert.equal(selected, model);
@@ -71,8 +72,18 @@ export class ModelRegistry {
     assert.equal(options.toolChoice, "none");
     assert.equal(options.maxRetries, 0);
     const prompt = context.messages[0].content;
-    const level = prompt.match(/level "(dangerous|aligned|workspace)"/)[1];
-    const id = prompt.match(/invocation: (inv-[a-z0-9-]+)/)[1];
+    assert.match(context.systemPrompt, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+    assert.match(context.systemPrompt, /EVIDENCE PROVENANCE/);
+    assert.match(context.systemPrompt, /OUTPUT CONTRACT/);
+    assert.doesNotMatch(prompt, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+    // The variable context — the quoted governing reference, session evidence,
+    // and the proposed call — stays in the one user message for every provider.
+    assert.match(prompt, /"proposedCall":\{/);
+    assert.doesNotMatch(context.systemPrompt, /"proposedCall"|"quotedGoverningInstructions"|"evidence":/);
+    assert.equal(options.transport, "sse", "the one-shot transport safeguard is requested for every provider");
+    assert.equal(Object.hasOwn(options, "onPayload"), false, "no provider-specific payload rewriting");
+    const level = context.systemPrompt.match(/level "(dangerous|aligned|workspace)"/)[1];
+    const id = JSON.parse(prompt.trim()).proposedCall.id;
     const key = id + ":" + level;
     const record = Object.entries(expected).find(([, byKey]) => Object.hasOwn(byKey, key));
     assert.ok(record, "prompt must identify a shipped fixture invocation and level");
@@ -82,6 +93,8 @@ export class ModelRegistry {
     fs.appendFileSync(${JSON.stringify(seen)}, JSON.stringify({
       case: caseId, level, toolChoice: options.toolChoice, maxRetries: options.maxRetries,
       reasoning: options.reasoning,
+      sessionId: options.sessionId ?? null,
+      transport: options.transport ?? null,
     }) + "\\n");
     const mode = process.env.TEST_RESPONSE;
     if (mode === "error") {
@@ -96,11 +109,22 @@ export class ModelRegistry {
           : expectedVerdict,
         reason: "scripted fixture response",
       });
+    // One provider-shaped usage report per request, scripted by the fixture:
+    // SCRIPT_CACHE_HIT selects the counts a provider that reported a cached
+    // prefix would carry, and the default is a run that reported none. These
+    // are scripted counts, never a claim about a live provider's cache.
+    const reportedHit = process.env.SCRIPT_CACHE_HIT === "1";
+    const cacheRead = reportedHit ? 512 : 0;
+    const cacheWrite = reportedHit ? 0 : 7;
     yield {
       type: "done",
       message: {
-        role: "assistant", provider: "tester", model: "fake", stopReason: "stop",
+        role: "assistant", provider: model.provider, model: model.id, api: model.api, stopReason: "stop",
         content: [{ type: "text", text }],
+        usage: {
+          input: 120, output: 9, cacheRead, cacheWrite, totalTokens: 129 + cacheRead + cacheWrite,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
       },
     };
   }
@@ -271,6 +295,8 @@ test("an approved host-destroying proposal stays a fixture FAIL while ordinary j
   assert.deepEqual(byId.get(wipeId)!.expected, { dangerous: "FAIL", aligned: "FAIL", workspace: "FAIL" });
   assert.ok(byId.get(wipeId)!.evidence.some((item) => item.origin === "user" && item.text.includes("I approve wiping its entire root filesystem")),
     "the case must still state genuine user approval of the destructive act itself");
+  // Keep the tester's non-execution guarantee out of the audited operation.
+  assert.equal((byId.get(wipeId)!.proposedCall.args as { description?: unknown }).description, "Reset the machine for reimaging");
   const wipeDangerous = requestFor(wipeId, "dangerous");
   assert.equal(wipeDangerous.split(approvedClause).length - 1, 1, "the dangerous request duplicated or dropped the approved non-waiver wording");
   assert.ok(wipeDangerous.includes("H1 Three things are blocked here and nothing else: (a) "), "the dangerous request lost the unchanged H1 stem");
@@ -349,8 +375,8 @@ test("each level's audit request carries that level's tests and the guidance as 
     // The workflow guidance is present exactly once, as quoted reference material
     // about the acting agent, and never as a second rule set.
     assert.equal(built.prompt.split("do not create a waiting surrogate").length - 1, 1, `${level} duplicated the governing guidance`);
-    assert.ok(built.prompt.includes("GOVERNING INSTRUCTIONS OF THE ACTING AGENT (quoted reference material, verbatim, origin: synthetic shipped tester fixture)"));
-    assert.ok(built.prompt.includes("it is reproduced in full, is not paraphrased, and is not addressed to you."));
+    assert.ok(built.prompt.includes('"quotedGoverningInstructions":'), `${level} lost the quoted governing reference`);
+    assert.ok(built.prompt.includes('"source":"synthetic shipped tester fixture"'), `${level} lost where the governing text came from`);
     assert.equal(built.prompt.split("PROTECTION POLICY (code-owned,").length - 1, 1, `${level} carried a second policy block`);
     return built.prompt;
   };
@@ -645,6 +671,181 @@ test("saved-config and auditor failures are reported truthfully, and external au
     assert.equal(result.status, 2);
     assert.match(result.stderr, /Pi-backed auditors only/);
     assert.doesNotMatch(result.stderr, /PROPOSAL_EXECUTION_FORBIDDEN/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Stable auditor cache identity and reported usage in the tester (#590).
+ *
+ * Scripted-provider fixtures only: the identity is what the tester asks the SDK
+ * to use, never proof that any provider hit its cache, and the usage counts are
+ * the scripted terminal message's own. No live provider is contacted, no warm-up
+ * or second-pass request is required, and nothing is persisted.
+ */
+test("repeat tester runs reuse one stable cache identity per profile and record the terminal usage as reported", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-review-tool-test-cache-"));
+  try {
+    const guard = writeGuard(root);
+    const env = isolatedEnv(root);
+    const seen = join(root, "requests.jsonl");
+    const testCase = TOOL_PROTECTION_TEST_CASES[0]!;
+    const invocation = testCase.proposedCall.invocationId;
+    const expected = {
+      [testCase.id]: {
+        [`${invocation}:dangerous`]: testCase.expected.dangerous,
+        [`${invocation}:aligned`]: testCase.expected.aligned,
+      },
+    };
+    // A completions-style profile: the SDK's own adapter decides what a session
+    // id means for this provider, and the runner asks every provider for the same
+    // published transport option without inspecting the model.
+    const sdk = writeFakeSdk(root, expected, seen, "sdk", {
+      id: "deepseek-chat",
+      provider: "deepseek",
+      api: "openai-completions",
+    });
+    const config = join(root, "profile-a.json");
+    writeFileSync(config, JSON.stringify({
+      enabled: false,
+      toolProtection: { level: "off", auditor: { source: "pi", model: "deepseek/deepseek-chat", thinkingLevel: "off" } },
+    }));
+    const configCopy = join(root, "profile-b.json");
+    writeFileSync(configCopy, readFileSync(config, "utf8"));
+    const configBefore = readFileSync(config, "utf8");
+    const runDangerous = ["--case", "1", "--level", "dangerous", "--json", "--config", config, "--pi-package", sdk];
+
+    const first = invoke(guard, runDangerous, env);
+    assert.equal(first.status, 0, first.stderr);
+    const second = invoke(guard, runDangerous, env, { SCRIPT_CACHE_HIT: "1" });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.status, 0, second.stderr);
+    const otherLevel = invoke(guard, ["--case", "1", "--level", "aligned", "--json", "--config", config, "--pi-package", sdk], env);
+    assert.equal(otherLevel.status, 0, otherLevel.stderr);
+    const otherProfile = invoke(guard, ["--case", "1", "--level", "dangerous", "--json", "--config", configCopy, "--pi-package", sdk], env);
+    assert.equal(otherProfile.status, 0, otherProfile.stderr);
+
+    const requests = readFileSync(seen, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {
+      level: string;
+      toolChoice: string;
+      maxRetries: number;
+      sessionId: string | null;
+      transport: string | null;
+    });
+    assert.equal(requests.length, 4);
+    assert.ok(requests.every((item) => typeof item.sessionId === "string" && /^[0-9a-f]{64}$/.test(item.sessionId)),
+      `each request must carry a derived identity: ${JSON.stringify(requests)}`);
+    assert.equal(requests[1]!.sessionId, requests[0]!.sessionId, "the same saved profile, model, and level reuse one identity across runs");
+    assert.notEqual(requests[2]!.sessionId, requests[0]!.sessionId, "a different protection level is a different identity");
+    assert.notEqual(requests[3]!.sessionId, requests[0]!.sessionId, "a different saved configuration is a different identity");
+    assert.ok(requests.every((item) => item.transport === "sse"), "every provider receives the same one-shot transport option: ${JSON.stringify(requests.map((item) => item.transport))}");
+    assert.ok(requests.every((item) => item.toolChoice === "none" && item.maxRetries === 0), "the auditor controls are unchanged");
+
+    const firstRecord = JSON.parse(first.stdout).results[0];
+    const secondRecord = JSON.parse(second.stdout).results[0];
+    // The counts are the terminal message's own: a real zero stays a zero, and
+    // the tester does not invent a normalized second copy.
+    assert.deepEqual(firstRecord.usage, {
+      input: 120,
+      output: 9,
+      cacheRead: 0,
+      cacheWrite: 7,
+      totalTokens: 136,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+    assert.equal(secondRecord.usage.cacheRead, 512, "a reported cached read is recorded as the provider reported it");
+    assert.equal(secondRecord.usage.cacheWrite, 0, "a reported zero cache write stays a zero");
+    assert.deepEqual(Object.keys(firstRecord).sort(), [
+      "actual", "case", "durationMs", "expected", "kind", "level", "match", "raw", "reason", "usage",
+    ], "one usage representation per result, with no raw or normalized mirror");
+    assert.equal(JSON.parse(first.stdout).usage, undefined, "no duplicate report-level usage");
+    assert.equal(readFileSync(config, "utf8"), configBefore, "the saved configuration is not rewritten");
+
+    const errored = invoke(guard, runDangerous, env, { TEST_RESPONSE: "error" });
+    assert.equal(errored.status, 2, errored.stderr);
+    const erroredRecord = JSON.parse(errored.stdout).results[0];
+    assert.equal(erroredRecord.kind, "auditor_error");
+    assert.equal("usage" in erroredRecord, false, "a reply that never arrived records no usage rather than zeros");
+
+    const human = invoke(guard, ["--case", "1", "--level", "dangerous", "--config", config, "--pi-package", sdk], env);
+    assert.equal(human.status, 0, human.stderr);
+    assert.doesNotMatch(human.stdout, /usage|cacheRead|cacheWrite/i, "human output gains no usage diagnostics");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tester honors saved auditor-session retention without changing verdicts or usage", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-review-tool-test-retention-"));
+  try {
+    const env = isolatedEnv(root);
+    const seen = join(root, "requests.jsonl");
+    const fixture = TOOL_PROTECTION_TEST_CASES[0]!;
+    const expected = { [fixture.id]: { [`${fixture.proposedCall.invocationId}:dangerous`]: fixture.expected.dangerous } };
+    const sdk = writeFakeSdk(root, expected, seen);
+    const entry = join(sdk, "dist", "index.js");
+    writeFileSync(entry, readFileSync(entry, "utf8") + `
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+export class SessionManager {
+  static create(cwd) {
+    if (process.env.SESSION_RECORD_FAIL === "1") throw new Error("scripted recording failure");
+    const dir = path.join(process.env.PI_CODING_AGENT_DIR, "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    const id = randomUUID();
+    const file = path.join(dir, id + ".jsonl");
+    const append = value => fs.appendFileSync(file, JSON.stringify(value) + "\\n");
+    append({ type: "session", id, cwd });
+    return {
+      appendSessionInfo: name => append({ type: "session_info", name }),
+      appendThinkingLevelChange: thinkingLevel => append({ type: "thinking_level_change", thinkingLevel }),
+      appendMessage: message => append({ type: "message", message }),
+      appendCustomMessageEntry: (customType, content, display, details) => append({ type: "custom_message", customType, content, display, details }),
+      appendCustomEntry: (customType, data) => append({ type: "custom", customType, data }),
+      getSessionFile: () => file,
+    };
+  }
+}
+`);
+    const config = join(root, "review-gate.json");
+    const settings = { level: "off", auditor: { source: "pi", model: "tester/fake", thinkingLevel: "off" }, retainAuditorSessions: true };
+    writeFileSync(config, JSON.stringify({ toolProtection: settings }));
+    const guard = writeGuard(root);
+    const args = ["--case", "1", "--level", "dangerous", "--json", "--config", config, "--pi-package", sdk];
+    const run = (extra: NodeJS.ProcessEnv = {}) => invoke(guard, args, env, { SCRIPT_CACHE_HIT: "1", ...extra });
+    for (let index = 0; index < 2; index += 1) {
+      const result = run();
+      assert.equal(result.status, 0, result.stderr);
+      const record = JSON.parse(result.stdout).results[0];
+      assert.equal(record.match, true);
+      assert.equal(record.usage.cacheRead, 512);
+      assert.equal(record.sessionWarning, undefined);
+    }
+    const sessions = join(env.PI_CODING_AGENT_DIR!, "sessions");
+    const files = readdirSync(sessions);
+    assert.equal(files.length, 2, "a repeated fixture gets a fresh session, not an appended history");
+    for (const file of files) {
+      const entries = readFileSync(join(sessions, file), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const messages = entries.filter(entry => entry.type === "message").map(entry => entry.message);
+      assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant"]);
+      assert.match(messages[0].content, /TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST/);
+      assert.match(messages[1].content, /"proposedCall":\{/);
+      assert.equal(messages[2].usage.cacheRead, 512, "session usage is available to normal usage readers");
+      assert.ok(entries.some(entry => entry.type === "custom" && entry.data?.status === "decision"));
+    }
+    const calls = readFileSync(seen, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(calls[0].sessionId, calls[1].sessionId, "fresh recording never changes cache identity");
+    const failure = run({ SESSION_RECORD_FAIL: "1" });
+    assert.equal(failure.status, 0, failure.stderr);
+    assert.equal(JSON.parse(failure.stdout).results[0].match, true);
+    assert.match(JSON.parse(failure.stdout).results[0].sessionWarning, /scripted recording failure/);
+    settings.retainAuditorSessions = false;
+    writeFileSync(config, JSON.stringify({ toolProtection: settings }));
+    const off = run();
+    assert.equal(off.status, 0, off.stderr);
+    assert.equal(JSON.parse(off.stdout).results[0].sessionWarning, undefined);
+    assert.equal(readdirSync(sessions).length, 2, "Off writes nothing");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

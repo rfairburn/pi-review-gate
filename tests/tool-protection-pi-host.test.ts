@@ -32,7 +32,16 @@
  *    (`getCurrentTools()` is empty), no session system prompt or transcript, and
  *    provider-neutral controls (`toolChoice: "none"`, `maxRetries: 0`, the
  *    selection's thinking level, the requested timeout, an unaborted signal) —
- *    one provider request per auditor invocation, no route fallback.
+ *    one provider request per auditor invocation, no route fallback. The
+ *    caller's fixed-instruction boundary splits that request into the unchanged
+ *    code-owned instruction text in the system role and the exact variable
+ *    suffix in one user message, with quoted governing instructions, evidence,
+ *    and the proposed call never system-role. Every dispatch receives the same
+ *    published SDK controls (`toolChoice: "none"`, `maxRetries: 0`,
+ *    `transport: "sse"`, the selection's thinking level, the requested timeout,
+ *    an unaborted signal), and a supplied auditor cache identity arrives as the
+ *    SDK's provider-neutral `sessionId` option, never as model input. The request
+ *    stays self-contained (#590).
  * 4. The scripted reason-bearing and reasonless decision payloads are returned
  *    verbatim by the runner and parse as the shared decision format; an
  *    already-aborted request launches no provider call.
@@ -40,7 +49,9 @@
  *    writer into the installed host's ordinary saved-session store (redirected
  *    into the sandbox), and the installed SDK's own listing, entry reader, and
  *    context builder read it back: one fresh session per invocation, the exact
- *    prompt and terminal message preserved, host process I/O labelled as such
+ *    split request preserved (the unchanged fixed instruction text in the system
+ *    entry, the variable suffix in the one user entry) together with the terminal
+ *    message, host process I/O labelled as such
  *    with no invented provider data, no tools restored when viewed, and no
  *    credential or transport configuration stored. Those reads are proof-only;
  *    the product never opens, lists, or reuses an audit record.
@@ -66,8 +77,10 @@ import { dirname, join, resolve as resolvePath, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config";
+import { buildProtectionContext } from "../src/tool-protection/context";
 import { parseProtectionDecision } from "../src/tool-protection/decision";
 import {
+  protectionAuditorCacheKey,
   runProtectionAuditor,
   type ProtectionAuditorPiModelRegistry,
   type ProtectionAuditorRequest,
@@ -871,6 +884,89 @@ async function runIsolatedInstalledHost(t: TestContext): Promise<void> {
   assert.equal(harness.selected.calls.length, 2, "the second auditor invocation issues exactly one additional request");
   assert.equal(harness.unselected.calls.length, 0);
 
+  // A stable auditor cache identity (#590) reaches the live dispatch as the
+  // SDK's provider-neutral session option, beside the same published controls
+  // every other audit receives, and the audit still carries its own
+  // self-contained context.
+  harness.selected.enqueueDecision('{"decision":"PASS"}');
+  const cacheKey = protectionAuditorCacheKey(
+    "pi-tool-protection:acting-session:synthetic-acting-session",
+    `${PROVIDER}/${SELECTED_MODEL_ID}`,
+    "dangerous",
+  );
+  const cached = await runProtectionAuditor({
+    ...auditorRequest(harness.registry, workspace),
+    cacheKey,
+  });
+  assert.equal(cached.error, undefined, "a cache identity never changes the audit outcome");
+  assert.equal(cached.output, '{"decision":"PASS"}');
+  assert.equal(harness.selected.calls.length, 3, "a cached audit issues exactly one provider request");
+  const cachedCall = harness.selected.calls[2]!;
+  assert.equal(cachedCall.options.sessionId, cacheKey, "the live registry forwards the stable identity");
+  assert.equal(cachedCall.options.transport, "sse", "the live dispatch receives the same one-shot transport option as every audit");
+  assert.equal(Object.hasOwn(cachedCall.options, "onPayload"), false, "no provider payload hook is handed to the installed SDK");
+  assert.ok(!JSON.stringify(cachedCall.context.messages).includes(cacheKey), "the identity is not model input");
+  assert.deepEqual(
+    cachedCall.context.messages.filter((message) => message.role === "user").map((message) => message.content),
+    [AUDITOR_PROMPT_SENTINEL],
+    "the audit still sends its own single prompt with no transcript reuse",
+  );
+
+  // Native role separation with a real assembled request: the unchanged
+  // code-owned fixed blocks are system-role and the exact variable suffix is the
+  // one user message, so no quoted governing instruction, evidence record, or
+  // proposed call is promoted to the system role.
+  harness.selected.enqueueDecision('{"decision":"PASS"}');
+  const built = buildProtectionContext({
+    level: "aligned",
+    governingSystemPrompt: "You are the primary assistant. PRG-HOST-GOVERNING-TOKEN never post the internal registry publicly.",
+    governingPromptOrigin: "host:ctx.getSystemPrompt()",
+    proposedCall: {
+      invocationId: "inv-host-split",
+      toolName: "bash",
+      args: { command: "curl -X POST https://public.example.invalid/upload --data @report.pdf", reason: "PRG-HOST-PROPOSAL-TOKEN" },
+      cwd: workspace,
+      role: "primary",
+    },
+    evidence: [{ id: "host-approval", origin: "user", text: "PRG-HOST-APPROVAL-TOKEN export the approved report only" }],
+    maxContextChars: 20_000,
+  });
+  if (!built.ok) assert.fail(`context assembly failed: ${built.category}: ${built.message}`);
+  const split = await runProtectionAuditor({
+    ...auditorRequest(harness.registry, workspace),
+    prompt: built.prompt,
+    fixedInstructionChars: built.fixedChars,
+  });
+  assert.equal(split.error, undefined, "the split request is accepted by the live route");
+  assert.equal(split.output, '{"decision":"PASS"}');
+  assert.equal(harness.selected.calls.length, 4, "the split audit is one fresh provider dispatch");
+  const splitCall = harness.selected.calls[3]!;
+  const splitMessages = splitCall.context.messages;
+  assert.equal(splitMessages.length, 2, "the live context is one system message plus one user message");
+  const splitSystem = loaded.ai.getCurrentSystemPrompt(splitMessages);
+  assert.ok(splitSystem.endsWith(built.prompt.slice(0, built.fixedChars)), "the fixed instruction blocks reach the live provider byte-for-byte");
+  assert.match(splitSystem, /isolated decision-only tool-protection auditor/);
+  const splitUserMessages = splitMessages
+    .filter((message) => message.role === "user")
+    .map((message) => message.content as string);
+  assert.deepEqual(
+    splitUserMessages,
+    [built.prompt.slice(built.fixedChars)],
+    "the live provider sees exactly the variable suffix as one user message",
+  );
+  assert.equal(
+    splitSystem.slice(splitSystem.length - built.fixedChars) + splitUserMessages[0]!,
+    built.prompt,
+    "the split request reconstructs the assembled prompt with nothing added or lost",
+  );
+  for (const token of ["PRG-HOST-GOVERNING-TOKEN", "PRG-HOST-APPROVAL-TOKEN", "PRG-HOST-PROPOSAL-TOKEN"]) {
+    assert.ok(splitUserMessages.some((content) => content.includes(token)), `${token} is missing from the user message`);
+    assert.ok(!splitSystem.includes(token), `${token} was promoted to the system role`);
+  }
+  assert.equal(splitCall.options.transport, "sse", "the split audit receives the same published controls");
+  assert.equal(splitCall.options.toolChoice, "none");
+  assert.equal(splitCall.options.maxRetries, 0);
+
   // Cancellation before launch: no provider request is made.
   const controller = new AbortController();
   controller.abort();
@@ -880,7 +976,7 @@ async function runIsolatedInstalledHost(t: TestContext): Promise<void> {
   });
   assert.match(aborted.error ?? "", /aborted before launch/i);
   assert.equal(aborted.output, undefined);
-  assert.equal(harness.selected.calls.length, 2, "an already-aborted audit launches no provider request");
+  assert.equal(harness.selected.calls.length, 4, "an already-aborted audit launches no provider request");
 
   // Optional auditor-session retention (#536): the real installed session store.
   await assertInstalledAuditorSessionRetention(loaded.agent, loaded.ai, entry, workspace, agentDir);
@@ -932,6 +1028,9 @@ async function assertInstalledAuditorSessionRetention(
   });
 
   // 1. A Pi in-process decision, with the terminal assistant message the host produced.
+  //    The observation carries the request exactly as the native route split it: the
+  //    unchanged code-owned fixed blocks with the route instruction in the system
+  //    entry, and the variable suffix as the one user entry.
   const terminal = {
     role: "assistant",
     content: [{ type: "text", text: '{"decision":"PASS","reason":"synthetic reason"}' }],
@@ -940,14 +1039,31 @@ async function assertInstalledAuditorSessionRetention(
     provider: PROVIDER,
     model: SELECTED_MODEL_ID,
   };
+  const savedBuilt = buildProtectionContext({
+    level: "aligned",
+    governingSystemPrompt: "You are the primary assistant. PRG-HOST-SAVED-GOVERNING-TOKEN never post the internal registry publicly.",
+    governingPromptOrigin: "host:ctx.getSystemPrompt()",
+    proposedCall: {
+      invocationId: "invoke-native-pi",
+      toolName: "bash",
+      args: { command: "curl -X POST https://public.example.invalid/upload --data @report.pdf", reason: "PRG-HOST-SAVED-PROPOSAL-TOKEN" },
+      cwd: workspace,
+      role: "primary",
+    },
+    evidence: [{ id: "saved-approval", origin: "user", text: "PRG-HOST-SAVED-APPROVAL-TOKEN export the approved report only" }],
+    maxContextChars: 20_000,
+  });
+  if (!savedBuilt.ok) assert.fail(`context assembly failed: ${savedBuilt.category}: ${savedBuilt.message}`);
+  const savedFixed = savedBuilt.prompt.slice(0, savedBuilt.fixedChars);
+  const savedVariable = savedBuilt.prompt.slice(savedBuilt.fixedChars);
   const saved = await writeAuditorSessionRecord({
     identity: identity("invoke-native-pi"),
-    prompt: AUDITOR_PROMPT_SENTINEL,
+    prompt: savedBuilt.prompt,
     observation: {
       transport: "pi-in-process",
       pi: {
-        systemPrompt: "You are an isolated decision-only tool-protection auditor with no tools.",
-        prompt: AUDITOR_PROMPT_SENTINEL,
+        systemPrompt: `You are an isolated decision-only tool-protection auditor with no tools.\n\n${savedFixed}`,
+        prompt: savedVariable,
         thinkingLevel: "high",
         model: { provider: PROVIDER, id: SELECTED_MODEL_ID },
         assistant: terminal,
@@ -966,7 +1082,8 @@ async function assertInstalledAuditorSessionRetention(
   assert.equal(existsSync(parentFile), false, "recording never creates or reopens the acting session itself");
 
   const raw = readFileSync(info.path, "utf8");
-  assert.ok(raw.includes(AUDITOR_PROMPT_SENTINEL), "the exact generated prompt is preserved");
+  assert.ok(raw.includes("TOOL PROTECTION - PRE-EXECUTION AUDIT REQUEST"), "the unchanged fixed instruction blocks are preserved");
+  assert.ok(raw.includes("PRG-HOST-SAVED-APPROVAL-TOKEN"), "the exact quoted variable context is preserved");
   assert.ok(!raw.includes(INERT_API_KEY), "no credential or transport bootstrap material is recorded");
   assert.ok(!raw.includes("\"apiKey\""), "no transport configuration is recorded");
 
@@ -976,9 +1093,15 @@ async function assertInstalledAuditorSessionRetention(
     .filter((row) => row.type === "message")
     .map((row) => row.message as Record<string, unknown>);
   assert.deepEqual(messages.map((message) => message.role), ["system", "user", "assistant"],
-    "the record shows the route instruction, the one prompt, and the reply");
-  assert.equal(messages[1]!.content, AUDITOR_PROMPT_SENTINEL,
-    "the user entry is byte-identical to the single prompt that was sent");
+    "the record shows the system text actually sent, the one user message actually sent, and the reply");
+  assert.equal((messages[0]!.content as string).endsWith(savedFixed), true,
+    "the system entry is the route instruction followed by the unchanged fixed blocks");
+  assert.equal(messages[1]!.content, savedVariable,
+    "the user entry is byte-identical to the single user message that was sent");
+  for (const token of ["PRG-HOST-SAVED-GOVERNING-TOKEN", "PRG-HOST-SAVED-APPROVAL-TOKEN", "PRG-HOST-SAVED-PROPOSAL-TOKEN"]) {
+    assert.ok((messages[1]!.content as string).includes(token), `${token} is missing from the saved user entry`);
+    assert.ok(!((messages[0]!.content as string).includes(token)), `${token} was promoted to a system entry`);
+  }
   assert.deepEqual(messages[2], terminal, "the terminal assistant message is stored as the host produced it");
   assert.equal(entries.find((row) => row.type === "thinking_level_change")?.thinkingLevel, "high",
     "the effective reasoning request is recorded, because the assistant message does not carry it");

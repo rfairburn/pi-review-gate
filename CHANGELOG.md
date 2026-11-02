@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.248]
+
+### Documentation
+
+- **README capability overview** (#392): refresh the overview with a self-contained
+  vector illustration of sidebar-managed sessions, review, and platform capabilities,
+  with matching alternative text. Usage screenshots remain outstanding.
+
 ## [0.1.0-dev.247]
 
 ### Fixed

@@ -1805,6 +1805,23 @@ handles native Pi's Kitty PNG image commands for a directly attached Ghostty Mai
 pane. This is a display feature only: native image input, model processing, and
 ordinary standalone launchers are unchanged.
 
+The sidebar never forwards the POSIX suspend control (Ctrl+Z) to a hosted
+session. The host refuses the keystroke in every spelling a terminal can report
+for it — the legacy control byte, Kitty CSI-u presses, held repeats and releases,
+and `modifyOtherKeys` forms, including the Ctrl+Shift and Ctrl+Alt spellings whose
+legacy re-encoding would carry the raw byte, and any primary key the terminal
+reports over a `z` base-layout key — before that input reaches the
+child's terminal, so it cannot stop or background the managed application and
+leave an unusable shell in its place. The refusal follows the same key identity
+the hosted application's own bindings match, so a remapped layout's Ctrl+A or
+Ctrl+K over that same physical position stays ordinary input. A raw
+suspend byte inside an already-joined text burst is dropped while the rest of
+that burst keeps its ordinary path.
+Bracketed-paste bodies stay byte-for-byte opaque: paste content is never
+rewritten. Unrelated control keys, focus and owner routing, and session
+lifecycle and shutdown are unchanged, and a terminal outside the sidebar keeps
+its own job-control behavior.
+
 ### Per-session content geometry
 
 Each session's content area is sized for the surfaces that actually display it. Every

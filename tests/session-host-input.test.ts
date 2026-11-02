@@ -47,6 +47,117 @@ test("bare Escape, q, Ctrl-C and joined UTF-8 bytes are preserved by the transla
 	assert.equal(translated(`${ESC}[?`), undefined, "unknown raw escape packet is dropped");
 });
 
+test("the POSIX suspend control is refused for every keyboard spelling and child mode", () => {
+	// One keystroke, every applicable encoding: the legacy raw byte, Kitty CSI-u,
+	// shifted/alternate-key spellings, Alt/Meta-prefixed legacy forms (whose legacy
+	// output would carry a raw 0x1A after the ESC), and xterm modifyOtherKeys.
+	const suspendPackets = [
+		"\x1a",
+		`${CSI}122;5u`,
+		`${CSI}90;5u`,
+		`${CSI}122;6u`,
+		`${CSI}90;6u`,
+		`${CSI}122:90:122;6u`,
+		`${CSI}122;7u`,
+		`${CSI}122;37u`,
+		`${CSI}27;5;122~`,
+		`${CSI}27;7;122~`,
+		`${CSI}27;13;122~`,
+		`${ESC}${String.fromCharCode(26)}`,
+	];
+	for (const kittyFlags of [0, 1, 2, 4, 7]) {
+		for (const modifyOtherKeys of [0, 1, 2] as const) {
+			for (const packet of suspendPackets) {
+				assert.equal(
+					translated(packet, { kittyFlags, modifyOtherKeys }),
+					undefined,
+					`${JSON.stringify(packet)} is refused for flags ${kittyFlags}/modifyOtherKeys ${modifyOtherKeys}`,
+				);
+			}
+		}
+	}
+	// A held key cannot smuggle the suspend byte back as a repeat, release, or
+	// explicit press event.
+	for (const packet of [`${CSI}122;5:1u`, `${CSI}122;5:2u`, `${CSI}122;5:3u`]) {
+		for (const kittyFlags of [0, 2, 3]) {
+			assert.equal(translated(packet, { kittyFlags }), undefined, `${packet} with flags ${kittyFlags}`);
+		}
+	}
+	// A raw suspend byte inside an already-joined plain-text burst is removed while
+	// the rest of that burst keeps its ordinary path.
+	assert.equal(translated("draft\x1atext"), "drafttext");
+	assert.equal(translated("\x1a\x1a"), undefined, "a burst of nothing but suspend is refused");
+	// Bracketed-paste bodies stay byte-for-byte opaque: the host rewrites no paste
+	// content, which is the documented boundary of this refusal.
+	const pasteBody = `draft\x1aanother`;
+	assert.equal(translated(`${CSI}200~${pasteBody}${CSI}201~`), pasteBody);
+	assert.equal(translated(`${CSI}200~${pasteBody}${CSI}201~`, { bracketedPaste: true }), `${CSI}200~${pasteBody}${CSI}201~`);
+	// Unrelated input is untouched: only the suspend keystroke is named.
+	assert.equal(translated("draft"), "draft");
+	assert.equal(translated("z"), "z");
+	assert.equal(translated(`${CSI}122;1u`), "z");
+	assert.equal(translated(`${CSI}122;2u`), "Z", "Shift+Z stays ordinary text");
+	assert.equal(translated(`${CSI}122;3u`), `${ESC}z`, "Alt+Z keeps its legacy form");
+	assert.equal(translated(`${CSI}27;3;122~`, { modifyOtherKeys: 2 }), `${CSI}27;3;122~`, "modifyOtherKeys Alt+Z is not suspend");
+	assert.equal(translated(`${CSI}121;5u`), "\x19", "Ctrl+Y is unrelated and stays native");
+	assert.equal(translated(`${CSI}97;5u`), "\x01", "Ctrl+A is unrelated and stays native");
+	assert.equal(translated("\x03"), "\x03", "Ctrl+C is unrelated and stays native");
+});
+
+test("Ctrl+Z reported through the matcher's non-Latin base-layout identity is refused too", () => {
+	// A non-Latin primary codepoint over a `z` base-layout key is the keystroke the
+	// pinned native matcher names ctrl+z through its non-Latin fallback, in press,
+	// held-repeat, release, and the Ctrl+Shift and Ctrl+Alt spellings.
+	const baseLayoutSuspend = [
+		`${CSI}1103::122;5u`,   // Ctrl+я over base-layout z
+		`${CSI}1103::122;5:2u`, // held repeat
+		`${CSI}1103::122;5:3u`, // release
+		`${CSI}1103::122;6u`,   // Ctrl+Shift over base-layout z
+		`${CSI}1103::122;7u`,   // Ctrl+Alt over base-layout z
+		`${CSI}1077::122;5u`,   // a different non-Latin primary (Cyrillic u)
+		`${CSI}945::122;5u`,    // Greek primary over base-layout z
+	];
+	for (const kittyFlags of [0, 1, 3, 7]) {
+		for (const packet of baseLayoutSuspend) {
+			assert.equal(translated(packet, { kittyFlags }), undefined,
+				`${packet} is refused as Ctrl+Z for flags ${kittyFlags}`);
+		}
+	}
+	// A letter or symbol primary stays authoritative, exactly like the binding
+	// matcher's alternate rule, so remapped unrelated keys keep working.
+	const preserved = [
+		`${CSI}97::122;5u`,   // Ctrl+A on a key whose base layout is z
+		`${CSI}107::122;5u`,  // Ctrl+K on the QWERTY z position
+		`${CSI}91::122;5u`,   // Ctrl+[ on the QWERTY z position
+		`${CSI}65::122;6u`,   // Shift+Ctrl+A folds to the authoritative Latin a
+	];
+	for (const packet of preserved) {
+		assert.equal(matchesKey(packet, "ctrl+z"), false, `the native binding matcher does not name ${packet} ctrl+z`);
+		assert.equal(translated(packet, { kittyFlags: 7 }), packet, `${packet} still reaches a Kitty child`);
+	}
+	assert.equal(translated(`${CSI}97::122;5u`, { kittyFlags: 0 }), "\x01", "Ctrl+A over a z-position key stays native");
+	assert.equal(translated(`${CSI}107::122;5u`, { kittyFlags: 0 }), "\x0b", "Ctrl+K over a z-position key stays native");
+	// Digits are not authoritative in the binding matcher's alternate rule, so every
+	// digit primary reported over a z base-layout key is the keystroke a Ctrl+Z
+	// binding matches (press, held repeat, and release) and is refused, while the
+	// same digit without that identity stays ordinary input.
+	for (let digit = 0x30; digit <= 0x39; digit++) {
+		for (const suffix of ["5u", "5:2u", "5:3u"]) {
+			const packet = `${CSI}${digit}::122;${suffix}`;
+			assert.equal(matchesKey(packet, "ctrl+z"), true, `the native binding matcher names ${packet} ctrl+z`);
+			assert.equal(translated(packet, { kittyFlags: 7 }), undefined, `${packet} is refused for a Kitty child`);
+			assert.equal(translated(packet, { kittyFlags: 0 }), undefined, `${packet} is refused for a legacy child`);
+		}
+		const ordinary = `${CSI}${digit};5u`;
+		assert.equal(matchesKey(ordinary, "ctrl+z"), false, `${ordinary} is not the suspend binding`);
+		assert.equal(translated(ordinary, { kittyFlags: 7 }), ordinary, `${ordinary} stays ordinary input`);
+	}
+	// A non-Latin primary over another base layout is unrelated input, and an
+	// uppercase base-layout field is not the identity a Ctrl+Z binding names.
+	assert.equal(translated(`${CSI}1103::107;5u`, { kittyFlags: 7 }), `${CSI}1103::107;5u`, "base-layout k is not suspend");
+	assert.equal(translated(`${CSI}1103::90;5u`, { kittyFlags: 7 }), `${CSI}1103::90;5u`, "base-layout Z is not the binding identity");
+});
+
 test("Kitty disambiguation, event and alternate-key flags stay independent", () => {
 	const shiftedCtrlA = `${CSI}97:65:99;6u`;
 	assert.equal(translated(shiftedCtrlA), `${CSI}97;6u`, "legacy child gets extended combo without guessed layout fields");

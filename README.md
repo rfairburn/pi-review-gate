@@ -14,7 +14,7 @@ gate transmits every result — passing, non-blocking, guidance, and errors — 
 implementing model, tracks corrections against a configurable budget, and keeps durable
 receipts of exactly what the model was told.
 
-![A Pi orchestrator delegates to representative Pi, Claude, and Codex executors in isolated worktrees across selected workspaces. Independent reviewers return findings for correction or approve results for landing. Tool capabilities remain role- and authorization-scoped.](docs/assets/orchestration.svg)
+![Pi Review Gate overview: sidebar-managed native sessions, coordinated work, independent read-only review, research subtasks, remote networking, scheduling, and platform tools.](docs/assets/orchestration.svg)
 
 ## Key capabilities
 

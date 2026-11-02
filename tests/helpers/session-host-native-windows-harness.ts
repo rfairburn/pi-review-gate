@@ -259,7 +259,7 @@ export interface NativePtyModule {
 export interface WindowsRuntimePin {
   readonly agentDir: string;
   readonly piExecutable: string;
-  readonly version: "1.4.0";
+  readonly version: "1.5.0";
   readonly nodePath: string;
   readonly pty: NativePtyModule;
   readonly ptyModulePath: string;
@@ -408,7 +408,7 @@ function resolvePiRuntime(agentDirValue: string, piBinValue: string, expectedVer
   agentDir: string;
   piExecutable: string;
 } {
-  if (expectedVersion !== "1.4.0") throw new Error("Windows native Main acceptance requires public Pi 1.4.0");
+  if (expectedVersion !== "1.5.0") throw new Error("Windows native Main acceptance requires public Pi 1.5.0");
   const agentDir = realpathSync(agentDirValue);
   const packageInfo = JSON.parse(readFileSync(join(agentDir, "package.json"), "utf8")) as {
     name?: string;
@@ -579,7 +579,7 @@ export function resolveWindowsRuntime(): WindowsRuntimePin {
     ...candidate,
     agentDir,
     piExecutable,
-    version: "1.4.0",
+    version: "1.5.0",
     nodePath: moduleRoots.nodePath,
     pty: moduleRoots.pty,
     ptyModulePath: moduleRoots.ptyModulePath,

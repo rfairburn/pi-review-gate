@@ -15,6 +15,43 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.254]
+
+### Changed
+
+- **Pi 1.5.0 is the managed runtime default** (#603): with no supported global or
+  `PATH` installation, `pi-review-sessions` provisions an isolated
+  `@earendil-works/pi-coding-agent@1.5.0` runtime, the shipped `pi-session-host-tui`
+  alias pins `@earendil-works/pi-tui@1.5.0`, and the test-only CI runtimes pin
+  `@earendil-works/pi-coding-agent@1.5.0` and `@earendil-works/pi-agent-core@1.5.0`.
+  A stale implicit selection recorded under an older default revalidates and
+  republishes for the current pin instead of keeping that older runtime.
+  Selection semantics are unchanged: explicit `--pi-executable` still gets no
+  fallback, global and `PATH` installations keep their precedence and cached
+  identity, the stable Pi `1.0.4` floor and the per-line Node security minimums
+  stay, and the ordinary `pi-review-gate`/`pi-review-gate-cmd` launchers plus the
+  reviewer, delegated-executor, and compaction-recovery Pi children keep
+  resolving `PATH` `pi` or their configured command — no managed resolution or
+  version check is added to those routes. Native clipboard and external-editor
+  provenance recognize the audited Pi 1.5.0 producer while retaining Pi 1.3.0 and
+  1.4.0 recognition and the existing source, origin, size, and authentication
+  guards; unverified runtimes still fail closed.
+- **Saved conversations search follows Pi 1.5.0's native `/resume` matching**
+  (#603): each conversation is matched field by field (session ID, stored name,
+  complete message text, recorded workspace), so a token, phrase, or `re:`
+  pattern never matches across a field boundary and different tokens may match
+  different fields. Session IDs and message text now match only as exact
+  case-insensitive substrings — `1024` matches a session UUID only when those
+  digits appear consecutively, not as scattered digits — while names and
+  recorded workspaces still match fuzzily. Nonempty results use
+  the native tiered relevance order (name literal, then other literal, then
+  name/workspace fuzzy) with newest-modified ties. The query grammar, the
+  transient-index privacy of message text, and the existing admission,
+  ownership, duplicate-open, cancellation, and deletion guards are unchanged. The
+  settings tool-deny pickers deliberately keep their single-text fuzzy tool-name
+  matching on the same grammar with the 1.5.0 fuzzy scores; no historical local
+  scorer is retained.
+
 ## [0.1.0-dev.253]
 
 ### Fixed

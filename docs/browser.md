@@ -493,7 +493,7 @@ claims a proven authorization denial. `BrowserExtract` and `WebFetch` keep their
 result contract.
 The real-runtime regression in `tests/browser-native-error.test.ts` accepts
 `PI_BROWSER_AGENT_RUNTIME` pointing to an installed Pi agent-core `dist/index.js`
-(1.0.0 or newer; CI installs the exact `@earendil-works/pi-agent-core@1.4.0` pinned
+(1.0.0 or newer; CI installs the exact `@earendil-works/pi-agent-core@1.5.0` pinned
 under `scripts/ci/pi-agent-runtime`); its model stream is entirely mocked, with no
 live model calls.
 Without that runtime path the optional contract test is explicitly skipped.

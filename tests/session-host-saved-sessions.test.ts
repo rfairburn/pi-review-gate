@@ -1918,27 +1918,36 @@ test("saved-file deletion matches trash-first status/gone semantics and revalida
 async function loadNativeSessionSelectorSearch(
   t: TestContext,
 ): Promise<NativeSessionSelectorSearch | undefined> {
-  let reason = "no installed Pi 1.4.0 native session-selector search module is available";
+  let reason = "no installed Pi 1.5.0 native session-selector search module is available";
   for (const agentDir of findInstalledAgentDirs()) {
     try {
       const manifest = JSON.parse(await readFile(join(agentDir, "package.json"), "utf8")) as {
         name?: unknown;
         version?: unknown;
       };
-      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.4.0") continue;
+      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.5.0") continue;
       const searchModulePath = join(agentDir, "dist", "modes", "interactive", "components", "session-selector-search.js");
       if (!existsSync(searchModulePath)) continue;
       const loaded = createRequire(join(agentDir, "package.json"))(searchModulePath) as Partial<NativeSessionSelectorSearch>;
       if (typeof loaded.filterAndSortSessions === "function") return loaded as NativeSessionSelectorSearch;
     } catch {
-      reason = "the installed Pi 1.4.0 native session-selector search module could not be loaded";
+      reason = "the installed Pi 1.5.0 native session-selector search module could not be loaded";
     }
   }
   skipOrFail(t, reason);
   return undefined;
 }
 
-test("branded saved catalog search matches the actual pinned Pi 1.4.0 native matcher", async (t) => {
+/**
+ * The branded catalog's search equals the pinned Pi 1.5.0 native relevance
+ * search: each field (name, id, complete message text, cwd) is matched
+ * separately, ids and message text match only as exact substrings, names and
+ * the working directory still match fuzzily, and the tier of the best field
+ * dominates the fuzzy score. The explicit per-field semantic cases live in
+ * tests/session-host-native-search-parity.test.ts, where the fields are
+ * controlled instead of living under a long fixture path.
+ */
+test("branded saved catalog search matches the actual pinned Pi 1.5.0 native matcher", async (t) => {
   const nativeSearch = await loadNativeSessionSelectorSearch(t);
   if (!nativeSearch) return;
 
@@ -1973,6 +1982,27 @@ test("branded saved catalog search matches the actual pinned Pi 1.4.0 native mat
       cwd: workspace.workspace,
       allMessagesText: "Search tool on migration for the user",
       modified: new Date("2025-01-09T00:00:00.000Z"),
+    },
+    {
+      id: "named-matcher",
+      cwd: workspace.workspace,
+      name: "Matcher triage",
+      allMessagesText: "unrelated notes about the ranking",
+      modified: new Date("2025-01-06T00:00:00.000Z"),
+    },
+    {
+      id: "a1b2c3d4",
+      cwd: workspace.workspace,
+      name: "Weekly sync",
+      allMessagesText: "planning the sprint review for the team",
+      modified: new Date("2025-01-05T00:00:00.000Z"),
+    },
+    {
+      id: "boundary-row",
+      cwd: workspace.workspace,
+      name: "ZetaFieldTail",
+      allMessagesText: "HeadFieldStart notes for the boundary demo",
+      modified: new Date("2025-01-04T00:00:00.000Z"),
     },
   ];
   const sdkEntries: SyntheticSearchSession[] = [];
@@ -2016,6 +2046,12 @@ test("branded saved catalog search matches the actual pinned Pi 1.4.0 native mat
     "re:[",
     'search "catalog search',
     "RE:deployment",
+    // Pi 1.5 semantics: exact-only ids and message text, fuzzy names and cwd,
+    // and no match across a field boundary.
+    "dpl", "deploy", "abc", "b2c3", "c3d4", "sprint", "planning review",
+    "ZetaFieldTail", "HeadFieldStart", '"ZetaFieldTail HeadFieldStart"',
+    "re:ZetaFieldTail\\s+HeadFieldStart", "re:ZetaFieldTail|HeadFieldStart",
+    "ZetaFieldTail HeadFieldStart", "boundary ranking",
   ];
 
   for (const query of queries) {
@@ -2027,6 +2063,26 @@ test("branded saved catalog search matches the actual pinned Pi 1.4.0 native mat
         `query ${JSON.stringify(query)} preserves the exact branded row reference`);
     }
   }
+
+  // The tier of the best-matching field dominates recency and fuzzy scores:
+  // the named row leads even though it is the oldest "matcher" hit, and a
+  // phrase or regex that would only match by joining two fields matches
+  // nothing, while each field alone still matches.
+  assert.deepEqual(
+    searchSavedSessions(catalog, "matcher").map((row) => row.id).slice(0, 1),
+    ["named-matcher"],
+    "an exact name hit outranks every exact id/message hit regardless of modification time",
+  );
+  assert.deepEqual(searchSavedSessions(catalog, '"ZetaFieldTail HeadFieldStart"'), [],
+    "a quoted phrase never matches across the name/message field boundary");
+  assert.deepEqual(searchSavedSessions(catalog, "re:ZetaFieldTail\\s+HeadFieldStart"), [],
+    "a regular expression never matches across the name/message field boundary");
+  assert.deepEqual(searchSavedSessions(catalog, "ZetaFieldTail").map((row) => row.id), ["boundary-row"],
+    "the name field alone still matches");
+  assert.deepEqual(searchSavedSessions(catalog, "HeadFieldStart").map((row) => row.id), ["boundary-row"],
+    "the message field alone still matches");
+  assert.ok(searchSavedSessions(catalog, "b2c3").map((row) => row.id).includes("a1b2c3d4"),
+    "an id matches as an exact substring");
 });
 
 // ---------------------------------------------------------------------------

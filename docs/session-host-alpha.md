@@ -98,8 +98,15 @@ terminal-restoration evidence. Green CI does not certify Windows runtime support
   fallback runtime is the checksum-pinned official Node.js 22.23.4 archive. Updating
   this requirement does not update or restart a running host or its sessions. Update
   Node.js, then restart them.
-- **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
-  acceptance fixture are pinned to **1.4.0**, with the matching 1.4.0 TUI dependency.
+- **Pi:** stable Pi 1.0.4 or newer; the managed fallback the launcher provisions
+  and the native UI acceptance fixture are pinned to **1.5.0**, with the matching
+  1.5.0 TUI dependency. An explicit `--pi-executable` (which never falls back),
+  an npm-global, or a `PATH` Pi still runs that installation under the same
+  1.0.4 floor and the existing precedence. That pin covers only the session
+  host's own resolution: the ordinary `pi-review-gate` and `pi-review-gate-cmd`
+  launchers and the reviewer, delegated-executor, and compaction-recovery Pi
+  children keep using `PATH` `pi` or their configured command, and gain no new
+  managed selection or version check.
 - An interactive terminal with both stdin and stdout attached.
 
 Start the host with the shipped one-command entry points: `./scripts/pi-review-sessions.sh`
@@ -461,7 +468,7 @@ conversation in that workspace, without creating a worktree, clone, or branch. N
 settings and compatible inherited launch options remain shared, but the parent's
 conversation name and startup message/file inputs are not inherited. The supplied title is
 forwarded unchanged to Pi's native session-name API; Pi applies its own persistence
-semantics, including trimming surrounding whitespace on the pinned 1.4.0 runtime. The
+semantics, including trimming surrounding whitespace on the pinned 1.5.0 runtime. The
 host does not crop or shorten titles to fit the sidebar, and titles longer than the
 recommendation remain stored in full after Pi's native normalization. The prompt is
 handed unchanged to Pi's public user-message API with prompt-template expansion disabled,
@@ -591,18 +598,30 @@ successful open makes the restored child the active Main input owner and focuses
 without a second Enter, with the pane still visible. A late listing or creation result
 never takes over a later-opened or dismissed pane.
 
-Type in the Saved search bar to filter this global catalog with native Pi `/resume`
-query semantics (adapted from Pi 1.1.0 and unchanged in the pinned 1.4.0 runtime): fuzzy tokens, quoted phrases such as `"node cve"`, and
-case-insensitive regular expressions such as `re:node.*cve`. Search covers the native
-session ID, full stored name, native all-message text, and recorded workspace. Message
-text is held only in a transient search index; it is never displayed in picker rows,
-sent over status IPC, logged, or persisted in the roster. All tokens/phrases must match;
-phrases ignore case and normalize whitespace. Unbalanced quotes fall back to native
-whitespace-token matching (including the quote characters). The `re:` prefix is
-case-sensitive; an empty or invalid regex yields no matches without crashing. Nonempty
-queries use native relevance ordering with newest-modified ties; clearing the query
-restores the catalog's existing recent-first order. There are no folder/global,
-sort, named-only, path-display, or rename controls in this picker.
+Type in the Saved search bar to filter this global catalog with the native Pi 1.5.0
+`/resume` query grammar: whitespace-separated fuzzy tokens, quoted phrases such as
+`"node cve"`, and case-insensitive regular expressions such as `re:node.*cve`.
+Every token and phrase must match, and different tokens may match different
+fields. Search covers the native session ID, full stored name, native
+all-message text, and recorded workspace, and each is matched as its own field:
+a token, phrase, or regular expression never matches across a field boundary.
+The session ID and message text match only as exact (case-insensitive)
+substrings — scattered letters no longer hit them, so `1024` matches a session
+UUID only when those digits appear consecutively, never as scattered digits —
+while stored names and recorded workspaces still match fuzzily. Message text is
+held only in a transient search index; it is never
+displayed in picker rows, sent over status IPC, logged, or persisted in the
+roster. Phrases ignore case and normalize whitespace. Unbalanced quotes fall
+back to native whitespace-token matching (including the quote characters). The
+`re:` prefix is case-sensitive; an empty or invalid regex yields no matches
+without crashing. Nonempty queries use the native tiered relevance order — an
+exact hit in the name ranks above an exact hit in the ID, message text, or
+workspace, which ranks above a scattered name/workspace match — with
+newest-modified ties; clearing the query restores the catalog's existing
+recent-first order. The settings tool-deny pickers reuse this query grammar but
+keep their own single-text tool-name matching, so the two surfaces do not match
+alike (see [Scoped tool denial](settings.md#scoped-tool-denial)). There are no
+folder/global, sort, named-only, path-display, or rename controls in this picker.
 
 Plain `d` edits the search query. The native Saved delete action defaults to **Ctrl+D**;
 **Ctrl+Backspace** is its noninvasive alias only when the query buffer is completely
@@ -1886,7 +1905,7 @@ displayed Main input owner before generating its own outer-terminal OSC 52 comma
 Stale, hidden, covered, sibling, or shutting-down owners cannot write the client
 clipboard. Ordinary local helper-only copying is unchanged.
 
-This provenance adapter recognizes the audited bundled **Pi 1.3.0 and 1.4.0** runtimes. A changed
+This provenance adapter recognizes the audited bundled **Pi 1.3.0, 1.4.0, and 1.5.0** runtimes. A changed
 runtime or unavailable native provenance fails closed rather than admitting arbitrary
 output. This is not a sandbox against trusted executable extensions running with the
 user's operating-system authority. Clipboard payloads are transient authenticated
@@ -1909,7 +1928,7 @@ recorded, and malformed, raw, or unauthenticated controls never produce a record
 A successful copy records nothing. It means only that bytes were submitted, not that
 Ghostty or another terminal acknowledged an OS clipboard write; only a paste on the
 client verifies delivery. Existing terminal permissions, multiplexers, and native size limits still apply
-(Pi 1.3.0 and 1.4.0 bound the encoded OSC 52 payload to 100,000 characters). No terminal/SSH
+(Pi 1.3.0, 1.4.0, and 1.5.0 bound the encoded OSC 52 payload to 100,000 characters). No terminal/SSH
 configuration or multiplexer passthrough is forced. A terminal or multiplexer that
 disables/does not implement clipboard writes may discard the request. There is no
 clipboard read, paste, synchronization, image transfer, or remote-host backend here. The
@@ -2133,7 +2152,7 @@ already-running child. Remote saved conversations are described under
 #### Isolated manual SSH clipboard comparison
 
 Run these source-checkout steps **on the SSH host**, from the checkout root, in the same
-client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.4.0 package
+client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.5.0 package
 directory, not its launcher shim. This creates a disposable home, agent directory,
 workspaces, and an inactive candidate build; it does not use the live roster,
 credentials, or installation. Dependencies must already be installed in the checkout:
@@ -2231,7 +2250,7 @@ passing result. Synthetic PTY tests do not replace these operator-driven paste c
 ### Inline images and compatibility
 
 Ghostty is the concrete image-display target, not a blanket terminal-graphics
-compatibility promise. The native protocol fixture uses Pi and pi-tui **1.4.0**.
+compatibility promise. The native protocol fixture uses Pi and pi-tui **1.5.0**.
 The hosted Kitty path requires `TERM_PROGRAM=ghostty` and `TERM=xterm-ghostty`,
 with no `TMUX`, `TMUX_PANE`, or `STY` marker. A customized terminal environment
 that does not meet this narrow gate uses text fallback, even if standalone Pi's

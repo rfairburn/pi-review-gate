@@ -23,10 +23,19 @@ SOFTWARE.
 --------------------------------------------------------------------------
 
 This license applies to the saved-session search parser, matching, and
-relevance ordering in src/session-host/saved-sessions.ts, adapted from Pi
-Coding Agent v1.1.0, packages/coding-agent/src/modes/interactive/components/
-session-selector-search.ts:
-https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/src/modes/interactive/components/session-selector-search.ts
+relevance ordering in src/session-host/saved-search.ts (previously in
+src/session-host/saved-sessions.ts), adapted from Pi Coding Agent, packages/
+coding-agent/src/modes/interactive/components/session-selector-search.ts:
+
+- v1.1.0 (the query grammar and the original single-text matcher that the
+  settings deny pickers still use):
+  https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/src/modes/interactive/components/session-selector-search.ts
+- v1.5.0 (the per-field tiered session matcher the saved-conversation catalog
+  now follows: name, id, complete message text, and working directory are
+  matched separately, ids and message text match only as exact substrings,
+  names and working directories still match fuzzily, and tiers dominate fuzzy
+  scores):
+  https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/components/session-selector-search.ts
 
 Copyright (c) 2025 Mario Zechner. The fuzzy matcher itself is imported from
 the pinned pi-session-host-tui dependency and is not copied here.

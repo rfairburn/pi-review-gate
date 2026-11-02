@@ -55,12 +55,21 @@ const nodePty = nodeRequire("@lydell/node-pty") as {
   spawn(file: string, args: string[], options: Record<string, unknown>): PtySurface;
 };
 
+/**
+ * The audited runtimes this process evidence may run against. The list is closed and
+ * additive: an unlisted installed runtime is never used, and the launcher's own source
+ * must still state the inherited-stdio launch this adapter recognizes.
+ */
+const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0"];
+
 function installedRuntimeRoot(): string | undefined {
   for (const dir of findInstalledAgentDirs()) {
     try {
       const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version?: string };
       const launcher = readFileSync(join(dir, "dist", "modes", "interactive", "external-editor.js"), "utf8");
-      if ((manifest.version === "1.3.0" || manifest.version === "1.4.0") && launcher.includes("stdio: \"inherit\"")) return dir;
+      if (AUDITED_PI_VERSIONS.includes(manifest.version ?? "")
+        && launcher.includes("export async function editInExternalEditor")
+        && launcher.includes("stdio: \"inherit\"")) return dir;
     } catch {
       // Not a usable pinned runtime; try the next candidate.
     }
@@ -276,6 +285,18 @@ function result(output: string, index: number): { status: string; content?: stri
   return JSON.parse(match[1]!) as { status: string; content?: string };
 }
 
+/**
+ * Pi's own failed-edit result, on every audited runtime. The contract this evidence
+ * proves is that the edit is failed and NO result content is accepted. Pi 1.5.0 added
+ * its own user-facing `message` field to this result (upstream "the external editor
+ * failed silently" fix); that wording is Pi's, not this package's, so it is present or
+ * absent without changing what is asserted here.
+ */
+function assertFailedResult(value: { status: string; content?: string }, label: string): void {
+  assert.equal(value.status, "failed", label);
+  assert.equal(value.content, undefined, `${label}: a failed edit never accepts result content`);
+}
+
 function shellQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
@@ -312,7 +333,7 @@ function alive(pid: number): boolean {
 }
 
 const runtime = installedRuntimeRoot();
-const skip = available() ? false : "no installed Pi 1.3/1.4 runtime with the external-editor launcher";
+const skip = available() ? false : "no installed Pi 1.3/1.4/1.5 runtime with the external-editor launcher";
 function available(): boolean { return runtime !== undefined && process.platform !== "win32"; }
 
 test("handoff: a real editor launched by the production Pi launcher edits and returns through its own terminal", { skip }, async (t) => {
@@ -369,7 +390,7 @@ test("handoff: a configured editor that changes the draft and dies by signal is 
   t.after(() => child.dispose());
   await child.waitFor("the strict readiness capsule", (value) => value.includes(READY_MARKER));
   const done = await child.waitFor("the signal-killed editor result", (value) => value.includes("PRG_RESULT 1 "));
-  assert.deepEqual(result(done, 1), { status: "failed" },
+  assertFailedResult(result(done, 1),
     `a signal death never accepts the result file: ${tail(done)}`);
   await child.waitFor("the driver finishing", (value) => value.includes("PRG_DRIVER_DONE"));
 });
@@ -386,7 +407,7 @@ test("handoff: a failing edit and a later edit both settle", { skip }, async (t)
   t.after(() => child.dispose());
   await child.waitFor("the strict readiness capsule", (value) => value.includes(READY_MARKER));
   const first = await child.waitFor("the failed edit", (value) => value.includes("PRG_RESULT 1 "));
-  assert.deepEqual(result(first, 1), { status: "failed" }, "a launch that cannot start is Pi's own failed result");
+  assertFailedResult(result(first, 1), "a launch that cannot start is Pi's own failed result");
   await child.settle("PRG_RESULT 1");
   child.send(Buffer.from("abc\n", "utf8"));
   child.send(Buffer.from("\x04", "utf8"));
@@ -449,7 +470,7 @@ test("handoff: the awaited native shutdown settles a real open editor before the
   assert.ok(!alive(pid), "the owned editor was gone before the awaited shutdown returned");
   assert.equal(child.exited(), false, "settling the editor is not the child exiting");
   const done = await child.waitFor("the edit result", (value) => value.includes("PRG_RESULT 1 "));
-  assert.deepEqual(result(done, 1), { status: "failed" },
+  assertFailedResult(result(done, 1),
     `an editor stopped by shutdown is Pi's own failed result: ${tail(done)}`);
   await child.waitFor("the driver finishing", (value) => value.includes("PRG_DRIVER_DONE"));
 });

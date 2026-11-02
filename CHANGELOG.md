@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.248]
+
+### Fixed
+
+- **Embedded auditor decisions** (#597): tool protection now uses the review gate's
+  bounded JSON candidate extraction for auditor replies, so a valid decision still
+  counts when surrounding commentary, a JSON fence, or repeated agreeing objects
+  accompany it. Provider phase metadata is not required. Text that only mentions
+  `decision` — the word quoted in prose or an array element — is never a decision,
+  while decision-shaped text in an array, dangling in commentary, or inside a broken
+  envelope blocks the call. Every extracted decision
+  object is still validated strictly; a malformed object beside a valid one and
+  contradictory PASS/FAIL objects fail closed, no JSON repair is applied, and PASS,
+  FAIL, refusal, retry, and admission behavior otherwise stay unchanged.
+
 ## [0.1.0-dev.247]
 
 ### Fixed

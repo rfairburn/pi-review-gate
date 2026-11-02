@@ -463,7 +463,7 @@ never carries a second copy of the submitted arguments, the working directory, o
 governing instructions, so an oversized proposal cannot reach an auditor unbounded through
 a side field, and a saved audit record does not duplicate what it already saved.
 
-It writes exactly one decision object to stdout and nothing else:
+It writes a decision object to stdout. The clean form is exactly one object:
 
 ```text
 {"decision":"PASS"}
@@ -478,12 +478,33 @@ reply at every enabled level, on both routes. `reason` is optional and belongs t
 is then reported in generic wording rather than with an invented justification. A supplied
 reason up to 4000 characters is preserved verbatim and is what makes the refusal
 actionable; an oversized one is malformed rather than truncated. An omitted reason stays
-absent and may be labelled by the host, but no rationale is invented. Surrounding prose,
-extra fields, a non-string or oversized reason, and any other decision value are
-malformed. The parser is unchanged, so a reply that still attaches a `reason` to a `PASS`
-remains a valid decision; that unexpected reason is not shown to you and is not forwarded
-to the acting model, while a retained auditor record and the fixture tester report the
-reply that actually came back.
+absent and may be labelled by the host, but no rationale is invented.
+
+The reply may also embed the decision in surrounding commentary, a JSON code fence, or
+multiple agreeing decision objects. Candidate discovery is the same bounded extraction
+used for review results: the complete reply, JSON code fences, then balanced JSON objects,
+in source order with exact-text duplicates removed. Unrelated prose and metadata objects are
+skipped, and provider phase metadata is not required. Every decision object found must be
+valid on its own: a malformed decision object anywhere in the reply, including one beside a
+valid decision, makes the whole reply malformed, as does both a valid `PASS` and a valid
+`FAIL`. A decision nested inside an array or another non-object JSON envelope is not mined
+from that envelope, and a decision inside an array makes the whole reply malformed. Agreeing objects keep the extractor's first-candidate order, so a
+fenced object is preferred over earlier prose. Extra fields, a non-string or oversized reason, any other
+decision value, a decision inside a fenced block declaring another language, or JSON
+that would need repair are malformed; no repair is applied to a decision. A reply that
+still attaches a `reason` to a `PASS` remains a valid decision; that unexpected reason
+is not shown to you and is not forwarded to the acting model, while a retained auditor
+record and the fixture tester report the reply that actually came back.
+
+Candidate discovery stays exactly as described above: a JSON fence is still read even when
+surrounding commentary carries an unbalanced quote, and nothing the bounded extraction
+does not surface is reconstructed into a decision. A `decision` name counts only as a
+property name of a JSON object: the same word quoted in prose, or appearing as an array
+element or a value, is commentary, never a decision, and it can never authorize a call.
+Decision-shaped syntax that is not a complete decision object — a dangling `"decision": …`
+fragment in commentary or inside a fence that declares another language, a decision inside
+an array, or a truncated or otherwise invalid envelope — is malformed, and so is a reply
+in which no valid decision is found; both fail closed.
 
 A nonzero exit, timeout, empty or truncated output, unconfirmed process settlement,
 malformed decision, or unavailable auditor fails closed: the proposed call does not run.

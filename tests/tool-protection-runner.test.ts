@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG, type ExternalAgentCatalog, type ReviewGateConfig } from "../src/config";
 import type { ProcessRunResult } from "../src/adapters/process";
+import { parseProtectionDecision } from "../src/tool-protection/decision";
 import { buildProtectionContext, type ProtectionContextInput } from "../src/tool-protection/context";
 import {
   PROTECTION_AUDITOR_PROTOCOL,
@@ -151,6 +152,27 @@ test("Pi in-process auditor uses streamSimple with no tools and no CLI launch", 
   assert.equal(call.options?.maxRetries, 0);
   assert.equal(call.options?.timeoutMs, 5_000);
   assert.equal(call.options?.reasoning, "high");
+});
+
+test("Pi in-process auditor concatenates every text block without selecting a phase", async () => {
+  const first = '{"decision":"PASS"}\nAdditional auditor commentary.\n';
+  const second = '{"decision":"PASS"}';
+  const registry = fakePiRegistry(syntheticPiModels, [{
+    type: "done",
+    reason: "stop",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [
+        { type: "text", text: first, textSignature: "commentary" },
+        { type: "text", text: second, textSignature: "final_answer" },
+      ],
+    },
+  }]);
+  const result = await runProtectionAuditor(request({ modelRegistry: registry }));
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, first + second, "the raw transport text is not phase-selected");
+  assert.deepEqual(parseProtectionDecision(result.output ?? ""), { decision: "PASS" });
 });
 
 test("Pi in-process auditor resolves provider/model and omits off reasoning", async () => {

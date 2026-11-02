@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.252]
+
+### Fixed
+
+- **Sidebar suspend control forwarded to a hosted session** (#566): the sidebar no
+  longer forwards Ctrl+Z to a managed session in any keyboard spelling — the legacy
+  control byte, Kitty CSI-u presses, held repeats and releases, or
+  `modifyOtherKeys` forms, including the Ctrl+Shift and Ctrl+Alt spellings whose
+  legacy re-encoding carries the raw byte and any primary key the terminal reports
+  over a `z` base-layout key — so the keystroke can no longer stop or
+  background the managed application and leave an unusable shell in its place. A raw
+  suspend byte inside an already-joined text burst is dropped while the rest of that
+  burst keeps its ordinary path, and bracketed-paste bodies stay byte-for-byte
+  opaque. Unrelated control keys, focus and owner routing, session lifecycle and
+  shutdown, and terminal behavior outside the sidebar are unchanged.
+
 ## [0.1.0-dev.251]
 
 ### Fixed

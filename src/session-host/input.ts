@@ -37,6 +37,39 @@ const KITTY_NUM_LOCK = 128;
 const LOCK_MODIFIERS = KITTY_CAPS_LOCK | KITTY_NUM_LOCK;
 const XTERM_MODIFIERS = KITTY_SHIFT | KITTY_ALT | KITTY_CTRL | KITTY_META;
 const MAX_CSI_PACKET_LENGTH = 256;
+/**
+ * The POSIX suspend control character (VSUSP, Ctrl+Z, 0x1A). A hosted child
+ * reaches the suspend endpoint by one of two routes: a cooked child terminal
+ * signals the child's foreground job through its line discipline, while a child
+ * that owns its tty in raw mode (Pi does, and raw mode clears `ISIG`) receives
+ * the byte as a keystroke and suspends through its own binding. The sidebar
+ * never forwards it, in any keyboard spelling, so neither route is reached.
+ */
+const SUSPEND_CONTROL = "\x1a";
+/** Keyboard codepoints naming the Z key: unshifted `z` and shifted `Z`. */
+const Z_KEY_CODEPOINTS: readonly number[] = [0x5a, 0x7a];
+/**
+ * The base-layout identity a Ctrl+Z binding names. Kitty reports a third key
+ * field as the standard-layout key of the pressed physical key, and the pinned
+ * native binding matcher uses it only when the reported key is not already an
+ * authoritative Latin letter or symbol.
+ */
+const Z_BASE_LAYOUT_CODEPOINT = 0x7a;
+/**
+ * Key names the pinned native binding matcher treats as authoritative, so a
+ * reported base-layout key never overrides them: a Latin letter or one of the
+ * symbols it names. Digits are deliberately NOT in this set. The matcher's
+ * alternate rule (`matchesKey`) excludes only letters and symbols, so a digit
+ * primary reported over a `z` base-layout key still matches a Ctrl+Z binding
+ * (`parseKey` merely names that packet differently), and the guard follows the
+ * binding matcher. Remapped letter layouts stay usable: Ctrl+K stays Ctrl+K even
+ * when its physical key sits on the QWERTY `z` position.
+ */
+const AUTHORITATIVE_IDENTITY_SYMBOLS: readonly string[] = [
+	"`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+	"!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "+", "|", "~",
+	"{", "}", ":", "<", ">", "?",
+];
 const OBSERVER_BYTE_BUDGET = 16 * 1024;
 const OBSERVER_WINDOW_MS = 5_000;
 const NEGOTIATION_FRAGMENT_TIMEOUT_MS = 150;
@@ -299,6 +332,50 @@ function parseLegacyKeyboardSequence(data: string): KeyEvent | undefined | null 
 		return key ? { key, modifiers, eventType } : null;
 	}
 	return undefined;
+}
+
+/** True when the binding matcher names this identity itself, not its physical key. */
+function isAuthoritativeIdentityCodepoint(codepoint: number): boolean {
+	return (codepoint >= 0x61 && codepoint <= 0x7a)
+		|| AUTHORITATIVE_IDENTITY_SYMBOLS.includes(String.fromCharCode(codepoint));
+}
+
+/** The matcher's letter identity: a reported Shift name folds to lowercase. */
+function letterIdentityCodepoint(codepoint: number, modifiers: number): number {
+	return hasModifier(modifiers & ~LOCK_MODIFIERS, KITTY_SHIFT) && codepoint >= 0x41 && codepoint <= 0x5a
+		? codepoint + 0x20
+		: codepoint;
+}
+
+/**
+ * True when one already-parsed key event names Ctrl+Z. Only the recognized
+ * keyboard identity is refused, never a guessed raw byte: the legacy 0x1A
+ * packet is handled separately, while Kitty CSI-u presses/repeats/releases,
+ * xterm `modifyOtherKeys` packets, and Alt/Meta-prefixed spellings all reach
+ * this point as key events. Refusing them here is what stops the translator
+ * from re-encoding any of them into the suspend byte for a legacy child.
+ *
+ * The identity follows the pinned native binding matcher, including its
+ * non-Latin base-layout fallback: when the primary codepoint is not an
+ * authoritative Latin letter or symbol, the reported base-layout key names the
+ * keystroke, so Ctrl+я over a `z` key is exactly the Ctrl+Z a suspend binding
+ * would match. This deliberately follows the broader `matchesKey` rule rather
+ * than `parseKey`'s naming rule, and an authoritative primary codepoint stays
+ * authoritative, so remapped unrelated keys keep working.
+ */
+function isSuspendKeyEvent(event: KeyEvent): boolean {
+	if (event.codepoint === undefined || !hasModifier(event.modifiers, KITTY_CTRL)) return false;
+	const identity = letterIdentityCodepoint(event.codepoint, event.modifiers);
+	if (Z_KEY_CODEPOINTS.includes(identity)) return true;
+	return event.baseLayout === Z_BASE_LAYOUT_CODEPOINT && !isAuthoritativeIdentityCodepoint(identity);
+}
+
+/** True when one escape packet is a recognized Ctrl+Z keyboard packet. */
+function isSuspendEscapePacket(data: string): boolean {
+	const key = parseLegacyKeyboardSequence(data);
+	// Malformed and unknown packets keep their existing fail-closed refusal below;
+	// only a positively identified suspend keystroke is named here.
+	return key !== undefined && key !== null && isSuspendKeyEvent(key);
 }
 
 const KEYPAD_VALUES: Readonly<Record<number, string>> = {
@@ -744,6 +821,13 @@ function translateLegacyAltPacket(data: string, modes: InputTargetModes): string
  * normalizeNativeSourceInput with the actual source ProcessTerminal state.
  * This function has no focus, ownership, or routing policy; callers must gate
  * the actual main focus and selected live child themselves.
+ *
+ * The one content rule is that the POSIX suspend control never leaves the host:
+ * every route that forwards input to a hosted child goes through this
+ * translator, so a sidebar keystroke cannot stop/background that child's job or
+ * expose the shell behind it. A recognized Ctrl+Z packet translates to nothing,
+ * and a raw 0x1A inside an already-joined plain-text burst is removed while the
+ * rest of that burst is kept. Bracketed-paste bodies stay byte-for-byte opaque.
  */
 export function translateInput(
 	data: string,
@@ -759,8 +843,14 @@ export function translateInput(
 			const codepoint = char.codePointAt(0);
 			if (codepoint === undefined || (codepoint >= 0x80 && codepoint <= 0x9f)) return undefined;
 		}
-		return data;
+		if (!data.includes(SUSPEND_CONTROL)) return data;
+		// A joined text burst can still carry the raw suspend byte. Drop only that
+		// control; the surrounding keystrokes keep their ordinary path.
+		const withoutSuspend = data.split(SUSPEND_CONTROL).join("");
+		return withoutSuspend.length === 0 ? undefined : withoutSuspend;
 	}
+
+	if (isSuspendEscapePacket(data)) return undefined;
 
 	const paste = translatePaste(data, modes);
 	if (paste !== undefined) return paste === null ? undefined : paste;

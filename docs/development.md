@@ -432,6 +432,78 @@ write receipt, operator certification, full-suite or CI success, or release appr
 real-Main local-New framing regressions; the main-framing case requests the framing
 explicitly, which production Main now also does by default.
 
+### Sidebar suspend control (#566)
+
+After `npm run build:test`, the focused suspend checks are:
+
+```sh
+node --test dist-test/tests/session-host-input.test.js \
+  dist-test/tests/session-host-sidebar-suspend-input.test.js
+node --test --test-name-pattern='foreground (application|job)' \
+  dist-test/tests/session-host-instances.test.js
+```
+
+`session-host-input.test.ts` is the packet tier for the shared forwarded-input
+translator. Every Ctrl+Z spelling — the legacy control byte, Kitty CSI-u presses,
+held repeats and releases, the shifted and alternate-key spellings, the
+`modifyOtherKeys` forms, and the Alt/Meta-prefixed legacy forms whose legacy
+re-encoding carries the raw byte — is refused for each child keyboard-mode
+combination, while ordinary `z`, `Z`, `Alt+Z`, unrelated control keys, joined
+text bursts, and bracketed-paste bodies keep their existing behavior. A second
+case follows the pinned matcher's *binding* rule rather than its naming rule: the
+keystroke identity comes from a reported `z` base-layout key whenever the primary
+codepoint is not an authoritative Latin letter or symbol, so non-Latin primaries
+and digit primaries over that position — press, held repeat, and release — are
+refused, and each refusal is checked against the pinned `matchesKey` result for
+`ctrl+z`. A Latin or symbol primary over that same physical position, a base-layout
+field naming `k` or uppercase `Z`, and an ordinary digit without the `z`
+base-layout identity all stay ordinary input. No process
+or PTY runs in this tier.
+
+`session-host-sidebar-suspend-input.test.ts` drives production Main's Main-focus
+route inside the host harness — terminal packet, sidebar forward action, Main
+owner routing, the shared translator, then the manager write — with the shared
+harness fakes. It proves the refused keystroke produces no child write, no
+speculative frame, no layout reconciliation, and no row stop, and that drafts,
+ordinary editing, focus and owner routing, a configured Ctrl+Z host chord, and
+normal shutdown stay intact. Its packet list includes the base-layout spellings,
+non-Latin and digit, and the same route confirms a remapped Ctrl+K over the `z`
+position still reaches the child.
+
+`session-host-instances.test.ts` adds the real-process tier on the pinned
+`@lydell/node-pty` addon (POSIX only, skipped when the addon or a POSIX
+job-control shell is unavailable). Its owned child is a Node-entry program that
+starts a synthetic interactive shell running a synthetic foreground application
+which records its own pid. The guarded case forwards each suspend spelling through
+the same production translator and checks that the owned foreground process never
+enters the stopped state, the shell reports no job-control stop, the suspend
+character never appears in the child's terminal echo, and the untouched draft plus
+later ordinary input still reach the running application. The control case writes
+the raw suspend byte straight into that fixture's own PTY — what an unguarded
+forward does — and observes the reported escape happen for real: the foreground
+application stops, the shell reports it, and the session stays alive but stuck at
+the prompt. Both cases signal only processes they created.
+
+This is same-host POSIX job-control evidence with synthetic shells and
+applications, not a real Pi child, a physical terminal, Linux, SSH, Windows, or
+operator certification, and it does not imply full-suite or CI success. One
+recorded line-discipline limit: the fixture never changes the terminal's special
+characters, so it exercises job control with whatever suspend character the
+spawned PTY already reports. On the current host the pinned addon's spawned
+terminal reports the standard `susp = ^Z` (its BSD delayed-suspend character is
+`dsusp = ^Y`), and the fixture's `bash --norc --noprofile -i` leaves `VSUSP`
+untouched, so both cases run against that inherited setting; a spawned PTY with
+a remapped `VSUSP` would not be exercised by these cases. The host-side refusal
+is encoding-based and does not depend on that setting.
+
+The stop these cases observe comes from the child terminal's line discipline. A
+hosted Pi child instead reaches the endpoint through Pi's own `app.suspend`
+binding: the running child puts its tty in raw mode, which clears `ISIG`, so the
+control byte would arrive as a keystroke rather than a line-discipline signal.
+The shared refusal sits upstream of both routes; the synthetic fixture is not
+evidence about that binding, which is established from the pinned public Pi
+1.4.0 sources.
+
 ### Network owner Saved conversations (#389)
 
 After `npm run build:test`, the focused Saved files are:

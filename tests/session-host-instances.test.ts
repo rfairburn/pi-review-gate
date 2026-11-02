@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { execFileSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -41,7 +42,7 @@ import {
   type ViewerOpenOptions,
 } from "../src/session-host/instances";
 import { ProfileRegistry } from "../src/session-host/profiles";
-import { translateInput } from "../src/session-host/input";
+import { translateInput, type InputViewport } from "../src/session-host/input";
 import {
   admitSavedSession,
   listSavedSessions,
@@ -120,8 +121,9 @@ import { terminalInputModesAgree } from "./helpers/session-host-input-mode-preco
  * reporter and protocol through Main's status adapter over an authenticated
  * in-memory transport. These do not prove native Pi runtime behavior or the
  * real broker's socket authentication; the parent owns broader integration.
- * The final native-addon case exercises the pinned PTY binding with an owned
- * Node shim, not a real Pi child. Broker/protocol
+ * The native-addon cases exercise the pinned PTY binding with owned Node and
+ * POSIX shell shims, not a real Pi child. The #566 cases add real POSIX
+ * job-control observation for those owned processes only. Broker/protocol
  * components have landed, but this file does not exercise them.
  */
 
@@ -2766,6 +2768,228 @@ test("pinned native addon: independent PTYs with an owned Node shim, explicit cw
     cleanupIfSettled(harness, realManager);
   }
 });
+// --- REAL POSIX job control for the sidebar suspend control (#566). ---
+
+/**
+ * REAL POSIX job-control evidence (#566). POSIX only, and skipped when the
+ * pinned @lydell/node-pty addon cannot be loaded. The owned child is a
+ * synthetic interactive shell running a synthetic foreground application that
+ * records its own pid, so every process observation here names a process this
+ * fixture created. No live user session, external shell, or remote host is
+ * involved, and nothing here signals a process outside the fixture.
+ *
+ * The guarded case forwards each suspend spelling through the SAME shared
+ * production translator that Main's Main-focus route and the native I/O bridge
+ * use (`translateInput` -> `InstanceManager.write` -> the child PTY), so it
+ * proves the keystroke is refused before it can reach the child's terminal.
+ * The control case writes the raw suspend byte straight into that fixture's own
+ * PTY — what an unguarded forward does — and observes the reported escape
+ * happen for real: the foreground application stops and the shell prompt comes
+ * back. That is genuine process evidence, not a parser fixture.
+ */
+const posixJobControlAvailable = nodePtyLoadable && guardedExistsSync("/bin/bash");
+const POSIX_JOB_SKIP = posixJobControlAvailable
+  ? false
+  : "the pinned @lydell/node-pty addon or a POSIX job-control shell is unavailable";
+
+/** One Ctrl+Z keystroke in each applicable terminal spelling. */
+const POSIX_SUSPEND_PACKETS: readonly string[] = [
+  "\x1a",              // legacy raw Ctrl+Z byte
+  "\x1b[122;5u",       // Kitty CSI-u press
+  "\x1b[90;5u",        // shifted-Z identity with Ctrl
+  "\x1b[122;6u",       // Ctrl+Shift+Z
+  "\x1b[122;7u",       // Ctrl+Alt+Z (its legacy form carries the raw byte)
+  "\x1b[27;5;122~",    // xterm modifyOtherKeys spelling
+  "\x1b[122;5:2u",     // held repeat
+  "\x1b[1103::122;5u", // non-Latin primary over a z base-layout key
+  "\x1b[51::122;5u",   // digit primary over a z base-layout key (binding-matcher identity)
+];
+
+/** `ps` state letters for one pid; "gone" once the process is reaped. */
+function posixProcessState(pid: number): string {
+  try {
+    return execFileSync("/bin/ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf8" }).trim();
+  } catch {
+    return "gone";
+  }
+}
+
+interface RealPosixSession {
+  harness: Harness;
+  manager: InstanceManager;
+  id: string;
+  surface: TerminalSurface;
+  childPid: number;
+  jobPid: number;
+  /** Forward exactly as the host does: translate first, write only a defined result. */
+  forward: (packet: string) => string | Buffer | undefined;
+  /** Raw write to this fixture's own PTY, bypassing the translator (control only). */
+  writeRawToChildPty: (data: string) => void;
+}
+
+/** Lets the caller settle a child that spawned before a start-up assertion failed. */
+interface OwnedPosixStartup {
+  manager?: InstanceManager;
+}
+
+async function startRealPosixSession(label: string): Promise<RealPosixSession> {
+  const harness = makeHarness(label);
+  const started: OwnedPosixStartup = {};
+  try {
+    return await startOwnedPosixJob(harness, started);
+  } catch (error) {
+    // A fixture that never finished starting leaves no owned root and no owned
+    // child behind.
+    await started.manager?.dispose().catch(() => undefined);
+    cleanup(harness);
+    throw error;
+  }
+}
+
+async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup): Promise<RealPosixSession> {
+  // The owned foreground application records its own pid, and echoes input
+  // visibly (`cat -v`) so a forwarded control character would show in the frame.
+  const jobPidFile = join(harness.root, "foreground-job.pid");
+  const jobScript = join(harness.workspace, "foreground-job.sh");
+  writeFileSync(jobScript, "#!/bin/sh\necho \"$$\" > \"$JOB_PID_FILE\"\nexec cat -v\n", "utf8");
+  chmodSync(jobScript, 0o755);
+  // The production launch admission accepts only a positive Node-entry shebang,
+  // exactly like the real Pi CLI child. This owned Node program starts the
+  // synthetic POSIX shell that puts a foreground job in its own process group —
+  // the arrangement in which a terminal's suspend character has job-control
+  // effect. Nothing outside this fixture is started or signalled.
+  const app = join(harness.root, "bin", "shim-posix-session.js");
+  mkdirSync(join(app, ".."), { recursive: true });
+  writeFileSync(app, [
+    "#!/usr/bin/env node",
+    "\"use strict\";",
+    "const { spawn } = require(\"node:child_process\");",
+    "const shell = spawn(\"/bin/bash\", [\"--norc\", \"--noprofile\", \"-i\"], { stdio: \"inherit\" });",
+    "shell.on(\"exit\", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));",
+    "process.on(\"SIGTERM\", () => { try { shell.kill(\"SIGTERM\"); } catch { /* already gone */ } process.exit(0); });",
+    "",
+  ].join("\n"), "utf8");
+  chmodSync(app, 0o755);
+
+  const defaultFactory = createDefaultPtyFactory();
+  let childPty: InstancePty | undefined;
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: app,
+    statusRegistrar: harness.registrar,
+    nativeSetup: false,
+    profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+    args: [],
+    // HOME stays inside the fixture so no user rc file or private home state is
+    // read by the synthetic shell.
+    env: { ...cleanTestEnv(), HOME: harness.root, PS1: "PRGSYNTH$ ", JOB_PID_FILE: jobPidFile },
+    ptyFactory: (descriptor) => {
+      childPty = defaultFactory(descriptor);
+      return childPty;
+    },
+  });
+  started.manager = manager;
+  const id = await manager.create({ label: "posix", workspace: harness.workspace });
+  const surface = manager.surface(id);
+  assert.ok(surface, "the real row owns a surface");
+  await until(() => frameText(surface).includes("PRGSYNTH$"), "the owned shell prompt", 20_000);
+  manager.write(id, "./foreground-job.sh\r");
+  await until(() => guardedExistsSync(jobPidFile), "the owned foreground application records its pid", 20_000);
+  const jobPid = Number(readBytesSync(jobPidFile).toString("utf8").trim());
+  assert.ok(Number.isSafeInteger(jobPid) && jobPid > 0, "the recorded pid is a real pid");
+  await until(() => posixProcessState(jobPid) !== "gone" && !posixProcessState(jobPid).includes("T"),
+    "the owned foreground application runs", 20_000);
+  assert.ok(childPty, "the pinned factory produced the child PTY");
+  const viewport: InputViewport = {
+    column: 0,
+    row: 0,
+    cols: DEFAULT_INSTANCE_COLS,
+    rows: DEFAULT_INSTANCE_ROWS,
+  };
+  return {
+    harness,
+    manager,
+    id,
+    surface,
+    childPid: childPty.pid,
+    jobPid,
+    forward: (packet) => {
+      const translated = translateInput(packet, surface.inputModes(), viewport);
+      if (translated !== undefined) manager.write(id, translated);
+      return translated;
+    },
+    writeRawToChildPty: (data) => childPty!.write(data),
+  };
+}
+
+async function stopRealPosixSession(session: RealPosixSession): Promise<void> {
+  try {
+    const result = await session.manager.shutdown({ graceMs: 2000, killMs: 2000 });
+    assert.deepEqual(result.remainingIds, [], "the owned session settles inside the shutdown window");
+  } finally {
+    // The fixture's own foreground application, if it outlived its shell.
+    try {
+      process.kill(session.jobPid, "SIGKILL");
+    } catch { /* already settled */ }
+    await session.manager.dispose().catch(() => undefined);
+    cleanupIfSettled(session.harness, session.manager);
+  }
+}
+
+test("pinned native addon: no sidebar suspend spelling stops the owned POSIX foreground application", { skip: POSIX_JOB_SKIP, timeout: 90_000 }, async () => {
+  const session = await startRealPosixSession("suspend-guard");
+  try {
+    const draft = "draft text";
+    for (const char of draft) session.forward(char);
+    for (const packet of POSIX_SUSPEND_PACKETS) {
+      assert.equal(session.forward(packet), undefined,
+        `${JSON.stringify(packet)} is refused before the child's terminal`);
+    }
+    await sleep(500);
+    assert.equal(posixProcessState(session.jobPid).includes("T"), false,
+      `the owned foreground application is never stopped (state ${posixProcessState(session.jobPid)})`);
+    assert.equal(posixProcessState(session.childPid).includes("T"), false, "the owned session shell is never stopped");
+    const frame = frameText(session.surface);
+    assert.equal(/Stopped/i.test(frame), false, "the owned shell reports no job-control stop");
+    assert.equal(frame.includes("^Z"), false, "the suspend control never reaches the child's terminal echo");
+
+    // The draft stays in the running application's own line buffer, and ordinary
+    // input keeps working with no resume, restart, or shell recovery.
+    session.forward("\r");
+    await until(() => frameText(session.surface).includes(draft), "the application echoes the untouched draft", 20_000);
+    session.forward(" still typing");
+    session.forward("\r");
+    await until(() => frameText(session.surface).includes("still typing"), "ordinary input still reaches it", 20_000);
+    assert.equal(/Stopped/i.test(frameText(session.surface)), false, "no delayed job-control stop appears");
+    assert.equal(viewFor(session.manager, session.id).lifecycle, "alive", "the row stays alive");
+    assert.equal(viewFor(session.manager, session.id).hasLiveProcess, true);
+  } finally {
+    await stopRealPosixSession(session);
+  }
+});
+
+test("control: the same owned PTY fixture stops its foreground job when the suspend byte is forwarded", { skip: POSIX_JOB_SKIP, timeout: 90_000 }, async () => {
+  const session = await startRealPosixSession("suspend-control");
+  try {
+    session.forward("draft text");
+    // What an unguarded forward does: the raw suspend byte lands on the child's
+    // terminal, whose line discipline signals the foreground job.
+    session.writeRawToChildPty("\x1a");
+    await until(() => posixProcessState(session.jobPid).includes("T"), "the owned foreground job stops", 10_000);
+    // The shell's stop notification arrives as ordinary child output; wait for it
+    // instead of assuming the state change already reached the terminal surface.
+    await until(() => /Stopped/.test(frameText(session.surface)), "the owned shell reports the stop", 10_000);
+    assert.match(frameText(session.surface), /Stopped/, "the owned shell reports the stop it just made");
+    // The reported dead end: the job is stopped while the managed session itself
+    // is still alive, so the visible session is stuck at the shell. Nothing else
+    // outside this fixture is signalled; cleanup settles the owned processes.
+    assert.equal(posixProcessState(session.childPid).includes("T"), false, "the managed session row itself stays running");
+    assert.equal(viewFor(session.manager, session.id).hasLiveProcess, true, "a stopped job is not an exit");
+  } finally {
+    await stopRealPosixSession(session);
+  }
+});
+
 // --- Deliberate saved-conversation creation (issue 323). ---
 //
 // These cases use the landed read-only saved-sessions API with a synthetic

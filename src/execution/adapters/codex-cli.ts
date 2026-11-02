@@ -407,6 +407,11 @@ function isSafeCodexResearchConfig(value: string): boolean {
   return separator > 0 && CODEX_RESEARCH_CONFIG_KEYS.has(value.slice(0, separator).trim());
 }
 
+/**
+ * Keep the research restrictions explicit, but omit the inapplicable app approval
+ * enum overrides: Codex 0.164.0/0.166.0 reject null values during startup (#604).
+ * The existing app-disabling boolean fields remain pinned below.
+ */
 function codexResearchThreadConfig(allowedTools: readonly string[] | undefined): Record<string, unknown> {
   if (!allowedTools) {
     throw new Error("Codex research launch requires an authoritative parent tool allowlist.");
@@ -417,10 +422,8 @@ function codexResearchThreadConfig(allowedTools: readonly string[] | undefined):
     apps: {
       _default: {
         enabled: false,
-        approvals_reviewer: null,
         destructive_enabled: false,
         open_world_enabled: false,
-        default_tools_approval_mode: null,
         default_tools_enabled: false,
       },
     },

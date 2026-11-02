@@ -293,8 +293,9 @@ reported to you and to the acting model; a routine `PASS` or `NOT AUDITED` resul
 audit text to what the acting model receives, and its audit line is shown to you only
 when `toolProtection.debug` is On. A PASS preserves native output and nested return
 values and is not a claim that execution succeeded. This is not coverage for arbitrary
-wrappers or other harnesses, and unsupported external acting
-executors are refused before they start under a non-Off level. The reserved discovery
+wrappers or other harnesses, and non-Pi acting workers — Codex, Claude, and generic
+binary executors — are out of scope for this added gate today: no Protection level
+refuses, audits, or pins their launches. The reserved discovery
 loader `tool_search` is the single infrastructure exception: it is never audited, its
 user-only debug diagnostic is `NOT AUDITED — discovery loader`, and every native authorization, permission,
 and liveness guard still applies to them. See

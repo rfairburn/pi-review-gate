@@ -282,25 +282,51 @@ export function extractJsonObject(text: string): string | null {
   return extractBalancedJsonObjects(text)[0] ?? null;
 }
 
-function extractJsonCandidates(text: string): Array<{ value: string; repaired: boolean }> {
-  const candidates: Array<{ value: string; repaired: boolean }> = [];
-  const seen = new Set<string>();
-  const add = (candidate: string): void => {
+export interface JsonCandidate {
+  value: string;
+  repaired: boolean;
+  /** The complete trimmed response, before any extraction. */
+  whole: boolean;
+}
+
+export interface ExtractJsonCandidatesOptions {
+  /**
+   * Add a control-character-repaired variant when it differs. Review parsing keeps
+   * this historical default; strict decision parsing disables it so a malformed
+   * reply can never be repaired into a decision.
+   */
+  repair?: boolean;
+}
+
+export function extractJsonCandidates(
+  text: string,
+  options: ExtractJsonCandidatesOptions = {},
+): JsonCandidate[] {
+  const candidates: JsonCandidate[] = [];
+  const seen = new Map<string, JsonCandidate>();
+  const add = (candidate: string, whole = false): void => {
     const trimmed = candidate.trim();
-    if (trimmed && !seen.has(trimmed)) {
-      seen.add(trimmed);
-      candidates.push({ value: trimmed, repaired: false });
+    if (!trimmed) return;
+    let entry = seen.get(trimmed);
+    if (!entry) {
+      entry = { value: trimmed, repaired: false, whole };
+      seen.set(trimmed, entry);
+      candidates.push(entry);
+    } else if (whole) {
+      entry.whole = true;
     }
+    if (options.repair === false) return;
     const repaired = escapeControlCharactersInJsonStrings(trimmed);
     if (repaired && repaired !== trimmed && !seen.has(repaired)) {
-      seen.add(repaired);
-      candidates.push({ value: repaired, repaired: true });
+      const repairedEntry = { value: repaired, repaired: true, whole };
+      seen.set(repaired, repairedEntry);
+      candidates.push(repairedEntry);
     }
   };
 
   const trimmed = text.trim();
   if (trimmed) {
-    add(trimmed);
+    add(trimmed, true);
   }
 
   const fencePattern = /```[ \t]*json\b[ \t]*(?:\r?\n)?([\s\S]*?)```/gi;

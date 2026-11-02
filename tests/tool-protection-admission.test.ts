@@ -499,6 +499,172 @@ test("a reasonless FAIL blocks with the plain denial line and invents no reason"
   assert.doesNotMatch(decision!.reason, /because|reason:/);
 });
 
+test("embedded extracted decisions admit, refuse, or fail closed exactly once and never dispatch", async () => {
+  const repeated = '{"decision":"PASS"}\nAdditional auditor commentary.\n{"decision":"PASS"}';
+  const cases: Array<{ name: string; output: string; admitted: boolean; invalid?: boolean; reason?: string }> = [
+    { name: "embedded-pass", output: repeated, admitted: true },
+    {
+      name: "embedded-fail",
+      output: '{"decision":"FAIL","reason":"embedded refusal"}\nAdditional auditor commentary.',
+      admitted: false,
+      reason: "Tool protection: FAIL — embedded refusal The bash call did not run.",
+    },
+    {
+      name: "embedded-contradiction",
+      output: '{"decision":"PASS"}\n{"decision":"FAIL"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-duplicate",
+      output: '{"decision":"FAIL","\\u0064ecision":"PASS"}\n{"decision":"PASS"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-fenced-array",
+      output: '```json\n[{"decision":"PASS"},]\n```\n{"decision":"PASS"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-fenced-array-after-quoted-prose",
+      output: 'Auditor commentary with an unmatched "\n```json\n[{"decision":"PASS"},]\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-truncated-fence-after-quoted-prose",
+      output: 'Auditor commentary with an unmatched "\n```json\n{"decision":"FAIL"\n```\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-unfenced-malformed-after-quoted-prose",
+      output: 'Auditor commentary with an unmatched "\n{"decision":"FAIL",}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-unfenced-array-after-quoted-prose",
+      output: 'Auditor commentary with an unmatched "\n[{"decision":"PASS"},]\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-string-hiding-decision",
+      output: '{"reason":"unterminated\n,"decision":"FAIL"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-string-missing-separator",
+      output: '{"reason":"unterminated\n"decision":"FAIL"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-non-json-fence-after-quoted-prose",
+      output: '```yaml\nCommentary with an unmatched "\n{"decision":"PASS"}\n```\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-wrapper-with-accepted-copy",
+      output: 'Commentary with an unmatched "\n{"wrapper":{"decision":"PASS"},}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-truncated-wrapper-with-accepted-copy",
+      output: 'Commentary with an unmatched "\n{"wrapper":{"decision":"PASS"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-truncated-wrapper-missing-colon",
+      output: 'Commentary with an unmatched "\n{"wrapper" {"decision":"PASS"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-incomplete-unquoted-wrapper",
+      output: '{wrapper:{"decision":"PASS"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-wrapper-unterminated-string",
+      output: '{"wrapper":"\n{"decision":"PASS"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-array-unterminated-string",
+      output: '["\n{"decision":"PASS"}\n```json\n{"decision":"PASS"}\n```',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-prose-array",
+      output: 'Commentary before\n[{"decision":"PASS"}]\n{"decision":"PASS"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-key",
+      output: '{"decision" "FAIL"}\n{"decision":"PASS"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-key-after-unterminated-string",
+      output: '{"decision":"PASS"}\n{"reason":"unterminated\n,"decision" "FAIL"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-key-after-unterminated-string-escaped",
+      output: '{"decision":"PASS"}\n{"reason":"unterminated\n,"\\u0064ecision" "FAIL"}',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-dangling-decision-fragment",
+      output: '{"decision":"PASS"}\ntail "decision":"FAIL',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-dangling-decision-after-unmatched-quote",
+      output: '{"decision":"PASS"}\nCommentary with an unmatched "\n"decision":"FAIL',
+      admitted: false,
+      invalid: true,
+    },
+    {
+      name: "embedded-malformed-key-before-valid-after-unterminated-string",
+      output: '{"reason":"unterminated\n,"decision" "FAIL"}\n{"decision":"PASS"}',
+      admitted: false,
+      invalid: true,
+    },
+  ];
+  for (const item of cases) {
+    const { coordinator, calls } = coordinatorHarness({ results: [{ output: item.output }] });
+    let effects = 0;
+    const decision = await coordinator.admitToolCall(callArgs(`call-${item.name}`, "bash", { command: "echo hi" }));
+    if (decision === undefined) effects += 1;
+    assert.equal(effects, item.admitted ? 1 : 0, `${item.name} dispatch`);
+    assert.equal(calls.length, 1, `${item.name} is audited exactly once and never retried`);
+    if (item.admitted) {
+      assert.equal(decision, undefined, `${item.name} is admitted`);
+    } else {
+      assert.equal(decision?.block, true, `${item.name} blocks before execution`);
+      if (item.invalid) assert.match(decision!.reason, /invalid auditor response/, item.name);
+      else assert.equal(decision!.reason, item.reason, item.name);
+    }
+  }
+});
+
 /**
  * #551 admission regressions with a scripted auditor.
  *

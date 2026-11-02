@@ -117,8 +117,6 @@ test("the parser rejects every ambiguous, coerced, or partial payload", () => {
     "{\"decision\":\"PASS\",\"confidence\":0.9}",
     "{\"decision\":\"PASS\",\"decision\":\"FAIL\"}",
     "{\"decision\":\"PASS\"} {\"decision\":\"FAIL\"}",
-    "I think the answer is {\"decision\":\"PASS\"}",
-    "{\"decision\":\"PASS\"} — hope that helps",
     "{\"decision\":\"PASS\",\"reason\":5}",
     "{\"decision\":\"PASS\",\"reason\":null}",
     "{\"decision\":\"PASS\",\"reason\":[\"a\"]}",
@@ -128,6 +126,265 @@ test("the parser rejects every ambiguous, coerced, or partial payload", () => {
     "{\"decision\":\"PASS\"",
   ];
   for (const payload of rejected) {
+    assert.throws(() => parseProtectionDecision(payload), Error, payload);
+  }
+});
+
+test("embedded decisions reuse the review gate's candidate extraction without phase metadata", () => {
+  const repeated = '{"decision":"PASS"}\nAdditional auditor commentary.\n{"decision":"PASS"}';
+  assert.deepEqual(parseProtectionDecision(repeated), { decision: "PASS" });
+
+  const fenced = [
+    "All blocking issues have been fixed:",
+    "1. capturedPieces now uses `{{white: string[], black: string[]}}`.",
+    "2. MoveResult now uses `{ok: false, reason}`.",
+    "",
+    "```json",
+    '{"decision":"FAIL","reason":"fenced refusal"}',
+    "```",
+  ].join("\n");
+  assert.deepEqual(parseProtectionDecision(fenced), { decision: "FAIL", reason: "fenced refusal" });
+
+  const later = [
+    "Runtime shape: {{white: string[], black: string[]}}",
+    'Metadata example: {"kind":"decision metadata"}',
+    '{"decision":"PASS","reason":"later object accepted"}',
+  ].join("\n");
+  assert.deepEqual(parseProtectionDecision(later), { decision: "PASS", reason: "later object accepted" });
+  assert.deepEqual(parseProtectionDecision('I think the answer is {"decision":"PASS"}'), { decision: "PASS" });
+  assert.deepEqual(parseProtectionDecision('{"decision":"PASS"} — hope that helps'), { decision: "PASS" });
+});
+
+test("agreeing extracted decisions keep fence-first then source order and their reasons", () => {
+  const earlier = '{"decision":"PASS","reason":"earlier prose"}';
+  const fence = '```json\n{"decision":"PASS","reason":"fenced first"}\n```';
+  assert.deepEqual(parseProtectionDecision([earlier, fence].join("\n")), {
+    decision: "PASS",
+    reason: "fenced first",
+  });
+
+  const first = '{"decision":"FAIL","reason":"first balanced"}';
+  const second = '{"decision":"FAIL","reason":"second balanced"}';
+  assert.deepEqual(parseProtectionDecision([first, second].join("\n")), {
+    decision: "FAIL",
+    reason: "first balanced",
+  });
+});
+
+test("contradictory valid decisions fail closed in either order and across a fence", () => {
+  for (const payload of [
+    '{"decision":"PASS"}\n{"decision":"FAIL"}',
+    '{"decision":"FAIL"}\n{"decision":"PASS"}',
+    '{"decision":"PASS"}\n```json\n{"decision":"FAIL"}\n```',
+    '```json\n{"decision":"PASS"}\n```\n{"decision":"FAIL"}',
+  ]) {
+    assert.throws(() => parseProtectionDecision(payload), /contradictory PASS and FAIL/, payload);
+  }
+});
+
+test("a malformed decision candidate beside a valid one fails the whole response", () => {
+  const valid = '{"decision":"PASS"}';
+  const malformed = [
+    '{"decision":"FAIL","\\u0064ecision":"PASS"}',
+    '{"decision":"pass"}',
+    '{"decision":"FAIL","confidence":0.9}',
+    '{"decision":"FAIL","reason":7}',
+    `{"decision":"FAIL","reason":"${"x".repeat(PROTECTION_DECISION_MAX_REASON_CHARS + 1)}"}`,
+    '{"decision":"FAIL",}',
+    '{"decision":"FAIL"',
+  ];
+  for (const bad of malformed) {
+    assert.throws(() => parseProtectionDecision(`${bad}\n${valid}`), Error, `malformed first: ${bad}`);
+    assert.throws(() => parseProtectionDecision(`${valid}\n${bad}`), Error, `valid first: ${bad}`);
+  }
+});
+
+test("decision objects nested in array envelopes are rejected instead of mined", () => {
+  const valid = '{"decision":"PASS"}';
+  const arrays = [
+    'Auditor commentary with an unmatched "\n[{"decision":"PASS"},]\n```json\n{"decision":"PASS"}\n```',
+    'Auditor commentary with an unmatched "\n```json\n[{"decision":"PASS"},]\n```',
+    '```json\n[{"decision":"PASS"},]\n```',
+    'Commentary before\n[{"decision":"PASS"}]',
+    '```json\n[{"decision":"FAIL"}]\n```',
+    '[{"decision":"PASS"},]',
+  ];
+  for (const array of arrays) {
+    assert.throws(() => parseProtectionDecision(array), /must be a JSON object/, `array alone: ${array}`);
+    assert.throws(() => parseProtectionDecision(`${array}\n${valid}`), /must be a JSON object/, `array first: ${array}`);
+    assert.throws(() => parseProtectionDecision(`${valid}\n${array}`), /must be a JSON object/, `valid first: ${array}`);
+  }
+});
+
+test("malformed decision-key syntax cannot be skipped for a later valid decision", () => {
+  const valid = '{"decision":"PASS"}';
+  for (const malformed of [
+    '{"decision" "FAIL"}',
+    '{"\\u0064ecision" "FAIL"}',
+    '{"decision"}',
+    '{"decision" false}',
+  ]) {
+    assert.throws(() => parseProtectionDecision(`${malformed}\n${valid}`), Error, `malformed first: ${malformed}`);
+    assert.throws(() => parseProtectionDecision(`${valid}\n${malformed}`), Error, `valid first: ${malformed}`);
+  }
+  // A decision-named string value is data, not a malformed key or a second decision.
+  assert.deepEqual(
+    parseProtectionDecision('{"decision":"PASS","reason":"the word decision is not a field"}'),
+    { decision: "PASS", reason: "the word decision is not a field" },
+  );
+  assert.deepEqual(
+    parseProtectionDecision('Metadata {"kind":"decision"}\n{"decision":"PASS"}'),
+    { decision: "PASS" },
+  );
+});
+
+test("truncated fenced decisions cannot hide behind unmatched prose quotes", () => {
+  const malformed = 'Auditor commentary with an unmatched "\n```json\n{"decision":"FAIL"\n```';
+  const valid = '```json\n{"decision":"PASS"}\n```';
+  for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+    assert.throws(() => parseProtectionDecision(payload), Error);
+  }
+});
+
+test("unfenced malformed decisions cannot hide behind unmatched prose quotes", () => {
+  const valid = '```json\n{"decision":"PASS"}\n```';
+  for (const fragment of [
+    '{"decision":"FAIL",}',
+    '{"decision":"FAIL"',
+    '{"decision":"FAIL","\\u0064ecision":"PASS"}',
+  ]) {
+    const malformed = 'Auditor commentary with an unmatched "\n' + fragment;
+    for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+      assert.throws(() => parseProtectionDecision(payload), Error);
+    }
+  }
+});
+
+test("malformed strings and missing separators cannot hide decision keys", () => {
+  const valid = '```json\n{"decision":"PASS"}\n```';
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    for (const separator of ["\n,", "\n"]) {
+      for (const afterKey of [":", ' "']) {
+        const malformed = '{"reason":"unterminated' + separator + key + afterKey + 'FAIL"}';
+        for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+          assert.throws(() => parseProtectionDecision(payload), Error);
+        }
+        // The same broken key beside a plain valid decision object, in either order.
+        for (const payload of [`${malformed}\n{"decision":"PASS"}`, `{"decision":"PASS"}\n${malformed}`]) {
+          assert.throws(() => parseProtectionDecision(payload), Error, payload);
+        }
+      }
+    }
+  }
+});
+
+test("unmatched prose quotes cannot hide decisions in non-JSON fences", () => {
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const object = `{${key}:"PASS"}`;
+    const forbidden = '```yaml\nCommentary with an unmatched "\n' + object + '\n```';
+    const valid = '```json\n' + object + '\n```';
+    for (const payload of [`${forbidden}\n${valid}`, `${valid}\n${forbidden}`]) {
+      assert.throws(() => parseProtectionDecision(payload), Error);
+    }
+  }
+});
+
+test("accepted duplicates cannot hide malformed enclosing objects", () => {
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const object = `{${key}:"PASS"}`;
+    const valid = '```json\n' + object + '\n```';
+    for (const separator of [":", " "]) {
+      for (const suffix of [",}", "", ","]) {
+        const malformed = 'Commentary with an unmatched "\n{"wrapper"' + separator + object + suffix;
+        for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+          assert.throws(() => parseProtectionDecision(payload), Error);
+        }
+      }
+    }
+  }
+});
+
+test("unquoted incomplete wrappers cannot hide behind accepted copies", () => {
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const object = `{${key}:"PASS"}`;
+    const valid = '```json\n' + object + '\n```';
+    const malformed = '{wrapper:' + object;
+    for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+      assert.throws(() => parseProtectionDecision(payload), Error);
+    }
+  }
+});
+
+test("commentary quotes and braces cannot fake a decision or break selection", () => {
+  // Unrelated quotes and braces in commentary are skipped: they never become a
+  // malformed envelope and never change which extracted candidate is selected.
+  for (const payload of [
+    'a " b " c {"decision":"PASS"}',
+    'Auditor commentary with an unmatched "\n```json\n{"decision":"PASS"}\n```',
+    'The config `{ "a": }` and `{{white: string[], black: string[]}}` are wrong\n{"decision":"PASS"}',
+  ]) {
+    assert.deepEqual(parseProtectionDecision(payload), { decision: "PASS" }, payload);
+  }
+  // A quoted `decision` word with no colon stays commentary.
+  assert.deepEqual(parseProtectionDecision('he said "decision" then\n{"decision":"PASS"}'), { decision: "PASS" });
+  // Dangling decision-shaped syntax outside every JSON object is malformed: it is
+  // never mined for a verdict, and it is never waved past a valid decision.
+  for (const payload of [
+    'the schema key "decision":"PASS" is required\n{"decision":"PASS"}',
+    '{"decision":"PASS"}\ntail "decision":"FAIL',
+    '```yaml\n"decision": "PASS"\n```\n```json\n{"decision":"PASS"}\n```',
+  ]) {
+    assert.throws(() => parseProtectionDecision(payload), Error, payload);
+  }
+  // A decision inside an array is refused wherever that array sits.
+  for (const payload of [
+    '[{"decision":"PASS"}]',
+    '{"a":[1,{"decision":"PASS"}]}\n{"decision":"FAIL"}',
+    '{"wrapper":[{"decision":"PASS"}]}\n{"decision":"PASS"}',
+  ]) {
+    assert.throws(() => parseProtectionDecision(payload), /must be a JSON object/, payload);
+  }
+});
+
+test("commentary quotes cannot hide dangling decision keys", () => {
+  // An unmatched commentary quote must not consume the opening quote of a later
+  // dangling decision key and hide the malformed fragment from the gap scan.
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const payload = '{"decision":"PASS"}\nCommentary with an unmatched "\n' + key + ':"FAIL';
+    assert.throws(() => parseProtectionDecision(payload), Error, payload);
+  }
+});
+
+test("decision-named metadata array values are not decision fields", () => {
+  const valid = '{"decision":"PASS"}';
+  for (const metadata of [
+    '["metadata","decision"]',
+    '["metadata","\\u0064ecision"]',
+  ]) {
+    for (const payload of [`${metadata}\n${valid}`, `${valid}\n${metadata}`]) {
+      assert.deepEqual(parseProtectionDecision(payload), { decision: "PASS" });
+    }
+  }
+});
+
+test("unterminated envelope strings cannot hide accepted decision copies", () => {
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const object = `{${key}:"PASS"}`;
+    const valid = '```json\n' + object + '\n```';
+    for (const prefix of ['{"wrapper":"\n', '["\n']) {
+      const malformed = prefix + object;
+      for (const payload of [`${malformed}\n${valid}`, `${valid}\n${malformed}`]) {
+        assert.throws(() => parseProtectionDecision(payload), Error);
+      }
+    }
+  }
+});
+
+test("extracted decisions are never repaired from malformed JSON", () => {
+  for (const payload of [
+    '{"decision":"PASS","reason":"line one\nline two"}',
+    `{"decision":"FAIL"}\n{"decision":"PASS","reason":"line one\nline two"}`,
+  ]) {
     assert.throws(() => parseProtectionDecision(payload), Error, payload);
   }
 });

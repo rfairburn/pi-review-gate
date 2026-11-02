@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.251]
+
+### Fixed
+
+- **Valid auditor metadata strings** (#597): quote-independent decision-key recovery
+  now runs only for malformed containers, so escaped quotation marks inside valid
+  metadata values do not turn those values into decision keys. Real decision keys
+  inside arrays and malformed array-rooted responses still fail closed.
+
 ## [0.1.0-dev.250]
 
 ### Fixed

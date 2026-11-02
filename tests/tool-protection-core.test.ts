@@ -380,6 +380,14 @@ test("unterminated envelope strings cannot hide accepted decision copies", () =>
   }
 });
 
+test("escaped quotes in valid array metadata are not decision keys", () => {
+  const metadata = JSON.stringify([{ note: 'a "decision' }]);
+  const valid = '{"decision":"PASS"}';
+  for (const payload of [`${metadata}\n${valid}`, `${valid}\n${metadata}`]) {
+    assert.deepEqual(parseProtectionDecision(payload), { decision: "PASS" });
+  }
+});
+
 test("array-root malformed decision keys cannot hide behind shifted quotes", () => {
   const valid = '{"decision":"PASS"}';
   for (const key of ['"decision"', '"\\u0064ecision"']) {

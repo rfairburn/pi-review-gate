@@ -216,8 +216,8 @@ function scanContainerRegions(payload: string): ContainerRegion[] {
     const end = closed < 0 ? payload.length : closed;
     coveredUntil = end;
     const text = payload.slice(start, end);
-    const decision = scanDecisionKeys(payload, start, end);
     const parsed = closed >= 0 ? tryParseJsonValue(text) : undefined;
+    const decision = scanDecisionKeys(payload, start, end, parsed === undefined);
     const parsedObject = parsed !== undefined && isRecord(parsed) ? parsed : undefined;
     const keys = parsedObject === undefined ? undefined : scanTopLevelKeys(text);
     regions.push({
@@ -288,6 +288,7 @@ function scanDecisionKeys(
   payload: string,
   start: number,
   end: number,
+  recoverMalformed: boolean,
 ): { found: boolean; inArray: boolean } {
   const containers: Array<"{" | "["> = [];
   let found = false;
@@ -311,7 +312,7 @@ function scanDecisionKeys(
       containers.pop();
     }
   }
-  if (found) return { found: true, inArray: false };
+  if (found || !recoverMalformed) return { found, inArray: false };
   // Quote-independent recovery: an unterminated string inside the region shifts the
   // quote parity, so the structural walk above never decodes the key at all.
   for (let at = start; at < end; at += 1) {

@@ -216,7 +216,7 @@ function scanContainerRegions(payload: string): ContainerRegion[] {
     const end = closed < 0 ? payload.length : closed;
     coveredUntil = end;
     const text = payload.slice(start, end);
-    const decision = scanDecisionKeys(payload, start, end, kind);
+    const decision = scanDecisionKeys(payload, start, end);
     const parsed = closed >= 0 ? tryParseJsonValue(text) : undefined;
     const parsedObject = parsed !== undefined && isRecord(parsed) ? parsed : undefined;
     const keys = parsedObject === undefined ? undefined : scanTopLevelKeys(text);
@@ -288,7 +288,6 @@ function scanDecisionKeys(
   payload: string,
   start: number,
   end: number,
-  root: "{" | "[",
 ): { found: boolean; inArray: boolean } {
   const containers: Array<"{" | "["> = [];
   let found = false;
@@ -321,8 +320,8 @@ function scanDecisionKeys(
     if (read?.value !== "decision") continue;
     const next = payload[skipJsonWhitespace(payload, read.next)];
     if (next === ":") return { found: true, inArray: false };
-    if (root !== "{") continue;
-    // Inside a broken object, a quoted `decision` is a decision key with broken
+    // Inside a broken object, including one nested beneath an array root, a
+    // quoted `decision` is a decision key with broken
     // syntax (`{"decision" "FAIL"}`, `{"decision"}`, or one whose quotes were shifted
     // by an earlier unterminated string) unless it is plainly the value of another
     // field (a colon before it) or an element in a sequence (`,` or `]` after it).

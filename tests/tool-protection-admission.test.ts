@@ -2555,6 +2555,37 @@ function externalAuditorConfig(agentScript: string): ReviewGateConfig {
   } as ReviewGateConfig;
 }
 
+test("activate: array-root malformed decisions never invoke the protected callback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-array-root-malformed-"));
+  try {
+    await withActivationEnvironment(root, async (configPath) => {
+      let index = 0;
+      for (const key of ['"decision"', '"\\u0064ecision"']) {
+        const malformed = '[{"reason":"unterminated\n,' + key + ' "FAIL"}]';
+        const valid = '{"decision":"PASS"}';
+        for (const output of [`${valid}\n${malformed}`, `${malformed}\n${valid}`]) {
+          const script = "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write("
+            + JSON.stringify(output) + "));";
+          await writeFile(configPath, JSON.stringify(externalAuditorConfig(script)));
+          const runtime = new ActivationRuntime(root, `array-root-${index++}`);
+          await runtime.start();
+          try {
+            const result = await runtime.dispatch(`malformed-${index}`, { command: "echo synthetic array-root probe" });
+            assert.equal(result.blocked, true, output);
+            assert.equal(result.executed, false, output);
+            assert.match(result.reason ?? "", /invalid auditor response/, output);
+            assert.deepEqual(runtime.executed, [], "the protected callback was never invoked");
+          } finally {
+            await runtime.fire("session_shutdown", { type: "session_shutdown" }, runtime.context);
+          }
+        }
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a delegated executor audits only with the parent-pinned external auditor definition", async () => {
   // The ambient (child-file) definition would answer FAIL. The parent pin is a
   // different executable definition for the same id and must win exclusively.

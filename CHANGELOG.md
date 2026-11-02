@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.250]
+
+### Fixed
+
+- **Malformed auditor decisions inside arrays** (#597): tool protection now rejects
+  missing-colon decision keys hidden by an unterminated string inside an array-rooted
+  response, including escaped key spellings, instead of accepting a neighboring PASS.
+  Ordinary array string values named `decision` remain unrelated metadata.
+
 ## [0.1.0-dev.249]
 
 ### Fixed

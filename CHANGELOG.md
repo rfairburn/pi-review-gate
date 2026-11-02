@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.248]
+## [0.1.0-dev.249]
 
 ### Fixed
 
@@ -29,6 +29,14 @@ dates.
   object is still validated strictly; a malformed object beside a valid one and
   contradictory PASS/FAIL objects fail closed, no JSON repair is applied, and PASS,
   FAIL, refusal, retry, and admission behavior otherwise stay unchanged.
+
+## [0.1.0-dev.248]
+
+### Documentation
+
+- **README capability overview** (#392): refresh the overview with a self-contained
+  vector illustration of sidebar-managed sessions, review, and platform capabilities,
+  with matching alternative text. Usage screenshots remain outstanding.
 
 ## [0.1.0-dev.247]
 

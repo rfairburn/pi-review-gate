@@ -380,6 +380,19 @@ test("unterminated envelope strings cannot hide accepted decision copies", () =>
   }
 });
 
+test("array-root malformed decision keys cannot hide behind shifted quotes", () => {
+  const valid = '{"decision":"PASS"}';
+  for (const key of ['"decision"', '"\\u0064ecision"']) {
+    const malformed = '[{"reason":"unterminated\n,' + key + ' "FAIL"}]';
+    for (const payload of [`${valid}\n${malformed}`, `${malformed}\n${valid}`]) {
+      assert.throws(() => parseProtectionDecision(payload), Error, payload);
+    }
+    for (const metadata of [`["metadata",${key}]`, `[{"reason":${key}}]`]) {
+      assert.deepEqual(parseProtectionDecision(`${metadata}\n${valid}`), { decision: "PASS" });
+    }
+  }
+});
+
 test("extracted decisions are never repaired from malformed JSON", () => {
   for (const payload of [
     '{"decision":"PASS","reason":"line one\nline two"}',

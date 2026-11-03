@@ -184,6 +184,12 @@ test("diagnostic formatter withholds private sequences and every substantial tok
 });
 
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
+/**
+ * The closed set of native Pi releases this real-runtime proof runs against, matching
+ * the runtimes the production provenance adapter audits. Listing a release here never
+ * certifies it: the child's own stack provenance still has to verify.
+ */
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0"] as const;
 type Witness = Record<string, unknown>;
 interface CopyFixtureIdentity {
   readonly nonce: string;
@@ -253,9 +259,9 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
   if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
   const packageRoot = findInstalledAgentDirs().find((path) => {
-    try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.4.0"; } catch { return false; }
+    try { return AUDITED_PI_VERSIONS.includes(JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version); } catch { return false; }
   });
-  if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
+  if (!packageRoot) { skipOrFail(t, `installed native Pi ${AUDITED_PI_VERSIONS.join("/")} is required`); return; }
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
   const cli = realpathSync(join(packageRoot, manifest.bin.pi));
   assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -271,7 +277,7 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   }
   const tuiManifest = JSON.parse(readFileSync(join(tuiRoot, "package.json"), "utf8")) as { name: string; version: string };
   assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
-  assert.equal(tuiManifest.version, "1.4.0");
+  assert.equal(tuiManifest.version, "1.5.0");
   const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
   const root = realpathSync(mkdtempSync("/tmp/prg-copy-"));
@@ -322,7 +328,7 @@ record.dlopenHook=process.dlopen!==dlopen;publish();`, { mode: 0o600, flag: "wx"
   const decoy = Buffer.from("UNSOLICITED-466").toString("base64");
   writeFileSync(fixture, `const fs=require('node:fs');
 module.exports=pi=>{
-// In pinned Pi 1.4.0 the real submit handler is installed before the public
+// In the audited pinned Pi runtimes the real submit handler is installed before the public
 // session_start event. An editor border can be drawn earlier with startup-only
 // submission feedback. Probe only the documented LOAD-only backend accessor:
 // never getText/getImage/getFilePaths/setText or any physical clipboard action.

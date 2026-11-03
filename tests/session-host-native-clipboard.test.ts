@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { tmpdir } from "node:os";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import {
   createNativeClipboardReceiver, encodeNativeClipboardCapsule, encodeNativeClipboardOriginCapsule,
@@ -11,6 +13,8 @@ import {
   type NativeClipboardEvent, type NativeClipboardOriginEvent, type NativeClipboardRuntime,
 } from "../src/session-host/native-clipboard";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
+import { findInstalledAgentDirs } from "./menu-tui-fakes";
+import { skipOrFail } from "./bridge-fakes";
 
 const bootstrap: SessionHostBootstrap = {
   version: 1, instanceId: "11111111-1111-1111-1111-111111111111",
@@ -83,7 +87,7 @@ test("clipboard provenance resolves only the exact audited CLI and peer TUI vers
   const writePeerManifest = (version: string): void => writeFileSync(peerManifest,
     JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/tui-alt-screen.js" }));
 
-  for (const version of ["1.3.0", "1.4.0"]) {
+  for (const version of ["1.3.0", "1.4.0", "1.5.0"]) {
     writeFileSync(file, JSON.stringify({ ...manifest, version }));
     writePeerManifest(version);
     const runtime = resolveNativeClipboardRuntime(cli);
@@ -91,7 +95,7 @@ test("clipboard provenance resolves only the exact audited CLI and peer TUI vers
     assert.equal(runtime?.supported, true, `exact audited Pi ${version} is supported`);
     assert.equal(runtime?.tuiRoot, peerRoot, `exact audited pi-tui ${version} source is recognized`);
   }
-  for (const version of ["1.4.1", "1.5.0", "2.0.0"]) {
+  for (const version of ["1.4.1", "1.5.1", "1.6.0", "2.0.0"]) {
     writeFileSync(file, JSON.stringify({ ...manifest, version }));
     assert.equal(resolveNativeClipboardRuntime(cli)?.supported, false, `Pi ${version} is not silently certified`);
   }
@@ -120,7 +124,7 @@ test("native producer provenance accepts actual native selection and Main copy p
     `Error\n    at async InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true);
   assert.equal(isNativeClipboardOrigin(runtime, sites,
     `Error\n    at async _InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true,
-    "actual bundled Pi 1.3.0 and 1.4.0 Main class alias is source-verified");
+    "actual bundled Pi 1.3.0, 1.4.0, and 1.5.0 Main class alias is source-verified");
   const unbundled = selectionStack.replace(/TuiAltScreen.copyTextToClipboard \(.+?:30:10\)/,
     `TuiAltScreen.copyTextToClipboard (${pathToFileURL(join(runtime.tuiRoot!, "dist", "tui-alt-screen.js")).href}:30:10)`);
   assert.equal(isNativeClipboardOrigin(runtime, sites, unbundled), true);
@@ -409,3 +413,172 @@ test("a refusing readiness consumer still consumes the statement exactly once", 
   receive(ready);
   assert.equal(calls, 1, "readiness is consumed before its callback runs, even when it throws");
 });
+
+/**
+ * Native-process proof against the ACTUAL shipped copy producer of an installed audited
+ * runtime — not the named-frame stand-in in
+ * tests/fixtures/session-host-native-clipboard-origin-bridge.cjs.
+ *
+ * The producer that runs here is the installation's own `dist/utils/clipboard.js` (plus
+ * its two relative imports), copied byte-for-byte out of that installation into scratch;
+ * nothing inside the installation is ever written. Only the one named caller frame the
+ * provenance gate also requires (`_InteractiveMode.handleCopyCommand`) comes from this
+ * test's driver, so what is exercised is the runtime's real `emitOsc52` →
+ * `copyToClipboard` pair, with its real encoded payload, inside this package's
+ * production child bridge. The full native UI, host routing, and saved-copy lanes stay
+ * in their own native tests.
+ *
+ * Isolation, so no physical clipboard is reachable: the child's own `process.dlopen`
+ * hook refuses the runtime's OS-clipboard native module, and the child's PATH contains
+ * no clipboard command at all, so the runtime's remaining copy route is its own OSC 52
+ * write, which the bridge intercepts and replaces. `PI_CLIPBOARD_OSC52=1` is that
+ * runtime's documented "also send the copy to the terminal" switch, so the route is
+ * taken deterministically. No credential, network access, or user state is used.
+ */
+const PRODUCER_TEXT = "PRG-NATIVE-PRODUCER-466 αβ café 雪 \u{1f9ea}";
+const PRODUCER_TUPLE = { sessionId: "33333333-3333-3333-3333-333333333333", sessionEpoch: 7 };
+const PRODUCER_MODULES = ["clipboard.js", "clipboard-command.js", "wsl.js"] as const;
+
+/** Blocks the runtime's OS-clipboard native module inside the producer child. */
+const PRODUCER_PRELOAD = `"use strict";
+const dlopen = process.dlopen;
+process.dlopen = function (mod, file, ...args) {
+  if (/(?:darwin|win32|linux)-platform(?:-x11)?\\.node$/.test(String(file))) throw Error("owned fixture blocks the OS clipboard module");
+  return dlopen.call(this, mod, file, ...args);
+};
+`;
+
+/**
+ * The driver: this package's production bridge installed over the child's real stdio, the
+ * installed runtime's own copied `copyToClipboard`, and the one named frame the gate also
+ * requires. The copy runs INSIDE a real stdin `data` dispatch, which is how the bridge
+ * binds a copy to the current native conversation; the parent supplies that one input line.
+ * It reports only fixed facts plus the runtime's own failure message.
+ */
+const PRODUCER_DRIVER = `import { createRequire } from "node:module";
+import { copyToClipboard } from "./utils/clipboard.js";
+const bridge = createRequire(import.meta.url)(process.env.PRG_BRIDGE_MODULE);
+const bootstrap = JSON.parse(process.env.PRG_BOOTSTRAP);
+const report = { installed: false, errors: [], dispatched: false };
+report.installed = bridge.installNativeClipboardBridge(bootstrap);
+bridge.updateNativeClipboardSession(JSON.parse(process.env.PRG_TUPLE));
+class _InteractiveMode {
+  async handleCopyCommand() {
+    await copyToClipboard(process.env.PRG_PRODUCER_TEXT);
+  }
+}
+const dispatched = new Promise((resolve) => {
+  process.stdin.once("data", () => {
+    report.dispatched = true;
+    void new _InteractiveMode().handleCopyCommand()
+      .catch((error) => report.errors.push(String(error && error.message || error)))
+      .then(resolve);
+  });
+});
+process.stdin.resume();
+await dispatched;
+process.stdout.write("PRG_PRODUCER_REPORT " + JSON.stringify(report) + "\\n");
+`;
+
+interface ProducerRun {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly report: { installed: boolean; dispatched: boolean; errors: string[] };
+  readonly events: NativeClipboardEvent[];
+  readonly capsules: number;
+}
+
+test("the shipped audited runtime's own copy producer passes the provenance gate natively",
+  { timeout: 120_000 }, (t) => {
+    if (process.platform === "win32") { t.skip("native Windows clipboard provenance stays experimental"); return; }
+    const auditedVersions = ["1.3.0", "1.4.0", "1.5.0"];
+    const installed = findInstalledAgentDirs().find((path) => {
+      try { return auditedVersions.includes(JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version); } catch { return false; }
+    });
+    if (!installed) { skipOrFail(t, `installed native Pi ${auditedVersions.join("/")} is required`); return; }
+    const installedVersion = (JSON.parse(readFileSync(join(installed, "package.json"), "utf8")) as { version: string }).version;
+    // The runtime's own pi-tui peer, resolved from that installation and reached through a
+    // link in scratch; the installation itself is never written.
+    const tuiEntry = createRequire(join(installed, "package.json")).resolve("@earendil-works/pi-tui");
+    let tuiPackage = dirname(tuiEntry);
+    while (!existsSync(join(tuiPackage, "package.json"))) {
+      const parent = dirname(tuiPackage);
+      assert.notEqual(parent, tuiPackage, "the peer entry has its own package manifest");
+      tuiPackage = parent;
+    }
+    const roots: string[] = [];
+    t.after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+
+    const run = (manifestVersion: string): ProducerRun => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-producer-")));
+      roots.push(root);
+      mkdirSync(join(root, "dist", "utils"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(root, "node_modules", "@earendil-works"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(root, "empty-bin"), { mode: 0o700 });
+      symlinkSync(tuiPackage, join(root, "node_modules", "@earendil-works", "pi-tui"));
+      for (const file of PRODUCER_MODULES) {
+        cpSync(join(installed, "dist", "utils", file), join(root, "dist", "utils", file));
+        // The producer under test must be the shipped bytes, not a transcription.
+        assert.equal(readFileSync(join(root, "dist", "utils", file), "utf8"),
+          readFileSync(join(installed, "dist", "utils", file), "utf8"), `${file} is copied unchanged`);
+      }
+      writeFileSync(join(root, "package.json"), JSON.stringify({
+        name: "@earendil-works/pi-coding-agent", type: "module", version: manifestVersion,
+        bin: { pi: "dist/producer-driver.mjs" },
+      }), { mode: 0o600, flag: "wx" });
+      writeFileSync(join(root, "dist", "producer-driver.mjs"), PRODUCER_DRIVER, { mode: 0o600, flag: "wx" });
+      writeFileSync(join(root, "block-os-clipboard.cjs"), PRODUCER_PRELOAD, { mode: 0o600, flag: "wx" });
+      const driver = join(root, "dist", "producer-driver.mjs");
+      const identity = resolveNativeClipboardRuntime(driver);
+      assert.ok(identity, "the bridge resolves this scratch runtime by its own manifest");
+      assert.equal(identity.supported, manifestVersion === installedVersion,
+        `only the audited version is certified (manifest ${manifestVersion})`);
+      assert.ok(identity.tuiRoot !== undefined, "the runtime's own pi-tui peer source is recognized");
+      const result = spawnSync(process.execPath, ["--require", join(root, "block-os-clipboard.cjs"), driver], {
+        cwd: root, encoding: "utf8", timeout: 60_000, input: "PRG-INPUT-466\n",
+        // An explicit allowlist: the child never inherits this worker's environment.
+        env: {
+          PATH: join(root, "empty-bin"), HOME: root, TMPDIR: root, TERM: "xterm-256color",
+          PI_CLIPBOARD_OSC52: "1",
+          PRG_BRIDGE_MODULE: join(__dirname, "..", "src", "session-host", "native-clipboard.js"),
+          PRG_BOOTSTRAP: JSON.stringify(bootstrap), PRG_TUPLE: JSON.stringify(PRODUCER_TUPLE),
+          PRG_PRODUCER_TEXT: PRODUCER_TEXT,
+        },
+      });
+      const stdout = result.stdout ?? "";
+      const match = /PRG_PRODUCER_REPORT (\{[^\n]*\})/.exec(stdout);
+      assert.ok(match !== null, `the producer child reported its run (status ${result.status}): ${stdout} ${result.stderr}`);
+      const events: NativeClipboardEvent[] = [];
+      const capsules = [...stdout.matchAll(/\x1b\]777;(prg-native-copy-v[12];[^\x07]*)/g)].map((found) => found[1]!);
+      const receive = createNativeClipboardReceiver(bootstrap, (event) => events.push(event));
+      for (const capsule of capsules) receive(capsule);
+      return { status: result.status, stdout, stderr: result.stderr ?? "", report: JSON.parse(match[1]!) as ProducerRun["report"], events, capsules: capsules.length };
+    };
+
+    // The scratch identity resolves exactly as the audit sees it, and only the child's
+    // provenance decides the event.
+    const audited = run(installedVersion);
+    assert.equal(audited.status, 0, `the producer child exits cleanly: ${audited.stderr}`);
+    assert.deepEqual(audited.report.errors, [], "the runtime's own copy path completed: " + audited.report.errors.join("; "));
+    assert.equal(audited.report.installed, true, "the production bridge installed over this child's stdio");
+    assert.equal(audited.report.dispatched, true, "the copy ran inside a real input dispatch");
+    assert.equal(audited.capsules, 1, "exactly one authenticated copy request reached the host side");
+    assert.equal(audited.events.length, 1, "and it verified against this registration's key and identity");
+    assert.deepEqual(audited.events[0], { kind: "copy", encoded: Buffer.from(PRODUCER_TEXT, "utf8").toString("base64"),
+      sessionId: PRODUCER_TUPLE.sessionId, sessionEpoch: PRODUCER_TUPLE.sessionEpoch },
+      `the shipped Pi ${installedVersion} producer's own stack is proven, with its exact payload`);
+    assert.equal(audited.stdout.includes("\x1b]52;"), false, "the native OSC 52 write never reaches the terminal raw");
+
+    const unaudited = run("9.9.9");
+    assert.equal(unaudited.status, 0, `the same shipped code runs under an unlisted version: ${unaudited.stderr}`);
+    assert.deepEqual(unaudited.report.errors, [], "the runtime's copy path still completes");
+    assert.equal(unaudited.report.installed, true, "the bridge installs for a resolvable runtime of any version");
+    assert.equal(unaudited.report.dispatched, true, "the copy ran inside a real input dispatch");
+    assert.equal(unaudited.capsules, 1, "the refusal is still one authenticated request, not silence");
+    assert.equal(unaudited.events.length, 1);
+    assert.deepEqual(unaudited.events[0], { kind: "unavailable", reason: "unsupported-runtime",
+      sessionId: PRODUCER_TUPLE.sessionId, sessionEpoch: PRODUCER_TUPLE.sessionEpoch },
+      "an unlisted version of the same shipped code fails closed instead of being certified");
+    assert.equal(unaudited.stdout.includes("\x1b]52;"), false, "a refused copy still never relays raw OSC 52");
+  });

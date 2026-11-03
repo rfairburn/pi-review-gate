@@ -22,7 +22,9 @@ const PREFIX = "prg-native-copy-v1;";
 const PREFIX_V2 = "prg-native-copy-v2;";
 const DOMAIN_V1 = "pi-review-gate/native-copy/v1\0";
 const DOMAIN_V2 = "pi-review-gate/native-copy/v2\0";
-const MAX_ENCODED = 100_000; // Pi 1.3.0 and 1.4.0's native OSC 52 limit.
+// Every audited release caps its own encoded OSC 52 payload at 100,000 characters
+// (`MAX_OSC52_ENCODED_LENGTH` in the shipped `dist/utils/clipboard.js`).
+const MAX_ENCODED = 100_000;
 const MAX_CAPSULE = 140_000;
 /** Opaque viewer-token bound, identical to the accepted native-input codec's. */
 const MAX_INPUT_ORIGIN_TOKEN_CHARS = 128;
@@ -311,6 +313,19 @@ function readManifest(path: string): Record<string, unknown> | null | undefined 
   finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* Unavailable metadata is never a clipboard grant. */ } } }
 }
 
+/**
+ * The closed set of runtime releases this module audits, for both the CLI package
+ * and its `@earendil-works/pi-tui` peer (the two publish in lockstep for these
+ * releases). Listing a version is never a grant: each entry was audited against
+ * that published package's own shipped code — an identical `dist/utils/clipboard.js`
+ * and the same `emitOsc52` → `copyToClipboard` producer pair, the same
+ * `TuiAltScreen.copySelection` / `TuiAltScreen.copyTextToClipboard` selection
+ * frames, the same `_InteractiveMode.handleCopyCommand` bundle alias, and the same
+ * 100,000-character encoded OSC 52 bound. Any version outside this set stays
+ * `supported: false` and fails closed.
+ */
+const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0"]);
+
 /** Bounded inspection of the actual CLI's package, never an ambient SDK instance. */
 export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRuntime | undefined {
   try {
@@ -327,13 +342,13 @@ export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRunti
         try {
           const peerRoot = dirname(dirname(realpathSync(createRequire(entry).resolve("@earendil-works/pi-tui"))));
           const peer = readManifest(join(peerRoot, "package.json"));
-          if (peer?.name === "@earendil-works/pi-tui"
-            && (peer.version === "1.3.0" || peer.version === "1.4.0")) tuiRoot = peerRoot;
+          if (peer?.name === "@earendil-works/pi-tui" && typeof peer.version === "string"
+            && AUDITED_PI_VERSIONS.has(peer.version)) tuiRoot = peerRoot;
         } catch { /* Bundled runtime needs no separate peer. */ }
         return {
           root: dir,
           ...(tuiRoot ? { tuiRoot } : {}),
-          supported: manifest.version === "1.3.0" || manifest.version === "1.4.0",
+          supported: typeof manifest.version === "string" && AUDITED_PI_VERSIONS.has(manifest.version),
         };
       }
       const parent = dirname(dir);
@@ -379,7 +394,7 @@ export function isNativeClipboardOrigin(
       return path !== undefined && (nativeSource(runtime, frame.scriptName)
         || (runtime.tuiRoot !== undefined && path === join(runtime.tuiRoot, "dist", "tui-alt-screen.js")));
     });
-  // The shipped 1.3.0 and 1.4.0 bundles name their self-referencing class _InteractiveMode;
+  // The shipped 1.3.0, 1.4.0, and 1.5.0 bundles name their self-referencing class _InteractiveMode;
   // the unbundled public SDK uses InteractiveMode. Both were source-verified.
   const mainCopy = frames.some((frame) => (frame.functionName === "InteractiveMode.handleCopyCommand"
     || frame.functionName === "_InteractiveMode.handleCopyCommand") && nativeSource(runtime, frame.scriptName));

@@ -54,7 +54,10 @@ Attribution to Pi Coding Agent (saved-session search)
 This product includes the adapted saved-session search parser, matcher, and
 relevance ordering in src/session-host/saved-sessions.ts, based on Pi Coding
 Agent v1.1.0's packages/coding-agent/src/modes/interactive/components/
-session-selector-search.ts:
+session-selector-search.ts, and on the same file as released in Pi Coding
+Agent v1.5.0, whose per-field tiered matching (name, id, complete message
+text, working directory) the saved-catalog matcher now follows. That parser,
+matcher, and ordering now live in src/session-host/saved-search.ts:
 
 Pi Coding Agent (https://github.com/earendil-works/pi)
 Copyright 2025 Mario Zechner

@@ -104,7 +104,7 @@ const CTRL_X = "\x18";
  * local keystroke through the same framed seam as every other input here.
  */
 const F7 = "\x1b[18~";
-/** The clipboard commands Pi 1.4.0 may spawn; all must be owned recorders. */
+/** The clipboard commands the audited Pi runtimes may spawn; all must be owned recorders. */
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
 const ASSISTANT_TEXT = "SAVEDCOPY466-A αβ café 雪\nSAVEDCOPY466-B ünïcödé end";
 const ASSISTED_ID = "0672e0a1-4a1f-7c31-9b2a-1f4c9d000001";
@@ -129,15 +129,22 @@ interface CapsuleBody {
   input?: { origin: { kind: string }; dispatchId: number };
 }
 
+/**
+ * The closed set of native Pi releases this proof runs against, matching the runtimes the
+ * production provenance adapter audits. The SDK identity check below always states the
+ * discovered installation's own version, so an unlisted release is never admitted.
+ */
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0"] as const;
+
 test("resumed saved-session copy is bound to its own conversation, keystroke, and pre-copy OS-write interception",
   { timeout: 120_000 }, async (t) => {
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.4.0"; } catch { return false; }
+      try { return AUDITED_PI_VERSIONS.includes(JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version); } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
-    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
+    if (!packageRoot) { skipOrFail(t, `installed native Pi ${AUDITED_PI_VERSIONS.join("/")} is required`); return; }
+    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string }; version: string };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
     const requireHere = createRequire(join(process.cwd(), "package.json"));
@@ -501,7 +508,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
 
     try {
       leg = "owned catalog and admission";
-      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: "1.4.0" });
+      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: manifest.version });
       assert.equal(catalog.issueCount, 0, "the owned saved conversations catalog is clean");
       const admit = (file: string, id: string): SavedSessionAdmission => {
         const row = catalog.rows.find((entry) => entry.file === file);

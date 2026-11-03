@@ -15,7 +15,7 @@ import {
   NativeSessionSdkInfo,
   resolveNativeSessionSdk,
 } from "./native-session-sdk";
-import { matchSavedSearchText, parseSavedSearchQuery } from "./saved-search";
+import { matchSavedSessionFields, parseSavedSearchQuery, type SavedSessionSearchFields } from "./saved-search";
 import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
 
 /**
@@ -247,7 +247,7 @@ const admissionBrand = new WeakSet<object>();
  * branded catalog and its exact minted row. It is never copied onto a display
  * row, IPC shape, log, or persisted roster.
  */
-const catalogSearchIndexes = new WeakMap<SavedSessionCatalog, WeakMap<SavedSessionRow, string>>();
+const catalogSearchIndexes = new WeakMap<SavedSessionCatalog, WeakMap<SavedSessionRow, SavedSessionSearchFields>>();
 /**
  * Authoritative file identity observed when each row was minted (safe bigint
  * dev/ino). Kept outside the mutable row objects so a caller can never
@@ -266,15 +266,22 @@ export function isSavedSessionAdmission(value: unknown): value is SavedSessionAd
 }
 
 /**
- * Search parsing and scoring are adapted from Pi 1.1.0's native
- * `session-selector-search.ts` (MIT; attribution in NOTICE). The selector's
- * threaded/recent UI modes and controls are intentionally not part of this
- * saved-catalog data API.
+ * Search parsing and per-field scoring are adapted from Pi 1.5.0's native
+ * `session-selector-search.ts` (MIT; attribution in NOTICE). The parser and
+ * the shared module are described in src/session-host/saved-search.ts: the
+ * saved catalog matches each field separately (name, id, complete message
+ * text, cwd), so no token, phrase, or regular expression matches across a
+ * field boundary; ids and message text match only as exact substrings, while
+ * names and working directories still match fuzzily, and an exact name hit
+ * outranks any other exact hit and every fuzzy hit. The settings deny pickers
+ * deliberately keep the generic fuzzy tool-name matcher in that shared module
+ * instead of this session-field matcher. The selector's threaded/recent UI
+ * modes and controls are intentionally not part of this saved-catalog data
+ * API.
  *
- * The parser and matcher themselves live in the shared
- * src/session-host/saved-search.ts module (issue #463), which the settings
- * deny pickers reuse so both surfaces search with the same grammar. This
- * module's own filtering, ordering, and tie-breaking are unchanged.
+ * This module's own filtering, ordering, and tie-breaking are unchanged:
+ * relevance first, then the existing modification-time-descending order, with
+ * the minted row order preserved for exact ties.
  */
 
 /** Per-agent-directory query revision: a newer list supersedes older catalogs. */
@@ -666,7 +673,7 @@ function emptyCatalog(
   Object.freeze(catalog);
   rememberCatalogFreshnessScope(catalog, freshnessScope);
   catalogBrand.add(catalog);
-  catalogSearchIndexes.set(catalog, new WeakMap<SavedSessionRow, string>());
+  catalogSearchIndexes.set(catalog, new WeakMap<SavedSessionRow, SavedSessionSearchFields>());
   return catalog;
 }
 
@@ -755,7 +762,7 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
 
   const { dirs: projectDirs, identities } = discoverProjectSessionDirs(sessionsRoot, addIssue);
   const rows: SavedSessionRow[] = [];
-  const searchIndex = new WeakMap<SavedSessionRow, string>();
+  const searchIndex = new WeakMap<SavedSessionRow, SavedSessionSearchFields>();
 
   const sessionsRootReal = realpathSync(sessionsRoot);
   const perDirResults = await mapWithConcurrency(projectDirs, MAX_PROJECT_LIST_CONCURRENCY, async (projectDir) => {
@@ -848,7 +855,15 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
       // admission can detect a file replaced after cataloging (identical
       // header bytes, new inode) instead of trusting the current inode.
       rowIdentity.set(row, { dev: stats.dev, ino: stats.ino });
-      searchIndex.set(row, `${info.id} ${info.name ?? ""} ${info.allMessagesText ?? ""} ${info.cwd}`);
+      // Private per-field index (never a public row field): the native 1.5
+      // matcher needs the fields separately so nothing matches across a field
+      // boundary, and the full name and complete message text stay private.
+      searchIndex.set(row, {
+        id: info.id,
+        name: info.name ?? "",
+        messages: info.allMessagesText ?? "",
+        cwd: info.cwd,
+      });
       dirRows.push(row);
     }
     return dirRows;
@@ -894,7 +909,8 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
 /**
  * Filter a branded catalog using the native session-selector query language.
  * Empty/whitespace queries preserve the catalog's existing recent order;
- * nonempty searches sort by match score, then modification time descending.
+ * nonempty searches sort by native per-field match score (name literal, then
+ * other literal, then name/cwd fuzzy), then modification time descending.
  * Every result is the exact identity-bearing row minted into this catalog.
  */
 export function searchSavedSessions(
@@ -912,9 +928,9 @@ export function searchSavedSessions(
 
   const scored: Array<{ row: SavedSessionRow; score: number }> = [];
   for (const row of catalog.rows) {
-    const text = searchIndex.get(row);
-    if (text === undefined) continue;
-    const match = matchSavedSearchText(text, parsed);
+    const fields = searchIndex.get(row);
+    if (fields === undefined) continue;
+    const match = matchSavedSessionFields(fields, parsed);
     if (match.matches) scored.push({ row, score: match.score });
   }
   scored.sort((left, right) => {

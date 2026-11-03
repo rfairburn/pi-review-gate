@@ -118,7 +118,7 @@ after(() => {
  * exercises, unmodified: the `/app` TLS listener and its WebSocket upgrade, the
  * pairing accept and the directional grant the content endpoint consults, both
  * in-memory TLS identities, ONE `createLocalOwningHostService` and its ONE
- * `InstanceManager` over a REAL owned PTY running the installed pinned Pi 1.4.0
+ * `InstanceManager` over a REAL owned PTY running the installed pinned Pi 1.5.0
  * bundled CLI, the manager's per-viewer input scope and viewer-only copy sink,
  * and BOTH content endpoints. The conversation is a deliberately resumed saved
  * session admitted through the real public catalog, so no model, provider, API
@@ -149,7 +149,7 @@ after(() => {
  * recorder first on that child's PATH. An installed hook only attests that the
  * interception is in place, so the same child must also OBSERVE the block: its
  * own fixture `session_start` handler imports the exact resolved public pinned
- * `@earendil-works/pi-tui` 1.4.0 module and calls exactly one documented
+ * `@earendil-works/pi-tui` 1.5.0 module and calls exactly one documented
  * load-only public probe, `getNativeClipboard()`, which loads the addon but does
  * not open a display and does not touch a clipboard. The probe never calls
  * `getText`, `getImage`, `getFilePaths`, or `setText`. It writes this child's own
@@ -166,7 +166,7 @@ after(() => {
  * module identity. The native producer and helper code are not modified.
  *
  * The copy payload is deliberately the full native producer bound: 75,000 ASCII
- * assistant bytes encode to exactly 100,000 base64 characters (Pi 1.4.0's OSC 52
+ * assistant bytes encode to exactly 100,000 base64 characters (Pi 1.5.0's OSC 52
  * limit), so the copy has to cross whole instead of being trimmed to a transport
  * message. The wire pages that canonical base64 STRING as ASCII bytes: the
  * header declares 100,000 bytes and four chunks (32,768, 32,768, 32,768, 1,696).
@@ -182,9 +182,14 @@ after(() => {
  * translates exactly once and the viewer never double-wraps.
  */
 
-/** Pi 1.4.0's documented default `app.message.copy` binding (Ctrl+X). */
+/**
+ * The exact installed native Pi release both native cases in this file require:
+ * the same release the managed launcher pins.
+ */
+const PI_VERSION = "1.5.0";
+/** Pi 1.5.0's documented default `app.message.copy` binding (Ctrl+X). */
 const CTRL_X = "\x18";
-/** Legacy F7 as Pi 1.4.0's own key table spells it. */
+/** Legacy F7 as Pi 1.5.0's own key table spells it. */
 const F7 = "\x1b[18~";
 /** Read-only owned shortcut proving Pi's editor is handling input after Ctrl+G. */
 const EDITOR_READY_KEY = "\x1b[19~";
@@ -192,7 +197,7 @@ const EDITOR_READY_KEY = "\x1b[19~";
 const COPY_COMMAND = "/copy\r";
 /** The public registered command this fixture adds for an independent digest. */
 const PROOF_PREFIX = "/input-proof ";
-/** The clipboard commands Pi 1.4.0 may spawn; all must be owned recorders. */
+/** The clipboard commands Pi 1.5.0 may spawn; all must be owned recorders. */
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
 const SAVED_SESSION_ID = "0672e0a1-4a1f-7c31-9b2a-1f4c9d0000c1";
 
@@ -540,9 +545,9 @@ test("network viewer native input and copy stay bound to the pinned native child
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.4.0"; } catch { return false; }
+      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === PI_VERSION; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
+    if (!packageRoot) { skipOrFail(t, `installed native Pi ${PI_VERSION} is required`); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -551,7 +556,7 @@ test("network viewer native input and copy stay bound to the pinned native child
 
     // The pre-copy backend probe imports the EXACT public TUI alias this package
     // declares, resolved here before any owned child starts: the alias entry resolves
-    // to its real package root, that package's name and pinned 1.4.0 version are
+    // to its real package root, that package's name and pinned 1.5.0 version are
     // asserted positively, and the probe imports that same package's resolved public
     // entry, which exports the load-only `getNativeClipboard()`. No private subpath
     // is substituted. A resolution or version mismatch fails this case closed
@@ -578,8 +583,8 @@ test("network viewer native input and copy stay bound to the pinned native child
       name: string; version: string;
     };
     assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
-    assert.equal(tuiManifest.version, "1.4.0",
-      "the public backend probe is pinned to the exact @earendil-works/pi-tui 1.4.0 this case exercises");
+    assert.equal(tuiManifest.version, "1.5.0",
+      "the public backend probe is pinned to the exact @earendil-works/pi-tui 1.5.0 this case exercises");
     const nativeTuiUrl = pathToFileURL(realpathSync(tuiEntry)).href;
 
     // The unchanged content/producer budgets this case must preserve. These are three
@@ -672,7 +677,7 @@ test("network viewer native input and copy stay bound to the pinned native child
     // fence can require that THIS child observed the absence of a native backend
     // before any copy gesture exists. The stem carries this launch's nonce.
     const backendProofStem = join(root, `${nonce}.native-backend-probe`);
-    // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.4.0 calls a
+    // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.5.0 calls a
     // registered shortcut handler synchronously from the editor's input handling, so
     // the raw OSC 52 write is issued inside the framed dispatch for this exact viewer
     // keystroke. The public `/input-proof` command digests the text the real child
@@ -741,7 +746,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       { type: "session_info", id: `${SAVED_SESSION_ID}-name`, parentId: null, name: "Owned network native proof", timestamp: stamp },
       { type: "message", id: `${SAVED_SESSION_ID}-user`, parentId: `${SAVED_SESSION_ID}-name`, timestamp: stamp,
         message: { role: "user", content: [{ type: "text", text: "synthetic saved prompt" }], timestamp: Date.parse(stamp) } },
-      // A well-formed Pi 1.4.0 assistant message: the native copy path reads its last
+      // A well-formed Pi 1.5.0 assistant message: the native copy path reads its last
       // text block and nothing here contacts a model, provider, or network.
       { type: "message", id: `${SAVED_SESSION_ID}-assistant`, parentId: `${SAVED_SESSION_ID}-user`, timestamp: stamp,
         message: {
@@ -936,7 +941,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       });
 
       leg = "public saved-session catalog and admission";
-      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: "1.4.0" });
+      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: PI_VERSION });
       assert.equal(catalog.issueCount, 0, "the owned saved conversation catalog is clean");
       const catalogRow = catalog.rows.find((entry) => entry.file === sessionFile);
       assert.ok(catalogRow, "the owned saved conversation is listed through the public SDK");
@@ -1135,7 +1140,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(backendProof.pid, child.item.pid, "the backend proof belongs to this exact child pid");
       assert.equal(backendProof.nonce, nonce, "the backend proof belongs to this launch");
       assert.equal(backendProof.moduleUrl, nativeTuiUrl,
-        "the proof imported the exact resolved public 1.4.0 TUI module this case pinned before startup");
+        "the proof imported the exact resolved public 1.5.0 TUI module this case pinned before startup");
       assert.equal(backendProof.probe, "getNativeClipboard", "the proof called only the documented load-only probe");
       assert.equal(backendProof.exportType, "function", "the pinned public module exported the load-only probe");
       assert.equal(backendProof.backendUnavailable, true,
@@ -1823,7 +1828,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
  * Startup input: the real native project-trust selector, before any tuple.
  * ========================================================================== */
 
-/** The exact native Pi 1.4.0 startup project-trust question. */
+/** The exact native Pi 1.5.0 startup project-trust question. */
 const TRUST_TITLE = "Trust project folder?";
 /**
  * The optional capability naming startup-phase native input, as the protocol
@@ -1871,7 +1876,7 @@ const inputFrameCount = (wire: RecordingChannel): number =>
  * Startup input acceptance over the same real TLS content lane.
  *
  * Proof level is identical to the copy case above: SAME-HOST POSIX only, one real
- * owned PTY running the installed pinned Pi 1.4.0 bundled CLI, one owning-host
+ * owned PTY running the installed pinned Pi 1.5.0 bundled CLI, one owning-host
  * service and manager, both real content endpoints, and the same owned clipboard
  * interception. The contract under test: the reporter arms the child's explicit
  * startup phase after registering its hooks; before the first accepted status the
@@ -1893,7 +1898,7 @@ const inputFrameCount = (wire: RecordingChannel): number =>
  *
  * Action: the selected owner row's viewer observes the native trust frame, a null
  * `nativeSession`, and an explicit startup source, then sends one authorized
- * keyboard Escape under that startup source. Pi 1.4.0's startup selector maps a
+ * keyboard Escape under that startup source. Pi 1.5.0's startup selector maps a
  * cancelled `ui.select` (undefined) to "not trusted" without saving any trust
  * result, so Escape is a NON-PERSISTING decline that lets native startup continue.
  * Escape is the one viewer dispatch before the tuple, and no owner-local user
@@ -1926,9 +1931,9 @@ test("network viewer input answers the real native startup project-trust selecto
     }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === "1.4.0"; } catch { return false; }
+      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === PI_VERSION; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, "installed native Pi 1.4.0 is required"); return; }
+    if (!packageRoot) { skipOrFail(t, `installed native Pi ${PI_VERSION} is required`); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -1994,7 +1999,7 @@ module.exports=()=>{};
     // No project-trust default. Mark this pinned version's changelog already seen
     // so fresh-install bookkeeping cannot contaminate the trust-persistence check.
     const settingsFile = join(agentDir, "settings.json");
-    const settingsText = JSON.stringify({ fullscreenCopyOnSelect: false, lastChangelogVersion: "1.4.0" }, null, 2);
+    const settingsText = JSON.stringify({ fullscreenCopyOnSelect: false, lastChangelogVersion: PI_VERSION }, null, 2);
     writeFileSync(settingsFile, settingsText, { mode: 0o600, flag: "wx" });
     assert.equal(settingsText.includes("defaultProjectTrust"), false,
       "the task-owned synthetic agent settings state no project-trust default in this case");

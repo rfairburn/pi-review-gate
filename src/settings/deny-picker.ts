@@ -33,11 +33,14 @@
  * - A held key's repeat/release never repeats a host action (toggle, save,
  *   back); navigation and ordinary query-editing repeats are preserved.
  *
- * The matching itself is the project's existing saved-conversation search
- * grammar (src/session-host/saved-search.ts): `re:` patterns, quoted
- * phrases, and whitespace-separated fuzzy tokens, all of which must match.
- * Only the tool NAME is searched — never a tool's description or purpose —
- * so a query can never match text that is not a tool name.
+ * The matching itself uses the project's shared saved-conversation search
+ * grammar (src/session-host/saved-search.ts): `re:` patterns, quoted phrases,
+ * and whitespace-separated fuzzy tokens, all of which must match. The picker
+ * matches with that module's generic single-text matcher, and only the tool
+ * NAME is searched — never a tool's description or purpose — so a query can
+ * never match text that is not a tool name. The saved-conversation catalog's
+ * Pi 1.5 per-field session matcher is deliberately NOT used here: deny
+ * candidates are one name, and fuzzy tool-name matching is the contract.
  *
  * Non-TUI hosts (RPC, print, test mocks) and any host without a resolvable
  * pi-tui Input keep the existing retained full-list selector: the same
@@ -116,11 +119,11 @@ export interface DenyPickerFilter {
  * The rows a query keeps.
  *
  * The empty query keeps every row in its original order. A nonempty query
- * keeps the rows whose tool name matches, ordered by the shared
- * saved-conversation score (lower is better) with the incoming order
- * preserved for equal scores — so an empty query shows the inventory in its
- * original order and a narrowed query keeps the inventory order among equal
- * matches. An unparsable `re:` query matches nothing.
+ * keeps the rows whose tool name matches, ordered by the shared generic
+ * single-text score (lower is better) with the incoming order preserved for
+ * equal scores — so an empty query shows the inventory in its original order
+ * and a narrowed query keeps the inventory order among equal matches. An
+ * unparsable `re:` query matches nothing.
  *
  * The always-visible rows (the Back row) are kept in their inventory order
  * behind the matches, so the navigation out of the picker is never lost.

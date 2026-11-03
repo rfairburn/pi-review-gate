@@ -3,12 +3,14 @@
  *
  * Production coverage for the search-capable deny picker
  * (src/settings/deny-picker.ts) and the shared saved-conversation search
- * grammar it reuses (src/session-host/saved-search.ts):
+ * grammar plus the generic single-text matcher it reuses
+ * (src/session-host/saved-search.ts):
  *
  * - The pure filter narrows a large synthetic inventory of MCP-style tool
- *   names by NAME only, keeps the Back row reachable under any query, and
- *   matches exactly like the saved-conversation search and Pi's own /resume
- *   reference.
+ *   names by NAME only, keeps the Back row reachable under any query, parses
+ *   exactly like Pi's own /resume grammar, and keeps the project's fuzzy
+ *   tool-NAME matcher (the saved catalog's Pi 1.5 per-field matcher is
+ *   deliberately not used here).
  * - The picker is driven through the host's real custom-component contract
  *   (`done()` settles it, the host focuses it) with the native pi-tui Input
  *   and SelectList: live filtering, navigation, identity retention, scroll,
@@ -59,6 +61,7 @@ import {
 import {
   filterBySavedSearch,
   matchSavedSearchText,
+  matchSavedSessionFields,
   parseSavedSearchQuery,
 } from "../src/session-host/saved-search";
 import { skipOrFail } from "./bridge-fakes";
@@ -430,42 +433,79 @@ test("the deny picker matches exactly like the shared saved-conversation search 
   assert.deepEqual(unbalanced.tokens, [{ kind: "fuzzy", value: "mcp__beta__" }, { kind: "fuzzy", value: '"read' }]);
 });
 
-test("the deny picker's tool-name search matches Pi's native /resume search reference", (t) => {
+/**
+ * The deny pickers keep fuzzy tool-NAME matching (the authorized exception to
+ * the saved catalog's Pi 1.5 per-field matcher) while sharing the native
+ * query grammar. The two matchers are deliberately NOT conflated: the picker
+ * scores every token as a scattered subsequence of the tool name, so letters
+ * like `b3` still find `mcp__beta__read_3`, `read_13`, and `read_23, and a
+ * multi-word query like `gam rd 2` stays fuzzy name-only.
+ */
+test("the deny picker keeps fuzzy tool-name search on the native grammar", (t) => {
   const agentPackage = findInstalledAgentDirs().find((path) => {
     try {
       const manifest = JSON.parse(readFileSync(join(path, "package.json"), "utf8"));
-      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.4.0";
+      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.5.0";
     } catch { return false; }
   });
   if (!agentPackage) {
-    skipOrFail(t, "no installed Pi 1.4.0 for native search parity");
+    skipOrFail(t, "no installed Pi 1.5.0 for native search grammar parity");
     return;
   }
-  // Reference-only import of the native selector search (the same reference
-  // the saved-conversation parity test uses); production never loads it.
+  // Reference-only import of the native selector search; production never
+  // loads it, and only its shared grammar is compared here.
   const native = createRequire(join(agentPackage, "package.json"))(
     join(agentPackage, "dist", "modes", "interactive", "components", "session-selector-search.js"),
   ) as {
     parseSearchQuery(query: string): { mode: string; tokens: unknown[]; error?: string };
-    filterAndSortSessions(sessions: unknown[], query: string, sortMode: "relevance"): Array<{ id: string }>;
   };
-  // Synthetic "sessions" whose searched text is the tool name alone. A shared
-  // modification time leaves score ties in inventory order, as in the picker.
-  const modified = new Date(Date.UTC(2025, 0, 1));
-  const sessions = INVENTORY_NAMES.map((name) => ({ id: name, name: undefined, allMessagesText: "", cwd: "", modified }));
+  // The grammar is the native one, for every query shape.
   for (const query of GRAMMAR_QUERIES) {
     const ours = parseSavedSearchQuery(query);
     const theirs = native.parseSearchQuery(query);
     assert.equal(ours.mode, theirs.mode, `mode for ${JSON.stringify(query)}`);
     assert.deepEqual(ours.tokens, theirs.tokens, `tokens for ${JSON.stringify(query)}`);
     assert.equal(ours.error !== undefined, theirs.error !== undefined, `error for ${JSON.stringify(query)}`);
-    // The native text appends empty fields, so an end-anchored regex is not
-    // comparable; every other query must rank identically.
-    if (/\$/.test(query)) continue;
-    const expected = native.filterAndSortSessions(sessions, query, "relevance").map((session) => session.id);
-    const actual = filterDenyPickerRows(PICKER_ROWS, query).matches.map((row) => row.searchText);
-    assert.deepEqual(actual, expected, `ranking for ${JSON.stringify(query)}`);
   }
+
+  const namesFor = (query: string): string[] =>
+    filterDenyPickerRows(PICKER_ROWS, query).matches.map((row) => row.searchText);
+
+  // Fuzzy name matching: scattered letters find the near-match names, best
+  // alignment first, with equal scores keeping the inventory order.
+  assert.deepEqual(namesFor("b3"), ["mcp__beta__read_3", "mcp__beta__read_13", "mcp__beta__read_23"],
+    "b3 finds beta read_3 and its _13/_23 neighbours");
+  assert.deepEqual(namesFor("gam rd 2"), [
+    "mcp__gamma__read_2",
+    ...Array.from({ length: 10 }, (_, index) => `mcp__gamma__read_2${index}`),
+    "mcp__gamma__read_12",
+  ], "gam rd 2 stays a fuzzy name-only AND of three scattered tokens");
+  assert.deepEqual(namesFor("beta \"read_2\""), [
+    "mcp__beta__read_2",
+    ...Array.from({ length: 10 }, (_, index) => `mcp__beta__read_2${index}`),
+  ], "a quoted phrase and a fuzzy token both match inside the same name");
+
+  // Grammar behavior on the single searched name.
+  assert.deepEqual(namesFor("mcp__alpha__ mcp__beta__"), [], "every token must match (AND)");
+  assert.deepEqual(namesFor('"mcp__alpha__read_3"'), ["mcp__alpha__read_3"], "a quoted phrase is exact");
+  assert.deepEqual(namesFor("re:^mcp__gamma__read_1"), [
+    "mcp__gamma__read_1",
+    ...Array.from({ length: 10 }, (_, index) => `mcp__gamma__read_1${index}`),
+  ], "a regex anchors to the searched name itself");
+  assert.deepEqual(namesFor("mcp__beta__"), INVENTORY_NAMES.filter((name) => name.startsWith("mcp__beta__")),
+    "equal scores keep the stable inventory order");
+
+  // The two matchers are not conflated. The saved-catalog field matcher treats
+  // an id-like field as exact-only, so the same scattered query finds nothing
+  // there, while the deny picker still finds the near-match names.
+  const scattered = parseSavedSearchQuery("b3");
+  const fieldMatcherMatches = INVENTORY_NAMES
+    .map((name) => ({ id: name, name: "", messages: "", cwd: "" }))
+    .filter((fields) => matchSavedSessionFields(fields, scattered).matches);
+  assert.deepEqual(fieldMatcherMatches, [],
+    "the saved-catalog matcher would refuse scattered letters in an exact-only field");
+  assert.equal(namesFor("b3").length, 3,
+    "the deny pickers keep fuzzy tool-name matching instead of that field matcher");
 });
 
 // ---------------------------------------------------------------------------

@@ -352,10 +352,13 @@ means **denied**, the opposite of the reviewer picker's allowed marker.
 - **Both deny pickers have a live search field.** In the TUI, a query line sits above
 the rows: type part of a tool name to narrow the list as you type, move through the
 matches with the arrow keys, and press Enter to toggle the highlighted row. Navigation,
-confirm, and cancel follow your `tui.select.*` keybindings. The query uses the
-saved-conversation picker's grammar: whitespace-separated fuzzy tokens,
+confirm, and cancel follow your `tui.select.*` keybindings. The query uses the same
+grammar as the sidebar's saved-conversation picker: whitespace-separated fuzzy tokens,
 `"quoted phrases"`, and `re:<pattern>`; every term must match. Only tool names are searched,
-never descriptions. A query that matches nothing shows **No matching tools** and the
+never descriptions, and matching stays single-text: a term may match as a scattered
+subsequence of the tool name, and matches are ordered by that one-text score. The
+saved-conversation picker's per-field matching and its name / ID / message / workspace
+tier ordering do not apply here. A query that matches nothing shows **No matching tools** and the
 picker stays open and editable, with **Back** and Escape still available. The query is
 view state only: it never changes what is denied, a denial hidden by the query stays
 denied and is applied or saved with the whole draft, and the query is never stored.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
@@ -2224,3 +2225,301 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
   assert.fail("timed out waiting for condition");
 }
+
+// issue #604 — installed Codex app servers (0.164.0 and 0.166.0 on Darwin arm64)
+// reject the read-only research config the adapter sends for `thread/start` and
+// `thread/resume`: `apps._default.approvals_reviewer: null` fails with
+// "unknown variant `''`", and omitting only that key then fails on
+// `default_tools_approval_mode: null`. The settings are nullable enums, so an
+// explicit null is not an accepted "no override". These fixtures stand in for
+// that protocol boundary and refuse any payload that carries a nullable enum
+// override, so the production adapter must omit the keys outright while keeping
+// every read-only restriction.
+
+/** Nullable enum settings installed Codex servers reject when sent as null. */
+const CODEX_NULL_ENUM_KEYS = ["approvals_reviewer", "default_tools_approval_mode"];
+/**
+ * Verbatim `thread/start` failures recorded from the installed codex-cli 0.166.0
+ * app server on Darwin arm64. The server reports the first bad key only, so the
+ * pre-#604 payload that carries both always fails on `approvals_reviewer`.
+ */
+const CODEX_NULL_ENUM_REJECTIONS: Record<string, string> = {
+  approvals_reviewer:
+    "failed to load configuration: unknown variant ``, expected one of `user`, `auto_review`, `guardian_subagent`\nin `apps._default.approvals_reviewer`",
+  default_tools_approval_mode:
+    "failed to load configuration: unknown variant ``, expected one of `auto`, `prompt`, `writes`, `approve`\nin `apps._default.default_tools_approval_mode`",
+};
+/** Explicit boolean safety fields the read-only profile must keep sending. */
+const CODEX_APPS_SAFETY_FIELDS = {
+  enabled: false,
+  destructive_enabled: false,
+  open_world_enabled: false,
+  default_tools_enabled: false,
+};
+
+type StrictCodexFixture = {
+  /** `execute` models a non-research launch, where no research config may appear. */
+  mode?: "research" | "execute";
+  /** Thread id the fixture accepts for `thread/resume`. */
+  resumeThreadId?: string;
+  /** Refuse every `thread/start`/`thread/resume` with the #604 rejection. */
+  rejectThreadStart?: boolean;
+};
+
+type CapturedRpcCall = { id?: string; method?: string; params?: Record<string, any>; result?: unknown; error?: { code: number; message: string } };
+
+function strictCodexAppServerSource(capture: string, fixture: StrictCodexFixture): string {
+  return [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');",
+    `const CAPTURE=${JSON.stringify(capture)};`,
+    `const FIXTURE=${JSON.stringify({ mode: fixture.mode ?? "research", resumeThreadId: fixture.resumeThreadId, rejectThreadStart: fixture.rejectThreadStart === true })};`,
+    "const NULL_ENUM_KEYS=['approvals_reviewer','default_tools_approval_mode'];",
+    "const SAFETY_FIELDS=['enabled','destructive_enabled','open_world_enabled','default_tools_enabled'];",
+    `const NULL_ENUM_REJECTIONS=${JSON.stringify(CODEX_NULL_ENUM_REJECTIONS)};`,
+    "let input='';process.stdin.setEncoding('utf8');",
+    "const send=(m)=>process.stdout.write(JSON.stringify(m)+'\\n');",
+    "const reply=(id,result)=>send({jsonrpc:'2.0',id,result});",
+    "const reject=(id,message)=>send({jsonrpc:'2.0',id,error:{code:-32602,message}});",
+    // One validator for both startup methods: the read-only contract must stay
+    // pinned, and a nullable enum override is refused with the rejection real
+    // Codex servers return.
+    "function startupIssue(params){",
+    "  const sandbox=FIXTURE.mode==='execute'?'workspace-write':'read-only';",
+    "  if(params.sandbox!==sandbox)return 'sandbox must stay '+sandbox;",
+    "  if(params.approvalPolicy!=='never')return 'approvalPolicy must stay never';",
+    "  if(FIXTURE.mode==='execute')return params.config===undefined?undefined:'a non-research launch must not carry the research config';",
+    "  const config=params.config;",
+    "  if(!config)return 'research startup must carry the read-only config';",
+    "  if(config.web_search!=='live'&&config.web_search!=='disabled')return 'web_search must follow the parent tool allowlist';",
+    "  if(JSON.stringify(config.mcp_servers??null)!=='{}')return 'mcp_servers must stay empty';",
+    "  const apps=config.apps&&config.apps._default;",
+    "  if(!apps)return 'apps._default must stay present';",
+    "  for(const key of NULL_ENUM_KEYS){if(Object.hasOwn(apps,key))return NULL_ENUM_REJECTIONS[key];}",
+    "  for(const key of SAFETY_FIELDS){if(apps[key]!==false)return 'apps._default.'+key+' must stay false';}",
+    "  return undefined;",
+    "}",
+    "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);fs.appendFileSync(CAPTURE,JSON.stringify(c)+'\\n');if(!c.id)continue;",
+    "if(c.method==='initialize'){reply(c.id,{userAgent:'codex-cli 0.166.0 (strict fixture)'});continue;}",
+    "if(c.method==='thread/start'||c.method==='thread/resume'){",
+    "  if(FIXTURE.rejectThreadStart){reject(c.id,NULL_ENUM_REJECTIONS.approvals_reviewer);continue;}",
+    "  const issue=startupIssue(c.params);if(issue){reject(c.id,issue);continue;}",
+    "  if(c.method==='thread/resume'&&c.params.threadId!==FIXTURE.resumeThreadId){reject(c.id,'unexpected resume thread '+c.params.threadId);continue;}",
+    "  reply(c.id,{thread:{id:'thread-strict-1'}});continue;}",
+    "if(c.method==='turn/start'){reply(c.id,{turn:{id:'turn-strict-1'}});send({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'strict fixture complete'}}});send({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-strict-1',turn:{id:'turn-strict-1',status:'completed'}}});continue;}",
+    "if(c.method==='turn/interrupt'){reply(c.id,{});continue;}",
+    "}});",
+  ].join("\n");
+}
+
+async function startStrictCodexFixture(root: string, fixture: StrictCodexFixture): Promise<{ command: string; capture: string }> {
+  const capture = join(root, "capture.jsonl");
+  const command = join(root, "codex-strict-app-server.cjs");
+  await writeFile(command, strictCodexAppServerSource(capture, fixture), "utf8");
+  await chmod(command, 0o755);
+  return { command, capture };
+}
+
+/** Drive one real adapter startup against the strict app-server fixture. */
+async function runStrictCodexStartup(options: {
+  fixture?: StrictCodexFixture;
+  workspaceAccess?: "read-only" | "workspace-write";
+  allowedTools?: readonly string[];
+  session?: { adapter: string; id: string };
+}): Promise<{ calls: CapturedRpcCall[]; turn?: Awaited<ReturnType<CodexExecutorAdapter["run"]>>; error?: unknown }> {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-strict-"));
+  try {
+    const { command, capture } = await startStrictCodexFixture(root, options.fixture ?? {});
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    const allowedTools = options.allowedTools;
+    const run = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" }).run({
+      cwd: root,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      workspaceAccess: options.workspaceAccess ?? "read-only",
+      ...(options.session ? { session: options.session } : {}),
+      ...(allowedTools
+        ? { executorToolCatalog: { allowedToolCatalog: [...allowedTools], initialActiveTools: [...allowedTools] } }
+        : {}),
+    });
+    let turn: Awaited<ReturnType<CodexExecutorAdapter["run"]>> | undefined;
+    let error: unknown;
+    try {
+      turn = await run;
+    } catch (cause) {
+      error = cause;
+    }
+    const calls = existsSync(capture)
+      ? (await readFile(capture, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as CapturedRpcCall)
+      : [];
+    return { calls, turn, error };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function threadStartupCall(calls: CapturedRpcCall[], method: "thread/start" | "thread/resume"): CapturedRpcCall {
+  const call = calls.find((entry) => entry.method === method);
+  assert.ok(call, `the strict fixture must observe ${method}`);
+  return call!;
+}
+
+function assertResearchApps(payload: unknown): void {
+  const apps = (payload ?? {}) as Record<string, unknown>;
+  for (const key of CODEX_NULL_ENUM_KEYS) {
+    assert.equal(key in apps, false, `apps._default.${key} must be omitted, never sent as null (#604)`);
+  }
+  // The read-only restrictions the payload must keep: apps stay disabled and no
+  // inherited or default config can re-enable tool approvals, destructive or
+  // open-world app capabilities.
+  assert.deepEqual(apps, CODEX_APPS_SAFETY_FIELDS);
+}
+
+// These owned executable-script fixtures require POSIX shebang execution. Do not
+// weaken the production research-argument guard to launch them on Windows.
+test("Codex research thread/start omits the nullable enum overrides installed Codex rejects (#604)", { skip: process.platform === "win32" }, async () => {
+  const { calls, turn, error } = await runStrictCodexStartup({ allowedTools: ["read", "WebFetch", "WebSearch"] });
+  assert.equal(error, undefined);
+  assert.equal(turn?.failure, undefined, JSON.stringify(turn?.failure));
+  assert.equal(turn?.text, "strict fixture complete");
+  const threadStart = threadStartupCall(calls, "thread/start");
+  assertResearchApps(threadStart.params?.config?.apps?._default);
+  // Everything else in the read-only startup contract stays exactly where it was.
+  assert.equal(threadStart.params?.sandbox, "read-only");
+  assert.equal(threadStart.params?.approvalPolicy, "never");
+  assert.equal(threadStart.params?.ephemeral, false);
+  assert.equal(threadStart.params?.config?.web_search, "live");
+  assert.deepEqual(threadStart.params?.config?.mcp_servers, {});
+  assert.deepEqual(threadStart.params?.environments, []);
+  assert.deepEqual(threadStart.params?.dynamicTools, []);
+  assert.deepEqual(threadStart.params?.selectedCapabilityRoots, []);
+  assert.ok(calls.some((call) => call.method === "initialize"));
+  assert.ok(calls.some((call) => call.method === "initialized"));
+  assert.equal(calls.filter((call) => call.method === "turn/start").length, 1);
+});
+
+test("Codex research thread/resume carries the same #604-safe startup config", { skip: process.platform === "win32" }, async () => {
+  const { calls, turn, error } = await runStrictCodexStartup({
+    allowedTools: ["read"],
+    session: { adapter: "codex-cli", id: "thread-existing" },
+    fixture: { resumeThreadId: "thread-existing" },
+  });
+  assert.equal(error, undefined);
+  assert.equal(turn?.failure, undefined, JSON.stringify(turn?.failure));
+  const resume = threadStartupCall(calls, "thread/resume");
+  assert.equal(resume.params?.threadId, "thread-existing");
+  assert.equal(resume.params?.sandbox, "read-only");
+  assert.equal(resume.params?.approvalPolicy, "never");
+  assert.equal(resume.params?.config?.web_search, "disabled");
+  assert.deepEqual(resume.params?.config?.mcp_servers, {});
+  assertResearchApps(resume.params?.config?.apps?._default);
+});
+
+test("the strict app-server fixture rejects the pre-#604 payload with the installed Codex error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-strict-reject-"));
+  try {
+    const { command } = await startStrictCodexFixture(root, {});
+    // The payload the adapter sent before #604, replayed verbatim against the
+    // same fixture the startup tests use. Without this, the guard above could
+    // pass against a fixture that never enforced the real protocol boundary.
+    const preFixApps = {
+      enabled: false,
+      approvals_reviewer: null,
+      destructive_enabled: false,
+      open_world_enabled: false,
+      default_tools_approval_mode: null,
+      default_tools_enabled: false,
+    };
+    const child = spawn(process.execPath, [command], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+    const responses: CapturedRpcCall[] = [];
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line) responses.push(JSON.parse(line) as CapturedRpcCall);
+      }
+    });
+    const closed = new Promise<number | null>((resolvePromise) => child.once("close", (code) => resolvePromise(code)));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: "1", method: "initialize", params: { clientInfo: { name: "replay", version: "0" }, capabilities: { experimentalApi: true } } })}\n`);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: "2", method: "thread/start", params: { cwd: root, model: "gpt-test", sandbox: "read-only", approvalPolicy: "never", ephemeral: false, config: { web_search: "live", mcp_servers: {}, apps: { _default: preFixApps } }, environments: [], dynamicTools: [], selectedCapabilityRoots: [] } })}\n`);
+    // Removing only the first nullable enum key is not enough: the installed server
+    // then fails on the second one, which is why the fix omits both.
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: "3", method: "thread/start", params: { cwd: root, model: "gpt-test", sandbox: "read-only", approvalPolicy: "never", ephemeral: false, config: { web_search: "live", mcp_servers: {}, apps: { _default: { ...preFixApps, approvals_reviewer: undefined } } }, environments: [], dynamicTools: [], selectedCapabilityRoots: [] } })}\n`);
+    child.stdin.end();
+    await closed;
+    assert.equal(responses.length, 3);
+    assert.notEqual(responses[0].result, undefined, "initialize must still succeed");
+    assert.equal(responses[1].result, undefined, "a rejected thread/start must not return a thread id");
+    assert.equal(responses[1].error?.message, CODEX_NULL_ENUM_REJECTIONS.approvals_reviewer);
+    assert.equal(responses[2].error?.message, CODEX_NULL_ENUM_REJECTIONS.default_tools_approval_mode);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex research startup fails closed when the app-server rejects the startup config", { skip: process.platform === "win32" }, async () => {
+  const { calls, turn, error } = await runStrictCodexStartup({
+    allowedTools: ["read"],
+    fixture: { rejectThreadStart: true },
+  });
+  const message = error ? String(error) : turn?.failure?.message ?? "";
+  assert.ok(message.includes(CODEX_NULL_ENUM_REJECTIONS.approvals_reviewer), message);
+  assert.equal(turn?.failure?.category, "protocol");
+  assert.equal(calls.some((call) => call.method === "turn/start"), false, "a rejected startup must never send the prompt");
+});
+
+test("Codex research launch sends no startup request without the authoritative tool allowlist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-no-allowlist-"));
+  try {
+    const { command, capture } = await startStrictCodexFixture(root, {});
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    await assert.rejects(
+      () => new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" }).run({
+        cwd: root,
+        prompt: "work",
+        artifactDir,
+        turn: 1,
+        workspaceAccess: "read-only",
+      }),
+      /authoritative parent tool allowlist/,
+    );
+    assert.equal(existsSync(capture), false, "no app-server request may be sent without the allowlist");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex research web_search follows the parent allowlist while app capabilities stay disabled", { skip: process.platform === "win32" }, async () => {
+  const withoutSearch = await runStrictCodexStartup({ allowedTools: ["read", "WebFetch"] });
+  assert.equal(withoutSearch.error, undefined);
+  assert.equal(withoutSearch.turn?.failure, undefined, JSON.stringify(withoutSearch.turn?.failure));
+  assert.equal(threadStartupCall(withoutSearch.calls, "thread/start").params?.config?.web_search, "disabled");
+  assertResearchApps(threadStartupCall(withoutSearch.calls, "thread/start").params?.config?.apps?._default);
+
+  const withSearch = await runStrictCodexStartup({ allowedTools: ["read", "WebSearch"] });
+  assert.equal(withSearch.error, undefined);
+  assert.equal(withSearch.turn?.failure, undefined, JSON.stringify(withSearch.turn?.failure));
+  assert.equal(threadStartupCall(withSearch.calls, "thread/start").params?.config?.web_search, "live");
+  assertResearchApps(threadStartupCall(withSearch.calls, "thread/start").params?.config?.apps?._default);
+});
+
+test("Codex workspace-write startup carries no research config while research stays read-only", { skip: process.platform === "win32" }, async () => {
+  const { calls, turn, error } = await runStrictCodexStartup({
+    workspaceAccess: "workspace-write",
+    fixture: { mode: "execute" },
+  });
+  assert.equal(error, undefined);
+  assert.equal(turn?.failure, undefined, JSON.stringify(turn?.failure));
+  const threadStart = threadStartupCall(calls, "thread/start");
+  assert.equal(threadStart.params?.sandbox, "workspace-write");
+  assert.equal(threadStart.params?.approvalPolicy, "never");
+  assert.equal("config" in (threadStart.params ?? {}), false, "the read-only research config is research-only");
+});

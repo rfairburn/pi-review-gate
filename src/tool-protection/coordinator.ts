@@ -394,27 +394,27 @@ export function configuredToolProtectionLoadError(): string | undefined {
   return activeLoadError;
 }
 
-/** Why a delegated acting executor cannot be admitted under a non-Off level. */
+/** Why a delegated Pi executor launch cannot be admitted under the protection state. */
 export interface ExecutorProtectionRefusal {
   blocked: true;
   reason: string;
 }
 
 /**
- * Decide whether one executor launch is admissible under the live (or pinned)
- * protection state. Pi executors receive the pinned pin; external acting
- * executors have no proven pre-effect tool seam, so a non-Off level refuses the
- * launch before that executor starts rather than pretending to cover it.
+ * Admit a delegated Pi executor and pin the parent's protection snapshot.
+ * The factory calls this only for Pi selections; non-Pi acting workers are
+ * outside this gate, without changing protection settings or issuing a pin.
  */
 export function executorProtectionAdmission(
   config: ReviewGateConfig,
-  selection: { source: "pi" | "external"; id?: string } | undefined,
 ): { pin: ToolProtectionLaunchPin } | ExecutorProtectionRefusal {
   const loadError = configuredToolProtectionLoadError();
   if (loadError) {
+    // Fail closed on the protected path: an unvalidated stored block cannot
+    // silently admit a Pi executor at an unknown level.
     return {
       blocked: true,
-      reason: `Tool protection is unavailable (${loadError}); no executor was started. Save a valid toolProtection configuration before delegating work.`,
+      reason: `Tool protection is unavailable (${loadError}); no Pi executor was started. Save a valid toolProtection configuration before delegating work to a Pi executor.`,
     };
   }
   const settings = effectiveToolProtectionSettings(config);
@@ -422,13 +422,6 @@ export function executorProtectionAdmission(
     // Off is pinned explicitly, so an ambient child configuration file cannot
     // silently turn the added gate on or off inside a delegated worker.
     return { pin: { settings } };
-  }
-  if (selection?.source !== "pi") {
-    const target = selection?.source === "external" ? `external executor "${selection.id ?? "unknown"}"` : "this executor";
-    return {
-      blocked: true,
-      reason: `Tool protection (level "${settings.level}") cannot audit tool calls inside ${target}: this project has no proven pre-effect seam for a non-Pi acting executor. The execution was refused before it started, not silently left unprotected. Use a Pi executor/resource or explicitly set toolProtection.level to "off".`,
-    };
   }
   return { pin: { settings, ...pinnedAuditorDefinition(settings, config) } };
 }

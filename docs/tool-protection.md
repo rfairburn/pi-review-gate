@@ -97,10 +97,14 @@ disclosed count is still disclosed, while routine positive rows follow
 [What each call reports](#what-each-call-reports). An individual nested auditor reason is
 not guaranteed visible. No retention loss here is silent.
 
-Under a non-Off level, unsupported external acting executors are refused before they
-start, regardless of which auditor is selected. The gate does not mediate human shell
-use, effects inside an already-running process, autonomous descendants, or
-provider/server-side effects. See [Limits and non-goals](#limits-and-non-goals).
+Coverage is Pi admission only. Non-Pi acting workers — Codex, Claude, and generic
+binary executors — are currently out of scope: this gate neither refuses nor audits
+them at any Protection level, including when its configuration is unavailable, and
+issues no protection pin for them. Existing harness permissions, role restrictions,
+review/landing gates, and lifecycle behavior remain unchanged. Auditor selections are
+unaffected. The gate also does not mediate human shell use, effects inside an
+already-running process, autonomous descendants, or provider/server-side effects. See
+[Limits and non-goals](#limits-and-non-goals).
 
 ## What each call reports
 
@@ -108,7 +112,7 @@ The audit's output is presentation, not authority, and the gate is quiet about t
 it does not stop.
 
 - A `FAIL`, an audit error (timeout, malformed decision, unavailable auditor, context
-  missing mandatory context, an invalidated pending decision, an unsupported acting executor), and a
+  missing mandatory context, an invalidated pending decision), and a
   nested refusal are reported to you and to the acting model at either
   `toolProtection.debug` value. A native tool error that follows a `PASS` stays a native
   tool error; this gate never restates it as an audit `FAIL`.
@@ -545,7 +549,9 @@ never retried, replayed, routed to a fallback, or answered from a cache.
   confinement. Human shell commands, effects inside an already-running process,
   autonomous descendants, and provider or server-side effects are not mediated.
 - **Not all harnesses.** Coverage is native Pi admission as described above. Arbitrary
-  wrappers, other agent harnesses, and calls that never reach Pi's hooks are not covered.
+  wrappers, other agent harnesses, and calls that never reach Pi's hooks are not covered,
+  and that includes this extension's own non-Pi acting workers (Codex, Claude, and
+  generic binary executors): the gate neither refuses nor audits them.
 - **No proven final-call fence.** A later trusted extension hook can mutate a proposal
   after admission, and a provider request rewrite can change the governing instructions.
   The gate cannot prove that the final dispatched call and instructions are identical to

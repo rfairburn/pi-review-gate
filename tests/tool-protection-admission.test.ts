@@ -1172,8 +1172,8 @@ test("a malformed stored block blocks admissions until a valid apply clears the 
     await host.emit("tool_result", resultEvent("call-load-error", "read"));
 
     assert.throws(
-      () => createExecutorAdapter({ ...DEFAULT_CONFIG } as ReviewGateConfig, { source: "external", id: "worker" }),
-      /Tool protection is unavailable .*no executor was started/,
+      () => createExecutorAdapter({ ...DEFAULT_CONFIG } as ReviewGateConfig, { source: "pi", model: "synthetic/model" }),
+      /Tool protection is unavailable .*no Pi executor was started/,
     );
   } finally {
     noteToolProtectionLoadError(undefined);
@@ -1181,16 +1181,13 @@ test("a malformed stored block blocks admissions until a valid apply clears the 
   }
 });
 
-test("external acting executors are refused while protection is enabled and admitted when Off", () => {
+test("Pi launches carry the pinned snapshot; a non-Pi selection never reaches protection admission", () => {
   noteToolProtectionLoadError(undefined);
+  // The added gate is Pi-only, so an unresolvable external selection keeps only
+  // its pre-existing resolution failure even at a non-Off level: there is no
+  // unsupported-coverage refusal on that path anymore.
   assert.throws(
     () => createExecutorAdapter(enabledConfig(), { source: "external", id: "worker" }),
-    /cannot audit tool calls inside external executor "worker".*refused before it started/,
-  );
-  // Off removes only the added gate: the pre-existing external-resolution error
-  // is the only remaining refusal, never the unsupported-coverage one.
-  assert.throws(
-    () => createExecutorAdapter({ ...DEFAULT_CONFIG } as ReviewGateConfig, { source: "external", id: "worker" }),
     /external executor definition is unavailable: worker/,
   );
   // A Pi executor launch is admitted and carries the pinned snapshot.

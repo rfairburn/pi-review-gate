@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.253]
+
+### Fixed
+
+- **Non-Pi worker launches** (#604): tool protection no longer refuses Claude,
+  Codex, or generic binary workers at non-Off levels or when its configuration is
+  unavailable. These acting workers are explicitly out of scope for the Pi-only
+  gate. Pi protection, external-worker permissions, review, and lifecycle behavior
+  remain unchanged.
+- **Codex research startup** (#604): omit two null app-approval enum overrides
+  rejected by Codex 0.164.0 and 0.166.0, retaining the existing read-only sandbox,
+  parent tool allowlist, and disabled app-capability settings.
+
 ## [0.1.0-dev.252]
 
 ### Fixed

@@ -463,9 +463,11 @@ effect.
   reference material. Fixed auditor instructions are separate from that budget.
 - An external auditor reference that no longer resolves is preserved and reported as
   unavailable; the menu does not silently rewrite it to Off or choose another auditor.
-- Under a non-Off level, unsupported external acting executors are refused before they
-  start, regardless of the auditor selection. The gate is not an OS sandbox and does not
-  cover other harnesses; see [Limits and non-goals](tool-protection.md#limits-and-non-goals).
+- Coverage is Pi admission only. Non-Pi acting workers — Codex, Claude, and generic
+  binary executors — are out of scope for this added gate today: no Protection level
+  refuses, audits, or pins their launches, whatever the auditor selection. The gate is
+  not an OS sandbox and does not cover other harnesses; see
+  [Limits and non-goals](tool-protection.md#limits-and-non-goals).
 
 ### Moved controls
 

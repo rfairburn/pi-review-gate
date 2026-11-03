@@ -605,16 +605,16 @@ Every token and phrase must match, and different tokens may match different
 fields. Search covers the native session ID, full stored name, native
 all-message text, and recorded workspace, and each is matched as its own field:
 a token, phrase, or regular expression never matches across a field boundary.
-The session ID and message text match only as exact (case-insensitive)
-substrings — scattered letters no longer hit them, so `1024` matches a session
+Unquoted tokens match the session ID and message text only as exact
+(case-insensitive) substrings — scattered letters no longer hit them, so `1024` matches a session
 UUID only when those digits appear consecutively, never as scattered digits —
 while stored names and recorded workspaces still match fuzzily. Message text is
 held only in a transient search index; it is never
 displayed in picker rows, sent over status IPC, logged, or persisted in the
 roster. Phrases ignore case and normalize whitespace. Unbalanced quotes fall
 back to native whitespace-token matching (including the quote characters). The
-`re:` prefix is case-sensitive; an empty or invalid regex yields no matches
-without crashing. Nonempty queries use the native tiered relevance order — an
+literal `re:` prefix must be lowercase; the pattern itself matches
+case-insensitively. An empty or invalid regex yields no matches without crashing. Nonempty queries use the native tiered relevance order — an
 exact hit in the name ranks above an exact hit in the ID, message text, or
 workspace, which ranks above a scattered name/workspace match — with
 newest-modified ties; clearing the query restores the catalog's existing

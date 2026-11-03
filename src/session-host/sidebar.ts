@@ -1828,6 +1828,21 @@ const FUNCTION_KEY_BY_CSI_FINAL: Readonly<Record<string, string>> = {
 };
 const FUNCTION_KEY_TILDE_EVENT = /^\x1b\[(\d+);(\d+)(?::([123]))?~$/;
 const FUNCTION_KEY_LETTER_EVENT = /^\x1b\[1;(\d+)(?::([123]))?([PQRS])$/;
+/**
+ * Packets that NAME one of the function keys these tables cover, whatever event
+ * digits they claim: a tilde packet carrying a modifier field, an event-type
+ * suffix, or both, and any P/Q/S packet. The bare `CSI <code>~` spelling stays
+ * outside the tilde families because it is the legacy function-key packet the
+ * public matcher has always owned, and `ESC O P` never enters either family.
+ * Event digits and codes are deliberately unbounded here — the public matcher
+ * parses a code numerically, so `CSI 020;…~` names the same key there — while
+ * the strict acceptance parser above stays literal. A packet that parser
+ * rejects is never claimed as a chord, whatever a native matcher version makes
+ * of it.
+ */
+const FUNCTION_KEY_TILDE_EVENT_FAMILY = /^\x1b\[(\d+)(?:;\d+)?:\d+~$/;
+const FUNCTION_KEY_TILDE_MODIFIER_FAMILY = /^\x1b\[(\d+);\d+~$/;
+const FUNCTION_KEY_LETTER_FAMILY = /^\x1b\[(?:1;\d+)?(?::\d+)?([PQRS])$/;
 const PATH_FIELD_MAX_CODEPOINTS = 2048;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
@@ -2147,6 +2162,21 @@ function functionKeyEventType(data: string, key: string): KeyEventType | undefin
   return undefined;
 }
 
+/** Table key for a tilde code, which the public matcher parses numerically. */
+function numericTildeCode(raw: string): string {
+  const numeric = Number(raw);
+  return Number.isSafeInteger(numeric) ? String(numeric) : raw;
+}
+
+/** True for a packet naming a function key these host tables cover. */
+function isCoveredFunctionKeyPacket(data: string): boolean {
+  const tilde =
+    FUNCTION_KEY_TILDE_EVENT_FAMILY.exec(data) ?? FUNCTION_KEY_TILDE_MODIFIER_FAMILY.exec(data);
+  if (tilde !== null) return FUNCTION_KEY_BY_TILDE_CODE[numericTildeCode(tilde[1] ?? "")] !== undefined;
+  const letter = FUNCTION_KEY_LETTER_FAMILY.exec(data);
+  return letter !== null && FUNCTION_KEY_BY_CSI_FINAL[letter[1] ?? ""] !== undefined;
+}
+
 function hasOnlyFunctionKeyLockModifiers(value: string | undefined): boolean {
   const modifierValue = Number(value);
   // Public key matching ignores Caps Lock/Num Lock while preserving every
@@ -2172,6 +2202,14 @@ function eventTypeFromDigit(value: string | undefined): KeyEventType | undefined
 function hostKeyEventType(data: string, key: string): KeyEventType | undefined {
   const fallback = functionKeyEventType(data, key);
   if (!matchesKey(data, asHostKeyId(key)) && fallback === undefined) return undefined;
+  // A packet for a covered function key is classified by this host's own parser
+  // alone. The native matcher accepts spellings this contract does not define:
+  // Pi 1.5 reports any event-type digit other than 2 and 3 — such as
+  // `CSI 20;1:4~` — as a fresh press of that key, and Pi 1.4 recognized the
+  // parameterized function-key families not at all. A packet the strict parser
+  // rejects is therefore not a reserved chord and stays native input for the
+  // child, exactly as before the native change.
+  if (fallback === undefined && isCoveredFunctionKeyPacket(data)) return undefined;
   if (isKeyRelease(data) || fallback === "release") return "release";
   if (isKeyRepeat(data) || fallback === "repeat") return "repeat";
   return "press";

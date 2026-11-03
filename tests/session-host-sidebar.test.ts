@@ -1032,6 +1032,57 @@ test("different, modified, malformed, DSR, and pasted F-key packets stay native 
   }
 });
 
+test("unsupported function-key event spellings stay native in both CSI families", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    // The tilde family: an explicit event type outside press/repeat/release, or
+    // an event suffix with no modifier field, names F9 but is not a packet.
+    const tilde = makeController({ toggleKey: "f9", initialVisible: false });
+    const focusBefore = tilde.controller.focus;
+    const tildePackets = [
+      "\x1b[20;1:0~",
+      "\x1b[20;1:4~",
+      "\x1b[20;1:10~",
+      "\x1b[20:1~",
+      "\x1b[020;1:4~", // the public matcher parses a tilde code numerically
+      "\x1b[00020;1:10~",
+      "\x1b[020;1~",
+    ];
+    for (const packet of tildePackets) tilde.send(packet);
+    assert.deepEqual(
+      tilde.actions,
+      tildePackets.map((data) => ({ type: "forward", data })),
+      "an unsupported event spelling is forwarded byte for byte",
+    );
+    assert.equal(tilde.controller.visible, false, "no forwarded packet shows the pane");
+    assert.equal(tilde.controller.focus, focusBefore, "and none changes input ownership");
+
+    // The P/Q/S family: the same unsupported event digits, plus the
+    // parameterless CSI spelling this host's parser has never covered.
+    const letter = makeController({ toggleKey: "f1", initialVisible: false });
+    const letterPackets = ["\x1b[1;1:0P", "\x1b[1;1:4P", "\x1b[P"];
+    for (const packet of letterPackets) letter.send(packet);
+    assert.deepEqual(
+      letter.actions,
+      letterPackets.map((data) => ({ type: "forward", data })),
+      "an unsupported P/Q/S spelling is forwarded byte for byte",
+    );
+    assert.equal(letter.controller.visible, false, "no forwarded packet shows the pane");
+
+    // The same keys keep their defined press/repeat/release fencing: one fresh
+    // press acts, then the held repeat and the release stay consumed.
+    const fenced = makeController({ toggleKey: "f1", initialVisible: false });
+    fenced.send("\x1b[1;1:1P");
+    fenced.send("\x1b[1;1:2P");
+    fenced.send("\x1b[1;1:3P");
+    assert.equal(fenced.controller.visible, true);
+    assert.deepEqual(fenced.actions, [{ type: "visibility", visible: true }]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
 test("invalid toggle chords fail construction instead of going silently dead", () => {
   for (const bad of ["", "bogus", "ctrl+bogus", "f8+ctrl", "alt+alt+left", "ctrl+ctrl+a"]) {
     assert.throws(

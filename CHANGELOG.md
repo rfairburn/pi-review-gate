@@ -40,8 +40,8 @@ dates.
   (#603): each conversation is matched field by field (session ID, stored name,
   complete message text, recorded workspace), so a token, phrase, or `re:`
   pattern never matches across a field boundary and different tokens may match
-  different fields. Session IDs and message text now match only as exact
-  case-insensitive substrings — `1024` matches a session UUID only when those
+  different fields. Unquoted tokens now match session IDs and message text only
+  as exact case-insensitive substrings — `1024` matches a session UUID only when those
   digits appear consecutively, not as scattered digits — while names and
   recorded workspaces still match fuzzily. Nonempty results use
   the native tiered relevance order (name literal, then other literal, then

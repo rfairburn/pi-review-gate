@@ -502,7 +502,7 @@ binding: the running child puts its tty in raw mode, which clears `ISIG`, so the
 control byte would arrive as a keystroke rather than a line-discipline signal.
 The shared refusal sits upstream of both routes; the synthetic fixture is not
 evidence about that binding, which is established from the pinned public Pi
-1.4.0 sources.
+1.5.0 sources.
 
 ### Network owner Saved conversations (#389)
 

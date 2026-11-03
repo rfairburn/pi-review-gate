@@ -64,6 +64,11 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const mode = Object.create(InteractiveMode.prototype);
   mode.ui = screen;
   mode.keybindings = keybindings;
+  // Object.create skips InteractiveMode's class-field initializers. Pi 1.5.0
+  // setCustomEditorComponent reads this.extensionDialogs.length, so the stand-in
+  // must supply the constructor-owned dialog stack a real mode always has; this
+  // test's popup is a ui.showOverlay, which never pushes an editor-slot dialog.
+  mode.extensionDialogs = [];
   mode.extensionTerminalInputSubscriptions = new Set();
   mode.editorContainer = new tui.Container();
   mode.defaultEditor = new agent.CustomEditor(screen, themeModule.getEditorTheme(), keybindings);

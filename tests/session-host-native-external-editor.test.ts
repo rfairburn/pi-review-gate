@@ -140,7 +140,12 @@ test("production Main Ctrl+G edits through real Vim and restores the native draf
   // leakage. Pi still chooses and launches its configured editor normally.
   writeFileSync(editor, `#!/bin/sh
 mode=$(/bin/cat ${quote(modeFile)})
-/bin/cp "$1" ${quote(join(scratch, "before-"))}"$mode"
+# The prefill receipt must become observable only once it is complete: cp creates
+# the destination before its bytes land, and the failure episode has no rendered
+# child output to gate the wait on. Copy to a temporary name in the same owned
+# scratch directory and rename atomically, only on a successful copy.
+partial=${quote(join(scratch, "before-"))}"$mode.partial"
+/bin/cp "$1" "$partial" && /bin/mv -f "$partial" ${quote(join(scratch, "before-"))}"$mode"
 if [ "$mode" = failure ]; then exit 17; fi
 /usr/bin/vim -u NONE -i NONE -n -N -X -c 'set encoding=utf-8 nobackup nowritebackup noswapfile laststatus=2 statusline=PRG499-VIM' "$1"
 status=$?

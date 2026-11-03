@@ -251,17 +251,22 @@ function tierScore(tier: number, score = 0): number {
 }
 
 /**
- * Lowercased/whitespace-normalized views of one field record. Message text can
- * be megabytes, so it is lowered once per record instead of on every keystroke
- * (the same caching shape the native selector uses).
+ * Lowercased/whitespace-normalized views of one field record.
+ *
+ * Only the SMALL fields are cached here for the record's lifetime. The
+ * message-text views are deliberately NOT part of this cache: message text can
+ * be megabytes per conversation and the caller keeps every record of a catalog
+ * for that catalog's lifetime, so retaining a lowered and a whitespace-
+ * normalized copy of every conversation grew the retained derived text to the
+ * size of the whole corpus and re-pinned it on every query refinement
+ * (issue #609). Those two views live per {@link matchSavedSessionFields}
+ * invocation instead — see {@link createMessageViews}.
  */
 interface SavedSessionFieldText {
   lowerId?: string;
   lowerName?: string;
-  lowerMessages?: string;
   lowerCwd?: string;
   normalizedName?: string;
-  normalizedMessages?: string;
   normalizedCwd?: string;
 }
 
@@ -288,12 +293,6 @@ function lowerName(fields: SavedSessionSearchFields): string {
   return cached.lowerName;
 }
 
-function lowerMessages(fields: SavedSessionSearchFields): string {
-  const cached = fieldText(fields);
-  cached.lowerMessages ??= fields.messages.toLowerCase();
-  return cached.lowerMessages;
-}
-
 function lowerCwd(fields: SavedSessionSearchFields): string {
   const cached = fieldText(fields);
   cached.lowerCwd ??= fields.cwd.toLowerCase();
@@ -306,12 +305,6 @@ function normalizedName(fields: SavedSessionSearchFields): string {
   return cached.normalizedName;
 }
 
-function normalizedMessages(fields: SavedSessionSearchFields): string {
-  const cached = fieldText(fields);
-  cached.normalizedMessages ??= normalizeSearchWhitespace(lowerMessages(fields));
-  return cached.normalizedMessages;
-}
-
 function normalizedCwd(fields: SavedSessionSearchFields): string {
   const cached = fieldText(fields);
   cached.normalizedCwd ??= normalizeSearchWhitespace(fields.cwd);
@@ -319,22 +312,60 @@ function normalizedCwd(fields: SavedSessionSearchFields): string {
 }
 
 /**
+ * The message-text views of ONE {@link matchSavedSessionFields} invocation.
+ *
+ * The transformations and their order are exactly the ones the lifetime cache
+ * used (`fields.messages.toLowerCase()`, then `normalizeSearchWhitespace` over
+ * that lowered text), so matching, tiers, and scores are unchanged. The views
+ * are computed lazily and at most once each per invocation, so a multi-token
+ * query still lowers and normalizes one conversation's text once rather than
+ * once per token, and both copies become collectable as soon as that
+ * invocation returns instead of surviving for the catalog's lifetime.
+ */
+interface SavedSessionMessageViews {
+  lowerMessages(): string;
+  normalizedMessages(): string;
+}
+
+function createMessageViews(fields: SavedSessionSearchFields): SavedSessionMessageViews {
+  let lower: string | undefined;
+  let normalized: string | undefined;
+  const lowerMessages = (): string => {
+    lower ??= fields.messages.toLowerCase();
+    return lower;
+  };
+  const normalizedMessages = (): string => {
+    normalized ??= normalizeSearchWhitespace(lowerMessages());
+    return normalized;
+  };
+  return { lowerMessages, normalizedMessages };
+}
+
+/**
  * Exact (case-insensitive) text match. Messages and ids are only matched
  * exactly: scattered matches in them are noise (the Pi 1.5 `/resume` fix —
  * e.g. `1024` no longer matching inside a session UUID).
  */
-function matchLiteralFieldToken(fields: SavedSessionSearchFields, lowerValue: string): number | undefined {
+function matchLiteralFieldToken(
+  fields: SavedSessionSearchFields,
+  messages: SavedSessionMessageViews,
+  lowerValue: string,
+): number | undefined {
   const name = lowerName(fields);
   if (name.includes(lowerValue)) return tierScore(TIER_NAME, fuzzyMatch(lowerValue, name).score);
   if (lowerId(fields).includes(lowerValue)) return tierScore(TIER_TEXT);
-  if (lowerMessages(fields).includes(lowerValue)) return tierScore(TIER_TEXT);
+  if (messages.lowerMessages().includes(lowerValue)) return tierScore(TIER_TEXT);
   if (lowerCwd(fields).includes(lowerValue)) return tierScore(TIER_TEXT);
   return undefined;
 }
 
 /** A fuzzy token: its literal match first, otherwise scattered in the name or cwd only. */
-function matchFuzzyFieldToken(fields: SavedSessionSearchFields, value: string): number | undefined {
-  const literal = matchLiteralFieldToken(fields, value.toLowerCase());
+function matchFuzzyFieldToken(
+  fields: SavedSessionSearchFields,
+  messages: SavedSessionMessageViews,
+  value: string,
+): number | undefined {
+  const literal = matchLiteralFieldToken(fields, messages, value.toLowerCase());
   if (literal !== undefined) return literal;
   let best: number | undefined;
   for (const field of [fields.name, fields.cwd]) {
@@ -345,11 +376,15 @@ function matchFuzzyFieldToken(fields: SavedSessionSearchFields, value: string): 
 }
 
 /** A quoted phrase: exact, whitespace-normalized, per field. */
-function matchPhraseFieldToken(fields: SavedSessionSearchFields, phrase: string): number | undefined {
+function matchPhraseFieldToken(
+  fields: SavedSessionSearchFields,
+  messages: SavedSessionMessageViews,
+  phrase: string,
+): number | undefined {
   const name = normalizedName(fields);
   if (name.includes(phrase)) return tierScore(TIER_NAME, fuzzyMatch(phrase, name).score);
   if (lowerId(fields).includes(phrase)) return tierScore(TIER_TEXT);
-  if (normalizedMessages(fields).includes(phrase)) return tierScore(TIER_TEXT);
+  if (messages.normalizedMessages().includes(phrase)) return tierScore(TIER_TEXT);
   if (normalizedCwd(fields).includes(phrase)) return tierScore(TIER_TEXT);
   return undefined;
 }
@@ -381,15 +416,19 @@ export function matchSavedSessionFields(
     const score = matchFieldRegex(fields, parsed.regex);
     return score === undefined ? { matches: false, score: 0 } : { matches: true, score };
   }
+  // The message-text views are scoped to this one invocation: a multi-token
+  // query derives each view at most once, and neither derived copy outlives
+  // the match (issue #609).
+  const messages = createMessageViews(fields);
   let totalScore = 0;
   for (const token of parsed.tokens) {
     let score: number | undefined;
     if (token.kind === "phrase") {
       const phrase = normalizeSearchWhitespace(token.value);
       if (!phrase) continue;
-      score = matchPhraseFieldToken(fields, phrase);
+      score = matchPhraseFieldToken(fields, messages, phrase);
     } else {
-      score = matchFuzzyFieldToken(fields, token.value);
+      score = matchFuzzyFieldToken(fields, messages, token.value);
     }
     if (score === undefined) return { matches: false, score: 0 };
     totalScore += score;

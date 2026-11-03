@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.255]
+
+### Fixed
+
+- **Saved-conversation search retained derived transcript copies** (#609): the
+  saved-conversation picker no longer keeps a lowercased copy and a
+  whitespace-normalized copy of every loaded conversation's complete message
+  text alive for the lifetime of the catalog. Those two message-field views are
+  now derived at most once per match invocation and released when it returns,
+  so refining a query keystroke by keystroke over a large private corpus no
+  longer accumulates and re-pins corpus-sized derived copies until the host runs
+  out of memory. The small per-conversation session-ID, name, and recorded-
+  workspace views stay cached exactly as before. Matching is unchanged: the same
+  lowercase and whitespace-normalization transformations, the same quoted-
+  phrase, `re:`, exact-substring and fuzzy semantics, the same field tiers,
+  scores, and result order, and the same picker query editing, navigation,
+  selection, ownership, and dismissal behavior. No size, count, or result cap
+  was added, nothing is truncated or suppressed, no picker is disabled, and no
+  user cache is cleared.
+
 ## [0.1.0-dev.254]
 
 ### Changed

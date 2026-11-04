@@ -15,6 +15,35 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.256]
+
+### Changed
+
+- **The shared popup now scrolls with the mouse wheel under the pointer** (#413):
+  in Pi's fullscreen mode, a wheel over the pending-input popup — anywhere
+  inside its drawn frame, including body text, a menu entry, the rules, padding,
+  blank cells, and the fixed keyboard-hint row — scrolls that popup's existing
+  scroll viewport and is consumed there, so the conversation behind the popup no
+  longer moves at the same time. A wheel over the conversation around the popup
+  keeps Pi's ordinary behavior: the conversation scrolls and the popup holds its
+  own position; a closed popup intercepts nothing, and there is no global or
+  modal wheel capture. The popup uses the step Pi reports for the event (its
+  wheel-scroll setting and the Alt multiplier), so it adds no wheel speed or
+  acceleration setting of its own, and one viewport remains authoritative:
+  keyboard paging and the wheel move the same offset, and a resize still clamps
+  it. The wheel only scrolls — it selects, highlights, activates, submits, or
+  dismisses nothing and never touches a free-text draft, including while the
+  native editor is active. A wheel the popup consumes also cancels a menu press
+  that was still held when it arrived, the same way keyboard input does, so
+  pressing an entry and then scrolling can never end as an accidental
+  activation; a fresh deliberate click still works. The shipped keyboard
+  scrolling (**Shift+Alt+Up/Down**, **Shift+Option+Up/Down** on macOS, and
+  **Ctrl+Alt+PageUp/PageDown**) is
+  unchanged and stays the popup's only scroll path in regular mode, where the
+  terminal keeps the wheel and its scrollback. Pointer selection, copy, and
+  single-click activation, plus routing, privacy, focus, and ongoing-task
+  behavior, are unchanged.
+
 ## [0.1.0-dev.255]
 
 ### Fixed

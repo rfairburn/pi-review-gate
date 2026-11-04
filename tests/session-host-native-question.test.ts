@@ -1499,10 +1499,10 @@ function createWorkspace(root: string, name: string): string {
 // fullscreen renderer pinned through the synthetic profile's own Pi
 // settings.json (`tuiMode`). Every key below is written to the real PTY, so
 // Pi's own stdin parser, overlay compositing, and focus dispatch decide where
-// it goes — no synthetic ctx.ui or component callback is involved. Popup
-// scrolling is keyboard-only (the popup never handles wheel input; its
-// fullscreen item clicks are covered by user-question-mouse-host), so this
-// scenario sends no mouse reports.
+// it goes — no synthetic ctx.ui or component callback is involved. This
+// scenario exercises keyboard scrolling only and sends no mouse reports;
+// fullscreen item clicks and pointer-owned wheel dispatch are covered by
+// user-question-mouse-host.
 
 const KEY_UP = "\x1b[A";
 const KEY_ESCAPE = "\x1b";

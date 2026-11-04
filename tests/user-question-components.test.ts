@@ -1289,24 +1289,143 @@ test("notice actions are revealed by Up/Down and keep their semantics", () => {
   assert.equal(fixture.sent.length, 0, "Close sends nothing");
 });
 
-test("popup scrolling is keyboard-only: wheel input is never handled, so Pi keeps native wheel behavior", () => {
-  const fixture = makeFixture({ getViewportRows: () => 12 });
-  registerNotice(fixture, longNoticeBody(30));
-  fixture.component.handleInput(ENTER);
-  fixture.component.handleInput(SHIFT_ALT_DOWN);
-  const before = fixture.component.render(60);
-  // Fullscreen item clicks (#431) add a mouse handler, but it declines every
-  // wheel event: pi-tui then applies its own unhandled-wheel behavior, and
-  // the popup's single scroll offset never moves by wheel.
-  assert.equal(typeof fixture.component.handleMouse, "function");
-  for (const [y] of before.entries()) {
-    for (const wheelDelta of [-3, -1, 1, 3]) {
-      const event = { type: "wheel", button: "none", x: 4, y, width: 60, height: before.length, wheelDelta } as Parameters<typeof fixture.component.handleMouse>[0];
-      assert.equal(fixture.component.handleMouse(event), undefined, `row ${y}: wheel ${wheelDelta} is left to the host`);
-    }
+test("wheel over the drawn popup scrolls its own viewport; wheel outside that frame is left to the host", () => {
+  const rows = 12;
+  const width = 60;
+  const openNotice = (): Fixture => {
+    const fixture = makeFixture({ getViewportRows: () => rows });
+    registerNotice(fixture, longNoticeBody(24), "Context opening row\nCONTEXT-END");
+    fixture.component.handleInput(ENTER);
+    return fixture;
+  };
+  const bodyOf = (lines: readonly string[]): string[] => splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows).body;
+  const fixture = openNotice();
+  const opening = draw(fixture, width);
+  assert.equal(bodyOf(opening.lines)[0], "n1: Scroll regression notice", "the long notice opens at its beginning");
+  const bodyCell = cellOf(opening, "Native Markdown unavailable");
+
+  // One wheel notch inside the body is claimed by the popup and moves exactly
+  // the one authoritative offset a keyboard page step moves: no second scroll
+  // engine and no separate position of its own.
+  assert.deepEqual(fixture.component.handleMouse(pointer(opening, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: 1 })),
+    { handled: true, render: true }, "a wheel notch over the popup body is claimed and scrolls");
+  const wheelFrame = draw(fixture, width);
+  const keyboard = openNotice();
+  keyboard.component.handleInput(SHIFT_ALT_DOWN);
+  assert.deepEqual(wheelFrame.lines, draw(keyboard, width).lines,
+    "one wheel notch and one keyboard page step produce the same frame");
+  assert.ok(bodyOf(wheelFrame.lines)[0] !== bodyOf(opening.lines)[0], "the wheel moved the popup's own viewport");
+
+  // Every other cell of the same drawn rectangle is the same popup scroll:
+  // rules, padding rows, blank cells, the heading, and the fixed hint area.
+  const hintCell = cellOf(opening, "arrows select");
+  const headingCell = cellOf(opening, "n1: Scroll regression notice");
+  const insideCells: Array<[string, { x: number; y: number }]> = [
+    ["top rule", { x: 3, y: 0 }],
+    ["top padding row", { x: 3, y: 1 }],
+    ["heading row", headingCell],
+    ["blank separator row", { x: 3, y: hintCell.y - 1 }],
+    ["fixed hint row", hintCell],
+    ["bottom padding row", { x: 3, y: opening.lines.length - 2 }],
+    ["bottom rule", { x: 3, y: opening.lines.length - 1 }],
+  ];
+  for (const [name, cell] of insideCells) {
+    assert.deepEqual(fixture.component.handleMouse(pointer(opening, "wheel", cell.x, cell.y, "none", { wheelDelta: 1 })),
+      { handled: true, render: true }, `${name}: a wheel inside the drawn frame is the popup's own scroll`);
   }
-  assert.deepEqual(fixture.component.render(60), before, "wheel input never scrolls or changes the popup");
-  assert.doesNotMatch(before.join("\n"), /wheel|mouse|click/iu, "no view advertises mouse behavior");
+
+  // Outside that rectangle the popup claims nothing, so Pi keeps its native
+  // wheel routing and the conversation scrolls instead of the popup.
+  const beforeOutside = draw(fixture, width).lines;
+  const outsideCells: Array<[string, Partial<PopupMouseEvent>]> = [
+    ["row below the bottom rule", { y: beforeOutside.length }],
+    ["row above the top rule", { y: -1 }],
+    ["column right of the frame", { x: width }],
+    ["bounds the last render does not describe", { width: width - 8 }],
+    ["height the last render does not describe", { height: beforeOutside.length + 4 }],
+  ];
+  for (const [name, extra] of outsideCells) {
+    const event = { ...pointer(wheelFrame, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: 2 }), ...extra };
+    assert.equal(fixture.component.handleMouse(event), undefined, `${name}: the wheel is left to the host`);
+  }
+  assert.deepEqual(draw(fixture, width).lines, beforeOutside, "unhandled wheel events left the popup exactly as it was");
+
+  // The offset is clamped at both ends, and a wheel at a bound is still
+  // claimed so the background viewport cannot move under the popup.
+  for (let step = 0; step < 40; step += 1) {
+    assert.equal(fixture.component.handleMouse(pointer(wheelFrame, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: 3 }))?.handled,
+      true, "the wheel stays claimed at the end");
+  }
+  const atEnd = draw(fixture, width);
+  const endBody = bodyOf(atEnd.lines);
+  assert.ok(endBody.includes("CONTEXT-END") && endBody.some((line) => line.includes("Close")),
+    `the wheel reaches the end of the complete content:\n${plainFrame(atEnd)}`);
+  assert.equal(fixture.component.handleMouse(pointer(atEnd, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: 1 }))?.handled,
+    true, "a wheel past the end is still the popup's");
+  assert.deepEqual(draw(fixture, width).lines, atEnd.lines, "a wheel at the end bound changes nothing else");
+  for (let step = 0; step < 40; step += 1) {
+    fixture.component.handleMouse(pointer(atEnd, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: -3 }));
+  }
+  assert.deepEqual(draw(fixture, width).lines, opening.lines, "the wheel returns to the beginning, selection intact");
+  assert.equal(fixture.component.handleMouse(pointer(opening, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: -2 }))?.handled,
+    true, "a wheel before the beginning is still the popup's");
+  assert.deepEqual(draw(fixture, width).lines, opening.lines, "and changes nothing there either");
+  assert.equal(fixture.controller.listPending().length, 1, "the wheel dismisses nothing");
+  assert.equal(fixture.sent.length, 0, "the wheel answers nothing");
+  assert.equal(fixture.done.length, 0, "the wheel never closes the popup");
+
+  // A host wheel report with no usable step is still claimed over the popup,
+  // and simply leaves the viewport where it is.
+  for (const wheelDelta of [undefined, Number.NaN, 0]) {
+    assert.deepEqual(fixture.component.handleMouse(pointer(opening, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta })),
+      { handled: true, render: false }, `wheel step ${String(wheelDelta)}: claimed, no movement`);
+  }
+  assert.deepEqual(draw(fixture, width).lines, opening.lines, "an unusable wheel step never moves the viewport");
+
+  // Content that fits has nothing to scroll: the wheel is still the popup's,
+  // and a closed popup intercepts nothing at all.
+  const short = makeFixture({ getViewportRows: () => rows });
+  register(short, "One question?");
+  const shortFrame = draw(short, width);
+  assert.ok(shortFrame.lines.length < rows, "the one-item list is sized to its own content");
+  assert.deepEqual(short.component.handleMouse(pointer(shortFrame, "wheel", 3, 2, "none", { wheelDelta: 5 })),
+    { handled: true, render: true }, "a wheel over a short popup is claimed with nothing to scroll");
+  assert.deepEqual(draw(short, width).lines, shortFrame.lines, "and the short popup is unchanged");
+  short.component.handleInput(CHORD);
+  assert.equal(short.component.handleMouse(pointer(shortFrame, "wheel", 3, 2, "none", { wheelDelta: 1 })), undefined,
+    "a closed popup leaves the wheel to the host");
+  assert.equal(short.done.length, 1, "the popup closed normally");
+});
+
+test("wheel while the native field is editing scrolls the popup and never touches the draft", () => {
+  const rows = 12;
+  const width = 60;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  register(fixture, Array.from({ length: 12 }, (_, index) => `Detail ${index + 1}.`).join("\n\n"), { choices: ["Canary"] });
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // editing
+  fixture.component.handleInput("draft");
+  const frame = draw(fixture, width);
+  assert.ok(frame.lines.some((line) => line.includes("[field:draft]")), "the cursor row is visible while editing");
+  const inputsBefore = fixture.field!.inputLog.length;
+
+  const detailCell = cellOf(frame, "Detail 12.");
+  assert.equal(fixture.component.handleMouse(pointer(frame, "wheel", detailCell.x, detailCell.y, "none", { wheelDelta: -4 }))?.handled,
+    true, "a wheel over the popup while editing is claimed by the popup");
+  const after = draw(fixture, width);
+  assert.notDeepEqual(after.lines, frame.lines, "the wheel moved the popup viewport");
+  assert.ok(!after.lines.some((line) => line.includes("[field:")), "nothing snaps the view back to the field");
+  assert.equal(fixture.field!.getText(), "draft", "the native draft is untouched");
+  assert.equal(fixture.field!.inputLog.length, inputsBefore, "no wheel bytes reached the native field");
+  assert.equal(fixture.sent.length, 0, "the wheel submits nothing");
+  assert.equal(fixture.done.length, 0, "the wheel never closes the popup");
+
+  // The next editing input re-reveals the cursor, exactly as keyboard paging
+  // followed by editing input does.
+  fixture.component.handleInput("!");
+  assert.ok(draw(fixture, width).lines.some((line) => line.includes("[field:draft!]")),
+    "editing input brings the cursor row back into view");
 });
 
 test("keyboard scrolling while editing stays with the native field; the next editing input re-reveals the cursor", async () => {
@@ -1747,13 +1866,15 @@ test("mouse: non-left buttons, motion, releases, stray clicks, and wheel never a
   }
   assert.equal(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 })),
     undefined, "a click with no paired press in this popup never activates");
-  // Scrolling stays keyboard-only: wheel is never handled, so it neither
-  // activates nor scrolls the popup body.
-  for (const wheelDelta of [1, -1, 3]) {
-    assert.equal(fixture.component.handleMouse(pointer(frame, "wheel", cell.x, cell.y, "none", { wheelDelta } as Partial<PopupMouseEvent>)),
-      undefined, "wheel policy is left to the host");
+  // The wheel scrolls the popup's own viewport (claimed inside the drawn
+  // frame) but never activates, highlights, closes, or answers anything; the
+  // paired deltas return the offset to where it was.
+  for (const wheelDelta of [1, -1, 3, -3]) {
+    assert.deepEqual(fixture.component.handleMouse(pointer(frame, "wheel", cell.x, cell.y, "none", { wheelDelta } as Partial<PopupMouseEvent>)),
+      { handled: true, render: true },
+      "wheel over the popup is the popup's own scroll, never a host passthrough");
   }
-  assert.deepEqual(fixture.component.render(80), before, "nothing highlighted or scrolled");
+  assert.deepEqual(fixture.component.render(80), before, "nothing highlighted, scrolled away, or submitted");
   assert.equal(fixture.controller.listPending().length, 1);
   assert.equal(fixture.done.length, 0);
 });
@@ -2312,4 +2433,139 @@ test("mouse: a narrow notice press highlights without reflowing the wrapped acti
     other.component.handleMouse(pointer(otherFrame, "click", x, 0));
     assert.deepEqual(draw(other, width).lines, otherFrame.lines, `width ${width}: a cancelled narrow press changes nothing`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #413 wheel policy over the #431 pointer gesture: a wheel report the
+// popup consumes retires a press it claimed earlier — the same convention
+// keyboard scrolling already uses — so the release and the synthesized click
+// that follow cannot activate content that moved under the held pointer, or
+// content a clamped offset left exactly where it was. A fresh deliberate click
+// still activates.
+// ---------------------------------------------------------------------------
+
+/** Whether a plain row continues a wrapped label instead of starting an entry. */
+function continuesWrappedLabel(row: string | undefined): boolean {
+  return row !== undefined && /^\s+\S/.test(row)
+    && !/^\s+(?:> )?(?:\d+\. |Type something|Decline)/.test(row);
+}
+
+test("mouse: a wheel inside the popup retires a held press, so its release and click cannot activate", async () => {
+  const question = Array.from({ length: 8 }, (_, index) => `Detail ${index + 1}.`).join("\n\n");
+  const longChoice = "Use the managed Postgres cluster with read replicas in every region we deploy to across all continents";
+  const fixture = makeFixture({ getViewportRows: () => 9 });
+  register(fixture, question, { choices: ["SQLite", longChoice] });
+  fixture.component.handleInput(ENTER);
+
+  // Page until the wrapped choice is fully drawn: its label row plus exactly
+  // one continuation row.
+  const frame = pageUntil(fixture, 80, (current) => {
+    const rows = current.lines.map(plainRow);
+    const label = rows.findIndex((row) => row.includes("2. Use the managed"));
+    return label >= 0 && continuesWrappedLabel(rows[label + 1]) && !continuesWrappedLabel(rows[label + 2]);
+  });
+  const labelRow = frame.lines.map(plainRow).findIndex((row) => row.includes("2. Use the managed"));
+  const continuationText = plainRow(frame.lines[labelRow + 1]!).trim();
+  const held = { x: frame.lines[labelRow]!.search(/\S/), y: labelRow };
+
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "press", held.x, held.y)),
+    { handled: true, render: true }, "the popup claims the wrapped label row's press");
+  const pressedFrame = draw(fixture, 80);
+  assert.match(plainFrame(pressedFrame), /> 2\. Use the managed/, "the press highlights that choice");
+
+  // One wheel notch inside the drawn frame scrolls the popup up while the
+  // press is held, so this same cell now draws that same choice's wrapped
+  // continuation row.
+  assert.deepEqual(fixture.component.handleMouse(pointer(pressedFrame, "wheel", held.x, held.y, "none", { wheelDelta: 1 })),
+    { handled: true, render: true }, "the wheel is the popup's own scroll");
+  const scrolled = draw(fixture, 80);
+  assert.equal(plainRow(scrolled.lines[held.y]!).trim(), continuationText,
+    `the same choice's continuation row moved under the held pointer:\n${plainFrame(scrolled)}`);
+
+  // The release, and the click the host synthesizes from it, are no longer
+  // completing a claimed item press.
+  assert.equal(fixture.component.handleMouse(pointer(scrolled, "release", held.x, held.y)), undefined,
+    "the release of a wheel-retired press is left to the host");
+  assert.equal(fixture.component.handleMouse(pointer(scrolled, "click", held.x, held.y, "left", { clickCount: 1 })), undefined,
+    "and so is the synthesized click");
+  await flushDelivery();
+  assert.equal(fixture.sent.length, 0, "the wheel-retired gesture submitted nothing");
+  assert.equal(fixture.controller.listPending().length, 1, "the question stays pending");
+
+  // Positive control: a fresh deliberate click on the choice now drawn at that
+  // cell acts exactly as before.
+  clickCell(fixture, scrolled, { x: plainRow(scrolled.lines[held.y]!).search(/\S/), y: held.y });
+  await flushDelivery();
+  assert.deepEqual(fixture.sent.map((entry) => entry.message),
+    [`Answer to pending question "${question}": ${longChoice}`],
+    "a fresh click after the wheel submits the visible choice");
+});
+
+test("mouse: a wheel at a scroll bound retires a held press before its release can activate", () => {
+  const rows = 12;
+  const width = 60;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  const noticeId = registerNotice(fixture, longNoticeBody(24), "Context opening row\nCONTEXT-END");
+  fixture.component.handleInput(ENTER);
+  let frame = draw(fixture, width);
+  const bodyCell = cellOf(frame, "Native Markdown unavailable");
+  for (let step = 0; step < 40; step += 1) {
+    fixture.component.handleMouse(pointer(frame, "wheel", bodyCell.x, bodyCell.y, "none", { wheelDelta: 3 }));
+    frame = draw(fixture, width);
+  }
+  const close = cellOf(frame, "Close");
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "press", close.x, close.y)),
+    { handled: true, render: true }, "the popup claims the Close press");
+  frame = draw(fixture, width);
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "wheel", close.x, close.y, "none", { wheelDelta: 1 })),
+    { handled: true, render: true }, "a wheel at the end bound is claimed by the popup");
+  const unchanged = draw(fixture, width);
+  assert.deepEqual(unchanged.lines, frame.lines, "the bound wheel left every drawn row exactly where it was");
+
+  assert.equal(fixture.component.handleMouse(pointer(unchanged, "release", close.x, close.y)), undefined,
+    "the release of the wheel-retired press is left to the host");
+  assert.equal(fixture.component.handleMouse(pointer(unchanged, "click", close.x, close.y, "left", { clickCount: 1 })), undefined,
+    "and so is the synthesized click, even with no row moved");
+  assert.notEqual(fixture.controller.getPending(noticeId), undefined, "the notice was not closed");
+
+  // Positive control: the same cell with its own fresh press still runs Close.
+  clickCell(fixture, unchanged, close);
+  assert.equal(fixture.controller.getPending(noticeId), undefined, "a fresh deliberate click still runs Close");
+  assert.equal(fixture.controller.listPending().length, 0);
+});
+
+test("mouse: a wheel while editing retires a pressed choice, keeps the draft, and submits nothing", () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
+  register(fixture, Array.from({ length: 12 }, (_, index) => `Detail ${index + 1}.`).join("\n\n"),
+    { choices: ["Canary", "Postgres"] });
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // editing
+  fixture.component.handleInput("draft");
+  let frame = draw(fixture, 60);
+  assert.ok(frame.lines.some((line) => line.includes("[field:draft]")), "the native cursor row shows while editing");
+  const choice = cellOf(frame, "1. Canary");
+
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "press", choice.x, choice.y)),
+    { handled: true, render: true }, "a pressed choice shows the transient editing highlight");
+  frame = draw(fixture, 60);
+  assert.match(plainFrame(frame), /> 1\. Canary/, "the pressed choice is highlighted");
+  const inputsBefore = fixture.field!.inputLog.length;
+
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "wheel", choice.x, choice.y, "none", { wheelDelta: -1 })),
+    { handled: true, render: true }, "the wheel scrolls the popup while editing");
+  frame = draw(fixture, 60);
+  assert.match(plainFrame(frame), /1\. Canary/, "the pressed choice is still drawn after the wheel");
+  assert.doesNotMatch(plainFrame(frame), /> 1\. Canary/, "and the retired press leaves no stale highlight");
+
+  assert.equal(fixture.component.handleMouse(pointer(frame, "release", choice.x, choice.y)), undefined,
+    "the release of the retired press is left to the host");
+  assert.equal(fixture.component.handleMouse(pointer(frame, "click", choice.x, choice.y, "left", { clickCount: 1 })), undefined,
+    "and so is the synthesized click");
+  assert.equal(fixture.field!.getText(), "draft", "the native draft is untouched");
+  assert.equal(fixture.field!.fieldActive, true, "the editing episode is untouched");
+  assert.equal(fixture.field!.inputLog.length, inputsBefore, "no pointer bytes reached the native field");
+  assert.equal(fixture.sent.length, 0, "nothing was submitted");
+  assert.equal(fixture.done.length, 0, "the popup stays open");
 });

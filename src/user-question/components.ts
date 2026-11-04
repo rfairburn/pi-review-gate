@@ -36,11 +36,10 @@
  * only the body). Opening a
  * question or notice starts at its beginning; Up/Down (even at a bound) and
  * editing input bring the selected row or native cursor into view; keyboard
- * paging moves only the offset. Resize clamps the offset to the new bounds
- * and re-reveals only the list selection or an active editing cursor. The
- * popup keeps its content-sized height up to the overlay's row budget.
- * Scrolling is keyboard-only: wheel events are never handled here, so Pi and
- * the terminal keep their native wheel behavior.
+ * paging and the pointer wheel move only the offset. Resize clamps the offset
+ * to the new bounds and re-reveals only the list selection or an active
+ * editing cursor. The popup keeps its content-sized height up to the
+ * overlay's row budget.
  *
  * Fullscreen pointer input (#431): the public custom overlay hands this
  * component to pi-tui directly, so pointer events arrive in coordinates local
@@ -64,8 +63,19 @@
  * frame the last render no longer describes — returns unhandled, so Pi's
  * existing native text selection and clipboard paths read the visible
  * composited popup (issue #436). Keyboard input cancels a pending gesture,
- * and a closed popup intercepts nothing. Regular mode delivers no pointer
- * input.
+ * and a closed popup intercepts nothing. Wheel input (#413) is pointer-owned:
+ * a wheel event whose cell lies inside the frame this component last drew
+ * moves the same authoritative offset by the host's own signed `wheelDelta`
+ * (any cell of that rectangle — body text, items, headings, the fixed hint,
+ * rules, padding, or blank cells — and also while editing), and claims the
+ * event so Pi's background viewport does not move with it. A claimed wheel
+ * also cancels a pointer gesture this popup captured earlier, as keyboard
+ * input does, so a press held across a scroll can never activate on the
+ * release and synthesized click that follow it. A wheel event outside that
+ * rectangle, or one the last render cannot describe, is returned unhandled, so
+ * Pi scrolls the conversation exactly as it does with no popup at all; the
+ * popup never scrolls content the pointer is not over, and never captures the
+ * wheel globally. Regular mode delivers no pointer input.
  *
  * Explicit selection copy (#436): while this overlay holds keyboard focus, the
  * configured `app.message.copy` binding mirrors Pi's own policy for a live
@@ -235,6 +245,13 @@ export interface QuestionMouseEvent {
   screenY?: number;
   /** Ignored: like the native SelectList, every completed click is one activation. */
   clickCount?: number;
+  /**
+   * Pi's own signed wheel step in lines (negative toward the beginning), as
+   * the host's wheel parser computes it from its wheel-scroll settings and the
+   * Alt multiplier. Only a wheel event carries it; without it the popup's
+   * viewport simply stays where it is.
+   */
+  wheelDelta?: number;
 }
 
 /** Structural subset of pi-tui's mouse handler result. */
@@ -251,8 +268,12 @@ export interface QuestionListComponent {
    * item is claimed and highlights it; a completed left click on the same live
    * item runs that item's existing confirm action. Every other primary pointer
    * event over the popup is left to the host, so native selection can read the
-   * visible popup rows; non-primary presses stay consumed as before, and wheel
-   * events are left to the host as well.
+   * visible popup rows; non-primary presses stay consumed as before. A wheel
+   * over the rectangle this component last drew scrolls the popup's own
+   * viewport by the host's `wheelDelta` and claims the event; a wheel outside
+   * it is left to the host, so the conversation scrolls normally. A claimed
+   * wheel also ends a press this popup captured earlier, so that press never
+   * activates afterwards.
    */
   handleMouse(event: QuestionMouseEvent): QuestionMouseResult | undefined;
   invalidate(): void;
@@ -875,15 +896,22 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return !(row === TYPE_ROW && editing);
   }
 
-  /** Resolve the drawn item under a local cell of the last composited frame. */
-  function itemAt(frame: PopupFrame | undefined, event: QuestionMouseEvent): PopupItemRef | undefined {
+  /** The frame whose drawn rectangle contains the event's local cell, if any. */
+  function frameUnderPointer(frame: PopupFrame | undefined, event: QuestionMouseEvent): PopupFrame | undefined {
     if (!frame || event.width !== frame.width || event.height !== frame.height) return undefined;
     const { x, y } = event;
     if (!Number.isInteger(x) || !Number.isInteger(y) || y < 0 || y >= frame.height || x < 0 || x >= frame.width) {
       return undefined;
     }
-    const row = frame.rows[y];
-    return row && x >= row.start && x < row.end ? row.ref : undefined;
+    return frame;
+  }
+
+  /** Resolve the drawn item under a local cell of the last composited frame. */
+  function itemAt(frame: PopupFrame | undefined, event: QuestionMouseEvent): PopupItemRef | undefined {
+    const under = frameUnderPointer(frame, event);
+    if (!under) return undefined;
+    const row = under.rows[event.y];
+    return row && event.x >= row.start && event.x < row.end ? row.ref : undefined;
   }
 
   /** Same bounds, viewport budget, and terminal: the compositor placed both frames at one origin. */
@@ -942,8 +970,33 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const handleMouse = (event: QuestionMouseEvent): QuestionMouseResult | undefined => {
     // A closed popup intercepts nothing: ordinary routing resumes at once.
     if (closed || typeof event !== "object" || event === null) return undefined;
-    // Scrolling is keyboard-only: the wheel keeps Pi's native behavior.
-    if (event.type === "wheel") return undefined;
+    // Pointer-owned wheel scrolling (#413): only the popup under the pointer
+    // moves, and only within the frame this component last drew. Any cell of
+    // that rectangle counts — body text, items, headings, the fixed hint,
+    // rules, padding, blank cells — and the host's own signed `wheelDelta` is
+    // the step, so its wheel settings and Alt multiplier are honored without
+    // adding a scrolling engine or speed control of our own. The wheel itself
+    // selects, activates, submits, or dismisses nothing and never touches an
+    // editing episode or a draft. A wheel the popup claims also retires a
+    // press it captured earlier, exactly as keyboard input does: the host
+    // keeps its own press capture across a wheel report and synthesizes a
+    // click from the stationary release that follows, so a press taken before
+    // the scroll can never act on rows that moved under the held pointer, or
+    // on rows a clamped offset left exactly where they were. At a bound the
+    // event stays claimed, so the background viewport cannot move under the
+    // popup; outside the drawn rectangle (or with no frame to describe it) the
+    // event is left to Pi, the pending gesture stays with the events the host
+    // owns, and the conversation scrolls exactly as it does with no popup open.
+    if (event.type === "wheel") {
+      if (!frameUnderPointer(lastFrame, event)) return undefined;
+      const hadHighlight = clearMouseGesture();
+      if (hadHighlight) invalidateContent();
+      const step = typeof event.wheelDelta === "number" && Number.isFinite(event.wheelDelta)
+        ? Math.trunc(event.wheelDelta)
+        : 0;
+      if (step !== 0) scrollViewportBy(step);
+      return { handled: true, render: step !== 0 || hadHighlight };
+    }
     if (event.type !== "press" && event.type !== "release" && event.type !== "click"
       && event.type !== "move" && event.type !== "drag") return undefined;
     if (isStale()) {

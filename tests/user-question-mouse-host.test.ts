@@ -163,6 +163,10 @@ const sgr = {
   drag: (x: number, y: number) => `\x1b[<32;${x + 1};${y + 1}M`,
   move: (x: number, y: number) => `\x1b[<35;${x + 1};${y + 1}M`,
   wheelDown: (x: number, y: number) => `\x1b[<65;${x + 1};${y + 1}M`,
+  wheelUp: (x: number, y: number) => `\x1b[<64;${x + 1};${y + 1}M`,
+  /** Alt+wheel: the host's own parser multiplies its step, and the popup follows that delta. */
+  wheelAltDown: (x: number, y: number) => `\x1b[<73;${x + 1};${y + 1}M`,
+  wheelAltUp: (x: number, y: number) => `\x1b[<72;${x + 1};${y + 1}M`,
 };
 
 function plain(line: string): string {
@@ -568,11 +572,19 @@ test("native fullscreen dispatch: drag-off, a shifted centered origin, resize, a
   await harness.draw();
   assert.ok(listOpen(), "a resized gesture did not activate");
 
-  // Wheel over the popup is not a click: no item activates (wheel policy is #413's).
+  // Wheel over the popup is not a click: no item activates. This short list has
+  // nothing to scroll, and the popup claims the report (#413), so no row moves
+  // here or in the background underneath.
   const q4 = harness.cell("q4: Fourth question?");
+  const frameBeforeWheel = harness.frame();
   harness.terminal.input(sgr.wheelDown(q4.x, q4.y));
   await harness.draw();
   assert.ok(listOpen(), "wheel never activates a popup item");
+  assert.deepEqual(harness.frame(), frameBeforeWheel, "a wheel over a popup with nothing to scroll changes no drawn row");
+  harness.terminal.input(sgr.wheelAltDown(q4.x, q4.y));
+  harness.terminal.input(sgr.wheelUp(q4.x, q4.y));
+  await harness.draw();
+  assert.deepEqual(harness.frame(), frameBeforeWheel, "nor do an Alt+wheel report or its opposite");
 
   // Hover motion with no button is inert as well.
   harness.terminal.input(sgr.move(q4.x, q4.y));
@@ -580,8 +592,8 @@ test("native fullscreen dispatch: drag-off, a shifted centered origin, resize, a
   assert.ok(listOpen());
   assert.equal(harness.surface.controller.listPending().length, 4);
   assert.equal(harness.sent.length, 0);
-  assert.deepEqual(harness.backgroundEvents.filter((event) => event.type !== "wheel"), [],
-    "no press, drag, release, or click reached the background");
+  assert.equal(harness.backgroundEvents.length, 0,
+    "no press, drag, release, click, or wheel report reached the background transcript");
 
   // Ordinary routing is restored when the popup closes, and reopening owns input again.
   harness.terminal.input(ESCAPE);
@@ -1562,6 +1574,377 @@ test("native fullscreen dispatch: a selection inherited from the transcript is f
   assert.equal(harness.sent.length, 0);
   harness.terminal.input(ESCAPE);
   await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+// ---------------------------------------------------------------------------
+// Issue #413: pointer-owned wheel scrolling. A wheel report whose cell is
+// inside the popup's own drawn rectangle scrolls that popup's single viewport
+// and is consumed there, so the native conversation viewport behind it never
+// moves — at a bound, on content that fits, on the fixed hint and frame cells,
+// and while the native free-text editor is active. A wheel report outside that
+// rectangle keeps Pi's ordinary routing: the transcript scrolls and the popup
+// keeps its own position. The rows drawn outside the popup's rules are the
+// double-scroll witness in every case, and every report enters through the
+// terminal input callback into the installed TuiAltScreen's own wheel parser:
+// the component's handler is never called directly and no viewport is copied.
+// ---------------------------------------------------------------------------
+
+/** The drawn rows outside the popup's rules: the live native viewport behind it. */
+function backgroundRows(harness: Harness): string[] {
+  const { top, bottom } = popupRules(harness);
+  return harness.frame().filter((_, index) => index < top || index > bottom);
+}
+
+/** One wheel report through the terminal input callback, then a redraw. */
+async function wheelAt(
+  harness: Harness,
+  packet: (x: number, y: number) => string,
+  cell: { x: number; y: number },
+): Promise<void> {
+  harness.terminal.input(packet(cell.x, cell.y));
+  await harness.draw();
+}
+
+/** Bounded wheeling until `done` holds for the drawn frame. */
+async function wheelUntil(
+  harness: Harness,
+  packet: (x: number, y: number) => string,
+  cell: { x: number; y: number },
+  done: () => boolean,
+  limit = 80,
+): Promise<void> {
+  for (let steps = 0; steps <= limit; steps += 1) {
+    if (done()) return;
+    await wheelAt(harness, packet, cell);
+  }
+  throw new Error(`the wheel target was not reached in ${limit} steps:\n${harness.frame().join("\n")}`);
+}
+
+/** The ordered markers of one content pattern that are currently drawn. */
+function drawnMarks(harness: Harness, pattern: RegExp): string[] {
+  return harness.frame().flatMap((row) => {
+    const match = pattern.exec(row);
+    return match ? [match[0]] : [];
+  });
+}
+
+test("native fullscreen dispatch: wheel inside the popup scrolls only the popup, wheel outside scrolls the transcript", async (t) => {
+  // An unhandled transcript, so Pi's own unhandled-wheel routing (its primary
+  // scroll view) is the background witness rather than a test handler.
+  const harness = await createHarness(t, { transcriptHandlesMouse: false });
+  if (!harness) return;
+  harness.terminal.resize(80, 14);
+  registerQuestion(harness, "Which database?", ["SQLite", "Postgres"]);
+  const noticeId = registerNotice(harness, "Long notice",
+    Array.from({ length: 40 }, (_, index) => `wheelbody line ${String(index + 1).padStart(2, "0")}`).join("\n"));
+  const before = pendingSnapshot(harness);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${noticeId}: Long notice`));
+  assert.ok(onScreen(harness, "wheelbody line 01"), `the long notice opens at its beginning:\n${harness.frame().join("\n")}`);
+
+  const rules = popupRules(harness);
+  const backgroundBefore = backgroundRows(harness);
+  assert.ok(backgroundBefore.length > 0 && backgroundBefore.every((row) => row.startsWith("transcript line")),
+    `the native transcript stays drawn around the popup:\n${harness.frame().join("\n")}`);
+  const frameBefore = harness.frame();
+  const marks = /wheelbody line \d+/u;
+  const marksBefore = drawnMarks(harness, marks);
+  assert.ok(marksBefore.length >= 3, `several body rows are visible:\n${frameBefore.join("\n")}`);
+  const bodyCell = harness.cell("wheelbody line 02");
+
+  // One wheel report inside the body moves the popup's viewport, and the
+  // popup claims it: no transcript row behind the popup moves. A shipped
+  // keyboard page back reproduces the earlier frame exactly, so the wheel and
+  // the keyboard share one viewport and the wheel moved exactly one line.
+  await wheelAt(harness, sgr.wheelDown, bodyCell);
+  const afterOneWheel = harness.frame();
+  assert.notDeepEqual(afterOneWheel, frameBefore, "a wheel report inside the popup scrolls its viewport");
+  assert.ok(onScreen(harness, "wheelbody line 04"), "one wheel report reveals the next body line");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "the transcript behind the popup never moved");
+  harness.terminal.input(SHIFT_ALT_UP);
+  await harness.draw();
+  assert.deepEqual(harness.frame(), frameBefore, "the wheel and the shipped keyboard page share one viewport");
+
+  // Alt+wheel: the host's parser reports a larger step and the popup follows
+  // exactly that delta; no wheel speed or acceleration is the popup's own.
+  await wheelAt(harness, sgr.wheelAltDown, bodyCell);
+  assert.ok(onScreen(harness, "wheelbody line 06") && !onScreen(harness, "wheelbody line 01"),
+    "an Alt+wheel report moves exactly the larger step the installed host reported");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "and still moves no transcript row");
+  await wheelAt(harness, sgr.wheelAltUp, bodyCell);
+  assert.deepEqual(harness.frame(), frameBefore, "the reported step reverses exactly");
+
+  // The wheel reaches the end of the content and stays claimed past the bound.
+  await wheelUntil(harness, sgr.wheelDown, bodyCell, () => onScreen(harness, "Close"));
+  assert.ok(onScreen(harness, "wheelbody line 40"), "the wheel reveals the last body row and the actions");
+  const atEnd = harness.frame();
+  await wheelAt(harness, sgr.wheelDown, bodyCell);
+  assert.deepEqual(harness.frame(), atEnd, "a wheel past the popup's end changes nothing");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "and the transcript behind it still never moved");
+
+  // ... and back to the beginning, also claimed past the bound.
+  const atBeginning = (): boolean => harness.frame()[rules.top + 2]!.includes("Long notice");
+  await wheelUntil(harness, sgr.wheelUp, bodyCell, atBeginning);
+  const atStart = harness.frame();
+  assert.ok(atBeginning(), "the popup is drawn from its title row");
+  await wheelAt(harness, sgr.wheelUp, bodyCell);
+  assert.deepEqual(harness.frame(), atStart, "a wheel before the popup's beginning changes nothing");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "again with no background motion");
+
+  // Non-menu cells of the same rectangle — the rules and the fixed hint row —
+  // are the popup's wheel as well, and scroll no background row.
+  for (const [name, cell] of [
+    ["top rule", { x: 6, y: rules.top }],
+    ["bottom rule", { x: 6, y: rules.bottom }],
+    ["fixed hint row", harness.cell("Shift+Alt+Up/Down")],
+  ] as const) {
+    const frameBeforeCell = harness.frame();
+    await wheelAt(harness, sgr.wheelDown, cell);
+    assert.notDeepEqual(harness.frame(), frameBeforeCell, `${name}: a wheel there scrolls the popup`);
+    assert.deepEqual(backgroundRows(harness), backgroundBefore, `${name}: and no transcript row moved`);
+    await wheelAt(harness, sgr.wheelUp, cell);
+    assert.deepEqual(harness.frame(), frameBeforeCell, `${name}: and reverses exactly`);
+  }
+  await wheelUntil(harness, sgr.wheelUp, bodyCell, atBeginning);
+
+  // A wheel report outside the popup's rectangle keeps Pi's ordinary routing:
+  // the live transcript scrolls and the popup holds its own viewport.
+  const above = rules.top - 1;
+  assert.ok(above >= 0 && harness.frame()[above]!.startsWith("transcript line"),
+    `a transcript row is drawn above the popup:\n${harness.frame().join("\n")}`);
+  const marksBeforeOutside = drawnMarks(harness, marks);
+  await wheelAt(harness, sgr.wheelUp, { x: 6, y: above });
+  assert.notDeepEqual(backgroundRows(harness), backgroundBefore,
+    "a wheel outside the popup scrolls the native conversation viewport");
+  assert.deepEqual(drawnMarks(harness, marks), marksBeforeOutside, "and the popup's own viewport did not move");
+  await wheelAt(harness, sgr.wheelDown, { x: 6, y: above });
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "the wheel back restores those transcript rows");
+
+  // Closing restores ordinary routing: the same cell's wheel now belongs to Pi.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+  assert.equal(harness.screen.hasOverlay(), false, "the popup closed normally");
+  const frameAfterClose = harness.frame();
+  await wheelAt(harness, sgr.wheelUp, bodyCell);
+  assert.notDeepEqual(harness.frame(), frameAfterClose, "with the popup closed the same wheel scrolls the conversation");
+
+  // A reopened popup owns the wheel again, with its own fresh geometry.
+  const reopened = await harness.open();
+  await harness.click(harness.cell(`${noticeId}: Long notice`));
+  const frameReopened = harness.frame();
+  await wheelAt(harness, sgr.wheelDown, bodyCell);
+  assert.notDeepEqual(harness.frame(), frameReopened, "the reopened popup owns the wheel again");
+  assert.ok(onScreen(harness, "wheelbody line 04"), "with its own correct scroll owner");
+  assert.equal(harness.sent.length, 0, "no wheel report answered or acted anywhere");
+  assertOthersUntouched(harness, before, [], "wheel scrolling");
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await reopened.closed;
+});
+
+test("native fullscreen dispatch: wheel while the native editor is active scrolls the popup, never the draft or the transcript", async (t) => {
+  const harness = await createHarness(t, { transcriptHandlesMouse: false });
+  if (!harness) return;
+  harness.terminal.resize(80, 14);
+  const questionId = registerQuestion(harness,
+    Array.from({ length: 20 }, (_, index) => `Detail ${index + 1}.`).join("\n\n"), ["SQLite", "Postgres"]);
+  const before = pendingSnapshot(harness);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${questionId}: Detail 1.`));
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "Type something…"));
+  await harness.click(harness.cell("Type something…"));
+  for (const character of "my draft") harness.terminal.input(character);
+  await harness.draw();
+  assert.ok(onScreen(harness, "my draft"), `the native draft shows while editing:\n${harness.frame().join("\n")}`);
+
+  const frameBefore = harness.frame();
+  const backgroundBefore = backgroundRows(harness);
+  const fieldCell = harness.cell("my draft");
+  await wheelAt(harness, sgr.wheelUp, fieldCell);
+  assert.notDeepEqual(harness.frame(), frameBefore, "a wheel over the popup while editing scrolls the popup");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "the transcript behind the popup never moved");
+  assert.equal(harness.sent.length, 0, "the wheel submits nothing");
+  assert.equal(harness.screen.hasOverlay(), true, "and never closes the popup");
+  await wheelAt(harness, sgr.wheelDown, fieldCell);
+  assert.deepEqual(harness.frame(), frameBefore, "the wheel returns the editing view exactly, one shared viewport");
+
+  // The draft survives wheel scrolling and stays editable afterwards.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  await harness.click(harness.cell("Type something…"));
+  await harness.draw();
+  assert.ok(onScreen(harness, "my draft"), "the kept draft shows again on re-entering editing");
+  harness.terminal.input(" typed");
+  await harness.draw();
+  assert.ok(onScreen(harness, "my draft typed"), "the field still edits normally after wheel input");
+  assert.equal(harness.sent.length, 0, "nothing was submitted by the wheel or the re-entry");
+  assertOthersUntouched(harness, before, [], "editing wheel");
+  // Back out of editing, then the options, then the list: the shortcut handler
+  // resolves only once the popup actually closes.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+test("native fullscreen dispatch: wheel claims nothing else, survives a narrowing resize, and never reaches the background handler", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 14);
+  const noticeId = registerNotice(harness, "Wheel resize notice",
+    Array.from({ length: 30 }, (_, index) => `resizewrap line ${String(index + 1).padStart(2, "0")} with enough words to wrap again when the terminal narrows`).join("\n"));
+  const before = pendingSnapshot(harness);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${noticeId}: Wheel resize notice`));
+  const marks = /resizewrap line \d+/u;
+  const bodyCell = harness.cell("resizewrap line 01");
+
+  // The popup claims the report: its own handler-bearing background region
+  // never sees a wheel event, and no item is highlighted or activated.
+  const marksBefore = drawnMarks(harness, marks);
+  const backgroundBefore = backgroundRows(harness);
+  await wheelAt(harness, sgr.wheelDown, bodyCell);
+  assert.notDeepEqual(drawnMarks(harness, marks), marksBefore, "the wheel scrolled the popup's own viewport");
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "and no transcript row around the popup moved");
+  assert.deepEqual(harness.backgroundEvents, [], "no wheel report reached the background's own pointer handler");
+  assert.ok(harness.frame().some((row) => row.includes("Enter choose")), "the popup stays in the same notice view");
+  assert.equal(harness.sent.length, 0);
+
+  // A narrowing resize re-wraps the complete content; the wheel then scrolls
+  // the re-wrapped rows inside the new frame, still with no background motion.
+  harness.terminal.resize(56, 12);
+  await harness.draw();
+  assert.ok(harness.frame().every((row) => row.length <= 56), "the frame fits the narrowed terminal");
+  const backgroundAfterResize = backgroundRows(harness);
+  assert.ok(backgroundAfterResize.length > 0, "transcript rows stay drawn outside the resized popup");
+  const resizedCell = harness.cell(drawnMarks(harness, marks)[0]!);
+  const frameBeforeResizeWheel = harness.frame();
+  await wheelAt(harness, sgr.wheelDown, resizedCell);
+  assert.notDeepEqual(harness.frame(), frameBeforeResizeWheel, "the wheel scrolls the re-wrapped rows");
+  await wheelAt(harness, sgr.wheelUp, resizedCell);
+  assert.deepEqual(harness.frame(), frameBeforeResizeWheel,
+    "and one wheel report moves exactly one line, the same shared viewport as before the resize");
+  assert.deepEqual(backgroundRows(harness), backgroundAfterResize,
+    "the transcript rows around the resized popup did not move");
+  assert.equal(harness.backgroundEvents.length, 0, "and the background handler saw none of it");
+
+  // Wheel scrolling leaves the pointer-click ownership intact: a wheel reveals
+  // an action, and a deliberate click on the revealed row runs it once.
+  await wheelUntil(harness, sgr.wheelDown, resizedCell, () => onScreen(harness, "Close"));
+  await harness.click(harness.cell("Close"));
+  await settle();
+  assert.equal(harness.surface.controller.getPending(noticeId), undefined, "the revealed Close ran exactly once");
+  assertOthersUntouched(harness, before, [noticeId], "wheel then Close");
+  assert.equal(harness.sent.length, 0, "Close sends nothing");
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+// ---------------------------------------------------------------------------
+// Issue #413 wheel policy layered on the #431 pointer gesture: TuiAltScreen
+// keeps its own press capture across a wheel report and synthesizes a click
+// from the stationary release that follows it. A wheel report the popup
+// consumes must therefore retire a press the popup claimed earlier — the rows
+// under the held pointer moved, or a clamped offset left them exactly where
+// they were — and scrolling must never turn into an activation. Every packet
+// enters through the terminal input callback, and the fresh deliberate click
+// at the end proves ordinary clicks still act.
+// ---------------------------------------------------------------------------
+
+/** Whether `row` continues a wrapped label instead of starting a new entry. */
+function isWrappedContinuation(row: string | undefined): boolean {
+  return row !== undefined && /^\s+\S/.test(row)
+    && !/^\s+(?:> )?(?:\d+\. |Type something|Decline)/.test(row);
+}
+
+test("native fullscreen dispatch: a wheel inside the popup retires a held press before its release can activate", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 14);
+  const question = Array.from({ length: 12 }, (_, index) => `Detail ${index + 1}.`).join("\n\n");
+  const longChoice = "Use the managed Postgres cluster with read replicas in every region we deploy to across all continents";
+  const questionId = registerQuestion(harness, question, ["SQLite", longChoice]);
+  const before = pendingSnapshot(harness);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${questionId}: Detail 1.`));
+  assert.ok(onScreen(harness, "Detail 1.") && onScreen(harness, "arrows select"),
+    `the answer view opened at its beginning:\n${harness.frame().join("\n")}`);
+  const wheelCell = harness.cell("Detail 1.");
+
+  // Wheel until the long choice is fully drawn: its label row plus exactly one
+  // continuation row, both inside the popup.
+  await wheelUntil(harness, sgr.wheelDown, wheelCell, () => {
+    const rows = harness.frame();
+    const label = rows.findIndex((row) => row.includes("2. Use the managed"));
+    return label >= 0 && isWrappedContinuation(rows[label + 1]) && !isWrappedContinuation(rows[label + 2]);
+  });
+  const labelRow = harness.frame().findIndex((row) => row.includes("2. Use the managed"));
+  assert.ok(labelRow >= 0 && isWrappedContinuation(harness.frame()[labelRow + 1]),
+    `the wrapped choice is fully drawn:\n${harness.frame().join("\n")}`);
+  const continuationText = harness.frame()[labelRow + 1]!.trim();
+  const held = { x: harness.frame()[labelRow]!.search(/\S/), y: labelRow };
+
+  // Press the choice's label row: the popup claims it and highlights the
+  // choice, and a press alone submits nothing.
+  harness.terminal.input(sgr.press(held.x, held.y));
+  await harness.draw();
+  assert.match(harness.frame()[labelRow]!, /> 2\. Use the managed/, "the press highlights the wrapped choice");
+  assert.equal(harness.sent.length, 0, "a press alone submits nothing");
+
+  // Wheel inside the popup while the press is held: the content moves up, so
+  // this same cell now draws that same choice's wrapped continuation row, and
+  // no transcript row behind the popup moves.
+  const frameBeforeWheel = harness.frame();
+  const backgroundBefore = backgroundRows(harness);
+  await wheelAt(harness, sgr.wheelDown, held);
+  assert.notDeepEqual(harness.frame(), frameBeforeWheel, "the wheel scrolled the popup while the press was held");
+  assert.equal(harness.frame()[held.y]!.trim(), continuationText,
+    `the same choice's continuation row moved under the held pointer:\n${harness.frame().join("\n")}`);
+  assert.deepEqual(backgroundRows(harness), backgroundBefore, "no transcript row moved under the popup");
+
+  // The stationary release, and the click the host synthesizes from it, must
+  // not activate a press captured before that scroll.
+  harness.terminal.input(sgr.release(held.x, held.y));
+  await settle();
+  assert.equal(harness.sent.length, 0, "a wheel during a held press never activates the item on release");
+  assert.equal(harness.surface.controller.listPending().length, 1, "the question stays pending");
+  await harness.draw();
+  assert.equal(harness.screen.hasOverlay(), true, "and the popup stays open in the same view");
+  assert.ok(onScreen(harness, "arrows select"), "the answer view's fixed hint is still drawn");
+
+  // The same gesture at the end bound: the offset is clamped so no drawn row
+  // changes, and the press still must not survive the consumed wheel report.
+  await wheelUntil(harness, sgr.wheelDown, wheelCell, () => onScreen(harness, "Decline (no answer"));
+  const decline = harness.cell("Decline (no answer");
+  harness.terminal.input(sgr.press(decline.x, decline.y));
+  await harness.draw();
+  assert.match(harness.frame()[decline.y]!, /> Decline \(no answer/, "the press highlights Decline");
+  const atEnd = harness.frame();
+  await wheelAt(harness, sgr.wheelDown, decline);
+  assert.deepEqual(harness.frame(), atEnd, "a wheel past the popup's end changes nothing on screen");
+  harness.terminal.input(sgr.release(decline.x, decline.y));
+  await settle();
+  assert.equal(harness.sent.length, 0, "the bound wheel and release declined nothing");
+  assert.equal(harness.surface.controller.listPending().length, 1, "the question is still pending");
+
+  // Positive control: a fresh deliberate click after all that wheeling still
+  // submits exactly the visible choice.
+  await wheelUntil(harness, sgr.wheelUp, wheelCell, () => onScreen(harness, "2. Use the managed"));
+  await harness.click(harness.cell("2. Use the managed"));
+  await settle();
+  assert.deepEqual(harness.sent.map((entry) => entry.message),
+    [`Answer to pending question "${question}": ${longChoice}`],
+    "a fresh click after wheeling submits exactly the visible choice");
+  assertOthersUntouched(harness, before, [questionId], "held press-wheel-release");
+  assert.equal(harness.backgroundEvents.length, 0, "no press, release, click, or wheel report reached the background transcript");
+  assert.equal(harness.screen.hasActiveSelection(), false, "the retired gesture fabricated no native selection");
   harness.terminal.input(ESCAPE);
   await closed;
 });

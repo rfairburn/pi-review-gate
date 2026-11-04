@@ -286,6 +286,42 @@ separately covers the session-host authority this relies on: only an initial lef
 press above a pane can activate a row, so stray drag or release packets outside
 the popup cannot switch sessions or trigger a deliberate action.
 
+Wheel scrolling of the shared popup (#413) is covered in
+`tests/user-question-mouse-host.test.ts` and
+`tests/user-question-native-popup.test.ts`, through the installed runtime's
+own wheel parser: synthetic SGR
+wheel reports (including the Alt-modifier report) enter the terminal input
+callback and the assertions read the composited screen. They pin the pointer
+contract: a report whose cell is inside the popup's own drawn rectangle — body
+text, a menu item, a rule, a padding row, or the fixed hint row — scrolls the
+popup's single viewport and is consumed there, so the live transcript rows
+around the popup do not move at all, including at the start and end bounds, on
+content that fits without scrolling, and while the native free-text editor is
+active (the draft stays intact and editable). A report the popup consumes also
+retires a menu press it captured earlier, so the release and synthesized click
+that follow activate nothing on rows that moved under the held pointer or that a
+clamped bound left in place, while a fresh deliberate click still acts. A
+report outside that rectangle
+keeps Pi's ordinary routing: the conversation viewport moves and the popup keeps
+its own scroll position; after the popup closes the same cell's wheel belongs to
+Pi again, and a reopened popup owns the wheel with its own fresh geometry. The
+Alt report shows the popup following the step the host supplied instead of a
+step of its own, and a wheel report undone by one shipped Shift+Alt+Up press
+reproduces the earlier frame exactly, which is the witness that keyboard paging
+and the wheel share one viewport rather than two scroll positions.
+
+Manual wheel check on a real terminal: with the popup open, put the pointer over
+the popup and turn the wheel — the popup's content scrolls while the
+conversation around it stays put — then move the pointer outside the popup and
+scroll: the conversation scrolls instead and the popup holds its position.
+Closing and reopening the popup restores the same behavior. The keyboard path
+(**Shift+Option+Up/Down** on macOS, or Ctrl+Alt+PageUp/PageDown) is unchanged
+and is the only popup scroll path in regular mode, where the terminal keeps the
+wheel and its scrollback. No physical-terminal wheel acceptance has been
+recorded for this behavior: the automated coverage is headless synthetic SGR
+reports, which prove the dispatch the installed runtime performs for given
+bytes, not which bytes a particular terminal emits.
+
 ### Native SSH clipboard routing (#466)
 
 After `npm run build:test`, the focused controls are:

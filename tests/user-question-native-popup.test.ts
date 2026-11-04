@@ -21,8 +21,10 @@
  * around it, with the popup's theme surface only inside its bounds. Within
  * that frame the keyboard hint stays fixed at every scroll position, keyboard
  * scrolling moves exactly one line, Up/Down reveal the selection, resize
- * clamps and keeps content reachable, the popup handles no wheel input, and
- * ordinary answer delivery, close, and reopen are unchanged.
+ * clamps and keeps content reachable, a wheel report inside the popup's own
+ * rectangle scrolls that popup (and never the transcript behind it) while a
+ * wheel report outside it scrolls the transcript and leaves the popup alone,
+ * and ordinary answer delivery, close, and reopen are unchanged.
  */
 
 import assert from "node:assert/strict";
@@ -70,6 +72,15 @@ const EDITING_HINT = "Enter submit · Esc back to options to scroll";
 /** SGR wheel report (1-based terminal coordinates). */
 function wheel(direction: "up" | "down", x: number, y: number): string {
   return `\x1b[<${direction === "up" ? 64 : 65};${x + 1};${y + 1}M`;
+}
+
+/**
+ * The rows outside a rendered popup rectangle — the live native transcript
+ * behind it. A wheel the popup claims must leave every one of these rows
+ * untouched; a wheel outside the popup must move them.
+ */
+function outsideBoundsRows(lines: readonly string[], bounds: { row: number; height: number }): string[] {
+  return lines.filter((_, index) => index < bounds.row || index >= bounds.row + bounds.height);
 }
 
 const stripAnsi = (text: string): string =>
@@ -198,7 +209,7 @@ test("synthetic popup wrap witness: one contiguous rendered run carries the wrap
     "rows are not reordered to manufacture the path");
 });
 
-test("native fullscreen: the compact popup keeps its natural size over the live transcript and scrolls by keyboard only", async () => {
+test("native fullscreen: the compact popup keeps its natural size over the live transcript and scrolls by keyboard and pointer-owned wheel", async () => {
   previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
   previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
@@ -378,12 +389,16 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
       "transcript updates render above and below the open popup");
     popup = view(LIST_ANSWER_HINT);
 
-    // A wheel report over the popup is not handled by it: the popup body and
-    // selection stay as they were (wheel behavior remains Pi's own).
+    // A wheel report over the popup belongs to the popup (#413). This short
+    // list has nothing to scroll, so no popup row moves — and because the
+    // popup claims the event, the live transcript behind it never moves.
     const beforeWheel = popup.interior;
+    const beforeWheelScreen = screen();
     terminal.send(wheel("down", 10, popup.bounds.row + 3));
     terminal.send(wheel("up", 10, popup.bounds.row + 3));
-    assert.deepEqual(view(LIST_ANSWER_HINT).interior, beforeWheel, "wheel input does not scroll or select within the popup");
+    assert.deepEqual(view(LIST_ANSWER_HINT).interior, beforeWheel,
+      "a wheel over a popup with nothing to scroll moves no popup row and selects nothing");
+    assert.deepEqual(screen(), beforeWheelScreen, "and the native transcript behind the popup never moved");
 
     // --- Short question: only its natural rows ---
     terminal.send(ENTER);
@@ -456,6 +471,58 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     popup = view(NOTICE_HINT);
     assert.ok(selected(popup, "More details"), "Up selects and reveals More details");
 
+    // --- Pointer-owned wheel scrolling over that same long notice ---
+    // One wheel report inside the popup's rectangle moves exactly one line —
+    // the same line Shift+Alt+Down moves — while the live transcript rows
+    // around the popup stay put. The pointer cell is inside the drawn frame
+    // but on no menu entry, so nothing is highlighted or activated.
+    const wheelCell = 10;
+    const wheelRow = popup.bounds.row + 3;
+    const outsidePopup = (lines: string[]): string[] => outsideBoundsRows(lines, popup.bounds);
+    const bodyBeforeWheel = popup.body;
+    const screenBeforeWheel = screen();
+    terminal.send(wheel("up", wheelCell, wheelRow));
+    let wheelPopup = view(NOTICE_HINT);
+    assert.deepEqual(wheelPopup.body.slice(1), bodyBeforeWheel.slice(0, -1),
+      "one wheel report inside the popup moves exactly one line");
+    assert.ok(selected(wheelPopup, "More details") && !selected(wheelPopup, "Close"),
+      "the wheel highlights, selects, and activates nothing of its own");
+    assert.deepEqual(outsidePopup(screen()), outsidePopup(screenBeforeWheel),
+      "the transcript around the popup never moves under a wheel inside it");
+    for (let step = 0; step < 80; step += 1) terminal.send(wheel("down", wheelCell, wheelRow));
+    wheelPopup = view(NOTICE_HINT);
+    assert.ok(wheelPopup.body.some((line) => line.includes("Close")), "the wheel reaches the end of the notice content");
+    const atWheelEnd = wheelPopup.interior;
+    terminal.send(wheel("down", wheelCell, wheelRow));
+    assert.deepEqual(view(NOTICE_HINT).interior, atWheelEnd, "a wheel past the popup's end is claimed and changes nothing");
+    assert.deepEqual(outsidePopup(screen()), outsidePopup(screenBeforeWheel),
+      "even at that bound the transcript behind the popup does not move");
+    for (let step = 0; step < 80; step += 1) terminal.send(wheel("up", wheelCell, wheelRow));
+    wheelPopup = view(NOTICE_HINT);
+    assert.equal(wheelPopup.body[0], "n1: Long notice", "the wheel returns the popup to its beginning");
+    const atWheelStart = wheelPopup.interior;
+    terminal.send(wheel("up", wheelCell, wheelRow));
+    assert.deepEqual(view(NOTICE_HINT).interior, atWheelStart, "a wheel before the popup's beginning is claimed and changes nothing");
+    assert.deepEqual(outsidePopup(screen()), outsidePopup(screenBeforeWheel),
+      "and the transcript behind it still does not move");
+
+    // A wheel report outside the popup's rectangle is left to Pi: the native
+    // transcript scrolls and the popup keeps its own scroll position.
+    const abovePopup = popup.bounds.row - 1;
+    assert.ok(abovePopup >= 0, "one transcript row stays visible above the capped popup");
+    const bodyBeforeBackgroundWheel = view(NOTICE_HINT).body;
+    terminal.send(wheel("up", wheelCell, abovePopup));
+    assert.notDeepEqual(outsidePopup(screen()), outsidePopup(screenBeforeWheel),
+      "a wheel outside the popup scrolls the native transcript as usual");
+    assert.deepEqual(view(NOTICE_HINT).body, bodyBeforeBackgroundWheel,
+      "and that wheel leaves the popup's viewport exactly where it was");
+    terminal.send(wheel("down", wheelCell, abovePopup));
+    assert.deepEqual(outsidePopup(screen()), outsidePopup(screenBeforeWheel),
+      "a wheel back down outside the popup returns the native transcript to its earlier rows");
+    assert.deepEqual(view(NOTICE_HINT).body, bodyBeforeBackgroundWheel,
+      "and the popup is still untouched by background wheel input");
+    popup = view(NOTICE_HINT);
+
     // --- Resize: the cap follows the live terminal; the offset is kept and content stays reachable ---
     const firstBeforeResize = popup.body[0];
     terminal.resize(RESIZED_ROWS);
@@ -485,6 +552,24 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     assert.equal(popup.bounds.height, ROWS - 2);
     assert.equal(popup.body[0], "q2:", "the long question opens at its beginning");
     assert.ok(!popup.body.some((line) => line.includes("> 1. Alpha")), "opening does not jump to the first choice");
+
+    // The same pointer-owned wheel rule applies to a long AskUserQuestion:
+    // one report inside the popup scrolls the question body one line, and the
+    // live transcript behind the popup does not move.
+    const questionBodyBefore = popup.body;
+    const questionScreenBefore = screen();
+    terminal.send(wheel("down", 10, popup.bounds.row + 3));
+    let questionWheel = view(ANSWER_HINT);
+    assert.deepEqual(questionWheel.body.slice(0, -1), questionBodyBefore.slice(1),
+      "a wheel report inside a long question scrolls its body exactly one line");
+    assert.deepEqual(outsideBoundsRows(screen(), questionWheel.bounds), outsideBoundsRows(questionScreenBefore, questionWheel.bounds),
+      "and the transcript behind the question never moved");
+    terminal.send(wheel("up", 10, popup.bounds.row + 3));
+    questionWheel = view(ANSWER_HINT);
+    assert.deepEqual(questionWheel.body, questionBodyBefore, "the wheel returns the question to where it was");
+    assert.deepEqual(outsideBoundsRows(screen(), questionWheel.bounds), outsideBoundsRows(questionScreenBefore, questionWheel.bounds),
+      "with the transcript still untouched");
+
     terminal.send(DOWN);
     assert.ok(selected(view(ANSWER_HINT), "2. Beta"), "Down selects and reveals the second choice");
     terminal.send(DOWN); // Type something…

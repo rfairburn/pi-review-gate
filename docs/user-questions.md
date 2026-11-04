@@ -138,11 +138,23 @@ within the content's start and end.
   to one row inside the top and bottom of the conversation viewport; any
   further content scrolls within that cap. The conversation stays visible
   around the popup.
-- Scrolling the popup is keyboard-only. The popup does not handle the mouse
-  wheel, so the wheel keeps Pi's and the terminal's native behavior and does
-  not scroll the popup content. In fullscreen mode the popup does accept
-  single left clicks on its visible menu entries (see below); clicks use the
-  current scroll position, and the fixed hint area is not clickable.
+- The wheel follows the pointer in Pi's **fullscreen mode**: a wheel over the
+  popup — anywhere inside its drawn frame, including its rules, padding, blank
+  cells, and the fixed hint row — scrolls that popup's own content, using Pi's
+  own wheel step for the event (Alt+wheel moves five times as far; the popup
+  adds no wheel speed or acceleration setting of its own). The wheel only
+  scrolls: it selects, highlights, activates, submits, or dismisses nothing,
+  and it never touches a free-text draft. A wheel inside the popup also cancels
+  a menu press that was still held when it arrived, the same way keyboard input
+  does, so pressing an entry and then scrolling never ends as an accidental
+  activation; a fresh deliberate click still works. A wheel over the
+  conversation around
+  the popup scrolls that conversation exactly as it does while no popup is
+  open, and a closed popup intercepts nothing: the popup never captures the
+  wheel globally. In regular mode the terminal keeps the wheel and its
+  scrollback, so use the keyboard shortcuts above. Single left clicks on the
+  visible menu entries still use the current scroll position, and the fixed
+  hint area is not clickable.
 
 Press **Escape** to return to the shared list; returning does not dismiss a
 notice. The only notice actions are **More details** and
@@ -276,6 +288,9 @@ arrows select · Enter confirm · Esc back
   active, clicking its box never submits the draft; still-visible choice and
   Decline rows remain clickable. Clicking one leaves editing and invokes that menu
   action. Merely leaving editing without resolving the question keeps the draft.
+  The wheel is pointer-owned the same way: a wheel inside the popup's drawn
+  frame scrolls the popup, and a wheel outside it scrolls the conversation
+  (see [Scrolling the shared popup](#scrolling-the-shared-popup)).
 - **Copying popup text in fullscreen mode.** Select the text you want with a
   left-button drag — over the question/notice body, its context, or the
   conversation around the popup. That fullscreen selection is Pi's own, drawn in

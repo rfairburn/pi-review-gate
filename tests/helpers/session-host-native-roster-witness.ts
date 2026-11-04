@@ -16,8 +16,9 @@
  * one card's extent never overlaps another's, and the three required fixed
  * actions ("Saved conversations", "New session", "Quit host") follow every
  * native card as ordered one-row entries. ONE optional one-row action may
- * appear, only at the renderer's own position: the final "Settings" action
- * (#613), present when at least one grouped settings entry point is available.
+ * appear, only at the renderer's own position: "Settings" (#613), present when
+ * at least one grouped settings entry point is available, sits between "New
+ * session" and the final "Quit host" action.
  * There is no independent top-level "Network" or "Host shortcuts" row: those
  * are Settings submenus, drawn in the content pane, never in the roster. Only
  * the leftmost sidebar columns (the wide 32-column pane or the full
@@ -29,9 +30,10 @@
  * cards under this grammar and yield no parse: a stale witness cannot silently
  * accept them. Public consumers are fail-closed: a frame is only usable when
  * the header-declared native count, every native card's full 3/5-row extent,
- * the ordered required action tail (with the optional final Settings action
- * only after "Quit host") all agree, so a partially painted roster can never
- * satisfy an entry, card, selection, or "hidden" witness.
+ * the ordered required action tail (with the optional Settings action only
+ * between "New session" and the final "Quit host") all agree, so a partially
+ * painted roster can never satisfy an entry, card, selection, or "hidden"
+ * witness.
  *
  * A Network-shaped row is never an accepted roster action any more: that entry
  * point moved under Settings. It stays a visible-sidebar remnant marker for the
@@ -68,10 +70,11 @@ const MARKER_CELLS = 2;
 /** The three required fixed host actions, in their rendered order. */
 export const ROSTER_ACTIONS = ["Saved conversations", "New session", "Quit host"] as const;
 /**
- * The optional grouped settings action (#613). The renderer draws it only after
- * `"Quit host"`, and only when at least one entry point it offers (Theme,
- * Network, Host shortcuts) is available, so it is never part of the required
- * tail and never reorders that tail.
+ * The optional grouped settings action (#613). The renderer draws it only
+ * between `"New session"` and the final `"Quit host"`, and only when at least
+ * one entry point it offers (Theme, Network, Host shortcuts) is available, so
+ * it is never part of the required labels and never follows the destructive
+ * Quit action.
  */
 export const SETTINGS_ACTION = "Settings";
 /**
@@ -84,6 +87,17 @@ const HOST_SHORTCUTS_ACTION = "Host shortcuts";
 export type RosterActionLabel =
   | (typeof ROSTER_ACTIONS)[number]
   | typeof SETTINGS_ACTION;
+
+/**
+ * The renderer's complete action-tail order for one availability state. Quit
+ * host is always last; Settings, when present, separates it from New session.
+ */
+export function rosterActionOrder(settingsAvailable: boolean): readonly RosterActionLabel[] {
+  const [saved, newSession, quitHost] = ROSTER_ACTIONS;
+  return settingsAvailable
+    ? [saved, newSession, SETTINGS_ACTION, quitHost]
+    : [saved, newSession, quitHost];
+}
 
 export interface RosterCardEntry {
   readonly kind: "native";
@@ -146,8 +160,9 @@ export interface ParsedRoster {
   readonly entryEnd: number;
   /**
    * True only for a complete roster: exactly `count` full native cards followed
-   * by the ordered required action tail, with the optional final Settings
-   * action only after "Quit host", and no extra entry-shaped row.
+   * by the ordered required action tail, with the optional Settings action
+   * only between "New session" and the final "Quit host", and no extra
+   * entry-shaped row.
    */
   readonly complete: boolean;
 }
@@ -410,18 +425,18 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     return true;
   };
 
-  // The renderer's fixed tail, in its actual order. The three required actions
-  // stay mandatory in their order, and there is no optional Network row any
-  // more: a Network-shaped row anywhere in the roster leaves the parse
-  // incomplete rather than being accepted as an entry point.
+  // The renderer's fixed tail, in its actual order. Saved conversations and New
+  // session stay mandatory first; Settings is optional between them and the
+  // final mandatory Quit host. There is no optional Network row any more: a
+  // Network-shaped row anywhere in the roster leaves the parse incomplete
+  // rather than being accepted as an entry point.
   const [saved, newSession, quitHost] = ROSTER_ACTIONS;
   if (!consumeAction(saved)) return incomplete(header, count, index);
   if (!consumeAction(newSession)) return incomplete(header, count, index);
-  if (!consumeAction(quitHost)) return incomplete(header, count, index);
 
-  // Settings is the one grouped settings action and is appended only when an
-  // entry point it offers is available. It is accepted only in the exact form
-  // the renderer produces.
+  // Settings is the one grouped settings action and appears only when an entry
+  // point it offers is available. It must be before Quit host and is accepted
+  // only in the exact form the renderer produces.
   const optionalLine = body[index];
   if (optionalLine !== undefined && rosterActionLabel(optionalLine, width) === SETTINGS_ACTION) {
     const marker = statusMarker(optionalLine)!;
@@ -437,6 +452,7 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     entries.push(action);
     index += 1;
   }
+  if (!consumeAction(quitHost)) return incomplete(header, count, index);
 
   // Anything extra that looks like an entry (a marker row or another full
   // card) means the roster is stale/duplicated, not complete. Footer hints,

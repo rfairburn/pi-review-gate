@@ -1032,6 +1032,12 @@ test("Main's actual remote owner is structured and distinct from the left highli
       .includes(ACTIVE_MAIN_WHITE),
     "a different local row is not marked as the actual owner",
   );
+  show(harness); // sidebar focus while the remote card still owns Main
+  const sidebarFocusLines = harness.controller.renderRoster(40, 30).lines;
+  assert.ok((sidebarFocusLines.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "the actual remote owner keeps its bright title while sidebar navigation has focus");
+  assert.ok(!(sidebarFocusLines.find((line) => line.includes("local-local-a")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "sidebar focus still does not invent a local owner");
 
   harness.controller.setActiveMainOwner("local-a");
   assert.deepEqual(harness.controller.activeMainOwnerKey, { kind: "local", id: "local-a" });

@@ -1833,8 +1833,7 @@ function wideRightPane(harness: Harness, formCols = 47, rows = 24): string {
 function openNetworkFromRoster(harness: Harness): void {
   show(harness);
   void rosterText(harness); // deliberate Enter only acts on a row the last roster render drew
-  harness.send(DOWN); // New session -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New session -> the one grouped Settings entry
   void rosterText(harness);
   harness.send(ENTER); // open Settings
   void rosterText(harness);

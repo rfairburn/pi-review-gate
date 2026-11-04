@@ -225,7 +225,8 @@ settings and the defaults are described below. Put native Pi arguments after a l
 
 ### Sidebar Settings and themes
 
-The sidebar's **Settings** entry groups **Theme**, **Network**, and **Host shortcuts**.
+The sidebar's **Settings** entry appears above **Quit host** and groups **Theme**,
+**Network**, and **Host shortcuts**.
 Network and Host shortcuts open their existing controls as submenus rather than separate
 roster actions; their permissions, defaults, and session routing are unchanged. Back
 returns from a submenu to Settings, and closing Settings returns to the roster.
@@ -241,7 +242,9 @@ an invalid existing record. A failed save keeps the previous active palette.
 The sidebar works with only remote sessions and no local Pi session running: Pi's saved
 theme is not read or synchronized, and changing this theme neither restarts sessions nor
 changes any local or remote session's own theme. Status text and the distinction between
-the navigation highlight and the active Main conversation remain visible.
+the navigation highlight and the active Main conversation remain visible. The base
+sidebar background uses the terminal default, like Pi's normal chat viewport; choosing
+a foreground palette does not force a black or white pane background.
 
 ### Host shortcut configuration
 
@@ -1723,11 +1726,17 @@ error, or process exit does not turn unknown into Idle. Exited rows retain their
 explicitly removed. There is no heartbeat timeout that declares a quiet session dead,
 so a valid idle state may remain for hours.
 
-Title highlighting is focus-domain, never both at once: while a sidebar-owned surface
-(roster, form, or confirmation) has focus, the LEFT selected navigation target's title
-is blue; while Main has focus, the ACTUAL active Main conversation's title is white
-(never a sibling or the stale left selection). With no active owner, no row is falsely
-highlighted.
+Agent states have distinct theme colors, and pending input is emphasized independently:
+`agent running | input pending` keeps both distinctions visible. The words and the
+observed/unknown classification remain unchanged; color never substitutes for status text.
+
+The actual active Main conversation keeps its brighter title while its card is visible,
+even when keyboard focus moves to the sidebar and Up/Down moves the blue navigation
+highlight to another item. The two marks identify different things: navigation does not
+activate a session or change Main's owner. If the active card is also the navigation
+target, its active-title color takes precedence and the existing selection marker still
+identifies the target. This applies to local and remote owners; with no active owner,
+no row receives a false active-title mark.
 
 The local status channel uses a private Unix socket and per-instance authorization
 identity bound to the owned child. A pre-main Node preload consumes the one-shot
@@ -1754,7 +1763,7 @@ a second authoritative process or status store, and it never moves a process,
 conversation, or saved state between hosts.
 
 Only session cards reorder, including exited rows and the bounded error and
-identity-unavailable placeholder rows that already hold a remembered position. The action entries (New, Saved, Settings, Quit host)
+identity-unavailable placeholder rows that already hold a remembered position. The action entries (Saved conversations, New session, Settings, Quit host)
 and the roster's [Terminal diagnostics](#terminal-parser-diagnostics) entry keep their
 existing relative order after the session cards, and no session card can be moved among
 them.

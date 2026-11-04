@@ -713,8 +713,7 @@ test("the configured return chord is consumed in host forms and confirmations", 
 test("both Host shortcuts labels stay beside their real editable body row", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open Settings
   void harness.controller.render(60, 20);
@@ -749,8 +748,7 @@ test("host shortcut settings edit configured bindings and Cancel leaves active b
   const harness = makeController({ settingsAvailable: true });
   const open = (): void => {
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> the one grouped Settings entry
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
     harness.send(ENTER); // open Settings
     void harness.controller.render(60, 20);
@@ -781,8 +779,7 @@ test("host shortcut settings edit configured bindings and Cancel leaves active b
 test("the grouped Settings chain takes two deliberate Escapes and refuses a pasted body", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open Settings
   void harness.controller.render(60, 20);
@@ -812,8 +809,7 @@ test("the grouped Settings chain takes two deliberate Escapes and refuses a past
 test("Settings and Theme rows activate only from the pane the renderer drew", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN);
-  harness.send(DOWN);
+  harness.send(DOWN); // New -> the one grouped Settings entry
   harness.send(ENTER); // open Settings with no written submenu yet
   harness.send(ENTER); // and immediately try to activate a row
   const text = harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, "");
@@ -826,8 +822,7 @@ test("Settings and Theme rows activate only from the pane the renderer drew", ()
 function openThemePaneHarness(): { harness: Harness; lightRow: number } {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open Settings
   void harness.controller.render(60, 20);
@@ -892,8 +887,7 @@ test("a Settings or Theme pane that no longer fits cannot authorize Enter or a c
 test("a Settings menu that cannot show every entry falls back instead of hiding one", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open the grouped menu
   const wide = harness.controller.renderForm(60, 20).lines
@@ -935,8 +929,7 @@ test("a direct openPeerMenu keeps its own roster return after a grouped Network 
   const harness = makeController({ settingsAvailable: true });
   harness.controller.setPeerUiSnapshot(networkSnapshot(null));
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open Settings
   void harness.controller.render(60, 20);
@@ -962,8 +955,7 @@ test("a direct openPeerMenu keeps its own roster return after a grouped Network 
 test("host shortcut Save validates the pair and applies only after successful completion", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN); // New -> Quit host
-  harness.send(DOWN); // -> the one grouped Settings entry
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
   harness.send(ENTER); // open Settings
   void harness.controller.render(60, 20);
@@ -995,8 +987,7 @@ test("a held old toggle chord stays fenced across Save and its fresh press remai
     assert.equal(harness.controller.visible, true);
     assert.equal(harness.controller.focus, "sidebar");
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> the one grouped Settings entry
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
     harness.send(ENTER); // open Settings
     void harness.controller.render(60, 20);
@@ -1041,8 +1032,7 @@ test("a held return chord keeps its original repeat/release fence through Save a
       settingsAvailable: true,
     });
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> the one grouped Settings entry
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
     harness.send(ENTER); // open Settings
     void harness.controller.render(60, 20);
@@ -1085,8 +1075,7 @@ test("a fresh press of the originally claimed return chord clears its old fence"
       settingsAvailable: true,
     });
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> the one grouped Settings entry
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
     harness.send(ENTER); // open Settings
     void harness.controller.render(60, 20);
@@ -2846,6 +2835,24 @@ test("truthful card status: observed/unknown agent and input state below the tit
   assert.equal(statusFor("gone"), "  exited (code 3)");
   assert.equal(statusFor("err"), "  error (code 1)");
   assert.equal(statusFor("warm"), "  starting | input none");
+
+  // Agent and input facts stay independently painted: the running agent and
+  // its ordinary empty input are two roles on the SAME row, while the waiting
+  // agent and its conspicuous pending input use two different roles again.
+  const dark = sidebarPaletteFor("dark");
+  const runStatus = harness.controller.render(80, 60).lines[cardIndex(texts, "label-run") + 1] ?? "";
+  assert.ok(runStatus.includes(`\x1b[${dark.statusRunning}magent running\x1b[0m`),
+    "the running agent uses the running status role");
+  assert.ok(runStatus.includes(`\x1b[${dark.statusUnknown}minput none\x1b[0m`),
+    "input none stays muted independently of the running agent");
+  const typedStatus = harness.controller.render(80, 60).lines[cardIndex(texts, "label-typed") + 1] ?? "";
+  assert.ok(typedStatus.includes(`\x1b[${dark.statusWaiting}magent waiting\x1b[0m`),
+    "the waiting agent keeps its own status role");
+  assert.ok(typedStatus.includes(`\x1b[${dark.inputPending}minput pending\x1b[0m`),
+    "pending input is conspicuous and independent of the agent role");
+  assert.ok(typedStatus.indexOf(`\x1b[${dark.statusWaiting}magent waiting`)
+    < typedStatus.indexOf(`\x1b[${dark.inputPending}minput pending`),
+    "both distinctions survive on one exact status row");
 });
 
 test("card title line carries only the sanitized canonical title", () => {
@@ -2867,8 +2874,8 @@ test("card title line carries only the sanitized canonical title", () => {
   assert.equal(texts[1]?.trimEnd(), "Canonical title");
   // Sidebar focus: the selected navigation target's title is blue (the focus-
   // domain highlight), not the old inverse mark. The row opens with the chosen
-  // appearance's explicit ground (#613) so the role colour never has to rely on
-  // the terminal's own default background, then the role sequence itself.
+  // appearance's foreground on the TERMINAL-DEFAULT background (#613), matching
+  // Pi's own canvas-free chat viewport, then the role sequence itself.
   const ground = `\x1b[0m\x1b[${sidebarPaletteFor("dark").canvas}m`;
   assert.ok(lines[1]?.startsWith(`${ground}\x1b[1;34mCanonical title`), JSON.stringify(lines[1]));
   assert.equal(texts[2]?.trimEnd(), "> agent running | input pending", "the selection marker lives on the status row");

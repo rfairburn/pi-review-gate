@@ -1,20 +1,21 @@
 /**
- * Standalone pending-consent alert band and the themed pane ground (#613 audit
- * correction).
+ * Standalone pending-consent alert band and the terminal-default pane ground
+ * (#613 audit correction).
  *
  * `renderPeerAlert` is the notification band Main hands the compositor as a
  * banner (the sidebar pane is hidden, or a narrow layout while Main holds
  * focus), so its rows land directly on the operator's terminal instead of inside
- * a host pane that already carries the appearance's explicit ground. Before this
- * correction the band painted its `notice`, `secondary`, and `hint` foregrounds
- * with NO ground at all: Dark's yellow/grey became unreadable on a light
- * terminal default, and Light's red/grey/magenta on a dark one.
+ * a host pane that already carries the appearance's explicit foreground. Before
+ * this correction the band painted its `notice`, `secondary`, and `hint`
+ * foregrounds with NO foreground at all: Dark's yellow/grey became unreadable on
+ * a light terminal default, and Light's red/grey/magenta on a dark one.
  *
  * Everything here is the production renderer plus the real `TerminalSurface`
  * parser: the band rows are written to the emulator at absolute rows and read
  * back as terminal CELLS. Every cell of every band row must carry an explicit
- * foreground AND background drawn from the SAME finite palette the rest of the
- * sidebar already uses — no new role, no new palette, no terminal query,
+ * foreground from the SAME finite palette the rest of the sidebar already uses,
+ * while the background stays the terminal default exactly like Pi's own
+ * canvas-free chat viewport — no new role, no new palette, no terminal query,
  * detection, or configuration write, and no native/child cell is involved.
  *
  * Geometry (row count, padded width, text, absence of a cursor) and the band's
@@ -141,18 +142,18 @@ function allRuns(styles: readonly { runs: readonly TerminalCellRun[] }[]): Termi
 
 interface ThemeCase {
   readonly theme: SidebarThemeId;
-  /** Palette index of the appearance's own canvas ground (`40` / `47`). */
-  readonly canvasBg: number;
+  /** Palette index of the appearance's explicit foreground (`37` -> 7, `30` -> 0). */
+  readonly canvasFg: number;
   /** Palette index of the `notice` heading foreground (`33` -> 3, `31` -> 1). */
   readonly noticeFg: number;
 }
 
 const THEME_CASES: readonly ThemeCase[] = [
-  { theme: "dark", canvasBg: 0, noticeFg: 3 },
-  { theme: "light", canvasBg: 7, noticeFg: 1 },
+  { theme: "dark", canvasFg: 7, noticeFg: 3 },
+  { theme: "light", canvasFg: 0, noticeFg: 1 },
 ];
 
-test("the standalone pending-consent band sits on its own explicit ground on both appearances", async () => {
+test("the standalone pending-consent band keeps the terminal default ground on both appearances", async () => {
   for (const testCase of THEME_CASES) {
     const palette = sidebarPaletteFor(testCase.theme);
     const cols = 60;
@@ -162,8 +163,8 @@ test("the standalone pending-consent band sits on its own explicit ground on bot
     const ground = `\x1b[0m\x1b[${palette.canvas}m`;
 
     // The SAME finite seam every other host pane uses: every row opens on the
-    // appearance's own canvas, and nothing outside the palette's closed set of
-    // roles is emitted.
+    // appearance's foreground/default canvas, and nothing outside the palette's
+    // closed set of roles is emitted.
     for (const line of band.lines) {
       assert.ok(line.startsWith(ground), `${testCase.theme}: band row opens on the pane canvas: ${JSON.stringify(line)}`);
     }
@@ -182,7 +183,8 @@ test("the standalone pending-consent band sits on its own explicit ground on bot
     assert.ok(texts.join("\n").includes("key: SHA256:A"));
     assert.ok(texts.join("\n").includes("from: 192.0.2.10:51234"));
 
-    // Real terminal cells: the band never inherits the operator's defaults.
+    // Real terminal cells: the band sets a readable foreground but leaves the
+    // operator's terminal background untouched.
     const surface = new TerminalSurface(cols, rows);
     try {
       await drawBand(surface, band.lines);
@@ -192,16 +194,14 @@ test("the standalone pending-consent band sits on its own explicit ground on bot
       assert.ok(runs.length > 0, `${testCase.theme}: the band painted cells`);
       for (const run of runs) {
         assert.ok(run.fg !== undefined, `${testCase.theme}: band cell ${JSON.stringify(run.text)} has an explicit foreground`);
-        assert.ok(run.bg !== undefined, `${testCase.theme}: band cell ${JSON.stringify(run.text)} has an explicit background`);
-        assert.equal(run.bg.mode, "palette", `${testCase.theme}: the band ground is a basic palette colour`);
-        assert.equal(run.bg.value, testCase.canvasBg,
-          `${testCase.theme}: every band cell sits on the appearance's own ground, not the terminal default`);
-        assert.notEqual(run.fg.value, run.bg.value,
-          `${testCase.theme}: band cell ${JSON.stringify(run.text)} cannot paint its foreground on its own ground`);
+        assert.equal(run.fg.mode, "palette", `${testCase.theme}: the band foreground is a basic palette colour`);
+        assert.equal(run.bg, undefined,
+          `${testCase.theme}: every band cell leaves the background on the terminal default`);
       }
-      // The exact regression this correction fixes: the notice heading's
-      // foreground is the palette's own notice colour ON the appearance ground,
-      // which is what keeps yellow-on-white and grey-on-black readable.
+      assert.ok(runs.some((run) => run.fg?.value === testCase.canvasFg),
+        `${testCase.theme}: the band's ordinary rows carry the appearance's canvas foreground`);
+      // The notice heading keeps the palette's own notice foreground on that
+      // terminal-default ground, so the band never emits an unstyled run.
       const heading = styles.find((entry) => entry.line === 0);
       assert.ok(heading !== undefined, `${testCase.theme}: the heading row is read back from cells`);
       const headingRuns = heading.runs;
@@ -210,7 +210,7 @@ test("the standalone pending-consent band sits on its own explicit ground on bot
       for (const run of headingRuns) {
         if (run.text.trim() === "") continue;
         assert.equal(run.fg?.value, testCase.noticeFg,
-          `${testCase.theme}: heading cell ${JSON.stringify(run.text)} keeps the notice role's colour on the canvas`);
+          `${testCase.theme}: heading cell ${JSON.stringify(run.text)} keeps the notice role's colour`);
       }
     } finally {
       surface.dispose();
@@ -228,9 +228,9 @@ test("the ground changes no band geometry: row counts, padded width, and text ar
       const texts = assertBandSafe(band.lines, cols, rows);
       assert.equal(texts.length, rows, `${cols}x${rows}: the band fills its banner geometry`);
       assert.ok(texts[0].includes("! Incoming connection request"), `${cols}x${rows}: heading stays first`);
-      // Rows past the band's own content are ground-filled padding, so the
-      // banner stays continuous instead of showing the terminal default. The
-      // band's own content is at most PEER_CONSENT_ALERT_ROWS (6) rows.
+      // Rows past the band's own content still carry the same foreground/default
+      // canvas so the banner's text region stays continuous. The band's own
+      // content is at most PEER_CONSENT_ALERT_ROWS (6) rows.
       const contentRows = Math.min(rows, 6);
       for (let row = contentRows; row < rows; row += 1) {
         assert.equal(band.lines[row], `${ground}${" ".repeat(cols)}\x1b[0m`,

@@ -15,6 +15,7 @@ import {
   NETWORK_ACTION,
   SETTINGS_ACTION,
   type OwnedRosterLabel,
+  type RosterActionLabel,
   ROSTER_ACTIONS,
   SIDEBAR_COLUMNS,
   frameHeader,
@@ -23,6 +24,7 @@ import {
   nextRosterNavigationTarget,
   parseRosterFrame,
   renderedTitleMatches,
+  rosterActionOrder,
   rosterCards,
   rosterNavigationDirection,
   rosterNavigationTargets,
@@ -34,9 +36,9 @@ import {
 
 const HEADER = (count: number): string => ` Sessions (${count}) `;
 const ACTIONS = ["  Saved conversations", "  New session", "  Quit host"];
-/** The required tail plus the one optional grouped Settings row (#613). */
-const ACTIONS_WITH_SETTINGS = [...ACTIONS, "  Settings"];
-const SETTINGS_LABELS = [...ROSTER_ACTIONS, SETTINGS_ACTION];
+/** The required tail with the one optional grouped Settings row (#613). */
+const ACTIONS_WITH_SETTINGS = ["  Saved conversations", "  New session", "  Settings", "  Quit host"];
+const SETTINGS_LABELS = rosterActionOrder(true);
 
 /** Fixed injected clock for the pure network DTO; no real clock is read. */
 const PEER_NOW = 1_700_000_000_000;
@@ -260,6 +262,16 @@ test("a partial roster, a header/count mismatch, and duplicate actions are all i
   const wrongOrder = compose([HEADER(1), ...expandedCard("Card"), "  New session", "  Saved conversations", "  Quit host"]);
   assert.equal(parseRosterFrame(wrongOrder).complete, false);
 
+  const settingsAfterQuit = compose([HEADER(1), ...expandedCard("Card"), ...ACTIONS_WITH_SETTINGS.slice(0, 2),
+    "  Quit host", "  Settings"]);
+  assert.equal(parseRosterFrame(settingsAfterQuit).complete, false,
+    "Settings after the destructive Quit host action is never accepted");
+
+  const settingsBeforeNew = compose([HEADER(1), ...expandedCard("Card"), "  Saved conversations",
+    "  Settings", "  New session", "  Quit host"]);
+  assert.equal(parseRosterFrame(settingsBeforeNew).complete, false,
+    "Settings before New session is never accepted");
+
   const noHeader = compose(["not a roster header", ...expandedCard("Card"), ...ACTIONS]);
   assert.equal(parseRosterFrame(noHeader).complete, false);
   assert.equal(parseRosterFrame(noHeader).count, undefined);
@@ -449,7 +461,7 @@ test("production-rendered grouped Settings roster rows parse at wide and narrow 
     const noSettingsFrame = withoutSettings.renderRoster(width, 40).lines.join("\n");
     const noSettings = parseRosterFrame(noSettingsFrame, width);
     assert.equal(noSettings.complete, true);
-    assert.deepEqual(noSettings.actions.map((entry) => entry.label), [...ROSTER_ACTIONS],
+    assert.deepEqual(noSettings.actions.map((entry) => entry.label), rosterActionOrder(false),
       "the production renderer keeps the existing three-action roster when settings are unavailable");
     assert.equal(isSidebarFocusedFrame(noSettingsFrame, width), true);
 
@@ -462,20 +474,24 @@ test("production-rendered grouped Settings roster rows parse at wide and narrow 
       const frame = controller.renderRoster(width, 40).lines.join("\n");
       const parsed = parseRosterFrame(frame, width);
       assert.equal(parsed.complete, true, `complete production roster at width ${width}, override=${legacyToggleOverride}`);
-      assert.deepEqual(parsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS, "Settings"]);
+      assert.deepEqual(parsed.actions.map((entry) => entry.label), rosterActionOrder(true));
       assert.deepEqual(parsed.actions.map((entry) => entry.position),
         parsed.actions.map((entry) => parsed.entries.indexOf(entry)),
       "each action position comes from its actual rendered entry order");
       assert.equal(isSidebarFocusedFrame(frame, width), true,
         "the complete sidebar-focus footer follows the actual optional action row");
 
-      const settingsRow = parsed.actions.at(-1)!.raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+      const settingsAction = parsed.actions.find((entry) => entry.label === SETTINGS_ACTION);
+      assert.ok(settingsAction, "the grouped Settings row is drawn between New session and Quit host");
+      assert.equal(parsed.actions.at(-1)?.label, "Quit host",
+        "the destructive Quit host action remains LAST");
+      const settingsRow = settingsAction.raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
       // Grouping keeps the roster row short: the legacy --sidebar-key override
       // is stated inside the Settings submenu and the shortcuts editor, never
       // annotated onto the roster's one Settings row.
       assert.equal(settingsRow, "  Settings",
         `the grouped Settings row is identical at width ${width} (override=${legacyToggleOverride})`);
-      assert.equal(sidebarRosterHidden(parsed.actions.at(-1)!.raw, width), false,
+      assert.equal(sidebarRosterHidden(settingsAction.raw, width), false,
         "a stale Settings row alone is not mistaken for a hidden sidebar");
     }
   }
@@ -489,8 +505,7 @@ test("production grouped Settings selection navigation uses its actual parsed en
       legacyToggleOverride: true,
     });
     void controller.renderRoster(width, 40);
-    controller.handleInput("\x1b[B"); // New session -> Quit host
-    controller.handleInput("\x1b[B"); // Quit host -> Host shortcuts
+    controller.handleInput("\x1b[B"); // New session -> Settings
     const frame = controller.renderRoster(width, 40).lines.join("\n");
     const parsed = parseRosterFrame(frame, width);
     const selected = selectedRosterEntry(frame, width);
@@ -568,11 +583,12 @@ test("production-rendered roster navigation wraps through Settings and handles a
       legacyToggleOverride: true,
     });
     withSettings.updateItems(nativeItems);
-    assert.equal(pressAndAssertNext(withSettings, width, owned), "Quit host");
     assert.equal(pressAndAssertNext(withSettings, width, owned), "Settings",
-      "Quit host advances to the actual optional Settings action");
+      "New session advances to the optional Settings action");
+    assert.equal(pressAndAssertNext(withSettings, width, owned), "Quit host",
+      "Settings advances to the final Quit host action");
     assert.equal(pressAndAssertNext(withSettings, width, owned), "owned-a",
-      "the selected Settings row wraps to the first owned native entry");
+      "the final Quit host row wraps to the first owned native entry");
 
     const startingOnShortcuts = new SidebarController({
       toggleKey: "f8",
@@ -581,15 +597,16 @@ test("production-rendered roster navigation wraps through Settings and handles a
     });
     startingOnShortcuts.updateItems(nativeItems);
     void startingOnShortcuts.renderRoster(width, 40);
-    startingOnShortcuts.handleInput("\x1b[B");
-    startingOnShortcuts.handleInput("\x1b[B");
+    startingOnShortcuts.handleInput("\x1b[B"); // New session -> Settings
     const hostFrame = startingOnShortcuts.renderRoster(width, 40).lines.join("\n");
     const hostParsed = parseRosterFrame(hostFrame, width);
     assert.equal(selectedRosterEntry(hostFrame, width)?.label, "Settings");
     assert.ok(rosterNavigationTargets(hostParsed, owned)?.some((target) => target.label === "Settings"),
       "the known-highlight fence includes the actual optional action");
+    assert.equal(pressAndAssertNext(startingOnShortcuts, width, owned), "Quit host",
+      "navigation can start on Settings and advance to the final Quit host action");
     assert.equal(pressAndAssertNext(startingOnShortcuts, width, owned), "owned-a",
-      "navigation can start on Settings and advance to the first owned native entry");
+      "the final Quit host row then wraps to the first owned native entry");
 
     const withoutSettings = new SidebarController({
       toggleKey: "f8",
@@ -600,7 +617,7 @@ test("production-rendered roster navigation wraps through Settings and handles a
     assert.equal(pressAndAssertNext(withoutSettings, width, owned), "Quit host");
     const noSettingsFrame = withoutSettings.renderRoster(width, 40).lines.join("\n");
     const noSettingsParsed = parseRosterFrame(noSettingsFrame, width);
-    assert.deepEqual(noSettingsParsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS]);
+    assert.deepEqual(noSettingsParsed.actions.map((entry) => entry.label), rosterActionOrder(false));
     assert.equal(pressAndAssertNext(withoutSettings, width, owned), "owned-a",
       "the no-settings three-action tail wraps directly from Quit to the first owned native entry");
   }
@@ -647,25 +664,32 @@ test("Settings tails reject partial, unknown, out-of-order, and duplicate rows",
     const completeFrame = renderedLines.join("\n");
     const complete = parseRosterFrame(completeFrame, width);
     assert.equal(complete.complete, true);
-    const actionRows = complete.actions.map((entry) => renderedLines[1 + entry.position]!);
-    const requiredRows = complete.actions.slice(0, ROSTER_ACTIONS.length)
-      .map((entry) => renderedLines[1 + entry.position]!);
-    const settingsIndex = complete.actions.findIndex((entry) => entry.label === "Settings");
-    assert.notEqual(settingsIndex, -1);
-    const settingsRow = actionRows[settingsIndex]!;
+    const rowFor = (label: RosterActionLabel): string => {
+      const action = complete.actions.find((entry) => entry.label === label);
+      assert.ok(action, `the complete renderer draws ${label}`);
+      return renderedLines[1 + action.position]!;
+    };
+    const savedRow = rowFor("Saved conversations");
+    const newRow = rowFor("New session");
+    const settingsRow = rowFor(SETTINGS_ACTION);
+    const quitRow = rowFor("Quit host");
     const footer = renderedLines.slice(1 + complete.entryEnd);
     const frameWithTail = (tail: readonly string[]): string => [renderedLines[0]!, ...tail, ...footer].join("\n");
     const plainSettings = settingsRow.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
     assert.equal(plainSettings, "  Settings");
     const partialSettings = "  Setting";
-    const outOfOrder = [...requiredRows.slice(0, -1), settingsRow, requiredRows.at(-1)!];
 
     const malformedTails: readonly (readonly string[])[] = [
-      [...requiredRows, partialSettings],
-      [...requiredRows, "  Unknown action"],
-      [...requiredRows, "  Settings (unknown suffix)"],
-      outOfOrder,
-      [...actionRows, settingsRow],
+      [savedRow, newRow, partialSettings, quitRow],
+      [savedRow, newRow, "  Unknown action", quitRow],
+      [savedRow, newRow, "  Settings (unknown suffix)", quitRow],
+      [savedRow, newRow, quitRow, settingsRow],
+      [savedRow, settingsRow, newRow, quitRow],
+      [savedRow, newRow, settingsRow, settingsRow, quitRow],
+      [settingsRow, savedRow, newRow, quitRow],
+      [savedRow, quitRow],
+      [savedRow, newRow, settingsRow],
+      [savedRow, newRow, settingsRow, quitRow, settingsRow],
     ];
     for (const tail of malformedTails) {
       const frame = frameWithTail(tail);
@@ -695,12 +719,12 @@ test("an attached network snapshot adds no roster row; Settings is the one entry
       const beforeParsed = parseRosterFrame(before);
       assert.equal(beforeParsed.complete, true, "the roster keeps parsing unchanged");
       assert.deepEqual(beforeParsed.actions.map((entry) => entry.label),
-        settingsAvailable ? [...ROSTER_ACTIONS, SETTINGS_ACTION] : [...ROSTER_ACTIONS],
+        rosterActionOrder(settingsAvailable),
       `no snapshot means no extra roster row (settings=${settingsAvailable})`);
 
       // Arrival of the coordinator DTO stays presentation only. It never adds a
       // top-level Network row; where settings were unavailable it only makes the
-      // ONE grouped Settings entry available, in the same final position.
+      // ONE grouped Settings entry available, between New session and Quit host.
       controller.setPeerUiSnapshot(peerSnapshot());
       const after = renderRoster(controller);
       const parsed = parseRosterFrame(after);
@@ -709,14 +733,15 @@ test("an attached network snapshot adds no roster row; Settings is the one entry
       assert.equal(parsed.count, 1);
       assert.deepEqual(parsed.cards.map((card) => card.title), ["Native A"]);
       assert.deepEqual(parsed.actions.map((entry) => entry.label),
-        [...ROSTER_ACTIONS, SETTINGS_ACTION],
+        rosterActionOrder(true),
       `the grouped Settings entry is the only settings row (${flags})`);
       assert.deepEqual(parsed.actions.map((entry) => entry.position),
         parsed.actions.map((_, index) => parsed.cards.length + index),
       `every action keeps its actual rendered entry position (${flags})`);
       assert.equal(parsed.actions.filter((entry) => entry.raw.includes(NETWORK_ACTION)).length, 0,
       `no Network row is drawn in the roster (${flags})`);
-      assert.equal(parsed.actions.at(-1)?.selected, false, "the new row is not secretly highlighted");
+      assert.equal(parsed.actions.find((entry) => entry.label === SETTINGS_ACTION)?.selected, false,
+        "the new Settings row is not secretly highlighted");
       assert.equal(selectedRosterEntry(after)?.label, "New session",
         "an arriving snapshot never moves the existing highlight");
       assert.equal(isSidebarFocusedFrame(after), true, `the footer still follows the optional row (${flags})`);
@@ -767,8 +792,7 @@ test("grouped Settings navigation reports its actual parsed position in both dir
   assert.equal(beforeTargets.filter((target) => target.label === NETWORK_ACTION).length, 0,
     "Network is a Settings submenu, never a roster navigation target");
 
-  controller.handleInput("\x1b[B"); // New session -> Quit host
-  controller.handleInput("\x1b[B"); // -> the grouped Settings entry
+  controller.handleInput("\x1b[B"); // New session -> the grouped Settings entry
   const onSettings = renderRoster(controller);
   const parsed = parseRosterFrame(onSettings);
   const selected = selectedRosterEntry(onSettings);
@@ -778,10 +802,14 @@ test("grouped Settings navigation reports its actual parsed position in both dir
   assert.equal(parsed.entries[selected!.position]?.label, SETTINGS_ACTION);
   const targets = rosterNavigationTargets(parsed, OWNED);
   assert.ok(targets);
-  assert.equal(nextRosterNavigationTarget(targets, selected!.position)?.label, "owned-a",
-    "Down wraps from the last rendered entry to the first owned native entry");
-  assert.equal(nextRosterNavigationTarget(targets, selected!.position, "up")?.label, "Quit host",
-    "Up steps back from the grouped entry to the required tail");
+  assert.equal(nextRosterNavigationTarget(targets, selected!.position)?.label, "Quit host",
+    "Down steps from Settings to the final Quit host action");
+  assert.equal(nextRosterNavigationTarget(targets, selected!.position, "up")?.label, "New session",
+    "Up steps back from Settings to New session");
+  const quit = targets.find((target) => target.label === "Quit host");
+  assert.ok(quit);
+  assert.equal(nextRosterNavigationTarget(targets, quit.position)?.label, "owned-a",
+    "Down wraps from the final entry to the first owned native entry");
 });
 
 test("misplaced, duplicated, partial, annotated, and unknown Network rows stay fail-closed", () => {
@@ -859,7 +887,7 @@ test("navigation direction chooses the shortest known cyclic step and refuses am
   const targets = rosterNavigationTargets(parsed, OWNED);
   assert.ok(targets);
   assert.deepEqual(targets.map((target) => target.label),
-    ["owned-a", "owned-b", "Saved conversations", "New session", "Quit host", SETTINGS_ACTION]);
+    ["owned-a", "owned-b", "Saved conversations", "New session", SETTINGS_ACTION, "Quit host"]);
   const positionOf = (label: string): number => targets.find((target) => target.label === label)!.position;
 
   assert.equal(rosterNavigationDirection(targets, positionOf("owned-b"), "owned-a"), "up",
@@ -883,12 +911,15 @@ test("navigation direction chooses the shortest known cyclic step and refuses am
   assert.equal(downs, 5, "five Down presses are needed where one Up step suffices");
 
   assert.equal(rosterNavigationDirection(targets, positionOf("New session"), SETTINGS_ACTION), "down",
-    "the grouped entry sits after the required tail");
+    "the grouped entry sits between New session and the final Quit host");
   assert.equal(rosterNavigationDirection(targets, positionOf("owned-a"), "Settings"), "up",
-    "Up wraps from the first rendered entry to the last");
-  assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-a"), "up")?.label, "Settings");
-  assert.equal(nextRosterNavigationTarget(targets, positionOf("Settings"), "down")?.label, "owned-a",
-    "Down still wraps from the last entry to the first");
+    "the shorter Up path reaches Settings through the final entry");
+  assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-a"), "up")?.label, "Quit host",
+    "Up wraps from the first rendered entry to the final Quit host action");
+  assert.equal(nextRosterNavigationTarget(targets, positionOf("Settings"), "down")?.label, "Quit host",
+    "Down steps from Settings to the final Quit host action");
+  assert.equal(nextRosterNavigationTarget(targets, positionOf("Quit host"), "down")?.label, "owned-a",
+    "Down still wraps from the final entry to the first");
 
   // Equal-length steps go Down, the direction every existing driver can press.
   const legacy = rosterController({ settingsAvailable: false, legacyToggleOverride: false, items: [nativeItem("A")] });

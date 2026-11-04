@@ -711,7 +711,7 @@ test("the lane never manufactures overflow, and wheel and keyboard viewport path
     const parsed = parsedRoster(fitting);
     assert.equal(parsed.complete, true, "the fitting roster is drawn completely, never capped to create overflow");
     assert.equal(parsed.entries.length, 5, "one card plus the whole fixed action tail");
-    for (const action of ["Saved conversations", "New session", "Quit host", "Settings"]) {
+    for (const action of ["Saved conversations", "New session", "Settings", "Quit host"]) {
       assert.ok(fittingRows.some((row) => row.replace(/^> /, "").trim() === action),
         `the fixed action tail is drawn, nothing was hidden to manufacture overflow:\n${rosterText(fitting)}`);
     }

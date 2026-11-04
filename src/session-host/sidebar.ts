@@ -2524,50 +2524,70 @@ interface SessionStatusFacts {
   readonly exitCode?: number;
 }
 
-function cardStatusText(item: SessionStatusFacts): string {
-  const parts: string[] = [];
+/**
+ * One independently paintable part of the truthful status row. `text` is the
+ * exact existing plaintext; `role` only chooses the generated foreground.
+ */
+interface CardStatusSegment {
+  readonly text: string;
+  readonly role: SidebarThemeRole;
+}
+
+/**
+ * The status row's exact text and semantic roles. Classification stays here and
+ * nowhere else: the agent/lifecycle part and the input part are produced
+ * independently, so `agent running | input pending` can color both facts
+ * without either one overriding the other. The words are unchanged.
+ */
+function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
+  const parts: CardStatusSegment[] = [];
   switch (item.lifecycle) {
     case "starting":
-      parts.push("starting");
+      parts.push({ text: "starting", role: "statusStarting" });
       break;
     case "alive":
       parts.push(
         item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
           || (sanitizeCount(item.activeShells) ?? 0) > 0
-          ? "agent running"
+          ? { text: "agent running", role: "statusRunning" }
           : item.pendingInput === true || item.inputSurface === true
-            ? "agent waiting"
+            ? { text: "agent waiting", role: "statusWaiting" }
             : item.busy === false && item.pendingInput === false
               && sanitizeCount(item.activeTasks) === 0 && sanitizeCount(item.activeShells) === 0
-              ? "agent idle"
-              : "agent unknown",
+              ? { text: "agent idle", role: "statusIdle" }
+              : { text: "agent unknown", role: "statusUnknown" },
       );
       break;
     case "exited":
       parts.push(
         typeof item.exitCode === "number"
-          ? `exited (code ${Math.trunc(item.exitCode)})`
-          : "exited",
+          ? { text: `exited (code ${Math.trunc(item.exitCode)})`, role: "statusExited" }
+          : { text: "exited", role: "statusExited" },
       );
       break;
     case "error":
       parts.push(
         typeof item.exitCode === "number"
-          ? `error (code ${Math.trunc(item.exitCode)})`
-          : "error",
+          ? { text: `error (code ${Math.trunc(item.exitCode)})`, role: "statusError" }
+          : { text: "error", role: "statusError" },
       );
       break;
   }
   if (item.lifecycle === "starting" || item.lifecycle === "alive") {
     parts.push(
       item.pendingInput === true || item.inputSurface === true
-        ? "input pending"
+        ? { text: "input pending", role: "inputPending" }
         : item.pendingInput === false
-          ? "input none"
-          : "input unknown",
+          ? { text: "input none", role: "statusUnknown" }
+          : { text: "input unknown", role: "statusUnknown" },
     );
   }
-  return parts.join(" | ");
+  return parts;
+}
+
+/** The complete plaintext status row; this remains the single source of truth. */
+function cardStatusText(item: SessionStatusFacts): string {
+  return cardStatusSegments(item).map((segment) => segment.text).join(" | ");
 }
 
 /** Honest ACTIVITY-INTENT counts: a missing/invalid count is "unknown", never 0. */
@@ -4881,11 +4901,11 @@ export class SidebarController {
    * complete lines with the review hint kept in view.
    *
    * This is the STANDALONE band the compositor places directly on the terminal,
-   * so it carries the same explicit pane canvas every other host-owned pane row
-   * gets (see `withPaneCanvas`): its `notice`, `secondary`, and `hint`
-   * foregrounds would otherwise sit on the operator's own terminal default
-   * ground. The ground changes no geometry, row count, text, control, token,
-   * focus, or consent authority.
+   * so it carries the same explicit foreground/default-background canvas every
+   * other host-owned pane row gets (see `withPaneCanvas`): its `notice`,
+   * `secondary`, and `hint` foregrounds stay readable on the operator's own
+   * terminal default ground. The canvas changes no geometry, row count, text,
+   * control, token, focus, or consent authority.
    */
   renderPeerAlert(
     cols: number,
@@ -6194,8 +6214,9 @@ export class SidebarController {
   }
 
   /**
-   * One rendered pane with the appearance's explicit ground applied to every row
-   * it drew (see `withPaneCanvas`). The cursor is carried through untouched.
+   * One rendered pane with the appearance's explicit foreground/default canvas
+   * applied to every row it drew (see `withPaneCanvas`). The cursor is carried
+   * through untouched.
    */
   private paneWithCanvas(
     pane: { lines: string[]; cursor?: { column: number; row: number } },
@@ -8989,6 +9010,18 @@ export class SidebarController {
   }
 
   /**
+   * The truthful status text with each semantic part painted independently.
+   * Separators stay on the pane canvas, so the generated foregrounds never
+   * bleed into the marker glyph, the pipe, or the rest of the row. The plaintext
+   * is exactly `cardStatusText`; only finite palette roles add colour.
+   */
+  private cardStatusRuns(item: SessionStatusFacts): string {
+    return cardStatusSegments(item)
+      .map((segment) => `${this.paint(segment.role)}${segment.text}\x1b[0m`)
+      .join(" | ");
+  }
+
+  /**
    * One painted scrollbar cell: a single terminal column carrying exactly one
    * generated role sequence between explicit resets, so it composes with the
    * row it is appended to and never leaks a style past its own cell.
@@ -8998,25 +9031,26 @@ export class SidebarController {
   }
 
   /**
-   * Give every row this pane drew an explicit foreground/background pair.
+   * Give every row this pane drew the appearance's explicit foreground while
+   * leaving the background on the terminal default, like Pi's canvas-free chat
+   * viewport.
    *
-   * The palette's `canvas` is the host's OWN pane ground. A row that otherwise
-   * inherits the terminal's default foreground or background can be unreadable
-   * when the operator's terminal defaults are the opposite of the chosen
-   * appearance — a Light black `activeMain` title on a dark terminal, or a Dark
-   * grey status line on a light one. Applying it here covers exactly the rows
-   * this renderer produced: every escape sequence in them is generated by this
-   * module (entry text passes through `sanitizeCellText`, which strips
-   * controls), so restoring the canvas after each generated row reset keeps the
-   * whole padded row inside one finite, allowlisted pair. A restyled content row
-   * therefore ends on that canvas rather than on a bare reset (a blank padding
-   * row closes its ground-filled cells with a reset). Either way the
-   * compositor's own row wrapper closes every host pane row with an explicit
-   * reset, so the ground stops at the pane edge instead of bleeding into the
-   * next cell.
+   * The palette's `canvas` is the host's OWN foreground/default pair. Without an
+   * explicit foreground, a Light black `scrollbarThumb` glyph on a dark terminal or
+   * a Dark grey status line on a light one can be unreadable. The background is
+   * deliberately SGR 49 (terminal default), never a forced black or white
+   * whole-pane fill. Applying the canvas here covers exactly the rows this
+   * renderer produced: every escape sequence in them is generated by this module
+   * (entry text passes through `sanitizeCellText`, which strips controls), so
+   * restoring the canvas after each generated row reset keeps the whole padded
+   * row inside one finite, allowlisted pair. A restyled content row therefore
+   * ends on that canvas rather than on a bare reset (a blank padding row closes
+   * its canvas cells with a reset). Either way the compositor's own row wrapper
+   * closes every host pane row with an explicit reset, so the style stops at the
+   * pane edge instead of bleeding into the next cell.
    *
-   * Blank padding rows are padded to the pane width so the pane ground stays
-   * continuous instead of showing the terminal default through it.
+   * Blank padding rows are padded to the pane width so the host's foreground
+   * stays continuous without changing the terminal's own background.
    *
    * This styles HOST-owned rows only. The native child's cells, the outer
    * header, the pane divider, and every child process are untouched, and no
@@ -11733,17 +11767,18 @@ export class SidebarController {
         : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
       { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
-      { key: ENTRY_QUIT_KEY, kind: "quit" },
       // ONE grouped Settings entry (#613): Theme, Network, and Host shortcuts
       // are its submenus, so no independent top-level Network or Host
       // shortcuts row exists any more. It appears exactly when at least one of
       // the entry points it would offer is available under its EXISTING
       // authority — the attached peer snapshot for Network, the canonical
       // native agent directory for Theme and Host shortcuts — and nothing else
-      // decides its presence.
+      // decides its presence. It sits between New session and Quit host, so the
+      // destructive host action stays the LAST row.
       ...(this.settingsEntryAvailable()
         ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }]
         : []),
+      { key: ENTRY_QUIT_KEY, kind: "quit" },
     ];
     this.pruneVanishedRemoteSelection();
     this.pruneRemoteExpansionMemory();
@@ -12368,14 +12403,15 @@ export class SidebarController {
       : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
-      // One focus-domain title highlight: white identifies the ACTUAL active
-      // Main conversation only while Main has focus; blue identifies the LEFT
-      // selected navigation target while the sidebar-owned surfaces have
-      // focus. Never both at once, and never a false sibling/owner mark.
-      // The two roles come from the host's own palette, so a theme change
-      // restyles them without ever merging or moving the distinction.
+      // The actual active Main conversation keeps its brighter owner title even
+      // while sidebar navigation highlights a different card. Blue belongs ONLY
+      // to the left selected navigation target, so the owner and the navigation
+      // target stay independently readable; when they are the same card, the
+      // owner title wins and the existing `>` marker still shows the target.
+      // Both roles come from the host's own palette, so a theme change restyles
+      // them without ever merging or moving the distinction.
       let titleSgr: string;
-      if (this._focus === "main" && this.activeMainOwnerID === item.id) {
+      if (this.activeMainOwnerID === item.id) {
         titleSgr = this.paint("activeMain");
       } else if (selected && this._focus !== "main") {
         titleSgr = this.paint("selected");
@@ -12384,7 +12420,7 @@ export class SidebarController {
       }
       const lines = [
         wrapRow(cardTitle(item), cols, titleSgr),
-        wrapRow(`${insertionMarker ?? marker}${cardStatusText(item)}`, cols),
+        wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(item)}`, cols),
         wrapRow(`  ${cardBackgroundText(item)}`, cols),
       ];
       if (!this.collapsedItemIds.has(item.id)) {
@@ -12460,11 +12496,12 @@ export class SidebarController {
     const insertionMarker = insertion === undefined ? undefined
       : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     const facts = remoteSessionStatusFacts(remote.row);
-    // Same one focus-domain title highlight as local cards; the white mark is
-    // Main's actual content owner, which is always a structured identity and
-    // never inferred from the left highlight.
+    // Same owner/navigation split as local cards: the actual remote content
+    // owner keeps the brighter owner title while blue marks only the left
+    // navigation target. The structured owner identity is never inferred from
+    // the left highlight.
     let titleSgr: string;
-    if (this._focus === "main" && this.remoteIsActiveMainOwner(remote)) {
+    if (this.remoteIsActiveMainOwner(remote)) {
       titleSgr = this.paint("activeMain");
     } else if (selected && this._focus !== "main") {
       titleSgr = this.paint("selected");
@@ -12478,7 +12515,7 @@ export class SidebarController {
     const lines = [
       wrapRow(cardTitle(remote.row), cols, titleSgr),
       wrapRow(`  host ${stale}${hostLabel}`, cols),
-      wrapRow(`${insertionMarker ?? marker}${cardStatusText(facts)}`, cols),
+      wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(facts)}`, cols),
       wrapRow(`  ${cardBackgroundText(facts)}`, cols),
     ];
     if (!this.collapsedRemoteEntryKeys.has(entry.key)) {

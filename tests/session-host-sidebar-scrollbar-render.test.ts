@@ -1,6 +1,6 @@
 /**
  * #613 pure-renderer proof for the session-host sidebar scrollbar lane, and for
- * the themed pane ground the lane and every host-owned row are painted on.
+ * the terminal-default pane canvas the lane and every host-owned row use.
  *
  * Everything here is the production renderer and the production draw-derived
  * pointer seams of `SidebarController` — no Main, frame writer, compositor, PTY,
@@ -14,9 +14,9 @@
  *
  * The colour half writes those exact pane rows through the real
  * `TerminalSurface` parser and reads the resulting terminal CELLS: every cell of
- * every host-owned row must carry an explicit foreground and background, so the
- * chosen appearance never depends on whether the operator's terminal defaults are
- * light or dark. No child/native cell, header, or divider is recolored, and no
+ * every host-owned row must carry an explicit foreground while leaving the
+ * background on the terminal default, exactly like Pi's own canvas-free chat
+ * viewport. No child/native cell, header, or divider is recolored, and no
  * terminal query or theme detection is involved.
  *
  * This is renderer and input-protocol evidence, not a physical-mouse claim.
@@ -44,6 +44,7 @@ const TOGGLE = "\x1b[1;3D"; // the reserved sidebar toggle (alt+left)
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
 const ENTER = "\r";
+const ESC = "\x1b";
 
 /** The three glyphs the lane may paint, in the order the renderer owns them. */
 const TRACK = "\u2502";
@@ -163,9 +164,11 @@ function makeHarness(
   const remoteTitles = (options.hosts ?? []).flatMap((host) => host.rows.map((row) => `remote-${row}`));
   // The renderer's fixed action tail, in its drawn order. The grouped Settings
   // row exists exactly when an entry point it offers does: a peer snapshot makes
-  // Network available, so a roster with hosts carries it.
-  const actionTitles = ["Saved conversations", "New session", "Quit host"];
+  // Network available, so a roster with hosts carries it between New session and
+  // the final Quit host.
+  const actionTitles = ["Saved conversations", "New session"];
   if ((options.hosts?.length ?? 0) > 0) actionTitles.push("Settings");
+  actionTitles.push("Quit host");
   const rosterOrder = [...localTitles, ...remoteTitles, ...actionTitles];
   const rosterHeights = [
     ...localTitles.map(() => LOCAL_CARD_ROWS),
@@ -557,7 +560,7 @@ test("a resize recomputes the lane; the same roster at a taller geometry may nee
 });
 
 // ---------------------------------------------------------------------------
-// The themed lane and the explicit pane ground, read from real terminal cells.
+// The themed lane and the terminal-default pane canvas, read from real cells.
 // ---------------------------------------------------------------------------
 
 /**
@@ -611,10 +614,18 @@ function applyLightTheme(harness: Harness): void {
   assert.equal(harness.controller.currentTheme, "light");
 }
 
-test("both appearances give every host-owned pane row an explicit foreground and background", async () => {
-  const cases: { theme: SidebarThemeId; bgPalette: number }[] = [
-    { theme: "dark", bgPalette: 0 },
-    { theme: "light", bgPalette: 7 },
+/** Leave the Theme pane and Settings menu that the appearance switch left open. */
+function closeSettings(harness: Harness): void {
+  for (let press = 0; press < 3 && harness.controller.focus !== "sidebar"; press += 1) {
+    harness.controller.handleInput(ESC);
+  }
+  assert.equal(harness.controller.focus, "sidebar", "leaving Settings closes to the roster");
+}
+
+test("both appearances give every host-owned pane row an explicit foreground and terminal-default background", async () => {
+  const cases: { theme: SidebarThemeId; fgPalette: number }[] = [
+    { theme: "dark", fgPalette: 7 },
+    { theme: "light", fgPalette: 0 },
   ];
   for (const testCase of cases) {
     const harness = makeHarness({
@@ -636,18 +647,19 @@ test("both appearances give every host-owned pane row an explicit foreground and
         assert.ok(line.runs.length > 0, `row ${line.line} has at least one styled run`);
         for (const run of line.runs) {
           assert.ok(run.fg !== undefined, `row ${line.line} run ${JSON.stringify(run.text)} has an explicit foreground`);
-          assert.ok(run.bg !== undefined, `row ${line.line} run ${JSON.stringify(run.text)} has an explicit background`);
-          assert.equal(run.bg.mode, "palette", `the pane ground is a basic palette colour (${testCase.theme})`);
-          assert.equal(run.bg.value, testCase.bgPalette,
-            `row ${line.line} sits on the ${testCase.theme} appearance's own ground, not the terminal default`);
-          assert.notEqual(run.fg.value, run.bg.value,
-            `row ${line.line} run ${JSON.stringify(run.text)} cannot paint its foreground on the same colour`);
+          assert.equal(run.fg.mode, "palette", `the ${testCase.theme} foreground is a basic palette colour`);
+          assert.equal(run.bg, undefined,
+            `row ${line.line} run ${JSON.stringify(run.text)} leaves the background on the terminal default`);
         }
       }
+      assert.ok(styles.flatMap((line) => [...line.runs]).some((run) => run.fg?.value === testCase.fgPalette),
+        `the ${testCase.theme} pane carries the appearance's canvas foreground`);
       // The scrollbar lane itself is themed, and both of its colours differ from
-      // the ground it is painted on.
+      // the row's canvas.
       const palette = sidebarPaletteFor(testCase.theme);
       const raw = rendered.lines.join("\n");
+      assert.equal(rendered.lines.some((line) => line.includes("\x1b[40m") || line.includes("\x1b[47m")), false,
+        `the ${testCase.theme} pane never paints a forced black or white whole-pane ground`);
       assert.ok(raw.includes(`\x1b[${palette.scrollbarTrack}m`),
         `the lane track uses the ${testCase.theme} palette's track role`);
       assert.ok(raw.includes(`\x1b[${palette.scrollbarThumb}m`),
@@ -658,10 +670,10 @@ test("both appearances give every host-owned pane row an explicit foreground and
   }
 });
 
-test("the focus-domain roles stay distinct on both grounds (no colour-only conflation)", async () => {
+test("the focus-domain roles stay distinct with terminal-default backgrounds (no colour-only conflation)", async () => {
   // Main focus: the active-Main card title; sidebar focus: the selected target.
-  // Both appearances must paint them with an explicit foreground that is not the
-  // ground colour, so the distinction survives any terminal defaults.
+  // Both appearances must paint them with explicit, distinct foregrounds while
+  // leaving the background native.
   for (const theme of ["dark", "light"] as const) {
     const harness = makeHarness({ locals: 2, controllerOptions: { settingsAvailable: true } });
     const palette = sidebarPaletteFor(theme);
@@ -675,8 +687,8 @@ test("the focus-domain roles stay distinct on both grounds (no colour-only confl
         .filter((run) => run.text.includes("local-l1") || run.text.includes("local-l2"));
       assert.ok(titleRuns.length > 0, `${theme}: card titles are drawn`);
       for (const run of titleRuns) {
-        assert.ok(run.fg !== undefined && run.bg !== undefined, `${theme}: a title cell carries both colours`);
-        assert.notEqual(run.fg.value, run.bg.value, `${theme}: a title is readable on its own row ground`);
+        assert.ok(run.fg !== undefined, `${theme}: a title cell carries an explicit foreground`);
+        assert.equal(run.bg, undefined, `${theme}: a title cell keeps the terminal-default background`);
       }
       // The palette keeps the two roles as different parameter strings, so the
       // renderer can never merge them into one look.
@@ -689,7 +701,150 @@ test("the focus-domain roles stay distinct on both grounds (no colour-only confl
   }
 });
 
-test("the too-small fallback stays readable: its inverse row keeps an explicit pair", async () => {
+// ---------------------------------------------------------------------------
+// The focus-domain roles read as ACTUAL terminal cells. Two palette parameter
+// strings that resolve to the same foreground index under the same boldness are
+// ONE look on the screen, so the proof has to be the cell attributes the
+// emulator recorded, not the palette strings compared side by side.
+// ---------------------------------------------------------------------------
+
+/**
+ * The palette index a palette value's basic or bright foreground paints,
+ * restated here from the SGR rule so the cell assertions name the colour the
+ * palette INTENDS instead of a magic index.
+ */
+function paletteForegroundIndex(sgr: string): number {
+  const params = sgr.split(";").map((part) => Number.parseInt(part, 10));
+  const colour = params.find((part) => (part >= 30 && part <= 37) || (part >= 90 && part <= 97));
+  assert.ok(colour !== undefined, `${JSON.stringify(sgr)} carries a basic or bright foreground`);
+  return colour >= 90 ? colour - 90 + 8 : colour - 30;
+}
+
+/** The one drawn run carrying the `label` card's title row. */
+function titleRun(surface: TerminalSurface, label: string) {
+  const runs = (surface.frame().styles ?? [])
+    .flatMap((line) => [...line.runs])
+    .filter((run) => run.text.includes(label));
+  assert.equal(runs.length, 1, `exactly one drawn cell run carries the ${JSON.stringify(label)} title`);
+  return runs[0];
+}
+
+test("the actual owner's title cell stays distinct from the navigation target and from an ordinary card in both appearances", async () => {
+  for (const theme of ["dark", "light"] as const) {
+    const harness = makeHarness({ locals: 3, controllerOptions: { settingsAvailable: true } });
+    if (theme === "light") {
+      applyLightTheme(harness);
+      closeSettings(harness);
+    }
+    // Main's content owner is one card, sidebar navigation sits on ANOTHER card,
+    // and a third card is ordinary: the exact state in which the persistent
+    // owner mark has to be readable.
+    harness.controller.setActiveMainOwner("l1");
+    harness.controller.select("l2");
+    const actionsBefore = harness.actions.length;
+    assert.equal(harness.controller.focus, "sidebar", `${theme}: sidebar focus keeps a separate navigation target`);
+    assert.equal(harness.controller.selectedId, "l2", `${theme}: the navigation target is not the owner`);
+    assert.equal(harness.controller.activeMainOwnerID, "l1", `${theme}: the content owner is unchanged`);
+
+    const cols = 32;
+    const rows = 24;
+    const rendered = harness.controller.renderRoster(cols, rows);
+    const surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, rendered.lines);
+      const owner = titleRun(surface, "local-l1");
+      const nav = titleRun(surface, "local-l2");
+      const ordinary = titleRun(surface, "local-l3");
+      for (const [name, run] of [["owner", owner], ["navigation target", nav], ["ordinary", ordinary]] as const) {
+        assert.ok(run.fg !== undefined, `${theme}: the ${name} title cell carries an explicit foreground`);
+        assert.equal(run.fg.mode, "palette", `${theme}: the ${name} title foreground is a basic palette colour`);
+        assert.equal(run.bg, undefined, `${theme}: the ${name} title cell keeps the terminal-default background`);
+        assert.equal(run.bold, true, `${theme}: the ${name} title cell keeps its bold treatment`);
+      }
+      // The effective cell attributes decide what the operator sees: three
+      // equally bold titles in one foreground colour are indistinguishable.
+      assert.notEqual(owner.fg!.value, nav.fg!.value,
+        `${theme}: the owner title differs from the navigation target on the actual cells`);
+      assert.notEqual(owner.fg!.value, ordinary.fg!.value,
+        `${theme}: the owner title differs from an ordinary card on the actual cells`);
+      assert.notEqual(nav.fg!.value, ordinary.fg!.value,
+        `${theme}: the navigation target differs from an ordinary card on the actual cells`);
+      // And each cell is the colour its own role intends, so the distinction is
+      // the palette's, not an accident of one terminal emulator.
+      const palette = sidebarPaletteFor(theme);
+      assert.equal(owner.fg!.value, paletteForegroundIndex(palette.activeMain),
+        `${theme}: the owner title paints the activeMain colour`);
+      assert.equal(nav.fg!.value, paletteForegroundIndex(palette.selected),
+        `${theme}: the navigation target paints the selected colour`);
+      assert.equal(ordinary.fg!.value, paletteForegroundIndex(palette.canvas),
+        `${theme}: an ordinary title is bold on the pane canvas foreground`);
+    } finally {
+      surface.dispose();
+    }
+
+    // The distinction is colour on top of the unchanged non-colour marks: the
+    // owner card still carries no selection marker and the marker still follows
+    // the navigation target, and no action was emitted anywhere.
+    const plain = harness.view(cols, rows).texts.map((line) => line.trimEnd());
+    const ownerRow = plain.findIndex((line) => line === "local-l1");
+    const navRow = plain.findIndex((line) => line === "local-l2");
+    assert.ok(ownerRow >= 0 && navRow >= 0, `${theme}: both titles draw their own rows`);
+    assert.ok(plain[ownerRow + 1]?.startsWith("  "), `${theme}: the owner card keeps no selection marker`);
+    assert.ok(plain[navRow + 1]?.startsWith("> "), `${theme}: the marker still follows the navigation target`);
+    assert.equal(harness.actions.length, actionsBefore, `${theme}: the owner distinction emitted no action`);
+  }
+});
+
+test("an owner that is also the navigation target keeps the owner cell, and that cell survives navigation moving away", async () => {
+  for (const theme of ["dark", "light"] as const) {
+    const harness = makeHarness({ locals: 3, controllerOptions: { settingsAvailable: true } });
+    if (theme === "light") {
+      applyLightTheme(harness);
+      closeSettings(harness);
+    }
+    harness.controller.setActiveMainOwner("l1");
+    harness.controller.select("l1"); // the owner IS the navigation target
+    const cols = 32;
+    const rows = 24;
+    const palette = sidebarPaletteFor(theme);
+    const ownerIndex = paletteForegroundIndex(palette.activeMain);
+    const selectedIndex = paletteForegroundIndex(palette.selected);
+    const canvasIndex = paletteForegroundIndex(palette.canvas);
+
+    let surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
+        `${theme}: the owner role wins on a card that is both owner and target`);
+      assert.notEqual(titleRun(surface, "local-l1").fg?.value, titleRun(surface, "local-l2").fg?.value,
+        `${theme}: the winning owner cell is still distinguishable from an ordinary card's cells`);
+      assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
+        `${theme}: no ordinary card borrows the owner colour`);
+      assert.equal(titleRun(surface, "local-l3").fg?.value, canvasIndex,
+        `${theme}: no other card is highlighted either`);
+    } finally {
+      surface.dispose();
+    }
+
+    // Navigation moves elsewhere; the persistent owner mark stays on its card.
+    harness.controller.select("l3");
+    assert.equal(harness.controller.activeMainOwnerID, "l1", `${theme}: navigation changed no content owner`);
+    surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
+        `${theme}: the owner keeps its own cell after navigation moved away`);
+      assert.equal(titleRun(surface, "local-l3").fg?.value, selectedIndex,
+        `${theme}: the new navigation target paints the selected colour`);
+      assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
+        `${theme}: the untouched ordinary card stays ordinary`);
+    } finally {
+      surface.dispose();
+    }
+  }
+});
+
+test("the too-small fallback stays readable: its inverse row keeps explicit foreground/default ground", async () => {
   const harness = makeHarness({ locals: 4, controllerOptions: { settingsAvailable: true } });
   const rendered = harness.controller.renderRoster(12, 4);
   const surface = new TerminalSurface(12, 4);
@@ -700,8 +855,9 @@ test("the too-small fallback stays readable: its inverse row keeps an explicit p
     assert.ok(banner, "the fallback row is drawn");
     const run = banner.runs.find((candidate) => candidate.text.includes("too small"))!;
     assert.equal(run.inverse, true, "the fallback keeps its inverse treatment");
-    assert.ok(run.fg !== undefined && run.bg !== undefined,
-      "and an explicit pair, so the swap is defined on any terminal default");
+    assert.ok(run.fg !== undefined, "and an explicit foreground");
+    assert.equal(run.bg, undefined,
+      "while its background stays the terminal default, so the inverse swap is defined natively");
   } finally {
     surface.dispose();
   }

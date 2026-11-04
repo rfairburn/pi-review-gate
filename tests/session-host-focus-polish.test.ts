@@ -5,10 +5,11 @@
  *    without activating the highlighted row, resizing, hiding, or emitting a
  *    select action. Repeats/releases are fenced so a held key never leaks into
  *    the child; a fresh Alt+Right in Main focus is ordinary native input.
- * 2. Focus-domain title highlighting: blue identifies the LEFT selected
- *    navigation target while a sidebar-owned surface has focus; white
- *    identifies the ACTUAL active Main conversation only while Main has focus.
- *    Never both at once, never a false sibling/owner mark.
+ * 2. Owner/navigation title highlighting: the ACTUAL active Main conversation
+ *    keeps its brighter owner title even while sidebar navigation highlights a
+ *    different card; blue identifies only the LEFT selected navigation target
+ *    while a sidebar-owned surface has focus. The existing `>` marker still
+ *    shows the navigation target. Never a false sibling/owner mark.
  * 3. Escape in the Edit form cancels ONLY that form and returns to the VISIBLE
  *    roster (sidebar focus) without hiding; a held Escape repeat does not
  *    bubble into the roster hide, but a fresh roster Escape still hides. The
@@ -201,7 +202,7 @@ test("the roster footer shows the Alt+Right main hint while the roster owns focu
 // Focus-domain title highlighting (blue selection / white active owner)
 // ---------------------------------------------------------------------------
 
-test("sidebar focus highlights the selected target blue, not the active owner", () => {
+test("sidebar focus keeps the actual owner bright while blue marks the navigation target", () => {
   const harness = makeRoster(["a", "b"]);
   harness.controller.setActiveMainOwner("a"); // actual Main owner is a
   harness.controller.select("b"); // left navigation target is b
@@ -211,7 +212,42 @@ test("sidebar focus highlights the selected target blue, not the active owner", 
   const blueIndex = lines.findIndex((line) => line.includes("\x1b[1;34m"));
   assert.ok(blueIndex >= 0, "the selected target title is blue");
   assert.ok(lines[blueIndex]?.includes("label-b"), "blue is on the selected row b");
-  assert.ok(!lines.some((line) => line.includes("\x1b[1;97m")), "no white highlight in sidebar focus");
+  const whiteIndex = lines.findIndex((line) => line.includes("\x1b[1;97m"));
+  assert.ok(whiteIndex >= 0, "the actual owner keeps its brighter title in sidebar focus");
+  assert.ok(lines[whiteIndex]?.includes("label-a"), "the bright owner title is on a, not the navigation target");
+  assert.ok(!lines[whiteIndex]?.includes("label-b"), "blue and the owner title never merge on one card");
+});
+
+test("moving sidebar navigation does not move the bright actual owner title", () => {
+  const harness = makeRoster(["a", "b", "c"]);
+  harness.controller.setActiveMainOwner("a");
+  const owner = harness.controller.activeMainOwnerID;
+  void harness.controller.render(40, 30);
+  harness.baseline = harness.actions.length;
+
+  harness.send(DOWN); // New session -> Quit host
+  harness.send(DOWN); // -> first session card a
+  assert.equal(harness.controller.selectedId, "a");
+  let lines = harness.controller.render(40, 30).lines;
+  assert.ok(lines.some((line) => line.includes("\x1b[1;97m") && line.includes("label-a")),
+    "the actual owner stays bright when it is also the navigation target");
+  assert.ok(!lines.some((line) => line.includes("\x1b[1;34m")),
+    "an owner that is also the navigation target keeps the owner title, not a merged blue one");
+
+  harness.send(DOWN); // a -> b
+  assert.equal(harness.controller.selectedId, "b");
+  lines = harness.controller.render(40, 30).lines;
+  assert.ok(lines.some((line) => line.includes("\x1b[1;97m") && line.includes("label-a")),
+    "the actual owner a remains bright after navigation moved to b");
+  assert.ok(lines.some((line) => line.includes("\x1b[1;34m") && line.includes("label-b")),
+    "the navigation target b is blue");
+  const plain = lines.map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  const bTitle = plain.findIndex((line) => line === "label-b");
+  assert.ok(bTitle >= 0 && plain[bTitle + 1]?.startsWith("> "),
+    "the existing selection marker follows the navigation target");
+  assert.equal(harness.controller.activeMainOwnerID, owner, "navigation changed no content owner");
+  assert.equal(harness.controller.focus, "sidebar", "navigation did not activate a row");
+  assert.deepEqual(harness.sinceActions(), [], "navigation emitted no select or lifecycle action");
 });
 
 test("main focus highlights the actual active owner white, not the left selection", () => {

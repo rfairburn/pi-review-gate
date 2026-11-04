@@ -168,7 +168,7 @@ function drawnCardTitles(harness: Harness): string[] {
 function drawnActions(harness: Harness): string[] {
   return rosterRows(harness)
     .map((line) => line.trimEnd())
-    .filter((line) => /^(?:> |  )(?:Saved conversations|New session|Quit host)$/u.test(line))
+    .filter((line) => /^(?:> |  )(?:Saved conversations|New session|Settings|Quit host)$/u.test(line))
     .map((line) => line.slice(2));
 }
 
@@ -325,7 +325,7 @@ test("a roster that fits one page is untouched by wheeling in either direction",
   await seedRoster(harness, 2);
   const before = drawnCardTitles(harness);
   assert.deepEqual(before, ["Session 1", "Session 2"], "both cards fit the visible page");
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings", "Quit host"],
     "the whole list, actions included, is on one page");
   const frames = harness.writer.frames.length;
   for (let notch = 0; notch < 4; notch += 1) {
@@ -334,7 +334,7 @@ test("a roster that fits one page is untouched by wheeling in either direction",
     await nextTurn();
   }
   assert.deepEqual(drawnCardTitles(harness), before, "a one-page list never scrolls");
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings", "Quit host"],
     "and stays fully usable");
   assert.equal(harness.writer.frames.length, frames, "a refused scroll repaints nothing");
   assert.equal(parseRosterFrame(latestFrameText(harness)).complete, true,
@@ -366,8 +366,8 @@ test("keyboard navigation still works after scrolling and reaches rows that were
     if (highlighted === "Saved conversations") break;
   }
   assert.equal(highlighted, "Saved conversations", "the keyboard path still reaches the fixed actions");
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
-    "and the whole tail that was off-screen is now visible");
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings"],
+    "and the action rows that fit the scrolled page are visible, with Settings before Quit");
 
   // Up from the tail follows the highlight back down into the window.
   harness.terminal.emitInput(UP);
@@ -395,7 +395,7 @@ test("boundaries: repeated notches stop at the first and last page and never dra
     lastTop = cards;
   }
   assert.ok(lastTop.includes("Session 6"), "the tail stays reachable: the last card is drawn");
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings", "Quit host"],
     "the window never scrolls past the last whole page");
   for (let notch = 0; notch < 12; notch += 1) {
     emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "up");
@@ -438,7 +438,7 @@ test("resize and roster-content changes keep the viewport valid and every entry 
     await nextTurn();
   }
   assert.ok(drawnCardTitles(harness).includes("Session 7"), "the new session joins the same list and is reachable");
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings", "Quit host"],
     "and the scrolled window settles on its last whole page");
   assert.equal(await closeWithSignal(harness), 0);
 });
@@ -461,7 +461,7 @@ test("a short pane refuses a notch whose next entry cannot fit and stays wheel-u
   await nextTurn();
   harness.terminal.emitInput(DOWN); // New session
   await nextTurn();
-  const tail = ["Saved conversations", "New session", "Quit host"];
+  const tail = ["Saved conversations", "New session", "Settings", "Quit host"];
   assert.equal(highlightedEntry(harness), "New session");
   assert.deepEqual(drawnActions(harness), tail, "the action tail is actually visible");
   assert.deepEqual(drawnCardTitles(harness), [], "the five-row card cannot fit four list rows");
@@ -589,7 +589,7 @@ test("wheel over a form slot, a hidden sidebar, or a horizontal notch never scro
     emitWheel(harness.terminal, ROSTER_POINT.column, ROSTER_POINT.row, "down");
     await nextTurn();
   }
-  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Quit host"],
+  assert.deepEqual(drawnActions(harness), ["Saved conversations", "New session", "Settings"],
     "the wheel itself brought the fixed actions on screen");
   const newRow = rosterRowOf(harness, "New session");
   assert.ok(newRow > 0, "the New session action is drawn in the scrolled roster");

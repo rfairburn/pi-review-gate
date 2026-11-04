@@ -32,7 +32,13 @@ dates.
 
 - **One sidebar Settings menu** (#613) contains Theme, Network, and Host shortcuts,
   replacing the separate Network and Host shortcuts roster actions while preserving
-  their existing capabilities, defaults, permissions, and actions.
+  their existing capabilities, defaults, permissions, and actions. Settings appears
+  above Quit host.
+- **Sidebar presentation** (#613) preserves the terminal's default background rather
+  than forcing a black or white base fill, colors observed agent states and pending
+  input independently, and keeps the active conversation's brighter title visible
+  while the separate keyboard-navigation highlight moves. Status text, state
+  classification, session ownership, and scrollbar behavior are unchanged.
 
 ## [0.1.0-dev.257]
 

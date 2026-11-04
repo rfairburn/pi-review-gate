@@ -95,6 +95,20 @@ function sgrCodes(text: string): Set<string> {
   return codes;
 }
 
+/**
+ * Pi's own chat viewport has no whole-pane canvas. Both host appearances keep
+ * their explicit foreground but must leave the background on the terminal
+ * default, never paint a forced black (`40`) or white (`47`) ground.
+ */
+function assertTerminalDefaultGround(text: string, theme: "dark" | "light"): void {
+  const palette = sidebarPaletteFor(theme);
+  assert.match(palette.canvas, /^[0-9;]+;49$/, `${theme}: the canvas resets the background to terminal default`);
+  assert.ok(text.includes(`\x1b[${palette.canvas}m`),
+    `${theme}: written host rows carry the appearance's foreground/default ground`);
+  assert.equal(text.includes("\x1b[40m"), false, `${theme}: no forced black whole-pane background`);
+  assert.equal(text.includes("\x1b[47m"), false, `${theme}: no forced white whole-pane background`);
+}
+
 /** True when the LAST written frame draws `label` as its highlighted row. */
 function highlighted(harness: Harness, label: string): boolean {
   return frameText(harness).split("\n").some((line) => line.includes(`> ${label}`));
@@ -324,6 +338,7 @@ test("a host with no appearance file starts Dark and writes nothing", async () =
       `the written roster carries the dark palette header:\n${frameText(harness)}`);
     assert.equal(codes.has(sidebarPaletteFor("light").selected), false,
       "no light-only sequence appears while Dark is active");
+    assertTerminalDefaultGround(rawFrameText(harness), "dark");
     assert.equal(await closeWithSignal(harness), 0);
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
@@ -346,6 +361,7 @@ test("a persisted light appearance is live at startup and every emitted sequence
       assert.ok(SIDEBAR_GENERATED_SGR_ALLOWLIST.has(code), `unexpected generated SGR ${code}`);
       assert.ok(!code.includes(";2;") && !code.includes("38;2"), `no truecolor sequence: ${code}`);
     }
+    assertTerminalDefaultGround(rawFrameText(harness), "light");
     assert.equal(await closeWithSignal(harness), 0);
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
@@ -409,6 +425,8 @@ test("the Theme submenu saves through Main, applies live, and the next host star
     const codes = sgrCodes(rawFrameText(harness));
     assert.ok(codes.has(sidebarPaletteFor("light").selected), "the live palette is the light one");
     assert.equal(codes.has(sidebarPaletteFor("dark").header), false);
+    // The Theme pane is a host form, so this covers form and roster rows.
+    assertTerminalDefaultGround(rawFrameText(harness), "light");
     for (const code of codes) {
       assert.ok(SIDEBAR_THEME_SGR_CODES.has(code) || SIDEBAR_GENERATED_SGR_ALLOWLIST.has(code),
         `every generated sequence stays inside the closed palette set: ${code}`);

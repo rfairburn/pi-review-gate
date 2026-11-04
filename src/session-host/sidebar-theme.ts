@@ -53,6 +53,21 @@ export type SidebarThemeRole =
   | "activeMain"
   /** Secondary host-owned text: card status/background, owner and status lines. */
   | "secondary"
+  /**
+   * The agent/lifecycle portion of a card's status row. These are separate
+   * semantic roles because one status row can carry two independent facts:
+   * an idle agent waiting for input is not the same as a running agent that
+   * happens to have no pending input.
+   */
+  | "statusStarting"
+  | "statusRunning"
+  | "statusWaiting"
+  | "statusIdle"
+  | "statusUnknown"
+  | "statusExited"
+  | "statusError"
+  /** Pending editable input, emphasized independently of the agent state. */
+  | "inputPending"
   /** Footer hint rows the pane draws for its own keys. */
   | "hint"
   /** A bounded host notice ("! ..."). */
@@ -73,14 +88,16 @@ export type SidebarThemeRole =
 /**
  * One palette: a value for every semantic role PLUS the pane's own `canvas`.
  *
- * `canvas` is an explicit foreground/background pair (`"37;40"`, `"30;47"`) the
- * renderer restores after every row reset it generates. Without it a row that
- * inherits the terminal's default foreground or background can be unreadable
- * when the operator's terminal defaults are the opposite of the chosen
- * appearance: a Light black `activeMain` title on a dark terminal, or a Dark
- * grey status line on a light one. The pair is finite, allowlisted, and applied
- * only to rows this host draws — no native child cell, outer header, or divider
- * is recolored, and there is no terminal query, detection, or configuration
+ * `canvas` is the pane's explicit foreground plus the TERMINAL'S DEFAULT
+ * background (`"37;49"` for Dark, `"30;49"` for Light), and the renderer
+ * restores it after every row reset it generates. Pi 1.5's own chat viewport is
+ * a ScrollView/VStack with no overall canvas: `export.pageBg` is HTML-only,
+ * message/tool panels carry their own scoped backgrounds, and terminal-default
+ * colours are the native fallback. The sidebar therefore keeps the host's
+ * chosen foreground readable without painting a black or white ground over the
+ * operator's terminal. The pair is finite, allowlisted, and applied only to
+ * rows this host draws — no native child cell, outer header, or divider is
+ * recolored, and there is no terminal query, detection, or configuration
  * write. The operator's explicit appearance choice stays the only input.
  */
 export type SidebarPalette = Readonly<Record<SidebarThemeRole, string>> & {
@@ -88,15 +105,23 @@ export type SidebarPalette = Readonly<Record<SidebarThemeRole, string>> & {
 };
 
 const DARK_PALETTE: SidebarPalette = Object.freeze({
-  // Explicit pane ground: white-on-black. Every role below either names its own
-  // foreground or inherits this one, so no sidebar row depends on what the
-  // operator's terminal uses as its default colours.
-  canvas: "37;40",
+  // White foreground on the terminal's OWN default background. The host never
+  // turns the whole sidebar into a black panel; rows inherit whatever native
+  // ground the operator already uses, exactly like Pi's own chat viewport.
+  canvas: "37;49",
   header: "1;36",
   title: "1",
   selected: "1;34",
   activeMain: "1;97",
   secondary: "90",
+  statusStarting: "1;34",
+  statusRunning: "1;36",
+  statusWaiting: "33",
+  statusIdle: "32",
+  statusUnknown: "90",
+  statusExited: "90",
+  statusError: "1;31",
+  inputPending: "1;35",
   hint: "90",
   notice: "33",
   error: "1;31",
@@ -106,16 +131,30 @@ const DARK_PALETTE: SidebarPalette = Object.freeze({
 });
 
 const LIGHT_PALETTE: SidebarPalette = Object.freeze({
-  // Explicit pane ground: black-on-white, which is what makes the Light
-  // `activeMain` black title readable on any terminal instead of invisible on a
-  // dark one. The notice drops to plain red because yellow on white is not
-  // readable; the refusal stays bold red, so the two notices stay distinct.
-  canvas: "30;47",
+  // Black foreground on the terminal's OWN default background, not a forced
+  // white panel. The notice drops to plain red because yellow on a light ground
+  // is not readable; the refusal stays bold red, so the two notices stay
+  // distinct. Status colours stay dark enough to read on the same default.
+  canvas: "30;49",
   header: "1;34",
   title: "1",
   selected: "1;35",
-  activeMain: "1;30",
+  // The owner title needs its OWN colour, not the canvas black: once the pane
+  // canvas foreground is applied, a black `activeMain` and a bold-only `title`
+  // land on the same terminal cell attributes, so the conversation that owns
+  // Main would be indistinguishable from an ordinary card. This is the SAME
+  // blue the Light header and running status already use, and it stays distinct
+  // from the magenta navigation target above it.
+  activeMain: "1;34",
   secondary: "34",
+  statusStarting: "34",
+  statusRunning: "1;34",
+  statusWaiting: "33",
+  statusIdle: "32",
+  statusUnknown: "90",
+  statusExited: "90",
+  statusError: "1;31",
+  inputPending: "1;35",
   hint: "35",
   notice: "31",
   error: "1;31",

@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.258]
+
+### Added
+
+- **Live sidebar themes and an interactive overflow scrollbar** (#613): Dark and
+  Light Pi-styled palettes are saved in the session host's own per-agent settings
+  and applied without restarting sessions, including remote-only rosters with no
+  local Pi session. Pi's saved theme and child-session themes are untouched. An
+  overflowing roster keeps its themed scrollbar visible while idle, with direct
+  mouse navigation through the existing viewport; fitting content has no scrollbar.
+  Selection, focus, status text, wheel/keyboard navigation, and session routing
+  retain their existing meanings.
+
+### Changed
+
+- **One sidebar Settings menu** (#613) contains Theme, Network, and Host shortcuts,
+  replacing the separate Network and Host shortcuts roster actions while preserving
+  their existing capabilities, defaults, permissions, and actions.
+
 ## [0.1.0-dev.257]
 
 ### Fixed

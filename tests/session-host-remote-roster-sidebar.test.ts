@@ -469,8 +469,10 @@ test("empty and never-observed rosters add no cards and do not disturb the local
   const none = wideRoster(withNoHosts, 40, 24);
   assert.deepEqual(never.text, none.text,
     "a never-observed roster projects no card and changes nothing else");
-  assert.ok(never.text.some((line) => line.includes("Network")),
-    "the existing Network menu row is unchanged");
+  assert.ok(never.text.some((line) => line.includes("Settings")),
+    "the grouped Settings row is the roster's one settings entry point");
+  assert.equal(never.text.filter((line) => /^\s*>?\s*Network/.test(line)).length, 0,
+    "#613: Network is a Settings submenu, never a top-level roster row");
   assert.ok(!never.text.some((line) => line.includes("remote-")),
     "no remote title is fabricated from an unobserved roster");
 });

@@ -160,6 +160,48 @@ async function activateRosterRow(harness: Harness, label: string): Promise<void>
   assert.fail(`the actual rendered roster never offered its ${label} row`);
 }
 
+/** The one grouped roster row that owns every host entry point (#613). */
+const SETTINGS_ROSTER_LABEL = "Settings";
+
+/**
+ * Open the host shortcut editor through the ONE grouped Settings roster row
+ * (#613): roster -> Settings submenu -> its Host shortcuts entry. The submenu
+ * highlight is read from the written frame, so the walk proves the row the
+ * operator actually saw rather than a guessed press count.
+ */
+async function openHostShortcutsEditor(harness: Harness): Promise<void> {
+  await activateRosterRow(harness, SETTINGS_ROSTER_LABEL);
+  const highlighted = (label: string): boolean => harness.writer.frames.at(-1)?.frame.lines
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+    .some((line) => line.includes(`> ${label}`)) ?? false;
+  for (let step = 0; step <= 4 && !highlighted("Host shortcuts"); step += 1) {
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.ok(highlighted("Host shortcuts"), "the Settings submenu highlighted its Host shortcuts entry");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+}
+
+/**
+ * Open the Network menu through the real #613 keyboard path: the roster offers
+ * ONE grouped Settings row, and Network is its second submenu entry. The walk
+ * exercises the submenu's own input ownership rather than a shortcut.
+ */
+async function activateNetworkMenu(harness: Harness): Promise<void> {
+  await activateRosterRow(harness, SETTINGS_ROSTER_LABEL);
+  const networkHighlighted = (): boolean => harness.writer.frames.at(-1)?.frame.lines
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+    .some((line) => line.includes("> Network")) ?? false;
+  for (let step = 0; step <= 4 && !networkHighlighted(); step += 1) {
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.ok(networkHighlighted(), "the Settings submenu highlighted its Network entry");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+}
+
 /** Mutes the arrival bell first, so only the visual alert can prove the request is visible. */
 async function deliverMutedIncomingRequest(peer: FakePeerCoordinator, id: string): Promise<void> {
   peer.publish({ settings: { ...peer.snapshot.settings!, bellEnabled: false } });
@@ -568,7 +610,7 @@ test("a muted request arriving above the open narrow Network pane stays visible"
     await nextTurn();
     harness.terminal.setSize(40, 24);
     await nextTurn();
-    await activateRosterRow(harness, "Network");
+    await activateNetworkMenu(harness);
     assert.equal(harness.sidebar!.focus, "form", "the narrow Network pane opened before the request arrived");
     const selection = harness.sidebar!.selectedId;
     assert.equal(screenRowOfHeader(harness.writer.frames.at(-1)?.frame, "Network"), 1,
@@ -601,7 +643,7 @@ test("a muted request arriving while the Add destination menu is open stays visi
     await nextTurn();
     harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
     await nextTurn();
-    await activateRosterRow(harness, "Network");
+    await activateNetworkMenu(harness);
     assert.equal(harness.sidebar!.focus, "form", "the narrow Network pane opened before the request arrived");
     await openAddMenuInNarrowNetwork(harness);
 
@@ -655,7 +697,7 @@ test("a muted request arriving with one Add destination field editor open stays 
     await nextTurn();
     harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
     await nextTurn();
-    await activateRosterRow(harness, "Network");
+    await activateNetworkMenu(harness);
     await openAddMenuInNarrowNetwork(harness);
     await openOneAddFieldEditor(harness, "Host:");
     assert.equal(harness.sidebar!.focus, "form", "the single-field editor opened before the request arrived");
@@ -1241,8 +1283,7 @@ test("host shortcut editor persists F8/F9, applies them immediately, and preserv
   await nextTurn();
   assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
   harness.terminal.emitInput(ALT_LEFT); // focus the visible roster without resizing
-  for (let index = 0; index < 4; index += 1) harness.terminal.emitInput("\x1b[B"); // row -> Saved -> New -> Quit -> Host shortcuts
-  harness.terminal.emitInput(ENTER);
+  await openHostShortcutsEditor(harness); // roster -> Settings -> Host shortcuts
   assert.equal(harness.sidebar?.focus, "form");
 
   harness.terminal.emitInput("\x15");
@@ -1313,9 +1354,7 @@ test("Main loads the dedicated host shortcut file without changing native Pi key
 test("legacy --sidebar-key overrides configured toggle and the editor identifies the override", async () => {
   const harness = createHarness({ toggleKey: "f7" });
   await ready(harness);
-  harness.terminal.emitInput("\x1b[B"); // New -> Quit host
-  harness.terminal.emitInput("\x1b[B"); // -> Host shortcuts
-  harness.terminal.emitInput(ENTER);
+  await openHostShortcutsEditor(harness); // roster -> Settings -> Host shortcuts
   const formText = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
   assert.match(formText, /Legacy --sidebar-key override active: F7/);
 
@@ -1343,9 +1382,7 @@ test("failed host shortcut write keeps the editor open and the previous active t
     writeHostShortcutConfig: () => { throw new Error("synthetic settings write failure"); },
   });
   await ready(harness);
-  harness.terminal.emitInput("\x1b[B");
-  harness.terminal.emitInput("\x1b[B");
-  harness.terminal.emitInput(ENTER);
+  await openHostShortcutsEditor(harness); // roster -> Settings -> Host shortcuts
   harness.terminal.emitInput("\x15");
   harness.terminal.emitInput("f8");
   harness.terminal.emitInput("\t");
@@ -1356,6 +1393,13 @@ test("failed host shortcut write keeps the editor open and the previous active t
   const errorText = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
   assert.match(errorText, /synthetic settings write failure/);
   harness.terminal.emitInput("\x1b"); // Cancel does not commit the draft
+  assert.equal(harness.sidebar?.focus, "form",
+    "#613: Cancel returns the editor to the Settings menu that opened it");
+  const menuText = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  assert.match(menuText, /Theme/);
+  assert.equal(menuText.includes("synthetic settings write failure"), false,
+    "the failed-Save error belongs to the closed editor, not the returned-to menu");
+  harness.terminal.emitInput("\x1b"); // leaving Settings closes to the roster
   assert.equal(harness.sidebar?.focus, "sidebar");
   harness.terminal.emitInput(ALT_LEFT);
   assert.equal(harness.sidebar?.visible, false, "the previous Alt+Left toggle remains active after failed Save");
@@ -1397,9 +1441,7 @@ test("Save refuses a configured return chord that conflicts with the active lega
     },
   });
   await ready(harness);
-  harness.terminal.emitInput("\x1b[B");
-  harness.terminal.emitInput("\x1b[B");
-  harness.terminal.emitInput(ENTER);
+  await openHostShortcutsEditor(harness); // roster -> Settings -> Host shortcuts
   harness.terminal.emitInput("\x15");
   harness.terminal.emitInput("f8");
   harness.terminal.emitInput("\t");
@@ -1411,7 +1453,9 @@ test("Save refuses a configured return chord that conflicts with the active lega
   assert.equal(harness.sidebar?.focus, "form", "the validation error keeps the editor open");
   const text = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
   assert.match(text, /different shortcut chords/);
-  harness.terminal.emitInput("\x1b");
+  harness.terminal.emitInput("\x1b"); // Cancel returns to the Settings menu
+  assert.equal(harness.sidebar?.focus, "form", "the editor's Cancel target is the menu that opened it");
+  harness.terminal.emitInput("\x1b"); // leaving Settings closes to the roster
   assert.equal(harness.sidebar?.focus, "sidebar");
   harness.terminal.emitInput("\x1b[20~"); // legacy F9 remains the active toggle
   assert.equal(harness.sidebar?.visible, false);
@@ -1436,9 +1480,7 @@ test("Save refuses matcher-overlapping legacy/file pairs before calling persiste
       },
     });
     await ready(harness);
-    harness.terminal.emitInput("\x1b[B");
-    harness.terminal.emitInput("\x1b[B");
-    harness.terminal.emitInput(ENTER);
+    await openHostShortcutsEditor(harness); // roster -> Settings -> Host shortcuts
     harness.terminal.emitInput("\x15");
     harness.terminal.emitInput("f8");
     harness.terminal.emitInput("\t");
@@ -5350,7 +5392,7 @@ test("a left-roster click beside the live network pane closes it and decides not
     const ownerBefore = harness.sidebar?.activeMainOwnerID;
     harness.terminal.emitInput(ALT_LEFT);
     await nextTurn();
-    await activateRosterRow(harness, "Network");
+    await activateNetworkMenu(harness);
     assert.equal(harness.sidebar?.focus, "form", "the Network pane owns the right-hand slot");
     const networkFrame = harness.writer.frames.at(-1)!.frame;
     assert.ok(rightText(networkFrame).includes("Network"), rightText(networkFrame));
@@ -5358,8 +5400,9 @@ test("a left-roster click beside the live network pane closes it and decides not
     const createsBefore = manager.createOptions.length;
     const commandsBefore = peer.commands.length;
 
-    // The highlighted Network row is a pure no-op while its own pane is open.
-    emitMouse(harness.terminal, 2, leftRow(networkFrame, "Network"));
+    // #613: the grouped Settings row carries the LEFT highlight while the
+    // Network submenu pane it opened is up, so clicking it is a pure no-op.
+    emitMouse(harness.terminal, 2, leftRow(networkFrame, SETTINGS_ROSTER_LABEL));
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "form", "the highlighted row keeps the pane open");
     assert.equal(peer.commands.length, commandsBefore, "the no-op sends nothing");
@@ -5380,19 +5423,31 @@ test("a left-roster click beside the live network pane closes it and decides not
     assert.equal(manager.createOptions.length, createsBefore, "no destination or session was added");
     assert.equal(manager.writes.length, writesBefore, "no mouse packet reaches the native child");
     assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "the native Main owner is unchanged");
-    assert.ok(plainRow(closedFrame, leftRow(closedFrame, "Network")).slice(0, 32).includes("Network"),
-      "the Network row is still drawn for a later deliberate visit");
+    assert.ok(plainRow(closedFrame, leftRow(closedFrame, SETTINGS_ROSTER_LABEL)).slice(0, 32)
+      .includes(SETTINGS_ROSTER_LABEL),
+      "the grouped Settings row is still drawn for a later deliberate visit");
 
-    // Its own row performs its ordinary action again afterwards.
-    emitMouse(harness.terminal, 2, leftRow(closedFrame, "Network"));
+    // Its own row performs its ordinary action again afterwards: the pointer
+    // reopens the submenu, and a deliberate submenu entry reopens the pane.
+    emitMouse(harness.terminal, 2, leftRow(closedFrame, SETTINGS_ROSTER_LABEL));
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await nextTurn();
       const frame = harness.writer.frames.at(-1);
-      if (frame !== undefined && rightText(frame.frame).includes("Network")) break;
+      if (frame !== undefined && rightText(frame.frame).includes("Theme")) break;
     }
+    assert.ok(rightText(harness.writer.frames.at(-1)!.frame).includes("Network"),
+      "the clicked grouped row offers the Network entry again");
+    for (let step = 0; step <= 4; step += 1) {
+      if (rightText(harness.writer.frames.at(-1)!.frame).split("\n")
+        .some((line) => line.trimStart().startsWith("> Network"))) break;
+      harness.terminal.emitInput("\x1b[B");
+      await nextTurn();
+    }
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
     assert.equal(harness.sidebar?.focus, "form");
     assert.ok(rightText(harness.writer.frames.at(-1)!.frame).includes("Network"),
-      "the clicked row reopens its ordinary pane");
+      "the deliberate submenu entry reopens its ordinary pane");
     assert.equal(peer.commands.length, commandsBefore, "reopening the pane sends nothing either");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
@@ -6180,7 +6235,7 @@ test("Network menu pointer clicks act on the written row once and refuse unseen 
     }
     assert.equal(sidebar.visible, true, "the host panes are visible before the pointer gestures");
     assert.equal(sidebar.focus, "sidebar", "the host roster owns input before the pointer gestures");
-    await activateRosterRow(harness, "Network");
+    await activateNetworkMenu(harness);
     assert.equal(sidebar.focus, "form", "the Network menu opened in the right-hand form slot");
     assert.ok(formPaneRowOfHeader(written(), "Network") > 0,
       "the open network pane is drawn in the right-hand slot beside the roster");

@@ -13,6 +13,7 @@ import type { PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-
 import {
   NATIVE_PANE_START,
   NETWORK_ACTION,
+  SETTINGS_ACTION,
   type OwnedRosterLabel,
   ROSTER_ACTIONS,
   SIDEBAR_COLUMNS,
@@ -33,9 +34,9 @@ import {
 
 const HEADER = (count: number): string => ` Sessions (${count}) `;
 const ACTIONS = ["  Saved conversations", "  New session", "  Quit host"];
-/** The required tail with the optional Network row at its actual renderer position. */
-const ACTIONS_WITH_NETWORK = ["  Saved conversations", "  New session", "  Network", "  Quit host"];
-const NETWORK_LABELS = ["Saved conversations", "New session", NETWORK_ACTION, "Quit host"];
+/** The required tail plus the one optional grouped Settings row (#613). */
+const ACTIONS_WITH_SETTINGS = [...ACTIONS, "  Settings"];
+const SETTINGS_LABELS = [...ROSTER_ACTIONS, SETTINGS_ACTION];
 
 /** Fixed injected clock for the pure network DTO; no real clock is read. */
 const PEER_NOW = 1_700_000_000_000;
@@ -438,7 +439,7 @@ test("pane-only renderer output parses without an outer composed header", () => 
   assert.equal(rosterCards(rendered)[0]!.title, "Rendered title");
 });
 
-test("production-rendered Host shortcuts roster rows parse at wide and narrow pane widths", () => {
+test("production-rendered grouped Settings roster rows parse at wide and narrow pane widths", () => {
   for (const width of [32, 24]) {
     const withoutSettings = new SidebarController({
       toggleKey: "f8",
@@ -461,27 +462,26 @@ test("production-rendered Host shortcuts roster rows parse at wide and narrow pa
       const frame = controller.renderRoster(width, 40).lines.join("\n");
       const parsed = parseRosterFrame(frame, width);
       assert.equal(parsed.complete, true, `complete production roster at width ${width}, override=${legacyToggleOverride}`);
-      assert.deepEqual(parsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS, "Host shortcuts"]);
+      assert.deepEqual(parsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS, "Settings"]);
       assert.deepEqual(parsed.actions.map((entry) => entry.position),
         parsed.actions.map((entry) => parsed.entries.indexOf(entry)),
       "each action position comes from its actual rendered entry order");
       assert.equal(isSidebarFocusedFrame(frame, width), true,
         "the complete sidebar-focus footer follows the actual optional action row");
 
-      const shortcutsRow = parsed.actions.at(-1)!.raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
-      if (legacyToggleOverride) {
-        assert.ok(shortcutsRow.startsWith("  Host shortcuts ("), shortcutsRow);
-        assert.ok(shortcutsRow.endsWith("..."), `legacy annotation is width-clipped at ${width}: ${shortcutsRow}`);
-      } else {
-        assert.equal(shortcutsRow, "  Host shortcuts");
-      }
+      const settingsRow = parsed.actions.at(-1)!.raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+      // Grouping keeps the roster row short: the legacy --sidebar-key override
+      // is stated inside the Settings submenu and the shortcuts editor, never
+      // annotated onto the roster's one Settings row.
+      assert.equal(settingsRow, "  Settings",
+        `the grouped Settings row is identical at width ${width} (override=${legacyToggleOverride})`);
       assert.equal(sidebarRosterHidden(parsed.actions.at(-1)!.raw, width), false,
-        "a stale Host shortcuts row alone is not mistaken for a hidden sidebar");
+        "a stale Settings row alone is not mistaken for a hidden sidebar");
     }
   }
 });
 
-test("production Host shortcuts selection navigation uses its actual parsed entry position", () => {
+test("production grouped Settings selection navigation uses its actual parsed entry position", () => {
   for (const width of [32, 24]) {
     const controller = new SidebarController({
       toggleKey: "f8",
@@ -497,17 +497,17 @@ test("production Host shortcuts selection navigation uses its actual parsed entr
     assert.equal(parsed.complete, true);
     assert.ok(selected);
     assert.equal(selected.kind, "action");
-    assert.equal(selected.label, "Host shortcuts");
+    assert.equal(selected.label, "Settings");
     const renderedPosition = parsed.entries.findIndex((entry) => entry.kind === "action"
-      && entry.label === "Host shortcuts");
+      && entry.label === "Settings");
     assert.notEqual(renderedPosition, -1);
     assert.equal(selected.position, renderedPosition);
-    assert.equal(parsed.entries[selected.position]?.label, "Host shortcuts",
+    assert.equal(parsed.entries[selected.position]?.label, "Settings",
       "keyboard navigation and the witness agree on the rendered entry index");
   }
 });
 
-test("production-rendered roster navigation wraps through Host shortcuts and handles a three-action tail", () => {
+test("production-rendered roster navigation wraps through Settings and handles a three-action tail", () => {
   const pressAndAssertNext = (
     controller: SidebarController,
     width: number,
@@ -569,10 +569,10 @@ test("production-rendered roster navigation wraps through Host shortcuts and han
     });
     withSettings.updateItems(nativeItems);
     assert.equal(pressAndAssertNext(withSettings, width, owned), "Quit host");
-    assert.equal(pressAndAssertNext(withSettings, width, owned), "Host shortcuts",
-      "Quit host advances to the actual optional fourth action");
+    assert.equal(pressAndAssertNext(withSettings, width, owned), "Settings",
+      "Quit host advances to the actual optional Settings action");
     assert.equal(pressAndAssertNext(withSettings, width, owned), "owned-a",
-      "the selected Host shortcuts row wraps to the first owned native entry");
+      "the selected Settings row wraps to the first owned native entry");
 
     const startingOnShortcuts = new SidebarController({
       toggleKey: "f8",
@@ -585,11 +585,11 @@ test("production-rendered roster navigation wraps through Host shortcuts and han
     startingOnShortcuts.handleInput("\x1b[B");
     const hostFrame = startingOnShortcuts.renderRoster(width, 40).lines.join("\n");
     const hostParsed = parseRosterFrame(hostFrame, width);
-    assert.equal(selectedRosterEntry(hostFrame, width)?.label, "Host shortcuts");
-    assert.ok(rosterNavigationTargets(hostParsed, owned)?.some((target) => target.label === "Host shortcuts"),
+    assert.equal(selectedRosterEntry(hostFrame, width)?.label, "Settings");
+    assert.ok(rosterNavigationTargets(hostParsed, owned)?.some((target) => target.label === "Settings"),
       "the known-highlight fence includes the actual optional action");
     assert.equal(pressAndAssertNext(startingOnShortcuts, width, owned), "owned-a",
-      "navigation can start on Host shortcuts and advance to the first owned native entry");
+      "navigation can start on Settings and advance to the first owned native entry");
 
     const withoutSettings = new SidebarController({
       toggleKey: "f8",
@@ -636,7 +636,7 @@ test("navigation targets retain one-to-one owned-session correlation", () => {
     "a nonmatching owned-session title cannot be guessed into the navigation order");
 });
 
-test("Host shortcuts tails reject partial, unknown, out-of-order, and duplicate rows", () => {
+test("Settings tails reject partial, unknown, out-of-order, and duplicate rows", () => {
   for (const width of [32, 24]) {
     const controller = new SidebarController({
       toggleKey: "f8",
@@ -650,22 +650,22 @@ test("Host shortcuts tails reject partial, unknown, out-of-order, and duplicate 
     const actionRows = complete.actions.map((entry) => renderedLines[1 + entry.position]!);
     const requiredRows = complete.actions.slice(0, ROSTER_ACTIONS.length)
       .map((entry) => renderedLines[1 + entry.position]!);
-    const shortcutsIndex = complete.actions.findIndex((entry) => entry.label === "Host shortcuts");
-    assert.notEqual(shortcutsIndex, -1);
-    const shortcutsRow = actionRows[shortcutsIndex]!;
+    const settingsIndex = complete.actions.findIndex((entry) => entry.label === "Settings");
+    assert.notEqual(settingsIndex, -1);
+    const settingsRow = actionRows[settingsIndex]!;
     const footer = renderedLines.slice(1 + complete.entryEnd);
     const frameWithTail = (tail: readonly string[]): string => [renderedLines[0]!, ...tail, ...footer].join("\n");
-    const plainShortcuts = shortcutsRow.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
-    assert.ok(plainShortcuts.endsWith("..."), plainShortcuts);
-    const partialShortcuts = plainShortcuts.slice(0, -3);
-    const outOfOrder = [...requiredRows.slice(0, -1), shortcutsRow, requiredRows.at(-1)!];
+    const plainSettings = settingsRow.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+    assert.equal(plainSettings, "  Settings");
+    const partialSettings = "  Setting";
+    const outOfOrder = [...requiredRows.slice(0, -1), settingsRow, requiredRows.at(-1)!];
 
     const malformedTails: readonly (readonly string[])[] = [
-      [...requiredRows, partialShortcuts],
+      [...requiredRows, partialSettings],
       [...requiredRows, "  Unknown action"],
-      [...requiredRows, "  Host shortcuts (unknown suffix)"],
+      [...requiredRows, "  Settings (unknown suffix)"],
       outOfOrder,
-      [...actionRows, shortcutsRow],
+      [...actionRows, settingsRow],
     ];
     for (const tail of malformedTails) {
       const frame = frameWithTail(tail);
@@ -678,12 +678,12 @@ test("Host shortcuts tails reject partial, unknown, out-of-order, and duplicate 
       assert.equal(isSidebarFocusedFrame(frame, width), false);
     }
 
-    assert.equal(sidebarRosterHidden(partialShortcuts, width), false,
+    assert.equal(sidebarRosterHidden(partialSettings, width), false,
       "a partially painted settings row remains a visible remnant, not a hidden witness");
   }
 });
 
-test("an attached network snapshot adds the optional Network row at its exact renderer position", () => {
+test("an attached network snapshot adds no roster row; Settings is the one entry point", () => {
   for (const settingsAvailable of [false, true]) {
     for (const legacyToggleOverride of [false, true]) {
       const controller = rosterController({
@@ -693,30 +693,30 @@ test("an attached network snapshot adds the optional Network row at its exact re
       });
       const before = renderRoster(controller);
       const beforeParsed = parseRosterFrame(before);
-      assert.equal(beforeParsed.complete, true, "the legacy roster keeps parsing unchanged");
+      assert.equal(beforeParsed.complete, true, "the roster keeps parsing unchanged");
       assert.deepEqual(beforeParsed.actions.map((entry) => entry.label),
-        settingsAvailable ? [...ROSTER_ACTIONS, "Host shortcuts"] : [...ROSTER_ACTIONS],
-      `no snapshot means no Network row (settings=${settingsAvailable})`);
+        settingsAvailable ? [...ROSTER_ACTIONS, SETTINGS_ACTION] : [...ROSTER_ACTIONS],
+      `no snapshot means no extra roster row (settings=${settingsAvailable})`);
 
-      // Arrival of the coordinator DTO is presentation only: it adds exactly one
-      // row between "New session" and "Quit host" and moves nothing else.
+      // Arrival of the coordinator DTO stays presentation only. It never adds a
+      // top-level Network row; where settings were unavailable it only makes the
+      // ONE grouped Settings entry available, in the same final position.
       controller.setPeerUiSnapshot(peerSnapshot());
       const after = renderRoster(controller);
       const parsed = parseRosterFrame(after);
       const flags = `settings=${settingsAvailable}, override=${legacyToggleOverride}`;
-      assert.equal(parsed.complete, true, `complete roster with the optional Network row (${flags})`);
+      assert.equal(parsed.complete, true, `complete roster after the snapshot (${flags})`);
       assert.equal(parsed.count, 1);
       assert.deepEqual(parsed.cards.map((card) => card.title), ["Native A"]);
       assert.deepEqual(parsed.actions.map((entry) => entry.label),
-        settingsAvailable ? [...NETWORK_LABELS, "Host shortcuts"] : [...NETWORK_LABELS],
-      `the Network row sits between New session and Quit host (${flags})`);
+        [...ROSTER_ACTIONS, SETTINGS_ACTION],
+      `the grouped Settings entry is the only settings row (${flags})`);
       assert.deepEqual(parsed.actions.map((entry) => entry.position),
         parsed.actions.map((_, index) => parsed.cards.length + index),
       `every action keeps its actual rendered entry position (${flags})`);
-      const networkIndex = parsed.entries.findIndex((entry) => entry.kind === "action" && entry.label === NETWORK_ACTION);
-      assert.equal(parsed.entries[networkIndex - 1]?.label, "New session");
-      assert.equal(parsed.entries[networkIndex + 1]?.label, "Quit host");
-      assert.equal(parsed.entries[networkIndex]?.selected, false, "the new row is not secretly highlighted");
+      assert.equal(parsed.actions.filter((entry) => entry.raw.includes(NETWORK_ACTION)).length, 0,
+      `no Network row is drawn in the roster (${flags})`);
+      assert.equal(parsed.actions.at(-1)?.selected, false, "the new row is not secretly highlighted");
       assert.equal(selectedRosterEntry(after)?.label, "New session",
         "an arriving snapshot never moves the existing highlight");
       assert.equal(isSidebarFocusedFrame(after), true, `the footer still follows the optional row (${flags})`);
@@ -738,18 +738,18 @@ test("the empty Sessions (0) roster with an attached snapshot parses at wide and
       assert.equal(parsed.complete, true, `the observed empty-with-network frame parses (${flags})`);
       assert.equal(parsed.count, 0);
       assert.deepEqual(parsed.cards, []);
-      assert.deepEqual(parsed.actions.map((entry) => entry.label), [...NETWORK_LABELS, "Host shortcuts"]);
-      assert.deepEqual(parsed.actions.map((entry) => entry.position), [0, 1, 2, 3, 4]);
+      assert.deepEqual(parsed.actions.map((entry) => entry.label), SETTINGS_LABELS);
+      assert.deepEqual(parsed.actions.map((entry) => entry.position), [0, 1, 2, 3]);
       assert.equal(selectedRosterEntry(frame, width)?.label, "New session");
       assert.equal(selectedRosterEntry(frame, width)?.position, 1);
       assert.equal(isSidebarFocusedFrame(frame, width), true);
       assert.equal(sidebarRosterHidden(frame, width), false,
-        "the drawn Network row is a visible sidebar remnant, never a hidden witness");
+        "the drawn Settings row is a visible sidebar remnant, never a hidden witness");
     }
   }
 });
 
-test("Network navigation reports its actual parsed position in both directions", () => {
+test("grouped Settings navigation reports its actual parsed position in both directions", () => {
   const controller = rosterController({
     settingsAvailable: true,
     legacyToggleOverride: false,
@@ -760,25 +760,28 @@ test("Network navigation reports its actual parsed position in both directions",
   const beforeParsed = parseRosterFrame(before);
   const beforeTargets = rosterNavigationTargets(beforeParsed, OWNED);
   assert.ok(beforeTargets);
-  const network = beforeTargets.find((target) => target.label === NETWORK_ACTION);
-  assert.ok(network, "the optional row is part of the real navigation order");
-  assert.equal(beforeTargets[network.position]?.label, NETWORK_ACTION,
+  const settings = beforeTargets.find((target) => target.label === SETTINGS_ACTION);
+  assert.ok(settings, "the grouped Settings entry is part of the real navigation order");
+  assert.equal(beforeTargets[settings.position]?.label, SETTINGS_ACTION,
     "the navigation position is the rendered entry index, not a guessed offset");
+  assert.equal(beforeTargets.filter((target) => target.label === NETWORK_ACTION).length, 0,
+    "Network is a Settings submenu, never a roster navigation target");
 
-  controller.handleInput("\x1b[B"); // New session -> Network
-  const onNetwork = renderRoster(controller);
-  const parsed = parseRosterFrame(onNetwork);
-  const selected = selectedRosterEntry(onNetwork);
+  controller.handleInput("\x1b[B"); // New session -> Quit host
+  controller.handleInput("\x1b[B"); // -> the grouped Settings entry
+  const onSettings = renderRoster(controller);
+  const parsed = parseRosterFrame(onSettings);
+  const selected = selectedRosterEntry(onSettings);
   assert.equal(parsed.complete, true);
-  assert.equal(selected?.label, NETWORK_ACTION);
-  assert.equal(selected?.position, network.position);
-  assert.equal(parsed.entries[selected!.position]?.label, NETWORK_ACTION);
+  assert.equal(selected?.label, SETTINGS_ACTION);
+  assert.equal(selected?.position, settings.position);
+  assert.equal(parsed.entries[selected!.position]?.label, SETTINGS_ACTION);
   const targets = rosterNavigationTargets(parsed, OWNED);
   assert.ok(targets);
-  assert.equal(nextRosterNavigationTarget(targets, selected!.position)?.label, "Quit host",
-    "Down advances the optional row to the required tail");
-  assert.equal(nextRosterNavigationTarget(targets, selected!.position, "up")?.label, "New session",
-    "Up steps back from the optional row");
+  assert.equal(nextRosterNavigationTarget(targets, selected!.position)?.label, "owned-a",
+    "Down wraps from the last rendered entry to the first owned native entry");
+  assert.equal(nextRosterNavigationTarget(targets, selected!.position, "up")?.label, "Quit host",
+    "Up steps back from the grouped entry to the required tail");
 });
 
 test("misplaced, duplicated, partial, annotated, and unknown Network rows stay fail-closed", () => {
@@ -787,7 +790,7 @@ test("misplaced, duplicated, partial, annotated, and unknown Network rows stay f
     [HEADER(1), ...card, "  Network", ...ACTIONS],
     [HEADER(1), ...card, "  Saved conversations", "  Network", "  New session", "  Quit host"],
     [HEADER(1), ...card, ...ACTIONS, "  Network"],
-    [HEADER(1), ...card, ...ACTIONS_WITH_NETWORK, "  Network"],
+    [HEADER(1), ...card, ...ACTIONS_WITH_SETTINGS, "  Network"],
     [HEADER(1), ...card, "  Saved conversations", "  New session", "  Networ", "  Quit host"],
     [HEADER(1), ...card, "  Saved conversations", "  New session", "  Network (1 request)", "  Quit host"],
     [HEADER(1), ...card, "  Saved conversations", "  New session", "  Networks", "  Quit host"],
@@ -806,9 +809,10 @@ test("misplaced, duplicated, partial, annotated, and unknown Network rows stay f
     assert.equal(isSidebarFocusedFrame(frame), false);
   }
 
-  // The renderer's own pending-consent annotation is refused too: the witness
-  // never learns an arbitrary annotated row, and the annotated row is still a
-  // visible sidebar remnant for the hide witness.
+  // Grouping (#613) means the renderer draws NO Network row in the roster at
+  // all: the pending request stays in the roster's own bounded alert band, and
+  // the Network submenu inside Settings keeps the request-count annotation. Any
+  // Network-shaped row is therefore only ever a visible sidebar remnant.
   const annotated = rosterController({
     settingsAvailable: true,
     legacyToggleOverride: false,
@@ -816,21 +820,31 @@ test("misplaced, duplicated, partial, annotated, and unknown Network rows stay f
     snapshot: peerSnapshot({ consents: [peerConsent("a")] }),
   });
   const annotatedFrame = renderRoster(annotated);
-  assert.ok(annotatedFrame.includes("  Network (1 request)"), annotatedFrame);
+  assert.ok(annotatedFrame.includes("  Settings"), annotatedFrame);
+  assert.equal(annotatedFrame.split("\n").some((line) =>
+    /^\s*(> )?(Network|Host shortcuts)/.test(line.replace(/\x1b\[[0-9;]*m/g, ""))), false,
+    "the roster draws no Network or Host shortcuts row, annotated or otherwise");
+  assert.ok(annotatedFrame.includes("Incoming connection request"),
+    "the pending request keeps its own notification band, so grouping loses no discoverability");
   assert.equal(parseRosterFrame(annotatedFrame).complete, false,
-    "an annotated Network row is not an accepted action and leaves the roster incomplete");
+    "the reserved alert band rows are not cards, so the strict parse stays incomplete (unchanged by #613)");
   for (const remnant of [
     "  Network",
     "> Network",
     "  Networ",
     "  Network (1 request)",
     "  Network (2 requ...",
+    "  Host shortcuts",
   ]) {
     assert.equal(sidebarRosterHidden(remnant, SIDEBAR_COLUMNS), false,
-      `${JSON.stringify(remnant)} is a visible Network remnant, not a hidden sidebar`);
+      `${JSON.stringify(remnant)} is a visible submenu remnant, not a hidden sidebar`);
+  }
+  for (const remnant of ["  Settings", "> Setting", "  Setti"]) {
+    assert.equal(sidebarRosterHidden(remnant, SIDEBAR_COLUMNS), false,
+      `${JSON.stringify(remnant)} is a visible Settings remnant, not a hidden sidebar`);
   }
   assert.equal(sidebarRosterHidden(["Canonical title", "native content row"].join("\n")), true,
-    "a Network-free divider-free frame is still witnessed as hidden");
+    "a settings-row-free, divider-free frame is still witnessed as hidden");
 });
 
 test("navigation direction chooses the shortest known cyclic step and refuses ambiguous steps", () => {
@@ -845,11 +859,11 @@ test("navigation direction chooses the shortest known cyclic step and refuses am
   const targets = rosterNavigationTargets(parsed, OWNED);
   assert.ok(targets);
   assert.deepEqual(targets.map((target) => target.label),
-    ["owned-a", "owned-b", "Saved conversations", "New session", NETWORK_ACTION, "Quit host", "Host shortcuts"]);
+    ["owned-a", "owned-b", "Saved conversations", "New session", "Quit host", SETTINGS_ACTION]);
   const positionOf = (label: string): number => targets.find((target) => target.label === label)!.position;
 
   assert.equal(rosterNavigationDirection(targets, positionOf("owned-b"), "owned-a"), "up",
-    "the seven-entry roster reaches the first card in one Up instead of six Downs");
+    "the six-entry roster reaches the first card in one Up instead of five Downs");
   assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-b"), "up")?.label, "owned-a");
   assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-b"))?.label, "Saved conversations",
     "the default direction stays Down");
@@ -862,17 +876,18 @@ test("navigation direction chooses the shortest known cyclic step and refuses am
     const step = nextRosterNavigationTarget(targets, cursor, "down");
     assert.ok(step);
     downs += 1;
-    assert.ok(downs <= 7, "the Down path is bounded by the rendered entry count");
+    assert.ok(downs <= 6, "the Down path is bounded by the rendered entry count");
     if (step.label === "owned-a") break;
     cursor = step.position;
   }
-  assert.equal(downs, 6, "six Down presses are needed where one Up step suffices");
+  assert.equal(downs, 5, "five Down presses are needed where one Up step suffices");
 
-  assert.equal(rosterNavigationDirection(targets, positionOf(NETWORK_ACTION), "Quit host"), "down");
-  assert.equal(rosterNavigationDirection(targets, positionOf("owned-a"), "Host shortcuts"), "up",
+  assert.equal(rosterNavigationDirection(targets, positionOf("New session"), SETTINGS_ACTION), "down",
+    "the grouped entry sits after the required tail");
+  assert.equal(rosterNavigationDirection(targets, positionOf("owned-a"), "Settings"), "up",
     "Up wraps from the first rendered entry to the last");
-  assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-a"), "up")?.label, "Host shortcuts");
-  assert.equal(nextRosterNavigationTarget(targets, positionOf("Host shortcuts"), "down")?.label, "owned-a",
+  assert.equal(nextRosterNavigationTarget(targets, positionOf("owned-a"), "up")?.label, "Settings");
+  assert.equal(nextRosterNavigationTarget(targets, positionOf("Settings"), "down")?.label, "owned-a",
     "Down still wraps from the last entry to the first");
 
   // Equal-length steps go Down, the direction every existing driver can press.

@@ -223,6 +223,26 @@ settings and the defaults are described below. Put native Pi arguments after a l
 `--`; allowed arguments retain their original order and bytes. There are no initial host
 `--workspace`, `--profile`, or `--label` options.
 
+### Sidebar Settings and themes
+
+The sidebar's **Settings** entry groups **Theme**, **Network**, and **Host shortcuts**.
+Network and Host shortcuts open their existing controls as submenus rather than separate
+roster actions; their permissions, defaults, and session routing are unchanged. Back
+returns from a submenu to Settings, and closing Settings returns to the roster.
+
+Choose a Pi-styled **Dark** or **Light** sidebar theme through Settings. The host applies
+the choice live after saving it in its own
+`<agentDir>/session-host/appearance.json`, using the same per-agent scope as the roster
+and host shortcuts. An absent appearance file uses Dark without creating a file.
+The file has the strict shape `{"version":1,"theme":"dark"}` (or `"light"`).
+An unsafe or unreadable file is left untouched: the host shows a bounded refusal
+while keeping Dark available for display, and a later theme save will not replace
+an invalid existing record. A failed save keeps the previous active palette.
+The sidebar works with only remote sessions and no local Pi session running: Pi's saved
+theme is not read or synchronized, and changing this theme neither restarts sessions nor
+changes any local or remote session's own theme. Status text and the distinction between
+the navigation highlight and the active Main conversation remain visible.
+
 ### Host shortcut configuration
 
 The host's two existing keyboard actions have independent bindings. Their dedicated
@@ -240,7 +260,7 @@ review-gate configuration. A missing host file uses defaults without creating th
 }
 ```
 
-The Host shortcuts roster entry opens a host-owned editor. Tab switches between the two
+**Settings → Host shortcuts** opens the existing host-owned editor. Tab switches between the two
 configured fields; the current native form submit binding saves, and the current native
 cancel binding cancels. Save validates both configured chords and the effective pair,
 then atomically writes the file and applies the bindings immediately. Cancel changes
@@ -834,7 +854,7 @@ manual comparison next.
 
 ### Network sidebar: hosting, pairing, and remote metadata
 
-The optional native session host exposes a **Network** entry in its sidebar when the
+The optional native session host exposes **Settings → Network** in its sidebar when the
 network UI snapshot is attached. Ordinary Pi sessions and both standalone review-gate
 launchers are unchanged and have no Network entry. The sidebar is a pure display and
 command frontend: one coordinator owned by the host performs every listener, client,
@@ -1446,9 +1466,9 @@ never steal focus.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-an existing action entry. A single left-click on a displayed New, Saved, Quit, or Host shortcuts action entry
+an existing action entry. A single left-click on a displayed New, Saved, Quit, or Settings action entry
 invokes that same action: New still opens its form, Saved its picker, Quit follows its
-existing confirmation rules, and Host shortcuts opens its dedicated editor. These sidebar clicks are handled by the
+existing confirmation rules, and Settings opens the grouped settings menu. These sidebar clicks are handled by the
 host, not forwarded to a native child; existing keyboard controls remain available.
 With the roster focused, a single left click inside a currently displayed native Main
 pane returns keyboard focus to the unchanged active Main owner and consumes that first
@@ -1473,6 +1493,14 @@ after wheeling, including moving the highlight to an entry that is off-screen an
 bringing it into view. No wheel preference, acceleration, smooth-scrolling mode, or
 rows-per-notch setting is added, and hosted-conversation and popup scrolling are
 unchanged.
+
+When the roster overflows vertically, a themed Pi-chat-style scrollbar stays visible
+at rest; it is hidden when the content fits. Its thumb reflects the existing viewport.
+Click its track or drag its thumb to reach earlier or later entries without activating
+a session, moving the highlight, changing focus, or forwarding the gesture into Main
+or a popup. Content and terminal-size changes recompute its range and geometry; theme
+changes update its colors without restarting sessions.
+
 While a host UI occupies the right-hand pane beside the visible roster, the roster stays
 clickable. A single left click on a *different* left row first closes that right-hand UI
 through its own cancellation route — the same route its keyboard cancel uses, so an
@@ -1726,7 +1754,7 @@ a second authoritative process or status store, and it never moves a process,
 conversation, or saved state between hosts.
 
 Only session cards reorder, including exited rows and the bounded error and
-identity-unavailable placeholder rows that already hold a remembered position. The action entries (New, Saved, Network, Host shortcuts, Quit host)
+identity-unavailable placeholder rows that already hold a remembered position. The action entries (New, Saved, Settings, Quit host)
 and the roster's [Terminal diagnostics](#terminal-parser-diagnostics) entry keep their
 existing relative order after the session cards, and no session card can be moved among
 them.
@@ -2598,7 +2626,7 @@ reported and keeps agent-directory ownership; shutdown never waits for a remote 
 and never stops a remote session or remote work.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
 not removed as part of host shutdown. Apart from deliberate Saved-file deletion,
-Host shortcuts saves, explicit network actions that save settings or trust, and the
+Host shortcuts and sidebar theme saves, explicit network actions that save settings or trust, and the
 bounded terminal diagnostics log (written only after a
 diagnostic, see [Terminal parser diagnostics](#terminal-parser-diagnostics)), the
 persistent roster and ownership record are the only

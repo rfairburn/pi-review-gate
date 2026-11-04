@@ -170,10 +170,17 @@ function startRun(runtime: WindowsRuntimePin, root: string, nativeAgentDir: stri
   };
 }
 
-/** Opens the Network pane from sidebar focus and waits for `ready` text. */
+/**
+ * Opens the Network pane from sidebar focus through the ONE grouped Settings
+ * roster row (#613), then waits for `ready` text in the right-hand pane.
+ */
 async function openNetwork(driver: WindowsMainPtyDriver, ready: (pane: string) => boolean, description: string): Promise<void> {
   await driver.ensureSidebarFocus();
-  await driver.moveRosterTo("Network");
+  await driver.moveRosterTo("Settings");
+  await driver.sendKeys(WINDOWS_KEYS.enter, "the grouped Settings submenu opens",
+    (frame) => highlighted(frame).includes("Theme"));
+  await driver.sendKeys(WINDOWS_KEYS.down, "the submenu highlights Network",
+    (frame) => highlighted(frame).includes("Network"));
   await driver.sendKeys(WINDOWS_KEYS.enter, description, (frame) => ready(paneText(frame)));
 }
 

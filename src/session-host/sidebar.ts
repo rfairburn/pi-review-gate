@@ -224,6 +224,23 @@ import {
   type PeerUiTrustedPeer,
 } from "./peer-ui-protocol";
 import { isOwnerSavedWindowFacts, type OwnerSavedWindowFacts } from "./network/peer-saved";
+import {
+  sidebarScrollbarGeometry,
+  sidebarScrollbarOffsetAt,
+  type SidebarScrollbarGeometry,
+} from "./sidebar-scrollbar";
+import {
+  DEFAULT_SIDEBAR_THEME,
+  SIDEBAR_THEME_IDS,
+  SIDEBAR_THEME_SGR_CODES,
+  isSidebarThemeId,
+  parseSidebarThemeId,
+  sidebarPaletteFor,
+  sidebarThemeLabel,
+  type SidebarPalette,
+  type SidebarThemeId,
+  type SidebarThemeRole,
+} from "./sidebar-theme";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -515,6 +532,18 @@ export type SidebarAction =
       readonly requestId: number;
       readonly bindings: HostShortcutBindings;
     }
+  /**
+   * One deliberate appearance choice (#613). It asks Main to persist the
+   * selection in the host's OWN per-native-agent settings file; the sidebar
+   * performs no filesystem, config, or Pi work, and the chosen palette is only
+   * applied live after Main reports a successful save. It is never a request to
+   * read, write, or follow Pi's own theme or configuration.
+   */
+  | {
+      readonly type: "theme-save";
+      readonly requestId: number;
+      readonly theme: SidebarThemeId;
+    }
   | { readonly type: "visibility"; readonly visible: boolean }
   /**
    * Network sidebar actions are exactly the parent-owned `PeerUiAction` DTOs.
@@ -617,6 +646,14 @@ export interface SidebarControllerOptions {
   readonly legacyToggleOverride?: boolean;
   /** Main disables persistence UI only when no canonical native agent dir exists. */
   readonly settingsAvailable?: boolean;
+  /**
+   * The host's current appearance choice, already resolved by Main from the
+   * host's own settings file (defaults to Dark; an unreadable file keeps the
+   * default and reports it through `themeNotice`).
+   */
+  readonly theme?: SidebarThemeId;
+  /** One bounded notice explaining why the stored appearance could not be read. */
+  readonly themeNotice?: string;
   /** Suggested editable workspace path pre-filled in the New session form. */
   readonly initialWorkspace?: string;
   /** Host-startup cwd used by the native path completer for relative input. */
@@ -696,6 +733,45 @@ export interface SidebarMousePresentation {
     rows: number,
     direction: SidebarScrollDirection,
   ): boolean;
+  /**
+   * Begins ONE scrollbar-thumb drag on the lane this render actually painted
+   * (#613). True only when the coordinate is the thumb of a track THAT render
+   * drew, in the pane geometry it drew, for the projection it drew: a list that
+   * fits (the renderer paints no track for it), a tiny/hidden/overlaid/reflowed
+   * roster, and a stale map all refuse, and no lane is ever invented from the
+   * current state. A painted track whose thumb cannot travel (a one-row track)
+   * still begins the hold: the inverse keeps the window on its current offset,
+   * so its motion packets are a safe no-op rather than a jump. Nothing is
+   * activated and no action is emitted — Main holds the press for the
+   * drag — and an open right-hand form, picker, or popup is not cancelled.
+   */
+  beginScrollbarAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * A press on the bare track (not the thumb): the SAME single viewport jumps so
+   * the thumb centres under the pointer, landing on the nearest entry index
+   * inside the roster's own whole-card range. It moves no highlight, focus,
+   * visibility, activation target, or Main content owner, and this press is not
+   * held: its later motion and release change nothing. True when the press
+   * landed on the painted track, so Main consumes a gesture the scrollbar owns
+   * instead of falling through to row activation.
+   */
+  jumpScrollbarAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * One motion packet of that held thumb drag. The coordinate may be OUTSIDE the
+   * roster pane — the drag follows the pointer wherever it goes and clamps to the
+   * ends of the drawn range — so no hit test is performed here: Main's
+   * written-frame/geometry fence is what authorizes the packet. True while the
+   * drag is live (even if this packet could not move the window); false when the
+   * drag is gone or the map stopped describing the drawn roster.
+   */
+  moveScrollbarAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Ends that drag exactly once. The release moves nothing by itself: the
+   * viewport keeps what the last motion packet set, and no activation, highlight,
+   * focus, or owner state is involved. True only when a drag was live for this
+   * token, so Main can consume a release that belongs to the scrollbar.
+   */
+  endScrollbarAt(): boolean;
   /** Activates only saved rows captured by the exact sidebar render this token represents. */
   activateSavedAt(column: number, row: number, cols: number, rows: number): boolean;
   /**
@@ -936,12 +1012,11 @@ export const SIDEBAR_GENERATED_SGR_ALLOWLIST: ReadonlySet<string> = new Set([
   // target, white for the actual active Main conversation (native focus).
   "1;34",
   "1;97",
+  // Every SGR parameter the application-owned appearance palettes can emit
+  // (#613). The set stays finite: palettes carry parameter codes only, never
+  // truecolor or 256-color parameters.
+  ...SIDEBAR_THEME_SGR_CODES,
 ]);
-
-/** Sidebar-selected navigation-target title highlight (blue). */
-const SGR_SELECTION_BLUE = "\x1b[1;34m";
-/** Actual active Main conversation title highlight (white). */
-const SGR_ACTIVE_MAIN_WHITE = "\x1b[1;97m";
 
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
@@ -953,8 +1028,7 @@ interface SidebarEntry {
     | "new"
     | "quit"
     | "settings"
-    | "diagnostics"
-    | "peer";
+    | "diagnostics";
   readonly item?: SidebarItem;
   /** Structured remote facts; present only for kind "remote". */
   readonly remote?: SidebarRemoteEntry;
@@ -1315,6 +1389,17 @@ interface DisplayedRoster {
    */
   readonly listStart: number;
   readonly listTop: number;
+  /**
+   * The scrollbar this render drew in the list window's last column, or
+   * `undefined` when it drew none (the list fits, the window has no usable
+   * travel, or no entries were showable at all). Its coordinates are PANE-
+   * RELATIVE like every other hit map here, and its `offset`/`maxOffset` are
+   * the roster's own whole-card range (the cumulative entry rows before the
+   * last usable `listTop`), never `contentHeight - trackHeight`. A pointer
+   * gesture may only act on the track a written frame actually painted, so this
+   * record is the only thing the scrollbar input methods trust.
+   */
+  readonly scrollbar: SidebarScrollbarGeometry | undefined;
 }
 
 /**
@@ -1547,6 +1632,36 @@ interface DisplayedPeerRow {
   readonly row: PeerPaneRow;
 }
 
+/**
+ * One row of the Settings submenu or of the Theme pane. Both are host-owned
+ * menus: every label is fixed, bounded text this module owns, and a row names
+ * an existing capability rather than a new one.
+ */
+interface SettingsPaneRow {
+  readonly key: string;
+  readonly text: string;
+  /** True for the row marking the current value (the active appearance). */
+  readonly current?: boolean;
+}
+
+/** One Settings/Theme row paired with the pane row it was actually drawn on. */
+interface DisplayedSettingsRow {
+  readonly paneRow: number;
+  readonly row: SettingsPaneRow;
+}
+
+/** Exact rows and geometry of the last complete Settings or Theme render. */
+interface DisplayedSettingsRows {
+  readonly cols: number;
+  readonly rows: number;
+  readonly signature: string;
+  readonly selectedKey: string | undefined;
+  readonly entries: readonly DisplayedSettingsRow[];
+}
+
+/** The three grouped Settings entry points; each reuses an existing pane. */
+type SettingsRowKey = "theme" | "network" | "shortcuts";
+
 /** Immutable, latched consent identity: snapshot reordering never retargets it. */
 interface PeerConsentLatch {
   readonly id: string;
@@ -1675,6 +1790,27 @@ function sameDisplayedPeerRows(
   });
 }
 
+/**
+ * True when two drawn scrollbar tracks are the same lane: same column, same
+ * window rows, same thumb size, same representable range. The thumb's CURRENT
+ * row and the represented offset are deliberately excluded, because they move
+ * with the viewport: a repaint of the same window (an activity update, a status
+ * change, a theme change) keeps the lane the operator grabbed, while a resize,
+ * a content change that added or removed the overflow, or a window that lost its
+ * travel is a different lane and retires the gesture.
+ */
+function sameScrollbarTrack(
+  a: SidebarScrollbarGeometry | undefined,
+  b: SidebarScrollbarGeometry | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return false;
+  return a.column === b.column
+    && a.trackTop === b.trackTop
+    && a.trackHeight === b.trackHeight
+    && a.thumbHeight === b.thumbHeight
+    && a.maxOffset === b.maxOffset;
+}
+
 function mouseAuthorizationKey(
   roster: DisplayedRoster | undefined,
   saved: DisplayedSavedRows | undefined,
@@ -1682,10 +1818,22 @@ function mouseAuthorizationKey(
   consent: DisplayedPeerConsent | undefined,
   consentRendered: boolean,
   formHost: DisplayedFormHostRow | undefined,
+  settings: DisplayedSettingsRows | undefined,
+  theme: DisplayedSettingsRows | undefined,
 ): string {
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
-      [...roster.regions.values()].map((region) => [region.row, region.height, sidebarActivationIdentity(region.entry)])],
+      [...roster.regions.values()].map((region) => [region.row, region.height, sidebarActivationIdentity(region.entry)]),
+      // The drawn scrollbar is a written pointer target like every row: a
+      // presentation captured from a frame whose track differs (a resize, a
+      // content change that added or removed the overflow, or a window that
+      // lost its travel) can never press an older track. The thumb's current
+      // row is deliberately NOT part of this identity: it moves with the
+      // viewport, and the viewport's own drawn rows are already here.
+      roster.scrollbar === undefined
+        ? null
+        : [roster.scrollbar.column, roster.scrollbar.trackTop, roster.scrollbar.trackHeight,
+          roster.scrollbar.thumbHeight, roster.scrollbar.maxOffset]],
     // Local rows keep their exact identity; a remote row adds its opaque owner
     // handles and the drawn picker frame token, so equal display text on two
     // hosts (or on a local and a remote row) can never share authorization.
@@ -1712,6 +1860,13 @@ function mouseAuthorizationKey(
       formHost.pane, formHost.cols, formHost.rows, formHost.row, formHost.valueStart, formHost.valueEnd,
       formHost.optionKey, formHost.formGeneration,
     ],
+    // The grouped Settings submenu and the Theme pane are ordinary written
+    // menus: their drawn rows and exact wording belong to this same identity,
+    // so a re-rendered menu never authorizes an older coordinate.
+    settings: settings === undefined ? null : [settings.cols, settings.rows, settings.signature,
+      settings.entries.map((entry) => [entry.paneRow, entry.row.key, entry.row.text])],
+    theme: theme === undefined ? null : [theme.cols, theme.rows, theme.signature,
+      theme.entries.map((entry) => [entry.paneRow, entry.row.key, entry.row.text])],
   });
 }
 
@@ -1961,6 +2116,18 @@ const ROSTER_MIN_ROWS = 4;
 const INSERTION_MARKER_BEFORE = "^ ";
 const INSERTION_MARKER_AFTER = "v ";
 const INSERTION_MARKER_END = "v>> end of sessions";
+/**
+ * The #613 scrollbar glyphs, drawn in ONE terminal column inside the roster
+ * pane. They are the same three glyphs the pinned Pi 1.5.0 chat scrollbar uses:
+ * a light box for the track, a heavy box for an idle thumb, and a full block
+ * for the thumb the operator is actually holding. The colour of each comes from
+ * the host's own palette (`scrollbarTrack` / `scrollbarThumb`); the glyphs
+ * themselves are not themeable and carry no meaning beyond "this is the track
+ * and this is where you are in it".
+ */
+const SCROLLBAR_TRACK_GLYPH = "\u2502";
+const SCROLLBAR_THUMB_GLYPH = "\u2503";
+const SCROLLBAR_ACTIVE_THUMB_GLYPH = "\u2588";
 const FORM_MIN_COLS = 24;
 const FORM_MIN_ROWS = 6;
 const PANE_MAX_COLS = 1000;
@@ -1969,12 +2136,11 @@ const PANE_MAX_ROWS = 1000;
 const ENTRY_NEW_KEY = "new";
 const ENTRY_QUIT_KEY = "quit";
 const ENTRY_SAVED_KEY = "saved";
-const ENTRY_SETTINGS_KEY = "host-shortcuts";
+/** The single grouped Settings entry (#613); its submenus reuse existing panes. */
+const ENTRY_SETTINGS_KEY = "settings";
 const ENTRY_DIAGNOSTICS_KEY = "terminal-diagnostics";
 /** Namespace of projected remote cards; never a local item id namespace. */
 const REMOTE_ENTRY_KEY_PREFIX = "remote:";
-/** Network menu key; present only with an attached snapshot. */
-const ENTRY_PEER_KEY = "peer-network";
 /** Fixed height of the host-owned terminal diagnostics warning entry. */
 const DIAGNOSTICS_ENTRY_ROWS = 3;
 /**
@@ -3019,7 +3185,16 @@ export class SidebarController {
   private formHints = DEFAULT_FORM_HINTS;
   private formNotice: string | undefined;
   private formGeneration = 0;
-  private formKind: "new" | "edit" | "saved" | "shortcuts" | "peer" | "peer-field" | undefined;
+  private formKind:
+    | "new"
+    | "edit"
+    | "saved"
+    | "shortcuts"
+    | "peer"
+    | "peer-field"
+    | "settings"
+    | "theme"
+    | undefined;
   /**
    * The New form's one Host choice. It is Local at every form opening and is
    * never carried across forms; `label` is a bounded display copy remembered
@@ -3042,6 +3217,31 @@ export class SidebarController {
   private shortcutDraft: { toggle: string; returnToMain: string } = { ...DEFAULT_HOST_SHORTCUTS };
   private shortcutFieldIndex: 0 | 1 = 0;
   private pendingShortcutSave: { readonly requestId: number } | undefined;
+  /**
+   * The application-owned appearance (#613). It is the host's own choice: it
+   * never reads, follows, or writes Pi's theme, and it changes nothing outside
+   * the panes this module draws.
+   */
+  private themeId: SidebarThemeId = DEFAULT_SIDEBAR_THEME;
+  private palette: SidebarPalette = sidebarPaletteFor(DEFAULT_SIDEBAR_THEME);
+  /** One bounded notice about the stored appearance (read refusal or save failure). */
+  private themeNoticeValue: string | undefined;
+  private pendingThemeSave: { readonly requestId: number; readonly theme: SidebarThemeId } | undefined;
+  /** Highlighted row of the Theme pane (kept while it stays open). */
+  private themeSelectedId: SidebarThemeId | undefined;
+  /** Exact rows/geometry drawn by the last complete Theme-pane render. */
+  private themeDisplay: DisplayedSettingsRows | undefined;
+  /** Highlighted row of the Settings submenu (one of the SettingsRowKey ids). */
+  private settingsSelectedKey: string | undefined;
+  /** Exact rows/geometry drawn by the last complete Settings-submenu render. */
+  private settingsDisplay: DisplayedSettingsRows | undefined;
+  /**
+   * True only while the open sub-pane (Theme, Network, or Host shortcuts) was
+   * entered FROM the Settings submenu, so its Back returns through Settings
+   * instead of straight to the roster. A programmatic `openPeerMenu()` is not
+   * entered from Settings and keeps its existing direct-to-roster behavior.
+   */
+  private settingsPaneReturn = false;
   /** Outstanding saved-conversation listing request (issue 323). */
   private pendingSavedList: { readonly requestId: number } | undefined;
   /** Deliberate saved-open in flight; late results are fenced by requestId. */
@@ -3226,6 +3426,25 @@ export class SidebarController {
   /** True while a session drag owns the list's scroll window. */
   private sessionPointerScroll = false;
   /**
+   * One in-flight scrollbar-thumb drag (#613): only where inside the drawn thumb
+   * the press grabbed. The viewport itself stays the single `listTop`; this holds
+   * no second scroll position, no target, and no order, and it is retired by a
+   * render that draws no track, by a render whose content or usable range changed
+   * under it, by `forgetDisplayedRoster`, and by Main when its written-map fence
+   * or the outer geometry stops authorizing the gesture.
+   *
+   * `baseline` is the content-and-track identity captured at the press. A held
+   * drag may only drive THAT range: a later frame that added, removed, reordered,
+   * or resized an entry, or that painted a different track, retires the gesture
+   * instead of silently aiming the old grab at rows the operator never pressed.
+   * A repaint that changes only colours, the highlight, or the window position
+   * leaves the baseline identical, so ordinary repaints keep the drag alive.
+   */
+  private scrollbarDrag: {
+    readonly grabOffset: number;
+    readonly baseline: string;
+  } | undefined;
+  /**
    * Item ids whose cards the user collapsed with Space. Cards default to
    * expanded; each card's state persists independently of the highlight.
    */
@@ -3267,6 +3486,11 @@ export class SidebarController {
     this.returnToMainLabel = toggleDisplayName(this.returnToMainKey);
     this.legacyToggleOverride = options.legacyToggleOverride === true;
     this.settingsAvailable = options.settingsAvailable ?? false;
+    this.themeId = options.theme === undefined ? DEFAULT_SIDEBAR_THEME : parseSidebarThemeId(options.theme);
+    this.palette = sidebarPaletteFor(this.themeId);
+    this.themeNoticeValue = options.themeNotice === undefined
+      ? undefined
+      : sanitizeBounded(options.themeNotice, ERROR_TEXT_MAX_CODEPOINTS);
     this.onAction = options.onAction;
     this.onInvalidate = options.onInvalidate;
     this._visible = options.initialVisible ?? true;
@@ -4480,8 +4704,17 @@ export class SidebarController {
       this.peerRepairLocalNotice = "Network storage changed; no repair was requested. Close this and review it again";
     }
     this.rebuildEntries();
-    if (this.selectedEntryKey === ENTRY_PEER_KEY && this.currentEntry() === undefined) {
+    if (this.selectedEntryKey === ENTRY_SETTINGS_KEY && this.currentEntry() === undefined) {
       this.selectedEntryKey = undefined;
+    }
+    // A Settings submenu or Theme pane whose entry point disappeared cannot
+    // stay open: the roster keeps focus where it is and nothing is emitted.
+    if ((this.formKind === "settings" || this.formKind === "theme") && !this.settingsEntryAvailable()) {
+      this.settingsDisplay = undefined;
+      this.themeDisplay = undefined;
+      this.formKind = undefined;
+      this.settingsPaneReturn = false;
+      if (this._focus === "form") this._focus = "sidebar";
     }
   }
 
@@ -4498,6 +4731,11 @@ export class SidebarController {
     }
     this.forgetDisplayedRoster();
     this.disposeFormField();
+    // A direct open is its own origin: it returns to the roster, never to a
+    // Settings menu that some earlier grouped visit left behind. The grouped
+    // caller marks its newly opened pane as Settings-origin afterwards.
+    this.settingsDisplay = undefined;
+    this.settingsPaneReturn = false;
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
     this.pendingShortcutSave = undefined;
@@ -4641,23 +4879,41 @@ export class SidebarController {
    * authorizes nothing. Useful for the bounded 1..6 row bands the compositor
    * supplies; taller bands are padded, and short bands show the most important
    * complete lines with the review hint kept in view.
+   *
+   * This is the STANDALONE band the compositor places directly on the terminal,
+   * so it carries the same explicit pane canvas every other host-owned pane row
+   * gets (see `withPaneCanvas`): its `notice`, `secondary`, and `hint`
+   * foregrounds would otherwise sit on the operator's own terminal default
+   * ground. The ground changes no geometry, row count, text, control, token,
+   * focus, or consent authority.
    */
   renderPeerAlert(
     cols: number,
     rows: number,
   ): { lines: string[]; cursor?: { column: number; row: number } } {
+    return { lines: this.withPaneCanvas(this.peerAlertLines(cols, rows), cols) };
+  }
+
+  /**
+   * The alert band's own rows before any canvas. The surfaces that embed the
+   * band (the roster's reserved rows and the too-small fallback) already receive
+   * the canvas from their own pane, so they read these raw rows unchanged.
+   */
+  private peerAlertLines(cols: number, rows: number): string[] {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     const consents = this.orderedPeerConsents();
     const oldest = consents[0];
-    if (oldest === undefined) return { lines: [] };
+    if (oldest === undefined) return [];
     const heading = oldest.kind === "incoming"
       ? "! Incoming connection request"
       : "! Server key confirmation needed";
     const count = consents.length > 1 ? ` (${consents.length})` : "";
     const hint = consents.length > 1
-      ? `open Network to review ${consents.length} pending requests`
-      : "open Network or the sidebar to review before approving";
+      // Grouping moved the entry point, not the notification: the band still
+      // names where the review lives now that Network sits under Settings.
+      ? `open Settings > Network to review ${consents.length} pending requests`
+      : "open Settings > Network or the sidebar to review before approving";
     const identityLines = [
       `name: ${sanitizeBounded(oldest.label, PEER_LABEL_MAX_CODEPOINTS)}`,
       `key: ${sanitizeBounded(oldest.fingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`,
@@ -4671,14 +4927,16 @@ export class SidebarController {
     if (capacity === 1) {
       // A single row cannot show identity; it only points at the real review
       // surface. Nothing here can be approved.
-      lines.push(wrapRow(`${heading}${count} — review`, cols, "\x1b[1m"));
+      lines.push(wrapRow(`${heading}${count} — review`, cols, this.paint("notice")));
     } else {
-      lines.push(wrapRow(`${heading}${count}`, cols, "\x1b[1m"));
-      for (const line of identityLines.slice(0, capacity - 2)) lines.push(wrapRow(line, cols));
-      lines.push(wrapRow(hint, cols));
+      lines.push(wrapRow(`${heading}${count}`, cols, this.paint("notice")));
+      for (const line of identityLines.slice(0, capacity - 2)) {
+        lines.push(wrapRow(line, cols, this.paint("secondary")));
+      }
+      lines.push(wrapRow(hint, cols, this.paint("hint")));
     }
     while (lines.length < rows) lines.push("");
-    return { lines };
+    return lines;
   }
 
   /** Shows a bounded, sanitized error near the pane's footer. */
@@ -4698,6 +4956,8 @@ export class SidebarController {
     const displayedPeerRows = this.peerDisplay;
     const displayedPeerConsent = this.peerConsentDisplay;
     const displayedFormHost = this.formHostDisplay;
+    const displayedSettingsRows = this.settingsDisplay;
+    const displayedThemeRows = this.themeDisplay;
     return Object.freeze({
       authorizationKey: mouseAuthorizationKey(
         displayedRoster,
@@ -4706,6 +4966,8 @@ export class SidebarController {
         displayedPeerConsent,
         this.peerConsentRendered,
         displayedFormHost,
+        displayedSettingsRows,
+        displayedThemeRows,
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       remoteEdit: this.remoteEditRowFrom(displayedRoster),
@@ -4713,6 +4975,18 @@ export class SidebarController {
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
       scrollRosterAt: (column: number, row: number, cols: number, rows: number, direction: SidebarScrollDirection): boolean =>
         this.scrollRosterViewFrom(displayedRoster, column, row, cols, rows, direction),
+      // The drawn scrollbar lane (#613). Every callback is bound to the roster
+      // THIS render painted, so Main drives them with the presentation whose
+      // frame it actually wrote, and a packet can never press a lane that was
+      // never on screen. The lane moves only the one `listTop` viewport the
+      // wheel already moves; nothing else in this module changes.
+      beginScrollbarAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.beginScrollbarDragFrom(displayedRoster, column, row, cols, rows),
+      jumpScrollbarAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.jumpScrollbarViewFrom(displayedRoster, column, row, cols, rows),
+      moveScrollbarAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.moveScrollbarViewFrom(displayedRoster, column, row, cols, rows),
+      endScrollbarAt: (): boolean => this.endScrollbarDragFrom(),
       activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
       activatePeerAt: (column: number, row: number, cols: number, rows: number): boolean =>
@@ -4736,7 +5010,9 @@ export class SidebarController {
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows)
           || (displayedSavedRows !== undefined
             ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
-            : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows)),
+            : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows))
+          || this.activateSettingsAtFrom(displayedSettingsRows, column, row, cols, rows)
+          || this.activateThemeAtFrom(displayedThemeRows, column, row, cols, rows),
     });
   }
 
@@ -5418,6 +5694,227 @@ export class SidebarController {
     return true;
   }
 
+  // --- #613: the drawn scrollbar lane, driven through the SAME viewport. ---
+
+  /** True while the operator holds one scrollbar thumb this controller began. */
+  get scrollbarDragActive(): boolean {
+    return this.scrollbarDrag !== undefined;
+  }
+
+  /**
+   * Ends a held scrollbar drag without moving anything: the roster left the
+   * screen, was replaced by an overlay or a confirmation, stopped overflowing,
+   * or Main abandoned its geometry-bound gesture. No action is emitted, no entry
+   * is activated, and the viewport stays where it is. Main keeps fencing the
+   * pressed button; that fence is Main's, not this module's.
+   */
+  cancelScrollbarDrag(): void {
+    if (this.scrollbarDrag === undefined) return;
+    this.scrollbarDrag = undefined;
+  }
+
+  /**
+   * The track this captured render painted, only while that render is still the
+   * roster being drawn at exactly this pane geometry: the roster visible, the
+   * current projection, a map that actually drew entries, and a track that
+   * exists. A hidden, overlaid, replaced, too-small, reflowed, or since-changed
+   * roster authorizes nothing, exactly like every other draw-derived hit map
+   * here, and a coordinate outside the painted track column/rows is refused
+   * rather than resolved against an invented lane.
+   */
+  private scrollbarTrackFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): SidebarScrollbarGeometry | undefined {
+    if (shown === undefined || !this._visible) return undefined;
+    if (!validHitGeometry(column, row, cols, rows)) return undefined;
+    if (shown.cols !== cols || shown.rows !== rows) return undefined;
+    if (shown.signature !== this.rosterSignature() || shown.focus !== this._focus) return undefined;
+    if (shown.regions.size === 0 || shown.listRows < 1) return undefined;
+    const bar = shown.scrollbar;
+    if (bar === undefined) return undefined;
+    if (column !== bar.column) return undefined;
+    if (row < bar.trackTop || row >= bar.trackTop + bar.trackHeight) return undefined;
+    return bar;
+  }
+
+  /**
+   * A press on the thumb of the scrollbar this written render drew: the drag
+   * begins and nothing else happens. No entry is activated, no highlight,
+   * focus, visibility, or Main content owner moves, and an open right-hand
+   * form, picker, or popup is neither cancelled nor touched — the press is
+   * consumed here. The grab offset is where inside the thumb the press landed,
+   * so a held drag never jumps the viewport under the operator's pointer.
+   */
+  private beginScrollbarDragFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const bar = this.scrollbarTrackFrom(shown, column, row, cols, rows);
+    if (bar === undefined) return false;
+    if (row < bar.thumbTop || row >= bar.thumbTop + bar.thumbHeight) return false;
+    this.scrollbarDrag = {
+      grabOffset: row - bar.thumbTop,
+      baseline: this.scrollbarDragBaseline(this.previewRosterEntries(), bar),
+    };
+    return true;
+  }
+
+  /**
+   * A press on the bare track (NOT the thumb): the same viewport jumps so the
+   * thumb centres under the pointer, using the half-thumb grab Pi's own track
+   * press uses. The destination is the nearest entry index inside the roster's
+   * own usable whole-card range whose complete card fits the drawn rows, so a
+   * jump can never land on the blank window the renderer refuses to draw. This
+   * press is not held: its later motion and release change nothing, and no
+   * activation, highlight, focus, or owner state is involved.
+   *
+   * The return value reports whether the PAINTED TRACK consumed this press, not
+   * whether the window happened to move. A mapped destination can be the window
+   * already on screen — the inverse rounds to an entry index, and entries taller
+   * than the drawn rows are skipped, so a press a row or two from the thumb can
+   * land where the window already sits. Consuming it is what keeps the press,
+   * and therefore its motion and release, out of the session-card activation
+   * path underneath the lane; returning false there would hand a scrollbar click
+   * to the card the lane is painted over.
+   */
+  private jumpScrollbarViewFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const bar = this.scrollbarTrackFrom(shown, column, row, cols, rows);
+    if (bar === undefined) return false;
+    if (row >= bar.thumbTop && row < bar.thumbTop + bar.thumbHeight) return false;
+    this.setListTopFromScrollbarOffset(
+      bar,
+      sidebarScrollbarOffsetAt(bar, row, Math.floor(bar.thumbHeight / 2)),
+    );
+    return true;
+  }
+
+  /**
+   * One motion packet of a held scrollbar drag. The pointer may be ANYWHERE —
+   * outside the roster pane, over the native pane, or past either track end —
+   * and still drives the SAME viewport: Main fences the packet against the frame
+   * it actually wrote, and the inverse clamps to the ends of the drawn range
+   * instead of extrapolating. True while the drag is live even when this packet
+   * could not move the window (a boundary, or a destination card taller than the
+   * drawn rows); false only when no drag is live or the map stopped describing
+   * the drawn roster, which retires the gesture here.
+   */
+  private moveScrollbarViewFrom(
+    shown: DisplayedRoster | undefined,
+    _column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (this.scrollbarDrag === undefined) return false;
+    const current = this.displayedRoster;
+    const live = current !== undefined
+      && this._visible
+      && shown !== undefined
+      && shown.cols === cols
+      && shown.rows === rows
+      && shown.signature === this.rosterSignature()
+      && shown.focus === this._focus
+      && current.listRows >= 1
+      && sameScrollbarTrack(shown?.scrollbar, current.scrollbar);
+    if (!live || current.scrollbar === undefined) {
+      this.scrollbarDrag = undefined;
+      return false;
+    }
+    const bar = current.scrollbar;
+    if (this.scrollbarDrag.baseline !== this.scrollbarDragBaseline(this.previewRosterEntries(), bar)) {
+      // The content or usable range this grab was pressed against is gone: retire
+      // the drag rather than drive the new range with the old grab. Main keeps
+      // fencing the pressed button and restores the ordinary mouse reporting.
+      this.scrollbarDrag = undefined;
+      return false;
+    }
+    // A pointer outside the pane is the nearest END of the drawn track, never an
+    // offset outside the range this render painted.
+    const pointerRow = Math.min(Math.max(row, 0), current.rows - 1);
+    this.setListTopFromScrollbarOffset(
+      bar,
+      sidebarScrollbarOffsetAt(bar, pointerRow, this.scrollbarDrag.grabOffset),
+    );
+    return true;
+  }
+
+  /**
+   * Ends the held drag exactly once. The release moves nothing by itself: the
+   * viewport keeps whatever the last motion packet set, and the pressed button's
+   * terminal ownership stays Main's single record. True only when a drag was
+   * actually live for this token.
+   */
+  private endScrollbarDragFrom(): boolean {
+    if (this.scrollbarDrag === undefined) return false;
+    this.scrollbarDrag = undefined;
+    return true;
+  }
+
+  /**
+   * The identity of the range one render painted, for the held-drag retirement
+   * rule (#613): every entry's composite key and drawn height, plus the track the
+   * geometry helper produced for this pane. Membership, entry height, usable
+   * range, and pane geometry all appear; colours, the highlight, and the current
+   * window position deliberately do not, so a theme change or an ordinary repaint
+   * cannot retire a gesture the operator is still holding.
+   */
+  private scrollbarDragBaseline(
+    entries: readonly SidebarEntry[],
+    bar: SidebarScrollbarGeometry,
+  ): string {
+    return JSON.stringify([
+      bar.column,
+      bar.trackTop,
+      bar.trackHeight,
+      bar.thumbHeight,
+      bar.maxOffset,
+      entries.map((entry) => `${entry.key}:${this.entryHeight(entry)}`),
+    ]);
+  }
+
+  /**
+   * Moves the ONE viewport (`listTop`, an entry index) to the entry nearest the
+   * given row offset inside the whole-card range this render drew. The range is
+   * the renderer's own: `lastTop` is the largest index whose complete tail fits,
+   * and a destination card taller than the drawn rows is never a target, because
+   * the renderer stops at the first entry that does not fit and a window starting
+   * there would be drawn blank. The highlighted entry, focus, visibility, order,
+   * and every activation target stay exactly as they were.
+   */
+  private setListTopFromScrollbarOffset(bar: SidebarScrollbarGeometry, offset: number): boolean {
+    if (!Number.isSafeInteger(offset) || offset < 0) return false;
+    const entries = this.previewRosterEntries();
+    const bound = this.rosterUsableTopBound(entries, bar.trackHeight);
+    if (bound.totalHeight <= bar.trackHeight) return false;
+    let target: { index: number; distance: number } | undefined;
+    let cumulative = 0;
+    for (let index = 0; index <= bound.lastTop && index < entries.length; index += 1) {
+      const height = this.entryHeight(entries[index]);
+      if (height <= bar.trackHeight) {
+        const distance = Math.abs(cumulative - offset);
+        if (target === undefined || distance < target.distance) target = { index, distance };
+      }
+      cumulative += height;
+    }
+    if (target === undefined) return false;
+    if (target.index === this.listTop) return false;
+    this.listTop = target.index;
+    return true;
+  }
+
   /**
    * True only while a host UI occupies the wide layout's right-hand pane slot
    * next to the still-visible roster: any host form, or exactly the
@@ -5488,6 +5985,20 @@ export class SidebarController {
         this.closePeerFieldForm();
         if (this.peerAddMenuOpen) this.closePeerAddMenu();
         this.closePeerPane();
+        this._focus = "sidebar";
+        this.onInvalidate?.();
+        return true;
+      case "settings":
+        this.closeSettingsMenu();
+        this._focus = "sidebar";
+        this.onInvalidate?.();
+        return true;
+      case "theme":
+        // Nested UI is dismissed completely: the Theme pane returns to the
+        // Settings submenu, and the submenu then closes to the roster.
+        this.closeThemePane();
+        this.closeSettingsMenu();
+        this.settingsPaneReturn = false;
         this._focus = "sidebar";
         this.onInvalidate?.();
         return true;
@@ -5679,7 +6190,21 @@ export class SidebarController {
       this.invalidateRemoteCloseConfirmationDisplay();
       return { lines: [] };
     }
-    return this.renderForFocus(cols, rows);
+    return this.paneWithCanvas(this.renderForFocus(cols, rows), cols);
+  }
+
+  /**
+   * One rendered pane with the appearance's explicit ground applied to every row
+   * it drew (see `withPaneCanvas`). The cursor is carried through untouched.
+   */
+  private paneWithCanvas(
+    pane: { lines: string[]; cursor?: { column: number; row: number } },
+    cols: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    return {
+      lines: this.withPaneCanvas(pane.lines, cols),
+      ...(pane.cursor === undefined ? {} : { cursor: pane.cursor }),
+    };
   }
 
   /**
@@ -5702,9 +6227,9 @@ export class SidebarController {
       this.invalidateSavedPickerPresentation();
     }
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
-      return this.renderRosterTooSmall(cols, rows);
+      return { lines: this.withPaneCanvas(this.renderRosterTooSmall(cols, rows).lines, cols) };
     }
-    return this.renderRosterPane(cols, rows);
+    return { lines: this.withPaneCanvas(this.renderRosterPane(cols, rows).lines, cols) };
   }
 
   /**
@@ -5713,6 +6238,16 @@ export class SidebarController {
    * rect; on narrow terminals it becomes the full-content overlay.
    */
   renderForm(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
+    return this.paneWithCanvas(this.renderFormSlot(cols, rows), cols);
+  }
+
+  /**
+   * The form-slot pane exactly as its own state and geometry decide it, before
+   * the appearance ground is applied. `renderForm` is the public entry that
+   * applies it once; the narrow-overlay path reaches this directly through
+   * `renderForFocus`, which applies it once itself.
+   */
+  private renderFormSlot(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     this.peerConsentRendered = false;
@@ -5723,6 +6258,9 @@ export class SidebarController {
     // Only the network pane owns the displayed peer-row mapping; every other
     // form-slot pane forgets it so a stale map can never authorize an action.
     if (this.formKind !== "peer") this.peerDisplay = undefined;
+    // The same rule for the grouped Settings submenu and the Theme pane.
+    if (this.formKind !== "settings") this.settingsDisplay = undefined;
+    if (this.formKind !== "theme") this.themeDisplay = undefined;
     // Likewise only an uncovered Saved picker render may keep its drawn frame.
     if (this.formKind !== "saved" || this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) {
       this.invalidateSavedPickerPresentation();
@@ -5735,6 +6273,10 @@ export class SidebarController {
       this.peerDisplay = undefined;
       this.invalidatePeerConsentDisplay();
       this.invalidatePeerRepairDisplay();
+      // An unshowable grouped menu or Theme pane is not on screen either: its
+      // drawn rows may not keep authorizing Enter or a captured press.
+      this.settingsDisplay = undefined;
+      this.themeDisplay = undefined;
       // An unshowable New form is not on screen at all.
       this.invalidateFormPanePresentations();
       return this.renderTooSmall(cols, rows);
@@ -5768,6 +6310,14 @@ export class SidebarController {
       this.invalidateFormPanePresentations();
       return this.renderHostShortcutPane(cols, rows);
     }
+    if (this.formKind === "settings") {
+      this.invalidateFormPanePresentations();
+      return this.renderSettingsMenuPane(cols, rows);
+    }
+    if (this.formKind === "theme") {
+      this.invalidateFormPanePresentations();
+      return this.renderThemePane(cols, rows);
+    }
     // The New/Edit pane is the only render that re-establishes (or, for an
     // absent/covered/Edit/Local form, retires) the drawn New-form candidate.
     return this.renderFormPane(cols, rows);
@@ -5789,8 +6339,10 @@ export class SidebarController {
     // The confirmation covers the picker: its drawn frame is not on screen.
     this.invalidateSavedPickerPresentation();
     if (!this.savedDeleteConfirmationActive) return { lines: [] };
-    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
-    return this.renderSavedDeleteConfirmPane(cols, rows);
+    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
+      return { lines: this.withPaneCanvas(this.renderTooSmall(cols, rows).lines, cols) };
+    }
+    return { lines: this.withPaneCanvas(this.renderSavedDeleteConfirmPane(cols, rows).lines, cols) };
   }
 
   private renderForFocus(
@@ -5802,7 +6354,7 @@ export class SidebarController {
     // drew it earlier; standalone renderForm() keeps the wide roster record.
     if (this._focus === "form") {
       this.forgetDisplayedRoster();
-      return this.renderForm(cols, rows);
+      return this.renderFormSlot(cols, rows);
     }
     if (this._focus === "confirm") {
       this.forgetDisplayedRoster();
@@ -6305,6 +6857,7 @@ export class SidebarController {
     // The roster is not on screen: no unfinished move, press, or drag may
     // survive it, and none of them is committed or emitted on the way out.
     this.cancelSessionPointer();
+    this.cancelScrollbarDrag();
     this.endSessionMoveMode();
     this.displayedRoster = undefined;
   }
@@ -6389,11 +6942,7 @@ export class SidebarController {
       return;
     }
     if (entry.kind === "settings") {
-      this.openHostShortcutForm();
-      return;
-    }
-    if (entry.kind === "peer") {
-      this.openPeerMenu();
+      this.openSettingsMenu();
       return;
     }
     this.activateQuit();
@@ -6795,6 +7344,14 @@ export class SidebarController {
     }
     if (this.formKind === "peer") {
       this.handlePeerPaneInput(data);
+      return;
+    }
+    if (this.formKind === "settings") {
+      this.handleSettingsMenuInput(data);
+      return;
+    }
+    if (this.formKind === "theme") {
+      this.handleThemePaneInput(data);
       return;
     }
     // Standard Shift+Tab is recognized BEFORE the bracketed-paste carry: the
@@ -8424,6 +8981,513 @@ export class SidebarController {
       && selected.row.id === target.rowId && this.remoteEditRowStillProjected(target);
   }
 
+  // --- Settings: ONE grouped entry whose submenus reuse the existing panes. ---
+
+  /** One palette role's complete SGR sequence for the current appearance. */
+  private paint(role: SidebarThemeRole): string {
+    return `\x1b[${this.palette[role]}m`;
+  }
+
+  /**
+   * One painted scrollbar cell: a single terminal column carrying exactly one
+   * generated role sequence between explicit resets, so it composes with the
+   * row it is appended to and never leaks a style past its own cell.
+   */
+  private scrollbarCell(glyph: string, role: SidebarThemeRole): string {
+    return `\x1b[0m${this.paint(role)}${glyph}\x1b[0m`;
+  }
+
+  /**
+   * Give every row this pane drew an explicit foreground/background pair.
+   *
+   * The palette's `canvas` is the host's OWN pane ground. A row that otherwise
+   * inherits the terminal's default foreground or background can be unreadable
+   * when the operator's terminal defaults are the opposite of the chosen
+   * appearance — a Light black `activeMain` title on a dark terminal, or a Dark
+   * grey status line on a light one. Applying it here covers exactly the rows
+   * this renderer produced: every escape sequence in them is generated by this
+   * module (entry text passes through `sanitizeCellText`, which strips
+   * controls), so restoring the canvas after each generated row reset keeps the
+   * whole padded row inside one finite, allowlisted pair. A restyled content row
+   * therefore ends on that canvas rather than on a bare reset (a blank padding
+   * row closes its ground-filled cells with a reset). Either way the
+   * compositor's own row wrapper closes every host pane row with an explicit
+   * reset, so the ground stops at the pane edge instead of bleeding into the
+   * next cell.
+   *
+   * Blank padding rows are padded to the pane width so the pane ground stays
+   * continuous instead of showing the terminal default through it.
+   *
+   * This styles HOST-owned rows only. The native child's cells, the outer
+   * header, the pane divider, and every child process are untouched, and no
+   * terminal query, detection, or configuration write is involved.
+   */
+  private withPaneCanvas(lines: readonly string[], cols: number): string[] {
+    const ground = `\x1b[0m\x1b[${this.palette.canvas}m`;
+    return lines.map((line) => {
+      if (line === "") return `${ground}${" ".repeat(Math.max(0, cols))}\x1b[0m`;
+      const styled = line.split("\x1b[0m").join(ground);
+      return styled.startsWith(ground) ? styled : `${ground}${styled}`;
+    });
+  }
+
+  /** The host's current appearance choice; never Pi's saved theme. */
+  get currentTheme(): SidebarThemeId {
+    return this.themeId;
+  }
+
+  /**
+   * The palette matching `currentTheme`. Roles are a closed set and every
+   * value is an SGR parameter string, so a later sidebar-owned surface (the
+   * roster scrollbar lane) can restyle itself from the SAME finite seam.
+   */
+  get themePalette(): SidebarPalette {
+    return this.palette;
+  }
+
+  /** True when at least one grouped Settings entry point is available. */
+  private settingsEntryAvailable(): boolean {
+    return this.settingsAvailable || this.peerUiSnapshot !== undefined;
+  }
+
+  /**
+   * The Settings submenu's rows in their drawn order. Every row opens an
+   * EXISTING pane under its EXISTING availability rule: Theme and Host
+   * shortcuts require the canonical native agent directory (the same
+   * `settingsAvailable` authority that gated the old Host shortcuts row), and
+   * Network requires the attached peer snapshot (the same rule that gated the
+   * old top-level Network row). The pending-request annotation the old Network
+   * row carried stays on the Network row here, so grouping never costs
+   * discoverability.
+   */
+  private settingsRows(): SettingsPaneRow[] {
+    const rows: SettingsPaneRow[] = [];
+    if (this.settingsAvailable) rows.push({ key: "theme", text: "Theme" });
+    if (this.peerUiSnapshot !== undefined) {
+      const pending = this.peerPendingConsentCount();
+      rows.push({
+        key: "network",
+        text: `Network${pending > 0 ? ` (${pending} request${pending === 1 ? "" : "s"})` : ""}`,
+      });
+    }
+    if (this.settingsAvailable) rows.push({ key: "shortcuts", text: "Host shortcuts" });
+    return rows;
+  }
+
+  /** Row identity AND drawn wording: a changed label never reuses an old map. */
+  private settingsRowsSignature(rows: readonly SettingsPaneRow[]): string {
+    return JSON.stringify(rows.map((row) => [row.key, row.text]));
+  }
+
+  private sameSettingsPaneRow(a: SettingsPaneRow, b: SettingsPaneRow): boolean {
+    return a.key === b.key && a.text === b.text;
+  }
+
+  private normalizeSettingsSelection(rows: readonly SettingsPaneRow[]): number {
+    if (rows.length === 0) {
+      this.settingsSelectedKey = undefined;
+      return -1;
+    }
+    const index = rows.findIndex((row) => row.key === this.settingsSelectedKey);
+    if (index >= 0) return index;
+    this.settingsSelectedKey = rows[0]?.key;
+    return rows.findIndex((row) => row.key === this.settingsSelectedKey);
+  }
+
+  private moveSettingsSelection(delta: number): void {
+    const rows = this.settingsRows();
+    if (rows.length === 0) return;
+    const current = rows.findIndex((row) => row.key === this.settingsSelectedKey);
+    const next = current < 0
+      ? (delta > 0 ? 0 : rows.length - 1)
+      : (current + delta + rows.length) % rows.length;
+    this.settingsSelectedKey = rows[next]?.key;
+    this.formError = undefined;
+  }
+
+  /** Opens the grouped Settings submenu. Nothing is emitted and nothing runs. */
+  private openSettingsMenu(): void {
+    if (!this.settingsEntryAvailable()) return;
+    if (!this._visible) {
+      this._visible = true;
+      this.emit({ type: "visibility", visible: true });
+    }
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
+    this.pendingSavedOpen = undefined;
+    this.pendingThemeSave = undefined;
+    this.editTarget = undefined;
+    this.settingsDisplay = undefined;
+    this.themeDisplay = undefined;
+    this.settingsPaneReturn = false;
+    this.formKind = "settings";
+    this.formError = undefined;
+    this.noticeError = undefined;
+    this._focus = "form";
+    this.onInvalidate?.();
+  }
+
+  /** Leaves the Settings submenu for the roster; no action and no hiding. */
+  private closeSettingsMenu(): void {
+    this.settingsDisplay = undefined;
+    this.settingsSelectedKey = undefined;
+    // Leaving the grouped menu also drops its return routing, so a later
+    // programmatic pane open never inherits a stale "back to Settings" path.
+    this.settingsPaneReturn = false;
+    this.formKind = undefined;
+    this.formError = undefined;
+  }
+
+  /** Returns from a sub-pane to the Settings submenu that opened it. */
+  private returnToSettingsMenu(): void {
+    if (!this.settingsEntryAvailable()) {
+      this.settingsPaneReturn = false;
+      this._focus = "sidebar";
+      this.onInvalidate?.();
+      return;
+    }
+    this.settingsDisplay = undefined;
+    this.themeDisplay = undefined;
+    this.themeSelectedId = undefined;
+    this.pendingThemeSave = undefined;
+    this.formKind = "settings";
+    this.formError = undefined;
+    this._focus = "form";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * A deliberate lone Escape press in a selection-only grouped pane is host UI,
+   * not a possible paste opener. The paste fence parks a lone Escape as a carry
+   * so a split bracketed-paste marker is still recognised, but that carry would
+   * otherwise swallow the operator's NEXT Escape, and the grouped Settings chain
+   * needs both (Theme -> Settings, then Settings -> roster). Only the carry that
+   * a previous lone Escape parked is dropped: an active paste, or a body that is
+   * already streaming, keeps its fence exactly as it is. Two consecutive lone
+   * Escape presses are never a split paste marker (that marker is ESC [ 2 0 0 ~).
+   */
+  private unblockLoneEscape(data: string): void {
+    if (this.formPasteActive) return;
+    if (data !== "\x1b" || isKeyRepeat(data) || isKeyRelease(data)) return;
+    if (this.formPasteCarry === "\x1b") this.formPasteCarry = "";
+  }
+
+  private handleSettingsMenuInput(data: string): void {
+    // No text target: a pasted body can never open a settings pane.
+    this.unblockLoneEscape(data);
+    if (this.routeBracketedPaste(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
+    if (this.handleReservedToggle(data, () => this.closeSettingsMenu())) return;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
+      return;
+    }
+    if (this.consumeSavedActionClaim(data)) return;
+    if (isKeyRelease(data)) return;
+    if (matchesKey(data, "up")) {
+      this.moveSettingsSelection(-1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.moveSettingsSelection(1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      // Root of the grouped menu: Escape closes to the roster, exactly like a
+      // form cancellation. The held key is claimed so its repeat/release can
+      // neither hide the roster nor leak to the child.
+      this.formEscapeClaimed = true;
+      this.closeSettingsMenu();
+      this._focus = "sidebar";
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      if (isKeyRepeat(data)) return;
+      this.activateSettingsRow();
+      return;
+    }
+  }
+
+  /** The row the current complete Settings render drew for `key`, or undefined. */
+  private drawnSettingsRow(key: string): SettingsPaneRow | undefined {
+    const shown = this.settingsDisplay;
+    if (shown === undefined || this.formKind !== "settings" || this._focus !== "form" || !this._visible) {
+      return undefined;
+    }
+    if (shown.signature !== this.settingsRowsSignature(this.settingsRows())) {
+      return undefined;
+    }
+    const drawn = shown.entries.find((entry) => entry.row.key === key);
+    if (drawn === undefined) return undefined;
+    const current = this.settingsRows().find((row) => row.key === key);
+    if (current === undefined || !this.sameSettingsPaneRow(current, drawn.row)) return undefined;
+    return drawn.row;
+  }
+
+  private selectedSettingsRow(): SettingsPaneRow | undefined {
+    const shown = this.settingsDisplay;
+    if (shown === undefined || shown.selectedKey !== this.settingsSelectedKey) return undefined;
+    return this.drawnSettingsRow(shown.selectedKey ?? "");
+  }
+
+  /**
+   * Opens the submenu row's EXISTING pane. Keyboard Enter and a pointer press
+   * both arrive with a row the last complete render actually drew, so neither
+   * path duplicates an action and neither can open a pane the operator never
+   * saw. Each opened pane keeps its own input ownership, defaults, actions,
+   * and confirmations; only Back routing differs (it returns through Settings).
+   */
+  private openSettingsRowPane(row: SettingsPaneRow): void {
+    switch (row.key as SettingsRowKey) {
+      case "theme":
+        this.openThemePane();
+        return;
+      case "network":
+        this.settingsDisplay = undefined;
+        this.openPeerMenu();
+        this.settingsPaneReturn = true;
+        this.onInvalidate?.();
+        return;
+      case "shortcuts":
+        this.settingsDisplay = undefined;
+        this.openHostShortcutForm();
+        this.settingsPaneReturn = true;
+        this.onInvalidate?.();
+        return;
+      default:
+        return;
+    }
+  }
+
+  private activateSettingsRow(): void {
+    const row = this.selectedSettingsRow();
+    if (row === undefined) {
+      this.formError = "The Settings menu changed; review it before acting";
+      this.onInvalidate?.();
+      return;
+    }
+    this.openSettingsRowPane(row);
+  }
+
+  /** Pointer activation inside the drawn Settings submenu. */
+  private activateSettingsAtFrom(
+    shown: DisplayedSettingsRows | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (!this._visible || this._focus !== "form" || this.formKind !== "settings"
+      || !validHitGeometry(column, row, cols, rows)) return false;
+    if (shown === undefined || shown.cols !== cols || shown.rows !== rows) return false;
+    const live = this.settingsDisplay;
+    if (live === undefined || live.signature !== shown.signature
+      || live.cols !== shown.cols || live.rows !== shown.rows) return false;
+    const clicked = shown.entries.find((candidate) => candidate.paneRow === row);
+    if (clicked === undefined) return false;
+    const drawn = live.entries.find((candidate) => candidate.paneRow === row);
+    if (drawn === undefined || !this.sameSettingsPaneRow(drawn.row, clicked.row)) return false;
+    const current = this.drawnSettingsRow(drawn.row.key);
+    if (current === undefined || !this.sameSettingsPaneRow(current, drawn.row)) return false;
+    this.settingsSelectedKey = current.key;
+    this.openSettingsRowPane(current);
+    return true;
+  }
+
+  /** Pointer activation inside the drawn Theme pane: the row's Enter action. */
+  private activateThemeAtFrom(
+    shown: DisplayedSettingsRows | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (!this._visible || this._focus !== "form" || this.formKind !== "theme"
+      || !validHitGeometry(column, row, cols, rows)) return false;
+    if (shown === undefined || shown.cols !== cols || shown.rows !== rows) return false;
+    const live = this.themeDisplay;
+    if (live === undefined || live.signature !== shown.signature
+      || live.cols !== shown.cols || live.rows !== shown.rows) return false;
+    const clicked = shown.entries.find((candidate) => candidate.paneRow === row);
+    if (clicked === undefined) return false;
+    const drawn = live.entries.find((candidate) => candidate.paneRow === row);
+    if (drawn === undefined || !this.sameSettingsPaneRow(drawn.row, clicked.row)) return false;
+    const current = this.drawnThemeRow(drawn.row.key);
+    if (current === undefined || !this.sameSettingsPaneRow(current, drawn.row)) return false;
+    // The clicked row is already proven against the written frame, so it is the
+    // activation target; moving the highlight first and re-resolving it through
+    // the PREVIOUS render's selection would refuse a normal click on the
+    // unselected choice.
+    this.themeSelectedId = current.key.slice("theme:".length) as SidebarThemeId;
+    this.emitThemeSaveFor(current);
+    return true;
+  }
+
+  // --- Theme: the host's own appearance choice, persisted by Main. ---
+
+  private themeRows(): SettingsPaneRow[] {
+    return SIDEBAR_THEME_IDS.map((id) => ({
+      key: `theme:${id}`,
+      text: sidebarThemeLabel(id),
+      current: id === this.themeId,
+    }));
+  }
+
+  private openThemePane(): void {
+    if (!this.settingsAvailable) return;
+    this.themeDisplay = undefined;
+    this.themeSelectedId = this.themeId;
+    this.pendingThemeSave = undefined;
+    this.formKind = "theme";
+    this.formError = undefined;
+    this._focus = "form";
+    this.onInvalidate?.();
+  }
+
+  private moveThemeSelection(delta: number): void {
+    const rows = this.themeRows();
+    const current = rows.findIndex((row) => row.key === `theme:${this.themeSelectedId ?? ""}`);
+    const next = current < 0
+      ? (delta > 0 ? 0 : rows.length - 1)
+      : (current + delta + rows.length) % rows.length;
+    this.themeSelectedId = rows[next]?.key.slice("theme:".length) as SidebarThemeId;
+    this.formError = undefined;
+  }
+
+  private drawnThemeRow(key: string): SettingsPaneRow | undefined {
+    const shown = this.themeDisplay;
+    if (shown === undefined || this.formKind !== "theme" || this._focus !== "form" || !this._visible) {
+      return undefined;
+    }
+    if (shown.signature !== this.settingsRowsSignature(this.themeRows())) return undefined;
+    const drawn = shown.entries.find((entry) => entry.row.key === key);
+    if (drawn === undefined) return undefined;
+    const current = this.themeRows().find((row) => row.key === key);
+    if (current === undefined || !this.sameSettingsPaneRow(current, drawn.row)) return undefined;
+    return drawn.row;
+  }
+
+  private selectedThemeRow(): SettingsPaneRow | undefined {
+    const shown = this.themeDisplay;
+    const selectedKey = this.themeSelectedId === undefined ? undefined : `theme:${this.themeSelectedId}`;
+    if (shown === undefined || selectedKey === undefined || shown.selectedKey !== selectedKey) {
+      return undefined;
+    }
+    return this.drawnThemeRow(selectedKey);
+  }
+
+  /**
+   * Validate and act on ONE already-proven Theme row. Keyboard activation
+   * supplies the row its own written selection resolved to; pointer activation
+   * supplies the row whose written coordinate was just proven, so a click on an
+   * unhighlighted choice still applies without weakening the drawn-row proof.
+   */
+  private emitThemeSaveFor(row: SettingsPaneRow): void {
+    if (this.pendingThemeSave !== undefined) return;
+    const theme = row.key.slice("theme:".length);
+    if (!isSidebarThemeId(theme)) return;
+    if (theme === this.themeId) {
+      this.formError = `${row.text} is already the current appearance`;
+      this.onInvalidate?.();
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingThemeSave = { requestId, theme };
+    this.formError = undefined;
+    // Main owns the write to the host's own settings file; the palette is only
+    // applied after Main reports that the save actually succeeded.
+    this.emit({ type: "theme-save", requestId, theme });
+  }
+
+  private activateThemeRow(): void {
+    if (this.pendingThemeSave !== undefined) return;
+    const row = this.selectedThemeRow();
+    if (row === undefined) {
+      this.formError = "The Theme pane changed; review it before choosing";
+      this.onInvalidate?.();
+      return;
+    }
+    this.emitThemeSaveFor(row);
+  }
+
+  /**
+   * Apply a completed appearance save: the new palette is live immediately,
+   * with no restart and no write to any child, native Pi theme, or config.
+   */
+  completeThemeSave(requestId: number, theme: SidebarThemeId): boolean {
+    if (this.pendingThemeSave?.requestId !== requestId) return false;
+    const validated = parseSidebarThemeId(theme);
+    this.pendingThemeSave = undefined;
+    this.themeId = validated;
+    this.palette = sidebarPaletteFor(validated);
+    this.themeNoticeValue = undefined;
+    this.formError = undefined;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** A refused read or write keeps the previous palette active and says so. */
+  failThemeSave(requestId: number, message: string): void {
+    if (this.pendingThemeSave?.requestId !== requestId) return;
+    this.pendingThemeSave = undefined;
+    this.formError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.onInvalidate?.();
+  }
+
+  private handleThemePaneInput(data: string): void {
+    this.unblockLoneEscape(data);
+    if (this.routeBracketedPaste(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
+    if (this.handleReservedToggle(data, () => this.closeThemePane())) return;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
+      return;
+    }
+    if (this.consumeSavedActionClaim(data)) return;
+    if (isKeyRelease(data)) return;
+    if (matchesKey(data, "up")) {
+      this.moveThemeSelection(-1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.moveThemeSelection(1);
+      this.onInvalidate?.();
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      this.formEscapeClaimed = true;
+      // Back to the Settings submenu, not past it: the grouped menu keeps its
+      // place until the operator leaves it.
+      this.closeThemePane();
+      this.returnToSettingsMenu();
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      if (isKeyRepeat(data)) return;
+      this.activateThemeRow();
+      return;
+    }
+  }
+
+  private closeThemePane(): void {
+    this.themeDisplay = undefined;
+    this.themeSelectedId = undefined;
+    this.pendingThemeSave = undefined;
+    this.formKind = undefined;
+    this.formError = undefined;
+  }
+
   private openHostShortcutForm(): void {
     this.forgetDisplayedRoster();
     this.disposeFormField();
@@ -8828,6 +9892,7 @@ export class SidebarController {
       this.closePeerFieldForm();
       return;
     }
+    const backToSettings = this.settingsPaneReturn && this.formKind === "shortcuts";
     this.abandonForm();
     // New and Edit cancellations are both LOCAL: return to the VISIBLE roster
     // without hiding and without forwarding anything to the child. The active
@@ -8837,6 +9902,13 @@ export class SidebarController {
     // does not bubble into the roster's Escape-hide or leak into the child as
     // native input; a fresh roster Escape still hides (existing semantics).
     this.formEscapeClaimed = true;
+    if (backToSettings) {
+      // Cancel still cancels: no save is emitted and the active chords stay in
+      // force. Only the return target changes, because the operator entered
+      // this editor through the grouped Settings menu.
+      this.returnToSettingsMenu();
+      return;
+    }
     this._focus = "sidebar";
     this.onInvalidate?.();
   }
@@ -9197,17 +10269,17 @@ export class SidebarController {
       + noticeLines.length + 2 + hintLines.length;
     if (bodyRows > rows) return tooSmall();
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
-    for (const line of identityLines) lines.push(wrapRow(line, cols));
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    for (const line of identityLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
     for (const line of windowLines) lines.push(wrapRow(line, cols));
     for (const line of warningLines) lines.push(wrapRow(line, cols));
-    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
     const approveRow = lines.length;
     lines.push(wrapRow(`${this.peerConsentChoice === "approve" ? "> " : "  "}Approve`, cols,
-      this.peerConsentChoice === "approve" ? SGR_SELECTION_BLUE : undefined));
+      this.peerConsentChoice === "approve" ? this.paint("selected") : undefined));
     const denyRow = lines.length;
     lines.push(wrapRow(`${this.peerConsentChoice === "deny" ? "> " : "  "}Deny`, cols,
-      this.peerConsentChoice === "deny" ? SGR_SELECTION_BLUE : undefined));
+      this.peerConsentChoice === "deny" ? this.paint("selected") : undefined));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
     for (const line of hintLines) lines.push(wrapRow(line, cols));
 
@@ -9466,17 +10538,17 @@ export class SidebarController {
     const bodyRows = 1 + intro.length + targetLines.length + body.length + noticeLines.length + 2 + hintLines.length;
     if (bodyRows > rows) return tooSmall();
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     for (const line of intro) lines.push(wrapRow(line, cols));
     for (const line of targetLines) lines.push(wrapRow(line, cols));
     for (const line of body) lines.push(wrapRow(line, cols));
-    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
     const repairRow = lines.length;
     lines.push(wrapRow(`${this.peerRepairChoice === "repair" ? "> " : "  "}Repair permissions`, cols,
-      this.peerRepairChoice === "repair" ? SGR_SELECTION_BLUE : undefined));
+      this.peerRepairChoice === "repair" ? this.paint("selected") : undefined));
     const cancelRow = lines.length;
     lines.push(wrapRow(`${this.peerRepairChoice === "cancel" ? "> " : "  "}Cancel`, cols,
-      this.peerRepairChoice === "cancel" ? SGR_SELECTION_BLUE : undefined));
+      this.peerRepairChoice === "cancel" ? this.paint("selected") : undefined));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
     for (const line of hintLines) lines.push(wrapRow(line, cols));
 
@@ -9880,11 +10952,14 @@ export class SidebarController {
     const paneRows = this.buildPeerPaneRows();
     const selectedIndex = this.normalizePeerSelection(paneRows);
     const top = this.peerScrollWindow(Math.max(0, selectedIndex), listRows, paneRows.length);
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
-    for (const line of statusLines) lines.push(wrapRow(line, cols));
-    for (const line of identityLines) lines.push(wrapRow(line, cols));
-    for (const line of storageLines) lines.push(wrapRow(line, cols));
-    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    // The pane's own status segments (hosting, listener, auto, bell, counts)
+    // are host-owned text: they read as secondary rows, and their WORDS stay
+    // the whole meaning — no state is conveyed by color alone.
+    for (const line of statusLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    for (const line of identityLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    for (const line of storageLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
     const drawn: DisplayedPeerRow[] = [];
     for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
       const row = paneRows[index];
@@ -9895,7 +10970,7 @@ export class SidebarController {
       lines.push(wrapRow(
         `${selected ? "> " : "  "}${this.peerPaneRowText(row)}`,
         cols,
-        selected ? SGR_SELECTION_BLUE : undefined,
+        selected ? this.paint("selected") : undefined,
       ));
     }
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
@@ -9943,6 +11018,13 @@ export class SidebarController {
         return;
       }
       this.closePeerPane();
+      if (this.settingsPaneReturn) {
+        // Entered from the grouped Settings menu, so Back returns THROUGH that
+        // menu. A directly opened Network pane (a programmatic seam) keeps its
+        // existing straight-to-roster behavior.
+        this.returnToSettingsMenu();
+        return;
+      }
       this._focus = "sidebar";
       this.onInvalidate?.();
       return;
@@ -10267,7 +11349,7 @@ export class SidebarController {
     if (nameLines === undefined || endpointLines === undefined) return this.renderTooSmall(cols, rows);
     const targetLines = [...nameLines, ...endpointLines];
     if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of targetLines) lines.push(wrapRow(line, cols));
     for (const line of warnings) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
@@ -10293,7 +11375,7 @@ export class SidebarController {
     if (nameLines === undefined || keyLines === undefined) return this.renderTooSmall(cols, rows);
     const targetLines = [...nameLines, ...keyLines];
     if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of targetLines) lines.push(wrapRow(line, cols));
     for (const line of warnings) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
@@ -10538,7 +11620,7 @@ export class SidebarController {
     );
     if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of contextLines) lines.push(wrapRow(line, cols));
     const fieldTopRow = lines.length;
     lines.push(...labeledRows);
@@ -10589,6 +11671,12 @@ export class SidebarController {
     // A hidden pane also holds no Add-destination menu: reopening Network shows
     // the network rows, and an unseen menu can never authorize an Add.
     this.peerAddMenuOpen = false;
+    // Nor does it hold a Settings submenu, a Theme pane, or the grouping's
+    // return routing: none of them may authorize anything off-screen.
+    this.settingsDisplay = undefined;
+    this.themeDisplay = undefined;
+    this.pendingThemeSave = undefined;
+    this.settingsPaneReturn = false;
     this._visible = false;
     this._focus = "main";
     this.emit({ type: "visibility", visible: false });
@@ -10645,11 +11733,17 @@ export class SidebarController {
         : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
       { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
-      ...(this.peerUiSnapshot === undefined
-        ? []
-        : [{ key: ENTRY_PEER_KEY, kind: "peer" as const }]),
       { key: ENTRY_QUIT_KEY, kind: "quit" },
-      ...(this.settingsAvailable ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }] : []),
+      // ONE grouped Settings entry (#613): Theme, Network, and Host shortcuts
+      // are its submenus, so no independent top-level Network or Host
+      // shortcuts row exists any more. It appears exactly when at least one of
+      // the entry points it would offer is available under its EXISTING
+      // authority — the attached peer snapshot for Network, the canonical
+      // native agent directory for Theme and Host shortcuts — and nothing else
+      // decides its presence.
+      ...(this.settingsEntryAvailable()
+        ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }]
+        : []),
     ];
     this.pruneVanishedRemoteSelection();
     this.pruneRemoteExpansionMemory();
@@ -10887,7 +11981,7 @@ export class SidebarController {
     // selected row can never scroll it out of view. It is the same bounded,
     // notification-only presentation as renderPeerAlert: no confirmation
     // control, no authority, and no focus/selection change.
-    const alertLines = this.renderPeerAlert(cols, PEER_CONSENT_ALERT_ROWS).lines;
+    const alertLines = this.peerAlertLines(cols, PEER_CONSENT_ALERT_ROWS);
     // One wrapped hint line, with the move key advertised in its own segment
     // when that is affordable (below). The move segment sits with the other
     // row-target actions so it never reorders or displaces another hint.
@@ -10980,9 +12074,48 @@ export class SidebarController {
     if (listRows < 1 || listRows < selectedHeight) {
       return this.renderRosterTooSmall(cols, rows);
     }
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     lines.push(...alertLines);
     const top = this.scrollWindow(selectedIndex, listRows, rosterEntries, cols, rows);
+    const listStart = 1 + alertLines.length;
+    // The scrollbar (#613) describes THIS window and nothing else. Its range is
+    // the roster's own whole-card range: `totalHeight` is every entry's rows,
+    // and the largest representable offset is the cumulative entry rows BEFORE
+    // the last usable `listTop` the renderer's own tail rule lands on — never
+    // `totalHeight - listRows`, which would let the thumb point at a window the
+    // renderer refuses to draw. `offset` is the cumulative rows before the one
+    // viewport position. A list that fits, a window with no travel, or a track
+    // with no room produces `undefined`, and no bar is painted.
+    const bound = this.rosterUsableTopBound(rosterEntries, listRows);
+    let traversed = 0;
+    for (let index = 0; index < bound.lastTop; index += 1) traversed += this.entryHeight(rosterEntries[index]);
+    const maxOffset = traversed;
+    let currentOffset = 0;
+    for (let index = 0; index < top; index += 1) currentOffset += this.entryHeight(rosterEntries[index]);
+    const scrollbar = sidebarScrollbarGeometry(
+      cols - 1, listStart, listRows, bound.totalHeight, currentOffset, maxOffset,
+    );
+    // A held drag is bound to the content and range it was pressed against, not
+    // merely to the existence of a track (#613). A frame that added, removed,
+    // reordered, or resized an entry — or that painted a different track — retires
+    // the gesture HERE, on the render that changed the range, so Main's frame
+    // boundary restores the ordinary mouse reporting immediately instead of
+    // leaving the outer terminal in temporary drag reporting until the next mouse
+    // packet happens to arrive. Colours, the highlight, and the current window
+    // position are deliberately not part of the baseline, so an ordinary repaint
+    // or a live appearance change keeps the hold the operator still has.
+    if (scrollbar === undefined
+      || (this.scrollbarDrag !== undefined
+        && this.scrollbarDrag.baseline !== this.scrollbarDragBaseline(rosterEntries, scrollbar))) {
+      this.cancelScrollbarDrag();
+    }
+    // The last column belongs to the track whenever a track is painted, so the
+    // list's own fixed-height card/action rows are clipped to the remaining
+    // columns. Nothing else moves: the row budget, the footer, the entry
+    // heights, the entry order, and the usable range are exactly what they were,
+    // and no entry is hidden or capped to manufacture the overflow.
+    const listCols = scrollbar === undefined ? cols : cols - 1;
+    const listLines: string[] = [];
     const displayed = new Map<string, number>();
     const regions = new Map<string, DisplayedRosterRegion>();
     let y = 0;
@@ -10992,7 +12125,7 @@ export class SidebarController {
       const entryLines = this.renderEntryLines(
         entry,
         index === selectedIndex,
-        cols,
+        listCols,
         entry.key === movingKey,
         entry.key === insertionTargetKey ? move?.placement : undefined,
       );
@@ -11001,9 +12134,13 @@ export class SidebarController {
       if (y + entryLines.length > listRows) {
         break;
       }
-      lines.push(...entryLines);
+      listLines.push(...entryLines);
       displayed.set(entry.key, entryLines.length);
-      regions.set(entry.key, { row: lines.length - entryLines.length, height: entryLines.length, entry });
+      regions.set(entry.key, {
+        row: listStart + listLines.length - entryLines.length,
+        height: entryLines.length,
+        entry,
+      });
       if (isSessionRosterEntry(entry)) lastDrawnSession = entry;
       y += entryLines.length;
     }
@@ -11018,8 +12155,27 @@ export class SidebarController {
       && move.sourceKey !== move.targetKey && lastDrawnSession !== undefined
       && y < listRows
       && sessionListTailKey(rosterEntries) === lastDrawnSession.key) {
-      lines.push(wrapRow(INSERTION_MARKER_END, cols));
+      listLines.push(wrapRow(INSERTION_MARKER_END, listCols));
       y += 1;
+    }
+    if (scrollbar === undefined) {
+      lines.push(...listLines);
+    } else {
+      // The track spans the whole list window — the drawn cards and the blank
+      // remainder below them — and never a header, notice, or footer row. The
+      // thumb sits where this window's offset lands; while the operator holds
+      // it, the same cell is drawn with the block glyph, which is the only
+      // "active" state the drag needs (no hover tracking anywhere).
+      while (listLines.length < listRows) listLines.push(wrapRow("", listCols));
+      const thumbStart = scrollbar.thumbTop - scrollbar.trackTop;
+      for (let row = 0; row < listRows; row += 1) {
+        const inThumb = row >= thumbStart && row < thumbStart + scrollbar.thumbHeight;
+        lines.push(listLines[row] + (inThumb
+          ? this.scrollbarCell(this.scrollbarDragActive
+            ? SCROLLBAR_ACTIVE_THUMB_GLYPH
+            : SCROLLBAR_THUMB_GLYPH, "scrollbarThumb")
+          : this.scrollbarCell(SCROLLBAR_TRACK_GLYPH, "scrollbarTrack")));
+      }
     }
     this.displayedRoster = {
       signature: this.rosterSignature(),
@@ -11031,15 +12187,16 @@ export class SidebarController {
       focus: this._focus,
       selectedKey: this.selectedEntryKey,
       selectedIndex,
-      listStart: 1 + alertLines.length,
+      listStart,
       listTop: top,
+      scrollbar,
     };
     for (const noticeLine of noticeLines) {
-      lines.push(wrapRow(noticeLine, cols));
+      lines.push(wrapRow(noticeLine, cols, this.paint("notice")));
     }
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) {
-      lines.push(wrapRow(footerLine, cols));
+      lines.push(wrapRow(footerLine, cols, this.paint("hint")));
     }
     return { lines };
   }
@@ -11051,6 +12208,10 @@ export class SidebarController {
    * message. With nothing pending the legacy too-small message is unchanged.
    */
   private renderRosterTooSmall(cols: number, rows: number): { lines: string[] } {
+    // No entry row and therefore no painted track exists at this geometry, so no
+    // lane gesture may survive into it: the drag ends on the render that drew the
+    // fallback, not on the next mouse packet.
+    this.cancelScrollbarDrag();
     this.displayedRoster = {
       signature: this.rosterSignature(),
       heights: new Map(),
@@ -11064,9 +12225,11 @@ export class SidebarController {
       selectedIndex: -1,
       listStart: 0,
       listTop: 0,
+      // Nothing was drawn, so no track exists to press.
+      scrollbar: undefined,
     };
-    const alert = this.renderPeerAlert(cols, rows);
-    return alert.lines.length === 0 ? this.renderTooSmall(cols, rows) : { lines: alert.lines };
+    const alertLines = this.peerAlertLines(cols, rows);
+    return alertLines.length === 0 ? this.renderTooSmall(cols, rows) : { lines: alertLines };
   }
 
   /**
@@ -11209,13 +12372,15 @@ export class SidebarController {
       // Main conversation only while Main has focus; blue identifies the LEFT
       // selected navigation target while the sidebar-owned surfaces have
       // focus. Never both at once, and never a false sibling/owner mark.
+      // The two roles come from the host's own palette, so a theme change
+      // restyles them without ever merging or moving the distinction.
       let titleSgr: string;
       if (this._focus === "main" && this.activeMainOwnerID === item.id) {
-        titleSgr = SGR_ACTIVE_MAIN_WHITE;
+        titleSgr = this.paint("activeMain");
       } else if (selected && this._focus !== "main") {
-        titleSgr = SGR_SELECTION_BLUE;
+        titleSgr = this.paint("selected");
       } else {
-        titleSgr = "\x1b[1m";
+        titleSgr = this.paint("title");
       }
       const lines = [
         wrapRow(cardTitle(item), cols, titleSgr),
@@ -11251,25 +12416,27 @@ export class SidebarController {
         ? "details: diagnostics log"
         : `NOT saved: ${terminalDiagnosticsFailurePhrase(warning.logFailure)}`;
       return [
-        wrapRow(`${marker}${title}`, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : "\x1b[1m"),
-        wrapRow(`  ${status}`, cols),
+        wrapRow(`${marker}${title}`, cols,
+          selected && this._focus !== "main" ? this.paint("selected") : this.paint("title")),
+        wrapRow(`  ${status}`, cols, this.paint("secondary")),
         wrapRow("  enter clears warning", cols),
       ];
     }
+    // ONE grouped Settings row (#613): there is no independent Network or Host
+    // shortcuts row any more. Pending-request discoverability stays where it
+    // already was — the roster's own bounded alert band — and the Network
+    // submenu row inside Settings carries the same request count annotation
+    // the old top-level row did.
     const text = entry.kind === "saved"
       ? `${marker}Saved conversations`
       : entry.kind === "new"
         ? `${marker}New session`
-        : entry.kind === "peer"
-          ? `${marker}Network${this.peerPendingConsentCount() > 0
-            ? ` (${this.peerPendingConsentCount()} request${this.peerPendingConsentCount() === 1 ? "" : "s"})`
-            : ""}`
         : entry.kind === "settings"
-          ? `${marker}Host shortcuts${this.legacyToggleOverride ? " (--sidebar-key override active)" : ""}`
+          ? `${marker}Settings`
           : `${marker}Quit host`;
-    // Host-owned action rows take the blue selection target while a
+    // Host-owned action rows take the palette's selection target while a
     // sidebar-owned surface has focus; they are never the native active owner.
-    return [wrapRow(text, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : undefined)];
+    return [wrapRow(text, cols, selected && this._focus !== "main" ? this.paint("selected") : undefined)];
   }
 
   /**
@@ -11298,11 +12465,11 @@ export class SidebarController {
     // never inferred from the left highlight.
     let titleSgr: string;
     if (this._focus === "main" && this.remoteIsActiveMainOwner(remote)) {
-      titleSgr = SGR_ACTIVE_MAIN_WHITE;
+      titleSgr = this.paint("activeMain");
     } else if (selected && this._focus !== "main") {
-      titleSgr = SGR_SELECTION_BLUE;
+      titleSgr = this.paint("selected");
     } else {
-      titleSgr = "\x1b[1m";
+      titleSgr = this.paint("title");
     }
     const hostLabel = sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS);
     // Staleness leads the variable-length owner label so clipping can never
@@ -11397,7 +12564,7 @@ export class SidebarController {
     );
     if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     let hostRow: number | undefined;
     let hostValueStart = 0;
     let hostValueEnd = 0;
@@ -11431,7 +12598,7 @@ export class SidebarController {
     );
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
-    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols, this.paint("hint")));
 
     // This complete pane IS the drawn New form: retain the Host line's written
     // geometry so only that drawn control can be clicked.
@@ -11478,6 +12645,138 @@ export class SidebarController {
   }
 
   /** Host-owned editor for the two reserved sidebar chords. */
+  /**
+   * The grouped Settings submenu. It owns no capability of its own: each row
+   * opens an existing pane, and the drawn text states the current appearance so
+   * the state never depends on a color.
+   */
+  private renderSettingsMenuPane(
+    cols: number,
+    rows: number,
+  ): { lines: string[] } {
+    // Only a COMPLETE render may leave a pointer/activation map behind: a
+    // too-small or wrapped-refusal fallback must not keep an earlier pane's
+    // rows authorizable.
+    this.settingsDisplay = undefined;
+    const header = " Settings ";
+    const contextLines = wrapHintLines([
+      `theme: ${sidebarThemeLabel(this.themeId)}`,
+      ...(this.legacyToggleOverride ? [`Legacy --sidebar-key override active: ${this.toggleLabel}`] : []),
+    ], cols);
+    const footerLines = wrapHintLines([
+      `${this.toggleLabel} toggle`,
+      "up/down select",
+      "enter open",
+      "esc back",
+    ], cols);
+    const noticeLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
+    if (contextLines === undefined || footerLines === undefined || noticeLines === undefined
+      || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+    const paneRows = this.settingsRows();
+    const listRows = rows - 1 - contextLines.length - noticeLines.length - footerLines.length;
+    // The grouped menu has no scrolling: it always draws from the first entry,
+    // so a pane that cannot show EVERY entry would let navigation highlight a
+    // row that is never drawn and can therefore never be activated. Exactly as
+    // the Theme picker requires, an incomplete menu truthfully falls back and
+    // keeps no activation map.
+    if (listRows < paneRows.length) return this.renderTooSmall(cols, rows);
+    const selectedIndex = this.normalizeSettingsSelection(paneRows);
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    for (const line of contextLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
+    const drawn: DisplayedSettingsRow[] = [];
+    for (let index = 0; index < paneRows.length && drawn.length < listRows; index += 1) {
+      const row = paneRows[index];
+      const selected = index === selectedIndex;
+      // The written position is the pointer target, exactly like every other
+      // host menu here.
+      drawn.push({ paneRow: lines.length, row });
+      lines.push(wrapRow(
+        `${selected ? "> " : "  "}${row.text}`,
+        cols,
+        selected ? this.paint("selected") : undefined,
+      ));
+    }
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols, this.paint("hint")));
+    this.settingsDisplay = {
+      cols,
+      rows,
+      signature: this.settingsRowsSignature(paneRows),
+      selectedKey: paneRows[selectedIndex]?.key,
+      entries: drawn,
+    };
+    return { lines };
+  }
+
+  /**
+   * The host's own appearance picker. Both choices are always shown, the
+   * current one is marked in TEXT (never by color alone), and a pending save
+   * states that it is pending rather than claiming it applied.
+   */
+  private renderThemePane(
+    cols: number,
+    rows: number,
+  ): { lines: string[] } {
+    // Exactly as for the Settings menu: a refused or too-small render clears the
+    // drawn-row map, so Enter or a captured pointer target cannot authorize a
+    // save until the pane is completely drawn again.
+    this.themeDisplay = undefined;
+    const header = " Theme ";
+    const contextLines = wrapHintLines([
+      "Host sidebar only; Pi's own theme is never read or changed.",
+      ...(this.settingsAvailable
+        ? ["Saved for this native Pi agent."]
+        : ["No native Pi agent directory: a choice cannot be saved."]),
+    ], cols);
+    const footerLines = wrapHintLines([
+      `${this.toggleLabel} toggle`,
+      "up/down select",
+      "enter apply",
+      "esc back",
+    ], cols);
+    const notices = [this.themeNoticeValue, this.formError]
+      .filter((message): message is string => typeof message === "string" && message.trim().length > 0)
+      .map((message) => `! ${sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS)}`);
+    const noticeLines = notices.length === 0 ? [] : wrapHintLines(notices, cols);
+    if (contextLines === undefined || footerLines === undefined || noticeLines === undefined
+      || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+    const statusLines = this.pendingThemeSave === undefined
+      ? []
+      : wrapHintLines(["Applying the saved appearance..."], cols);
+    if (statusLines === undefined) return this.renderTooSmall(cols, rows);
+    const paneRows = this.themeRows();
+    const listRows = rows - 1 - contextLines.length - noticeLines.length - statusLines.length
+      - footerLines.length;
+    if (listRows < paneRows.length) return this.renderTooSmall(cols, rows);
+    const selectedIndex = paneRows.findIndex((row) => row.key === `theme:${this.themeSelectedId ?? ""}`);
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    for (const line of contextLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("error")));
+    for (const line of statusLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
+    const drawn: DisplayedSettingsRow[] = [];
+    for (let index = 0; index < paneRows.length && drawn.length < listRows; index += 1) {
+      const row = paneRows[index];
+      const selected = index === selectedIndex;
+      drawn.push({ paneRow: lines.length, row });
+      lines.push(wrapRow(
+        `${selected ? "> " : "  "}${row.text}${row.current === true ? " (current)" : ""}`,
+        cols,
+        selected ? this.paint("selected") : row.current === true ? this.paint("accent") : undefined,
+      ));
+    }
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols, this.paint("hint")));
+    this.themeDisplay = {
+      cols,
+      rows,
+      signature: this.settingsRowsSignature(paneRows),
+      selectedKey: paneRows[selectedIndex]?.key,
+      entries: drawn,
+    };
+    return { lines };
+  }
+
   private renderHostShortcutPane(
     cols: number,
     rows: number,
@@ -11515,8 +12814,8 @@ export class SidebarController {
     const fieldFrame = this.formField.render(fieldWidth, activeRows);
     if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
 
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
-    for (const contextLine of contextLines) lines.push(wrapRow(contextLine, cols));
+    const lines = [wrapRow(header, cols, this.paint("header"))];
+    for (const contextLine of contextLines) lines.push(wrapRow(contextLine, cols, this.paint("secondary")));
     const inactiveRows = inactiveLines.map((line, index) => wrapRow(
       `${index === 0 ? inactivePrefix : " ".repeat(inactivePrefixWidth)}${line}`,
       cols,
@@ -11535,14 +12834,16 @@ export class SidebarController {
     const toggleRows = this.shortcutFieldIndex === 0 ? activeRowsToDraw : inactiveRows;
     const returnRows = this.shortcutFieldIndex === 1 ? activeRowsToDraw : inactiveRows;
     lines.push(...toggleRows, ...returnRows);
-    const status = this.pendingShortcutSave !== undefined
+    const savePending = this.pendingShortcutSave !== undefined;
+    const status = savePending
       ? " Saving host shortcuts... "
       : errorLines.length === 0 ? "" : errorLines[0];
-    lines.push(wrapRow(status, cols));
-    for (const errorLine of errorLines.slice(1)) lines.push(wrapRow(errorLine, cols));
+    lines.push(wrapRow(status, cols,
+      savePending ? this.paint("secondary") : errorLines.length > 0 ? this.paint("error") : undefined));
+    for (const errorLine of errorLines.slice(1)) lines.push(wrapRow(errorLine, cols, this.paint("error")));
     const fieldRow = 1 + contextLines.length + (this.shortcutFieldIndex === 0 ? 0 : toggleRows.length);
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
-    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols, this.paint("hint")));
     return {
       lines,
       cursor: {
@@ -11616,7 +12917,7 @@ export class SidebarController {
     }
     this.savedLastListRows = listRows;
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     let hostRow: number | undefined;
     let hostValueEnd = 0;
     if (hostLine) {
@@ -11701,7 +13002,7 @@ export class SidebarController {
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     for (const issueLine of issueLines) lines.push(wrapRow(issueLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
-    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols, this.paint("hint")));
     return {
       lines,
       // While the Host line owns focus the hardware cursor belongs to it.
@@ -11772,7 +13073,7 @@ export class SidebarController {
       if (cached === undefined) {
         // A placeholder is not a row: no hit target, no details, no authority.
         lines.push(wrapRow(`${index === selected ? "> " : "  "}loading...`, cols,
-          index === selected ? SGR_SELECTION_BLUE : undefined));
+          index === selected ? this.paint("selected") : undefined));
       } else {
         const identity: RemoteSavedRowIdentity = Object.freeze({
           hostId,
@@ -11927,7 +13228,7 @@ export class SidebarController {
       const visibleLabel = labelWidth > 0 ? truncateToWidth(caption, labelWidth, "...", true) : "";
       text = `${marker}${visibleLabel}`;
     }
-    return wrapRow(text, cols, selected ? SGR_SELECTION_BLUE : undefined);
+    return wrapRow(text, cols, selected ? this.paint("selected") : undefined);
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
@@ -11967,7 +13268,7 @@ export class SidebarController {
     if (rows < 1 + countLines.length + hintLines.length) {
       return this.renderTooSmall(cols, rows);
     }
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of countLines) {
       lines.push(wrapRow(line, cols));
     }
@@ -12028,7 +13329,7 @@ export class SidebarController {
     }
     if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
 
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of targetLines) lines.push(wrapRow(line, cols));
     for (const line of warnings) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
@@ -12069,7 +13370,7 @@ export class SidebarController {
       this.stopConfirmDisplayed = false;
       return this.renderTooSmall(cols, rows);
     }
-    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, this.paint("header"))];
     for (const line of targetLines) {
       lines.push(wrapRow(line, cols));
     }
@@ -12119,14 +13420,14 @@ export class SidebarController {
       + noticeLines.length + hints.length;
     if (bodyRows > rows) return tooSmall();
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     for (const line of titleLines) lines.push(wrapRow(line, cols));
     for (const line of hostLines) lines.push(wrapRow(line, cols));
     for (const line of warnings) lines.push(wrapRow(line, cols));
-    for (const line of noticeLines) lines.push(wrapRow(line, cols));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
     lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
     const controlRow = lines.length;
-    for (const line of hints) lines.push(wrapRow(line, cols));
+    for (const line of hints) lines.push(wrapRow(line, cols, this.paint("hint")));
 
     const generation = this.remoteCloseGeneration;
     // Identity is the frozen target, the monotonic generation, this pane's

@@ -229,16 +229,16 @@ test("moving sidebar navigation does not move the bright actual owner title", ()
   harness.send(DOWN); // -> first session card a
   assert.equal(harness.controller.selectedId, "a");
   let lines = harness.controller.render(40, 30).lines;
-  assert.ok(lines.some((line) => line.includes("\x1b[1;97m") && line.includes("label-a")),
-    "the actual owner stays bright when it is also the navigation target");
-  assert.ok(!lines.some((line) => line.includes("\x1b[1;34m")),
-    "an owner that is also the navigation target keeps the owner title, not a merged blue one");
+  assert.ok(lines.some((line) => line.includes("\x1b[1;34m") && line.includes("label-a")),
+    "the navigation highlight is what the owner card shows while the highlight sits on it");
+  assert.ok(!lines.some((line) => line.includes("\x1b[1;97m")),
+    "the owner colour does not double up with the highlight the operator is on");
 
   harness.send(DOWN); // a -> b
   assert.equal(harness.controller.selectedId, "b");
   lines = harness.controller.render(40, 30).lines;
   assert.ok(lines.some((line) => line.includes("\x1b[1;97m") && line.includes("label-a")),
-    "the actual owner a remains bright after navigation moved to b");
+    "the actual owner a reclaims its bright title once the highlight moved to b");
   assert.ok(lines.some((line) => line.includes("\x1b[1;34m") && line.includes("label-b")),
     "the navigation target b is blue");
   const plain = lines.map((line) => line.replace(SGR_PATTERN, "").trimEnd());

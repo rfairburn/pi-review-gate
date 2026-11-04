@@ -1733,10 +1733,11 @@ observed/unknown classification remain unchanged; color never substitutes for st
 The actual active Main conversation keeps its brighter title while its card is visible,
 even when keyboard focus moves to the sidebar and Up/Down moves the blue navigation
 highlight to another item. The two marks identify different things: navigation does not
-activate a session or change Main's owner. If the active card is also the navigation
-target, its active-title color takes precedence and the existing selection marker still
-identifies the target. This applies to local and remote owners; with no active owner,
-no row receives a false active-title mark.
+activate a session or change Main's owner. While the navigation highlight sits on the
+active card itself, that row shows the navigation highlight, and the owner's own title
+color returns as soon as the highlight moves to another card or Main's focus is active.
+This applies to local and remote owners; with no active owner, no row receives a false
+active-title mark.
 
 The local status channel uses a private Unix socket and per-instance authorization
 identity bound to the owned child. A pre-main Node preload consumes the one-shot

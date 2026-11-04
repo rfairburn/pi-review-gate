@@ -2836,23 +2836,45 @@ test("truthful card status: observed/unknown agent and input state below the tit
   assert.equal(statusFor("err"), "  error (code 1)");
   assert.equal(statusFor("warm"), "  starting | input none");
 
-  // Agent and input facts stay independently painted: the running agent and
-  // its ordinary empty input are two roles on the SAME row, while the waiting
-  // agent and its conspicuous pending input use two different roles again.
+  // Agent and input facts stay independently painted, and only the observed
+  // VALUE carries colour: the `agent ` / `input ` label words, the separator,
+  // and a plain `none` stay on the neutral pane canvas, while the running agent
+  // and its ordinary empty input keep two different treatments on the SAME row.
   const dark = sidebarPaletteFor("dark");
-  const runStatus = harness.controller.render(80, 60).lines[cardIndex(texts, "label-run") + 1] ?? "";
-  assert.ok(runStatus.includes(`\x1b[${dark.statusRunning}magent running\x1b[0m`),
-    "the running agent uses the running status role");
-  assert.ok(runStatus.includes(`\x1b[${dark.statusUnknown}minput none\x1b[0m`),
-    "input none stays muted independently of the running agent");
-  const typedStatus = harness.controller.render(80, 60).lines[cardIndex(texts, "label-typed") + 1] ?? "";
-  assert.ok(typedStatus.includes(`\x1b[${dark.statusWaiting}magent waiting\x1b[0m`),
+  const ground = `\x1b[0m\x1b[${dark.canvas}m`;
+  const rawStatusFor = (id: string): string =>
+    harness.controller.render(80, 60).lines[cardIndex(texts, `label-${id}`) + 1] ?? "";
+  const runStatus = rawStatusFor("run");
+  assert.ok(runStatus.startsWith(`${ground}  agent `),
+    "the marker and the agent label word stay on the neutral pane canvas");
+  assert.ok(runStatus.includes(`\x1b[${dark.statusRunning}mrunning\x1b[0m`),
+    "the running status VALUE uses the running status role");
+  assert.ok(runStatus.includes(`${ground} | input none`),
+    "the separator and `input none` stay neutral independently of the running agent");
+  const typedStatus = rawStatusFor("typed");
+  assert.ok(typedStatus.includes(`\x1b[${dark.statusWaiting}mwaiting\x1b[0m`),
     "the waiting agent keeps its own status role");
-  assert.ok(typedStatus.includes(`\x1b[${dark.inputPending}minput pending\x1b[0m`),
+  assert.ok(typedStatus.includes(`\x1b[${dark.inputPending}mpending\x1b[0m`),
     "pending input is conspicuous and independent of the agent role");
-  assert.ok(typedStatus.indexOf(`\x1b[${dark.statusWaiting}magent waiting`)
-    < typedStatus.indexOf(`\x1b[${dark.inputPending}minput pending`),
+  assert.ok(typedStatus.indexOf(`\x1b[${dark.statusWaiting}mwaiting`)
+    < typedStatus.indexOf(`\x1b[${dark.inputPending}mpending`),
     "both distinctions survive on one exact status row");
+  assert.ok(!typedStatus.includes(`\x1b[${dark.statusWaiting}magent`)
+    && !typedStatus.includes(`\x1b[${dark.inputPending}minput`),
+    "neither label word borrows a status colour");
+  const unknownStatus = rawStatusFor("unobserved");
+  assert.ok(unknownStatus.includes(`${ground}  agent `) && unknownStatus.includes(`${ground} | input `),
+    "an unknown row still labels itself in the neutral canvas foreground");
+  assert.ok(unknownStatus.includes(`\x1b[${dark.statusUnknown}munknown\x1b[0m`),
+    "the unknown VALUES keep the muted unknown role");
+  // The lifecycle words keep their existing roles: this follow-up repaints only
+  // the alive-agent and pending-input VALUES.
+  assert.ok(rawStatusFor("gone").includes(`\x1b[${dark.statusExited}mexited (code 3)\x1b[0m`),
+    "the exited word keeps its existing role");
+  assert.ok(rawStatusFor("err").includes(`\x1b[${dark.statusError}merror (code 1)\x1b[0m`),
+    "the error word keeps its existing role");
+  assert.ok(rawStatusFor("warm").includes(`\x1b[${dark.statusStarting}mstarting\x1b[0m`),
+    "the starting word keeps its existing role");
 });
 
 test("card title line carries only the sanitized canonical title", () => {

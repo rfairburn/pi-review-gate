@@ -33,6 +33,16 @@ const SCENARIO = join(process.cwd(), "tests", "fixtures", "session-host-412-scen
 const EXECUTOR_SCENARIO = join(process.cwd(), "tests", "fixtures", "session-host-412-executor.cjs");
 const SESSION_ID = "synthetic-412-session";
 
+/**
+ * The sidebar palette paints only a status VALUE word, so the status WORDS are
+ * asserted on the row with the renderer's generated SGR removed. The plaintext
+ * itself is unchanged by the colouring.
+ */
+const GENERATED_SGR = /\x1b\[[0-9;]*m/g;
+function plainRow(rendered: string): string {
+  return rendered.replace(GENERATED_SGR, "");
+}
+
 interface FirstStatus {
   busy: boolean | null;
   activity: string[];
@@ -160,7 +170,7 @@ function assertFirstLoaded(
   assert.equal(view.pendingInput, false, `${what}: manager row has no pending input`);
   assert.match(summary.rendered, new RegExp(`bg tasks ${expected.activeTasks ?? "unknown"} \\| shells 0`, "u"),
     `${what}: rendered row shows the actual activity counts\n${summary.rendered}`);
-  assert.match(summary.rendered, expected.activeTasks === 0 ? /agent idle/u : /agent running/u,
+  assert.match(plainRow(summary.rendered), expected.activeTasks === 0 ? /agent idle/u : /agent running/u,
     `${what}: rendered row shows the actual agent state\n${summary.rendered}`);
   assert.match(summary.rendered, /Ready/u, `${what}: rendered row shows the real Ready activity\n${summary.rendered}`);
 }
@@ -294,7 +304,7 @@ test("real prompt, shell, task and review work publish actual nonzero then settl
 
   const promptBusy = step("prompt-busy");
   assert.equal(promptBusy.view?.busy, true, "prompt work marks the row busy");
-  assert.match(promptBusy.rendered, /agent running/u);
+  assert.match(plainRow(promptBusy.rendered), /agent running/u);
   assert.equal(promptBusy.view?.activeTasks, 0, "prompt work alone is not background activity");
   const promptSettled = step("prompt-settled");
   assert.equal(promptSettled.view?.busy, false);
@@ -305,7 +315,7 @@ test("real prompt, shell, task and review work publish actual nonzero then settl
     assert.equal(running.view?.activeShells, 1, `shell ${cycle} publishes running intent`);
     assert.equal(running.view?.backgroundShells, 1, `shell ${cycle} is independently owned until its actual exit`);
     assert.match(running.rendered, /bg tasks 0 \| shells 1/u, `rendered row shows running shells ${cycle}\n${running.rendered}`);
-    assert.match(running.rendered, /agent running/u);
+    assert.match(plainRow(running.rendered), /agent running/u);
     const settled = step(`shell-${cycle}-settled`);
     assert.equal(settled.view?.activeShells, 0);
     assert.equal(settled.view?.backgroundShells, 0);

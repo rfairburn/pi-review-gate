@@ -2525,61 +2525,67 @@ interface SessionStatusFacts {
 }
 
 /**
- * One independently paintable part of the truthful status row. `text` is the
- * exact existing plaintext; `role` only chooses the generated foreground.
+ * One independently paintable part of the truthful status row. `label` is the
+ * neutral wording the palette never paints (`agent `, `input `, or the whole
+ * `input none` row part), `value` is the status word a role MAY paint, and
+ * `role` chooses that foreground (`null` keeps the value on the neutral canvas
+ * too). `label + value` is the exact existing plaintext.
  */
 interface CardStatusSegment {
-  readonly text: string;
-  readonly role: SidebarThemeRole;
+  readonly label: string;
+  readonly value: string;
+  readonly role: SidebarThemeRole | null;
 }
 
 /**
  * The status row's exact text and semantic roles. Classification stays here and
  * nowhere else: the agent/lifecycle part and the input part are produced
  * independently, so `agent running | input pending` can color both facts
- * without either one overriding the other. The words are unchanged.
+ * without either one overriding the other. The words are unchanged, and the
+ * label words never take a status colour: only the observed VALUE is painted.
  */
 function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
   const parts: CardStatusSegment[] = [];
   switch (item.lifecycle) {
     case "starting":
-      parts.push({ text: "starting", role: "statusStarting" });
+      parts.push({ label: "", value: "starting", role: "statusStarting" });
       break;
     case "alive":
       parts.push(
         item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
           || (sanitizeCount(item.activeShells) ?? 0) > 0
-          ? { text: "agent running", role: "statusRunning" }
+          ? { label: "agent ", value: "running", role: "statusRunning" }
           : item.pendingInput === true || item.inputSurface === true
-            ? { text: "agent waiting", role: "statusWaiting" }
+            ? { label: "agent ", value: "waiting", role: "statusWaiting" }
             : item.busy === false && item.pendingInput === false
               && sanitizeCount(item.activeTasks) === 0 && sanitizeCount(item.activeShells) === 0
-              ? { text: "agent idle", role: "statusIdle" }
-              : { text: "agent unknown", role: "statusUnknown" },
+              ? { label: "agent ", value: "idle", role: "statusIdle" }
+              : { label: "agent ", value: "unknown", role: "statusUnknown" },
       );
       break;
     case "exited":
       parts.push(
         typeof item.exitCode === "number"
-          ? { text: `exited (code ${Math.trunc(item.exitCode)})`, role: "statusExited" }
-          : { text: "exited", role: "statusExited" },
+          ? { label: "", value: `exited (code ${Math.trunc(item.exitCode)})`, role: "statusExited" }
+          : { label: "", value: "exited", role: "statusExited" },
       );
       break;
     case "error":
       parts.push(
         typeof item.exitCode === "number"
-          ? { text: `error (code ${Math.trunc(item.exitCode)})`, role: "statusError" }
-          : { text: "error", role: "statusError" },
+          ? { label: "", value: `error (code ${Math.trunc(item.exitCode)})`, role: "statusError" }
+          : { label: "", value: "error", role: "statusError" },
       );
       break;
   }
   if (item.lifecycle === "starting" || item.lifecycle === "alive") {
     parts.push(
       item.pendingInput === true || item.inputSurface === true
-        ? { text: "input pending", role: "inputPending" }
+        ? { label: "input ", value: "pending", role: "inputPending" }
         : item.pendingInput === false
-          ? { text: "input none", role: "statusUnknown" }
-          : { text: "input unknown", role: "statusUnknown" },
+          // "none" is not a status to emphasize: the whole part stays neutral.
+          ? { label: "input none", value: "", role: null }
+          : { label: "input ", value: "unknown", role: "statusUnknown" },
     );
   }
   return parts;
@@ -2587,7 +2593,7 @@ function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
 
 /** The complete plaintext status row; this remains the single source of truth. */
 function cardStatusText(item: SessionStatusFacts): string {
-  return cardStatusSegments(item).map((segment) => segment.text).join(" | ");
+  return cardStatusSegments(item).map((segment) => `${segment.label}${segment.value}`).join(" | ");
 }
 
 /** Honest ACTIVITY-INTENT counts: a missing/invalid count is "unknown", never 0. */
@@ -9010,14 +9016,18 @@ export class SidebarController {
   }
 
   /**
-   * The truthful status text with each semantic part painted independently.
-   * Separators stay on the pane canvas, so the generated foregrounds never
-   * bleed into the marker glyph, the pipe, or the rest of the row. The plaintext
-   * is exactly `cardStatusText`; only finite palette roles add colour.
+   * The truthful status text with each semantic VALUE painted independently.
+   * The `agent ` / `input ` label words, the separator, and a plain `none` are
+   * emitted with no generated sequence of their own, so they read in the pane
+   * canvas foreground the row wrapper restores after every generated reset.
+   * The plaintext is exactly `cardStatusText`; only finite palette roles add
+   * colour.
    */
   private cardStatusRuns(item: SessionStatusFacts): string {
     return cardStatusSegments(item)
-      .map((segment) => `${this.paint(segment.role)}${segment.text}\x1b[0m`)
+      .map((segment) => segment.role === null
+        ? `${segment.label}${segment.value}`
+        : `${segment.label}${this.paint(segment.role)}${segment.value}\x1b[0m`)
       .join(" | ");
   }
 
@@ -12403,18 +12413,21 @@ export class SidebarController {
       : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
-      // The actual active Main conversation keeps its brighter owner title even
-      // while sidebar navigation highlights a different card. Blue belongs ONLY
-      // to the left selected navigation target, so the owner and the navigation
-      // target stay independently readable; when they are the same card, the
-      // owner title wins and the existing `>` marker still shows the target.
-      // Both roles come from the host's own palette, so a theme change restyles
-      // them without ever merging or moving the distinction.
+      // The sidebar-selected navigation target keeps its own highlight even when
+      // the highlighted card is also the conversation that actually owns Main:
+      // the left highlight is what the operator is pointing at, so it wins on the
+      // overlap. As soon as navigation moves to another card the owner reclaims
+      // its brighter owner title, and with Main's focus active the owner is the
+      // only mark. Blue belongs ONLY to the left navigation target and the owner
+      // colour ONLY to the actual owner, so the two never merge on one card and
+      // the existing `>` marker still identifies the target either way. Both
+      // roles come from the host's own palette, so a theme change restyles them
+      // without ever merging or moving the distinction.
       let titleSgr: string;
-      if (this.activeMainOwnerID === item.id) {
-        titleSgr = this.paint("activeMain");
-      } else if (selected && this._focus !== "main") {
+      if (selected && this._focus !== "main") {
         titleSgr = this.paint("selected");
+      } else if (this.activeMainOwnerID === item.id) {
+        titleSgr = this.paint("activeMain");
       } else {
         titleSgr = this.paint("title");
       }
@@ -12496,15 +12509,16 @@ export class SidebarController {
     const insertionMarker = insertion === undefined ? undefined
       : insertion === "before" ? INSERTION_MARKER_BEFORE : INSERTION_MARKER_AFTER;
     const facts = remoteSessionStatusFacts(remote.row);
-    // Same owner/navigation split as local cards: the actual remote content
-    // owner keeps the brighter owner title while blue marks only the left
-    // navigation target. The structured owner identity is never inferred from
-    // the left highlight.
+    // Same owner/navigation split as local cards, with the same precedence: the
+    // navigation highlight wins while it sits on the owner card under sidebar
+    // focus, and the actual remote content owner reclaims its brighter owner
+    // title as soon as the highlight moves or Main's focus is active. The
+    // structured owner identity is never inferred from the left highlight.
     let titleSgr: string;
-    if (this.remoteIsActiveMainOwner(remote)) {
-      titleSgr = this.paint("activeMain");
-    } else if (selected && this._focus !== "main") {
+    if (selected && this._focus !== "main") {
       titleSgr = this.paint("selected");
+    } else if (this.remoteIsActiveMainOwner(remote)) {
+      titleSgr = this.paint("activeMain");
     } else {
       titleSgr = this.paint("title");
     }

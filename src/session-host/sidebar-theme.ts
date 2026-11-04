@@ -54,10 +54,12 @@ export type SidebarThemeRole =
   /** Secondary host-owned text: card status/background, owner and status lines. */
   | "secondary"
   /**
-   * The agent/lifecycle portion of a card's status row. These are separate
+   * The agent/lifecycle STATUS VALUE on a card's status row. These are separate
    * semantic roles because one status row can carry two independent facts:
    * an idle agent waiting for input is not the same as a running agent that
-   * happens to have no pending input.
+   * happens to have no pending input. A role paints only the value word
+   * (`running`, `idle`, `unknown`); the `agent ` / `input ` label words, the
+   * separator, and a plain `none` stay on the neutral pane canvas.
    */
   | "statusStarting"
   | "statusRunning"
@@ -66,7 +68,10 @@ export type SidebarThemeRole =
   | "statusUnknown"
   | "statusExited"
   | "statusError"
-  /** Pending editable input, emphasized independently of the agent state. */
+  /**
+   * Pending editable input, emphasized independently of the agent state: the
+   * `pending` value word only, never its `input ` label.
+   */
   | "inputPending"
   /** Footer hint rows the pane draws for its own keys. */
   | "hint"
@@ -115,13 +120,17 @@ const DARK_PALETTE: SidebarPalette = Object.freeze({
   activeMain: "1;97",
   secondary: "90",
   statusStarting: "1;34",
-  statusRunning: "1;36",
+  // Running is bold green and idle plain green: the SAME hue carries the agent's
+  // own state, and the bold is what separates a working agent from a positively
+  // idle one. Pending input keeps its own amber, bold on waiting's hue, so the
+  // two facts on one status row stay independently readable.
+  statusRunning: "1;32",
   statusWaiting: "33",
   statusIdle: "32",
   statusUnknown: "90",
   statusExited: "90",
   statusError: "1;31",
-  inputPending: "1;35",
+  inputPending: "1;33",
   hint: "90",
   notice: "33",
   error: "1;31",
@@ -143,18 +152,20 @@ const LIGHT_PALETTE: SidebarPalette = Object.freeze({
   // canvas foreground is applied, a black `activeMain` and a bold-only `title`
   // land on the same terminal cell attributes, so the conversation that owns
   // Main would be indistinguishable from an ordinary card. This is the SAME
-  // blue the Light header and running status already use, and it stays distinct
-  // from the magenta navigation target above it.
+  // blue the Light header already uses, and it stays distinct from the magenta
+  // navigation target above it.
   activeMain: "1;34",
   secondary: "34",
   statusStarting: "34",
-  statusRunning: "1;34",
+  // Same running/idle and pending/waiting relationship as the Dark palette: one
+  // hue per fact, bold for the two states that ask for attention.
+  statusRunning: "1;32",
   statusWaiting: "33",
   statusIdle: "32",
   statusUnknown: "90",
   statusExited: "90",
   statusError: "1;31",
-  inputPending: "1;35",
+  inputPending: "1;33",
   hint: "35",
   notice: "31",
   error: "1;31",

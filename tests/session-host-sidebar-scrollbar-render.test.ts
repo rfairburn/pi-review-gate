@@ -795,7 +795,7 @@ test("the actual owner's title cell stays distinct from the navigation target an
   }
 });
 
-test("an owner that is also the navigation target keeps the owner cell, and that cell survives navigation moving away", async () => {
+test("the navigation cell wins where it sits on the owner, and the owner cell returns when navigation moves away", async () => {
   for (const theme of ["dark", "light"] as const) {
     const harness = makeHarness({ locals: 3, controllerOptions: { settingsAvailable: true } });
     if (theme === "light") {
@@ -814,30 +814,226 @@ test("an owner that is also the navigation target keeps the owner cell, and that
     let surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
-        `${theme}: the owner role wins on a card that is both owner and target`);
+      assert.equal(harness.controller.focus, "sidebar", `${theme}: sidebar navigation owns the highlight`);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedIndex,
+        `${theme}: the navigation highlight wins on a card that is both owner and target`);
       assert.notEqual(titleRun(surface, "local-l1").fg?.value, titleRun(surface, "local-l2").fg?.value,
-        `${theme}: the winning owner cell is still distinguishable from an ordinary card's cells`);
+        `${theme}: the highlighted cell stays distinguishable from an ordinary card's cells`);
       assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
-        `${theme}: no ordinary card borrows the owner colour`);
+        `${theme}: no ordinary card borrows the owner or navigation colour`);
       assert.equal(titleRun(surface, "local-l3").fg?.value, canvasIndex,
         `${theme}: no other card is highlighted either`);
     } finally {
       surface.dispose();
     }
 
-    // Navigation moves elsewhere; the persistent owner mark stays on its card.
+    // Navigation moves elsewhere; the actual owner immediately reclaims its own cell.
     harness.controller.select("l3");
     assert.equal(harness.controller.activeMainOwnerID, "l1", `${theme}: navigation changed no content owner`);
     surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
       assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
-        `${theme}: the owner keeps its own cell after navigation moved away`);
+        `${theme}: the owner reclaims its own cell once the highlight moved away`);
       assert.equal(titleRun(surface, "local-l3").fg?.value, selectedIndex,
         `${theme}: the new navigation target paints the selected colour`);
       assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
         `${theme}: the untouched ordinary card stays ordinary`);
+    } finally {
+      surface.dispose();
+    }
+
+    // With Main's focus active there is no navigation highlight: the owner keeps
+    // its own colour and the still-highlighted card shows no navigation colour.
+    assert.equal(harness.controller.focusMainFromNativeClick(), true, `${theme}: Main takes focus`);
+    surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
+        `${theme}: Main focus keeps the owner's own cell`);
+      assert.equal(titleRun(surface, "local-l3").fg?.value, canvasIndex,
+        `${theme}: Main focus paints no spurious navigation colour`);
+    } finally {
+      surface.dispose();
+    }
+    assert.equal(harness.controller.activeMainOwnerID, "l1", `${theme}: the content owner never changed`);
+  }
+});
+
+/**
+ * Move the roster highlight with DOWN until the `title` card carries its marker.
+ * A remote card's marker sits two rows under its title (title, owner-host line,
+ * status), so both offsets are checked.
+ */
+function highlightCard(harness: Harness, title: string, cols: number, rows: number): void {
+  for (let press = 0; press < 40; press += 1) {
+    const texts = harness.view(cols, rows).texts;
+    const titleRow = texts.findIndex((line) => line.trim() === title);
+    if (titleRow >= 0 && [1, 2].some((offset) => (texts[titleRow + offset] ?? "").startsWith("> "))) return;
+    harness.controller.handleInput(DOWN);
+  }
+  assert.fail(`the roster highlight never reached ${JSON.stringify(title)}`);
+}
+
+/**
+ * The drawn runs of the status row under the `label` card's title row, narrowed
+ * to the runs whose text contains `needle`.
+ */
+function statusRuns(surface: TerminalSurface, label: string, needle: string) {
+  const styles = surface.frame().styles ?? [];
+  const titleLine = styles.find((line) => line.runs.some((run) => run.text.includes(label)))?.line;
+  assert.ok(titleLine !== undefined, `the ${JSON.stringify(label)} card draws a styled title row`);
+  const row = styles.find((line) => line.line === titleLine + 1);
+  assert.ok(row !== undefined, `${JSON.stringify(label)} draws a styled status row`);
+  return row.runs.filter((run) => run.text.includes(needle));
+}
+
+test("the remote owner's title cell follows the same navigation precedence as a local owner", async () => {
+  for (const theme of ["dark", "light"] as const) {
+    const harness = makeHarness({
+      locals: 1,
+      hosts: [{ id: "h1", rows: ["r1"] }],
+      controllerOptions: { settingsAvailable: true },
+    });
+    if (theme === "light") {
+      applyLightTheme(harness);
+      closeSettings(harness);
+    }
+    harness.controller.setActiveMainOwnerKey({ kind: "remote", hostId: "h1", hostRunId: "run-h1", rowId: "r1" });
+    assert.equal(harness.controller.activeMainOwnerID, undefined,
+      `${theme}: a remote owner is never exposed as a local id`);
+    const cols = 32;
+    const rows = 24;
+    const palette = sidebarPaletteFor(theme);
+    const ownerIndex = paletteForegroundIndex(palette.activeMain);
+    const selectedIndex = paletteForegroundIndex(palette.selected);
+    const canvasIndex = paletteForegroundIndex(palette.canvas);
+
+    // The keyboard highlight sits on the remote owner card itself.
+    highlightCard(harness, "remote-r1", cols, rows);
+    let surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, selectedIndex,
+        `${theme}: the remote owner row shows the navigation highlight on the overlap`);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, canvasIndex,
+        `${theme}: no other card borrows either colour`);
+    } finally {
+      surface.dispose();
+    }
+
+    // The highlight moves to the local card; the remote owner reclaims its cell.
+    harness.controller.select("l1");
+    assert.deepEqual(harness.controller.activeMainOwnerKey,
+      { kind: "remote", hostId: "h1", hostRunId: "run-h1", rowId: "r1" },
+      `${theme}: the local highlight claimed no ownership`);
+    surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerIndex,
+        `${theme}: the remote owner reclaims its own cell once the highlight moved`);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedIndex,
+        `${theme}: the local navigation target paints the selected colour`);
+    } finally {
+      surface.dispose();
+    }
+
+    // Main focus: the remote owner keeps its colour, with no navigation colour.
+    assert.equal(harness.controller.focusMainFromNativeClick(), true, `${theme}: Main takes focus`);
+    surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerIndex,
+        `${theme}: Main focus keeps the remote owner's own cell`);
+      assert.equal(titleRun(surface, "local-l1").fg?.value, canvasIndex,
+        `${theme}: Main focus paints no spurious navigation colour`);
+    } finally {
+      surface.dispose();
+    }
+  }
+});
+
+test("status labels and a plain none stay on the neutral canvas while the status VALUES carry their colours", async () => {
+  // The exact contract rows: a running agent with pending input, an idle agent
+  // with no pending input, and an unknown agent with unknown input.
+  const cases: readonly {
+    id: string;
+    facts: Partial<SidebarItem>;
+    text: string;
+  }[] = [
+    { id: "l1", facts: { busy: true, pendingInput: true }, text: "agent running | input pending" },
+    { id: "l2", facts: { busy: false, pendingInput: false, activeTasks: 0, activeShells: 0 }, text: "agent idle | input none" },
+    { id: "l3", facts: { busy: null, pendingInput: null }, text: "agent unknown | input unknown" },
+  ];
+  for (const theme of ["dark", "light"] as const) {
+    const harness = makeHarness({ locals: 3, controllerOptions: { settingsAvailable: true } });
+    if (theme === "light") {
+      applyLightTheme(harness);
+      closeSettings(harness);
+    }
+    harness.controller.updateItems(cases.map((testCase) => ({ ...makeItem(testCase.id), ...testCase.facts })));
+    const palette = sidebarPaletteFor(theme);
+    // The agreed roles for BOTH appearances, pinned as parameter strings: running
+    // keeps its bold on a green hue, pending keeps its bold on waiting's amber.
+    assert.equal(palette.statusRunning, "1;32", `${theme}: running is bold green`);
+    assert.equal(palette.statusIdle, "32", `${theme}: idle stays plain green`);
+    assert.equal(palette.inputPending, "1;33", `${theme}: pending input is bold amber`);
+    assert.equal(palette.statusWaiting, "33", `${theme}: waiting stays plain amber`);
+    const cols = 32;
+    const rows = 24;
+    const view = harness.view(cols, rows);
+    for (const testCase of cases) {
+      const titleRow = view.texts.findIndex((line) => line.trim() === `local-${testCase.id}`);
+      assert.ok(titleRow >= 0, `${theme}: the ${testCase.id} card draws its title row`);
+      assert.equal((view.texts[titleRow + 1] ?? "").trim(), testCase.text,
+        `${theme}: the status plaintext is exactly unchanged`);
+    }
+    const surface = new TerminalSurface(cols, rows);
+    try {
+      await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
+      const canvasIndex = paletteForegroundIndex(palette.canvas);
+      // The label words are ordinary canvas cells in both appearances.
+      for (const label of ["agent", "input"]) {
+        for (const testCase of cases) {
+          const [run] = statusRuns(surface, `local-${testCase.id}`, label);
+          assert.ok(run, `${theme}: the ${label} label is drawn on the ${testCase.id} status row`);
+          assert.equal(run.fg?.mode, "palette", `${theme}: the ${label} label keeps an explicit foreground`);
+          assert.equal(run.fg?.value, canvasIndex,
+            `${theme}: the ${label} label stays on the ${theme} canvas foreground, not a status colour`);
+          assert.notEqual(run.bold, true, `${theme}: the ${label} label is not bold`);
+          assert.equal(run.bg, undefined, `${theme}: the ${label} label keeps the terminal-default background`);
+        }
+      }
+      const noneRuns = statusRuns(surface, "local-l2", "none");
+      assert.equal(noneRuns.length, 1, `${theme}: the plain none is one drawn run`);
+      assert.equal(noneRuns[0]?.fg?.value, canvasIndex, `${theme}: input none stays on the neutral canvas`);
+      assert.notEqual(noneRuns[0]?.bold, true, `${theme}: input none is not emphasized`);
+      // Only the VALUE words carry status colours, and the two facts on one row
+      // stay independently painted.
+      const running = statusRuns(surface, "local-l1", "running");
+      assert.equal(running.length, 1, `${theme}: one drawn running VALUE`);
+      assert.equal(running[0]?.fg?.value, paletteForegroundIndex(palette.statusRunning),
+        `${theme}: the running VALUE paints green`);
+      assert.equal(running[0]?.bold, true, `${theme}: the running VALUE keeps its bold`);
+      const pending = statusRuns(surface, "local-l1", "pending");
+      assert.equal(pending.length, 1, `${theme}: one drawn pending VALUE`);
+      assert.equal(pending[0]?.fg?.value, paletteForegroundIndex(palette.inputPending),
+        `${theme}: the pending VALUE paints amber`);
+      assert.equal(pending[0]?.bold, true, `${theme}: the pending VALUE keeps its bold salience`);
+      assert.notEqual(running[0]?.fg?.value, pending[0]?.fg?.value,
+        `${theme}: both facts stay distinguishable on the same status row`);
+      const idle = statusRuns(surface, "local-l2", "idle");
+      assert.equal(idle.length, 1, `${theme}: one drawn idle VALUE`);
+      assert.equal(idle[0]?.fg?.value, paletteForegroundIndex(palette.statusIdle),
+        `${theme}: the idle VALUE paints green`);
+      assert.notEqual(idle[0]?.bold, true, `${theme}: idle stays plain, so running and idle stay apart`);
+      const unknown = statusRuns(surface, "local-l3", "unknown").filter((run) => run.text.trim() === "unknown");
+      assert.equal(unknown.length, 2, `${theme}: the agent and input unknown VALUES are two drawn values`);
+      for (const run of unknown) {
+        assert.equal(run.fg?.value, paletteForegroundIndex(palette.statusUnknown),
+          `${theme}: an unknown VALUE stays muted`);
+        assert.notEqual(run.bold, true, `${theme}: an unknown VALUE is not emphasized`);
+      }
     } finally {
       surface.dispose();
     }

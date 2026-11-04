@@ -33,6 +33,8 @@ const ESC = "\x1b";
 const DELETE = "\x1b[3~";
 const SPACE = " ";
 const ACTIVE_MAIN_WHITE = "\x1b[1;97m";
+/** The Dark palette's sidebar navigation-target colour. */
+const SELECTED_BLUE = "\x1b[1;34m";
 const SAVED_ROWS = [
   { id: "conv-1", file: "/agents/a/sessions/proj/one.jsonl", caption: "First conversation" },
 ] as const;
@@ -1034,19 +1036,42 @@ test("Main's actual remote owner is structured and distinct from the left highli
   );
   show(harness); // sidebar focus while the remote card still owns Main
   const sidebarFocusLines = harness.controller.renderRoster(40, 30).lines;
-  assert.ok((sidebarFocusLines.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
-    "the actual remote owner keeps its bright title while sidebar navigation has focus");
+  assert.ok((sidebarFocusLines.find((line) => line.includes("Remote one")) ?? "").includes(SELECTED_BLUE),
+    "the navigation highlight is what the owner row shows while the highlight sits on it");
+  assert.ok(!(sidebarFocusLines.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "the owner colour does not double up with the highlight the operator is on");
   assert.ok(!(sidebarFocusLines.find((line) => line.includes("local-local-a")) ?? "").includes(ACTIVE_MAIN_WHITE),
     "sidebar focus still does not invent a local owner");
+
+  // The highlight moves to the local card: the actual remote owner immediately
+  // reclaims its own title colour, and the highlight claimed no ownership.
+  harness.controller.select("local-a");
+  const movedLines = harness.controller.renderRoster(40, 30).lines;
+  assert.ok((movedLines.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "the actual remote owner reclaims its bright title once the highlight moved away");
+  assert.ok((movedLines.find((line) => line.includes("local-local-a")) ?? "").includes(SELECTED_BLUE),
+    "the local navigation target takes the highlight colour");
+  assert.deepEqual(harness.controller.activeMainOwnerKey, owner,
+    "moving the highlight claimed no content ownership");
 
   harness.controller.setActiveMainOwner("local-a");
   assert.deepEqual(harness.controller.activeMainOwnerKey, { kind: "local", id: "local-a" });
   assert.equal(harness.controller.activeMainOwnerID, "local-a");
+  // The highlight still sits on the local owner card, so that row shows the
+  // navigation colour while the remote card keeps no mark at all.
   const rawLocal = harness.controller.renderRoster(40, 30).lines;
-  assert.ok((rawLocal.find((line) => line.includes("local-local-a")) ?? "").includes(ACTIVE_MAIN_WHITE),
-    "the local owner keeps its existing white highlight");
+  assert.ok((rawLocal.find((line) => line.includes("local-local-a")) ?? "").includes(SELECTED_BLUE),
+    "the local owner row shows the navigation highlight while the highlight sits on it");
   assert.ok(!(rawLocal.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
     "the remote card is no longer falsely marked");
+  // The highlight leaves the local owner, which reclaims its own white mark.
+  harness.send(DOWN);
+  const localOwnerLines = harness.controller.renderRoster(40, 30).lines;
+  assert.notEqual(harness.controller.selectedId, "local-a", "the highlight moved off the local owner");
+  assert.ok((localOwnerLines.find((line) => line.includes("local-local-a")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "the local owner keeps its existing white highlight once the highlight moved on");
+  assert.ok(!(localOwnerLines.find((line) => line.includes("Remote one")) ?? "").includes(ACTIVE_MAIN_WHITE),
+    "the remote card stays unmarked");
 
   harness.controller.setActiveMainOwnerKey(undefined);
   assert.equal(harness.controller.activeMainOwnerKey, undefined);

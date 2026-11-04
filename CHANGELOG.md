@@ -37,8 +37,9 @@ dates.
 - **Sidebar presentation** (#613) preserves the terminal's default background rather
   than forcing a black or white base fill, colors observed agent states and pending
   input independently, and keeps the active conversation's brighter title visible
-  while the separate keyboard-navigation highlight moves. Status text, state
-  classification, session ownership, and scrollbar behavior are unchanged.
+  while the separate keyboard-navigation highlight moves to another card. Status
+  text, state classification, session ownership, and scrollbar behavior are
+  unchanged.
 
 ## [0.1.0-dev.257]
 

@@ -15,6 +15,47 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.257]
+
+### Fixed
+
+- **Escape inside `/review-settings` no longer cancels a running review** (#419):
+  Pi dispatches extension terminal-input listeners BEFORE the focused component, so an
+  Escape pressed while a settings screen was in the foreground still reached the
+  automatic or command-driven review's abort listener underneath the menu. The review
+  could be cancelled instead of navigating the menu, and cancellation during checkpoint
+  comparison could surface `review gate: comparing window failed (aborted): git read-tree
+  was aborted; refusing snapshot fallback` as an extension error. The settings command's
+  own custom-component seam now publishes foreground Escape ownership for the life of
+  each settings screen — the retained menus and submenus, the reviewer/model choice
+  lists, the searchable tool picker, and the native settings text field — scoped to that
+  command invocation's native session and retired exactly when that slot closes. The
+  settings confirmation dialogs open on the host's dialog surface rather than through a
+  custom component, so the same command invocation also wraps its own host dialog seams
+  (confirm, select, input, editor) while a live settings surface exists: Escape routes to
+  the focused dialog component's own binding, preserving native Yes/No/cancel handling,
+  nothing is published when the host reports no focused component or offers no such seam,
+  and ownership releases when the dialog settles — so Escape at the browser-YOLO
+  enablement confirmation declines it rather than cancelling the review. The press now
+  performs only that screen's existing back/cancel/exit action, including the
+  root's session-only apply, and the review underneath keeps its captured candidate,
+  baseline, reviewer selection, and configuration, is not stopped, and still delivers its
+  real verdict; closing the menu never waits for it. Ownership is claimed only while the
+  host reports that screen as its focused component, so a pending-input popup opened
+  above an open settings menu keeps its own Escape and the settings menu owns Escape
+  again once the popup is dismissed; the shared ownership registry became a per-session
+  stack so dismissing an overlay uncovers the surface underneath instead of leaving the
+  session with no owner, with retirement still identity-exact and a covered or stale
+  surface never routed to. The same keypress stays consumed even when the screen
+  dismisses synchronously inside that dispatch, so a later-registered aborter cannot use
+  it, and the NEXT press with no settings screen in the foreground is ordinary explicit
+  cancellation with the existing positive process-settlement reporting. Nothing else
+  changes: no global cancellation disable, no sticky suppression, no review bypass,
+  manufactured verdict, or discarded candidate, no change to Save/Ctrl+S, the
+  root-Escape session-only apply, Cancel, the held-action repeat fences, popup
+  scrolling, or the plain/RPC selector fallback (which publishes no ownership), and the
+  genuine aborted-comparison diagnostic is neither widened nor hidden.
+
 ## [0.1.0-dev.256]
 
 ### Changed

@@ -226,7 +226,15 @@ order (minute, hour, day-of-month, month, day-of-week), stating machine-local
 time and `* * * * * = every minute`.
 
 Escape from a submenu returns to the settings root; nested Escape/**Back** navigation is
-unchanged. The root has three distinct exits:
+unchanged, and a running review is never part of it: while any settings screen holds the
+foreground — a menu, submenu, reviewer or model choice list, the searchable tool picker, a
+text field, or a settings confirmation dialog such as the one that gates enabling browser
+YOLO — Escape belongs to that screen alone, so the review underneath is not cancelled,
+its reviewers are not stopped, and its captured inputs and eventual verdict are unchanged.
+Declining such a confirmation changes nothing about the setting it guards.
+Closing the menu never waits for that review. With no settings screen in the foreground, a
+separate Escape press keeps its ordinary review-cancellation meaning
+(see [Cancellation](review-workflow.md#cancellation)). The root has three distinct exits:
 
 - **Escape** applies the edited choices to the running session in memory only, using
   the same validation and image handling as a save, and never writes the configuration

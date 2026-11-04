@@ -596,6 +596,17 @@ command-driven review underneath continues unchanged to its real verdict. After 
 popup closes, a separate Escape, even immediately afterward, cancels normally.
 Pending input without a foreground popup does not suppress cancellation.
 
+The same ownership applies to the `/review-settings` transaction: while a settings
+screen — a menu, a submenu, a reviewer/model choice list, the searchable tool picker, a
+settings text field, or a settings confirmation dialog such as the one that gates enabling
+browser YOLO — holds the foreground, Escape performs only that screen's existing back,
+cancel, or apply-for-session action. It does not abort the review underneath, stop
+its reviewer processes, discard its captured candidate or baseline, or change what that
+running review was asked to review, and it still delivers its real verdict. Closing the
+settings UI never waits for the review to finish, and a separate Escape after no settings
+screen has the foreground cancels normally. A popup opened above an open settings menu
+keeps its own Escape, and the settings menu owns it again once the popup closes.
+
 Canceling a running review with Escape cancels the whole parallel review, even if one
 reviewer has already completed. Escape is recognized in legacy terminals (raw ESC) and
 in Kitty-keyboard-protocol / CSI-u and xterm `modifyOtherKeys` terminals, where

@@ -59,6 +59,47 @@ test("inactive automatic review listeners neither route a popup nor abort", () =
   } finally { abort.cleanup(); retire(); }
 });
 
+test("a surface opened above another keeps its own Escape and uncovers the one beneath", () => {
+  const sessionManager = {};
+  const origin = { sessionManager };
+  const inputs: string[] = [];
+  // The settings menu publishes first; a popup overlay opens above it.
+  const retireSettings = publishForegroundEscape(origin, {
+    handleInput: () => { inputs.push("settings"); }, isForeground: () => true, isCurrent: () => true,
+  });
+  const retirePopup = publishForegroundEscape(origin, {
+    handleInput: () => { inputs.push("popup"); }, isForeground: () => true, isCurrent: () => true,
+  });
+  try {
+    assert.equal(routeForegroundEscape(origin, "\x1b"), true);
+    assert.equal(routeForegroundEscape({ sessionManager }, "\x1b[27u"), true);
+    assert.deepEqual(inputs, ["popup", "popup"], "the newest surface owns its presses");
+    // Dismissing the overlay restores the settings surface underneath rather
+    // than leaving the session with no owner.
+    retirePopup();
+    assert.equal(routeForegroundEscape(origin, "\x1b"), true);
+    assert.deepEqual(inputs, ["popup", "popup", "settings"]);
+    // A covered or invalidated owner is skipped, never revived: a stale
+    // settings owner beneath a live popup claims nothing.
+    const retireStale = publishForegroundEscape(origin, {
+      handleInput: () => { inputs.push("stale"); }, isForeground: () => false, isCurrent: () => true,
+    });
+    const retireLive = publishForegroundEscape(origin, {
+      handleInput: () => { inputs.push("live"); }, isForeground: () => true, isCurrent: () => true,
+    });
+    assert.equal(routeForegroundEscape(origin, "\x1b"), true);
+    assert.deepEqual(inputs.at(-1), "live");
+    // Identity-exact retirement: an older surface's cleanup cannot retire the
+    // surface that replaced it, and nothing outlives its own retire.
+    retireSettings();
+    assert.equal(routeForegroundEscape(origin, "\x1b"), true);
+    assert.deepEqual(inputs.at(-1), "live");
+    retireLive();
+    retireStale();
+    assert.equal(routeForegroundEscape(origin, "\x1b"), false, "no owner survives its own retirement");
+  } finally { retireSettings(); }
+});
+
 test("automatic abort signal stays untouched through synchronous popup done; next press aborts", () => {
   const listeners = new Set<(input: unknown) => { consume?: boolean } | undefined>();
   const ctx = { sessionManager: {}, ui: {

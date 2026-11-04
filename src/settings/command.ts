@@ -19,8 +19,9 @@ import {
 } from "../config";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { registerHook, sendNotice } from "../pi";
+import { publishForegroundEscape } from "../foreground-escape";
 import { abortActiveNativeEditorField } from "../native-editor-bridge";
-import { createMenuActionFence, retainedSelect, type SettingsSaveControl } from "./menu";
+import { createMenuActionFence, retainedSelect, type MenuCustomFactory, type SettingsSaveControl } from "./menu";
 import { captureExternalAgentReferenceBaseline, changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, persistReviewSettings, replaceConfig, type ReviewSettingsSelection } from "./persistence";
@@ -832,7 +833,234 @@ function extractUi(ctx: unknown): UiContext | undefined {
   // The session cwd anchors the workspace field's native path completion
   // against the host's own working directory, never process.cwd (issue #26).
   if (typeof ctx.cwd === "string") ui.cwd = ctx.cwd;
+  // Issue #419: this command's own custom seam is where Escape ownership lives.
+  // The host dialog seams (confirmation, plain selector, input, editor) join it
+  // through the same invocation-local surface, because a settings confirmation
+  // opens AFTER its preceding menu slot has already closed.
+  const surface: SettingsHostSurface = {};
+  publishSettingsCustomEscape(ctx, ui, surface);
+  publishSettingsHostDialogEscape(ctx, ui, surface);
   return ui;
+}
+
+/**
+ * The live host TUI this settings invocation has already been handed, shared by
+ * the custom-slot and host-dialog owners. It is captured from the public
+ * custom-component factory argument, so a host that never gave this command a
+ * TUI (an RPC/print host, or a plain-selector-only run) keeps today's input
+ * path with no ownership published at all.
+ */
+interface SettingsHostSurface {
+  tui?: unknown;
+}
+
+/**
+ * Issue #419: while a settings screen is the foreground UI, Escape belongs to
+ * that screen and to nothing else.
+ *
+ * Pi dispatches raw terminal-input listeners BEFORE the focused component, so
+ * an Escape pressed inside `/review-settings` still reached the automatic or
+ * command-driven review's abort listener underneath the menu and cancelled a
+ * review the user never asked to cancel. Every native settings surface opens
+ * through this command's own `ui.custom` seam — the retained menus, the
+ * search-capable deny picker, and the native text-field slot — so ownership is
+ * published there and nowhere else: unrelated host editors, host dialogs, and
+ * the plain/RPC selector fallback (which has no `custom`) keep their exact
+ * current input path.
+ *
+ * One publish exists per `custom()` call. It retires the moment that slot
+ * closes, so a separate, later Escape stays ordinary review cancellation — no
+ * sticky suppression and no global disabling. `routeForegroundEscape` captures
+ * the owner before invoking it, so a menu that dismisses synchronously inside
+ * the same dispatch still consumes that one packet while the next press is
+ * fresh.
+ *
+ * Ownership is claimed only on positive focus evidence: the host's public
+ * `getFocusedComponent()` must still name the component this seam produced.
+ * That is what keeps a popup overlay opened above an open settings menu in
+ * charge of its own Escape (the settings publish is not foreground while the
+ * overlay holds focus), and it means a host that cannot report focus, or a
+ * slot the host has already replaced, claims nothing at all.
+ */
+function publishSettingsCustomEscape(ctx: unknown, ui: UiContext, surface: SettingsHostSurface): void {
+  const custom = ui.custom;
+  if (typeof custom !== "function") return;
+  // Forwarded through the original method with the original receiver so a
+  // receiver-dependent host or forwarding wrapper keeps working unchanged.
+  const forward = custom as (factory: MenuCustomFactory, options?: unknown) => Promise<string | undefined>;
+  ui.custom = (factory: MenuCustomFactory, options?: unknown): Promise<string | undefined> => {
+    let tui: unknown;
+    let component: { handleInput?(data: string): void } | undefined;
+    let closed = false;
+    const release = publishForegroundEscape(ctx, {
+      handleInput: (data) => {
+        if (closed) return;
+        try {
+          // The screen keeps its own existing back/cancel/exit handling —
+          // including its held-action fence and Ctrl+S save latch.
+          component?.handleInput?.(data);
+        } finally {
+          // Pi renders after the focused component consumes input.
+          requestHostRender(tui);
+        }
+      },
+      isCurrent: () => !closed,
+      isForeground: () => !closed && component !== undefined && holdsHostFocus(tui, component),
+    });
+    const guarded: MenuCustomFactory = (hostTui, theme, keybindings, done) => {
+      tui = hostTui;
+      surface.tui = hostTui;
+      let settled = false;
+      const close = (result?: string): void => {
+        // The slot is over the instant done() runs: mark it before the host
+        // starts tearing it down, so no later listener can route a separate
+        // press here and a re-entrant done() cannot settle twice.
+        if (settled) return;
+        settled = true;
+        closed = true;
+        done(result);
+      };
+      const produced = factory(hostTui, theme, keybindings, close);
+      if (isThenable(produced)) {
+        // A host factory may resolve its component asynchronously; the host
+        // focuses whatever it resolves to, so ownership follows the same value.
+        void Promise.resolve(produced).then(
+          (value) => { component = asInputComponent(value); },
+          () => { /* a rejecting factory rejects custom(); the finally retires */ },
+        );
+      } else {
+        component = asInputComponent(produced);
+      }
+      return produced;
+    };
+    try {
+      return Promise
+        .resolve(forward.call(ui, guarded, options))
+        .finally(() => { closed = true; release(); });
+    } catch (error) {
+      // A host slot that fails synchronously never produced a promise to
+      // retire on: retire here so the publish cannot outlive the attempt.
+      closed = true;
+      release();
+      throw error;
+    }
+  };
+}
+
+function asInputComponent(value: unknown): { handleInput?(data: string): void } | undefined {
+  return isRecord(value) && typeof value.handleInput === "function"
+    ? value as { handleInput(data: string): void }
+    : undefined;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (isRecord(value) || typeof value === "function")
+    && typeof (value as { then?: unknown }).then === "function";
+}
+
+/**
+ * True only when the live host still reports the component this seam produced
+ * as its focused component. A missing or throwing focus seam is not evidence:
+ * such a host owns nothing here, which leaves today's input path in place
+ * rather than inventing ownership that cannot be observed.
+ */
+function holdsHostFocus(tui: unknown, component: unknown): boolean {
+  if (!isRecord(tui) || typeof tui.getFocusedComponent !== "function") return false;
+  try {
+    return tui.getFocusedComponent() === component;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Issue #419: the settings transaction's own host DIALOGS are foreground
+ * settings screens too — the YOLO-enable confirmation and the tool-protection
+ * auditor confirmations go through the public `ui.confirm` seam (and a
+ * degraded run can reach the plain `ui.select`/`ui.input`/`ui.editor` seams),
+ * which the host implements as an editor-slot dialog, not a `custom`
+ * component. Their preceding settings menu slot has already closed by then, so
+ * without this the Escape would reach a review aborter and cancel a review
+ * while the confirmation stayed open.
+ *
+ * Ownership is published only with the same positive evidence the custom slot
+ * requires: this invocation must already hold the live host TUI (the public
+ * custom-component factory argument), the host must report a focus transition
+ * to a NEW component when the dialog opens, and that component must still hold
+ * focus when the press arrives. The routed press goes to that component's own
+ * `handleInput`, so the confirmation keeps its exact existing Yes/No/cancel
+ * semantics — a declined or cancelled confirmation still leaves YOLO Off — and
+ * the publish retires as soon as the dialog settles. A host without a reported
+ * TUI (RPC/print, or a run that never opened a settings custom screen) keeps
+ * today's behavior with nothing published.
+ */
+function publishSettingsHostDialogEscape(ctx: unknown, ui: UiContext, surface: SettingsHostSurface): void {
+  // Only seams the host really offers are wrapped: settings code branches on
+  // the ABSENCE of some of them (YOLO requires a confirmation dialog and fails
+  // closed without one), so a synthetic member would change that behavior.
+  const target = ui as unknown as Record<string, unknown>;
+  for (const member of ["confirm", "select", "input", "editor"] as const) {
+    if (typeof target[member] !== "function") continue;
+    target[member] = settingsHostDialogOwner(ctx, ui, surface, member);
+  }
+}
+
+function settingsHostDialogOwner(
+  ctx: unknown,
+  ui: UiContext,
+  surface: SettingsHostSurface,
+  member: "confirm" | "select" | "input" | "editor",
+): (...args: unknown[]) => unknown {
+  const original = (ui as unknown as Record<string, unknown>)[member];
+  return (...args: unknown[]): unknown => {
+    const call = original as (...rest: unknown[]) => unknown;
+    if (typeof call !== "function") return undefined;
+    const tui = surface.tui;
+    if (!isRecord(tui) || typeof tui.getFocusedComponent !== "function") {
+      // No observable host focus for this run: the documented cancellation
+      // path stays exactly as it was.
+      return call.apply(ui, args);
+    }
+    let before: unknown;
+    try {
+      before = tui.getFocusedComponent();
+    } catch {
+      before = undefined;
+    }
+    const pending = call.apply(ui, args);
+    // showExtensionConfirm/showExtensionSelector push and focus their dialog
+    // synchronously inside this call; a host that does not is not claimed.
+    let after: unknown;
+    try {
+      after = tui.getFocusedComponent();
+    } catch {
+      after = undefined;
+    }
+    if (after === undefined || after === null || after === before) return pending;
+    let closed = false;
+    const release = publishForegroundEscape(ctx, {
+      handleInput: (data) => {
+        if (closed) return;
+        try {
+          asInputComponent(after)?.handleInput?.(data);
+        } finally {
+          requestHostRender(tui);
+        }
+      },
+      isCurrent: () => !closed,
+      isForeground: () => !closed && holdsHostFocus(tui, after),
+    });
+    return Promise.resolve(pending).finally(() => { closed = true; release(); });
+  };
+}
+
+function requestHostRender(tui: unknown): void {
+  if (!isRecord(tui) || typeof tui.requestRender !== "function") return;
+  try {
+    tui.requestRender();
+  } catch {
+    // A stale host handle owns no frame; the input already landed.
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

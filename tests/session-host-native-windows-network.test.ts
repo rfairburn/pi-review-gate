@@ -12,7 +12,11 @@
  * deliberate restart with the same key and explicit Off values, and explicit
  * Hosting and Connect admission. The only listener and connection are
  * invocation-owned loopback ones on 127.0.0.1. No provider, clipboard, native
- * child session, or live profile is used. Nothing outside the fresh harness
+ * child session, or live profile is used. Every Network visit closes the way the
+ * product routes it — back THROUGH the written Settings submenu to a written
+ * sidebar-focused roster frame, the two Escape transitions #613 introduced —
+ * before the same run walks the roster again, so the caller's focus bookkeeping
+ * always matches what the host actually drew. Nothing outside the fresh harness
  * root is inspected or modified, and every owned process is settled before that
  * exact root is removed.
  *
@@ -38,6 +42,8 @@ import { createPeerStatePermissionPolicy } from "../src/session-host/network/pee
 import { inspectPeerStateAcl, verifyPrivateAclEvidence } from "../src/session-host/network/peer-state-windows-permissions";
 import { createSessionHostStateDirectory } from "../src/session-host/roster-store";
 
+import { closeNetworkThroughSettings } from "./helpers/session-host-network-settings-return";
+import { isSidebarFocusedFrame } from "./helpers/session-host-native-roster-witness";
 import {
   WINDOWS_KEYS,
   WINDOWS_REQUIRE_ENV,
@@ -184,6 +190,19 @@ async function openNetwork(driver: WindowsMainPtyDriver, ready: (pane: string) =
   await driver.sendKeys(WINDOWS_KEYS.enter, description, (frame) => ready(paneText(frame)));
 }
 
+/**
+ * Closes the Network pane through the two Escape transitions #613 routed, then
+ * requires the same complete sidebar-focus footer witness the driver itself
+ * asserts before any roster navigation. One Escape alone leaves the Settings
+ * submenu on screen with Network still carried, so the next "move to Settings"
+ * would be a no-op and its Enter would re-open the pane.
+ */
+async function closeNetwork(driver: WindowsMainPtyDriver, label: string): Promise<void> {
+  await closeNetworkThroughSettings(driver, label);
+  assert.ok(isSidebarFocusedFrame(driver.currentText(), 32),
+    `${label}: the written roster proves public sidebar focus before the roster is walked again`);
+}
+
 async function highlightPaneRow(driver: WindowsMainPtyDriver, text: string): Promise<void> {
   for (let step = 0; step < 24; step += 1) {
     if (highlighted(driver.currentText()).includes(text)) return;
@@ -291,8 +310,7 @@ test("real public Main shows Windows Network storage refusal, repairs only after
   assert.deepEqual(readFileSync(join(stateDir, "peers", "state.json")), stateBytes, "the key document is byte-identical");
   assert.deepEqual(readFileSync(join(stateDir, "peer-preferences", "preferences.json")), preferenceBytes);
 
-  await first.driver.sendKeys(WINDOWS_KEYS.escape, "Escape leaves the Network pane for the sidebar",
-    (frame) => !paneText(frame).includes("Permissions were repaired"));
+  await closeNetwork(first.driver, "first run after the written repair");
   await first.quit();
 
   // ---- Deliberate restart: same key, explicit Off, then explicit Hosting/Connect.
@@ -316,8 +334,7 @@ test("real public Main shows Windows Network storage refusal, repairs only after
     (frame) => paneText(frame).includes("approval window"), 60_000);
   await second.driver.sendKeys("x", "Disconnect ends the explicit attempt and both pending approvals",
     (frame) => !paneText(frame).includes("approval window") && !paneText(frame).includes("connecting"), 60_000);
-  await second.driver.sendKeys(WINDOWS_KEYS.escape, "Escape leaves the Network pane for the sidebar",
-    (frame) => !paneText(frame).includes("listener: listening"));
+  await closeNetwork(second.driver, "restarted run after the explicit attempt");
   await second.quit();
   assert.equal(readFileSync(join(stateDir, "peers", "state.json")).length > 0, true);
   completed = true;
@@ -412,8 +429,7 @@ async function observeDefaultsAcrossRestart(harness: DefaultsHarness, nativeAgen
       await openNetwork(run.driver, showsUnchangedDefaults, `${step}: Network shows the unchanged defaults`);
       assertUnchangedDefaults(paneText(run.driver.currentText()), step);
       assertNoNetworkState(stateDir, step);
-      await run.driver.sendKeys(WINDOWS_KEYS.escape, `${step}: Escape leaves the Network pane for the sidebar`,
-        (frame) => !paneText(frame).includes("Listen port:"));
+      await closeNetwork(run.driver, step);
       assertNoNetworkState(stateDir, `${step} after leaving`);
     }
     await run.quit();

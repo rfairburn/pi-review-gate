@@ -48,6 +48,22 @@ dates.
   state classification, navigation precedence, and layout are unchanged. The
   copied values are MIT-attributed in NOTICE and
   LICENSES/MIT-pi-theme-colors.txt.
+- **Sidebar activity counts and remote host names** (#613): each independent
+  number on a card's background row (`bg tasks`, `shells`) is banded by how much
+  work that session intends — 0 in Pi's muted grey, 1-2 in Pi's success green
+  (bold), 3-6 in Pi's warning colour (bold), 7 or more in Pi's error red (bold),
+  uncapped — so a busy card reads hotter. That red is activity intensity only:
+  it never reclassifies the row's status, notice, or lifecycle, and a busy card
+  never reads as failed. The `bg tasks` and `shells` labels, the spaces and the
+  `|` separator, and any `unknown` value stay in the pane's normal text colour,
+  and the row's wording, counts, and honest unknown handling are unchanged on
+  local and remote cards alike. Only the friendly hostname on a remote card's
+  indented owner line takes Pi's own cyan variable colour, unbolded as before;
+  the indentation, the `host` word, and `[stale]` stay ordinary text, and the
+  clipping that keeps `[stale]` ahead of a long name is unchanged. Both colours
+  are Pi 1.5.0 authored foregrounds (now eleven copied tokens) through the same
+  pinned conversion: the generated colour set stays closed, and no colour
+  detection, setting, action, or routing changed.
 - **Sidebar presentation** (#613) preserves the terminal's default background rather
   than forcing a black or white base fill, colors observed agent states and pending
   input independently, and keeps the active conversation's own title colour visible

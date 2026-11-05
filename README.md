@@ -59,7 +59,9 @@ receipts of exactly what the model was told.
   Sidebar Settings groups themes, Network, and Host shortcuts; application-owned
   themes use Pi's own built-in Dark/Light foreground colours and apply live,
   independently of the sessions' own themes, over the terminal's default
-  background. Status colors distinguish agent state and pending input, and the
+  background. Status colors distinguish agent state and pending input, background
+  activity counts read hotter as a session's intended work grows (activity only, never an
+  error state), a remote card's owner hostname uses Pi's cyan, and the
   active conversation remains marked while browsing the sidebar
   ([Session host](docs/session-host-alpha.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only

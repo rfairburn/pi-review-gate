@@ -99,6 +99,15 @@ export type SidebarThemeRole =
   | "error"
   /** The current value of a host-owned setting (the chosen appearance). */
   | "accent"
+  /**
+   * The friendly OWNER HOSTNAME on a projected remote card's indented host row.
+   * A separate role because only the actual sanitized name is painted: the
+   * leading `host ` word, the row indentation, and the optional `[stale] `
+   * observation stay ordinary pane text, and the hostname keeps its existing
+   * unbolded weight. It is a NAME colour and nothing else — it never carries
+   * reachability, staleness, ownership, or an action.
+   */
+  | "remoteHost"
   /** The scrollbar track glyph an overflowing roster draws in its last column. */
   | "scrollbarTrack"
   /**
@@ -206,6 +215,10 @@ const SHARED_ROLE_COLOURS: Readonly<Record<SidebarThemeRole, SidebarRoleColour>>
   notice: { token: "warning", bold: false },
   error: { token: "error", bold: true },
   accent: { token: "accent", bold: false },
+  // The remote owner's name borrows Pi's own cyan variable colour, at the same
+  // unbolded weight it always had: the distinction is hue only, so a theme
+  // change never turns a host name into emphasis or into a status.
+  remoteHost: { token: "syntaxVariable", bold: false },
   scrollbarTrack: { token: "scrollbarTrack", bold: false },
   scrollbarThumb: { token: "scrollbarThumb", bold: false },
 });

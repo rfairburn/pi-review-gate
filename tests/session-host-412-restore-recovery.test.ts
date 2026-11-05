@@ -34,9 +34,10 @@ const EXECUTOR_SCENARIO = join(process.cwd(), "tests", "fixtures", "session-host
 const SESSION_ID = "synthetic-412-session";
 
 /**
- * The sidebar palette paints only a status VALUE word, so the status WORDS are
- * asserted on the row with the renderer's generated SGR removed. The plaintext
- * itself is unchanged by the colouring.
+ * The sidebar palette paints only VALUE words (agent/input status and the
+ * numeric activity counts), so those WORDS are asserted on the row with the
+ * renderer's generated SGR removed. The plaintext itself is unchanged by the
+ * colouring.
  */
 const GENERATED_SGR = /\x1b\[[0-9;]*m/g;
 function plainRow(rendered: string): string {
@@ -168,7 +169,7 @@ function assertFirstLoaded(
   assert.equal(view.nativeSessionId, SESSION_ID, `${what}: manager loaded the conversation`);
   assert.equal(view.activeTasks, expected.activeTasks, `${what}: manager row keeps the actual activity`);
   assert.equal(view.pendingInput, false, `${what}: manager row has no pending input`);
-  assert.match(summary.rendered, new RegExp(`bg tasks ${expected.activeTasks ?? "unknown"} \\| shells 0`, "u"),
+  assert.match(plainRow(summary.rendered), new RegExp(`bg tasks ${expected.activeTasks ?? "unknown"} \\| shells 0`, "u"),
     `${what}: rendered row shows the actual activity counts\n${summary.rendered}`);
   assert.match(plainRow(summary.rendered), expected.activeTasks === 0 ? /agent idle/u : /agent running/u,
     `${what}: rendered row shows the actual agent state\n${summary.rendered}`);
@@ -314,21 +315,21 @@ test("real prompt, shell, task and review work publish actual nonzero then settl
     const running = step(`shell-${cycle}-running`);
     assert.equal(running.view?.activeShells, 1, `shell ${cycle} publishes running intent`);
     assert.equal(running.view?.backgroundShells, 1, `shell ${cycle} is independently owned until its actual exit`);
-    assert.match(running.rendered, /bg tasks 0 \| shells 1/u, `rendered row shows running shells ${cycle}\n${running.rendered}`);
+    assert.match(plainRow(running.rendered), /bg tasks 0 \| shells 1/u, `rendered row shows running shells ${cycle}\n${running.rendered}`);
     assert.match(plainRow(running.rendered), /agent running/u);
     const settled = step(`shell-${cycle}-settled`);
     assert.equal(settled.view?.activeShells, 0);
     assert.equal(settled.view?.backgroundShells, 0);
-    assert.match(settled.rendered, /bg tasks 0 \| shells 0/u);
+    assert.match(plainRow(settled.rendered), /bg tasks 0 \| shells 0/u);
   }
 
   const reviewRunning = step("review-running");
   assert.equal(reviewRunning.view?.activeTasks, 1, "the real automatic review publishes activity");
   assert.equal(reviewRunning.view?.busy, false, "a background review does not make the agent itself busy");
-  assert.match(reviewRunning.rendered, /bg tasks 1 \| shells 0/u, `rendered row shows the running review\n${reviewRunning.rendered}`);
+  assert.match(plainRow(reviewRunning.rendered), /bg tasks 1 \| shells 0/u, `rendered row shows the running review\n${reviewRunning.rendered}`);
   const reviewSettled = step("review-settled");
   assert.equal(reviewSettled.view?.activeTasks, 0, "the review verdict settles the count back to zero");
-  assert.match(reviewSettled.rendered, /bg tasks 0 \| shells 0/u);
+  assert.match(plainRow(reviewSettled.rendered), /bg tasks 0 \| shells 0/u);
   assert.deepEqual(reviewSettled.view?.activity, ["Ready"]);
   assert.match((result.notices as string[]).join("\n"), /review gate: passed/u, "the real reviewer's verdict settled the review");
 });
@@ -437,7 +438,7 @@ test("fresh owning-source payloads recover poisoned telemetry and render the rea
     assert.ok(found.activityRequests > 0, `${label}: the host automatically requested a fresh census`);
     assert.ok(found.refreshCalls > 0, `${label}: the owning source's canonical refresher was invoked`);
     assert.ok(found.requestResults.includes("complete"), `${label}: complete correlated payloads delivered`);
-    assert.match(found.rendered, new RegExp(`bg tasks ${expected.activeTasks} \\| shells ${expected.activeShells}`, "u"),
+    assert.match(plainRow(found.rendered), new RegExp(`bg tasks ${expected.activeTasks} \\| shells ${expected.activeShells}`, "u"),
       `${label}: rendered row shows the fresh actual counts\n${found.rendered}`);
   };
 
@@ -476,5 +477,5 @@ test("a genuinely unreadable live source stays unknown in the correlated request
   assert.equal(payload.activeTasks, null, "unreadable canonical evidence stays unknown");
   assert.notEqual(payload.activeTasks, 0, "unreadable evidence is never certified as zero");
   assert.ok((result.refreshCalls as number) > 0, "the request invoked the owning source");
-  assert.match(result.renderedUnknown as string, /bg tasks unknown/u, "the rendered row shows truthful unknown at that exact reply");
+  assert.match(plainRow(result.renderedUnknown as string), /bg tasks unknown/u, "the rendered row shows truthful unknown at that exact reply");
 });

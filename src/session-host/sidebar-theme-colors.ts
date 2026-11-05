@@ -58,6 +58,13 @@ export type PiSidebarColorToken =
   | "warning"
   /** Pi's Markdown link colour. */
   | "mdLink"
+  /**
+   * Pi's own syntax-highlighting colour for a variable reference — the cyan
+   * family Pi uses when it names a value in code. The sidebar borrows it for
+   * one thing only: the friendly hostname in a projected remote card's owner
+   * row (#613 follow-up).
+   */
+  | "syntaxVariable"
   /** Pi's own scrollbar track colour. */
   | "scrollbarTrack"
   /** Pi's own scrollbar thumb colour. */
@@ -73,6 +80,7 @@ export const PI_SIDEBAR_COLOR_TOKENS: readonly PiSidebarColorToken[] = Object.fr
   "error",
   "warning",
   "mdLink",
+  "syntaxVariable",
   "scrollbarTrack",
   "scrollbarThumb",
 ]);
@@ -96,6 +104,7 @@ export const PI_BUILTIN_FOREGROUND_COLORS: Readonly<
     error: "okhsl(20 72% 67%)",
     warning: "okhsl(83 88% 67%)",
     mdLink: "okhsl(232 54% 67%)",
+    syntaxVariable: "okhsl(202 58% 67%)",
     scrollbarTrack: "okhsl(237 7% 33%)",
     scrollbarThumb: "okhsl(232 7% 65%)",
   }),
@@ -109,6 +118,7 @@ export const PI_BUILTIN_FOREGROUND_COLORS: Readonly<
     error: "okhsl(20 91% 47%)",
     warning: "okhsl(83 99% 47%)",
     mdLink: "okhsl(231 68% 47%)",
+    syntaxVariable: "okhsl(203 73% 46%)",
     scrollbarTrack: "okhsl(248 3% 90%)",
     scrollbarThumb: "okhsl(226 7% 65%)",
   }),

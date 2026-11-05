@@ -99,6 +99,7 @@ const GOLDEN_PALETTE: Readonly<Record<SidebarThemeId, Readonly<Record<keyof Side
     notice: "38;2;205;154;34",
     error: "1;38;2;234;127;129",
     accent: "38;2;167;152;215",
+    remoteHost: "38;2;93;179;186",
     scrollbarTrack: "38;2;72;78;82",
     scrollbarThumb: "38;2;151;160;165",
   },
@@ -121,6 +122,7 @@ const GOLDEN_PALETTE: Readonly<Record<SidebarThemeId, Readonly<Record<keyof Side
     notice: "38;2;143;104;2",
     error: "1;38;2;200;37;61",
     accent: "38;2;116;89;180",
+    remoteHost: "38;2;40;122;129",
     scrollbarTrack: "38;2;225;227;228",
     scrollbarThumb: "38;2;150;160;164",
   },
@@ -217,6 +219,30 @@ test("idle, the ordinary agent word, and a running agent stay three different co
     assert.notDeepEqual(rgbOf(palette.title), rgbOf(palette.activeMain), `${theme}: ordinary title and owner differ`);
     assert.notDeepEqual(rgbOf(palette.statusUnknown), rgbOf(palette.statusIdle), `${theme}: unknown is not idle`);
     assert.notDeepEqual(rgbOf(palette.scrollbarTrack), rgbOf(palette.scrollbarThumb), `${theme}: track and thumb differ`);
+    // The remote owner's hostname is Pi's cyan variable colour: distinct from
+    // every other foreground on the card, and never an emphasis the row can
+    // mistake for a status. Hue only — the same unbolded weight as before.
+    assert.equal(/^1;/.test(palette.remoteHost), false, `${theme}: the host name stays unbolded`);
+    for (const other of ["canvas", "secondary", "title", "selected", "activeMain", "statusStarting",
+      "statusRunning", "statusWaiting", "statusIdle", "statusUnknown", "statusError", "accent"] as const) {
+      assert.notDeepEqual(rgbOf(palette.remoteHost), rgbOf(palette[other]),
+        `${theme}: the host name reads differently from ${other}`);
+    }
+  }
+});
+
+test("the copied token set is exactly the eleven Pi colours the sidebar borrows", () => {
+  // A twelfth copied token, or a rename away from a real Pi colour key, has to
+  // show up here as well as in the real-Pi parity tier below.
+  assert.deepEqual([...PI_SIDEBAR_COLOR_TOKENS], [
+    "text", "muted", "dim", "accent", "success", "error", "warning", "mdLink",
+    "syntaxVariable", "scrollbarTrack", "scrollbarThumb",
+  ]);
+  assert.equal(PI_SIDEBAR_COLOR_TOKENS.length, 11);
+  for (const theme of SIDEBAR_THEME_IDS) {
+    assert.deepEqual(Object.keys(PI_BUILTIN_FOREGROUND_COLORS[theme]).sort(),
+      [...PI_SIDEBAR_COLOR_TOKENS].sort(),
+      `${theme}: every copied token has a value in both built-in themes`);
   }
 });
 
@@ -264,6 +290,7 @@ const EXPECTED_ROLE_STYLES: Readonly<Record<SidebarThemeId, Readonly<Record<Side
     notice: { token: "warning", bold: false },
     error: { token: "error", bold: true },
     accent: { token: "accent", bold: false },
+    remoteHost: { token: "syntaxVariable", bold: false },
     scrollbarTrack: { token: "scrollbarTrack", bold: false },
     scrollbarThumb: { token: "scrollbarThumb", bold: false },
   },
@@ -285,6 +312,7 @@ const EXPECTED_ROLE_STYLES: Readonly<Record<SidebarThemeId, Readonly<Record<Side
     notice: { token: "warning", bold: false },
     error: { token: "error", bold: true },
     accent: { token: "accent", bold: false },
+    remoteHost: { token: "syntaxVariable", bold: false },
     scrollbarTrack: { token: "scrollbarTrack", bold: false },
     scrollbarThumb: { token: "scrollbarThumb", bold: false },
   },

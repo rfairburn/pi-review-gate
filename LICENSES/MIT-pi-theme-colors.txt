@@ -29,10 +29,11 @@ src/session-host/sidebar-theme-colors.ts (used by
 src/session-host/sidebar-theme.ts for the session-host sidebar palettes):
 
 - v1.5.0 dark.json (the `text`, `muted`, `dim`, `accent`, `success`, `error`,
-  `warning`, `mdLink`, `scrollbarTrack`, and `scrollbarThumb` foreground values,
-  each recorded here as the value its shared `vars` entry resolves to):
+  `warning`, `mdLink`, `syntaxVariable`, `scrollbarTrack`, and `scrollbarThumb`
+  foreground values, each recorded here as the value its shared `vars` entry
+  resolves to):
   https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/dark.json
-- v1.5.0 light.json (the same ten foreground values for the built-in light
+- v1.5.0 light.json (the same eleven foreground values for the built-in light
   appearance):
   https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/light.json
 

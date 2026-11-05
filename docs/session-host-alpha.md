@@ -250,7 +250,16 @@ positively idle agent and for an empty `none` input value, Pi's warning colour
 (bold) for waiting and pending input, Pi's dim colour for an unknown or exited
 agent, and Pi's error colour (bold) for a failed state. The `agent` and `input`
 label words and the `|` separator stay in the pane's normal text colour, so the
-colour always carries the state word rather than replacing it. The sidebar's own
+colour always carries the state word rather than replacing it. Each number on a
+card's background row is coloured on its own: 0 in Pi's muted grey, 1-2 in Pi's
+success green (bold), 3-6 in Pi's warning colour (bold), and 7 or more in Pi's
+error red (bold), uncapped, so a session with more intended work reads hotter.
+That red is activity intensity only — it never reclassifies the row's status,
+notice, or lifecycle, and a busy card never reads as a failed one. The `bg tasks`
+and `shells` label words, the spaces, and the `|` separator stay in the pane's
+normal text colour, and an `unknown` count stays ordinary text: only an observed
+number is painted, and the row's wording and honest unknown handling are
+unchanged. The sidebar's own
 title, the navigation highlight, the active conversation's title, and the
 scrollbar roles likewise take Pi's accent, link, body-text, track, and thumb
 colours for the chosen appearance.
@@ -1013,7 +1022,10 @@ activity lines under the existing activity-only collapse. It adds exactly one ow
 destination's bounded local display name, never an identity claim — and it shows no
 workspace path. That one line is clipped with the card's usual ellipsis when the label is
 unusually long, rather than wrapping or widening the card, and the honest stale marker
-leads it so a long label cannot hide the observation. The leading selection marker is
+leads it so a long label cannot hide the observation. Only the host's friendly name is
+painted, in Pi's own cyan variable colour and at the same unbolded weight as before; the
+indentation, the `host` word, and the `[stale]` marker stay in the pane's normal text
+colour. The leading selection marker is
 omitted in this example:
 
 ```
@@ -1753,7 +1765,11 @@ Pi's muted grey for a positively idle one and for an empty `none` input value, P
 warning colour and bold for waiting and pending input, Pi's dim colour for unknown or
 exited), and the `agent`/`input` label words and the separator stay in the pane's normal
 text colour. The words and the observed/unknown classification remain unchanged; color
-never substitutes for status text.
+never substitutes for status text. The two background activity numbers are coloured
+independently by how much work each reports (0 muted, 1-2 success, 3-6 warning, 7 or
+more error red, uncapped), while their labels, the separator, and any `unknown` value stay
+ordinary text; the error-family red is activity intensity only and never means the session
+failed.
 
 The actual active Main conversation keeps its own title colour while its card is visible,
 even when keyboard focus moves to the sidebar and Up/Down moves the navigation

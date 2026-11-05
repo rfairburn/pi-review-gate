@@ -2594,14 +2594,67 @@ function cardStatusText(item: SessionStatusFacts): string {
   return cardStatusSegments(item).map((segment) => `${segment.label}${segment.value}`).join(" | ");
 }
 
-/** Honest ACTIVITY-INTENT counts: a missing/invalid count is "unknown", never 0. */
-function cardBackgroundText(item: SessionStatusFacts): string {
+/**
+ * One independently paintable part of the honest ACTIVITY-INTENT count row.
+ * Same shape and same contract as `CardStatusSegment`: `label` is the neutral
+ * wording the palette never paints (`bg tasks ` / `shells `), `value` is the
+ * count a role MAY paint, and `role` chooses that foreground (`null` keeps the
+ * value on the neutral canvas too). Joined with `" | "`, `label + value` is the
+ * exact existing background plaintext, so this stays the single source of truth
+ * for both the painted card row and the plain Network activity summary.
+ */
+interface CardBackgroundSegment {
+  readonly label: string;
+  readonly value: string;
+  readonly role: SidebarThemeRole | null;
+}
+
+/**
+ * The emphasis band one OBSERVED activity-intent count is drawn with. These are
+ * RPM-style ACTIVITY bands on a card that already says what it is doing: more
+ * concurrent work reads hotter, up to and past the busiest bands, and the number
+ * is never capped or rounded. The bands REUSE the status roles the palette
+ * already owns (idle muted, running success, waiting warning) and the red of
+ * `7+` is activity intensity ONLY — it is not an error, it never reclassifies
+ * the row's status, notice, lifecycle, or routing, and it never makes a busy
+ * card read as failed.
+ */
+function countEmphasisRole(count: number): SidebarThemeRole {
+  if (count <= 0) return "statusIdle";
+  if (count <= 2) return "statusRunning";
+  if (count <= 6) return "statusWaiting";
+  return "statusError";
+}
+
+/**
+ * The count row's exact text and semantic roles, classified once for every
+ * renderer. A missing/invalid count stays `unknown` in its existing exact
+ * plaintext and stays ordinary pane text: only an OBSERVED NUMBER is painted,
+ * and each of the two counts is banded independently.
+ */
+function cardBackgroundSegments(item: SessionStatusFacts): CardBackgroundSegment[] {
   const tasks = sanitizeCount(item.activeTasks);
   const shells = sanitizeCount(item.activeShells);
   if (tasks === null && shells === null) {
-    return "background unknown";
+    return [{ label: "", value: "background unknown", role: null }];
   }
-  return `bg tasks ${tasks ?? "unknown"} | shells ${shells ?? "unknown"}`;
+  return [
+    tasks === null
+      ? { label: "bg tasks ", value: "unknown", role: null }
+      : { label: "bg tasks ", value: String(tasks), role: countEmphasisRole(tasks) },
+    shells === null
+      ? { label: "shells ", value: "unknown", role: null }
+      : { label: "shells ", value: String(shells), role: countEmphasisRole(shells) },
+  ];
+}
+
+/**
+ * The ANSI-FREE background row text — the single source of truth for the plain
+ * rows this host draws outside its palette, such as the Network activity
+ * summary. It carries no escape sequence of any kind.
+ */
+function cardBackgroundText(item: SessionStatusFacts): string {
+  return cardBackgroundSegments(item).map((segment) => `${segment.label}${segment.value}`).join(" | ");
 }
 
 /** Accepts only nonnegative safe integers; everything else is unknown. */
@@ -9029,6 +9082,21 @@ export class SidebarController {
   }
 
   /**
+   * The same honest count facts as `cardBackgroundText`, with ONLY the numeric
+   * VALUE painted. The `bg tasks ` / `shells ` labels and the ` | ` separator
+   * carry no generated sequence of their own, and an `unknown` value stays on
+   * the neutral canvas exactly as it was before this styling existed. Stripping
+   * the finite palette sequences reproduces `cardBackgroundText` byte for byte.
+   */
+  private cardBackgroundRuns(item: SessionStatusFacts): string {
+    return cardBackgroundSegments(item)
+      .map((segment) => segment.role === null
+        ? `${segment.label}${segment.value}`
+        : `${segment.label}${this.paint(segment.role)}${segment.value}\x1b[0m`)
+      .join(" | ");
+  }
+
+  /**
    * One painted scrollbar cell: a single terminal column carrying exactly one
    * generated role sequence between explicit resets, so it composes with the
    * row it is appended to and never leaks a style past its own cell.
@@ -12431,7 +12499,7 @@ export class SidebarController {
       const lines = [
         wrapRow(cardTitle(item), cols, titleSgr),
         wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(item)}`, cols),
-        wrapRow(`  ${cardBackgroundText(item)}`, cols),
+        wrapRow(`  ${this.cardBackgroundRuns(item)}`, cols),
       ];
       if (!this.collapsedItemIds.has(item.id)) {
         const activity = renderActivityLines(item.activity, cols);
@@ -12521,13 +12589,17 @@ export class SidebarController {
     }
     const hostLabel = sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS);
     // Staleness leads the variable-length owner label so clipping can never
-    // hide the honest observation behind a long friendly name.
+    // hide the honest observation behind a long friendly name. Only the actual
+    // sanitized hostname takes the palette's remote-host foreground; the
+    // indentation, the `host ` word, and `[stale] ` stay ordinary pane text.
     const stale = remote.rosterState === "stale" ? "[stale] " : "";
+    // The explicit reset closes the name's own run before the row's padding.
+    const paintedHostLabel = `${this.paint("remoteHost")}${hostLabel}\x1b[0m`;
     const lines = [
       wrapRow(cardTitle(remote.row), cols, titleSgr),
-      wrapRow(`  host ${stale}${hostLabel}`, cols),
+      wrapRow(`  host ${stale}${paintedHostLabel}`, cols),
       wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(facts)}`, cols),
-      wrapRow(`  ${cardBackgroundText(facts)}`, cols),
+      wrapRow(`  ${this.cardBackgroundRuns(facts)}`, cols),
     ];
     if (!this.collapsedRemoteEntryKeys.has(entry.key)) {
       const activity = renderActivityLines(remote.row.activity, cols);

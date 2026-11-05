@@ -1008,13 +1008,10 @@ export const SIDEBAR_GENERATED_SGR_ALLOWLIST: ReadonlySet<string> = new Set([
   "7",
   "27",
   "1;7",
-  // Focus-domain title highlights: blue for the sidebar-selected navigation
-  // target, white for the actual active Main conversation (native focus).
-  "1;34",
-  "1;97",
   // Every SGR parameter the application-owned appearance palettes can emit
-  // (#613). The set stays finite: palettes carry parameter codes only, never
-  // truecolor or 256-color parameters.
+  // (#613): Pi's own built-in Dark/Light foregrounds, converted once at module
+  // load. The set stays finite and closed — only the specific generated RGB
+  // parameter strings are allowed, never an arbitrary RGB triple.
   ...SIDEBAR_THEME_SGR_CODES,
 ]);
 

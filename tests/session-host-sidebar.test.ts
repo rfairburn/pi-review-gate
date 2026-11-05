@@ -2894,17 +2894,20 @@ test("card title line carries only the sanitized canonical title", () => {
   // Header, then the selected native card: the title row is the title alone —
   // no marker, prefix, or status badge — styled only by generated SGR.
   assert.equal(texts[1]?.trimEnd(), "Canonical title");
-  // Sidebar focus: the selected navigation target's title is blue (the focus-
-  // domain highlight), not the old inverse mark. The row opens with the chosen
-  // appearance's foreground on the TERMINAL-DEFAULT background (#613), matching
-  // Pi's own canvas-free chat viewport, then the role sequence itself.
-  const ground = `\x1b[0m\x1b[${sidebarPaletteFor("dark").canvas}m`;
-  assert.ok(lines[1]?.startsWith(`${ground}\x1b[1;34mCanonical title`), JSON.stringify(lines[1]));
+  // Sidebar focus: the selected navigation target's title carries the active
+  // appearance's navigation colour, not the old inverse mark. The row opens with
+  // the chosen appearance's foreground on the TERMINAL-DEFAULT background (#613),
+  // matching Pi's own canvas-free chat viewport, then the role sequence itself —
+  // Pi's own converted foreground, never a generic ANSI colour.
+  const darkPalette = sidebarPaletteFor("dark");
+  const ground = `\x1b[0m\x1b[${darkPalette.canvas}m`;
+  assert.ok(lines[1]?.startsWith(`${ground}\x1b[${darkPalette.selected}mCanonical title`), JSON.stringify(lines[1]));
   assert.equal(texts[2]?.trimEnd(), "> agent running | input pending", "the selection marker lives on the status row");
   assert.ok(!texts.join("\n").includes("stale label"));
-  // Unselected title: sanitized label only, bold without inverse, no marker.
+  // Unselected title: sanitized label only, bold in the palette's muted title
+  // colour, no inverse, no marker.
   const plain = cardIndex(texts, "Plain label");
-  assert.ok(lines[plain]?.startsWith(`${ground}\x1b[1mPlain label`), JSON.stringify(lines[plain]));
+  assert.ok(lines[plain]?.startsWith(`${ground}\x1b[${darkPalette.title}mPlain label`), JSON.stringify(lines[plain]));
   assert.equal(texts[plain + 1]?.trimEnd(), "  exited (code 0)");
   assert.ok(texts.every((line) => !line.includes("evil")));
   for (const title of [texts[1], texts[plain]]) {

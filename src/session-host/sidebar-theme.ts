@@ -7,12 +7,30 @@
  * this host is the only input. Selection persists in the same per-native-agent
  * session-host state directory as the other host-owned settings.
  *
- * Every palette value is an SGR *parameter string* drawn from one closed set,
- * so the renderer's generated ANSI stays finite and every emitted sequence is
- * checkable against `SIDEBAR_THEME_SGR_CODES`. No truecolor or 256-color
- * parameter is ever generated here, and a palette never carries text: semantic
- * status stays in the rendered words.
+ * What the palettes PAINT is Pi's own colour vocabulary: every role takes its
+ * foreground from a copied, var-resolved foreground token of Pi 1.5.0's
+ * built-in `dark`/`light` themes (`sidebar-theme-colors.ts`), converted to
+ * terminal output once at module load through the pinned `pi-session-host-tui`
+ * colour API. There is no generic ANSI colour anywhere in a sidebar palette,
+ * no hand-picked RGB triple, no colour math of our own, and no capability
+ * query: the conversion mode is the fixed `"truecolor"` constant, so Pi's
+ * authored colour is emitted exactly instead of being quantised to a palette
+ * index.
+ *
+ * Every palette value is still an SGR *parameter string* drawn from one closed,
+ * finite set derived from the two frozen palettes, so the renderer's generated
+ * ANSI stays checkable against `SIDEBAR_THEME_SGR_CODES`. Only the specific
+ * generated RGB parameter strings are allowed — never an arbitrary RGB triple.
+ * A palette never carries text either: semantic status stays in the rendered
+ * words.
  */
+
+import { foregroundAnsi, parseColor } from "pi-session-host-tui";
+
+import {
+  PI_BUILTIN_FOREGROUND_COLORS,
+  type PiSidebarColorToken,
+} from "./sidebar-theme-colors";
 
 export type SidebarThemeId = "dark" | "light";
 
@@ -93,10 +111,10 @@ export type SidebarThemeRole =
 /**
  * One palette: a value for every semantic role PLUS the pane's own `canvas`.
  *
- * `canvas` is the pane's explicit foreground plus the TERMINAL'S DEFAULT
- * background (`"37;49"` for Dark, `"30;49"` for Light), and the renderer
- * restores it after every row reset it generates. Pi 1.5's own chat viewport is
- * a ScrollView/VStack with no overall canvas: `export.pageBg` is HTML-only,
+ * `canvas` is the pane's explicit foreground — Pi's own body-text foreground
+ * for that appearance — plus the TERMINAL'S DEFAULT background (`;49`), and the
+ * renderer restores it after every row reset it generates. Pi 1.5's own chat
+ * viewport is a ScrollView/VStack with no overall canvas: `export.pageBg` is HTML-only,
  * message/tool panels carry their own scoped backgrounds, and terminal-default
  * colours are the native fallback. The sidebar therefore keeps the host's
  * chosen foreground readable without painting a black or white ground over the
@@ -109,77 +127,137 @@ export type SidebarPalette = Readonly<Record<SidebarThemeRole, string>> & {
   readonly canvas: string;
 };
 
-const DARK_PALETTE: SidebarPalette = Object.freeze({
-  // White foreground on the terminal's OWN default background. The host never
-  // turns the whole sidebar into a black panel; rows inherit whatever native
-  // ground the operator already uses, exactly like Pi's own chat viewport.
-  canvas: "37;49",
-  header: "1;36",
-  title: "1",
-  selected: "1;34",
-  activeMain: "1;97",
-  secondary: "90",
-  statusStarting: "1;34",
-  // Running is bold green and idle plain green: the SAME hue carries the agent's
-  // own state, and the bold is what separates a working agent from a positively
-  // idle one. Pending input keeps its own amber, bold on waiting's hue, so the
-  // two facts on one status row stay independently readable.
-  statusRunning: "1;32",
-  statusWaiting: "33",
-  statusIdle: "32",
-  statusUnknown: "90",
-  statusExited: "90",
-  statusError: "1;31",
-  inputPending: "1;33",
-  hint: "90",
-  notice: "33",
-  error: "1;31",
-  accent: "36",
-  scrollbarTrack: "90",
-  scrollbarThumb: "97",
+/**
+ * The fixed conversion mode. Pi's authored colours are emitted exactly; a
+ * 256-color mode would quantise them and a basic-ANSI palette cannot express
+ * them at all. This is a constant, NOT `getCapabilities()` or
+ * `getTerminalColorMode()`: the emitted SGR set must stay deterministic and
+ * checkable, and the host performs no terminal query, environment sniffing, or
+ * appearance detection of any kind.
+ */
+const SIDEBAR_COLOR_MODE = "truecolor";
+
+/**
+ * Convert one copied Pi token to the bare SGR foreground parameters the palette
+ * mechanism stores (`38;2;<r>;<g>;<b>`). `foregroundAnsi` returns a complete
+ * `ESC [ … m` sequence, so the wrapper is stripped here; anything that is not
+ * exactly one in-range RGB foreground triple refuses rather than being passed
+ * through, which keeps the generated set closed.
+ */
+function piForegroundParams(value: string): string {
+  const sequence = foregroundAnsi(parseColor(value), SIDEBAR_COLOR_MODE);
+  const params = /^\x1b\[(38;2;\d{1,3};\d{1,3};\d{1,3})m$/.exec(sequence)?.[1];
+  if (params === undefined) {
+    throw new Error(`Pi colour ${JSON.stringify(value)} did not convert to one exact truecolor foreground`);
+  }
+  const channels = params.split(";").slice(2).map((part) => Number.parseInt(part, 10));
+  const inRange = channels.length === 3
+    && channels.every((channel) => Number.isInteger(channel) && channel >= 0 && channel <= 255);
+  if (!inRange) {
+    throw new Error(`Pi colour ${JSON.stringify(value)} converted to an out-of-range foreground`);
+  }
+  return params;
+}
+
+/**
+ * One sidebar role's colour: a Pi token plus the emphasis the role already had.
+ * Bold stays a separate attribute layer (Pi's own themes carry no bold either),
+ * so a palette change can never drop the bold distinction between two states.
+ */
+interface SidebarRoleColour {
+  readonly token: PiSidebarColorToken;
+  readonly bold: boolean;
+}
+
+/** Per-appearance role differences, keyed by role. */
+type SidebarRoleOverrides = Readonly<Partial<Record<SidebarThemeRole, SidebarRoleColour>>>;
+
+/**
+ * The role map, shared by both appearances. Status VALUES are painted, never
+ * the `agent ` / `input ` label words, the separator, or a plain `none`, which
+ * stay on the pane canvas.
+ *
+ * A positively idle agent is Pi's muted colour, NOT a variant of the running
+ * colour: idle, the ordinary `agent` word on the same row, and a running agent
+ * then all read differently (muted, canvas text, and bold success). Running is
+ * Pi's success, pending input is bold Pi's warning, and waiting input is the
+ * same warning hue without the bold, so the two independent facts on one status
+ * row stay separable while keeping their existing emphasis.
+ */
+const SHARED_ROLE_COLOURS: Readonly<Record<SidebarThemeRole, SidebarRoleColour>> = Object.freeze({
+  header: { token: "accent", bold: true },
+  // An ordinary card title keeps bold, and Pi's muted colour gives it real
+  // contrast against the bold body-text title of the conversation that owns
+  // Main (`activeMain` below) instead of resting on bold alone.
+  title: { token: "muted", bold: true },
+  selected: { token: "mdLink", bold: true },
+  activeMain: { token: "text", bold: true },
+  secondary: { token: "muted", bold: false },
+  statusStarting: { token: "mdLink", bold: true },
+  statusRunning: { token: "success", bold: true },
+  statusWaiting: { token: "warning", bold: false },
+  statusIdle: { token: "muted", bold: false },
+  statusUnknown: { token: "dim", bold: false },
+  statusExited: { token: "dim", bold: false },
+  statusError: { token: "error", bold: true },
+  inputPending: { token: "warning", bold: true },
+  hint: { token: "muted", bold: false },
+  notice: { token: "warning", bold: false },
+  error: { token: "error", bold: true },
+  accent: { token: "accent", bold: false },
+  scrollbarTrack: { token: "scrollbarTrack", bold: false },
+  scrollbarThumb: { token: "scrollbarThumb", bold: false },
 });
 
-const LIGHT_PALETTE: SidebarPalette = Object.freeze({
-  // Black foreground on the terminal's OWN default background, not a forced
-  // white panel. The notice drops to plain red because yellow on a light ground
-  // is not readable; the refusal stays bold red, so the two notices stay
-  // distinct. Status colours stay dark enough to read on the same default.
-  canvas: "30;49",
-  header: "1;34",
-  title: "1",
-  selected: "1;35",
-  // The owner title needs its OWN colour, not the canvas black: once the pane
-  // canvas foreground is applied, a black `activeMain` and a bold-only `title`
-  // land on the same terminal cell attributes, so the conversation that owns
-  // Main would be indistinguishable from an ordinary card. This is the SAME
-  // blue the Light header already uses, and it stays distinct from the magenta
-  // navigation target above it.
-  activeMain: "1;34",
-  secondary: "34",
-  statusStarting: "34",
-  // Same running/idle and pending/waiting relationship as the Dark palette: one
-  // hue per fact, bold for the two states that ask for attention.
-  statusRunning: "1;32",
-  statusWaiting: "33",
-  statusIdle: "32",
-  statusUnknown: "90",
-  statusExited: "90",
-  statusError: "1;31",
-  inputPending: "1;33",
-  hint: "35",
-  notice: "31",
-  error: "1;31",
-  accent: "35",
-  scrollbarTrack: "90",
-  scrollbarThumb: "30",
-});
+/**
+ * The only per-appearance differences, so both palettes stay recognisably the
+ * same map. The Light navigation target uses Pi's accent rather than its link
+ * colour, which keeps the magenta-family navigation and the violet header in
+ * the family the Light palette already draws attention with; and Light's
+ * `starting` value keeps the plain (unbolded) emphasis it had before.
+ */
+const THEME_ROLE_OVERRIDES = Object.freeze({
+  dark: Object.freeze({}),
+  light: Object.freeze({
+    selected: Object.freeze({ token: "accent", bold: true }),
+    statusStarting: Object.freeze({ token: "mdLink", bold: false }),
+  }),
+}) satisfies Readonly<Record<SidebarThemeId, SidebarRoleOverrides>>;
+
+/**
+ * Build one appearance's palette: every role's Pi token converted once, plus the
+ * pane canvas (Pi's body-text foreground on the terminal's own default
+ * background). The host never turns the whole sidebar into a black or white
+ * panel; rows inherit whatever native ground the operator already uses, exactly
+ * like Pi's own chat viewport, and no Pi background token is ever copied or
+ * painted.
+ */
+function buildSidebarPalette(theme: SidebarThemeId): SidebarPalette {
+  const colors = PI_BUILTIN_FOREGROUND_COLORS[theme];
+  const overrides: SidebarRoleOverrides = THEME_ROLE_OVERRIDES[theme];
+  const roles = {} as Record<SidebarThemeRole, string>;
+  for (const role of Object.keys(SHARED_ROLE_COLOURS) as SidebarThemeRole[]) {
+    const colour = overrides[role] ?? SHARED_ROLE_COLOURS[role];
+    const foreground = piForegroundParams(colors[colour.token]);
+    roles[role] = colour.bold ? `1;${foreground}` : foreground;
+  }
+  return Object.freeze({ ...roles, canvas: `${piForegroundParams(colors.text)};49` });
+}
+
+const DARK_PALETTE: SidebarPalette = buildSidebarPalette("dark");
+const LIGHT_PALETTE: SidebarPalette = buildSidebarPalette("light");
 
 /** The palette for one theme; both palettes cover exactly the same roles. */
 export function sidebarPaletteFor(theme: SidebarThemeId): SidebarPalette {
   return theme === "light" ? LIGHT_PALETTE : DARK_PALETTE;
 }
 
-/** Every SGR parameter string any palette can produce, plus the row resets. */
+/**
+ * Every SGR parameter string the two frozen palettes can produce: the exact
+ * generated set, one entry per distinct palette role value. It is closed — the
+ * renderer can never emit an RGB triple that is not in this set, and the set is
+ * not a general RGB range or pattern.
+ */
 export const SIDEBAR_THEME_SGR_CODES: ReadonlySet<string> = Object.freeze(
   new Set<string>(SIDEBAR_THEME_IDS.flatMap((theme) => Object.values(sidebarPaletteFor(theme)))),
 );

@@ -6,10 +6,12 @@
  *    select action. Repeats/releases are fenced so a held key never leaks into
  *    the child; a fresh Alt+Right in Main focus is ordinary native input.
  * 2. Owner/navigation title highlighting: the ACTUAL active Main conversation
- *    keeps its brighter owner title even while sidebar navigation highlights a
- *    different card; blue identifies only the LEFT selected navigation target
- *    while a sidebar-owned surface has focus. The existing `>` marker still
- *    shows the navigation target. Never a false sibling/owner mark.
+ *    keeps its own owner title even while sidebar navigation highlights a
+ *    different card; the selected-navigation colour identifies only the LEFT
+ *    selected navigation target while a sidebar-owned surface has focus. The
+ *    existing `>` marker still shows the navigation target. Never a false
+ *    sibling/owner mark. The two title sequences are read from the active
+ *    appearance's palette rather than pinned as ANSI literals (#613).
  * 3. Escape in the Edit form cancels ONLY that form and returns to the VISIBLE
  *    roster (sidebar focus) without hiding; a held Escape repeat does not
  *    bubble into the roster hide, but a fresh roster Escape still hides. The
@@ -30,6 +32,7 @@ import {
   type SidebarItem,
   SidebarController,
 } from "../src/session-host/sidebar";
+import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 const ALT_RIGHT_LEGACY = "\x1b[1;3C";
@@ -43,6 +46,17 @@ const ENTER = "\r";
 const ESC = "\x1b";
 const ESC_REPEAT = "\x1b[27;1:2u";
 const ESC_RELEASE = "\x1b[27;1:3u";
+
+/**
+ * The focus-domain title sequences of the default (Dark) appearance, taken from
+ * the palette instead of pinned as ANSI colour literals (#613): the palette now
+ * carries Pi's own converted foregrounds, so a literal here would go stale the
+ * moment the palette does. They are the two distinct sequences the renderer can
+ * put on a card title, and they are exact 24-bit Pi colours.
+ */
+const DARK_PALETTE = sidebarPaletteFor("dark");
+const SELECTED_SGR = `\x1b[${DARK_PALETTE.selected}m`;
+const OWNER_SGR = `\x1b[${DARK_PALETTE.activeMain}m`;
 
 function makeItem(overrides: Partial<SidebarItem> & { id: string }): SidebarItem {
   return {
@@ -199,26 +213,34 @@ test("the roster footer shows the Alt+Right main hint while the roster owns focu
 });
 
 // ---------------------------------------------------------------------------
-// Focus-domain title highlighting (blue selection / white active owner)
+// Focus-domain title highlighting (navigation colour / active-owner colour)
 // ---------------------------------------------------------------------------
 
-test("sidebar focus keeps the actual owner bright while blue marks the navigation target", () => {
+test("the focus-domain title sequences are the palette's own 24-bit Pi colours", () => {
+  assert.notEqual(SELECTED_SGR, OWNER_SGR, "navigation and owner titles stay two different sequences");
+  assert.match(SELECTED_SGR, /^\x1b\[1;38;2;\d{1,3};\d{1,3};\d{1,3}m$/,
+    "the navigation highlight is an exact 24-bit Pi foreground, not an ANSI colour");
+  assert.match(OWNER_SGR, /^\x1b\[1;38;2;\d{1,3};\d{1,3};\d{1,3}m$/,
+    "the active-owner highlight is an exact 24-bit Pi foreground, not an ANSI colour");
+});
+
+test("sidebar focus keeps the actual owner's own title while the navigation colour marks the target", () => {
   const harness = makeRoster(["a", "b"]);
   harness.controller.setActiveMainOwner("a"); // actual Main owner is a
   harness.controller.select("b"); // left navigation target is b
   void harness.controller.render(40, 30);
   assert.equal(harness.controller.selectedId, "b");
   const lines = harness.controller.render(40, 30).lines;
-  const blueIndex = lines.findIndex((line) => line.includes("\x1b[1;34m"));
-  assert.ok(blueIndex >= 0, "the selected target title is blue");
-  assert.ok(lines[blueIndex]?.includes("label-b"), "blue is on the selected row b");
-  const whiteIndex = lines.findIndex((line) => line.includes("\x1b[1;97m"));
-  assert.ok(whiteIndex >= 0, "the actual owner keeps its brighter title in sidebar focus");
-  assert.ok(lines[whiteIndex]?.includes("label-a"), "the bright owner title is on a, not the navigation target");
-  assert.ok(!lines[whiteIndex]?.includes("label-b"), "blue and the owner title never merge on one card");
+  const navIndex = lines.findIndex((line) => line.includes(SELECTED_SGR));
+  assert.ok(navIndex >= 0, "the selected target title carries the navigation colour");
+  assert.ok(lines[navIndex]?.includes("label-b"), "the navigation colour is on the selected row b");
+  const ownerIndex = lines.findIndex((line) => line.includes(OWNER_SGR));
+  assert.ok(ownerIndex >= 0, "the actual owner keeps its own title colour in sidebar focus");
+  assert.ok(lines[ownerIndex]?.includes("label-a"), "the owner title is on a, not the navigation target");
+  assert.ok(!lines[ownerIndex]?.includes("label-b"), "the navigation colour and the owner title never merge on one card");
 });
 
-test("moving sidebar navigation does not move the bright actual owner title", () => {
+test("moving sidebar navigation does not move the actual owner's own title", () => {
   const harness = makeRoster(["a", "b", "c"]);
   harness.controller.setActiveMainOwner("a");
   const owner = harness.controller.activeMainOwnerID;
@@ -229,18 +251,18 @@ test("moving sidebar navigation does not move the bright actual owner title", ()
   harness.send(DOWN); // -> first session card a
   assert.equal(harness.controller.selectedId, "a");
   let lines = harness.controller.render(40, 30).lines;
-  assert.ok(lines.some((line) => line.includes("\x1b[1;34m") && line.includes("label-a")),
+  assert.ok(lines.some((line) => line.includes(SELECTED_SGR) && line.includes("label-a")),
     "the navigation highlight is what the owner card shows while the highlight sits on it");
-  assert.ok(!lines.some((line) => line.includes("\x1b[1;97m")),
+  assert.ok(!lines.some((line) => line.includes(OWNER_SGR)),
     "the owner colour does not double up with the highlight the operator is on");
 
   harness.send(DOWN); // a -> b
   assert.equal(harness.controller.selectedId, "b");
   lines = harness.controller.render(40, 30).lines;
-  assert.ok(lines.some((line) => line.includes("\x1b[1;97m") && line.includes("label-a")),
-    "the actual owner a reclaims its bright title once the highlight moved to b");
-  assert.ok(lines.some((line) => line.includes("\x1b[1;34m") && line.includes("label-b")),
-    "the navigation target b is blue");
+  assert.ok(lines.some((line) => line.includes(OWNER_SGR) && line.includes("label-a")),
+    "the actual owner a reclaims its own title colour once the highlight moved to b");
+  assert.ok(lines.some((line) => line.includes(SELECTED_SGR) && line.includes("label-b")),
+    "the navigation target b carries the navigation colour");
   const plain = lines.map((line) => line.replace(SGR_PATTERN, "").trimEnd());
   const bTitle = plain.findIndex((line) => line === "label-b");
   assert.ok(bTitle >= 0 && plain[bTitle + 1]?.startsWith("> "),
@@ -250,7 +272,7 @@ test("moving sidebar navigation does not move the bright actual owner title", ()
   assert.deepEqual(harness.sinceActions(), [], "navigation emitted no select or lifecycle action");
 });
 
-test("main focus highlights the actual active owner white, not the left selection", () => {
+test("main focus highlights the actual active owner, not the left selection", () => {
   const harness = makeRoster(["a", "b"]);
   harness.controller.setActiveMainOwner("a"); // actual Main owner is a
   harness.controller.select("b"); // left navigation target is b
@@ -258,31 +280,30 @@ test("main focus highlights the actual active owner white, not the left selectio
   harness.send(ALT_RIGHT_LEGACY); // focus -> main, selection b retained
   assert.equal(harness.controller.focus, "main");
   const lines = harness.controller.render(40, 30).lines;
-  const whiteIndex = lines.findIndex((line) => line.includes("\x1b[1;97m"));
-  assert.ok(whiteIndex >= 0, "the active owner title is white");
-  assert.ok(lines[whiteIndex]?.includes("label-a"), "white is on the active owner a");
-  assert.ok(!lines.some((line) => line.includes("\x1b[1;34m")), "no blue highlight in main focus");
+  const ownerIndex = lines.findIndex((line) => line.includes(OWNER_SGR));
+  assert.ok(ownerIndex >= 0, "the active owner title carries the owner colour");
+  assert.ok(lines[ownerIndex]?.includes("label-a"), "the owner colour is on the active owner a");
+  assert.ok(!lines.some((line) => line.includes(SELECTED_SGR)), "no navigation highlight in main focus");
 });
 
-test("no active owner in Main focus produces no false white highlight", () => {
+test("no active owner in Main focus produces no false owner highlight", () => {
   const harness = makeRoster(["a", "b"]);
   harness.controller.setActiveMainOwner(undefined);
   harness.send(ALT_RIGHT_LEGACY); // focus -> main, no owner
   assert.equal(harness.controller.focus, "main");
   const lines = harness.controller.render(40, 30).lines;
-  assert.ok(!lines.some((line) => line.includes("\x1b[1;97m")), "no false white highlight without an owner");
+  assert.ok(!lines.some((line) => line.includes(OWNER_SGR)), "no false owner highlight without an owner");
 });
 
-test("clearing the active owner removes the white highlight (no sibling adoption)", () => {
+test("clearing the active owner removes the owner highlight (no sibling adoption)", () => {
   const harness = makeRoster(["a", "b"]);
   harness.controller.setActiveMainOwner("a");
-  harness.send(ALT_RIGHT_LEGACY); // focus -> main, a is white
-  assert.ok(harness.controller.render(40, 30).lines.some((line) => line.includes("\x1b[1;97m")));
+  harness.send(ALT_RIGHT_LEGACY); // focus -> main, a carries the owner colour
+  assert.ok(harness.controller.render(40, 30).lines.some((line) => line.includes(OWNER_SGR)));
   // The owner row leaves the roster: Main clears the active id.
   harness.controller.setActiveMainOwner(undefined);
   const lines = harness.controller.render(40, 30).lines;
-  const whiteSgr = "\x1b[1;97m";
-  assert.ok(!lines.some((line) => line.includes(whiteSgr)), "no sibling is falsely highlighted");
+  assert.ok(!lines.some((line) => line.includes(OWNER_SGR)), "no sibling is falsely highlighted");
 });
 
 // ---------------------------------------------------------------------------

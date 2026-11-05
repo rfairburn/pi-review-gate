@@ -1453,3 +1453,13 @@ bridge (`src/stream-failure-report.ts`), consumed by both tool families
   search and the settings deny pickers (issue #463) both use: the two surfaces parse
   one grammar, but the catalog matches conversation fields with the v1.5.0 tiered
   matcher while the deny pickers keep matching one searched text (the tool name).
+- The session-host sidebar palettes copy Pi Coding Agent v1.5.0's built-in Dark and
+  Light theme foreground values (ten authored colour tokens per appearance) into the
+  host-owned table `src/session-host/sidebar-theme-colors.ts`, used under the MIT
+  License. See [NOTICE](../NOTICE) and
+  [LICENSES/MIT-pi-theme-colors.txt](../LICENSES/MIT-pi-theme-colors.txt). The values
+  are converted to terminal output by the pinned `pi-session-host-tui` dependency's
+  public colour API, never by a copied converter, and no Pi theme loader, saved theme,
+  configuration, or running Pi is read. `tests/session-host-sidebar-pi-color-parity.test.ts`
+  compares the copied values and every converted role against the pinned installed Pi
+  package's own theme files, so a drifted copy fails.

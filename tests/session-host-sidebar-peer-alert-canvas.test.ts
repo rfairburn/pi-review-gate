@@ -142,15 +142,15 @@ function allRuns(styles: readonly { runs: readonly TerminalCellRun[] }[]): Termi
 
 interface ThemeCase {
   readonly theme: SidebarThemeId;
-  /** Palette index of the appearance's explicit foreground (`37` -> 7, `30` -> 0). */
+  /** Packed 0xRRGGBB of the appearance's explicit canvas foreground (Pi's body text). */
   readonly canvasFg: number;
-  /** Palette index of the `notice` heading foreground (`33` -> 3, `31` -> 1). */
+  /** Packed 0xRRGGBB of the `notice` heading foreground (Pi's warning colour). */
   readonly noticeFg: number;
 }
 
 const THEME_CASES: readonly ThemeCase[] = [
-  { theme: "dark", canvasFg: 7, noticeFg: 3 },
-  { theme: "light", canvasFg: 0, noticeFg: 1 },
+  { theme: "dark", canvasFg: 0xDEE0E1, noticeFg: 0xCD9A22 },
+  { theme: "light", canvasFg: 0x3B3F41, noticeFg: 0x8F6802 },
 ];
 
 test("the standalone pending-consent band keeps the terminal default ground on both appearances", async () => {
@@ -194,7 +194,7 @@ test("the standalone pending-consent band keeps the terminal default ground on b
       assert.ok(runs.length > 0, `${testCase.theme}: the band painted cells`);
       for (const run of runs) {
         assert.ok(run.fg !== undefined, `${testCase.theme}: band cell ${JSON.stringify(run.text)} has an explicit foreground`);
-        assert.equal(run.fg.mode, "palette", `${testCase.theme}: the band foreground is a basic palette colour`);
+        assert.equal(run.fg.mode, "rgb", `${testCase.theme}: the band foreground is an exact 24-bit Pi colour`);
         assert.equal(run.bg, undefined,
           `${testCase.theme}: every band cell leaves the background on the terminal default`);
       }

@@ -95,6 +95,22 @@ function sgrCodes(text: string): Set<string> {
   return codes;
 }
 
+/** The attribute-only sequences the renderer owns: resets, bold, inverse. */
+const ATTRIBUTE_SGR_CODES: ReadonlySet<string> = new Set<string>(["", "0", "1", "7", "27", "1;7"]);
+
+/**
+ * The closed-set rule for one generated sequence: it is either an attribute the
+ * renderer owns or one of the exact palette parameter strings. An arbitrary RGB
+ * triple, a 256-color index, or a background selector is refused even though it
+ * is valid SGR syntax.
+ */
+function assertClosedSgr(code: string, where: string): void {
+  assert.ok(
+    SIDEBAR_THEME_SGR_CODES.has(code) || ATTRIBUTE_SGR_CODES.has(code),
+    `${where}: ${JSON.stringify(code)} is outside the closed generated set`,
+  );
+}
+
 /**
  * Pi's own chat viewport has no whole-pane canvas. Both host appearances keep
  * their explicit foreground but must leave the background on the terminal
@@ -359,7 +375,14 @@ test("a persisted light appearance is live at startup and every emitted sequence
       "the dark-only header sequence is gone");
     for (const code of codes) {
       assert.ok(SIDEBAR_GENERATED_SGR_ALLOWLIST.has(code), `unexpected generated SGR ${code}`);
-      assert.ok(!code.includes(";2;") && !code.includes("38;2"), `no truecolor sequence: ${code}`);
+      // The set is closed: every colour the pane emits is one of the exact
+      // generated Pi foreground parameter strings, never an arbitrary RGB
+      // triple, a 256-color index, or a background selector.
+      assertClosedSgr(code, "a written light-theme host row");
+    }
+    for (const refused of ["38;2;255;0;0", "1;38;2;255;0;0", "38;5;39", "44"]) {
+      assert.equal(SIDEBAR_GENERATED_SGR_ALLOWLIST.has(refused), false,
+        `an unknown RGB or palette colour stays refused: ${refused}`);
     }
     assertTerminalDefaultGround(rawFrameText(harness), "light");
     assert.equal(await closeWithSignal(harness), 0);
@@ -428,8 +451,7 @@ test("the Theme submenu saves through Main, applies live, and the next host star
     // The Theme pane is a host form, so this covers form and roster rows.
     assertTerminalDefaultGround(rawFrameText(harness), "light");
     for (const code of codes) {
-      assert.ok(SIDEBAR_THEME_SGR_CODES.has(code) || SIDEBAR_GENERATED_SGR_ALLOWLIST.has(code),
-        `every generated sequence stays inside the closed palette set: ${code}`);
+      assertClosedSgr(code, "a written Theme-pane or roster row");
     }
     assert.equal(manager.writes.length, writesBefore,
       "no settings keystroke reached a native child");

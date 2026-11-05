@@ -623,9 +623,11 @@ function closeSettings(harness: Harness): void {
 }
 
 test("both appearances give every host-owned pane row an explicit foreground and terminal-default background", async () => {
-  const cases: { theme: SidebarThemeId; fgPalette: number }[] = [
-    { theme: "dark", fgPalette: 7 },
-    { theme: "light", fgPalette: 0 },
+  // Pi 1.5.0's own body-text foreground per appearance (the canvas colour), as
+  // the emulator records it: an exact 24-bit value, never a palette index.
+  const cases: { theme: SidebarThemeId; fgRgb: number }[] = [
+    { theme: "dark", fgRgb: 0xDEE0E1 },
+    { theme: "light", fgRgb: 0x3B3F41 },
   ];
   for (const testCase of cases) {
     const harness = makeHarness({
@@ -647,12 +649,12 @@ test("both appearances give every host-owned pane row an explicit foreground and
         assert.ok(line.runs.length > 0, `row ${line.line} has at least one styled run`);
         for (const run of line.runs) {
           assert.ok(run.fg !== undefined, `row ${line.line} run ${JSON.stringify(run.text)} has an explicit foreground`);
-          assert.equal(run.fg.mode, "palette", `the ${testCase.theme} foreground is a basic palette colour`);
+          assert.equal(run.fg.mode, "rgb", `the ${testCase.theme} foreground is an exact 24-bit Pi colour`);
           assert.equal(run.bg, undefined,
             `row ${line.line} run ${JSON.stringify(run.text)} leaves the background on the terminal default`);
         }
       }
-      assert.ok(styles.flatMap((line) => [...line.runs]).some((run) => run.fg?.value === testCase.fgPalette),
+      assert.ok(styles.flatMap((line) => [...line.runs]).some((run) => run.fg?.value === testCase.fgRgb),
         `the ${testCase.theme} pane carries the appearance's canvas foreground`);
       // The scrollbar lane itself is themed, and both of its colours differ from
       // the row's canvas.
@@ -702,22 +704,22 @@ test("the focus-domain roles stay distinct with terminal-default backgrounds (no
 });
 
 // ---------------------------------------------------------------------------
-// The focus-domain roles read as ACTUAL terminal cells. Two palette parameter
-// strings that resolve to the same foreground index under the same boldness are
-// ONE look on the screen, so the proof has to be the cell attributes the
-// emulator recorded, not the palette strings compared side by side.
+// The focus-domain roles read as ACTUAL terminal cells. Two palette values that
+// resolve to the same foreground RGB under the same boldness are ONE look on
+// the screen, so the proof has to be the cell attributes the emulator recorded,
+// not the palette strings compared side by side.
 // ---------------------------------------------------------------------------
 
 /**
- * The palette index a palette value's basic or bright foreground paints,
- * restated here from the SGR rule so the cell assertions name the colour the
- * palette INTENDS instead of a magic index.
+ * The packed 0xRRGGBB a palette value paints, read off its `38;2;<r>;<g>;<b>`
+ * parameters. A palette value that fell back to a basic, bright, or 256-color
+ * foreground has no triple to read and refuses here, so the cell assertions can
+ * name the exact colour the palette INTENDS instead of a magic index.
  */
-function paletteForegroundIndex(sgr: string): number {
-  const params = sgr.split(";").map((part) => Number.parseInt(part, 10));
-  const colour = params.find((part) => (part >= 30 && part <= 37) || (part >= 90 && part <= 97));
-  assert.ok(colour !== undefined, `${JSON.stringify(sgr)} carries a basic or bright foreground`);
-  return colour >= 90 ? colour - 90 + 8 : colour - 30;
+function paletteForegroundRgb(sgr: string): number {
+  const match = /38;2;(\d{1,3});(\d{1,3});(\d{1,3})/.exec(sgr);
+  assert.ok(match, `${JSON.stringify(sgr)} carries an exact 24-bit foreground`);
+  return ((Number(match[1]) << 16) | (Number(match[2]) << 8) | Number(match[3])) >>> 0;
 }
 
 /** The one drawn run carrying the `label` card's title row. */
@@ -757,7 +759,7 @@ test("the actual owner's title cell stays distinct from the navigation target an
       const ordinary = titleRun(surface, "local-l3");
       for (const [name, run] of [["owner", owner], ["navigation target", nav], ["ordinary", ordinary]] as const) {
         assert.ok(run.fg !== undefined, `${theme}: the ${name} title cell carries an explicit foreground`);
-        assert.equal(run.fg.mode, "palette", `${theme}: the ${name} title foreground is a basic palette colour`);
+        assert.equal(run.fg.mode, "rgb", `${theme}: the ${name} title foreground is an exact 24-bit Pi colour`);
         assert.equal(run.bg, undefined, `${theme}: the ${name} title cell keeps the terminal-default background`);
         assert.equal(run.bold, true, `${theme}: the ${name} title cell keeps its bold treatment`);
       }
@@ -772,12 +774,12 @@ test("the actual owner's title cell stays distinct from the navigation target an
       // And each cell is the colour its own role intends, so the distinction is
       // the palette's, not an accident of one terminal emulator.
       const palette = sidebarPaletteFor(theme);
-      assert.equal(owner.fg!.value, paletteForegroundIndex(palette.activeMain),
+      assert.equal(owner.fg!.value, paletteForegroundRgb(palette.activeMain),
         `${theme}: the owner title paints the activeMain colour`);
-      assert.equal(nav.fg!.value, paletteForegroundIndex(palette.selected),
+      assert.equal(nav.fg!.value, paletteForegroundRgb(palette.selected),
         `${theme}: the navigation target paints the selected colour`);
-      assert.equal(ordinary.fg!.value, paletteForegroundIndex(palette.canvas),
-        `${theme}: an ordinary title is bold on the pane canvas foreground`);
+      assert.equal(ordinary.fg!.value, paletteForegroundRgb(palette.title),
+        `${theme}: an ordinary title is bold in Pi's muted colour, not the owner's body-text colour`);
     } finally {
       surface.dispose();
     }
@@ -807,21 +809,21 @@ test("the navigation cell wins where it sits on the owner, and the owner cell re
     const cols = 32;
     const rows = 24;
     const palette = sidebarPaletteFor(theme);
-    const ownerIndex = paletteForegroundIndex(palette.activeMain);
-    const selectedIndex = paletteForegroundIndex(palette.selected);
-    const canvasIndex = paletteForegroundIndex(palette.canvas);
+    const ownerRgb = paletteForegroundRgb(palette.activeMain);
+    const selectedRgb = paletteForegroundRgb(palette.selected);
+    const titleRgb = paletteForegroundRgb(palette.title);
 
     let surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
       assert.equal(harness.controller.focus, "sidebar", `${theme}: sidebar navigation owns the highlight`);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedRgb,
         `${theme}: the navigation highlight wins on a card that is both owner and target`);
       assert.notEqual(titleRun(surface, "local-l1").fg?.value, titleRun(surface, "local-l2").fg?.value,
         `${theme}: the highlighted cell stays distinguishable from an ordinary card's cells`);
-      assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l2").fg?.value, titleRgb,
         `${theme}: no ordinary card borrows the owner or navigation colour`);
-      assert.equal(titleRun(surface, "local-l3").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l3").fg?.value, titleRgb,
         `${theme}: no other card is highlighted either`);
     } finally {
       surface.dispose();
@@ -833,11 +835,11 @@ test("the navigation cell wins where it sits on the owner, and the owner cell re
     surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerRgb,
         `${theme}: the owner reclaims its own cell once the highlight moved away`);
-      assert.equal(titleRun(surface, "local-l3").fg?.value, selectedIndex,
+      assert.equal(titleRun(surface, "local-l3").fg?.value, selectedRgb,
         `${theme}: the new navigation target paints the selected colour`);
-      assert.equal(titleRun(surface, "local-l2").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l2").fg?.value, titleRgb,
         `${theme}: the untouched ordinary card stays ordinary`);
     } finally {
       surface.dispose();
@@ -849,9 +851,9 @@ test("the navigation cell wins where it sits on the owner, and the owner cell re
     surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, ownerRgb,
         `${theme}: Main focus keeps the owner's own cell`);
-      assert.equal(titleRun(surface, "local-l3").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l3").fg?.value, titleRgb,
         `${theme}: Main focus paints no spurious navigation colour`);
     } finally {
       surface.dispose();
@@ -905,18 +907,18 @@ test("the remote owner's title cell follows the same navigation precedence as a 
     const cols = 32;
     const rows = 24;
     const palette = sidebarPaletteFor(theme);
-    const ownerIndex = paletteForegroundIndex(palette.activeMain);
-    const selectedIndex = paletteForegroundIndex(palette.selected);
-    const canvasIndex = paletteForegroundIndex(palette.canvas);
+    const ownerRgb = paletteForegroundRgb(palette.activeMain);
+    const selectedRgb = paletteForegroundRgb(palette.selected);
+    const titleRgb = paletteForegroundRgb(palette.title);
 
     // The keyboard highlight sits on the remote owner card itself.
     highlightCard(harness, "remote-r1", cols, rows);
     let surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "remote-r1").fg?.value, selectedIndex,
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, selectedRgb,
         `${theme}: the remote owner row shows the navigation highlight on the overlap`);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, titleRgb,
         `${theme}: no other card borrows either colour`);
     } finally {
       surface.dispose();
@@ -930,9 +932,9 @@ test("the remote owner's title cell follows the same navigation precedence as a 
     surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerIndex,
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerRgb,
         `${theme}: the remote owner reclaims its own cell once the highlight moved`);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, selectedRgb,
         `${theme}: the local navigation target paints the selected colour`);
     } finally {
       surface.dispose();
@@ -943,10 +945,12 @@ test("the remote owner's title cell follows the same navigation precedence as a 
     surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerIndex,
+      assert.equal(titleRun(surface, "remote-r1").fg?.value, ownerRgb,
         `${theme}: Main focus keeps the remote owner's own cell`);
-      assert.equal(titleRun(surface, "local-l1").fg?.value, canvasIndex,
+      assert.equal(titleRun(surface, "local-l1").fg?.value, titleRgb,
         `${theme}: Main focus paints no spurious navigation colour`);
+      assert.notEqual(titleRun(surface, "local-l1").fg?.value, selectedRgb,
+        `${theme}: the unselected local card keeps no navigation colour under Main focus`);
     } finally {
       surface.dispose();
     }
@@ -973,12 +977,24 @@ test("status labels and a plain none stay on the neutral canvas while the status
     }
     harness.controller.updateItems(cases.map((testCase) => ({ ...makeItem(testCase.id), ...testCase.facts })));
     const palette = sidebarPaletteFor(theme);
-    // The agreed roles for BOTH appearances, pinned as parameter strings: running
-    // keeps its bold on a green hue, pending keeps its bold on waiting's amber.
-    assert.equal(palette.statusRunning, "1;32", `${theme}: running is bold green`);
-    assert.equal(palette.statusIdle, "32", `${theme}: idle stays plain green`);
-    assert.equal(palette.inputPending, "1;33", `${theme}: pending input is bold amber`);
-    assert.equal(palette.statusWaiting, "33", `${theme}: waiting stays plain amber`);
+    // The agreed roles for BOTH appearances, pinned to Pi's own converted
+    // foregrounds: running keeps its bold on Pi's success colour, idle is Pi's
+    // muted colour with NO bold (so it can never read as a bold variant of
+    // running, and never shares the ordinary `agent` word's colour), and pending
+    // keeps its bold on waiting's warning hue. The parity suite proves these
+    // literals are the built-in Pi 1.5.0 Dark/Light values.
+    const statusGoldens = theme === "dark"
+      ? { canvas: 0xDEE0E1, running: 0x68B78D, idle: 0x9DA5A9, waiting: 0xCD9A22, pending: 0xCD9A22 }
+      : { canvas: 0x3B3F41, running: 0x337E58, idle: 0x677176, waiting: 0x8F6802, pending: 0x8F6802 };
+    assert.equal(paletteForegroundRgb(palette.canvas), statusGoldens.canvas, `${theme}: the canvas is Pi's body-text colour`);
+    assert.equal(paletteForegroundRgb(palette.statusRunning), statusGoldens.running, `${theme}: running is Pi's success colour`);
+    assert.equal(paletteForegroundRgb(palette.statusIdle), statusGoldens.idle, `${theme}: idle is Pi's muted colour, not a running-hue variant`);
+    assert.equal(paletteForegroundRgb(palette.inputPending), statusGoldens.pending, `${theme}: pending input is Pi's warning colour`);
+    assert.equal(paletteForegroundRgb(palette.statusWaiting), statusGoldens.waiting, `${theme}: waiting stays on the same warning hue`);
+    assert.equal(/^1;/.test(palette.statusRunning), true, `${theme}: running keeps its bold attribute`);
+    assert.equal(/^1;/.test(palette.statusIdle), false, `${theme}: idle carries no bold`);
+    assert.equal(/^1;/.test(palette.inputPending), true, `${theme}: pending keeps its bold attribute`);
+    assert.equal(/^1;/.test(palette.statusWaiting), false, `${theme}: waiting carries no bold`);
     const cols = 32;
     const rows = 24;
     const view = harness.view(cols, rows);
@@ -991,14 +1007,14 @@ test("status labels and a plain none stay on the neutral canvas while the status
     const surface = new TerminalSurface(cols, rows);
     try {
       await drawPane(surface, harness.controller.renderRoster(cols, rows).lines);
-      const canvasIndex = paletteForegroundIndex(palette.canvas);
+      const canvasRgb = paletteForegroundRgb(palette.canvas);
       // The label words are ordinary canvas cells in both appearances.
       for (const label of ["agent", "input"]) {
         for (const testCase of cases) {
           const [run] = statusRuns(surface, `local-${testCase.id}`, label);
           assert.ok(run, `${theme}: the ${label} label is drawn on the ${testCase.id} status row`);
-          assert.equal(run.fg?.mode, "palette", `${theme}: the ${label} label keeps an explicit foreground`);
-          assert.equal(run.fg?.value, canvasIndex,
+          assert.equal(run.fg?.mode, "rgb", `${theme}: the ${label} label keeps an explicit 24-bit foreground`);
+          assert.equal(run.fg?.value, canvasRgb,
             `${theme}: the ${label} label stays on the ${theme} canvas foreground, not a status colour`);
           assert.notEqual(run.bold, true, `${theme}: the ${label} label is not bold`);
           assert.equal(run.bg, undefined, `${theme}: the ${label} label keeps the terminal-default background`);
@@ -1006,32 +1022,40 @@ test("status labels and a plain none stay on the neutral canvas while the status
       }
       const noneRuns = statusRuns(surface, "local-l2", "none");
       assert.equal(noneRuns.length, 1, `${theme}: the plain none is one drawn run`);
-      assert.equal(noneRuns[0]?.fg?.value, canvasIndex, `${theme}: input none stays on the neutral canvas`);
+      assert.equal(noneRuns[0]?.fg?.value, canvasRgb, `${theme}: input none stays on the neutral canvas`);
       assert.notEqual(noneRuns[0]?.bold, true, `${theme}: input none is not emphasized`);
       // Only the VALUE words carry status colours, and the two facts on one row
       // stay independently painted.
       const running = statusRuns(surface, "local-l1", "running");
       assert.equal(running.length, 1, `${theme}: one drawn running VALUE`);
-      assert.equal(running[0]?.fg?.value, paletteForegroundIndex(palette.statusRunning),
-        `${theme}: the running VALUE paints green`);
+      assert.equal(running[0]?.fg?.value, paletteForegroundRgb(palette.statusRunning),
+        `${theme}: the running VALUE paints Pi's success colour`);
       assert.equal(running[0]?.bold, true, `${theme}: the running VALUE keeps its bold`);
       const pending = statusRuns(surface, "local-l1", "pending");
       assert.equal(pending.length, 1, `${theme}: one drawn pending VALUE`);
-      assert.equal(pending[0]?.fg?.value, paletteForegroundIndex(palette.inputPending),
-        `${theme}: the pending VALUE paints amber`);
+      assert.equal(pending[0]?.fg?.value, paletteForegroundRgb(palette.inputPending),
+        `${theme}: the pending VALUE paints Pi's warning colour`);
       assert.equal(pending[0]?.bold, true, `${theme}: the pending VALUE keeps its bold salience`);
       assert.notEqual(running[0]?.fg?.value, pending[0]?.fg?.value,
         `${theme}: both facts stay distinguishable on the same status row`);
       const idle = statusRuns(surface, "local-l2", "idle");
       assert.equal(idle.length, 1, `${theme}: one drawn idle VALUE`);
-      assert.equal(idle[0]?.fg?.value, paletteForegroundIndex(palette.statusIdle),
-        `${theme}: the idle VALUE paints green`);
+      assert.equal(idle[0]?.fg?.value, paletteForegroundRgb(palette.statusIdle),
+        `${theme}: the idle VALUE paints Pi's muted colour`);
       assert.notEqual(idle[0]?.bold, true, `${theme}: idle stays plain, so running and idle stay apart`);
+      // The three states the operator has to tell apart on one row: the ordinary
+      // `agent` word, an idle agent, and a running agent.
+      const [agentLabel] = statusRuns(surface, "local-l2", "agent");
+      assert.ok(agentLabel, `${theme}: the agent label is drawn on the idle card's status row`);
+      assert.notEqual(idle[0]?.fg?.value, agentLabel?.fg?.value,
+        `${theme}: an idle VALUE does not blend into the ordinary agent word`);
+      assert.notEqual(idle[0]?.fg?.value, running[0]?.fg?.value,
+        `${theme}: an idle VALUE is not a recoloured running VALUE`);
       const unknown = statusRuns(surface, "local-l3", "unknown").filter((run) => run.text.trim() === "unknown");
       assert.equal(unknown.length, 2, `${theme}: the agent and input unknown VALUES are two drawn values`);
       for (const run of unknown) {
-        assert.equal(run.fg?.value, paletteForegroundIndex(palette.statusUnknown),
-          `${theme}: an unknown VALUE stays muted`);
+        assert.equal(run.fg?.value, paletteForegroundRgb(palette.statusUnknown),
+          `${theme}: an unknown VALUE uses Pi's dim colour`);
         assert.notEqual(run.bold, true, `${theme}: an unknown VALUE is not emphasized`);
       }
     } finally {

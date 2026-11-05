@@ -239,12 +239,32 @@ The file has the strict shape `{"version":1,"theme":"dark"}` (or `"light"`).
 An unsafe or unreadable file is left untouched: the host shows a bounded refusal
 while keeping Dark available for display, and a later theme save will not replace
 an invalid existing record. A failed save keeps the previous active palette.
-The sidebar works with only remote sessions and no local Pi session running: Pi's saved
-theme is not read or synchronized, and changing this theme neither restarts sessions nor
-changes any local or remote session's own theme. Status text and the distinction between
-the navigation highlight and the active Main conversation remain visible. The base
-sidebar background uses the terminal default, like Pi's normal chat viewport; choosing
-a foreground palette does not force a black or white pane background.
+
+The two palettes use Pi's OWN built-in Dark and Light foreground colours, copied
+from Pi 1.5.0's published theme files and converted once through the pinned Pi
+TUI colour API (attribution in [NOTICE](../NOTICE) and
+[LICENSES/MIT-pi-theme-colors.txt](../LICENSES/MIT-pi-theme-colors.txt)); no
+generic terminal palette colour is substituted. The agent/lifecycle status value
+uses Pi's success green for a running agent (bold), Pi's muted grey for a
+positively idle agent, Pi's warning colour for waiting input and, bold, for
+pending input, Pi's dim colour for an unknown or exited agent, and Pi's error
+colour (bold) for a failed state. The `agent` and `input` label words, the `|`
+separator, and a plain `none` stay in the pane's normal text colour, so the
+colour always carries the state word rather than replacing it. The sidebar's own
+title, the navigation highlight, the active conversation's title, and the
+scrollbar roles likewise take Pi's accent, link, body-text, track, and thumb
+colours for the chosen appearance.
+
+This is colour only: the wording, the state classification, and which facts are
+shown never change. The sidebar works with only remote sessions and no local Pi
+session running: Pi's saved theme is not read or synchronized, and changing this
+theme neither restarts sessions nor changes any local or remote session's own
+theme. Status text and the distinction between the navigation highlight and the
+active Main conversation remain visible. The base sidebar background uses the
+terminal default, like Pi's normal chat viewport; choosing a foreground palette
+does not force a black or white pane background. The host never queries the
+terminal for its palette, follows a custom or adaptive theme, or adds a colour
+setting: the operator's explicit Dark/Light choice is the only input.
 
 ### Host shortcut configuration
 
@@ -1727,11 +1747,16 @@ explicitly removed. There is no heartbeat timeout that declares a quiet session 
 so a valid idle state may remain for hours.
 
 Agent states have distinct theme colors, and pending input is emphasized independently:
-`agent running | input pending` keeps both distinctions visible. The words and the
-observed/unknown classification remain unchanged; color never substitutes for status text.
+`agent running | input pending` keeps both distinctions visible. The colors are Pi's own
+built-in foregrounds for the chosen appearance (Pi's success green for a running agent,
+Pi's muted grey for a positively idle one, Pi's warning colour for waiting and, bold,
+for pending input, Pi's dim colour for unknown or exited), and the `agent`/`input` label
+words, the separator, and a plain `none` stay in the pane's normal text colour. The words
+and the observed/unknown classification remain unchanged; color never substitutes for
+status text.
 
-The actual active Main conversation keeps its brighter title while its card is visible,
-even when keyboard focus moves to the sidebar and Up/Down moves the blue navigation
+The actual active Main conversation keeps its own title colour while its card is visible,
+even when keyboard focus moves to the sidebar and Up/Down moves the navigation
 highlight to another item. The two marks identify different things: navigation does not
 activate a session or change Main's owner. While the navigation highlight sits on the
 active card itself, that row shows the navigation highlight, and the owner's own title

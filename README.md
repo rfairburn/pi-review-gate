@@ -57,9 +57,10 @@ receipts of exactly what the model was told.
   terminal's left sidebar roster, each row an ordinary native Pi session that
   carries the review gate with its own workspace, conversation, and lifecycle.
   Sidebar Settings groups themes, Network, and Host shortcuts; application-owned
-  Pi-styled themes apply live, independently of the sessions' own themes. Status
-  colors distinguish agent state and pending input, and the active conversation
-  remains marked while browsing the sidebar
+  themes use Pi's own built-in Dark/Light foreground colours and apply live,
+  independently of the sessions' own themes, over the terminal's default
+  background. Status colors distinguish agent state and pending input, and the
+  active conversation remains marked while browsing the sidebar
   ([Session host](docs/session-host-alpha.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only
   request format (multi-file create/update/rename/delete with sequential application and

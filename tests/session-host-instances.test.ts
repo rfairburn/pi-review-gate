@@ -3711,7 +3711,9 @@ test("real reporter/protocol/broker/manager rendered row recovers fresh zero and
     const renderRow = (view: NativeInstanceView): string => {
       const sidebar = new SidebarController({ onAction: () => undefined });
       sidebar.updateItems([mainTest.toSidebarItem(view)]);
-      return sidebar.renderRoster(32, 20).lines.join("\n");
+      // The palette paints only the count VALUEs, so these plaintext count
+      // assertions read the row with the renderer's generated SGR removed.
+      return sidebar.renderRoster(32, 20).lines.map((line) => stripSgr(line)).join("\n");
     };
 
     const first = await waitForView(

@@ -15,30 +15,30 @@
  * A card is therefore exactly 5 rows expanded (default) or 3 rows collapsed,
  * one card's extent never overlaps another's, and the three required fixed
  * actions ("Saved conversations", "New session", "Quit host") follow every
- * native card as ordered one-row entries. Two optional one-row actions may
- * appear among them, each only at the renderer's own position: "Network"
- * between "New session" and "Quit host" when a network snapshot is attached,
- * and a final "Host shortcuts" action when settings are available. Only the leftmost sidebar columns (the wide
- * 32-column pane or the full narrow-overlay width) are inspected, extracted by
- * the pinned terminal-cell width model so wide/combining characters can never
- * pull the divider or native right pane into scope.
+ * native card as ordered one-row entries. ONE optional one-row action may
+ * appear, only at the renderer's own position: "Settings" (#613), present when
+ * at least one grouped settings entry point is available, sits between "New
+ * session" and the final "Quit host" action.
+ * There is no independent top-level "Network" or "Host shortcuts" row: those
+ * are Settings submenus, drawn in the content pane, never in the roster. Only
+ * the leftmost sidebar columns (the wide 32-column pane or the full
+ * narrow-overlay width) are inspected, extracted by the pinned terminal-cell
+ * width model so wide/combining characters can never pull the divider or native
+ * right pane into scope.
  *
  * The older inline `title [AGENT: …]` / `[exited (code 0)]` badge rows are not
  * cards under this grammar and yield no parse: a stale witness cannot silently
  * accept them. Public consumers are fail-closed: a frame is only usable when
  * the header-declared native count, every native card's full 3/5-row extent,
- * the ordered required action tail (with the optional Network row only at its
- * own position, and any optional final settings action) all agree, so a
- * partially painted roster can never satisfy an entry, card, selection, or
- * "hidden" witness.
+ * the ordered required action tail (with the optional Settings action only
+ * between "New session" and the final "Quit host") all agree, so a partially
+ * painted roster can never satisfy an entry, card, selection, or "hidden"
+ * witness.
  *
- * The optional Network row is accepted only as the exact renderer-drawn
- * `Network` label at its exact position. The renderer's pending-consent
- * annotation (`Network (2 requests)`) is deliberately NOT an accepted action:
- * a roster carrying it stays incomplete (fail closed) instead of teaching the
- * witness to accept an arbitrary annotated row, and the hide witness still
- * treats every Network-shaped row — exact, annotated, or half-painted — as a
- * visible sidebar remnant.
+ * A Network-shaped row is never an accepted roster action any more: that entry
+ * point moved under Settings. It stays a visible-sidebar remnant marker for the
+ * hide witness, together with a half-painted Settings row, so a stale paint can
+ * never satisfy a "hidden" claim.
  */
 import { sliceByColumn, truncateToWidth, visibleWidth } from "pi-session-host-tui";
 
@@ -70,17 +70,34 @@ const MARKER_CELLS = 2;
 /** The three required fixed host actions, in their rendered order. */
 export const ROSTER_ACTIONS = ["Saved conversations", "New session", "Quit host"] as const;
 /**
- * The optional network-menu action. The renderer draws it between
- * `"New session"` and `"Quit host"` only while a network snapshot is attached,
- * so it is never part of the required tail and never reorders that tail.
+ * The optional grouped settings action (#613). The renderer draws it only
+ * between `"New session"` and the final `"Quit host"`, and only when at least
+ * one entry point it offers (Theme, Network, Host shortcuts) is available, so
+ * it is never part of the required labels and never follows the destructive
+ * Quit action.
+ */
+export const SETTINGS_ACTION = "Settings";
+/**
+ * Not roster actions any more: Network and Host shortcuts live inside the
+ * Settings submenu. Their text stays known so the hide witness can still treat
+ * any painted occurrence as a visible sidebar remnant.
  */
 export const NETWORK_ACTION = "Network";
 const HOST_SHORTCUTS_ACTION = "Host shortcuts";
-const HOST_SHORTCUTS_OVERRIDE_ACTION = "Host shortcuts (--sidebar-key override active)";
 export type RosterActionLabel =
   | (typeof ROSTER_ACTIONS)[number]
-  | typeof NETWORK_ACTION
-  | typeof HOST_SHORTCUTS_ACTION;
+  | typeof SETTINGS_ACTION;
+
+/**
+ * The renderer's complete action-tail order for one availability state. Quit
+ * host is always last; Settings, when present, separates it from New session.
+ */
+export function rosterActionOrder(settingsAvailable: boolean): readonly RosterActionLabel[] {
+  const [saved, newSession, quitHost] = ROSTER_ACTIONS;
+  return settingsAvailable
+    ? [saved, newSession, SETTINGS_ACTION, quitHost]
+    : [saved, newSession, quitHost];
+}
 
 export interface RosterCardEntry {
   readonly kind: "native";
@@ -143,9 +160,9 @@ export interface ParsedRoster {
   readonly entryEnd: number;
   /**
    * True only for a complete roster: exactly `count` full native cards followed
-   * by the ordered required action tail, with the optional Network row only
-   * between "New session" and "Quit host", the optional final Host shortcuts
-   * action only after "Quit host", and no extra entry-shaped row.
+   * by the ordered required action tail, with the optional Settings action
+   * only between "New session" and the final "Quit host", and no extra
+   * entry-shaped row.
    */
   readonly complete: boolean;
 }
@@ -242,45 +259,67 @@ function rosterActionLabel(line: string, width: number): RosterActionLabel | und
   for (const label of ROSTER_ACTIONS) {
     if (rendered === renderedActionRow(`${prefix}${label}`, width)) return label;
   }
-  if (rendered === renderedActionRow(`${prefix}${NETWORK_ACTION}`, width)) return NETWORK_ACTION;
-  const shortcuts = renderedActionRow(`${prefix}${HOST_SHORTCUTS_ACTION}`, width);
-  const legacyOverride = renderedActionRow(`${prefix}${HOST_SHORTCUTS_OVERRIDE_ACTION}`, width);
-  return rendered === shortcuts || rendered === legacyOverride ? HOST_SHORTCUTS_ACTION : undefined;
+  // Only the grouped Settings row is an action any more. An annotated Network
+  // or Host shortcuts row is submenu content, never a roster action, so it
+  // leaves the parse incomplete exactly as an unknown row does.
+  return rendered === renderedActionRow(`${prefix}${SETTINGS_ACTION}`, width) ? SETTINGS_ACTION : undefined;
 }
 
 /**
- * A partial repaint of the settings row is still a visible sidebar remnant,
- * but is never a parsed action. Match only proper prefixes of renderer-valid
- * Host shortcuts rows so unrelated native-pane text cannot block the witness.
+ * A partial repaint of the grouped Settings row is still a visible sidebar
+ * remnant, but is never a parsed action. Match only proper prefixes of the
+ * renderer-valid Settings row so unrelated native-pane text cannot block the
+ * witness.
  */
-function isHostShortcutsActionRemnant(line: string, width: number): boolean {
+function isSettingsActionRemnant(line: string, width: number): boolean {
   const marker = statusMarker(line);
   if (marker === undefined) return false;
   const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
   const rendered = line.trimEnd();
-  const candidates = [
-    renderedActionRow(`${prefix}${HOST_SHORTCUTS_ACTION}`, width),
-    renderedActionRow(`${prefix}${HOST_SHORTCUTS_OVERRIDE_ACTION}`, width),
-  ];
+  const candidates = [renderedActionRow(`${prefix}${SETTINGS_ACTION}`, width)];
   return candidates.some((candidate) => rendered.length < candidate.length
     && candidate.slice(0, rendered.length) === rendered);
 }
 
 /**
- * A Network row in any paint state is a visible sidebar remnant: the exact
- * label, a half-painted prefix of it, or the annotated pending-consent form the
- * parser deliberately refuses as an action. Each proves the sidebar is still
- * drawn, so none of them may accompany a "hidden" witness.
+ * A Network-shaped row in any paint state is a visible sidebar remnant: the
+ * exact label, a half-painted prefix of it, or the annotated pending-consent
+ * form. None of them is a roster action any more (Network lives in the Settings
+ * submenu), and each still proves a sidebar surface is drawn, so none may
+ * accompany a "hidden" witness.
  */
 function isNetworkActionRemnant(line: string, width: number): boolean {
   const marker = statusMarker(line);
   if (marker === undefined) return false;
   const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
   const rendered = line.trimEnd();
-  const full = `${prefix}${NETWORK_ACTION}`;
-  if (rendered.length < full.length && full.startsWith(rendered)) return true;
+  if (isSubmenuRowRemnant(rendered, `${prefix}${NETWORK_ACTION}`, width)) return true;
   const text = rendered.startsWith(prefix) ? rendered.slice(prefix.length) : "";
   return text.startsWith(`${NETWORK_ACTION} (`);
+}
+
+/**
+ * The Host shortcuts submenu row (and any half-painted prefix of it) is likewise
+ * proof that a sidebar surface is still drawn, never a roster action.
+ */
+function isHostShortcutsSubmenuRemnant(line: string, width: number): boolean {
+  const marker = statusMarker(line);
+  if (marker === undefined) return false;
+  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
+  return isSubmenuRowRemnant(line.trimEnd(), `${prefix}${HOST_SHORTCUTS_ACTION}`, width);
+}
+
+/**
+ * True for the exact submenu row, its renderer-padded form, or any proper prefix
+ * of either. Submenu rows are never parsed as roster actions after #613, but a
+ * leftover one on screen still means the sidebar is visible.
+ */
+function isSubmenuRowRemnant(rendered: string, unpadded: string, width: number): boolean {
+  for (const candidate of [unpadded, renderedActionRow(unpadded, width)]) {
+    if (rendered === candidate) return true;
+    if (rendered.length < candidate.length && candidate.startsWith(rendered)) return true;
+  }
+  return false;
 }
 
 interface CardRead {
@@ -386,28 +425,25 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     return true;
   };
 
-  // The renderer's fixed tail, in its actual order. The optional Network row
-  // is accepted only between "New session" and "Quit host", and only while a
-  // network snapshot is attached: a Network row before "Saved conversations",
-  // between "Saved conversations" and "New session", after "Quit host", or
-  // drawn twice is a misplaced or duplicated row and leaves the roster
-  // incomplete. The three required actions stay mandatory in their order.
+  // The renderer's fixed tail, in its actual order. Saved conversations and New
+  // session stay mandatory first; Settings is optional between them and the
+  // final mandatory Quit host. There is no optional Network row any more: a
+  // Network-shaped row anywhere in the roster leaves the parse incomplete
+  // rather than being accepted as an entry point.
   const [saved, newSession, quitHost] = ROSTER_ACTIONS;
   if (!consumeAction(saved)) return incomplete(header, count, index);
   if (!consumeAction(newSession)) return incomplete(header, count, index);
-  if (rosterActionLabel(body[index] ?? "", width) === NETWORK_ACTION) consumeAction(NETWORK_ACTION);
-  if (!consumeAction(quitHost)) return incomplete(header, count, index);
 
-  // Host shortcuts is the existing settings action and is appended only when
-  // settings are available. Its legacy-override suffix is accepted only in
-  // the exact complete or width-clipped form produced by the renderer.
+  // Settings is the one grouped settings action and appears only when an entry
+  // point it offers is available. It must be before Quit host and is accepted
+  // only in the exact form the renderer produces.
   const optionalLine = body[index];
-  if (optionalLine !== undefined && rosterActionLabel(optionalLine, width) === HOST_SHORTCUTS_ACTION) {
+  if (optionalLine !== undefined && rosterActionLabel(optionalLine, width) === SETTINGS_ACTION) {
     const marker = statusMarker(optionalLine)!;
     const action: RosterActionEntry = {
       kind: "action",
       position: entries.length,
-      label: HOST_SHORTCUTS_ACTION,
+      label: SETTINGS_ACTION,
       selected: marker === "selected",
       rows: 1,
       raw: optionalLine,
@@ -416,6 +452,7 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     entries.push(action);
     index += 1;
   }
+  if (!consumeAction(quitHost)) return incomplete(header, count, index);
 
   // Anything extra that looks like an entry (a marker row or another full
   // card) means the roster is stale/duplicated, not complete. Footer hints,
@@ -441,12 +478,50 @@ function paneCell(line: string, sidebarColumns: number): string {
 }
 
 /**
+ * The three glyphs the #613 roster scrollbar paints: a light box for the track,
+ * a heavy box for an idle thumb, and a full block for a thumb the operator is
+ * holding. They are drawn in the pane's LAST column, across the list window
+ * only, and the list's own rows are clipped to the remaining columns.
+ */
+const SCROLLBAR_LANE_GLYPHS = new Set(["\u2502", "\u2503", "\u2588"]);
+
+/**
+ * Remove the #613 scrollbar lane from SGR-stripped pane text so consumers keep
+ * reading ROSTER TEXT: while the roster overflows, the renderer clips the list's
+ * own rows to one column fewer and paints the track/thumb in the pane's last
+ * column. That decoration is not a title, status, background, or activity cell,
+ * and every existing witness rule (markers, card extents, action tail, hide
+ * proof) must be able to ignore it.
+ *
+ * Fail-closed recognition: the lane is only stripped when at least TWO rows end
+ * in one of the three glyphs, because the renderer always paints the whole track
+ * at once (track rows plus at least one thumb row). A single content row whose
+ * own text happens to end in a box glyph is therefore never trimmed, and a pane
+ * with no lane comes back unchanged.
+ */
+export function withoutScrollbarLane(texts: readonly string[]): string[] {
+  const marked = texts.map((text) => {
+    const code = text.codePointAt(text.length - 1) ?? 0;
+    return code !== 0 && SCROLLBAR_LANE_GLYPHS.has(String.fromCodePoint(code));
+  });
+  if (marked.filter(Boolean).length < 2) return [...texts];
+  return texts.map((text, index) => {
+    if (!marked[index]) return text;
+    const code = text.codePointAt(text.length - 1) ?? 0;
+    return text.slice(0, text.length - (code > 0xffff ? 2 : 1));
+  });
+}
+
+/**
  * Scopes a frame or pane to the actual sidebar columns using the pinned
  * terminal-cell width model, so a wide/combining character can never pull the
- * divider or native right-pane content into the inspected region.
+ * divider or native right-pane content into the inspected region. The #613
+ * scrollbar lane is removed (see `withoutScrollbarLane`) and every row keeps its
+ * full pane width.
  */
 export function sidebarPaneLines(text: string, sidebarColumns: number = SIDEBAR_COLUMNS): string[] {
-  return text.split("\n").map((line) => paneCell(line, sidebarColumns));
+  const cells = withoutScrollbarLane(text.split("\n").map((line) => paneCell(line, sidebarColumns)));
+  return cells.map((cell) => cell + " ".repeat(Math.max(0, sidebarColumns - visibleWidth(cell))));
 }
 
 /** Offset of the roster's first line within pane lines (0 pane-only, 1 composed). */
@@ -649,7 +724,8 @@ export function sidebarRosterHidden(text: string, sidebarColumns: number = SIDEB
       if (STATUS_PATTERN.test(contents)
         || isBackgroundRow(contents, sidebarColumns)
         || rosterActionLabel(line, sidebarColumns) !== undefined
-        || isHostShortcutsActionRemnant(line, sidebarColumns)
+        || isSettingsActionRemnant(line, sidebarColumns)
+        || isHostShortcutsSubmenuRemnant(line, sidebarColumns)
         || isNetworkActionRemnant(line, sidebarColumns)) return true;
     }
     return /(?:F8 toggle|e edit name|d stop\/remove|esc hide|q quit|space expand)/u.test(line);

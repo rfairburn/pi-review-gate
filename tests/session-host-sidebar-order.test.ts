@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "pi-session-host-tui";
+import { withoutScrollbarLane } from "./helpers/session-host-native-roster-witness";
 import {
   SIDEBAR_GENERATED_SGR_ALLOWLIST,
   SidebarController,
@@ -208,7 +209,9 @@ function plainLines(lines: string[], cols: number, rows?: number): string[] {
     assert.ok(!text.includes("\x1b"), `raw ESC outside generated SGR: ${JSON.stringify(line)}`);
     assert.ok(visibleWidth(text) <= cols, `rendered row wider than pane: ${JSON.stringify(line)}`);
   }
-  return lines.map((line) => line.replace(SGR_PATTERN, ""));
+  // The #613 scrollbar lane is decoration in the pane's last column, never
+  // roster text; the shipped witness rule strips it (and only a real lane).
+  return withoutScrollbarLane(lines.map((line) => line.replace(SGR_PATTERN, "")));
 }
 
 /** The drawn row that carries a card's title line, or -1 when it is not drawn. */

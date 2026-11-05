@@ -30,6 +30,8 @@ import {
   SidebarController,
 } from "../src/session-host/sidebar";
 import { createSessionHostTextField } from "../src/session-host/field-editor";
+import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
+import { withoutScrollbarLane } from "./helpers/session-host-native-roster-witness";
 import type { PeerUiHost, PeerUiSettings, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
@@ -201,7 +203,9 @@ function assertPaneSafe(
   if (rowCount !== undefined) {
     assert.equal(lines.length, rowCount, "pane must fill the supplied geometry");
   }
-  return lines.map((line) => line.replace(SGR_PATTERN, ""));
+  // The #613 scrollbar lane is decoration in the pane's last column, never
+  // roster text; the shipped witness rule strips it (and only a real lane).
+  return withoutScrollbarLane(lines.map((line) => line.replace(SGR_PATTERN, "")));
 }
 
 function rosterView(
@@ -394,12 +398,19 @@ test("a left-roster click beside an open right-hand UI cancels it and activates 
   assert.equal(savedSame.controller.focus, "form", "the picker stays open under the same-row click");
   assert.equal(savedSame.controller.savedPickerRequestId, savedSameList.requestId, "the same picker is retained");
 
-  // Host shortcuts: a different row closes the editor through its own cancel
-  // route without saving anything, and the clicked row acts normally.
+  // Host shortcuts: reached through the one grouped Settings entry, a
+  // different roster row closes the editor through its own cancel route without
+  // saving anything, and the clicked row acts normally.
   const shortcuts = makeRoster(["a"], { settingsAvailable: true });
   const shortcutsRoster = assertPaneSafe(shortcuts.controller.renderRoster(32, 24).lines, 32, 24);
-  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutsRoster, "Host shortcuts"), 32, 24), true);
+  assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutsRoster, "Settings"), 32, 24), true);
   assert.equal(shortcuts.controller.focus, "form");
+  void shortcuts.controller.renderForm(47, 24);
+  shortcuts.send(DOWN); // the submenu's first row -> Host shortcuts
+  void shortcuts.controller.renderForm(47, 24);
+  shortcuts.send(ENTER);
+  assert.ok(wideFormText(shortcuts).includes("Toggle (stored)"),
+    "the grouped entry opens the real Host shortcuts editor, not a duplicate");
   shortcuts.baseline = shortcuts.actions.length;
   const shortcutView = widePanes(shortcuts);
   assert.equal(shortcuts.controller.activateRosterAt(1, wideRosterRow(shortcutView.roster, "label-a"), 32, shortcutView.rows), true);
@@ -702,10 +713,13 @@ test("the configured return chord is consumed in host forms and confirmations", 
 test("both Host shortcuts labels stay beside their real editable body row", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN);
-  harness.send(DOWN);
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
-  harness.send(ENTER);
+  harness.send(ENTER); // open Settings
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // Theme -> Host shortcuts
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // the existing Host shortcuts editor
   assert.equal(harness.controller.focus, "form");
   for (const [index, prefix, value, inactive] of [
     [0, "> Toggle (stored): ", "f8", "  Return to Main: "],
@@ -734,10 +748,13 @@ test("host shortcut settings edit configured bindings and Cancel leaves active b
   const harness = makeController({ settingsAvailable: true });
   const open = (): void => {
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> Host shortcuts
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
-    harness.send(ENTER);
+    harness.send(ENTER); // open Settings
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // Theme -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER); // the existing Host shortcuts editor
     assert.equal(harness.controller.focus, "form");
   };
   open();
@@ -747,19 +764,204 @@ test("host shortcut settings edit configured bindings and Cancel leaves active b
   harness.send("\x15");
   harness.send("f9");
   harness.send(ESC); // Cancel is local and emits no save action
+  assert.equal(harness.controller.focus, "form",
+    "Cancel returns through the Settings menu that opened the editor");
+  const menu = harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, "");
+  assert.ok(menu.includes("Host shortcuts") && menu.includes("Theme"),
+    "the grouped Settings menu is still on screen with its existing rows");
+  harness.send(ESC); // leaving Settings closes to the roster
   assert.equal(harness.controller.focus, "sidebar");
   assert.deepEqual(harness.focusedActions(), []);
   harness.send(ALT_LEFT_LEGACY);
   assert.equal(harness.controller.visible, false, "the old active toggle remains in force after Cancel");
 });
 
+test("the grouped Settings chain takes two deliberate Escapes and refuses a pasted body", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // New -> the one grouped Settings entry
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // open Settings
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // -> the Theme pane
+  void harness.controller.render(60, 20);
+  assert.match(harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, ""), /Theme/);
+
+  // A pasted body has no text target here and must never act as Enter.
+  harness.send("\x1b[200~\r\x1b[201~");
+  void harness.controller.render(60, 20);
+  assert.equal(harness.controller.focus, "form", "a paste leaves the Theme pane open");
+  assert.deepEqual(harness.focusedActions(), [], "a pasted Enter applies no appearance");
+
+  harness.send(ESC); // Theme -> the Settings menu that opened it
+  void harness.controller.render(60, 20);
+  assert.equal(harness.controller.focus, "form");
+  assert.match(harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, ""),
+    /Host shortcuts/, "the parent submenu is back on screen");
+
+  harness.send(ESC); // Settings -> roster (the SECOND lone Escape still lands)
+  void harness.controller.render(60, 20);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.visible, true, "leaving Settings never hides the sidebar");
+  assert.deepEqual(harness.focusedActions(), [], "the whole chain commits nothing");
+});
+
+test("Settings and Theme rows activate only from the pane the renderer drew", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // New -> the one grouped Settings entry
+  harness.send(ENTER); // open Settings with no written submenu yet
+  harness.send(ENTER); // and immediately try to activate a row
+  const text = harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, "");
+  assert.match(text, /The Settings menu changed; review it before acting/);
+  assert.deepEqual(harness.focusedActions(), [], "an undrawn row activates nothing");
+  assert.equal(harness.controller.focus, "form", "the refusal stays in the pane, it never escapes it");
+});
+
+/** Open Settings, then the Theme pane, leaving Light unhighlighted. */
+function openThemePaneHarness(): { harness: Harness; lightRow: number } {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // New -> the one grouped Settings entry
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // open Settings
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // -> the Theme pane
+  const lines = harness.controller.renderForm(60, 20).lines
+    .map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  const lightRow = lines.findIndex((line) => line.startsWith("  Light"));
+  assert.ok(lightRow >= 0, `the Theme pane draws an unhighlighted Light row:\n${lines.join("\n")}`);
+  return { harness, lightRow };
+}
+
+test("one written-frame click on the unselected Theme choice emits exactly one save", () => {
+  const { harness, lightRow } = openThemePaneHarness();
+  const map = harness.controller.captureMousePresentation();
+  assert.equal(map.activateFormRowAt(1, lightRow, 60, 20), true,
+    "the press lands on the row that render actually drew");
+  const saves = harness.sinceActions().filter((action) => action.type === "theme-save");
+  assert.equal(saves.length, 1, "a normal click on the unselected choice applies it once");
+  assert.equal(harness.controller.currentTheme, "dark",
+    "the palette still waits for Main to report a successful write");
+  const save = saves[0];
+  assert.ok(save && save.type === "theme-save");
+  assert.equal(save.theme, "light");
+  assert.equal(harness.controller.completeThemeSave(save.requestId, save.theme), true);
+  assert.equal(harness.controller.currentTheme, "light");
+});
+
+test("a Settings or Theme pane that no longer fits cannot authorize Enter or a captured press", () => {
+  const { harness, lightRow } = openThemePaneHarness();
+  const staleMap = harness.controller.captureMousePresentation();
+  harness.baseline = harness.actions.length;
+
+  const small = harness.controller.renderForm(20, 6).lines.join(" ").replace(SGR_PATTERN, "");
+  assert.match(small, /too small/, "the shrunk pane drew only its fallback");
+
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions().filter((action) => action.type === "theme-save"), [],
+    "the unreadable pane cannot authorize a save from its earlier row map");
+  assert.equal(staleMap.activateFormRowAt(1, lightRow, 60, 20), false,
+    "a press captured before the shrink refuses");
+  assert.equal(harness.controller.currentTheme, "dark");
+
+  // A complete redraw makes the same deliberate choice act again.
+  const redrawn = harness.controller.renderForm(60, 20).lines
+    .map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  const row = redrawn.findIndex((line) => line.startsWith("  Light"));
+  assert.ok(row >= 0, redrawn.join("\n"));
+  assert.equal(harness.controller.captureMousePresentation().activateFormRowAt(1, row, 60, 20), true,
+    "the resumed pane authorizes its own written row");
+  assert.equal(harness.sinceActions().filter((action) => action.type === "theme-save").length, 1);
+
+  // The grouped menu itself behaves the same way under a too-small render.
+  harness.send(ESC); // Theme -> Settings
+  void harness.controller.renderForm(60, 20);
+  harness.baseline = harness.actions.length;
+  assert.match(harness.controller.renderForm(18, 5).lines.join(" ").replace(SGR_PATTERN, ""), /too small/);
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions(), [],
+    "a too-small Settings menu cannot open a submenu from its earlier map");
+});
+
+test("a Settings menu that cannot show every entry falls back instead of hiding one", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // New -> the one grouped Settings entry
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // open the grouped menu
+  const wide = harness.controller.renderForm(60, 20).lines
+    .map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  assert.ok(wide.some((line) => line.startsWith("> Theme")), wide.join("\n"));
+  assert.ok(wide.some((line) => line.endsWith("Host shortcuts")), wide.join("\n"));
+  harness.baseline = harness.actions.length;
+
+  // 24x6 leaves room for the header, one context line, and ONE entry, while the
+  // menu has three. It has no scrolling, so it must fall back truthfully.
+  const small = harness.controller.renderForm(24, 6).lines
+    .map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  assert.match(small.join(" "), /too small/, small.join("\n"));
+  assert.equal(small.some((line) => /^\s*(> )?(Theme|Network|Host shortcuts)\s*$/.test(line)), false,
+    "no partial submenu list is drawn that navigation could silently leave behind");
+
+  // Navigation may still move the logical selection, but nothing invisible can
+  // act: neither Enter nor a press captured at that geometry.
+  harness.send(DOWN); // toward the entry that is not drawn
+  harness.send(DOWN);
+  const smallMap = harness.controller.captureMousePresentation();
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions(), [], "an entry the pane never drew cannot be activated");
+  assert.equal(smallMap.activateFormRowAt(1, 3, 24, 6), false, "the fallback offers no pointer target");
+  assert.match(harness.controller.renderForm(24, 6).lines.join(" ").replace(SGR_PATTERN, ""), /too small/);
+
+  // A complete larger redraw restores access to the very entry that was hidden.
+  const restored = harness.controller.renderForm(60, 20).lines
+    .map((line) => line.replace(SGR_PATTERN, "").trimEnd());
+  const hostRow = restored.findIndex((line) => /^\s*(> )?Host shortcuts\s*$/.test(line));
+  assert.ok(hostRow >= 0, restored.join("\n"));
+  assert.equal(harness.controller.captureMousePresentation().activateFormRowAt(1, hostRow, 60, 20), true,
+    "after the resize the same deliberate entry acts again");
+  assert.match(harness.controller.renderForm(60, 20).lines.join(" ").replace(SGR_PATTERN, ""), /Toggle/,
+    "the restored press opened the Host shortcuts editor");
+});
+
+test("a direct openPeerMenu keeps its own roster return after a grouped Network visit", () => {
+  const harness = makeController({ settingsAvailable: true });
+  harness.controller.setPeerUiSnapshot(networkSnapshot(null));
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // New -> the one grouped Settings entry
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // open Settings
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // Theme -> Network
+  void harness.controller.render(60, 20);
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form", "the grouped entry opened the Network pane");
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "form", "the grouped entry returns to Settings");
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "sidebar", "leaving Settings closes to the roster");
+
+  // The programmatic seam is its own origin: an incoming-request notice opens
+  // this pane directly, and its Escape still goes straight back to the roster.
+  harness.controller.openPeerMenu();
+  assert.equal(harness.controller.focus, "form");
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "sidebar",
+    "a directly opened Network pane never inherits a stale Settings return path");
+  assert.deepEqual(harness.focusedActions(), [], "the whole chain sends nothing");
+});
+
 test("host shortcut Save validates the pair and applies only after successful completion", () => {
   const harness = makeController({ settingsAvailable: true });
   void harness.controller.render(60, 20);
-  harness.send(DOWN);
-  harness.send(DOWN);
+  harness.send(DOWN); // New -> the one grouped Settings entry
   void harness.controller.render(60, 20);
-  harness.send(ENTER);
+  harness.send(ENTER); // open Settings
+  void harness.controller.render(60, 20);
+  harness.send(DOWN); // Theme -> Host shortcuts
+  void harness.controller.render(60, 20);
+  harness.send(ENTER); // the existing Host shortcuts editor
   harness.send("\x15");
   harness.send("f8");
   harness.send("\t");
@@ -785,10 +987,13 @@ test("a held old toggle chord stays fenced across Save and its fresh press remai
     assert.equal(harness.controller.visible, true);
     assert.equal(harness.controller.focus, "sidebar");
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> Host shortcuts
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
-    harness.send(ENTER);
+    harness.send(ENTER); // open Settings
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // Theme -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER); // the existing Host shortcuts editor
     harness.send("\x15");
     harness.send("f8");
     harness.send("\t");
@@ -827,10 +1032,13 @@ test("a held return chord keeps its original repeat/release fence through Save a
       settingsAvailable: true,
     });
     void harness.controller.render(60, 20);
-    harness.send(DOWN); // New -> Quit host
-    harness.send(DOWN); // -> Host shortcuts
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
-    harness.send(ENTER);
+    harness.send(ENTER); // open Settings
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // Theme -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER); // the existing Host shortcuts editor
     harness.send(KITTY_ALT_RIGHT_PRESS); // old return binding is claimed by the editor
     harness.send("\x15");
     harness.send("f8");
@@ -867,10 +1075,13 @@ test("a fresh press of the originally claimed return chord clears its old fence"
       settingsAvailable: true,
     });
     void harness.controller.render(60, 20);
-    harness.send(DOWN);
-    harness.send(DOWN);
+    harness.send(DOWN); // New -> the one grouped Settings entry
     void harness.controller.render(60, 20);
-    harness.send(ENTER);
+    harness.send(ENTER); // open Settings
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // Theme -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER); // the existing Host shortcuts editor
     harness.send(KITTY_F9_PRESS); // claimed by the editor before rebinding
     harness.send("\t");
     harness.send("\x15");
@@ -2624,6 +2835,47 @@ test("truthful card status: observed/unknown agent and input state below the tit
   assert.equal(statusFor("gone"), "  exited (code 3)");
   assert.equal(statusFor("err"), "  error (code 1)");
   assert.equal(statusFor("warm"), "  starting | input none");
+
+  // Agent and input facts stay independently painted, and only the observed
+  // VALUE carries colour: the `agent ` / `input ` label words and the separator
+  // stay on the neutral pane canvas, while the running agent and the muted empty
+  // input keep two different treatments on the SAME row.
+  const dark = sidebarPaletteFor("dark");
+  const ground = `\x1b[0m\x1b[${dark.canvas}m`;
+  const rawStatusFor = (id: string): string =>
+    harness.controller.render(80, 60).lines[cardIndex(texts, `label-${id}`) + 1] ?? "";
+  const runStatus = rawStatusFor("run");
+  assert.ok(runStatus.startsWith(`${ground}  agent `),
+    "the marker and the agent label word stay on the neutral pane canvas");
+  assert.ok(runStatus.includes(`\x1b[${dark.statusRunning}mrunning\x1b[0m`),
+    "the running status VALUE uses the running status role");
+  assert.ok(runStatus.includes(`${ground} | input `)
+    && runStatus.includes(`\x1b[${dark.statusIdle}mnone\x1b[0m`),
+    "the separator and input label stay neutral while the empty input VALUE uses the idle role");
+  const typedStatus = rawStatusFor("typed");
+  assert.ok(typedStatus.includes(`\x1b[${dark.statusWaiting}mwaiting\x1b[0m`),
+    "the waiting agent keeps its own status role");
+  assert.ok(typedStatus.includes(`\x1b[${dark.inputPending}mpending\x1b[0m`),
+    "pending input is conspicuous and independent of the agent role");
+  assert.ok(typedStatus.indexOf(`\x1b[${dark.statusWaiting}mwaiting`)
+    < typedStatus.indexOf(`\x1b[${dark.inputPending}mpending`),
+    "both distinctions survive on one exact status row");
+  assert.ok(!typedStatus.includes(`\x1b[${dark.statusWaiting}magent`)
+    && !typedStatus.includes(`\x1b[${dark.inputPending}minput`),
+    "neither label word borrows a status colour");
+  const unknownStatus = rawStatusFor("unobserved");
+  assert.ok(unknownStatus.includes(`${ground}  agent `) && unknownStatus.includes(`${ground} | input `),
+    "an unknown row still labels itself in the neutral canvas foreground");
+  assert.ok(unknownStatus.includes(`\x1b[${dark.statusUnknown}munknown\x1b[0m`),
+    "the unknown VALUES keep the muted unknown role");
+  // The lifecycle words keep their existing roles: this follow-up repaints only
+  // the alive-agent and pending-input VALUES.
+  assert.ok(rawStatusFor("gone").includes(`\x1b[${dark.statusExited}mexited (code 3)\x1b[0m`),
+    "the exited word keeps its existing role");
+  assert.ok(rawStatusFor("err").includes(`\x1b[${dark.statusError}merror (code 1)\x1b[0m`),
+    "the error word keeps its existing role");
+  assert.ok(rawStatusFor("warm").includes(`\x1b[${dark.statusStarting}mstarting\x1b[0m`),
+    "the starting word keeps its existing role");
 });
 
 test("card title line carries only the sanitized canonical title", () => {
@@ -2643,14 +2895,20 @@ test("card title line carries only the sanitized canonical title", () => {
   // Header, then the selected native card: the title row is the title alone —
   // no marker, prefix, or status badge — styled only by generated SGR.
   assert.equal(texts[1]?.trimEnd(), "Canonical title");
-  // Sidebar focus: the selected navigation target's title is blue (the focus-
-  // domain highlight), not the old inverse mark.
-  assert.ok(lines[1]?.startsWith("\x1b[0m\x1b[1;34mCanonical title"), JSON.stringify(lines[1]));
+  // Sidebar focus: the selected navigation target's title carries the active
+  // appearance's navigation colour, not the old inverse mark. The row opens with
+  // the chosen appearance's foreground on the TERMINAL-DEFAULT background (#613),
+  // matching Pi's own canvas-free chat viewport, then the role sequence itself —
+  // Pi's own converted foreground, never a generic ANSI colour.
+  const darkPalette = sidebarPaletteFor("dark");
+  const ground = `\x1b[0m\x1b[${darkPalette.canvas}m`;
+  assert.ok(lines[1]?.startsWith(`${ground}\x1b[${darkPalette.selected}mCanonical title`), JSON.stringify(lines[1]));
   assert.equal(texts[2]?.trimEnd(), "> agent running | input pending", "the selection marker lives on the status row");
   assert.ok(!texts.join("\n").includes("stale label"));
-  // Unselected title: sanitized label only, bold without inverse, no marker.
+  // Unselected title: sanitized label only, bold in the palette's muted title
+  // colour, no inverse, no marker.
   const plain = cardIndex(texts, "Plain label");
-  assert.ok(lines[plain]?.startsWith("\x1b[0m\x1b[1mPlain label"), JSON.stringify(lines[plain]));
+  assert.ok(lines[plain]?.startsWith(`${ground}\x1b[${darkPalette.title}mPlain label`), JSON.stringify(lines[plain]));
   assert.equal(texts[plain + 1]?.trimEnd(), "  exited (code 0)");
   assert.ok(texts.every((line) => !line.includes("evil")));
   for (const title of [texts[1], texts[plain]]) {

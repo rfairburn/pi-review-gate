@@ -223,6 +223,58 @@ settings and the defaults are described below. Put native Pi arguments after a l
 `--`; allowed arguments retain their original order and bytes. There are no initial host
 `--workspace`, `--profile`, or `--label` options.
 
+### Sidebar Settings and themes
+
+The sidebar's **Settings** entry appears above **Quit host** and groups **Theme**,
+**Network**, and **Host shortcuts**.
+Network and Host shortcuts open their existing controls as submenus rather than separate
+roster actions; their permissions, defaults, and session routing are unchanged. Back
+returns from a submenu to Settings, and closing Settings returns to the roster.
+
+Choose a Pi-styled **Dark** or **Light** sidebar theme through Settings. The host applies
+the choice live after saving it in its own
+`<agentDir>/session-host/appearance.json`, using the same per-agent scope as the roster
+and host shortcuts. An absent appearance file uses Dark without creating a file.
+The file has the strict shape `{"version":1,"theme":"dark"}` (or `"light"`).
+An unsafe or unreadable file is left untouched: the host shows a bounded refusal
+while keeping Dark available for display, and a later theme save will not replace
+an invalid existing record. A failed save keeps the previous active palette.
+
+The two palettes use Pi's OWN built-in Dark and Light foreground colours, copied
+from Pi 1.5.0's published theme files and converted once through the pinned Pi
+TUI colour API (attribution in [NOTICE](../NOTICE) and
+[LICENSES/MIT-pi-theme-colors.txt](../LICENSES/MIT-pi-theme-colors.txt)); no
+generic terminal palette colour is substituted. The agent/lifecycle status value
+uses Pi's success green for a running agent (bold), Pi's muted grey for a
+positively idle agent and for an empty `none` input value, Pi's warning colour
+(bold) for waiting and pending input, Pi's dim colour for an unknown or exited
+agent, and Pi's error colour (bold) for a failed state. The `agent` and `input`
+label words and the `|` separator stay in the pane's normal text colour, so the
+colour always carries the state word rather than replacing it. Each number on a
+card's background row is coloured on its own: 0 in Pi's muted grey, 1-2 in Pi's
+success green (bold), 3-6 in Pi's warning colour (bold), and 7 or more in Pi's
+error red (bold), uncapped, so a session with more intended work reads hotter.
+That red is activity intensity only — it never reclassifies the row's status,
+notice, or lifecycle, and a busy card never reads as a failed one. The `bg tasks`
+and `shells` label words, the spaces, and the `|` separator stay in the pane's
+normal text colour, and an `unknown` count stays ordinary text: only an observed
+number is painted, and the row's wording and honest unknown handling are
+unchanged. The sidebar's own
+title, the navigation highlight, the active conversation's title, and the
+scrollbar roles likewise take Pi's accent, link, body-text, track, and thumb
+colours for the chosen appearance.
+
+This is colour only: the wording, the state classification, and which facts are
+shown never change. The sidebar works with only remote sessions and no local Pi
+session running: Pi's saved theme is not read or synchronized, and changing this
+theme neither restarts sessions nor changes any local or remote session's own
+theme. Status text and the distinction between the navigation highlight and the
+active Main conversation remain visible. The base sidebar background uses the
+terminal default, like Pi's normal chat viewport; choosing a foreground palette
+does not force a black or white pane background. The host never queries the
+terminal for its palette, follows a custom or adaptive theme, or adds a colour
+setting: the operator's explicit Dark/Light choice is the only input.
+
 ### Host shortcut configuration
 
 The host's two existing keyboard actions have independent bindings. Their dedicated
@@ -240,7 +292,7 @@ review-gate configuration. A missing host file uses defaults without creating th
 }
 ```
 
-The Host shortcuts roster entry opens a host-owned editor. Tab switches between the two
+**Settings → Host shortcuts** opens the existing host-owned editor. Tab switches between the two
 configured fields; the current native form submit binding saves, and the current native
 cancel binding cancels. Save validates both configured chords and the effective pair,
 then atomically writes the file and applies the bindings immediately. Cancel changes
@@ -834,7 +886,7 @@ manual comparison next.
 
 ### Network sidebar: hosting, pairing, and remote metadata
 
-The optional native session host exposes a **Network** entry in its sidebar when the
+The optional native session host exposes **Settings → Network** in its sidebar when the
 network UI snapshot is attached. Ordinary Pi sessions and both standalone review-gate
 launchers are unchanged and have no Network entry. The sidebar is a pure display and
 command frontend: one coordinator owned by the host performs every listener, client,
@@ -970,7 +1022,10 @@ activity lines under the existing activity-only collapse. It adds exactly one ow
 destination's bounded local display name, never an identity claim — and it shows no
 workspace path. That one line is clipped with the card's usual ellipsis when the label is
 unusually long, rather than wrapping or widening the card, and the honest stale marker
-leads it so a long label cannot hide the observation. The leading selection marker is
+leads it so a long label cannot hide the observation. Only the host's friendly name is
+painted, in Pi's own cyan variable colour and at the same unbolded weight as before; the
+indentation, the `host` word, and the `[stale]` marker stay in the pane's normal text
+colour. The leading selection marker is
 omitted in this example:
 
 ```
@@ -1446,9 +1501,9 @@ never steal focus.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-an existing action entry. A single left-click on a displayed New, Saved, Quit, or Host shortcuts action entry
+an existing action entry. A single left-click on a displayed New, Saved, Quit, or Settings action entry
 invokes that same action: New still opens its form, Saved its picker, Quit follows its
-existing confirmation rules, and Host shortcuts opens its dedicated editor. These sidebar clicks are handled by the
+existing confirmation rules, and Settings opens the grouped settings menu. These sidebar clicks are handled by the
 host, not forwarded to a native child; existing keyboard controls remain available.
 With the roster focused, a single left click inside a currently displayed native Main
 pane returns keyboard focus to the unchanged active Main owner and consumes that first
@@ -1473,6 +1528,14 @@ after wheeling, including moving the highlight to an entry that is off-screen an
 bringing it into view. No wheel preference, acceleration, smooth-scrolling mode, or
 rows-per-notch setting is added, and hosted-conversation and popup scrolling are
 unchanged.
+
+When the roster overflows vertically, a themed Pi-chat-style scrollbar stays visible
+at rest; it is hidden when the content fits. Its thumb reflects the existing viewport.
+Click its track or drag its thumb to reach earlier or later entries without activating
+a session, moving the highlight, changing focus, or forwarding the gesture into Main
+or a popup. Content and terminal-size changes recompute its range and geometry; theme
+changes update its colors without restarting sessions.
+
 While a host UI occupies the right-hand pane beside the visible roster, the roster stays
 clickable. A single left click on a *different* left row first closes that right-hand UI
 through its own cancellation route — the same route its keyboard cancel uses, so an
@@ -1695,11 +1758,27 @@ error, or process exit does not turn unknown into Idle. Exited rows retain their
 explicitly removed. There is no heartbeat timeout that declares a quiet session dead,
 so a valid idle state may remain for hours.
 
-Title highlighting is focus-domain, never both at once: while a sidebar-owned surface
-(roster, form, or confirmation) has focus, the LEFT selected navigation target's title
-is blue; while Main has focus, the ACTUAL active Main conversation's title is white
-(never a sibling or the stale left selection). With no active owner, no row is falsely
-highlighted.
+Agent states have distinct theme colors, and pending input is emphasized independently:
+`agent running | input pending` keeps both distinctions visible. The colors are Pi's own
+built-in foregrounds for the chosen appearance (Pi's success green for a running agent,
+Pi's muted grey for a positively idle one and for an empty `none` input value, Pi's
+warning colour and bold for waiting and pending input, Pi's dim colour for unknown or
+exited), and the `agent`/`input` label words and the separator stay in the pane's normal
+text colour. The words and the observed/unknown classification remain unchanged; color
+never substitutes for status text. The two background activity numbers are coloured
+independently by how much work each reports (0 muted, 1-2 success, 3-6 warning, 7 or
+more error red, uncapped), while their labels, the separator, and any `unknown` value stay
+ordinary text; the error-family red is activity intensity only and never means the session
+failed.
+
+The actual active Main conversation keeps its own title colour while its card is visible,
+even when keyboard focus moves to the sidebar and Up/Down moves the navigation
+highlight to another item. The two marks identify different things: navigation does not
+activate a session or change Main's owner. While the navigation highlight sits on the
+active card itself, that row shows the navigation highlight, and the owner's own title
+color returns as soon as the highlight moves to another card or Main's focus is active.
+This applies to local and remote owners; with no active owner, no row receives a false
+active-title mark.
 
 The local status channel uses a private Unix socket and per-instance authorization
 identity bound to the owned child. A pre-main Node preload consumes the one-shot
@@ -1726,7 +1805,7 @@ a second authoritative process or status store, and it never moves a process,
 conversation, or saved state between hosts.
 
 Only session cards reorder, including exited rows and the bounded error and
-identity-unavailable placeholder rows that already hold a remembered position. The action entries (New, Saved, Network, Host shortcuts, Quit host)
+identity-unavailable placeholder rows that already hold a remembered position. The action entries (Saved conversations, New session, Settings, Quit host)
 and the roster's [Terminal diagnostics](#terminal-parser-diagnostics) entry keep their
 existing relative order after the session cards, and no session card can be moved among
 them.
@@ -2598,7 +2677,7 @@ reported and keeps agent-directory ownership; shutdown never waits for a remote 
 and never stops a remote session or remote work.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
 not removed as part of host shutdown. Apart from deliberate Saved-file deletion,
-Host shortcuts saves, explicit network actions that save settings or trust, and the
+Host shortcuts and sidebar theme saves, explicit network actions that save settings or trust, and the
 bounded terminal diagnostics log (written only after a
 diagnostic, see [Terminal parser diagnostics](#terminal-parser-diagnostics)), the
 persistent roster and ownership record are the only

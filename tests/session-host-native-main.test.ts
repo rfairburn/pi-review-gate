@@ -571,7 +571,7 @@ test("the settled-frame activation fence waits past a mixed frame and still fail
 // local-scripted-provider/no-session-override fixture boundary.
 test("roster navigation sends no key when its fresh complete frame already selects the destination", async () => {
   const frame = ["Session host", ...[
-    " Sessions (0)", "  Saved conversations", "> New session", "  Network", "  Quit host", "  Host shortcuts",
+    " Sessions (0)", "  Saved conversations", "> New session", "  Settings", "  Quit host",
   ].map((line) => line.padEnd(32) + "│Welcome")].join("\n");
   let displayed = ""; // The first synchronous probe is still an incomplete paint.
   let waits = 0;

@@ -15,6 +15,62 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.258]
+
+### Added
+
+- **Live sidebar themes and an interactive overflow scrollbar** (#613): Dark and
+  Light Pi-styled palettes are saved in the session host's own per-agent settings
+  and applied without restarting sessions, including remote-only rosters with no
+  local Pi session. Pi's saved theme and child-session themes are untouched. An
+  overflowing roster keeps its themed scrollbar visible while idle, with direct
+  mouse navigation through the existing viewport; fitting content has no scrollbar.
+  Selection, focus, status text, wheel/keyboard navigation, and session routing
+  retain their existing meanings.
+
+### Changed
+
+- **One sidebar Settings menu** (#613) contains Theme, Network, and Host shortcuts,
+  replacing the separate Network and Host shortcuts roster actions while preserving
+  their existing capabilities, defaults, permissions, and actions. Settings appears
+  above Quit host.
+- **Sidebar colors are Pi's own** (#613): every sidebar foreground role now uses
+  the exact authored foreground of Pi 1.5.0's built-in Dark and Light themes
+  (body text, muted, dim, accent, success, error, warning, Markdown link,
+  scrollbar track and thumb), converted once through the pinned Pi TUI colour
+  API, instead of generic ANSI 30–37/90–97 substitutions. A positively idle agent
+  now reads in Pi's muted grey, distinct from the ordinary `agent` word and from
+  a running agent's Pi success green; waiting and pending input keep one warning
+  hue and its bold; unknown and exited states use Pi's dim colour. The
+  background stays the terminal default, the host still picks Dark or Light for
+  its own sidebar only (Pi's saved theme is never read, synchronized, or
+  restarted for), no terminal colour detection was added, and the wording,
+  state classification, navigation precedence, and layout are unchanged. The
+  copied values are MIT-attributed in NOTICE and
+  LICENSES/MIT-pi-theme-colors.txt.
+- **Sidebar activity counts and remote host names** (#613): each independent
+  number on a card's background row (`bg tasks`, `shells`) is banded by how much
+  work that session intends — 0 in Pi's muted grey, 1-2 in Pi's success green
+  (bold), 3-6 in Pi's warning colour (bold), 7 or more in Pi's error red (bold),
+  uncapped — so a busy card reads hotter. That red is activity intensity only:
+  it never reclassifies the row's status, notice, or lifecycle, and a busy card
+  never reads as failed. The `bg tasks` and `shells` labels, the spaces and the
+  `|` separator, and any `unknown` value stay in the pane's normal text colour,
+  and the row's wording, counts, and honest unknown handling are unchanged on
+  local and remote cards alike. Only the friendly hostname on a remote card's
+  indented owner line takes Pi's own cyan variable colour, unbolded as before;
+  the indentation, the `host` word, and `[stale]` stay ordinary text, and the
+  clipping that keeps `[stale]` ahead of a long name is unchanged. Both colours
+  are Pi 1.5.0 authored foregrounds (now eleven copied tokens) through the same
+  pinned conversion: the generated colour set stays closed, and no colour
+  detection, setting, action, or routing changed.
+- **Sidebar presentation** (#613) preserves the terminal's default background rather
+  than forcing a black or white base fill, colors observed agent states and pending
+  input independently, and keeps the active conversation's own title colour visible
+  while the separate keyboard-navigation highlight moves to another card. Status
+  text, state classification, session ownership, and scrollbar behavior are
+  unchanged.
+
 ## [0.1.0-dev.257]
 
 ### Fixed

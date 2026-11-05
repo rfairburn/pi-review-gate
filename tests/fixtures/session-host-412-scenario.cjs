@@ -39,6 +39,17 @@ const { registerBackgroundShell, __test: shellTest } = require(join(DIST, "src",
 const HISTORY_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-412-history-group.cjs");
 const WORKER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-412-running-worker.cjs");
 
+/**
+ * The sidebar palette paints only VALUE words (agent/input status and the
+ * numeric activity counts), so those words are asserted on the row with the
+ * renderer's generated SGR removed. The plaintext itself is unchanged by the
+ * colouring.
+ */
+const GENERATED_SGR = /\x1b\[[0-9;]*m/g;
+function plainRow(rendered) {
+  return rendered.replace(GENERATED_SGR, "");
+}
+
 const scenario = process.argv[2];
 if (!scenario) throw new Error("usage: session-host-412-scenario.cjs <scenario>");
 
@@ -507,7 +518,7 @@ async function scenarioPoisonRecovery() {
         await lab.waitForView((view) => view.activeTasks === expected.activeTasks && view.activeShells === expected.activeShells,
           `${name}: rendered row converges to the fresh actual counts`, 8_000);
         const rendered = lab.renderRow();
-        assert.match(rendered, new RegExp(`bg tasks ${expected.activeTasks} \\| shells ${expected.activeShells}`, "u"),
+        assert.match(plainRow(rendered), new RegExp(`bg tasks ${expected.activeTasks} \\| shells ${expected.activeShells}`, "u"),
           `${name}: rendered row shows the fresh actual counts\n${rendered}`);
         phases.push({ name, ...statusSummary(lab), refreshCalls, payload });
         return payload;
@@ -680,7 +691,7 @@ async function scenarioUnreadableLive() {
       assert.equal(payload.activeTasks, null, "unreadable canonical evidence stays unknown in the correlated payload");
       assert.notEqual(payload.activeTasks, 0, "unreadable evidence is never certified as zero");
       const renderedUnknown = lab.renderRow();
-      assert.match(renderedUnknown, /bg tasks unknown/u, "the rendered row shows truthful unknown");
+      assert.match(plainRow(renderedUnknown), /bg tasks unknown/u, "the rendered row shows truthful unknown");
       renameSync(heldManifest, manifest);
       return { payload, refreshCalls, renderedUnknown, final: statusSummary(lab) };
     } finally {

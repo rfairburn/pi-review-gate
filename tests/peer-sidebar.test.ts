@@ -342,8 +342,21 @@ test("an attached snapshot adds the Network menu and the alert without stealing 
   assert.deepEqual(harness.commands(), [], "arrival emits no action at all");
 
   const text = rosterText(harness);
-  assert.ok(text.some((line) => line.includes("Network")), "the menu appears once attached");
+  assert.ok(text.some((line) => line.includes("Settings")), "the grouped Settings entry appears once attached");
   assert.ok(text.some((line) => line.includes("Incoming connection request")), "the alert is rendered");
+
+  // Grouping costs nothing: the Settings submenu offers the SAME Network entry
+  // with the SAME pending-request annotation the old top-level row carried.
+  for (let step = 0; step < 8; step += 1) {
+    const highlighted = rosterText(harness).find((line) => line.startsWith("> ")) ?? "";
+    if (highlighted.includes("Settings")) break;
+    harness.send(DOWN);
+  }
+  rosterText(harness);
+  harness.send(ENTER);
+  const menu = assertPaneSafe(harness.controller.renderForm(60, 20).lines, 60, 20);
+  assert.ok(menu.some((line) => line.includes("Network (2 requests)")),
+    "the Network submenu row keeps the pending-request discoverability text");
 });
 
 // ---------------------------------------------------------------------------
@@ -1820,8 +1833,11 @@ function wideRightPane(harness: Harness, formCols = 47, rows = 24): string {
 function openNetworkFromRoster(harness: Harness): void {
   show(harness);
   void rosterText(harness); // deliberate Enter only acts on a row the last roster render drew
-  harness.send(DOWN); // New session -> Network
-  harness.send(ENTER);
+  harness.send(DOWN); // New session -> the one grouped Settings entry
+  void rosterText(harness);
+  harness.send(ENTER); // open Settings
+  void rosterText(harness);
+  harness.send(ENTER); // its Network row opens the existing pane
   assert.equal(harness.controller.focus, "form");
   harness.baseline = harness.actions.length;
 }
@@ -1833,7 +1849,7 @@ test("a left-roster click closes the network pane and its Add menu without sendi
 
   // The highlighted Network row is a pure no-op while its own pane is open.
   let roster = wideDraw(harness);
-  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Network"), 32, 24), true);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Settings"), 32, 24), true);
   assert.deepEqual(harness.commands(), [], "the highlighted Network row emits nothing while its pane is open");
   assert.equal(harness.controller.focus, "form", "the network pane stays open");
   assert.ok(wideRightPane(harness).includes("Network"), "the same pane is still on screen");
@@ -1852,8 +1868,12 @@ test("a left-roster click closes the network pane and its Add menu without sendi
   // field: the click closes the editor AND its containing pane and adds
   // nothing, while the untouched local draft rules stay as they are.
   roster = wideDraw(harness);
-  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Network"), 32, 24), true);
+  assert.equal(harness.controller.activateRosterAt(1, wideRow(roster, "Settings"), 32, 24), true);
   assert.equal(harness.controller.focus, "form");
+  // The grouped entry's own Network row then opens the existing pane.
+  void harness.controller.renderForm(47, 24);
+  harness.send(ENTER);
+  assert.ok(wideRightPane(harness).includes("hosting:"), "the real Network pane is open again");
   harness.baseline = harness.actions.length; // the shared Add-menu helper compares against this point
   openAddMenu(harness);
   focusPeerEntry(harness, "Host:");

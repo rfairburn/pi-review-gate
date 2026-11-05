@@ -475,10 +475,10 @@ test("native roster-position witness permits moving actions but rejects displace
   const after = entries([...items, { ...items[0]!, id: "owned-new", label: "New native process" }]);
   assert.equal(before.filter((entry) => entry.kind === "native").length, 2);
   assert.equal(before.filter((entry) => entry.kind === "action").length, 4);
-  const shortcutsPosition = (rows: readonly RosterEntry[]): number | undefined => rows.find((entry) =>
-    entry.kind === "action" && entry.label === "Host shortcuts")?.position;
-  assert.equal(shortcutsPosition(after), shortcutsPosition(before)! + 1,
-    "the actual Host shortcuts action moves when a new native card is appended");
+  const settingsPosition = (rows: readonly RosterEntry[]): number | undefined => rows.find((entry) =>
+    entry.kind === "action" && entry.label === "Settings")?.position;
+  assert.equal(settingsPosition(after), settingsPosition(before)! + 1,
+    "the actual grouped Settings action moves when a new native card is appended");
   assert.doesNotThrow(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, after));
   assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before,
     entries([{ ...items[0]!, label: "Changed native title" }, items[1]!])), /previous process row 0/);
@@ -622,9 +622,9 @@ test("native position witness excludes shifting host actions by kind, not conver
   };
   const before = entries(["Quit host"]);
   const after = entries(["Quit host", "New native"]);
-  assert.ok(before.some((entry) => entry.kind === "action" && entry.label === "Host shortcuts"));
+  assert.ok(before.some((entry) => entry.kind === "action" && entry.label === "Settings"));
   assert.doesNotThrow(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, after),
-    "adding a native child shifts all host action rows, including Host shortcuts");
+    "adding a native child shifts all host action rows, including the grouped Settings row");
   assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, entries(["New native", "Quit host"])),
     "a native conversation named like a host action must still retain its observed position");
   const actionReplacement: RosterEntry[] = [...after];

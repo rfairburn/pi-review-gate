@@ -89,7 +89,7 @@ const GOLDEN_PALETTE: Readonly<Record<SidebarThemeId, Readonly<Record<keyof Side
     secondary: "38;2;157;165;169",
     statusStarting: "1;38;2;105;173;208",
     statusRunning: "1;38;2;104;183;141",
-    statusWaiting: "38;2;205;154;34",
+    statusWaiting: "1;38;2;205;154;34",
     statusIdle: "38;2;157;165;169",
     statusUnknown: "38;2;126;136;142",
     statusExited: "38;2;126;136;142",
@@ -111,7 +111,7 @@ const GOLDEN_PALETTE: Readonly<Record<SidebarThemeId, Readonly<Record<keyof Side
     secondary: "38;2;103;113;118",
     statusStarting: "38;2;47;120;153",
     statusRunning: "1;38;2;51;126;88",
-    statusWaiting: "38;2;143;104;2",
+    statusWaiting: "1;38;2;143;104;2",
     statusIdle: "38;2;103;113;118",
     statusUnknown: "38;2;135;144;149",
     statusExited: "38;2;135;144;149",
@@ -191,9 +191,9 @@ test("no sidebar role falls back to a generic ANSI, bright, or 256-color foregro
 test("idle, the ordinary agent word, and a running agent stay three different colours", () => {
   for (const theme of SIDEBAR_THEME_IDS) {
     const palette = paletteEntries(theme);
-    // The `agent ` / `input ` label words, the separator, and a plain `none`
-    // carry the canvas foreground (Pi's body text) with no emphasis of their
-    // own, on the terminal's default ground.
+    // The `agent ` / `input ` label words and the separator carry the canvas
+    // foreground (Pi's body text) with no emphasis of their own, on the
+    // terminal's default ground; the `none` VALUE takes the idle role instead.
     assert.equal(palette.canvas.endsWith(";49"), true, `${theme}: canvas keeps the default background`);
     assert.equal(/^1;/.test(palette.canvas), false, `${theme}: the canvas foreground is not bold`);
     // idle: muted and unbolded, and different from BOTH the ordinary word and
@@ -203,11 +203,14 @@ test("idle, the ordinary agent word, and a running agent stay three different co
     assert.notDeepEqual(rgbOf(palette.statusIdle), rgbOf(palette.statusRunning), `${theme}: idle differs from running`);
     assert.equal(/^1;/.test(palette.statusIdle), false, `${theme}: idle is muted, not emphasized`);
     assert.equal(/^1;/.test(palette.statusRunning), true, `${theme}: running keeps its bold`);
-    // waiting/pending share one warning hue; only the emphasis differs.
+    // waiting/pending share one warning hue AND its bold: the two value words
+    // read identically while their labels stay canvas text.
     assert.deepEqual(rgbOf(palette.statusWaiting), rgbOf(palette.inputPending),
       `${theme}: waiting and pending keep the same warning hue`);
-    assert.equal(/^1;/.test(palette.statusWaiting), false, `${theme}: waiting stays plain`);
+    assert.equal(/^1;/.test(palette.statusWaiting), true, `${theme}: waiting carries pending's bold`);
     assert.equal(/^1;/.test(palette.inputPending), true, `${theme}: pending keeps its bold`);
+    assert.equal(palette.statusWaiting, palette.inputPending,
+      `${theme}: waiting and pending are the one warning look`);
     // The focus-domain roles stay three distinct looks, and an ordinary title no
     // longer rests on bold alone against the owner's title.
     assert.notDeepEqual(rgbOf(palette.selected), rgbOf(palette.activeMain), `${theme}: nav target and owner differ`);
@@ -251,7 +254,7 @@ const EXPECTED_ROLE_STYLES: Readonly<Record<SidebarThemeId, Readonly<Record<Side
     secondary: { token: "muted", bold: false },
     statusStarting: { token: "mdLink", bold: true },
     statusRunning: { token: "success", bold: true },
-    statusWaiting: { token: "warning", bold: false },
+    statusWaiting: { token: "warning", bold: true },
     statusIdle: { token: "muted", bold: false },
     statusUnknown: { token: "dim", bold: false },
     statusExited: { token: "dim", bold: false },
@@ -272,7 +275,7 @@ const EXPECTED_ROLE_STYLES: Readonly<Record<SidebarThemeId, Readonly<Record<Side
     secondary: { token: "muted", bold: false },
     statusStarting: { token: "mdLink", bold: false },
     statusRunning: { token: "success", bold: true },
-    statusWaiting: { token: "warning", bold: false },
+    statusWaiting: { token: "warning", bold: true },
     statusIdle: { token: "muted", bold: false },
     statusUnknown: { token: "dim", bold: false },
     statusExited: { token: "dim", bold: false },

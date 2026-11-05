@@ -246,10 +246,10 @@ TUI colour API (attribution in [NOTICE](../NOTICE) and
 [LICENSES/MIT-pi-theme-colors.txt](../LICENSES/MIT-pi-theme-colors.txt)); no
 generic terminal palette colour is substituted. The agent/lifecycle status value
 uses Pi's success green for a running agent (bold), Pi's muted grey for a
-positively idle agent, Pi's warning colour for waiting input and, bold, for
-pending input, Pi's dim colour for an unknown or exited agent, and Pi's error
-colour (bold) for a failed state. The `agent` and `input` label words, the `|`
-separator, and a plain `none` stay in the pane's normal text colour, so the
+positively idle agent and for an empty `none` input value, Pi's warning colour
+(bold) for waiting and pending input, Pi's dim colour for an unknown or exited
+agent, and Pi's error colour (bold) for a failed state. The `agent` and `input`
+label words and the `|` separator stay in the pane's normal text colour, so the
 colour always carries the state word rather than replacing it. The sidebar's own
 title, the navigation highlight, the active conversation's title, and the
 scrollbar roles likewise take Pi's accent, link, body-text, track, and thumb
@@ -1749,11 +1749,11 @@ so a valid idle state may remain for hours.
 Agent states have distinct theme colors, and pending input is emphasized independently:
 `agent running | input pending` keeps both distinctions visible. The colors are Pi's own
 built-in foregrounds for the chosen appearance (Pi's success green for a running agent,
-Pi's muted grey for a positively idle one, Pi's warning colour for waiting and, bold,
-for pending input, Pi's dim colour for unknown or exited), and the `agent`/`input` label
-words, the separator, and a plain `none` stay in the pane's normal text colour. The words
-and the observed/unknown classification remain unchanged; color never substitutes for
-status text.
+Pi's muted grey for a positively idle one and for an empty `none` input value, Pi's
+warning colour and bold for waiting and pending input, Pi's dim colour for unknown or
+exited), and the `agent`/`input` label words and the separator stay in the pane's normal
+text colour. The words and the observed/unknown classification remain unchanged; color
+never substitutes for status text.
 
 The actual active Main conversation keeps its own title colour while its card is visible,
 even when keyboard focus moves to the sidebar and Up/Down moves the navigation

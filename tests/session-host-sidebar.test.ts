@@ -2837,9 +2837,9 @@ test("truthful card status: observed/unknown agent and input state below the tit
   assert.equal(statusFor("warm"), "  starting | input none");
 
   // Agent and input facts stay independently painted, and only the observed
-  // VALUE carries colour: the `agent ` / `input ` label words, the separator,
-  // and a plain `none` stay on the neutral pane canvas, while the running agent
-  // and its ordinary empty input keep two different treatments on the SAME row.
+  // VALUE carries colour: the `agent ` / `input ` label words and the separator
+  // stay on the neutral pane canvas, while the running agent and the muted empty
+  // input keep two different treatments on the SAME row.
   const dark = sidebarPaletteFor("dark");
   const ground = `\x1b[0m\x1b[${dark.canvas}m`;
   const rawStatusFor = (id: string): string =>
@@ -2849,8 +2849,9 @@ test("truthful card status: observed/unknown agent and input state below the tit
     "the marker and the agent label word stay on the neutral pane canvas");
   assert.ok(runStatus.includes(`\x1b[${dark.statusRunning}mrunning\x1b[0m`),
     "the running status VALUE uses the running status role");
-  assert.ok(runStatus.includes(`${ground} | input none`),
-    "the separator and `input none` stay neutral independently of the running agent");
+  assert.ok(runStatus.includes(`${ground} | input `)
+    && runStatus.includes(`\x1b[${dark.statusIdle}mnone\x1b[0m`),
+    "the separator and input label stay neutral while the empty input VALUE uses the idle role");
   const typedStatus = rawStatusFor("typed");
   assert.ok(typedStatus.includes(`\x1b[${dark.statusWaiting}mwaiting\x1b[0m`),
     "the waiting agent keeps its own status role");

@@ -76,8 +76,8 @@ export type SidebarThemeRole =
    * semantic roles because one status row can carry two independent facts:
    * an idle agent waiting for input is not the same as a running agent that
    * happens to have no pending input. A role paints only the value word
-   * (`running`, `idle`, `unknown`); the `agent ` / `input ` label words, the
-   * separator, and a plain `none` stay on the neutral pane canvas.
+   * (`running`, `idle`, `none`, `unknown`); the `agent ` / `input ` label words
+   * and the separator stay on the neutral pane canvas.
    */
   | "statusStarting"
   | "statusRunning"
@@ -174,15 +174,16 @@ type SidebarRoleOverrides = Readonly<Partial<Record<SidebarThemeRole, SidebarRol
 
 /**
  * The role map, shared by both appearances. Status VALUES are painted, never
- * the `agent ` / `input ` label words, the separator, or a plain `none`, which
- * stay on the pane canvas.
+ * the `agent ` / `input ` label words or the separator, which stay on the pane
+ * canvas.
  *
  * A positively idle agent is Pi's muted colour, NOT a variant of the running
  * colour: idle, the ordinary `agent` word on the same row, and a running agent
- * then all read differently (muted, canvas text, and bold success). Running is
- * Pi's success, pending input is bold Pi's warning, and waiting input is the
- * same warning hue without the bold, so the two independent facts on one status
- * row stay separable while keeping their existing emphasis.
+ * then all read differently (muted, canvas text, and bold success). The plain
+ * `input none` VALUE shares the idle role, so an empty input reads like an idle
+ * agent. Running is Pi's success, and waiting and pending input both carry Pi's
+ * warning hue WITH the same bold, so the two independent facts on one status
+ * row stay separable from each other and from the labels.
  */
 const SHARED_ROLE_COLOURS: Readonly<Record<SidebarThemeRole, SidebarRoleColour>> = Object.freeze({
   header: { token: "accent", bold: true },
@@ -195,7 +196,7 @@ const SHARED_ROLE_COLOURS: Readonly<Record<SidebarThemeRole, SidebarRoleColour>>
   secondary: { token: "muted", bold: false },
   statusStarting: { token: "mdLink", bold: true },
   statusRunning: { token: "success", bold: true },
-  statusWaiting: { token: "warning", bold: false },
+  statusWaiting: { token: "warning", bold: true },
   statusIdle: { token: "muted", bold: false },
   statusUnknown: { token: "dim", bold: false },
   statusExited: { token: "dim", bold: false },

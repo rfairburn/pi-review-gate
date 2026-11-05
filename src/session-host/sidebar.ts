@@ -2523,10 +2523,10 @@ interface SessionStatusFacts {
 
 /**
  * One independently paintable part of the truthful status row. `label` is the
- * neutral wording the palette never paints (`agent `, `input `, or the whole
- * `input none` row part), `value` is the status word a role MAY paint, and
- * `role` chooses that foreground (`null` keeps the value on the neutral canvas
- * too). `label + value` is the exact existing plaintext.
+ * neutral wording the palette never paints (`agent ` or `input `), `value` is
+ * the status word a role MAY paint, and `role` chooses that foreground (`null`
+ * keeps the value on the neutral canvas too). `label + value` is the exact
+ * existing plaintext.
  */
 interface CardStatusSegment {
   readonly label: string;
@@ -2580,8 +2580,9 @@ function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
       item.pendingInput === true || item.inputSurface === true
         ? { label: "input ", value: "pending", role: "inputPending" }
         : item.pendingInput === false
-          // "none" is not a status to emphasize: the whole part stays neutral.
-          ? { label: "input none", value: "", role: null }
+          // `none` is a VALUE like `idle`: the label stays neutral and the word
+          // takes the same muted, unbolded role as a positively idle agent.
+          ? { label: "input ", value: "none", role: "statusIdle" }
           : { label: "input ", value: "unknown", role: "statusUnknown" },
     );
   }
@@ -9014,11 +9015,10 @@ export class SidebarController {
 
   /**
    * The truthful status text with each semantic VALUE painted independently.
-   * The `agent ` / `input ` label words, the separator, and a plain `none` are
-   * emitted with no generated sequence of their own, so they read in the pane
-   * canvas foreground the row wrapper restores after every generated reset.
-   * The plaintext is exactly `cardStatusText`; only finite palette roles add
-   * colour.
+   * The `agent ` / `input ` label words and the separator are emitted with no
+   * generated sequence of their own, so they read in the pane canvas foreground
+   * the row wrapper restores after every generated reset. The plaintext is
+   * exactly `cardStatusText`; only finite palette roles add colour.
    */
   private cardStatusRuns(item: SessionStatusFacts): string {
     return cardStatusSegments(item)

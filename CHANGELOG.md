@@ -41,7 +41,7 @@ dates.
   API, instead of generic ANSI 30–37/90–97 substitutions. A positively idle agent
   now reads in Pi's muted grey, distinct from the ordinary `agent` word and from
   a running agent's Pi success green; waiting and pending input keep one warning
-  hue with pending bold; unknown and exited states use Pi's dim colour. The
+  hue and its bold; unknown and exited states use Pi's dim colour. The
   background stays the terminal default, the host still picks Dark or Light for
   its own sidebar only (Pi's saved theme is never read, synchronized, or
   restarted for), no terminal colour detection was added, and the wording,

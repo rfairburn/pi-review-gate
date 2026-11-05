@@ -957,9 +957,9 @@ test("the remote owner's title cell follows the same navigation precedence as a 
   }
 });
 
-test("status labels and a plain none stay on the neutral canvas while the status VALUES carry their colours", async () => {
-  // The exact contract rows: a running agent with pending input, an idle agent
-  // with no pending input, and an unknown agent with unknown input.
+test("status labels stay on the neutral canvas while the observed VALUES carry their colours and emphasis", async () => {
+  // The exact contract rows: running+pending, idle+none, unknown+unknown, a
+  // running agent with no input, and a waiting agent with pending input.
   const cases: readonly {
     id: string;
     facts: Partial<SidebarItem>;
@@ -968,6 +968,8 @@ test("status labels and a plain none stay on the neutral canvas while the status
     { id: "l1", facts: { busy: true, pendingInput: true }, text: "agent running | input pending" },
     { id: "l2", facts: { busy: false, pendingInput: false, activeTasks: 0, activeShells: 0 }, text: "agent idle | input none" },
     { id: "l3", facts: { busy: null, pendingInput: null }, text: "agent unknown | input unknown" },
+    { id: "l4", facts: { busy: true, pendingInput: false }, text: "agent running | input none" },
+    { id: "l5", facts: { busy: false, pendingInput: true }, text: "agent waiting | input pending" },
   ];
   for (const theme of ["dark", "light"] as const) {
     const harness = makeHarness({ locals: 3, controllerOptions: { settingsAvailable: true } });
@@ -980,9 +982,9 @@ test("status labels and a plain none stay on the neutral canvas while the status
     // The agreed roles for BOTH appearances, pinned to Pi's own converted
     // foregrounds: running keeps its bold on Pi's success colour, idle is Pi's
     // muted colour with NO bold (so it can never read as a bold variant of
-    // running, and never shares the ordinary `agent` word's colour), and pending
-    // keeps its bold on waiting's warning hue. The parity suite proves these
-    // literals are the built-in Pi 1.5.0 Dark/Light values.
+    // running, and never shares the ordinary `agent` word's colour), and waiting
+    // and pending BOTH keep the one warning hue with its bold. The parity suite
+    // proves these literals are the built-in Pi 1.5.0 Dark/Light values.
     const statusGoldens = theme === "dark"
       ? { canvas: 0xDEE0E1, running: 0x68B78D, idle: 0x9DA5A9, waiting: 0xCD9A22, pending: 0xCD9A22 }
       : { canvas: 0x3B3F41, running: 0x337E58, idle: 0x677176, waiting: 0x8F6802, pending: 0x8F6802 };
@@ -994,9 +996,10 @@ test("status labels and a plain none stay on the neutral canvas while the status
     assert.equal(/^1;/.test(palette.statusRunning), true, `${theme}: running keeps its bold attribute`);
     assert.equal(/^1;/.test(palette.statusIdle), false, `${theme}: idle carries no bold`);
     assert.equal(/^1;/.test(palette.inputPending), true, `${theme}: pending keeps its bold attribute`);
-    assert.equal(/^1;/.test(palette.statusWaiting), false, `${theme}: waiting carries no bold`);
+    assert.equal(/^1;/.test(palette.statusWaiting), true, `${theme}: waiting carries pending's bold as well`);
+    assert.equal(palette.statusWaiting, palette.inputPending, `${theme}: waiting and pending are the one warning look`);
     const cols = 32;
-    const rows = 24;
+    const rows = 40;
     const view = harness.view(cols, rows);
     for (const testCase of cases) {
       const titleRow = view.texts.findIndex((line) => line.trim() === `local-${testCase.id}`);
@@ -1021,8 +1024,11 @@ test("status labels and a plain none stay on the neutral canvas while the status
         }
       }
       const noneRuns = statusRuns(surface, "local-l2", "none");
-      assert.equal(noneRuns.length, 1, `${theme}: the plain none is one drawn run`);
-      assert.equal(noneRuns[0]?.fg?.value, canvasRgb, `${theme}: input none stays on the neutral canvas`);
+      assert.equal(noneRuns.length, 1, `${theme}: the none VALUE is one drawn run`);
+      assert.equal(noneRuns[0]?.fg?.value, paletteForegroundRgb(palette.statusIdle),
+        `${theme}: input none paints the SAME Pi muted colour as the idle VALUE`);
+      assert.notEqual(noneRuns[0]?.fg?.value, canvasRgb,
+        `${theme}: input none is not the ordinary label/canvas text colour`);
       assert.notEqual(noneRuns[0]?.bold, true, `${theme}: input none is not emphasized`);
       // Only the VALUE words carry status colours, and the two facts on one row
       // stay independently painted.
@@ -1043,6 +1049,8 @@ test("status labels and a plain none stay on the neutral canvas while the status
       assert.equal(idle[0]?.fg?.value, paletteForegroundRgb(palette.statusIdle),
         `${theme}: the idle VALUE paints Pi's muted colour`);
       assert.notEqual(idle[0]?.bold, true, `${theme}: idle stays plain, so running and idle stay apart`);
+      assert.equal(noneRuns[0]?.fg?.value, idle[0]?.fg?.value,
+        `${theme}: the none and idle VALUES read in the exact same muted colour`);
       // The three states the operator has to tell apart on one row: the ordinary
       // `agent` word, an idle agent, and a running agent.
       const [agentLabel] = statusRuns(surface, "local-l2", "agent");
@@ -1058,6 +1066,31 @@ test("status labels and a plain none stay on the neutral canvas while the status
           `${theme}: an unknown VALUE uses Pi's dim colour`);
         assert.notEqual(run.bold, true, `${theme}: an unknown VALUE is not emphasized`);
       }
+      // A running agent and an empty input are independent facts on one row: the
+      // running VALUE keeps its bold success colour while `none` stays muted.
+      const runningWithNone = statusRuns(surface, "local-l4", "running");
+      const noneWithRunning = statusRuns(surface, "local-l4", "none");
+      assert.equal(runningWithNone.length, 1, `${theme}: one drawn running VALUE beside an empty input`);
+      assert.equal(runningWithNone[0]?.fg?.value, paletteForegroundRgb(palette.statusRunning),
+        `${theme}: running beside none keeps Pi's success colour`);
+      assert.equal(runningWithNone[0]?.bold, true, `${theme}: running beside none keeps its bold`);
+      assert.equal(noneWithRunning.length, 1, `${theme}: the independent none VALUE is drawn once`);
+      assert.equal(noneWithRunning[0]?.fg?.value, paletteForegroundRgb(palette.statusIdle),
+        `${theme}: none beside running paints the idle muted colour, not running's`);
+      assert.notEqual(noneWithRunning[0]?.bold, true, `${theme}: none beside running stays unbolded`);
+      assert.notEqual(noneWithRunning[0]?.fg?.value, runningWithNone[0]?.fg?.value,
+        `${theme}: the two facts on one row stay visually independent`);
+      // Waiting and pending share the warning hue AND its bold, exactly.
+      const waiting = statusRuns(surface, "local-l5", "waiting");
+      const pendingWithWaiting = statusRuns(surface, "local-l5", "pending");
+      assert.equal(waiting.length, 1, `${theme}: one drawn waiting VALUE`);
+      assert.equal(pendingWithWaiting.length, 1, `${theme}: one drawn pending VALUE beside it`);
+      for (const [name, run] of [["waiting", waiting[0]], ["pending", pendingWithWaiting[0]]] as const) {
+        assert.equal(run?.fg?.value, statusGoldens.waiting, `${theme}: the ${name} VALUE paints Pi's warning colour`);
+        assert.equal(run?.bold, true, `${theme}: the ${name} VALUE keeps its bold`);
+      }
+      assert.equal(waiting[0]?.fg?.value, pendingWithWaiting[0]?.fg?.value,
+        `${theme}: waiting and pending share the exact warning foreground`);
     } finally {
       surface.dispose();
     }

@@ -48,6 +48,10 @@ import io.github.rfairburn.pireviewgate.core.client.ui.destination
  *   paste. They reach the surface's own public submit API; this screen never
  *   synthesizes a hardware event or encodes a packet.
  *
+ * [status] is the app's latest notice. Non-terminal routes keep their caller-owned
+ * status slot; the fullscreen terminal shows it in an overlay instead, so no status
+ * row is measured into the terminal pane.
+ *
  * Coverage is reported from here as well: a modal dialog or the quick switcher sheet
  * means terminal input is suspended and in-flight proofs retire, and the controller
  * learns that from the same screen that drew the covering control.
@@ -59,6 +63,7 @@ fun RootUIScreen(
     onTerminalKey: (TerminalKeyRequest) -> Unit,
     onTerminalPaste: () -> Unit,
     terminalContent: @Composable (TerminalUiState) -> Unit,
+    status: String? = null,
 ) {
     // List positions are owned above the route switch: entering the fullscreen
     // terminal leaves this route's composition, and a state owned by the screen
@@ -74,14 +79,15 @@ fun RootUIScreen(
 
             val route = state.route
             if (route is ClientRoute.Terminal) {
-                // Fullscreen: no navigation bar, no sidebar, no host list. Just the
-                // terminal, its compact app bar, and the toolbar.
+                // Fullscreen: no app bar, navigation bar, sidebar, host list, or
+                // permanent key rows. Just the terminal pane and in-window overlays.
                 TerminalScreen(
                     terminal = route.terminal,
                     terminalContent = terminalContent,
                     onKey = onTerminalKey,
                     onPaste = onTerminalPaste,
                     onIntent = onIntent,
+                    status = status,
                 )
             } else {
                 NonTerminalScaffold(
@@ -202,9 +208,10 @@ private fun reportCoverage(state: ClientUiState, onIntent: (ClientIntent) -> Uni
  * System back.
  *
  * On the terminal the order is fixed: retire the quick switcher, then let the soft
- * keyboard go, then leave the terminal. Anywhere else, Hosts, Settings, and Saved
- * return to the session list, and on the session list itself the UI claims nothing so
- * the system decides.
+ * keyboard go, then leave the terminal. (TerminalScreen's own handler closes an open
+ * Keys pop-out after the keyboard and before leaving.) Anywhere else, Hosts,
+ * Settings, and Saved return to the session list, and on the session list itself the
+ * UI claims nothing so the system decides.
  */
 @Composable
 private fun handleBack(state: ClientUiState, onIntent: (ClientIntent) -> Unit) {

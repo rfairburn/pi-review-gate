@@ -400,37 +400,6 @@ class ContentEndpointInputTest {
 	}
 
 	@Test
-	fun `a replacement publication with an unchanged source invalidates an admitted input`() {
-		val harness = readyNative()
-		harness.commitWrittenFrame(contentSource(geometry = TARGET_GEOMETRY))
-		val accepted = harness.admit(keyboardRequest()) as ContentInputAdmission.Accepted
-		val guard = accepted.effects.single().guard
-		assertTrue(harness.endpoint.isSendGuardCurrent(guard))
-
-		// A newer publication with byte-identical source and modes still replaces the
-		// admitted lifetime: the endpoint can no longer prove the exact written receipt
-		// that admission was bound to, so the bytes are never written into the newer view.
-		harness.publish(
-			sequence = harness.nextSequence,
-			transferId = "transfer-${harness.nextSequence}",
-			inputSource = OptionalNativeIoSource.Stated(contentSource(geometry = TARGET_GEOMETRY)),
-		)
-
-		assertFalse(harness.endpoint.isSendGuardCurrent(guard))
-		assertEquals(
-			listOf(
-				ContentEndpointEvent.InputSettled(
-					accepted.inputId,
-					1L,
-					ContentSendOutcome.NotSent(ContentNotSentReason.STALE_SOURCE),
-				),
-			),
-			harness.events.filterIsInstance<ContentEndpointEvent.InputSettled>(),
-		)
-		assertEquals(0, harness.observation.pendingInputCount)
-	}
-
-	@Test
 	fun `a later return to the same source never revives an invalidated operation`() {
 		val a = contentSource(geometry = TARGET_GEOMETRY)
 		val b = contentSource(sourceToken = "host-source-token-b", geometry = TARGET_GEOMETRY)

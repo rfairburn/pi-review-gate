@@ -295,7 +295,12 @@ data class ContentEndpointObservation(
 	val inputPolicy: ContentInputPolicy,
 	/** Logical input operations admitted and not yet settled. */
 	val pendingInputCount: Int,
-	/** Monotonic source/modes generation; the only proof that survives A → B → A. */
+	/**
+	 * Monotonic semantic input generation (source, modes, geometry, and frame
+	 * extents); the only proof that survives A → B → A. Ordinary same-context output
+	 * never advances it, and a written-frame proof must carry the generation its
+	 * committed publish was observed under.
+	 */
 	val inputGeneration: Long,
 	/**
 	 * The live resize epoch. A caller composes a written-frame proof under it, and an

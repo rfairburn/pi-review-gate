@@ -335,9 +335,17 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
             TerminalViewBinding(selected.target.hostId.value, observation.target.connectionGeneration,
                 selected.selectionGeneration, observation.subscriptionId, selected.target.ownerRunId, selected.target.rowId,
                 snapshot.meta.sequence, snapshot.meta.geometry, TerminalViewBinding.sourceOf(snapshot.meta.inputSource),
-                snapshot.meta.inputModes, observation.inputPolicy.generation, snapshot.frame), observation.resizeEpoch)
-        if (render.value != next) {
-            inputEpoch.incrementAndGet()
+                snapshot.meta.inputModes, observation.inputPolicy.generation, snapshot.frame,
+                inputGeneration = observation.inputGeneration, resizeEpoch = observation.resizeEpoch),
+            observation.resizeEpoch)
+        val previous = render.value
+        if (previous != next) {
+            // Ordinary output (same semantic input context, newer publish/content) only
+            // changes what is displayed: guards captured against the committed proof
+            // for this context stay valid. Any semantic context change — including an
+            // A -> B -> A return a conflated emission never showed — is a writer boundary.
+            if (previous == null || next == null || !previous.binding.sameInputContextAs(next.binding) ||
+                previous.resizeEpoch != next.resizeEpoch) inputEpoch.incrementAndGet()
             rendered.set(next)
             render.value = next
         }
@@ -384,13 +392,18 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
         override fun onFrameCommitted(receipt: FrameCommitReceipt) {
             val view = view() ?: return
             val frozen = rendered.get() ?: return
-            if (view.currentBinding() !== frozen.binding || !matches(receipt, frozen.binding) ||
+            // The view may still be showing an earlier binding of the newest frame's input
+            // context, and the receipt may name an earlier publish of it that genuinely drew
+            // before newer output arrived. Both are the same context; nothing else is.
+            if (view.currentBinding()?.sameInputContextAs(frozen.binding) != true || !matches(receipt, frozen) ||
                 !view.verifyReceipt(receipt) || !selected(receipt) || !viewportApplied() || !app.platform.terminalInputEligible ||
                 app.policyChangePending.get() || !app.platform.registry.snapshot.value.viewerRemoteInputEnabled || covered) return
-            // All geometry comes from THIS actual draw's CELL extent and frozen resize epoch.
+            // All geometry comes from THIS actual draw's CELL extent, publish, input
+            // generation, and resize epoch; the endpoint rejects anything outside its
+            // current context.
             app.runtime.recordWrittenFrame(ContentWrittenFrameProof(receipt.selectionGeneration, receipt.subscriptionId,
-                receipt.publishSequence, receipt.geometry, frozen.resizeEpoch, receipt.policyGeneration,
-                ContentPaneRect(0, 0, receipt.drawnColumns, receipt.drawnRows)))
+                receipt.publishSequence, receipt.geometry, receipt.resizeEpoch, receipt.policyGeneration,
+                ContentPaneRect(0, 0, receipt.drawnColumns, receipt.drawnRows), receipt.inputGeneration))
         }
         override fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt) {
             val view = view() ?: return
@@ -436,24 +449,30 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
         val measured = measuredViewport.get() ?: return false
         return app.runtime.state.value.content?.requestedViewport == measured
     }
+    /**
+     * The receipt's input context is the selected stream's CURRENT semantic context:
+     * same selection, connection, subscription, monotonic input generation, resize
+     * epoch, geometry, frame extents, modes, and exact source, drawn from a publish no
+     * newer than the current one. Ordinary output (a newer publish of that context)
+     * keeps it; a source, mode, geometry, resize, or A -> B -> A change never does.
+     */
     private fun selected(receipt: FrameCommitReceipt): Boolean {
         val selected = app.runtime.state.value.selection ?: return false
         val observation = selected.observation
-        val meta = observation.view?.meta ?: return false
+        val view = observation.view ?: return false
+        val meta = view.meta
         return selected.selectionGeneration == receipt.selectionGeneration &&
             selected.target.hostId.value == receipt.hostId && selected.target.ownerRunId == receipt.ownerRun &&
             selected.target.rowId == receipt.rowId && observation.target.connectionGeneration == receipt.connectionGeneration &&
-            observation.subscriptionId == receipt.subscriptionId && meta.sequence == receipt.publishSequence &&
+            observation.subscriptionId == receipt.subscriptionId &&
+            observation.inputGeneration == receipt.inputGeneration && observation.resizeEpoch == receipt.resizeEpoch &&
+            receipt.publishSequence <= meta.sequence &&
             meta.geometry == receipt.geometry && meta.inputModes == receipt.modes &&
+            view.frame.cols == receipt.frameCols && view.frame.rows == receipt.frameRows &&
             receipt.source?.let { source -> TerminalViewBinding.sourceOf(meta.inputSource)?.let { nativeIoSourceEquals(source, it) } } == true
     }
-    private fun matches(receipt: FrameCommitReceipt, binding: TerminalViewBinding): Boolean =
-        receipt.hostId == binding.hostId && receipt.connectionGeneration == binding.connectionGeneration &&
-        receipt.selectionGeneration == binding.selectionGeneration && receipt.subscriptionId == binding.subscriptionId &&
-        receipt.ownerRun == binding.ownerRun && receipt.rowId == binding.rowId && receipt.publishSequence == binding.publishSequence &&
-        receipt.geometry == binding.geometry && receipt.modes == binding.modes && receipt.policyGeneration == binding.policyGeneration &&
-        receipt.frameCols == binding.frame.cols && receipt.frameRows == binding.frame.rows &&
-        receipt.source?.let { source -> binding.source?.let { nativeIoSourceEquals(source, it) } } == true
+    private fun matches(receipt: FrameCommitReceipt, frame: RenderFrame): Boolean =
+        receipt.source != null && receipt.inContextOf(frame.binding) && receipt.resizeEpoch == frame.resizeEpoch
 
     fun deliverCopy(event: ClientRuntimeEvent.TerminalCopyOffered) {
         val view = owned.get()?.view

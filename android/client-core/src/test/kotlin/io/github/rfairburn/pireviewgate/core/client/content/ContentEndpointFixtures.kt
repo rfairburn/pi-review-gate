@@ -402,6 +402,7 @@ internal fun writtenProof(
 	geometry: SessionGeometry = TARGET_GEOMETRY,
 	policyGeneration: Long = harness.observation.inputPolicy.generation,
 	selectionGeneration: Long = SELECTION_GENERATION,
+	inputGeneration: Long = harness.observation.inputGeneration,
 ): ContentWrittenFrameProof = ContentWrittenFrameProof(
 	selectionGeneration = selectionGeneration,
 	subscriptionId = harness.endpoint.subscriptionId,
@@ -410,6 +411,7 @@ internal fun writtenProof(
 	resizeEpoch = harness.observation.resizeEpoch,
 	policyGeneration = policyGeneration,
 	nativeContent = ContentPaneRect(column = 0, row = 0, cols = geometry.cols, rows = geometry.rows),
+	inputGeneration = inputGeneration,
 )
 
 /** One startup-phase source of the sample publish. */

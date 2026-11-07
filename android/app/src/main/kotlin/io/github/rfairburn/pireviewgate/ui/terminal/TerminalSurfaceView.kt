@@ -96,6 +96,12 @@ import kotlin.math.ceil
  * refuses the keystroke. A queued layout or recomposition is never treated as a
  * receipt, and nothing is buffered for a later one: a refused keystroke is over.
  *
+ * Ordinary output is not one of those changes. A newer binding in the same input
+ * context ([TerminalViewBinding.sameInputContextAs]) is drawn, and may earn newer
+ * display commits, while the input proof the platform genuinely committed for that
+ * context keeps standing; only a genuine context, layout, or lifecycle change
+ * retires it.
+ *
  * A source-less frame never becomes a blank terminal, and a source is never
  * invented to make input possible: the frame, its geometry, and its modes are
  * everything drawing needs, and a source is only ever what a keystroke gets
@@ -206,7 +212,19 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * is safe to read away from the UI thread. A display-only commit is never
 	 * published, so a source-less frame is drawn and publishes no input proof at all.
 	 */
-	private val publishedProof = InputProofPublication<FrameCommitReceipt>()
+	private val publishedProof = InputProofPublication<CommittedInputProof>()
+
+	/**
+	 * The input proof standing for one input context.
+	 *
+	 * [anchor] is the first genuine platform commit of the context, and every
+	 * keystroke is attributed to it. [latest] is the newest genuine commit of the same
+	 * context, so a caller holding the receipt it was just told about can verify it.
+	 * A newer same-context commit replaces [latest] in one atomic publication and never
+	 * replaces [anchor], so a write queued against the anchor survives ordinary output
+	 * and newer display commits alike; any retirement drops both at once.
+	 */
+	private data class CommittedInputProof(val anchor: FrameCommitReceipt, val latest: FrameCommitReceipt)
 
 	private var activeConnection: TerminalInputConnection? = null
 	private var inputConnectionEpoch = 0L
@@ -214,7 +232,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	init {
 		// Every input path — hardware keys, the IME, mouse reports — needs focus,
 		// and a plain View is not focusable in touch mode by default. Without this a
-		// tap could never open a keyboard, and the surface would fence its own input.
+		// tap could never take focus, and the surface would fence its own input.
 		isFocusable = true
 		isFocusableInTouchMode = true
 		isClickable = true
@@ -227,11 +245,19 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	/**
 	 * Install [newBinding], or clear the surface with null.
 	 *
-	 * The previous frame and its receipt are retired before anything is drawn.
-	 * The IME connection and composition survive a content-only publish of the same
-	 * input context, but a target, source, geometry, modes, or policy change retires
-	 * them too. Even a preserved connection must wait for a fresh platform commit
-	 * before sending anything; refused input is never buffered.
+	 * A binding in the same input context as the current one
+	 * ([TerminalViewBinding.sameInputContextAs]) is ordinary output: it is laid out and
+	 * drawn, and it may earn a newer display commit, but the input proof the platform
+	 * already committed for that context keeps standing, and the IME connection, its
+	 * composition, and any latched chips survive. A draw pass that already drew an
+	 * earlier binding of the context still owes its commit and keeps it; one that has
+	 * not drawn yet is withdrawn and can never be attested.
+	 *
+	 * Anything else — a target, source, geometry, modes, policy, frame extent, input
+	 * generation, or resize epoch change — retires the previous frame, its receipt,
+	 * and its input proof before anything is drawn, and nothing drawn before the switch
+	 * can ever be revived. The IME connection and composition survive only when the
+	 * input context was unchanged; refused input is never buffered.
 	 *
 	 * A binding whose source is null is not refused: its frame is drawn exactly like
 	 * any other, and input against it is denied. A binding whose non-null source
@@ -239,12 +265,17 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 */
 	fun setBinding(newBinding: TerminalViewBinding?) {
 		if (binding === newBinding) return
+		val previous = binding
+		if (previous != null && newBinding != null && previous.sameInputContextAs(newBinding) &&
+			installSameContext(newBinding)
+		) {
+			return
+		}
 		// First, and before anything else about the switch is handled: the old
 		// target's proof stops being valid here, on the publishing side, so a writer
 		// thread checking it concurrently cannot be told "yes" for a frame that is on
 		// its way out.
 		publishedProof.retire()
-		val previous = binding
 		binding = newBinding
 		// A different session, connection, native tuple, or source state is a
 		// different target, and a modifier chip latched for the old one must never
@@ -257,18 +288,55 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		geometry = null
 		frameRejected = false
 		clearImages()
-		// sameTargetAs alone is not an IME context: the encoding and geometry the
-		// keyboard was composing against must also stay unchanged. Frame dimensions
-		// participate because they determine layout even if session geometry agrees.
-		val sameInputContext = previous != null && newBinding != null &&
-			previous.sameTargetAs(newBinding) && previous.geometry == newBinding.geometry &&
-			previous.modes == newBinding.modes && previous.policyGeneration == newBinding.policyGeneration &&
-			previous.frame.cols == newBinding.frame.cols && previous.frame.rows == newBinding.frame.rows
-		if (!sameInputContext) retireInputConnection()
+		// The input method's connection belongs to an input context, never to one
+		// publish: the composition the keyboard holds survives only when the target,
+		// source, geometry, modes, policy, frame extents, input generation, and resize
+		// epoch are all unchanged. Even then, nothing is sent until a fresh platform
+		// commit stands behind it.
+		if (previous == null || !previous.sameInputContextAs(newBinding)) retireInputConnection()
 		// A binding whose source contradicts its own owner run or owner row is a
 		// caller mistake, and it is refused in [applyFrame] — the one path every
 		// draw goes through — rather than only here.
 		applyFrame()
+	}
+
+	/**
+	 * Install an ordinary-output binding of the current input context, or return
+	 * false when the context cannot be kept and the full retirement path must run.
+	 *
+	 * The context is only kept when the current frame is laid out and the new frame
+	 * lays out into exactly the same drawn grid: the cell geometry, the layout epoch,
+	 * the binding epoch, and the standing input proof all stay what the platform
+	 * committed. Nothing here publishes, revives, or invents a proof.
+	 */
+	private fun installSameContext(next: TerminalViewBinding): Boolean {
+		val previousLayout = layout ?: return false
+		if (geometry == null || frameRejected || requestedCols <= 0 || requestedRows <= 0) return false
+		if (InputSourceFence.state(next.source, next.ownerRun, next.rowId) == InputSourceState.CONTRADICTORY) return false
+		val laidOut = TerminalCellLayout.layout(next.frame, requestedCols, requestedRows) ?: return false
+		if (laidOut.frameCols != previousLayout.frameCols || laidOut.frameRows != previousLayout.frameRows ||
+			laidOut.drawnColumns != previousLayout.drawnColumns || laidOut.drawnRows != previousLayout.drawnRows
+		) {
+			return false
+		}
+		val previousFrame = binding?.frame
+		binding = next
+		layout = laidOut
+		// The display receipt describes the binding it drew; the newer pixels have not
+		// been committed yet. The standing input proof is untouched.
+		receipt = null
+		val candidate = pendingDraw
+		if (candidate != null && !candidate.drawn) {
+			// Not drawn yet, so it can never be attested; the next pass draws the newer
+			// binding instead. A candidate that already drew keeps its owed commit.
+			pendingDraw = null
+			watcher?.cancel()
+		}
+		// Unchanged graphics keep their decodes, so steady output with an image on screen
+		// does not withhold every pass behind a fresh decode.
+		if (previousFrame?.graphics != next.frame.graphics) prepareImages(next.frame)
+		scheduleDraw()
+		return true
 	}
 
 	/** The frame currently installed, or null. */
@@ -287,9 +355,11 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * The input proof published right now, or null. Safe from any thread.
 	 *
 	 * Non-null only for a committed frame that carries a host-written input source and
-	 * is still standing: it is exactly the value [verifyReceipt] accepts.
+	 * is still standing. It is the first genuine commit of the current input context,
+	 * which every keystroke is attributed to, and it stays the same receipt across
+	 * ordinary output and newer same-context commits.
 	 */
-	fun currentInputProof(): FrameCommitReceipt? = publishedProof.current()?.proof
+	fun currentInputProof(): FrameCommitReceipt? = publishedProof.current()?.proof?.anchor
 
 	/**
 	 * True when [candidate] is exactly the input proof this surface publishes now.
@@ -299,12 +369,24 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * or the eligibility state. Callers check it immediately before a queued write.
 	 *
 	 * A proof stops being current as soon as the UI thread retires it, which it does
-	 * before any other handling of a binding, source, subscription, layout, policy,
-	 * focus, coverage, modal, or detach change — and a display-only commit is never
-	 * published in the first place. So the answer needs no further fence to be honest,
-	 * and it never says yes to a frame the surface has stopped standing behind.
+	 * before any other handling of a binding context, source, subscription, layout,
+	 * policy, focus, coverage, modal, or detach change — and a display-only commit is
+	 * never published in the first place. So the answer needs no further fence to be
+	 * honest, and it never says yes to a frame the surface has stopped standing behind.
+	 *
+	 * Exactly two values are accepted, both genuine platform commits of the standing
+	 * input context: its anchor ([currentInputProof]) and its newest commit. Nothing
+	 * structurally similar, older, or from another context is.
 	 */
-	fun verifyReceipt(candidate: FrameCommitReceipt?): Boolean = publishedProof.isCurrent(candidate)
+	fun verifyReceipt(candidate: FrameCommitReceipt?): Boolean {
+		candidate ?: return false
+		val standing = publishedProof.current()?.proof ?: return false
+		return candidate == standing.anchor || candidate == standing.latest
+	}
+
+	/** True when [candidate] is the anchor of the standing input proof. Any thread. */
+	private fun isStandingAnchor(candidate: FrameCommitReceipt): Boolean =
+		publishedProof.current()?.proof?.anchor == candidate
 
 	/** Take input away from this surface for a modal (a session chooser, say). */
 	fun setModalSuspended(suspended: Boolean) {
@@ -380,7 +462,8 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * Focus the surface and ask the platform to show the soft keyboard.
 	 *
 	 * This is the explicit interaction a host screen calls when it wants the keyboard
-	 * up; beyond a tap on itself the surface never raises one. True means the request
+	 * up; the surface never raises one on its own, not even for a tap on itself. True
+	 * means the request
 	 * reached the window's inset controller, not that a keyboard is on screen — only
 	 * the platform decides that, and nothing here claims otherwise.
 	 */
@@ -702,11 +785,22 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		invalidate()
 	}
 
+	/**
+	 * True while [candidate] can still be attested: it is the pending pass, and the
+	 * surface is still in the input context, binding epoch, layout epoch, and cell
+	 * geometry it drew under. A newer binding of the same context (ordinary output)
+	 * does not stop an already drawn candidate from earning its commit — the receipt
+	 * is built from what the candidate drew, never from the newest binding.
+	 */
 	private fun isCurrent(candidate: DrawCandidate): Boolean =
-		pendingDraw === candidate && binding === candidate.binding &&
-			layout === candidate.layout && geometry === candidate.geometry &&
+		pendingDraw === candidate && candidate.binding.sameInputContextAs(binding) &&
+			geometry === candidate.geometry &&
 			gate.currentBindingEpoch == candidate.bindingEpoch &&
 			gate.currentLayoutEpoch == candidate.layoutEpoch
+
+	/** True when this pass is drawing exactly [candidate]'s binding and layout. */
+	private fun isDrawing(candidate: DrawCandidate): Boolean =
+		isCurrent(candidate) && binding === candidate.binding && layout === candidate.layout
 
 	override fun onDraw(canvas: Canvas) {
 		val saved = canvas.save()
@@ -740,18 +834,51 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			// was presented, so the pass earns nothing: the decode callback
 			// invalidates, and the next pass — with the image drawn, or the fallback
 			// standing in honestly — is the one that can be attested to.
-			retireDraw(FrameInvalidationReason.FRAME_INCOMPLETE)
+			withholdIncompletePass()
 			return
 		}
-		if (candidate != null && isCurrent(candidate) && syncEligibility().isEligible) {
+		if (candidate != null && isDrawing(candidate) && syncEligibility().isEligible) {
 			candidate.drawn = true
 		}
+	}
+
+	/**
+	 * This pass is not a complete frame, so it earns no commit.
+	 *
+	 * An undrawn candidate is withdrawn and the display receipt stops describing the
+	 * screen. Without a standing input proof that is the whole commit retirement, as
+	 * before. With one, the proof is about the committed input context, not about this
+	 * pass's pixels, so ordinary output carrying a still-decoding image does not revoke
+	 * it — and a candidate that already drew a complete earlier pass of the context
+	 * keeps the commit it is owed.
+	 */
+	private fun withholdIncompletePass() {
+		if (publishedProof.current() == null) {
+			val owed = pendingDraw?.takeIf { it.drawn && isCurrent(it) }
+			if (owed == null) {
+				retireDraw(FrameInvalidationReason.FRAME_INCOMPLETE)
+				return
+			}
+		}
+		receipt = null
+		val candidate = pendingDraw ?: return
+		if (candidate.drawn && isCurrent(candidate)) return
+		pendingDraw = null
+		watcher?.cancel()
 	}
 
 	private fun handleFrameCommit(drawEpoch: Long) {
 		val candidate = pendingDraw ?: return
 		if (candidate.epoch != drawEpoch || !candidate.drawn || !isCurrent(candidate)) {
-			retireDraw(FrameInvalidationReason.FRAME_INCOMPLETE)
+			if (publishedProof.current() == null) {
+				retireDraw(FrameInvalidationReason.FRAME_INCOMPLETE)
+			} else {
+				// A same-context pass that did not draw attests nothing, but it does not
+				// unsay the context's earlier genuine commit either: every genuine
+				// context or lifecycle change already retired that proof on its own path.
+				pendingDraw = null
+				watcher?.cancel()
+			}
 			return
 		}
 		pendingDraw = null
@@ -770,20 +897,25 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			publishedProof.retire()
 			return
 		}
-		val laidOut = layout ?: return
-		val cellGeometry = geometry ?: return
+		// Everything below comes from what the candidate actually drew, never from a
+		// newer binding of the same context that arrived after it drew.
+		val drawn = candidate.binding
+		val laidOut = candidate.layout
+		val cellGeometry = candidate.geometry
 		val newReceipt = FrameCommitReceipt(
-			hostId = current.hostId,
-			connectionGeneration = current.connectionGeneration,
-			selectionGeneration = current.selectionGeneration,
-			subscriptionId = current.subscriptionId,
-			ownerRun = current.ownerRun,
-			rowId = current.rowId,
-			publishSequence = current.publishSequence,
-			geometry = current.geometry,
-			source = current.source,
-			modes = current.modes,
-			policyGeneration = current.policyGeneration,
+			hostId = drawn.hostId,
+			connectionGeneration = drawn.connectionGeneration,
+			selectionGeneration = drawn.selectionGeneration,
+			subscriptionId = drawn.subscriptionId,
+			ownerRun = drawn.ownerRun,
+			rowId = drawn.rowId,
+			publishSequence = drawn.publishSequence,
+			geometry = drawn.geometry,
+			source = drawn.source,
+			modes = drawn.modes,
+			policyGeneration = drawn.policyGeneration,
+			inputGeneration = drawn.inputGeneration,
+			resizeEpoch = drawn.resizeEpoch,
 			frameCols = laidOut.frameCols,
 			frameRows = laidOut.frameRows,
 			drawnColumns = laidOut.drawnColumns,
@@ -794,12 +926,22 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			drawEpoch = record.drawEpoch,
 			commitSequence = record.commitSequence,
 		)
-		receipt = newReceipt
+		// The display receipt describes the installed binding only; a commit of an
+		// earlier binding of the context leaves the newer pixels to earn their own.
+		if (drawn === current) receipt = newReceipt else scheduleDraw()
 		// Published before the listener hears about it: this is what a writer thread
 		// on the other side of that callback checks. A display-only commit is never
 		// published, so a source-less frame leaves no proof behind rather than a fake
-		// one, while still being drawn and reported as a commit.
-		if (newReceipt.authorizesInput) publishedProof.publish(newReceipt) else publishedProof.retire()
+		// one, while still being drawn and reported as a commit. A newer commit of the
+		// same context only advances [CommittedInputProof.latest]; the anchor every
+		// keystroke is attributed to stays, atomically, in the same publication.
+		if (newReceipt.authorizesInput) {
+			val standing = publishedProof.current()?.proof
+			val anchor = standing?.anchor?.takeIf { it.sameInputContextAs(newReceipt) } ?: newReceipt
+			publishedProof.publish(CommittedInputProof(anchor, newReceipt))
+		} else {
+			publishedProof.retire()
+		}
 		listener?.onFrameCommitted(newReceipt)
 	}
 
@@ -1359,11 +1501,12 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return super.onTouchEvent(event)
 		when (event.actionMasked) {
 			MotionEvent.ACTION_DOWN -> {
-				// A tap on the terminal means the user wants to type, so it takes
-				// focus and raises the keyboard whether or not the child asked for
-				// mouse events. A tap the child does not track consumes the gesture
-				// without emitting an unsolicited report.
-				openKeyboard()
+				// A tap takes focus, so hardware keys and mouse reports can reach the
+				// terminal, whether or not the child asked for mouse events. It never
+				// raises the soft keyboard: the explicit keyboard control is the only
+				// path that does ([openKeyboard]). A tap the child does not track
+				// consumes the gesture without emitting an unsolicited report.
+				if (!hasFocus()) requestFocus()
 				return pointerAt(event, button = 0, release = false) || super.onTouchEvent(event)
 			}
 			MotionEvent.ACTION_MOVE -> return pointerAt(event, button = 0, release = false, motion = true)
@@ -1445,8 +1588,10 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * The receipt input may be attributed to, or null after reporting why not.
 	 *
 	 * Every fence is re-checked here rather than trusted from the last callback: a
-	 * keystroke is only allowed against pixels the platform confirmed and that
-	 * nothing has since replaced.
+	 * keystroke is only allowed against an input context the platform confirmed a
+	 * commit of and that nothing has since retired. The receipt returned is the
+	 * standing proof's anchor — the first genuine commit of the context — so newer
+	 * same-context output or display commits never strand a keystroke.
 	 */
 	private fun currentInputReceipt(): FrameCommitReceipt? {
 		if (binding == null) {
@@ -1463,14 +1608,24 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.COMMIT_REPORTING_UNAVAILABLE)
 			return null
 		}
-		val committed = receipt
-		if (committed == null) {
+		val standing = publishedProof.current()?.proof
+		if (standing == null) {
+			val display = receipt
 			reportUnavailable(
-				if (frameRejected) InputUnavailableReason.FRAME_REJECTED else InputUnavailableReason.NO_COMMITTED_FRAME,
+				when {
+					// The pixels are honest and the frame is complete; there is simply no
+					// host-written source for a keystroke to be attributed to. Saying so is
+					// the whole response: no source, no permission, and no stand-in receipt
+					// is manufactured to get past this point.
+					display != null && !display.authorizesInput -> InputUnavailableReason.SOURCE_ABSENT
+					frameRejected -> InputUnavailableReason.FRAME_REJECTED
+					else -> InputUnavailableReason.NO_COMMITTED_FRAME
+				},
 			)
 			return null
 		}
-		if (!isBoundTo(committed)) {
+		val committed = standing.anchor
+		if (!isInContext(committed)) {
 			retireCommit(InputUnavailableReason.BINDING_RETIRED)
 			return null
 		}
@@ -1483,18 +1638,8 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			return null
 		}
 		if (!InputSourceFence.authorizesInput(committed.source)) {
-			// The pixels are honest and the frame is complete; there is simply no
-			// host-written source for a keystroke to be attributed to. Saying so is the
-			// whole response: no source, no permission, and no stand-in receipt is
-			// manufactured to get past this point.
+			// Fail-closed net: a display-only commit is never published as a proof.
 			reportUnavailable(InputUnavailableReason.SOURCE_ABSENT)
-			return null
-		}
-		if (!publishedProof.isCurrent(committed)) {
-			// The display commit is not the published input proof, so nothing may be
-			// attributed to it. This is a fail-closed net, not a normal path: every
-			// retirement that could cause it already retired the proof with the frame.
-			reportUnavailable(InputUnavailableReason.BINDING_RETIRED)
 			return null
 		}
 		return committed
@@ -1520,22 +1665,15 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		InputBlockReason.USER_INPUT_DISABLED -> InputUnavailableReason.USER_INPUT_DISABLED
 	}
 
-	/** True when [candidate] describes the binding this surface is showing now. */
-	private fun isBoundTo(candidate: FrameCommitReceipt): Boolean {
+	/** True when [candidate] is a commit of the input context this surface shows now. */
+	private fun isInContext(candidate: FrameCommitReceipt): Boolean {
 		val current = binding ?: return false
 		if (!current.sourceMatches()) return false
 		// A source that moved — present to absent, absent to present, or one source
 		// for another — is a different target for input even when every other field
 		// still lines up, so the proof the earlier source carried stops being proof.
-		if (!InputSourceFence.isSameSource(candidate.source, current.source)) return false
-		return candidate.subscriptionId == current.subscriptionId &&
-			candidate.hostId == current.hostId &&
-			candidate.connectionGeneration == current.connectionGeneration &&
-			candidate.selectionGeneration == current.selectionGeneration &&
-			candidate.ownerRun == current.ownerRun &&
-			candidate.rowId == current.rowId &&
-			candidate.publishSequence == current.publishSequence &&
-			candidate.policyGeneration == current.policyGeneration
+		// Only the publish sequence and displayed content may have moved on.
+		return candidate.inContextOf(current)
 	}
 
 	/**
@@ -1558,7 +1696,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	}
 
 	private fun proofStillCurrent(committed: FrameCommitReceipt): Boolean {
-		if (publishedProof.isCurrent(committed)) return true
+		if (isStandingAnchor(committed)) return true
 		// Whatever the cause, the frame this batch was attributed to is gone: the rest
 		// of it is dropped rather than delivered against a retired proof.
 		reportUnavailable(InputUnavailableReason.BINDING_RETIRED)

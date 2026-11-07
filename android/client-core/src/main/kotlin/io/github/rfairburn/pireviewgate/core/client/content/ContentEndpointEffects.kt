@@ -265,6 +265,12 @@ data class ContentPaneRect(
  * one. It carries no permission by itself — every attempt re-proves the current
  * publication, the caller's proof, the live policy generation, and the pending
  * resize epoch.
+ *
+ * A receipt names the semantic input context it was drawn under ([inputGeneration]),
+ * not merely one publish: a later publication with the same source, modes, and
+ * geometry (ordinary terminal output) leaves it standing, while any semantic change
+ * advances the generation and retires it for good — an exact A → B → A return
+ * included.
  */
 data class WrittenRemoteContent(
 	val hostId: HostId,
@@ -286,6 +292,8 @@ data class WrittenRemoteContent(
 	val resizeEpoch: Long,
 	/** Policy generation this frame was composed under. */
 	val policyGeneration: Long,
+	/** The endpoint's monotonic semantic input generation the drawn publish belonged to. */
+	val inputGeneration: Long,
 )
 
 /**
@@ -307,6 +315,12 @@ data class ContentWrittenFrameProof(
 	val policyGeneration: Long,
 	/** The rectangle inside the native pane the written frame actually filled. */
 	val nativeContent: ContentPaneRect,
+	/**
+	 * The endpoint's semantic input generation the committed publish was observed
+	 * under. A commit drawn under any other generation — an older context, even one
+	 * that reads the same again after A → B → A — is never registered.
+	 */
+	val inputGeneration: Long,
 )
 
 /** Outcome of one written-frame registration attempt. */
@@ -323,7 +337,11 @@ enum class ContentWrittenFrameRejectReason {
 	/** No complete current view exists to have been drawn. */
 	NO_VIEW,
 
-	/** The proof names a different publish than the current one. */
+	/**
+	 * The proof names a publish outside the current semantic input context: a future
+	 * sequence, one published before the current context began, or another input
+	 * generation.
+	 */
 	SEQUENCE_MISMATCH,
 
 	/** The proof names another selection, subscription, run, or row. */

@@ -61,12 +61,19 @@ class ClientActivity : ComponentActivity() {
                 val capturedRoute = capturedFrame.route
                 val observedWindowEpoch by window.epochs.collectAsState()
                 val capturedEpoch = observedWindowEpoch
-                Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                    // A fixed-height, noninteractive status slot never moves a pending form or
-                    // terminal pane when an admission/settlement arrives. No owner fact is inferred.
-                    Box(Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 8.dp)) {
-                        Text(status ?: "", maxLines = 2, style = MaterialTheme.typography.bodySmall)
+                // The terminal route owns the whole app window: it applies its own stable
+                // bar/cutout insets and overlays status, so no slot is reserved above it.
+                val terminalRoute = capturedRoute is ClientRoute.Terminal
+                Column(Modifier.fillMaxSize().then(if (terminalRoute) Modifier else Modifier.statusBarsPadding())) {
+                    // A fixed-height, noninteractive status slot never moves a pending form
+                    // when an admission/settlement arrives. No owner fact is inferred.
+                    if (!terminalRoute) {
+                        Box(Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 8.dp)) {
+                            Text(status ?: "", maxLines = 2, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
+                    // Same call site on every route, so RootUIScreen's remembered list
+                    // positions survive entering and leaving the terminal.
                     Box(Modifier.weight(1f)) {
                         RootUIScreen(
                             state = state,
@@ -74,6 +81,7 @@ class ClientActivity : ComponentActivity() {
                             onTerminalKey = { request -> window.key(request, (capturedRoute as? ClientRoute.Terminal)?.terminal?.target) },
                             onTerminalPaste = { window.paste((capturedRoute as? ClientRoute.Terminal)?.terminal?.target) },
                             terminalContent = { window.Surface() },
+                            status = status,
                         )
                     }
                 }

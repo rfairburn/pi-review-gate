@@ -138,6 +138,12 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	private var retired = false
 
 	private var inputGeneration = 0L
+	/**
+	 * The publish sequence at which the current [inputGeneration] began. Every
+	 * publication from here up to the current one shares one semantic input context,
+	 * so a commit of any of them is a commit of that context; nothing older is.
+	 */
+	private var contextStartSequence = 0L
 	private var policy: ContentInputPolicy = config.inputPolicy
 	private var writtenReceipt: WrittenRemoteContent? = null
 
@@ -167,9 +173,8 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		val ordinal: Long,
 		val source: NativeIoInputSource,
 		val inputModes: TerminalInputModes,
+		/** The semantic input generation admitted under; a newer one ends this lifetime. */
 		val generation: Long,
-		/** The exact publication (and therefore the exact written receipt) admitted here. */
-		val publicationSequence: Long,
 		val effectIds: List<Long>,
 	) {
 		var invoked = false
@@ -569,19 +574,24 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		val events = ArrayList<ContentEndpointEvent>()
 		// Semantic generation first: it is the only proof that survives an exact
 		// A → B → A transition, where present equality looks unchanged. Ordinary
-		// text-only publications do not advance it.
+		// output — new text, a new snapshot object, a new publish sequence — under an
+		// unchanged source, modes, and geometry does not advance it.
 		val previous = this.snapshot
-		if (previous == null || !samePublicationIdentity(previous, snapshot)) inputGeneration += 1
+		if (previous == null || !samePublicationIdentity(previous, snapshot)) {
+			inputGeneration += 1
+			contextStartSequence = snapshot.meta.sequence
+		}
 		this.snapshot = snapshot
 		status = ContentViewStatus.CURRENT
 		reason = null
-		// A newer publication is a new source lifetime: pending input admitted against
-		// a different source can never finish as `submitted`, and a copy whose header
-		// belonged to a different source is withheld for good.
+		// A semantic change is a new source lifetime: pending input admitted against a
+		// different context can never finish as `submitted`, and a copy whose header
+		// belonged to a different source is withheld for good. Ordinary output in the
+		// same context ends neither.
 		invalidatePendingInputsFor(snapshot, events)
 		withholdActiveCopy(snapshot, events)
-		// A written receipt describes one exact drawn frame; a newer publish makes the
-		// older receipt describe something the caller no longer sees.
+		// A written receipt proves the caller committed this semantic context. It stays
+		// standing across same-context output and is retired by any semantic change.
 		if (!receiptMatchesPublication(writtenReceipt, snapshot)) writtenReceipt = null
 		events += ContentEndpointEvent.SnapshotPublished(snapshot)
 		return step(emptyList(), events)
@@ -595,7 +605,11 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		} else {
 			a != b
 		}
-		return !sourceChanged && sameInputModes(left.meta.inputModes, right.meta.inputModes)
+		// Geometry and frame extents are part of the input context: what was typed
+		// against one grid is never attributed to a reflowed one.
+		return !sourceChanged && sameInputModes(left.meta.inputModes, right.meta.inputModes) &&
+			left.meta.geometry == right.meta.geometry &&
+			left.frame.cols == right.frame.cols && left.frame.rows == right.frame.rows
 	}
 
 	private fun clearSnapshot(why: ContentUnavailableReason, events: MutableList<ContentEndpointEvent>) {
@@ -759,8 +773,13 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	 *
 	 * This is the ONLY way a written receipt comes to exist: the endpoint never
 	 * invents one, and a queued, held, or superseded candidate never becomes one.
-	 * The proof must match the current published binding, publish sequence, geometry
-	 * and revision, and the caller's own pending resize epoch and policy generation.
+	 * The proof must match the current published binding, geometry and revision, the
+	 * caller's own pending resize epoch and policy generation, and the current
+	 * semantic input context: its generation must be the live one and its sequence
+	 * must name a publication of that context — never a future sequence and never one
+	 * published before the context began. A commit of an earlier publication of the
+	 * same context (drawn just before newer output arrived) is therefore a genuine
+	 * commit of that context; one from any other context never is.
 	 */
 	@Synchronized
 	fun recordWrittenFrame(proof: ContentWrittenFrameProof): ContentWrittenFrameOutcome {
@@ -773,7 +792,10 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		) {
 			return ContentWrittenFrameOutcome.Rejected(ContentWrittenFrameRejectReason.BINDING_MISMATCH)
 		}
-		if (proof.sequence != current.meta.sequence) {
+		if (proof.inputGeneration != inputGeneration ||
+			proof.sequence > current.meta.sequence ||
+			proof.sequence < contextStartSequence
+		) {
 			return ContentWrittenFrameOutcome.Rejected(ContentWrittenFrameRejectReason.SEQUENCE_MISMATCH)
 		}
 		if (proof.geometry != current.meta.geometry) {
@@ -793,13 +815,14 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 			rowId = current.meta.rowId,
 			selectionGeneration = target.selectionGeneration,
 			subscriptionId = subscriptionId,
-			sequence = current.meta.sequence,
+			sequence = proof.sequence,
 			source = source,
 			inputModes = current.meta.inputModes,
 			geometry = current.meta.geometry,
 			nativeContent = proof.nativeContent,
 			resizeEpoch = proof.resizeEpoch,
 			policyGeneration = proof.policyGeneration,
+			inputGeneration = inputGeneration,
 		)
 		writtenReceipt = receipt
 		return ContentWrittenFrameOutcome.Registered(receipt)
@@ -845,8 +868,8 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	 * `true` admits the operation, and passing it as a value keeps caller code out of
 	 * this endpoint's monitor. Admission still requires this endpoint's own fences —
 	 * negotiation, a current publication, the exact source and modes, a written
-	 * receipt of that exact publish, the live policy generation, and the current
-	 * resize epoch.
+	 * receipt of that same semantic input context, the live policy generation, and
+	 * the current resize epoch.
 	 *
 	 * The returned effects are this operation's frames in wire order and must be
 	 * serialized by the caller one operation at a time, so a paste's pages never
@@ -894,7 +917,6 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 			source = open.source,
 			inputModes = open.inputModes,
 			generation = generation,
-			publicationSequence = open.publicationSequence,
 			effectIds = effects.map { it.effectId },
 		)
 		pendingInputs[inputId] = pending
@@ -998,20 +1020,23 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	}
 
 	/**
-	 * Invalidate pending input operations whose admitted source or modes no longer
-	 * match the snapshot that just became current. The flag is permanent for that
+	 * Invalidate pending input operations whose admitted semantic context no longer
+	 * matches the snapshot that just became current. The flag is permanent for that
 	 * operation: a later return to the same source does not restore its lifetime, and
 	 * the invalidation survives the completion of a write already in flight.
+	 *
+	 * Ordinary output under the same source, modes, and geometry keeps the generation
+	 * and leaves an admitted operation alone; the documented contract is that a new
+	 * snapshot or publish sequence alone never stalls input.
 	 */
 	private fun invalidatePendingInputsFor(snapshot: ContentSnapshot, events: MutableList<ContentEndpointEvent>) {
 		if (pendingInputs.isEmpty()) return
 		val current = (snapshot.meta.inputSource as? OptionalNativeIoSource.Stated)?.source
 		for (pending in pendingInputs.values.toList()) {
 			if (pending.settled) continue
-			// An admitted operation is bound to the exact publication (and therefore the
-			// exact written receipt) it was admitted against. ANY newer frame — even one
-			// with an identical source and modes — ends that lifetime.
-			if (pending.publicationSequence != snapshot.meta.sequence ||
+			// An admitted operation is bound to the semantic generation it was admitted
+			// under. Any advance — even A → B → A — ends that lifetime for good.
+			if (pending.generation != inputGeneration ||
 				current == null ||
 				!nativeIoSourceEquals(pending.source, current) ||
 				!sameInputModes(pending.inputModes, snapshot.meta.inputModes)
@@ -1227,8 +1252,6 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		class Open(
 			val source: NativeIoInputSource,
 			val inputModes: TerminalInputModes,
-			/** The exact publication the admission is bound to. */
-			val publicationSequence: Long,
 		) : Gate
 
 		/** One fixed reason nothing was staged. */
@@ -1267,7 +1290,7 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		if (receipt.resizeEpoch != resizeEpoch) return refuse(ContentNotSentReason.STALE_RESIZE)
 		// Only this endpoint's own immutable facts are ever used for the wire, never the
 		// caller's mutable objects that merely had to compare equal to them.
-		return Gate.Open(stated.source, snapshot.meta.inputModes, snapshot.meta.sequence)
+		return Gate.Open(stated.source, snapshot.meta.inputModes)
 	}
 
 	private fun receiptMatchesPublication(receipt: WrittenRemoteContent?, snapshot: ContentSnapshot): Boolean {
@@ -1275,7 +1298,10 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		if (receipt.selectionGeneration != target.selectionGeneration) return false
 		if (receipt.subscriptionId != subscriptionId) return false
 		if (receipt.hostRunId != target.ownerRunId || receipt.rowId != target.rowId) return false
-		if (receipt.sequence != snapshot.meta.sequence) return false
+		// The receipt is proof of the current semantic context, not of one publish: it
+		// must belong to the live generation and name a publication of it.
+		if (receipt.inputGeneration != inputGeneration) return false
+		if (receipt.sequence > snapshot.meta.sequence || receipt.sequence < contextStartSequence) return false
 		if (receipt.geometry != snapshot.meta.geometry) return false
 		if (!sameInputModes(receipt.inputModes, snapshot.meta.inputModes)) return false
 		val stated = snapshot.meta.inputSource as? OptionalNativeIoSource.Stated ?: return false

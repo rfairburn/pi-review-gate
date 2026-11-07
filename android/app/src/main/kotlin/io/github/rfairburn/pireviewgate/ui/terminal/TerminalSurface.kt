@@ -25,9 +25,10 @@ import androidx.compose.ui.viewinterop.AndroidView
  * A binding with no input source is drawn in full and denies input; the wrapper
  * takes no part in that choice.
  *
- * The view is focusable, focusable in touch mode, and raises the keyboard when
- * tapped, so a screen that hosts it does not have to arrange input on its behalf.
- * A host that wants the keyboard up without a tap calls [openKeyboard].
+ * The view is focusable and focusable in touch mode, and a tap gives it focus, so a
+ * screen that hosts it does not have to arrange focus on its behalf. A tap never
+ * raises the soft keyboard: a host that wants the keyboard up calls [openKeyboard]
+ * from its explicit keyboard control.
  */
 @Composable
 fun TerminalSurface(

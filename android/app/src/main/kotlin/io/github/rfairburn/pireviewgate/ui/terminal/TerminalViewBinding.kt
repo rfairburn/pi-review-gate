@@ -28,7 +28,20 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalInputModes
  *    keyboard and mouse packets must be encoded against;
  *  - [policyGeneration] is the caller's policy snapshot stamp, so a policy change
  *    retires the frame without the surface having to know what a policy is;
- *  - [frame] is the validated viewport content itself.
+ *  - [frame] is the validated viewport content itself;
+ *  - [inputGeneration] is the content lane's monotonic semantic input generation
+ *    (source, modes, geometry), so an A → B → A return — even one whose intermediate
+ *    B publication was never installed here — is a different input context;
+ *  - [resizeEpoch] is the content lane's viewer resize epoch the frame was observed
+ *    under, so a resize request retires input attribution before any reflow arrives.
+ *
+ * ## Input context
+ *
+ * [sameInputContextAs] is the one rule for "ordinary output": a newer publish of the
+ * same target with an identical source, geometry, modes, policy, frame extents, input
+ * generation, and resize epoch only changes what is displayed. A surface keeps the
+ * input proof it genuinely committed for that context and keeps drawing the newer
+ * frames; anything else is a new context that retires the proof.
  *
  * The surface never sends a byte for this binding and never writes a clipboard:
  * it renders and reports. A later integration owns the socket and the copy path.
@@ -55,6 +68,10 @@ data class TerminalViewBinding(
 	val modes: TerminalInputModes,
 	val policyGeneration: Long,
 	val frame: TerminalFrame,
+	/** Monotonic semantic input generation of the content lane this frame came from. */
+	val inputGeneration: Long = 0L,
+	/** Viewer resize epoch of the content lane this frame was observed under. */
+	val resizeEpoch: Long = 0L,
 ) {
 	init {
 		require(hostId.isNotEmpty()) { "a binding needs its host" }
@@ -65,6 +82,8 @@ data class TerminalViewBinding(
 		require(connectionGeneration >= 0L) { "connection generations are non-negative" }
 		require(selectionGeneration >= 0L) { "selection generations are non-negative" }
 		require(policyGeneration >= 0L) { "policy generations are non-negative" }
+		require(inputGeneration >= 0L) { "input generations are non-negative" }
+		require(resizeEpoch >= 0L) { "resize epochs are non-negative" }
 		require(frame.cols > 0 && frame.rows > 0) { "a viewport has positive dimensions" }
 		require(frame.lines.size == frame.rows) { "a viewport carries one line per row" }
 	}
@@ -109,6 +128,23 @@ data class TerminalViewBinding(
 			ownerRun == other.ownerRun &&
 			rowId == other.rowId &&
 			InputSourceFence.isSameSource(source, other.source)
+	}
+
+	/**
+	 * True when [other] is the same semantic input context: the same target and
+	 * source ([sameTargetAs]) with identical geometry, modes, policy generation, frame
+	 * extents, input generation, and resize epoch. Only [publishSequence] and the
+	 * frame's displayed content may differ — that is ordinary output.
+	 */
+	fun sameInputContextAs(other: TerminalViewBinding?): Boolean {
+		if (other == null || !sameTargetAs(other)) return false
+		return geometry == other.geometry &&
+			modes == other.modes &&
+			policyGeneration == other.policyGeneration &&
+			frame.cols == other.frame.cols &&
+			frame.rows == other.frame.rows &&
+			inputGeneration == other.inputGeneration &&
+			resizeEpoch == other.resizeEpoch
 	}
 
 	companion object {

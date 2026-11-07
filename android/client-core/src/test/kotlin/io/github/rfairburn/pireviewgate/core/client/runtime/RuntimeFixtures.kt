@@ -699,6 +699,7 @@ internal class RuntimeHarness(
         sequence: Long = 1L,
         policyGeneration: Long = runtime.state.value.inputPolicy.generation,
         geometry: SessionGeometry = CONTENT_GEOMETRY,
+        inputGeneration: Long? = null,
     ): ContentWrittenFrameOutcome {
         val observation = runtime.currentContentObservation()
             ?: error("no content stream is live to have committed a frame")
@@ -716,6 +717,7 @@ internal class RuntimeHarness(
                     cols = geometry.cols,
                     rows = geometry.rows,
                 ),
+                inputGeneration = inputGeneration ?: observation.inputGeneration,
             ),
         )
     }

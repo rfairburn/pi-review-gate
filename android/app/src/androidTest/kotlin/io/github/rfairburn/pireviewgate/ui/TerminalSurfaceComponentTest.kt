@@ -223,17 +223,21 @@ class TerminalSurfaceComponentTest {
             assertTrue(connection.deleteSurroundingTextInCodePoints(0, 5))
             assertTrue(fixture.packets.isEmpty())
 
+            // Ordinary output in the same input context keeps the committed proof: the
+            // deletion is still delivered, attributed to that same genuine commit.
             installBinding(fixture, contentOnlyPublish(requireNotNull(fixture.binding)))
-            assertFalse(connection.deleteSurroundingTextInCodePoints(1, 0))
-            assertEquals(InputUnavailableReason.NO_COMMITTED_FRAME, fixture.refusals.last())
-            assertTrue(fixture.packets.isEmpty())
+            assertTrue(connection.deleteSurroundingTextInCodePoints(1, 0))
+            assertArrayEquals(byteArrayOf(127), fixture.packets.single().bytes)
+            assertEquals(proof, fixture.packets.single().receipt)
+            assertTrue(fixture.packets.single().verifiedAtCapture)
+            fixture.packets.clear()
         }
         val fresh = awaitInput(fixture)
         compose.runOnIdle {
-            assertNotEquals(proof, fresh)
-            assertFalse(fixture.surface!!.verifyReceipt(proof))
+            assertEquals("Same-context output never replaces the input anchor", proof, fresh)
+            assertTrue(fixture.surface!!.verifyReceipt(proof))
             assertTrue(connection.finishComposingText())
-            assertTrue("Refused deletion must not replay", fixture.packets.isEmpty())
+            assertTrue("A finished empty composition sends nothing", fixture.packets.isEmpty())
             assertTrue(connection.deleteSurroundingTextInCodePoints(1, 0))
             assertEquals(fresh, fixture.packets.single().receipt)
             // Replacing the InputConnection also permanently retires the old object.
@@ -244,7 +248,7 @@ class TerminalSurfaceComponentTest {
         }
     }
 
-    @Test fun sameContextPublishPreservesImeCompositionButRequiresAGenuineFreshReceipt() {
+    @Test fun sameContextPublishPreservesImeCompositionAndTheGenuineCommittedProof() {
         val fixture = terminalFixture(sourced = true)
         compose.setContent { fixture.Content() }
         val old = awaitInput(fixture)
@@ -258,48 +262,38 @@ class TerminalSurfaceComponentTest {
             val next = contentOnlyPublish(requireNotNull(fixture.binding))
             assertNotEquals(fixture.binding!!.frame.lines, next.frame.lines)
             installBinding(fixture, next)
-            assertFalse(surface.verifyReceipt(old))
+            // Ordinary output: the newer pixels have no display commit yet, but the
+            // input context's genuine commit keeps standing.
             assertNull(surface.currentReceipt())
-            assertNull(surface.currentInputProof())
+            assertTrue(surface.verifyReceipt(old))
+            assertEquals(old, surface.currentInputProof())
             assertEquals("ni", connection.composingText)
             assertEquals(KeyboardModifiers.SHIFT, surface.selectedMobileModifiers())
             surface.clearMobileModifiers()
-            assertFalse("No fresh platform commit yet", connection.commitText("refused", 1))
-            assertEquals("", connection.composingText)
-            assertTrue(fixture.packets.isEmpty())
-        }
-        val afterRefusal = awaitInput(fixture)
-        compose.runOnIdle {
-            assertFalse(fixture.surface!!.verifyReceipt(old))
-            assertTrue(connection.finishComposingText())
-            assertTrue("A refused commit has no latent replay", fixture.packets.isEmpty())
-            // A separate composition path on the SAME connection waits for the draw.
-            assertTrue(connection.setComposingText("zhong", 1))
-            val next = contentOnlyPublish(requireNotNull(fixture.binding))
-            assertNotEquals(fixture.binding!!.frame.lines, next.frame.lines)
-            installBinding(fixture, next)
-            assertFalse(fixture.surface!!.verifyReceipt(afterRefusal))
-            assertNull(fixture.surface!!.currentInputProof())
-            assertEquals("zhong", connection.composingText)
-        }
-        val fresh = awaitInput(fixture) // Actual Canvas + platform frame commit, no synthetic callback.
-        compose.runOnIdle {
-            val surface = fixture.surface!!
-            assertTrue(fresh.publishSequence > afterRefusal.publishSequence)
-            assertTrue(fresh.commitSequence > afterRefusal.commitSequence)
-            assertFalse(surface.verifyReceipt(old))
-            assertFalse(surface.verifyReceipt(afterRefusal))
-            assertEquals("zhong", connection.composingText)
             assertTrue(connection.commitText("中文", 1))
             val packet = fixture.packets.single()
             assertArrayEquals("中文".toByteArray(Charsets.UTF_8), packet.bytes)
-            assertEquals(fresh, packet.receipt)
+            assertEquals(old, packet.receipt)
             assertTrue(packet.verifiedAtCapture)
-            assertTrue(surface.verifyReceipt(fresh))
-            assertTrue(connection.finishComposingText())
-            assertEquals(1, fixture.packets.size)
-            assertFalse(surface.verifyReceipt(old))
-            assertFalse(surface.verifyReceipt(afterRefusal))
+            fixture.packets.clear()
+            assertTrue(connection.setComposingText("zhong", 1))
+        }
+        // The newer binding still earns its own actual display commit.
+        val shown = compose.runOnIdle { fixture.binding!!.publishSequence }
+        compose.waitUntil(10_000) { fixture.receipts.any { it.publishSequence == shown } }
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            val display = fixture.receipts.last { it.publishSequence == shown }
+            assertTrue(display.commitSequence > old.commitSequence)
+            assertEquals(display, surface.currentReceipt())
+            assertTrue(surface.verifyReceipt(display))
+            assertTrue(surface.verifyReceipt(old))
+            assertEquals("A newer same-context commit never replaces the anchor", old, surface.currentInputProof())
+            assertEquals("zhong", connection.composingText)
+            assertTrue(connection.commitText("中", 1))
+            val packet = fixture.packets.single()
+            assertEquals(old, packet.receipt)
+            assertTrue(packet.verifiedAtCapture)
         }
     }
 
@@ -332,6 +326,9 @@ class TerminalSurfaceComponentTest {
             "native epoch" to { it.copy(source = source.copy(nativeSession = source.nativeSession.copy(epoch = source.nativeSession.epoch + 1))) },
             "native tuple absence" to { it.copy(source = NativeIoStartupSource(source.hostRunId, source.sessionId,
                 source.geometry, source.viewerRevision, source.sourceToken)) },
+            // An A -> B -> A return whose B emission was conflated away still differs here.
+            "input generation" to { it.copy(inputGeneration = it.inputGeneration + 1) },
+            "resize epoch" to { it.copy(resizeEpoch = it.resizeEpoch + 1) },
         )
         for ((label, change) in changes) {
             compose.runOnIdle { installBinding(fixture, baseline) }

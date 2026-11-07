@@ -31,6 +31,12 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalInputModes
  *
  * Instances are immutable and compared by value, so a caller can hold one across
  * a queued write and ask the surface whether it is still current.
+ *
+ * [publishSequence] names the publish whose pixels this commit actually drew. Under
+ * an unchanged input context ([inputGeneration], [resizeEpoch], and every other
+ * context field) a later publish only changes what is displayed, so a receipt for an
+ * earlier publish of that context stays a genuine commit of it; see
+ * [TerminalViewBinding.sameInputContextAs].
  */
 data class FrameCommitReceipt(
 	val hostId: String,
@@ -44,6 +50,10 @@ data class FrameCommitReceipt(
 	val source: NativeIoInputSource?,
 	val modes: TerminalInputModes,
 	val policyGeneration: Long,
+	/** The content lane's semantic input generation the drawn binding carried. */
+	val inputGeneration: Long,
+	/** The content lane's resize epoch the drawn binding carried. */
+	val resizeEpoch: Long,
 	val frameCols: Int,
 	val frameRows: Int,
 	val drawnColumns: Int,
@@ -67,4 +77,51 @@ data class FrameCommitReceipt(
 	 */
 	val authorizesInput: Boolean
 		get() = InputSourceFence.authorizesInput(source)
+
+	/**
+	 * True when this commit belongs to [binding]'s input context: same target and
+	 * source, geometry, modes, policy, frame extents, input generation, and resize
+	 * epoch, drawn from a publish no newer than [binding]'s. The display content and
+	 * the publish sequence are the only things allowed to have moved on.
+	 */
+	fun inContextOf(binding: TerminalViewBinding?): Boolean {
+		binding ?: return false
+		return hostId == binding.hostId &&
+			connectionGeneration == binding.connectionGeneration &&
+			selectionGeneration == binding.selectionGeneration &&
+			subscriptionId == binding.subscriptionId &&
+			ownerRun == binding.ownerRun &&
+			rowId == binding.rowId &&
+			InputSourceFence.isSameSource(source, binding.source) &&
+			geometry == binding.geometry &&
+			modes == binding.modes &&
+			policyGeneration == binding.policyGeneration &&
+			frameCols == binding.frame.cols &&
+			frameRows == binding.frame.rows &&
+			inputGeneration == binding.inputGeneration &&
+			resizeEpoch == binding.resizeEpoch &&
+			publishSequence <= binding.publishSequence
+	}
+
+	/** True when [other] is a commit of the same input context as this one. */
+	fun sameInputContextAs(other: FrameCommitReceipt): Boolean =
+		hostId == other.hostId &&
+			connectionGeneration == other.connectionGeneration &&
+			selectionGeneration == other.selectionGeneration &&
+			subscriptionId == other.subscriptionId &&
+			ownerRun == other.ownerRun &&
+			rowId == other.rowId &&
+			InputSourceFence.isSameSource(source, other.source) &&
+			geometry == other.geometry &&
+			modes == other.modes &&
+			policyGeneration == other.policyGeneration &&
+			frameCols == other.frameCols &&
+			frameRows == other.frameRows &&
+			drawnColumns == other.drawnColumns &&
+			drawnRows == other.drawnRows &&
+			contentRect == other.contentRect &&
+			inputGeneration == other.inputGeneration &&
+			resizeEpoch == other.resizeEpoch &&
+			bindingEpoch == other.bindingEpoch &&
+			layoutEpoch == other.layoutEpoch
 }

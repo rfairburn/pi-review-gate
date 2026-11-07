@@ -1,11 +1,16 @@
 package io.github.rfairburn.pireviewgate.ui
 
-import android.util.Size
+import android.graphics.Rect
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
@@ -21,7 +26,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** Actual native commits must not resize the pane through readiness presentation. */
+/**
+ * Actual native commits must not resize or move the pane through readiness,
+ * status, or Keys-panel presentation: all of them are overlays on a full pane.
+ */
 @RunWith(AndroidJUnit4::class)
 class TerminalReadinessLayoutComponentTest {
     @get:Rule val compose = createAndroidComposeRule<UiVerificationActivity>()
@@ -29,10 +37,11 @@ class TerminalReadinessLayoutComponentTest {
     @Test fun realCommittedReadinessKeepsPanePixelsAndViewportRequestsInvariant() {
         var terminal by mutableStateOf(NativeUiFixtures.terminal())
         var binding by mutableStateOf(NativeUiFixtures.binding(sourced = true))
+        var status by mutableStateOf<String?>(null)
         var surface: TerminalSurfaceView? = null
         val viewports = CopyOnWriteArrayList<Pair<Int, Int>>()
         val receipts = CopyOnWriteArrayList<FrameCommitReceipt>()
-        var beforeReady: Pair<Size, Int>? = null
+        var beforeReady: Pair<Rect, Int>? = null
         val listener = object : TerminalSurfaceListener {
             override fun onViewportRequested(cols: Int, rows: Int) {
                 viewports += cols to rows
@@ -46,7 +55,7 @@ class TerminalReadinessLayoutComponentTest {
             override fun onFrameCommitted(receipt: FrameCommitReceipt) {
                 val view = requireNotNull(surface)
                 if (!view.verifyReceipt(receipt)) return
-                if (beforeReady == null) beforeReady = Size(view.width, view.height) to viewports.size
+                if (beforeReady == null) beforeReady = view.windowBounds() to viewports.size
                 receipts += receipt
                 // No test-minted proof: only the real platform-committed native receipt.
                 terminal = terminal.copy(inputReady = true)
@@ -67,7 +76,10 @@ class TerminalReadinessLayoutComponentTest {
                 },
                 onKey = { error("No key gesture in layout test") },
                 onPaste = { error("No paste gesture in layout test") },
+                // Keys panel and status dismissal are screen-local presentation:
+                // neither may emit an intent (coverage, focus, or otherwise).
                 onIntent = { error("No navigation gesture in layout test") },
+                status = status,
             )
         }
         compose.waitUntil(10_000) { terminal.inputReady && receipts.isNotEmpty() }
@@ -75,11 +87,23 @@ class TerminalReadinessLayoutComponentTest {
         fun assertStablePane() = compose.runOnIdle {
             val view = requireNotNull(surface)
             val (pixels, requests) = requireNotNull(beforeReady)
-            assertEquals(pixels, Size(view.width, view.height))
+            assertEquals("Pane must not move or resize", pixels, view.windowBounds())
+            assertTrue(view.hasFocus())
             assertEquals("Readiness alone must not request another resize", requests, viewports.size)
             assertTrue(terminal.inputReady)
             assertTrue(view.verifyReceipt(requireNotNull(view.currentInputProof())))
         }
+        assertStablePane()
+        // Status arrives and is dismissed as an overlay, never a reserved slot.
+        compose.runOnIdle { status = "Synthetic status notice" }
+        compose.onNodeWithText("Synthetic status notice").assertIsDisplayed()
+        assertStablePane()
+        compose.onNodeWithText("Dismiss").performClick()
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        assertStablePane()
+        // The Keys panel stays open through the readiness churn below.
+        compose.onNodeWithText("Keys").performClick()
+        compose.onNodeWithText("Esc").assertIsDisplayed()
         assertStablePane()
         repeat(3) {
             var oldSequence = 0L
@@ -98,5 +122,13 @@ class TerminalReadinessLayoutComponentTest {
             compose.waitForIdle()
             assertStablePane()
         }
+        compose.onNodeWithText("Close keys").performClick()
+        compose.onAllNodesWithText("Esc").assertCountEquals(0)
+        assertStablePane()
+    }
+
+    private fun TerminalSurfaceView.windowBounds(): Rect {
+        val location = IntArray(2).also(this::getLocationInWindow)
+        return Rect(location[0], location[1], location[0] + width, location[1] + height)
     }
 }

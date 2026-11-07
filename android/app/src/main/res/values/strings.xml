@@ -193,6 +193,9 @@
     <string name="action_switch_session">Switch</string>
     <string name="terminal_suspended_coverage">Terminal input is paused while this is open.</string>
     <string name="terminal_suspended_viewport">Terminal input is paused until the resized screen is ready.</string>
+    <string name="terminal_keys_open">Keys</string>
+    <string name="terminal_keys_close">Close keys</string>
+    <string name="terminal_status_dismiss">Dismiss</string>
     <string name="quick_switcher_title">Switch session</string>
     <string name="quick_switcher_current">Current</string>
     <string name="key_ctrl">Ctrl</string>
@@ -213,7 +216,7 @@
     <string name="key_delete">Del</string>
     <string name="key_paste">Paste</string>
     <string name="key_show_keyboard">Keyboard</string>
-    <string name="key_hide_keyboard">Hide keys</string>
+    <string name="key_hide_keyboard">Hide keyboard</string>
     <string name="key_show_extra">More keys</string>
     <string name="key_hide_extra">Fewer keys</string>
 

@@ -142,6 +142,37 @@ class SelectedContentLaneTest {
     }
 
     @Test
+    fun busySameContextOutputNeitherRevokesTheCommitNorStallsAdmittedInput() = runBlocking {
+        val harness = nativeInputHarness(coroutineContext)
+        val content = harness.terminalUp()
+        // The caller drew sequence 1; newer same-context output lands before its commit
+        // callback. That genuine commit of the same context still registers.
+        harness.publishContent(content, source = nativeSource(), sequence = 2L)
+        harness.publishContent(content, source = nativeSource(), sequence = 3L)
+        val registered = harness.commitPublishedFrame(selectionGeneration = 1L, sequence = 1L)
+        assertIs<ContentWrittenFrameOutcome.Registered>(registered)
+        val generation = harness.runtime.currentContentObservation()!!.inputGeneration
+
+        for (sequence in 4L..40L) harness.publishContent(content, source = nativeSource(), sequence = sequence)
+
+        val observation = harness.runtime.currentContentObservation()!!
+        assertEquals(generation, observation.inputGeneration, "ordinary output is not a semantic change")
+        assertEquals(registered.receipt, observation.writtenReceipt, "the committed context proof stays standing")
+        val writtenBefore = content.writes.size
+        val admission = harness.runtime.submitInput(keyboardRequest(source = nativeSource()), ALWAYS_TRUE)
+        assertIs<ContentInputAdmission.Accepted>(admission, "busy output must not refuse committed input")
+        // More output between admission and the writer's own dispatch checks.
+        for (sequence in 41L..45L) harness.publishContent(content, source = nativeSource(), sequence = sequence)
+        harness.settle()
+
+        val inputFrames = content.contentFrames().filter { it.wireType.startsWith("input") }
+        assertTrue(inputFrames.isNotEmpty(), "the admitted input reached the transport")
+        assertTrue(content.writes.size > writtenBefore)
+        assertEquals(listOf(ContentSendOutcome.Submitted), harness.inputOutcomes())
+        harness.closeRuntime()
+    }
+
+    @Test
     fun aProofThatTurnsFalseBetweenAdmissionAndDispatchNeverWritesTheInput() = runBlocking {
         val harness = nativeInputHarness(coroutineContext)
         val content = harness.terminalUp()

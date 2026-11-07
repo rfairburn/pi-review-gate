@@ -25,7 +25,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.rfairburn.pireviewgate.R
@@ -201,9 +203,27 @@ private fun OwnerSelector(
     }
 }
 
+/**
+ * The request status. Both the drawn status and the pending text are always laid out in
+ * one slot, and only their visibility changes, so admitted-read feedback never changes
+ * this line's height or moves a control below it. The hidden text is not announced.
+ */
 @Composable
 private fun StatusLine(saved: SavedUiState) {
-    val text = when (val status = saved.status) {
+    val base = saved.readFeedbackBaseStatus
+    val hidden = Modifier.alpha(0f).clearAndSetSemantics { }
+    Box {
+        NoticeText(savedStatusText(base ?: saved.status), modifier = if (base != null) hidden else Modifier)
+        NoticeText(
+            savedStatusText(SavedRequestStatus.Requesting),
+            modifier = if (base != null) Modifier else hidden,
+        )
+    }
+}
+
+@Composable
+private fun savedStatusText(value: SavedRequestStatus): String {
+    val text = when (val status = value) {
         SavedRequestStatus.Idle -> stringResource(R.string.saved_status_idle)
         SavedRequestStatus.Requesting -> stringResource(R.string.saved_status_requesting)
         SavedRequestStatus.Ready -> stringResource(R.string.saved_status_ready)
@@ -218,7 +238,7 @@ private fun StatusLine(saved: SavedUiState) {
             }
         }
     }
-    NoticeText(text)
+    return text
 }
 
 /** The owner's own totals, spelled out when the owner did not state them. */

@@ -39,7 +39,6 @@ import io.github.rfairburn.pireviewgate.core.client.ui.RemoveHostTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.EditHostAddressTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.UiCoverage
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionObservation
-import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterWire
 import io.github.rfairburn.pireviewgate.permissions.LocalNetworkPermissionDeniedPanel
 
 /**
@@ -48,8 +47,8 @@ import io.github.rfairburn.pireviewgate.permissions.LocalNetworkPermissionDenied
  * Every saved association is listed with its real endpoint, its real connection
  * state, and the full fingerprint this client remembers for it — never abbreviated,
  * because an abbreviated identity is not comparable. The operations offered here are
- * the local ones this client actually has: connect, disconnect, forget, and the
- * owner-side operations their negotiated capabilities allow.
+ * the local ones this client actually has: connect, disconnect, edit address, and
+ * forget. New session and Saved conversations live in the session list's header.
  *
  * Remove is a local forget only. The confirmation the intent opens says so in fixed
  * text and never claims to stop anything remote.
@@ -147,24 +146,6 @@ private fun HostCard(
                             menuOpen = false
                             onIntent(ClientIntent.UiCoverageChanged(UiCoverage.NONE))
                             onIntent(ClientIntent.DisconnectHost(host.host.id))
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.action_create_session)) },
-                        enabled = host.canCreateSession,
-                        onClick = {
-                            menuOpen = false
-                            onIntent(ClientIntent.UiCoverageChanged(UiCoverage.NONE))
-                            onIntent(ClientIntent.RequestSessionCreate)
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.action_saved)) },
-                        enabled = host.capabilities.supports(RosterWire.SAVED_CAPABILITY),
-                        onClick = {
-                            menuOpen = false
-                            onIntent(ClientIntent.UiCoverageChanged(UiCoverage.NONE))
-                            onIntent(ClientIntent.ShowSaved(host.host.id))
                         },
                     )
                     DropdownMenuItem(

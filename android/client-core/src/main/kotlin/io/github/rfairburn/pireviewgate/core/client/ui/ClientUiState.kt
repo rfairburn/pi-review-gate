@@ -10,8 +10,10 @@ import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionO
  *
  * [Sessions], [Hosts], and [Settings] are the three top-level destinations and are
  * reachable from each other by native navigation. [Saved] is a per-owner browser
- * opened from a host, and [Terminal] is fullscreen: it carries its own state and
- * deliberately has no persistent navigation bar or sidebar, only a compact app bar.
+ * opened from the session list's header after an explicit host choice, so it belongs
+ * to [NavigationDestination.SESSIONS]. [Terminal] is fullscreen: it carries its own
+ * state and deliberately has no app bar, navigation bar, or sidebar, only in-window
+ * overlays.
  */
 public sealed interface ClientRoute {
     public data object Sessions : ClientRoute
@@ -37,7 +39,7 @@ public fun ClientRoute.destination(): NavigationDestination? = when (this) {
     is ClientRoute.Sessions -> NavigationDestination.SESSIONS
     is ClientRoute.Hosts -> NavigationDestination.HOSTS
     is ClientRoute.Settings -> NavigationDestination.SETTINGS
-    is ClientRoute.Saved -> NavigationDestination.HOSTS
+    is ClientRoute.Saved -> NavigationDestination.SESSIONS
     is ClientRoute.Terminal -> null
 }
 

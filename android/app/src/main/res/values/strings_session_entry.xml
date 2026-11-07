@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The session list's one entry point for New session and Saved conversations. -->
+<resources>
+    <string name="sessions_header_saved_chooser_title">Choose a host to browse its saved conversations</string>
+    <string name="sessions_header_saved_no_hosts">No hosts are configured. Add a host on the Hosts screen first.</string>
+    <string name="sessions_header_saved_host">%1$s — %2$s</string>
+    <string name="sessions_header_saved_available">Saved conversations available</string>
+    <string name="sessions_header_saved_not_connected">Not connected (%1$s)</string>
+    <string name="sessions_header_saved_unconfirmed">Saved support not confirmed by this host yet</string>
+    <string name="sessions_header_saved_unsupported">This host does not offer saved conversations</string>
+</resources>

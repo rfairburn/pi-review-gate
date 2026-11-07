@@ -84,3 +84,21 @@ reproduced verbatim from that file and the width function reproduces its
 wcwidth fall-through, so the phone places cells exactly as the pinned owner's
 terminal does. The same notice is packaged inside the installed Android
 application at app/src/main/assets/licenses/MIT-xterm-addon-unicode11.txt.
+
+--------------------------------------------------------------------------
+Attribution to Pi Coding Agent (session-card status colors)
+--------------------------------------------------------------------------
+
+This product includes session-card status color values in
+android/client-core/src/main/kotlin/io/github/rfairburn/pireviewgate/core/client/ui/SessionCardStatusStyle.kt,
+derived from the dark and light themes of:
+
+Pi Coding Agent v1.5.0 (https://github.com/earendil-works/pi),
+packages/coding-agent/src/modes/interactive/theme/dark.json and light.json,
+Copyright (c) 2025 Mario Zechner
+
+Licensed under the MIT License; the full text, the resolved values, and their
+provenance are reproduced in LICENSES/MIT-pi-theme-colors.txt. Only the color
+values are embedded; no Pi code is included. The same notice is packaged
+inside the installed Android application at
+app/src/main/assets/licenses/MIT-pi-theme-colors.txt.

@@ -45,6 +45,10 @@ import io.github.rfairburn.pireviewgate.core.input.TerminalKey
 import io.github.rfairburn.pireviewgate.core.input.TerminalKeyEventType
 import io.github.rfairburn.pireviewgate.core.input.TerminalLayout
 import io.github.rfairburn.pireviewgate.core.input.TerminalPointerEvent
+import io.github.rfairburn.pireviewgate.core.input.TouchGesturePhase
+import io.github.rfairburn.pireviewgate.core.input.TouchPointer
+import io.github.rfairburn.pireviewgate.core.input.TouchWheelSteps
+import io.github.rfairburn.pireviewgate.core.input.TwoFingerWheelGesture
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalGraphicsFallback
@@ -76,6 +80,9 @@ import kotlin.math.ceil
  *  - encoding: keyboard, paste, and mouse packets built against the modes that
  *    arrived with the committed frame, with the root screen's latched modifier
  *    chips folded into the keystrokes they modify;
+ *  - touch: one finger is the existing press, drag, and release; a two-finger
+ *    vertical swipe is the owner's own mouse wheel, one report per measured cell
+ *    of travel, attributed to the input proof standing when the swipe began;
  *  - display-only frames: a publish that states no host-written input source is
  *    laid out and drawn in full, and every keystroke, paste, and pointer report
  *    against it is refused with a fixed reason.
@@ -229,6 +236,31 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	private var activeConnection: TerminalInputConnection? = null
 	private var inputConnectionEpoch = 0L
 
+	/** Pointer bookkeeping for the two-finger wheel; one finger keeps its existing path. */
+	private val touchGesture = TwoFingerWheelGesture()
+
+	/**
+	 * The input proof's anchor standing when the current touch gesture's first finger
+	 * came down, or null when none stood. Every report the gesture makes — its drag,
+	 * its release, the release ending it before a wheel, and the wheel itself — is
+	 * attributed to exactly this anchor or not sent at all; a gesture that began with
+	 * no proof never reports, even after a fresh commit arrives.
+	 */
+	private var touchAnchor: FrameCommitReceipt? = null
+
+	/** The cell the gesture's forwarded press was last reported at, or null when none was forwarded. */
+	private var touchPressCell: CellPosition? = null
+
+	/**
+	 * What a two-finger wheel captured when it began: the standing input proof's
+	 * anchor, the drawn geometry that anchor was committed with, and the cell every
+	 * one of its reports names. A wheel step is only ever reported while all three
+	 * are still exactly what the surface stands behind.
+	 */
+	private class TouchWheelLease(val anchor: FrameCommitReceipt, val geometry: CellGeometry, val cell: CellPosition)
+
+	private var touchWheelLease: TouchWheelLease? = null
+
 	init {
 		// Every input path — hardware keys, the IME, mouse reports — needs focus,
 		// and a plain View is not focusable in touch mode by default. Without this a
@@ -275,7 +307,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		// target's proof stops being valid here, on the publishing side, so a writer
 		// thread checking it concurrently cannot be told "yes" for a frame that is on
 		// its way out.
-		publishedProof.retire()
+		retireInputProof()
 		binding = newBinding
 		// A different session, connection, native tuple, or source state is a
 		// different target, and a modifier chip latched for the old one must never
@@ -335,8 +367,28 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		// Unchanged graphics keep their decodes, so steady output with an image on screen
 		// does not withhold every pass behind a fresh decode.
 		if (previousFrame?.graphics != next.frame.graphics) prepareImages(next.frame)
-		scheduleDraw()
+		scheduleDrawAfterTraversal()
 		return true
+	}
+
+	/**
+	 * Ask for a pass that draws the installed binding and can earn its own commit.
+	 *
+	 * Output may arrive while a traversal is already drawing — from a draw-time
+	 * listener, say, after this pane's pre-draw step registered (and this install just
+	 * withdrew) the pass's candidate. An invalidate issued then is folded into the pass
+	 * already under way, which draws the new pixels with no candidate behind them, and
+	 * the platform schedules nothing after it: the newer binding would never be
+	 * attested. So the ordinary invalidate is paired with one posted for the next frame,
+	 * which runs after the current traversal and, finding this view drawn, schedules a
+	 * genuine fresh pass. When no traversal was under way it finds the view still dirty
+	 * and costs nothing. Nothing here touches a commit: only a real platform commit of
+	 * a real pass can ever be attested.
+	 */
+	private fun scheduleDrawAfterTraversal() {
+		if (!attachedToWindow) return
+		invalidate()
+		postInvalidateOnAnimation()
 	}
 
 	/** The frame currently installed, or null. */
@@ -384,6 +436,19 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		return candidate == standing.anchor || candidate == standing.latest
 	}
 
+	/**
+	 * Stop standing behind the published input proof. UI thread only.
+	 *
+	 * Every genuine retirement — a context, layout, policy, focus, coverage, or
+	 * lifecycle change, or a commit nobody can attest to — comes through here, and a
+	 * touch gesture begun under the retired proof ends with it: nothing more of it is
+	 * reported, released, or revived by a later commit. Ordinary same-context output
+	 * never retires the proof, so it never reaches here and never ends a gesture.
+	 */
+	private fun retireInputProof() {
+		if (publishedProof.retire() != null) abandonTouchGesture()
+	}
+
 	/** True when [candidate] is the anchor of the standing input proof. Any thread. */
 	private fun isStandingAnchor(candidate: FrameCommitReceipt): Boolean =
 		publishedProof.current()?.proof?.anchor == candidate
@@ -391,7 +456,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	/** Take input away from this surface for a modal (a session chooser, say). */
 	fun setModalSuspended(suspended: Boolean) {
 		if (eligibility.modalSuspended == suspended) return
-		publishedProof.retire()
+		retireInputProof()
 		eligibility.modalSuspended = suspended
 		// Both edges: a chip held while a modal took over, or held into the moment it
 		// came back, is a chip whose effect the user can no longer see.
@@ -407,7 +472,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	/** Turn user input off or back on for this surface. */
 	fun setUserInputEnabled(enabled: Boolean) {
 		if (eligibility.userInputEnabled == enabled) return
-		publishedProof.retire()
+		retireInputProof()
 		eligibility.userInputEnabled = enabled
 		if (!enabled) {
 			retireCommit(InputUnavailableReason.USER_INPUT_DISABLED)
@@ -423,7 +488,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * next draw pass establishes a new receipt.
 	 */
 	fun invalidateCommittedFrame(reason: InputUnavailableReason) {
-		publishedProof.retire()
+		retireInputProof()
 		retireCommit(reason)
 		// The caller's fence covers text already in flight too: a composition the
 		// keyboard still holds must not arrive after a new frame is committed.
@@ -543,7 +608,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 
 	/** Close the image decode thread. The surface stays usable for text. */
 	fun release() {
-		publishedProof.retire()
+		retireInputProof()
 		imageDecoder?.close()
 		imageDecoder = null
 		clearImages()
@@ -563,7 +628,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	}
 
 	override fun onDetachedFromWindow() {
-		publishedProof.retire()
+		retireInputProof()
 		attachedToWindow = false
 		drawObserver?.takeIf { it.isAlive }?.removeOnPreDrawListener(beforeDraw)
 		drawObserver = null
@@ -572,6 +637,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		watcher = null
 		retireInputConnection()
 		clearMobileModifiersForTarget()
+		abandonTouchGesture()
 		imageDecoder?.close()
 		imageDecoder = null
 		retireCommit(InputUnavailableReason.DETACHED)
@@ -582,7 +648,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	override fun onVisibilityAggregated(isVisible: Boolean) {
 		super.onVisibilityAggregated(isVisible)
 		if (!isVisible) {
-			publishedProof.retire()
+			retireInputProof()
 			// Hidden pixels cannot be attested to, and a composition left behind by
 			// the input method must not survive into the next time this is shown.
 			retireCommit(InputUnavailableReason.NOT_VISIBLE)
@@ -596,7 +662,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	override fun onWindowVisibilityChanged(visibility: Int) {
 		super.onWindowVisibilityChanged(visibility)
 		if (visibility != VISIBLE) {
-			publishedProof.retire()
+			retireInputProof()
 			retireCommit(InputUnavailableReason.NOT_VISIBLE)
 			retireInputConnection()
 			clearMobileModifiersForTarget()
@@ -608,7 +674,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
 		super.onWindowFocusChanged(hasWindowFocus)
 		if (!hasWindowFocus) {
-			publishedProof.retire()
+			retireInputProof()
 			// Another window is on top: the pixels last drawn may be covered, and a
 			// composition the input method still holds belongs to the other window.
 			retireCommit(InputUnavailableReason.NOT_VISIBLE)
@@ -623,7 +689,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
 		super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
 		if (!gainFocus) {
-			publishedProof.retire()
+			retireInputProof()
 			retireCommit(InputUnavailableReason.NOT_FOCUSED)
 			retireInputConnection()
 			clearMobileModifiersForTarget()
@@ -686,7 +752,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	private fun applyFrame() {
 		// Every path through here ends with the previous commit no longer standing, so
 		// the published proof goes first. Only an actual platform commit restores it.
-		publishedProof.retire()
+		retireInputProof()
 		pendingDraw = null
 		watcher?.cancel()
 		val current = binding
@@ -890,11 +956,11 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		if (record == null) {
 			// Nothing is attested by this pass. Retire rather than leave an older proof
 			// standing behind pixels nobody confirmed.
-			publishedProof.retire()
+			retireInputProof()
 			return
 		}
 		val current = binding ?: run {
-			publishedProof.retire()
+			retireInputProof()
 			return
 		}
 		// Everything below comes from what the candidate actually drew, never from a
@@ -938,9 +1004,12 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		if (newReceipt.authorizesInput) {
 			val standing = publishedProof.current()?.proof
 			val anchor = standing?.anchor?.takeIf { it.sameInputContextAs(newReceipt) } ?: newReceipt
+			// A new anchor replacing a standing one is a new context: a touch gesture begun
+			// under the old anchor ends here, exactly as if it had been retired first.
+			if (standing != null && anchor !== standing.anchor) abandonTouchGesture()
 			publishedProof.publish(CommittedInputProof(anchor, newReceipt))
 		} else {
-			publishedProof.retire()
+			retireInputProof()
 		}
 		listener?.onFrameCommitted(newReceipt)
 	}
@@ -950,7 +1019,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	}
 
 	private fun retireDraw(frameReason: FrameInvalidationReason) {
-		publishedProof.retire()
+		retireInputProof()
 		receipt = null
 		gate.invalidateCommit(frameReason)
 		pendingDraw = null
@@ -1497,22 +1566,224 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		return modifiers
 	}
 
+	/**
+	 * Touchscreen input.
+	 *
+	 * One finger is the existing path: the first touch takes focus and is a press,
+	 * moving it is a drag, and lifting it is the release — each reported only when the
+	 * child asked for mouse events. The whole gesture belongs to the input proof that
+	 * stood when its first finger came down: a genuine retirement of that proof ends
+	 * the gesture on the spot, and no drag, release, or wheel of it is ever attributed
+	 * to a newer proof, however soon one is committed. Only a fresh first finger
+	 * reports again.
+	 *
+	 * A second finger turns the gesture into a two-finger wheel. A press the first
+	 * finger already forwarded is released first, and only under the anchor it went
+	 * out under; then the standing input proof, the drawn geometry, and the cell under
+	 * the fingers' centroid are captured, and every whole cell of vertical centroid
+	 * travel becomes one wheel report through the same encoder a physical wheel uses.
+	 * Each report re-checks that the captured anchor and geometry are still exactly
+	 * current, so ordinary output keeps the swipe going while any genuine context,
+	 * layout, focus, policy, coverage, or lifecycle change ends it for good — a fresh
+	 * commit never revives it. A third finger, a lifted finger, or a cancel ends it
+	 * too, and nothing that remains is ever turned back into a press or a drag: the
+	 * next report waits for a fresh first finger.
+	 *
+	 * Neither path raises the soft keyboard; [openKeyboard] is the only one that does.
+	 */
 	override fun onTouchEvent(event: MotionEvent): Boolean {
 		if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return super.onTouchEvent(event)
 		when (event.actionMasked) {
 			MotionEvent.ACTION_DOWN -> {
+				// A fresh first finger is a fresh gesture: nothing from an earlier one
+				// carries over.
+				touchGesture.down()
+				touchAnchor = null
+				touchPressCell = null
+				touchWheelLease = null
 				// A tap takes focus, so hardware keys and mouse reports can reach the
 				// terminal, whether or not the child asked for mouse events. It never
 				// raises the soft keyboard: the explicit keyboard control is the only
 				// path that does ([openKeyboard]). A tap the child does not track
 				// consumes the gesture without emitting an unsolicited report.
 				if (!hasFocus()) requestFocus()
-				return pointerAt(event, button = 0, release = false) || super.onTouchEvent(event)
+				val delivered = deliverPointerAt(event.x, event.y, button = 0, release = false)
+				// The gesture belongs to the proof standing now. A press that left names
+				// it exactly; one that did not still binds the gesture to whatever stood —
+				// or to nothing, and then the gesture never reports at all.
+				if (touchGesture.phase == TouchGesturePhase.SINGLE) {
+					touchAnchor = delivered?.receipt ?: publishedProof.current()?.proof?.anchor
+					touchPressCell = delivered?.cell
+				}
+				return delivered != null || super.onTouchEvent(event)
 			}
-			MotionEvent.ACTION_MOVE -> return pointerAt(event, button = 0, release = false, motion = true)
-			MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-				return pointerAt(event, button = 3, release = true) || super.onTouchEvent(event)
+			MotionEvent.ACTION_MOVE -> return when (touchGesture.phase) {
+				TouchGesturePhase.WHEEL -> {
+					touchGesture.move(touchPointers(event))?.let { emitTouchWheel(it) }
+					true
+				}
+				TouchGesturePhase.DORMANT -> true
+				TouchGesturePhase.SINGLE -> {
+					val anchor = touchAnchor
+					val delivered = anchor?.let {
+						deliverPointerAt(event.x, event.y, button = 0, release = false, motion = true, under = it)
+					}
+					if (delivered != null && touchPressCell != null) touchPressCell = delivered.cell
+					delivered != null
+				}
+				// A move with no first finger seen keeps its existing, unfenced report.
+				TouchGesturePhase.IDLE -> pointerAt(event, button = 0, release = false, motion = true)
+			}
+			MotionEvent.ACTION_POINTER_DOWN -> {
+				beginTouchWheel(event)
+				return true
+			}
+			MotionEvent.ACTION_POINTER_UP -> {
+				touchGesture.pointerUp()
+				touchWheelLease = null
+				return true
+			}
+			MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+				val phase = touchGesture.phase
+				val anchor = touchAnchor
+				touchWheelLease = null
+				touchAnchor = null
+				touchPressCell = null
+				touchGesture.end()
+				return when (phase) {
+					// No first finger seen: the existing, unfenced release.
+					TouchGesturePhase.IDLE -> pointerAt(event, button = 3, release = true) || super.onTouchEvent(event)
+					// One finger: its release, only under the proof the gesture began under.
+					TouchGesturePhase.SINGLE -> anchor?.let {
+						deliverPointerAt(event.x, event.y, button = 3, release = true, under = it)
+					} != null || super.onTouchEvent(event)
+					// A wheel, or a gesture that stopped reporting, ends with nothing: there is
+					// no press of its own to release. The platform's own tap tracking still
+					// sees the end, so a tap it was following is not left pressed.
+					else -> {
+						super.onTouchEvent(event)
+						true
+					}
+				}
+			}
 			else -> return super.onTouchEvent(event)
+		}
+	}
+
+	/**
+	 * A further finger touched down: begin a two-finger wheel when this makes exactly
+	 * two, and otherwise stop reporting until a fresh gesture.
+	 */
+	private fun beginTouchWheel(event: MotionEvent) {
+		if (touchGesture.phase == TouchGesturePhase.SINGLE) {
+			// The owner must not be left holding the first finger's press, and the
+			// platform's own tap tracking must not turn this into a click.
+			releaseHeldTouchPress()
+			cancelPlatformTouch(event)
+		}
+		touchWheelLease = null
+		if (!touchGesture.pointerDown(touchPointers(event))) return
+		val anchor = touchAnchor
+		if (anchor == null) {
+			// The gesture began with no proof standing; a later commit is no licence.
+			touchGesture.abandon()
+			return
+		}
+		val lease = captureTouchWheelLease(touchGesture.centroidX, touchGesture.centroidY, anchor)
+		if (lease == null || !touchGesture.arm(lease.geometry.cellHeightPx)) {
+			touchGesture.abandon()
+			return
+		}
+		touchWheelLease = lease
+	}
+
+	/**
+	 * Release the first finger's forwarded press, under the anchor it was forwarded
+	 * under and at the last cell it was reported at — or not at all. A release is
+	 * never attributed to a newer proof than its press, and never replayed later.
+	 */
+	private fun releaseHeldTouchPress() {
+		val anchor = touchAnchor ?: return
+		val cell = touchPressCell ?: return
+		touchPressCell = null
+		pointerReportUnder(
+			TerminalPointerEvent(button = 3, column = cell.column, row = cell.row, release = true),
+			anchor,
+		)
+	}
+
+	/**
+	 * Capture what a two-finger wheel reports against — [anchor], the proof its first
+	 * finger came down under, and only while that is still exactly the receipt input is
+	 * attributed to — or null after reporting why not.
+	 */
+	private fun captureTouchWheelLease(x: Float, y: Float, anchor: FrameCommitReceipt): TouchWheelLease? {
+		val committed = currentInputReceipt() ?: return null
+		if (committed != anchor) {
+			reportUnavailable(InputUnavailableReason.BINDING_RETIRED)
+			return null
+		}
+		val cellGeometry = geometry
+		if (cellGeometry == null || cellGeometry.contentRect != anchor.contentRect ||
+			cellGeometry.columns != anchor.drawnColumns || cellGeometry.rows != anchor.drawnRows
+		) {
+			reportUnavailable(InputUnavailableReason.LAYOUT_RETIRED)
+			return null
+		}
+		val cell = cellGeometry.cellOf(x, y)
+		if (cell == null || !anchor.covers(cell)) {
+			reportUnavailable(InputUnavailableReason.POINTER_OUTSIDE_CONTENT)
+			return null
+		}
+		return TouchWheelLease(anchor, cellGeometry, cell)
+	}
+
+	/**
+	 * Report [steps] wheel reports, each only while the wheel's captured anchor and
+	 * geometry are still exactly current. The first one that is not ends the wheel,
+	 * and the steps after it are dropped, never held for a later receipt.
+	 */
+	private fun emitTouchWheel(steps: TouchWheelSteps) {
+		repeat(steps.count) {
+			val lease = touchWheelLease ?: return
+			if (geometry !== lease.geometry) {
+				reportUnavailable(InputUnavailableReason.LAYOUT_RETIRED)
+				abandonTouchGesture()
+				return
+			}
+			val wheel = TerminalPointerEvent(
+				button = steps.button,
+				column = lease.cell.column,
+				row = lease.cell.row,
+				wheel = true,
+			)
+			if (!pointerReportUnder(wheel, lease.anchor)) {
+				abandonTouchGesture()
+				return
+			}
+		}
+	}
+
+	/** Stop the current touch gesture from reporting anything more. */
+	private fun abandonTouchGesture() {
+		touchAnchor = null
+		touchPressCell = null
+		touchWheelLease = null
+		if (touchGesture.phase != TouchGesturePhase.IDLE) touchGesture.abandon()
+	}
+
+	/** Every finger on the screen, by its platform pointer id rather than its index. */
+	private fun touchPointers(event: MotionEvent): List<TouchPointer> =
+		List(event.pointerCount) { index -> TouchPointer(event.getPointerId(index), event.getX(index), event.getY(index)) }
+
+	/** End the platform's own tap and press tracking for a gesture that is no longer a tap. */
+	private fun cancelPlatformTouch(event: MotionEvent) {
+		val cancel = MotionEvent.obtain(event)
+		try {
+			cancel.action = MotionEvent.ACTION_CANCEL
+			super.onTouchEvent(cancel)
+		} finally {
+			cancel.recycle()
 		}
 	}
 
@@ -1550,27 +1821,65 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		release: Boolean,
 		motion: Boolean = false,
 		wheel: Boolean = false,
-	): Boolean {
-		val cellGeometry = geometry ?: return false
-		val position = cellGeometry.cellOf(event.x, event.y)
+	): Boolean = deliverPointerAt(event.x, event.y, button, release, motion, wheel) != null
+
+	/** The receipt a pointer report was attributed to, and the cell it named. */
+	private class PointerDelivery(val receipt: FrameCommitReceipt, val cell: CellPosition)
+
+	private fun deliverPointerAt(
+		x: Float,
+		y: Float,
+		button: Int,
+		release: Boolean,
+		motion: Boolean = false,
+		wheel: Boolean = false,
+		under: FrameCommitReceipt? = null,
+	): PointerDelivery? {
+		val cellGeometry = geometry ?: return null
+		val position = cellGeometry.cellOf(x, y)
 		if (position == null) {
 			if (!motion) reportUnavailable(InputUnavailableReason.POINTER_OUTSIDE_CONTENT)
-			return false
+			return null
 		}
-		return pointerReport(
-			TerminalPointerEvent(
-				button = if (motion) button or MOTION_BIT else button,
-				column = position.column,
-				row = position.row,
-				release = release,
-				motion = motion,
-				wheel = wheel,
-			),
+		val pointer = TerminalPointerEvent(
+			button = if (motion) button or MOTION_BIT else button,
+			column = position.column,
+			row = position.row,
+			release = release,
+			motion = motion,
+			wheel = wheel,
 		)
+		// With [under], the report leaves only while that exact anchor still stands.
+		val receipt = if (under == null) {
+			pointerReport(pointer) ?: return null
+		} else {
+			if (!pointerReportUnder(pointer, under)) return null
+			under
+		}
+		return PointerDelivery(receipt, position)
 	}
 
-	private fun pointerReport(pointer: TerminalPointerEvent): Boolean {
+	/** Report [pointer] against the current input receipt, and return that receipt. */
+	private fun pointerReport(pointer: TerminalPointerEvent): FrameCommitReceipt? {
+		val committed = currentInputReceipt() ?: return null
+		return if (deliverPointer(pointer, committed)) committed else null
+	}
+
+	/**
+	 * Report [pointer] only while [anchor] is still exactly the receipt input is
+	 * attributed to; a newer proof — even a fresh one of an equal-looking context — is
+	 * a different one, and nothing is reported against it on [anchor]'s behalf.
+	 */
+	private fun pointerReportUnder(pointer: TerminalPointerEvent, anchor: FrameCommitReceipt): Boolean {
 		val committed = currentInputReceipt() ?: return false
+		if (committed != anchor) {
+			reportUnavailable(InputUnavailableReason.BINDING_RETIRED)
+			return false
+		}
+		return deliverPointer(pointer, committed)
+	}
+
+	private fun deliverPointer(pointer: TerminalPointerEvent, committed: FrameCommitReceipt): Boolean {
 		if (!committed.covers(CellPosition(pointer.column, pointer.row))) {
 			reportUnavailable(InputUnavailableReason.POINTER_OUTSIDE_CONTENT)
 			return false

@@ -67,6 +67,12 @@ class ClientApplicationController private constructor(
     private var savedDeletion: AcceptedSavedDeletion? = null
     private fun cancelSavedDeletion() { savedDeletion?.cancel(); savedDeletion = null }
     private var savedConnectionGeneration: Long? = null
+    // Status-only pending feedback for the exact admitted user LIST/SEARCH; never a proof.
+    private val savedFeedback = SavedReadFeedback()
+    private var savedResultGeneration: Long? = null // Channel of the adopted result's sequence.
+    private val savedReadSettlements = SavedReadSettlementFence() // Every projected read, data or not.
+    private fun savedView() = SavedReadFeedback.View(saved.selectedHostId, saved.hostRunId, saved.query,
+        savedEpoch, saved.selectedHostId?.let { generation(it) }, route is ClientRoute.Saved)
     private var coverage = UiCoverage.NONE
     private var chooser = false
     private var keyboard = false
@@ -314,6 +320,7 @@ class ClientApplicationController private constructor(
             savedEpoch++
             saved = SavedUiState(selectedHostId = saved.selectedHostId, hostRunId = savedRun, query = saved.query)
         }
+        saved = savedFeedback.observe(savedView(), saved)
         if (savedHost != null && savedRun == saved.hostRunId && route is ClientRoute.Saved) {
             val generation = registryState.hosts.firstOrNull { it.hostId == savedHost.host.id }?.generation
             val result = SavedResultTarget.of(saved)
@@ -956,7 +963,8 @@ class ClientApplicationController private constructor(
         val catalog = saved.catalogId?.takeIf { owned != null && owned.hostRunId == intent.target.hostRunId && owned.catalogId == it }
         val pickerRevision = intent.proof.target.generation
         val p = RosterSendProof.PickerRead(gen, intent.target.hostRunId, catalogId = catalog, queryRevision = pickerRevision, ui = frozen)
-        operation(OperationContext(intent.target.hostId, gen, intent.proof, savedQuery = intent.query)) {
+        operation(OperationContext(intent.target.hostId, gen, intent.proof, savedQuery = intent.query,
+            savedIntake = savedView())) {
             if (catalog == null) runtime.savedList(intent.target.hostId,
                 RosterSavedListCommand(intent.target.hostRunId, intent.query, 0, 50, p))
             else runtime.savedSearch(intent.target.hostId,
@@ -1008,7 +1016,8 @@ class ClientApplicationController private constructor(
     private data class OperationContext(val host: HostId, val generation: Long, val proof: UiActionProof?,
         val savedQuery: String? = null, val entry: SavedEntryTarget? = null, val sequence: Long? = null,
         val pickerEpoch: Long? = null, val savedResult: SavedResultTarget? = null,
-        val deletion: AcceptedSavedDeletion? = null, val savedReadLifetime: AcceptedSavedDeletion? = null)
+        val deletion: AcceptedSavedDeletion? = null, val savedReadLifetime: AcceptedSavedDeletion? = null,
+        val savedIntake: SavedReadFeedback.View? = null)
 
     private fun operation(context: OperationContext, command: suspend () -> RosterOperationAdmission) {
         if (context.proof in busyForms || busyForms.size >= 64) { report("Operation not submitted: busy"); return }
@@ -1024,6 +1033,12 @@ class ClientApplicationController private constructor(
                         val accepted = captured.copy(sequence = admission.pending?.sequence)
                         val key = OperationKey(context.host, context.generation, admission.kind, admission.requestId)
                         val settled = operations.accept(key, accepted)
+                        // Status only: the committed Search proof and every drawn control keep
+                        // their identity and placement (the base status keeps their presentation).
+                        if (admission.kind.isSavedRead) {
+                            saved = savedFeedback.accepted(key, admission.pending?.sequence, captured.savedIntake,
+                                settled != null, savedView(), saved)
+                        }
                         // Do not hide/re-key the load-more or entry control before its
                         // queued writer has consumed the actual committed proof. The fixed
                         // application status slot reports pending without moving that control.
@@ -1046,6 +1061,16 @@ class ClientApplicationController private constructor(
         }
     }
     private fun finish(context: OperationContext, event: RosterClientEvent.OperationSettled) {
+        if (!event.kind.isSavedRead) return finishSettled(context, event, true)
+        val key = OperationKey(context.host, context.generation, event.kind, event.requestId)
+        saved = savedFeedback.observe(savedView(), saved)
+        try {
+            finishSettled(context, event, savedFeedback.projects(key))
+        } finally {
+            saved = savedFeedback.settled(key, savedView(), saved)
+        }
+    }
+    private fun finishSettled(context: OperationContext, event: RosterClientEvent.OperationSettled, projectRead: Boolean) {
         busyForms.remove(context.proof)
         if (generation(context.host) != context.generation) {
             if (event.kind == RosterOperationKind.SAVED_DELETE) report(resultText(event))
@@ -1056,11 +1081,26 @@ class ClientApplicationController private constructor(
             report(resultText(event))
             return
         }
+        // A delayed older read cannot replace a newer result already adopted on this channel.
+        if (event.kind.isSavedRead && saved.selectedHostId == context.host &&
+            SavedReadFeedback.olderThanAdopted(context.sequence, context.generation, saved, savedResultGeneration)) {
+            report(resultText(event))
+            return
+        }
+        // Nor a newer read's non-data answer, which leaves the displayed sequence unchanged.
+        if (event.kind.isSavedRead && projectRead && saved.selectedHostId == context.host &&
+            !savedReadSettlements.projects(
+                OperationKey(context.host, context.generation, event.kind, event.requestId), context.sequence)) {
+            report(resultText(event))
+            return
+        }
         val owner = (event.result as? RosterRequestResult.OwnerResult)?.outcome
         if (owner !is RosterOwnerOutcome.SavedDelete || owner.facts !is OwnerSavedDeleteFacts.Deleted) {
             context.deletion?.cancel()
         }
-        if (owner is RosterOwnerOutcome.SavedWindow && saved.selectedHostId == context.host &&
+        if (!projectRead) {
+            // An older read superseded by the displayed pending read writes nothing here.
+        } else if (owner is RosterOwnerOutcome.SavedWindow && saved.selectedHostId == context.host &&
             saved.query == context.savedQuery && saved.hostRunId == event.hostRunId) {
             when (val facts = owner.facts) {
                 is RosterSavedWindowFacts.Complete -> {
@@ -1070,6 +1110,7 @@ class ClientApplicationController private constructor(
                     val sequence = context.sequence
                     if (sequence != null && (context.savedReadLifetime == null || context.savedReadLifetime.adoptResult())) {
                         if (savedDeletion === context.savedReadLifetime) savedDeletion = null
+                        savedResultGeneration = context.generation
                         saved = saved.copy(status = SavedRequestStatus.Ready, hostRunId = facts.hostRunId,
                             catalogId = facts.catalogId, resultId = facts.resultId, requestId = event.requestId, sequence = sequence,
                             total = facts.total, issueCount = facts.issueCount, offset = facts.offset, entries = facts.entries,

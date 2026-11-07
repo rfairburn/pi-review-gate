@@ -31,11 +31,14 @@ class NativeScreensComponentTest {
         // All fields remain in the actual native card, including unknown versus zero.
         listOf("Owner label", "Workspace", "Live process", "Busy", "Pending input", "Input surface",
             "Background tasks", "Background shells", "Active tasks", "Active shells", "Exit code",
-            "Error", "Roster slot", "Native conversation", "Native epoch", "Native name", "Persistence",
+            "Error", "Native conversation", "Native epoch", "Native name", "Persistence",
             "Owner label A", "/synthetic/workspace/a", "native-a", "Synthetic activity one",
             "Synthetic activity two").forEach { value ->
             compose.onNodeWithText(value).assertExists()
         }
+        // The durable roster slot is an internal presentation identity, not card text.
+        compose.onAllNodesWithText("Roster slot").assertCountEquals(0)
+        compose.onAllNodesWithText("slot-a", substring = true).assertCountEquals(0)
         captureSyntheticScreen("expanded-metadata")
         // The expanded card is taller than a phone. The visible Open button, not
         // the clipped extent of the entire card, is the actionable placement.

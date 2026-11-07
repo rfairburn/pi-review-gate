@@ -159,6 +159,12 @@ public data class SavedUiState(
     public val windowProof: UiActionProof? = null,
     /** Commit proofs for the controls of individual entries, keyed by entry handle. */
     public val entryProofs: Map<SavedEntryKey, SavedEntryControlProofs> = emptyMap(),
+    /**
+     * The status drawn before an admitted user read began showing [SavedRequestStatus.Requesting],
+     * kept only while that feedback is shown. Control and layout presentation keep following it,
+     * so pending feedback alone never swaps, moves or re-arms a drawn control. `null` otherwise.
+     */
+    public val readFeedbackBaseStatus: SavedRequestStatus? = null,
 ) {
     /** True when the owner stated a total and more rows exist beyond what is shown. */
     public val hasMore: Boolean?
@@ -277,7 +283,7 @@ public enum class SavedMoreDecision {
 
 /** The honest decision for the "load more" control. */
 public fun SavedUiState.moreDecision(): SavedMoreDecision = when {
-    status == SavedRequestStatus.Requesting -> SavedMoreDecision.REQUEST_IN_FLIGHT
+    (readFeedbackBaseStatus ?: status) == SavedRequestStatus.Requesting -> SavedMoreDecision.REQUEST_IN_FLIGHT
     hasMore == null -> SavedMoreDecision.UNKNOWN_TOTAL
     hasMore == true -> SavedMoreDecision.MAY_REQUEST
     else -> SavedMoreDecision.NOTHING_MORE

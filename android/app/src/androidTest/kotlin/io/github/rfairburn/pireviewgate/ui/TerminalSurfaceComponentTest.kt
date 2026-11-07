@@ -6,6 +6,7 @@ import android.content.res.Configuration
 import android.graphics.Rect
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.view.View
 import android.view.WindowManager
 import android.os.SystemClock
 import android.view.MotionEvent
@@ -19,7 +20,15 @@ import android.graphics.Color
 import android.util.Log
 import android.view.ViewTreeObserver
 import android.view.WindowInsets
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.*
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.*
@@ -70,7 +79,13 @@ class TerminalSurfaceComponentTest {
             assertTrue(fixture.packets.isEmpty())
             assertTrue(fixture.refusals.contains(InputUnavailableReason.SOURCE_ABSENT))
         }
-        compose.onNodeWithText("Paste").assertIsNotEnabled()
+        compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Paste").performScrollTo().assertIsDisplayed().assertIsNotEnabled()
+        compose.onNodeWithText("Esc").performScrollTo().assertIsDisplayed().assertIsNotEnabled()
+        compose.runOnIdle {
+            assertNull(fixture.surface!!.currentInputProof())
+            assertTrue(fixture.packets.isEmpty())
+        }
         captureSyntheticScreen("display-only-terminal")
     }
 
@@ -78,9 +93,10 @@ class TerminalSurfaceComponentTest {
         val fixture = terminalFixture(sourced = true)
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
-        compose.onNodeWithText("Ctrl").performClick()
+        compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Ctrl").performScrollTo().performClick()
         compose.runOnIdle { assertEquals(KeyboardModifiers.CTRL, fixture.surface!!.selectedMobileModifiers()) }
-        compose.onNodeWithText("↑").performClick()
+        compose.onNodeWithText("↑").performScrollTo().performClick()
         compose.runOnIdle {
             val packet = fixture.packets.single()
             assertEquals(NativeIoInputKind.KEYBOARD, packet.kind)
@@ -90,7 +106,7 @@ class TerminalSurfaceComponentTest {
             assertEquals("duplicate-row", packet.receipt.rowId)
             assertEquals(1L, packet.receipt.selectionGeneration)
         }
-        compose.onNodeWithText("Paste").performClick()
+        compose.onNodeWithText("Paste").performScrollTo().performClick()
         compose.runOnIdle {
             val packet = fixture.packets.last()
             assertEquals(NativeIoInputKind.PASTE, packet.kind)
@@ -104,7 +120,10 @@ class TerminalSurfaceComponentTest {
 
     @Test fun modalFocusLayoutAndTargetChangesFenceOldReceiptsUntilNewCommit() {
         val fixture = terminalFixture(sourced = true)
-        compose.setContent { fixture.Content() }
+        var bottomInset by mutableStateOf(0.dp)
+        compose.setContent {
+            Box(Modifier.fillMaxSize().padding(bottom = bottomInset)) { fixture.Content() }
+        }
         var old = awaitInput(fixture)
         val dialogProof = NativeUiFixtures.rowProof(generation = 2)
         compose.runOnIdle {
@@ -135,15 +154,49 @@ class TerminalSurfaceComponentTest {
         val afterFocus = awaitInput(fixture)
         assertNotEquals(old, afterFocus)
         old = afterFocus
-        val previousViewport = fixture.viewports.last()
-        compose.onNodeWithText("More keys").performClick()
-        compose.waitUntil(10_000) { fixture.viewports.lastOrNull() != previousViewport }
-        val afterResize = awaitInput(fixture)
+        val previousPane = compose.runOnIdle { paneBounds(fixture) }
+        val previousRequests = fixture.viewports.size
+        compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
+        compose.onNodeWithText("More keys").performScrollTo().performClick()
+        compose.onNodeWithText("F12").assertExists()
         compose.runOnIdle {
-            assertFalse(fixture.surface!!.verifyReceipt(old))
+            assertEquals("The extra-key overlay is not a layout change", previousPane, paneBounds(fixture))
+            assertEquals(previousRequests, fixture.viewports.size)
+            assertTrue(fixture.surface!!.verifyReceipt(old))
+        }
+        val connection = compose.runOnIdle {
+            (fixture.surface!!.onCreateInputConnection(EditorInfo()) as TerminalInputConnection).also {
+                assertTrue(it.setComposingText("未確定", 1))
+            }
+        }
+        var observedLayoutRetirement = false
+        val onResize = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
+                // Observe the REAL native size change before its replacement draw can
+                // commit. An overlay toggle cannot exercise this negative anymore.
+                assertRetiredIme("real pane resize", fixture, connection, old)
+                assertNull(fixture.surface!!.currentInputProof())
+                assertFalse(fixture.surface!!.submitKey(TerminalKey(codepoint = 9)))
+                observedLayoutRetirement = true
+            }
+        }
+        compose.runOnIdle {
+            fixture.surface!!.addOnLayoutChangeListener(onResize)
+            bottomInset = 96.dp
+        }
+        val afterResize = try {
+            compose.waitUntil(10_000) { compose.runOnIdle { observedLayoutRetirement } }
+            awaitInput(fixture)
+        } finally {
+            compose.runOnIdle { fixture.surface!!.removeOnLayoutChangeListener(onResize) }
+        }
+        compose.runOnIdle {
+            assertNotEquals(previousPane, paneBounds(fixture))
+            assertTrue(fixture.viewports.size > previousRequests)
+            assertRetiredIme("real pane resize stays retired", fixture, connection, old)
             assertTrue(afterResize.layoutEpoch > old.layoutEpoch)
         }
-        captureSyntheticScreen("extra-keys-resize")
+        captureSyntheticScreen("native-pane-resize")
         old = afterResize
         compose.runOnIdle {
             val surface = fixture.surface!!
@@ -524,13 +577,15 @@ class TerminalSurfaceComponentTest {
         }
         try {
             captureSyntheticScreen("ime-$orientation-before")
-            compose.onNodeWithText("Keyboard").performScrollTo().performClick()
+            compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
+            compose.onNodeWithText("Keyboard").assertIsDisplayed().performClick()
             compose.waitUntil(10_000) { compose.runOnIdle {
                 fixture.surface?.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
             } }
             // Observe, do not infer visibility from the request. This also exercises
             // the real production label change without changing toolbar measurement.
             setObservedKeyboard(fixture, true)
+            compose.onNodeWithText("Hide keyboard").assertIsDisplayed()
             awaitInput(fixture) // Focus loss, if any, must earn a genuinely fresh draw.
             compose.waitForIdle()
             assertUnchanged()
@@ -563,6 +618,8 @@ class TerminalSurfaceComponentTest {
             assertUnchanged()
             recordWindowEvidence("ime-$orientation-hidden", fixture)
             captureSyntheticScreen("ime-$orientation-hidden")
+            compose.onNodeWithText("Close keys").assertIsDisplayed().performClick()
+            assertUnchanged()
         } finally {
             compose.runOnIdle { if (observer.isAlive) observer.removeOnGlobalLayoutListener(onLayout) }
         }

@@ -83,20 +83,17 @@ class TerminalFullscreenOverlayComponentTest {
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
         val touches = recordSurfaceTouches(fixture)
-        overlayControls.forEach { label ->
-            compose.onNodeWithText(label).assertHasClickAction()
-                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        overlayControls.forEach { label -> safeTouchBounds(label, fixture) }
+        repeat(4) { edge ->
+            tapIntentEdge("Back", edge, ClientIntent.LeaveTerminal, fixture)
+            tapIntentEdge("Switch", edge, ClientIntent.ShowQuickSwitcher, fixture)
+            tapControlEdge("Keys", edge, fixture)
+            compose.onNodeWithText("Esc").assertIsDisplayed()
+            // A tap on the panel's own non-button area is still the panel's.
+            compose.onNodeWithText("Conversation A").performTouchInput { click(center) }
+            tapControlEdge("Close keys", edge, fixture)
+            compose.onAllNodesWithText("Esc").assertCountEquals(0)
         }
-        compose.onNodeWithText("Back").performClick()
-        compose.runOnIdle { assertEquals(ClientIntent.LeaveTerminal, fixture.intents.last().intent) }
-        compose.onNodeWithText("Switch").performClick()
-        compose.runOnIdle { assertEquals(ClientIntent.ShowQuickSwitcher, fixture.intents.last().intent) }
-        compose.onNodeWithText("Keys").performClick()
-        compose.onNodeWithText("Esc").assertIsDisplayed()
-        // A tap on the panel's own non-button area is still the panel's.
-        compose.onNodeWithText("Conversation A").performTouchInput { click(center) }
-        compose.onNodeWithText("Close keys").performClick()
-        compose.onAllNodesWithText("Esc").assertCountEquals(0)
         compose.runOnIdle {
             assertTrue("Overlay taps must never reach the terminal: $touches", touches.isEmpty())
             assertTrue(fixture.packets.isEmpty())
@@ -117,28 +114,42 @@ class TerminalFullscreenOverlayComponentTest {
         awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
         val requests = fixture.viewports.size
+        val touches = recordSurfaceTouches(fixture)
         fun assertReachable(vararg labels: String) {
-            labels.forEach { label ->
-                val node = compose.onNodeWithText(label).assertIsDisplayed().assertHasClickAction()
-                    .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
-                val bounds = node.fetchSemanticsNode().boundsInWindow
-                assertTrue("$label must lie entirely inside the pane: $bounds vs $pane",
-                    bounds.left >= pane.left - 1 && bounds.top >= pane.top - 1 &&
-                        bounds.right <= pane.right + 1 && bounds.bottom <= pane.bottom + 1)
-            }
+            labels.forEach { label -> safeTouchBounds(label, fixture) }
             compose.runOnIdle {
                 assertEquals("Overlay wrapping must not move or resize the pane", pane, paneBounds(fixture))
                 assertEquals("Overlay wrapping must not request a reflow", requests, fixture.viewports.size)
             }
         }
         assertReachable("Back", "Switch", "Keyboard", "Keys")
-        compose.onNodeWithText("Keys").performClick()
+        repeat(4) { edge ->
+            tapIntentEdge("Back", edge, ClientIntent.LeaveTerminal, fixture)
+            tapIntentEdge("Switch", edge, ClientIntent.ShowQuickSwitcher, fixture)
+            tapControlEdge("Keys", edge, fixture)
+            compose.onNodeWithText("Esc").assertExists()
+            tapControlEdge("Close keys", edge, fixture)
+            compose.onAllNodesWithText("Esc").assertCountEquals(0)
+        }
+        tapControlEdge("Keys", 0, fixture)
         // Observed keyboard state only (no IME is opened); exercises the longer label.
         setObservedKeyboard(fixture, true)
         assertReachable("Back", "Switch", "Hide keyboard", "Close keys")
+        repeat(4) { edge ->
+            tapIntentEdge("Back", edge, ClientIntent.LeaveTerminal, fixture)
+            tapIntentEdge("Switch", edge, ClientIntent.ShowQuickSwitcher, fixture)
+            tapControlEdge("Close keys", edge, fixture)
+            compose.onAllNodesWithText("Esc").assertCountEquals(0)
+            tapControlEdge("Keys", edge, fixture)
+            compose.onNodeWithText("Esc").assertExists()
+        }
         setObservedKeyboard(fixture, false)
-        compose.onNodeWithText("Close keys").performClick()
+        tapControlEdge("Close keys", 1, fixture)
         assertReachable("Back", "Switch", "Keyboard", "Keys")
+        compose.runOnIdle {
+            assertTrue("Large-text boundary taps must never reach the terminal: $touches", touches.isEmpty())
+            assertTrue(fixture.packets.isEmpty())
+        }
     }
 
     @Test fun keysPanelTogglesNeverResizeRefocusOrCoverThePane() {
@@ -252,12 +263,10 @@ class TerminalFullscreenOverlayComponentTest {
         awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
         val requests = fixture.viewports.size
+        val touches = recordSurfaceTouches(fixture)
         try {
             compose.onNodeWithText("Keys").performClick()
-            compose.onNodeWithText("Keyboard").performClick()
-            compose.runOnIdle {
-                assertEquals(ClientIntent.SetTerminalKeyboardVisible(true), fixture.intents.last().intent)
-            }
+            tapIntentEdge("Keyboard", 0, ClientIntent.SetTerminalKeyboardVisible(true), fixture)
             // Not optimistic: the label waits for observed visibility.
             compose.onAllNodesWithText("Hide keyboard").assertCountEquals(0)
             compose.waitUntil(10_000) { compose.runOnIdle {
@@ -278,10 +287,7 @@ class TerminalFullscreenOverlayComponentTest {
             }
             val key = compose.onNodeWithText("↓").fetchSemanticsNode().boundsInWindow
             assertTrue("Keys panel stays above the IME", key.bottom <= bottom + 1f)
-            compose.onNodeWithText("Hide keyboard").performClick()
-            compose.runOnIdle {
-                assertEquals(ClientIntent.SetTerminalKeyboardVisible(false), fixture.intents.last().intent)
-            }
+            tapIntentEdge("Hide keyboard", 1, ClientIntent.SetTerminalKeyboardVisible(false), fixture)
             // Still the observed label until the fixture reports the real insets again.
             compose.onNodeWithText("Hide keyboard").assertIsDisplayed()
             compose.waitUntil(10_000) { compose.runOnIdle {
@@ -290,7 +296,11 @@ class TerminalFullscreenOverlayComponentTest {
             setObservedKeyboard(fixture, false)
             compose.onNodeWithText("Keyboard").assertIsDisplayed()
             awaitInput(fixture)
-            compose.runOnIdle { assertEquals(pane, paneBounds(fixture)) }
+            compose.runOnIdle {
+                assertEquals(pane, paneBounds(fixture))
+                assertTrue("Keyboard boundary taps must never reach the terminal: $touches", touches.isEmpty())
+                assertTrue(fixture.packets.isEmpty())
+            }
         } finally {
             compose.runOnIdle { fixture.surface?.windowInsetsController?.hide(WindowInsets.Type.ime()) }
         }
@@ -330,6 +340,44 @@ class TerminalFullscreenOverlayComponentTest {
         compose.onNodeWithText("Hosts").assertIsDisplayed()
         compose.onAllNodesWithText("Settings").onFirst().assertIsDisplayed()
         listOf("Switch", "Keys", "Keyboard").forEach { compose.onAllNodesWithText(it).assertCountEquals(0) }
+    }
+
+    /** Material's painted TextButton can be 40dp; its interactive bounds must be >=48dp. */
+    private fun safeTouchBounds(label: String, fixture: NativeUiFixture): androidx.compose.ui.geometry.Rect {
+        val node = compose.onNodeWithText(label).assertIsDisplayed().assertHasClickAction().fetchSemanticsNode()
+        val bounds = node.touchBoundsInRoot
+        val minimum = 48f * compose.activity.resources.displayMetrics.density
+        assertTrue("$label touch width must be at least 48dp: $bounds", bounds.width >= minimum)
+        assertTrue("$label touch height must be at least 48dp: $bounds", bounds.height >= minimum)
+        val inWindow = bounds.translate(node.boundsInWindow.topLeft - node.boundsInRoot.topLeft)
+        val pane = compose.runOnIdle { paneBounds(fixture) }
+        assertTrue("$label's whole touch target must lie inside the pane: $inWindow vs $pane",
+            inWindow.left >= pane.left - 1 && inWindow.top >= pane.top - 1 &&
+                inWindow.right <= pane.right + 1 && inWindow.bottom <= pane.bottom + 1)
+        return bounds
+    }
+
+    /** Real pointer injection just inside each edge, including outside the painted button. */
+    private fun tapControlEdge(label: String, edge: Int, fixture: NativeUiFixture) {
+        val bounds = safeTouchBounds(label, fixture)
+        val point = when (edge) {
+            0 -> Offset(bounds.center.x, bounds.top + 1f)
+            1 -> Offset(bounds.center.x, bounds.bottom - 1f)
+            2 -> Offset(bounds.left + 1f, bounds.center.y)
+            else -> Offset(bounds.right - 1f, bounds.center.y)
+        }
+        val root = compose.onRoot()
+        val origin = root.fetchSemanticsNode().boundsInRoot.topLeft
+        root.performTouchInput { click(point - origin) }
+    }
+
+    private fun tapIntentEdge(label: String, edge: Int, expected: ClientIntent, fixture: NativeUiFixture) {
+        val before = compose.runOnIdle { fixture.intents.size }
+        tapControlEdge(label, edge, fixture)
+        compose.runOnIdle {
+            assertEquals("$label boundary tap must activate exactly once", before + 1, fixture.intents.size)
+            assertEquals(expected, fixture.intents.last().intent)
+        }
     }
 
     private fun isDisplayed(text: String): Boolean =

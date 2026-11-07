@@ -51,7 +51,15 @@ export type GitCheckpointFailureReason =
   | "pin_generation_mismatch"
   | "descriptor_record_mismatch"
   | "unsafe_advance_path"
-  | "aborted";
+  | "aborted"
+  /**
+   * A cancellation whose required owned cleanup could not be positively
+   * confirmed (for example the killed child's close event was never observed,
+   * or this arm's own pin/scratch removal was unconfirmed). Distinct from
+   * `aborted`: an expected lifecycle cancellation may never hide leaked owned
+   * state, so callers must keep reporting this as a genuine failure.
+   */
+  | "cleanup_unconfirmed";
 
 export type GitCheckpointReason = GitCheckpointUnsupportedReason | GitCheckpointFailureReason;
 

@@ -13,7 +13,7 @@ import { GitCheckpointError, messageOf, resultFromError, throwIfAborted, truncat
 import { GIT_CHECKPOINT_DESCRIPTOR_FORMAT, GIT_CHECKPOINT_RECORD_FORMAT, OID_RE_40, OID_RE_64, SCRATCH_SUBDIR, checkpointRefForWindow, encodeGitCheckpointRecord, isSafeWindowId, type GitCheckpointArmStats, type GitCheckpointDescriptor, type GitCheckpointObjectFormat, type GitCheckpointRecord, type GitCheckpointUntrackedEntry } from "./record";
 import { DEFAULT_MAX_PATCH_BYTES, DEFAULT_MAX_UNTRACKED_BYTES, DEFAULT_TIMEOUT_MS, ZERO_OID_SHA1, ZERO_OID_SHA256, runGit, runGitWithInput, type GitRunOutput, type GitRunSpec } from "./run-git";
 import { assertAuditProofStable, auditRepository, resolveRepo, runAfterInitialAuditHook, type ResolvedRepo } from "./audit";
-import { acquireWindowPinLock, cleanupAfterFailedArm, createPinIfMissing } from "./pin";
+import { acquireWindowPinLock, cleanupAfterFailedArm, createPinIfMissing, reconcileCancelledPin } from "./pin";
 import { captureDiff, captureUntrackedEntry, listUntrackedPaths, snapshotIndexTree } from "./capture";
 import { publishRecordDurable, syncAncestorChain, syncLooseGitObject } from "./durability";
 import type { GitCheckpointOptions } from "./types";
@@ -126,10 +126,25 @@ async function createSyntheticEmptyBaseline(
   return { base, objectFormat };
 }
 
-function reviewEvidenceCaptureFailure(error: unknown, cleanupConfirmed: boolean): GitCheckpointResult<never> {
+/**
+ * Map a failed arm to its fail-closed result.
+ *
+ * A cancellation is an expected lifecycle outcome ONLY when this arm's own
+ * pin and scratch removal were positively confirmed. With unconfirmed owned
+ * cleanup the result is reported as `cleanup_unconfirmed`, so a caller can
+ * never treat a leaked pin or scratch directory as an ordinary cancel.
+ */
+function armFailureResult(error: unknown, cleanupConfirmed: boolean): GitCheckpointResult<never> {
   const result = resultFromError(error);
   if (result.status !== "failed") return result;
   const { evidenceCaptureFailure, ...blocked } = result;
+  if (result.reason === "aborted" && !cleanupConfirmed) {
+    return {
+      status: "failed",
+      reason: "cleanup_unconfirmed",
+      detail: `${blocked.detail ?? "arm cancelled"}; owned checkpoint pin or scratch cleanup was not confirmed after the cancellation`,
+    };
+  }
   return cleanupConfirmed && (evidenceCaptureFailure || result.reason === "patch_too_large" || result.reason === "untracked_too_large")
     ? { ...blocked, evidenceCaptureFailure: true } : blocked;
 }
@@ -263,7 +278,24 @@ export async function armGitCheckpoint(
     } finally {
       await unlockPin();
     }
-    if (pinCreated.status !== "ok") return pinCreated;
+    if (pinCreated.status !== "ok") {
+      // A cancelled update-ref can have published this generation's pin before
+      // the runner observed close. Reconcile after releasing the creation lock:
+      // confirm the ref is absent, remove only our generation-proofed pin, or
+      // preserve another generation. Unconfirmed reconciliation is a real
+      // cleanup failure, never an expected cancellation.
+      if (pinCreated.status === "failed" && pinCreated.reason === "aborted") {
+        const reconciled = await reconcileCancelledPin(gitPath, repo, windowId, base, armId, spec);
+        if (!reconciled) {
+          return {
+            status: "failed",
+            reason: "cleanup_unconfirmed",
+            detail: `${pinCreated.detail ?? "checkpoint pin creation was aborted"}; owned checkpoint pin absence or removal was not confirmed after the cancellation`,
+          };
+        }
+      }
+      return pinCreated;
+    }
 
     // Owned scratch for this arm: a per-arm subdirectory inside the shared
     // window dir, so a failed arm removes exactly what it created and can
@@ -280,8 +312,8 @@ export async function armGitCheckpoint(
       // the arm dir itself around the rename.
       await syncAncestorChain(scratchDir, repo.gitDir);
     } catch (error) {
-      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return resultFromError(error);
+      const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return armFailureResult(error, cleanupConfirmed);
     }
 
     const maxPatchBytes = options.maxPatchBytes ?? DEFAULT_MAX_PATCH_BYTES;
@@ -346,7 +378,7 @@ export async function armGitCheckpoint(
       }
     } catch (error) {
       const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return reviewEvidenceCaptureFailure(error, cleanupConfirmed);
+      return armFailureResult(error, cleanupConfirmed);
     }
 
     let untracked: GitCheckpointUntrackedEntry[];
@@ -378,15 +410,15 @@ export async function armGitCheckpoint(
       }
     } catch (error) {
       const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return reviewEvidenceCaptureFailure(error, cleanupConfirmed);
+      return armFailureResult(error, cleanupConfirmed);
     }
 
     try {
       const finalAudit = await auditRepository(gitPath, repo.root, spec);
       assertAuditProofStable(initialAuditProof, finalAudit);
     } catch (error) {
-      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return resultFromError(error);
+      const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return armFailureResult(error, cleanupConfirmed);
     }
 
     const record: GitCheckpointRecord = {
@@ -407,8 +439,8 @@ export async function armGitCheckpoint(
       // torn file that load could trust.
       await publishRecordDurable(scratchDir, encoded);
     } catch (error) {
-      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return resultFromError(error);
+      const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return armFailureResult(error, cleanupConfirmed);
     }
 
     // Compact descriptor: identity + integrity only, never record content.

@@ -32,6 +32,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
@@ -473,10 +474,10 @@ internal class SelectedContentLane(
                 null
             }
             if (bytes == null) {
-                signals.send(ContentSignal.ChannelEnd)
+                sendSignal(ContentSignal.ChannelEnd)
                 return
             }
-            signals.send(ContentSignal.Inbound(bytes))
+            if (!sendSignal(ContentSignal.Inbound(bytes))) return
         }
     }
 
@@ -784,15 +785,38 @@ internal class SelectedContentLane(
     }
 
     private fun signal(signal: ContentSignal) {
-        if (signals.trySend(signal).isSuccess) return
+        val attempt = signals.trySend(signal)
+        if (attempt.isSuccess) return
+        // Only `finalize` closes this queue, after the lane is no longer live and before
+        // its reconciliation. A notification that arrives then has no reader left and no
+        // settlement to carry: the durable receipts are already authoritative.
+        if (attempt.isClosed) return
         laneScope.launch {
             try {
-                signals.send(signal)
+                sendSignal(signal)
             } catch (cancellation: CancellationException) {
                 // The lane is ending. `finalize` reconciles from the durable receipts.
             }
         }
     }
+
+    /**
+     * Deliver one signal to the driver, or report that retirement already closed the queue.
+     *
+     * A live full queue still suspends rather than dropping: losing a deadline or a write
+     * settlement would leave accepted work unresolved. The queue is closed only by
+     * `finalize`, which does so after the lane is no longer live and before reconciliation
+     * owns every outstanding receipt, so a send that loses that race is redundant.
+     */
+    private suspend fun sendSignal(signal: ContentSignal): Boolean =
+        try {
+            signals.send(signal)
+            true
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (closed: ClosedSendChannelException) {
+            false
+        }
 
     /** The composed, non-authorizing input gate for this selection. */
     private fun gateAllowsInput(): Boolean =

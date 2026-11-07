@@ -7,6 +7,9 @@ import io.github.rfairburn.pireviewgate.core.client.content.ContentInputPolicy
 import io.github.rfairburn.pireviewgate.core.client.content.ContentNotSentReason
 import io.github.rfairburn.pireviewgate.core.client.content.ContentSendOutcome
 import io.github.rfairburn.pireviewgate.core.client.content.ContentWrittenFrameOutcome
+import io.github.rfairburn.pireviewgate.core.client.content.ackFrame
+import io.github.rfairburn.pireviewgate.core.client.content.endpointConfig
+import io.github.rfairburn.pireviewgate.core.client.content.endpointTarget
 import io.github.rfairburn.pireviewgate.core.client.content.inlineCopyFrames
 import io.github.rfairburn.pireviewgate.core.client.content.keyboardRequest
 import io.github.rfairburn.pireviewgate.core.client.content.pasteRequest
@@ -24,10 +27,18 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.NativeSessionRef
 import io.github.rfairburn.pireviewgate.core.protocol.content.SubscribeFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.contentSource
 import io.github.rfairburn.pireviewgate.core.transport.PeerAppLane
+import io.github.rfairburn.pireviewgate.core.transport.PeerSendGuard
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -35,6 +46,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.assertIs
+import kotlin.test.fail
 
 /**
  * The one currently wanted CONTENT stream: how it opens, what it may write, and what it
@@ -955,10 +967,186 @@ class SelectedContentLaneTest {
         assertEquals(0, harness.runtime.trackedInputFlights(), "no queued page recreated a settled record")
         harness.closeRuntime()
     }
+
+    @Test
+    fun aFullLiveSignalQueueCarriesADeadlineInsteadOfDiscardingIt() = runBlocking {
+        val time = VirtualTime()
+        val channel = FakePeerByteChannel(PeerAppLane.CONTENT, "content-notifications")
+        val failures = mutableListOf<Throwable>()
+        val published = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val events = mutableListOf<ContentEndpointEvent>()
+        val (lane, scope) = notificationLane(
+            context = coroutineContext,
+            channel = channel,
+            time = time,
+            failures = failures,
+        ) { event ->
+            if (event is ClientRuntimeEvent.Content) {
+                events += event.event
+                if (event.event is ContentEndpointEvent.HelloAccepted) {
+                    published.complete(Unit)
+                    release.await()
+                }
+            }
+        }
+        try {
+            lane.start()
+            awaitLane("the hello reached the transport") { channel.writes.isNotEmpty() }
+            channel.push(ackFrame())
+            awaitLane("the hello acknowledgement parked publication") { published.isCompleted }
+            awaitLane("the subscribe write released its driver notification") {
+                channel.writes.size >= 2
+            }
+
+            // The driver is parked in publication and the writer's completion notices
+            // fill the one-slot signal queue. This deadline can only reach the driver
+            // through the full-queue fallback, so a live notification may not be dropped.
+            time.advanceMillis(60_000L)
+            release.complete(Unit)
+            awaitLane("the queued deadline retired the endpoint") {
+                events.any { it is ContentEndpointEvent.Retired }
+            }
+
+            assertEquals(ContentEndpointPhase.RETIRED, lane.observation().phase)
+            assertEquals(0, time.armedCount(), "retirement cancelled its own arm")
+            assertTrue(failures.isEmpty(), "no routine notification failure is uncaught: $failures")
+        } finally {
+            release.complete(Unit)
+            lane.finalize()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun aNotificationThatLosesTheCloseRaceLeavesNoUncaughtFailure() = runBlocking {
+        val time = VirtualTime()
+        val channel = FakePeerByteChannel(PeerAppLane.CONTENT, "content-retirement")
+        val failures = mutableListOf<Throwable>()
+        val (lane, scope) = notificationLane(
+            context = coroutineContext,
+            channel = channel,
+            time = time,
+            failures = failures,
+        ) { }
+        try {
+            channel.blockWrites()
+            lane.start()
+            awaitLane("the first write entered the transport") { channel.firstSendEntered.isCompleted }
+            // The write is inside the transport, so writer cancellation reaches the
+            // dispatch's own finally after finalize has already closed the signal queue.
+            lane.finalize()
+            yieldTurns(32)
+
+            assertEquals(1, channel.closeCount, "this lane closes the channel it opened")
+            assertEquals(0, time.armedCount(), "no deadline of a retired stream stays armed")
+            assertTrue(
+                failures.isEmpty(),
+                "routine retirement surfaced an uncaught notification failure: $failures",
+            )
+        } finally {
+            lane.finalize()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun aPendingFullQueueNotificationRetiredWithItsQueueLeavesNoUncaughtFailure() = runBlocking {
+        val time = VirtualTime()
+        val channel = FakePeerByteChannel(PeerAppLane.CONTENT, "content-pending-notification")
+        val failures = mutableListOf<Throwable>()
+        val published = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val (lane, scope) = notificationLane(
+            context = coroutineContext,
+            channel = channel,
+            time = time,
+            failures = failures,
+        ) { event ->
+            if (event is ClientRuntimeEvent.Content && event.event is ContentEndpointEvent.HelloAccepted) {
+                published.complete(Unit)
+                release.await()
+            }
+        }
+        try {
+            lane.start()
+            awaitLane("the hello reached the transport") { channel.writes.isNotEmpty() }
+            channel.push(ackFrame())
+            awaitLane("the hello acknowledgement parked publication") { published.isCompleted }
+            awaitLane("the live signal queue became full") { channel.writes.size >= 2 }
+
+            // The queue is full and this deadline is carried by a fallback that suspends
+            // in send. A reader notification is likewise waiting for room. Retirement
+            // closes the queue underneath both: those sends lose the race and must be
+            // treated as redundant, not surface as uncaught failures.
+            time.advanceMillis(60_000L)
+            channel.push(ackFrame())
+            yieldTurns(8)
+            lane.finalize()
+            yieldTurns(32)
+
+            assertEquals(1, channel.closeCount, "this lane closes the channel it opened")
+            assertEquals(0, time.armedCount(), "no deadline of a retired stream stays armed")
+            assertTrue(
+                failures.isEmpty(),
+                "retirement surfaced an uncaught pending notification failure: $failures",
+            )
+        } finally {
+            release.complete(Unit)
+            lane.finalize()
+            scope.cancel()
+        }
+    }
 }
 
 /** The default content chunk page size, so a suite asks for "more than one page" honestly. */
 private const val PASTED_PAGE: Int = 32 * 1024
+
+/**
+ * Construct one content lane with the suite's own dispatcher and a handler that records
+ * any coroutine failure instead of letting it escape to the test framework.
+ */
+private fun notificationLane(
+    context: CoroutineContext,
+    channel: FakePeerByteChannel,
+    time: VirtualTime,
+    failures: MutableList<Throwable>,
+    emit: suspend (ClientRuntimeEvent) -> Unit,
+): Pair<SelectedContentLane, CoroutineScope> {
+    val scope = CoroutineScope(
+        context + SupervisorJob() + CoroutineExceptionHandler { _, failure -> failures += failure },
+    )
+    val lane = SelectedContentLane(
+        laneScope = scope,
+        hostId = HostId.parse(HOST_A),
+        channel = channel,
+        connectionGuard = PeerSendGuard.NONE,
+        endpointConfig = endpointConfig(target = endpointTarget(hostId = HOST_A)),
+        selectionGeneration = 4L,
+        gate = ContentSelectionGate(4L),
+        visibility = AtomicReference(VisibilitySnapshot(appForeground = true, terminalInputCovered = true)),
+        config = runtimeConfig(ids = CountingRuntimeIds(), signalCapacity = 1),
+        clock = time.clock,
+        scheduler = time.scheduler,
+        emit = emit,
+        onStateChanged = {},
+    )
+    return lane to scope
+}
+
+/** Hand the calling test's event loop a bounded number of turns. */
+private suspend fun yieldTurns(turns: Int) {
+    repeat(turns) { yield() }
+}
+
+/** Wait for a lane condition without sleeping; a condition that never holds fails loudly. */
+private suspend fun awaitLane(description: String, condition: () -> Boolean) {
+    repeat(400) {
+        if (condition()) return
+        yield()
+    }
+    fail("condition never held: $description")
+}
 
 /** A runtime whose content streams offer native input and start with it switched on. */
 internal fun nativeInputHarness(

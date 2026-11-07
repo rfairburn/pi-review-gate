@@ -123,6 +123,10 @@ internal class FakePeerByteChannel(
     override val label: String? = name
 
     val writes: MutableList<Write> = mutableListOf()
+
+    /** Completes when a send first enters the transport, before any fence or block. */
+    val firstSendEntered: CompletableDeferred<Unit> = CompletableDeferred()
+
     var closeCount: Int = 0
         private set
 
@@ -207,6 +211,7 @@ internal class FakePeerByteChannel(
      *    provably never sent, exactly as [PeerSendReceipt] documents.
      */
     override suspend fun send(bytes: ByteArray, writeGuard: PeerSendGuard, receipt: PeerSendReceipt) {
+        firstSendEntered.complete(Unit)
         val epochAtAdmission = writeGuard.epoch()
         val allowedAtAdmission = writeGuard.allows()
         val refused = refuseNext

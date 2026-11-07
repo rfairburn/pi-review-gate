@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.260]
+
+### Fixed
+
+- **Reviewer visibility on in-place subtask rows** (#314): an in-place task that
+  enters review now names its reviewers in the subtask indicator exactly like an
+  execute task does — the existing shared `· reviewers <labels> (<phase>)` segment
+  on the task's row — instead of showing only its executor. The labels are the
+  ones the worker emits for its frozen reviewer set, projected through the same
+  shared review-status path the wave pipeline already uses; nothing is guessed
+  from current configuration and no new label format was introduced. Running
+  executor labels and immutable invocation identity stay unchanged, and the
+  existing multiple/unknown/empty reviewer presentation is preserved. This is presentation data only: no in-place
+  lifecycle, routing, outcome, review semantics, or model selection changed.
+
 ## [0.1.0-dev.259]
 
 ### Fixed

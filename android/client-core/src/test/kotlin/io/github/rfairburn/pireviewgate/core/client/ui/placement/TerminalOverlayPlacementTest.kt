@@ -673,14 +673,37 @@ class TerminalOverlayPlacementTest {
             assertNull(holder.uiState.value.warning)
             assertTrue(holder.uiState.value.ready)
 
+            // The idle single writer is already suspended in its conflated receive. The
+            // first snapshot is handed straight to that waiting receiver (it is owned,
+            // not pending), so only snapshots queued behind it can be conflated: the
+            // middle one is replaced by the last before the writer asks again.
             val first = moved(TerminalOverlay.CONTROLS, TerminalOverlayOrientation.PORTRAIT, 100, 200)
+            val middle = moved(TerminalOverlay.KEYS, TerminalOverlayOrientation.LANDSCAPE, 30, 40)
             val last = allSix()
             holder.commit(first)
+            holder.commit(middle)
             holder.commit(last)
-            // Both commands were accepted without waiting for IO; conflation keeps the last.
+            // All three commands returned without any IO having run, and the visible
+            // state is already the newest completed six-slot snapshot.
+            assertTrue(store.writes.isEmpty(), "commit never runs or waits for the IO write")
             assertEquals(last, holder.uiState.value.placement)
             advanceUntilIdle()
-            assertEquals(listOf(last), store.writes)
+            // One writer, in commit order: the snapshot it already owned, then the last
+            // state. The unconsumed middle snapshot never reaches the store.
+            assertEquals(listOf(first, last), store.writes)
+            assertEquals(last, store.writes.last(), "the last completed state is what persists")
+            assertEquals(last, holder.uiState.value.placement)
+            assertNull(holder.uiState.value.warning)
+
+            // The writer is serving again: a later completed drag is written after, never
+            // interleaved with or reordered before, the earlier ones.
+            val again = moved(TerminalOverlay.STATUS, TerminalOverlayOrientation.PORTRAIT, 7, 8)
+            holder.commit(again)
+            assertEquals(listOf(first, last), store.writes, "commit still does not wait for IO")
+            assertEquals(again, holder.uiState.value.placement)
+            advanceUntilIdle()
+            assertEquals(listOf(first, last, again), store.writes)
+            assertEquals(again, holder.uiState.value.placement)
             assertNull(holder.uiState.value.warning)
         } finally {
             holder.close()

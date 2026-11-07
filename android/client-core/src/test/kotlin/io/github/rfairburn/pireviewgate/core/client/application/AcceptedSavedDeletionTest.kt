@@ -239,7 +239,11 @@ class AcceptedSavedDeletionTest {
     @Test fun canceledPostDeleteRefreshStatusIsRetiredWithoutAnOwnerRequestOrLateRevival() {
         for (reason in listOf("query", "modal", "leave", "owner")) {
             val f = Fixture(); f.continuation.admitted(f.pending)
-            val refresh = assertNotNull(f.refresh())
+            // The one genuine Deleted settlement of the accepted confirmed delete. It is
+            // captured once: the endpoint already settled that request, so re-delivering
+            // its result frame later correlates to nothing and yields no settlement.
+            val event = f.deleted()
+            val refresh = assertNotNull(f.refresh(event))
             f.h.push(f.h.endpoint.savedList(refresh.command)); f.h.drain()
             val read = f.h.lastRequestOf("saved")
             val feedback = SavedRefreshFeedback()
@@ -276,7 +280,12 @@ class AcceptedSavedDeletionTest {
             assertTrue(f.h.endpoint.state().pending.none { it.kind.isSaved }, "no pending read: $reason")
             assertNull(f.h.endpoint.state().savedOwnership, reason)
             assertFalse(f.continuation.adoptResult(), reason)
-            assertNull(f.refresh(), "the one-shot continuation cannot mint another read: $reason")
+            // Replaying the exact same genuine Deleted settlement cannot mint another read.
+            assertNull(f.refresh(event), "the one-shot continuation cannot mint another read: $reason")
+            // A duplicate late Deleted frame for the already-settled delete resolves nothing.
+            assertTrue(f.h.deliver(RosterFrame.SavedDeleteResult(f.pending.requestId,
+                OwnerSavedDeleteFacts.Deleted(SavedDeleteMethod.TRASH))).events
+                .none { it is RosterClientEvent.OperationSettled }, "no second delete settlement: $reason")
             assertSame(retired, feedback.observe(retired, trackedRead = false),
                 "a late settlement revives no status: $reason")
             assertEquals(2, f.h.countOfType("saved_list_request"), "no retry or replacement request: $reason")

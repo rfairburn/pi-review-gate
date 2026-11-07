@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.259]
+
+### Fixed
+
+- **Checkpoint capture cancellation** (#617): intentional review aborts during
+  evidence capture follow the cancellation lifecycle rather than surfacing as an
+  unexpected checkpoint error. Cancelled captures never become valid checkpoints
+  or passing reviews; retained baselines, evidence, and review obligations survive
+  for the next prompt's fresh capture. Owned Git capture processes must settle,
+  while genuine capture failures and unconfirmed cleanup remain fail-closed.
+  Cancellation after recovery invocation preparation preserves actual reviewer
+  settlement diagnostics and durable checkpoint ownership rather than claiming
+  cleanup or retiring a checkpoint before its replacement state is saved.
+
 ## [0.1.0-dev.258]
 
 ### Added

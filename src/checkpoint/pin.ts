@@ -174,6 +174,92 @@ export async function cleanupAfterFailedArm(
   return pinRemoved && scratchRemoved;
 }
 
+/**
+ * Reconcile a pin whose creating `update-ref` was cancelled.
+ *
+ * The runner can observe the child's positive close AFTER the ref write has
+ * already landed, so "aborted" at pin creation does not prove that no pin was
+ * published. Under the same ownership lock (with the caller's signal stripped
+ * from cleanup), this confirms one of:
+ * - the ref is absent (nothing was published, or a concurrent release removed it);
+ * - the ref currently belongs to another base/generation (preserved, never deleted);
+ * - this arm's generation-owned ref was deleted by generation-proof CAS and its
+ *   absence was re-observed.
+ *
+ * False means reconciliation could not be confirmed (lock, probe, proof, delete,
+ * or post-delete observation uncertainty), so the caller must keep the result
+ * visible as `cleanup_unconfirmed`.
+ */
+export async function reconcileCancelledPin(
+  gitPath: string,
+  repo: ResolvedRepo,
+  windowId: string,
+  base: string,
+  armId: string,
+  spec: GitRunSpec,
+): Promise<boolean> {
+  const reconcileSpec: GitRunSpec = { ...spec, signal: undefined };
+  const ref = checkpointRefForWindow(windowId);
+  let unlockPin: (() => Promise<void>) | undefined;
+  let confirmed = false;
+  try {
+    unlockPin = await acquireWindowPinLock(repo.gitDir, windowId, reconcileSpec);
+    let refOut: GitRunOutput;
+    try {
+      refOut = await runGit(gitPath, repo.root, ["rev-parse", "--verify", "--quiet", ref], reconcileSpec);
+    } catch { return false; }
+    if (refOut.stderr.trim() !== "") return false;
+    if (refOut.code !== 0) {
+      // Quiet rev-parse reports a missing ref as exit 1 with no stderr; any
+      // other nonzero status is probe uncertainty.
+      if (refOut.code !== 1) return false;
+      confirmed = true;
+    } else {
+      const pinned = refOut.stdout.toString("utf8").trim();
+      if (pinned.length !== base.length) return false;
+      if (pinned !== base) {
+        // A different checkpoint currently owns this window ref. Never delete
+        // another generation; this arm's pin is not present.
+        confirmed = true;
+      } else {
+        let genOut: GitRunOutput;
+        try {
+          genOut = await runGit(gitPath, repo.root, ["log", "-g", "-1", "--format=%gs", ref], reconcileSpec);
+        } catch { return false; }
+        if (genOut.code !== 0 || genOut.stderr.trim() !== "") return false;
+        const generation = genOut.stdout.toString("utf8").trim();
+        if (generation.length === 0) return false;
+        if (generation !== pinGenerationMessage(armId)) {
+          // A newer generation replaced this arm; preserve it.
+          confirmed = true;
+        } else {
+          let delOut: GitRunOutput;
+          try {
+            delOut = await runGit(
+              gitPath,
+              repo.root,
+              ["update-ref", "--no-deref", "-m", "prg-git-checkpoint cancellation cleanup", "-d", ref, base],
+              reconcileSpec,
+            );
+          } catch { return false; }
+          if (delOut.code !== 0 || delOut.stderr.trim() !== "") return false;
+          let verifyOut: GitRunOutput;
+          try {
+            verifyOut = await runGit(gitPath, repo.root, ["rev-parse", "--verify", "--quiet", ref], reconcileSpec);
+          } catch { return false; }
+          confirmed = verifyOut.code === 1 && verifyOut.stderr.trim() === "";
+        }
+      }
+    }
+  } catch {
+    // Lock/probe uncertainty: leave the pin for bounded manual recovery.
+    return false;
+  } finally {
+    try { await unlockPin?.(); } catch { confirmed = false; }
+  }
+  return confirmed;
+}
+
 // ── Pin verification ─────────────────────────────────────────────────────────
 
 /**

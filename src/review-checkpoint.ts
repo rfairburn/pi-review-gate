@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { promisify } from "node:util";
 import {
+  GitCheckpointError,
   armGitCheckpoint, loadGitCheckpoint, compareGitCheckpoints, releaseGitCheckpointPin,
   gitCheckpointDiscoveryEnv, isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
@@ -72,8 +73,25 @@ class RawCheckpointDamage extends Error {
   constructor(detail: string) { super(`${RAW_CHECKPOINT_DAMAGE_PREFIX}${detail}`); }
 }
 
-function fail(detail: string): ReviewCheckpointResult<never> { return { status: "failed", reason: "raw_checkpoint_failed", detail }; }
+type ReviewCheckpointFailure = Extract<ReviewCheckpointResult<never>, { status: "failed" }>;
+
+function fail(detail: string): ReviewCheckpointFailure { return { status: "failed", reason: "raw_checkpoint_failed", detail }; }
 function errorOf(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+/**
+ * Map a thrown value to a read/capture operation's failed outcome.
+ *
+ * Only an abort-classified cause carried by this operation's own signal keeps
+ * the honest `aborted` reason, so the owning review can treat a deliberate
+ * cancellation as a lifecycle outcome. Every other failure — including a
+ * cleanup, publication, or integrity failure that merely raced an abort —
+ * stays a `raw_checkpoint_failed` the caller must report.
+ */
+function failureFromError(error: unknown, options: GitCheckpointOptions): ReviewCheckpointFailure {
+  if (options.signal?.aborted && error instanceof GitCheckpointError && error.reason === "aborted") {
+    return { status: "failed", reason: "aborted", detail: errorOf(error) };
+  }
+  return fail(errorOf(error));
+}
 function isMissing(error: unknown): boolean { return (error as NodeJS.ErrnoException)?.code === "ENOENT"; }
 function safePath(path: string): boolean {
   return path.length > 0 && !path.includes("\0") && !path.includes("\uFFFD")
@@ -99,8 +117,9 @@ function fileHandleIdentity(pathStat: Stats, handleStat: Stats): boolean {
     ? { ...handleStat, dev: 0 } : handleStat);
 }
 function sha(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
+/** Abort-classified cancellation of a raw checkpoint operation. */
 function checkAbort(options: GitCheckpointOptions): void {
-  if (options.signal?.aborted) throw new Error("checkpoint aborted");
+  if (options.signal?.aborted) throw new GitCheckpointError("checkpoint aborted", "aborted");
 }
 async function command(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string }> {
   try {
@@ -618,7 +637,10 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
         throw error;
       }
     } finally { if (!published) await rm(owned, { recursive: true, force: true }); }
-  } catch (error) { return { ...fail(errorOf(error)), ...(error instanceof ReviewEvidenceCaptureFailure ? { evidenceCaptureFailure: true as const } : {}) }; }
+  } catch (error) {
+    if (error instanceof ReviewEvidenceCaptureFailure) return { ...fail(errorOf(error)), evidenceCaptureFailure: true as const };
+    return failureFromError(error, options);
+  }
 }
 
 /** Compose verified old raw entries with a frozen capture of selected live paths.
@@ -693,7 +715,7 @@ export async function advanceRawReviewCheckpoint(
     checkAbort(options);
     published = true;
     return { status: "ok", value: result };
-  } catch (error) { return fail(errorOf(error)); }
+  } catch (error) { return failureFromError(error, options); }
   finally {
     if (!published && owned) await rm(owned, { recursive: true, force: true });
   }
@@ -730,7 +752,7 @@ export async function changedRawCheckpointPaths(root: string, descriptor: RawDes
     const verified = await loadReviewCheckpoint(root, descriptor, options);
     if (verified.status !== "ok") return verified;
     return { status: "ok", value: changed };
-  } catch (error) { return fail(errorOf(error)); }
+  } catch (error) { return failureFromError(error, options); }
 }
 
 const DESCRIPTOR_KEYS = ["digest", "format", "kind", "owner", "root", "sessionId", "windowId"].join(",");
@@ -822,7 +844,7 @@ export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheck
       if (size > MAX_BYTES) throw new RawCheckpointDamage("raw byte cap exceeded");
     }
     return { status: "ok", value: { kind: "raw", entries: record.entries } };
-  } catch (error) { return fail(errorOf(error)); }
+  } catch (error) { return failureFromError(error, options); }
 }
 function state(entry: GitCheckpointUntrackedEntry): ReviewCheckpointState {
   return entry.kind === "file" ? { kind: "file", mode: entry.mode, bytes: Buffer.from(entry.contentB64!, "base64") }
@@ -838,7 +860,7 @@ export async function compareReviewCheckpoints(root: string, before: ReviewCheck
   if (before.kind === "git" && after.kind === "git") {
     let checkpointRoot: string;
     try { checkpointRoot = await gitCheckpointRoot(root); }
-    catch (error) { return fail(errorOf(error)); }
+    catch (error) { return failureFromError(error, options); }
     const compared = await compareGitCheckpoints(checkpointRoot, before.checkpoint, after.checkpoint, gitOptions(options), true);
     if (compared.status !== "ok") return compared;
     // Tracked symlinks are Git blobs, not necessarily UTF-8 text. Refuse a

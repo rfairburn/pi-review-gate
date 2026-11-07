@@ -1073,7 +1073,12 @@ test("worker acquisition handoff cannot bypass fallback Off, cancellation, or a 
     };
     await assert.rejects(runReview({ ...input, evidencePolicy: { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" } }), /preceding evidence acquisition failure/);
     const controller = new AbortController(); controller.abort(new Error("cancelled before handoff"));
-    await assert.rejects(runReview({ ...input, signal: controller.signal, evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" } }), /cancelled before handoff/);
+    const cancelled = await runReview({ ...input, signal: controller.signal, evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" } });
+    assert.equal(cancelled.changed, true);
+    assert.equal(cancelled.result?.error, "aborted");
+    assert.equal(cancelled.result?.processSettlement, "confirmed");
+    assert.equal(cancelled.reviewedBaseline, undefined, "a cancelled handoff never promotes an unverified baseline");
+    assert.equal(cancelled.reviewerResults, undefined);
     const window = (await f.restored())!.state.reviewWindow!;
     const wrongKind = await createWorkspaceSnapshot(f.cwd, config);
     await assert.rejects(runReview({ ...input, before: wrongKind, window, evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" } }), /mixed evidence baseline kinds/);

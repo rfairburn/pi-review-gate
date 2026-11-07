@@ -20,6 +20,7 @@ import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { createReviewTurnCoordinator } from "../src/activation/review-turn";
+import * as bundleArtifacts from "../src/bundle";
 import { armGitCheckpoint, loadGitCheckpoint } from "../src/git-checkpoint";
 import * as capture from "../src/capture";
 import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
@@ -570,6 +571,179 @@ test("primary recovery-warning cancellation restores original bases and releases
     if (bundleDir) await rm(bundleDir, { recursive: true, force: true });
     await rm(repo, { recursive: true, force: true });
   }
+});
+
+test("an owned abort thrown by the delayed recovery warning still rolls back before invocation", { timeout: 15000 }, async () => {
+  const repo = await initRepo();
+  const promptPath = join(repo, "prompt.md");
+  const invocationPath = join(repo, "reviewer-invocations.log");
+  const config = reviewerConfig(promptPath, invocationPath);
+  try {
+    const { state, window, baseline: tool } = toolWindow(repo);
+    window.nextReviewSequence = 2;
+    recordReviewerFeedback(state, {
+      result: { reviewerId: "gate", verdict: "needs_changes", summary: "an earlier review left this work unresolved", findings: [] },
+      source: "automatic",
+      disposition: "sent_for_correction",
+      reviewSequence: 1,
+    });
+    await writeFile(join(repo, "warning-thrown.txt"), "warning-thrown change\n");
+    const originalExchange = window.activeExchange;
+    const originalExchangeCount = window.exchanges.length;
+    const controller = new AbortController();
+    let recoveryWarnings = 0;
+    const output = await runReview({
+      cwd: repo,
+      request: "warning-thrown cancellation",
+      before: tool,
+      window,
+      config,
+      signal: controller.signal,
+      evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "primary" },
+      notify: (message) => {
+        if (message.includes("Snapshot capture recovered")) {
+          recoveryWarnings += 1;
+          controller.abort("escape");
+          throw controller.signal.reason;
+        }
+      },
+    });
+    assert.equal(recoveryWarnings, 1, "the real delayed warning threw its owned abort reason");
+    assert.equal(output.result?.error, "aborted");
+    assert.equal(output.bundleDir, undefined);
+    assert.equal(window.baseline, tool);
+    assert.equal(window.activeExchange, originalExchange);
+    assert.equal(window.exchanges.length, originalExchangeCount);
+    assert.deepEqual(await checkpointRefs(repo), [], "the warning-thrown cancellation releases the still-private recovery");
+    assert.equal(await reviewerRan(invocationPath), false);
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
+test("a genuine delayed-warning failure concurrent with abort stays visible and releases its private recovery", { timeout: 15000 }, async () => {
+  const repo = await initRepo();
+  const promptPath = join(repo, "prompt.md");
+  const invocationPath = join(repo, "reviewer-invocations.log");
+  const config = reviewerConfig(promptPath, invocationPath);
+  try {
+    const { state, window, baseline: tool } = toolWindow(repo);
+    window.nextReviewSequence = 2;
+    recordReviewerFeedback(state, {
+      result: { reviewerId: "gate", verdict: "needs_changes", summary: "an earlier review left this work unresolved", findings: [] },
+      source: "automatic",
+      disposition: "sent_for_correction",
+      reviewSequence: 1,
+    });
+    await writeFile(join(repo, "warning-failure.txt"), "warning-failure change\n");
+    const originalExchange = window.activeExchange;
+    const originalExchangeCount = window.exchanges.length;
+    const controller = new AbortController();
+    await assert.rejects(
+      runReview({
+        cwd: repo,
+        request: "genuine warning failure",
+        before: tool,
+        window,
+        config,
+        signal: controller.signal,
+        evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "primary" },
+        notify: (message) => {
+          if (message.includes("Snapshot capture recovered")) {
+            controller.abort("escape");
+            throw new Error("fixture recovery warning failure");
+          }
+        },
+      }),
+      /fixture recovery warning failure/,
+      "a concurrent abort never normalizes an unrelated callback failure",
+    );
+    assert.equal(window.baseline, tool);
+    assert.equal(window.activeExchange, originalExchange);
+    assert.equal(window.exchanges.length, originalExchangeCount);
+    assert.deepEqual(await checkpointRefs(repo), [], "the still-private recovery is released after the genuine failure");
+    assert.equal(await reviewerRan(invocationPath), false);
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
+test("a no-review recovery cancellation during artifact synchronization returns aborted and releases the private capture", { timeout: 15000 }, async (t) => {
+  const repo = await initRepo();
+  const promptPath = join(repo, "prompt.md");
+  const invocationPath = join(repo, "reviewer-invocations.log");
+  const config = reviewerConfig(promptPath, invocationPath);
+  try {
+    const { window, baseline: tool } = toolWindow(repo);
+    const originalExchange = window.activeExchange;
+    const originalExchangeCount = window.exchanges.length;
+    const originalRequestIndex = window.nextExchangeRequestIndex;
+    window.bundleDir = join(repo, "existing-bundle");
+    await mkdir(window.bundleDir);
+    window.activeExchange!.reviewResponseMode = "deferred";
+    const controller = new AbortController();
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let releaseSync!: () => void;
+    const release = new Promise<void>((resolve) => { releaseSync = resolve; });
+    const realSync = bundleArtifacts.syncReviewWindowArtifacts;
+    t.mock.method(bundleArtifacts, "syncReviewWindowArtifacts", async (...args: Parameters<typeof realSync>) => {
+      markStarted();
+      await release;
+      return realSync(...args);
+    });
+    const pending = runReview({
+      cwd: repo,
+      request: "cancelled no-review synchronization",
+      before: tool,
+      window,
+      config,
+      signal: controller.signal,
+      evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
+    });
+    await started;
+    controller.abort("escape");
+    releaseSync();
+    const output = await pending;
+    assert.equal(output.result?.error, "aborted");
+    assert.deepEqual(output.changes, []);
+    assert.equal(output.bundleDir, undefined);
+    assert.equal(window.baseline, tool, "the original window basis is restored");
+    assert.equal(window.activeExchange, originalExchange, "the original active exchange is restored");
+    assert.equal(window.activeExchange?.baseline, tool);
+    assert.equal(window.exchanges.length, originalExchangeCount);
+    assert.equal(window.nextExchangeRequestIndex, originalRequestIndex);
+    assert.deepEqual(await checkpointRefs(repo), [], "the still-private recovered capture is released");
+    assert.equal(await reviewerRan(invocationPath), false);
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
+test("a genuine no-review artifact-sync failure preserves its error and releases the still-private recovery", { timeout: 15000 }, async () => {
+  const repo = await initRepo();
+  const promptPath = join(repo, "prompt.md");
+  const invocationPath = join(repo, "reviewer-invocations.log");
+  const config = reviewerConfig(promptPath, invocationPath);
+  try {
+    const { window, baseline: tool } = toolWindow(repo);
+    const originalExchange = window.activeExchange;
+    const originalExchangeCount = window.exchanges.length;
+    window.bundleDir = join(repo, "bundle-path-is-a-file");
+    await writeFile(window.bundleDir, "not a directory\n");
+    window.activeExchange!.reviewResponseMode = "deferred";
+    await assert.rejects(
+      runReview({
+        cwd: repo,
+        request: "failing no-review synchronization",
+        before: tool,
+        window,
+        config,
+        evidencePolicy: { toolOnly: false, snapshotFailureFallback: true, scope: "worktree" },
+      }),
+      /ENOTDIR|EEXIST|not a directory/,
+      "the real artifact-sync failure remains visible",
+    );
+    assert.equal(window.baseline, tool);
+    assert.equal(window.activeExchange, originalExchange);
+    assert.equal(window.exchanges.length, originalExchangeCount);
+    assert.deepEqual(await checkpointRefs(repo), [], "a genuine precommit failure releases the still-private recovery");
+    assert.equal(await reviewerRan(invocationPath), false);
+  } finally { await rm(repo, { recursive: true, force: true }); }
 });
 
 test("recovery cancellation whose release fails stays visible and leaves the pin", { timeout: 15000 }, async (t) => {

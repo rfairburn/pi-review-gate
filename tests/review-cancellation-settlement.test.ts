@@ -14,7 +14,7 @@ import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
 import { createReviewTurnCoordinator } from "../src/activation/review-turn";
 import { createReviewCancellationCoordinator } from "../src/review-cancellation";
-import { beginAgentRun, createState, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { beginAgentRun, createState, rememberUserRequest, setReviewWindowCheckpointBaseline, snapshotReviewBaseline } from "../src/state";
 import { recordToolCallEvidence, recordToolResultEvidence } from "../src/evidence";
 import * as review from "../src/review";
 import * as processArtifacts from "../src/adapters/process";
@@ -94,9 +94,14 @@ async function ownedReviewers(root: string, uncertain: boolean) {
 }
 
 for (const path of ["automatic", "review-now", "ask-reviewer", "ask-reviewer-interactive"] as const) {
-  for (const mode of ["uncertain", "confirmed", ...(path === "automatic" || path === "review-now" ? ["artifact-error"] : [])]) {
+  const cases = [
+    ...["uncertain", "confirmed", ...(path === "automatic" || path === "review-now" ? ["artifact-error"] : [])]
+      .map((mode) => ({ mode, recovery: false })),
+    ...(path === "automatic" || path === "review-now" ? [{ mode: "uncertain", recovery: true }] : []),
+  ];
+  for (const { mode, recovery } of cases) {
     const uncertain = mode !== "confirmed";
-    test(`${path}: real inherited-pipe cancellation reports ${uncertain ? "unconfirmed cleanup" : "confirmed settlement"} (${mode})`, { timeout: 35000 }, async (t) => {
+    test(`${path}: real inherited-pipe cancellation reports ${uncertain ? "unconfirmed cleanup" : "confirmed settlement"} (${mode}${recovery ? ", recovered tool basis" : ""})`, { timeout: 35000 }, async (t) => {
       const root = await mkdtemp(join(tmpdir(), "prg-cancel-settlement-"));
       const cwd = join(root, "repo");
       const cancellation = createReviewCancellationCoordinator();
@@ -112,16 +117,24 @@ for (const path of ["automatic", "review-now", "ask-reviewer", "ask-reviewer-int
         rememberUserRequest(state, "change index");
         const window = state.reviewWindow!;
         const snapshotOptions = { maxFileBytes: 1048576, maxSnapshotBytes: 52428800 };
-        window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(cwd, snapshotOptions));
+        // Keep every original snapshot-basis control, adding automatic and
+        // /review-now recovery cases whose initial basis predates capture.
+        // Their recovered checkpoint must survive an actual invocation cancel.
+        if (path === "automatic") beginAgentRun(state);
+        if (recovery) {
+          setReviewWindowCheckpointBaseline(state, { kind: "tool", cwd, capturedAt: new Date().toISOString() });
+        } else {
+          window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(cwd, snapshotOptions));
+        }
         const baseline = window.baseline;
         // Automatic review requires agent tool activity: model the agent's write
         // tool around the actual write; command paths stay filesystem-only controls.
         const write = { toolName: "write", toolInput: { path: "index.ts", content: "after\n" } };
-        if (path === "automatic") beginAgentRun(state);
         const exchangeSequence = path === "automatic" ? window.activeExchange!.sequence : undefined;
-        if (path === "automatic") await recordToolCallEvidence({ state: window.evidence, cwd, ...write, snapshotOptions, exchangeSequence });
+        if (path === "automatic" || recovery) await recordToolCallEvidence({ state: window.evidence, cwd, ...write, snapshotOptions, exchangeSequence });
         await writeFile(join(cwd, "index.ts"), "after\n");
-        if (path === "automatic") recordToolResultEvidence({ state: window.evidence, ...write, result: { content: [{ type: "text", text: "Wrote index.ts" }] }, exchangeSequence });
+        if (path === "automatic" || recovery) recordToolResultEvidence({ state: window.evidence, ...write, result: { content: [{ type: "text", text: "Wrote index.ts" }] }, exchangeSequence });
+        if (recovery) window.reviewerSessions.set("prior-reviewer", { adapter: "generic-cli", id: `prior-${randomUUID()}` });
         fixture = await ownedReviewers(root, uncertain);
         const fastExit = join(root, "fast-exit");
         const config = { ...fakeNeedsChangesConfig(), retainBundles: "always" as const,
@@ -129,7 +142,10 @@ for (const path of ["automatic", "review-now", "ask-reviewer", "ask-reviewer-int
             slow: fixture.slow,
             fast: { adapter: "generic-cli" as const, command: process.execPath, args: [],
               review: { args: ["-e", `process.stdin.resume();process.on('exit',()=>require('node:fs').writeFileSync(${JSON.stringify(fastExit)},String(process.pid)));process.stdin.on('end',()=>process.stdout.write(JSON.stringify({verdict:'pass',summary:'DISCARD_THIS_PARTIAL_VERDICT',findings:[]})))`], timeoutMs: 15000 } },
-          }, review: { activeReviewers: [{ source: "external" as const, id: "slow" }, { source: "external" as const, id: "fast" }] },
+          }, review: {
+            activeReviewers: [{ source: "external" as const, id: "slow" }, { source: "external" as const, id: "fast" }],
+            ...(recovery ? { evidence: { primaryToolOnly: false, snapshotFailureFallback: true } } : {}),
+          },
         };
         const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
         const notices: string[] = [];
@@ -199,7 +215,17 @@ for (const path of ["automatic", "review-now", "ask-reviewer", "ask-reviewer-int
         assert.equal(await exists(join(invocation, "reviewer-results.json")), false);
         assert.equal(sent.length, 0, "no verdict or reviewer answer delivered after cancellation");
         assert.equal(window.reviewHistory.length, 0);
-        assert.equal(window.baseline, baseline);
+        if (recovery) {
+          assert.notEqual(output.bundleDir, undefined, "an actual invocation keeps its real bundle reference");
+          assert.equal(output.bundleDir, window.bundleDir);
+          assert.equal(baseline?.kind, "tool");
+          assert.equal(window.baseline?.kind, "checkpoint", "the recovered basis is retained after invocation preparation");
+          assert.equal(state.primarySnapshotFallback, undefined, "recovery does not latch a session fallback");
+          assert.equal(window.reviewerSessions.size, 1, "the pre-review session ledger is restored, not replaced");
+          assert.match(window.reviewerSessions.get("prior-reviewer")!.id, /^prior-/);
+        } else {
+          assert.equal(window.baseline, baseline);
+        }
         assert.equal(cancellation.current(), undefined);
         assert.doesNotMatch(notices.join("\n"), /private reviewer text|DISCARD_THIS_PARTIAL_VERDICT/);
         assert.equal(notices.some((message) => message.includes(root)), false, "no private fixture path enters cancellation notices");

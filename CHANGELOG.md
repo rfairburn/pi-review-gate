@@ -25,6 +25,9 @@ dates.
   or passing reviews; retained baselines, evidence, and review obligations survive
   for the next prompt's fresh capture. Owned Git capture processes must settle,
   while genuine capture failures and unconfirmed cleanup remain fail-closed.
+  Cancellation after recovery invocation preparation preserves actual reviewer
+  settlement diagnostics and durable checkpoint ownership rather than claiming
+  cleanup or retiring a checkpoint before its replacement state is saved.
 
 ## [0.1.0-dev.258]
 

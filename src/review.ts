@@ -208,7 +208,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   // Legacy baselines retain their original fail-closed settlement paths.
   let settled: SettledBaseline;
   try {
-    settled = await settleReviewEvidence(input);
+    settled = await settleReviewEvidence(input, { deferRecoveredBaselinePromotion: true });
   } catch (error) {
     // A deliberate cancellation of this run — its own signal plus an
     // abort-classified cause — is the expected lifecycle outcome, not an
@@ -234,23 +234,24 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   }
   try {
     const output = await runReviewSettled(input, settled);
-    // A staged Tool-baseline recovery is promoted before the delayed Primary
-    // warning that runReviewSettled sends. If cancellation wins after that
-    // point, restore the original window/exchange bases and release the
-    // recovered checkpoint before reporting the aborted lifecycle. A release
-    // failure propagates rather than being hidden by the cancellation.
-    if (settled.cancelSettlement && input.signal?.aborted) {
-      await settled.cancelSettlement();
-      return cancelledReviewOutput();
-    }
     return { ...output, evidenceMethod: settled.evidenceMethod, evidenceCoverageNotice: settled.evidenceCoverageNotice };
   } catch (error) {
-    // A proven cancellation may also surface after settlement, for example
-    // from the delayed recovery warning. Roll back the staged recovery;
-    // genuine failures that merely raced the abort keep their own error.
-    if (settled.cancelSettlement && input.signal?.aborted && isProvenCancellation(input.signal, error)) {
-      await settled.cancelSettlement();
-      return cancelledReviewOutput();
+    // The staged recovery is reversible only until its explicit pre-invocation
+    // commitment boundary. Once bundle/preparation/invocation starts, the
+    // recovered baseline stays under ordinary window/persistence ownership and
+    // the actual aborted invocation result is returned above; no later error
+    // may release it or synthesize a zero-reviewer cancellation.
+    if (settled.cancelSettlement) {
+      if (error instanceof PreInvocationRecoveryCancelled) {
+        const cancelled = await settled.cancelSettlement();
+        if (cancelled) return cancelledReviewOutput();
+        throw error;
+      }
+      // Every genuine failure still inside the reversible precommit interval
+      // must restore the original bases and release the private capture before
+      // its own error is rethrown. After commitment this is a no-op: the
+      // recovered owner stays under normal window/persistence ownership.
+      return rethrowAfterRelease(error, async () => { await settled.cancelSettlement!(); });
     }
     throw error;
   } finally {
@@ -331,23 +332,41 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     && responseExchange.userRequests.length === 0;
   const capturedPassActivity = input.capturedPassActivity === true || (input.requireNewToolActivity === true && passResponse
     && hasCapturedPrimaryActivity(input.evidence, responseExchange.evidenceEvents, input.cwd, settled.evidenceRoot ?? input.cwd, responseExchange.sequence));
+  const throwIfPreInvocationRecoveryCancelled = (): void => {
+    if (!settled.cancelSettlement) return;
+    try {
+      input.signal?.throwIfAborted();
+    } catch (error) {
+      if (isProvenCancellation(input.signal, error)) throw new PreInvocationRecoveryCancelled();
+      throw error;
+    }
+  };
+  // A staged Tool-baseline recovery is not published to the canonical window
+  // until this run leaves its reversible pre-invocation interval. No-review
+  // outcomes are unchanged: after their artifact synchronization they check
+  // the owned signal, then establish the recovered basis before return.
+  const completeWithoutInvocation = <T extends ReviewRunOutput>(output: T): T => {
+    throwIfPreInvocationRecoveryCancelled();
+    settled.promoteBaseline?.();
+    return output;
+  };
   if (input.requireNewToolActivity === true && passResponse && !capturedPassActivity) {
     await syncUnreviewedExchangeArtifacts();
-    return { changed: false, changes, noReviewReason: "no_new_reviewable_activity" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_new_reviewable_activity" });
   }
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges && !capturedPassActivity) {
     await syncUnreviewedExchangeArtifacts();
-    return {
+    return completeWithoutInvocation({
       changed: false,
       changes,
       noReviewReason: reviewResponseMode === "deferred"
         ? "unchanged_deferred_response"
         : "unchanged_review_response",
-    };
+    });
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
   if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && !capturedPassActivity && input.evidence?.requiresReview !== true) {
-    return { changed: false, changes, noReviewReason: "no_initial_changes" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_initial_changes" });
   }
   // #465: an evidence method, its warning, an assistant summary, or known
   // read-only observations are not work. Primary Tools only review needs
@@ -355,7 +374,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // outstanding correction — the same no-change rule snapshots apply.
   if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation && !capturedPassActivity
     && input.evidence?.requiresReview !== true && !(input.evidence?.events ?? []).some(isReviewableToolObservation)) {
-    return { changed: false, changes, noReviewReason: "no_initial_changes" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_initial_changes" });
   }
   // #461: automatic Primary review also needs a new qualifying tool call since
   // the last recorded review. This only narrows the checks above: workspace
@@ -364,9 +383,32 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // window, its evidence and any unresolved feedback stay open, unreviewed.
   if (input.requireNewToolActivity === true && !capturedPassActivity && !hasNewQualifyingToolCall(input.window)) {
     await syncUnreviewedExchangeArtifacts();
-    return { changed: false, changes, noReviewReason: "no_new_tool_activity" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_new_tool_activity" });
   }
-  if (settled.reviewMethodNotice) await input.notify?.(settled.reviewMethodNotice);
+  if (settled.reviewMethodNotice) {
+    try {
+      await input.notify?.(settled.reviewMethodNotice);
+    } catch (error) {
+      // Only an abort this run can prove was thrown by the pre-invocation
+      // warning is normalized. A genuine callback failure that merely races
+      // the same abort keeps its own error, after the still-private recovered
+      // descriptor is restored and released.
+      if (settled.cancelSettlement && isProvenCancellation(input.signal, error)) {
+        throw new PreInvocationRecoveryCancelled();
+      }
+      if (settled.cancelSettlement) {
+        return rethrowAfterRelease(error, async () => { await settled.cancelSettlement!(); });
+      }
+      throw error;
+    }
+  }
+  // Deliberate owned-signal boundary after the delayed recovery warning and
+  // before any bundle or persistence preparation. The recovered descriptor is
+  // still private to this run here, so rollback can restore and release it
+  // without touching durable ownership. Past this point it is committed and a
+  // cancellation reports the actual invocation outcome instead.
+  throwIfPreInvocationRecoveryCancelled();
+  settled.promoteBaseline?.();
 
   // When exactChange is present, use the exact Git commit patch as authoritative.
   const patchResult = settled.evidenceMethod === "snapshot" && input.exactChange !== undefined
@@ -1315,7 +1357,10 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
 // inputs keep the existing settle semantics unchanged.
 
 /** The policy is copied at invocation entry. It never follows a live settings toggle. */
-async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBaseline> {
+async function settleReviewEvidence(
+  input: ReviewRunInput,
+  options: { deferRecoveredBaselinePromotion?: boolean } = {},
+): Promise<SettledBaseline> {
   input.signal?.throwIfAborted();
   const policy = { ...(input.evidencePolicy ?? primaryEvidencePolicy(input.config)) };
   const beforeKind = isReviewBaseline(input.before) ? input.before.kind : "snapshot";
@@ -1434,19 +1479,41 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
       const exchange = window.activeExchange;
       if (exchange === originalExchange && exchange?.baseline === baseline) exchange.baseline = originalExchangeBaseline;
     };
-    const cancelSettlement = async (): Promise<void> => {
+    // The recovered descriptor and its promoted basis stay private to this run
+    // until the caller commits them at the pre-invocation boundary. A shared
+    // persistence save cannot observe a descriptor that a later rollback is
+    // still allowed to release.
+    let recoveryCommitted = false;
+    let recoveryCancelled = false;
+    let staged: SettledBaseline | undefined;
+    const commitRecoveredBaseline = (): void => {
+      if (recoveryCommitted) return;
+      if (recoveryCancelled) throw new Error("review gate: a cancelled recovery baseline cannot be committed");
+      if (!staged?.promoteBaseline) throw new Error("review gate: staged recovery promotion is unavailable");
+      staged.promoteBaseline();
+      recoveryCommitted = true;
+    };
+    const cancelSettlement = async (): Promise<boolean> => {
+      if (recoveryCommitted || recoveryCancelled) return false;
+      recoveryCancelled = true;
       restoreOriginalBaselines();
       await release();
+      return true;
     };
     try {
-      const settled = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, true);
+      staged = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, true);
       input.signal?.throwIfAborted();
       const ownershipTransferred = Boolean(input.window);
-      if (ownershipTransferred) {
-        if (!settled.promoteBaseline) throw new Error("review gate: staged recovery promotion is unavailable");
-        settled.promoteBaseline();
-      }
-      return { ...settled, reviewedBaseline: baseline, releaseOrphan: ownershipTransferred ? undefined : release, ownershipTransferred, ...(ownershipTransferred ? { cancelSettlement } : {}) };
+      const deferred = ownershipTransferred && options.deferRecoveredBaselinePromotion === true;
+      if (ownershipTransferred && !deferred) commitRecoveredBaseline();
+      return {
+        ...staged,
+        reviewedBaseline: baseline,
+        releaseOrphan: ownershipTransferred ? undefined : release,
+        ownershipTransferred,
+        ...(ownershipTransferred ? { cancelSettlement } : {}),
+        ...(deferred ? { promoteBaseline: commitRecoveredBaseline } : {}),
+      };
     } catch (error) {
       restoreOriginalBaselines();
       return rethrowAfterRelease(error, release);
@@ -1489,10 +1556,12 @@ interface SettledBaseline {
   reviewedBaseline?: ReviewBaseline;
   /** Releases the ephemeral after-checkpoint pin (Git only). Throws on failure — never hides an orphaned pin. */
   releaseOrphan?: () => Promise<void>;
-  /** Staged recovery only: promote the recovered basis after its cancellation boundary. */
+  /** Staged recovery only: one-way publication of the recovered basis at the
+   * pre-invocation commitment boundary. */
   promoteBaseline?: () => void;
-  /** Staged recovery only: restore the pre-recovery bases and release on post-settle cancellation. */
-  cancelSettlement?: () => Promise<void>;
+  /** Staged recovery only: restore the pre-recovery bases and release before
+   * commitment. Resolves false after commitment (or a completed rollback). */
+  cancelSettlement?: () => Promise<boolean>;
   /** Tool-method notice sent only once an actual review proceeds (#465). */
   reviewMethodNotice?: string;
   /** Primary tool-method review requires reviewable change evidence (#465). */
@@ -1535,6 +1604,19 @@ class ReviewRunCancelled extends Error {
   constructor() {
     super("review gate: the review was cancelled while capturing review evidence");
     this.name = "ReviewRunCancelled";
+  }
+}
+
+/**
+ * Narrow internal marker for the deliberate cancellation boundary that runs
+ * after the delayed recovery warning and before invocation preparation. It is
+ * only constructed by that boundary, so a later failure that happens to carry
+ * the same signal reason can never trigger release of a committed recovery.
+ */
+class PreInvocationRecoveryCancelled extends Error {
+  constructor() {
+    super("review gate: the recovered review basis was cancelled before invocation preparation");
+    this.name = "PreInvocationRecoveryCancelled";
   }
 }
 

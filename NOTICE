@@ -65,3 +65,22 @@ Copyright 2025 Mario Zechner
 Licensed under the MIT License; the full text and adaptation details are in
 LICENSES/MIT-pi-session-search.txt. The fuzzy matcher is imported from the
 pinned pi-session-host-tui dependency and is not copied.
+
+--------------------------------------------------------------------------
+Attribution to xterm.js (Unicode 11 cell widths)
+--------------------------------------------------------------------------
+
+This product includes the Unicode 11 cell-width range tables and the wcwidth
+fall-through used to lay out the Android phone client's terminal grid, in
+android/client-core/src/main/kotlin/io/github/rfairburn/pireviewgate/core/input/UnicodeCellWidths.kt,
+mechanically ported from:
+
+@xterm/addon-unicode11 0.9.0 (https://github.com/xtermjs/xterm.js),
+src/UnicodeV11.ts, Copyright (c) 2019 The xterm.js authors
+
+Licensed under the MIT License; the full text and the scope of the port are
+reproduced in LICENSES/MIT-xterm-addon-unicode11.txt. The range tables are
+reproduced verbatim from that file and the width function reproduces its
+wcwidth fall-through, so the phone places cells exactly as the pinned owner's
+terminal does. The same notice is packaged inside the installed Android
+application at app/src/main/assets/licenses/MIT-xterm-addon-unicode11.txt.

@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.test.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "outDir": "../../dist-test"
+  },
+  "include": [
+    "multi-host-*.ts",
+    "../android-peer-multi-host-fixture.test.ts"
+  ]
+}

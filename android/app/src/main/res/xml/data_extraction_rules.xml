@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Private local state is never replicated.
+
+  The client stores its configured hosts, endpoints, connection history, and the
+  exact server keys it remembers. Backup and device-to-device transfer are both
+  switched off, matching android:allowBackup="false": copying that state to another
+  device would move trust material without the operator choosing it, and restoring an
+  older copy would silently roll back a pin the operator already acted on.
+
+  This file is the explicit statement of that rule. The client's own documents also
+  live under noBackupFilesDir, so they stay out of transport even if a future build
+  ever enabled backup for something else. No key material is ever stored in a
+  document: the device's private half lives in the Android key store, which has no
+  export path.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

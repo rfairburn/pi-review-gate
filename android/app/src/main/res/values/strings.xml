@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pi Review Gate</string>
+    <string name="client_startup_loading">Reading private client state…</string>
+    <string name="client_startup_refused">Client state is unavailable. No identity was created or repaired.</string>
+    <string name="local_network_permission_rationale_title">Local network access needed</string>
+    <string name="local_network_permission_rationale_body">To reach %2$s, %1$s needs permission to use this device\'s local network. Android blocks direct connections to devices on your Wi-Fi or LAN without it. Internet access is not affected.</string>
+    <string name="local_network_permission_continue">Continue</string>
+    <string name="local_network_permission_not_now">Not now</string>
+    <string name="local_network_permission_denied_title">Local network access is off</string>
+    <string name="local_network_permission_denied_body">Android has not allowed %1$s to reach %2$s on your local network.</string>
+    <string name="local_network_permission_denied_body_settings">Android did not allow %1$s to reach %2$s. You can try again, or open system settings to allow local network access.</string>
+    <string name="local_network_permission_try_again">Try again</string>
+    <string name="local_network_permission_open_settings">Open settings</string>
+
+    <!-- Navigation and screen titles -->
+    <string name="nav_sessions">Sessions</string>
+    <string name="nav_hosts">Hosts</string>
+    <string name="nav_settings">Settings</string>
+    <string name="sessions_title">Sessions</string>
+    <string name="hosts_title">Hosts</string>
+    <string name="settings_title">Settings</string>
+    <string name="saved_title">Saved conversations</string>
+    <string name="terminal_title">Terminal</string>
+
+    <!-- Shared values -->
+    <string name="value_yes">yes</string>
+    <string name="value_no">no</string>
+    <string name="value_none">none</string>
+    <string name="value_unknown">unknown</string>
+    <string name="action_back">Back</string>
+    <string name="action_menu">Actions</string>
+    <string name="dialog_dismiss">Dismiss</string>
+    <string name="commit_unavailable_notice">This screen cannot confirm that the dialog was drawn, so it will not act on this button.</string>
+
+    <!-- Connection states -->
+    <string name="connection_disconnected">Disconnected</string>
+    <string name="connection_connecting">Connecting</string>
+    <string name="connection_pairing">Pairing</string>
+    <string name="connection_retrying">Retrying</string>
+    <string name="connection_connected">Connected</string>
+    <string name="connection_error">Error</string>
+
+    <!-- Roster freshness -->
+    <string name="roster_current">Live</string>
+    <string name="roster_stale">Stale</string>
+    <string name="roster_never_reported">No session report yet</string>
+
+    <!-- Agent activity and input observation -->
+    <string name="activity_running">Agent running</string>
+    <string name="activity_waiting">Agent waiting</string>
+    <string name="activity_idle">Agent idle</string>
+    <string name="activity_unknown">Agent state unknown</string>
+    <string name="activity_not_applicable">No agent</string>
+    <string name="input_pending">Input pending</string>
+    <string name="input_none">No input pending</string>
+    <string name="input_unknown">Input state unknown</string>
+
+    <!-- Lifecycle -->
+    <string name="lifecycle_starting">Starting</string>
+    <string name="lifecycle_alive">Alive</string>
+    <string name="lifecycle_exited">Exited</string>
+    <string name="lifecycle_error">Error</string>
+
+    <!-- Session list -->
+    <string name="sessions_empty_no_hosts">No sessions to show. Add a host to get started.</string>
+    <string name="session_host_context">On %1$s</string>
+    <string name="session_slot">Slot %1$s</string>
+    <string name="session_error">Owner reported an error: %1$s</string>
+    <string name="session_no_native">No native conversation reported for this row.</string>
+    <string name="session_no_activity">No activity lines reported.</string>
+    <string name="session_activity_lines">Activity</string>
+    <string name="action_open_terminal">Open terminal</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_close">Close</string>
+    <string name="action_saved">Saved conversations</string>
+    <string name="action_move_up">Move up</string>
+    <string name="action_move_down">Move down</string>
+    <string name="action_show_details">Show details</string>
+    <string name="action_hide_details">Hide details</string>
+
+    <!-- Hosts that contribute no rows -->
+    <string name="empty_host_never_reported">This host has not reported any sessions yet. Nothing is known about its sessions.</string>
+    <string name="empty_host_reported_empty">This host reported no sessions.</string>
+    <string name="empty_host_stale">This host\'s session view is no longer live and reported no sessions when it went stale.</string>
+
+    <!-- Owner facts -->
+    <string name="fact_row_label">Owner label</string>
+    <string name="fact_workspace">Workspace</string>
+    <string name="fact_live_process">Live process</string>
+    <string name="fact_busy">Busy</string>
+    <string name="fact_pending_input">Pending input</string>
+    <string name="fact_input_surface">Input surface</string>
+    <string name="fact_background_tasks">Background tasks</string>
+    <string name="fact_background_shells">Background shells</string>
+    <string name="fact_active_tasks">Active tasks</string>
+    <string name="fact_active_shells">Active shells</string>
+    <string name="fact_exit_code">Exit code</string>
+    <string name="fact_error">Error</string>
+    <string name="fact_roster_slot">Roster slot</string>
+    <string name="fact_native_id">Native conversation</string>
+    <string name="fact_native_epoch">Native epoch</string>
+    <string name="fact_native_name">Native name</string>
+    <string name="fact_native_persistence">Persistence</string>
+    <string name="fact_connection_history">Connected before</string>
+    <string name="fact_reconnect_suppressed">Reconnect suppressed</string>
+    <string name="fact_server_fingerprint">Remembered server key</string>
+    <string name="persistence_saved">Saved</string>
+    <string name="persistence_unsaved">Unsaved</string>
+
+    <!-- Host screen -->
+    <string name="hosts_empty">No hosts are saved yet. Add a host to connect to a review-gate host on your network.</string>
+    <string name="action_add_host">Add host</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_remove_host">Forget host</string>
+    <string name="action_create_session">New session</string>
+
+    <!-- Add host dialog -->
+    <string name="add_host_title">Add host</string>
+    <string name="add_host_label_field">Label</string>
+    <string name="add_host_host_field">Address</string>
+    <string name="add_host_port_field">Port</string>
+    <string name="add_host_submit">Save host</string>
+    <string name="error_label_invalid">Use up to 64 bytes of letters, digits, or space . _ @ : ( ) -</string>
+    <string name="error_host_invalid">Enter an address or host name without spaces, slashes, or @</string>
+    <string name="error_port_invalid">Enter a port between 1 and 65535</string>
+
+    <!-- Remove host dialog -->
+    <string name="remove_host_title">Forget this host?</string>
+    <string name="remove_host_body">This removes the saved association and its remembered server key from this device only. It does not stop, signal, or otherwise touch anything running on the host.</string>
+    <string name="remove_host_confirm">Forget host</string>
+
+    <!-- First-contact server key consent -->
+    <string name="consent_title">Verify this server key</string>
+    <string name="consent_body">This host has not been connected to from this device before. Compare the key below with the one shown on the host. Until you approve it, nothing is sent.</string>
+    <string name="consent_approve">Approve key</string>
+    <string name="consent_decline">Decline</string>
+    <string name="consent_remaining">This request expires in %1$d seconds.</string>
+    <string name="consent_expired">This request has expired. Decline it and connect again.</string>
+
+    <!-- Create session -->
+    <string name="create_title">New session</string>
+    <string name="create_owner_none">No host chosen</string>
+    <string name="create_choose_owner">Choose</string>
+    <string name="create_owner_not_connected">That host is not connected. It stays chosen; connect to it first.</string>
+    <string name="create_workspace_field">Workspace path</string>
+    <string name="create_workspace_note">The path is sent to that host exactly as you type it. This device does not browse or complete its filesystem.</string>
+    <string name="create_submit">Create session</string>
+
+    <!-- Rename session -->
+    <string name="rename_title">Rename session</string>
+    <string name="rename_native_field">Current name</string>
+    <string name="rename_tuple_field">Native conversation</string>
+    <string name="rename_note">The rename applies only to this conversation. If the host\'s conversation has changed, the rename is refused rather than applied elsewhere.</string>
+    <string name="rename_name_field">New name</string>
+    <string name="rename_submit">Rename</string>
+
+    <!-- Close session -->
+    <string name="close_title">Close this session?</string>
+    <string name="close_body">The host decides what closing means for its own process and may require its own confirmation. A close the host has already accepted cannot be withdrawn from here.</string>
+    <string name="close_confirm">Close session</string>
+
+    <!-- Saved conversations -->
+    <string name="saved_owner_none">No host chosen</string>
+    <string name="saved_owner_not_eligible">That host is not connected with Saved support acknowledged, so its saved list cannot be requested now.</string>
+    <string name="saved_search_label">Search</string>
+    <string name="saved_search_action">Search</string>
+    <string name="saved_status_idle">Nothing requested yet.</string>
+    <string name="saved_status_requesting">Waiting for the host.</string>
+    <string name="saved_status_ready">Result from the host.</string>
+    <string name="saved_status_refused">The host refused this request.</string>
+    <string name="saved_status_refused_reason">The host refused this request (%1$s).</string>
+    <string name="saved_status_unavailable">The host has no usable saved list for this request.</string>
+    <string name="saved_status_unknown">The outcome of the last request is unknown. Nothing is resent.</string>
+    <string name="saved_total">Showing through %1$d of %2$d</string>
+    <string name="saved_total_unknown">Showing %1$d entries. The host did not state a total.</string>
+    <string name="saved_total_unknown_more">The host did not state a total, so there may be more.</string>
+    <string name="saved_all_shown">All entries from this result are shown.</string>
+    <string name="saved_request_in_flight">Another window is already in flight.</string>
+    <string name="saved_load_more">Load more</string>
+    <string name="saved_issue_count">Host reported %1$d issue(s).</string>
+    <string name="saved_file">File</string>
+    <string name="saved_cwd">Directory</string>
+    <string name="saved_resume">Resume</string>
+    <string name="saved_delete">Delete</string>
+    <string name="saved_not_addressable">The host has not given this entry an addressable result, so it cannot be resumed or deleted from here.</string>
+    <string name="saved_delete_title">Delete this saved conversation?</string>
+    <string name="saved_delete_body">The host removes its own saved file. It may refuse, and an unknown outcome is not retried.</string>
+    <string name="saved_delete_confirm">Delete</string>
+
+    <!-- Terminal -->
+    <string name="action_switch_session">Switch</string>
+    <string name="terminal_suspended_coverage">Terminal input is paused while this is open.</string>
+    <string name="terminal_suspended_viewport">Terminal input is paused until the resized screen is ready.</string>
+    <string name="quick_switcher_title">Switch session</string>
+    <string name="quick_switcher_current">Current</string>
+    <string name="key_ctrl">Ctrl</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_shift">Shift</string>
+    <string name="key_escape">Esc</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_shift_tab">Shift+Tab</string>
+    <string name="key_home">Home</string>
+    <string name="key_end">End</string>
+    <string name="key_page_up">PgUp</string>
+    <string name="key_page_down">PgDn</string>
+    <string name="key_arrow_left">←</string>
+    <string name="key_arrow_up">↑</string>
+    <string name="key_arrow_down">↓</string>
+    <string name="key_arrow_right">→</string>
+    <string name="key_insert">Ins</string>
+    <string name="key_delete">Del</string>
+    <string name="key_paste">Paste</string>
+    <string name="key_show_keyboard">Keyboard</string>
+    <string name="key_hide_keyboard">Hide keys</string>
+    <string name="key_show_extra">More keys</string>
+    <string name="key_hide_extra">Fewer keys</string>
+
+    <!-- Settings -->
+    <string name="setting_auto_reconnect">Automatic reconnect</string>
+    <string name="setting_auto_reconnect_body">Retry a host that connected successfully before, unless you disconnected from it on purpose.</string>
+    <string name="setting_viewer_remote_input">Remote input and copy</string>
+    <string name="setting_viewer_remote_input_body">Let this viewer send native input and copy to the remote pane.</string>
+    <string name="settings_identity_section">This device</string>
+    <string name="identity_unknown">Identity state not read yet.</string>
+    <string name="identity_not_initialized">This device has not created its client identity yet.</string>
+    <string name="identity_refused">Identity storage refused: %1$s</string>
+    <string name="identity_fingerprint_label">This device\'s fingerprint</string>
+    <string name="settings_storage_section">Saved state</string>
+    <string name="storage_unknown">Saved-state status not read yet.</string>
+    <string name="storage_healthy">Saved hosts and remembered server keys are readable.</string>
+    <string name="storage_missing_initialized">Saved state is initialised but unreadable.</string>
+    <string name="storage_unsafe_object">Saved state is not a safe file.</string>
+    <string name="storage_malformed">Saved state could not be read.</string>
+    <string name="storage_unsupported_version">Saved state was written by a newer version.</string>
+    <string name="storage_unreadable">Saved state could not be read.</string>
+    <string name="storage_changed">Saved state changed underneath this session.</string>
+    <string name="storage_write_failed">Saved state could not be saved.</string>
+    <string name="storage_unavailable">Saved state is unavailable.</string>
+    <string name="settings_permission_section">Local network permission</string>
+    <string name="permission_unknown">Permission state not read yet.</string>
+    <string name="permission_not_required">This Android version does not require a local-network permission.</string>
+    <string name="permission_granted">Local network access is allowed.</string>
+    <string name="permission_denied">Local network access is not allowed. Internet access is unaffected.</string>
+    <string name="permission_denied_settings">Local network access is not allowed. It can be allowed from system settings.</string>
+    <string name="action_edit_host_address">Edit address</string>
+    <string name="action_save_address_and_reconnect">Save and reconnect</string>
+    <string name="action_cancel_address_edit">Cancel</string>
+    <string name="edit_host_address_port">Port %1$d (unchanged)</string>
+</resources>

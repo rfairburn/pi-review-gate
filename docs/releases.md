@@ -17,6 +17,11 @@ pushes to `main`; it does not run on demand and there is no floating-dispatch pu
 - **Tag** `b<N>` identifies the exact commit (for example `b1` after the baseline).
 - **Package version** `0.1.0-dev.<N>` is written only into the staged package metadata;
   no version bump is ever committed and the live `dist` is never touched.
+- **Android** uses that same `N` as `versionCode` (bounded to `1..2100000000`),
+  `versionName` `0.1.0+N`, and asset `pi-review-gate-bN.apk`. The application ID and
+  namespace stay `io.github.rfairburn.pireviewgate`, minimum SDK 33, target/compile SDK
+  37. CI release tasks require explicit `-PreleaseNumber=N`; missing, noncanonical,
+  or out-of-range values fail. Ordinary debug defaults remain `1` / `0.1.0`.
 
 ## Eligibility
 
@@ -88,10 +93,13 @@ job then:
    tarball. The tarball is extracted and checked against an allowlist derived from
    `package.json` `files`, with secret-shaped file names and private-key content
    rejected.
-4. Uploads the three assets — the tarball, `SHA256SUMS`, and a bounded deterministic
-   `provenance.json` (schema, package version, source repository/SHA/baseline/distance/
-   pull request, and the tarball digest; no run timestamps) — verifying each uploaded
-   asset's bytes by downloading it again and comparing SHA-256 digests.
+4. Requires six assets: the unchanged Node tarball, `SHA256SUMS`, and
+   `provenance.json`, plus `pi-review-gate-bN.apk`, `ANDROID_SHA256SUMS`, and
+   `android-provenance.json`. The Android build/sign chain described below completes
+   before the publisher starts. Every asset is downloaded and verified while still a
+   draft, including APK signature, certificate, application identity, SDK versions,
+   digest, and size. The authoritative release-body JSON fence remains **only the
+   original Node provenance**; Android metadata is separate.
 5. Publishes the draft with `draft: false`, `prerelease: true`, `make_latest: "false"`,
    and re-verifies the published release. For policy-adopted builds the body also
    carries that build's collapsed change notes derived from the exact source changelog
@@ -106,9 +114,106 @@ never touched.
 Published releases are immutable: retries verify the published assets against the
 published `provenance.json` and `SHA256SUMS` (the tarball bytes themselves are only
 re-built for a draft, because tar packing is not byte-reproducible across runs) and
-otherwise do nothing. For policy-adopted builds they additionally verify that the
+otherwise do nothing. New producers also verify all three Android assets and the
+actual APK signature, never rebuild or re-sign them. For policy-adopted builds they additionally verify that the
 published body still carries exactly the collapsed change notes derived from the exact
 source changelog. Any mismatch fails closed; nothing is replaced or clobbered.
+
+## Android build and isolated signing
+
+All six assets publish together after the existing CI/review/eligibility gates. A missing
+secret, invalid certificate, build failure, environment failure, or signature failure
+blocks the **whole** publication. There is no Node-only fallback, late APK attachment,
+per-release manual approval, Play pipeline, auto-updater, or installation step.
+
+A read-only planner validates the exact merged SHA and derives `N` through existing
+eligibility. An already-published plan skips both Android build and signing; if that
+release disappears, the publisher fails read-only rather than rebuilding. Otherwise:
+
+- A separate read-only job checks out the exact event SHA, runs the full JVM core tests
+  and unsigned release build, and inspects package/version/SDK identity and absence of
+  signatures/debuggability. Gradle 9.6.1 retains its wrapper checksum; AGP 9.3.1,
+  Kotlin 2.4.21, Temurin JDK 21.0.9+10, command-line tools 22.0 (checksum-pinned
+  official archive), and SDK Build Tools 37.0.0 are pinned. No signing secret is available.
+- Only the unsigned APK and public metadata cross to the protected `android-release`
+  environment, by same-run immutable artifact ID and digest, not name or latest success.
+  Metadata binds repository, push SHA, run ID/attempt, input digest/size, version, and
+  toolchain. The signer repeats push/main/repository and checkout-HEAD checks.
+- The signer runs no Gradle, npm, application code, dependencies, or artifact scripts.
+  SDK/JDK provisioning finishes before the single secret-bearing helper step. The
+  dependency-free helper decodes the user-managed PKCS12 into a mode-0700 temporary
+  directory (key mode 0600), aligns first, then signs with APK v2 and v3; v4 is disabled
+  for the standalone APK. Passwords enter `apksigner` through environment input, not
+  literal arguments. Tool diagnostics and secret aliases are not logged. Key material
+  is removed in `finally`; ephemeral runners are the cancellation backstop. No key or
+  temporary signing directory is cached or uploaded.
+- Only the verified APK, Android checksum, and Android provenance leave the signer.
+  The publisher checks artifact identity and verifies them again, then downloads and
+  verifies **all six** draft assets before publishing. Android provenance records the
+  exact source SHA/tag/N, application/version/SDK identity, unsigned input digest/size,
+  signed output digest/size, public certificate digest, and toolchain versions. It
+  contains no alias, password, key material, or private path.
+
+The normal CLI producer (`node scripts/release/publish.cjs`) declares the
+`node-and-android/1` contract: Android is mandatory, including published verification.
+`--inspect` is a read-only plan, not certification or publication. The explicit
+`--verify-legacy-node-only` mode is read-only and requires an already-published release
+whose **exact target source** positively declares the original three-asset producer
+contract. Unknown/new producers are rejected, never downgraded by missing APKs or an
+edited release body. Original-run retries execute their original immutable producer,
+so already-published historical Node-only releases remain valid under their actual old
+contract; they are not claimed to contain an APK. Nothing attaches Android retroactively.
+
+For an interrupted draft, re-run **all jobs** of the original push run so the build and
+signing metadata share the current run attempt. No per-release approval is needed once
+the one-time environment setup below is complete.
+
+### Signing environment and key setup
+
+Complete this setup **before enabling the new producer on main**. Referencing an absent
+GitHub environment may create an unprotected one: create and configure `android-release`
+in repository Settings → Environments separately from the release workflow, and restrict
+its deployment branches to **main only**. Keep it automatic: do not configure required
+reviewers or a wait timer. The workflow does not generate signing keys.
+
+Generate and retain the signing key locally in a private directory **outside the
+repository**, not in CI or chat. Disable shell tracing and restrict newly created files
+to owner-only permissions before generating the key or its base64 copy. Use the JDK's
+interactive password prompts (no password flags or shell history containing passwords):
+
+```sh
+set +x
+umask 077
+keytool -genkeypair -alias release -keystore android-release.p12 -storetype PKCS12 -keyalg RSA -keysize 4096 -validity 10000
+keytool -list -v -keystore android-release.p12 -storetype PKCS12
+base64 < android-release.p12 > android-release.p12.base64
+```
+
+Use the same strong password for the store and entry. Back up the PKCS12 file and its
+password in **1Password**. Restore a copy to a separate private directory and verify it
+with interactive `keytool -list -v` before relying on the backup; compare its public
+SHA-256 certificate fingerprint to the original. Keep the key, password, base64, and
+vault contents out of chat, source control, automation logs, and build artifacts. Base64 is
+**not encryption**. Delete disposable plaintext/base64/restore copies after upload and
+backup verification, retaining the protected backup and intended private original.
+
+Upload these environment secrets through GitHub's UI:
+
+- `ANDROID_SIGNING_KEYSTORE_BASE64`: the PKCS12 base64 as one line (remove wrapping).
+- `ANDROID_SIGNING_PASSWORD`: the shared store/entry password.
+- `ANDROID_SIGNING_ALIAS`: `release` for the command above.
+
+Set the public repository Actions variable `ANDROID_SIGNING_CERT_SHA256` to the
+certificate's 64 hexadecimal SHA-256 digits; colon-separated fingerprints and case are
+normalized by the verifier. This is a **certificate** digest, not the PKCS12 file digest.
+Missing/invalid configuration fails closed. No debug key, new key, global keystore, or
+client Android Keystore identity is used as a fallback.
+
+Keep this same signing key for normal app updates: with the unchanged application ID,
+Android can update the installation without intentionally resetting app data, mTLS
+identity, or pins. This pipeline does not implement reset/re-enrollment or claim a
+physical-device update-continuity test. A future optional Play setup may import the same
+app signing key and use a separate upload key; no Play publication is configured now.
 
 ## Release notes (per-build changes)
 
@@ -158,8 +263,9 @@ carries that build's human-readable changes in a collapsed-by-default block:
 
 ## Costs and limits
 
-- Runs on standard public runners alongside the normal CI verification; a full
-  publication costs one verify job plus one build/publish job.
+- Runs on standard public runners alongside normal CI: verification, a read-only
+  planner, isolated unsigned build and protected signing, and the single publisher.
+  Published retries skip the Android build/sign jobs and do not rebuild Node assets.
 - The `GITHUB_TOKEN` cannot obtain the `workflows` permission. Per the
   [GitHub REST releases API](https://docs.github.com/en/rest/releases/releases), a target
   that modifies workflow files relative to the current default branch can therefore be

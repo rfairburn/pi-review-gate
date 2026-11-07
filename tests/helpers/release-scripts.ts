@@ -135,7 +135,7 @@ export interface ChangelogModule {
 export interface PublishModule {
   identityMarker(eligibility: Eligibility): string;
   ensureTag(options: { api: ReleaseApi; tag: string; target: string }): Promise<{ created: boolean; sha: string }>;
-  expectedAssetNames(tarballFilename: string): string[];
+  expectedAssetNames(tarballFilename: string, n?: number): string[];
   parseProvenanceFromBody(body: string): Record<string, unknown> | null;
   bodyWithoutNotes(body: string): string;
   changelogPolicyAdopted(options: { repoRoot: string; target: string; policyAnchor: string }): boolean;
@@ -152,6 +152,9 @@ export interface PublishModule {
     scratchRoot?: string;
     baseline?: string;
     policyAnchor?: string;
+    legacyVerifyOnly?: boolean;
+    inspectOnly?: boolean;
+    androidRun?: (file: string, args: string[], options?: unknown) => { status: number; stdout: string };
     buildArtifacts?(options: { eligibility: Eligibility; projectRoot: string; scratch: string }): Promise<{
       assets: Array<{ filename: string; buffer: Buffer; sha256: string; size: number }>;
       provenance: Record<string, unknown>;
@@ -182,6 +185,10 @@ export interface PublishModule {
     eligibility: Eligibility;
     tarballFilename?: string;
     expectedNotesBlock?: string | null;
+    legacyVerifyOnly?: boolean;
+    env?: Record<string, string>;
+    scratch?: string;
+    androidRun?: (file: string, args: string[], options?: unknown) => { status: number; stdout: string };
   }): Promise<{ verified: boolean; tarballSha256: string }>;
   buildReleaseArtifacts(options: { eligibility: Eligibility; projectRoot: string; scratch: string }): Promise<{
     assets: Array<{ filename: string; buffer: Buffer; sha256: string; size: number }>;

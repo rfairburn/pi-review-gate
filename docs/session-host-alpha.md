@@ -1425,6 +1425,16 @@ be deleted. Live, unknown, or current-file conversations owned by the owner's ch
 are refused, as are pending reservations and canonical-path, header, or file-identity
 replacements. Every removal is performed only by the owner.
 
+On Android, an exact owner-confirmed successful Delete retires that obsolete Saved
+result's action authority and automatically requests one fresh List for the same
+still-current owner, picker, and query. While that read is pending, the last received
+rows and total stay displayed with Requesting status. Only a complete owner reply
+supplies the actual new result, including zero or a nonzero total; deletion itself
+never implies an empty result.
+Leaving or changing that picker cancels this read continuation, not the reported
+Delete outcome. Prepare-only, refused, unconfirmed, and uncertain outcomes do not
+trigger it, and Delete is never retried.
+
 **Fences and outcomes.** Requests come from the picker frame, or confirmation, that the
 writer actually wrote. Resume and delete-prepare need the written picker; a confirmed
 delete needs the written confirmation. Each uses a one-shot proof that is re-proved

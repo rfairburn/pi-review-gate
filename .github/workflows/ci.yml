@@ -470,4 +470,6 @@ jobs:
       github.repository == 'rfairburn/pi-review-gate'
     permissions:
       contents: write
+      # Read immutable same-run Android artifact metadata in the callee.
+      actions: read
     uses: ./.github/workflows/release.yml

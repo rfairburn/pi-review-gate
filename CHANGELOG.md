@@ -17,7 +17,19 @@ dates.
 
 ## [0.1.0-dev.257]
 
+### Added
+
+- Numbered prereleases require a CI-signed Android APK, separate Android checksum
+  and provenance, and the unchanged Node assets, verified together before atomic
+  publication. Signing uses a user-managed key in the isolated `android-release`
+  environment; Android failures block the whole release. Published retries are
+  read-only, and historical Node-only releases retain their original contract.
+
 ### Fixed
+
+- Android Saved now requests one fresh List after an exact confirmed successful
+  Delete on the still-current picker (#508). Old rows remain non-actionable until
+  the owner's complete result arrives; refusal or uncertainty never triggers a retry.
 
 - **Escape inside `/review-settings` no longer cancels a running review** (#419):
   Pi dispatches extension terminal-input listeners BEFORE the focused component, so an

@@ -663,6 +663,77 @@ function aclEntries(target: string): string[] {
 	return lines.slice(1).map((line) => line.trim());
 }
 
+/** dsmemberutil emits a bare UUID, optionally followed by one newline. */
+function parseNobodyUuid(stdout: string): string {
+	const uuid = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+	assert.equal(uuid.length, 36, "nobody metadata must contain exactly one canonical UUID");
+	assert.match(uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu, "nobody metadata must contain a canonical UUID");
+	return uuid.toLowerCase();
+}
+
+/** Compare only this known user's display aliases; leave all other ACL bytes intact. */
+function normalizeNobodyAclFixture(entries: readonly string[], nobodyUuid: string): string[] {
+	const uuid = parseNobodyUuid(nobodyUuid);
+	return entries.map((entry) => entry.replace(/^(\d+: )(\S+)(?= )/u, (match: string, prefix: string, principal: string) => {
+		const identity = principal.startsWith("user:") ? principal.slice(5) : principal;
+		return principal === "user:nobody" || identity.toLowerCase() === uuid ? `${prefix}user:${uuid}` : match;
+	}));
+}
+
+test("macOS ACL fixture comparison: only the resolved nobody user's display aliases compare equal", () => {
+	for (const uuid of ["00000000-0000-0000-0000-000000000001", "abcdef01-2345-6789-abcd-ef0123456789"]) {
+		const before = ["0: user:nobody deny list,search", "1: user:nobody allow add_file"];
+		const expected = [`0: user:${uuid} deny list,search`, `1: user:${uuid} allow add_file`];
+		const mixedCaseUuid = uuid.slice(0, 8).toUpperCase() + uuid.slice(8);
+		for (const principal of ["user:nobody", uuid, uuid.toUpperCase(), mixedCaseUuid, `user:${uuid}`, `user:${uuid.toUpperCase()}`, `user:${mixedCaseUuid}`]) {
+			const after = [`0: ${principal} deny list,search`, `1: ${principal} allow add_file`];
+			assert.deepEqual(normalizeNobodyAclFixture(after, uuid.toUpperCase()), normalizeNobodyAclFixture(before, uuid), principal);
+			assert.deepEqual(normalizeNobodyAclFixture(after, uuid), expected, principal);
+		}
+		assert.deepEqual(before, ["0: user:nobody deny list,search", "1: user:nobody allow add_file"], "input entries are untouched");
+	}
+});
+
+test("macOS ACL fixture comparison: other identities and every non-principal field stay distinct", () => {
+	const uuid = "00000000-0000-0000-0000-000000000001";
+	const before = ["0: user:nobody deny list,search", "1: user:nobody allow add_file"];
+	const baseline = normalizeNobodyAclFixture(before, uuid);
+	for (const first of [
+		"0: 00000000-0000-0000-0000-000000000002 deny list,search",
+		"0: user:00000000-0000-0000-0000-000000000002 deny list,search",
+		"0: group:nobody deny list,search",
+		`0: group:${uuid} deny list,search`,
+		"0: user:someone-else deny list,search",
+		"0: user:nobody allow list,search",
+		"0: user:nobody deny list",
+		"0: user:nobody deny search,list",
+		"2: user:nobody deny list,search",
+		"0: user:nobody inherited deny list,search",
+		"0: user:nobody deny list,search,directory_inherit",
+		"0:  user:nobody deny list,search",
+		"0: user:nobody deny list,search ",
+	]) {
+		assert.notDeepEqual(normalizeNobodyAclFixture([first, before[1]!], uuid), baseline, first);
+	}
+	assert.notDeepEqual(normalizeNobodyAclFixture([...before].reverse(), uuid), baseline, "entry order is preserved");
+	assert.notDeepEqual(normalizeNobodyAclFixture(before.slice(0, 1), uuid), baseline, "entry count is preserved");
+	const untouched = [
+		"0: group:nobody deny list,search",
+		"1: ABCDEF01-2345-6789-ABCD-EF0123456789 allow add_file",
+		"2: user:someone-else allow read,file_inherit",
+	];
+	assert.deepEqual(normalizeNobodyAclFixture(untouched, uuid), untouched, "unknown identities are not rewritten");
+});
+
+test("macOS ACL fixture comparison: missing or malformed nobody metadata fails closed", () => {
+	const uuid = "00000000-0000-0000-0000-000000000001";
+	assert.equal(parseNobodyUuid(`${uuid}\n`), uuid);
+	for (const stdout of ["", "\n", "nobody", `UUID: ${uuid}\n`, `${uuid}\n\n`, `${uuid}\r\n`, ` ${uuid}`, `${uuid} `, uuid.slice(1), uuid.replace(/1$/u, "g"), `${uuid}\n${uuid}\n`]) {
+		assert.throws(() => parseNobodyUuid(stdout), assert.AssertionError, "invalid metadata must fail, not fall back");
+		assert.throws(() => normalizeNobodyAclFixture([], stdout), assert.AssertionError);
+	}
+});
+
 function addAcl(target: string, entry: string): void {
 	execFileSync("/bin/chmod", ["+a", entry, target]);
 }
@@ -1004,6 +1075,12 @@ test("remediation (macOS): an unknown right anywhere in the ACL refuses removal,
 });
 
 test("remediation (macOS): broad mode bits are tightened and verified before an ACL with a deny entry is removed", { skip: ACL_SKIP }, (t) => {
+	const nobodyUuid = parseNobodyUuid(execFileSync("/usr/bin/dsmemberutil", ["getuuid", "-U", "nobody"], {
+		encoding: "utf8",
+		env: { LC_ALL: "C", LANG: "C" },
+		timeout: 15_000,
+		maxBuffer: 1024,
+	}));
 	interface Case {
 		readonly label: string;
 		readonly target: "peer-state" | "session-host";
@@ -1066,7 +1143,11 @@ test("remediation (macOS): broad mode bits are tightened and verified before an 
 		assert.equal(removals, 0, `${fixture.label}: no ACL removal before the mode is established`);
 		assert.equal(failed.outcome, "partial", fixture.label);
 		assert.deepEqual(failed.targets.find((target) => target.target === fixture.target), { target: fixture.target, outcome: "failed-possibly-changed", reason: "unreadable" }, fixture.label);
-		assert.deepEqual(aclEntries(failing.object), entries, `${fixture.label}: the deny entry still narrows the broad mode`);
+		assert.deepEqual(
+			normalizeNobodyAclFixture(aclEntries(failing.object), nobodyUuid),
+			normalizeNobodyAclFixture(entries, nobodyUuid),
+			`${fixture.label}: the deny entry still narrows the broad mode`,
+		);
 		assert.equal(modeOf(failing.object), fixture.broadMode, fixture.label);
 
 		// The real repair runs mode first, then the descriptor-bound ACL removal.

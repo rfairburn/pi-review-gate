@@ -11,9 +11,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasScrollToNodeAction
 import androidx.compose.ui.test.hasText
@@ -45,6 +47,7 @@ import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterWire
 import io.github.rfairburn.pireviewgate.ui.client.SessionsScreen
 import io.github.rfairburn.pireviewgate.ui.client.UiCommitScope
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -187,6 +190,29 @@ class SessionCardDragComponentTest {
 
     private fun cardBounds(title: String): Rect = cardNode(title).fetchSemanticsNode().boundsInRoot
 
+    /**
+     * The title of a drawn card nearest the list's vertical centre.
+     *
+     * A press there starts inside neither auto-scroll edge band, so holding it must not
+     * scroll the list and the drag must settle instead of asking for frame after frame.
+     */
+    private fun centeredTitle(titles: List<String>): String {
+        val list = listBounds()
+        val centre = list.top + list.height / 2f
+        val drawn = titles.filter { compose.onAllNodesWithText(it).fetchSemanticsNodes().isNotEmpty() }
+        assertTrue("none of $titles is drawn", drawn.isNotEmpty())
+        val nearest = drawn.map { it to abs(bounds(it).center.y - centre) }.minBy { it.second }
+        assertTrue(
+            "${nearest.first} is not near the list centre (${nearest.second}px away in ${list.height}px)",
+            nearest.second < list.height / 4f,
+        )
+        return nearest.first
+    }
+
+    /** The one card currently marked as the live drag's source. */
+    private fun draggingCards() =
+        compose.onAllNodes(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Moving"))
+
     private val a1 = row(hostA, "a1")
     private val a2 = row(hostA, "a2")
     private val a3 = row(hostA, "a3")
@@ -319,6 +345,38 @@ class SessionCardDragComponentTest {
         assertTrue(moves().isEmpty())
     }
 
+    // -- a held drag that is not at an edge ------------------------------------------------
+
+    @Test fun aStationaryHeldDragInsideTheListSettlesWithoutScrolling() {
+        val rows = (0 until 8).map { row(hostA, "h%02d".format(it)) }
+        show(stateOf(rows))
+        pressAndHold(centeredTitle(rows.map { "Card ${it.rowId}" }))
+
+        // The drag really is live: exactly its source card is marked, and both header
+        // controls refuse while it is held.
+        draggingCards().assertCountEquals(1)
+        compose.onNodeWithText("New session").assertIsNotEnabled()
+        compose.onNodeWithText("Saved conversations").assertIsNotEnabled()
+
+        val before = compose.runOnIdle {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }
+        // Frames stay available while the pointer is held down. A drag held away from
+        // both edge bands must ask for none of them and must not move the list: an
+        // unconditional frame loop would keep the screen busy for the whole hold.
+        compose.mainClock.advanceTimeBy(1_000)
+        compose.waitForIdle()
+        assertEquals(
+            before,
+            compose.runOnIdle { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset },
+        )
+        draggingCards().assertCountEquals(1)
+
+        release()
+        assertTrue(moves().isEmpty())
+        assertNoRowAction()
+    }
+
     // -- long lists -------------------------------------------------------------------------
 
     @Test fun holdingAtTheBottomEdgeScrollsToOffscreenRowsAndDropsOnce() {
@@ -332,6 +390,12 @@ class SessionCardDragComponentTest {
         }
         compose.waitForIdle()
         assertTrue("list did not scroll", compose.runOnIdle { listState.firstVisibleItemIndex } > 0)
+        // Holding at the edge is bounded: scrolling stops once the list reaches its end,
+        // so the hold settles rather than requesting a frame for every held moment.
+        assertTrue(
+            "the edge hold did not settle at the list's end",
+            compose.runOnIdle { !listState.canScrollForward },
+        )
         // Settle back onto a drawn card, away from the edge band, and drop there.
         list().performTouchInput { moveTo(Offset(bottom.x, listBounds().height / 2f)) }
         compose.waitForIdle()

@@ -34,6 +34,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -98,6 +99,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.style
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteNativePersistence
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterWire
+import kotlinx.coroutines.flow.collectLatest
 
 /**
  * The unified session list.
@@ -166,24 +168,34 @@ fun SessionsScreen(
         if (cancelInvalid && holder.drag === current) holder.cancel(null)
     }
 
-    // Edge auto-scroll reaches rows that are not on screen in a long list. Each step
-    // re-resolves the drop position against the frame drawn after the scroll.
+    // Edge auto-scroll reaches rows that are not on screen in a long list.
+    //
+    // A frame is awaited only while the held pointer is in an edge band that can still
+    // move the list. A drag held anywhere else never awaits a frame, and an edge that has
+    // reached the list's own start or end stops awaiting them, so a held drag settles
+    // instead of keeping the frame clock busy for as long as the finger is down: a
+    // pending frame awaiter is pending work to the recomposer, so an unconditional loop
+    // would make every held drag permanently non-idle. Moving the pointer decides again,
+    // and each step re-resolves the drop position against the frame drawn after the
+    // scroll.
     val dragging = dragValid
     val density = LocalDensity.current
     val edgePx = with(density) { DRAG_EDGE.toPx() }
     val maxStepPx = with(density) { DRAG_MAX_STEP.toPx() }
     LaunchedEffect(dragging, listState) {
         if (!dragging) return@LaunchedEffect
-        while (true) {
-            withFrameNanos { }
-            val pointer = holder.pointer ?: continue
-            val size = holder.listSize() ?: continue
-            // Beside the list (left or right) is outside: no scroll from there.
-            val step = sessionDragEdgeScroll(pointer.x, pointer.y, size.width, size.height, edgePx, maxStepPx)
-            if (step == 0f) continue
-            if (listState.scrollBy(step) != 0f) {
+        snapshotFlow { holder.pointer }.collectLatest { start ->
+            var position: Offset = start ?: return@collectLatest
+            while (true) {
+                val size = holder.listSize() ?: return@collectLatest
+                // Beside the list (left or right) is outside: no scroll from there.
+                val step = sessionDragEdgeScroll(position.x, position.y, size.width, size.height, edgePx, maxStepPx)
+                if (step == 0f) return@collectLatest
+                withFrameNanos { }
+                if (listState.scrollBy(step) == 0f) return@collectLatest
                 withFrameNanos { }
                 holder.retargetAt(holder.pointer)
+                position = holder.pointer ?: return@collectLatest
             }
         }
     }

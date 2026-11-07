@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { chromium, type Browser } from "playwright";
 import { activate } from "../src/index";
-import { normalizeConfig } from "../src/config";
+import { loadConfig, normalizeConfig } from "../src/config";
 import { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
 import { testCheckpointActivation } from "./checkpoint-scope-helpers";
@@ -299,6 +299,30 @@ interface ManagerHarness {
 
 function baseConfig() {
   return normalizeConfig({ enabled: true, retainBundles: "never" });
+}
+
+/**
+ * Run one fixture step with loadConfig() pinned to a fixture-owned review-gate
+ * config under `root`. Without the explicit PI_REVIEW_GATE_CONFIG override,
+ * activate() would fall through to implicit discovery and read the caller's
+ * `<PI_CODING_AGENT_DIR>/review-gate.json`. The caller's previous override
+ * value, or its absence, is restored on every path, including failures.
+ */
+async function withOwnedReviewGateConfig<T>(
+  root: string,
+  config: ReturnType<typeof normalizeConfig>,
+  run: (configPath: string) => Promise<T>,
+): Promise<T> {
+  const configPath = join(root, "owned-review-gate.json");
+  const previous = process.env.PI_REVIEW_GATE_CONFIG;
+  await writeFile(configPath, JSON.stringify(config));
+  process.env.PI_REVIEW_GATE_CONFIG = configPath;
+  try {
+    return await run(configPath);
+  } finally {
+    if (previous === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previous;
+  }
 }
 
 interface ManagerHarnessOptions {
@@ -827,6 +851,57 @@ test("manager shutdown drains every live WebSocket and broker socket", async () 
   }
 });
 
+test("owned review-gate config shadows a caller agent-dir config and restores the caller override", async () => {
+  const root = await mkdtemp(join(tmpdir(), "browser-websocket-config-scope-"));
+  const previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  try {
+    // Synthetic caller agent-data directory: a fixture-owned temporary canary,
+    // never the real user root. Passed explicitly so the caller's own
+    // PI_CODING_AGENT_DIR is neither read nor mutated.
+    const canaryAgentDir = await mkdtemp(join(root, "caller-agent-dir-"));
+    const canaryPath = join(canaryAgentDir, "review-gate.json");
+    await writeFile(canaryPath, JSON.stringify({ enabled: false, retainBundles: "always" }));
+    const resolution = { homeDir: canaryAgentDir };
+    const currentEnv = (): NodeJS.ProcessEnv => ({
+      PI_CODING_AGENT_DIR: canaryAgentDir,
+      ...(process.env.PI_REVIEW_GATE_CONFIG === undefined ? {} : { PI_REVIEW_GATE_CONFIG: process.env.PI_REVIEW_GATE_CONFIG }),
+    });
+    const assertRestored = (prior: string | undefined, label: string) => {
+      assert.equal(Object.hasOwn(process.env, "PI_REVIEW_GATE_CONFIG"), prior !== undefined, `${label}: override presence restored`);
+      assert.equal(process.env.PI_REVIEW_GATE_CONFIG, prior, `${label}: override value restored`);
+    };
+
+    // Control: without an explicit override, discovery selects the caller canary.
+    delete process.env.PI_REVIEW_GATE_CONFIG;
+    assert.equal(loadConfig(currentEnv(), resolution).path, canaryPath, "implicit discovery reaches the caller agent dir");
+
+    for (const prior of [undefined, join(root, "caller-override.json")]) {
+      const label = prior === undefined ? "absent override" : "caller override";
+      if (prior === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+      else process.env.PI_REVIEW_GATE_CONFIG = prior;
+
+      await withOwnedReviewGateConfig(root, baseConfig(), async (configPath) => {
+        const loaded = loadConfig(currentEnv(), resolution);
+        assert.equal(loaded.path, configPath, `${label}: fixture-owned config selected`);
+        assert.notEqual(loaded.path, canaryPath, `${label}: caller agent-dir config not selected`);
+        assert.equal(loaded.config.enabled, true, `${label}: fixture-owned contents loaded, not the canary`);
+        assert.equal(loaded.config.retainBundles, "never", `${label}: fixture-owned contents loaded, not the canary`);
+      });
+      assertRestored(prior, `${label} after success`);
+
+      await assert.rejects(
+        withOwnedReviewGateConfig(root, baseConfig(), async () => { throw new Error("fixture activation failed"); }),
+        /fixture activation failed/,
+      );
+      assertRestored(prior, `${label} after failure`);
+    }
+  } finally {
+    if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
+    else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("frame payload markers never appear in diagnostics or tool text", async () => {
   const root = await mkdtemp(join(tmpdir(), "browser-websocket-secrecy-"));
   const marker = `SECRET-MARKER-${Date.now().toString(36)}`;
@@ -836,7 +911,10 @@ test("frame payload markers never appear in diagnostics or tool text", async () 
   const harness = createManagerHarness();
   try {
     const parent = host();
-    await activate(parent.pi, { ...testCheckpointActivation(), webTools: new WebToolManager(parent.pi, baseConfig(), undefined, undefined, harness.manager) });
+    // activate() loads its review-gate config only from this fixture-owned
+    // file, never from the caller's agent-dir config.
+    await withOwnedReviewGateConfig(root, baseConfig(), () =>
+      activate(parent.pi, { ...testCheckpointActivation(), webTools: new WebToolManager(parent.pi, baseConfig(), undefined, undefined, harness.manager) }));
     const ctx = { cwd: root, isIdle: () => true, notify: parent.pi.notify };
     await parent.emit("session_start", { reason: "startup" }, ctx);
 

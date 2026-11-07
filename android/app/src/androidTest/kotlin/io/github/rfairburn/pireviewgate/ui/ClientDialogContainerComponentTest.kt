@@ -48,6 +48,37 @@ class ClientDialogContainerComponentTest {
         compose.runOnIdle { assertFalse(captured.stillAuthorized) }
     }
 
+    @Test fun ownerConfirmationRequiredShowsASeparateSecondInAppStageAndTap() {
+        val state = savedScreen()
+        val target = SessionActionTarget.of(state.sessions.first())
+        val proof = NativeUiFixtures.rowProof(generation = 4)
+        val fixture = NativeUiFixture(state.copy(
+            dialogs = ClientDialogs(closeSession = CloseSessionDialog(
+                target = target,
+                proof = proof,
+                confirmationRequestId = "opaque-owner-request",
+                connectionGeneration = 4,
+            )),
+        ))
+        assertFalse(proof.grantsAction())
+        show(fixture)
+        compose.waitUntil(10_000) { proof.grantsAction() }
+        dialogControl("Host confirmation required").assertIsDisplayed()
+        dialogControl("Ask host to close").assertIsDisplayed()
+        dialogControl("Close session").assertDoesNotExist()
+        compose.waitForIdle()
+        assertTrue("the second stage arms only a fresh deliberate tap",
+            fixture.intents.none { it.intent is ClientIntent.ConfirmSessionClose })
+        dialogControl("Ask host to close").performClick()
+        compose.runOnIdle {
+            val captured = fixture.intents.single { it.intent is ClientIntent.ConfirmSessionClose }
+            val request = captured.intent as ClientIntent.ConfirmSessionClose
+            assertEquals(target, request.target)
+            assertSame(proof, request.proof)
+            assertTrue(captured.stillAuthorized)
+        }
+    }
+
     @Test fun savedDeletePaintsOpaqueMaterialInteriorAndKeepsItsCommittedTarget() {
         val state = savedScreen()
         val target = requireNotNull(SavedEntryTarget.of(state.saved, state.saved.entries.single()))

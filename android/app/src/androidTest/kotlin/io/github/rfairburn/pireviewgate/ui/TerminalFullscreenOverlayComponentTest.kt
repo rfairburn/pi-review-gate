@@ -62,7 +62,7 @@ class TerminalFullscreenOverlayComponentTest {
                 }
                 // Controls are overlays drawn INSIDE the pane, not beside it.
                 overlayControls.forEach { label ->
-                    val bounds = compose.onNodeWithText(label).assertIsDisplayed().fetchSemanticsNode().boundsInWindow
+                    val bounds = control(label).assertIsDisplayed().fetchSemanticsNode().boundsInWindow
                     assertTrue("$label must overlay the pane", bounds.left >= pane.left - 1 &&
                         bounds.top >= pane.top - 1 && bounds.right <= pane.right + 1 && bounds.bottom <= pane.bottom + 1)
                 }
@@ -267,13 +267,13 @@ class TerminalFullscreenOverlayComponentTest {
         try {
             compose.onNodeWithText("Keys").performClick()
             tapIntentEdge("Keyboard", 0, ClientIntent.SetTerminalKeyboardVisible(true), fixture)
-            // Not optimistic: the label waits for observed visibility.
-            compose.onAllNodesWithText("Hide keyboard").assertCountEquals(0)
+            // Not optimistic: the accessible description waits for observed visibility.
+            compose.onAllNodesWithContentDescription("Hide keyboard").assertCountEquals(0)
             compose.waitUntil(10_000) { compose.runOnIdle {
                 fixture.surface?.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
             } }
             setObservedKeyboard(fixture, true)
-            compose.onNodeWithText("Hide keyboard").assertIsDisplayed()
+            control("Hide keyboard").assertIsDisplayed()
             awaitInput(fixture)
             // Native window/inset reads on the UI thread; semantics queries must
             // synchronize from the instrumentation thread, outside runOnIdle.
@@ -288,13 +288,13 @@ class TerminalFullscreenOverlayComponentTest {
             val key = compose.onNodeWithText("↓").fetchSemanticsNode().boundsInWindow
             assertTrue("Keys panel stays above the IME", key.bottom <= bottom + 1f)
             tapIntentEdge("Hide keyboard", 1, ClientIntent.SetTerminalKeyboardVisible(false), fixture)
-            // Still the observed label until the fixture reports the real insets again.
-            compose.onNodeWithText("Hide keyboard").assertIsDisplayed()
+            // Still the observed description until the fixture reports the real insets again.
+            control("Hide keyboard").assertIsDisplayed()
             compose.waitUntil(10_000) { compose.runOnIdle {
                 fixture.surface?.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == false
             } }
             setObservedKeyboard(fixture, false)
-            compose.onNodeWithText("Keyboard").assertIsDisplayed()
+            control("Keyboard").assertIsDisplayed()
             awaitInput(fixture)
             compose.runOnIdle {
                 assertEquals(pane, paneBounds(fixture))
@@ -339,12 +339,13 @@ class TerminalFullscreenOverlayComponentTest {
         compose.onAllNodesWithText("Sessions").onFirst().assertIsDisplayed()
         compose.onNodeWithText("Hosts").assertIsDisplayed()
         compose.onAllNodesWithText("Settings").onFirst().assertIsDisplayed()
-        listOf("Switch", "Keys", "Keyboard").forEach { compose.onAllNodesWithText(it).assertCountEquals(0) }
+        listOf("Switch", "Keys").forEach { compose.onAllNodesWithText(it).assertCountEquals(0) }
+        compose.onAllNodesWithContentDescription("Keyboard").assertCountEquals(0)
     }
 
     /** Material's painted TextButton can be 40dp; its interactive bounds must be >=48dp. */
     private fun safeTouchBounds(label: String, fixture: NativeUiFixture): androidx.compose.ui.geometry.Rect {
-        val node = compose.onNodeWithText(label).assertIsDisplayed().assertHasClickAction().fetchSemanticsNode()
+        val node = control(label).assertIsDisplayed().assertHasClickAction().fetchSemanticsNode()
         val bounds = node.touchBoundsInRoot
         val minimum = 48f * compose.activity.resources.displayMetrics.density
         assertTrue("$label touch width must be at least 48dp: $bounds", bounds.width >= minimum)
@@ -382,6 +383,14 @@ class TerminalFullscreenOverlayComponentTest {
 
     private fun isDisplayed(text: String): Boolean =
         runCatching { compose.onNodeWithText(text).assertIsDisplayed() }.isSuccess
+
+    /** The keyboard control is an icon with dynamic accessible content, not a text label. */
+    private fun control(label: String) =
+        if (label == "Keyboard" || label == "Hide keyboard") {
+            compose.onNodeWithContentDescription(label)
+        } else {
+            compose.onNodeWithText(label)
+        }
 
     private fun terminalFixture() = NativeUiFixture(NativeUiFixtures.sessions().copy(
         route = ClientRoute.Terminal(NativeUiFixtures.terminal()),

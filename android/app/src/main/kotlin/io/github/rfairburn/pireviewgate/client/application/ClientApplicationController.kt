@@ -66,9 +66,28 @@ class ClientApplicationController private constructor(
     private var savedDeleteScope: SavedResultTarget? = null
     private var savedDeletion: AcceptedSavedDeletion? = null
     private fun cancelSavedDeletion() { savedDeletion?.cancel(); savedDeletion = null }
+    // Only the owner-returned row of an accepted create may be activated here, once.
+    private var createdActivation: AcceptedCreateActivation? = null
+    // The exact in-flight create form. A newer explicit intent retires its delayed
+    // navigation but keeps this receipt so the exact form can still close on Started.
+    private var submittedCreate: AcceptedCreateActivation? = null
+    private fun cancelSubmittedCreate(activation: AcceptedCreateActivation) {
+        activation.cancel()
+        if (submittedCreate === activation) submittedCreate = null
+    }
+    private fun cancelCreatedActivation() {
+        createdActivation?.cancel(); createdActivation = null
+    }
+    private fun supersedeSubmittedCreate() {
+        // Retire delayed navigation, but keep the exact submitted receipt so an actual
+        // owner `started` can still close its form and prevent a duplicate create.
+        submittedCreate?.supersede()
+    }
     private var savedConnectionGeneration: Long? = null
     // Status-only pending feedback for the exact admitted user LIST/SEARCH; never a proof.
     private val savedFeedback = SavedReadFeedback()
+    // The one post-delete refresh whose synchronously raised pending display it owns.
+    private val savedRefreshFeedback = SavedRefreshFeedback()
     private var savedResultGeneration: Long? = null // Channel of the adopted result's sequence.
     private val savedReadSettlements = SavedReadSettlementFence() // Every projected read, data or not.
     private fun savedView() = SavedReadFeedback.View(saved.selectedHostId, saved.hostRunId, saved.query,
@@ -262,7 +281,7 @@ class ClientApplicationController private constructor(
             it.isStillCurrent() // Latch observed window/owner loss even if those facts later return.
         }
         val registryState = registry.snapshot.value
-        val runtimeState = runtime.state.value
+        var runtimeState = runtime.state.value
         runtimeState.selection?.let { displayedContent = it.target.hostId to it.selectionGeneration }
         var hosts = projection.hosts(registryState, runtimeState)
         hosts = hosts.map { host ->
@@ -307,6 +326,12 @@ class ClientApplicationController private constructor(
         }
         retireCoveredDialogProofs()
         renewDialogProofs()
+        observeCloseDialog(registryState)
+        observeSubmittedCreate(hosts, registryState)
+        observeCreatedActivation(hosts, registryState)
+        // Created activation may have withdrawn an old selection synchronously; the
+        // terminal-route build and window publication below must see that state.
+        runtimeState = runtime.state.value
         val savedHost = saved.selectedHostId?.let { id -> hosts.firstOrNull { it.host.id == id } }
         val savedRun = savedHost?.roster?.takeIf { it.freshness == RosterFreshness.CURRENT }?.hostRunId
         val savedGeneration = saved.selectedHostId?.let { generation(it) }
@@ -321,6 +346,9 @@ class ClientApplicationController private constructor(
             saved = SavedUiState(selectedHostId = saved.selectedHostId, hostRunId = savedRun, query = saved.query)
         }
         saved = savedFeedback.observe(savedView(), saved)
+        // The post-delete LIST is not tracked by that helper; a canceled continuation
+        // retires only its own pending display, never a replacement read's Requesting.
+        saved = savedRefreshFeedback.observe(saved, trackedRead = savedFeedback.pending != null)
         if (savedHost != null && savedRun == saved.hostRunId && route is ClientRoute.Saved) {
             val generation = registryState.hosts.firstOrNull { it.hostId == savedHost.host.id }?.generation
             val result = SavedResultTarget.of(saved)
@@ -374,8 +402,12 @@ class ClientApplicationController private constructor(
         }
         val failure = registryState.storage.settings.reason ?: registryState.storage.trust.reason
         val nextUi = ClientUiState(
-            route, NetworkSettings(registryState.autoReconnectEnabled, registryState.viewerRemoteInputEnabled,
-                HostCatalog.of(hosts.map { it.host })), hosts, state.value.rowOrder, saved, dialogs,
+            route, NetworkSettings(
+                autoReconnect = registryState.autoReconnectEnabled,
+                viewerRemoteInputEnabled = registryState.viewerRemoteInputEnabled,
+                hosts = HostCatalog.of(hosts.map { it.host }),
+                savedFirstReplyTimeoutSeconds = registryState.savedFirstReplyTimeoutSeconds,
+            ), hosts, state.value.rowOrder, saved, dialogs,
             when (val identity = registryState.identity) {
                 is DeviceIdentityObservation.Ready -> ClientIdentityState.Ready(identity.fingerprint)
                 DeviceIdentityObservation.NeverInitialized -> ClientIdentityState.NotInitialized
@@ -503,10 +535,23 @@ class ClientApplicationController private constructor(
             roster.rows.any { it.id == wanted.target.rowId }
     }
 
-    fun cancelNavigation() { navigation.cancel() }
+    fun cancelNavigation() {
+        navigation.cancel()
+        cancelCreatedActivation()
+        supersedeSubmittedCreate()
+    }
+    /**
+     * Focus/pause loss retires only the accepted created-row continuation, never the
+     * in-flight form or a form's own normal closure. A later resume never revives it.
+     */
+    fun terminalLifecycleLost() {
+        createdActivation?.let { it.focusLost(); createdActivation = null }
+    }
     fun retireWindowProofs() {
         cancelSavedDeletion()
         cancelAddressEdit()
+        cancelCreatedActivation()
+        supersedeSubmittedCreate()
         measuredWindow.set(false)
         proofs.values.forEach { it.invalidate(UiProofInvalidationReason.LIFECYCLE_CHANGE) }
         prompt.set(null)
@@ -567,6 +612,136 @@ class ClientApplicationController private constructor(
     private fun currentRow(target: SessionActionTarget): SessionUiState? = state.value.sessions.firstOrNull {
         !it.stale && SessionActionTarget.of(it) == target
     }
+    // Close-only: stable owner identity and current/non-stale/capability facts, not a
+    // display-context freeze. Other actions keep the exact currentRow match above.
+    // The runtime check makes CURRENT/non-stale/generation source facts authoritative,
+    // even if the last published UI frame is one refresh behind.
+    private fun closeRow(target: SessionActionTarget): SessionUiState? {
+        val row = CloseRowFence.row(state.value.hostState(target.hostId), target) ?: return null
+        val runtimeHost = runtime.hostState(target.hostId) ?: return null
+        val projection = runtimeHost.roster.projection
+        if (runtimeHost.lane != HostLanePhase.ATTACHED ||
+            runtimeHost.connectionGeneration != generation(target.hostId) ||
+            projection.state != RosterProjectionState.CURRENT ||
+            projection.hostRunId != target.hostRunId ||
+            projection.rows.none { it.id == target.rowId }) return null
+        return row
+    }
+
+    /**
+     * Retire an open close form when its original connection attempt is gone.
+     *
+     * The same stable host/run/row may reappear after reconnect, but that is a new
+     * channel attempt and old committed consent must not follow it. Ordinary title or
+     * revision drift on the same attempt is deliberately not a retirement reason.
+     */
+    private fun observeCloseDialog(registryState: ConnectionRegistrySnapshot) {
+        val form = dialogs.closeSession ?: return
+        val host = registryState.hosts.firstOrNull { it.hostId == form.target.hostId }
+        val runtimeHost = runtime.hostState(form.target.hostId)
+        if (!CloseConnectionFence.survives(form, host?.generation, host?.phase == HostConnectionPhase.CONNECTED,
+                runtimeHost?.connectionGeneration, runtimeHost?.lane == HostLanePhase.ATTACHED)) {
+            (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.DISMISSED)
+            dialogs = dialogs.copy(closeSession = null)
+            report("Close confirmation retired: connection changed")
+        }
+    }
+
+    /**
+     * A submitted create survives harmless roster refreshes, but never a background,
+     * disconnect, or owner generation/run change. Cancellation is permanent.
+     */
+    private fun observeSubmittedCreate(hosts: List<HostUiState>, registryState: ConnectionRegistrySnapshot) {
+        val activation = submittedCreate ?: return
+        val host = hosts.firstOrNull { it.host.id == activation.hostId }
+        val connectionGeneration = registryState.hosts.firstOrNull { it.hostId == activation.hostId }?.generation
+        val currentRun = host?.roster?.takeIf { it.freshness == RosterFreshness.CURRENT }?.hostRunId
+        if (!registryState.foreground || host == null || host.connection != HostConnectionState.CONNECTED ||
+            connectionGeneration != activation.connectionGeneration ||
+            (currentRun != null && currentRun != activation.hostRunId)) {
+            activation.supersede()
+        }
+    }
+
+    /**
+     * Advance one owner-confirmed create without inventing a row or stealing a later
+     * destination choice.
+     *
+     * The activation survives only harmless roster/metadata refreshes. Any replacement
+     * dialog, explicit route change, foreground loss, host generation/run change, or
+     * disconnect cancels it permanently. The exact returned row is taken only from a
+     * CURRENT, non-stale projection of the matching host.
+     */
+    private fun observeCreatedActivation(hosts: List<HostUiState>, registryState: ConnectionRegistrySnapshot) {
+        val activation = createdActivation ?: return
+        val host = hosts.firstOrNull { it.host.id == activation.hostId }
+        val connectionGeneration = registryState.hosts.firstOrNull { it.hostId == activation.hostId }?.generation
+        val projectedRun = host?.roster?.hostRunId
+        if (!registryState.foreground || dialogs.hasModal || createdActivationCovered() ||
+            route != activation.originRoute || connectionGeneration != activation.connectionGeneration ||
+            host == null || host.connection != HostConnectionState.CONNECTED ||
+            !host.capabilities.supports(RosterWire.CREATE_CAPABILITY) ||
+            (projectedRun != null && projectedRun != activation.hostRunId)) {
+            cancelCreatedActivation()
+            return
+        }
+        // A temporary non-current roster is not a run change: wait for the owner's
+        // own CURRENT snapshot rather than inventing a row or an activation timeout.
+        if (host.roster?.freshness != RosterFreshness.CURRENT) return
+        val returned = activation.returnedRow ?: return
+        if (returned.hostRunId != activation.hostRunId) {
+            cancelCreatedActivation()
+            return
+        }
+        val row = host.rows.firstOrNull {
+            it.hostRunId == returned.hostRunId && it.rowId == returned.rowId && !it.stale
+        } ?: return // The owner has not published this row yet; no local row is invented.
+        activateCreatedRow(activation, row, host)
+    }
+
+    /**
+     * The UI's own modal coverage can be one report behind the controller closing this
+     * form. With no dialog left, that stale `MODAL_DIALOG` is not a newer cover; a real
+     * sheet, menu, or dialog still blocks.
+     */
+    private fun createdActivationCovered(): Boolean =
+        coverage != UiCoverage.NONE && !(coverage == UiCoverage.MODAL_DIALOG && !dialogs.hasModal)
+
+    private fun activateCreatedRow(activation: AcceptedCreateActivation, row: SessionUiState, host: HostUiState) {
+        if (createdActivation !== activation) {
+            activation.cancel()
+            return
+        }
+        if (dialogs.hasModal || createdActivationCovered() || route != activation.originRoute) {
+            cancelCreatedActivation()
+            return
+        }
+        val owner = window ?: run { cancelCreatedActivation(); return }
+        val generation = generation(activation.hostId) ?: run { cancelCreatedActivation(); return }
+        val target = RuntimeTarget(row.hostId, row.hostRunId, row.rowId)
+        val wanted = navigation.acceptReturnedRow(target, generation, activation)
+        if (wanted == null) {
+            cancelCreatedActivation()
+            return
+        }
+        createdActivation = null
+        // The existing measured-viewport selection flow owns CONTENT. This only
+        // admits navigation to the row the owner actually returned.
+        displayedContent = null
+        establishedWanted.set(null)
+        measuredWindow.set(false)
+        terminalRouteActive.set(true)
+        owner.retireTerminal()
+        runtime.leaveTerminal()
+        terminalTitle = row.displayTitle
+        terminalHostLabel = row.hostLabel
+        chooser = false; coverage = UiCoverage.NONE; extraKeys = false; modifiers = TerminalModifiers.NONE
+        route = ClientRoute.Terminal(TerminalUiState(
+            UiTerminalTarget(row.hostId, row.hostRunId, row.rowId, wanted.epoch),
+            terminalTitle, terminalHostLabel, host.connection))
+        owner.newSelection()
+        report("Terminal opening")
+    }
     private fun generation(host: HostId): Long? = registry.snapshot.value.hosts.firstOrNull { it.hostId == host }?.generation
     private fun currentRun(host: HostId): String? = runtime.hostState(host)?.roster?.projection?.takeIf {
         it.state == RosterProjectionState.CURRENT
@@ -574,6 +749,14 @@ class ClientApplicationController private constructor(
 
     /** Synchronous native intake. Immutable target/draft AND proof epoch freeze here. */
     fun intent(intent: ClientIntent) {
+        // Any newer explicit user action supersedes a delayed created-row activation.
+        // Coverage reports are layout facts emitted by the screen itself, not intent.
+        // A repeated submit of the same drawn form is resolved below so it cannot
+        // cancel the one create already in flight.
+        if (intent !is ClientIntent.UiCoverageChanged && intent !is ClientIntent.SubmitSessionCreate) {
+            cancelCreatedActivation()
+            supersedeSubmittedCreate()
+        }
         // A newer deliberate request supersedes a pending combined gesture immediately,
         // before any later FIFO command/IO can complete. Unrelated metadata is not intent.
         when (intent) {
@@ -696,28 +879,66 @@ class ClientApplicationController private constructor(
                 val gen = generation(intent.hostId) ?: return
                 if (intent.proof.target.hostRunId != run) return
                 val frozen = FrozenAction.capture(intent.proof) ?: return
-                operation(OperationContext(intent.hostId, gen, intent.proof)) {
+                val inFlight = submittedCreate
+                if (inFlight != null && inFlight.formProof === form.proof && inFlight.hostId == intent.hostId &&
+                    inFlight.hostRunId == run && inFlight.workspace == intent.workspace) {
+                    // Same deliberate submit is already in flight; keep its one receipt.
+                    report("Operation not submitted: busy")
+                    return
+                }
+                // A different submit is a newer explicit intent than any earlier one.
+                cancelCreatedActivation()
+                inFlight?.let { cancelSubmittedCreate(it) }
+                // Preserve the actual committed form receipt and the route it was opened
+                // from. Only the exact owner-returned row may later be activated, even
+                // when the form was opened from Hosts rather than Sessions.
+                val activation = AcceptedCreateActivation.capture(intent.hostId, gen, run, intent.workspace,
+                    form, frozen, route) ?: return
+                submittedCreate = activation
+                operation(OperationContext(intent.hostId, gen, intent.proof, created = activation)) {
                     runtime.createSession(intent.hostId, RosterCreateCommand(run, intent.workspace,
                         RosterSendProof.Form(gen, run, intent.workspace, frozen)))
                 }
             }
             is ClientIntent.RequestSessionClose -> {
-                if (currentRow(intent.target) == null) return
-                dialogs = dialogs.copy(closeSession = CloseSessionDialog(intent.target,
-                    proof(listOf("close", intent.target, ++proofGeneration), UiProofScreen.SESSION_CLOSE,
-                        intent.target.hostId, intent.target.hostRunId, intent.target.rowId)))
+                // Re-freeze the same stable row from the current projection: an ordinary
+                // title or revision refresh while the close menu was drawn must not make
+                // that owner row unclosable.
+                val row = closeRow(intent.target) ?: return
+                val closeGeneration = generation(row.hostId) ?: return
+                val target = SessionActionTarget.of(row)
+                dialogs = dialogs.copy(closeSession = CloseSessionDialog(target,
+                    proof(listOf("close", closeGeneration, target, ++proofGeneration), UiProofScreen.SESSION_CLOSE,
+                        target.hostId, target.hostRunId, target.rowId),
+                    connectionGeneration = closeGeneration))
             }
             is ClientIntent.ConfirmSessionClose -> {
                 val form = dialogs.closeSession ?: return
-                if (form.target != intent.target || form.proof !== intent.proof || currentRow(intent.target) == null) return
-                val gen = generation(intent.target.hostId) ?: return
+                if (form.target != intent.target || form.proof !== intent.proof) return
+                val row = closeRow(form.target) ?: return
+                val gen = generation(form.target.hostId) ?: return
+                if (!CloseConnectionFence.admits(form, gen)) {
+                    report("Close not submitted: connection changed")
+                    return
+                }
+                val secondStage = form.confirmationRequestId != null
+                if (secondStage) {
+                    // The second stage is bound to the exact owner arm produced by this
+                    // form's request. Never optimistically resend confirmed=true.
+                    val armed = runtime.hostState(form.target.hostId)?.roster?.armedCloseConfirmationRows
+                        ?.contains(row.rowId) == true
+                    if (form.confirmationRequestId != form.proof.target.requestId || !armed) {
+                        report("Close not submitted: host confirmation is no longer current")
+                        return
+                    }
+                }
                 val frozen = FrozenAction.capture(intent.proof) ?: return
-                val target = intent.target
+                val target = form.target
                 operation(OperationContext(target.hostId, gen, intent.proof)) {
-                    val armed = runtime.hostState(target.hostId)?.roster?.armedCloseConfirmationRows?.contains(target.rowId) == true
-                    runtime.closeSession(target.hostId, RosterCloseCommand(target.hostRunId, target.rowId, armed,
+                    runtime.closeSession(target.hostId, RosterCloseCommand(target.hostRunId, target.rowId, secondStage,
                         RosterSendProof.RowAction(gen, target.hostRunId, target.rowId, ui = frozen,
-                            confirmation = if (armed) frozen else null), if (armed) frozen else null))
+                            confirmation = if (secondStage) frozen else null),
+                        if (secondStage) frozen else null))
                 }
             }
             is ClientIntent.RequestSessionRename -> {
@@ -776,6 +997,19 @@ class ClientApplicationController private constructor(
                         refresh()
                     }
                     report(result?.let { commandText("Input preference", it) } ?: "Input preference not saved: intent no longer current")
+                }
+            }
+            is ClientIntent.SetSavedFirstReplyTimeoutSeconds -> {
+                if (!NetworkSettings.isValidSavedFirstReplyTimeoutSeconds(intent.seconds)) {
+                    report("Saved timeout not saved: enter a positive whole number of seconds")
+                    return
+                }
+                val lifetime = window?.freezeIntentLifetime() ?: return
+                scope.launch {
+                    val result = preferenceLock.withLock { withContext(Dispatchers.IO) {
+                        if (lifetime.isStillCurrent()) registry.setSavedFirstReplyTimeoutSeconds(intent.seconds) else null
+                    } }
+                    report(result?.let { commandText("Saved timeout", it) } ?: "Saved timeout not saved: intent no longer current")
                 }
             }
             is ClientIntent.SetTerminalKeyboardVisible -> window?.keyboard(intent.visible)
@@ -876,6 +1110,8 @@ class ClientApplicationController private constructor(
     }
     private fun cancelTarget(host: HostId) {
         if (saved.selectedHostId == host) cancelSavedDeletion()
+        if (createdActivation?.hostId == host) cancelCreatedActivation()
+        submittedCreate?.takeIf { it.hostId == host }?.supersede()
         if (establishedWanted.get()?.target?.hostId == host) establishedWanted.set(null)
         if (navigation.wanted()?.target?.hostId == host) cancelNavigation()
         if (runtime.state.value.selection?.target?.hostId == host) { window?.retireTerminal(); runtime.leaveTerminal() }
@@ -953,6 +1189,9 @@ class ClientApplicationController private constructor(
         savedConnectionGeneration = generation(host)
         saved = SavedUiState(selectedHostId = host, hostRunId = currentRun(host))
     }
+    private fun savedFirstReplyTimeoutMs(): Long? = NetworkSettings.savedFirstReplyTimeoutMillis(
+        registry.snapshot.value.savedFirstReplyTimeoutSeconds,
+    )
     private fun savedList(intent: ClientIntent.RequestSavedList) {
         if (saved.selectedHostId != intent.target.hostId || saved.hostRunId != intent.target.hostRunId ||
             saved.query != intent.query || saved.listProof !== intent.proof || currentRun(intent.target.hostId) != intent.target.hostRunId) return
@@ -962,13 +1201,19 @@ class ClientApplicationController private constructor(
         val owned = runtime.hostState(intent.target.hostId)?.roster?.savedOwnership
         val catalog = saved.catalogId?.takeIf { owned != null && owned.hostRunId == intent.target.hostRunId && owned.catalogId == it }
         val pickerRevision = intent.proof.target.generation
+        val firstReplyTimeoutMs = savedFirstReplyTimeoutMs() ?: run {
+            report("Saved read not submitted: timeout unavailable")
+            return
+        }
         val p = RosterSendProof.PickerRead(gen, intent.target.hostRunId, catalogId = catalog, queryRevision = pickerRevision, ui = frozen)
         operation(OperationContext(intent.target.hostId, gen, intent.proof, savedQuery = intent.query,
             savedIntake = savedView())) {
             if (catalog == null) runtime.savedList(intent.target.hostId,
-                RosterSavedListCommand(intent.target.hostRunId, intent.query, 0, 50, p))
+                RosterSavedListCommand(intent.target.hostRunId, intent.query, 0, 50, p,
+                    firstReplyTimeoutMs = firstReplyTimeoutMs))
             else runtime.savedSearch(intent.target.hostId,
-                RosterSavedSearchCommand(intent.target.hostRunId, catalog, intent.query, 0, 50, p))
+                RosterSavedSearchCommand(intent.target.hostRunId, catalog, intent.query, 0, 50, p,
+                    firstReplyTimeoutMs = firstReplyTimeoutMs))
         }
     }
     private fun savedWindow(intent: ClientIntent.RequestSavedWindow) {
@@ -1017,10 +1262,15 @@ class ClientApplicationController private constructor(
         val savedQuery: String? = null, val entry: SavedEntryTarget? = null, val sequence: Long? = null,
         val pickerEpoch: Long? = null, val savedResult: SavedResultTarget? = null,
         val deletion: AcceptedSavedDeletion? = null, val savedReadLifetime: AcceptedSavedDeletion? = null,
-        val savedIntake: SavedReadFeedback.View? = null)
+        val savedIntake: SavedReadFeedback.View? = null, val created: AcceptedCreateActivation? = null)
 
     private fun operation(context: OperationContext, command: suspend () -> RosterOperationAdmission) {
-        if (context.proof in busyForms || busyForms.size >= 64) { report("Operation not submitted: busy"); return }
+        if (context.proof in busyForms || busyForms.size >= 64) {
+            context.created?.let { cancelSubmittedCreate(it) }
+            context.savedReadLifetime?.cancel()
+            report("Operation not submitted: busy")
+            return
+        }
         val captured = context.copy(pickerEpoch = if (context.savedQuery != null || context.entry != null) savedEpoch else null)
         context.proof?.let { busyForms.add(it) }
         operations.begin(context.host, context.generation)
@@ -1030,6 +1280,7 @@ class ClientApplicationController private constructor(
                 when (val admission = withContext(Dispatchers.Default) { command() }) {
                     is RosterOperationAdmission.Accepted -> {
                         captured.deletion?.admitted(admission.pending)
+                        captured.created?.admitted(admission.pending)
                         val accepted = captured.copy(sequence = admission.pending?.sequence)
                         val key = OperationKey(context.host, context.generation, admission.kind, admission.requestId)
                         val settled = operations.accept(key, accepted)
@@ -1046,11 +1297,15 @@ class ClientApplicationController private constructor(
                         settled?.let { finish(it.first, it.second) }
                     }
                     is RosterOperationAdmission.Refused -> {
-                        captured.deletion?.cancel(); busyForms.remove(context.proof)
+                        captured.deletion?.cancel(); captured.savedReadLifetime?.cancel()
+                        captured.created?.let { cancelSubmittedCreate(it) }
+                        busyForms.remove(context.proof)
                         report("Operation not submitted: ${admission.reason.name}")
                     }
                     is RosterOperationAdmission.NotReached -> {
-                        captured.deletion?.cancel(); busyForms.remove(context.proof)
+                        captured.deletion?.cancel(); captured.savedReadLifetime?.cancel()
+                        captured.created?.let { cancelSubmittedCreate(it) }
+                        busyForms.remove(context.proof)
                         report("Operation not submitted: ${admission.reason.name}")
                     }
                 }
@@ -1067,13 +1322,21 @@ class ClientApplicationController private constructor(
         try {
             finishSettled(context, event, savedFeedback.projects(key))
         } finally {
+            // A canceled continuation is retired by refresh(); only its exact live
+            // settlement ends this display ownership here.
+            context.savedReadLifetime?.takeIf { it.isStillCurrent() }?.let { savedRefreshFeedback.settled(it) }
             saved = savedFeedback.settled(key, savedView(), saved)
         }
     }
     private fun finishSettled(context: OperationContext, event: RosterClientEvent.OperationSettled, projectRead: Boolean) {
         busyForms.remove(context.proof)
         if (generation(context.host) != context.generation) {
+            context.created?.let { cancelSubmittedCreate(it) }
             if (event.kind == RosterOperationKind.SAVED_DELETE) report(resultText(event))
+            return
+        }
+        if (context.created != null) {
+            finishCreated(context, event)
             return
         }
         if (context.savedReadLifetime?.isStillCurrent() == false) { report(resultText(event)); return }
@@ -1133,7 +1396,21 @@ class ClientApplicationController private constructor(
             val target = context.entry
             if (owner.facts is OwnerSavedDeleteFacts.Deleted) {
                 val continuation = context.deletion
-                val refresh = continuation?.refresh(event, saved, savedEpoch, dialogs.savedDelete?.proof)
+                val refresh = if (continuation == null) {
+                    null
+                } else {
+                    val timeout = savedFirstReplyTimeoutMs()
+                    if (timeout == null) {
+                        continuation.cancel()
+                        report("Saved read not submitted: timeout unavailable")
+                        null
+                    } else {
+                        continuation.refresh(
+                            event, saved, savedEpoch, dialogs.savedDelete?.proof,
+                            firstReplyTimeoutMs = timeout,
+                        )
+                    }
+                }
                 // Completion may close only its own dialog, even if the read was canceled.
                 // Never dismiss a replacement or infer a result from this deletion.
                 if (continuation != null && dialogs.savedDelete?.proof === context.proof) {
@@ -1141,9 +1418,12 @@ class ClientApplicationController private constructor(
                     dialogs = dialogs.copy(savedDelete = null)
                     savedDeleteScope = null
                 }
-                if (refresh != null) {
+                if (refresh != null && continuation != null) {
                     val command = refresh.command
+                    savedRefreshFeedback.shown(continuation)
                     saved = refresh.display
+                    // This continuation owns its synchronously raised display; it is
+                    // not presented as a picker-intake read by SavedReadFeedback.
                     operation(OperationContext(context.host, context.generation, null,
                         savedQuery = command.query, savedReadLifetime = continuation)) {
                         runtime.savedList(context.host, command)
@@ -1163,13 +1443,65 @@ class ClientApplicationController private constructor(
                 }
             }
         }
-        // Close confirmation-required arms a NEW deliberate confirmation, never auto-resends.
-        if (owner is RosterOwnerOutcome.Close && owner.facts == OwnerCloseFacts.CONFIRMATION_REQUIRED) {
-            dialogs.closeSession?.takeIf { it.proof === context.proof }?.let { form ->
-                dialogs = dialogs.copy(closeSession = form.copy(proof = proof(listOf("close-confirm", form.target, event.requestId),
-                    UiProofScreen.SESSION_CLOSE, form.target.hostId, form.target.hostRunId, form.target.rowId)))
+        // Close results act only on the exact form/request that produced them.
+        if (owner is RosterOwnerOutcome.Close) {
+            val form = CloseResultFence.matching(dialogs.closeSession, context.proof, context.host, event.hostRunId)
+            if (form != null && CloseConnectionFence.admits(form, context.generation)) {
+                when (owner.facts) {
+                    OwnerCloseFacts.CONFIRMATION_REQUIRED -> {
+                        // A real owner answer opens a distinct second in-app stage with a
+                        // fresh committed receipt. It never auto-sends confirmed=true and
+                        // keeps the form's original connection attempt.
+                        dialogs = dialogs.copy(closeSession = form.copy(
+                            proof = proof(listOf("close-confirm", form.target, event.requestId),
+                                UiProofScreen.SESSION_CLOSE, form.target.hostId, form.target.hostRunId,
+                                form.target.rowId, request = event.requestId),
+                            confirmationRequestId = event.requestId,
+                        ))
+                    }
+                    OwnerCloseFacts.REMOVED -> {
+                        // Only this form closes. The row itself disappears only from the
+                        // owner's next complete roster snapshot; nothing is deleted locally.
+                        dialogs = dialogs.copy(closeSession = null)
+                    }
+                    else -> Unit // Retained/non-success outcomes keep their truthful form and notice.
+                }
             }
         }
+        report(resultText(event))
+    }
+
+    private fun finishCreated(context: OperationContext, event: RosterClientEvent.OperationSettled) {
+        val activation = context.created ?: return
+        if (submittedCreate !== activation) {
+            // A newer explicit intent already retired this submit; it may have changed
+            // the form or destination. Nothing is closed, activated, or retargeted.
+            activation.cancel()
+            report(resultText(event))
+            return
+        }
+        val returned = activation.started(event, dialogs.createSession)
+        if (returned == null) {
+            // Refusal, uncertainty, a superseded form, or a retired receipt leaves the
+            // form and every row untouched. No other outcome starts navigation.
+            submittedCreate = null
+            activation.cancel()
+            report(resultText(event))
+            return
+        }
+        // Close exactly the form that was submitted, then wait for the owner's own
+        // CURRENT row. No row, target, or navigation is invented before it arrives.
+        submittedCreate = null
+        cancelCreatedActivation()
+        dialogs = dialogs.copy(createSession = null)
+        if (!activation.mayActivate) {
+            // The owner did create the row, so the submitted form is done; the exact
+            // committed receipt is no longer current, so no delayed navigation is owed.
+            activation.cancel()
+            report(resultText(event))
+            return
+        }
+        createdActivation = activation
         report(resultText(event))
     }
 

@@ -29,12 +29,14 @@ class NativeScreensComponentTest {
         compose.onAllNodesWithText("Actions").onFirst().performClick()
         compose.onNodeWithText("Show details").performClick()
         // All fields remain in the actual native card, including unknown versus zero.
+        // A delivered activity line also appears on collapsed cards, so a value may be
+        // drawn more than once; every one of them is still the same delivered fact.
         listOf("Owner label", "Workspace", "Live process", "Busy", "Pending input", "Input surface",
             "Background tasks", "Background shells", "Active tasks", "Active shells", "Exit code",
             "Error", "Native conversation", "Native epoch", "Native name", "Persistence",
             "Owner label A", "/synthetic/workspace/a", "native-a", "Synthetic activity one",
             "Synthetic activity two").forEach { value ->
-            compose.onNodeWithText(value).assertExists()
+            compose.onAllNodesWithText(value).onFirst().assertExists()
         }
         // The durable roster slot is an internal presentation identity, not card text.
         compose.onAllNodesWithText("Roster slot").assertCountEquals(0)

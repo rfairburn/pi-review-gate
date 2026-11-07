@@ -784,6 +784,7 @@ public class RosterClientEndpoint(
         proof = command.proof,
         confirmation = null,
         resultLifetime = command.resultLifetime,
+        firstReplyTimeoutMs = command.firstReplyTimeoutMs,
     )
 
     /** Search within one exact owner catalog; replaces the owner's result only. */
@@ -800,6 +801,7 @@ public class RosterClientEndpoint(
         confirmed = null,
         proof = command.proof,
         confirmation = null,
+        firstReplyTimeoutMs = command.firstReplyTimeoutMs,
     )
 
     /** Another bounded window of one exact owner result. Never relists and never remints ids. */
@@ -1254,6 +1256,7 @@ public class RosterClientEndpoint(
         proof: RosterSendProof?,
         confirmation: RosterUiProof?,
         resultLifetime: RosterUiProof? = null,
+        firstReplyTimeoutMs: Long = bounds.createResultTimeoutMs,
     ): RosterClientStep {
         controlRefusal()?.let { return refuse(kind, it) }
         if (!snapshot().supportsSaved) return refuse(kind, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
@@ -1273,6 +1276,11 @@ public class RosterClientEndpoint(
         if (catalogId != null && !isIdentifier(catalogId)) return refuse(kind, RosterNotSentReason.INVALID_REQUEST)
         if (resultId != null && !isIdentifier(resultId)) return refuse(kind, RosterNotSentReason.INVALID_REQUEST)
         if (entryId != null && !isIdentifier(entryId)) return refuse(kind, RosterNotSentReason.INVALID_REQUEST)
+        // Local patience only: a zero, negative, or unsafe value is refused rather
+        // than clamped, and it is never encoded into the owner request.
+        if (firstReplyTimeoutMs < 1L || firstReplyTimeoutMs > MAX_SAFE_INTEGER) {
+            return refuse(kind, RosterNotSentReason.INVALID_REQUEST)
+        }
         if (kind == RosterOperationKind.SAVED_SEARCH && catalogId == null) {
             return refuse(kind, RosterNotSentReason.INVALID_REQUEST)
         }
@@ -1347,10 +1355,11 @@ public class RosterClientEndpoint(
                 ?: (proof as? RosterSendProof.PickerEntry)?.pickerRevision ?: 0L,
             confirmed = confirmed,
             resultLifetime = resultLifetime,
-            deadlineAt = clock() + bounds.createResultTimeoutMs,
+            deadlineAt = clock() + firstReplyTimeoutMs,
         )
-        // The same patience class as Create for the first answer; never a retry.
-        armSavedDeadline(requireNotNull(pendingSaved), bounds.createResultTimeoutMs)
+        // Local first-answer patience; never a retry. Once a window begins, the
+        // existing progress-sensitive transfer idle bound replaces it.
+        armSavedDeadline(requireNotNull(pendingSaved), firstReplyTimeoutMs)
         events += RosterClientEvent.OperationAccepted(kind, requestId, hostRunId)
         val sent = send(frame, SendPurpose.SAVED, requestId, requireNotNull(proof))
         if (!sent) settleSaved(requireNotNull(pendingSaved), RosterRequestResult.NotSent(RosterNotSentReason.NOT_READY))

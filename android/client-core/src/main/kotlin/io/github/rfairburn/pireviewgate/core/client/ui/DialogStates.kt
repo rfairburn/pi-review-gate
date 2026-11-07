@@ -101,10 +101,23 @@ public data class RenameSessionDialog(
  * The dialog is armed by a deliberate Close request on the exact drawn row. It never
  * claims that a close already accepted by the owner can be cancelled from here, and
  * it never retries an unknown outcome.
+ *
+ * [connectionGeneration] is the connection attempt that opened this form. Both the
+ * first and second stage must still be on that exact attempt before submitting; a
+ * disconnect or reconnect permanently retires the form's authority rather than
+ * letting old consent ride a new channel.
+ *
+ * [confirmationRequestId] is set only after the owner actually answered
+ * `confirmation-required` for this exact form's request. It marks the explicit second
+ * in-app confirmation stage: the UI must show a distinct confirmation control, and
+ * only another deliberate tap may submit `confirmed = true`. It is never optimistically
+ * armed by the client.
  */
 public data class CloseSessionDialog(
     public val target: SessionActionTarget,
     public val proof: UiActionProof,
+    public val connectionGeneration: Long? = null,
+    public val confirmationRequestId: String? = null,
 )
 
 /** Delete one Saved entry, after the owner's prepare asked for confirmation. */

@@ -584,8 +584,11 @@ private fun CloseDialogView(
     covered: Boolean,
     onIntent: (ClientIntent) -> Unit,
 ) {
+    val hostConfirmation = dialog.confirmationRequestId != null
     ClientAlertDialog(
-        title = stringResource(R.string.close_title),
+        title = stringResource(
+            if (hostConfirmation) R.string.close_host_confirmation_title else R.string.close_title,
+        ),
         onDismiss = { onIntent(ClientIntent.DismissDialog(ClientDialogKind.CLOSE_SESSION)) },
         covered = covered,
         proof = dialog.proof,
@@ -596,7 +599,12 @@ private fun CloseDialogView(
             gate.CriticalIdentityText(key = "row", value = dialog.target.drawnTitle)
             // Fixed wording. It never says a close already accepted can be withdrawn,
             // and it never offers a retry.
-            Text(stringResource(R.string.close_body), style = MaterialTheme.typography.bodyMedium)
+            Text(
+                stringResource(
+                    if (hostConfirmation) R.string.close_host_confirmation_body else R.string.close_body,
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             DismissButton { onIntent(ClientIntent.DismissDialog(ClientDialogKind.CLOSE_SESSION)) }
@@ -606,7 +614,13 @@ private fun CloseDialogView(
                         onIntent(ClientIntent.ConfirmSessionClose(dialog.target, dialog.proof))
                     }
                 },
-            ) { Text(stringResource(R.string.close_confirm)) }
+            ) {
+                Text(
+                    stringResource(
+                        if (hostConfirmation) R.string.close_host_confirmation_button else R.string.close_confirm,
+                    ),
+                )
+            }
         }
     }
 }

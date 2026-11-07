@@ -3,10 +3,13 @@ package io.github.rfairburn.pireviewgate.ui.client
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.res.Configuration
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -16,8 +19,11 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsIgnoringVisibility
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.waterfall
@@ -29,6 +35,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -38,22 +45,33 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import io.github.rfairburn.pireviewgate.R
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientUiState
@@ -66,10 +84,20 @@ import io.github.rfairburn.pireviewgate.core.client.ui.TerminalModifier
 import io.github.rfairburn.pireviewgate.core.client.ui.TerminalModifiers
 import io.github.rfairburn.pireviewgate.core.client.ui.TerminalUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.UiActionProof
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlay
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayGeometry
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayOrientation
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacement
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementWarning
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPoint
 import io.github.rfairburn.pireviewgate.core.client.ui.quickSwitcherRows
+import kotlin.math.roundToInt
 
 /** Overlay chrome is translucent enough to hint at covered cells, opaque enough to read. */
 private const val OVERLAY_ALPHA = 0.92f
+
+/** Smallest Keys viewport that lets scrolling bring a full 48dp target clear of panel padding. */
+private val MinimumKeysViewport = 56.dp
 
 /**
  * The fullscreen terminal.
@@ -81,13 +109,25 @@ private const val OVERLAY_ALPHA = 0.92f
  * and grid change only when the real window or orientation does.
  *
  * Everything else floats over the pane in this same window: a compact control strip
- * (Back, Switch, Keyboard, Keys), truthful readiness/status notices, and the
+ * (Back, Switch, keyboard icon, Keys), truthful readiness/status notices, and the
  * dismissible Keys panel with the existing modifiers, paste, special and function
  * keys. None of them is a Dialog, sheet, or focusable popup, so opening one neither
  * takes native window focus nor reports coverage; only the real quick switcher and
  * modal dialogs do that. Every overlay surface consumes its own touches so a tap on
  * a control never reaches the terminal underneath, while the rest of the pane
  * remains the terminal's.
+ *
+ * The three overlays are independently positioned. A recognized long-press drag on
+ * the control strip, the notice's text, or the Keys panel's header moves only that
+ * surface; a short tap still delivers the same button/action behavior. A completed
+ * drag submits the complete six-slot state through [onOverlayPlacementCommitted];
+ * cancels, rotations, IME changes, and ordinary frames never save. The overlay layer
+ * is not composed until [overlayPlacementReady] reports the completed placement load,
+ * so an early interaction cannot submit defaults over saved slots. The IME may clamp
+ * what is visible but never rewrites a remembered position or reflows the pane. In an
+ * IME-short layer the Keys panel keeps a scrollable viewport in the free band above or
+ * below the controls strip, and a wrapped control strip is height-capped and scrollable
+ * so neither surface loses its actions.
  *
  * There is no persistent sidebar and no host or session navigation chrome here.
  * The viewport itself is [terminalContent], supplied by whoever owns a real
@@ -108,6 +148,10 @@ fun TerminalScreen(
     onIntent: (ClientIntent) -> Unit,
     modifier: Modifier = Modifier,
     status: String? = null,
+    overlayPlacement: TerminalOverlayPlacement = TerminalOverlayPlacement.DEFAULT,
+    overlayPlacementWarning: TerminalOverlayPlacementWarning? = null,
+    overlayPlacementReady: Boolean = true,
+    onOverlayPlacementCommitted: (TerminalOverlayPlacement) -> Unit = {},
 ) {
     TerminalImeWindowPolicy()
     // safeDrawing includes IME. Keep bars/cutouts/waterfall, but never subtract
@@ -125,30 +169,447 @@ fun TerminalScreen(
     Box(modifier.fillMaxSize().windowInsetsPadding(stable)) {
         // The pane: identical constraints whatever the overlays, IME, or readiness.
         Box(Modifier.fillMaxSize()) { terminalContent(terminal) }
-        // Overlays only. The IME may cover cells: the overlay layer (never the pane)
-        // keeps the Keys panel above it. Stable painting is not a claim of physical
-        // pixel visibility and grants no input or commit authority. This column has
-        // no pointer handler of its own, so touches outside its surfaces reach the
-        // terminal.
-        Column(
-            modifier = Modifier.matchParentSize().windowInsetsPadding(WindowInsets.ime),
-            horizontalAlignment = Alignment.End,
-        ) {
-            TerminalControls(
+        // Overlays only. This layer has no pointer handler of its own and each
+        // positioned surface wraps only its own content, so the rest of the pane
+        // remains the terminal's. Stable painting is not a claim of physical pixel
+        // visibility and grants no input or commit authority. Nothing here composes
+        // until the initial placement load completed with saved positions or the
+        // warned defaults, so an early interaction cannot write partial state.
+        if (overlayPlacementReady) {
+            TerminalOverlayLayer(
                 terminal = terminal,
                 keysOpen = keysOpen,
                 onToggleKeys = { keysOpen = !keysOpen },
-                onIntent = onIntent,
-            )
-            TerminalNotices(
-                terminal = terminal,
-                status = status?.takeIf { it != dismissedStatus },
+                status = status,
+                dismissedStatus = dismissedStatus,
                 onDismissStatus = { dismissedStatus = it },
+                onKey = onKey,
+                onPaste = onPaste,
+                onIntent = onIntent,
+                placement = overlayPlacement,
+                placementWarning = overlayPlacementWarning,
+                onPlacementCommitted = onOverlayPlacementCommitted,
             )
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.BottomCenter) {
-                if (keysOpen) TerminalKeysPanel(terminal, status, onKey, onPaste, onIntent)
+        }
+    }
+}
+
+/**
+ * The independently positioned overlay layer.
+ *
+ * Resolution uses the stable pane's free space; the currently visible layer (after
+ * IME insets) only clamps the display point. Moving or clamping one surface never
+ * changes another slot, and no layout in here changes the pane's constraints.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TerminalOverlayLayer(
+    terminal: TerminalUiState,
+    keysOpen: Boolean,
+    onToggleKeys: () -> Unit,
+    status: String?,
+    dismissedStatus: String?,
+    onDismissStatus: (String) -> Unit,
+    onKey: (TerminalKeyRequest) -> Unit,
+    onPaste: () -> Unit,
+    onIntent: (ClientIntent) -> Unit,
+    placement: TerminalOverlayPlacement,
+    placementWarning: TerminalOverlayPlacementWarning?,
+    onPlacementCommitted: (TerminalOverlayPlacement) -> Unit,
+) {
+    val orientation = when (LocalConfiguration.current.orientation) {
+        Configuration.ORIENTATION_LANDSCAPE -> TerminalOverlayOrientation.LANDSCAPE
+        else -> TerminalOverlayOrientation.PORTRAIT
+    }
+    val warningText = when (placementWarning) {
+        TerminalOverlayPlacementWarning.LOADED_DEFAULTS -> stringResource(R.string.terminal_overlay_positions_defaulted)
+        TerminalOverlayPlacementWarning.SAVE_FAILED -> stringResource(R.string.terminal_overlay_positions_save_failed)
+        null -> null
+    }
+    val visibleStatus = status?.takeIf { it != dismissedStatus }
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val stableWidth = constraints.maxWidth
+        val stableHeight = constraints.maxHeight
+        var controlsSlotHeight by remember { mutableStateOf(0) }
+        var noticesSlotHeight by remember { mutableStateOf(0) }
+        Box(
+            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.ime),
+        ) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val visibleWidth = constraints.maxWidth
+                val visibleHeight = constraints.maxHeight
+                val minimumKeysViewportPx = with(LocalDensity.current) { MinimumKeysViewport.roundToPx() }
+                var controlsCapped by remember(keysOpen) { mutableStateOf(false) }
+                var constrainedKeys by remember(keysOpen) { mutableStateOf(false) }
+                var keysSlotHeight by remember(keysOpen) { mutableStateOf(0) }
+
+                // A wrapped control strip that cannot fit at all is capped so its own
+                // controls stay reachable. While Keys is open, cap it far enough to keep
+                // a usable Keys band too. The state resets when Keys closes, so a taller
+                // window never inherits a scroll container it no longer needs.
+                val controlsOverflow = visibleHeight - controlsSlotHeight < 0
+                val keysNeedControlsCap =
+                    keysOpen && visibleHeight - controlsSlotHeight < minimumKeysViewportPx
+                if (!controlsCapped && (controlsOverflow || keysNeedControlsCap)) {
+                    SideEffect { controlsCapped = true }
+                }
+                val capControlsNow = controlsCapped || controlsOverflow || keysNeedControlsCap
+                val controlsMaxHeightPx = if (capControlsNow) {
+                    if (keysOpen) {
+                        (visibleHeight - minimumKeysViewportPx).coerceAtLeast(0)
+                    } else {
+                        visibleHeight
+                    }
+                } else {
+                    null
+                }
+
+                // While Keys is open, use the height the control strip will occupy
+                // after its cap applies. This keeps the chosen Keys band stable instead
+                // of collapsing to zero during the frame before the cap is measured.
+                val effectiveControlsSlotHeightPx = if (keysOpen) {
+                    controlsSlotHeight.coerceAtMost(
+                        (visibleHeight - minimumKeysViewportPx).coerceAtLeast(0),
+                    )
+                } else {
+                    controlsSlotHeight
+                }
+                val unobstructedKeysHeightPx =
+                    (visibleHeight - effectiveControlsSlotHeightPx - noticesSlotHeight).coerceAtLeast(0)
+                val controlsPosition = placement.position(TerminalOverlay.CONTROLS, orientation)
+                val controlsResolvedTop = if (controlsPosition != null) {
+                    TerminalOverlayGeometry.resolve(
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        overlayWidth = 0,
+                        overlayHeight = effectiveControlsSlotHeightPx,
+                        position = controlsPosition,
+                    ).y
+                } else {
+                    TerminalOverlayGeometry.resolveDefault(
+                        overlay = TerminalOverlay.CONTROLS,
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        overlayWidth = 0,
+                        overlayHeight = effectiveControlsSlotHeightPx,
+                        controlsSlotHeight = 0,
+                    ).y
+                }
+                val controlsDisplayTop = TerminalOverlayGeometry.clampToVisible(
+                    point = TerminalOverlayPoint(0, controlsResolvedTop),
+                    visibleWidth = visibleWidth,
+                    visibleHeight = visibleHeight,
+                    overlayWidth = 0,
+                    overlayHeight = effectiveControlsSlotHeightPx,
+                ).y
+                val controlsDisplayBottom =
+                    (controlsDisplayTop + effectiveControlsSlotHeightPx).coerceAtMost(visibleHeight)
+
+                // Enter the short-layer layout when the ordinary Keys viewport is too
+                // small or intersects a moved control strip. A moved control that does
+                // not overlap keeps the ordinary layout and its existing Keys bounds.
+                val normalKeysHeightPx = keysSlotHeight.coerceAtMost(unobstructedKeysHeightPx)
+                val normalKeysTopPx = if (normalKeysHeightPx > 0) {
+                    val resolved = placement.position(TerminalOverlay.KEYS, orientation)?.let { explicit ->
+                        TerminalOverlayGeometry.resolve(
+                            stableWidth = stableWidth,
+                            stableHeight = stableHeight,
+                            overlayWidth = 0,
+                            overlayHeight = normalKeysHeightPx,
+                            position = explicit,
+                        )
+                    } ?: TerminalOverlayGeometry.resolveDefault(
+                        overlay = TerminalOverlay.KEYS,
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        overlayWidth = 0,
+                        overlayHeight = normalKeysHeightPx,
+                        controlsSlotHeight = 0,
+                    )
+                    TerminalOverlayGeometry.clampToVisible(
+                        point = resolved,
+                        visibleWidth = visibleWidth,
+                        visibleHeight = visibleHeight,
+                        overlayWidth = 0,
+                        overlayHeight = normalKeysHeightPx,
+                    ).y
+                } else {
+                    0
+                }
+                val controlsOverlapNormalKeys = normalKeysHeightPx > 0 &&
+                    controlsDisplayTop < normalKeysTopPx + normalKeysHeightPx &&
+                    controlsDisplayBottom > normalKeysTopPx
+                val needsConstrainedKeys = keysOpen &&
+                    (unobstructedKeysHeightPx < minimumKeysViewportPx || controlsOverlapNormalKeys)
+                if (needsConstrainedKeys && !constrainedKeys) {
+                    SideEffect { constrainedKeys = true }
+                }
+                val shortKeysLayout = keysOpen && (constrainedKeys || needsConstrainedKeys)
+
+                // effectiveControlsSlotHeight leaves at least MinimumKeysViewport of free
+                // height while Keys is open, so every short-layer band below is usable.
+                val totalFreeHeightPx = (visibleHeight - effectiveControlsSlotHeightPx).coerceAtLeast(0)
+                val aboveControlsPx = controlsDisplayTop.coerceIn(0, visibleHeight)
+                val belowControlsPx = (visibleHeight - controlsDisplayBottom).coerceAtLeast(0)
+                var keysMaxHeightPx = unobstructedKeysHeightPx
+                var keysMinimumTopPx = 0
+                var forcedControlsTopPx: Int? = null
+                // Short-layer bands are display-only. If neither side of a moved control
+                // strip can fit Keys, pin that strip to the nearer edge; its saved slot is
+                // untouched.
+                if (shortKeysLayout) {
+                    when {
+                        belowControlsPx >= minimumKeysViewportPx && belowControlsPx >= aboveControlsPx -> {
+                            keysMaxHeightPx = belowControlsPx
+                            keysMinimumTopPx = controlsDisplayBottom
+                        }
+                        aboveControlsPx >= minimumKeysViewportPx -> {
+                            keysMaxHeightPx = aboveControlsPx
+                            keysMinimumTopPx = 0
+                        }
+                        belowControlsPx >= aboveControlsPx -> {
+                            forcedControlsTopPx = 0
+                            keysMaxHeightPx = totalFreeHeightPx
+                            keysMinimumTopPx = effectiveControlsSlotHeightPx
+                        }
+                        else -> {
+                            forcedControlsTopPx =
+                                (visibleHeight - effectiveControlsSlotHeightPx).coerceAtLeast(0)
+                            keysMaxHeightPx = totalFreeHeightPx
+                            keysMinimumTopPx = 0
+                        }
+                    }
+                }
+                // Bind the Keys display and drag clamp to the chosen band's bottom.
+                // A bottom-anchored default must not land under a moved control strip.
+                val keysVisibleBottomPx = if (shortKeysLayout) {
+                    (keysMinimumTopPx + keysMaxHeightPx).coerceAtMost(visibleHeight)
+                } else {
+                    visibleHeight
+                }
+                PlaceableOverlay(
+                    overlay = TerminalOverlay.CONTROLS,
+                    placement = placement,
+                    orientation = orientation,
+                    stableWidth = stableWidth,
+                    stableHeight = stableHeight,
+                    visibleWidth = visibleWidth,
+                    visibleHeight = visibleHeight,
+                    controlsSlotHeight = 0,
+                    onMeasured = { size ->
+                        if (size.height != controlsSlotHeight) controlsSlotHeight = size.height
+                    },
+                    maxHeightPx = controlsMaxHeightPx,
+                    forcedTopPx = forcedControlsTopPx,
+                    layerZIndex = if (shortKeysLayout) 2f else 1f,
+                    onCommitted = onPlacementCommitted,
+                ) { dragModifier ->
+                    TerminalControls(
+                        terminal = terminal,
+                        keysOpen = keysOpen,
+                        onToggleKeys = onToggleKeys,
+                        onIntent = onIntent,
+                        dragModifier = dragModifier,
+                        scrollable = capControlsNow,
+                    )
+                }
+                PlaceableOverlay(
+                    overlay = TerminalOverlay.STATUS,
+                    placement = placement,
+                    orientation = orientation,
+                    stableWidth = stableWidth,
+                    stableHeight = stableHeight,
+                    visibleWidth = visibleWidth,
+                    visibleHeight = visibleHeight,
+                    controlsSlotHeight = controlsSlotHeight,
+                    onMeasured = { size ->
+                        if (size.height != noticesSlotHeight) noticesSlotHeight = size.height
+                    },
+                    layerZIndex = 1f,
+                    onCommitted = onPlacementCommitted,
+                ) { dragModifier ->
+                    TerminalNotices(
+                        terminal = terminal,
+                        status = visibleStatus,
+                        placementWarning = warningText,
+                        onDismissStatus = onDismissStatus,
+                        dragModifier = dragModifier,
+                    )
+                }
+                if (keysOpen) {
+                    // Keys uses the ordinary cap while that leaves a usable, unobstructed
+                    // viewport. In a short layer it moves into the larger free band above
+                    // or below the control strip, which is display-only: the persisted
+                    // six-slot placement is never rewritten by this adaptation.
+                    PlaceableOverlay(
+                        overlay = TerminalOverlay.KEYS,
+                        placement = placement,
+                        orientation = orientation,
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        visibleWidth = visibleWidth,
+                        visibleHeight = keysVisibleBottomPx,
+                        controlsSlotHeight = 0,
+                        maxHeightPx = keysMaxHeightPx,
+                        minimumTopPx = keysMinimumTopPx,
+                        layerZIndex = if (shortKeysLayout) 1.5f else 0f,
+                        onCommitted = onPlacementCommitted,
+                        onMeasured = { size ->
+                            if (size.height != keysSlotHeight) keysSlotHeight = size.height
+                        },
+                    ) { dragModifier ->
+                        TerminalKeysPanel(
+                            terminal = terminal,
+                            status = status,
+                            onKey = onKey,
+                            onPaste = onPaste,
+                            onIntent = onIntent,
+                            dragModifier = dragModifier,
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+/**
+ * Position one wrapping overlay and own its long-press drag.
+ *
+ * The wrapper never fills the layer; only the content [content] touches, so no
+ * background hit target is introduced. The long-press detector consumes movement
+ * only after the pointer has crossed the touch slop, which cancels a child button
+ * click exactly when a drag is recognized while leaving short taps untouched.
+ */
+@Composable
+private fun PlaceableOverlay(
+    overlay: TerminalOverlay,
+    placement: TerminalOverlayPlacement,
+    orientation: TerminalOverlayOrientation,
+    stableWidth: Int,
+    stableHeight: Int,
+    visibleWidth: Int,
+    visibleHeight: Int,
+    controlsSlotHeight: Int,
+    maxHeightPx: Int? = null,
+    minimumTopPx: Int = 0,
+    forcedTopPx: Int? = null,
+    layerZIndex: Float = 0f,
+    onCommitted: (TerminalOverlayPlacement) -> Unit,
+    onMeasured: (IntSize) -> Unit = {},
+    content: @Composable (Modifier) -> Unit,
+) {
+    var size by remember(overlay) { mutableStateOf(IntSize.Zero) }
+    var dragPoint by remember(overlay, orientation) { mutableStateOf<TerminalOverlayPoint?>(null) }
+    val layoutHeight = if (maxHeightPx != null) {
+        size.height.coerceAtMost(maxHeightPx).coerceAtLeast(0)
+    } else {
+        size.height
+    }
+    val position = placement.position(overlay, orientation)
+    val resolved = position?.let { explicit ->
+        TerminalOverlayGeometry.resolve(stableWidth, stableHeight, size.width, layoutHeight, explicit)
+    } ?: TerminalOverlayGeometry.resolveDefault(
+        overlay = overlay,
+        stableWidth = stableWidth,
+        stableHeight = stableHeight,
+        overlayWidth = size.width,
+        overlayHeight = layoutHeight,
+        controlsSlotHeight = controlsSlotHeight,
+    )
+    val basePoint = TerminalOverlayGeometry.clampToVisible(
+        point = resolved,
+        visibleWidth = visibleWidth,
+        visibleHeight = visibleHeight,
+        overlayWidth = size.width,
+        overlayHeight = layoutHeight,
+        minimumY = minimumTopPx,
+    ).let { clamped ->
+        val forced = forcedTopPx ?: return@let clamped
+        val maximumTop = TerminalOverlayGeometry.freeHeight(visibleHeight, layoutHeight)
+        val minimumTop = minimumTopPx.coerceIn(0, maximumTop)
+        TerminalOverlayPoint(clamped.x, forced.coerceIn(minimumTop, maximumTop))
+    }
+    val currentBase = rememberUpdatedState(basePoint)
+    val currentPlacement = rememberUpdatedState(placement)
+    val currentSize = rememberUpdatedState(size)
+    val currentCommit = rememberUpdatedState(onCommitted)
+    val currentMinimumTop = rememberUpdatedState(minimumTopPx)
+    val heightConstraint = if (maxHeightPx != null) {
+        val maxHeight = with(LocalDensity.current) { maxHeightPx.toDp() }
+        Modifier.heightIn(max = maxHeight)
+    } else {
+        Modifier
+    }
+    val dragModifier = Modifier.pointerInput(overlay, orientation, stableWidth, stableHeight, visibleWidth, visibleHeight) {
+        var moved = false
+        var accumulated = Offset.Zero
+        var working: TerminalOverlayPoint? = null
+        detectDragGesturesAfterLongPress(
+            onDragStart = {
+                moved = false
+                accumulated = Offset.Zero
+                working = currentBase.value
+            },
+            onDragCancel = {
+                moved = false
+                working = null
+                dragPoint = null
+            },
+            onDragEnd = {
+                val finished = working
+                if (moved && finished != null && currentSize.value != IntSize.Zero) {
+                    val committed = TerminalOverlayGeometry.toPosition(
+                        point = finished,
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        overlayWidth = currentSize.value.width,
+                        overlayHeight = currentSize.value.height,
+                    )
+                    currentCommit.value(currentPlacement.value.withPosition(overlay, orientation, committed))
+                }
+                moved = false
+                working = null
+                dragPoint = null
+            },
+            onDrag = { change, dragAmount ->
+                accumulated += dragAmount
+                if (!moved && accumulated.getDistance() > viewConfiguration.touchSlop) moved = true
+                if (moved) {
+                    change.consume()
+                    val start = working ?: currentBase.value
+                    val next = TerminalOverlayGeometry.clampToVisible(
+                        point = TerminalOverlayPoint(
+                            x = start.x + dragAmount.x.roundToInt(),
+                            y = start.y + dragAmount.y.roundToInt(),
+                        ),
+                        visibleWidth = visibleWidth,
+                        visibleHeight = visibleHeight,
+                        overlayWidth = currentSize.value.width,
+                        overlayHeight = currentSize.value.height,
+                        minimumY = currentMinimumTop.value,
+                    )
+                    working = next
+                    dragPoint = next
+                }
+            },
+        )
+    }
+    val point = dragPoint ?: basePoint
+    Box(
+        Modifier
+            .offset { IntOffset(point.x, point.y) }
+            .zIndex(layerZIndex)
+            .then(heightConstraint)
+            .onGloballyPositioned { coordinates ->
+                val measured = coordinates.size
+                if (measured != size) {
+                    size = measured
+                    onMeasured(measured)
+                }
+            },
+    ) {
+        content(dragModifier)
     }
 }
 
@@ -188,9 +649,10 @@ private fun Modifier.ownsTouches(): Modifier = pointerInput(Unit) {}
 
 /**
  * The compact control strip: Back, cross-host Switch, the explicit keyboard toggle,
- * and the Keys pop-out. The keyboard toggle only emits the existing intent; its
- * label follows observed IME insets ([TerminalUiState.keyboardVisible]), never the
- * tap.
+ * and the Keys pop-out. The keyboard toggle is one fixed-footprint vector icon; its
+ * accessible description follows observed IME insets ([TerminalUiState.keyboardVisible]),
+ * never the tap. [dragModifier] is the long-press drag region for this strip; it adds
+ * no grip and no occupied width.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -199,33 +661,42 @@ private fun TerminalControls(
     keysOpen: Boolean,
     onToggleKeys: () -> Unit,
     onIntent: (ClientIntent) -> Unit,
+    dragModifier: Modifier = Modifier,
+    scrollable: Boolean = false,
 ) {
     Surface(
-        modifier = Modifier.padding(4.dp).ownsTouches(),
+        modifier = Modifier.padding(4.dp).then(dragModifier).ownsTouches(),
         shape = MaterialTheme.shapes.small,
         color = MaterialTheme.colorScheme.surface.copy(alpha = OVERLAY_ALPHA),
         tonalElevation = 2.dp,
     ) {
-        // Wraps rather than squeezing trailing controls in narrow windows or with
-        // enlarged text; only this overlay grows, never the pane's constraints.
-        FlowRow(horizontalArrangement = Arrangement.End) {
-            OverlayButton(onClick = { onIntent(ClientIntent.LeaveTerminal) }) {
-                Text(stringResource(R.string.action_back), maxLines = 1)
-            }
-            OverlayButton(onClick = { onIntent(ClientIntent.ShowQuickSwitcher) }) {
-                Text(stringResource(R.string.action_switch_session), maxLines = 1)
-            }
-            OverlayButton(onClick = { onIntent(ClientIntent.SetTerminalKeyboardVisible(!terminal.keyboardVisible)) }) {
-                StableLabel(
-                    R.string.key_hide_keyboard to terminal.keyboardVisible,
-                    R.string.key_show_keyboard to !terminal.keyboardVisible,
-                )
-            }
-            OverlayButton(onClick = onToggleKeys) {
-                StableLabel(
-                    R.string.terminal_keys_close to keysOpen,
-                    R.string.terminal_keys_open to !keysOpen,
-                )
+        val scrollState = rememberScrollState()
+        Column(modifier = if (scrollable) Modifier.verticalScroll(scrollState) else Modifier) {
+            // Wraps rather than squeezing trailing controls in narrow windows or with
+            // enlarged text; only this overlay grows, never the pane's constraints. A
+            // short layer caps this overlay and makes it scrollable instead.
+            FlowRow(horizontalArrangement = Arrangement.End) {
+                OverlayButton(onClick = { onIntent(ClientIntent.LeaveTerminal) }) {
+                    Text(stringResource(R.string.action_back), maxLines = 1)
+                }
+                OverlayButton(onClick = { onIntent(ClientIntent.ShowQuickSwitcher) }) {
+                    Text(stringResource(R.string.action_switch_session), maxLines = 1)
+                }
+                OverlayButton(onClick = { onIntent(ClientIntent.SetTerminalKeyboardVisible(!terminal.keyboardVisible)) }) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_terminal_keyboard),
+                        contentDescription = stringResource(
+                            if (terminal.keyboardVisible) R.string.key_hide_keyboard else R.string.key_show_keyboard,
+                        ),
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
+                OverlayButton(onClick = onToggleKeys) {
+                    StableLabel(
+                        R.string.terminal_keys_close to keysOpen,
+                        R.string.terminal_keys_open to !keysOpen,
+                    )
+                }
             }
         }
     }
@@ -251,22 +722,26 @@ private fun StableLabel(vararg labels: Pair<Int, Boolean>) {
 }
 
 /**
- * Readiness and status notices, overlaid without reserving layout. A paused
- * terminal always says so while it is paused; the latest app status can be
- * dismissed here and stays readable in the Keys panel.
+ * Readiness, status, and required placement-load/save notices, overlaid without
+ * reserving layout. A paused terminal always says so while it is paused; the latest
+ * app status can be dismissed here and stays readable in the Keys panel. The text
+ * regions are the existing non-button drag targets for this surface; the dismiss
+ * button stays an ordinary button with no new row.
  */
 @Composable
 private fun TerminalNotices(
     terminal: TerminalUiState,
     status: String?,
+    placementWarning: String?,
     onDismissStatus: (String) -> Unit,
+    dragModifier: Modifier = Modifier,
 ) {
     val paused = when {
         terminal.coverage.suspendsTerminalInput -> R.string.terminal_suspended_coverage
         !terminal.inputReady -> R.string.terminal_suspended_viewport
         else -> null
     }
-    if (paused == null && status == null) return
+    if (paused == null && status == null && placementWarning == null) return
     Surface(
         modifier = Modifier.padding(horizontal = 4.dp).widthIn(max = 360.dp).ownsTouches(),
         shape = MaterialTheme.shapes.small,
@@ -281,7 +756,7 @@ private fun TerminalNotices(
                 Text(
                     stringResource(paused),
                     style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    modifier = dragModifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
             }
             if (status != null) {
@@ -289,12 +764,20 @@ private fun TerminalNotices(
                     Text(
                         status,
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.weight(1f, fill = false).semantics { liveRegion = LiveRegionMode.Polite },
+                        modifier = Modifier.weight(1f, fill = false).then(dragModifier)
+                            .semantics { liveRegion = LiveRegionMode.Polite },
                     )
                     TextButton(onClick = { onDismissStatus(status) }) {
                         Text(stringResource(R.string.terminal_status_dismiss))
                     }
                 }
+            }
+            if (placementWarning != null) {
+                Text(
+                    placementWarning,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = dragModifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
             }
         }
     }
@@ -318,6 +801,7 @@ private fun TerminalKeysPanel(
     onKey: (TerminalKeyRequest) -> Unit,
     onPaste: () -> Unit,
     onIntent: (ClientIntent) -> Unit,
+    dragModifier: Modifier = Modifier,
 ) {
     val suspended = terminal.coverage.suspendsTerminalInput || !terminal.inputReady
     val held = terminal.modifiers
@@ -330,23 +814,32 @@ private fun TerminalKeysPanel(
         Column(
             modifier = Modifier
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Text(
-                text = terminal.sessionTitle,
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = stringResource(R.string.session_host_context, terminal.hostLabel),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // The existing title/host header is the Keys surface's drag region. It
+            // keeps both context fields and adds no row, grip, or height.
+            Column(
+                modifier = dragModifier,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = terminal.sessionTitle,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = stringResource(R.string.session_host_context, terminal.hostLabel),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             status?.let { NoticeText(it) }
 
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            // Modifier, action, and special keys stay in their existing order and
+            // availability, packed into one row so only the flow gap is saved.
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 ModifierToggle(
                     modifier = TerminalModifier.CTRL,
                     label = stringResource(R.string.key_ctrl),
@@ -365,11 +858,16 @@ private fun TerminalKeysPanel(
                     held = held,
                     onIntent = onIntent,
                 )
-                OutlinedButton(onClick = onPaste, enabled = !suspended) {
+                OutlinedButton(
+                    onClick = onPaste,
+                    enabled = !suspended,
+                    contentPadding = OverlayKeyPadding,
+                ) {
                     Text(stringResource(R.string.key_paste))
                 }
                 OutlinedButton(
                     onClick = { onIntent(ClientIntent.SetTerminalExtraKeysVisible(!terminal.extraKeysVisible)) },
+                    contentPadding = OverlayKeyPadding,
                 ) {
                     Text(
                         stringResource(
@@ -377,9 +875,6 @@ private fun TerminalKeysPanel(
                         ),
                     )
                 }
-            }
-
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 KeyButton(TerminalControlKey.ESCAPE, stringResource(R.string.key_escape), held, suspended, onKey)
                 KeyButton(TerminalControlKey.TAB, stringResource(R.string.key_tab), held, suspended, onKey)
                 KeyButton(TerminalControlKey.BACKTAB, stringResource(R.string.key_shift_tab), held, suspended, onKey)
@@ -389,15 +884,14 @@ private fun TerminalKeysPanel(
                 KeyButton(TerminalControlKey.PAGE_DOWN, stringResource(R.string.key_page_down), held, suspended, onKey)
             }
 
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            // Arrows, then the existing optional Insert/Delete/function keys. The
+            // expansion behavior, key set, and order are unchanged.
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 KeyButton(TerminalControlKey.ARROW_LEFT, stringResource(R.string.key_arrow_left), held, suspended, onKey)
                 KeyButton(TerminalControlKey.ARROW_UP, stringResource(R.string.key_arrow_up), held, suspended, onKey)
                 KeyButton(TerminalControlKey.ARROW_DOWN, stringResource(R.string.key_arrow_down), held, suspended, onKey)
                 KeyButton(TerminalControlKey.ARROW_RIGHT, stringResource(R.string.key_arrow_right), held, suspended, onKey)
-            }
-
-            if (terminal.extraKeysVisible) {
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (terminal.extraKeysVisible) {
                     KeyButton(TerminalControlKey.INSERT, stringResource(R.string.key_insert), held, suspended, onKey)
                     KeyButton(TerminalControlKey.DELETE, stringResource(R.string.key_delete), held, suspended, onKey)
                     val functionKeys = listOf(
@@ -423,6 +917,8 @@ private fun TerminalKeysPanel(
     }
 }
 
+private val OverlayKeyPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+
 @Composable
 private fun ModifierToggle(
     modifier: TerminalModifier,
@@ -431,9 +927,15 @@ private fun ModifierToggle(
     onIntent: (ClientIntent) -> Unit,
 ) {
     if (held.holds(modifier)) {
-        Button(onClick = { onIntent(ClientIntent.ToggleTerminalModifier(modifier)) }) { Text(label) }
+        Button(
+            onClick = { onIntent(ClientIntent.ToggleTerminalModifier(modifier)) },
+            contentPadding = OverlayKeyPadding,
+        ) { Text(label) }
     } else {
-        OutlinedButton(onClick = { onIntent(ClientIntent.ToggleTerminalModifier(modifier)) }) { Text(label) }
+        OutlinedButton(
+            onClick = { onIntent(ClientIntent.ToggleTerminalModifier(modifier)) },
+            contentPadding = OverlayKeyPadding,
+        ) { Text(label) }
     }
 }
 
@@ -448,6 +950,7 @@ private fun KeyButton(
     OutlinedButton(
         onClick = { onKey(TerminalKeyRequest(key, held)) },
         enabled = !suspended,
+        contentPadding = OverlayKeyPadding,
     ) { Text(label) }
 }
 
@@ -553,7 +1056,12 @@ private fun QuickSwitcherSessionRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(row.session.displayTitle, style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    text = row.session.displayTitle,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 Text(
                     text = stringResource(R.string.session_host_context, row.session.hostLabel),
                     style = MaterialTheme.typography.bodySmall,

@@ -11,16 +11,21 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assertHasNoClickAction
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.hasScrollToNodeAction
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.HostCapabilities
@@ -36,9 +41,11 @@ import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.hosts.HostLabel
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetadata
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
+import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterMetadataRow
 import io.github.rfairburn.pireviewgate.ui.client.SessionsScreen
 import io.github.rfairburn.pireviewgate.ui.client.UiCommitScope
 import io.github.rfairburn.pireviewgate.ui.client.sessionStatusChipText
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -46,7 +53,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Desktop status color parity on actual native session cards.
+ * Desktop status color parity on actual native session cards, plus the delivered
+ * activity line and activity-intent count chips.
  *
  * Only the observed value carries the status color and weight; the "Agent"/"Input"
  * labels stay neutral, the words stay readable, and exited/error cards show no input
@@ -64,31 +72,79 @@ class SessionCardStatusComponentTest {
         lifecycle: RosterLifecycle = RosterLifecycle.ALIVE,
         busy: Boolean? = null,
         pendingInput: Boolean? = null,
+        activeTasks: Long? = null,
+        activeShells: Long? = null,
+        backgroundTasks: Long? = null,
+        backgroundShells: Long? = null,
         exitCode: Double? = null,
+        activity: List<String> = emptyList(),
     ) = SessionUiState(
         hostId = host, hostLabel = "Status owner", hostRunId = run, stale = false, rosterRevision = 1,
         metadata = RemoteSessionMetadata(
             id = id, label = "Status $id", workspace = "/synthetic/status/$id",
             lifecycle = lifecycle, hasLiveProcess = lifecycle == RosterLifecycle.ALIVE, inputSurface = false,
-            rosterSlotId = "slot-$id", busy = busy, pendingInput = pendingInput, exitCode = exitCode,
+            rosterSlotId = "slot-$id", busy = busy, pendingInput = pendingInput,
+            activeTasks = activeTasks, activeShells = activeShells,
+            backgroundTasks = backgroundTasks, backgroundShells = backgroundShells,
+            exitCode = exitCode, activity = activity,
         ),
     )
 
+    /**
+     * One row as the wire decoder delivers it, handed to the card unchanged exactly as
+     * the client projection passes delivered metadata through.
+     */
+    private fun deliveredRow(
+        id: String,
+        activity: String = "[\"Ready\"]",
+        activeTasks: String = "null",
+        activeShells: String = "null",
+        backgroundTasks: String = "null",
+        backgroundShells: String = "null",
+    ): SessionUiState {
+        val metadata = requireNotNull(
+            RosterMetadataRow.parse(
+                Json.parseToJsonElement(
+                    """{"id":"$id","rosterSlotId":"slot-$id","label":"Status $id",""" +
+                        """"workspace":"/synthetic/status/$id","lifecycle":"alive","hasLiveProcess":true,""" +
+                        """"busy":false,"pendingInput":false,"inputSurface":false,"activity":$activity,""" +
+                        """"nativeSession":null,"backgroundTasks":$backgroundTasks,""" +
+                        """"backgroundShells":$backgroundShells,"activeTasks":$activeTasks,""" +
+                        """"activeShells":$activeShells}""",
+                ),
+            ),
+        )
+        return SessionUiState(
+            hostId = host, hostLabel = "Status owner", hostRunId = run, stale = false, rosterRevision = 1,
+            metadata = metadata,
+        )
+    }
+
     private val rows = listOf(
         row("running", busy = true, pendingInput = true),
-        row("unknown"),
+        row("unknown", backgroundTasks = 13, backgroundShells = 14),
         row("starting", lifecycle = RosterLifecycle.STARTING),
         row("exited", lifecycle = RosterLifecycle.EXITED, pendingInput = true, exitCode = 0.0),
         row("error", lifecycle = RosterLifecycle.ERROR, pendingInput = false, exitCode = 2.0),
+        row(
+            "background-positive",
+            activeTasks = 2, activeShells = 1, backgroundTasks = 20, backgroundShells = 10,
+        ),
+        row(
+            "background-zero",
+            activeTasks = 0, activeShells = 0, backgroundTasks = 8, backgroundShells = 9,
+        ),
+        row("task-unknown", activeShells = 1, backgroundTasks = 11, backgroundShells = 12),
+        row("shell-unknown", activeTasks = 2, backgroundTasks = 15, backgroundShells = 16),
     )
 
     private var dark by mutableStateOf(true)
 
-    private fun show() {
+    private fun show(cards: List<SessionUiState> = rows) {
         val state = ClientUiState(hostStates = listOf(HostUiState(
             host = ConfiguredHost(host, HostLabel.parse("Status owner"), Endpoint("status-a.invalid", 8443)),
             connection = HostConnectionState.CONNECTED,
-            roster = RosterSnapshot(RosterFreshness.CURRENT, run, 1, rows),
+            roster = RosterSnapshot(RosterFreshness.CURRENT, run, 1, cards),
             capabilities = HostCapabilities.UNKNOWN,
         )))
         compose.setContent {
@@ -175,6 +231,36 @@ class SessionCardStatusComponentTest {
         assertPaintedValue("Error 2", "Error 2", 0xC8253D, bold = true)
     }
 
+    @Test fun backgroundCountsRenderAsSeparateAccessibleNeutralChips() {
+        show()
+
+        fun assertBackgroundChips(title: String, tasks: String, shells: String) {
+            reveal(title)
+            listOf("bg tasks $tasks", "bg shells $shells").forEach { text ->
+                val node = compose.onNode(hasText(text) and hasAnyAncestor(card(title)))
+                node.assertIsDisplayed().assertHasNoClickAction()
+                val content = node.fetchSemanticsNode().config[SemanticsProperties.Text]
+                    .single { it.text == text }
+                assertTrue(content.spanStyles.isEmpty())
+            }
+        }
+
+        assertBackgroundChips("Status background-positive", "2", "1")
+        assertBackgroundChips("Status background-zero", "0", "0")
+        assertBackgroundChips("Status task-unknown", "unknown", "1")
+        assertBackgroundChips("Status shell-unknown", "2", "unknown")
+        assertBackgroundChips("Status unknown", "unknown", "unknown")
+
+        // Background chips do not replace or alter the established accessible status chips.
+        // Positive activity-intent counts mean running; input is a separate observation.
+        reveal("Status background-positive")
+        compose.onNode(hasText("Agent running") and hasAnyAncestor(card("Status background-positive")))
+            .assertIsDisplayed()
+        compose.onNode(hasText("Input state unknown") and hasAnyAncestor(card("Status background-positive")))
+            .assertIsDisplayed()
+        assertEquals(0, compose.onAllNodesWithText("bg tasks 2 | shells 1").fetchSemanticsNodes().size)
+    }
+
     @Test fun inputStatusIsShownOnlyForStartingAndAliveCards() {
         show()
         fun inputChips(title: String) = compose.onAllNodes(
@@ -192,5 +278,94 @@ class SessionCardStatusComponentTest {
         compose.onNodeWithText("Exited 0").fetchSemanticsNode()
         compose.onNodeWithText("Error 2").fetchSemanticsNode()
         assertTrue(compose.onAllNodesWithText("No agent").fetchSemanticsNodes().isNotEmpty())
+    }
+
+    @Test fun collapsedCardsShowTheFirstDeliveredActivityLineInFull() {
+        val long = "tool: read src/main/kotlin/io/github/rfairburn/pireviewgate/ui/client/SessionsScreen.kt now"
+        val second = "Reading 12 files"
+        show(
+            listOf(
+                row("activity-lines", activity = listOf("", "   ", long, second)),
+                row("activity-blank", activity = listOf("", " \t ")),
+            ),
+        )
+        reveal("Status activity-lines")
+        // One width-ellipsized line: the semantics keep the whole delivered text, so the
+        // ellipsis is a visual truncation and never the accessible fact.
+        val line = compose.onNode(hasText(long) and hasAnyAncestor(card("Status activity-lines")))
+        line.assertIsDisplayed()
+        assertEquals(long, line.fetchSemanticsNode().config[SemanticsProperties.Text].single { it.text == long }.text)
+        // One drawn line, truncated at the card width: the layout, not the string, is what
+        // is short; the accessible text above stays complete. The node is fetched on the
+        // test thread (it synchronizes with Compose idleness); only the layout action runs
+        // on the UI thread.
+        val layoutAction = line.fetchSemanticsNode()
+            .config[SemanticsActions.GetTextLayoutResult].action
+        val layouts = mutableListOf<TextLayoutResult>()
+        compose.runOnIdle { requireNotNull(layoutAction).invoke(layouts) }
+        assertEquals(1, layouts.size)
+        val layout = layouts.single()
+        assertEquals(1, layout.lineCount)
+        assertEquals(1, layout.layoutInput.maxLines)
+        assertEquals(TextOverflow.Ellipsis, layout.layoutInput.overflow)
+        // Only the first nonblank line is on the collapsed card; the rest stay for details.
+        assertEquals(0, compose.onAllNodesWithText(second).fetchSemanticsNodes().size)
+        assertEquals(1, compose.onAllNodesWithText("tool: read", substring = true).fetchSemanticsNodes().size)
+        // A blank-only activity adds no invented line and no details placeholder.
+        assertEquals(0, compose.onAllNodesWithText("No activity lines reported.").fetchSemanticsNodes().size)
+    }
+
+    @Test fun expandedDetailsKeepEveryDeliveredActivityLineUnchanged() {
+        show(listOf(row("activity-details", activity = listOf(" ", "tool: read", "Reading 12 files"))))
+        reveal("Status activity-details")
+        // Collapsed: the compact line only.
+        assertEquals(1, compose.onAllNodesWithText("tool: read").fetchSemanticsNodes().size)
+        assertEquals(0, compose.onAllNodesWithText("Reading 12 files").fetchSemanticsNodes().size)
+
+        compose.onNodeWithText("Actions").performClick()
+        compose.onNodeWithText("Show details").performClick()
+        compose.waitForIdle()
+        // Expanded: the compact line gives way to the delivered list, so every delivered
+        // line is present exactly as delivered and nothing is duplicated or dropped.
+        compose.onNodeWithText("Activity").fetchSemanticsNode()
+        assertEquals(1, compose.onAllNodesWithText("tool: read").fetchSemanticsNodes().size)
+        assertEquals(1, compose.onAllNodesWithText("Reading 12 files").fetchSemanticsNodes().size)
+    }
+
+    @Test fun deliveredWireCountsReachTheCountChipsIndependently() {
+        show(
+            listOf(
+                deliveredRow(
+                    "wire-zero", activeTasks = "0", activeShells = "0",
+                    backgroundTasks = "9", backgroundShells = "8",
+                ),
+                deliveredRow(
+                    "wire-positive", activeTasks = "3", activeShells = "2",
+                    backgroundTasks = "0", backgroundShells = "0",
+                ),
+                deliveredRow(
+                    "wire-partial", activeTasks = "null", activeShells = "1",
+                    backgroundTasks = "7", backgroundShells = "null",
+                ),
+            ),
+        )
+        fun chip(title: String, text: String) =
+            compose.onNode(hasText(text) and hasAnyAncestor(card("Status $title")))
+
+        reveal("Status wire-zero")
+        chip("wire-zero", "bg tasks 0").assertIsDisplayed()
+        chip("wire-zero", "bg shells 0").assertIsDisplayed()
+        reveal("Status wire-positive")
+        chip("wire-positive", "bg tasks 3").assertIsDisplayed()
+        chip("wire-positive", "bg shells 2").assertIsDisplayed()
+        // The delivered activity line reaches the same collapsed card.
+        chip("wire-positive", "Ready").assertIsDisplayed()
+        reveal("Status wire-partial")
+        chip("wire-partial", "bg tasks unknown").assertIsDisplayed()
+        chip("wire-partial", "bg shells 1").assertIsDisplayed()
+        // Delivered ownership counts are a different fact and never become intent counts.
+        listOf("bg tasks 9", "bg shells 8", "bg tasks 7").forEach { text ->
+            assertEquals(0, compose.onAllNodesWithText(text).fetchSemanticsNodes().size)
+        }
     }
 }

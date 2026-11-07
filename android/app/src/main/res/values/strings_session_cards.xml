@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Session card strings. The background line mirrors the desktop card's background
-  text: activity-intent counts only, and an unreported count is "unknown", never 0.
+  Session card background labels. Counts use activity-intent observations only;
+  an unreported count is "unknown", never 0.
 -->
 <resources>
-    <string name="session_card_background_unknown">background unknown</string>
-    <string name="session_card_background_counts">bg tasks %1$s | shells %2$s</string>
+    <string name="session_card_background_tasks_label">bg tasks</string>
+    <string name="session_card_background_shells_label">bg shells</string>
     <string name="session_card_count_unknown">unknown</string>
     <!--
       Status chips: a neutral label followed by the observed value. Only the value

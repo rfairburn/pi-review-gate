@@ -41,6 +41,20 @@ public fun sessionCardBackground(metadata: RemoteSessionMetadata): SessionCardBa
 /** Only a nonnegative count is an observation; everything else is unknown. */
 private fun reportedCount(value: Long?): Long? = value?.takeIf { it >= 0L }
 
+// ---- Activity line -------------------------------------------------------------
+
+/**
+ * The one compact activity line a collapsed session card shows, or `null`.
+ *
+ * It is the first nonblank line the owner delivered, returned unchanged: the card
+ * never invents a phrase and never derives one from a count, a busy bit, a
+ * lifecycle, or terminal output. A row that delivered no nonblank line draws no
+ * line at all, and its full activity list stays exactly as delivered for the
+ * details expansion.
+ */
+public fun sessionCardActivityLine(metadata: RemoteSessionMetadata): String? =
+    metadata.activity.firstOrNull { it.isNotBlank() }
+
 // ---- Presentation identity, fail closed -----------------------------------------
 
 /**

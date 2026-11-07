@@ -114,14 +114,203 @@ class TerminalTouchWheelComponentTest {
             tap.down(0, grid.x(2), grid.y(row))
             tap.up()
             assertPackets(fixture, anchor,
-                "\u001b[<0;2;${row + 1}M", "\u001b[<32;5;${row + 2}M", "\u001b[<3;5;${row + 2}m",
-                "\u001b[<0;3;${row + 1}M", "\u001b[<3;3;${row + 1}m",
+                "\u001b[<0;2;${row + 1}M", "\u001b[<32;5;${row + 2}M", "\u001b[<0;5;${row + 2}m",
+                "\u001b[<0;3;${row + 1}M", "\u001b[<0;3;${row + 1}m",
             )
             fixture.packets.clear()
             assertTrue(scroll(surface, grid.x(6), grid.y(row), 1f))
             assertTrue(scroll(surface, grid.x(6), grid.y(row), -1f))
             assertPackets(fixture, anchor, "\u001b[<64;7;${row + 1}M", "\u001b[<65;7;${row + 1}M")
             assertTrue(fixture.intents.none { it.intent is ClientIntent.SetTerminalKeyboardVisible })
+        }
+    }
+
+    @Test fun aOneFingerTapSendsALeftPressAndALeftReleaseAtThePressedCell() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val tap = Touch(fixture.surface!!)
+            tap.down(0, grid.x(2), grid.y(row))
+            tap.up()
+            assertPackets(fixture, anchor, "\u001b[<0;3;${row + 1}M", "\u001b[<0;3;${row + 1}m")
+        }
+    }
+
+    @Test fun sameCellJitterIsNotForwardedAndTheTapStillReleasesLeftAtThePressedCell() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val tap = Touch(fixture.surface!!)
+            tap.down(0, grid.x(2), grid.y(row))
+            tap.moveAllBy(grid.cellHeight / 4f)
+            tap.moveAllBy(-grid.cellHeight / 4f)
+            tap.up()
+            assertPackets(fixture, anchor, "\u001b[<0;3;${row + 1}M", "\u001b[<0;3;${row + 1}m")
+        }
+    }
+
+    @Test fun anAdjacentLiftWithoutForwardedMotionStillReleasesAtThePressedCell() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val tap = Touch(fixture.surface!!)
+            tap.down(0, grid.x(2), grid.y(row))
+            // The platform can report the lift one cell away even though no move was
+            // ever forwarded: the tap is still the press's own cell.
+            tap.upAt(grid.x(3), grid.y(row))
+            assertPackets(fixture, anchor, "\u001b[<0;3;${row + 1}M", "\u001b[<0;3;${row + 1}m")
+        }
+    }
+
+    @Test fun aCrossCellDragForwardsMotionAndReleasesLeftAtTheLiftedCell() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val drag = Touch(fixture.surface!!)
+            drag.down(0, grid.x(1), grid.y(row))
+            drag.moveTo(0, grid.x(3), grid.y(row + 1))
+            drag.moveTo(0, grid.x(4), grid.y(row + 1))
+            drag.upAt(grid.x(5), grid.y(row + 1))
+            assertPackets(fixture, anchor,
+                "\u001b[<0;2;${row + 1}M", "\u001b[<32;4;${row + 2}M", "\u001b[<32;5;${row + 2}M",
+                "\u001b[<0;6;${row + 2}m",
+            )
+            // A drag that comes back to its press cell is still a drag: a raw lift at a
+            // neighbouring cell names that lift, not the cell the press began at.
+            fixture.packets.clear()
+            val returned = Touch(fixture.surface!!)
+            returned.down(0, grid.x(1), grid.y(row))
+            returned.moveTo(0, grid.x(3), grid.y(row))
+            returned.moveTo(0, grid.x(1), grid.y(row))
+            returned.upAt(grid.x(2), grid.y(row))
+            assertPackets(fixture, anchor,
+                "\u001b[<0;2;${row + 1}M", "\u001b[<32;4;${row + 1}M", "\u001b[<32;2;${row + 1}M",
+                "\u001b[<0;3;${row + 1}m",
+            )
+        }
+    }
+
+    @Test fun sameCellJitterBeforeASecondFingerStillEndsThePressAsNoneAndStartsTheWheel() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val touch = Touch(fixture.surface!!)
+            touch.down(0, grid.x(1), grid.y(row))
+            touch.moveAllBy(grid.cellHeight / 4f)
+            assertPackets(fixture, anchor, "\u001b[<0;2;${row + 1}M")
+            fixture.packets.clear()
+            touch.pointerDown(1, grid.x(3), grid.y(row))
+            touch.moveAllBy(grid.cellHeight.toFloat())
+            touch.pointerUp(1)
+            touch.up()
+            // The jitter never became a drag, the press ends as no button, and the
+            // wheel reports without turning the transition into an activation.
+            assertPackets(fixture, anchor, "\u001b[<3;2;${row + 1}m", "\u001b[<64;3;${row + 1}M")
+        }
+    }
+
+    @Test fun aCancelledOneFingerGestureReleasesAsNoButtonAndNeverAsAClick() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val touch = Touch(fixture.surface!!)
+            touch.down(0, grid.x(2), grid.y(row))
+            assertPackets(fixture, anchor, "\u001b[<0;3;${row + 1}M")
+            fixture.packets.clear()
+            touch.cancel()
+            assertPackets(fixture, anchor, "\u001b[<3;3;${row + 1}m")
+        }
+    }
+
+    @Test fun aPressThatNeverLeftIsNeverFollowedByARelease() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val touch = Touch(fixture.surface!!)
+            touch.down(0, grid.x(2), anchor.contentRect.bottom + 1f)
+            assertTrue("A press outside the content does not leave: ${fixture.packets}", fixture.packets.isEmpty())
+            touch.upAt(grid.x(2), grid.y(row))
+            assertTrue("No admitted press means no release: ${fixture.packets}", fixture.packets.isEmpty())
+            assertTrue(fixture.refusals.contains(InputUnavailableReason.POINTER_OUTSIDE_CONTENT))
+        }
+    }
+
+    @Test fun aTapKeepsItsAnchorAcrossSameContextOutputBeforeTheRelease() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        val anchor = awaitMouseProof(fixture)
+        val touch = compose.runOnIdle {
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            Touch(fixture.surface!!).also {
+                it.down(0, grid.x(2), grid.y(row))
+                assertPackets(fixture, anchor, "\u001b[<0;3;${row + 1}M")
+                fixture.packets.clear()
+                repeat(10) { install(fixture, output(fixture.binding!!)) }
+            }
+        }
+        val newest = compose.runOnIdle { fixture.binding!!.publishSequence }
+        compose.waitUntil(10_000) { fixture.receipts.any { it.publishSequence == newest } }
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertEquals(anchor, surface.currentInputProof())
+            touch.up()
+            assertPackets(fixture, anchor, "\u001b[<0;3;${Grid(anchor).midRow + 1}m")
+        }
+    }
+
+    @Test fun aOneFingerGestureRetiredByFocusOrLayoutNeverReleasesUnderTheNextProof() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        for (disruption in listOf("focus", "layout")) {
+            val anchor = awaitMouseProof(fixture)
+            val grid = Grid(anchor)
+            val row = grid.midRow
+            val touch = compose.runOnIdle {
+                val surface = fixture.surface!!
+                fixture.packets.clear()
+                Touch(surface).also {
+                    it.down(0, grid.x(1), grid.y(row))
+                    assertPackets(fixture, anchor, "\u001b[<0;2;${row + 1}M")
+                    fixture.packets.clear()
+                    when (disruption) {
+                        "focus" -> {
+                            surface.clearFocus()
+                            assertTrue(surface.requestFocus())
+                        }
+                        else -> surface.layout(surface.left, surface.top, surface.right, surface.bottom - 1)
+                    }
+                    assertFalse("$disruption retires the proof", surface.verifyReceipt(anchor))
+                }
+            }
+            val fresh = awaitMouseProof(fixture)
+            compose.runOnIdle {
+                assertNotEquals(disruption, anchor, fresh)
+                touch.up()
+                assertTrue("$disruption: a retired gesture never releases under a fresh proof: ${fixture.packets}",
+                    fixture.packets.isEmpty())
+            }
         }
     }
 
@@ -194,7 +383,7 @@ class TerminalTouchWheelComponentTest {
             val fresh = Touch(surface)
             fresh.down(0, grid.x(2), grid.y(grid.midRow))
             fresh.up()
-            assertPackets(fixture, anchor, "\u001b[<0;3;${row}M", "\u001b[<3;3;${row}m")
+            assertPackets(fixture, anchor, "\u001b[<0;3;${row}M", "\u001b[<0;3;${row}m")
         }
     }
 
@@ -393,7 +582,7 @@ class TerminalTouchWheelComponentTest {
                 val fresh = Touch(surface)
                 fresh.down(0, grid.x(2), grid.y(grid.midRow))
                 fresh.up()
-                assertPackets(fixture, next, "\u001b[<0;3;${row}M", "\u001b[<3;3;${row}m")
+                assertPackets(fixture, next, "\u001b[<0;3;${row}M", "\u001b[<0;3;${row}m")
                 fixture.packets.clear()
             }
         }
@@ -441,6 +630,14 @@ class TerminalTouchWheelComponentTest {
         fun up() {
             send(MotionEvent.ACTION_UP, fingers.keys.toList(), null)
             fingers.clear()
+        }
+
+        /** Lift at a platform-reported point without forwarding a move from the old one. */
+        fun upAt(x: Float, y: Float) {
+            val finger = requireNotNull(fingers.values.firstOrNull()) { "a finger to lift" }
+            finger.x = x
+            finger.y = y
+            up()
         }
 
         fun cancel() {

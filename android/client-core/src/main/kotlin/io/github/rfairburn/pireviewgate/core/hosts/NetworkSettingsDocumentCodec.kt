@@ -9,6 +9,7 @@ import kotlinx.serialization.json.JsonPrimitive
  *
  * ```
  * {"version":1,"autoReconnect":false,"viewerRemoteInputEnabled":false,
+ *  "savedFirstReplyTimeoutSeconds":120,
  *  "hosts":[{"id":"...","label":"...","host":"...","port":8443,
  *            "previouslyConnected":true,"reconnectSuppressed":false}]}
  * ```
@@ -24,6 +25,10 @@ import kotlinx.serialization.json.JsonPrimitive
  * - `viewerRemoteInputEnabled` is the one optional default-on flag: a genuinely
  *   absent key means on, while a present key must be a real boolean. Only an
  *   explicit `false` is ever written.
+ * - `savedFirstReplyTimeoutSeconds` is optional only at its default of 60. An
+ *   absent key means 60, a present key must be a positive whole number inside the
+ *   document's existing nine-digit integer width, and the default is never written.
+ *   Zero is refused rather than meaning infinite, and nothing is clamped.
  * - Ports are JSON numbers in `1..65535` (a quoted port is refused); ids, labels,
  *   and hosts are bounds-checked; a duplicate id refuses the whole document.
  *
@@ -41,6 +46,7 @@ public object NetworkSettingsDocumentCodec {
     private const val KEY_VERSION = "version"
     private const val KEY_AUTO_RECONNECT = "autoReconnect"
     private const val KEY_VIEWER_REMOTE_INPUT = "viewerRemoteInputEnabled"
+    private const val KEY_SAVED_FIRST_REPLY_TIMEOUT = "savedFirstReplyTimeoutSeconds"
     private const val KEY_HOSTS = "hosts"
 
     private const val HOST_KEY_ID = "id"
@@ -50,7 +56,13 @@ public object NetworkSettingsDocumentCodec {
     private const val HOST_KEY_PREVIOUSLY_CONNECTED = "previouslyConnected"
     private const val HOST_KEY_RECONNECT_SUPPRESSED = "reconnectSuppressed"
 
-    private val TOP_LEVEL_KEYS = setOf(KEY_VERSION, KEY_AUTO_RECONNECT, KEY_VIEWER_REMOTE_INPUT, KEY_HOSTS)
+    private val TOP_LEVEL_KEYS = setOf(
+        KEY_VERSION,
+        KEY_AUTO_RECONNECT,
+        KEY_VIEWER_REMOTE_INPUT,
+        KEY_SAVED_FIRST_REPLY_TIMEOUT,
+        KEY_HOSTS,
+    )
     private val HOST_KEYS = setOf(
         HOST_KEY_ID,
         HOST_KEY_LABEL,
@@ -103,6 +115,18 @@ public object NetworkSettingsDocumentCodec {
             NetworkSettings.DEFAULT_VIEWER_REMOTE_INPUT_ENABLED
         }
 
+        // Optional only at its default: absent is 60, present must be admitted.
+        val savedFirstReplyTimeoutSeconds = if (KEY_SAVED_FIRST_REPLY_TIMEOUT in root) {
+            val seconds = root[KEY_SAVED_FIRST_REPLY_TIMEOUT].asNumberOrNull()
+                ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
+            if (!NetworkSettings.isValidSavedFirstReplyTimeoutSeconds(seconds)) {
+                return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
+            }
+            seconds
+        } else {
+            NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS
+        }
+
         val rawHosts = root[KEY_HOSTS].asArrayOrNull()
             ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
         if (rawHosts.size > HostCatalog.MAX_HOSTS) {
@@ -125,6 +149,7 @@ public object NetworkSettingsDocumentCodec {
                 autoReconnect = autoReconnect,
                 viewerRemoteInputEnabled = viewerRemoteInputEnabled,
                 hosts = HostCatalog.of(hosts),
+                savedFirstReplyTimeoutSeconds = savedFirstReplyTimeoutSeconds,
             ),
         )
     }
@@ -143,6 +168,11 @@ public object NetworkSettingsDocumentCodec {
             // Sparse default-on flag: an on value writes no key at all.
             if (!settings.viewerRemoteInputEnabled) {
                 append(",\"").append(KEY_VIEWER_REMOTE_INPUT).append("\":false")
+            }
+            // Sparse default: the default 60 writes no key at all.
+            if (settings.savedFirstReplyTimeoutSeconds != NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS) {
+                append(",\"").append(KEY_SAVED_FIRST_REPLY_TIMEOUT)
+                    .append("\":").append(settings.savedFirstReplyTimeoutSeconds)
             }
             append(",\"").append(KEY_HOSTS).append("\":[")
             settings.hosts.hosts.forEachIndexed { index, host ->

@@ -73,7 +73,8 @@ class AcceptedSavedDeletion private constructor(
 
     /** Only exact Deleted consumes this one-shot. Self-closing its own dialog is intentional. */
     fun refresh(event: RosterClientEvent.OperationSettled, display: SavedUiState, epoch: Long,
-                dialog: UiActionProof?): Refresh? {
+                dialog: UiActionProof?,
+                firstReplyTimeoutMs: Long = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS): Refresh? {
         if (settled) return null
         observe(display, epoch, dialog)
         settled = true
@@ -89,7 +90,8 @@ class AcceptedSavedDeletion private constructor(
         // Match the existing List query/window policy, not Search on the retired catalog.
         val command = RosterSavedListCommand(entry.hostRunId, query, 0, 50,
             RosterSendProof.PickerRead(send.channelGeneration, entry.hostRunId,
-                queryRevision = send.pickerRevision, ui = this), resultLifetime = resultLifetime)
+                queryRevision = send.pickerRevision, ui = this), resultLifetime = resultLifetime,
+            firstReplyTimeoutMs = firstReplyTimeoutMs)
         return Refresh(command, display.copy(status = SavedRequestStatus.Requesting, deletePreparation = null,
             listProof = null, windowProof = null, entryProofs = emptyMap()))
     }

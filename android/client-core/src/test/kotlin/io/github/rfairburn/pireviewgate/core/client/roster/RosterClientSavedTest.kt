@@ -5,6 +5,7 @@ import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedEntry
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedResumeFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedWindowOutcome
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterFrame
+import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterProtocol
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedDeleteMethod
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedDeleteRefusalReason
 import kotlin.test.Test
@@ -37,19 +38,27 @@ internal class RosterClientSavedTest {
             it.ownSavedWindow(entries = entries)
         }
 
-    private fun listCommand(harness: RosterClientHarness, query: String = "", offset: Long = 0L, count: Long = 32L) =
+    private fun listCommand(
+        harness: RosterClientHarness,
+        query: String = "",
+        offset: Long = 0L,
+        count: Long = 32L,
+        firstReplyTimeoutMs: Long = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS,
+    ) =
         RosterSavedListCommand(
             RosterClientHarness.RUN_ID,
             query,
             offset,
             count,
             RosterClientHarness.readProof(harness.generation, RosterClientHarness.RUN_ID),
+            firstReplyTimeoutMs = firstReplyTimeoutMs,
         )
 
     private fun searchCommand(
         harness: RosterClientHarness,
         catalogId: String = RosterClientHarness.CATALOG_ID,
         query: String = "needle",
+        firstReplyTimeoutMs: Long = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS,
     ) = RosterSavedSearchCommand(
         RosterClientHarness.RUN_ID,
         catalogId,
@@ -57,6 +66,7 @@ internal class RosterClientSavedTest {
         0L,
         32L,
         RosterClientHarness.readProof(harness.generation, RosterClientHarness.RUN_ID, catalogId, null),
+        firstReplyTimeoutMs = firstReplyTimeoutMs,
     )
 
     private fun windowCommand(
@@ -240,7 +250,13 @@ internal class RosterClientSavedTest {
         assertEquals(2L, searchFrame.sequence)
         assertEquals(searchFrame.sequence, search.sequence)
 
-        val listStep = harness.push(harness.endpoint.savedList(listCommand(harness, query = "newer")))
+        // Exercise the old 15-second first-reply boundary explicitly; the 60-second
+        // default has its own checks below.
+        val listStep = harness.push(
+            harness.endpoint.savedList(
+                listCommand(harness, query = "newer", firstReplyTimeoutMs = 15_000L),
+            ),
+        )
         val list = listStep.state.pending.single { it.kind.isSaved }
         val listAtAcceptance = list.copy()
         val listFrame = savedRequest(harness) as RosterFrame.SavedListRequest
@@ -604,6 +620,7 @@ internal class RosterClientSavedTest {
         harness.deliver(windowBegin(harness, requestId, rows = 2L, pageCount = 2L))
         val afterBegin = harness.pendingSavedDeadline()
         assertTrue(afterBegin > firstDue, "a progressing transfer must outlive the patience it was first given")
+        assertEquals(harness.now + harness.bounds.transferIdleTimeoutMs, afterBegin)
         val secondArm = harness.armed.keys.single {
             it.kind == RosterDeadlineKind.SAVED_RESULT && it.id == requestId
         }
@@ -622,6 +639,119 @@ internal class RosterClientSavedTest {
         val window = ((harness.settled().last().third as RosterRequestResult.OwnerResult).outcome
             as RosterOwnerOutcome.SavedWindow).facts as RosterSavedWindowFacts.Complete
         assertEquals(2, window.entries.size)
+    }
+
+    @Test
+    fun `default saved list and searches wait sixty seconds instead of the create result bound`() {
+        val listHarness = harness()
+        val listStart = listHarness.now
+        listHarness.push(listHarness.endpoint.savedList(listCommand(listHarness)))
+        assertEquals(listStart + DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS, listHarness.pendingSavedDeadline())
+
+        listHarness.advance(listHarness.bounds.createResultTimeoutMs + 1L)
+        assertTrue(listHarness.settled().isEmpty(), "the old 15-second create bound must not end a Saved read")
+
+        listHarness.advance(
+            DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS - (listHarness.bounds.createResultTimeoutMs + 1L) - 1L,
+        )
+        assertTrue(listHarness.settled().isEmpty(), "the read is still pending just before its own deadline")
+        listHarness.advance(1L)
+        listHarness.fireDeadline(RosterDeadlineKind.SAVED_RESULT)
+        assertEquals(RosterRequestResult.Unknown, listHarness.settled().single().third)
+        assertEquals(1, listHarness.countOfType("saved_list_request"))
+
+        val searchHarness = ownedHarness(entries = listOf(RosterClientHarness.entry(0)))
+        val settledBeforeSearch = searchHarness.settled().size
+        val searchStart = searchHarness.now
+        searchHarness.push(searchHarness.endpoint.savedSearch(searchCommand(searchHarness)))
+        assertEquals(searchStart + DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS, searchHarness.pendingSavedDeadline())
+
+        searchHarness.advance(searchHarness.bounds.createResultTimeoutMs + 1L)
+        assertEquals(settledBeforeSearch, searchHarness.settled().size)
+    }
+
+    @Test
+    fun `a custom saved read wait is captured at admission and a later read uses its own`() {
+        val harness = harness()
+        val firstStart = harness.now
+        harness.push(harness.endpoint.savedList(listCommand(harness, query = "first", firstReplyTimeoutMs = 120_000L)))
+        assertEquals(firstStart + 120_000L, harness.pendingSavedDeadline())
+
+        harness.advance(DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS)
+        assertTrue(harness.settled().isEmpty(), "an admitted read keeps the wait it captured")
+        assertEquals(firstStart + 120_000L, harness.pendingSavedDeadline())
+
+        val secondStart = harness.now
+        harness.push(harness.endpoint.savedList(listCommand(harness, query = "second", firstReplyTimeoutMs = 1_000L)))
+        assertEquals(RosterRequestResult.Unknown, harness.settled().single().third)
+        assertEquals(secondStart + 1_000L, harness.pendingSavedDeadline())
+
+        harness.advance(1_001L)
+        harness.fireDeadline(RosterDeadlineKind.SAVED_RESULT)
+        assertEquals(RosterRequestResult.Unknown, harness.settled().last().third)
+        assertEquals(2, harness.countOfType("saved_list_request"))
+    }
+
+    @Test
+    fun `a nonpositive or unsafe local Saved wait is refused before encoding`() {
+        val harness = harness()
+        for (invalid in listOf(0L, -1L, Long.MAX_VALUE)) {
+            harness.push(harness.endpoint.savedList(listCommand(harness, firstReplyTimeoutMs = invalid)))
+        }
+
+        assertEquals(
+            List(3) { RosterOperationKind.SAVED_LIST to RosterNotSentReason.INVALID_REQUEST },
+            harness.refusals(),
+        )
+        assertEquals(0, harness.countOfType("saved_list_request"))
+        assertTrue(harness.endpoint.state().pending.none { it.kind.isSaved })
+    }
+
+    @Test
+    fun `saved window and create first replies keep the unchanged fifteen second bound`() {
+        val harness = ownedHarness(entries = listOf(RosterClientHarness.entry(0)))
+        val windowStart = harness.now
+        harness.push(harness.endpoint.savedWindow(windowCommand(harness, count = 1L)))
+        assertEquals(windowStart + harness.bounds.createResultTimeoutMs, harness.pendingSavedDeadline())
+
+        val createStart = harness.now
+        val workspace = "/srv/owner/work"
+        harness.push(
+            harness.endpoint.createSession(
+                RosterCreateCommand(
+                    RosterClientHarness.RUN_ID,
+                    workspace,
+                    RosterClientHarness.formProof(harness.generation, RosterClientHarness.RUN_ID, workspace),
+                ),
+            ),
+        )
+        val create = harness.endpoint.state().pending.single { it.kind == RosterOperationKind.CREATE }
+        assertEquals(createStart + harness.bounds.createResultTimeoutMs, create.deadlineAtMs)
+    }
+
+    @Test
+    fun `saved read patience stays local and never changes wire bytes`() {
+        fun encodedList(timeoutMs: Long): ByteArray {
+            val harness = harness()
+            harness.push(harness.endpoint.savedList(listCommand(harness, firstReplyTimeoutMs = timeoutMs)))
+            return RosterProtocol.encode(harness.sends.last().frame, harness.bounds)
+        }
+
+        fun encodedSearch(timeoutMs: Long): ByteArray {
+            val harness = ownedHarness(entries = listOf(RosterClientHarness.entry(0)))
+            harness.push(harness.endpoint.savedSearch(searchCommand(harness, firstReplyTimeoutMs = timeoutMs)))
+            return RosterProtocol.encode(harness.sends.last().frame, harness.bounds)
+        }
+
+        val defaultBytes = encodedList(DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS)
+        val customBytes = encodedList(120_000L)
+
+        assertTrue(
+            defaultBytes.contentEquals(customBytes),
+            "the local patience must not alter the owner request",
+        )
+        assertTrue(!defaultBytes.decodeToString().contains("timeout", ignoreCase = true))
+        assertTrue(encodedSearch(DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS).contentEquals(encodedSearch(120_000L)))
     }
 
     // --------------------------------------------------------------- policy

@@ -8,14 +8,22 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.rfairburn.pireviewgate.R
@@ -23,6 +31,8 @@ import io.github.rfairburn.pireviewgate.core.client.ui.ClientIdentityState
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientStorageState
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientUiState
+import io.github.rfairburn.pireviewgate.core.client.ui.SavedFirstReplyTimeoutEditor
+import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.hosts.StorageFailureReason
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionObservation
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionStatus
@@ -30,10 +40,11 @@ import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionS
 /**
  * The settings screen.
  *
- * Only what this client actually is: a viewer. It exposes the two remembered global
+ * Only what this client actually is: a viewer. It exposes the three remembered global
  * preferences with their source defaults — automatic reconnect off, this viewer's
- * remote native input and copy on — plus this device's own identity fingerprint when
- * it is known and the state of its private storage.
+ * remote native input and copy on, and a 60-second Saved first-reply timeout — plus
+ * this device's own identity fingerprint when it is known and the state of its
+ * private storage.
  *
  * There is deliberately no hosting control, no incoming-connection grant or revoke,
  * no listener control, and no owner-side history or policy control: this client hosts
@@ -64,6 +75,10 @@ fun SettingsScreen(
             checked = state.settings.viewerRemoteInputEnabled,
             onCheckedChange = { onIntent(ClientIntent.SetViewerRemoteInputEnabled(it)) },
         )
+        SavedFirstReplyTimeoutRow(
+            currentSeconds = state.settings.savedFirstReplyTimeoutSeconds,
+            onSave = { onIntent(ClientIntent.SetSavedFirstReplyTimeoutSeconds(it)) },
+        )
 
         SectionTitle(stringResource(R.string.settings_identity_section))
         IdentitySection(state.identity)
@@ -83,6 +98,57 @@ fun SettingsScreen(
             text = permissionText(state.localNetworkPermission),
             style = MaterialTheme.typography.bodyMedium,
         )
+    }
+}
+
+/**
+ * One editable global preference with an explicit save.
+ *
+ * The text is a local draft: changing it writes nothing and emits nothing. Only the
+ * Save control emits the parsed value, and invalid text leaves that control disabled
+ * with the fixed error below the field.
+ */
+@Composable
+private fun SavedFirstReplyTimeoutRow(
+    currentSeconds: Int,
+    onSave: (Int) -> Unit,
+) {
+    var editor by remember(currentSeconds) {
+        mutableStateOf(SavedFirstReplyTimeoutEditor.of(currentSeconds))
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            stringResource(R.string.setting_saved_first_reply_timeout),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.setting_saved_first_reply_timeout_body),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+            value = editor.draft,
+            onValueChange = { editor = editor.edited(it) },
+            label = { Text(stringResource(R.string.setting_saved_first_reply_timeout_field)) },
+            isError = editor.showsError,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (editor.showsError) {
+            NoticeText(
+                stringResource(
+                    R.string.setting_saved_first_reply_timeout_invalid,
+                    NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
+                ),
+            )
+        }
+        Button(
+            onClick = { editor.parsedSeconds?.let(onSave) },
+            enabled = editor.canSave,
+        ) {
+            Text(stringResource(R.string.setting_saved_first_reply_timeout_save))
+        }
     }
 }
 

@@ -1433,7 +1433,11 @@ supplies the actual new result, including zero or a nonzero total; deletion itse
 never implies an empty result.
 Leaving or changing that picker cancels this read continuation, not the reported
 Delete outcome. Prepare-only, refused, unconfirmed, and uncertain outcomes do not
-trigger it, and Delete is never retried.
+trigger it, and Delete is never retried. Canceling the post-delete read retires its
+pending status without issuing another request; late replies cannot revive it.
+This is part of the experimental
+[Android phone client](#android-phone-client-experimental) behavior described later
+on this page.
 
 **Fences and outcomes.** Requests come from the picker frame, or confirmation, that the
 writer actually wrote. Resume and delete-prepare need the written picker; a confirmed
@@ -1451,6 +1455,59 @@ loss after a write may have been invoked is `unknown`. Nothing is retried, repla
 regranted, reconnected, or claimed cancelled automatically. Refusals and uncertainty
 appear as brief, fixed, non-modal notices without raw errors or payloads, and they
 never steal focus.
+
+### Android phone client (experimental)
+
+The Android client remains experimental: it is not daily-use or release-ready, and
+device and runtime acceptance remain pending. This phase is
+client-only and changes no production host, backend, or protocol behavior. It includes
+the Saved delete refresh above.
+
+**Terminal input.** A single-finger tap on the terminal delivers one clean host
+left-click and does not open the IME. A real drag still reaches the host as
+selection/drag input, a two-finger vertical swipe still produces the owner's own wheel
+reports, and the existing committed-frame, ownership, focus, and input fences remain
+unchanged. Stream retirement handles late internal notifications without abandoning
+accepted input settlements.
+
+**Create and Close.** Create submits once from the exact drawn form. After the
+correlated owner `started` answer, the client closes only that exact form and may
+activate only the matching row in the owner's current roster. Later user navigation,
+background or focus loss, or a connection or owner-run change cancels the deferred
+activation permanently. Nothing is retried or invented. Close addresses the stable
+owner row. When the owner actually answers `CONFIRMATION_REQUIRED`, the phone client
+opens a distinct second confirmation entirely in its own UI. It never automatically
+resends `confirmed = true`, requires no desktop step, and performs no optimistic row
+removal or Saved-conversation deletion.
+
+**Session cards.** A compact card title is one line and width-ellipsized; the full
+title stays available in details and accessibility text. Cards show the delivered
+owner activity: a tool name, `Working`, or `Ready`, not full shell command text.
+Native noninteractive activity-intent counts appear as `activeTasks` and
+`activeShells` bubbles: an explicit `0` stays zero, a missing count stays unknown, and
+the ownership counts are never substituted. There are no job lists or count popups.
+
+**Overlay placement.** The controls strip, status area, and Keys panel keep three
+independent positions, remembered separately for portrait and landscape across app
+restarts. Each moves by long-press drag on its own surface, with no extra grip. The
+compact keyboard icon and Keys entry keep their existing actions and 48 dp touch
+accessibility. Placement data is cosmetic and isolated from host, trust, identity, and
+settings state. Malformed or unreadable placement content restores defaults with a
+warning, then resumes saving and overwrites only that invalid cosmetic data; ordinary
+path, ownership, and permission protections remain, and write failures are reported.
+Open/closed overlay state, modifier latches, and dismissed status notices are not
+persisted. Terminal geometry stays stable while the IME or overlays move; existing
+Back/reset behavior remains, and no new keyboard implementation is added.
+
+**Saved first reply timeout.** The phone client's Settings screen accepts a positive
+finite whole number of seconds for the Saved first reply, default 60. New LIST and
+SEARCH requests capture the setting when issued, including the automatic refresh after
+an exact successful delete. The wait is local only and is not sent to the owner. The
+separate 30-second idle bound that begins after a transfer starts, and other operation
+deadlines, caps, cancellation, late-result fencing, and no-automatic-retry behavior,
+are unchanged. A Saved LIST that changes from pending to unknown is not proven to be
+caused or fixed by this timeout, and no new diagnostics are part of this phase. No
+pagination scope, clipboard acceptance, or new permission is implied.
 
 ## Focus, display, and status
 

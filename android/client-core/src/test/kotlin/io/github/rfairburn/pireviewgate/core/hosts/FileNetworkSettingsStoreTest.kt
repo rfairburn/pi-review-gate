@@ -203,6 +203,20 @@ class FileNetworkSettingsStoreTest {
     }
 
     @Test
+    fun `an old document without the saved timeout reads as sixty and is not rewritten`() {
+        val old = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}\n"
+        tree.settingsContainer.mkdirs()
+        tree.settingsDocument.writeText(old)
+
+        val store = FileNetworkSettingsStore(tree.settingsStorage())
+        val loaded = store.read()!!
+        store.close()
+
+        assertEquals(60, loaded.savedFirstReplyTimeoutSeconds)
+        assertEquals(old, tree.settingsDocument.readText(), "reading defaults must not create a migration")
+    }
+
+    @Test
     fun `an empty document is malformed rather than empty defaults`() {
         tree.settingsContainer.mkdirs()
         tree.settingsDocument.writeText("")

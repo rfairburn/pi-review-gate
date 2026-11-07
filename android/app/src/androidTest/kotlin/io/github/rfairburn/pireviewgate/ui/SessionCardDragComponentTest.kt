@@ -432,18 +432,29 @@ class SessionCardDragComponentTest {
         assertEquals(slot(hostA, "a2"), a2.presentationIdentity)
     }
 
-    @Test fun backgroundLineShowsActivityCountsAndUnknownNeverZero() {
+    @Test fun backgroundChipsShowActivityCountsAndUnknownNeverZero() {
         show(stateOf(listOf(
             row(hostA, "n1", backgroundTasks = 4, backgroundShells = 5),
             row(hostA, "n2", activeTasks = 0, activeShells = null),
             row(hostA, "n3", activeTasks = 0, activeShells = 0, backgroundTasks = 7),
             row(hostA, "n4", activeTasks = 2, activeShells = 1),
         )))
-        compose.onAllNodesWithText("background unknown").assertCountEquals(1)
-        compose.onAllNodesWithText("bg tasks 0 | shells unknown").assertCountEquals(1)
-        compose.onAllNodesWithText("bg tasks 0 | shells 0").assertCountEquals(1)
-        compose.onAllNodesWithText("bg tasks 2 | shells 1").assertCountEquals(1)
+        // Activity-intent counts are chips; a missing count is unknown, never zero.
+        compose.onAllNodesWithText("bg tasks unknown").assertCountEquals(1)
+        compose.onAllNodesWithText("bg shells unknown").assertCountEquals(2)
+        compose.onAllNodesWithText("bg tasks 0").assertCountEquals(2)
+        compose.onAllNodesWithText("bg shells 0").assertCountEquals(1)
+        compose.onAllNodesWithText("bg tasks 2").assertCountEquals(1)
+        compose.onAllNodesWithText("bg shells 1").assertCountEquals(1)
+        // Ownership counts stay in details and are never presented as activity.
         compose.onAllNodesWithText("bg tasks 4", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("bg tasks 7", substring = true).assertCountEquals(0)
+        // The retired plain line is not drawn alongside the native chips.
+        listOf(
+            "background unknown",
+            "bg tasks 0 | shells unknown",
+            "bg tasks 0 | shells 0",
+            "bg tasks 2 | shells 1",
+        ).forEach { text -> compose.onAllNodesWithText(text).assertCountEquals(0) }
     }
 }

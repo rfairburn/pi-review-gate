@@ -25,6 +25,30 @@ dates.
   environment; Android failures block the whole release. Published retries are
   read-only, and historical Node-only releases retain their original contract.
 
+### Changed
+
+- **Experimental Android phone feedback (#508)**: terminal taps send clean host
+  left-clicks without opening the keyboard; drag, selection, wheel input, and proof
+  fences remain. Retiring a terminal stream handles late notifications without
+  abandoning input settlements. Create closes its exact form after owner-confirmed `started` and
+  opens only the matching current row unless superseded. Close tolerates ordinary
+  metadata refreshes and presents any owner-required second confirmation in mobile,
+  never automatically resending, removing rows optimistically, or deleting Saved data.
+- Compact session titles use one-line width ellipsis with full accessibility text.
+  Cards show delivered owner activity (a tool name, `Working`, or `Ready`) and
+  noninteractive activity-intent count bubbles; zero and unknown stay distinct, with
+  no ownership-count substitution or job popups. Controls, status, and Keys move
+  independently by long-press drag, with separate portrait/landscape positions saved
+  across restarts. Compact controls retain their actions and touch targets without
+  reflowing the terminal. Invalid cosmetic placement warns and can be replaced by a
+  later save; host settings, trust, identity, and storage protections are unchanged.
+- Android Settings now configures the local Saved LIST/SEARCH first-reply timeout
+  (positive whole seconds, default 60), captured by each new read, including confirmed
+  delete refresh. The 30-second begun-transfer idle bound, other deadlines, and
+  cancellation/no-retry rules are unchanged. Canceling a post-delete refresh clears
+  its stale pending status without making another request. This does not establish the cause of
+  observed unknown outcomes or complete device/runtime acceptance.
+
 ### Fixed
 
 - Android Saved now requests one fresh List after an exact confirmed successful

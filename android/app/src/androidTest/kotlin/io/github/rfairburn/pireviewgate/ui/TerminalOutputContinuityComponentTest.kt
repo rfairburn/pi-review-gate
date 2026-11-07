@@ -8,6 +8,7 @@ import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -231,7 +232,7 @@ class TerminalOutputContinuityComponentTest {
             val raised = runCatching { compose.waitUntil(1_500) { imeVisible() } }.isSuccess
             assertFalse("A terminal tap must not raise the soft keyboard", raised)
             // The explicit keyboard control remains the one path that opens it.
-            compose.onNodeWithText("Keyboard").assertIsDisplayed().performClick()
+            compose.onNodeWithContentDescription("Keyboard").assertIsDisplayed().performClick()
             compose.runOnIdle {
                 assertEquals(ClientIntent.SetTerminalKeyboardVisible(true), fixture.intents.last().intent)
             }

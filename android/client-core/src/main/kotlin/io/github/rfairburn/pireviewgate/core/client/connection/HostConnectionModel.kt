@@ -2,6 +2,7 @@ package io.github.rfairburn.pireviewgate.core.client.connection
 
 import io.github.rfairburn.pireviewgate.core.hosts.Endpoint
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
+import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.hosts.StorageFailureReason
 
 /**
@@ -219,4 +220,12 @@ public data class ConnectionRegistrySnapshot(
      * error thrown" for "the durable state matches what I asked for".
      */
     public val notice: RegistryNotice?,
+
+    /**
+     * Saved LIST/SEARCH first-reply patience, in whole seconds.
+     *
+     * This is a local requester deadline only; it never appears on the wire. Absent
+     * saved configuration reports the in-memory default of 60.
+     */
+    public val savedFirstReplyTimeoutSeconds: Int = NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
 )

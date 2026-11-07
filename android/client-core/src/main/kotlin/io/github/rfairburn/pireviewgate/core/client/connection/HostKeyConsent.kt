@@ -162,6 +162,9 @@ public enum class HostCommandRefusal {
     /** Saved configuration refused the publication. */
     SETTINGS_UNAVAILABLE,
 
+    /** The requested value is not one this setting admits. Nothing was written. */
+    INVALID_VALUE,
+
     /** Trust storage refused. */
     TRUST_UNAVAILABLE,
     ;

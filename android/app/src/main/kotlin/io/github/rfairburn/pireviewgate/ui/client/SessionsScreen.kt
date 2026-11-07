@@ -61,6 +61,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -91,6 +92,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.SessionStatusTheme
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.UiCoverage
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardAccessibleMoves
+import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardActivityLine
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardBackground
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardStatusRoles
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionDragEdgeScroll
@@ -667,7 +669,12 @@ private fun SessionCard(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(modifier = Modifier.weight(1f).then(dragRegionTitle)) {
-                Text(text = row.displayTitle, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    text = row.displayTitle,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 Text(
                     text = stringResource(R.string.session_host_context, row.hostLabel),
                     style = MaterialTheme.typography.bodySmall,
@@ -747,11 +754,27 @@ private fun SessionCard(
                 if (row.stale) TextChip(stringResource(R.string.roster_stale))
             }
 
-            Text(
-                text = backgroundText(sessionCardBackground(row.metadata)),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                backgroundChipTexts(sessionCardBackground(row.metadata)).forEach { chip ->
+                    StatusValueChip(chip)
+                }
+            }
+
+            // One compact line of the owner's own activity, the same fact the desktop
+            // card shows. Only the first nonblank delivered line is drawn here; the
+            // full delivered list stays untouched in the details expansion, which
+            // supersedes this line. Nothing is invented for a row that delivered no
+            // nonblank line, and nothing is derived from counts, busy, or output.
+            if (!expanded) {
+                sessionCardActivityLine(row.metadata)?.let { activity ->
+                    Text(
+                        text = activity,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
 
             row.metadata.error?.let { NoticeText(stringResource(R.string.session_error, it)) }
 
@@ -857,18 +880,30 @@ private fun inputChipText(observation: InputObservation, style: SessionStatusSty
     )
 }
 
-/** The desktop card's background line: activity-intent counts, unknown never zero. */
+/** Two neutral background chips from activity-intent counts; unknown never means zero. */
 @Composable
-private fun backgroundText(background: SessionCardBackground): String = when (background) {
-    SessionCardBackground.Unknown -> stringResource(R.string.session_card_background_unknown)
-    is SessionCardBackground.Counts -> {
-        val unknown = stringResource(R.string.session_card_count_unknown)
-        stringResource(
-            R.string.session_card_background_counts,
-            background.activeTasks?.toString() ?: unknown,
-            background.activeShells?.toString() ?: unknown,
-        )
+private fun backgroundChipTexts(background: SessionCardBackground): List<AnnotatedString> {
+    val taskCount = when (background) {
+        SessionCardBackground.Unknown -> null
+        is SessionCardBackground.Counts -> background.activeTasks
     }
+    val shellCount = when (background) {
+        SessionCardBackground.Unknown -> null
+        is SessionCardBackground.Counts -> background.activeShells
+    }
+    val unknown = stringResource(R.string.session_card_count_unknown)
+    return listOf(
+        sessionStatusChipText(
+            stringResource(R.string.session_card_background_tasks_label),
+            taskCount?.toString() ?: unknown,
+            null,
+        ),
+        sessionStatusChipText(
+            stringResource(R.string.session_card_background_shells_label),
+            shellCount?.toString() ?: unknown,
+            null,
+        ),
+    )
 }
 
 /**

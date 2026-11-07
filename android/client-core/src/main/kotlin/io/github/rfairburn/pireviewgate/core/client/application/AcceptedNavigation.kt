@@ -33,6 +33,22 @@ class AcceptedNavigation {
         return Wanted(++nextEpoch, target, connectionGeneration).also { current.set(it) }
     }
 
+    /**
+     * Admit the one target an accepted create's owner actually returned.
+     *
+     * This is deliberately not another click-proof entry point: [created] is the
+     * preserved committed form receipt and accepted operation provenance, and its own
+     * [AcceptedCreateActivation.claim] admits exactly one exact run/row on the exact
+     * connection attempt. The caller has already observed that row in a CURRENT
+     * roster; navigation measurement remains the existing flow's responsibility.
+     */
+    @Synchronized
+    fun acceptReturnedRow(target: TerminalTarget, connectionGeneration: Long,
+                          created: AcceptedCreateActivation): Wanted? {
+        if (!created.claim(target, connectionGeneration)) return null
+        return Wanted(++nextEpoch, target, connectionGeneration).also { current.set(it) }
+    }
+
     fun wanted(): Wanted? = current.get()
     fun cancel() { current.set(null) }
     fun isCurrent(wanted: Wanted): Boolean = current.get() === wanted

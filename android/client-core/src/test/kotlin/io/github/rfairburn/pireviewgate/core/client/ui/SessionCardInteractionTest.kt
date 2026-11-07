@@ -4,6 +4,7 @@ import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationIdentity
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationMovePosition
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationOwnerKind
+import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -12,10 +13,13 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Session-card drag ordering, accessible moves, and the background line.
+ * Session-card drag ordering, accessible moves, the background line, and the compact
+ * owner-activity line.
  *
  * Every drop resolves to at most one existing [ClientIntent.MoveSessionRow] addressed
  * by presentation identities; anything stale, ambiguous, or unchanged drops nothing.
+ * The card facts read only delivered observations: intent counts are never ownership
+ * counts, an absent count is never zero, and a missing activity line is never invented.
  */
 class SessionCardInteractionTest {
 
@@ -75,6 +79,70 @@ class SessionCardInteractionTest {
             "a", backgroundTasks = 9L, backgroundShells = 9L, activeTasks = 1L, activeShells = 2L,
         )
         assertEquals(SessionCardBackground.Counts(1L, 2L), sessionCardBackground(both.metadata))
+    }
+
+    // -- compact activity line -------------------------------------------------------
+
+    @Test
+    fun `the compact line is the first nonblank delivered activity line`() {
+        val row = ClientUiFixtures.row("a", activity = listOf("", "  \t", "tool: read", "Ready"))
+        assertEquals("tool: read", sessionCardActivityLine(row.metadata))
+    }
+
+    @Test
+    fun `the compact line is the delivered text unchanged`() {
+        val row = ClientUiFixtures.row("a", activity = listOf("  tool: read  ", "second"))
+        assertEquals("  tool: read  ", sessionCardActivityLine(row.metadata))
+    }
+
+    @Test
+    fun `no nonblank delivered activity invents no compact line`() {
+        assertNull(sessionCardActivityLine(ClientUiFixtures.row("a", activity = emptyList()).metadata))
+        assertNull(sessionCardActivityLine(ClientUiFixtures.row("a", activity = listOf("", " \t ")).metadata))
+    }
+
+    @Test
+    fun `counts busy and lifecycle never synthesize a compact activity line`() {
+        val rows = listOf(
+            // Positive and zero activity-intent counts, alive and idle-looking, no lines.
+            ClientUiFixtures.row("a", busy = true, activeTasks = 3L, activeShells = 1L, activity = emptyList()),
+            ClientUiFixtures.row(
+                "a", busy = false, pendingInput = false, activeTasks = 0L, activeShells = 0L, activity = emptyList(),
+            ),
+            // Ownership counts differ from intent counts and still say nothing about activity.
+            ClientUiFixtures.row(
+                "a", backgroundTasks = 6L, backgroundShells = 5L, activity = emptyList(),
+            ),
+            ClientUiFixtures.row("a", lifecycle = RosterLifecycle.EXITED, activity = emptyList()),
+        )
+        for (row in rows) {
+            assertNull(sessionCardActivityLine(row.metadata), "row ${row.rowId} invented activity")
+            assertEquals(emptyList(), row.metadata.activity)
+        }
+    }
+
+    @Test
+    fun `the compact line leaves the delivered activity list for details unchanged`() {
+        val delivered = listOf("", "tool: read", "Reading 12 files")
+        val row = ClientUiFixtures.row("a", activity = delivered)
+        assertEquals("tool: read", sessionCardActivityLine(row.metadata))
+        assertEquals(delivered, row.metadata.activity)
+    }
+
+    @Test
+    fun `a count and activity update keeps the row identity and drag membership`() {
+        val before = ClientUiFixtures.row("a", rowId = "r1", activity = listOf("Ready"))
+        val after = before.copy(
+            metadata = before.metadata.copy(
+                activeTasks = 0L,
+                activeShells = 4L,
+                backgroundTasks = 7L,
+                activity = listOf("tool: read"),
+            ),
+        )
+        assertEquals(SessionRowKey.of(before), SessionRowKey.of(after))
+        assertEquals(before.presentationIdentity, after.presentationIdentity)
+        assertEquals(sessionDragMembership(listOf(before)), sessionDragMembership(listOf(after)))
     }
 
     // -- identity, fail closed --------------------------------------------------------

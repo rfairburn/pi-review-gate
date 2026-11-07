@@ -56,6 +56,7 @@ class ClientActivity : ComponentActivity() {
                 }
                 val state by app.ui.collectAsState()
                 val status by app.status.collectAsState()
+                val overlayPlacement by appOwner.overlayPlacements.uiState.collectAsState()
                 val rationale by window.permissionRationale.collectAsState()
                 val capturedFrame = state
                 val capturedRoute = capturedFrame.route
@@ -82,6 +83,12 @@ class ClientActivity : ComponentActivity() {
                             onTerminalPaste = { window.paste((capturedRoute as? ClientRoute.Terminal)?.terminal?.target) },
                             terminalContent = { window.Surface() },
                             status = status,
+                            overlayPlacement = overlayPlacement.placement,
+                            overlayPlacementWarning = overlayPlacement.warning,
+                            overlayPlacementReady = overlayPlacement.ready,
+                            onOverlayPlacementCommitted = { placement ->
+                                appOwner.overlayPlacements.commit(placement)
+                            },
                         )
                     }
                 }

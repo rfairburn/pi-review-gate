@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -100,6 +101,70 @@ class NetworkSettingsDocumentCodecTest {
             StorageFailureReason.MALFORMED,
             decodeInvalid("{\"version\":1,\"autoReconnect\":\"false\",\"hosts\":[]}"),
         )
+    }
+
+    @Test
+    fun `an absent saved first reply timeout means sixty and default encoding stays sparse`() {
+        val oldDocument = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}"
+        val decoded = decodeValid(oldDocument)
+        assertEquals(60, decoded.savedFirstReplyTimeoutSeconds)
+        assertEquals(
+            "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}\n",
+            NetworkSettingsDocumentCodec.encode(decoded),
+        )
+
+        val withHost = NetworkSettings(
+            autoReconnect = true,
+            viewerRemoteInputEnabled = false,
+            hosts = HostCatalog.of(listOf(first)),
+        )
+        val text = NetworkSettingsDocumentCodec.encode(withHost)
+        assertFalse(text.contains("savedFirstReplyTimeoutSeconds"), "the default timeout stays sparse: $text")
+        assertEquals(withHost, decodeValid(text))
+    }
+
+    @Test
+    fun `a custom saved first reply timeout round trips and invalid values are refused`() {
+        val custom = NetworkSettings(
+            autoReconnect = false,
+            viewerRemoteInputEnabled = true,
+            hosts = HostCatalog.of(listOf(first)),
+            savedFirstReplyTimeoutSeconds = 120,
+        )
+        val text = NetworkSettingsDocumentCodec.encode(custom)
+        assertTrue(text.contains("\"savedFirstReplyTimeoutSeconds\":120"), text)
+        assertEquals(custom, decodeValid(text))
+
+        val base = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]"
+        for (bad in listOf("0", "-1", "1.5", "1e2", "\"60\"", "null", "1000000000")) {
+            assertEquals(
+                StorageFailureReason.MALFORMED,
+                decodeInvalid("$base,\"savedFirstReplyTimeoutSeconds\":$bad}"),
+                "must refuse $bad rather than default or clamp",
+            )
+        }
+    }
+
+    @Test
+    fun `saved first reply timeout input admits only positive whole seconds in the document range`() {
+        assertEquals(1, NetworkSettings.parseSavedFirstReplyTimeoutSeconds("1"))
+        assertEquals(60, NetworkSettings.parseSavedFirstReplyTimeoutSeconds(" 60 "))
+        assertEquals(
+            NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
+            NetworkSettings.parseSavedFirstReplyTimeoutSeconds(
+                NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS.toString(),
+            ),
+        )
+        for (bad in listOf("", " ", "0", "-1", "+1", "1.0", "1e3", "1000000000", "9999999999")) {
+            assertNull(NetworkSettings.parseSavedFirstReplyTimeoutSeconds(bad), "must refuse '$bad'")
+        }
+        assertEquals(60_000L, NetworkSettings.savedFirstReplyTimeoutMillis(60))
+        assertEquals(
+            NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS.toLong() * 1_000L,
+            NetworkSettings.savedFirstReplyTimeoutMillis(NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS),
+        )
+        assertNull(NetworkSettings.savedFirstReplyTimeoutMillis(0))
+        assertEquals(60_000L, NetworkSettings.DEFAULTS.savedFirstReplyTimeoutMs)
     }
 
     @Test

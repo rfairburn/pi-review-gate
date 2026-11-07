@@ -2,6 +2,8 @@ package io.github.rfairburn.pireviewgate
 
 import android.app.Application
 import io.github.rfairburn.pireviewgate.client.application.ClientApplicationController
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementHolder
+import io.github.rfairburn.pireviewgate.storage.AndroidClientStorage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -14,8 +16,20 @@ class PiReviewGateApplication : Application() {
     private val failure = MutableStateFlow(false)
     val startupFailed = failure.asStateFlow()
 
+    /**
+     * UI-only overlay placement is independent of the client graph and its storage.
+     * Its IO load, warning, and later completed-drag saves can never fail startup,
+     * block composition, or touch host settings, trust, identity, or order state.
+     */
+    val overlayPlacements = TerminalOverlayPlacementHolder(
+        openStore = { AndroidClientStorage.overlayPlacementStore(this@PiReviewGateApplication) },
+    )
+
     override fun onCreate() {
         super.onCreate()
+        // Start separately from the client graph so a defaulted cosmetic layout and a
+        // refused client graph are reported independently rather than coupled.
+        overlayPlacements.start()
         scope.launch {
             try {
                 graph.value = withContext(Dispatchers.IO) { ClientApplicationController.create(this@PiReviewGateApplication) }

@@ -97,6 +97,10 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
     override fun invalidateTerminalInput() {
         retireTerminal()
         if (app.window !== this) return
+        // This lifecycle hook is focus/pause/window retirement only; normal dialog
+        // closure and coverage unwind do not reach it. Retire only the accepted created
+        // continuation, never the in-flight form's own close-on-started receipt.
+        app.terminalLifecycleLost()
         app.runtime.setTerminalInputCoverage(false)
         // Temporary OS/modal focus loss is NOT true application background.
         if (!app.platform.registry.snapshot.value.foreground) {

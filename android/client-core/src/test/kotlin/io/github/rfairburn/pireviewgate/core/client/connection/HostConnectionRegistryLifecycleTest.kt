@@ -3,6 +3,7 @@ package io.github.rfairburn.pireviewgate.core.client.connection
 import io.github.rfairburn.pireviewgate.core.hosts.ConfiguredHost
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.hosts.HostLabel
+import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.hosts.StorageFailureReason
 import io.github.rfairburn.pireviewgate.core.identity.PinRead
 import io.github.rfairburn.pireviewgate.core.identity.PeerIdentityStatus
@@ -599,6 +600,131 @@ class HostConnectionRegistryLifecycleTest {
             assertTrue(harness.savedSettings()!!.autoReconnect, "durable: ${harness.savedSettings()}")
             assertFalse(harness.savedSettings()!!.viewerRemoteInputEnabled, "durable")
             registry.close()
+        }
+    }
+
+    @Test
+    fun `saved first reply timeout defaults to sixty and a custom value survives restart`() = runTest {
+        RegistryHarness().use { harness ->
+            val one = RegistryFixtures.host(1)
+            harness.seedSettings(
+                RegistryFixtures.settings(one, autoReconnect = true)
+                    .withViewerRemoteInputEnabled(false),
+            )
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                assertEquals(60, registry.snapshot.value.savedFirstReplyTimeoutSeconds)
+                val generationBefore = registry.snapshot.value.settingsGeneration
+
+                assertIs<HostCommandResult.Accepted>(registry.setSavedFirstReplyTimeoutSeconds(120))
+
+                assertEquals(120, registry.snapshot.value.savedFirstReplyTimeoutSeconds)
+                assertEquals(generationBefore + 1, registry.snapshot.value.settingsGeneration)
+                assertEquals(120, harness.savedSettings()!!.savedFirstReplyTimeoutSeconds)
+                assertTrue(harness.savedSettings()!!.autoReconnect)
+                assertFalse(harness.savedSettings()!!.viewerRemoteInputEnabled)
+                assertEquals(listOf(one), harness.savedCatalog().hosts)
+            } finally {
+                registry.close()
+            }
+
+            val restarted = harness.restartingRegistry(StandardTestDispatcher(testScheduler))
+            restarted.start()
+            try {
+                assertEquals(120, restarted.snapshot.value.savedFirstReplyTimeoutSeconds)
+                assertEquals(120, harness.savedSettings()!!.savedFirstReplyTimeoutSeconds)
+            } finally {
+                restarted.close()
+            }
+        }
+    }
+
+    @Test
+    fun `saved timeout save preserves every other settings fact and a failed write publishes nothing`() = runTest {
+        RegistryHarness().use { harness ->
+            val one = RegistryFixtures.host(1, previouslyConnected = true, suppressed = true)
+            val two = RegistryFixtures.host(2)
+            harness.seedSettings(
+                RegistryFixtures.settings(one, two, autoReconnect = true)
+                    .withViewerRemoteInputEnabled(false)
+                    .withSavedFirstReplyTimeoutSeconds(90),
+            )
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                val savedBefore = harness.savedSettings()!!
+                assertIs<HostCommandResult.Accepted>(registry.setSavedFirstReplyTimeoutSeconds(1))
+
+                // Only the new preference moves; hosts, history, suppression, Auto,
+                // viewer input, and catalog order stay exactly as saved.
+                assertEquals(savedBefore.copy(savedFirstReplyTimeoutSeconds = 1), harness.savedSettings())
+                assertEquals(listOf(one.id, two.id), harness.savedCatalog().hosts.map { it.id })
+
+                val beforeFailure = registry.snapshot.value
+                val durableBeforeFailure = harness.savedSettings()
+                harness.settings.refuseWrites = StorageFailureReason.WRITE_FAILED
+
+                val refused = registry.setSavedFirstReplyTimeoutSeconds(120)
+                assertIs<HostCommandResult.Refused>(refused)
+                assertEquals(HostCommandRefusal.SETTINGS_UNAVAILABLE, refused.reason)
+
+                val afterFailure = registry.snapshot.value
+                assertEquals(beforeFailure.savedFirstReplyTimeoutSeconds, afterFailure.savedFirstReplyTimeoutSeconds)
+                assertEquals(beforeFailure.settingsGeneration, afterFailure.settingsGeneration)
+                assertEquals(durableBeforeFailure, harness.savedSettings())
+                assertEquals(RegistryNoticeReason.SETTINGS_WRITE_FAILED, afterFailure.notice?.reason)
+                assertFalse(afterFailure.storage.settings.available)
+            } finally {
+                registry.close()
+            }
+        }
+    }
+
+    @Test
+    fun `an invalid saved timeout is refused before any settings write`() = runTest {
+        RegistryHarness().use { harness ->
+            harness.seedSettings(RegistryFixtures.settings(RegistryFixtures.host(1)))
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                val before = registry.snapshot.value
+                val writesBefore = harness.settings.writes
+
+                for (invalid in listOf(0, -1, NetworkSettings.MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS + 1)) {
+                    val result = registry.setSavedFirstReplyTimeoutSeconds(invalid)
+                    assertIs<HostCommandResult.Refused>(result)
+                    assertEquals(HostCommandRefusal.INVALID_VALUE, result.reason)
+                }
+
+                assertEquals(60, registry.snapshot.value.savedFirstReplyTimeoutSeconds)
+                assertEquals(before.settingsGeneration, registry.snapshot.value.settingsGeneration)
+                assertEquals(writesBefore, harness.settings.writes)
+            } finally {
+                registry.close()
+            }
+        }
+    }
+
+    @Test
+    fun `a saved timeout save never repairs or rewrites unreadable settings`() = runTest {
+        RegistryHarness().use { harness ->
+            harness.seedSettings(RegistryFixtures.settings(RegistryFixtures.host(1)))
+            harness.settings.refuseReads = StorageFailureReason.MALFORMED
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                val writesBefore = harness.settings.writes
+                val result = registry.setSavedFirstReplyTimeoutSeconds(120)
+
+                assertIs<HostCommandResult.Refused>(result)
+                assertEquals(HostCommandRefusal.SETTINGS_UNAVAILABLE, result.reason)
+                assertEquals(60, registry.snapshot.value.savedFirstReplyTimeoutSeconds)
+                assertEquals(writesBefore, harness.settings.writes)
+                assertFalse(registry.snapshot.value.storage.settings.available)
+            } finally {
+                registry.close()
+            }
         }
     }
 

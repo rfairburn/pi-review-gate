@@ -248,7 +248,17 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 */
 	private var touchAnchor: FrameCommitReceipt? = null
 
-	/** The cell the gesture's forwarded press was last reported at, or null when none was forwarded. */
+	/** The cell the gesture's forwarded press first went out at, or null when it never did. */
+	private var touchOriginCell: CellPosition? = null
+
+	/** True once this gesture forwarded a real cross-cell motion report. */
+	private var touchMotionForwarded = false
+
+	/**
+	 * The cell the gesture's motion was last reported at, or null when no press was
+	 * forwarded. A tap keeps its original [touchOriginCell] here; a real cross-cell
+	 * drag advances it, and the release ending a wheel names it.
+	 */
 	private var touchPressCell: CellPosition? = null
 
 	/**
@@ -1570,12 +1580,15 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * Touchscreen input.
 	 *
 	 * One finger is the existing path: the first touch takes focus and is a press,
-	 * moving it is a drag, and lifting it is the release — each reported only when the
-	 * child asked for mouse events. The whole gesture belongs to the input proof that
-	 * stood when its first finger came down: a genuine retirement of that proof ends
-	 * the gesture on the spot, and no drag, release, or wheel of it is ever attributed
-	 * to a newer proof, however soon one is committed. Only a fresh first finger
-	 * reports again.
+	 * moving it into another cell is a drag, and lifting it is the left release — each
+	 * reported only when the child asked for mouse events. Motion that never leaves the
+	 * pressed cell is jitter, not a drag, so it is not reported, and a tap releases at
+	 * the cell it pressed even when the platform reports the lift at a nearby cell. A
+	 * cancelled gesture ends as no button, never as a left click. The whole gesture
+	 * belongs to the input proof that stood when its first finger came down: a genuine
+	 * retirement of that proof ends the gesture on the spot, and no drag, release, or
+	 * wheel of it is ever attributed to a newer proof, however soon one is committed.
+	 * Only a fresh first finger reports again.
 	 *
 	 * A second finger turns the gesture into a two-finger wheel. A press the first
 	 * finger already forwarded is released first, and only under the anchor it went
@@ -1599,6 +1612,8 @@ class TerminalSurfaceView @JvmOverloads constructor(
 				// carries over.
 				touchGesture.down()
 				touchAnchor = null
+				touchOriginCell = null
+				touchMotionForwarded = false
 				touchPressCell = null
 				touchWheelLease = null
 				// A tap takes focus, so hardware keys and mouse reports can reach the
@@ -1613,6 +1628,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 				// or to nothing, and then the gesture never reports at all.
 				if (touchGesture.phase == TouchGesturePhase.SINGLE) {
 					touchAnchor = delivered?.receipt ?: publishedProof.current()?.proof?.anchor
+					touchOriginCell = delivered?.cell
 					touchPressCell = delivered?.cell
 				}
 				return delivered != null || super.onTouchEvent(event)
@@ -1624,11 +1640,20 @@ class TerminalSurfaceView @JvmOverloads constructor(
 				}
 				TouchGesturePhase.DORMANT -> true
 				TouchGesturePhase.SINGLE -> {
+					// Jitter inside the cell the press or last drag reported is not motion the
+					// owner asked to see: forwarding it would turn a tap into a drag before its
+					// release. Only a genuine cell change is forwarded, and it advances the last
+					// reported cell the release ending a later wheel stands on.
+					val cell = geometry?.cellOf(event.x, event.y)
+					if (cell != null && cell == touchPressCell) return true
 					val anchor = touchAnchor
 					val delivered = anchor?.let {
 						deliverPointerAt(event.x, event.y, button = 0, release = false, motion = true, under = it)
 					}
-					if (delivered != null && touchPressCell != null) touchPressCell = delivered.cell
+					if (delivered != null) {
+						touchMotionForwarded = true
+						if (touchPressCell != null) touchPressCell = delivered.cell
+					}
 					delivered != null
 				}
 				// A move with no first finger seen keeps its existing, unfenced report.
@@ -1643,23 +1668,66 @@ class TerminalSurfaceView @JvmOverloads constructor(
 				touchWheelLease = null
 				return true
 			}
-			MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+			MotionEvent.ACTION_UP -> {
 				val phase = touchGesture.phase
 				val anchor = touchAnchor
+				val origin = touchOriginCell
+				val last = touchPressCell
+				val motionForwarded = touchMotionForwarded
 				touchWheelLease = null
 				touchAnchor = null
+				touchOriginCell = null
+				touchMotionForwarded = false
 				touchPressCell = null
 				touchGesture.end()
 				return when (phase) {
 					// No first finger seen: the existing, unfenced release.
 					TouchGesturePhase.IDLE -> pointerAt(event, button = 3, release = true) || super.onTouchEvent(event)
-					// One finger: its release, only under the proof the gesture began under.
-					TouchGesturePhase.SINGLE -> anchor?.let {
-						deliverPointerAt(event.x, event.y, button = 3, release = true, under = it)
-					} != null || super.onTouchEvent(event)
+					// One finger: a left release, only under the proof the gesture began under and
+					// only when its press actually left. Without forwarded motion the lift still
+					// belongs to the pressed cell; after a real drag it names the lifted cell.
+					TouchGesturePhase.SINGLE -> {
+						val released = when {
+							anchor == null || last == null -> null
+							!motionForwarded && origin != null && last == origin -> deliverPointerAtCell(
+								origin, button = 0, release = true, under = anchor,
+							)
+							else -> deliverPointerAt(event.x, event.y, button = 0, release = true, under = anchor)
+						}
+						released != null || super.onTouchEvent(event)
+					}
 					// A wheel, or a gesture that stopped reporting, ends with nothing: there is
 					// no press of its own to release. The platform's own tap tracking still
 					// sees the end, so a tap it was following is not left pressed.
+					else -> {
+						super.onTouchEvent(event)
+						true
+					}
+				}
+			}
+			MotionEvent.ACTION_CANCEL -> {
+				val phase = touchGesture.phase
+				val anchor = touchAnchor
+				val last = touchPressCell
+				touchWheelLease = null
+				touchAnchor = null
+				touchOriginCell = null
+				touchMotionForwarded = false
+				touchPressCell = null
+				touchGesture.end()
+				return when (phase) {
+					// No first finger seen: the existing, unfenced cancellation.
+					TouchGesturePhase.IDLE -> pointerAt(event, button = 3, release = true) || super.onTouchEvent(event)
+					// One finger: cancellation keeps its no-button release, never a left click,
+					// and never invents a release for a press that did not leave.
+					TouchGesturePhase.SINGLE -> {
+						val released = if (anchor != null && last != null) {
+							deliverPointerAt(event.x, event.y, button = 3, release = true, under = anchor)
+						} else {
+							null
+						}
+						released != null || super.onTouchEvent(event)
+					}
 					else -> {
 						super.onTouchEvent(event)
 						true
@@ -1767,6 +1835,8 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	/** Stop the current touch gesture from reporting anything more. */
 	private fun abandonTouchGesture() {
 		touchAnchor = null
+		touchOriginCell = null
+		touchMotionForwarded = false
 		touchPressCell = null
 		touchWheelLease = null
 		if (touchGesture.phase != TouchGesturePhase.IDLE) touchGesture.abandon()
@@ -1839,6 +1909,23 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		val position = cellGeometry.cellOf(x, y)
 		if (position == null) {
 			if (!motion) reportUnavailable(InputUnavailableReason.POINTER_OUTSIDE_CONTENT)
+			return null
+		}
+		return deliverPointerAtCell(position, button, release, motion, wheel, under)
+	}
+
+	/** The same report as [deliverPointerAt], for a cell already resolved above. */
+	private fun deliverPointerAtCell(
+		position: CellPosition,
+		button: Int,
+		release: Boolean,
+		motion: Boolean = false,
+		wheel: Boolean = false,
+		under: FrameCommitReceipt? = null,
+	): PointerDelivery? {
+		val cellGeometry = geometry ?: return null
+		if (position.column !in 0 until cellGeometry.columns || position.row !in 0 until cellGeometry.rows) {
+			reportUnavailable(InputUnavailableReason.POINTER_OUTSIDE_CONTENT)
 			return null
 		}
 		val pointer = TerminalPointerEvent(

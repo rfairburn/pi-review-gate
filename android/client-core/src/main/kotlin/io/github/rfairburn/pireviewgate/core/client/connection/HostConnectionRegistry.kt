@@ -713,6 +713,27 @@ public class HostConnectionRegistry(
         }
     }
 
+    /**
+     * Copy the remembered Saved LIST/SEARCH first-reply timeout.
+     *
+     * Only an already-validated positive whole number of seconds is admitted. The
+     * requested value is staged, written, and adopted in that order: unlike session
+     * history, a preference the user just saved is not a fact until its write lands,
+     * so a failed write leaves the published value and the durable document exactly
+     * as they were. Every other settings fact, host entry, and order is preserved.
+     */
+    public fun setSavedFirstReplyTimeoutSeconds(seconds: Int): HostCommandResult {
+        if (!NetworkSettings.isValidSavedFirstReplyTimeoutSeconds(seconds)) {
+            return HostCommandResult.Refused(HostCommandRefusal.INVALID_VALUE)
+        }
+        val saved = updatePreferencePersistFirst { it.withSavedFirstReplyTimeoutSeconds(seconds) }
+        return if (saved) {
+            HostCommandResult.Accepted
+        } else {
+            HostCommandResult.Refused(HostCommandRefusal.SETTINGS_UNAVAILABLE)
+        }
+    }
+
     // ------------------------------------------------------------- foreground
 
     /**
@@ -1163,6 +1184,7 @@ public class HostConnectionRegistry(
             autoReconnectEnabled = current.autoReconnect,
             // An unreadable document is never treated as "on".
             viewerRemoteInputEnabled = settingsState.available && current.viewerRemoteInputEnabled,
+            savedFirstReplyTimeoutSeconds = current.savedFirstReplyTimeoutSeconds,
             identity = identityObservation,
             storage = StorageObservation(settingsState, trustState),
             hosts = runtimes.values.map { runtime ->
@@ -1771,6 +1793,42 @@ public class HostConnectionRegistry(
     /** Copy one whole-preference value and publish it. */
     private fun updatePreference(copy: (NetworkSettings) -> NetworkSettings): Boolean =
         updateSettings { SettingsMutation.Ok(copy(it)) }
+
+    /**
+     * Stage one preference, write it, then publish it only after the write lands.
+     *
+     * This is deliberately narrower than [updatePreference]: automatic reconnect
+     * and viewer input are session facts that stay visibly changed even when their
+     * save fails, while this requested value must not be published until it is
+     * durable. The same settings transaction serializes the whole stage/write/adopt
+     * sequence, and the registry lock is still never held across disk IO.
+     */
+    private fun updatePreferencePersistFirst(copy: (NetworkSettings) -> NetworkSettings): Boolean =
+        synchronized(settingsTransaction) {
+            val next = synchronized(lock) {
+                if (closed || !started || !settingsState.available) return false
+                copy(settings)
+            }
+            val failure = runCatching { settingsStore.write(next) }.exceptionOrNull()
+            if (failure != null) {
+                synchronized(lock) {
+                    settingsState = StorageHandleState(
+                        available = false,
+                        reason = (failure as? StorageException)?.reason ?: StorageFailureReason.WRITE_FAILED,
+                    )
+                    notice = RegistryNotice(RegistryNoticeReason.SETTINGS_WRITE_FAILED, null)
+                    publishLocked()
+                }
+                return false
+            }
+            synchronized(lock) {
+                settings = next
+                settingsGeneration += 1
+                if (notice?.reason == RegistryNoticeReason.SETTINGS_WRITE_FAILED) notice = null
+                publishLocked()
+            }
+            true
+        }
 
     /**
      * Whether this destination carries an explicit Disconnect intent.

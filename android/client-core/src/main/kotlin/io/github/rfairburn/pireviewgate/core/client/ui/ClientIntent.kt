@@ -286,6 +286,15 @@ public sealed interface ClientIntent {
     /** Change this viewer's remote native input/copy preference. */
     public data class SetViewerRemoteInputEnabled(public val enabled: Boolean) : ClientIntent
 
+    /**
+     * Save the remembered Saved LIST/SEARCH first-reply timeout.
+     *
+     * The value is already parsed from whole seconds by the drawn form; the
+     * controller validates it again before any durable write. Typing in the field
+     * is a local draft only and never emits this intent.
+     */
+    public data class SetSavedFirstReplyTimeoutSeconds(public val seconds: Int) : ClientIntent
+
     // ---- terminal transient affordances -----------------------------------
 
     /** Show or hide the soft keyboard. */

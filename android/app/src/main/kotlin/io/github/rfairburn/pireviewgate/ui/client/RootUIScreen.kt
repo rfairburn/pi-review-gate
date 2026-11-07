@@ -29,6 +29,8 @@ import io.github.rfairburn.pireviewgate.core.client.ui.TerminalUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.UiCoverage
 import io.github.rfairburn.pireviewgate.core.client.ui.backAction
 import io.github.rfairburn.pireviewgate.core.client.ui.destination
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacement
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementWarning
 
 /**
  * The whole client screen.
@@ -50,7 +52,9 @@ import io.github.rfairburn.pireviewgate.core.client.ui.destination
  *
  * [status] is the app's latest notice. Non-terminal routes keep their caller-owned
  * status slot; the fullscreen terminal shows it in an overlay instead, so no status
- * row is measured into the terminal pane.
+ * row is measured into the terminal pane. Overlay placement, its completed-load
+ * readiness, and its warning are passed through unchanged: this screen never opens,
+ * reads, or writes their store.
  *
  * Coverage is reported from here as well: a modal dialog or the quick switcher sheet
  * means terminal input is suspended and in-flight proofs retire, and the controller
@@ -64,6 +68,10 @@ fun RootUIScreen(
     onTerminalPaste: () -> Unit,
     terminalContent: @Composable (TerminalUiState) -> Unit,
     status: String? = null,
+    overlayPlacement: TerminalOverlayPlacement = TerminalOverlayPlacement.DEFAULT,
+    overlayPlacementWarning: TerminalOverlayPlacementWarning? = null,
+    overlayPlacementReady: Boolean = true,
+    onOverlayPlacementCommitted: (TerminalOverlayPlacement) -> Unit = {},
 ) {
     // List positions are owned above the route switch: entering the fullscreen
     // terminal leaves this route's composition, and a state owned by the screen
@@ -88,6 +96,10 @@ fun RootUIScreen(
                     onPaste = onTerminalPaste,
                     onIntent = onIntent,
                     status = status,
+                    overlayPlacement = overlayPlacement,
+                    overlayPlacementWarning = overlayPlacementWarning,
+                    overlayPlacementReady = overlayPlacementReady,
+                    onOverlayPlacementCommitted = onOverlayPlacementCommitted,
                 )
             } else {
                 NonTerminalScaffold(

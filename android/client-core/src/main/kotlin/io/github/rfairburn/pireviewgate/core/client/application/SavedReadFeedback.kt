@@ -1,6 +1,7 @@
 package io.github.rfairburn.pireviewgate.core.client.application
 
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterOperationKind
+import io.github.rfairburn.pireviewgate.core.client.roster.RosterUiProof
 import io.github.rfairburn.pireviewgate.core.client.ui.SavedRequestStatus
 import io.github.rfairburn.pireviewgate.core.client.ui.SavedUiState
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
@@ -17,8 +18,9 @@ import io.github.rfairburn.pireviewgate.core.hosts.HostId
  * fresh for the current picker, and NOT settled inside its own admission step, may show
  * [SavedRequestStatus.Requesting]; its own settlement (projected by the caller) or the
  * replacement of its picker view ends it. Other admissions — older, delayed, for another
- * picker or channel, windows, the post-delete continuation — never touch it. Main-confined,
- * like the controller that owns it.
+ * picker or channel, windows, the post-delete continuation — never touch it. That
+ * continuation's own pre-admission display is retired by [SavedRefreshFeedback].
+ * Main-confined, like the controller that owns it.
  */
 class SavedReadFeedback {
     /** The facts that make one drawn Saved picker the view a read was raised from. */
@@ -106,6 +108,49 @@ class SavedReadFeedback {
          */
         fun olderThanAdopted(sequence: Long?, generation: Long, display: SavedUiState, adoptedGeneration: Long?): Boolean =
             sequence != null && adoptedGeneration == generation && sequence < display.sequence
+    }
+}
+
+/**
+ * Status-only ownership of the one pending display a confirmed post-delete Saved LIST
+ * sets synchronously, before that read is admitted.
+ *
+ * The post-delete continuation deliberately does not go through [SavedReadFeedback]:
+ * its display is raised with the continuation, not by a picker-intake admission. When
+ * that continuation is canceled — by a query edit, another dialog, leaving the picker,
+ * or loss of its owner/window — no request remains current. [observe] then retires only
+ * this exact untracked [SavedRequestStatus.Requesting] to [SavedRequestStatus.Unknown] and
+ * clears any base status that belonged to it. It never sends, retries, filters, adopts,
+ * or fabricates a result, never removes the displayed entries or handles, and never
+ * changes a read tracked by [SavedReadFeedback] or any settled status. A replacement
+ * read that shows its own pending status always has a non-null [SavedReadFeedback.pending]
+ * and keeps it until its own settlement. Main-confined, like the controller that owns it.
+ */
+class SavedRefreshFeedback {
+    private var continuation: RosterUiProof? = null
+
+    /** Register the exact continuation whose one-shot LIST produced its refresh display. */
+    fun shown(continuation: RosterUiProof) {
+        this.continuation = continuation
+    }
+
+    /** The exact read's own live settlement ends this display ownership. */
+    fun settled(continuation: RosterUiProof) {
+        if (this.continuation === continuation) this.continuation = null
+    }
+
+    /**
+     * Synchronously retire the pending display when its continuation is no longer
+     * current. [trackedRead] is true while [SavedReadFeedback] presents any current
+     * read; that read's Requesting is never this helper's to end. A live continuation
+     * and every non-Requesting status pass through unchanged.
+     */
+    fun observe(display: SavedUiState, trackedRead: Boolean): SavedUiState {
+        val pending = continuation ?: return display
+        if (pending.isStillCurrent()) return display
+        continuation = null
+        if (trackedRead || display.status != SavedRequestStatus.Requesting) return display
+        return display.copy(status = SavedRequestStatus.Unknown, readFeedbackBaseStatus = null)
     }
 }
 

@@ -160,6 +160,9 @@
     <string name="close_title">Close this session?</string>
     <string name="close_body">The host decides what closing means for its own process and may require its own confirmation. A close the host has already accepted cannot be withdrawn from here.</string>
     <string name="close_confirm">Close session</string>
+    <string name="close_host_confirmation_title">Host confirmation required</string>
+    <string name="close_host_confirmation_body">The host says this session is still in use. This second, separate confirmation asks the host to close this exact session under its own rules. Nothing has been closed yet.</string>
+    <string name="close_host_confirmation_button">Ask host to close</string>
 
     <!-- Saved conversations -->
     <string name="saved_owner_none">No host chosen</string>
@@ -195,6 +198,8 @@
     <string name="terminal_suspended_viewport">Terminal input is paused until the resized screen is ready.</string>
     <string name="terminal_keys_open">Keys</string>
     <string name="terminal_keys_close">Close keys</string>
+    <string name="terminal_overlay_positions_defaulted">Saved overlay positions could not be read. Default positions are in use until new positions are saved.</string>
+    <string name="terminal_overlay_positions_save_failed">Overlay positions could not be saved. They apply now but may not be remembered.</string>
     <string name="terminal_status_dismiss">Dismiss</string>
     <string name="quick_switcher_title">Switch session</string>
     <string name="quick_switcher_current">Current</string>

@@ -9,6 +9,7 @@ import io.github.rfairburn.pireviewgate.core.client.runtime.TerminalTarget
 import io.github.rfairburn.pireviewgate.core.hosts.*
 import io.github.rfairburn.pireviewgate.core.protocol.roster.*
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
 import kotlin.test.*
 
 /** Deterministic portable application admission, projection and provenance contracts. */
@@ -110,6 +111,95 @@ class ApplicationCompositionContractTest {
         VisibilitySnapshot(true, false), null, ContentInputPolicy(true, 0), false, false)
     private fun complete(rows: List<RemoteSessionMetadata>) = RosterProjection(RosterProjectionState.CURRENT,
         rows, "run-1", 4, "subscription-opaque", null)
+
+    /**
+     * One delivered row, decoded exactly as the protocol lane decodes every snapshot
+     * row. Counts and activity arrive as wire text so a decoding default is caught
+     * rather than agreed with.
+     */
+    private fun deliveredRow(
+        id: String,
+        activity: String = "[\"Ready\"]",
+        activeTasks: String = "null",
+        activeShells: String = "null",
+        backgroundTasks: String = "null",
+        backgroundShells: String = "null",
+    ): RemoteSessionMetadata = assertNotNull(
+        RosterMetadataRow.parse(
+            Json.parseToJsonElement(
+                """{"id":"$id","rosterSlotId":"slot-$id","label":"Row $id","workspace":"/srv/owner/work-$id",""" +
+                    """"lifecycle":"alive","hasLiveProcess":true,"busy":false,"pendingInput":false,""" +
+                    """"inputSurface":false,"activity":$activity,"nativeSession":null,""" +
+                    """"backgroundTasks":$backgroundTasks,"backgroundShells":$backgroundShells,""" +
+                    """"activeTasks":$activeTasks,"activeShells":$activeShells}""",
+            ),
+        ),
+    )
+
+    @Test fun deliveredActivityCountsReachTheCardFactsIndependently() {
+        val delivered = listOf(
+            deliveredRow(
+                "zero", activity = "[]", activeTasks = "0", activeShells = "0",
+                backgroundTasks = "9", backgroundShells = "8",
+            ),
+            deliveredRow(
+                "partial", activity = "[\"Working\"]", activeTasks = "null", activeShells = "3",
+                backgroundTasks = "5", backgroundShells = "null",
+            ),
+            deliveredRow(
+                "positive", activity = "[\"Ready\"]", activeTasks = "2", activeShells = "1",
+                backgroundTasks = "0", backgroundShells = "0",
+            ),
+        )
+        val projected = ClientProjection()
+            .hosts(registry(), runtime(roster(1, complete(delivered))))
+            .single().rows
+
+        // The numeric card facts are the delivered activity-intent counts, each on its
+        // own: zero is a count, a missing member stays unknown, and they are independent.
+        assertEquals(
+            listOf(
+                SessionCardBackground.Counts(0L, 0L),
+                SessionCardBackground.Counts(null, 3L),
+                SessionCardBackground.Counts(2L, 1L),
+            ),
+            projected.map { sessionCardBackground(it.metadata) },
+        )
+        // Ownership counts are a different fact and never become intent counts.
+        assertEquals(listOf(9L, 5L, 0L), projected.map { it.metadata.backgroundTasks })
+        assertEquals(listOf(8L, null, 0L), projected.map { it.metadata.backgroundShells })
+        // The compact card line is the delivered nonblank line; an empty delivery invents none.
+        assertEquals(listOf(null, "Working", "Ready"), projected.map { sessionCardActivityLine(it.metadata) })
+        // Decoding and projection added nothing to the delivered rows.
+        assertEquals(delivered, projected.map { it.metadata })
+    }
+
+    @Test fun deliveredCountAndActivityUpdatesKeepTheCardIdentity() {
+        val projection = ClientProjection()
+        val first = projection.hosts(
+            registry(1), runtime(roster(1, complete(listOf(deliveredRow("row-1", activity = "[\"Ready\"]"))))),
+        ).single().rows.single()
+        val second = projection.hosts(
+            registry(2),
+            runtime(
+                roster(
+                    2,
+                    complete(
+                        listOf(
+                            deliveredRow(
+                                "row-1", activity = "[\"Working\"]", activeTasks = "1", activeShells = "0",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ).single().rows.single()
+
+        assertEquals(SessionRowKey.of(first), SessionRowKey.of(second))
+        assertEquals(first.presentationIdentity, second.presentationIdentity)
+        assertEquals(SessionCardBackground.Counts(1L, 0L), sessionCardBackground(second.metadata))
+        assertEquals("Working", sessionCardActivityLine(second.metadata))
+    }
 
     @Test fun completeMetadataIsNotReconstructedAndUnknownIsNotZero() {
         val metadata = ClientUiFixtures.row("opaque-host", nativeSession = ClientUiFixtures.nativeSession(),

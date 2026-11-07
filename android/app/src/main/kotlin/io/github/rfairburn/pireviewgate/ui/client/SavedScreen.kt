@@ -332,7 +332,12 @@ private fun SavedEntryCard(
         covered = covered,
     )
     ClientCard {
-        Text(entry.caption, style = MaterialTheme.typography.titleMedium)
+        Text(
+            text = entry.caption,
+            style = MaterialTheme.typography.titleMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
         FactRow(stringResource(R.string.saved_file), entry.file)
         FactRow(stringResource(R.string.saved_cwd), entry.cwd)
         if (target == null) {

@@ -1,5 +1,8 @@
 package io.github.rfairburn.pireviewgate.core.client.roster
 
+/** Default local patience for a Saved LIST/SEARCH first reply: sixty seconds. */
+public const val DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS: Long = 60_000L
+
 /**
  * The caller-supplied inputs to one roster client endpoint, and the per-message
  * dynamic proof each submitted effect carries.
@@ -139,6 +142,11 @@ public data class RosterSavedListCommand(
     public val proof: RosterSendProof.PickerRead? = null,
     /** Optional accepted post-delete continuation lifetime, also checked during transfer. */
     public val resultLifetime: RosterUiProof? = null,
+    /**
+     * Local-only first-reply patience. This never appears on the wire: it is the
+     * deadline this side gives the owner's first answer before reporting unknown.
+     */
+    public val firstReplyTimeoutMs: Long = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS,
 )
 
 /** Search within one exact owner catalog. */
@@ -149,6 +157,8 @@ public data class RosterSavedSearchCommand(
     public val offset: Long,
     public val count: Long,
     public val proof: RosterSendProof.PickerRead? = null,
+    /** Local-only first-reply patience; never encoded into the owner request. */
+    public val firstReplyTimeoutMs: Long = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_MS,
 )
 
 /** Another bounded window of one exact owner result. Never relists and never remints ids. */

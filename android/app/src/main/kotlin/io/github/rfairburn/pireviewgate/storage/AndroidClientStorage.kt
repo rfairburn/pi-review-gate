@@ -14,6 +14,8 @@ import io.github.rfairburn.pireviewgate.core.identity.HostPinDocumentCodec
 import io.github.rfairburn.pireviewgate.core.identity.HostPinStore
 import io.github.rfairburn.pireviewgate.core.identity.PeerIdentityEvidenceStore
 import io.github.rfairburn.pireviewgate.core.identity.PeerIdentityStore
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementStorage
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementStore
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationOrderStorage
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationOrderStore
 import java.io.File
@@ -29,10 +31,11 @@ import java.io.File
  * the operator's knowledge, and restoring an older copy would silently roll back a pin
  * the operator already acted on.
  *
- * Settings, trust, identity evidence, and remote presentation order each keep their
- * own dedicated directory and separate lifecycle: saving a display preference never
- * touches trust, forgetting a host never disturbs this device's key-store identity,
- * and a refused reorder save never changes saved hosts or trust.
+ * Settings, trust, identity evidence, remote presentation order, and the cosmetic
+ * terminal overlay placement each keep their own dedicated directory and separate
+ * lifecycle: saving a display preference never touches trust, forgetting a host never
+ * disturbs this device's key-store identity, and a refused reorder or placement save
+ * never changes saved hosts or trust.
  *
  * The platform's app-private storage is the real protection boundary; the core stores
  * additionally refuse an unsafe, unreadable, or changed document instead of treating it
@@ -93,6 +96,17 @@ public object AndroidClientStorage {
      */
     public fun presentationOrderStore(context: Context): RemotePresentationOrderStore =
         RemotePresentationOrderStorage.openStore(rootDir(context))
+
+    /**
+     * Durable cosmetic placement for the terminal's three floating overlays.
+     *
+     * This is a dedicated UI-only document below no-backup storage: it holds overlay
+     * identities, orientations, and permille positions only. It never holds a host,
+     * trust, pin, identity, order, viewport, transcript, input, or proof value, and a
+     * malformed copy is never a reason to reset any of those other documents.
+     */
+    public fun overlayPlacementStore(context: Context): TerminalOverlayPlacementStore =
+        TerminalOverlayPlacementStorage.openStore(rootDir(context))
 
     /**
      * Lock serializing identity initialization for this app.

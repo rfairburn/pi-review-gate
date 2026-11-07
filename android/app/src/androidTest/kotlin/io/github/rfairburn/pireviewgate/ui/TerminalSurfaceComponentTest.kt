@@ -578,14 +578,14 @@ class TerminalSurfaceComponentTest {
         try {
             captureSyntheticScreen("ime-$orientation-before")
             compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
-            compose.onNodeWithText("Keyboard").assertIsDisplayed().performClick()
+            compose.onNodeWithContentDescription("Keyboard").assertIsDisplayed().performClick()
             compose.waitUntil(10_000) { compose.runOnIdle {
                 fixture.surface?.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
             } }
             // Observe, do not infer visibility from the request. This also exercises
-            // the real production label change without changing toolbar measurement.
+            // the real production accessible-description change without changing toolbar measurement.
             setObservedKeyboard(fixture, true)
-            compose.onNodeWithText("Hide keyboard").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Hide keyboard").assertIsDisplayed()
             awaitInput(fixture) // Focus loss, if any, must earn a genuinely fresh draw.
             compose.waitForIdle()
             assertUnchanged()

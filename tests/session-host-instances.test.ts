@@ -2814,6 +2814,16 @@ function posixProcessState(pid: number): string {
   }
 }
 
+/** Creation time for settlement observations of a recorded fixture pid; never authority to signal it. */
+function posixProcessStart(pid: number): string | undefined {
+  try {
+    const startedAt = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return startedAt || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface RealPosixSession {
   harness: Harness;
   manager: InstanceManager;
@@ -2821,32 +2831,55 @@ interface RealPosixSession {
   surface: TerminalSurface;
   childPid: number;
   jobPid: number;
+  /** Creation time paired with jobPid for conservative settlement observations only. */
+  jobStartedAt: string;
+  /** Written by the owned root only after its shell has actually exited. */
+  shellSettledFile: string;
+  /** Optional shell EXIT writer gated by an explicit fixture-owned release. */
+  writerHandshake?: { readyFile: string; releaseFile: string; outputFile: string };
   /** Forward exactly as the host does: translate first, write only a defined result. */
   forward: (packet: string) => string | Buffer | undefined;
   /** Raw write to this fixture's own PTY, bypassing the translator (control only). */
   writeRawToChildPty: (data: string) => void;
 }
 
+interface OwnedPosixOptions {
+  /** Install an owned shell EXIT writer that waits for an explicit release file. */
+  shellWriterHandshake?: boolean;
+  /** Test-only startup fault: the root releases without writing its shell receipt. */
+  startupFault?: "root-exits-without-shell-receipt";
+  /** Observe the created harness even when startup throws. */
+  onHarness?: (harness: Harness) => void;
+  /** Observe the actual native manager, which differs from the harness's default mock manager. */
+  onManager?: (manager: InstanceManager) => void;
+}
+
 /** Lets the caller settle a child that spawned before a start-up assertion failed. */
 interface OwnedPosixStartup {
   manager?: InstanceManager;
+  shellSettledFile?: string;
+  jobPid?: number;
+  jobStartedAt?: string;
+  jobLaunchAttempted?: boolean;
 }
 
-async function startRealPosixSession(label: string): Promise<RealPosixSession> {
+async function startRealPosixSession(label: string, options: OwnedPosixOptions = {}): Promise<RealPosixSession> {
   const harness = makeHarness(label);
+  options.onHarness?.(harness);
   const started: OwnedPosixStartup = {};
   try {
-    return await startOwnedPosixJob(harness, started);
+    return await startOwnedPosixJob(harness, started, options);
   } catch (error) {
-    // A fixture that never finished starting leaves no owned root and no owned
-    // child behind.
+    // A fixture that never finished starting may still have spawned an owned
+    // root. Preserve the root unless its shell and any launched foreground job
+    // are positively settled; missing descendant evidence is retained.
     await started.manager?.dispose().catch(() => undefined);
-    cleanup(harness);
+    await cleanupFailedOwnedPosixStart(harness, started);
     throw error;
   }
 }
 
-async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup): Promise<RealPosixSession> {
+async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup, options: OwnedPosixOptions = {}): Promise<RealPosixSession> {
   // The owned foreground application records its own pid, and echoes input
   // visibly (`cat -v`) so a forwarded control character would show in the frame.
   const jobPidFile = join(harness.root, "foreground-job.pid");
@@ -2859,14 +2892,43 @@ async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup):
   // the arrangement in which a terminal's suspend character has job-control
   // effect. Nothing outside this fixture is started or signalled.
   const app = join(harness.root, "bin", "shim-posix-session.js");
+  const shellSettledFile = join(harness.root, "posix-shell-settled");
+  started.shellSettledFile = shellSettledFile;
+  const writerHandshake = options.shellWriterHandshake ? {
+    readyFile: join(harness.root, "shell-exit-writer-ready"),
+    releaseFile: join(harness.root, "shell-exit-writer-release"),
+    outputFile: join(harness.root, "shell-exit-writer-output"),
+  } : undefined;
+  // Handshake fixtures allow their independent 30-second writer fallback to
+  // finish before forced shell termination; ordinary fixtures stay bounded.
+  const shellStopMs = writerHandshake ? 40_000 : 1200;
   mkdirSync(join(app, ".."), { recursive: true });
   writeFileSync(app, [
     "#!/usr/bin/env node",
     "\"use strict\";",
+    "const fs = require(\"node:fs\");",
     "const { spawn } = require(\"node:child_process\");",
     "const shell = spawn(\"/bin/bash\", [\"--norc\", \"--noprofile\", \"-i\"], { stdio: \"inherit\" });",
-    "shell.on(\"exit\", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));",
-    "process.on(\"SIGTERM\", () => { try { shell.kill(\"SIGTERM\"); } catch { /* already gone */ } process.exit(0); });",
+    "let terminating = false;",
+    "let forced;",
+    "shell.on(\"exit\", (code, signal) => {",
+    "  if (forced) clearTimeout(forced);",
+    options.startupFault === "root-exits-without-shell-receipt"
+      // Omit the protocol receipt, but retain an independent observation for
+      // the test author's eventual cleanup after asserting protocol refusal.
+      ? `  try { fs.writeFileSync(${JSON.stringify(join(harness.root, "fault-shell-exit-observed"))}, "shell-exit\\n"); } catch { process.exit(1); }`
+      : "  try { fs.writeFileSync(process.env.PRGSYNTH_SHELL_SETTLED_FILE, \"shell-exit\\n\"); } catch { process.exit(1); }",
+    "  process.exit(terminating ? 0 : (signal ? 1 : (code ?? 0)));",
+    "});",
+    "process.on(\"SIGTERM\", () => {",
+    "  if (terminating) return;",
+    "  terminating = true;",
+    "  // The manager owns this root. Translate its stop request into the owned",
+    "  // shell's terminal-hangup path and wait for the shell's actual exit, so",
+    "  // history and EXIT-trap writers finish before root settlement is visible.",
+    "  try { shell.kill(\"SIGHUP\"); } catch { /* already gone */ }",
+    `  forced = setTimeout(() => { try { shell.kill("SIGKILL"); } catch { /* gone */ } }, ${shellStopMs});`,
+    "});",
     "",
   ].join("\n"), "utf8");
   chmodSync(app, 0o755);
@@ -2882,23 +2944,48 @@ async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup):
     args: [],
     // HOME stays inside the fixture so no user rc file or private home state is
     // read by the synthetic shell.
-    env: { ...cleanTestEnv(), HOME: harness.root, PS1: "PRGSYNTH$ ", JOB_PID_FILE: jobPidFile },
+    env: {
+      ...cleanTestEnv(),
+      HOME: harness.root,
+      PS1: "PRGSYNTH$ ",
+      JOB_PID_FILE: jobPidFile,
+      PRGSYNTH_SHELL_SETTLED_FILE: shellSettledFile,
+      ...(writerHandshake === undefined ? {} : {
+        PRGSYNTH_WRITER_READY: writerHandshake.readyFile,
+        PRGSYNTH_WRITER_RELEASE: writerHandshake.releaseFile,
+        PRGSYNTH_WRITER_OUTPUT: writerHandshake.outputFile,
+        // The EXIT writer announces readiness, then waits for the test's explicit
+        // release. Its 600 x 0.05 s (30 s) fallback is independent and finite, so
+        // the test's delayed observation never depends on winning a short race.
+        PROMPT_COMMAND:
+          `trap 'printf ready > "$PRGSYNTH_WRITER_READY"; i=0; while [ ! -e "$PRGSYNTH_WRITER_RELEASE" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i+1)); done; printf released > "$PRGSYNTH_WRITER_OUTPUT"' EXIT`,
+      }),
+    },
     ptyFactory: (descriptor) => {
       childPty = defaultFactory(descriptor);
       return childPty;
     },
   });
   started.manager = manager;
+  options.onManager?.(manager);
   const id = await manager.create({ label: "posix", workspace: harness.workspace });
   const surface = manager.surface(id);
   assert.ok(surface, "the real row owns a surface");
   await until(() => frameText(surface).includes("PRGSYNTH$"), "the owned shell prompt", 20_000);
+  if (options.startupFault !== undefined) {
+    throw new Error("injected startup failure after the owned root spawned");
+  }
+  started.jobLaunchAttempted = true;
   manager.write(id, "./foreground-job.sh\r");
   await until(() => guardedExistsSync(jobPidFile), "the owned foreground application records its pid", 20_000);
   const jobPid = Number(readBytesSync(jobPidFile).toString("utf8").trim());
   assert.ok(Number.isSafeInteger(jobPid) && jobPid > 0, "the recorded pid is a real pid");
+  started.jobPid = jobPid;
   await until(() => posixProcessState(jobPid) !== "gone" && !posixProcessState(jobPid).includes("T"),
     "the owned foreground application runs", 20_000);
+  const jobStartedAt = posixProcessStart(jobPid);
+  assert.ok(jobStartedAt, "the owned foreground application has a live creation identity");
+  started.jobStartedAt = jobStartedAt;
   assert.ok(childPty, "the pinned factory produced the child PTY");
   const viewport: InputViewport = {
     column: 0,
@@ -2913,6 +3000,9 @@ async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup):
     surface,
     childPid: childPty.pid,
     jobPid,
+    jobStartedAt,
+    shellSettledFile,
+    writerHandshake,
     forward: (packet) => {
       const translated = translateInput(packet, surface.inputModes(), viewport);
       if (translated !== undefined) manager.write(id, translated);
@@ -2922,17 +3012,87 @@ async function startOwnedPosixJob(harness: Harness, started: OwnedPosixStartup):
   };
 }
 
+/** Bounded positive wait; false leaves the caller to preserve uncertain fixture state. */
+async function settledWithin(predicate: () => boolean, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  return predicate();
+}
+
+/** The recorded incarnation is gone, reaped, or its pid now names a different process. */
+function processSettlement(pid: number, expectedStart: string): "live" | "settled" | "uncertain" {
+  let output: string;
+  try {
+    output = execFileSync("/bin/ps",
+      ["-o", "state=", "-o", "lstart=", "-p", String(pid)],
+      { encoding: "utf8" }).trim();
+  } catch (error) {
+    // ps exits 1 for an unmatched pid: that incarnation is gone. Any other
+    // failure is uncertainty, never settlement.
+    return (error as { status?: number }).status === 1 ? "settled" : "uncertain";
+  }
+  const match = /^(\S+)\s+(.+)$/.exec(output);
+  if (!match) return "uncertain";
+  const [, state, startedAt] = match;
+  if (startedAt !== expectedStart) return "settled"; // pid reuse: the original is gone
+  return state.startsWith("Z") ? "settled" : "live";
+}
+
+async function settleOwnedProcess(pid: number, expectedStart: string, ms = 3000): Promise<boolean> {
+  // The owned shell's hangup path stops its jobs. Observe the foreground
+  // process only: a separate ps check cannot make a later numeric-PID kill
+  // safe against reuse. If it remains live or unknown, preserve the fixture.
+  return settledWithin(() => processSettlement(pid, expectedStart) === "settled", ms);
+}
+
+function shellReceiptSettled(file: string | undefined): boolean {
+  return file !== undefined
+    && guardedExistsSync(file)
+    && readBytesSync(file).toString("utf8") === "shell-exit\n";
+}
+
+async function cleanupFailedOwnedPosixStart(harness: Harness, started: OwnedPosixStartup): Promise<void> {
+  const manager = started.manager;
+  if (!manager) {
+    cleanup(harness);
+    return;
+  }
+  if (manager.hasLiveProcesses()) return;
+  if (!shellReceiptSettled(started.shellSettledFile)) return;
+  if (started.jobPid !== undefined) {
+    if (started.jobStartedAt === undefined) return;
+    if (!(await settleOwnedProcess(started.jobPid, started.jobStartedAt))) return;
+  } else if (started.jobLaunchAttempted) {
+    // A foreground launch began but its creation identity was never captured:
+    // its settlement cannot be proven, so the fixture root is retained.
+    return;
+  }
+  cleanupIfSettled(harness, manager);
+}
+
 async function stopRealPosixSession(session: RealPosixSession): Promise<void> {
+  let shellSettled = false;
+  let foregroundSettled = false;
   try {
     const result = await session.manager.shutdown({ graceMs: 2000, killMs: 2000 });
     assert.deepEqual(result.remainingIds, [], "the owned session settles inside the shutdown window");
+    shellSettled = shellReceiptSettled(session.shellSettledFile);
+    assert.equal(shellSettled, true,
+      "the owned root releases only after its shell's terminal exit receipt");
+    foregroundSettled = await settleOwnedProcess(session.jobPid, session.jobStartedAt);
+    assert.equal(foregroundSettled, true,
+      "the owned foreground application settles before fixture removal");
   } finally {
-    // The fixture's own foreground application, if it outlived its shell.
-    try {
-      process.kill(session.jobPid, "SIGKILL");
-    } catch { /* already settled */ }
+    if (!foregroundSettled) foregroundSettled = await settleOwnedProcess(session.jobPid, session.jobStartedAt);
     await session.manager.dispose().catch(() => undefined);
-    cleanupIfSettled(session.harness, session.manager);
+    // Remove the root only on positive settlement at both owned writer levels:
+    // the launcher's shell-exit receipt and the recorded foreground incarnation's
+    // disappearance. Root exit or a signal alone is not settlement evidence, and
+    // an unsettled fixture stays in place for inspection.
+    if (shellSettled && foregroundSettled) cleanupIfSettled(session.harness, session.manager);
   }
 }
 
@@ -2988,6 +3148,65 @@ test("control: the same owned PTY fixture stops its foreground job when the susp
   } finally {
     await stopRealPosixSession(session);
   }
+});
+
+// Deterministic teardown regression: an owned shell EXIT writer announces
+// readiness, is held by an explicit fixture-owned release, and only then
+// finishes. The root must stay owned and the fixture root retained until that
+// writer has actually produced its output.
+test("fixture teardown holds the owned shell exit writer until release, then settles before removal", { skip: POSIX_JOB_SKIP, timeout: 90_000 }, async () => {
+  const session = await startRealPosixSession("teardown-settlement", { shellWriterHandshake: true });
+  const handshake = session.writerHandshake;
+  assert.ok(handshake, "the shell exit-writer handshake is configured");
+  try {
+    const shutdown = session.manager.shutdown({ graceMs: 45_000, killMs: 5000 });
+    await until(() => guardedExistsSync(handshake.readyFile), "the owned shell exit writer is ready", 10_000);
+    // Deliberately observe beyond the ordinary fixture's 1200 ms shell-stop
+    // deadline while the writer is held by its own explicit gate.
+    await sleep(1500);
+    assert.equal(session.manager.hasLiveProcesses(), true,
+      "the owned root stays live while its shell writer is held");
+    assert.equal(guardedExistsSync(handshake.outputFile), false, "the held writer has not produced output");
+    writeFileSync(handshake.releaseFile, "release\n");
+    const result = await shutdown;
+    assert.deepEqual(result.remainingIds, [], "the owned root settles after the writer is released");
+    assert.equal(readBytesSync(handshake.outputFile).toString("utf8"), "released",
+      "the writer completed before root settlement was visible");
+  } finally {
+    // Idempotent release: a failed assertion must not leave the fixture's own
+    // shell waiting for its fallback deadline.
+    writeFileSync(handshake.releaseFile, "release\n");
+    await stopRealPosixSession(session);
+  }
+  assert.equal(guardedExistsSync(session.harness.root), false, "the settled fixture root is removed");
+});
+
+// A startup failure after spawn must not fall back to root-exit-only cleanup.
+// This fixture's root deliberately releases without a shell-exit receipt, so
+// disposal makes the root look settled while descendant evidence is absent.
+test("startup failure after spawn retains the root when the shell-exit receipt is absent", { skip: POSIX_JOB_SKIP, timeout: 90_000 }, async () => {
+  let harness: Harness | undefined;
+  let manager: InstanceManager | undefined;
+  await assert.rejects(
+    startRealPosixSession("startup-receipt-absent", {
+      startupFault: "root-exits-without-shell-receipt",
+      onHarness: (created) => { harness = created; },
+      onManager: (created) => { manager = created; },
+    }),
+    /injected startup failure after the owned root spawned/,
+  );
+  assert.ok(harness, "the failed fixture harness is observable");
+  assert.ok(manager, "the real native manager is observable");
+  assert.equal(manager.hasLiveProcesses(), false, "the failed startup disposed its owned root");
+  assert.equal(guardedExistsSync(harness.root), true,
+    "root exit without a shell-exit receipt never authorizes fixture removal");
+  assert.equal(guardedExistsSync(join(harness.root, "posix-shell-settled")), false,
+    "the failed fixture deliberately has no descendant settlement receipt");
+  // The normal protocol correctly refused cleanup above. The fault fixture's
+  // independent child-exit observation now proves the writer actually settled
+  // before the test author removes this deliberately retained owned root.
+  assert.equal(readBytesSync(join(harness.root, "fault-shell-exit-observed")).toString("utf8"), "shell-exit\n");
+  cleanup(harness);
 });
 
 // --- Deliberate saved-conversation creation (issue 323). ---

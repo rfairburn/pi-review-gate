@@ -347,7 +347,7 @@ describe("#84 captured diagnostics are allowlisted, redacted, and bounded", () =
         timestamp: 1,
         error: {
           name: "WebSocketError",
-          message: "connect ghp_abcdefghijklmnopqrst failed https://api.example.com/v1/secret?token=abc /Users/robert/private/file",
+          message: "connect ghp_abcdefghijklmnopqrst failed https://api.example.com/v1/secret?token=abc /Users/fixture-user/private/file",
           code: "ECONNRESET",
           stack: "at secret stack",
         },
@@ -357,7 +357,7 @@ describe("#84 captured diagnostics are allowlisted, redacted, and bounded", () =
           phase: "before_message_stream_start",
           requestBytes: 12,
           headers: { authorization: "Bearer secret" },
-          privatePath: "/Users/robert/private",
+          privatePath: "/Users/fixture-user/private",
           stack: "raw stack",
           unknownField: "leak",
         },
@@ -368,7 +368,7 @@ describe("#84 captured diagnostics are allowlisted, redacted, and bounded", () =
     const text = JSON.stringify(record);
     expect(text).not.toContain("ghp_abcdefghijklmnopqrst");
     expect(text).not.toContain("api.example.com");
-    expect(text).not.toContain("/Users/robert");
+    expect(text).not.toContain("/Users/fixture-user");
     expect(text).not.toContain("secret stack");
     expect(text).not.toContain("authorization");
     expect(text).not.toContain("leak");
@@ -380,15 +380,15 @@ describe("#84 captured diagnostics are allowlisted, redacted, and bounded", () =
     )).toBe(true);
     const card = renderLines(renderSubtaskResultCollapsed, syntheticResult(), { expanded: false, isPartial: false }, pendingContext("call-10")).join("\n");
     expect(card).not.toContain("ghp_");
-    expect(card).not.toContain("/Users/robert");
+    expect(card).not.toContain("/Users/fixture-user");
   });
 
   it("the displayed host error text is redacted and bounded like every other retained text (including Windows private paths)", () => {
-    const result = syntheticResult("boom ghp_abcdefghijklmnopqrst https://api.example.com/v1?token=abc /Users/robert/private/file C:\\Users\\robert\\secret\\file");
+    const result = syntheticResult("boom ghp_abcdefghijklmnopqrst https://api.example.com/v1?token=abc /Users/fixture-user/private/file C:\\Users\\fixture-user\\secret\\file");
     const card = renderLines(renderSubtaskResultCollapsed, result, { expanded: false, isPartial: false }, pendingContext("call-redact-host")).join("\n");
     expect(card).not.toContain("ghp_");
     expect(card).not.toContain("api.example.com");
-    expect(card).not.toContain("robert");
+    expect(card).not.toContain("fixture-user");
     expect(card).toContain("[REDACTED]");
     expect(card).toContain("[URL REDACTED]");
     expect(card).toContain("[PATH REDACTED]");
@@ -721,13 +721,13 @@ describe("#84 model-visible diagnostic note via the public context hook", () => 
   it("the note never leaks the raw reported error text", () => {
     captureFailure("call-23", "SubtasksStart", {
       diagnostics: [],
-      errorMessage: "failed ghp_abcdefghijklmnopqrst https://api.example.com/v1 /Users/robert/private/file",
+      errorMessage: "failed ghp_abcdefghijklmnopqrst https://api.example.com/v1 /Users/fixture-user/private/file",
     });
     const result = observeContextBuild({ type: "context", messages: baseMessages() })!;
     const text = String((result.messages as Array<Record<string, unknown>>)[1]!.content);
     expect(text).not.toContain("ghp_abcdefghijklmnopqrst");
     expect(text).not.toContain("api.example.com");
-    expect(text).not.toContain("/Users/robert");
+    expect(text).not.toContain("/Users/fixture-user");
     expect(text).toContain("[REDACTED]");
   });
 

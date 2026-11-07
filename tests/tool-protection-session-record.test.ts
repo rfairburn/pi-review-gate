@@ -133,7 +133,7 @@ test("retained host status withholds path-shaped tokens instead of quoting confi
   const manager = fakeManager();
   await writeAuditorSessionRecord(baseDraft({
     observation: { transport: "pi-in-process", pi: { systemPrompt: "route", prompt: "p", thinkingLevel: "off", model: { provider: "synthetic", id: "model" } } },
-    outcome: { status: "transport-error", error: "provider error while reading /Users/robert/SECRET-bootstrap.json for openai/model-1" },
+    outcome: { status: "transport-error", error: "provider error while reading /Users/fixture-user/SECRET-bootstrap.json for openai/model-1" },
   }), writer(manager));
   const serialized = JSON.stringify(manager.entries);
   assert.ok(!serialized.includes("SECRET-bootstrap"), `a configuration path was retained: ${serialized}`);

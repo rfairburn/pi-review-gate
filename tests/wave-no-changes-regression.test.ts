@@ -695,42 +695,42 @@ test("regression: absolute source path aliases are rewritten to worker paths", a
 test("rewriteSourcePaths: boundary-safe rewriting does not match similar prefixes", async () => {
   const { rewriteSourcePaths } = await import("../src/execution/wave-worker");
 
-  const sourceRoot = "/Users/robert/git/repo";
+  const sourceRoot = "/Users/fixture-user/git/repo";
   const workerRoot = "/tmp/wave-abc/workers/task-0";
 
   // Exact source root should be rewritten
   assert.equal(
-    rewriteSourcePaths("Create file at /Users/robert/git/repo/index.html", sourceRoot, workerRoot),
+    rewriteSourcePaths("Create file at /Users/fixture-user/git/repo/index.html", sourceRoot, workerRoot),
     "Create file at /tmp/wave-abc/workers/task-0/index.html",
   );
 
   // Similar prefix should NOT be rewritten
   assert.equal(
-    rewriteSourcePaths("Create file at /Users/robert/git/repo-other/index.html", sourceRoot, workerRoot),
-    "Create file at /Users/robert/git/repo-other/index.html",
+    rewriteSourcePaths("Create file at /Users/fixture-user/git/repo-other/index.html", sourceRoot, workerRoot),
+    "Create file at /Users/fixture-user/git/repo-other/index.html",
   );
 
   // A matching suffix inside a different absolute path is not the source root.
   assert.equal(
-    rewriteSourcePaths("Edit /mnt/Users/robert/git/repo/a.html", sourceRoot, workerRoot),
-    "Edit /mnt/Users/robert/git/repo/a.html",
+    rewriteSourcePaths("Edit /mnt/Users/fixture-user/git/repo/a.html", sourceRoot, workerRoot),
+    "Edit /mnt/Users/fixture-user/git/repo/a.html",
   );
 
   // Multiple occurrences should all be rewritten
   assert.equal(
-    rewriteSourcePaths("Edit /Users/robert/git/repo/a.html and /Users/robert/git/repo/b.html", sourceRoot, workerRoot),
+    rewriteSourcePaths("Edit /Users/fixture-user/git/repo/a.html and /Users/fixture-user/git/repo/b.html", sourceRoot, workerRoot),
     "Edit /tmp/wave-abc/workers/task-0/a.html and /tmp/wave-abc/workers/task-0/b.html",
   );
 
   // Source root at end of string should be rewritten
   assert.equal(
-    rewriteSourcePaths("Work in /Users/robert/git/repo", sourceRoot, workerRoot),
+    rewriteSourcePaths("Work in /Users/fixture-user/git/repo", sourceRoot, workerRoot),
     "Work in /tmp/wave-abc/workers/task-0",
   );
 
   // Nested paths should be rewritten
   assert.equal(
-    rewriteSourcePaths("Edit /Users/robert/git/repo/src/lib/util.ts", sourceRoot, workerRoot),
+    rewriteSourcePaths("Edit /Users/fixture-user/git/repo/src/lib/util.ts", sourceRoot, workerRoot),
     "Edit /tmp/wave-abc/workers/task-0/src/lib/util.ts",
   );
 
@@ -755,18 +755,18 @@ test("rewriteSourcePaths: nested CWD mapping preserves relative structure", asyn
   // Simulate a nested CWD: source root is /repo, but cwd is /repo/src
   // The worker root should be /wave/workers/task-0
   // The effective cwd should be /wave/workers/task-0/src
-  const sourceRoot = "/Users/robert/git/repo";
+  const sourceRoot = "/Users/fixture-user/git/repo";
   const workerRoot = "/tmp/wave-abc/workers/task-0";
 
   // Paths in the nested CWD should be rewritten correctly
   assert.equal(
-    rewriteSourcePaths("Edit /Users/robert/git/repo/src/index.ts", sourceRoot, workerRoot),
+    rewriteSourcePaths("Edit /Users/fixture-user/git/repo/src/index.ts", sourceRoot, workerRoot),
     "Edit /tmp/wave-abc/workers/task-0/src/index.ts",
   );
 
   // The source root itself should be rewritten
   assert.equal(
-    rewriteSourcePaths("CWD is /Users/robert/git/repo/src", sourceRoot, workerRoot),
+    rewriteSourcePaths("CWD is /Users/fixture-user/git/repo/src", sourceRoot, workerRoot),
     "CWD is /tmp/wave-abc/workers/task-0/src",
   );
 });
@@ -776,14 +776,14 @@ test("rewriteSourcePaths: nested CWD mapping preserves relative structure", asyn
 test("correction feedback paths are rewritten and isolation remains authoritative", async () => {
   const { buildWaveWorkerContinuationPrompt } = await import("../src/execution/wave-worker");
 
-  const sourceRoot = "/Users/robert/git/testworld2";
+  const sourceRoot = "/Users/fixture-user/git/testworld2";
   const workerRoot = "/tmp/wave-xyz/workers/task-0";
 
   // Simulate correction feedback containing source absolute paths
   const feedback = [
     "Review found issues:",
-    "- File /Users/robert/git/testworld2/index.html has a bug on line 5",
-    "- Please fix /Users/robert/git/testworld2/src/app.ts",
+    "- File /Users/fixture-user/git/testworld2/index.html has a bug on line 5",
+    "- Please fix /Users/fixture-user/git/testworld2/src/app.ts",
   ].join("\n");
 
   const rewritten = buildWaveWorkerContinuationPrompt(feedback, sourceRoot, workerRoot);

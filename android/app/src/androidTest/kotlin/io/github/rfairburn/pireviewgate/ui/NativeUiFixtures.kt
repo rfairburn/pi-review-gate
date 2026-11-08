@@ -258,7 +258,12 @@ internal class NativeUiFixture(initial: ClientUiState) {
     @Composable
     fun Content() {
         RootUIScreen(
-            state = state, onIntent = ::onIntent,
+            // The stored preference is the single source of truth for diagnostic notice
+            // presentation, exactly as in production. A fixture that expects notices
+            // enables the setting on its own state instead of a parallel flag.
+            state = state,
+            onIntent = ::onIntent,
+            debugInputMessagingEnabled = state.settings.debugInputMessagingEnabled,
             onTerminalKey = { request -> surface?.submitKey(request.asRendererKey()) },
             // Never access a device/user clipboard, even in instrumentation.
             onTerminalPaste = { surface?.submitPastedText("fixed synthetic paste") },

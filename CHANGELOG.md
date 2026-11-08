@@ -51,6 +51,18 @@ dates.
   cancellation/no-retry rules are unchanged. Canceling a post-delete refresh clears
   its stale pending status without making another request. This does not establish the cause of
   observed unknown outcomes or complete device/runtime acceptance.
+- Android now has a saved `Debug input messaging` preference, off by default, that
+  controls the whole app-wide diagnostic status/notice area. Off draws none of it: no
+  non-terminal status slot (its reserved height returns to the content below), no
+  terminal notice overlay with its readiness and placement-warning text, dismiss
+  control, and drag region, and no Keys-panel copy of the raw status — and the hidden
+  overlay reserves no Keys space either. On returns the same messages with the existing
+  dismiss behavior. The flag rides the same strict version-1 settings document (an
+  absent key means off, only `true` is written, non-boolean or unknown keys still
+  refuse the document), is saved before it is published, and a failed save changes
+  nothing. It is presentation only: input, source/frame commit, coverage, focus, ABA,
+  selection, grid, protocol, receipt, delivery, cancellation, no-retry, and clipboard
+  behavior are unchanged, and no notice producer is reset, cleared, or replayed.
 
 ### Fixed
 

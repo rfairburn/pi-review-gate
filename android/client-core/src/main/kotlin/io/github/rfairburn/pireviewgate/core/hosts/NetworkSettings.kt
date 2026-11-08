@@ -3,7 +3,7 @@ package io.github.rfairburn.pireviewgate.core.hosts
 /**
  * The client's complete durable network configuration.
  *
- * It holds every configured host plus the three remembered global preferences. A
+ * It holds every configured host plus the four remembered global preferences. A
  * hosting/listen configuration and owner-side policies are deliberately absent: this
  * client dials out and hosts nothing, so an enabled-listener or owner-policy field
  * would be a setting with no effect.
@@ -13,6 +13,9 @@ package io.github.rfairburn.pireviewgate.core.hosts
  * - [autoReconnect] is off by default.
  * - [viewerRemoteInputEnabled] is on by default; a stored document omits the field
  *   when it is on and writes an explicit `false` when it is off.
+ * - [debugInputMessagingEnabled] is off by default; a stored document omits the
+ *   field when it is off and writes an explicit `true` when it is on. It decides
+ *   only whether the app's diagnostic status/notice area is presented.
  * - [savedFirstReplyTimeoutSeconds] is 60 by default; a stored document omits the
  *   field at that default and writes a positive whole-second value otherwise.
  *
@@ -26,6 +29,7 @@ public data class NetworkSettings(
     val viewerRemoteInputEnabled: Boolean = DEFAULT_VIEWER_REMOTE_INPUT_ENABLED,
     val hosts: HostCatalog = HostCatalog.EMPTY,
     val savedFirstReplyTimeoutSeconds: Int = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
+    val debugInputMessagingEnabled: Boolean = DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED,
 ) {
     init {
         require(isValidSavedFirstReplyTimeoutSeconds(savedFirstReplyTimeoutSeconds)) {
@@ -39,6 +43,15 @@ public data class NetworkSettings(
 
         /** This viewer's remote native input/copy preference is on by default. */
         public const val DEFAULT_VIEWER_REMOTE_INPUT_ENABLED: Boolean = true
+
+        /**
+         * Whole-app diagnostic status/notice presentation, off by default.
+         *
+         * It is a display preference only. It grants nothing, revokes nothing, and
+         * changes no input, delivery, clipboard, storage, or proof behavior; it only
+         * decides whether the app's diagnostic status and notice surfaces are drawn.
+         */
+        public const val DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED: Boolean = false
 
         /** Saved list/search first-reply patience, in whole seconds. */
         public const val DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS: Int = 60
@@ -102,6 +115,16 @@ public data class NetworkSettings(
     /** One global preference changed; nothing else moves. */
     public fun withViewerRemoteInputEnabled(enabled: Boolean): NetworkSettings =
         copy(viewerRemoteInputEnabled = enabled)
+
+    /**
+     * One global preference changed; nothing else moves.
+     *
+     * Presentation only: turning this off hides the whole diagnostic status/notice
+     * area and turns it on restores it. Producers keep their own last-value behavior
+     * and nothing is reset, cleared, filtered, or replayed either way.
+     */
+    public fun withDebugInputMessagingEnabled(enabled: Boolean): NetworkSettings =
+        copy(debugInputMessagingEnabled = enabled)
 
     /** One global preference changed; nothing else moves. */
     public fun withSavedFirstReplyTimeoutSeconds(seconds: Int): NetworkSettings =

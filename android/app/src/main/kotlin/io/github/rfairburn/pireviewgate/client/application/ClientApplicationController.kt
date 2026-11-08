@@ -407,6 +407,7 @@ class ClientApplicationController private constructor(
                 viewerRemoteInputEnabled = registryState.viewerRemoteInputEnabled,
                 hosts = HostCatalog.of(hosts.map { it.host }),
                 savedFirstReplyTimeoutSeconds = registryState.savedFirstReplyTimeoutSeconds,
+                debugInputMessagingEnabled = registryState.debugInputMessagingEnabled,
             ), hosts, state.value.rowOrder, saved, dialogs,
             when (val identity = registryState.identity) {
                 is DeviceIdentityObservation.Ready -> ClientIdentityState.Ready(identity.fingerprint)
@@ -1010,6 +1011,18 @@ class ClientApplicationController private constructor(
                         if (lifetime.isStillCurrent()) registry.setSavedFirstReplyTimeoutSeconds(intent.seconds) else null
                     } }
                     report(result?.let { commandText("Saved timeout", it) } ?: "Saved timeout not saved: intent no longer current")
+                }
+            }
+            is ClientIntent.SetDebugInputMessagingEnabled -> {
+                // A display preference only. Unlike the input preference, nothing here
+                // retires a terminal, marks a policy change pending, disables input, or
+                // reconnects anything: only the durable preference and its projection move.
+                val lifetime = window?.freezeIntentLifetime() ?: return
+                scope.launch {
+                    val result = preferenceLock.withLock { withContext(Dispatchers.IO) {
+                        if (lifetime.isStillCurrent()) registry.setDebugInputMessagingEnabled(intent.enabled) else null
+                    } }
+                    report(result?.let { commandText("Debug messaging", it) } ?: "Debug messaging not saved: intent no longer current")
                 }
             }
             is ClientIntent.SetTerminalKeyboardVisible -> window?.keyboard(intent.visible)

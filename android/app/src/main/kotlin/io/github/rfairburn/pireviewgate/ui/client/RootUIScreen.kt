@@ -56,6 +56,16 @@ import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlay
  * readiness, and its warning are passed through unchanged: this screen never opens,
  * reads, or writes their store.
  *
+ * [debugInputMessagingEnabled] is the saved whole-app diagnostic presentation
+ * preference, off unless the caller passes the stored value. Off suppresses the
+ * diagnostic notice presentations this screen draws — the terminal's overlay notice
+ * surface with its readiness and placement-warning text and its dismiss control, and
+ * the Keys panel's copy of the raw status — with no reserved height and no touch
+ * region anywhere. The non-terminal routes' status slot belongs to the caller that
+ * reserves it and is suppressed there by the same flag. None of this changes input,
+ * delivery, clipboard, storage, or proof behavior, and it never resets or clears what
+ * a producer last reported: this screen still only renders what it is given.
+ *
  * Coverage is reported from here as well: a modal dialog or the quick switcher sheet
  * means terminal input is suspended and in-flight proofs retire, and the controller
  * learns that from the same screen that drew the covering control.
@@ -68,6 +78,7 @@ fun RootUIScreen(
     onTerminalPaste: () -> Unit,
     terminalContent: @Composable (TerminalUiState) -> Unit,
     status: String? = null,
+    debugInputMessagingEnabled: Boolean = false,
     overlayPlacement: TerminalOverlayPlacement = TerminalOverlayPlacement.DEFAULT,
     overlayPlacementWarning: TerminalOverlayPlacementWarning? = null,
     overlayPlacementReady: Boolean = true,
@@ -96,6 +107,7 @@ fun RootUIScreen(
                     onPaste = onTerminalPaste,
                     onIntent = onIntent,
                     status = status,
+                    debugInputMessagingEnabled = debugInputMessagingEnabled,
                     overlayPlacement = overlayPlacement,
                     overlayPlacementWarning = overlayPlacementWarning,
                     overlayPlacementReady = overlayPlacementReady,

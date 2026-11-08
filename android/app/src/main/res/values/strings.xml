@@ -230,6 +230,8 @@
     <string name="setting_auto_reconnect_body">Retry a host that connected successfully before, unless you disconnected from it on purpose.</string>
     <string name="setting_viewer_remote_input">Remote input and copy</string>
     <string name="setting_viewer_remote_input_body">Let this viewer send native input and copy to the remote pane.</string>
+    <string name="setting_debug_input_messaging">Debug input messaging</string>
+    <string name="setting_debug_input_messaging_body">Show the app-wide diagnostic status and notice area, including copy feedback such as \"Text copied\". Off by default: no status message, readiness notice, or dismiss control is shown and no space is reserved for them. Turning it on brings the existing messages back; input, delivery, and clipboard behavior are unchanged either way.</string>
     <string name="settings_identity_section">This device</string>
     <string name="identity_unknown">Identity state not read yet.</string>
     <string name="identity_not_initialized">This device has not created its client identity yet.</string>

@@ -17,6 +17,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientRoute
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermission
 import io.github.rfairburn.pireviewgate.permissions.LocalNetworkPermissionRationaleDialog
+import io.github.rfairburn.pireviewgate.ui.client.NonTerminalStatusSlot
 import io.github.rfairburn.pireviewgate.ui.client.RootUIScreen
 
 /** Exported native client launcher. There is no local owner, worker, gateway or service. */
@@ -65,13 +66,18 @@ class ClientActivity : ComponentActivity() {
                 // The terminal route owns the whole app window: it applies its own stable
                 // bar/cutout insets and overlays status, so no slot is reserved above it.
                 val terminalRoute = capturedRoute is ClientRoute.Terminal
+                // Saved presentation preference only: it decides whether the app's
+                // diagnostic status and notice surfaces are drawn, and nothing else.
+                val debugInputMessaging = capturedFrame.settings.debugInputMessagingEnabled
                 Column(Modifier.fillMaxSize().then(if (terminalRoute) Modifier else Modifier.statusBarsPadding())) {
                     // A fixed-height, noninteractive status slot never moves a pending form
-                    // when an admission/settlement arrives. No owner fact is inferred.
+                    // when an admission/settlement arrives. No owner fact is inferred. With
+                    // debugging off the slot composes nothing, reserved height included.
                     if (!terminalRoute) {
-                        Box(Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 8.dp)) {
-                            Text(status ?: "", maxLines = 2, style = MaterialTheme.typography.bodySmall)
-                        }
+                        NonTerminalStatusSlot(
+                            status = status,
+                            debugInputMessagingEnabled = debugInputMessaging,
+                        )
                     }
                     // Same call site on every route, so RootUIScreen's remembered list
                     // positions survive entering and leaving the terminal.
@@ -83,6 +89,7 @@ class ClientActivity : ComponentActivity() {
                             onTerminalPaste = { window.paste((capturedRoute as? ClientRoute.Terminal)?.terminal?.target) },
                             terminalContent = { window.Surface() },
                             status = status,
+                            debugInputMessagingEnabled = debugInputMessaging,
                             overlayPlacement = overlayPlacement.placement,
                             overlayPlacementWarning = overlayPlacement.warning,
                             overlayPlacementReady = overlayPlacement.ready,

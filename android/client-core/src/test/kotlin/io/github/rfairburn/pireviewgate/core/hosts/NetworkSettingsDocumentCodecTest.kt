@@ -72,6 +72,72 @@ class NetworkSettingsDocumentCodecTest {
     }
 
     @Test
+    fun `debug input messaging is absent off and only an explicit true is written`() {
+        assertFalse(NetworkSettings.DEFAULTS.debugInputMessagingEnabled, "the product default is off")
+
+        // An older document that never knew the key reads as off.
+        val oldDocument = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}"
+        assertFalse(decodeValid(oldDocument).debugInputMessagingEnabled)
+
+        // Off stays sparse: a saved document of defaults writes no key at all.
+        val off = NetworkSettings(
+            autoReconnect = false,
+            viewerRemoteInputEnabled = true,
+            hosts = HostCatalog.of(listOf(first)),
+        )
+        val offText = NetworkSettingsDocumentCodec.encode(off)
+        assertFalse(offText.contains("debugInputMessagingEnabled"), "an off default stays sparse: $offText")
+        assertFalse(decodeValid(offText).debugInputMessagingEnabled)
+
+        // Only an explicit true is written, and it round trips with every other fact.
+        val on = off.copy(debugInputMessagingEnabled = true)
+        val onText = NetworkSettingsDocumentCodec.encode(on)
+        assertTrue(onText.contains("\"debugInputMessagingEnabled\":true"), onText)
+        assertEquals(on, decodeValid(onText))
+
+        // Sparse true round trip alongside a non-default sibling preference and hosts.
+        val mixed = NetworkSettings(
+            autoReconnect = true,
+            viewerRemoteInputEnabled = false,
+            hosts = HostCatalog.of(listOf(first, second)),
+            savedFirstReplyTimeoutSeconds = 120,
+            debugInputMessagingEnabled = true,
+        )
+        val mixedText = NetworkSettingsDocumentCodec.encode(mixed)
+        assertTrue(mixedText.contains("\"debugInputMessagingEnabled\":true"), mixedText)
+        assertEquals(mixed, decodeValid(mixedText))
+        assertFalse(decodeValid(mixedText).viewerRemoteInputEnabled)
+        assertEquals(120, decodeValid(mixedText).savedFirstReplyTimeoutSeconds)
+        assertEquals(2, decodeValid(mixedText).hosts.hosts.size)
+    }
+
+    @Test
+    fun `a non-boolean or misnamed debug flag refuses instead of becoming a default`() {
+        val base = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]"
+        for (bad in listOf("\"yes\"", "\"false\"", "1", "0", "null", "{}", "[]")) {
+            assertEquals(
+                StorageFailureReason.MALFORMED,
+                decodeInvalid("$base,\"debugInputMessagingEnabled\":$bad}"),
+                "must refuse $bad rather than default or coerce it",
+            )
+        }
+        // The closed schema admits only the exact key name.
+        assertEquals(
+            StorageFailureReason.MALFORMED,
+            decodeInvalid("{\"version\":1,\"autoReconnect\":false,\"hosts\":[],\"debugInputMessaging\":true}"),
+        )
+        // A host entry cannot carry it either.
+        assertEquals(
+            StorageFailureReason.MALFORMED,
+            decodeInvalid(
+                "{\"version\":1,\"autoReconnect\":false,\"hosts\":[{\"id\":\"a\",\"label\":\"L\"," +
+                    "\"host\":\"h\",\"port\":443,\"previouslyConnected\":false," +
+                    "\"reconnectSuppressed\":false,\"debugInputMessagingEnabled\":true}]}",
+            ),
+        )
+    }
+
+    @Test
     fun `an unknown or non-boolean flag refuses instead of becoming a default`() {
         val base = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}"
         assertTrue(decodeValid(base).viewerRemoteInputEnabled)

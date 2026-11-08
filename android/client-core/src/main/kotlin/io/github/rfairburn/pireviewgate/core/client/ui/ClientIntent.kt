@@ -295,6 +295,16 @@ public sealed interface ClientIntent {
      */
     public data class SetSavedFirstReplyTimeoutSeconds(public val seconds: Int) : ClientIntent
 
+    /**
+     * Change the remembered whole-app diagnostic status/notice presentation.
+     *
+     * Off hides the app's diagnostic status and notice surfaces entirely; on restores
+     * them. It is presentation only: it grants no input, delivery, clipboard, storage,
+     * or proof authority and revokes none, and it never resets, clears, filters, or
+     * replays what a notice producer last reported.
+     */
+    public data class SetDebugInputMessagingEnabled(public val enabled: Boolean) : ClientIntent
+
     // ---- terminal transient affordances -----------------------------------
 
     /** Show or hide the soft keyboard. */

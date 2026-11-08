@@ -137,6 +137,16 @@ private val MinimumKeysViewport = 56.dp
  * negotiated modes. Nothing in this screen synthesizes a hardware event or writes a
  * packet. [status] is the app's latest admission/settlement notice, shown here
  * instead of in a layout-reserving slot.
+ *
+ * [debugInputMessagingEnabled] is the saved whole-app diagnostic presentation
+ * preference. Off, the entire status notice surface is absent: no notices surface, no
+ * readiness or placement-warning text, no dismiss control, no drag or touch region, and
+ * no Keys-panel copy of the raw status — and the height that surface remembered while
+ * it was visible reserves nothing, so the Keys panel gets that band back. The saved
+ * status position itself is untouched, the control strip and Keys panel keep their own
+ * surfaces, and the pane's real input readiness still comes from the genuine
+ * viewport/commit facts. On, every one of those messages and surfaces returns exactly
+ * as before, including the existing dismissible-per-text behavior.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -148,6 +158,7 @@ fun TerminalScreen(
     onIntent: (ClientIntent) -> Unit,
     modifier: Modifier = Modifier,
     status: String? = null,
+    debugInputMessagingEnabled: Boolean = false,
     overlayPlacement: TerminalOverlayPlacement = TerminalOverlayPlacement.DEFAULT,
     overlayPlacementWarning: TerminalOverlayPlacementWarning? = null,
     overlayPlacementReady: Boolean = true,
@@ -181,6 +192,7 @@ fun TerminalScreen(
                 keysOpen = keysOpen,
                 onToggleKeys = { keysOpen = !keysOpen },
                 status = status,
+                debugInputMessagingEnabled = debugInputMessagingEnabled,
                 dismissedStatus = dismissedStatus,
                 onDismissStatus = { dismissedStatus = it },
                 onKey = onKey,
@@ -208,6 +220,7 @@ private fun TerminalOverlayLayer(
     keysOpen: Boolean,
     onToggleKeys: () -> Unit,
     status: String?,
+    debugInputMessagingEnabled: Boolean,
     dismissedStatus: String?,
     onDismissStatus: (String) -> Unit,
     onKey: (TerminalKeyRequest) -> Unit,
@@ -275,7 +288,11 @@ private fun TerminalOverlayLayer(
                     controlsSlotHeight
                 }
                 val unobstructedKeysHeightPx =
-                    (visibleHeight - effectiveControlsSlotHeightPx - noticesSlotHeight).coerceAtLeast(0)
+                    (visibleHeight - effectiveControlsSlotHeightPx -
+                        // A hidden notices surface reserves nothing at all: a height this
+                        // layer remembered while debugging was visible must not keep
+                        // eating Keys space once that surface is gone.
+                        (if (debugInputMessagingEnabled) noticesSlotHeight else 0)).coerceAtLeast(0)
                 val controlsPosition = placement.position(TerminalOverlay.CONTROLS, orientation)
                 val controlsResolvedTop = if (controlsPosition != null) {
                     TerminalOverlayGeometry.resolve(
@@ -413,28 +430,34 @@ private fun TerminalOverlayLayer(
                         scrollable = capControlsNow,
                     )
                 }
-                PlaceableOverlay(
-                    overlay = TerminalOverlay.STATUS,
-                    placement = placement,
-                    orientation = orientation,
-                    stableWidth = stableWidth,
-                    stableHeight = stableHeight,
-                    visibleWidth = visibleWidth,
-                    visibleHeight = visibleHeight,
-                    controlsSlotHeight = controlsSlotHeight,
-                    onMeasured = { size ->
-                        if (size.height != noticesSlotHeight) noticesSlotHeight = size.height
-                    },
-                    layerZIndex = 1f,
-                    onCommitted = onPlacementCommitted,
-                ) { dragModifier ->
-                    TerminalNotices(
-                        terminal = terminal,
-                        status = visibleStatus,
-                        placementWarning = warningText,
-                        onDismissStatus = onDismissStatus,
-                        dragModifier = dragModifier,
-                    )
+                // The whole diagnostic notice surface is the saved debug presentation.
+                // Off, none of it composes: no Surface, no readiness or placement-warning
+                // text, no dismiss control, no drag or touch region, and no measured
+                // height. The saved STATUS position is never rewritten either way.
+                if (debugInputMessagingEnabled) {
+                    PlaceableOverlay(
+                        overlay = TerminalOverlay.STATUS,
+                        placement = placement,
+                        orientation = orientation,
+                        stableWidth = stableWidth,
+                        stableHeight = stableHeight,
+                        visibleWidth = visibleWidth,
+                        visibleHeight = visibleHeight,
+                        controlsSlotHeight = controlsSlotHeight,
+                        onMeasured = { size ->
+                            if (size.height != noticesSlotHeight) noticesSlotHeight = size.height
+                        },
+                        layerZIndex = 1f,
+                        onCommitted = onPlacementCommitted,
+                    ) { dragModifier ->
+                        TerminalNotices(
+                            terminal = terminal,
+                            status = visibleStatus,
+                            placementWarning = warningText,
+                            onDismissStatus = onDismissStatus,
+                            dragModifier = dragModifier,
+                        )
+                    }
                 }
                 if (keysOpen) {
                     // Keys uses the ordinary cap while that leaves a usable, unobstructed
@@ -460,7 +483,9 @@ private fun TerminalOverlayLayer(
                     ) { dragModifier ->
                         TerminalKeysPanel(
                             terminal = terminal,
-                            status = status,
+                            // The Keys panel's duplicate of the raw status is part of the
+                            // same diagnostic presentation, so it goes with the surface.
+                            status = if (debugInputMessagingEnabled) status else null,
                             onKey = onKey,
                             onPaste = onPaste,
                             onIntent = onIntent,
@@ -723,8 +748,10 @@ private fun StableLabel(vararg labels: Pair<Int, Boolean>) {
 
 /**
  * Readiness, status, and required placement-load/save notices, overlaid without
- * reserving layout. A paused terminal always says so while it is paused; the latest
- * app status can be dismissed here and stays readable in the Keys panel. The text
+ * reserving layout. This whole surface is the saved Debug input messaging
+ * presentation: the caller composes none of it while that preference is off, so a
+ * paused terminal says so only while it is on, and the latest app status can be
+ * dismissed here and has its Keys-panel copy under that same condition. The text
  * regions are the existing non-button drag targets for this surface; the dismiss
  * button stays an ordinary button with no new row.
  */

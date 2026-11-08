@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.*
+import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.input.KeyboardModifiers
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
 import io.github.rfairburn.pireviewgate.ui.terminal.FrameCommitReceipt
@@ -333,6 +334,55 @@ class TerminalFullscreenOverlayComponentTest {
         compose.onAllNodesWithText("Terminal input is paused while this is open.").assertCountEquals(0)
     }
 
+    @Test fun savedDebugPreferenceControlsTheTerminalNoticeSurfaceWithoutTouchingControlsOrKeys() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val pane = compose.runOnIdle { paneBounds(fixture) }
+        compose.runOnIdle {
+            val route = fixture.state.route as ClientRoute.Terminal
+            fixture.state = fixture.state.copy(
+                route = ClientRoute.Terminal(route.terminal.copy(coverage = UiCoverage.MODAL_DIALOG)),
+            )
+        }
+        compose.onNodeWithText("Terminal input is paused while this is open.").assertIsDisplayed()
+        compose.onNodeWithText("Keys").performClick()
+        compose.onNodeWithText("Esc").assertIsDisplayed()
+
+        // Off: the whole notice surface is absent — no readiness text, no dismiss
+        // control — while the control strip and Keys panel keep their own surfaces.
+        compose.runOnIdle {
+            fixture.state = fixture.state.copy(
+                settings = fixture.state.settings.withDebugInputMessagingEnabled(false),
+            )
+        }
+        compose.onAllNodesWithText("Terminal input is paused while this is open.").assertCountEquals(0)
+        compose.onAllNodesWithText("Dismiss").assertCountEquals(0)
+        compose.onNodeWithText("Back").assertIsDisplayed()
+        compose.onNodeWithText("Switch").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Keyboard").assertIsDisplayed()
+        compose.onNodeWithText("Esc").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals("Hiding notices must not move or resize the pane", pane, paneBounds(fixture))
+            assertTrue("Real input readiness is unchanged by a display preference",
+                fixture.surface?.currentInputProof() != null)
+            assertTrue(fixture.packets.isEmpty())
+        }
+
+        // On again returns the same content; nothing was reset, cleared, or replayed.
+        compose.runOnIdle {
+            fixture.state = fixture.state.copy(
+                settings = fixture.state.settings.withDebugInputMessagingEnabled(true),
+            )
+        }
+        compose.onNodeWithText("Terminal input is paused while this is open.").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals(pane, paneBounds(fixture))
+            assertTrue(fixture.intents.none { it.intent is ClientIntent.SetTerminalKeyboardVisible })
+            assertTrue(fixture.packets.isEmpty())
+        }
+    }
+
     @Test fun nonTerminalRoutesKeepTheirHeadingNavigationAndNoOverlays() {
         val fixture = NativeUiFixture(NativeUiFixtures.sessions())
         compose.setContent { fixture.Content() }
@@ -392,7 +442,9 @@ class TerminalFullscreenOverlayComponentTest {
             compose.onNodeWithText(label)
         }
 
+    /** Overlay tests need the diagnostic notice surface, so they enable the saved preference. */
     private fun terminalFixture() = NativeUiFixture(NativeUiFixtures.sessions().copy(
+        settings = NetworkSettings.DEFAULTS.withDebugInputMessagingEnabled(true),
         route = ClientRoute.Terminal(NativeUiFixtures.terminal()),
     )).apply { binding = NativeUiFixtures.binding(sourced = true) }
 

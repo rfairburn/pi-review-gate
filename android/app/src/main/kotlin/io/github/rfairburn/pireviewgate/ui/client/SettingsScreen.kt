@@ -40,11 +40,11 @@ import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionS
 /**
  * The settings screen.
  *
- * Only what this client actually is: a viewer. It exposes the three remembered global
+ * Only what this client actually is: a viewer. It exposes the four remembered global
  * preferences with their source defaults — automatic reconnect off, this viewer's
- * remote native input and copy on, and a 60-second Saved first-reply timeout — plus
- * this device's own identity fingerprint when it is known and the state of its
- * private storage.
+ * remote native input and copy on, a 60-second Saved first-reply timeout, and whole-app
+ * diagnostic status/notice messaging off — plus this device's own identity fingerprint
+ * when it is known and the state of its private storage.
  *
  * There is deliberately no hosting control, no incoming-connection grant or revoke,
  * no listener control, and no owner-side history or policy control: this client hosts
@@ -74,6 +74,12 @@ fun SettingsScreen(
             description = stringResource(R.string.setting_viewer_remote_input_body),
             checked = state.settings.viewerRemoteInputEnabled,
             onCheckedChange = { onIntent(ClientIntent.SetViewerRemoteInputEnabled(it)) },
+        )
+        SwitchRow(
+            title = stringResource(R.string.setting_debug_input_messaging),
+            description = stringResource(R.string.setting_debug_input_messaging_body),
+            checked = state.settings.debugInputMessagingEnabled,
+            onCheckedChange = { onIntent(ClientIntent.SetDebugInputMessagingEnabled(it)) },
         )
         SavedFirstReplyTimeoutRow(
             currentSeconds = state.settings.savedFirstReplyTimeoutSeconds,

@@ -2,10 +2,12 @@ package io.github.rfairburn.pireviewgate.ui.client
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.material3.Card
@@ -190,6 +192,36 @@ fun NoticeText(text: String, modifier: Modifier = Modifier) {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = modifier.fillMaxWidth(),
     )
+}
+
+/**
+ * The non-terminal routes' fixed-height diagnostic status slot.
+ *
+ * With [debugInputMessagingEnabled] off this composes nothing at all: no box, no
+ * reserved height, no placeholder, and no touch target, so the hidden region consumes
+ * no layout. With it on the existing fixed-height, noninteractive slot returns
+ * unchanged, which is what keeps a pending form from moving when an admission or
+ * settlement notice arrives.
+ */
+@Composable
+fun NonTerminalStatusSlot(
+    status: String?,
+    debugInputMessagingEnabled: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (!debugInputMessagingEnabled) return
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .padding(horizontal = 8.dp),
+    ) {
+        Text(
+            text = status ?: "",
+            maxLines = 2,
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
 }
 
 /** A short centred message for an empty list. */

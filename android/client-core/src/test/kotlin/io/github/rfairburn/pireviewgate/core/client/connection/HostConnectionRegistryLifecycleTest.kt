@@ -682,6 +682,92 @@ class HostConnectionRegistryLifecycleTest {
     }
 
     @Test
+    fun `debug input messaging is off until saved and a saved enable survives restart`() = runTest {
+        RegistryHarness().use { harness ->
+            val one = RegistryFixtures.host(1)
+            harness.seedSettings(
+                RegistryFixtures.settings(one, autoReconnect = true)
+                    .withViewerRemoteInputEnabled(false),
+            )
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                assertFalse(
+                    registry.snapshot.value.debugInputMessagingEnabled,
+                    "diagnostic messaging ships off: ${registry.snapshot.value}",
+                )
+                val generationBefore = registry.snapshot.value.settingsGeneration
+
+                assertIs<HostCommandResult.Accepted>(registry.setDebugInputMessagingEnabled(true))
+
+                assertTrue(registry.snapshot.value.debugInputMessagingEnabled)
+                assertEquals(generationBefore + 1, registry.snapshot.value.settingsGeneration)
+                assertTrue(harness.savedSettings()!!.debugInputMessagingEnabled)
+                assertTrue(harness.savedSettings()!!.autoReconnect)
+                assertFalse(harness.savedSettings()!!.viewerRemoteInputEnabled)
+                assertEquals(listOf(one), harness.savedCatalog().hosts)
+            } finally {
+                registry.close()
+            }
+
+            val restarted = harness.restartingRegistry(StandardTestDispatcher(testScheduler))
+            restarted.start()
+            try {
+                assertTrue(restarted.snapshot.value.debugInputMessagingEnabled)
+                assertTrue(harness.savedSettings()!!.debugInputMessagingEnabled)
+            } finally {
+                restarted.close()
+            }
+        }
+    }
+
+    @Test
+    fun `debug messaging save preserves every other settings fact and a failed write publishes nothing`() = runTest {
+        RegistryHarness().use { harness ->
+            val one = RegistryFixtures.host(1, previouslyConnected = true, suppressed = true)
+            val two = RegistryFixtures.host(2)
+            harness.seedSettings(
+                RegistryFixtures.settings(one, two, autoReconnect = true)
+                    .withViewerRemoteInputEnabled(false)
+                    .withSavedFirstReplyTimeoutSeconds(90),
+            )
+            val registry = harness.registry(StandardTestDispatcher(testScheduler))
+            registry.start()
+            try {
+                val savedBefore = harness.savedSettings()!!
+                assertIs<HostCommandResult.Accepted>(registry.setDebugInputMessagingEnabled(true))
+
+                // Only the new preference moves; hosts, history, suppression, Auto,
+                // viewer input, the saved timeout, and catalog order stay as saved.
+                assertEquals(savedBefore.copy(debugInputMessagingEnabled = true), harness.savedSettings())
+                assertEquals(listOf(one.id, two.id), harness.savedCatalog().hosts.map { it.id })
+
+                val beforeFailure = registry.snapshot.value
+                val durableBeforeFailure = harness.savedSettings()
+                harness.settings.refuseWrites = StorageFailureReason.WRITE_FAILED
+
+                val refused = registry.setDebugInputMessagingEnabled(false)
+                assertIs<HostCommandResult.Refused>(refused)
+                assertEquals(HostCommandRefusal.SETTINGS_UNAVAILABLE, refused.reason)
+
+                // A display preference whose save failed stays exactly as it was:
+                // nothing is published from memory and nothing else is disturbed.
+                val afterFailure = registry.snapshot.value
+                assertEquals(beforeFailure.debugInputMessagingEnabled, afterFailure.debugInputMessagingEnabled)
+                assertEquals(beforeFailure.savedFirstReplyTimeoutSeconds, afterFailure.savedFirstReplyTimeoutSeconds)
+                assertEquals(beforeFailure.autoReconnectEnabled, afterFailure.autoReconnectEnabled)
+                assertEquals(beforeFailure.viewerRemoteInputEnabled, afterFailure.viewerRemoteInputEnabled)
+                assertEquals(beforeFailure.settingsGeneration, afterFailure.settingsGeneration)
+                assertEquals(durableBeforeFailure, harness.savedSettings())
+                assertEquals(RegistryNoticeReason.SETTINGS_WRITE_FAILED, afterFailure.notice?.reason)
+                assertFalse(afterFailure.storage.settings.available)
+            } finally {
+                registry.close()
+            }
+        }
+    }
+
+    @Test
     fun `an invalid saved timeout is refused before any settings write`() = runTest {
         RegistryHarness().use { harness ->
             harness.seedSettings(RegistryFixtures.settings(RegistryFixtures.host(1)))

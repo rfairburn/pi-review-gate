@@ -734,6 +734,25 @@ public class HostConnectionRegistry(
         }
     }
 
+    /**
+     * Copy the remembered whole-app diagnostic status/notice presentation preference.
+     *
+     * This is a display preference and nothing else: no connection, terminal input,
+     * delivery, clipboard, storage, or proof state is touched here, and no attempt,
+     * settlement, or policy generation moves. Like the saved timeout, the requested
+     * value is staged, written, and adopted in that order, so a failed write leaves
+     * the published value and the durable document exactly as they were. Every other
+     * settings fact, host entry, and order is preserved.
+     */
+    public fun setDebugInputMessagingEnabled(enabled: Boolean): HostCommandResult {
+        val saved = updatePreferencePersistFirst { it.withDebugInputMessagingEnabled(enabled) }
+        return if (saved) {
+            HostCommandResult.Accepted
+        } else {
+            HostCommandResult.Refused(HostCommandRefusal.SETTINGS_UNAVAILABLE)
+        }
+    }
+
     // ------------------------------------------------------------- foreground
 
     /**
@@ -1163,6 +1182,7 @@ public class HostConnectionRegistry(
             foreground = true,
             autoReconnectEnabled = NetworkSettings.DEFAULT_AUTO_RECONNECT,
             viewerRemoteInputEnabled = NetworkSettings.DEFAULT_VIEWER_REMOTE_INPUT_ENABLED,
+            debugInputMessagingEnabled = NetworkSettings.DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED,
             identity = DeviceIdentityObservation.NeverInitialized,
             storage = StorageObservation(StorageHandleState(false), StorageHandleState(false)),
             hosts = emptyList(),
@@ -1185,6 +1205,8 @@ public class HostConnectionRegistry(
             // An unreadable document is never treated as "on".
             viewerRemoteInputEnabled = settingsState.available && current.viewerRemoteInputEnabled,
             savedFirstReplyTimeoutSeconds = current.savedFirstReplyTimeoutSeconds,
+            // Presentation only, and off until a saved document says otherwise.
+            debugInputMessagingEnabled = current.debugInputMessagingEnabled,
             identity = identityObservation,
             storage = StorageObservation(settingsState, trustState),
             hosts = runtimes.values.map { runtime ->

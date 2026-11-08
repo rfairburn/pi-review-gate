@@ -1509,6 +1509,20 @@ are unchanged. A Saved LIST that changes from pending to unknown is not proven t
 caused or fixed by this timeout, and no new diagnostics are part of this phase. No
 pagination scope, clipboard acceptance, or new permission is implied.
 
+**Debug input messaging.** A saved app-wide `Debug input messaging` setting, off by
+default, controls the whole diagnostic status and notice area. Off draws none of it: no
+status slot on the non-terminal routes (its reserved height goes back to the content
+below it), no terminal notice overlay with its readiness and placement-warning text,
+dismiss control, and drag region, and no copy of the raw status in the Keys panel — and
+the hidden overlay reserves no Keys space either. On returns the same messages and the
+existing per-text dismiss behavior. The preference is stored in the same strict
+version-1 settings document, where an absent key means off and only an explicit `true`
+is written; a non-boolean value, a null, or an unknown key still refuses the whole
+document, and a failed save publishes nothing. It changes presentation only: input,
+delivery, clipboard, storage, trust, identity, and proof behavior are unchanged, and no
+notice producer is reset, cleared, filtered, or replayed. Soft-keyboard visibility and
+the Keys dock layout are separate, later work.
+
 ## Focus, display, and status
 
 Host keyboard controls apply only while the corresponding host surface has focus. In

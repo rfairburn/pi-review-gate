@@ -217,6 +217,65 @@ class FileNetworkSettingsStoreTest {
     }
 
     @Test
+    fun `an old document without the debug flag reads as off and is not rewritten`() {
+        val old = "{\"version\":1,\"autoReconnect\":false,\"hosts\":[]}\n"
+        tree.settingsContainer.mkdirs()
+        tree.settingsDocument.writeText(old)
+
+        val store = FileNetworkSettingsStore(tree.settingsStorage())
+        val loaded = store.read()!!
+        store.close()
+
+        assertFalse(loaded.debugInputMessagingEnabled, "an absent key is off, never an inferred on")
+        assertEquals(old, tree.settingsDocument.readText(), "reading defaults must not create a migration")
+    }
+
+    @Test
+    fun `an enabled debug flag survives a reopen and turning it off again stays sparse`() {
+        val store = FileNetworkSettingsStore(tree.settingsStorage())
+        val enabled = NetworkSettings(
+            autoReconnect = true,
+            viewerRemoteInputEnabled = false,
+            hosts = HostCatalog.of(
+                listOf(
+                    host("a").withPreviouslyConnected(true),
+                    host("b", port = 9001).withReconnectSuppressed(true),
+                ),
+            ),
+            savedFirstReplyTimeoutSeconds = 120,
+            debugInputMessagingEnabled = true,
+        )
+        store.write(enabled)
+        store.close()
+
+        val reopened = FileNetworkSettingsStore(tree.settingsStorage())
+        assertEquals(enabled, reopened.read())
+        assertTrue(
+            tree.settingsDocument.readText().contains("\"debugInputMessagingEnabled\":true"),
+            tree.settingsDocument.readText(),
+        )
+
+        val disabled = reopened.read()!!.withDebugInputMessagingEnabled(false)
+        reopened.write(disabled)
+        reopened.close()
+
+        val final = FileNetworkSettingsStore(tree.settingsStorage())
+        assertEquals(disabled, final.read())
+        assertFalse(
+            tree.settingsDocument.readText().contains("debugInputMessagingEnabled"),
+            "returning to the off default writes no key at all: ${tree.settingsDocument.readText()}",
+        )
+        // Every sibling fact survived both publications.
+        assertTrue(final.read()!!.autoReconnect)
+        assertFalse(final.read()!!.viewerRemoteInputEnabled)
+        assertEquals(120, final.read()!!.savedFirstReplyTimeoutSeconds)
+        assertEquals(listOf(HostId.parse("a"), HostId.parse("b")), final.read()!!.hosts.ids)
+        assertTrue(final.read()!!.findHost(HostId.parse("a"))!!.previouslyConnected)
+        assertTrue(final.read()!!.findHost(HostId.parse("b"))!!.reconnectSuppressed)
+        final.close()
+    }
+
+    @Test
     fun `an empty document is malformed rather than empty defaults`() {
         tree.settingsContainer.mkdirs()
         tree.settingsDocument.writeText("")

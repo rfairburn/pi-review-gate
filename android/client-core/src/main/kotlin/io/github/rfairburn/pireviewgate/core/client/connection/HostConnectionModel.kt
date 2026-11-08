@@ -228,4 +228,13 @@ public data class ConnectionRegistrySnapshot(
      * saved configuration reports the in-memory default of 60.
      */
     public val savedFirstReplyTimeoutSeconds: Int = NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
+
+    /**
+     * Saved whole-app diagnostic status/notice presentation, off by default.
+     *
+     * Purely presentational: it decides whether the client draws its diagnostic
+     * status and notice surfaces, and it grants or revokes nothing. Input, delivery,
+     * clipboard, storage, and proof authority never consult it.
+     */
+    public val debugInputMessagingEnabled: Boolean = NetworkSettings.DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED,
 )

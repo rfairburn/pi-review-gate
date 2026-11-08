@@ -532,6 +532,103 @@ class TerminalOverlayPlacementComponentTest {
         }
     }
 
+    /**
+     * Debug off removes the entire notice presentation: its text, its dismiss control,
+     * its drag/touch region, and the Keys panel's duplicate of the raw status — and the
+     * height that surface reserved stops being subtracted from the Keys band. Debug on
+     * returns the same producer content, with nothing saved, reset, or replayed.
+     */
+    @Test fun debugOffRemovesEveryNoticePresentationItsTouchRegionAndReclaimsKeysHeight() {
+        val fixture = Fixture()
+        // Narrow and tall: the Keys panel's natural height then clearly exceeds the
+        // available band, so it is capped by the notices height and the reclaimed band
+        // is measurable, while the ordinary (non-short-layer) Keys layout still applies.
+        compose.setContent { Box(Modifier.width(240.dp).height(360.dp)) { fixture.Content() } }
+        awaitInput(fixture)
+        val pane = paneBounds(fixture)
+        val grid = fixture.viewports.last()
+        val requests = fixture.viewports.size
+
+        // Debug on: the raw status and its dismiss control form one notices surface.
+        val notices = compose.onNodeWithText("Synthetic status notice")
+            .assertIsDisplayed()
+            .fetchSemanticsNode()
+        compose.onNodeWithText("Dismiss").assertIsDisplayed().assertHasClickAction()
+        val noticesBounds = notices.boundsInWindow
+        // The notice text is a conservative lower bound on the surface's reserved
+        // height; the reclaim assertion below must at least cover this much of it.
+        val noticesHeightPx = noticesBounds.height
+        assertTrue("The notices surface must have a measurable height: $noticesBounds", noticesHeightPx > 0f)
+
+        // That surface owns every touch that lands on it, so the pane below sees none.
+        val touches = recordSurfaceTouches(fixture)
+        tapAt(noticesBounds.center)
+        compose.runOnIdle {
+            assertTrue("The notices surface owns its touches: $touches", touches.isEmpty())
+        }
+
+        // Debug off: no text, no dismiss control, and no touch region — the very same
+        // point now reaches the terminal pane, so the hidden region consumes nothing.
+        compose.runOnIdle { fixture.debugNotices = false }
+        compose.waitForIdle()
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        compose.onAllNodesWithText("Dismiss").assertCountEquals(0)
+        tapAt(noticesBounds.center)
+        compose.runOnIdle {
+            assertTrue("A hidden notices region must reserve no space and no touches: $touches",
+                touches.contains(MotionEvent.ACTION_DOWN))
+            touches.clear()
+            assertEquals("Hiding notices must not move or resize the pane", pane, paneBounds(fixture))
+            assertEquals(requests, fixture.viewports.size)
+            assertEquals(grid, fixture.viewports.last())
+            assertEquals("Presentation alone never saves a placement", 0, fixture.commits)
+        }
+
+        // Keys: no duplicate of the raw status, and the panel gets the band back.
+        compose.onNodeWithText("Keys").performClick()
+        compose.onNodeWithText("More keys").performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        val headerHidden = boundsOf("Conversation A")
+        // Deliberate baseline: expanding Keys is itself an intent. Toggling debug
+        // visibility must add nothing to this list, rather than be judged against an
+        // empty one.
+        val intentBaseline = compose.runOnIdle { fixture.intents.toList() }
+        assertEquals(1, intentBaseline.count { it.intent is ClientIntent.SetTerminalExtraKeysVisible })
+
+        // Debug on again: the notices surface and the Keys copy both return, so the same
+        // raw status is drawn twice, and the Keys band shrinks by the notices height.
+        compose.runOnIdle { fixture.debugNotices = true }
+        compose.waitForIdle()
+        // Both copies must be counted before either is addressed: a single-node lookup
+        // would fail on the duplicate.
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(2)
+        compose.onNodeWithText("Dismiss").assertIsDisplayed()
+        // The notices copy is the first matching node, the convention boundsOf uses.
+        compose.onAllNodesWithText("Synthetic status notice").onFirst().assertIsDisplayed()
+        val headerVisible = boundsOf("Conversation A")
+        val reclaimed = headerVisible.top - headerHidden.top
+        compose.runOnIdle {
+            assertTrue("Hidden notices must not keep pushing Keys down: $headerHidden vs $headerVisible",
+                reclaimed > 0f)
+            assertTrue("Keys must get back the band the hidden notices surface reserved: $reclaimed vs $noticesHeightPx",
+                reclaimed >= noticesHeightPx - 8f)
+            assertEquals(pane, paneBounds(fixture))
+            assertEquals(requests, fixture.viewports.size)
+            assertEquals(grid, fixture.viewports.last())
+            assertEquals("Presentation alone never saves a placement", 0, fixture.commits)
+            assertEquals("Toggling debug visibility emits no intent", intentBaseline, fixture.intents)
+            assertTrue("Toggling debug visibility submits nothing", fixture.keys.isEmpty() && fixture.pastes == 0)
+        }
+    }
+
+    /** Real pointer injection at an absolute window point. */
+    private fun tapAt(point: androidx.compose.ui.geometry.Offset) {
+        val root = compose.onRoot()
+        val origin = root.fetchSemanticsNode().boundsInWindow.topLeft
+        root.performTouchInput { click(point - origin) }
+    }
+
     private fun assertEveryKeyActionScrolls() {
         listOf("Ctrl", "Alt", "Shift", "Paste", "Fewer keys", "Esc", "Tab", "Shift+Tab",
             "Home", "End", "PgUp", "PgDn", "←", "↑", "↓", "→", "Ins", "Del",
@@ -703,6 +800,9 @@ class TerminalOverlayPlacementComponentTest {
         var placement by mutableStateOf(TerminalOverlayPlacement.DEFAULT)
         var warning by mutableStateOf<TerminalOverlayPlacementWarning?>(null)
         var placementReady by mutableStateOf(true)
+        // The saved whole-app debug presentation. These placement checks depend on the
+        // notice surface, so it starts enabled; one test flips it to cover the Off side.
+        var debugNotices by mutableStateOf(true)
         var observedKeyboard by mutableStateOf(false)
         var commits = 0
         var surface: TerminalSurfaceView? = null
@@ -767,6 +867,7 @@ class TerminalOverlayPlacementComponentTest {
                     onPaste = { pastes += 1 },
                     onIntent = ::onIntent,
                     status = "Synthetic status notice",
+                    debugInputMessagingEnabled = debugNotices,
                     overlayPlacement = placement,
                     overlayPlacementWarning = warning,
                     overlayPlacementReady = placementReady,

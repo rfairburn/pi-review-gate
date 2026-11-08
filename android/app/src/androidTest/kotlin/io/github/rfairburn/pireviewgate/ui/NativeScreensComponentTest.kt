@@ -1,12 +1,26 @@
 package io.github.rfairburn.pireviewgate.ui
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.Text
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.*
+import io.github.rfairburn.pireviewgate.ui.client.NonTerminalStatusSlot
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -369,6 +383,80 @@ class NativeScreensComponentTest {
             assertTrue(fixture.packets.isEmpty())
         }
     }
+
+    @Test
+    fun debugOffRemovesTheNonTerminalStatusSlotIncludingItsReservedHeight() {
+        var debug by mutableStateOf(false)
+        var status by mutableStateOf<String?>(null)
+        compose.setContent {
+            Column(Modifier.fillMaxSize()) {
+                NonTerminalStatusSlot(status = status, debugInputMessagingEnabled = debug)
+                Box(Modifier.fillMaxWidth().height(120.dp)) {
+                    Text("Synthetic content below the status slot")
+                }
+            }
+        }
+        val slotHeightPx = 40f * compose.activity.resources.displayMetrics.density
+        fun belowTop(): Float = compose.onNodeWithText("Synthetic content below the status slot")
+            .fetchSemanticsNode().boundsInRoot.top
+
+        // Off composes nothing: no text node, no placeholder, and no reserved gap.
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        assertTrue("Off must reserve no height at all: ${belowTop()}", belowTop() <= 1f)
+
+        // On restores the existing fixed-height, noninteractive slot — including while
+        // there is no notice text, which is what keeps a pending form from moving when
+        // an admission or settlement arrives.
+        compose.runOnIdle { debug = true }
+        assertTrue("On must reserve the existing slot: ${belowTop()}", belowTop() >= slotHeightPx - 1f)
+        compose.runOnIdle { status = "Synthetic status notice" }
+        compose.onNodeWithText("Synthetic status notice").assertIsDisplayed()
+        assertTrue("The slot keeps its height once a notice arrives: ${belowTop()}",
+            belowTop() >= slotHeightPx - 1f)
+
+        // Off again reclaims the whole gap, and the notice text is gone entirely.
+        compose.runOnIdle { debug = false }
+        assertTrue("Off must reclaim the whole slot: ${belowTop()}", belowTop() <= 1f)
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+    }
+
+    @Test
+    fun settingsShowsDebugMessagingOffByDefaultAndItsSwitchEmitsOnlyThatPreference() {
+        val fixture = NativeUiFixture(NativeUiFixtures.sessions().copy(route = ClientRoute.Settings))
+        compose.setContent { fixture.Content() }
+        compose.onNodeWithText("Automatic reconnect").assertIsDisplayed()
+        compose.onNodeWithText("Remote input and copy").assertIsDisplayed()
+        compose.onNodeWithText("Debug input messaging").performScrollTo().assertIsDisplayed()
+
+        // Three remembered switch preferences, in the order the screen draws them.
+        val switches = compose.onAllNodes(isSwitch)
+        assertEquals(3, switches.fetchSemanticsNodes().size)
+        val debugSwitch = switches[2]
+        debugSwitch.performScrollTo().assertIsOff()
+
+        // A tap asks the controller to change that one saved preference and nothing else.
+        debugSwitch.performClick()
+        compose.runOnIdle {
+            val requested = fixture.intents.filter { it.intent is ClientIntent.SetDebugInputMessagingEnabled }
+            assertEquals(1, requested.size)
+            assertEquals(ClientIntent.SetDebugInputMessagingEnabled(true), requested.single().intent)
+            assertTrue(fixture.intents.none { it.intent is ClientIntent.SetAutoReconnectEnabled })
+            assertTrue(fixture.intents.none { it.intent is ClientIntent.SetViewerRemoteInputEnabled })
+            assertTrue(fixture.intents.none { it.intent is ClientIntent.SetSavedFirstReplyTimeoutSeconds })
+        }
+        // The switch shows the stored value, not the tap: it stays off until the
+        // producer republishes the saved setting.
+        compose.onAllNodes(isSwitch)[2].assertIsOff()
+        compose.runOnIdle {
+            fixture.state = fixture.state.copy(
+                settings = fixture.state.settings.withDebugInputMessagingEnabled(true),
+            )
+        }
+        compose.onAllNodes(isSwitch)[2].assertIsOn()
+    }
+
+    /** Material's switch semantics: the only nodes carrying the Switch role. */
+    private val isSwitch = SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Switch)
 
     private fun scrollTo(text: String) {
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(text))

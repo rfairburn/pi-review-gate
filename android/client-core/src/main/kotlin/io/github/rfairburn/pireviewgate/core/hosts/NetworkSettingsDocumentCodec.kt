@@ -9,7 +9,7 @@ import kotlinx.serialization.json.JsonPrimitive
  *
  * ```
  * {"version":1,"autoReconnect":false,"viewerRemoteInputEnabled":false,
- *  "savedFirstReplyTimeoutSeconds":120,
+ *  "debugInputMessagingEnabled":true,"savedFirstReplyTimeoutSeconds":120,
  *  "hosts":[{"id":"...","label":"...","host":"...","port":8443,
  *            "previouslyConnected":true,"reconnectSuppressed":false}]}
  * ```
@@ -25,6 +25,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * - `viewerRemoteInputEnabled` is the one optional default-on flag: a genuinely
  *   absent key means on, while a present key must be a real boolean. Only an
  *   explicit `false` is ever written.
+ * - `debugInputMessagingEnabled` is the optional default-off flag for the whole
+ *   diagnostic status/notice area: a genuinely absent key means off, while a present
+ *   key must be a real boolean. Only an explicit `true` is ever written.
  * - `savedFirstReplyTimeoutSeconds` is optional only at its default of 60. An
  *   absent key means 60, a present key must be a positive whole number inside the
  *   document's existing nine-digit integer width, and the default is never written.
@@ -46,6 +49,7 @@ public object NetworkSettingsDocumentCodec {
     private const val KEY_VERSION = "version"
     private const val KEY_AUTO_RECONNECT = "autoReconnect"
     private const val KEY_VIEWER_REMOTE_INPUT = "viewerRemoteInputEnabled"
+    private const val KEY_DEBUG_INPUT_MESSAGING = "debugInputMessagingEnabled"
     private const val KEY_SAVED_FIRST_REPLY_TIMEOUT = "savedFirstReplyTimeoutSeconds"
     private const val KEY_HOSTS = "hosts"
 
@@ -60,6 +64,7 @@ public object NetworkSettingsDocumentCodec {
         KEY_VERSION,
         KEY_AUTO_RECONNECT,
         KEY_VIEWER_REMOTE_INPUT,
+        KEY_DEBUG_INPUT_MESSAGING,
         KEY_SAVED_FIRST_REPLY_TIMEOUT,
         KEY_HOSTS,
     )
@@ -115,6 +120,14 @@ public object NetworkSettingsDocumentCodec {
             NetworkSettings.DEFAULT_VIEWER_REMOTE_INPUT_ENABLED
         }
 
+        // Optional default-off flag: absent is off, present must be a real boolean.
+        val debugInputMessagingEnabled = if (KEY_DEBUG_INPUT_MESSAGING in root) {
+            root[KEY_DEBUG_INPUT_MESSAGING].asBooleanOrNull()
+                ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
+        } else {
+            NetworkSettings.DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED
+        }
+
         // Optional only at its default: absent is 60, present must be admitted.
         val savedFirstReplyTimeoutSeconds = if (KEY_SAVED_FIRST_REPLY_TIMEOUT in root) {
             val seconds = root[KEY_SAVED_FIRST_REPLY_TIMEOUT].asNumberOrNull()
@@ -150,6 +163,7 @@ public object NetworkSettingsDocumentCodec {
                 viewerRemoteInputEnabled = viewerRemoteInputEnabled,
                 hosts = HostCatalog.of(hosts),
                 savedFirstReplyTimeoutSeconds = savedFirstReplyTimeoutSeconds,
+                debugInputMessagingEnabled = debugInputMessagingEnabled,
             ),
         )
     }
@@ -168,6 +182,10 @@ public object NetworkSettingsDocumentCodec {
             // Sparse default-on flag: an on value writes no key at all.
             if (!settings.viewerRemoteInputEnabled) {
                 append(",\"").append(KEY_VIEWER_REMOTE_INPUT).append("\":false")
+            }
+            // Sparse default-off flag: an off value writes no key at all.
+            if (settings.debugInputMessagingEnabled) {
+                append(",\"").append(KEY_DEBUG_INPUT_MESSAGING).append("\":true")
             }
             // Sparse default: the default 60 writes no key at all.
             if (settings.savedFirstReplyTimeoutSeconds != NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS) {

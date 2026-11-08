@@ -38,6 +38,10 @@ class TerminalReadinessLayoutComponentTest {
         var terminal by mutableStateOf(NativeUiFixtures.terminal())
         var binding by mutableStateOf(NativeUiFixtures.binding(sourced = true))
         var status by mutableStateOf<String?>(null)
+        // The saved whole-app debug presentation. This test's existing assertions cover
+        // the notice surface, so it starts enabled and flips it off only for the
+        // suppression phase below.
+        var debugNotices by mutableStateOf(true)
         var surface: TerminalSurfaceView? = null
         val viewports = CopyOnWriteArrayList<Pair<Int, Int>>()
         val receipts = CopyOnWriteArrayList<FrameCommitReceipt>()
@@ -80,6 +84,7 @@ class TerminalReadinessLayoutComponentTest {
                 // neither may emit an intent (coverage, focus, or otherwise).
                 onIntent = { error("No navigation gesture in layout test") },
                 status = status,
+                debugInputMessagingEnabled = debugNotices,
             )
         }
         compose.waitUntil(10_000) { terminal.inputReady && receipts.isNotEmpty() }
@@ -100,6 +105,23 @@ class TerminalReadinessLayoutComponentTest {
         assertStablePane()
         compose.onNodeWithText("Dismiss").performClick()
         compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        assertStablePane()
+        // Debug off removes the whole notices surface, including its dismiss control.
+        // A notice the producer publishes afterwards stays hidden, and the pane is
+        // still never moved or resized by any of this.
+        compose.runOnIdle { debugNotices = false }
+        compose.runOnIdle { status = "Second synthetic status notice" }
+        compose.onAllNodesWithText("Second synthetic status notice").assertCountEquals(0)
+        compose.onAllNodesWithText("Dismiss").assertCountEquals(0)
+        assertStablePane()
+        // Turning debugging back on returns the producer's current last value only.
+        // The notice dismissed above is not resurrected and nothing is replayed.
+        compose.runOnIdle { debugNotices = true }
+        compose.onNodeWithText("Second synthetic status notice").assertIsDisplayed()
+        compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
+        assertStablePane()
+        compose.onNodeWithText("Dismiss").performClick()
+        compose.onAllNodesWithText("Second synthetic status notice").assertCountEquals(0)
         assertStablePane()
         // The Keys panel stays open through the readiness churn below.
         compose.onNodeWithText("Keys").performClick()

@@ -22,8 +22,10 @@ import androidx.compose.ui.unit.IntSize
  * scaling at 1 and leave the frame partly empty. Falling back to exact incoming constraints
  * keeps the modifier honest for any caller that does propagate them. With no frame at all —
  * the first frame, before one has been resolved — the node lays itself out at the logical
- * size, which is scale 1: the natural footprint is the smallest frame, so every logical
- * touch target keeps its own physical size.
+ * size, which is the natural default of scale 1. That natural size is not this modifier's
+ * floor: a caller may resolve a frame smaller than it, and the floating panel clamps its
+ * frame at half the footprint it measured, where the factors above keep every logical touch
+ * target at least half its own physical size.
  *
  * The contents are placed at the frame's own origin and scaled from there, so they reach it
  * edge to edge with no letterbox and no spare space. The scale is a placement layer, so

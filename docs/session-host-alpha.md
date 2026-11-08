@@ -1533,12 +1533,15 @@ measured at its own reference width and at the height the visible area leaves it
 stretches it into the frame with independent horizontal and vertical factors: text, buttons,
 padding, spacing, and the interior corner controls all scale together, so a frame of any
 shape is filled edge to edge with no re-wrapped rows and no blank letterbox, and the layout
-never re-wraps while you resize. The frame stops shrinking at that logical footprint, so
-every key, the corner toggle, and the grip keep a complete 48 dp physical target however
-far a grip drag overshoots; the floor is the footprint the panel measured, not a fixed
-number. A floating panel is never measured past the pane's own visible area, and the grip's
-own 48dp is reserved below the panel's scrollable viewport so it covers
-no key. One icon-only corner control switches
+never re-wraps while you resize. The frame stops shrinking at half that logical footprint on
+each axis, so every floating key, the corner toggle, and the grip keep at least half their
+logical size — a complete 24 dp physical target for a target laid out at 48 dp — however far
+a grip drag overshoots; the floor is half the footprint the panel measured, not a fixed
+number, and it belongs to the floating panel alone: a docked band's targets are never scaled
+and keep their full 48 dp. A floating panel is never measured past the pane's own visible
+area, and the grip reserves no strip of its own: it is the trailing element of the panel's
+last key row, so it covers no key, never wraps into an empty row by itself, and scrolls into
+view with that row when the panel is shorter than its content. One icon-only corner control switches
 docking: it never opens or closes the panel and never shows or hides the on-screen
 keyboard, and because it belongs to the panel header it scrolls and clips with that header
 rather than standing over key rows the header has scrolled past. A docked keyboard reserves the occluding inset the platform actually reports,

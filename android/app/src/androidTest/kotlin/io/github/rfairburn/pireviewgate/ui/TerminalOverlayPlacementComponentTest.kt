@@ -360,10 +360,9 @@ class TerminalOverlayPlacementComponentTest {
         compose.onNodeWithText("Esc").assertIsDisplayed()
         assertTrue("A floating panel keeps terminal focus", fixture.surface!!.hasFocus())
 
-        // A completed move and a completed resize are both remembered. A floating panel
-        // never shrinks below its own logical footprint, so the frame is first grown and
-        // the measured resize then takes a genuinely non-uniform bite out of that
-        // enlarged frame: narrower and taller at the same time.
+        // A completed move and a completed resize are both remembered. The frame is grown
+        // first so the measured resize has room on both axes and takes a genuinely
+        // non-uniform bite out of that enlarged frame: narrower and taller at the same time.
         dragBy("Conversation A", dx = -60f, dy = -120f)
         resizeKeysPanel(dx = 150f, dy = 150f)
         val moved = keysPanelBounds()
@@ -608,9 +607,9 @@ class TerminalOverlayPlacementComponentTest {
         val labels = listOf("Ctrl", "Alt", "Shift", "Paste", "Fewer keys", "Esc", "Tab",
             "Shift+Tab", "Home", "End", "PgUp", "PgDn", "←", "↑", "↓", "→", "Ins", "Del",
             "F1", "F6", "F12")
-        // Every key plus both interior corner controls — the docking toggle and the real 48dp
-        // grip container — because they belong to the same scaled layout and must scale with
-        // it exactly as the keys do.
+        // Every key plus both interior controls — the docking toggle and the real 48dp
+        // logical grip container riding the last key row — because they belong to the same
+        // scaled layout and must scale with it exactly as the keys do.
         val probes = linkedMapOf<String, () -> ComposeRect>()
         labels.forEach { label -> probes[label] = { controlNode(label).boundsInWindow } }
         probes["docking control"] = { controlNode("Dock keys").boundsInWindow }
@@ -647,14 +646,16 @@ class TerminalOverlayPlacementComponentTest {
         }
         assertEquals("A non-uniform resize must not re-wrap a single key into another row",
             beforeRows, keyRows(labels))
-        // Filled rather than letterboxed: the scrollable viewport spans the grown frame's
-        // whole width, and the viewport plus the grip's own band tile its whole height.
+        // Filled rather than letterboxed, and with nothing held outside the scroll: the
+        // scrollable viewport spans the grown frame's whole width and its whole height,
+        // because the grip rides the last key row inside it instead of tiling a band under it.
         val viewport = keysPanelBounds()
-        val grip = gripContainer().boundsInWindow
         assertEquals("The scaled viewport must span the frame's whole width: $viewport vs $afterFrame",
             afterFrame.width, viewport.width, 1f)
-        assertEquals("The scaled viewport and grip band must tile the frame's height: " +
-            "$viewport vs $grip vs $afterFrame", afterFrame.height, viewport.height + grip.height, 2f)
+        assertEquals("The scaled viewport must fill the frame's whole height, with the grip " +
+            "inside it rather than tiled beneath it: $viewport vs $afterFrame",
+            afterFrame.height, viewport.height, 2f)
+        assertGripRidesLastKeyRow("F12")
         compose.runOnIdle {
             assertEquals("Only the pop-out and the completed resize save", 2, fixture.commits)
             assertEquals("A non-uniform resize never reflows the pane", pane, paneBounds(fixture))
@@ -799,10 +800,9 @@ class TerminalOverlayPlacementComponentTest {
         compose.onNodeWithContentDescription("Pop keys out").performClick()
         awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
-        // A floating panel stops shrinking at its own logical footprint, which is the frame
-        // a never-resized panel shows, so the frame is grown first and the measured drag
-        // then takes a proportional bite out of that growth: only there does the travel have
-        // a shrink to apply rather than a clamp.
+        // A floating panel stops shrinking at half its own logical footprint, so the frame is
+        // grown first and the measured drag then takes a proportional bite out of that
+        // growth: there the travel has a shrink to apply well clear of either clamp.
         val footprint = floatingKeysFrameBounds()
         val footprintKey = controlNode("Esc").boundsInWindow
         resizeKeysPanel(dx = 200f, dy = 260f)
@@ -852,10 +852,11 @@ class TerminalOverlayPlacementComponentTest {
      * pretending to a real platform IME. A floating Keys panel that was never resized lays
      * its one logical layout out at the extent the pane actually leaves, so it never
      * measures past that extent and its contents still fill the frame it was given: the
-     * scrollable viewport and the grip's own reserved band tile the frame from edge to edge
-     * instead of leaving a blank strip, and what does not fit stays scroll-reachable inside
-     * it. Adapting to the reduced extent is display-only: the remembered floating size
-     * stays absent and nothing is saved.
+     * scrollable viewport is that frame on both axes — the resize grip rides the last key
+     * row inside it rather than reserving a blank strip beneath it — and what does not fit
+     * stays scroll-reachable inside it, the last row and its handle included. Adapting to
+     * the reduced extent is display-only: the remembered floating size stays absent and
+     * nothing is saved.
      */
     @Test fun neverResizedFloatingKeysFillTheVisibleExtentAndNeverSaveAnAdaptedSize() {
         val fixture = Fixture()
@@ -871,7 +872,6 @@ class TerminalOverlayPlacementComponentTest {
 
         val frame = floatingKeysFrameBounds()
         val viewport = keysPanelBounds()
-        val grip = gripContainer().boundsInWindow
         // The reduced extent has to bind for anything below to be evidence, and it is
         // measured rather than assumed: a panel fitted to a 200dp host cannot be taller
         // than it, and the scroll below proves content really sits past that viewport.
@@ -879,14 +879,17 @@ class TerminalOverlayPlacementComponentTest {
             frame.height <= visible.height() + 1f && frame.bottom <= visible.bottom + 1f)
         assertTrue("A never-resized panel stays inside the visible width: $frame vs $visible",
             frame.right <= visible.right + 1f && frame.left >= visible.left - 1f)
-        // Filled, not letterboxed: the scrollable viewport and the grip's own band tile the
-        // frame's whole height, and the grip sits on the frame's own bottom edge.
-        assertEquals("The viewport and the grip band must tile the frame's height: " +
-            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
-        assertEquals("The grip sits on the frame's bottom edge: $grip vs $frame",
-            frame.bottom, grip.bottom, 1f)
+        // Filled, not letterboxed, and with nothing held outside the scroll: the viewport is
+        // the frame on both axes, because the grip rides the last key row inside it instead
+        // of tiling a band beneath it.
+        assertEquals("The viewport must fill the frame's whole height, with no grip band " +
+            "reserved beneath it: $viewport vs $frame", frame.height, viewport.height, 2f)
         assertEquals("The frame and its viewport share one leading edge: $frame vs $viewport",
             frame.left, viewport.left, 1f)
+        // The grip is part of that scrollable content rather than an overlay pinned over it:
+        // on an extent this short it sits with the last key row, outside the fitted viewport,
+        // until a real scroll brings that row in.
+        assertGripStartsOutsideViewport(viewport)
         // The content is taller than the extent it was fitted to, so its own scroll is what
         // keeps the rest reachable inside that frame — measured, not assumed.
         val headerBeforeCapScroll = boundsOf("Conversation A")
@@ -900,6 +903,12 @@ class TerminalOverlayPlacementComponentTest {
         // with a complete target, rather than sitting behind it.
         compose.onNodeWithText("→").performScrollTo().assertIsDisplayed()
         assertTouchTarget("→")
+        // Scrolling that row in brings the handle with it: the same row, inside the viewport,
+        // trailing its last key rather than standing over it.
+        val gripAfterRowScroll = gripContainer().boundsInWindow
+        assertTrue("The grip must scroll into view with the last key row it belongs to: " +
+            "$gripAfterRowScroll vs $viewport", gripAfterRowScroll.bottom <= viewport.bottom + 1f)
+        assertGripRidesLastKeyRow("→")
         compose.onNodeWithText("Paste").performScrollTo().assertIsDisplayed()
         assertTouchTarget("Paste")
         compose.runOnIdle {
@@ -913,18 +922,19 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
-     * The resize grip belongs to the floating panel's one scaled layout, so it keeps its
-     * corner and its reserved band at any frame size: on a grown, scaled panel the grip
-     * still sits below the scrollable viewport, covers no key, and every key and interior
-     * control keeps a complete 48dp physical target — measured on the scaled panel, not
-     * asserted from a constant. A real injected tap still reaches its key and never the
-     * terminal underneath. A grown frame on a full host never has to scroll, so the other
-     * half of "at any scroll position" — that a panel taller than the extent it was fitted
-     * to genuinely has to scroll, and keeps the same clearance once it does — is witnessed
-     * on a measured short host in
+     * The resize grip belongs to the floating panel's one scaled layout and to its last key
+     * row, so it stays inline there at any frame size: on a grown, scaled panel the grip
+     * still trails that row's last key inside the scrollable viewport, covers no key, and
+     * every key and interior control keeps a complete 48dp physical target — measured on the
+     * scaled panel, not asserted from a constant. Nothing is reserved outside the viewport,
+     * so the viewport fills the grown frame on both axes. A real injected tap still reaches
+     * its key and never the terminal underneath. A grown frame on a full host never has to
+     * scroll, so the other half of "at any scroll position" — that a panel taller than the
+     * extent it was fitted to genuinely has to scroll that row and its handle into view, and
+     * keeps the same clearance once it does — is witnessed on a measured short host in
      * [shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader].
      */
-    @Test fun floatingGripKeepsItsCornerAndEveryKeyTargetStaysClearOfIt() {
+    @Test fun floatingGripRidesTheLastKeyRowAndEveryKeyTargetStaysClearOfIt() {
         val fixture = Fixture()
         // Every step is tagged with the existing placementPhase observer, so a replay names
         // the last phase reached and dumps the main and test stacks through that observer's
@@ -955,11 +965,14 @@ class TerminalOverlayPlacementComponentTest {
         placementPhase("grip-measure") {
             val frame = floatingKeysFrameBounds()
             val viewport = keysPanelBounds()
+            // The grip is not a band outside the scroll: the viewport fills the grown frame
+            // on both axes and the grip rides the last key row inside it.
+            assertEquals("A scaled panel's viewport fills its frame — nothing is reserved for " +
+                "a grip band beneath it: $viewport vs $frame", frame.height, viewport.height, 2f)
             val grip = gripContainer().boundsInWindow
-            assertTrue("The grip occupies its own band below the scrollable viewport: $grip vs $viewport",
-                grip.top >= viewport.bottom - 1f)
-            assertEquals("A scaled panel's viewport and grip band still tile its frame: " +
-                "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+            assertTrue("The grip stays inside the scrollable viewport it belongs to: " +
+                "$grip vs $viewport", grip.bottom <= viewport.bottom + 1f)
+            assertGripRidesLastKeyRow("F12")
             listOf("Esc", "→", "F12").forEach { label ->
                 val key = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed()
                     .fetchSemanticsNode()
@@ -995,8 +1008,8 @@ class TerminalOverlayPlacementComponentTest {
      * footprint can, and it does so without pretending to a real platform IME. The last
      * function key therefore starts outside the viewport the panel was fitted to, the
      * header really moves when the panel is scrolled to it, and the complete 48dp target
-     * and the grip-band clearance below are measured on a panel that first had to scroll
-     * before that row appeared on screen at all.
+     * and the resize handle that rides that same row are measured on a panel that first had
+     * to scroll before that row — and its handle — appeared on screen at all.
      *
      * The toggle is then measured against its own header across one real swipe. Its travel
      * is read from unclipped origins, because `SemanticsNode.boundsInWindow` is clipped to
@@ -1023,18 +1036,22 @@ class TerminalOverlayPlacementComponentTest {
 
         val frame = floatingKeysFrameBounds()
         val viewport = keysPanelBounds()
-        val grip = gripContainer().boundsInWindow
         // The short host has to bind, or nothing below is evidence about scrolling.
         assertTrue("A never-resized panel must not measure past the visible extent: $frame vs $visible",
             frame.height <= visible.height() + 1f && frame.bottom <= visible.bottom + 1f)
-        assertEquals("The viewport and the grip band must tile the frame's height: " +
-            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+        assertEquals("The viewport must fill the frame's whole height, with no grip band " +
+            "reserved beneath it: $viewport vs $frame", frame.height, viewport.height, 2f)
 
         // Scrolling is genuinely required, and measured that way: the last function key is
         // in the layout and starts outside the viewport the panel was fitted to. The header
         // is tracked by its unclipped origin, which keeps reporting the content's travel
         // even where a clipped rectangle would only report what is left on screen.
         compose.onNodeWithText("F12").assertExists().assertIsNotDisplayed()
+        // The handle rides that same row, so it is out of view with it — not pinned over the
+        // keys — and its off-screen position is read unclipped, because `boundsInWindow`
+        // cannot report where a clipped node went.
+        compose.onNodeWithTag("terminal-keys-resize-grip").assertIsNotDisplayed()
+        assertGripStartsOutsideViewport(viewport)
         val headerTopBeforeScroll = compose.onAllNodesWithText("Conversation A").onFirst()
             .fetchSemanticsNode().positionInWindow.y
         compose.onNodeWithText("F12").performScrollTo().assertIsDisplayed()
@@ -1051,6 +1068,10 @@ class TerminalOverlayPlacementComponentTest {
         val minimum = 48f * compose.activity.resources.displayMetrics.density
         assertTrue("The last key keeps a complete 48dp target after a real scroll: $lastTouch",
             lastTouch.width >= minimum && lastTouch.height >= minimum)
+        // The handle came in with that row: it is displayed now, it rides the row it belongs
+        // to, and it still covers nothing.
+        val grip = gripContainer().boundsInWindow
+        assertGripRidesLastKeyRow("F12")
         assertFalse("The grip must never cover a key, at any scroll position: $lastBounds vs $grip",
             lastBounds.left < grip.right && lastBounds.right > grip.left &&
                 lastBounds.top < grip.bottom && lastBounds.bottom > grip.top)
@@ -1117,15 +1138,21 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
-     * The floating panel's resize floor is the measured footprint of its one logical
-     * layout, not a named constant. Starting from a deliberately enlarged frame — a shrink
-     * from the never-resized footprint would be clamped away and prove nothing — the panel
-     * really shrinks, a second overshoot cannot shrink it further, and at that floor every
-     * measured interactive target (key buttons, the corner docking toggle, and the resize
-     * grip itself) still holds a complete 48dp physical target. A real injected tap still
+     * The floating panel's resize floor is half the measured footprint of its one logical
+     * layout on each axis — not that footprint itself, and not a named constant. Starting
+     * from a deliberately enlarged frame, the panel really shrinks to that half on both
+     * axes, a second armed drag cannot shrink it further, and at that floor every measured
+     * interactive target (key buttons, the corner docking toggle, and the resize grip
+     * itself) still holds at least half the physical size it carried at its natural frame —
+     * a real 24dp for a target laid out at 48dp. That is only evidence because the frame and
+     * the targets both genuinely moved: the same reads against an unchanged frame would
+     * prove only that a clamp did nothing. Both shrinks travel a measured distance derived
+     * from this panel's own frame, scale, and platform slop rather than an arbitrary number,
+     * and both pointer paths are checked to stay inside the real window. The grip still rides
+     * the last key row inside the viewport at that floor, and a real injected tap still
      * reaches a key and never the terminal.
      */
-    @Test fun floatingResizeFloorStopsShrinkingAndKeepsEveryTargetAtLeast48dp() {
+    @Test fun floatingResizeFloorStopsShrinkingAndKeepsEveryTargetAtLeast24dp() {
         val fixture = Fixture()
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
@@ -1135,46 +1162,114 @@ class TerminalOverlayPlacementComponentTest {
         awaitInput(fixture)
         compose.onNodeWithText("More keys").performClick()
         awaitInput(fixture)
+        // The frame a never-resized panel shows is its one logical footprint, and that is
+        // what the floor is half of. It is measured here rather than assumed, together with
+        // one key's real target before anything is scaled.
+        val natural = floatingKeysFrameBounds()
+        val naturalKey = controlNode("F12").touchBoundsInRoot
+        val window = pointerWindow()
+        val slopPx = touchSlopPx()
         // Enlarge first, so the shrink below is real rather than a clamp doing nothing.
         resizeKeysPanel(dx = 250f, dy = 250f)
         val enlarged = floatingKeysFrameBounds()
 
-        // Overshoot the drag so the floor lands the panel on its own footprint while the
-        // injected pointer stays inside the window.
-        resizeKeysPanel(dx = -900f, dy = -700f)
+        // Come down to the floor on measured travel, not on an arbitrary number that throws
+        // the pointer out of the window. The frame has to lose half its own footprint, and
+        // the only travel this gesture cannot report is the slop its own detector consumes in
+        // the layout's logical units before it arms. That cost is bounded on each axis by one
+        // slop times that axis's own factor — the discarded logical slop is never longer than
+        // the logical path, whose per-axis extent is the physical travel over that factor —
+        // so adding the bound plus a pixel is enough to reach the floor, and the exact value
+        // gripArmingLossPx computes for this travel is then checked rather than trusted.
+        val scaleX = enlarged.width / natural.width
+        val scaleY = enlarged.height / natural.height
+        val needX = enlarged.width - natural.width / 2f
+        val needY = enlarged.height - natural.height / 2f
+        val toFloor = Offset(
+            -(needX + slopPx * scaleX + 1f),
+            -(needY + slopPx * scaleY + 1f),
+        )
+        val floorLoss = gripArmingLossPx(toFloor, scaleX, scaleY, slopPx)
+        assertTrue("The shrink to the floor must travel far enough that its own detector's slop " +
+            "still leaves it reaching half the footprint ($enlarged -> half $natural, needs " +
+            "$needX, applies ${-(toFloor.x - floorLoss.x)}, travel ${toFloor.x}, loss " +
+            "${floorLoss.x} at x$scaleX, slop $slopPx)",
+            -(toFloor.x - floorLoss.x) >= needX)
+        assertTrue("The shrink to the floor must travel far enough that its own detector's slop " +
+            "still leaves it reaching half the footprint ($enlarged -> half $natural, needs " +
+            "$needY, applies ${-(toFloor.y - floorLoss.y)}, travel ${toFloor.y}, loss " +
+            "${floorLoss.y} at y$scaleY, slop $slopPx)",
+            -(toFloor.y - floorLoss.y) >= needY)
+        val firstStart = gripDragStart()
+        assertPointerPathInsideWindow(firstStart, firstStart + toFloor, window)
+        dispatchDragAt(firstStart, toFloor.x, toFloor.y, MotionEvent.ACTION_UP)
         val floored = floatingKeysFrameBounds()
+        val roundingPx = commitRoundingPx()
         assertTrue("The resize must actually shrink the enlarged panel: $enlarged vs $floored",
             floored.height < enlarged.height - 1f && floored.width < enlarged.width - 1f)
-        resizeKeysPanel(dx = -900f, dy = -700f)
+        assertEquals("The floor must be half the natural footprint's height, not the whole " +
+            "footprint: $natural vs $floored", natural.height / 2f, floored.height, roundingPx)
+        assertEquals("The floor must be half the natural footprint's width, not the whole " +
+            "footprint: $natural vs $floored", natural.width / 2f, floored.width, roundingPx)
+
+        // Below the floor there is nothing left to travel for, so the second drag only has to
+        // arm and attempt a real shrink the floor then refuses: several slops of applied
+        // travel, far more than the tolerance it is checked with, so what holds the frame is
+        // the clamp and not a shortage of movement. It stays inside the window instead of
+        // leaving it.
+        val floorScaleX = floored.width / natural.width
+        val floorScaleY = floored.height / natural.height
+        val attemptedPx = 4f * slopPx
+        val pastFloor = Offset(
+            -(attemptedPx + slopPx * floorScaleX + 1f),
+            -(attemptedPx + slopPx * floorScaleY + 1f),
+        )
+        val clampLoss = gripArmingLossPx(pastFloor, floorScaleX, floorScaleY, slopPx)
+        assertTrue("The second drag must attempt a shrink far past the tolerance it is checked " +
+            "with, so the floor and not a short travel holds the frame (attempts $attemptedPx " +
+            "on each axis, applies ${-(pastFloor.x - clampLoss.x)} and " +
+            "${-(pastFloor.y - clampLoss.y)}, travel ${pastFloor.x}/${pastFloor.y}, loss " +
+            "${clampLoss.x}/${clampLoss.y} at x$floorScaleX/y$floorScaleY, slop $slopPx)",
+            -(pastFloor.x - clampLoss.x) >= attemptedPx &&
+                -(pastFloor.y - clampLoss.y) >= attemptedPx)
+        val secondStart = gripDragStart()
+        assertPointerPathInsideWindow(secondStart, secondStart + pastFloor, window)
+        dispatchDragAt(secondStart, pastFloor.x, pastFloor.y, MotionEvent.ACTION_UP)
         val again = floatingKeysFrameBounds()
-        assertEquals("A second overshoot drag cannot go below the floor: $floored vs $again",
+        assertEquals("A second armed drag cannot go below the floor: $floored vs $again",
             floored.height, again.height, 2f)
-        assertEquals("A second overshoot drag cannot go below the floor: $floored vs $again",
+        assertEquals("A second armed drag cannot go below the floor: $floored vs $again",
             floored.width, again.width, 2f)
 
-        // What that floor guarantees is real physical size, read off the panel itself.
+        // What that floor guarantees is real physical size, read off the panel itself: each
+        // interactive target keeps at least half its logical 48dp, and the keys really came
+        // down with the halved frame rather than being held at 48dp by a re-wrap.
+        val minimumTarget = 24f * compose.activity.resources.displayMetrics.density
         listOf("Ctrl", "Esc", "F12").forEach { label ->
             compose.onNodeWithText(label).performScrollTo()
-            assertTouchTarget(label)
+            assertTouchTargetAtLeast(label, minimumTarget)
+            val target = controlNode(label).touchBoundsInRoot
+            assertTrue("$label must have come down with the halved frame rather than being " +
+                "held at its unscaled size: $naturalKey vs $target",
+                target.height <= naturalKey.height * 0.75f)
         }
-        // The interior corner controls scale with the layout too, so the floor is what
-        // keeps them whole. Neither sits inside the panel's scroll container: the grip is
-        // its own band below the viewport, and the docking toggle rides that container's
-        // scroll offset so it travels and clips with the header instead of standing still —
+        // The interior corner control scales with the layout too, so the floor is what keeps
+        // it whole — measured as its own target, and the grip as its real logical container
+        // rather than the 24dp glyph inside it. The docking toggle rides the container's
+        // scroll offset so it travels and clips with the header instead of standing still;
         // the witness for that behavior is
-        // [shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader]. What
-        // this floor guarantees here is complete physical size: the toggle measured as its
-        // own target, the grip as its real 48dp container rather than the 24dp glyph
-        // inside it.
-        assertTouchTarget("Dock keys")
+        // [shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader].
+        assertTouchTargetAtLeast("Dock keys", minimumTarget)
         val gripBounds = gripContainer().boundsInWindow
-        val minimumTarget = 48f * compose.activity.resources.displayMetrics.density
-        assertTrue("The resize grip keeps a complete 48dp target at the floor: $gripBounds",
+        assertTrue("The resize grip keeps at least a 24dp target at the floor: $gripBounds",
             gripBounds.width >= minimumTarget && gripBounds.height >= minimumTarget)
-        // The layout is still the one logical layout tiled by its viewport and grip band.
+        // The layout is still the one logical layout, filled by its own viewport with the
+        // grip riding the last key row inside it — nothing is reserved beneath the scroll.
         val viewport = keysPanelBounds()
-        assertEquals("The floored frame is still tiled by its viewport and grip band: " +
-            "$viewport vs $gripBounds vs $floored", floored.height, viewport.height + gripBounds.height, 2f)
+        assertEquals("The floored frame is still filled by its viewport, with no grip band " +
+            "reserved beneath it: $viewport vs $gripBounds vs $floored",
+            floored.height, viewport.height, 2f)
+        assertGripRidesLastKeyRow("F12")
 
         tapByTouch("F12")
         compose.runOnIdle {
@@ -1992,12 +2087,20 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /** Icon-only controls have no text, so a target check matches either presentation. */
-    private fun assertTouchTarget(label: String) {
-        val minimum = 48f * compose.activity.resources.displayMetrics.density
+    private fun assertTouchTarget(label: String) =
+        assertTouchTargetAtLeast(label, 48f * compose.activity.resources.displayMetrics.density)
+
+    /**
+     * The same target check against a stated physical minimum in pixels, so a scaled
+     * floating target can be measured against the floor it actually guarantees rather than
+     * against the unscaled 48 dp it was laid out at.
+     */
+    private fun assertTouchTargetAtLeast(label: String, minimumPx: Float) {
         val node = compose.onNode(hasText(label) or hasContentDescription(label))
             .assertExists().fetchSemanticsNode()
-        assertTrue("$label keeps a real 48dp touch target: ${node.touchBoundsInRoot}",
-            node.touchBoundsInRoot.width >= minimum && node.touchBoundsInRoot.height >= minimum)
+        assertTrue("$label keeps a touch target of at least $minimumPx physical pixels: " +
+            "${node.touchBoundsInRoot}",
+            node.touchBoundsInRoot.width >= minimumPx && node.touchBoundsInRoot.height >= minimumPx)
     }
 
     /**
@@ -2126,27 +2229,104 @@ class TerminalOverlayPlacementComponentTest {
         keysPanelScrollNode().fetchSemanticsNode().boundsInWindow
 
     /**
-     * The floating panel's real 48dp resize-grip container — the pointer-input box, not the
-     * 24dp glyph inside it. The tag is the one `TerminalScreen` puts on that container.
+     * The floating panel's real 48dp logical resize-grip container — the pointer-input box,
+     * not the 24dp glyph inside it. The tag is the one `TerminalScreen` puts on that
+     * container. It rides the panel's last key row, so this is the read for a grip that is
+     * expected to be on screen.
      */
     private fun gripContainer(): SemanticsNode =
         compose.onNodeWithTag("terminal-keys-resize-grip").assertIsDisplayed().fetchSemanticsNode()
 
+    /** The same container without a displayedness precondition, for a row still off screen. */
+    private fun gripNode(): SemanticsNode =
+        compose.onNodeWithTag("terminal-keys-resize-grip").fetchSemanticsNode()
+
     /**
-     * The floating Keys panel's own frame: the outer bounds its contents tile. The
-     * scrollable viewport carries its top and leading edges and the 48dp grip container,
-     * aligned to the opposite corner, carries its bottom and trailing edges, so the union is
-     * the frame the panel was resized to rather than a fixture's guess at it.
+     * The grip belongs to the panel's last key row rather than to a band outside the
+     * scrollable viewport: it trails that row's last key, shares the row's vertical extent,
+     * and overlaps no key target. Read from real bounds at whatever scale the panel holds,
+     * once that row is on screen.
      */
-    private fun floatingKeysFrameBounds(): ComposeRect {
-        val viewport = keysPanelBounds()
+    private fun assertGripRidesLastKeyRow(lastKeyLabel: String) {
+        val lastKey = controlNode(lastKeyLabel).boundsInWindow
         val grip = gripContainer().boundsInWindow
-        return ComposeRect(
-            left = minOf(viewport.left, grip.left),
-            top = minOf(viewport.top, grip.top),
-            right = maxOf(viewport.right, grip.right),
-            bottom = maxOf(viewport.bottom, grip.bottom),
-        )
+        val gripCenterY = (grip.top + grip.bottom) / 2f
+        assertTrue("The grip must trail the last key of the panel's last key row: " +
+            "$grip vs $lastKey", grip.left >= lastKey.right - 1f)
+        assertTrue("The grip must share the last key's row: $grip vs $lastKey",
+            gripCenterY >= lastKey.top - 1f && gripCenterY <= lastKey.bottom + 1f)
+        assertFalse("The grip must never overlap the last key it rides: $grip vs $lastKey",
+            grip.left < lastKey.right && grip.right > lastKey.left &&
+                grip.top < lastKey.bottom && grip.bottom > lastKey.top)
+    }
+
+    /**
+     * The pre-scroll witness that the resize handle is not reachable without scrolling that
+     * row in: its own unclipped bottom edge still sits past the fitted viewport, and the
+     * panel's clip box is cutting part of it away rather than leaving it standing in view.
+     *
+     * `SemanticsNode.boundsInWindow` is clipped to every ancestor, so a node outside the
+     * scroll viewport cannot report where it went — the position comes from the node's
+     * unclipped origin plus its own unclipped height, the same way the header-travel checks
+     * read unclipped origins, and the clipped rectangle is used only for what only it can
+     * show: that the visible portion really is being cut away.
+     */
+    private fun assertGripStartsOutsideViewport(viewport: ComposeRect) {
+        val node = gripNode()
+        val unclippedTop = node.positionInWindow.y
+        val unclippedBottom = unclippedTop + node.size.height
+        assertTrue("The grip's own row must start outside the viewport this panel was fitted " +
+            "to, rather than be pinned over it: unclipped top $unclippedTop, unclipped " +
+            "bottom $unclippedBottom, viewport $viewport",
+            unclippedBottom > viewport.bottom + 1f)
+        val clipped = node.boundsInWindow
+        assertTrue("The panel's own scroll must clip the off-screen grip away rather than " +
+            "leave it in the viewport: clipped $clipped vs its own ${node.size.height} height",
+            clipped.height < node.size.height)
+    }
+
+    /**
+     * The floating Keys panel's own frame: the outer bounds its contents tile, read from the
+     * tag `TerminalScreen` puts on that frame ahead of the scaling modifier. It is therefore
+     * the resolved frame and not the scrollable viewport inside it — the two are separate
+     * reads, so a check that the viewport fills the frame can fail. The frame tag stays
+     * readable while the last key row is scrolled off screen; the grip's visibility and
+     * containment are checked separately, once a real scroll brings its row into view.
+     */
+    private fun floatingKeysFrameBounds(): ComposeRect =
+        compose.onNodeWithTag("terminal-floating-keys-frame").fetchSemanticsNode().boundsInWindow
+
+    /**
+     * The window an injected pointer actually travels in. Events are dispatched to the
+     * Activity's decor view in window coordinates, and the Compose root is the part of this
+     * screen that is certainly inside that window, so a path kept inside it is a path the
+     * platform can deliver.
+     */
+    private fun pointerWindow(): ComposeRect =
+        compose.onRoot().fetchSemanticsNode().boundsInWindow
+
+    /**
+     * The point a corner-grip drag starts from — the real grip container's own center.
+     * Reading it here is what lets a travel be derived from, and checked against, the exact
+     * pointer path the drag will inject.
+     */
+    private fun gripDragStart(): Offset = gripContainer().boundsInWindow.center
+
+    /**
+     * A straight injected pointer path stays inside the window. Each drag is one segment
+     * from its down point to its last move, a window rectangle is convex, and every
+     * intermediate event is interpolated along that segment, so both endpoints being inside
+     * puts every event of the gesture inside it.
+     */
+    private fun assertPointerPathInsideWindow(start: Offset, end: Offset, window: ComposeRect) {
+        listOf("start" to start, "end" to end).forEach { (which, point) ->
+            assertTrue(
+                "Every injected pointer event must stay inside the window ($which $point, " +
+                    "path $start -> $end, window $window)",
+                point.x >= window.left && point.x <= window.right &&
+                    point.y >= window.top && point.y <= window.bottom,
+            )
+        }
     }
 
     /**
@@ -2235,9 +2415,11 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
-     * Real long-press-and-drag injection. A real timeout is allowed to elapse so the
-     * long-press detector arms before movement; repeated moves cross the touch slop so
-     * a child button's click is cancelled exactly once a drag is recognized.
+     * Real long-press-and-drag injection. The test clock is advanced past the long-press
+     * timeout so the long-press detector arms before movement — arming on the test clock
+     * rather than on a wall-clock pause, with the injected events, their coordinates, their
+     * step count, and their wall timestamps unchanged. Repeated moves cross the touch slop
+     * so a child button's click is cancelled exactly once a drag is recognized.
      */
     private fun dragBy(label: String, dx: Float, dy: Float, steps: Int = 6) {
         dispatchDrag(label, dx, dy, MotionEvent.ACTION_UP, steps)
@@ -2253,8 +2435,7 @@ class TerminalOverlayPlacementComponentTest {
 
     /** A completed corner-grip drag: the panel follows and only then is the size saved. */
     private fun resizeKeysPanel(dx: Float, dy: Float, steps: Int = 6) {
-        val center = gripContainer().boundsInWindow
-        dispatchDragAt(center.center, dx, dy, MotionEvent.ACTION_UP, steps)
+        dispatchDragAt(gripDragStart(), dx, dy, MotionEvent.ACTION_UP, steps)
     }
 
     private fun cancelResizeKeysPanel(dx: Float, dy: Float) {
@@ -2268,7 +2449,12 @@ class TerminalOverlayPlacementComponentTest {
         compose.runOnIdle {
             dispatchTouch(root, MotionEvent.ACTION_DOWN, downTime, downTime, start.x, start.y)
         }
-        Thread.sleep(650L)
+        // Arm the long-press detector on the test clock instead of a wall-clock pause: the
+        // injected DOWN is already in, and the moves below still arrive in the same order at
+        // the same coordinates with the same wall event timestamps. Whether an intervening
+        // idle call already pumped frames is not claimed here — this only makes the arming
+        // window deterministic rather than dependent on real elapsed time.
+        compose.mainClock.advanceTimeBy(650L, ignoreFrameDuration = true)
         for (step in 1..steps) {
             val eventTime = SystemClock.uptimeMillis()
             val x = start.x + dx * step / steps
@@ -2283,8 +2469,8 @@ class TerminalOverlayPlacementComponentTest {
         // increment only in the terminal event would therefore make every gesture one step
         // shorter than the travel it names, which is exactly what the travel checks here
         // measure. Zero movement on the terminal event keeps the requested total real while
-        // the event sequence, the long-press timeout, and the idleness handling stay as
-        // they were.
+        // the event sequence, the length of the long-press window, and the idleness handling
+        // stay as they were.
         compose.runOnIdle {
             dispatchTouch(root, endAction, downTime, SystemClock.uptimeMillis(), start.x + dx, start.y + dy)
         }

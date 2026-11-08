@@ -70,8 +70,13 @@ dates.
   Floating contents are one logical Keys layout stretched into the frame by independent
   horizontal and vertical factors, so any frame shape is filled with no re-wrapped rows and
   no blank letterbox, while text, buttons, padding, spacing, and the corner controls scale
-  together; the frame stops shrinking at that layout's own footprint, so keys, the corner
-  toggle, and the grip keep a complete 48 dp physical target. Docking, floating size, and position
+  together; the frame stops shrinking at half that layout's own footprint on each axis, so
+  floating keys, the corner toggle, and the grip keep at least half their logical size — a
+  real 24 dp for a target laid out at 48 dp — however far a grip drag overshoots, while a
+  docked band's targets are never scaled and keep their full 48 dp. The floating resize grip
+  is inline at the trailing end of the panel's last key row and shares that row's scroll, so
+  no blank footer strip is reserved below the panel's viewport, the handle never wraps into a
+  row of its own, and it scrolls in with that row on a short host. Docking, floating size, and position
   are remembered per orientation in the existing version-2 placement document and
   survive docking; only a completed drag, resize, or docking toggle saves, and cancelled
   gestures, rotations, keyboard changes, and ordinary frames save nothing. Whether Keys
@@ -79,8 +84,8 @@ dates.
   to no saved bundle or placement document: a rotation keeps them, while leaving and
   re-entering the terminal, or restarting, starts closed with nothing dismissed. Keys
   toggle, expansion, Back priority, modifiers, Paste, special, arrow, and function keys,
-  48 dp targets, scroll reachability, and the Debug input messaging zero-area behavior are
-  unchanged. Real on-screen keyboard float/dock behavior is not claimed here: it needs
+  docked 48 dp targets, scroll reachability, and the Debug input messaging zero-area behavior
+  are unchanged. Real on-screen keyboard float/dock behavior is not claimed here: it needs
   emulator and device evidence.
 - Android Settings now configures the local Saved LIST/SEARCH first-reply timeout
   (positive whole seconds, default 60), captured by each new read, including confirmed

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.FlowRowScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -116,10 +117,22 @@ private val MinimumKeysViewport = 56.dp
 private val KeysCornerControl = 48.dp
 
 /**
- * Identifies the floating panel's real 48dp resize-grip container — the pointer-input box,
- * not the 24dp glyph inside it — so its scaled bounds can be measured directly.
+ * Identifies the floating panel's real 48dp logical resize-grip container — the
+ * pointer-input box, not the 24dp glyph inside it — so its scaled bounds can be measured
+ * directly. It is laid out at [KeysCornerControl] inside the scaled subtree, so what the
+ * operator can actually press is that size times the frame's own factors, down to the
+ * half-footprint floor and never below it.
  */
 private const val KeysResizeGripTag = "terminal-keys-resize-grip"
+
+/**
+ * Identifies the floating panel's own outer frame — the box the one scaled layout fills,
+ * tagged ahead of the scaling modifier so it reports the resolved frame extent rather
+ * than the logical size of the subtree inside it. It carries no pointer input and adds no
+ * second subtree: it exists so a check can read the frame a panel shows independently of
+ * the scrollable viewport it happens to hold.
+ */
+private const val FloatingKeysFrameTag = "terminal-floating-keys-frame"
 
 /**
  * The width the one logical floating Keys layout is laid out at.
@@ -132,13 +145,13 @@ private const val KeysResizeGripTag = "terminal-keys-resize-grip"
  * panel that was never resized is a detached window the operator can move, not a second
  * full-width band sitting where the docked one was.
  *
- * The logical footprint is also the floating panel's resize floor: scale never drops
- * below 1, so every logical touch target — the key buttons, the corner toggle, and the
- * grip, all of which are at least [KeysCornerControl] in the layout — stays at least
- * [KeysCornerControl] of real physical size however far a grip drag overshoots. Shrinking
- * stops there. This is a rule about the floating panel's own contents only: the docked
- * band, its height, and the control strip's [MinimumKeysViewport] constraint are
- * untouched.
+ * Half that logical footprint is the floating panel's resize floor: scale never drops below
+ * one half on either axis, so every logical touch target — the key buttons, the corner
+ * toggle, and the grip, all of which are at least [KeysCornerControl] in the layout — stays
+ * at least half [KeysCornerControl] of real physical size however far a grip drag
+ * overshoots. Shrinking stops there. This is a rule about the floating panel's own contents
+ * only: the docked band, its targets, its height, and the control strip's
+ * [MinimumKeysViewport] constraint are untouched, and a docked target is never scaled.
  */
 private val FloatingKeysLogicalWidth = 320.dp
 
@@ -592,11 +605,12 @@ private fun DockedKeys(
  * at any frame shape with no re-wrap, no reflow, and no blank letterbox. Text, buttons,
  * padding, spacing, and the interior corner controls all scale with that one layout.
  *
- * The logical footprint is the panel's own resize floor, so the scale never drops below 1
- * and every logical target — already at least [KeysCornerControl] in the layout — keeps at
- * least [KeysCornerControl] of real physical size: an overshooting grip drag stops instead
- * of shrinking a key. The floor is that measured footprint, not a named constant, and it
- * and the frame are display values only.
+ * Half the measured logical footprint is the panel's own resize floor, so the scale never
+ * drops below one half on either axis and every logical target — already at least
+ * [KeysCornerControl] in the layout — keeps at least half that of real physical size: an
+ * overshooting grip drag stops instead of shrinking a key past it. The floor is half that
+ * measured footprint with whole-pixel ceiling rounding, not a named constant, and it and
+ * the frame are display values only.
  *
  * Its size comes from the remembered `TerminalKeysFloatingSize` — permille of the stable
  * layer's own extent — or from the logical footprint when nothing was ever resized. Either
@@ -604,10 +618,12 @@ private fun DockedKeys(
  * adaptation never writes a size, so a null remembered size stays null and a remembered
  * size is never normalized. A resize is transient until the corner grip's drag completes:
  * a cancel, a rotation, or an inset change leaves the remembered size exactly as it was.
- * Only a completed drag, resize, or docking toggle publishes placement. The grip's own
- * 48dp is reserved as a band inside the panel, so it never covers scrollable key content
- * at any scroll position, and the panel keeps its own scroll: content past the logical
- * viewport stays scroll-reachable inside the frame.
+ * Only a completed drag, resize, or docking toggle publishes placement. The grip reserves no
+ * band outside that viewport: it is the trailing item of the panel's last key row, so it
+ * scales with the keys beside it, shares that row's scroll, and overlaps no key target. On
+ * an extent shorter than the logical layout, that row — the grip with it — is genuinely
+ * scrolled into view rather than pinned over keys that scrolled up underneath it, and
+ * content past the logical viewport stays scroll-reachable inside the frame.
  *
  * Because the layout is a scaled placement layer, the pointer deltas its own detectors
  * report are in the layout's logical units. The move and resize gestures multiply them by
@@ -644,7 +660,11 @@ private fun FloatingKeys(
     // clips with it rather than standing still over key targets scrolled up underneath it.
     val keysScroll = rememberScrollState()
     val logical = logicalPx
-    val minimum = logical
+    // Half the measured logical footprint on each axis, independently, is where a grip drag
+    // stops: a target laid out at [KeysCornerControl] in the logical reference is then still
+    // a real half-that target, and the ceiling rounding keeps an odd pixel extent from
+    // undercutting its own half.
+    val minimum = TerminalDockGeometry.floatingMinimumSizePx(logical)
     val maximum = IntSize(visibleWidth, visibleHeight)
     val rememberedPx = TerminalDockGeometry.floatingSizePx(keysLayout.floatingSize, stableWidth, stableHeight)
     // The frame this panel actually shows. Before the logical layout has been measured
@@ -724,6 +744,25 @@ private fun FloatingKeys(
             },
         )
     }
+    // The resize grip belongs inside the scaled layout, so it scales with the keys it rides
+    // and its own pointer deltas arrive in that layout's logical units. The panel places it
+    // as the trailing item of its last key row; nothing reserves a band for it outside the
+    // scrollable viewport.
+    val resizeGrip: @Composable () -> Unit = {
+        Box(
+            modifier = Modifier
+                .size(KeysCornerControl)
+                .testTag(KeysResizeGripTag)
+                .then(resizeModifier),
+            contentAlignment = Alignment.BottomEnd,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_terminal_keys_resize),
+                contentDescription = stringResource(R.string.terminal_keys_resize),
+                modifier = Modifier.size(24.dp),
+            )
+        }
+    }
     PlaceableOverlay(
         overlay = TerminalOverlay.KEYS,
         placement = placement,
@@ -741,16 +780,19 @@ private fun FloatingKeys(
         onMeasured = { size -> if (size != measuredPx) measuredPx = size },
         onCommitted = onPlacementCommitted,
     ) { dragModifier ->
-        // One interactive subtree, and the corner controls that belong to it: they are
-        // part of the scaled layout, so they scale with the keys they sit beside and keep
-        // the same header and bottom-edge relation at any frame shape.
+        // One interactive subtree, and the corner toggle that belongs to it: both are part
+        // of the scaled layout, so they scale with the keys they sit beside and keep the
+        // same header relation at any frame shape. The resize grip lives inside this same
+        // subtree too, as the trailing element of the panel's last key row.
         Box(
-            Modifier.floatingKeysScaledFrame(
-                framePx = sizePx,
-                logicalWidthPx = logicalWidthPx,
-                logicalMaxHeightPx = logicalMaxHeightPx,
-                onLogicalSize = { size -> if (size != logicalPx) logicalPx = size },
-            ),
+            Modifier
+                .testTag(FloatingKeysFrameTag)
+                .floatingKeysScaledFrame(
+                    framePx = sizePx,
+                    logicalWidthPx = logicalWidthPx,
+                    logicalMaxHeightPx = logicalMaxHeightPx,
+                    onLogicalSize = { size -> if (size != logicalPx) logicalPx = size },
+                ),
         ) {
             TerminalKeysPanel(
                 modifier = Modifier.fillMaxWidth(),
@@ -763,7 +805,7 @@ private fun FloatingKeys(
                 onIntent = onIntent,
                 dragModifier = dragModifier,
                 headerEndInset = KeysCornerControl,
-                reservedBottomBand = KeysCornerControl,
+                resizeGrip = resizeGrip,
                 scrollState = keysScroll,
             )
             KeysDockingControl(
@@ -776,20 +818,6 @@ private fun FloatingKeys(
                 },
                 modifier = Modifier.align(Alignment.TopEnd),
             )
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .size(KeysCornerControl)
-                    .testTag(KeysResizeGripTag)
-                    .then(resizeModifier),
-                contentAlignment = Alignment.BottomEnd,
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_terminal_keys_resize),
-                    contentDescription = stringResource(R.string.terminal_keys_resize),
-                    modifier = Modifier.size(24.dp),
-                )
-            }
         }
     }
 }
@@ -1167,6 +1195,10 @@ private fun TerminalNotices(
  * panel taller than its slot never loses an action, and [headerEndInset] keeps the
  * header text clear of the corner docking control the caller draws over it.
  * [dragModifier] is the recognized move gesture, supplied only while floating.
+ * [resizeGrip] is a floating panel's resize grip, supplied only while floating: it becomes
+ * the trailing element of the panel's last key row rather than a band reserved outside the
+ * scrollable viewport, so it shares that row's scroll and its keys' scale. Docked callers
+ * pass none and their rows, targets, and measured height are exactly as before.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -1179,7 +1211,7 @@ private fun TerminalKeysPanel(
     onIntent: (ClientIntent) -> Unit,
     dragModifier: Modifier = Modifier,
     headerEndInset: Dp = 0.dp,
-    reservedBottomBand: Dp = 0.dp,
+    resizeGrip: (@Composable () -> Unit)? = null,
     scrollState: ScrollState = rememberScrollState(),
 ) {
     val suspended = terminal.coverage.suspendsTerminalInput || !terminal.inputReady
@@ -1192,11 +1224,6 @@ private fun TerminalKeysPanel(
     ) {
         Column(
             modifier = Modifier
-                // The floating panel reserves the resize grip's 48dp as a band outside
-                // its scrollable viewport, so the corner grip never covers key content at
-                // any scroll position and every key keeps a complete 48dp target. Docked
-                // and uncapped callers pass zero and are laid out exactly as before.
-                .padding(bottom = reservedBottomBand)
                 .verticalScroll(scrollState)
                 .padding(horizontal = 6.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -1270,13 +1297,16 @@ private fun TerminalKeysPanel(
             }
 
             // Arrows, then the existing optional Insert/Delete/function keys. The
-            // expansion behavior, key set, and order are unchanged.
+            // expansion behavior, key set, and order are unchanged. Whichever key is last
+            // in that order in either state is emitted through the trailing item below, so a
+            // floating panel's resize grip joins the existing last key row as its trailing
+            // element and a wrap can never leave the grip alone in a row of its own.
             FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 KeyButton(TerminalControlKey.ARROW_LEFT, stringResource(R.string.key_arrow_left), held, suspended, onKey)
                 KeyButton(TerminalControlKey.ARROW_UP, stringResource(R.string.key_arrow_up), held, suspended, onKey)
                 KeyButton(TerminalControlKey.ARROW_DOWN, stringResource(R.string.key_arrow_down), held, suspended, onKey)
-                KeyButton(TerminalControlKey.ARROW_RIGHT, stringResource(R.string.key_arrow_right), held, suspended, onKey)
                 if (terminal.extraKeysVisible) {
+                    KeyButton(TerminalControlKey.ARROW_RIGHT, stringResource(R.string.key_arrow_right), held, suspended, onKey)
                     KeyButton(TerminalControlKey.INSERT, stringResource(R.string.key_insert), held, suspended, onKey)
                     KeyButton(TerminalControlKey.DELETE, stringResource(R.string.key_delete), held, suspended, onKey)
                     val functionKeys = listOf(
@@ -1293,11 +1323,53 @@ private fun TerminalKeysPanel(
                         TerminalControlKey.F11,
                         TerminalControlKey.F12,
                     )
-                    functionKeys.forEach { key ->
-                        KeyButton(key, key.name, held, suspended, onKey)
+                    functionKeys.forEachIndexed { index, key ->
+                        if (index == functionKeys.lastIndex) {
+                            KeysTrailingItem(resizeGrip) {
+                                KeyButton(key, key.name, held, suspended, onKey)
+                            }
+                        } else {
+                            KeyButton(key, key.name, held, suspended, onKey)
+                        }
+                    }
+                } else {
+                    KeysTrailingItem(resizeGrip) {
+                        KeyButton(TerminalControlKey.ARROW_RIGHT, stringResource(R.string.key_arrow_right), held, suspended, onKey)
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * The one trailing item of the Keys panel's last key row: the last key in its existing
+ * order, and — for a floating panel only — the resize grip that belongs at that row's
+ * trailing end.
+ *
+ * They are one flow item, so a wrap can never leave the grip by itself in an empty row, and
+ * the grip shares that row's scroll rather than standing still over keys scrolled past it.
+ * The group takes the space the row has left and holds the key where the flow already had
+ * it and the grip at that row's trailing edge, so a floating panel's grip is the
+ * bottom-right target of its own key content with no blank footer row and nothing reserved
+ * outside the scrollable viewport. A caller that supplies no grip gets the key exactly where
+ * the flow laid it out before, so the docked band's rows and measured height are unchanged.
+ */
+@Composable
+private fun FlowRowScope.KeysTrailingItem(
+    resizeGrip: (@Composable () -> Unit)?,
+    key: @Composable () -> Unit,
+) {
+    if (resizeGrip == null) {
+        key()
+    } else {
+        Row(
+            modifier = Modifier.weight(1f),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            key()
+            resizeGrip()
         }
     }
 }

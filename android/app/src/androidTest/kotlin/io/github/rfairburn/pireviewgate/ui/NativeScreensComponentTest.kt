@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.ui
 
+import android.view.WindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
@@ -454,6 +456,125 @@ class NativeScreensComponentTest {
         }
         compose.onAllNodes(isSwitch)[2].assertIsOn()
     }
+
+    /**
+     * The shared non-terminal header's own vertical band, read from drawn bounds.
+     *
+     * Each route's first content starts one leading content padding below the header, so the
+     * distance between the header and that content is the header band's leftover plus the route's
+     * own padding — plus whatever of a control's minimum interactive allocation lies outside its
+     * drawn surface. A Material button may draw a smaller surface than the allocation it occupies,
+     * so both insets are measured rather than assumed to be zero, and the route padding bounds the
+     * resulting allocation-to-allocation gap, not the raw surface-to-surface one. Each route is
+     * measured on its own composition against freshly drawn nodes — a disposed route's nodes are
+     * never read again — and nothing here depends on a card's inner padding or on any text's font
+     * height.
+     */
+    @Test
+    fun sharedNonTerminalHeaderKeepsACompactBandAboveEveryRoutesContent() {
+        val fixture = NativeUiFixture(NativeUiFixtures.sessions())
+        compose.setContent { fixture.Content() }
+        val px = compose.activity.resources.displayMetrics.density
+        // Each route's own leading content padding, as its source declares it: the list routes
+        // keep 12dp and Settings keeps 16dp. The shared header may leave the route's interactive
+        // allocations no further apart than that padding already asks for.
+        val listPadding = 12f * px
+        val settingsPadding = 16f * px
+
+        // The header's own control, drawn above the bottom navigation's Settings destination.
+        val headerAction = topDrawnNode("Settings")
+        compose.onAllNodesWithText("Settings").onFirst().assertIsDisplayed()
+        assertTrue(
+            "the header control keeps its full 48dp touch target: ${headerAction.touchBoundsInRoot.height}px",
+            headerAction.touchBoundsInRoot.height >= 48f * px - 1f,
+        )
+        val statusBarPx = statusBarInsetPx()
+        assertTrue(
+            "the header still consumes the window's status bar inset: top=${headerAction.boundsInRoot.top}px, " +
+                "inset=${statusBarPx}px",
+            headerAction.boundsInRoot.top >= statusBarPx - 1f,
+        )
+        assertBandUnderHeader("Settings", "New session", listPadding, "Sessions")
+
+        // Hosts shares the header and the same 12dp leading padding, and keeps its navigation
+        // control's target on a route that draws one.
+        compose.runOnIdle { fixture.state = fixture.state.copy(route = ClientRoute.Hosts) }
+        assertBandUnderHeader("Settings", "Add host", listPadding, "Hosts")
+        val back = topDrawnNode("Back")
+        assertTrue(
+            "the header's Back control keeps its full 48dp touch target: ${back.touchBoundsInRoot.height}px",
+            back.touchBoundsInRoot.height >= 48f * px - 1f,
+        )
+
+        compose.runOnIdle {
+            fixture.state = NativeUiFixtures.saved(
+                NativeUiFixtures.savedProof(21), NativeUiFixtures.savedProof(22),
+                NativeUiFixtures.savedProof(23),
+            )
+        }
+        assertBandUnderHeader("Settings", "Owner A", listPadding, "Saved")
+
+        // Settings draws no action, so its Back control is the only header control to measure
+        // against, and its first content is plain text with no interactive allocation of its own.
+        // The route keeps its own 16dp leading inset rather than the list routes' 12dp.
+        compose.runOnIdle { fixture.state = fixture.state.copy(route = ClientRoute.Settings) }
+        assertBandUnderHeader("Back", "Automatic reconnect", settingsPadding, "Settings", contentIsControl = false)
+    }
+
+    /**
+     * Assert the route now composed starts no further than [routePadding] below the shared
+     * header's own [headerControl], and that neither interactive allocation overlaps the other.
+     *
+     * Both nodes are read from the current composition. A control's drawn surface and the
+     * allocation it occupies are different rectangles: a Material button may draw a smaller
+     * surface than the minimum interactive allocation it fills, so the measured surface-to-surface
+     * distance is converted to an allocation-to-allocation distance by subtracting the measured
+     * inset on each side, and that is what the route's own leading padding bounds. Neither inset is
+     * assumed to be zero, and neither is derived from a font or a control's nominal size.
+     * [contentIsControl] is false where the route's first content is plain text, which has no
+     * interactive allocation of its own. No card container, inner padding, or text font height
+     * enters the arithmetic, because none of those is what the shared header controls.
+     */
+    private fun assertBandUnderHeader(
+        headerControl: String,
+        content: String,
+        routePadding: Float,
+        route: String,
+        contentIsControl: Boolean = true,
+    ) {
+        val control = topDrawnNode(headerControl)
+        val first = topDrawnNode(content)
+        val band = first.boundsInRoot.top - control.boundsInRoot.bottom
+        assertTrue("$route content must not overlap the shared header: ${band}px", band >= -1f)
+        // Account for measured surface insets within minimum interactive allocations.
+        val headerInset = (control.touchBoundsInRoot.bottom - control.boundsInRoot.bottom)
+            .coerceAtLeast(0f)
+        val contentInset = if (contentIsControl) {
+            (first.boundsInRoot.top - first.touchBoundsInRoot.top).coerceAtLeast(0f)
+        } else {
+            0f
+        }
+        val allocationGap = band - headerInset - contentInset
+        assertTrue(
+            "$route interactive allocations must not overlap: ${allocationGap}px",
+            allocationGap >= -1f,
+        )
+        assertTrue(
+            "$route may sit no further than its own ${routePadding}px leading padding below the " +
+                "shared header: ${allocationGap}px",
+            allocationGap <= routePadding + 2f,
+        )
+    }
+
+    /** The drawn node carrying [text] that sits closest to the top of the window. */
+    private fun topDrawnNode(text: String): SemanticsNode =
+        compose.onAllNodesWithText(text).fetchSemanticsNodes().minByOrNull { it.boundsInRoot.top }
+            ?: throw AssertionError("no drawn node with text \"$text\"")
+
+    /** The status bar inset the real window reports; read, never assumed. */
+    private fun statusBarInsetPx(): Float =
+        compose.activity.window.decorView.rootWindowInsets
+            ?.getInsets(WindowInsets.Type.statusBars())?.top?.toFloat() ?: 0f
 
     /** Material's switch semantics: the only nodes carrying the Switch role. */
     private val isSwitch = SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Switch)

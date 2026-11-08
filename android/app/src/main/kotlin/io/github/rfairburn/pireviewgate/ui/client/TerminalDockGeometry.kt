@@ -48,11 +48,30 @@ internal object TerminalDockGeometry {
     }
 
     /**
-     * Keep one floating size inside the available layer and never below the panel's own
-     * logical footprint, which is where a scaled panel stops shrinking so every logical
-     * touch target keeps its real physical size. This is a display clamp only: it never
-     * rewrites a remembered size, and the floor it applies is the footprint the panel
-     * measured, not a constant.
+     * The smallest frame a floating panel may show: half of its measured logical footprint
+     * on each axis, independently.
+     *
+     * A floating layout's own touch targets are laid out at least 48 dp in that logical
+     * reference, so halving the footprint on each axis is where a scaled panel stops
+     * shrinking with every target still at least half its logical size — a real 24 dp —
+     * however far a grip drag overshoots. Each axis is halved on its own, so one axis can
+     * be at its floor while the other still has travel. Whole-pixel ceiling rounding keeps
+     * a footprint that is odd by a pixel from rounding down under that half.
+     *
+     * This is a display floor derived from what the panel measured, not a constant, and it
+     * says nothing about a docked band, whose targets are never scaled.
+     */
+    fun floatingMinimumSizePx(footprint: IntSize): IntSize =
+        IntSize(
+            width = halfCeiling(footprint.width),
+            height = halfCeiling(footprint.height),
+        )
+
+    /**
+     * Keep one floating size inside the available layer and never below the panel's resize
+     * floor, which is half the logical footprint it measured. This is a display clamp only:
+     * it never rewrites a remembered size, and the floor it applies comes from that
+     * footprint, not from a constant.
      */
     fun clampFloatingSize(size: IntSize, maximum: IntSize, minimum: IntSize): IntSize {
         val widthFloor = minimum.width.coerceAtMost(maximum.width)
@@ -80,6 +99,9 @@ internal object TerminalDockGeometry {
             widthPermille = scaleToPermille(sizePx.width, stableWidth),
             heightPermille = scaleToPermille(sizePx.height, stableHeight),
         )
+
+    /** Half of a pixel extent, rounded up, so an odd extent never undercuts its own half. */
+    private fun halfCeiling(pixels: Int): Int = if (pixels <= 0) 0 else (pixels + 1) / 2
 
     private fun scaleToPixels(permille: Int, extent: Int): Int {
         if (extent <= 0) return 0

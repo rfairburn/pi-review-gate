@@ -17,6 +17,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import io.github.rfairburn.pireviewgate.R
 import io.github.rfairburn.pireviewgate.core.client.ui.BackAction
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
@@ -152,7 +153,16 @@ fun RootUIScreen(
     }
 }
 
-/** The scaffold every non-terminal route shares. */
+/**
+ * The scaffold every non-terminal route shares.
+ *
+ * The header band is [NON_TERMINAL_HEADER_HEIGHT] plus the window's own top inset, and
+ * that one value is what decides how far each route's first row sits below the title and
+ * actions: the routes keep their own leading content padding (12dp on Sessions, Hosts,
+ * and Saved, 16dp on Settings) and never compensate for the header themselves. Material3's
+ * 64dp default left an empty strip under the header's controls, so the gap below them read
+ * larger than the 12dp slot a list already keeps between its own rows.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NonTerminalScaffold(
@@ -165,6 +175,7 @@ private fun NonTerminalScaffold(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(route.titleRes())) },
+                expandedHeight = NON_TERMINAL_HEADER_HEIGHT,
                 navigationIcon = {
                     if (state.backAction() == BackAction.SHOW_SESSIONS) {
                         TextButton(onClick = { onIntent(ClientIntent.ShowDestination(NavigationDestination.SESSIONS)) }) {
@@ -206,6 +217,16 @@ private fun NonTerminalScaffold(
         content = content,
     )
 }
+
+/**
+ * The shared header's content band, in dp, excluding any window inset.
+ *
+ * It is the height of the tallest control the header holds — a Material3 text button's own
+ * 48dp target — so the title and the Back and Settings actions keep their full touch target
+ * inside the band instead of floating in extra space above and below it. Window insets are
+ * left at Material3's own defaults and are still consumed by the header.
+ */
+private val NON_TERMINAL_HEADER_HEIGHT = 48.dp
 
 /**
  * Report coverage upward whenever a modal or a sheet appears or disappears.

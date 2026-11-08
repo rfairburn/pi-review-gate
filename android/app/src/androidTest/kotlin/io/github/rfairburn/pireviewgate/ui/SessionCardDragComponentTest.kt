@@ -23,6 +23,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -145,16 +146,21 @@ class SessionCardDragComponentTest {
     private val dragGeometry = ArrayDeque<String>()
 
     /** Bounded fixture facts travel with a failed assertion, not a new event stream. */
+    private fun pushGeometry(entry: String) {
+        if (dragGeometry.size == 8) dragGeometry.removeFirst()
+        dragGeometry.addLast(entry)
+    }
+
+    /** The list's own laid-out viewport and item spans: what a held hover resolves against. */
+    private fun layoutFacts(): String = compose.runOnIdle {
+        val info = listState.layoutInfo
+        "first=${listState.firstVisibleItemIndex}:${listState.firstVisibleItemScrollOffset} " +
+            "range=${info.viewportStartOffset}..${info.viewportEndOffset} " +
+            "items=" + info.visibleItemsInfo.take(6).joinToString { "${it.key}@${it.offset}+${it.size}" }
+    }
+
     private fun recordDragGeometry(phase: String, title: String, target: Offset) {
-        val viewport = listBounds()
-        val layout = compose.runOnIdle {
-            val info = listState.layoutInfo
-            "first=${listState.firstVisibleItemIndex}:${listState.firstVisibleItemScrollOffset} " +
-                "range=${info.viewportStartOffset}..${info.viewportEndOffset} " +
-                "items=" + info.visibleItemsInfo.take(6).joinToString { "${it.key}@${it.offset}+${it.size}" }
-        }
-        if (dragGeometry.size == 6) dragGeometry.removeFirst()
-        dragGeometry.addLast("$phase $title pointer=$target viewport=$viewport $layout")
+        pushGeometry("$phase $title pointer=$target viewport=${listBounds()} ${layoutFacts()}")
     }
 
     private fun assertOneMoveAfterA3() {
@@ -204,8 +210,11 @@ class SessionCardDragComponentTest {
         compose.waitForIdle()
     }
 
-    /** Move the held pointer onto [title]'s card in the drawn list, upper or lower part. */
-    private fun moveOnto(title: String, upper: Boolean) {
+    /**
+     * Move the held pointer onto [title]'s card in the drawn list, upper or lower part, and
+     * return where the pointer now stands: later frames must be recorded against that point.
+     */
+    private fun moveOnto(title: String, upper: Boolean): Offset {
         val card = cardBounds(title)
         val y = if (upper) card.top + card.height * 0.2f else card.bottom - card.height * 0.2f
         val target = inList(Offset(card.center.x, y))
@@ -222,14 +231,16 @@ class SessionCardDragComponentTest {
             listViewport(),
         )
         // A second packet re-resolves against the frame drawn after the preview.
-        list().performTouchInput { moveTo(target + Offset(0f, 1f)) }
+        val still = target + Offset(0f, 1f)
+        list().performTouchInput { moveTo(still) }
         compose.waitForIdle()
-        recordDragGeometry("after-second", title, target + Offset(0f, 1f))
+        recordDragGeometry("after-second", title, still)
         assertEquals(
             "re-resolving the still pointer drifted the viewport",
             viewport,
             listViewport(),
         )
+        return still
     }
 
     private fun release() {
@@ -242,6 +253,22 @@ class SessionCardDragComponentTest {
     )
 
     private fun cardBounds(title: String): Rect = cardNode(title).fetchSemanticsNode().boundsInRoot
+
+    /**
+     * Everything a held pointer's drop is resolved against: each drawn card's own bounds, the
+     * list viewport, and the laid-out item spans behind them.
+     */
+    private fun drawnFrame(cards: List<String>): String =
+        "viewport=${listBounds()} " + cards.joinToString(separator = " ") { "$it=${cardBounds(it)}" } +
+            " " + layoutFacts()
+
+    /** Whether [title]'s drawn card has real geometry whose centre a press inside the list hits. */
+    private fun drawnReachable(title: String): Boolean {
+        val card = cardBounds(title)
+        val list = listBounds()
+        val point = inList(card.center)
+        return card.width > 0f && card.height > 0f && point.x in 0f..list.width && point.y in 0f..list.height
+    }
 
     /**
      * The title of a drawn card nearest the list's vertical centre.
@@ -294,20 +321,47 @@ class SessionCardDragComponentTest {
     }
 
     @Test fun repeatedStatusAndCountUpdatesKeepAValidDrag() {
-        show(base())
+        // Only this case is seeded with a known running row and known one-digit counts, so the
+        // repeated updates genuinely change status and counts — busy flips, both counts move,
+        // the roster revision advances — while what a collapsed card draws keeps its shape: the
+        // agent chip keeps reading "running" because busy is true or a count is positive in
+        // every frame, and both count chips keep their wording and a single digit. Updates that
+        // instead moved a drawn chip between "unknown" and a number can reflow the list, and the
+        // drop a held pointer then re-resolves is not the drop the test chose.
+        val seeded = listOf(
+            row(hostA, "a1", busy = true, activeTasks = 0L, backgroundShells = 0L),
+            row(hostA, "a2", busy = true, activeTasks = 0L, backgroundShells = 0L),
+            row(hostA, "a3", busy = true, activeTasks = 0L, backgroundShells = 0L),
+        )
+        val seededB = row(hostB, "b1", busy = true, activeTasks = 0L, backgroundShells = 0L)
+        val cards = listOf("Card a1", "Card a2", "Card a3", "Card b1")
+        show(stateOf(seeded, listOf(seededB)))
         pressAndHold("Card a1")
-        moveOnto("Card a3", upper = false)
+        val pointer = moveOnto("Card a3", upper = false)
+        // The frame the held pointer's drop is resolved against, before anything is updated.
+        val drawn = drawnFrame(cards)
+        pushGeometry("before-updates pointer=$pointer $drawn")
         repeat(4) { n ->
             compose.runOnIdle {
-                state = stateOf(listOf(a1, a2, a3).map {
+                state = stateOf(seeded.map {
                     it.copy(rosterRevision = 2L + n, metadata = it.metadata.copy(busy = n % 2 == 0,
                         activeTasks = n.toLong(), backgroundShells = n.toLong()))
-                }, listOf(b1))
+                }, listOf(seededB))
             }
             compose.waitForIdle()
+            // The pointer is never moved again: the same held gesture carries every update.
+            val after = drawnFrame(cards)
+            pushGeometry("after-update-$n pointer=$pointer $after")
+            assertEquals("update $n moved the drawn list under the held pointer", drawn, after)
+            assertEquals("update $n ended the held drag", 1, draggingCards().fetchSemanticsNodes().size)
         }
+        val atRelease = drawnFrame(cards)
+        pushGeometry("before-release pointer=$pointer $atRelease")
+        assertEquals("the updates moved the drawn list before release", drawn, atRelease)
+        assertEquals("no drag was held at release", 1, draggingCards().fetchSemanticsNodes().size)
         release()
         assertOneMoveAfterA3()
+        assertNoRowAction()
     }
 
     // -- nothing to drop -------------------------------------------------------------------
@@ -367,24 +421,51 @@ class SessionCardDragComponentTest {
     }
 
     @Test fun membershipRunIdentityAndCoverageChangesCancelWithNoIntent() {
-        val changes = listOf<(ClientUiState) -> ClientUiState>(
-            { stateOf(listOf(a1, a2, a3, row(hostA, "a4")), listOf(b1)) },
-            { stateOf(listOf(a1, a2, a3.copy(hostRunId = RUN_B)), listOf(b1)) },
-            { stateOf(listOf(a1, a2, a3.copy(metadata = a3.metadata.copy(rosterSlotId = "slot-other"))), listOf(b1)) },
-            { it.copy(coverage = UiCoverage.OPEN_MENU) },
+        val changes = listOf<Pair<String, (ClientUiState) -> ClientUiState>>(
+            "a row joins" to { _ -> stateOf(listOf(a1, a2, a3, row(hostA, "a4")), listOf(b1)) },
+            "the owner run changes" to { _ -> stateOf(listOf(a1, a2, a3.copy(hostRunId = RUN_B)), listOf(b1)) },
+            "the roster slot changes" to { _ ->
+                stateOf(listOf(a1, a2, a3.copy(metadata = a3.metadata.copy(rosterSlotId = "slot-other"))), listOf(b1))
+            },
+            "ui coverage opens" to { current -> current.copy(coverage = UiCoverage.OPEN_MENU) },
         )
-        for (change in changes) {
+        changes.forEachIndexed { index, (what, mutate) ->
+            val where = "change ${index + 1}/${changes.size} ($what)"
             show(base())
+            // The composition survives the loop, so the list's scroll position survives it too.
+            // Read the card that is actually drawn, and when the press would land on an item the
+            // list kept composed but never laid out, bring the real card back into the viewport
+            // first: an item with no position starts no drag, and every "sends nothing" below
+            // would then be satisfied by a press that never held anything.
+            if (!drawnReachable("Card a1")) {
+                list().performScrollToNode(hasText("Card a1"))
+                compose.waitForIdle()
+            }
+            assertTrue(
+                "$where: Card a1 is not drawn where it is pressed " +
+                    "(${cardBounds("Card a1")} inside ${listBounds()})",
+                drawnReachable("Card a1"),
+            )
             intents.clear()
             pressAndHold("Card a1")
+            // A real drag has to be held before anything can cancel it.
+            assertEquals("$where: no drag was held to cancel", 1, draggingCards().fetchSemanticsNodes().size)
             moveOnto("Card a3", upper = false)
-            compose.runOnIdle { state = change(state) }
+            // The preview witnesses that the held pointer really chose Card a3: only a live drag
+            // resolved onto that card draws the held card below it.
+            assertTrue(
+                "$where: the held pointer never chose a drop after Card a3",
+                cardBounds("Card a1").center.y > cardBounds("Card a3").center.y,
+            )
+            compose.runOnIdle { state = mutate(state) }
             compose.waitForIdle()
+            assertEquals("$where: the change left a live drag", 0, draggingCards().fetchSemanticsNodes().size)
             // Even if the change is reverted before release, the cancelled drag stays dead.
             compose.runOnIdle { state = base() }
             compose.waitForIdle()
             release()
-            assertTrue("change produced a move: $intents", moves().isEmpty())
+            assertTrue("$where produced a move: $intents", moves().isEmpty())
+            assertNoRowAction()
         }
     }
 

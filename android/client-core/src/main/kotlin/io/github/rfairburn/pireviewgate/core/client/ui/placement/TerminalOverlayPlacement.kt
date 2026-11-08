@@ -88,6 +88,58 @@ public data class TerminalOverlayPosition(
 }
 
 /**
+ * One Keys panel's remembered floating size, as permille of its stable layer extent.
+ *
+ * Unlike [TerminalOverlayPosition], each component is permille of the stable layer's
+ * own width or height, never of the free space left after subtracting the overlay: a
+ * size is what the panel measured while floating, so `1000` means "as wide or as tall
+ * as the layer itself" and `500` means half of it. Both components are at least
+ * [MIN_PERMILLE], so a remembered size can never collapse to an invisible panel. A
+ * size is cosmetic placement data only: it names no host, session, input target, or
+ * action, and nothing here converts it into pixels.
+ */
+public data class TerminalKeysFloatingSize(
+    public val widthPermille: Int,
+    public val heightPermille: Int,
+) {
+    init {
+        require(widthPermille in MIN_PERMILLE..MAX_PERMILLE) { "width permille out of range" }
+        require(heightPermille in MIN_PERMILLE..MAX_PERMILLE) { "height permille out of range" }
+    }
+
+    public companion object {
+        /** Inclusive upper bound for both permille components. */
+        public const val MAX_PERMILLE: Int = 1000
+
+        /** Inclusive lower bound for both permille components: a remembered size never collapses. */
+        public const val MIN_PERMILLE: Int = 1
+    }
+}
+
+/**
+ * The Keys panel's remembered cosmetic layout in one orientation.
+ *
+ * `docked` is the two-state layout: docked Keys keeps its existing bottom slot,
+ * floating Keys is movable and resizable. `floatingSize` is the last remembered
+ * floating size, or `null` for the natural measured size. Both survive docking, so
+ * popping Keys back out returns it at its remembered size, and docking never clears
+ * the remembered [TerminalOverlayPosition] either. The default is today's behavior:
+ * docked with no remembered size.
+ *
+ * This is the only Keys layout state. There is no second mode flag and no second
+ * store, and nothing here carries open/close, modifier, or dismissed state.
+ */
+public data class TerminalKeysLayout(
+    public val docked: Boolean = true,
+    public val floatingSize: TerminalKeysFloatingSize? = null,
+) {
+    public companion object {
+        /** Docked, with the natural floating size. */
+        public val DEFAULT: TerminalKeysLayout = TerminalKeysLayout()
+    }
+}
+
+/**
  * The complete six-slot UI placement state: one position or default slot for each
  * overlay in each orientation.
  *
@@ -96,6 +148,11 @@ public data class TerminalOverlayPosition(
  * notice keeps its existing place directly below the controls slot even when the
  * controls strip is moved somewhere else, and the Keys panel keeps its existing
  * bottom-center slot. An explicit position is remembered across restarts.
+ *
+ * The two Keys layouts are the docking state and remembered floating size in each
+ * orientation, remembered per orientation alongside their own positions. They are
+ * appended rather than becoming a seventh position slot: an untouched Keys layout is
+ * [TerminalKeysLayout.DEFAULT], which is exactly today's docked behavior.
  *
  * This type is UI-only cosmetic state. It has no host, trust, identity, session,
  * ordering, viewport, input, or proof field, and no operation here touches any of
@@ -108,6 +165,8 @@ public data class TerminalOverlayPlacement(
     public val statusLandscape: TerminalOverlayPosition? = null,
     public val keysPortrait: TerminalOverlayPosition? = null,
     public val keysLandscape: TerminalOverlayPosition? = null,
+    public val keysPortraitLayout: TerminalKeysLayout = TerminalKeysLayout.DEFAULT,
+    public val keysLandscapeLayout: TerminalKeysLayout = TerminalKeysLayout.DEFAULT,
 ) {
     /** The explicit position for one overlay/orientation slot, or `null` when it is a default slot. */
     public fun position(
@@ -148,8 +207,30 @@ public data class TerminalOverlayPlacement(
         }
     }
 
+    /** The remembered Keys layout for one orientation. Keys is the only overlay that has one. */
+    public fun keysLayout(orientation: TerminalOverlayOrientation): TerminalKeysLayout =
+        when (orientation) {
+            TerminalOverlayOrientation.PORTRAIT -> keysPortraitLayout
+            TerminalOverlayOrientation.LANDSCAPE -> keysLandscapeLayout
+        }
+
+    /**
+     * Replace exactly one orientation's Keys layout.
+     *
+     * All six remembered positions are preserved: a docking toggle or a resize never
+     * rewrites or clears a remembered position, and the other orientation's Keys
+     * layout stays independently untouched.
+     */
+    public fun withKeysLayout(
+        orientation: TerminalOverlayOrientation,
+        layout: TerminalKeysLayout,
+    ): TerminalOverlayPlacement = when (orientation) {
+        TerminalOverlayOrientation.PORTRAIT -> copy(keysPortraitLayout = layout)
+        TerminalOverlayOrientation.LANDSCAPE -> copy(keysLandscapeLayout = layout)
+    }
+
     public companion object {
-        /** Every slot still in its existing layout default. */
+        /** Every slot still in its existing layout default, Keys docked in both orientations. */
         public val DEFAULT: TerminalOverlayPlacement = TerminalOverlayPlacement()
     }
 }

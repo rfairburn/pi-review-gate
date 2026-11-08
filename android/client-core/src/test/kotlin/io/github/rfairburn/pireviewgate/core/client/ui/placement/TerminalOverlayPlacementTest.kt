@@ -14,6 +14,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -59,6 +60,15 @@ class TerminalOverlayPlacementTest {
             .withPosition(TerminalOverlay.STATUS, TerminalOverlayOrientation.LANDSCAPE, TerminalOverlayPosition(800, 200))
             .withPosition(TerminalOverlay.KEYS, TerminalOverlayOrientation.PORTRAIT, TerminalOverlayPosition(500, 1000))
             .withPosition(TerminalOverlay.KEYS, TerminalOverlayOrientation.LANDSCAPE, TerminalOverlayPosition(250, 750))
+
+    /** The Keys layout defaults are the current docked behavior, so the six positions alone still round-trip. */
+    private fun allSixWithKeysLayouts(
+        portrait: TerminalKeysLayout,
+        landscape: TerminalKeysLayout,
+    ): TerminalOverlayPlacement =
+        allSix()
+            .withKeysLayout(TerminalOverlayOrientation.PORTRAIT, portrait)
+            .withKeysLayout(TerminalOverlayOrientation.LANDSCAPE, landscape)
 
     @Test
     fun `a fresh read creates no placement file directory or lock`() {
@@ -168,7 +178,7 @@ class TerminalOverlayPlacementTest {
         assertTrue(container.mkdirs())
         val unrelated = File(root, "other-private-document.json")
         unrelated.writeText("{\"keep\":true}\n")
-        val malformed = "{\"version\":1,\"overlays\":[{\"overlay\":\"controls\"}]}\n"
+        val malformed = "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\"}]}\n"
         document.writeText(malformed)
 
         val store = TerminalOverlayPlacementStorage.openStore(root)
@@ -421,21 +431,28 @@ class TerminalOverlayPlacementTest {
     fun `codec refuses unknown extra duplicate out-of-range and oversized data`() {
         val codec = TerminalOverlayPlacementDocumentCodec
         val rejected = listOf(
-            "{\"version\":2,\"overlays\":[]}\n" to StorageFailureReason.UNSUPPORTED_VERSION,
-            "{\"version\":1,\"overlays\":[],\"extra\":true}\n" to StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":0,\"y\":0,\"grip\":1}]}\n"
+            "{\"version\":3,\"overlays\":[]}\n" to StorageFailureReason.UNSUPPORTED_VERSION,
+            "{\"version\":0,\"overlays\":[]}\n" to StorageFailureReason.UNSUPPORTED_VERSION,
+            "{\"version\":2,\"overlays\":[],\"extra\":true}\n" to StorageFailureReason.MALFORMED,
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":0,\"y\":0,\"grip\":1}]}\n"
                 to StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":1001,\"y\":0}]}\n"
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":1001,\"y\":0}]}\n"
                 to StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":\"1\",\"y\":0}]}\n"
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":\"1\",\"y\":0}]}\n"
                 to StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[" +
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":-1,\"y\":0}]}\n"
+                to StorageFailureReason.MALFORMED,
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":null,\"y\":0}]}\n"
+                to StorageFailureReason.MALFORMED,
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"controls\",\"orientation\":\"portrait\",\"x\":1}]}\n"
+                to StorageFailureReason.MALFORMED,
+            "{\"version\":2,\"overlays\":[" +
                 "{\"overlay\":\"keys\",\"orientation\":\"portrait\",\"x\":1,\"y\":2}," +
                 "{\"overlay\":\"keys\",\"orientation\":\"portrait\",\"x\":3,\"y\":4}]}\n" to
                 StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[{\"overlay\":\"elsewhere\",\"orientation\":\"portrait\",\"x\":0,\"y\":0}]}\n"
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"elsewhere\",\"orientation\":\"portrait\",\"x\":0,\"y\":0}]}\n"
                 to StorageFailureReason.MALFORMED,
-            "{\"version\":1,\"overlays\":[{\"overlay\":\"keys\",\"orientation\":\"sideways\",\"x\":0,\"y\":0}]}\n"
+            "{\"version\":2,\"overlays\":[{\"overlay\":\"keys\",\"orientation\":\"sideways\",\"x\":0,\"y\":0}]}\n"
                 to StorageFailureReason.MALFORMED,
             "[]\n" to StorageFailureReason.MALFORMED,
         )
@@ -448,11 +465,309 @@ class TerminalOverlayPlacementTest {
             StorageFailureReason.UNREADABLE,
             assertIs<TerminalOverlayPlacementDecodeResult.Invalid>(invalidUtf8).reason,
         )
-        val oversized = "{\"version\":1,\"overlays\":[]}" +
+        val oversized = "{\"version\":2,\"overlays\":[]}" +
             " ".repeat(TerminalOverlayPlacementDocumentCodec.MAX_DOCUMENT_BYTES)
         assertEquals(
             StorageFailureReason.MALFORMED,
             assertIs<TerminalOverlayPlacementDecodeResult.Invalid>(codec.decode(oversized)).reason,
+        )
+    }
+
+    @Test
+    fun `a version other than two is refused as unsupported rather than read leniently`() {
+        val codec = TerminalOverlayPlacementDocumentCodec
+        for (version in listOf(2, 0, 1, 3, 99)) {
+            val body = "{\"version\":$version,\"overlays\":[]}\n"
+            val decoded = codec.decode(body)
+            when (version) {
+                2 -> assertIs<TerminalOverlayPlacementDecodeResult.Valid>(decoded, body)
+                else -> assertEquals(
+                    StorageFailureReason.UNSUPPORTED_VERSION,
+                    assertIs<TerminalOverlayPlacementDecodeResult.Invalid>(decoded, body).reason,
+                    body,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `keys docking and floating size round-trip independently in both orientations`() {
+        val floatingSize = TerminalKeysFloatingSize(420, 300)
+        val retainedSize = TerminalKeysFloatingSize(600, 400)
+        val saved = allSixWithKeysLayouts(
+            portrait = TerminalKeysLayout(docked = false, floatingSize = floatingSize),
+            landscape = TerminalKeysLayout(docked = true, floatingSize = retainedSize),
+        )
+
+        val store = TerminalOverlayPlacementStorage.openStore(root)
+        assertEquals(TerminalOverlayPlacementWriteResult.Published, store.write(saved))
+        store.close()
+
+        // Fixed slot and field order: the same state always produces the same bytes, a
+        // floating Keys writes docked:false, and a docked Keys keeps its remembered size.
+        assertEquals(
+            """{"version":2,"overlays":[""" +
+                """{"overlay":"controls","orientation":"portrait","x":1000,"y":0},""" +
+                """{"overlay":"controls","orientation":"landscape","x":900,"y":10},""" +
+                """{"overlay":"status","orientation":"portrait","x":1000,"y":120},""" +
+                """{"overlay":"status","orientation":"landscape","x":800,"y":200},""" +
+                """{"overlay":"keys","orientation":"portrait","x":500,"y":1000,"docked":false,"w":420,"h":300},""" +
+                """{"overlay":"keys","orientation":"landscape","x":250,"y":750,"w":600,"h":400}]}""" + "\n",
+            document.readText(),
+        )
+        assertTrue(document.length() <= TerminalOverlayPlacementStorage.MAX_DOCUMENT_BYTES.toLong())
+
+        val reopened = TerminalOverlayPlacementStorage.openStore(root)
+        val read = assertIs<TerminalOverlayPlacementRead.Saved>(reopened.read())
+        assertEquals(saved, read.placement)
+        assertEquals(TerminalOverlayPosition(500, 1000), read.placement.keysPortrait)
+        assertEquals(floatingSize, read.placement.keysPortraitLayout.floatingSize)
+        assertFalse(read.placement.keysPortraitLayout.docked)
+        assertEquals(TerminalOverlayPosition(250, 750), read.placement.keysLandscape)
+        assertEquals(retainedSize, read.placement.keysLandscapeLayout.floatingSize)
+        assertTrue(read.placement.keysLandscapeLayout.docked)
+        // Controls and status keep their own positions and have no Keys layout at all.
+        assertEquals(TerminalOverlayPosition(1000, 0), read.placement.controlsPortrait)
+        assertEquals(TerminalOverlayPosition(800, 200), read.placement.statusLandscape)
+        reopened.close()
+    }
+
+    @Test
+    fun `toggling keys docking keeps both sizes and positions and leaves the other orientation alone`() {
+        val portraitSize = TerminalKeysFloatingSize(420, 300)
+        val landscapeSize = TerminalKeysFloatingSize(600, 400)
+        val floating = allSixWithKeysLayouts(
+            portrait = TerminalKeysLayout(docked = false, floatingSize = portraitSize),
+            landscape = TerminalKeysLayout(docked = false, floatingSize = landscapeSize),
+        )
+
+        val dockedAgain = floating.withKeysLayout(
+            TerminalOverlayOrientation.PORTRAIT,
+            floating.keysLayout(TerminalOverlayOrientation.PORTRAIT).copy(docked = true),
+        )
+
+        // Docking is a layout toggle only: it clears neither position nor size, in
+        // either orientation, and it never touches the other orientation's layout.
+        assertEquals(TerminalOverlayPosition(500, 1000), dockedAgain.keysPortrait)
+        assertEquals(portraitSize, dockedAgain.keysPortraitLayout.floatingSize)
+        assertTrue(dockedAgain.keysPortraitLayout.docked)
+        assertEquals(TerminalOverlayPosition(250, 750), dockedAgain.keysLandscape)
+        assertEquals(landscapeSize, dockedAgain.keysLandscapeLayout.floatingSize)
+        assertFalse(dockedAgain.keysLandscapeLayout.docked)
+
+        val store = TerminalOverlayPlacementStorage.openStore(root)
+        assertEquals(TerminalOverlayPlacementWriteResult.Published, store.write(dockedAgain))
+        store.close()
+        assertTrue(document.readText().contains("""{"overlay":"keys","orientation":"portrait","x":500,"y":1000,"w":420,"h":300}"""))
+        assertTrue(document.readText().contains("""{"overlay":"keys","orientation":"landscape","x":250,"y":750,"docked":false,"w":600,"h":400}"""))
+
+        val reopened = TerminalOverlayPlacementStorage.openStore(root)
+        assertEquals(dockedAgain, assertIs<TerminalOverlayPlacementRead.Saved>(reopened.read()).placement)
+        reopened.close()
+    }
+
+    @Test
+    fun `a keys layout change without a position round-trips no position instead of an invented one`() {
+        val codec = TerminalOverlayPlacementDocumentCodec
+        val poppedOut = TerminalOverlayPlacement.DEFAULT
+            .withKeysLayout(TerminalOverlayOrientation.PORTRAIT, TerminalKeysLayout(docked = false))
+        assertEquals(
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false}]}""" + "\n",
+            codec.encode(poppedOut),
+        )
+        val decodedPopout = assertIs<TerminalOverlayPlacementDecodeResult.Valid>(codec.decode(codec.encode(poppedOut))).placement
+        assertEquals(poppedOut, decodedPopout)
+        assertNull(decodedPopout.keysPortrait, "no coordinate is invented before the first drag")
+        assertNull(decodedPopout.keysPortraitLayout.floatingSize)
+        assertFalse(decodedPopout.keysPortraitLayout.docked)
+        assertEquals(TerminalKeysLayout.DEFAULT, decodedPopout.keysLandscapeLayout)
+        assertNull(decodedPopout.keysLandscape)
+
+        val resized = TerminalOverlayPlacement.DEFAULT
+            .withKeysLayout(
+                TerminalOverlayOrientation.LANDSCAPE,
+                TerminalKeysLayout(docked = false, floatingSize = TerminalKeysFloatingSize(600, 400)),
+            )
+        assertEquals(
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"landscape","docked":false,"w":600,"h":400}]}""" + "\n",
+            codec.encode(resized),
+        )
+        assertEquals(resized, assertIs<TerminalOverlayPlacementDecodeResult.Valid>(codec.decode(codec.encode(resized))).placement)
+
+        // A remembered size while docked is still non-default state and still round-trips.
+        val dockedWithSize = TerminalOverlayPlacement.DEFAULT
+            .withKeysLayout(
+                TerminalOverlayOrientation.PORTRAIT,
+                TerminalKeysLayout(docked = true, floatingSize = TerminalKeysFloatingSize(600, 400)),
+            )
+        assertEquals(
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","w":600,"h":400}]}""" + "\n",
+            codec.encode(dockedWithSize),
+        )
+        assertEquals(dockedWithSize, assertIs<TerminalOverlayPlacementDecodeResult.Valid>(codec.decode(codec.encode(dockedWithSize))).placement)
+
+        val store = TerminalOverlayPlacementStorage.openStore(root)
+        assertEquals(TerminalOverlayPlacementWriteResult.Published, store.write(poppedOut))
+        store.close()
+        val reopened = TerminalOverlayPlacementStorage.openStore(root)
+        val read = assertIs<TerminalOverlayPlacementRead.Saved>(reopened.read())
+        assertEquals(poppedOut, read.placement)
+        assertNull(read.placement.keysPortrait)
+        reopened.close()
+    }
+
+    @Test
+    fun `the codec refuses malformed keys layout data in every shape`() {
+        val codec = TerminalOverlayPlacementDocumentCodec
+        val rejected = listOf(
+            // A Keys entry with no position, no docking state, and no size is empty.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait"}]}""" to
+                StorageFailureReason.MALFORMED,
+            // A half position and a half size are never remembered values.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":200,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","y":700,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","w":420,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","h":300,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            // docked is a real JSON boolean only.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":"false"}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":1}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":null}]}""" to
+                StorageFailureReason.MALFORMED,
+            // Sizes are real integers in 1..1000, never quoted, null, fractional, or out of range.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":0,"h":300}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":420,"h":0}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":1001,"h":300}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":-1,"h":300}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":"420","h":300}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":420.5,"h":300}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"w":null,"h":null}]}""" to
+                StorageFailureReason.MALFORMED,
+            // Positions stay strict even on a Keys entry that also carries layout data.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":1001,"y":700,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":-5,"y":700,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":null,"y":null,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":200,"y":"700","docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            // Keys-only fields never appear on controls or status.
+            """{"version":2,"overlays":[{"overlay":"controls","orientation":"portrait","x":0,"y":0,"docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"controls","orientation":"portrait","x":0,"y":0,"w":10,"h":10}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"status","orientation":"landscape","x":0,"y":0,"w":10,"h":10}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"status","orientation":"landscape","docked":true}]}""" to
+                StorageFailureReason.MALFORMED,
+            // Unknown fields, duplicate slots, and the six-slot bound still refuse.
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false,"grip":1}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false},{"overlay":"keys","orientation":"portrait","x":1,"y":2}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","x":1,"y":2},{"overlay":"keys","orientation":"portrait"}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"up","docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"somewhere","orientation":"portrait","docked":false}]}""" to
+                StorageFailureReason.MALFORMED,
+            """{"version":2,"overlays":[{"overlay":"keys","orientation":"portrait","docked":false},""" +
+                """{"overlay":"keys","orientation":"landscape","docked":false},""" +
+                """{"overlay":"controls","orientation":"portrait","x":1,"y":1},""" +
+                """{"overlay":"controls","orientation":"landscape","x":2,"y":2},""" +
+                """{"overlay":"status","orientation":"portrait","x":3,"y":3},""" +
+                """{"overlay":"status","orientation":"landscape","x":4,"y":4},""" +
+                """{"overlay":"keys","orientation":"portrait","x":5,"y":5}]}""" to
+                StorageFailureReason.MALFORMED,
+        )
+        for ((body, reason) in rejected) {
+            val decoded = assertIs<TerminalOverlayPlacementDecodeResult.Invalid>(codec.decode("$body\n"), body.take(140))
+            assertEquals(reason, decoded.reason, body.take(140))
+        }
+    }
+
+    @Test
+    fun `keys layout accessors preserve every position and both orientations independently`() {
+        val portraitSize = TerminalKeysFloatingSize(420, 300)
+        val base = allSix().withKeysLayout(
+            TerminalOverlayOrientation.PORTRAIT,
+            TerminalKeysLayout(docked = false, floatingSize = portraitSize),
+        )
+        assertEquals(TerminalKeysLayout.DEFAULT, base.keysLandscapeLayout)
+        assertEquals(base.keysPortraitLayout, base.keysLayout(TerminalOverlayOrientation.PORTRAIT))
+        assertEquals(TerminalKeysLayout.DEFAULT, base.keysLayout(TerminalOverlayOrientation.LANDSCAPE))
+
+        // A completed drag rewrites exactly one position; both Keys layouts survive.
+        val moved = base
+            .withPosition(TerminalOverlay.CONTROLS, TerminalOverlayOrientation.PORTRAIT, TerminalOverlayPosition(12, 34))
+            .withPosition(TerminalOverlay.KEYS, TerminalOverlayOrientation.LANDSCAPE, TerminalOverlayPosition(99, 88))
+        assertEquals(TerminalKeysLayout.DEFAULT, moved.keysLandscapeLayout)
+        assertEquals(portraitSize, moved.keysPortraitLayout.floatingSize)
+        assertFalse(moved.keysPortraitLayout.docked)
+        assertEquals(TerminalOverlayPosition(12, 34), moved.controlsPortrait)
+        assertEquals(TerminalOverlayPosition(99, 88), moved.keysLandscape)
+
+        // A docking or resize command rewrites exactly one layout; all six positions and
+        // the other orientation survive.
+        val layoutOnly = moved.withKeysLayout(
+            TerminalOverlayOrientation.LANDSCAPE,
+            TerminalKeysLayout(docked = false, floatingSize = TerminalKeysFloatingSize(1, 1000)),
+        )
+        assertEquals(TerminalOverlayPosition(12, 34), layoutOnly.controlsPortrait)
+        assertEquals(TerminalOverlayPosition(900, 10), layoutOnly.controlsLandscape)
+        assertEquals(TerminalOverlayPosition(1000, 120), layoutOnly.statusPortrait)
+        assertEquals(TerminalOverlayPosition(800, 200), layoutOnly.statusLandscape)
+        assertEquals(TerminalOverlayPosition(500, 1000), layoutOnly.keysPortrait)
+        assertEquals(TerminalOverlayPosition(99, 88), layoutOnly.keysLandscape)
+        assertEquals(portraitSize, layoutOnly.keysPortraitLayout.floatingSize)
+        assertEquals(TerminalKeysFloatingSize(1, 1000), layoutOnly.keysLandscapeLayout.floatingSize)
+
+        // A natural floating size is expressible without giving up the docking state.
+        val naturalSize = layoutOnly.withKeysLayout(
+            TerminalOverlayOrientation.LANDSCAPE,
+            TerminalKeysLayout(docked = false),
+        )
+        assertNull(naturalSize.keysLandscapeLayout.floatingSize)
+        assertFalse(naturalSize.keysLandscapeLayout.docked)
+        assertEquals(TerminalOverlayPosition(99, 88), naturalSize.keysLandscape)
+
+        assertEquals(TerminalKeysLayout.DEFAULT, TerminalOverlayPlacement.DEFAULT.keysLandscapeLayout)
+        assertEquals(TerminalKeysLayout.DEFAULT, TerminalKeysLayout())
+        assertTrue(TerminalKeysLayout.DEFAULT.docked)
+        assertNull(TerminalKeysLayout.DEFAULT.floatingSize)
+    }
+
+    @Test
+    fun `a keys floating size is bounded to one through one thousand permille per component`() {
+        TerminalKeysFloatingSize(1, 1000)
+        TerminalKeysFloatingSize(500, 500)
+        for (bad in listOf(0, -1, 1_001, Int.MIN_VALUE, Int.MAX_VALUE)) {
+            assertFailsWith<IllegalArgumentException> { TerminalKeysFloatingSize(bad, 500) }
+            assertFailsWith<IllegalArgumentException> { TerminalKeysFloatingSize(500, bad) }
+        }
+    }
+
+    @Test
+    fun `the default placement encodes an empty version two document`() {
+        val body = TerminalOverlayPlacementDocumentCodec.encode(TerminalOverlayPlacement.DEFAULT)
+        assertEquals("""{"version":2,"overlays":[]}""" + "\n", body)
+        assertEquals(
+            TerminalOverlayPlacement.DEFAULT,
+            assertIs<TerminalOverlayPlacementDecodeResult.Valid>(
+                TerminalOverlayPlacementDocumentCodec.decode(body),
+            ).placement,
         )
     }
 
@@ -555,7 +870,7 @@ class TerminalOverlayPlacementTest {
         assertTrue(container.mkdirs())
         val unrelated = File(root, "other-private-document.json")
         unrelated.writeText("{\"keep\":true}\n")
-        document.writeText("{\"version\":1,\"overlays\":[{\"overlay\":\"controls\"}]}\n")
+        document.writeText("{\"version\":2,\"overlays\":[{\"overlay\":\"controls\"}]}\n")
 
         val holder = TerminalOverlayPlacementHolder(
             openStore = { TerminalOverlayPlacementStorage.openStore(root) },

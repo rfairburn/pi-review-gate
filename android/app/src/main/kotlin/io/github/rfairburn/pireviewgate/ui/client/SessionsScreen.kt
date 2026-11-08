@@ -95,6 +95,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardAccessibleMove
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardActivityLine
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardBackground
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionCardStatusRoles
+import io.github.rfairburn.pireviewgate.core.client.ui.sessionCountStatusRole
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionDragEdgeScroll
 import io.github.rfairburn.pireviewgate.core.client.ui.sessionDragHover
 import io.github.rfairburn.pireviewgate.core.client.ui.style
@@ -755,7 +756,7 @@ private fun SessionCard(
             }
 
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                backgroundChipTexts(sessionCardBackground(row.metadata)).forEach { chip ->
+                backgroundChipTexts(sessionCardBackground(row.metadata), theme).forEach { chip ->
                     StatusValueChip(chip)
                 }
             }
@@ -880,9 +881,21 @@ private fun inputChipText(observation: InputObservation, style: SessionStatusSty
     )
 }
 
-/** Two neutral background chips from activity-intent counts; unknown never means zero. */
+/**
+ * Two neutral background chips from activity-intent counts; unknown never means zero.
+ *
+ * Each count is painted on its own from the desktop band of its own observed number
+ * in the current native [theme], so one count never colours the other and the red of
+ * the highest band is activity intensity only, never an error state or a status. A
+ * missing or invalid count has no observed number and stays a plain neutral
+ * "unknown". The neutral chip surfaces, the neutral labels, the exact wording, and
+ * the full-size numbers are unchanged, and neither chip is interactive.
+ */
 @Composable
-private fun backgroundChipTexts(background: SessionCardBackground): List<AnnotatedString> {
+private fun backgroundChipTexts(
+    background: SessionCardBackground,
+    theme: SessionStatusTheme,
+): List<AnnotatedString> {
     val taskCount = when (background) {
         SessionCardBackground.Unknown -> null
         is SessionCardBackground.Counts -> background.activeTasks
@@ -896,12 +909,12 @@ private fun backgroundChipTexts(background: SessionCardBackground): List<Annotat
         sessionStatusChipText(
             stringResource(R.string.session_card_background_tasks_label),
             taskCount?.toString() ?: unknown,
-            null,
+            sessionCountStatusRole(taskCount)?.style(theme),
         ),
         sessionStatusChipText(
             stringResource(R.string.session_card_background_shells_label),
             shellCount?.toString() ?: unknown,
-            null,
+            sessionCountStatusRole(shellCount)?.style(theme),
         ),
     )
 }

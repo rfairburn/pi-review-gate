@@ -36,9 +36,12 @@ dates.
   never automatically resending, removing rows optimistically, or deleting Saved data.
 - Compact session titles use one-line width ellipsis with full accessibility text.
   Cards show delivered owner activity (a tool name, `Working`, or `Ready`) and
-  noninteractive activity-intent count bubbles; zero and unknown stay distinct, with
-  no ownership-count substitution or job popups. Controls, status, and Keys move
-  independently by long-press drag, with separate portrait/landscape positions saved
+  noninteractive activity-intent count bubbles. Each bubble's number alone follows the
+  desktop bands (0 muted, 1-2 green, 3-6 yellow, 7 or more red — the red is activity
+  intensity only, never an error status), counted independently in the current dark or
+  light theme; labels and unknown counts stay neutral, zero and unknown stay distinct,
+  and there is no ownership-count substitution or job popups. Controls, status, and
+  Keys move independently by long-press drag, with separate portrait/landscape positions saved
   across restarts. Compact controls retain their actions and touch targets without
   reflowing the terminal. Invalid cosmetic placement warns and can be replaced by a
   later save; host settings, trust, identity, and storage protections are unchanged.

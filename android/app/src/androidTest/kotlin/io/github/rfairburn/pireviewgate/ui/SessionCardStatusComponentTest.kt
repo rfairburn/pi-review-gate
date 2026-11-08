@@ -59,7 +59,11 @@ import org.junit.runner.RunWith
  *
  * Only the observed value carries the status color and weight; the "Agent"/"Input"
  * labels stay neutral, the words stay readable, and exited/error cards show no input
- * status. Invented component inputs only; fixtures are local to this file.
+ * status. Each count value carries the desktop card's band of its own number — 0
+ * muted, 1-2 success, 3-6 warning, 7 or more the red highest-intensity band, which is
+ * never an error status — while the count chips' surface, label, wording, and
+ * non-interactivity stay neutral. Invented component inputs only; fixtures are local
+ * to this file.
  */
 @RunWith(AndroidJUnit4::class)
 class SessionCardStatusComponentTest {
@@ -232,30 +236,116 @@ class SessionCardStatusComponentTest {
         assertPaintedValue("Error 2", "Error 2", 0xC8253D, bold = true)
     }
 
-    @Test fun backgroundCountsRenderAsSeparateAccessibleNeutralChips() {
-        show()
+    /** The four desktop count-band colors of one native variant. */
+    private data class CountBands(val muted: Int, val success: Int, val warning: Int, val intense: Int)
 
-        fun assertBackgroundChips(title: String, tasks: String, shells: String) {
+    private fun countBands(darkVariant: Boolean) = CountBands(
+        muted = if (darkVariant) 0x9DA5A9 else 0x677176,
+        success = if (darkVariant) 0x68B78D else 0x337E58,
+        warning = if (darkVariant) 0xCD9A22 else 0x8F6802,
+        intense = if (darkVariant) 0xEA7F81 else 0xC8253D,
+    )
+
+    /**
+     * The count chips stay separate, neutral-surfaced, non-interactive, and fully
+     * readable, so this keeps its name: the chip container and its label never take a
+     * status color, and a missing count is a plain neutral "unknown" with no painted
+     * span at all. Only an observed NUMBER carries a color, on its own span.
+     */
+    @Test fun backgroundCountsRenderAsSeparateAccessibleNeutralChips() {
+        /**
+         * One count chip of [title], addressed through its own card so the two counts
+         * of a card never stand in for each other: displayed, never clickable, and
+         * neutral apart from exactly the trailing [value], which must carry [color] and
+         * [bold] weight when [color] is non-null. A null [color] means the whole chip
+         * text — the value included — stays unpainted.
+         */
+        fun assertCountChip(title: String, text: String, value: String, color: Int?, bold: Boolean) {
             reveal(title)
-            listOf("bg tasks $tasks", "bg shells $shells").forEach { text ->
-                val node = compose.onNode(hasText(text) and hasAnyAncestor(card(title)))
-                // Revealing the title can leave this lower row below the viewport.
-                // Scroll the actual chip into view before asserting its presentation.
-                node.performScrollTo().assertIsDisplayed().assertHasNoClickAction()
-                val content = node.fetchSemanticsNode().config[SemanticsProperties.Text]
-                    .single { it.text == text }
-                assertTrue(content.spanStyles.isEmpty())
+            val node = compose.onNode(hasText(text) and hasAnyAncestor(card(title)))
+            // Revealing the title can leave this lower row below the viewport.
+            // Scroll the actual chip into view before asserting its presentation.
+            node.performScrollTo().assertIsDisplayed().assertHasNoClickAction()
+            val content = node.fetchSemanticsNode().config[SemanticsProperties.Text]
+                .single { it.text == text }
+            if (color == null) {
+                assertTrue("$text must stay a plain neutral chip", content.spanStyles.isEmpty())
+                return
             }
+            val span = content.spanStyles.single()
+            assertEquals(text, content.text)
+            assertEquals(text.length - value.length, span.start)
+            assertEquals(text.length, span.end)
+            assertEquals(value, content.text.substring(span.start, span.end))
+            assertEquals(rgb(color), span.item.color)
+            assertEquals(if (bold) FontWeight.Bold else FontWeight.Normal, span.item.fontWeight)
         }
 
-        assertBackgroundChips("Status background-positive", "2", "1")
-        assertBackgroundChips("Status background-zero", "0", "0")
-        assertBackgroundChips("Status task-unknown", "unknown", "1")
-        assertBackgroundChips("Status shell-unknown", "2", "unknown")
-        assertBackgroundChips("Status unknown", "unknown", "unknown")
+        val bandRows = listOf(
+            row("band-zero", activeTasks = 0, activeShells = 0),
+            row("band-one", activeTasks = 1, activeShells = 2),
+            row("band-three", activeTasks = 3, activeShells = 6),
+            row("band-seven", activeTasks = 7, activeShells = 0),
+            row("band-large", activeTasks = 1_000_000, activeShells = 42),
+            row("band-mixed", activeTasks = null, activeShells = 1),
+            row("band-mixed-positive", activeTasks = 2, activeShells = 6),
+        )
+        dark = true
+        // AndroidComposeTestRule allows setContent once per test. Keep all fixtures
+        // in that one composition and switch only the existing theme state below.
+        show(rows + bandRows)
+        val darkBands = countBands(true)
+
+        // Each number is independently painted, including equal and different bands.
+        assertCountChip("Status background-positive", "bg tasks 2", "2", darkBands.success, bold = true)
+        assertCountChip("Status background-positive", "bg shells 1", "1", darkBands.success, bold = true)
+        // Zero is an observed number, never an unknown: it paints the muted band.
+        assertCountChip("Status background-zero", "bg tasks 0", "0", darkBands.muted, bold = false)
+        assertCountChip("Status background-zero", "bg shells 0", "0", darkBands.muted, bold = false)
+        assertCountChip("Status task-unknown", "bg tasks unknown", "unknown", null, bold = false)
+        assertCountChip("Status task-unknown", "bg shells 1", "1", darkBands.success, bold = true)
+        assertCountChip("Status shell-unknown", "bg tasks 2", "2", darkBands.success, bold = true)
+        assertCountChip("Status shell-unknown", "bg shells unknown", "unknown", null, bold = false)
+        // Both counts missing: two plain unknown bubbles, nothing painted at all.
+        assertCountChip("Status unknown", "bg tasks unknown", "unknown", null, bold = false)
+        assertCountChip("Status unknown", "bg shells unknown", "unknown", null, bold = false)
+
+        // The same bands in both native variants, with every 0 / 1-2 / 3-6 / 7+ boundary.
+        for (variant in listOf(true, false)) {
+            compose.runOnIdle { dark = variant }
+            compose.waitForIdle()
+            val bands = countBands(variant)
+            assertCountChip("Status band-zero", "bg tasks 0", "0", bands.muted, bold = false)
+            assertCountChip("Status band-zero", "bg shells 0", "0", bands.muted, bold = false)
+            assertCountChip("Status band-one", "bg tasks 1", "1", bands.success, bold = true)
+            assertCountChip("Status band-one", "bg shells 2", "2", bands.success, bold = true)
+            assertCountChip("Status band-three", "bg tasks 3", "3", bands.warning, bold = true)
+            assertCountChip("Status band-three", "bg shells 6", "6", bands.warning, bold = true)
+            // The red band is intensity only: it paints a number, never a status.
+            assertCountChip("Status band-seven", "bg tasks 7", "7", bands.intense, bold = true)
+            assertCountChip("Status band-seven", "bg shells 0", "0", bands.muted, bold = false)
+            assertCountChip("Status band-large", "bg tasks 1000000", "1000000", bands.intense, bold = true)
+            assertCountChip("Status band-large", "bg shells 42", "42", bands.intense, bold = true)
+            // A missing count stays a plain neutral unknown beside a painted number.
+            assertCountChip("Status band-mixed", "bg tasks unknown", "unknown", null, bold = false)
+            assertCountChip("Status band-mixed", "bg shells 1", "1", bands.success, bold = true)
+            assertCountChip("Status band-mixed-positive", "bg tasks 2", "2", bands.success, bold = true)
+            assertCountChip("Status band-mixed-positive", "bg shells 6", "6", bands.warning, bold = true)
+
+            // Painting a count never changes what the card classifies: the red 7 is an
+            // ordinary Running row, with no Error status on that card.
+            reveal("Status band-seven")
+            compose.onNode(hasText("Agent running") and hasAnyAncestor(card("Status band-seven")))
+                .performScrollTo().assertIsDisplayed()
+            assertEquals(0, compose.onAllNodes(
+                hasText("Error", substring = true) and hasAnyAncestor(card("Status band-seven")),
+            ).fetchSemanticsNodes().size)
+        }
 
         // Background chips do not replace or alter the established accessible status chips.
         // Positive activity-intent counts mean running; input is a separate observation.
+        compose.runOnIdle { dark = true }
+        compose.waitForIdle()
         reveal("Status background-positive")
         compose.onNode(hasText("Agent running") and hasAnyAncestor(card("Status background-positive")))
             .performScrollTo().assertIsDisplayed()

@@ -124,4 +124,74 @@ class SessionCardStatusStyleTest {
         val row = ClientUiFixtures.row("a", busy = true)
         assertNull(roles(row).lifecycle)
     }
+
+    // -- the desktop count bands paint only an observed number ------------------------
+
+    @Test
+    fun `each count band maps to the existing palette role it reuses`() {
+        // Zero is an observation and is never unknown; the bands are exactly the
+        // desktop card's 0 / 1-2 / 3-6 / 7+.
+        assertEquals(SessionStatusRole.IDLE, sessionCountStatusRole(0L))
+        assertEquals(SessionStatusRole.RUNNING, sessionCountStatusRole(1L))
+        assertEquals(SessionStatusRole.RUNNING, sessionCountStatusRole(2L))
+        assertEquals(SessionStatusRole.WAITING, sessionCountStatusRole(3L))
+        assertEquals(SessionStatusRole.WAITING, sessionCountStatusRole(6L))
+        assertEquals(SessionStatusRole.ERROR, sessionCountStatusRole(7L))
+        assertEquals(SessionStatusRole.ERROR, sessionCountStatusRole(1_000_000L))
+        assertEquals(SessionStatusRole.ERROR, sessionCountStatusRole(Long.MAX_VALUE))
+    }
+
+    @Test
+    fun `every count boundary paints the exact desktop color and weight`() {
+        // count to dark rgb, light rgb, and whether the number is bold.
+        val bands = listOf(
+            0L to Triple(0x9DA5A9, 0x677176, false), // muted, normal
+            1L to Triple(0x68B78D, 0x337E58, true), // success
+            2L to Triple(0x68B78D, 0x337E58, true), // success
+            3L to Triple(0xCD9A22, 0x8F6802, true), // warning
+            6L to Triple(0xCD9A22, 0x8F6802, true), // warning
+            7L to Triple(0xEA7F81, 0xC8253D, true), // error intensity
+            1_000_000L to Triple(0xEA7F81, 0xC8253D, true), // error intensity
+            Long.MAX_VALUE to Triple(0xEA7F81, 0xC8253D, true), // error intensity
+        )
+        bands.forEach { (count, painted) ->
+            val (darkRgb, lightRgb, bold) = painted
+            val role = requireNotNull(sessionCountStatusRole(count)) { "count $count must paint" }
+            assertEquals(darkRgb, role.style(dark).rgb, "dark count $count")
+            assertEquals(lightRgb, role.style(light).rgb, "light count $count")
+            assertEquals(bold, role.style(dark).bold, "dark count $count weight")
+            assertEquals(bold, role.style(light).bold, "light count $count weight")
+        }
+    }
+
+    @Test
+    fun `a missing or invalid count paints nothing and is never dimmed or zero`() {
+        // No observed number means no painted span at all: the chip keeps its own
+        // neutral content color instead of the dimmed UNKNOWN role, and a negative
+        // is not an observation either.
+        assertNull(sessionCountStatusRole(null))
+        assertNull(sessionCountStatusRole(-1L))
+        assertNull(sessionCountStatusRole(Long.MIN_VALUE))
+        // Zero stays distinct: it is an observed number, not an unknown.
+        assertEquals(SessionStatusRole.IDLE, sessionCountStatusRole(0L))
+    }
+
+    @Test
+    fun `a count band never changes what the card classifies`() {
+        // The highest band is red activity intensity on the number only. The row is
+        // still classified exactly as before: running, with input unknown.
+        val intense = ClientUiFixtures.row("a", activeTasks = 9L, activeShells = 7L)
+        assertEquals(AgentActivity.RUNNING, intense.agentActivity)
+        assertEquals(SessionStatusRole.RUNNING, roles(intense).agent)
+        assertEquals(SessionStatusRole.UNKNOWN, roles(intense).input)
+        assertEquals(
+            SessionStatusRole.ERROR,
+            sessionCountStatusRole(intense.metadata.activeTasks),
+        )
+        // And an unknown count keeps its neutral value while the agent classification
+        // stays unknown rather than becoming idle.
+        val missing = ClientUiFixtures.row("a", busy = false, pendingInput = false, activeTasks = null, activeShells = 0L)
+        assertNull(sessionCountStatusRole(missing.metadata.activeTasks))
+        assertEquals(SessionStatusRole.UNKNOWN, roles(missing).agent)
+    }
 }

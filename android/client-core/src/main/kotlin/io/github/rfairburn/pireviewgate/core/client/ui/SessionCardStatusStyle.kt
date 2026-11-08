@@ -17,6 +17,10 @@ import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
  * never a label or a separator, and the text itself always states the value, so
  * color is never the only signal. The roles add no classification of their own:
  * they read [RosterLifecycle], [AgentActivity], and [InputObservation] unchanged.
+ *
+ * The count seam [sessionCountStatusRole] reuses these same roles for the desktop
+ * card's count bands, where [ERROR] is only the highest observed activity
+ * intensity and never an error, a lifecycle, or a routing state.
  */
 public enum class SessionStatusRole {
     /** Lifecycle starting. */
@@ -104,6 +108,35 @@ public fun SessionStatusRole.style(theme: SessionStatusTheme): SessionStatusStyl
         SessionStatusRole.IDLE, SessionStatusRole.UNKNOWN, SessionStatusRole.EXITED -> false
     }
     return SessionStatusStyle(token.rgb(theme), bold)
+}
+
+/**
+ * The painted role of one observed background count, or `null` to stay neutral.
+ *
+ * These are the desktop card's count bands read off the number alone: zero is
+ * [SessionStatusRole.IDLE] (muted, normal weight), 1 to 2 are
+ * [SessionStatusRole.RUNNING] (success, bold), 3 to 6 are
+ * [SessionStatusRole.WAITING] (warning, bold), and 7 or more are
+ * [SessionStatusRole.ERROR] (error, bold). The bands are palette only — the red of
+ * [SessionStatusRole.ERROR] is the highest observed intensity and never an error, a
+ * lifecycle, or a routing decision — and this reads no classification and changes
+ * none: what the card says about the row is decided elsewhere, unchanged.
+ *
+ * Only an observed number is painted. A `null` count has no observed value and
+ * returns `null`, so the chip keeps its ordinary neutral content color rather than
+ * the dimmed [SessionStatusRole.UNKNOWN]; a negative is not an observed number
+ * either, and the card's existing count sanitation already reports it as unknown.
+ * Zero is an observation, never unknown.
+ */
+public fun sessionCountStatusRole(count: Long?): SessionStatusRole? {
+    val observed = count ?: return null
+    if (observed < 0L) return null
+    return when {
+        observed == 0L -> SessionStatusRole.IDLE
+        observed <= 2L -> SessionStatusRole.RUNNING
+        observed <= 6L -> SessionStatusRole.WAITING
+        else -> SessionStatusRole.ERROR
+    }
 }
 
 /**

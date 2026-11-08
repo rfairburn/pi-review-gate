@@ -38,8 +38,12 @@
  * editing input bring the selected row or native cursor into view; keyboard
  * paging and the pointer wheel move only the offset. Resize clamps the offset
  * to the new bounds and re-reveals only the list selection or an active
- * editing cursor. The popup keeps its content-sized height up to the
- * overlay's row budget.
+ * editing cursor. A controller update while the list is open — another entry
+ * registered, or another one resolved or closed — refreshes the list but keeps
+ * that offset, so an explicit scroll is
+ * never undone; only a selection that actually moved (the revealed entry
+ * disappeared and the list fell back to another live one) re-reveals (#615).
+ * The popup keeps its content-sized height up to the overlay's row budget.
  *
  * Fullscreen pointer input (#431): the public custom overlay hands this
  * component to pi-tui directly, so pointer events arrive in coordinates local
@@ -349,6 +353,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let scrollOffset = 0;
   let viewportFocus: ViewportFocus | undefined;
   let focusPending = true;
+  // The exact pending record the current list offset was revealed for. The list
+  // selection can be implicit (the first live entry) and can move on its own
+  // when that entry disappears, so the popup remembers which record the reveal
+  // aligned to. #615: a controller update that leaves it live is unrelated to
+  // the viewport and must not re-reveal over an explicit scroll.
+  let revealedListRecord: PendingUserInput | undefined;
   let lastViewportRows: number | undefined;
   let lastRenderedWidth: number | undefined;
   let lastMaxScrollOffset: number | undefined;
@@ -422,10 +432,14 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
   };
 
-  // Live questions (registered while the list is open) must refresh the view;
-  // the list keeps its live selection visible as entries come and go.
+  // Live questions (registered while the list is open) must refresh the view.
+  // A controller update only asks for a reveal when the list's selection
+  // actually moved: the revealed record disappeared and the selection fell
+  // back to another live entry (#615). While that record is still live — a new
+  // entry registered or another one resolved — the reader's own wheel or
+  // keyboard scroll survives the update.
   const unsubscribeState = controller.addStateListener(() => {
-    if (mode === "list") focusPending = true;
+    if (mode === "list" && currentListRecord() !== revealedListRecord) focusPending = true;
     invalidate();
   });
 
@@ -448,10 +462,18 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   /** Keep the list selection on a live question; fall back to the first. */
   function currentListSelection(): string | undefined {
+    return currentListRecord()?.id;
+  }
+
+  /**
+   * The live pending record the list's selection resolves to, including the
+   * implicit first entry while nothing was selected yet. Identity is the record
+   * object, never a reused per-session ID.
+   */
+  function currentListRecord(): PendingUserInput | undefined {
     const pending = pendingNow();
     if (pending.length === 0) return undefined;
-    if (selectedId && pending.some((question) => question.id === selectedId)) return selectedId;
-    return pending[0]!.id;
+    return pending.find((record) => record.id === selectedId) ?? pending[0];
   }
 
   function answerRows(): Array<string | typeof TYPE_ROW | typeof DECLINE_ROW> {
@@ -854,7 +876,10 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const maximum = lastMaxScrollOffset ?? Number.POSITIVE_INFINITY;
     scrollOffset = Math.min(Math.max(0, scrollOffset + amount), maximum);
     // Explicit scrolling wins over a pending reveal until the next selection
-    // or editing input asks for one again.
+    // or editing input asks for one again. Re-anchoring here is what makes it
+    // win (#615): a controller update arriving later must not perform the
+    // reveal the reader just scrolled away from.
+    if (focusPending && mode === "list") revealedListRecord = currentListRecord();
     focusPending = false;
   }
 
@@ -942,8 +967,14 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // put until the click that completes it, so the single authoritative
     // offset and any pending reveal are left exactly as they were.
     const keepFocusPending = focusPending;
-    if (ref.kind === "list") selectedId = ref.record.id;
-    else if (ref.kind === "answer") answerIndex = ref.row;
+    if (ref.kind === "list") {
+      selectedId = ref.record.id;
+      // A press moves the selection but deliberately never reveals it, so the
+      // reveal bookkeeping follows silently: a later unrelated controller
+      // update must not scroll the pressed entry back over the reader's own
+      // wheel (#615).
+      revealedListRecord = ref.record;
+    } else if (ref.kind === "answer") answerIndex = ref.row;
     else noticeActionIndex = ref.action;
     invalidate();
     focusPending = keepFocusPending;
@@ -1305,6 +1336,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (bodyRows > 0 && focusPending) {
       scrollOffset = offsetForFocus(scrollOffset, bodyRows, content.lines.length, viewportFocus);
       focusPending = false;
+      // The reveal is only owed again when this record stops being the list's
+      // selection (#615); an unrelated controller update keeps this offset.
+      if (mode === "list") revealedListRecord = currentListRecord();
     }
     lastMaxScrollOffset = maximum;
     const body = content.lines.slice(scrollOffset, scrollOffset + bodyRows);

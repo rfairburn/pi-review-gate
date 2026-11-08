@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.261]
+
+### Fixed
+
+- **A scrolled pending list keeps its place while entries come and go** (#615):
+  scrolling a long shared pending list with the pointer wheel or
+  **Shift+Alt+Up/Down** / **Ctrl+Alt+PageUp/PageDown** no longer snaps back to the
+  selected entry when the controller updates while the list is open — another
+  question or notice is registered, or another one is answered or closed.
+  The list still refreshes with that live state, and
+  every reveal stays where it was: opening the list or returning to it shows the
+  selected entry, **Up/Down** bring a newly selected entry into view, a pointer
+  press still selects without scrolling, resize still re-reveals the list
+  selection, and when the selected entry is resolved or closed the list falls
+  back to the first live entry and reveals it. Keyboard scroll keys and their
+  bounds, the fixed hint, answer choices and notice actions, free-text editor
+  ownership, popup routing, and the persistent panel are unchanged, and the
+  question/notice detail views never move the conversation behind the popup.
+
 ## [0.1.0-dev.260]
 
 ### Fixed

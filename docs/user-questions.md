@@ -123,6 +123,15 @@ within the content's start and end.
 - A long question or notice opens at its beginning, not at the first choice.
   **Up/Down** still change the selection and bring the selected choice or
   action into view, also when pressed at the first or last row.
+- **A scrolled pending list keeps its place.** While the list is open, the
+  controller keeps changing: another question or notice is registered, or another
+  one is answered or closed. The list
+  refreshes with that live state and keeps the viewport where the wheel or
+  scroll keys left it, so a later entry can be read in peace. The reveals you
+  would expect stay exactly as they were: opening the list or returning to it
+  shows the selected entry, **Up/Down** bring the newly selected entry into
+  view, and if the selected entry is resolved or closed the list falls back to
+  the first live entry and reveals it.
 - While you edit a free-text answer, every key belongs to the native text field,
   so the popup scroll shortcuts are not consumed; the hint says to press Esc to
   return to the options first. Editing input brings the field's cursor row back

@@ -256,6 +256,10 @@ async function runSettingsMenu(
   // YOLO is a master override; the individual values beneath it are preserved
   // so disabling restores them exactly as saved.
   let browserPermissions = { ...(input.config.web!.browserPermissions ?? DEFAULT_BROWSER_PERMISSIONS) };
+  // Issue #620: the shared acquisition URL blocklist is staged like every
+  // other Web value and persisted as one list for both WebFetch and
+  // BrowserExtract.
+  let webUrlBlocklist = [...(input.config.web!.urlBlocklist ?? [])];
   // Issue #26 scheduled tasks: the complete catalog is staged as its own
   // canonical copy; Save persists it through the shared save boundary. Entry
   // definitions stay visible and editable regardless of any runtime switch.
@@ -470,6 +474,7 @@ async function runSettingsMenu(
     browserDownloadRetention,
     browserVisible,
     webBrowserPermissions: browserPermissions,
+    webUrlBlocklist,
   });
 
   // Caller-local last selection for this loop only: the highlighted row is
@@ -517,7 +522,7 @@ async function runSettingsMenu(
       { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
       { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
       { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
-      { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions } }) },
+      { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions, urlBlocklist: webUrlBlocklist } }) },
       { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
       ...(input.schedulerRuntime
@@ -698,6 +703,7 @@ async function runSettingsMenu(
           browserDownloadRetention,
           browserVisible,
           browserPermissions,
+          urlBlocklist: webUrlBlocklist,
         },
       }, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped }, {
         // The audit subset reads the same display-only inventory WITHOUT the
@@ -720,6 +726,7 @@ async function runSettingsMenu(
       browserDownloadRetention = tools.web.browserDownloadRetention;
       browserVisible = tools.web.browserVisible;
       browserPermissions = tools.web.browserPermissions;
+      webUrlBlocklist = tools.web.urlBlocklist;
       continue;
     }
     if (choice === "subtasksView") {

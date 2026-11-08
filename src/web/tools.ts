@@ -60,6 +60,11 @@ import {
 import { ColumnProjectionError, mediaTypeOf } from "./page";
 import { browserRenderResult } from "./browser-renderer";
 import { searchDdgs, type SearchResponse } from "./network";
+import {
+  compileUrlBlocklist,
+  UrlBlocklistDeniedError,
+  type UrlBlocklist,
+} from "./url-blocklist";
 import type { BrowserClickButton } from "./browser-interaction-policy";
 
 interface PiWebExecutionContext {
@@ -111,6 +116,11 @@ export class WebToolManager {
   private readonly browserCache: WebPageCache;
   private readonly interactiveBrowser: InteractiveBrowserManager;
   private webConfig: WebConfig;
+  /**
+   * The one compiled `web.urlBlocklist` shared by both acquisition caches
+   * (issue #620). It is never handed to the interactive browser manager.
+   */
+  private urlBlocklist: UrlBlocklist;
   private registered = false;
 
   constructor(
@@ -121,8 +131,12 @@ export class WebToolManager {
     interactiveBrowser?: InteractiveBrowserManager,
   ) {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
-    this.cache = cache ?? new WebPageCache(this.webConfig.fetch);
-    this.browserCache = browserCache ?? new WebPageCache(this.webConfig.fetch, renderWithChromium);
+    this.urlBlocklist = compileUrlBlocklist(this.webConfig.urlBlocklist);
+    this.cache = cache ?? new WebPageCache(this.webConfig.fetch, undefined, this.urlBlocklist);
+    this.browserCache = browserCache ?? new WebPageCache(this.webConfig.fetch, renderWithChromium, this.urlBlocklist);
+    // An injected cache still receives the authoritative list.
+    this.cache.updateConfig(this.webConfig.fetch, this.urlBlocklist);
+    this.browserCache.updateConfig(this.webConfig.fetch, this.urlBlocklist);
     this.interactiveBrowser = interactiveBrowser ?? new InteractiveBrowserManager(this.webConfig.fetch);
     this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserPermissions, this.webConfig.browserVisible, this.webConfig.browserDownloadRetention);
     registerProcessExitCleanup(this.cache);
@@ -251,8 +265,9 @@ export class WebToolManager {
           });
           return textResult(formatPage(fetched, "WebFetch", "Fetched"), { response: fetched, request: requestDetails });
         } catch (error) {
+          const denied = error instanceof UrlBlocklistDeniedError;
           return textResult([
-            `WebFetch failed: ${messageOf(error)}`,
+            `${denied ? "WebFetch denied" : "WebFetch failed"}: ${messageOf(error)}`,
             webFetchRecoveryGuidance(error),
           ].join("\n"), { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) }, true);
         }
@@ -309,7 +324,14 @@ export class WebToolManager {
           });
           return textResult(formatPage(rendered, "BrowserExtract", "Rendered"), { response: rendered, request: requestDetails });
         } catch (error) {
-          return textResult(`BrowserExtract failed: ${messageOf(error)}`, { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) }, true);
+          const denied = error instanceof UrlBlocklistDeniedError;
+          return textResult(
+            denied
+              ? `BrowserExtract denied: ${messageOf(error)}\n${URL_BLOCKLIST_DENIAL_GUIDANCE}`
+              : `BrowserExtract failed: ${messageOf(error)}`,
+            { error: messageOf(error), ...(requestDetails ? { request: requestDetails } : {}) },
+            true,
+          );
         }
       },
     });
@@ -956,8 +978,12 @@ export class WebToolManager {
    * claiming the settings applied successfully. */
   sync(config: ReviewGateConfig): Promise<BrowserPermissionRevocationReport> {
     this.webConfig = config.web ?? DEFAULT_CONFIG.web!;
-    this.cache.updateConfig(this.webConfig.fetch);
-    this.browserCache.updateConfig(this.webConfig.fetch);
+    // One authoritative list for both acquisition routes; a changed list also
+    // invalidates cached acquisitions so no document fetched under the earlier
+    // policy can be served.
+    this.urlBlocklist = compileUrlBlocklist(this.webConfig.urlBlocklist);
+    this.cache.updateConfig(this.webConfig.fetch, this.urlBlocklist);
+    this.browserCache.updateConfig(this.webConfig.fetch, this.urlBlocklist);
     const report = this.interactiveBrowser.updateConfig(this.webConfig.fetch, this.webConfig.browserInteractionApproval, this.webConfig.browserIdleExpiryMinutes, this.webConfig.browserPermissions, this.webConfig.browserVisible, this.webConfig.browserDownloadRetention);
     // A stubbed manager may return nothing; normalize to the contract.
     return Promise.resolve(report ?? { entries: [] });
@@ -1038,12 +1064,26 @@ export function formatSearch(response: SearchResponse): string {
 }
 
 /**
+ * Fixed guidance for a shared URL blocklist denial (issue #620): the denial is
+ * the outcome, so no acquisition fallback is offered. Both acquisition tools
+ * consult the same list, which is stated so a retry through the other tool is
+ * not mistaken for a way around it.
+ */
+const URL_BLOCKLIST_DENIAL_GUIDANCE =
+  "This is a configured policy denial, not a transient failure. The same web.urlBlocklist applies to "
+  + "WebFetch and BrowserExtract, so retrying this URL with either tool is denied the same way; choose a "
+  + "different source, or change the blocklist in /review-settings \u2192 Tools \u2192 Web.";
+
+/**
  * Recovery guidance for a failed WebFetch (issue #534). A rejected `columns`
  * argument is an argument-validation failure against the already-cached
  * document, so it must never read as evidence that the source needs a browser or
- * a different URL; every other failure keeps the existing acquisition guidance.
+ * a different URL; a shared URL blocklist denial never recommends the browser
+ * fallback either, because the same list denies it; every other failure keeps
+ * the existing acquisition guidance.
  */
 function webFetchRecoveryGuidance(error: unknown): string {
+  if (error instanceof UrlBlocklistDeniedError) return URL_BLOCKLIST_DENIAL_GUIDANCE;
   if (error instanceof ColumnProjectionError) {
     return 'Correct the columns argument — a standalone "#N" ordinal or the exact header text, copied from the available columns when they are listed. The URL and the requested source do not need to change; this failure is not evidence that the page needs browser rendering.';
   }

@@ -6,6 +6,12 @@ import { join } from "node:path";
 import type { WebFetchConfig } from "../config";
 import type { BrowserOmissions } from "./network";
 import { downloadText } from "./network";
+import {
+  EMPTY_URL_BLOCKLIST,
+  urlBlocklistsEqual,
+  type UrlBlocklist,
+  type UrlGuard,
+} from "./url-blocklist";
 import { ColumnProjectionError, extractFetchedDocument, findInWebPage, renderWebPage, type ExtractedWebPage, type RenderedWebPage, type WebPageFindResult } from "./page";
 import { extractPdfDocument, isPdfResponse } from "./pdf";
 
@@ -51,14 +57,33 @@ export class WebPageCache {
   private readonly entries = new Map<string, CacheEntry>();
   private root?: string;
   private totalBytes = 0;
+  /**
+   * Bumped whenever a shared URL blocklist change invalidates the cache, so an
+   * acquisition that started under the earlier policy can be recognized and
+   * kept out of the cache (issue #620).
+   */
+  private policyGeneration = 0;
 
   constructor(
     private config: WebFetchConfig,
     private readonly downloader: typeof downloadText = downloadText,
+    private urlBlocklist: UrlBlocklist = EMPTY_URL_BLOCKLIST,
   ) {}
 
-  updateConfig(config: WebFetchConfig): void {
+  /**
+   * Apply a saved configuration. A CHANGED shared URL blocklist also
+   * invalidates every cached acquisition (issue #620): entries were fetched
+   * under the previous policy, and a cached document's earlier redirect hops
+   * are not recorded, so nothing cached earlier may serve a URL the new list
+   * denies. The generation bump additionally fences acquisitions that were
+   * already in flight. An unchanged list keeps the cache intact.
+   */
+  updateConfig(config: WebFetchConfig, urlBlocklist?: UrlBlocklist): void {
     this.config = config;
+    if (urlBlocklist === undefined || urlBlocklistsEqual(this.urlBlocklist, urlBlocklist)) return;
+    this.urlBlocklist = urlBlocklist;
+    this.policyGeneration += 1;
+    this.invalidate();
   }
 
   async fetch(input: {
@@ -70,15 +95,17 @@ export class WebPageCache {
     columns?: string[];
     signal?: AbortSignal;
   }): Promise<WebFetchResult> {
+    // The shared blocklist judges the raw supplied URL — fragment and all —
+    // before any cache lookup, so neither a cache hit nor a later policy
+    // change can evade a denial. The normalized cache key below loses the
+    // fragment for storage only and is never a policy input.
+    this.assertSuppliedAllowed(input.url);
     const requestedUrl = normalizedUrl(input.url);
     let entry = input.refresh ? undefined : this.entries.get(requestedUrl);
     const cacheHit = Boolean(entry);
     if (!entry) {
       if (input.refresh) await this.removeEntry(requestedUrl);
-      entry = await this.download(requestedUrl, input.signal);
-      this.entries.set(requestedUrl, entry);
-      this.totalBytes += entry.diskBytes;
-      await this.evict(requestedUrl);
+      entry = await this.acquire(requestedUrl, input.url, input.signal);
     }
     entry.lastAccessedAt = Date.now();
     const maxChars = Math.max(1_000, Math.min(input.maxChars ?? this.config.maxOutputChars, this.config.maxOutputChars));
@@ -138,12 +165,65 @@ export class WebPageCache {
     return this.root;
   }
 
-  private async download(requestedUrl: string, signal?: AbortSignal): Promise<CacheEntry> {
-    const downloaded = await this.downloader(requestedUrl, {
+  /**
+   * Acquire a document and admit it to the cache only when the shared URL
+   * blocklist did not change while it was in flight (issue #620). Redirect
+   * hops are validated as they happen, so an acquisition that started under an
+   * earlier list has never been checked against the new one — admitting it
+   * would let a later fetch skip that validation entirely, and a final-URL
+   * check cannot cover an intermediate hop. A stale acquisition is discarded and
+   * reported as a policy change the caller can retry; it is never re-requested
+   * automatically, because fetching again is the caller's decision. The guard
+   * installed for the running acquisition follows the current list, so a
+   * destination the new list denies is denied before it is contacted.
+   */
+  private async acquire(requestedUrl: string, suppliedUrl: string, signal?: AbortSignal): Promise<CacheEntry> {
+    const generation = this.policyGeneration;
+    this.assertSuppliedAllowed(suppliedUrl);
+    const entry = await this.download(suppliedUrl, requestedUrl, signal);
+    if (this.policyGeneration === generation) {
+      this.entries.set(requestedUrl, entry);
+      this.totalBytes += entry.diskBytes;
+      await this.evict(requestedUrl);
+      return entry;
+    }
+    await Promise.all([
+      rm(entry.rawPath, { force: true }),
+      rm(entry.indexPath, { force: true }),
+    ]);
+    throw new Error(
+      `The web.urlBlocklist changed while ${requestedUrl} was being acquired; `
+      + "the completed acquisition was discarded rather than served from a policy it was not validated against. "
+      + "No further request was made. Retry the request.",
+    );
+  }
+
+  /** Judge the caller's supplied URL exactly as supplied, fragment included. */
+  private assertSuppliedAllowed(url: string): void {
+    this.urlBlocklist.assertAllowed(url, "initial");
+  }
+
+  /**
+   * Run one acquisition. The downloader receives the caller's COMPLETE URL —
+   * fragment included — so the transport's own policy checks never see a
+   * fragmentless stand-in; each downloader canonicalizes its wire request and
+   * fragment handling internally. `requestedUrl` stays the fragmentless cache
+   * key and stored identity.
+   */
+  private async download(suppliedUrl: string, requestedUrl: string, signal?: AbortSignal): Promise<CacheEntry> {
+    // The guard is installed unconditionally and follows the CURRENT compiled
+    // list rather than capturing it: a live settings update can add entries
+    // while this acquisition is running, and a route that started without a
+    // guard would then contact a destination the new policy denies before the
+    // generation fence could reject the result. An empty list denies nothing,
+    // so the check stays cheap until an entry exists.
+    const urlGuard: UrlGuard = (url, stage) => this.urlBlocklist.assertAllowed(url, stage);
+    const downloaded = await this.downloader(suppliedUrl, {
       timeoutMs: this.config.timeoutMs,
       maxBytes: this.config.maxDownloadBytes,
       userAgent: this.config.userAgent,
       signal,
+      urlGuard,
     });
     const rawData = downloaded.data
       ?? (downloaded.text.slice(0, 1_024).includes("%PDF-") ? Buffer.from(downloaded.text, "latin1") : undefined);
@@ -184,6 +264,23 @@ export class WebPageCache {
       rawPath,
       indexPath,
     };
+  }
+
+  /**
+   * Drop every cached acquisition after a shared URL blocklist change, so a
+   * document fetched under the earlier policy can never answer a request the
+   * new policy denies. Cached files are removed on a best-effort basis; the
+   * in-memory entries are gone synchronously, and the cache root is removed in
+   * full by the ordinary shutdown cleanup.
+   */
+  private invalidate(): void {
+    const stale = [...this.entries.values()];
+    this.entries.clear();
+    this.totalBytes = 0;
+    void Promise.allSettled(stale.flatMap((entry) => [
+      rm(entry.rawPath, { force: true }),
+      rm(entry.indexPath, { force: true }),
+    ]));
   }
 
   private async ensureRoot(): Promise<string> {

@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.263]
+
+### Added
+
+- **Shared URL blocklist** (#620): `web.urlBlocklist` supplies one empty-by-default
+  list of JavaScript regular-expression sources for `WebFetch` and `BrowserExtract`.
+  Expressions search the complete supplied URL and each actual redirect destination
+  before access. Surrounding whitespace is trimmed from entries; anchors otherwise
+  retain their regex meaning. Matches explicitly deny the operation without an
+  extraction fallback. The existing Web
+  settings editor accepts one expression per line, with session-only and persistent
+  apply options. Changed lists invalidate acquisition caches. Existing network safety
+  stays intact; interactive browser tools and page subresources are outside this
+  convenience guard, which is not a security boundary.
+
 ## [0.1.0-dev.262]
 
 ### Changed

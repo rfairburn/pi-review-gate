@@ -2029,6 +2029,8 @@ class TerminalOverlayPlacementComponentTest {
 
     /** One bounded observation if an existing 10s phase wait stops returning.
      * Never interrupts the test, drives its clock, alters idleness or changes a deadline.
+     * A phase that fails on its own is logged with its name the moment it fails, before the
+     * observer is torn down, and the very same throwable is rethrown unchanged.
      */
     private fun <T> placementPhase(name: String, action: () -> T): T {
         val testThread = Thread.currentThread()
@@ -2040,7 +2042,7 @@ class TerminalOverlayPlacementComponentTest {
         val pending = observer.schedule({
             listOf("main" to mainThread, "test" to testThread).forEach { (label, thread) ->
                 Log.e("OverlayPlacementTest", "phase=$name still waiting; $label state=${thread.state}")
-                runCatching { thread.stackTrace.take(16) }.onSuccess { stack ->
+                runCatching { thread.stackTrace.take(64) }.onSuccess { stack ->
                     stack.forEach { Log.e("OverlayPlacementTest", "phase=$name $label at $it") }
                 }.onFailure { error ->
                     Log.e("OverlayPlacementTest", "phase=$name $label stack unavailable: ${error.javaClass.simpleName}")
@@ -2049,6 +2051,12 @@ class TerminalOverlayPlacementComponentTest {
         }, 10, TimeUnit.SECONDS)
         try {
             return action().also { Log.i("OverlayPlacementTest", "phase=$name end") }
+        } catch (failure: Throwable) {
+            // A later cleanup phase can stall forever and never report this throwable, so the
+            // original failure is written here while it is still the only thing that is known.
+            Log.e("OverlayPlacementTest", "phase=$name failed: ${failure.javaClass.name}: ${failure.message}",
+                failure)
+            throw failure
         } finally {
             pending.cancel(false)
             observer.shutdown()

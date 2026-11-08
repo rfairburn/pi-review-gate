@@ -192,14 +192,21 @@ class SessionCardDragComponentTest {
     private fun bounds(text: String): Rect = compose.onNodeWithText(text).fetchSemanticsNode().boundsInRoot
     private fun inList(root: Offset): Offset = root - listBounds().topLeft
 
-    /** Long-press the title of [title] and hold, leaving the pointer down. */
-    private fun pressAndHold(title: String) {
+    /**
+     * Long-press the title of [title] and hold, leaving the pointer down.
+     *
+     * [caseLabel] and the measured rects diagnose a failed press. A caller's card-container
+     * guard measures a different node from the title pressed here.
+     */
+    private fun pressAndHold(title: String, caseLabel: String = "") {
         val list = listBounds()
-        val start = inList(bounds(title).center)
+        val titleRect = bounds(title)
+        val start = inList(titleRect.center)
         // The card must be drawn where it is pressed: a press clipped by the viewport starts
         // no drag at all, and every later "sends nothing" assertion would then be vacuous.
         assertTrue(
-            "$title is not reachable at $start inside the ${list.width}x${list.height} list viewport",
+            "$caseLabel$title is not reachable at $start inside the ${list.width}x${list.height} " +
+                "list viewport: title=$titleRect list=$list",
             start.x in 0f..list.width && start.y in 0f..list.height,
         )
         list().performTouchInput {
@@ -447,7 +454,7 @@ class SessionCardDragComponentTest {
                 drawnReachable("Card a1"),
             )
             intents.clear()
-            pressAndHold("Card a1")
+            pressAndHold("Card a1", "$where: ")
             // A real drag has to be held before anything can cancel it.
             assertEquals("$where: no drag was held to cancel", 1, draggingCards().fetchSemanticsNodes().size)
             moveOnto("Card a3", upper = false)

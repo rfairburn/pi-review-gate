@@ -630,6 +630,18 @@ class ClientApplicationController private constructor(
     }
 
     /**
+     * Rename-only row admission: the stable owner triple plus the frozen native
+     * conversation tuple admit the row.
+     *
+     * The exact [currentRow] match also compares the row's roster revision and drawn
+     * title. A rename form stays open while the operator types, and the owner republishes
+     * its roster meanwhile, so that comparison dropped a deliberate Rename without any
+     * notice. The native tuple is the fence this action really has, and it stays exact.
+     */
+    private fun renameRow(target: RenameTarget): SessionUiState? =
+        RenameRowFence.row(state.value.hostState(target.base.hostId), target)
+
+    /**
      * Retire an open close form when its original connection attempt is gone.
      *
      * The same stable host/run/row may reappear after reconnect, but that is a new
@@ -943,24 +955,21 @@ class ClientApplicationController private constructor(
                 }
             }
             is ClientIntent.RequestSessionRename -> {
-                val row = currentRow(intent.target.base) ?: return
-                if (RenameTarget.of(row) != intent.target) return
+                if (renameRow(intent.target) == null) return
                 dialogs = dialogs.copy(renameSession = RenameSessionDialog(intent.target, intent.target.currentName,
                     proof(listOf("rename", intent.target, ++proofGeneration), UiProofScreen.SESSION_RENAME,
                         intent.target.base.hostId, intent.target.base.hostRunId, intent.target.base.rowId)))
             }
             is ClientIntent.SubmitSessionRename -> {
                 val form = dialogs.renameSession ?: return
-                if (form.target != intent.target || form.nameDraft != intent.name || form.proof !== intent.proof ||
-                    currentRow(intent.target.base)?.let { RenameTarget.of(it) } != intent.target) return
-                val target = intent.target
-                val gen = generation(target.base.hostId) ?: return
-                val frozen = FrozenAction.capture(intent.proof) ?: return
-                operation(OperationContext(target.base.hostId, gen, intent.proof)) {
-                    runtime.renameSession(target.base.hostId, RosterRenameCommand(target.base.hostRunId, target.base.rowId,
-                        target.expectedSessionId, target.expectedSessionEpoch, intent.name,
-                        RosterSendProof.RowAction(gen, target.base.hostRunId, target.base.rowId,
-                            target.expectedSessionId, target.expectedSessionEpoch, frozen)))
+                if (form.target != intent.target || form.nameDraft != intent.name || form.proof !== intent.proof) return
+                val hostId = intent.target.base.hostId
+                val gen = generation(hostId) ?: return
+                // The submission re-admits the drawn form against the owner facts held now,
+                // captures this click's committed receipt, and builds the one command.
+                val submission = RenameSubmission.begin(state.value.hostState(hostId), gen, form, intent.proof) ?: return
+                operation(OperationContext(hostId, gen, intent.proof, rename = submission)) {
+                    runtime.renameSession(hostId, submission.command)
                 }
             }
             is ClientIntent.MoveSessionRow -> move(intent)
@@ -1275,7 +1284,8 @@ class ClientApplicationController private constructor(
         val savedQuery: String? = null, val entry: SavedEntryTarget? = null, val sequence: Long? = null,
         val pickerEpoch: Long? = null, val savedResult: SavedResultTarget? = null,
         val deletion: AcceptedSavedDeletion? = null, val savedReadLifetime: AcceptedSavedDeletion? = null,
-        val savedIntake: SavedReadFeedback.View? = null, val created: AcceptedCreateActivation? = null)
+        val savedIntake: SavedReadFeedback.View? = null, val created: AcceptedCreateActivation? = null,
+        val rename: RenameSubmission? = null)
 
     private fun operation(context: OperationContext, command: suspend () -> RosterOperationAdmission) {
         if (context.proof in busyForms || busyForms.size >= 64) {
@@ -1348,6 +1358,10 @@ class ClientApplicationController private constructor(
             if (event.kind == RosterOperationKind.SAVED_DELETE) report(resultText(event))
             return
         }
+        // A rename result acts only on the exact form/request that submitted it, and only
+        // the owner's positive `renamed` closes that form. The displayed name still comes
+        // only from the owner's next complete authoritative snapshot.
+        context.rename?.let { dialogs = it.closeIfConfirmed(dialogs, event.hostRunId, event.result) }
         if (context.created != null) {
             finishCreated(context, event)
             return

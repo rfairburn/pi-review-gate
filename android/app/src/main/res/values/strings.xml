@@ -198,6 +198,9 @@
     <string name="terminal_suspended_viewport">Terminal input is paused until the resized screen is ready.</string>
     <string name="terminal_keys_open">Keys</string>
     <string name="terminal_keys_close">Close keys</string>
+    <string name="terminal_keys_pop_out">Pop keys out</string>
+    <string name="terminal_keys_pop_in">Dock keys</string>
+    <string name="terminal_keys_resize">Resize keys panel</string>
     <string name="terminal_overlay_positions_defaulted">Saved overlay positions could not be read. Default positions are in use until new positions are saved.</string>
     <string name="terminal_overlay_positions_save_failed">Overlay positions could not be saved. They apply now but may not be remembered.</string>
     <string name="terminal_status_dismiss">Dismiss</string>

@@ -1487,8 +1487,8 @@ Native noninteractive activity-intent counts appear as `activeTasks` and
 `activeShells` bubbles: an explicit `0` stays zero, a missing count stays unknown, and
 the ownership counts are never substituted. There are no job lists or count popups.
 
-**Overlay placement.** The controls strip, status area, and Keys panel keep three
-independent positions, remembered separately for portrait and landscape across app
+**Overlay placement.** The controls strip, status area, and a floating Keys panel keep
+three independent positions, remembered separately for portrait and landscape across app
 restarts. Each moves by long-press drag on its own surface, with no extra grip. The
 compact keyboard icon and Keys entry keep their existing actions and 48 dp touch
 accessibility. Placement data is cosmetic and isolated from host, trust, identity, and
@@ -1496,8 +1496,47 @@ settings state. Malformed or unreadable placement content restores defaults with
 warning, then resumes saving and overwrites only that invalid cosmetic data; ordinary
 path, ownership, and permission protections remain, and write failures are reported.
 Open/closed overlay state, modifier latches, and dismissed status notices are not
-persisted. Terminal geometry stays stable while the IME or overlays move; existing
-Back/reset behavior remains, and no new keyboard implementation is added.
+persisted: they live only as long as one instance of the terminal screen, so a rotation
+keeps an open Keys panel and a dismissed notice exactly as they are, while leaving the
+terminal and entering it again — or restarting the app — starts closed with nothing
+dismissed. Existing Back/reset behavior remains, and no new keyboard
+implementation is added.
+
+**Keys docking.** The Keys panel has one two-state layout per orientation, remembered in
+the same cosmetic placement document as its position. Docked — the default — it is a real
+bottom band: the terminal pane keeps the area that is left, so opening it is an ordinary
+native resize that goes through the surface's existing measurement, viewport request,
+commit, and input fences. A band reserves its own measured height, and it never takes the
+area the control strip itself measures: the strip is measured against the space currently
+available to the layout — never against the pane the band has already shrunk — and the
+band is capped by what that measurement leaves. While a band is composed the strip keeps
+the constraint it has always carried: it leaves the band one usable Keys viewport out of
+the current space and is capped and scrollable itself, so it scrolls its own controls into
+view when that cap binds and the pane keeps at least the strip's measured footprint. That
+bound is only as strong as the footprint itself: once the space available to the layout is
+no larger than that one usable Keys viewport the strip's own cap reaches zero, and a zero
+measured footprint then leaves the band the whole available extent, so the pane can be
+squeezed out entirely — no reachable pane is promised at an arbitrarily tiny extent. With
+room for both natural sizes nothing is
+capped and the band keeps the height it always measured. Both numbers describe the strip
+and the Keys viewport, never the terminal pane: there is no fixed pane minimum and no split
+of the layer.
+Floating Keys paints below the control strip and the notice area, so an overlapping panel
+never swallows a Back, Switch, keyboard, or Keys tap.
+Floating, the panel overlays the pane and reserves nothing; it moves by the same header
+long-press and resizes from a corner grip, and its remembered size is a fraction of the
+stable layer extent. A floating panel is never measured past the pane's own visible area,
+and the grip's own 48dp is reserved below the panel's scrollable viewport so it covers
+no key. One icon-only corner control switches
+docking: it never opens or closes the panel and never shows or hides the on-screen
+keyboard, and because it belongs to the panel header it scrolls and clips with that header
+rather than standing over key rows the header has scrolled past. A docked keyboard reserves the occluding inset the platform actually reports,
+so a floating keyboard that reports no occlusion reserves nothing; the safety insets
+(system bars, cutout, waterfall) and the keyboard inset are each subtracted once, never
+twice. Only a completed drag, resize, or docking toggle is saved; a cancelled gesture, a
+rotation, a keyboard change, and an ordinary frame save nothing and never normalize a
+remembered value. Position and remembered size survive docking. There is no docked-height
+control, no automatic collapse, and no new persistence field.
 
 **Saved first reply timeout.** The phone client's Settings screen accepts a positive
 finite whole number of seconds for the Saved first reply, default 60. New LIST and
@@ -1514,14 +1553,15 @@ default, controls the whole diagnostic status and notice area. Off draws none of
 status slot on the non-terminal routes (its reserved height goes back to the content
 below it), no terminal notice overlay with its readiness and placement-warning text,
 dismiss control, and drag region, and no copy of the raw status in the Keys panel — and
-the hidden overlay reserves no Keys space either. On returns the same messages and the
+the hidden overlay or hidden copy reserves no space anywhere, including inside a docked
+Keys band. On returns the same messages and the
 existing per-text dismiss behavior. The preference is stored in the same strict
 version-1 settings document, where an absent key means off and only an explicit `true`
 is written; a non-boolean value, a null, or an unknown key still refuses the whole
 document, and a failed save publishes nothing. It changes presentation only: input,
 delivery, clipboard, storage, trust, identity, and proof behavior are unchanged, and no
 notice producer is reset, cleared, filtered, or replayed. Soft-keyboard visibility and
-the Keys dock layout are separate, later work.
+the Keys dock layout are separate concerns from this flag.
 
 ## Focus, display, and status
 

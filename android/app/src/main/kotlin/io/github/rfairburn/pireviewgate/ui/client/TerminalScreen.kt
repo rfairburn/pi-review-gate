@@ -6,9 +6,12 @@ import android.content.ContextWrapper
 import android.content.res.Configuration
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -36,6 +39,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -45,7 +49,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,9 +58,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -68,6 +73,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -84,6 +90,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.TerminalModifier
 import io.github.rfairburn.pireviewgate.core.client.ui.TerminalModifiers
 import io.github.rfairburn.pireviewgate.core.client.ui.TerminalUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.UiActionProof
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalKeysLayout
 import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlay
 import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayGeometry
 import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayOrientation
@@ -91,62 +98,115 @@ import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlay
 import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacementWarning
 import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPoint
 import io.github.rfairburn.pireviewgate.core.client.ui.quickSwitcherRows
+import java.util.UUID
 import kotlin.math.roundToInt
 
 /** Overlay chrome is translucent enough to hint at covered cells, opaque enough to read. */
 private const val OVERLAY_ALPHA = 0.92f
 
-/** Smallest Keys viewport that lets scrolling bring a full 48dp target clear of panel padding. */
+/**
+ * The smallest Keys viewport that lets scrolling bring a full 48dp target clear of panel
+ * padding. Everything that reads it is a constraint on the Keys panel or on the control
+ * strip, never a rule about the terminal pane: while a docked band is composed the strip
+ * leaves this much of the current available extent to the band, and it is the viewport
+ * half of the floating panel's own resize floor.
+ */
 private val MinimumKeysViewport = 56.dp
 
+/** One accessible corner control: the Keys docking toggle, and the floating resize grip. */
+private val KeysCornerControl = 48.dp
+
 /**
- * The fullscreen terminal.
+ * The smallest floating Keys panel: one [MinimumKeysViewport] of scrollable viewport
+ * kept clear of the [KeysCornerControl] the resize grip occupies in the same corner.
  *
- * The pane is the whole app drawable window minus only the stable physical system
- * bars, display cutout, and waterfall insets. No app heading, permanent key rows,
- * navigation bar, or status slot is measured into it; those safety areas are kept,
- * not claimed as removed. Nothing below the pane is reserved, so its size, origin,
- * and grid change only when the real window or orientation does.
+ * This is the floating panel's own resize floor, derived from the panel's own footprint
+ * (a scrollable viewport plus the grip band it reserves), and only the floating resize
+ * path reads it. It is not a docked-band or terminal-pane height rule: a docked band is
+ * bounded by the current available extent and the control strip's independently measured
+ * footprint, which itself leaves this much of that extent to the band.
+ */
+private val MinimumFloatingKeysSize = MinimumKeysViewport + KeysCornerControl
+
+/**
+ * The control strip and the notice surface paint and hit-test above a floating Keys
+ * panel, as they did before docking existed. A floating panel that overlaps the strip
+ * therefore never swallows a Back, Switch, keyboard, or Keys tap.
+ */
+private const val ChromeLayerZIndex = 1f
+
+/** A floating Keys panel paints below that chrome. */
+private const val FloatingKeysLayerZIndex = 0f
+
+/**
+ * The terminal, with one dock-aware layout.
  *
- * Everything else floats over the pane in this same window: a compact control strip
- * (Back, Switch, keyboard icon, Keys), truthful readiness/status notices, and the
- * dismissible Keys panel with the existing modifiers, paste, special and function
- * keys. None of them is a Dialog, sheet, or focusable popup, so opening one neither
- * takes native window focus nor reports coverage; only the real quick switcher and
- * modal dialogs do that. Every overlay surface consumes its own touches so a tap on
- * a control never reaches the terminal underneath, while the rest of the pane
- * remains the terminal's.
+ * The pane is the app drawable window minus the stable physical system bars, display
+ * cutout, and waterfall insets, and minus the bottom area a docked surface actually
+ * occupies. Those two safety areas are consumed exactly once: the root consumes the
+ * stable safety insets, and the pane column below it is reserved only by what the
+ * platform reports as real occlusion on top of that band. A docked on-screen keyboard
+ * reserves its reported occluding magnitude, and a visible bottom-docked Keys panel
+ * reserves its own measured height; the remaining area is the pane, so its size,
+ * origin, and grid change only when one of those real reservations does. A floating
+ * keyboard or a floating Keys panel reserves nothing and simply overlays.
  *
- * The three overlays are independently positioned. A recognized long-press drag on
- * the control strip, the notice's text, or the Keys panel's header moves only that
- * surface; a short tap still delivers the same button/action behavior. A completed
- * drag submits the complete six-slot state through [onOverlayPlacementCommitted];
- * cancels, rotations, IME changes, and ordinary frames never save. The overlay layer
- * is not composed until [overlayPlacementReady] reports the completed placement load,
- * so an early interaction cannot submit defaults over saved slots. The IME may clamp
- * what is visible but never rewrites a remembered position or reflows the pane. In an
- * IME-short layer the Keys panel keeps a scrollable viewport in the free band above or
- * below the controls strip, and a wrapped control strip is height-capped and scrollable
- * so neither surface loses its actions.
+ * A docked band never takes the area the control strip itself measures. The strip is
+ * measured against the current available extent — never against the pane the band has
+ * already shrunk — and the band is capped by what that measurement leaves, so the strip
+ * cannot be squeezed by a reservation read back through its own shrunken pane. While a
+ * band is composed the strip carries the constraint this module has always applied to it:
+ * it leaves the band one usable [MinimumKeysViewport] out of the current extent, and is
+ * capped and scrollable itself. Both numbers therefore describe the strip and the Keys
+ * viewport, never the terminal pane: there is no fixed pane minimum, no split of the
+ * layer, and no remembered window size.
  *
- * There is no persistent sidebar and no host or session navigation chrome here.
- * The viewport itself is [terminalContent], supplied by whoever owns a real
+ * Observed keyboard visibility is never a reservation. Only the platform's reported
+ * occluding inset magnitude is, so a floating IME that reports no occlusion leaves the
+ * pane exactly as wide and as tall as it was, and no test or code path treats a tap on
+ * the keyboard control as proof that the pane shrank.
+ *
+ * Everything else floats over this layout in the same window: a compact control strip
+ * (Back, cross-host Switch, keyboard icon, Keys), truthful readiness/status notices,
+ * and the Keys panel when it is floating. None of them is a Dialog, sheet, or focusable
+ * popup, so opening one neither takes native window focus nor reports coverage; only
+ * the real quick switcher and modal dialogs do that. Every overlay surface consumes its
+ * own touches so a tap on a control never reaches the terminal underneath, while the
+ * rest of the pane remains the terminal's.
+ *
+ * The control strip and the notice surface paint and hit-test above a floating Keys
+ * panel, so an overlapping panel cannot swallow a Back, Switch, keyboard, or Keys tap.
+ *
+ * The controls strip, the notice surface, and a floating Keys panel are positioned
+ * independently. A recognized long-press drag on the control strip, the notice's text,
+ * or the floating panel's header moves only that surface; a short tap still delivers the
+ * same button/action behavior. A floating panel also resizes from its own corner grip.
+ * A completed drag, resize, or docking toggle submits the complete placement state
+ * through [onOverlayPlacementCommitted]; cancels, rotations, IME changes, and ordinary
+ * frames never save. Remembered positions and the remembered floating size survive
+ * docking and undocking untouched. The overlay layer is not composed until
+ * [overlayPlacementReady] reports the completed placement load, so an early interaction
+ * cannot submit defaults over saved slots. Remembered coordinates resolve against the
+ * stable layer and are only clamped for display into the pane's actual measured area,
+ * so a real reservation can move an overlay on screen without rewriting it.
+ *
+ * There is no persistent sidebar and no host or session navigation chrome here. The
+ * viewport itself is [terminalContent], supplied by whoever owns a real
  * `TerminalSurface` with its binding and listener. [onKey] and [onPaste] are equally
- * required: the Keys panel submits a semantic key request and a paste request
- * through them, and the surface's own public submit API encodes them under the
- * negotiated modes. Nothing in this screen synthesizes a hardware event or writes a
- * packet. [status] is the app's latest admission/settlement notice, shown here
- * instead of in a layout-reserving slot.
+ * required: the Keys panel submits a semantic key request and a paste request through
+ * them, and the surface's own public submit API encodes them under the negotiated
+ * modes. Nothing in this screen synthesizes a hardware event or writes a packet.
+ * [status] is the app's latest admission/settlement notice, shown here instead of in a
+ * layout-reserving slot.
  *
  * [debugInputMessagingEnabled] is the saved whole-app diagnostic presentation
  * preference. Off, the entire status notice surface is absent: no notices surface, no
  * readiness or placement-warning text, no dismiss control, no drag or touch region, and
- * no Keys-panel copy of the raw status — and the height that surface remembered while
- * it was visible reserves nothing, so the Keys panel gets that band back. The saved
- * status position itself is untouched, the control strip and Keys panel keep their own
- * surfaces, and the pane's real input readiness still comes from the genuine
- * viewport/commit facts. On, every one of those messages and surfaces returns exactly
- * as before, including the existing dismissible-per-text behavior.
+ * no Keys-panel copy of the raw status. The saved status position itself is untouched,
+ * the control strip and Keys panel keep their own surfaces, and the pane's real input
+ * readiness still comes from the genuine viewport/commit facts. On, every one of those
+ * messages and surfaces returns exactly as before, including the existing
+ * dismissible-per-text behavior.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -165,21 +225,112 @@ fun TerminalScreen(
     onOverlayPlacementCommitted: (TerminalOverlayPlacement) -> Unit = {},
 ) {
     TerminalImeWindowPolicy()
-    // safeDrawing includes IME. Keep bars/cutouts/waterfall, but never subtract
-    // the keyboard from the pane, even on enforced edge-to-edge Android versions.
-    // The ignoring-visibility bars keep the pane stable if transient bars change.
-    val stable = WindowInsets.systemBarsIgnoringVisibility.union(WindowInsets.displayCutout).union(WindowInsets.waterfall)
-    // Which pop-out is open is screen-owned presentation, like an open menu.
-    var keysOpen by rememberSaveable { mutableStateOf(false) }
-    var dismissedStatus by rememberSaveable { mutableStateOf<String?>(null) }
+    // One safety consumption for the whole screen: the bars a transient reveal may hide,
+    // the cutout, and the waterfall edge. Nothing below subtracts them again.
+    val safety = WindowInsets.systemBarsIgnoringVisibility
+        .union(WindowInsets.displayCutout)
+        .union(WindowInsets.waterfall)
+    // Which pop-out is open, and which raw status text was dismissed, is screen-owned
+    // presentation like an open menu. It lives exactly as long as this terminal route
+    // instance: a configuration change keeps it, backgrounding keeps it, changing the
+    // terminal target keeps it, and leaving the terminal or restarting the process does
+    // not. [TerminalKeysEphemeralState] holds the values outside any saved bundle, and
+    // [keysRouteToken] is the screen-local identity of this route instance — a random
+    // token and nothing else, so neither the open flag nor a dismissed notice is ever
+    // written to saved instance state or to the placement document.
+    val keysState = rememberTerminalKeysEphemeralState()
+    val keysRouteToken = rememberSaveable { UUID.randomUUID().toString() }
+    // Claimed during composition, before any child reads the open flag, so the first
+    // frame of a fresh route instance is already closed rather than flashing the panel
+    // the previous instance left behind.
+    keysState.claimRoute(keysRouteToken)
+    val keysOpen = keysState.keysOpen
+    val dismissedStatus = keysState.dismissedStatus
     // Registered after RootUIScreen's terminal handler, so it wins only while
     // enabled: the switcher and a visible IME keep their existing Back priority.
     BackHandler(enabled = keysOpen && !terminal.quickSwitcherVisible && !terminal.keyboardVisible) {
-        keysOpen = false
+        keysState.keysOpen = false
     }
-    Box(modifier.fillMaxSize().windowInsetsPadding(stable)) {
-        // The pane: identical constraints whatever the overlays, IME, or readiness.
-        Box(Modifier.fillMaxSize()) { terminalContent(terminal) }
+    val density = LocalDensity.current
+    val orientation = currentTerminalOrientation()
+    val keysLayout = overlayPlacement.keysLayout(orientation)
+    // The pane's single IME reservation is the platform's own reported occluding inset
+    // less the safety band this root already consumed, so the shared band is never
+    // subtracted twice. A floating IME reports no occluding magnitude and reserves
+    // nothing; keyboard visibility alone is never a reservation.
+    val imeReservePx = TerminalDockGeometry.imeReservePx(
+        imeBottomPx = WindowInsets.ime.getBottom(density),
+        safetyBottomPx = safety.getBottom(density),
+    )
+    // The pane's real measured area is what every floating surface clamps into. It
+    // already excludes the docked IME and a docked Keys band, so neither is subtracted
+    // a second time anywhere in this screen.
+    var paneSize by remember { mutableStateOf(IntSize.Zero) }
+    // The control strip's own measured footprint. The strip is measured against the
+    // current available extent (less the Keys viewport it must leave a docked band),
+    // never against the pane that band already shrank: reading the reservation basis back
+    // through the shrunk pane makes a zero-height pane — or any earlier, smaller one — a
+    // fixed point that survives forever. This is the one interactive strip in the one
+    // layout pass; there is no second measuring copy of it and nothing here remembers a
+    // previous window size.
+    var controlsFootprintPx by remember { mutableStateOf(0) }
+    BoxWithConstraints(modifier.fillMaxSize().windowInsetsPadding(safety)) {
+        val stableWidth = constraints.maxWidth
+        val stableHeight = constraints.maxHeight
+        val keysDocked = keysOpen && keysLayout.docked
+        val layerHeightPx = (stableHeight - imeReservePx).coerceAtLeast(0)
+        // The extent the control strip is measured against. While a docked band is
+        // composed the strip keeps this module's existing Keys-specific constraint: it
+        // gives the band one usable Keys viewport out of the current available extent and
+        // is capped and scrollable itself. That is a bound on the strip, not a pane
+        // minimum and not a split of the layer, and it never reads the pane back.
+        val minimumKeysViewportPx = with(density) { MinimumKeysViewport.roundToPx() }
+        val controlsMaxHeightPx = if (keysDocked) {
+            (layerHeightPx - minimumKeysViewportPx).coerceAtLeast(0)
+        } else {
+            layerHeightPx
+        }
+        // A docked band reserves its own measured height, bounded by what the strip's
+        // independent measurement leaves: band <= available extent - strip footprint. With
+        // room for both natural sizes nothing is capped and the band keeps the height it
+        // always measured; in a short layer the strip is capped instead, so the band keeps
+        // a usable Keys viewport and the pane keeps at least the strip's own measured
+        // footprint. That bound is only as strong as the footprint itself: once the
+        // available extent is no larger than one usable Keys viewport the strip's own cap
+        // reaches zero, and a zero measured footprint then leaves the band the whole
+        // available extent, so the pane can be squeezed out entirely. Nothing here promises
+        // a reachable pane at an arbitrarily tiny extent. No fixed pane minimum, no half
+        // split, no remembered window size.
+        val dockedBandMaxHeight = with(density) {
+            (layerHeightPx - controlsFootprintPx).coerceAtLeast(0).toDp()
+        }
+        Column(Modifier.fillMaxSize().padding(bottom = with(density) { imeReservePx.toDp() })) {
+            // The actual pane: everything the real docked reservations leave it. A size
+            // change here is a real native size change and reaches the surface through
+            // its own onSizeChanged, grid measurement, and commit fences.
+            Box(Modifier.weight(1f).onSizeChanged { if (it != paneSize) paneSize = it }) {
+                terminalContent(terminal)
+            }
+            // Docked Keys is a real bottom band, not an overlay: it reserves its own
+            // measured height, and the pane above it shrinks by exactly that much. Like
+            // every other placement-driven surface it waits for the initial placement
+            // load, so its pop-out cannot commit against a snapshot still loading.
+            if (keysDocked && overlayPlacementReady) {
+                DockedKeys(
+                    terminal = terminal,
+                    status = if (debugInputMessagingEnabled) status else null,
+                    onKey = onKey,
+                    onPaste = onPaste,
+                    onIntent = onIntent,
+                    maxHeight = dockedBandMaxHeight,
+                    onPopOut = {
+                        onOverlayPlacementCommitted(
+                            overlayPlacement.withKeysLayout(orientation, keysLayout.copy(docked = false)),
+                        )
+                    },
+                )
+            }
+        }
         // Overlays only. This layer has no pointer handler of its own and each
         // positioned surface wraps only its own content, so the rest of the pane
         // remains the terminal's. Stable painting is not a claim of physical pixel
@@ -190,34 +341,72 @@ fun TerminalScreen(
             TerminalOverlayLayer(
                 terminal = terminal,
                 keysOpen = keysOpen,
-                onToggleKeys = { keysOpen = !keysOpen },
+                keysLayout = keysLayout,
+                onToggleKeys = { keysState.keysOpen = !keysOpen },
                 status = status,
                 debugInputMessagingEnabled = debugInputMessagingEnabled,
                 dismissedStatus = dismissedStatus,
-                onDismissStatus = { dismissedStatus = it },
+                onDismissStatus = { keysState.dismissedStatus = it },
                 onKey = onKey,
                 onPaste = onPaste,
                 onIntent = onIntent,
                 placement = overlayPlacement,
                 placementWarning = overlayPlacementWarning,
+                orientation = orientation,
+                stableWidth = stableWidth,
+                stableHeight = stableHeight,
+                // The strip is measured against the current available extent (minus the
+                // Keys viewport it must leave a docked band), never against the pane that
+                // band shrinks, so the band's reservation basis cannot be set by the pane
+                // it produced.
+                controlsMaxHeightPx = controlsMaxHeightPx,
+                controlsSlotHeight = controlsFootprintPx,
+                onControlsMeasured = { height ->
+                    if (height != controlsFootprintPx) controlsFootprintPx = height
+                },
+                // The pane's measured area is the only clamp an overlay gets. A pane that
+                // has not been measured yet falls back to the stable layer; a pane that
+                // measured a real area is never replaced by a fabricated one, because
+                // that would let chrome paint over the band it must leave reachable.
+                visibleWidth = if (paneSize == IntSize.Zero) stableWidth else paneSize.width,
+                visibleHeight = if (paneSize == IntSize.Zero) stableHeight else paneSize.height,
                 onPlacementCommitted = onOverlayPlacementCommitted,
             )
         }
     }
 }
 
+/** The orientation whose independent placement and Keys layout slots are in use. */
+@Composable
+private fun currentTerminalOrientation(): TerminalOverlayOrientation =
+    when (LocalConfiguration.current.orientation) {
+        Configuration.ORIENTATION_LANDSCAPE -> TerminalOverlayOrientation.LANDSCAPE
+        else -> TerminalOverlayOrientation.PORTRAIT
+    }
+
 /**
- * The independently positioned overlay layer.
+ * The independently positioned overlay layer: the controls strip, the diagnostic notice
+ * surface, and the Keys panel while it is floating.
  *
- * Resolution uses the stable pane's free space; the currently visible layer (after
- * IME insets) only clamps the display point. Moving or clamping one surface never
- * changes another slot, and no layout in here changes the pane's constraints.
+ * Remembered coordinates resolve against the stable layer; the pane's actual measured
+ * area only clamps the display point. Moving, clamping, or resizing one surface never
+ * changes another slot, and nothing in here changes the pane's constraints: a floating
+ * panel reserves no pane area, and a docked one is not composed here at all.
+ *
+ * The control strip is measured against [controlsMaxHeightPx] — the current available
+ * extent, less the Keys viewport it must leave a docked band — and reports that footprint
+ * through [onControlsMeasured], which is what bounds the band. It is never measured
+ * against the already-shrunk pane, and the strip becomes scrollable exactly when its
+ * measured footprint no longer fits the pane it has to stay inside of, which is how its
+ * own controls stay reachable in a short layer. The strip and the notice surface carry
+ * [ChromeLayerZIndex] so they paint and hit-test above a floating Keys panel.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TerminalOverlayLayer(
     terminal: TerminalUiState,
     keysOpen: Boolean,
+    keysLayout: TerminalKeysLayout,
     onToggleKeys: () -> Unit,
     status: String?,
     debugInputMessagingEnabled: Boolean,
@@ -228,272 +417,337 @@ private fun TerminalOverlayLayer(
     onIntent: (ClientIntent) -> Unit,
     placement: TerminalOverlayPlacement,
     placementWarning: TerminalOverlayPlacementWarning?,
+    orientation: TerminalOverlayOrientation,
+    stableWidth: Int,
+    stableHeight: Int,
+    controlsMaxHeightPx: Int,
+    controlsSlotHeight: Int,
+    onControlsMeasured: (Int) -> Unit,
+    visibleWidth: Int,
+    visibleHeight: Int,
     onPlacementCommitted: (TerminalOverlayPlacement) -> Unit,
 ) {
-    val orientation = when (LocalConfiguration.current.orientation) {
-        Configuration.ORIENTATION_LANDSCAPE -> TerminalOverlayOrientation.LANDSCAPE
-        else -> TerminalOverlayOrientation.PORTRAIT
-    }
     val warningText = when (placementWarning) {
         TerminalOverlayPlacementWarning.LOADED_DEFAULTS -> stringResource(R.string.terminal_overlay_positions_defaulted)
         TerminalOverlayPlacementWarning.SAVE_FAILED -> stringResource(R.string.terminal_overlay_positions_save_failed)
         null -> null
     }
     val visibleStatus = status?.takeIf { it != dismissedStatus }
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val stableWidth = constraints.maxWidth
-        val stableHeight = constraints.maxHeight
-        var controlsSlotHeight by remember { mutableStateOf(0) }
-        var noticesSlotHeight by remember { mutableStateOf(0) }
-        Box(
-            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.ime),
-        ) {
-            BoxWithConstraints(Modifier.fillMaxSize()) {
-                val visibleWidth = constraints.maxWidth
-                val visibleHeight = constraints.maxHeight
-                val minimumKeysViewportPx = with(LocalDensity.current) { MinimumKeysViewport.roundToPx() }
-                var controlsCapped by remember(keysOpen) { mutableStateOf(false) }
-                var constrainedKeys by remember(keysOpen) { mutableStateOf(false) }
-                var keysSlotHeight by remember(keysOpen) { mutableStateOf(0) }
-
-                // A wrapped control strip that cannot fit at all is capped so its own
-                // controls stay reachable. While Keys is open, cap it far enough to keep
-                // a usable Keys band too. The state resets when Keys closes, so a taller
-                // window never inherits a scroll container it no longer needs.
-                val controlsOverflow = visibleHeight - controlsSlotHeight < 0
-                val keysNeedControlsCap =
-                    keysOpen && visibleHeight - controlsSlotHeight < minimumKeysViewportPx
-                if (!controlsCapped && (controlsOverflow || keysNeedControlsCap)) {
-                    SideEffect { controlsCapped = true }
-                }
-                val capControlsNow = controlsCapped || controlsOverflow || keysNeedControlsCap
-                val controlsMaxHeightPx = if (capControlsNow) {
-                    if (keysOpen) {
-                        (visibleHeight - minimumKeysViewportPx).coerceAtLeast(0)
-                    } else {
-                        visibleHeight
-                    }
-                } else {
-                    null
-                }
-
-                // While Keys is open, use the height the control strip will occupy
-                // after its cap applies. This keeps the chosen Keys band stable instead
-                // of collapsing to zero during the frame before the cap is measured.
-                val effectiveControlsSlotHeightPx = if (keysOpen) {
-                    controlsSlotHeight.coerceAtMost(
-                        (visibleHeight - minimumKeysViewportPx).coerceAtLeast(0),
-                    )
-                } else {
-                    controlsSlotHeight
-                }
-                val unobstructedKeysHeightPx =
-                    (visibleHeight - effectiveControlsSlotHeightPx -
-                        // A hidden notices surface reserves nothing at all: a height this
-                        // layer remembered while debugging was visible must not keep
-                        // eating Keys space once that surface is gone.
-                        (if (debugInputMessagingEnabled) noticesSlotHeight else 0)).coerceAtLeast(0)
-                val controlsPosition = placement.position(TerminalOverlay.CONTROLS, orientation)
-                val controlsResolvedTop = if (controlsPosition != null) {
-                    TerminalOverlayGeometry.resolve(
-                        stableWidth = stableWidth,
-                        stableHeight = stableHeight,
-                        overlayWidth = 0,
-                        overlayHeight = effectiveControlsSlotHeightPx,
-                        position = controlsPosition,
-                    ).y
-                } else {
-                    TerminalOverlayGeometry.resolveDefault(
-                        overlay = TerminalOverlay.CONTROLS,
-                        stableWidth = stableWidth,
-                        stableHeight = stableHeight,
-                        overlayWidth = 0,
-                        overlayHeight = effectiveControlsSlotHeightPx,
-                        controlsSlotHeight = 0,
-                    ).y
-                }
-                val controlsDisplayTop = TerminalOverlayGeometry.clampToVisible(
-                    point = TerminalOverlayPoint(0, controlsResolvedTop),
-                    visibleWidth = visibleWidth,
-                    visibleHeight = visibleHeight,
-                    overlayWidth = 0,
-                    overlayHeight = effectiveControlsSlotHeightPx,
-                ).y
-                val controlsDisplayBottom =
-                    (controlsDisplayTop + effectiveControlsSlotHeightPx).coerceAtMost(visibleHeight)
-
-                // Enter the short-layer layout when the ordinary Keys viewport is too
-                // small or intersects a moved control strip. A moved control that does
-                // not overlap keeps the ordinary layout and its existing Keys bounds.
-                val normalKeysHeightPx = keysSlotHeight.coerceAtMost(unobstructedKeysHeightPx)
-                val normalKeysTopPx = if (normalKeysHeightPx > 0) {
-                    val resolved = placement.position(TerminalOverlay.KEYS, orientation)?.let { explicit ->
-                        TerminalOverlayGeometry.resolve(
-                            stableWidth = stableWidth,
-                            stableHeight = stableHeight,
-                            overlayWidth = 0,
-                            overlayHeight = normalKeysHeightPx,
-                            position = explicit,
-                        )
-                    } ?: TerminalOverlayGeometry.resolveDefault(
-                        overlay = TerminalOverlay.KEYS,
-                        stableWidth = stableWidth,
-                        stableHeight = stableHeight,
-                        overlayWidth = 0,
-                        overlayHeight = normalKeysHeightPx,
-                        controlsSlotHeight = 0,
-                    )
-                    TerminalOverlayGeometry.clampToVisible(
-                        point = resolved,
-                        visibleWidth = visibleWidth,
-                        visibleHeight = visibleHeight,
-                        overlayWidth = 0,
-                        overlayHeight = normalKeysHeightPx,
-                    ).y
-                } else {
-                    0
-                }
-                val controlsOverlapNormalKeys = normalKeysHeightPx > 0 &&
-                    controlsDisplayTop < normalKeysTopPx + normalKeysHeightPx &&
-                    controlsDisplayBottom > normalKeysTopPx
-                val needsConstrainedKeys = keysOpen &&
-                    (unobstructedKeysHeightPx < minimumKeysViewportPx || controlsOverlapNormalKeys)
-                if (needsConstrainedKeys && !constrainedKeys) {
-                    SideEffect { constrainedKeys = true }
-                }
-                val shortKeysLayout = keysOpen && (constrainedKeys || needsConstrainedKeys)
-
-                // effectiveControlsSlotHeight leaves at least MinimumKeysViewport of free
-                // height while Keys is open, so every short-layer band below is usable.
-                val totalFreeHeightPx = (visibleHeight - effectiveControlsSlotHeightPx).coerceAtLeast(0)
-                val aboveControlsPx = controlsDisplayTop.coerceIn(0, visibleHeight)
-                val belowControlsPx = (visibleHeight - controlsDisplayBottom).coerceAtLeast(0)
-                var keysMaxHeightPx = unobstructedKeysHeightPx
-                var keysMinimumTopPx = 0
-                var forcedControlsTopPx: Int? = null
-                // Short-layer bands are display-only. If neither side of a moved control
-                // strip can fit Keys, pin that strip to the nearer edge; its saved slot is
-                // untouched.
-                if (shortKeysLayout) {
-                    when {
-                        belowControlsPx >= minimumKeysViewportPx && belowControlsPx >= aboveControlsPx -> {
-                            keysMaxHeightPx = belowControlsPx
-                            keysMinimumTopPx = controlsDisplayBottom
-                        }
-                        aboveControlsPx >= minimumKeysViewportPx -> {
-                            keysMaxHeightPx = aboveControlsPx
-                            keysMinimumTopPx = 0
-                        }
-                        belowControlsPx >= aboveControlsPx -> {
-                            forcedControlsTopPx = 0
-                            keysMaxHeightPx = totalFreeHeightPx
-                            keysMinimumTopPx = effectiveControlsSlotHeightPx
-                        }
-                        else -> {
-                            forcedControlsTopPx =
-                                (visibleHeight - effectiveControlsSlotHeightPx).coerceAtLeast(0)
-                            keysMaxHeightPx = totalFreeHeightPx
-                            keysMinimumTopPx = 0
-                        }
-                    }
-                }
-                // Bind the Keys display and drag clamp to the chosen band's bottom.
-                // A bottom-anchored default must not land under a moved control strip.
-                val keysVisibleBottomPx = if (shortKeysLayout) {
-                    (keysMinimumTopPx + keysMaxHeightPx).coerceAtMost(visibleHeight)
-                } else {
-                    visibleHeight
-                }
-                PlaceableOverlay(
-                    overlay = TerminalOverlay.CONTROLS,
-                    placement = placement,
-                    orientation = orientation,
-                    stableWidth = stableWidth,
-                    stableHeight = stableHeight,
-                    visibleWidth = visibleWidth,
-                    visibleHeight = visibleHeight,
-                    controlsSlotHeight = 0,
-                    onMeasured = { size ->
-                        if (size.height != controlsSlotHeight) controlsSlotHeight = size.height
-                    },
-                    maxHeightPx = controlsMaxHeightPx,
-                    forcedTopPx = forcedControlsTopPx,
-                    layerZIndex = if (shortKeysLayout) 2f else 1f,
-                    onCommitted = onPlacementCommitted,
-                ) { dragModifier ->
-                    TerminalControls(
-                        terminal = terminal,
-                        keysOpen = keysOpen,
-                        onToggleKeys = onToggleKeys,
-                        onIntent = onIntent,
-                        dragModifier = dragModifier,
-                        scrollable = capControlsNow,
-                    )
-                }
-                // The whole diagnostic notice surface is the saved debug presentation.
-                // Off, none of it composes: no Surface, no readiness or placement-warning
-                // text, no dismiss control, no drag or touch region, and no measured
-                // height. The saved STATUS position is never rewritten either way.
-                if (debugInputMessagingEnabled) {
-                    PlaceableOverlay(
-                        overlay = TerminalOverlay.STATUS,
-                        placement = placement,
-                        orientation = orientation,
-                        stableWidth = stableWidth,
-                        stableHeight = stableHeight,
-                        visibleWidth = visibleWidth,
-                        visibleHeight = visibleHeight,
-                        controlsSlotHeight = controlsSlotHeight,
-                        onMeasured = { size ->
-                            if (size.height != noticesSlotHeight) noticesSlotHeight = size.height
-                        },
-                        layerZIndex = 1f,
-                        onCommitted = onPlacementCommitted,
-                    ) { dragModifier ->
-                        TerminalNotices(
-                            terminal = terminal,
-                            status = visibleStatus,
-                            placementWarning = warningText,
-                            onDismissStatus = onDismissStatus,
-                            dragModifier = dragModifier,
-                        )
-                    }
-                }
-                if (keysOpen) {
-                    // Keys uses the ordinary cap while that leaves a usable, unobstructed
-                    // viewport. In a short layer it moves into the larger free band above
-                    // or below the control strip, which is display-only: the persisted
-                    // six-slot placement is never rewritten by this adaptation.
-                    PlaceableOverlay(
-                        overlay = TerminalOverlay.KEYS,
-                        placement = placement,
-                        orientation = orientation,
-                        stableWidth = stableWidth,
-                        stableHeight = stableHeight,
-                        visibleWidth = visibleWidth,
-                        visibleHeight = keysVisibleBottomPx,
-                        controlsSlotHeight = 0,
-                        maxHeightPx = keysMaxHeightPx,
-                        minimumTopPx = keysMinimumTopPx,
-                        layerZIndex = if (shortKeysLayout) 1.5f else 0f,
-                        onCommitted = onPlacementCommitted,
-                        onMeasured = { size ->
-                            if (size.height != keysSlotHeight) keysSlotHeight = size.height
-                        },
-                    ) { dragModifier ->
-                        TerminalKeysPanel(
-                            terminal = terminal,
-                            // The Keys panel's duplicate of the raw status is part of the
-                            // same diagnostic presentation, so it goes with the surface.
-                            status = if (debugInputMessagingEnabled) status else null,
-                            onKey = onKey,
-                            onPaste = onPaste,
-                            onIntent = onIntent,
-                            dragModifier = dragModifier,
-                        )
-                    }
-                }
+    val minimumFloatingKeysPx = with(LocalDensity.current) { MinimumFloatingKeysSize.roundToPx() }
+    Box(Modifier.fillMaxSize()) {
+        // A wrapped control strip is capped to the current available extent — less the
+        // usable Keys viewport it must leave a docked band — and becomes scrollable
+        // exactly when that cap binds, so its own controls stay reachable in a narrow or
+        // short layout. The cap is the current measurement alone: no latch remembers a
+        // taller or shorter window, and nothing here moves another overlay.
+        PlaceableOverlay(
+            overlay = TerminalOverlay.CONTROLS,
+            placement = placement,
+            orientation = orientation,
+            stableWidth = stableWidth,
+            stableHeight = stableHeight,
+            visibleWidth = visibleWidth,
+            visibleHeight = visibleHeight,
+            controlsSlotHeight = 0,
+            maxHeightPx = controlsMaxHeightPx,
+            layerZIndex = ChromeLayerZIndex,
+            onMeasured = { size ->
+                if (size.height != controlsSlotHeight) onControlsMeasured(size.height)
+            },
+            onCommitted = onPlacementCommitted,
+        ) { dragModifier ->
+            TerminalControls(
+                terminal = terminal,
+                keysOpen = keysOpen,
+                onToggleKeys = onToggleKeys,
+                onIntent = onIntent,
+                dragModifier = dragModifier,
+                scrollable = visibleHeight > 0 && controlsSlotHeight >= visibleHeight,
+            )
+        }
+        // The whole diagnostic notice surface is the saved debug presentation.
+        // Off, none of it composes: no Surface, no readiness or placement-warning
+        // text, no dismiss control, no drag or touch region, and no measured
+        // height. The saved STATUS position is never rewritten either way.
+        if (debugInputMessagingEnabled) {
+            PlaceableOverlay(
+                overlay = TerminalOverlay.STATUS,
+                placement = placement,
+                orientation = orientation,
+                stableWidth = stableWidth,
+                stableHeight = stableHeight,
+                visibleWidth = visibleWidth,
+                visibleHeight = visibleHeight,
+                controlsSlotHeight = controlsSlotHeight,
+                layerZIndex = ChromeLayerZIndex,
+                onCommitted = onPlacementCommitted,
+            ) { dragModifier ->
+                TerminalNotices(
+                    terminal = terminal,
+                    status = visibleStatus,
+                    placementWarning = warningText,
+                    onDismissStatus = onDismissStatus,
+                    dragModifier = dragModifier,
+                )
             }
+        }
+        // Floating Keys reserves nothing: it overlays the pane at its remembered size,
+        // moves by the same recognized header long-press, and resizes from its corner
+        // grip. Docking state is the only thing its corner toggle changes.
+        if (keysOpen && !keysLayout.docked) {
+            FloatingKeys(
+                terminal = terminal,
+                keysLayout = keysLayout,
+                status = if (debugInputMessagingEnabled) status else null,
+                onKey = onKey,
+                onPaste = onPaste,
+                onIntent = onIntent,
+                placement = placement,
+                orientation = orientation,
+                stableWidth = stableWidth,
+                stableHeight = stableHeight,
+                visibleWidth = visibleWidth,
+                visibleHeight = visibleHeight,
+                minimumFloatingSizePx = minimumFloatingKeysPx,
+                layerZIndex = FloatingKeysLayerZIndex,
+                onPlacementCommitted = onPlacementCommitted,
+            )
+        }
+    }
+}
+
+/**
+ * The Keys panel as a bottom-docked band: a real sibling of the pane that reserves its
+ * own measured height and never moves, so its header is not a drag region here.
+ *
+ * [maxHeight] is the caller's current available extent minus the control strip's
+ * independently measured footprint, so a band can never take the area the strip needs;
+ * within that bound the band measures its own natural height, and the panel's content
+ * stays scrollable. No fixed floor or split of the layer participates.
+ */
+@Composable
+private fun DockedKeys(
+    terminal: TerminalUiState,
+    status: String?,
+    onKey: (TerminalKeyRequest) -> Unit,
+    onPaste: () -> Unit,
+    onIntent: (ClientIntent) -> Unit,
+    maxHeight: Dp,
+    onPopOut: () -> Unit,
+) {
+    // The docking toggle belongs to the panel header, so it shares the header's scroll:
+    // when the header scrolls away the toggle scrolls and clips with it instead of
+    // standing still over key targets that moved up underneath it.
+    val keysScroll = rememberScrollState()
+    Box(Modifier.fillMaxWidth().heightIn(max = maxHeight)) {
+        TerminalKeysPanel(
+            modifier = Modifier.fillMaxWidth(),
+            terminal = terminal,
+            status = status,
+            onKey = onKey,
+            onPaste = onPaste,
+            onIntent = onIntent,
+            headerEndInset = KeysCornerControl,
+            scrollState = keysScroll,
+        )
+        KeysDockingControl(
+            docked = true,
+            scrollOffset = keysScroll.value,
+            onClick = onPopOut,
+            modifier = Modifier.align(Alignment.TopEnd),
+        )
+    }
+}
+
+/**
+ * The Keys panel while floating: an overlay that reserves no pane area.
+ *
+ * Its size comes from the remembered `TerminalKeysFloatingSize` — permille of the
+ * stable layer's own extent — or from its natural measurement when nothing was ever
+ * resized. Either way it never measures past the pane's current visible extent: a
+ * natural panel in a reduced-height layer is capped there rather than hanging its
+ * lower keys and grip behind the occlusion, and that display-only adaptation never
+ * writes a size, so a null remembered size stays null. A resize is transient until the
+ * corner grip's drag completes: a cancel, a rotation, or an inset change leaves the
+ * remembered size exactly as it was. Only a completed drag, resize, or docking toggle
+ * publishes placement. The grip's own 48dp is reserved as a band inside the panel, so
+ * it never covers scrollable key content at any scroll position.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FloatingKeys(
+    terminal: TerminalUiState,
+    keysLayout: TerminalKeysLayout,
+    status: String?,
+    onKey: (TerminalKeyRequest) -> Unit,
+    onPaste: () -> Unit,
+    onIntent: (ClientIntent) -> Unit,
+    placement: TerminalOverlayPlacement,
+    orientation: TerminalOverlayOrientation,
+    stableWidth: Int,
+    stableHeight: Int,
+    visibleWidth: Int,
+    visibleHeight: Int,
+    minimumFloatingSizePx: Int,
+    layerZIndex: Float,
+    onPlacementCommitted: (TerminalOverlayPlacement) -> Unit,
+) {
+    var resizingPx by remember(orientation) { mutableStateOf<IntSize?>(null) }
+    var measuredPx by remember { mutableStateOf(IntSize.Zero) }
+    // The docking toggle belongs to the panel header, so it shares the header's scroll and
+    // clips with it rather than standing still over key targets scrolled up underneath it.
+    val keysScroll = rememberScrollState()
+    val minimum = IntSize(minimumFloatingSizePx, minimumFloatingSizePx)
+    val maximum = IntSize(visibleWidth, visibleHeight)
+    val rememberedPx = TerminalDockGeometry.floatingSizePx(keysLayout.floatingSize, stableWidth, stableHeight)
+    val sizePx = rememberedPx?.let {
+        TerminalDockGeometry.clampFloatingSize(resizingPx ?: it, maximum = maximum, minimum = minimum)
+    } ?: resizingPx
+    val currentStart = rememberUpdatedState(if (measuredPx != IntSize.Zero) measuredPx else sizePx ?: IntSize.Zero)
+    val currentMaximum = rememberUpdatedState(maximum)
+    val currentMinimum = rememberUpdatedState(minimum)
+    val currentStable = rememberUpdatedState(IntSize(stableWidth, stableHeight))
+    val currentPlacement = rememberUpdatedState(placement)
+    val currentLayout = rememberUpdatedState(keysLayout)
+    val currentCommit = rememberUpdatedState(onPlacementCommitted)
+    val resizeModifier = Modifier.pointerInput(orientation) {
+        // The size the gesture started from is read once, and every per-event delta is
+        // accumulated onto it, so the finished size is the pointer's total movement
+        // rather than the last event's delta and cannot compound on a growth this same
+        // drag already applied.
+        var startPx = IntSize.Zero
+        var accumulated = Offset.Zero
+        var started = false
+        detectDragGestures(
+            onDragStart = {
+                startPx = currentStart.value
+                accumulated = Offset.Zero
+                started = true
+            },
+            onDragCancel = {
+                started = false
+                accumulated = Offset.Zero
+                resizingPx = null
+            },
+            onDragEnd = {
+                val finished = resizingPx
+                started = false
+                accumulated = Offset.Zero
+                resizingPx = null
+                if (finished != null) {
+                    val stable = currentStable.value
+                    val committed = currentLayout.value.copy(
+                        floatingSize = TerminalDockGeometry.toFloatingSize(finished, stable.width, stable.height),
+                    )
+                    currentCommit.value(
+                        currentPlacement.value.withKeysLayout(orientation, committed),
+                    )
+                }
+            },
+            onDrag = { change, dragAmount ->
+                if (started) {
+                    change.consume()
+                    accumulated += dragAmount
+                    resizingPx = TerminalDockGeometry.resizeFloatingSize(
+                        from = startPx,
+                        drag = accumulated,
+                        maximum = currentMaximum.value,
+                        minimum = currentMinimum.value,
+                    )
+                }
+            },
+        )
+    }
+    PlaceableOverlay(
+        overlay = TerminalOverlay.KEYS,
+        placement = placement,
+        orientation = orientation,
+        stableWidth = stableWidth,
+        stableHeight = stableHeight,
+        visibleWidth = visibleWidth,
+        visibleHeight = visibleHeight,
+        controlsSlotHeight = 0,
+        sizePx = sizePx,
+        // Below the control strip and the notice surface, exactly as before docking:
+        // an overlapping panel never swallows a chrome tap.
+        layerZIndex = layerZIndex,
+        // A natural (never-resized) panel is capped to the same visible extent a
+        // remembered size is clamped to, so nothing it shows can sit behind the
+        // occlusion that shrank that extent.
+        maxHeightPx = if (sizePx == null) visibleHeight else null,
+        onMeasured = { size -> if (size != measuredPx) measuredPx = size },
+        onCommitted = onPlacementCommitted,
+        cornerControls = {
+            KeysDockingControl(
+                docked = false,
+                scrollOffset = keysScroll.value,
+                onClick = {
+                    onPlacementCommitted(
+                        placement.withKeysLayout(orientation, keysLayout.copy(docked = true)),
+                    )
+                },
+                modifier = Modifier.align(Alignment.TopEnd),
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(KeysCornerControl)
+                    .then(resizeModifier),
+                contentAlignment = Alignment.BottomEnd,
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_terminal_keys_resize),
+                    contentDescription = stringResource(R.string.terminal_keys_resize),
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+        },
+    ) { dragModifier ->
+        TerminalKeysPanel(
+            modifier = if (sizePx != null) Modifier.fillMaxSize() else Modifier.fillMaxWidth(),
+            terminal = terminal,
+            // The Keys panel's duplicate of the raw status is part of the same
+            // diagnostic presentation, so it goes with the surface.
+            status = status,
+            onKey = onKey,
+            onPaste = onPaste,
+            onIntent = onIntent,
+            dragModifier = dragModifier,
+            headerEndInset = KeysCornerControl,
+            reservedBottomBand = KeysCornerControl,
+            scrollState = keysScroll,
+        )
+    }
+}
+
+/**
+ * The Keys corner toggle. It is icon-only and sits inside the panel's existing
+ * footprint: it adds no word, no row, and no height, and it changes only docking. It
+ * never opens or closes the panel and never touches the on-screen keyboard. It belongs to
+ * the panel header, so it is offset and clipped by the header's own scroll offset and can
+ * never sit over a key row the header has scrolled past.
+ */
+@Composable
+private fun KeysDockingControl(
+    docked: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    scrollOffset: Int = 0,
+) {
+    Box(modifier.size(KeysCornerControl).clipToBounds()) {
+        IconButton(
+            onClick = onClick,
+            modifier = Modifier.offset { IntOffset(0, -scrollOffset) }.size(KeysCornerControl),
+        ) {
+            Icon(
+                painter = painterResource(
+                    if (docked) R.drawable.ic_terminal_keys_pop_out else R.drawable.ic_terminal_keys_pop_in,
+                ),
+                contentDescription = stringResource(
+                    if (docked) R.string.terminal_keys_pop_out else R.string.terminal_keys_pop_in,
+                ),
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }
@@ -501,10 +755,12 @@ private fun TerminalOverlayLayer(
 /**
  * Position one wrapping overlay and own its long-press drag.
  *
- * The wrapper never fills the layer; only the content [content] touches, so no
- * background hit target is introduced. The long-press detector consumes movement
- * only after the pointer has crossed the touch slop, which cancels a child button
- * click exactly when a drag is recognized while leaving short taps untouched.
+ * The wrapper never fills the layer unless [sizePx] gives it an explicit size; only the
+ * content [content] touches, so no background hit target is introduced. The long-press
+ * detector consumes movement only after the pointer has crossed the touch slop, which
+ * cancels a child button click exactly when a drag is recognized while leaving short
+ * taps untouched. [cornerControls] draws inside the same wrapper bounds and never
+ * changes them.
  */
 @Composable
 private fun PlaceableOverlay(
@@ -517,28 +773,26 @@ private fun PlaceableOverlay(
     visibleHeight: Int,
     controlsSlotHeight: Int,
     maxHeightPx: Int? = null,
-    minimumTopPx: Int = 0,
-    forcedTopPx: Int? = null,
+    sizePx: IntSize? = null,
     layerZIndex: Float = 0f,
     onCommitted: (TerminalOverlayPlacement) -> Unit,
     onMeasured: (IntSize) -> Unit = {},
+    cornerControls: @Composable BoxScope.() -> Unit = {},
     content: @Composable (Modifier) -> Unit,
 ) {
     var size by remember(overlay) { mutableStateOf(IntSize.Zero) }
     var dragPoint by remember(overlay, orientation) { mutableStateOf<TerminalOverlayPoint?>(null) }
-    val layoutHeight = if (maxHeightPx != null) {
-        size.height.coerceAtMost(maxHeightPx).coerceAtLeast(0)
-    } else {
-        size.height
-    }
+    val layoutWidth = sizePx?.width ?: size.width
+    val layoutHeight = sizePx?.height
+        ?: (if (maxHeightPx != null) size.height.coerceAtMost(maxHeightPx).coerceAtLeast(0) else size.height)
     val position = placement.position(overlay, orientation)
     val resolved = position?.let { explicit ->
-        TerminalOverlayGeometry.resolve(stableWidth, stableHeight, size.width, layoutHeight, explicit)
+        TerminalOverlayGeometry.resolve(stableWidth, stableHeight, layoutWidth, layoutHeight, explicit)
     } ?: TerminalOverlayGeometry.resolveDefault(
         overlay = overlay,
         stableWidth = stableWidth,
         stableHeight = stableHeight,
-        overlayWidth = size.width,
+        overlayWidth = layoutWidth,
         overlayHeight = layoutHeight,
         controlsSlotHeight = controlsSlotHeight,
     )
@@ -546,26 +800,13 @@ private fun PlaceableOverlay(
         point = resolved,
         visibleWidth = visibleWidth,
         visibleHeight = visibleHeight,
-        overlayWidth = size.width,
+        overlayWidth = layoutWidth,
         overlayHeight = layoutHeight,
-        minimumY = minimumTopPx,
-    ).let { clamped ->
-        val forced = forcedTopPx ?: return@let clamped
-        val maximumTop = TerminalOverlayGeometry.freeHeight(visibleHeight, layoutHeight)
-        val minimumTop = minimumTopPx.coerceIn(0, maximumTop)
-        TerminalOverlayPoint(clamped.x, forced.coerceIn(minimumTop, maximumTop))
-    }
+    )
     val currentBase = rememberUpdatedState(basePoint)
     val currentPlacement = rememberUpdatedState(placement)
-    val currentSize = rememberUpdatedState(size)
+    val currentLayoutSize = rememberUpdatedState(IntSize(layoutWidth, layoutHeight))
     val currentCommit = rememberUpdatedState(onCommitted)
-    val currentMinimumTop = rememberUpdatedState(minimumTopPx)
-    val heightConstraint = if (maxHeightPx != null) {
-        val maxHeight = with(LocalDensity.current) { maxHeightPx.toDp() }
-        Modifier.heightIn(max = maxHeight)
-    } else {
-        Modifier
-    }
     val dragModifier = Modifier.pointerInput(overlay, orientation, stableWidth, stableHeight, visibleWidth, visibleHeight) {
         var moved = false
         var accumulated = Offset.Zero
@@ -583,13 +824,14 @@ private fun PlaceableOverlay(
             },
             onDragEnd = {
                 val finished = working
-                if (moved && finished != null && currentSize.value != IntSize.Zero) {
+                if (moved && finished != null) {
+                    val measured = currentLayoutSize.value
                     val committed = TerminalOverlayGeometry.toPosition(
                         point = finished,
                         stableWidth = stableWidth,
                         stableHeight = stableHeight,
-                        overlayWidth = currentSize.value.width,
-                        overlayHeight = currentSize.value.height,
+                        overlayWidth = measured.width,
+                        overlayHeight = measured.height,
                     )
                     currentCommit.value(currentPlacement.value.withPosition(overlay, orientation, committed))
                 }
@@ -602,6 +844,7 @@ private fun PlaceableOverlay(
                 if (!moved && accumulated.getDistance() > viewConfiguration.touchSlop) moved = true
                 if (moved) {
                     change.consume()
+                    val measured = currentLayoutSize.value
                     val start = working ?: currentBase.value
                     val next = TerminalOverlayGeometry.clampToVisible(
                         point = TerminalOverlayPoint(
@@ -610,9 +853,8 @@ private fun PlaceableOverlay(
                         ),
                         visibleWidth = visibleWidth,
                         visibleHeight = visibleHeight,
-                        overlayWidth = currentSize.value.width,
-                        overlayHeight = currentSize.value.height,
-                        minimumY = currentMinimumTop.value,
+                        overlayWidth = measured.width,
+                        overlayHeight = measured.height,
                     )
                     working = next
                     dragPoint = next
@@ -621,11 +863,23 @@ private fun PlaceableOverlay(
         )
     }
     val point = dragPoint ?: basePoint
+    val sizeConstraint = when {
+        sizePx != null -> {
+            val width = with(LocalDensity.current) { sizePx.width.toDp() }
+            val height = with(LocalDensity.current) { sizePx.height.toDp() }
+            Modifier.size(width, height)
+        }
+        maxHeightPx != null -> {
+            val maxHeight = with(LocalDensity.current) { maxHeightPx.toDp() }
+            Modifier.heightIn(max = maxHeight)
+        }
+        else -> Modifier
+    }
     Box(
         Modifier
             .offset { IntOffset(point.x, point.y) }
             .zIndex(layerZIndex)
-            .then(heightConstraint)
+            .then(sizeConstraint)
             .onGloballyPositioned { coordinates ->
                 val measured = coordinates.size
                 if (measured != size) {
@@ -635,12 +889,17 @@ private fun PlaceableOverlay(
             },
     ) {
         content(dragModifier)
+        cornerControls()
     }
 }
 
-/** Only the terminal Activity window opts out of both OS resize and OS pan.
- * Separate dialog/sheet windows retain their own IME behavior; leaving the route
- * restores the Activity's original mode for Add Host and other forms.
+/**
+ * Only the terminal Activity window opts out of both OS resize and OS pan, because
+ * this screen owns the one IME reservation: the pane column pads by the platform's
+ * reported occluding ime inset. Letting the OS resize or pan as well would subtract or
+ * shift the same keyboard area twice. Separate dialog/sheet windows retain their own
+ * IME behavior; leaving the route restores the Activity's original mode for Add Host
+ * and other forms.
  */
 @Composable
 private fun TerminalImeWindowPolicy() {
@@ -811,43 +1070,59 @@ private fun TerminalNotices(
 }
 
 /**
- * The Keys pop-out: the same native key toolbar, now transient.
+ * The Keys panel: the same native key toolbar, docked as a real bottom band or floating
+ * as an overlay, exactly as the caller places it.
  *
  * Sticky modifiers are held state, cleared across targets, coverage, and
  * backgrounding by the controller. Every key button submits a semantic
  * [TerminalControlKey] through the slot; nothing here builds an escape sequence or
- * fakes a hardware event. Opening, scrolling, or expanding this panel never
- * measures into the pane. It also carries the session title and host context that
+ * fakes a hardware event. It also carries the session title and host context that
  * the removed app bar used to show.
+ *
+ * Docked, this band reserves its own measured height and the pane above it shrinks by
+ * that much; floating, it reserves nothing. Either way its content is scrollable, so a
+ * panel taller than its slot never loses an action, and [headerEndInset] keeps the
+ * header text clear of the corner docking control the caller draws over it.
+ * [dragModifier] is the recognized move gesture, supplied only while floating.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TerminalKeysPanel(
+    modifier: Modifier = Modifier,
     terminal: TerminalUiState,
     status: String?,
     onKey: (TerminalKeyRequest) -> Unit,
     onPaste: () -> Unit,
     onIntent: (ClientIntent) -> Unit,
     dragModifier: Modifier = Modifier,
+    headerEndInset: Dp = 0.dp,
+    reservedBottomBand: Dp = 0.dp,
+    scrollState: ScrollState = rememberScrollState(),
 ) {
     val suspended = terminal.coverage.suspendsTerminalInput || !terminal.inputReady
     val held = terminal.modifiers
 
     Surface(
-        modifier = Modifier.fillMaxWidth().ownsTouches(),
+        modifier = modifier.ownsTouches(),
         color = MaterialTheme.colorScheme.surface.copy(alpha = OVERLAY_ALPHA),
         tonalElevation = 3.dp,
     ) {
         Column(
             modifier = Modifier
-                .verticalScroll(rememberScrollState())
+                // The floating panel reserves the resize grip's 48dp as a band outside
+                // its scrollable viewport, so the corner grip never covers key content at
+                // any scroll position and every key keeps a complete 48dp target. Docked
+                // and uncapped callers pass zero and are laid out exactly as before.
+                .padding(bottom = reservedBottomBand)
+                .verticalScroll(scrollState)
                 .padding(horizontal = 6.dp, vertical = 4.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            // The existing title/host header is the Keys surface's drag region. It
-            // keeps both context fields and adds no row, grip, or height.
+            // The existing title/host header is the floating panel's drag region. It
+            // keeps both context fields and adds no row, grip, or height; only the
+            // trailing inset for the existing corner control narrows the text.
             Column(
-                modifier = dragModifier,
+                modifier = dragModifier.padding(end = headerEndInset),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Text(

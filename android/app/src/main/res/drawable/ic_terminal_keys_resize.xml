@@ -1,0 +1,22 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- A corner grip: steps that grow toward the bottom-trailing corner. -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M21,21h-3v-3h3v3z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M21,15h-3v-3h3v3z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M15,21h-3v-3h3v3z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M21,9h-3v-3h3v3z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M9,21h-3v-3h3v3z" />
+</vector>

@@ -812,16 +812,13 @@ class TerminalOverlayPlacementTest {
         )
         assertEquals(TerminalOverlayPoint(350, 400), imeClamped)
 
-        val floored = TerminalOverlayGeometry.clampToVisible(
-            point = TerminalOverlayPoint(350, 0), visibleWidth = 800, visibleHeight = 500,
-            overlayWidth = 300, overlayHeight = 100, minimumY = 120,
+        // One extent smaller than the overlay itself still clamps into free space rather
+        // than inventing a floor or a second slot: the point lands on the only legal top.
+        val smallerThanOverlay = TerminalOverlayGeometry.clampToVisible(
+            point = TerminalOverlayPoint(350, 700), visibleWidth = 800, visibleHeight = 100,
+            overlayWidth = 300, overlayHeight = 100,
         )
-        assertEquals(TerminalOverlayPoint(350, 120), floored)
-        val cannotFitBelowFloor = TerminalOverlayGeometry.clampToVisible(
-            point = TerminalOverlayPoint(350, 0), visibleWidth = 800, visibleHeight = 100,
-            overlayWidth = 300, overlayHeight = 100, minimumY = 120,
-        )
-        assertEquals(TerminalOverlayPoint(350, 0), cannotFitBelowFloor)
+        assertEquals(TerminalOverlayPoint(350, 0), smallerThanOverlay)
 
         val roundTrip = TerminalOverlayGeometry.toPosition(
             point = TerminalOverlayPoint(500, 400), stableWidth = 1000, stableHeight = 800,

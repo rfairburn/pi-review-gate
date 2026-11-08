@@ -32,9 +32,9 @@ import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * The fullscreen terminal pane owns the whole stable app window; its controls are
- * same-window overlays. Synthetic component fixtures only: no host, transport, or
- * owner result is involved, and nothing here is native acceptance evidence.
+ * The terminal pane owns the stable app window minus what is really docked inside it,
+ * and its controls are same-window overlays. Synthetic component fixtures only: no host,
+ * transport, or owner result is involved, and nothing here is native acceptance evidence.
  */
 @RunWith(AndroidJUnit4::class)
 class TerminalFullscreenOverlayComponentTest {
@@ -118,12 +118,42 @@ class TerminalFullscreenOverlayComponentTest {
         val touches = recordSurfaceTouches(fixture)
         fun assertReachable(vararg labels: String) {
             labels.forEach { label -> safeTouchBounds(label, fixture) }
+        }
+        // A wrapped strip is capped and scrollable inside the pane, so the pane itself is
+        // untouched. That no-reflow half only holds while Keys has never been opened: an
+        // open docked band is a real reservation and resizing the pane for it is the point,
+        // so after docking cycles the pane must be back at its original area while the
+        // request count has genuinely grown.
+        //
+        // The commit standing before the first docking cycle. Closing a band is a real
+        // resize, so a check made after one waits for the pane to be back at `pane` with a
+        // newer commit than this standing, instead of reading a size still mid-resize.
+        val proofBeforeDockingCycles = requireNotNull(
+            compose.runOnIdle { fixture.surface?.currentInputProof()?.commitSequence },
+        )
+        fun assertPaneInvariant(afterDockingCycles: Boolean = false) {
+            if (afterDockingCycles) {
+                compose.waitUntil(10_000) {
+                    val observed = compose.runOnIdle {
+                        Triple(paneBounds(fixture), fixture.surface?.currentInputProof()?.commitSequence,
+                            fixture.viewports.size)
+                    }
+                    observed.first == pane && observed.third > requests &&
+                        (observed.second ?: 0L) > proofBeforeDockingCycles
+                }
+            }
             compose.runOnIdle {
                 assertEquals("Overlay wrapping must not move or resize the pane", pane, paneBounds(fixture))
-                assertEquals("Overlay wrapping must not request a reflow", requests, fixture.viewports.size)
+                if (afterDockingCycles) {
+                    assertTrue("Docked Keys cycles must request real reflows",
+                        fixture.viewports.size > requests)
+                } else {
+                    assertEquals("Overlay wrapping must not request a reflow", requests, fixture.viewports.size)
+                }
             }
         }
         assertReachable("Back", "Switch", "Keyboard", "Keys")
+        assertPaneInvariant()
         repeat(4) { edge ->
             tapIntentEdge("Back", edge, ClientIntent.LeaveTerminal, fixture)
             tapIntentEdge("Switch", edge, ClientIntent.ShowQuickSwitcher, fixture)
@@ -132,6 +162,7 @@ class TerminalFullscreenOverlayComponentTest {
             tapControlEdge("Close keys", edge, fixture)
             compose.onAllNodesWithText("Esc").assertCountEquals(0)
         }
+        assertPaneInvariant(afterDockingCycles = true)
         tapControlEdge("Keys", 0, fixture)
         // Observed keyboard state only (no IME is opened); exercises the longer label.
         setObservedKeyboard(fixture, true)
@@ -147,58 +178,85 @@ class TerminalFullscreenOverlayComponentTest {
         setObservedKeyboard(fixture, false)
         tapControlEdge("Close keys", 1, fixture)
         assertReachable("Back", "Switch", "Keyboard", "Keys")
+        assertPaneInvariant(afterDockingCycles = true)
         compose.runOnIdle {
             assertTrue("Large-text boundary taps must never reach the terminal: $touches", touches.isEmpty())
             assertTrue(fixture.packets.isEmpty())
         }
     }
 
-    @Test fun keysPanelTogglesNeverResizeRefocusOrCoverThePane() {
+    @Test fun dockedKeysReservesRealPaneAreaAndClosingGivesItBack() {
         val fixture = terminalFixture()
         compose.setContent { fixture.Content() }
         val before = awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
         val requests = fixture.viewports.size
-        val grid = fixture.viewports.last()
-        fun assertInvariant() {
-            val proof = awaitInput(fixture)
-            compose.runOnIdle {
-                val surface = requireNotNull(fixture.surface)
-                assertEquals("Overlay toggles must not move or resize the pane", pane, paneBounds(fixture))
-                assertEquals("Overlay toggles must not request a reflow", requests, fixture.viewports.size)
-                assertEquals(grid, proof.frameCols to proof.frameRows)
-                assertTrue("Opening an in-window pop-out keeps terminal focus", surface.hasFocus())
-                assertTrue(surface.hasWindowFocus())
-                assertTrue("No pop-out may report coverage",
-                    fixture.intents.none { it.intent is ClientIntent.UiCoverageChanged })
-                assertEquals(before.layoutEpoch, proof.layoutEpoch)
-            }
-        }
+
         compose.onNodeWithText("Keys").performClick()
-        compose.onNodeWithText("Esc").assertIsDisplayed()
-        assertInvariant()
+        // Docked Keys is a real bottom band: the surface actually changes size, which is
+        // the only thing that asks this renderer for a new grid.
+        compose.waitUntil(10_000) { fixture.viewports.size > requests }
+        val reserved = compose.runOnIdle { paneBounds(fixture) }
+        compose.runOnIdle {
+            assertEquals("Docked Keys must not move the pane's top or sides",
+                Triple(pane.left, pane.top, pane.right),
+                Triple(reserved.left, reserved.top, reserved.right))
+            assertTrue("Docked Keys must reserve real pane area: $pane vs $reserved",
+                reserved.bottom < pane.bottom)
+            val surface = requireNotNull(fixture.surface)
+            assertTrue("Opening an in-window pop-out keeps terminal focus", surface.hasFocus())
+            assertTrue(surface.hasWindowFocus())
+            assertTrue("No pop-out may report coverage",
+                fixture.intents.none { it.intent is ClientIntent.UiCoverageChanged })
+        }
+        // Readiness only returns on a genuinely new commit for the new geometry.
+        val fresh = awaitInput(fixture)
+        assertNotEquals(before, fresh)
+        compose.onNodeWithText("Esc").assertIsEnabled()
+
         compose.onNodeWithText("More keys").performClick()
+        val expanded = awaitInput(fixture)
         compose.onNodeWithText("F12").assertExists()
-        assertInvariant()
+        compose.runOnIdle {
+            val surface = requireNotNull(fixture.surface)
+            assertTrue("Expansion is backed by the real committed frame", surface.verifyReceipt(expanded))
+            assertEquals(expanded, surface.currentInputProof())
+        }
         compose.onNodeWithText("Fewer keys").performClick()
         compose.onNodeWithText("Close keys").performClick()
         compose.onAllNodesWithText("Esc").assertCountEquals(0)
-        assertInvariant()
+        compose.waitUntil(10_000) { compose.runOnIdle { paneBounds(fixture) == pane } }
+        val restored = awaitInput(fixture)
+        compose.runOnIdle {
+            assertEquals("Closing the band must give the pane its area back", pane, paneBounds(fixture))
+            assertTrue(requireNotNull(fixture.surface).verifyReceipt(restored))
+            assertTrue(fixture.packets.isEmpty())
+        }
     }
 
-    @Test fun constrainedKeysPanelScrollsByGradualRealDragAndItsKeysStillActivate() {
+    @Test fun dockedKeysPanelScrollsByGradualRealDragAndItsKeysStillActivate() {
         val fixture = terminalFixture()
-        // A short app window: the pane still fits a measured >=80x25 grid (the font
-        // adapts), but the open Keys panel with function keys cannot fit and scrolls.
+        // A short host: the docked band is capped to the pane the control strip's
+        // measured footprint leaves, so with the function keys expanded the band cannot
+        // show every key at once and scrolls. The pane that is left is small, and the
+        // adaptive font shrinks to keep a real measured grid there.
         compose.setContent { Box(Modifier.fillMaxWidth().height(280.dp)) { fixture.Content() } }
         awaitInput(fixture)
+        val dockRequests = fixture.viewports.size
+        compose.onNodeWithText("Keys").performClick()
+        compose.waitUntil(10_000) { fixture.viewports.size > dockRequests }
+        compose.onNodeWithText("More keys").performClick()
+        val fresh = awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
         val requests = fixture.viewports.size
-        compose.onNodeWithText("Keys").performClick()
-        compose.onNodeWithText("More keys").performClick()
         val touches = recordSurfaceTouches(fixture)
+        // The precondition, not a hope: the last action really does start out of view, so
+        // the gradual drags below have somewhere to go. A fixture that already fit
+        // everything would make the gradual-drag proof vacuous, so it fails here instead.
+        // A clipped node's semantics bounds never extend past its scroll viewport, so
+        // visibility — not a bounds comparison — is what states this honestly.
+        val panel = keysPanelScrollNode()
         compose.onNodeWithText("F12").assertExists().assertIsNotDisplayed()
-        val panel = compose.onNode(hasScrollAction())
         var drags = 0
         while (!isDisplayed("F12")) {
             assertTrue("Gradual drags must scroll the constrained Keys panel", drags++ < 12)
@@ -212,6 +270,7 @@ class TerminalFullscreenOverlayComponentTest {
             }
             compose.waitForIdle()
         }
+        assertTrue("The gradual drag must actually have run: $drags drags", drags > 0)
         compose.runOnIdle {
             assertTrue("Panel drags must never reach the terminal: $touches", touches.isEmpty())
             assertTrue("A drag is not a key press", fixture.packets.isEmpty())
@@ -224,8 +283,9 @@ class TerminalFullscreenOverlayComponentTest {
             assertTrue(packet.bytes.isNotEmpty() && packet.bytes[0] == 0x1b.toByte())
             assertTrue(packet.verifiedAtCapture)
             assertTrue(touches.isEmpty())
-            assertEquals("Scrolling the overlay must not move or resize the pane", pane, paneBounds(fixture))
+            assertEquals("Scrolling the docked band must not move or resize the pane", pane, paneBounds(fixture))
             assertEquals(requests, fixture.viewports.size)
+            assertTrue(requireNotNull(fixture.surface).verifyReceipt(fresh))
         }
     }
 
@@ -234,6 +294,9 @@ class TerminalFullscreenOverlayComponentTest {
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
         compose.onNodeWithText("Keys").performClick()
+        // The docked band took real pane area, so readiness only returns on a fresh
+        // commit for the new geometry. Keys are honestly disabled until then.
+        awaitInput(fixture)
         compose.onNodeWithText("Ctrl").performClick()
         compose.runOnIdle { assertEquals(KeyboardModifiers.CTRL, fixture.surface!!.selectedMobileModifiers()) }
         compose.onNodeWithText("↑").performClick()
@@ -258,15 +321,48 @@ class TerminalFullscreenOverlayComponentTest {
         compose.runOnIdle { assertEquals(ClientIntent.LeaveTerminal, fixture.intents.last().intent) }
     }
 
-    @Test fun keyboardControlUsesOnlyTheIntentAndShowsObservedStateNotTheTap() {
+    /**
+     * Back behavior is explicitly unchanged by docking, so the floating panel gets its
+     * own direct coverage: the first Back closes the panel locally and submits nothing,
+     * and only the second one leaves the terminal.
+     */
+    @Test fun backClosesAFloatingKeysPanelBeforeLeavingTheTerminal() {
         val fixture = terminalFixture()
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
-        val pane = compose.runOnIdle { paneBounds(fixture) }
-        val requests = fixture.viewports.size
+        val closedPane = compose.runOnIdle { paneBounds(fixture) }
+        compose.onNodeWithText("Keys").performClick()
+        compose.waitUntil(10_000) { compose.runOnIdle { paneBounds(fixture).bottom < closedPane.bottom } }
+        awaitInput(fixture)
+        compose.onNodeWithContentDescription("Pop keys out").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithText("Esc").assertIsDisplayed()
+        val floatingPane = compose.runOnIdle { paneBounds(fixture) }
+        val intentCount = compose.runOnIdle { fixture.intents.size }
+        compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.onAllNodesWithText("Esc").assertCountEquals(0)
+        compose.runOnIdle {
+            assertEquals("Back closes the floating pop-out locally, without an intent",
+                intentCount, fixture.intents.size)
+            assertEquals("A floating panel had reserved nothing to give back",
+                closedPane, floatingPane)
+            assertEquals(closedPane, paneBounds(fixture))
+            assertTrue(fixture.packets.isEmpty())
+        }
+        compose.runOnIdle { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        compose.runOnIdle { assertEquals(ClientIntent.LeaveTerminal, fixture.intents.last().intent) }
+    }
+
+    @Test fun keyboardControlUsesOnlyTheIntentAndReservesOnlyTheReportedOcclusion() {
+        val fixture = terminalFixture()
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val keysRequests = compose.runOnIdle { fixture.viewports.size }
         val touches = recordSurfaceTouches(fixture)
         try {
             compose.onNodeWithText("Keys").performClick()
+            compose.waitUntil(10_000) { compose.runOnIdle { fixture.viewports.size > keysRequests } }
+            val dockedPane = compose.runOnIdle { paneBounds(fixture) }
             tapIntentEdge("Keyboard", 0, ClientIntent.SetTerminalKeyboardVisible(true), fixture)
             // Not optimistic: the accessible description waits for observed visibility.
             compose.onAllNodesWithContentDescription("Hide keyboard").assertCountEquals(0)
@@ -275,19 +371,25 @@ class TerminalFullscreenOverlayComponentTest {
             } }
             setObservedKeyboard(fixture, true)
             control("Hide keyboard").assertIsDisplayed()
-            awaitInput(fixture)
+            // A docked keyboard reserves exactly the magnitude the platform reports as
+            // occluded beyond the safety band the layout already consumed. Nothing here
+            // assumes a height, and a keyboard that reported no occlusion would reserve
+            // nothing; only real emulator evidence can show which one happened.
+            compose.waitUntil(10_000) { compose.runOnIdle {
+                val occlusion = reportedOcclusion(requireNotNull(fixture.surface?.rootWindowInsets))
+                kotlin.math.abs(paneBounds(fixture).bottom - (dockedPane.bottom - occlusion)) <= 2
+            } }
             // Native window/inset reads on the UI thread; semantics queries must
             // synchronize from the instrumentation thread, outside runOnIdle.
-            val bottom = compose.runOnIdle {
-                assertEquals("IME must not move or resize the pane", pane, paneBounds(fixture))
-                assertEquals("IME must not request a reflow", requests, fixture.viewports.size)
+            val imeTop = compose.runOnIdle {
+                val decor = compose.activity.window.decorView
+                val location = IntArray(2).also(decor::getLocationInWindow)
                 val insets = requireNotNull(fixture.surface?.rootWindowInsets)
-                val window = compose.activity.window.decorView.height
-                window - maxOf(insets.getInsets(WindowInsets.Type.ime()).bottom,
-                    insets.getInsets(WindowInsets.Type.systemBars()).bottom)
+                location[1] + decor.height - insets.getInsets(WindowInsets.Type.ime()).bottom
             }
             val key = compose.onNodeWithText("↓").fetchSemanticsNode().boundsInWindow
-            assertTrue("Keys panel stays above the IME", key.bottom <= bottom + 1f)
+            assertTrue("Docked Keys stays above the docked IME: $key vs $imeTop", key.bottom <= imeTop + 1f)
+            awaitInput(fixture)
             tapIntentEdge("Hide keyboard", 1, ClientIntent.SetTerminalKeyboardVisible(false), fixture)
             // Still the observed description until the fixture reports the real insets again.
             control("Hide keyboard").assertIsDisplayed()
@@ -296,9 +398,11 @@ class TerminalFullscreenOverlayComponentTest {
             } }
             setObservedKeyboard(fixture, false)
             control("Keyboard").assertIsDisplayed()
+            compose.waitUntil(10_000) { compose.runOnIdle { paneBounds(fixture) == dockedPane } }
             awaitInput(fixture)
             compose.runOnIdle {
-                assertEquals(pane, paneBounds(fixture))
+                assertEquals("A hidden IME must give back exactly what it reserved",
+                    dockedPane, paneBounds(fixture))
                 assertTrue("Keyboard boundary taps must never reach the terminal: $touches", touches.isEmpty())
                 assertTrue(fixture.packets.isEmpty())
             }
@@ -312,6 +416,7 @@ class TerminalFullscreenOverlayComponentTest {
         compose.setContent { fixture.Content() }
         val old = awaitInput(fixture)
         compose.onNodeWithText("Keys").performClick()
+        awaitInput(fixture)
         compose.onNodeWithText("↑").assertIsEnabled()
         compose.runOnIdle {
             val route = fixture.state.route as ClientRoute.Terminal
@@ -338,7 +443,7 @@ class TerminalFullscreenOverlayComponentTest {
         val fixture = terminalFixture()
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
-        val pane = compose.runOnIdle { paneBounds(fixture) }
+        val keysRequests = compose.runOnIdle { fixture.viewports.size }
         compose.runOnIdle {
             val route = fixture.state.route as ClientRoute.Terminal
             fixture.state = fixture.state.copy(
@@ -348,6 +453,10 @@ class TerminalFullscreenOverlayComponentTest {
         compose.onNodeWithText("Terminal input is paused while this is open.").assertIsDisplayed()
         compose.onNodeWithText("Keys").performClick()
         compose.onNodeWithText("Esc").assertIsDisplayed()
+        // Docking the band is the one real reservation in this screen. Once that real
+        // reflow settles, a presentation-only preference must not move the pane again.
+        compose.waitUntil(10_000) { compose.runOnIdle { fixture.viewports.size > keysRequests } }
+        val pane = compose.runOnIdle { paneBounds(fixture) }
 
         // Off: the whole notice surface is absent — no readiness text, no dismiss
         // control — while the control strip and Keys panel keep their own surfaces.
@@ -478,6 +587,32 @@ class TerminalFullscreenOverlayComponentTest {
         val surface = requireNotNull(fixture.surface)
         val location = IntArray(2).also(surface::getLocationInWindow)
         return Rect(location[0], location[1], location[0] + surface.width, location[1] + surface.height)
+    }
+
+    /** The bottom area the platform reports as actually occluded, beyond the stable band. */
+    private fun reportedOcclusion(insets: android.view.WindowInsets): Int {
+        // Exactly the union the layout consumes once: system bars, cutout, and the
+        // waterfall edge. Reading only bars and cutout would claim more stable band than
+        // production reserves on a waterfall-bottom device and fail the comparison.
+        val bars = insets.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars()).bottom
+        val cutout = insets.getInsetsIgnoringVisibility(WindowInsets.Type.displayCutout()).bottom
+        val waterfall = insets.displayCutout?.waterfallInsets?.bottom ?: 0
+        return maxOf(0, insets.getInsets(WindowInsets.Type.ime()).bottom - maxOf(bars, cutout, waterfall))
+    }
+
+    /**
+     * The Keys panel's own scrollable area. A short layer can make the control strip
+     * scroll in the same composition, so the panel is identified by the header only it
+     * has rather than by being the only scroll container.
+     */
+    private fun keysPanelScrollNode(): SemanticsNodeInteraction {
+        val header = compose.onAllNodesWithText("Conversation A").onFirst()
+            .fetchSemanticsNode().boundsInWindow
+        val panel = compose.onAllNodes(hasScrollAction()).fetchSemanticsNodes()
+            .single { it.boundsInWindow.contains(header.center) }
+        // The test API exposes no public interaction constructor, so the identified
+        // container is reached again through a matcher on its unique node id.
+        return compose.onNode(SemanticsMatcher("node ${panel.id}") { it.id == panel.id })
     }
 
     /** The app window minus stable bars, cutout, and waterfall; never the IME. */

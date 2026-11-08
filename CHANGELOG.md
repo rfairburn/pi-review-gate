@@ -45,6 +45,35 @@ dates.
   across restarts. Compact controls retain their actions and touch targets without
   reflowing the terminal. Invalid cosmetic placement warns and can be replaced by a
   later save; host settings, trust, identity, and storage protections are unchanged.
+- The mobile terminal now uses one dock-aware layout instead of a fullscreen overlay with
+  short-layer rescue rules. A visible bottom-docked Keys band and a keyboard inset the
+  platform actually reports as occluding take real pane area, so opening docked Keys is an
+  ordinary native resize through the existing measurement, viewport, commit, and input
+  fences; a floating Keys panel or a keyboard reporting no occlusion reserves nothing, and
+  the safety insets and keyboard inset are each subtracted once. A band never takes the
+  area the control strip itself measures: the strip is measured against the currently
+  available space rather than the already-shrunk pane, and the band is capped by what that
+  measurement leaves, so the pane keeps at least the strip's measured footprint — no fixed
+  pane minimum and no split of the layer, and no promise of a usable pane at an arbitrarily
+  tiny available extent: once the available space is no larger than that one usable Keys
+  viewport the strip's own cap reaches zero, and a zero measured footprint then leaves the
+  band the whole available extent, so the pane can be squeezed out entirely. While a band
+  is composed the strip keeps the constraint it already carried: it leaves the band one
+  usable Keys viewport and is capped and scrollable itself.
+  Keys keeps an icon-only corner toggle that changes docking only — never opening,
+  closing, or showing the keyboard — and floating Keys moves by the existing header
+  long-press and resizes from a corner grip, painting below the control strip and the
+  notice area so it cannot swallow a control tap. Docking, floating size, and position
+  are remembered per orientation in the existing version-2 placement document and
+  survive docking; only a completed drag, resize, or docking toggle saves, and cancelled
+  gestures, rotations, keyboard changes, and ordinary frames save nothing. Whether Keys
+  is open and which notice was dismissed belong to one instance of the terminal screen and
+  to no saved bundle or placement document: a rotation keeps them, while leaving and
+  re-entering the terminal, or restarting, starts closed with nothing dismissed. Keys
+  toggle, expansion, Back priority, modifiers, Paste, special, arrow, and function keys,
+  48 dp targets, scroll reachability, and the Debug input messaging zero-area behavior are
+  unchanged. Real on-screen keyboard float/dock behavior is not claimed here: it needs
+  emulator and device evidence.
 - Android Settings now configures the local Saved LIST/SEARCH first-reply timeout
   (positive whole seconds, default 60), captured by each new read, including confirmed
   delete refresh. The 30-second begun-transfer idle bound, other deadlines, and

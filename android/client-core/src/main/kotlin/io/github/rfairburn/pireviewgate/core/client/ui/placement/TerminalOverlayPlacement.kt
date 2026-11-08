@@ -244,10 +244,11 @@ public data class TerminalOverlayPoint(
 /**
  * Pure placement math shared by the UI and its off-device checks.
  *
- * Resolution always uses the stable layer (the terminal pane's own bounds), never
- * the transient IME-adjusted layer. The result is then clamped into the visible
- * layer, so the soft keyboard can push an overlay on screen but can never rewrite
- * its remembered position or request a pane reflow.
+ * Resolution always uses the stable layer, never a transient one. The result is then
+ * clamped into the extent the caller reports as actually visible, so a real docked
+ * reservation — a reported occluding keyboard inset or a bottom-docked panel band — can
+ * move an overlay on screen but can never rewrite its remembered position or request a
+ * pane reflow.
  */
 public object TerminalOverlayGeometry {
     private const val PERMILLE = TerminalOverlayPosition.MAX_PERMILLE
@@ -303,10 +304,11 @@ public object TerminalOverlayGeometry {
     /**
      * Clamp one point into the currently visible free space.
      *
-     * The IME may reduce this layer; a clamped display point is never written back
-     * as a new remembered position by presentation alone. [minimumY] keeps one overlay
-     * below a higher-priority visible slot when a short layer would otherwise cover its
-     * only usable viewport; it is a display floor, not persisted placement data.
+     * The caller passes the extent the platform actually leaves visible: the stable
+     * layer minus whatever is really docked inside it, such as a reported occluding
+     * keyboard inset or a bottom-docked panel band. A clamped display point is never
+     * written back as a new remembered position by presentation alone, and nothing here
+     * keeps history or imposes a floor beyond that measured extent.
      */
     public fun clampToVisible(
         point: TerminalOverlayPoint,
@@ -314,15 +316,10 @@ public object TerminalOverlayGeometry {
         visibleHeight: Int,
         overlayWidth: Int,
         overlayHeight: Int,
-        minimumY: Int = 0,
-    ): TerminalOverlayPoint {
-        val maximumY = freeHeight(visibleHeight, overlayHeight)
-        val floorY = minimumY.coerceIn(0, maximumY)
-        return TerminalOverlayPoint(
-            x = point.x.coerceIn(0, freeWidth(visibleWidth, overlayWidth)),
-            y = point.y.coerceIn(floorY, maximumY),
-        )
-    }
+    ): TerminalOverlayPoint = TerminalOverlayPoint(
+        x = point.x.coerceIn(0, freeWidth(visibleWidth, overlayWidth)),
+        y = point.y.coerceIn(0, freeHeight(visibleHeight, overlayHeight)),
+    )
 
     /** Convert one completed drag's visible point back to stable-layer permille. */
     public fun toPosition(

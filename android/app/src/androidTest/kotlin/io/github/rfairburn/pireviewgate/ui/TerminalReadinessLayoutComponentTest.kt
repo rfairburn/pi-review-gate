@@ -27,8 +27,10 @@ import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Actual native commits must not resize or move the pane through readiness,
- * status, or Keys-panel presentation: all of them are overlays on a full pane.
+ * Actual native commits must not resize or move the pane through readiness, status, or
+ * Keys presentation. Docking the Keys panel is the one reservation the layout makes on
+ * purpose: it takes real pane area once, and after that single real reflow settles,
+ * nothing else in this screen moves the pane again.
  */
 @RunWith(AndroidJUnit4::class)
 class TerminalReadinessLayoutComponentTest {
@@ -45,7 +47,6 @@ class TerminalReadinessLayoutComponentTest {
         var surface: TerminalSurfaceView? = null
         val viewports = CopyOnWriteArrayList<Pair<Int, Int>>()
         val receipts = CopyOnWriteArrayList<FrameCommitReceipt>()
-        var beforeReady: Pair<Rect, Int>? = null
         val listener = object : TerminalSurfaceListener {
             override fun onViewportRequested(cols: Int, rows: Int) {
                 viewports += cols to rows
@@ -59,7 +60,6 @@ class TerminalReadinessLayoutComponentTest {
             override fun onFrameCommitted(receipt: FrameCommitReceipt) {
                 val view = requireNotNull(surface)
                 if (!view.verifyReceipt(receipt)) return
-                if (beforeReady == null) beforeReady = view.windowBounds() to viewports.size
                 receipts += receipt
                 // No test-minted proof: only the real platform-committed native receipt.
                 terminal = terminal.copy(inputReady = true)
@@ -89,23 +89,29 @@ class TerminalReadinessLayoutComponentTest {
         }
         compose.waitUntil(10_000) { terminal.inputReady && receipts.isNotEmpty() }
         compose.waitForIdle()
-        fun assertStablePane() = compose.runOnIdle {
+        val undocked = compose.runOnIdle { requireNotNull(surface).windowBounds() }
+        fun assertPaneUnchanged(anchor: Rect, phase: String) = compose.runOnIdle {
             val view = requireNotNull(surface)
-            val (pixels, requests) = requireNotNull(beforeReady)
-            assertEquals("Pane must not move or resize", pixels, view.windowBounds())
+            assertEquals("Pane must not move or resize ($phase)", anchor, view.windowBounds())
             assertTrue(view.hasFocus())
-            assertEquals("Readiness alone must not request another resize", requests, viewports.size)
             assertTrue(terminal.inputReady)
             assertTrue(view.verifyReceipt(requireNotNull(view.currentInputProof())))
         }
-        assertStablePane()
-        // Status arrives and is dismissed as an overlay, never a reserved slot.
+        val requestsBeforeDock = compose.runOnIdle { viewports.size }
+        fun assertNoNewResize(from: Int, phase: String) = compose.runOnIdle {
+            assertEquals("Nothing here must request another resize ($phase)", from, viewports.size)
+        }
+
+        // Status and debug presentation come first, with Keys closed: the notice is then
+        // a single overlay copy, and no docked band is measuring it a second time.
         compose.runOnIdle { status = "Synthetic status notice" }
         compose.onNodeWithText("Synthetic status notice").assertIsDisplayed()
-        assertStablePane()
+        assertPaneUnchanged(undocked, "status arrived")
+        assertNoNewResize(requestsBeforeDock, "status arrived")
         compose.onNodeWithText("Dismiss").performClick()
         compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
-        assertStablePane()
+        assertPaneUnchanged(undocked, "status dismissed")
+        assertNoNewResize(requestsBeforeDock, "status dismissed")
         // Debug off removes the whole notices surface, including its dismiss control.
         // A notice the producer publishes afterwards stays hidden, and the pane is
         // still never moved or resized by any of this.
@@ -113,20 +119,65 @@ class TerminalReadinessLayoutComponentTest {
         compose.runOnIdle { status = "Second synthetic status notice" }
         compose.onAllNodesWithText("Second synthetic status notice").assertCountEquals(0)
         compose.onAllNodesWithText("Dismiss").assertCountEquals(0)
-        assertStablePane()
+        assertPaneUnchanged(undocked, "debug off")
+        assertNoNewResize(requestsBeforeDock, "debug off")
         // Turning debugging back on returns the producer's current last value only.
         // The notice dismissed above is not resurrected and nothing is replayed.
         compose.runOnIdle { debugNotices = true }
         compose.onNodeWithText("Second synthetic status notice").assertIsDisplayed()
         compose.onAllNodesWithText("Synthetic status notice").assertCountEquals(0)
-        assertStablePane()
+        assertPaneUnchanged(undocked, "debug on again")
+        assertNoNewResize(requestsBeforeDock, "debug on again")
+        // The notice that arrived while debugging was off is dismissed by its own
+        // control, the same user action that dismissed the first one, rather than by
+        // clearing the producer's value. It is also cleared before docking, so the
+        // band's own duplicate of a raw status cannot be mistaken for a reservation
+        // change below.
         compose.onNodeWithText("Dismiss").performClick()
         compose.onAllNodesWithText("Second synthetic status notice").assertCountEquals(0)
-        assertStablePane()
-        // The Keys panel stays open through the readiness churn below.
+        assertPaneUnchanged(undocked, "second notice dismissed")
+        assertNoNewResize(requestsBeforeDock, "second notice dismissed")
+
+        // Docked Keys is a real bottom band, not an overlay: it reserves actual pane
+        // area, and the surface's own size change is what asks for a new grid.
+        // The wait has to observe the reflow itself. `inputReady` plus a non-null proof
+        // is already true before the band composes, so it would return on the pre-dock
+        // state and leave the geometry assertions below racing. Here the pane's bottom
+        // must have moved and a commit newer than the pre-dock one must be standing.
+        val preDock = requireNotNull(compose.runOnIdle { surface?.currentInputProof() })
         compose.onNodeWithText("Keys").performClick()
+        compose.waitUntil(10_000) {
+            val observed = compose.runOnIdle {
+                val view = requireNotNull(surface)
+                Triple(view.windowBounds(), view.currentInputProof(), terminal.inputReady)
+            }
+            val proof = observed.second
+            observed.third && proof != null && proof.commitSequence > preDock.commitSequence &&
+                observed.first.bottom < undocked.bottom
+        }
+        compose.waitForIdle()
+        val docked = compose.runOnIdle { requireNotNull(surface).windowBounds() }
+        compose.runOnIdle {
+            assertEquals("Docked Keys must not move the pane's top or sides",
+                Triple(undocked.left, undocked.top, undocked.right),
+                Triple(docked.left, docked.top, docked.right))
+            assertTrue("Docked Keys must reserve real pane area: $undocked vs $docked",
+                docked.bottom < undocked.bottom)
+            assertTrue("A real reflow must have been requested", viewports.size > requestsBeforeDock)
+            val view = requireNotNull(surface)
+            assertFalse("The real resize must retire the pre-dock commit",
+                view.verifyReceipt(preDock))
+            val fresh = requireNotNull(view.currentInputProof())
+            assertNotEquals("The standing proof is a new platform commit, not the pre-dock one",
+                preDock.commitSequence, fresh.commitSequence)
+            assertTrue("Only a fresh commit for the new geometry stands", view.verifyReceipt(fresh))
+        }
+        val requestsAfterDock = compose.runOnIdle { viewports.size }
+        // From here the band stays open, so this is the one reservation the layout made
+        // on purpose, and readiness churn has to leave that measured area alone.
+        assertPaneUnchanged(docked, "docked")
+        assertNoNewResize(requestsAfterDock, "docked")
         compose.onNodeWithText("Esc").assertIsDisplayed()
-        assertStablePane()
         repeat(3) {
             var oldSequence = 0L
             compose.runOnIdle {
@@ -142,11 +193,32 @@ class TerminalReadinessLayoutComponentTest {
                 terminal.inputReady && (surface?.currentInputProof()?.commitSequence ?: 0L) > oldSequence
             }
             compose.waitForIdle()
-            assertStablePane()
+            assertPaneUnchanged(docked, "readiness churn")
+            assertNoNewResize(requestsAfterDock, "readiness churn")
         }
+        // Closing the docked band gives the pane back exactly the area it held before.
+        val dockedReceipt = requireNotNull(compose.runOnIdle { surface?.currentInputProof() })
         compose.onNodeWithText("Close keys").performClick()
         compose.onAllNodesWithText("Esc").assertCountEquals(0)
-        assertStablePane()
+        compose.waitUntil(10_000) {
+            val observed = compose.runOnIdle {
+                val view = requireNotNull(surface)
+                Triple(view.windowBounds(), view.currentInputProof(), terminal.inputReady)
+            }
+            val proof = observed.second
+            observed.third && proof != null && proof.commitSequence > dockedReceipt.commitSequence &&
+                observed.first == undocked
+        }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            val view = requireNotNull(surface)
+            assertEquals("Closing docked Keys must return the reserved area",
+                undocked, view.windowBounds())
+            assertTrue(view.hasFocus())
+            assertFalse("Giving the area back retires the band's commit",
+                view.verifyReceipt(dockedReceipt))
+            assertTrue(view.verifyReceipt(requireNotNull(view.currentInputProof())))
+        }
     }
 
     private fun TerminalSurfaceView.windowBounds(): Rect {

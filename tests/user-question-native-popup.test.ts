@@ -40,6 +40,7 @@ import { activate } from "../src/index";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
 import { __resetActiveNativeEditorFieldForTest, setNativeEditorHost } from "../src/native-editor-bridge";
 import { questionShortcutLabel } from "../src/user-question/index";
+import { longFormMarkers, longFormQuestion } from "./long-question-fixtures";
 import { setUserQuestionTuiHost } from "../src/user-question/pi-tui-host";
 import {
   createBridgeUi,
@@ -1401,5 +1402,104 @@ test("native fullscreen: async native image pastes redraw the popup and preserve
   } finally {
     tui.stop();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * #396 on the installed native renderer: a question that the removed
+ * 2,000-character ceiling rejected is admitted by the real registered tool and
+ * then read through the real `TuiAltScreen` overlay — the composited screen is
+ * the only witness. Every paragraph must be reachable by the existing shared
+ * scroll controls, the choices, free-text row, and Decline stay reachable, and
+ * the answer is delivered with the complete question text.
+ */
+test("native fullscreen: a formerly rejected long question is readable in full and answerable over the live transcript (#396)", async () => {
+  const harness = await startNativePopupHarness({ rows: SHORT_ROWS });
+  const { terminal, sent, open, screen, view, askQuestion } = harness;
+  const paragraphs = 30;
+  const question = longFormQuestion(paragraphs);
+  assert.ok(question.length > 4_000, `the fixture is substantially larger than the removed ceiling (${question.length})`);
+
+  /** Scroll back to the content beginning, whatever the current offset is. */
+  const rewind = (): void => {
+    for (let step = 0; step < 600; step += 1) {
+      const before = view(ANSWER_HINT, SHORT_ROWS).body.join("\n");
+      terminal.send(SHIFT_ALT_UP);
+      if (view(ANSWER_HINT, SHORT_ROWS).body.join("\n") === before) return;
+    }
+    assert.fail("the long question never clamped while rewinding");
+  };
+
+  try {
+    await askQuestion("tc-396", question, ["Alpha lane", "Beta lane"]);
+    const { closed: opening } = await open();
+    view(LIST_ANSWER_HINT, SHORT_ROWS);
+
+    terminal.send(ENTER); // open the question's answer view
+    const first = view(ANSWER_HINT, SHORT_ROWS);
+    assert.equal(first.body[0], "q1:", "the answer view opens at the beginning of the long question");
+    assert.ok(!first.body.some((line) => line.includes("Alpha lane")), "the choices start below the visible fold");
+    assert.equal(first.bounds.height, SHORT_ROWS - 2, "the long question is capped inside the one-row margins");
+    const background = outsideBoundsRows(screen(), first.bounds);
+
+    const controls = [
+      { name: "the pointer wheel", down: (): void => { terminal.send(wheel("down", 10, first.bounds.row + 3)); } },
+      { name: "Shift+Alt+Down", down: (): void => { terminal.send(SHIFT_ALT_DOWN); } },
+      { name: "Ctrl+Alt+PageDown", down: (): void => { terminal.send(CTRL_ALT_PAGE_DOWN); } },
+    ];
+    const seen = new Set<string>();
+    for (const control of controls) {
+      rewind();
+      assert.equal(view(ANSWER_HINT, SHORT_ROWS).body[0], "q1:", `${control.name} starts from the content beginning`);
+      let steps = 0;
+      for (; steps < 600; steps += 1) {
+        const before = view(ANSWER_HINT, SHORT_ROWS).body;
+        for (const line of before) seen.add(line);
+        control.down();
+        const after = view(ANSWER_HINT, SHORT_ROWS).body;
+        if (after.join("\n") === before.join("\n")) break; // at the content end: claimed and inert
+        assert.deepEqual(after.slice(0, -1), before.slice(1), `${control.name} moves the body exactly one line`);
+      }
+      assert.ok(steps > 20, `${control.name} traverses the long question over ${steps} one-line steps`);
+      const atEnd = view(ANSWER_HINT, SHORT_ROWS);
+      assert.ok(atEnd.body.some((line) => line.includes("Decline")), `${control.name} reaches the trailing rows`);
+      assert.deepEqual(outsideBoundsRows(screen(), atEnd.bounds), background,
+        `${control.name} never moved the native transcript behind the popup`);
+    }
+
+    const rendered = [...seen].join("\n");
+    for (const marker of longFormMarkers(paragraphs)) {
+      assert.ok(rendered.includes(marker), `paragraph ${marker} is readable in the native popup`);
+    }
+    assert.ok(rendered.includes("1. Alpha lane") && rendered.includes("2. Beta lane"), "both choices are reachable");
+    assert.ok(rendered.includes("Type something…"), "the free-text row is reachable below the choices");
+    assert.ok(rendered.includes("Decline (no answer will be sent)"), "Decline is reachable below the free-text row");
+    assert.equal(sent.length, 0, "reading and scrolling sent nothing to the model");
+    terminal.send(ESCAPE); // back to the shared list
+    assert.ok(view(LIST_ANSWER_HINT, SHORT_ROWS).body.some((line) => line.includes("q1:")),
+      "the long question is still pending while it is being read");
+    terminal.send(ENTER); // re-open the answer view
+
+    // Scrolling never moved the selection, so Enter confirms the highlighted
+    // first choice and delivers the complete question text.
+    terminal.send(ENTER);
+    await opening;
+    assert.deepEqual(sent, [`Answer to pending question "${question}": Alpha lane`],
+      "the delivered answer carries the complete question, not a clipped quote");
+
+    // Decline on another long question still sends nothing.
+    await askQuestion("tc-396-decline", question, ["Alpha lane"]);
+    const { closed: reopening } = await open();
+    view(LIST_ANSWER_HINT, SHORT_ROWS);
+    terminal.send(ENTER);
+    view(ANSWER_HINT, SHORT_ROWS);
+    for (let step = 0; step < 3; step += 1) terminal.send(DOWN); // to the Decline row
+    assert.ok(view(ANSWER_HINT, SHORT_ROWS).body.some((line) => line.startsWith("> Decline")),
+      "Decline is the highlighted row");
+    terminal.send(ENTER);
+    await reopening;
+    assert.equal(sent.length, 1, "declining a long question fabricates no answer");
+  } finally {
+    await harness.dispose();
   }
 });

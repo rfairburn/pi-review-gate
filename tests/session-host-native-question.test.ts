@@ -1542,6 +1542,15 @@ const POPUP_QUESTION_TEXT = [
 ].join("\n");
 const POPUP_CHOICE_A = "Alpha lane";
 const POPUP_CHOICE_B = "Beta lane";
+/**
+ * The delivered answer echo's final transcript row: the question's last
+ * paragraph immediately followed by the selected choice. The complete
+ * full-question echo (#396) is taller than the visible transcript window, so
+ * the echo's first row can scroll out of view; this tail row is the live-screen
+ * witness, and it is one a question-only quote bound could never produce. The
+ * exact full payload the model received is pinned against the provider journal.
+ */
+const POPUP_ANSWER_ECHO_TAIL = `${POPUP_QUESTION_LAST_STEP}": ${POPUP_CHOICE_B}`;
 const POPUP_DECLINE = "Decline (no answer will be sent)";
 const POPUP_TRANSCRIPT_ROWS = 90;
 const POPUP_TRANSCRIPT = Array.from({ length: POPUP_TRANSCRIPT_ROWS }, (_, index) =>
@@ -1674,10 +1683,11 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
 
   initializeSyntheticDirectories(root);
   assertBrokerSocketPathBudget(root);
-  // Delivered answers quote the question bounded to 200 characters (the
-  // controller's existing DELIVERY_QUESTION_BOUND); the long question is cut.
-  assert.ok(POPUP_QUESTION_TEXT.length > 200, "the long question exceeds the delivered-answer quote bound");
-  const expectedAnswer = `Answer to pending question "${POPUP_QUESTION_TEXT.slice(0, 199)}…": ${POPUP_CHOICE_B}`;
+  // #396: a delivered answer quotes the accepted question in full, so the whole
+  // long question reaches the model inside the faux provider's own 400-character
+  // request preview (a fixture bound, not a product limit).
+  assert.ok(POPUP_QUESTION_TEXT.length > 300, "the long question far exceeds a 200-character quote");
+  const expectedAnswer = `Answer to pending question "${POPUP_QUESTION_TEXT}": ${POPUP_CHOICE_B}`;
   assert.ok(expectedAnswer.length < 400, "the complete delivered answer fits the faux provider's exact request preview");
   const pi = resolvePiExecutable(prerequisites, root, t);
   if (!pi) return;
@@ -2014,7 +2024,7 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
         const nextView = fixedHintPopupView(next, POPUP_NOTICE_LIST_HINT);
         if (!nextView || !naturalPopupHeight(nextView, 4)) return false;
         return next.split("\n").some((row, index) => (index < nextView.top || index > nextView.bottom)
-          && row.includes(`${ECHO_PREFIX}Answer to pending question`));
+          && row.includes(POPUP_ANSWER_ECHO_TAIL));
       }, EVENT_TIMEOUT_MS, "the answer echo renders in the live transcript around the open list", beforeAnswer);
     } catch (error) {
       throw frameDiagnostics("the answer echo renders in the live transcript around the open list", error);
@@ -2032,8 +2042,8 @@ test("native Pi fullscreen: the compact shared popup scrolls by keyboard over th
     }, "the short notice uses only its natural rows with native rows visible around it");
     frame = await act(KEY_CTRL_ALT_UP, (next) => locateNativeQuestionPopup(next) === undefined && frameContains(next, panelLine),
       "the shortcut closes the popup, leaving both notices pending");
-    assert.ok(frameContains(frame, `${ECHO_PREFIX}Answer to pending question`) && frameContains(frame, `": ${POPUP_CHOICE_B}`),
-      "the delivered answer echo is visible at the transcript end");
+    assert.ok(frameContains(frame, POPUP_ANSWER_ECHO_TAIL),
+      "the delivered answer echo is visible at the transcript end with the question's final paragraph");
     await providerSignal.waitForRecheck(() => modelRequests() >= 5, EVENT_TIMEOUT_MS, "the answer reaches the scripted model");
     const requests = journalRecords(providerJournalFile).filter((record) => record.event === "model_request");
     assert.equal(requests.length, 5, "exactly one model request followed the popup interaction");

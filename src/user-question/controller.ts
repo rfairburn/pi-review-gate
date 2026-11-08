@@ -39,6 +39,7 @@ export interface PendingQuestion {
   /** Stable per-session handle, e.g. "q1". */
   id: string;
   toolCallId: string;
+  /** Normalized question text; retained without truncation (#396). */
   question: string;
   choices: string[];
   mode: QuestionMode;
@@ -102,11 +103,8 @@ export interface UserQuestionDependencies {
   onStateChange?: () => void;
 }
 
-const MAX_QUESTION_CHARS = 2000;
 const MAX_CHOICE_COUNT = 12;
 const MAX_CHOICE_CHARS = 300;
-/** Bound for quoting a question inside delivered answer messages. */
-const DELIVERY_QUESTION_BOUND = 200;
 
 export interface RegisterQuestionInput {
   toolCallId: string;
@@ -245,12 +243,16 @@ export class UserQuestionController {
         message: "Question was rejected: the calling context does not belong to the current session.",
       };
     }
-    const question = input.question.trim();
-    if (question.length === 0 || question.length > MAX_QUESTION_CHARS) {
+    // No question-specific length ceiling (#396): the accepted question is
+    // retained and rendered in full, the same long-form content policy the
+    // YouShouldKnow body follows. The common guards stay — a non-string, an
+    // empty, or a whitespace-only question is rejected before registration.
+    const question = typeof input.question === "string" ? input.question.trim() : "";
+    if (question.length === 0) {
       return {
         ok: false,
         reason: "invalid",
-        message: `Invalid question: it must be 1-${MAX_QUESTION_CHARS} characters after trimming.`,
+        message: "Invalid question: it must be a non-empty string after trimming.",
       };
     }
     const choices = normalizeChoices(input.choices);
@@ -572,8 +574,14 @@ export function normalizeChoices(choices: readonly string[] | undefined): string
   return normalized;
 }
 
+/**
+ * Delivered answers quote the accepted question in full (#396): the settled
+ * message names the exact question it answers with no question-specific quote
+ * ceiling, matching the full retention of the pending record, the sync result,
+ * and the notice More details payload.
+ */
 export function formatAnswerDelivery(question: string, answer: string): string {
-  return `Answer to pending question "${boundQuestion(question)}": ${answer}`;
+  return `Answer to pending question "${question}": ${answer}`;
 }
 
 /** Full, unbounded request payload for the explicit More details action. */
@@ -581,11 +589,6 @@ export function formatNoticeDetailsDelivery(notice: Pick<PendingNotice, "title" 
   return `More details requested for "${notice.title}":\n\n${notice.body}`
     + (notice.context !== undefined ? `\n\nRelevant context:\n${notice.context}` : "")
     + "\n\nPlease elaborate on these details in your normal conversation reply.";
-}
-
-function boundQuestion(question: string): string {
-  if (question.length <= DELIVERY_QUESTION_BOUND) return question;
-  return `${question.slice(0, DELIVERY_QUESTION_BOUND - 1)}…`;
 }
 
 function unavailableMessage(): string {

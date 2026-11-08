@@ -11,7 +11,12 @@ session switches, `/new`, or forks.
 The model calls `AskUserQuestion` with:
 
 - `question` — one focused question, shown verbatim in the pending-question
-  list and rendered as Markdown in its answer view.
+  list and rendered as Markdown in its answer view. There is no question-only
+  length ceiling: the accepted text is retained in full, and the shared popup
+  scrolls, so a long question stays completely readable with its choices,
+  **Type something…**, and **Decline** rows still reachable below it. Include the
+  context needed to answer without earlier chat; keep it relevant and sanitized
+  rather than a transcript.
 - `choices` (optional) — up to 12 suggested answers. You may always type a
   free-text answer instead of picking one, or decline.
 - `mode` — `async` (default) or `sync`.
@@ -373,7 +378,9 @@ arrows select · Enter confirm · Esc back
 
 - **Async answer** — delivered as an ordinary user message to the session
   that asked: queued as steering while the agent is busy, sent normally when
-  it is idle. The run is never interrupted or aborted to deliver an answer.
+  it is idle. The message quotes the accepted question in full, so the answer
+  stays tied to the exact question it resolves. The run is never interrupted or
+  aborted to deliver an answer.
 - **Async decline** — the question simply leaves the pending set. No message
   is sent to the model: declining implies no answer, and none is fabricated.
 - **Sync answer / decline** — returned directly to the waiting tool call (see

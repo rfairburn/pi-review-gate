@@ -177,12 +177,25 @@ class SessionCardDragComponentTest {
 
     private fun list(): SemanticsNodeInteraction = compose.onNode(hasScrollToNodeAction())
     private fun listBounds(): Rect = list().fetchSemanticsNode().boundsInRoot
+
+    /** The list's own viewport position, as it is actually laid out. */
+    private fun listViewport(): Pair<Int, Int> = compose.runOnIdle {
+        listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+    }
+
     private fun bounds(text: String): Rect = compose.onNodeWithText(text).fetchSemanticsNode().boundsInRoot
     private fun inList(root: Offset): Offset = root - listBounds().topLeft
 
     /** Long-press the title of [title] and hold, leaving the pointer down. */
     private fun pressAndHold(title: String) {
+        val list = listBounds()
         val start = inList(bounds(title).center)
+        // The card must be drawn where it is pressed: a press clipped by the viewport starts
+        // no drag at all, and every later "sends nothing" assertion would then be vacuous.
+        assertTrue(
+            "$title is not reachable at $start inside the ${list.width}x${list.height} list viewport",
+            start.x in 0f..list.width && start.y in 0f..list.height,
+        )
         list().performTouchInput {
             down(start)
             advanceEventTime(viewConfiguration.longPressTimeoutMillis * 2)
@@ -196,14 +209,27 @@ class SessionCardDragComponentTest {
         val card = cardBounds(title)
         val y = if (upper) card.top + card.height * 0.2f else card.bottom - card.height * 0.2f
         val target = inList(Offset(card.center.x, y))
+        val viewport = listViewport()
         recordDragGeometry("before-first card=$card", title, target)
         list().performTouchInput { moveTo(target) }
         compose.waitForIdle()
         recordDragGeometry("after-preview", title, target)
+        // Drawing the preview must leave the viewport where it was. The pointer has not moved,
+        // so a list that scrolled under it would re-resolve the same packet onto another card.
+        assertEquals(
+            "the preview moved the viewport out from under the held pointer",
+            viewport,
+            listViewport(),
+        )
         // A second packet re-resolves against the frame drawn after the preview.
         list().performTouchInput { moveTo(target + Offset(0f, 1f)) }
         compose.waitForIdle()
         recordDragGeometry("after-second", title, target + Offset(0f, 1f))
+        assertEquals(
+            "re-resolving the still pointer drifted the viewport",
+            viewport,
+            listViewport(),
+        )
     }
 
     private fun release() {
@@ -300,6 +326,8 @@ class SessionCardDragComponentTest {
     @Test fun releaseOutsideTheViewportSendsNothing() {
         show(base())
         pressAndHold("Card a1")
+        // The release above the list is only a non-drop when a drag was really held first.
+        draggingCards().assertCountEquals(1)
         moveOnto("Card a3", upper = false)
         list().performTouchInput { moveTo(Offset(width / 2f, -200f)) }
         compose.waitForIdle()
@@ -312,6 +340,9 @@ class SessionCardDragComponentTest {
         for (side in listOf(-1, 1)) {
             intents.clear()
             pressAndHold("Card a1")
+            // Only a held drag can exit the list sideways: without this the empty result
+            // below would also be satisfied by a press that started nothing.
+            draggingCards().assertCountEquals(1)
             moveOnto("Card a3", upper = false)
             // Vertically still level with a3, horizontally outside the list.
             val card = cardBounds("Card a3")
@@ -326,6 +357,7 @@ class SessionCardDragComponentTest {
         }
         // A sideways excursion that returns over the card before release still drops once.
         pressAndHold("Card a1")
+        draggingCards().assertCountEquals(1)
         moveOnto("Card a3", upper = false)
         list().performTouchInput { moveTo(Offset(-24f, centerY)) }
         compose.waitForIdle()

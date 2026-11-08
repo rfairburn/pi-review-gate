@@ -171,6 +171,17 @@ fun SessionsScreen(
         if (cancelInvalid && holder.drag === current) holder.cancel(null)
     }
 
+    // The preview must not move what the pointer is over.
+    //
+    // The lazy list keeps the card it was drawing first at the same pixel position when the
+    // order it draws changes, so sliding the dragged card into another slot scrolls the whole
+    // list — here all the way to its own end — and a pointer that never moved now rests on a
+    // different card, silently replacing the drop that was chosen against the frame the drag
+    // started on. A drawn order that moved while the committed order did not can only be the
+    // preview's own, so exactly that viewport is asked back for those changes and no others.
+    val previewViewport = remember { DragPreviewViewport() }
+    SideEffect { previewViewport.keepStill(listState, sessions, displayRows) }
+
     // Edge auto-scroll reaches rows that are not on screen in a long list.
     //
     // A frame is awaited only while the held pointer is in an edge band that can still
@@ -500,6 +511,41 @@ private class SessionDragHolder {
             displayRows.lastOrNull()?.let { SessionRowKey.of(it) },
         )
     }
+}
+
+/**
+ * Keeps the list viewport still across the drag preview's own reorderings.
+ *
+ * [keepStill] runs after each committed composition, so the position it reads is the one the
+ * list was actually laid out at — for the order the previous composition drew. When the drawn
+ * order differs from that order while the committed order does not, the preview appeared,
+ * retargeted, or ended, and the next measure pass is asked to start from that same index and
+ * offset instead of anchoring the first visible card into its new slot.
+ *
+ * Nothing else is touched. A committed reorder repositions the list exactly as it always did,
+ * and intentional scrolling — a fling, or the held edge auto-scroll reaching rows that are
+ * offscreen — moves the recorded position before the preview changes again, so the viewport is
+ * kept where the scroll left it rather than pulled back.
+ */
+private class DragPreviewViewport {
+    private var drawnOrder: List<String>? = null
+    private var committedOrder: List<String>? = null
+
+    fun keepStill(listState: LazyListState, committed: List<SessionUiState>, drawn: List<SessionUiState>) {
+        val nowDrawn = orderOf(drawn)
+        val nowCommitted = if (drawn === committed) nowDrawn else orderOf(committed)
+        val wasDrawn = drawnOrder
+        val wasCommitted = committedOrder
+        drawnOrder = nowDrawn
+        committedOrder = nowCommitted
+        if (wasDrawn == null || wasDrawn == nowDrawn) return
+        // Only a change that leaves the committed order alone can be the preview's own.
+        if (wasCommitted != nowCommitted) return
+        listState.requestScrollToItem(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+    }
+
+    /** The order [rows] draws, by each row's lazy-list key. */
+    private fun orderOf(rows: List<SessionUiState>): List<String> = rows.map { sessionItemKey(it) }
 }
 
 /** Holder for one drag region's latest layout coordinates; not composition state. */

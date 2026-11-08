@@ -926,44 +926,62 @@ class TerminalOverlayPlacementComponentTest {
      */
     @Test fun floatingGripKeepsItsCornerAndEveryKeyTargetStaysClearOfIt() {
         val fixture = Fixture()
-        compose.setContent { fixture.Content() }
-        awaitInput(fixture)
-        compose.onNodeWithText("Keys").performClick()
-        awaitInput(fixture)
-        compose.onNodeWithContentDescription("Pop keys out").performClick()
-        awaitInput(fixture)
-        compose.onNodeWithText("More keys").performClick()
-        awaitInput(fixture)
+        // Every step is tagged with the existing placementPhase observer, so a replay names
+        // the last phase reached and dumps the main and test stacks through that observer's
+        // existing 10s observation. The wrapper adds no deadline, changes no idleness wait,
+        // and tolerates nothing: the gestures, waits, and assertions below are unchanged.
+        placementPhase("grip-setup") {
+            compose.setContent { fixture.Content() }
+            awaitInput(fixture)
+        }
+        placementPhase("grip-open-keys") {
+            compose.onNodeWithText("Keys").performClick()
+            awaitInput(fixture)
+        }
+        placementPhase("grip-pop-out") {
+            compose.onNodeWithContentDescription("Pop keys out").performClick()
+            awaitInput(fixture)
+        }
+        placementPhase("grip-more-keys") {
+            compose.onNodeWithText("More keys").performClick()
+            awaitInput(fixture)
+        }
         // A grown frame is the honest case: grip and keys scale together, so what follows
         // is measured on a scaled panel rather than only on a scale-1 one.
-        resizeKeysPanel(dx = 150f, dy = 150f)
-
-        val frame = floatingKeysFrameBounds()
-        val viewport = keysPanelBounds()
-        val grip = gripContainer().boundsInWindow
-        assertTrue("The grip occupies its own band below the scrollable viewport: $grip vs $viewport",
-            grip.top >= viewport.bottom - 1f)
-        assertEquals("A scaled panel's viewport and grip band still tile its frame: " +
-            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
-        listOf("Esc", "→", "F12").forEach { label ->
-            val key = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed()
-                .fetchSemanticsNode()
-            val keyBounds = key.boundsInWindow
-            val keyTouch = key.touchBoundsInRoot.translate(
-                keyBounds.topLeft - key.boundsInRoot.topLeft,
-            )
-            val minimum = 48f * compose.activity.resources.displayMetrics.density
-            assertTrue("$label keeps a complete 48dp target on the scaled panel: $keyTouch",
-                keyTouch.width >= minimum && keyTouch.height >= minimum)
-            assertFalse("The grip must never cover a key: $keyBounds vs $grip",
-                keyBounds.left < grip.right && keyBounds.right > grip.left &&
-                    keyBounds.top < grip.bottom && keyBounds.bottom > grip.top)
+        placementPhase("grip-resize") {
+            resizeKeysPanel(dx = 150f, dy = 150f)
         }
 
-        tapByTouch("F12")
-        compose.runOnIdle {
-            assertEquals(TerminalControlKey.F12, fixture.keys.last().key)
-            assertEquals("A floating panel's tap never reaches the terminal surface", 0, fixture.inputs)
+        placementPhase("grip-measure") {
+            val frame = floatingKeysFrameBounds()
+            val viewport = keysPanelBounds()
+            val grip = gripContainer().boundsInWindow
+            assertTrue("The grip occupies its own band below the scrollable viewport: $grip vs $viewport",
+                grip.top >= viewport.bottom - 1f)
+            assertEquals("A scaled panel's viewport and grip band still tile its frame: " +
+                "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+            listOf("Esc", "→", "F12").forEach { label ->
+                val key = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed()
+                    .fetchSemanticsNode()
+                val keyBounds = key.boundsInWindow
+                val keyTouch = key.touchBoundsInRoot.translate(
+                    keyBounds.topLeft - key.boundsInRoot.topLeft,
+                )
+                val minimum = 48f * compose.activity.resources.displayMetrics.density
+                assertTrue("$label keeps a complete 48dp target on the scaled panel: $keyTouch",
+                    keyTouch.width >= minimum && keyTouch.height >= minimum)
+                assertFalse("The grip must never cover a key: $keyBounds vs $grip",
+                    keyBounds.left < grip.right && keyBounds.right > grip.left &&
+                        keyBounds.top < grip.bottom && keyBounds.bottom > grip.top)
+            }
+        }
+
+        placementPhase("grip-tap-f12") {
+            tapByTouch("F12")
+            compose.runOnIdle {
+                assertEquals(TerminalControlKey.F12, fixture.keys.last().key)
+                assertEquals("A floating panel's tap never reaches the terminal surface", 0, fixture.inputs)
+            }
         }
     }
 
@@ -1521,6 +1539,10 @@ class TerminalOverlayPlacementComponentTest {
         var portraitSize: TerminalKeysFloatingSize? = null
         var landscapePosition: TerminalOverlayPosition? = null
         var landscapeSize: TerminalKeysFloatingSize? = null
+        // The first assertion to fail names the defect, so it is recorded rather than
+        // replaced: the cleanup and the post-recreation checks below still have to run, and
+        // any failure they add travels as suppressed on the primary one.
+        var primaryFailure: Throwable? = null
         try {
             placementPhase("portrait-load") { awaitInput(fixture) }
             assertEquals(TerminalOverlayPlacement.DEFAULT, fixture.placement)
@@ -1529,14 +1551,20 @@ class TerminalOverlayPlacementComponentTest {
                 awaitInput(fixture)
             }
             placementPhase("portrait-pop-out") {
+                val beforePopOut = compose.runOnIdle { fixture.commits }
                 compose.onNodeWithContentDescription("Pop keys out").performClick()
                 awaitInput(fixture)
+                assertOneCommit(fixture, "portrait-pop-out", beforePopOut)
             }
             // A completed move and a completed resize give this orientation numbers to
             // carry across the recreations below.
             placementPhase("portrait-shape") {
+                val beforeMove = compose.runOnIdle { fixture.commits }
                 dragBy("Conversation A", dx = -60f, dy = -90f)
+                assertOneCommit(fixture, "portrait-move", beforeMove)
+                val beforeResize = compose.runOnIdle { fixture.commits }
                 resizeKeysPanel(dx = 120f, dy = 140f)
+                assertOneCommit(fixture, "portrait-resize", beforeResize)
                 awaitInput(fixture)
             }
             portraitPosition = compose.runOnIdle { fixture.placement.keysPortrait }
@@ -1574,8 +1602,10 @@ class TerminalOverlayPlacementComponentTest {
             }
             val landscapeDocked = compose.runOnIdle { paneBounds(fixture) }
             placementPhase("landscape-pop-out") {
+                val beforePopOut = compose.runOnIdle { fixture.commits }
                 compose.onNodeWithContentDescription("Pop keys out").performClick()
                 awaitInput(fixture)
+                assertOneCommit(fixture, "landscape-pop-out", beforePopOut)
             }
             placementPhase("landscape-band-gave-its-area-back") {
                 val landscapeFloating = compose.runOnIdle { paneBounds(fixture) }
@@ -1594,8 +1624,12 @@ class TerminalOverlayPlacementComponentTest {
             placementPhase("landscape-shape") {
                 // A completed move and a completed resize give landscape its own numbers:
                 // a position and a size, each independent of what portrait saved.
+                val beforeMove = compose.runOnIdle { fixture.commits }
                 dragBy("Conversation A", dx = -50f, dy = -60f)
+                assertOneCommit(fixture, "landscape-move", beforeMove)
+                val beforeResize = compose.runOnIdle { fixture.commits }
                 resizeKeysPanel(dx = 140f, dy = 120f)
+                assertOneCommit(fixture, "landscape-resize", beforeResize)
                 awaitInput(fixture)
             }
             landscapePosition = compose.runOnIdle { fixture.placement.keysLandscape }
@@ -1616,29 +1650,39 @@ class TerminalOverlayPlacementComponentTest {
                     assertEquals(portraitSize, fixture.placement.keysPortraitLayout.floatingSize)
                 }
             }
-        } finally {
-            try {
-                placementPhase("portrait-recreation") {
-                    rotateTo(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT, fixture)
-                }
-                placementPhase("portrait-numbers-survive-both-recreations") {
-                    compose.runOnIdle {
-                        assertEquals("Neither recreation is a placement save", 6, fixture.commits)
-                        assertEquals(false, fixture.placement.keysPortraitLayout.docked)
-                        assertEquals(portraitPosition, fixture.placement.keysPortrait)
-                        assertEquals(portraitSize, fixture.placement.keysPortraitLayout.floatingSize)
-                        assertEquals("Landscape keeps its own popped-out docking state", false,
-                            fixture.placement.keysLandscapeLayout.docked)
-                        // Landscape's own saved position and size survive the second
-                        // recreation too, each orientation carrying its own numbers.
-                        assertEquals(landscapePosition, fixture.placement.keysLandscape)
-                        assertEquals(landscapeSize, fixture.placement.keysLandscapeLayout.floatingSize)
-                    }
-                }
-            } finally {
-                UiVerificationActivity.contentForRecreation = null
-            }
+        } catch (failure: Throwable) {
+            primaryFailure = failure
         }
+
+        try {
+            placementPhase("portrait-recreation") {
+                rotateTo(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT, fixture)
+            }
+            placementPhase("portrait-numbers-survive-both-recreations") {
+                compose.runOnIdle {
+                    assertEquals("Neither recreation is a placement save", 6, fixture.commits)
+                    assertEquals(false, fixture.placement.keysPortraitLayout.docked)
+                    assertEquals(portraitPosition, fixture.placement.keysPortrait)
+                    assertEquals(portraitSize, fixture.placement.keysPortraitLayout.floatingSize)
+                    assertEquals("Landscape keeps its own popped-out docking state", false,
+                        fixture.placement.keysLandscapeLayout.docked)
+                    // Landscape's own saved position and size survive the second
+                    // recreation too, each orientation carrying its own numbers.
+                    assertEquals(landscapePosition, fixture.placement.keysLandscape)
+                    assertEquals(landscapeSize, fixture.placement.keysLandscapeLayout.floatingSize)
+                }
+            }
+        } catch (failure: Throwable) {
+            // A cleanup or post-recreation failure never overwrites the primary failure;
+            // it is attached to it below instead.
+            val primary = primaryFailure
+            if (primary == null) primaryFailure = failure
+            else if (primary !== failure) primary.addSuppressed(failure)
+        } finally {
+            UiVerificationActivity.contentForRecreation = null
+        }
+
+        primaryFailure?.let { throw it }
     }
 
     /**
@@ -1983,6 +2027,18 @@ class TerminalOverlayPlacementComponentTest {
             assertEquals(anchor, surface.currentInputProof())
             assertTrue("Readiness stays as the real commit left it", fixture.terminal.inputReady)
         }
+    }
+
+    /**
+     * One completed gesture publishes exactly one placement save, tagged with the phase that
+     * owned it. The aggregate counts stay where they are; this only names which pop-out,
+     * move, or resize failed to commit, and logs the observed counts for the same phase.
+     */
+    private fun assertOneCommit(fixture: Fixture, phase: String, before: Int) {
+        val after = compose.runOnIdle { fixture.commits }
+        Log.i("OverlayPlacementTest", "commits phase=$phase before=$before after=$after")
+        assertEquals("$phase must publish exactly one placement save (commits $before -> $after)",
+            before + 1, after)
     }
 
     private fun awaitInput(fixture: Fixture): FrameCommitReceipt {
@@ -2409,6 +2465,10 @@ class TerminalOverlayPlacementComponentTest {
                     overlayPlacementReady = placementReady,
                     onOverlayPlacementCommitted = { next ->
                         commits += 1
+                        // Synthetic placement facts only: the count, the docking states, the
+                        // remembered sizes, and the permille positions. No input, host,
+                        // session, or clipboard value is logged here.
+                        Log.i("OverlayPlacementTest", "commit n=$commits placement=$next")
                         placement = next
                     },
                 )

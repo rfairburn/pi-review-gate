@@ -12,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.test.platform.app.InstrumentationRegistry
 import io.github.rfairburn.pireviewgate.core.client.ui.*
+import io.github.rfairburn.pireviewgate.core.client.ui.placement.TerminalOverlayPlacement
 import io.github.rfairburn.pireviewgate.core.hosts.ConfiguredHost
 import io.github.rfairburn.pireviewgate.core.hosts.Endpoint
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
@@ -174,6 +175,14 @@ internal class NativeUiFixture(initial: ClientUiState) {
     val refusals = CopyOnWriteArrayList<InputUnavailableReason>()
     val viewports = CopyOnWriteArrayList<Pair<Int, Int>>()
 
+    // Overlay placement is hoisted above the route exactly as production hoists it: the
+    // screen reads one placement value and a completed gesture replaces that value. The
+    // fixture never opens, reads, or writes a placement store, so a committed docking or
+    // remembered position lives only as long as the fixture does — no durable test state.
+    var overlayPlacement by mutableStateOf(TerminalOverlayPlacement.DEFAULT)
+    var overlayPlacementCommits = 0
+        private set
+
     private fun updateTerminal(block: (TerminalUiState) -> TerminalUiState) {
         val route = state.route as? ClientRoute.Terminal ?: return
         val next = block(route.terminal)
@@ -215,6 +224,18 @@ internal class NativeUiFixture(initial: ClientUiState) {
             }
             else -> Unit
         }
+    }
+
+    /**
+     * The screen's completed-gesture commit. It publishes the supplied placement exactly as
+     * the production holder does, and logs synthetic placement facts only: the count, the
+     * docking states, the remembered sizes, and the permille positions. No input, packet,
+     * host, session, or clipboard value is ever logged here.
+     */
+    fun onOverlayPlacementCommitted(placement: TerminalOverlayPlacement) {
+        overlayPlacementCommits += 1
+        overlayPlacement = placement
+        Log.i("NativeUiDiagnostics", "placement-commit n=$overlayPlacementCommits placement=$placement")
     }
 
     private val listener = object : TerminalSurfaceListener {
@@ -267,6 +288,10 @@ internal class NativeUiFixture(initial: ClientUiState) {
             onTerminalKey = { request -> surface?.submitKey(request.asRendererKey()) },
             // Never access a device/user clipboard, even in instrumentation.
             onTerminalPaste = { surface?.submitPastedText("fixed synthetic paste") },
+            // Wired rather than defaulted: an unwired fixture silently drops every docking
+            // toggle into the screen's no-op callback and cannot show a floating panel.
+            overlayPlacement = overlayPlacement,
+            onOverlayPlacementCommitted = ::onOverlayPlacementCommitted,
             terminalContent = {
                 TerminalSurface(binding, Modifier.fillMaxSize(), listener) { view ->
                     surface = view

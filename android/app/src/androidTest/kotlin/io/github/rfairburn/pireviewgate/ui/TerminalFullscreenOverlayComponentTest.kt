@@ -334,7 +334,32 @@ class TerminalFullscreenOverlayComponentTest {
         compose.onNodeWithText("Keys").performClick()
         compose.waitUntil(10_000) { compose.runOnIdle { paneBounds(fixture).bottom < closedPane.bottom } }
         awaitInput(fixture)
+        val dockedPane = compose.runOnIdle { paneBounds(fixture) }
+        val commitsBeforePopOut = compose.runOnIdle { fixture.overlayPlacementCommits }
+        val placementBeforePopOut = compose.runOnIdle { fixture.overlayPlacement }
         compose.onNodeWithContentDescription("Pop keys out").performClick()
+        // A click is not a claim about runtime state: the panel only counts as floating once
+        // it presents the floating control and the hoisted placement recorded the commit.
+        compose.onNodeWithContentDescription("Dock keys").assertIsDisplayed()
+        compose.onAllNodesWithContentDescription("Pop keys out").assertCountEquals(0)
+        compose.runOnIdle {
+            assertEquals("Popping the docked band out publishes exactly one placement save",
+                commitsBeforePopOut + 1, fixture.overlayPlacementCommits)
+            // The screen used this configuration's orientation, exactly as it does in
+            // production, so the floating layout is read from that same slot.
+            val landscape = compose.activity.resources.configuration.orientation ==
+                Configuration.ORIENTATION_LANDSCAPE
+            val committed = fixture.overlayPlacement
+            val committedDocked = if (landscape) committed.keysLandscapeLayout.docked
+                else committed.keysPortraitLayout.docked
+            assertTrue("The pop-out replaced the hoisted placement instead of dropping it",
+                committed != placementBeforePopOut)
+            assertEquals("The committed layout is the floating one", false, committedDocked)
+        }
+        // The band gives its area back in a real layout pass. Waiting for that growth, then
+        // for a fresh commit, is what makes the readiness below the grown pane's rather than
+        // an obsolete proof that still verifies.
+        compose.waitUntil(10_000) { compose.runOnIdle { paneBounds(fixture).bottom > dockedPane.bottom } }
         awaitInput(fixture)
         compose.onNodeWithText("Esc").assertIsDisplayed()
         val floatingPane = compose.runOnIdle { paneBounds(fixture) }

@@ -20,6 +20,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.hasScrollToNodeAction
 import androidx.compose.ui.text.AnnotatedString
@@ -238,7 +239,9 @@ class SessionCardStatusComponentTest {
             reveal(title)
             listOf("bg tasks $tasks", "bg shells $shells").forEach { text ->
                 val node = compose.onNode(hasText(text) and hasAnyAncestor(card(title)))
-                node.assertIsDisplayed().assertHasNoClickAction()
+                // Revealing the title can leave this lower row below the viewport.
+                // Scroll the actual chip into view before asserting its presentation.
+                node.performScrollTo().assertIsDisplayed().assertHasNoClickAction()
                 val content = node.fetchSemanticsNode().config[SemanticsProperties.Text]
                     .single { it.text == text }
                 assertTrue(content.spanStyles.isEmpty())
@@ -255,9 +258,9 @@ class SessionCardStatusComponentTest {
         // Positive activity-intent counts mean running; input is a separate observation.
         reveal("Status background-positive")
         compose.onNode(hasText("Agent running") and hasAnyAncestor(card("Status background-positive")))
-            .assertIsDisplayed()
+            .performScrollTo().assertIsDisplayed()
         compose.onNode(hasText("Input state unknown") and hasAnyAncestor(card("Status background-positive")))
-            .assertIsDisplayed()
+            .performScrollTo().assertIsDisplayed()
         assertEquals(0, compose.onAllNodesWithText("bg tasks 2 | shells 1").fetchSemanticsNodes().size)
     }
 

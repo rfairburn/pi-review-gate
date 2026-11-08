@@ -3,6 +3,7 @@ package io.github.rfairburn.pireviewgate.ui
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Rect as AndroidRect
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -47,6 +48,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Synthetic component checks for the independently movable terminal overlays.
@@ -452,34 +455,80 @@ class TerminalOverlayPlacementComponentTest {
         compose.setContent { fixture.Content() }
         UiVerificationActivity.contentForRecreation = { fixture.Content() }
         try {
-            awaitInput(fixture)
-            val pane = paneBounds(fixture)
+            placementPhase("initial-commit") { awaitInput(fixture) }
+            val pane = compose.runOnIdle { paneBounds(fixture) }
             val before = fixture.placement
             val beforeBounds = boundsOf("Back")
-            cancelDragBy("Switch", dx = -120f, dy = 100f)
-            val restoredBounds = boundsOf("Back")
-            val restoredPane = paneBounds(fixture)
-            compose.runOnIdle {
-                assertEquals("A cancelled drag is not a completed drag", 0, fixture.commits)
-                assertEquals(before, fixture.placement)
-                assertEquals("A cancelled drag restores the overlay", beforeBounds, restoredBounds)
-                assertEquals(pane, restoredPane)
+            placementPhase("cancel-drag") { cancelDragBy("Switch", dx = -120f, dy = 100f) }
+            placementPhase("cancel-invariants") {
+                val restoredBounds = boundsOf("Back")
+                compose.runOnIdle {
+                    assertEquals("A cancelled drag is not a completed drag", 0, fixture.commits)
+                    assertEquals(before, fixture.placement)
+                    assertEquals("A cancelled drag restores the overlay", beforeBounds, restoredBounds)
+                    assertEquals(pane, paneBounds(fixture))
+                }
             }
 
-            rotateTo(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, Configuration.ORIENTATION_LANDSCAPE, fixture)
-            compose.runOnIdle {
-                assertEquals("Rotation itself is never a placement save", 0, fixture.commits)
-                assertEquals(TerminalOverlayPlacement.DEFAULT, fixture.placement)
-                assertTrue(requireNotNull(fixture.surface).hasFocus())
+            placementPhase("landscape-recreation") {
+                rotateTo(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, Configuration.ORIENTATION_LANDSCAPE, fixture)
             }
-            assertInvariant(fixture, paneBounds(fixture), fixture.viewports.last(), fixture.viewports.size,
-                requireNotNull(fixture.surface).textSizePx, requireNotNull(fixture.surface!!.currentInputProof()))
+            placementPhase("landscape-invariants") {
+                val snapshot = compose.runOnIdle {
+                    assertEquals("Rotation itself is never a placement save", 0, fixture.commits)
+                    assertEquals(TerminalOverlayPlacement.DEFAULT, fixture.placement)
+                    val surface = requireNotNull(fixture.surface)
+                    assertTrue(surface.hasFocus())
+                    PlacementInvariantSnapshot(paneBounds(fixture), fixture.viewports.last(),
+                        fixture.viewports.size, surface.textSizePx, requireNotNull(surface.currentInputProof()))
+                }
+                // This helper synchronizes itself; do not nest it in runOnIdle.
+                assertInvariant(fixture, snapshot.pane, snapshot.grid, snapshot.requests, snapshot.fontPx, snapshot.anchor)
+            }
         } finally {
             try {
-                rotateTo(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT, fixture)
+                placementPhase("portrait-recreation") {
+                    rotateTo(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT, fixture)
+                }
             } finally {
                 UiVerificationActivity.contentForRecreation = null
             }
+        }
+    }
+
+    private data class PlacementInvariantSnapshot(
+        val pane: AndroidRect,
+        val grid: Pair<Int, Int>,
+        val requests: Int,
+        val fontPx: Float,
+        val anchor: FrameCommitReceipt,
+    )
+
+    /** One bounded observation if an existing 10s phase wait stops returning.
+     * Never interrupts the test, drives its clock, alters idleness or changes a deadline.
+     */
+    private fun <T> placementPhase(name: String, action: () -> T): T {
+        val testThread = Thread.currentThread()
+        val mainThread = Looper.getMainLooper().thread
+        val observer = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "placement-phase-observer").apply { isDaemon = true }
+        }
+        Log.i("OverlayPlacementTest", "phase=$name begin")
+        val pending = observer.schedule({
+            listOf("main" to mainThread, "test" to testThread).forEach { (label, thread) ->
+                Log.e("OverlayPlacementTest", "phase=$name still waiting; $label state=${thread.state}")
+                runCatching { thread.stackTrace.take(16) }.onSuccess { stack ->
+                    stack.forEach { Log.e("OverlayPlacementTest", "phase=$name $label at $it") }
+                }.onFailure { error ->
+                    Log.e("OverlayPlacementTest", "phase=$name $label stack unavailable: ${error.javaClass.simpleName}")
+                }
+            }
+        }, 10, TimeUnit.SECONDS)
+        try {
+            return action().also { Log.i("OverlayPlacementTest", "phase=$name end") }
+        } finally {
+            pending.cancel(false)
+            observer.shutdown()
         }
     }
 
@@ -632,7 +681,8 @@ class TerminalOverlayPlacementComponentTest {
             compose.runOnIdle {
                 compose.activity.resources.configuration.orientation == expected &&
                     (!needsRecreation || fixture.surface !== previousView) &&
-                    fixture.surface?.isAttachedToWindow == true && fixture.surface?.hasWindowFocus() == true
+                    fixture.surface?.isAttachedToWindow == true && fixture.surface?.hasWindowFocus() == true &&
+                    fixture.surface?.hasFocus() == true
             }
         }
         awaitInput(fixture)

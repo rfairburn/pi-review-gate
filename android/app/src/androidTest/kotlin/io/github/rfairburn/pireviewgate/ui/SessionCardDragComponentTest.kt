@@ -142,6 +142,30 @@ class SessionCardDragComponentTest {
 
     private fun moves() = intents.filterIsInstance<ClientIntent.MoveSessionRow>()
 
+    private val dragGeometry = ArrayDeque<String>()
+
+    /** Bounded fixture facts travel with a failed assertion, not a new event stream. */
+    private fun recordDragGeometry(phase: String, title: String, target: Offset) {
+        val viewport = listBounds()
+        val layout = compose.runOnIdle {
+            val info = listState.layoutInfo
+            "first=${listState.firstVisibleItemIndex}:${listState.firstVisibleItemScrollOffset} " +
+                "range=${info.viewportStartOffset}..${info.viewportEndOffset} " +
+                "items=" + info.visibleItemsInfo.take(6).joinToString { "${it.key}@${it.offset}+${it.size}" }
+        }
+        if (dragGeometry.size == 6) dragGeometry.removeFirst()
+        dragGeometry.addLast("$phase $title pointer=$target viewport=$viewport $layout")
+    }
+
+    private fun assertOneMoveAfterA3() {
+        assertEquals(
+            "Drag geometry: ${dragGeometry.joinToString("; ")}",
+            listOf(ClientIntent.MoveSessionRow(slot(hostA, "a1"), RemotePresentationMovePosition.AFTER,
+                slot(hostA, "a3"))),
+            moves(),
+        )
+    }
+
     /** Nothing but a move may come out of a drag: no selection, activation, or owner request. */
     private fun assertNoRowAction() {
         assertTrue(intents.none {
@@ -172,11 +196,14 @@ class SessionCardDragComponentTest {
         val card = cardBounds(title)
         val y = if (upper) card.top + card.height * 0.2f else card.bottom - card.height * 0.2f
         val target = inList(Offset(card.center.x, y))
+        recordDragGeometry("before-first card=$card", title, target)
         list().performTouchInput { moveTo(target) }
         compose.waitForIdle()
+        recordDragGeometry("after-preview", title, target)
         // A second packet re-resolves against the frame drawn after the preview.
         list().performTouchInput { moveTo(target + Offset(0f, 1f)) }
         compose.waitForIdle()
+        recordDragGeometry("after-second", title, target + Offset(0f, 1f))
     }
 
     private fun release() {
@@ -226,8 +253,7 @@ class SessionCardDragComponentTest {
         pressAndHold("Card a1")
         moveOnto("Card a3", upper = false)
         release()
-        assertEquals(listOf(ClientIntent.MoveSessionRow(slot(hostA, "a1"), RemotePresentationMovePosition.AFTER,
-            slot(hostA, "a3"))), moves())
+        assertOneMoveAfterA3()
         assertNoRowAction()
     }
 
@@ -255,8 +281,7 @@ class SessionCardDragComponentTest {
             compose.waitForIdle()
         }
         release()
-        assertEquals(listOf(ClientIntent.MoveSessionRow(slot(hostA, "a1"), RemotePresentationMovePosition.AFTER,
-            slot(hostA, "a3"))), moves())
+        assertOneMoveAfterA3()
     }
 
     // -- nothing to drop -------------------------------------------------------------------
@@ -306,8 +331,7 @@ class SessionCardDragComponentTest {
         compose.waitForIdle()
         moveOnto("Card a3", upper = false)
         release()
-        assertEquals(listOf(ClientIntent.MoveSessionRow(slot(hostA, "a1"), RemotePresentationMovePosition.AFTER,
-            slot(hostA, "a3"))), moves())
+        assertOneMoveAfterA3()
     }
 
     @Test fun membershipRunIdentityAndCoverageChangesCancelWithNoIntent() {

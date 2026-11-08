@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
 import { createUserQuestionTool, USER_QUESTION_TOOL_NAME, type UserQuestionTool } from "../src/user-question/tool";
+import { JUST_OVER_REMOVED_CAP, LARGE_QUESTION_PARAGRAPHS, longFormQuestion } from "./long-question-fixtures";
 
 /**
  * Decline and continuation semantics against the real Pi agent loop with a
@@ -114,6 +115,11 @@ function toolResultsOf(events: any[]): any[] {
   return events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult").map((event) => event.message);
 }
 
+/** The plain text of a host toolResult message (never the JSON-escaped form). */
+function resultTextOf(message: any): string {
+  return (message.content as Array<{ text?: string }>).map((part) => part.text ?? "").join("");
+}
+
 test("sync decline in a question-only batch ends the run after one model call", { skip: !runtime }, async () => {
   const sessionManager = { id: "solo-decline" };
   const controller = new UserQuestionController({ pi: {}, uiAvailable: () => true });
@@ -217,6 +223,98 @@ test("async question returns immediately and the run continues without any user 
     assert.equal(results.length, 1);
     assert.match(JSON.stringify(results[0].content), /Question registered as q1/);
     assert.equal(controller.listPending().length, 1, "the question stays pending and discoverable");
+  } finally {
+    controller.endSession();
+  }
+});
+
+/**
+ * #396 through the installed host's own argument validation: Pi compiles the
+ * advertised `AskUserQuestion` schema and validates every tool call before the
+ * tool runs, so this is the real schema admission path rather than a direct
+ * `execute()` call. Both formerly rejected long questions must validate, run,
+ * and survive in full, while the schema's remaining guard (a non-empty
+ * question) still fails closed with a host validation error.
+ */
+test("the host schema validator admits long questions and the tool retains them in full (#396)", { skip: !runtime }, async () => {
+  const sessionManager = { id: "long-question-schema" };
+  const controller = new UserQuestionController({ pi: {}, uiAvailable: () => true });
+  controller.beginSession(sessionManager);
+  const tool = withSessionContext(createUserQuestionTool(controller, { shortcutLabel: "Ctrl+Alt+Up" }), sessionManager);
+  const admitted = [JUST_OVER_REMOVED_CAP, longFormQuestion(LARGE_QUESTION_PARAGRAPHS)];
+
+  const run = await runLoop([tool], [
+    {
+      stopReason: "toolUse",
+      content: [
+        ...admitted.map((question, index) => toolCall(`c${index + 1}`, USER_QUESTION_TOOL_NAME, { question })),
+        toolCall("c-empty", USER_QUESTION_TOOL_NAME, { question: "" }),
+      ],
+    },
+    { stopReason: "stop", content: [{ type: "text", text: "continued with both questions pending" }] },
+  ]);
+  try {
+    await run.done;
+    const results = toolResultsOf(run.events);
+    assert.equal(results.length, 3, "the host ran both long questions and reported the invalid one");
+
+    for (const [index, question] of admitted.entries()) {
+      const result = results[index]!;
+      const text = resultTextOf(result);
+      assert.equal(result.isError, false, `the host schema validator admits a ${question.length}-character question`);
+      assert.equal(text.includes("Validation failed for tool"), false, "no schema rejection for the long question");
+      assert.ok(text.includes(question), "the pending handle quotes the complete accepted question");
+      assert.equal(controller.get(`q${index + 1}`)!.question, question,
+        "the accepted question is retained byte for byte through registration");
+    }
+
+    const invalid = results[2]!;
+    assert.equal(invalid.isError, true, "an empty question still fails the host's schema validation");
+    assert.match(resultTextOf(invalid), /Validation failed for tool/u,
+      "the host validator — not only the tool — is the gate that rejected it");
+    assert.equal(controller.listPending().length, 2, "only the two long questions are pending");
+  } finally {
+    controller.endSession();
+  }
+});
+
+/**
+ * The other half of the same evidence: with the pre-#396 shape — the identical
+ * question property plus the removed 2,000-character ceiling — the installed
+ * host validator rejects the very same long argument before the tool runs. That
+ * is what made the ceiling real at the schema layer and not only in the
+ * controller, and why removing it is what admits these inputs.
+ */
+test("the installed host validator honors a question-only length ceiling, which #396 removed", { skip: !runtime }, async () => {
+  const sessionManager = { id: "removed-ceiling-witness" };
+  const controller = new UserQuestionController({ pi: {}, uiAvailable: () => true });
+  controller.beginSession(sessionManager);
+  const production = createUserQuestionTool(controller, { shortcutLabel: "Ctrl+Alt+Up" });
+  const shape = production.parameters as Record<string, any>;
+  const ceilingTool = withSessionContext({
+    ...production,
+    name: "QuestionWithRemovedCeiling",
+    parameters: {
+      ...shape,
+      properties: {
+        ...shape.properties,
+        question: { ...shape.properties.question, maxLength: 2_000 },
+      },
+    },
+  }, sessionManager);
+
+  const run = await runLoop([ceilingTool], [
+    { stopReason: "toolUse", content: [toolCall("c1", "QuestionWithRemovedCeiling", { question: JUST_OVER_REMOVED_CAP })] },
+    { stopReason: "stop", content: [{ type: "text", text: "done" }] },
+  ]);
+  try {
+    await run.done;
+    const results = toolResultsOf(run.events);
+    assert.equal(results.length, 1);
+    assert.equal(results[0]!.isError, true,
+      "a declared 2,000-character ceiling makes the host validator reject the same long question");
+    assert.match(resultTextOf(results[0]!), /Validation failed for tool/u);
+    assert.equal(controller.listPending().length, 0, "the tool never ran under the removed ceiling");
   } finally {
     controller.endSession();
   }

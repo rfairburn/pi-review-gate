@@ -112,9 +112,11 @@ function userQuestionToolSchema(): Record<string, unknown> {
       question: {
         type: "string",
         minLength: 1,
-        maxLength: 2000,
         description:
-          "The question to ask the user. One focused question; it is shown verbatim in the pending-question list.",
+          "The question to ask the user. One focused question; it is shown verbatim in the pending-question list, "
+          + "retained in full, and rendered complete in its answer view (the popup scrolls, and the choices, free-text row, "
+          + "and Decline stay reachable), so include the context needed to answer without earlier chat. "
+          + "Keep it relevant and sanitized rather than a transcript.",
       },
       choices: {
         type: "array",

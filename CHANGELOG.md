@@ -15,6 +15,25 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.262]
+
+### Changed
+
+- **`AskUserQuestion` no longer caps question text at 2,000 characters** (#396):
+  the question-only ceiling is gone from both the advertised tool schema and the
+  controller's registration validation, and no other number replaces it. A long,
+  self-contained question — just past 2,000 characters, or a substantially larger
+  multiline Unicode one — is admitted and kept in full through registration, the
+  pending list, the shared popup, and settlement, matching the long-form content
+  policy `YouShouldKnow` already follows. The delivered async answer now quotes the
+  accepted question in full instead of a 200-character clipped quote, like the sync
+  result already did. Nothing is hidden behind a preview: the shared popup keeps
+  scrolling, so the whole question stays readable with its choices,
+  **Type something…**, and **Decline** rows reachable below it. Choice count and
+  label limits, empty/whitespace and non-string rejection, originating-session
+  routing, async/sync modes, decline semantics, and the existing scroll behavior are
+  unchanged.
+
 ## [0.1.0-dev.261]
 
 ### Fixed

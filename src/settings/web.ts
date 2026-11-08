@@ -28,23 +28,26 @@ export async function selectWebSettings(
   initialDownloadRetention: number,
   initialVisible: boolean,
   initialPermissions: WebBrowserPermissions,
-): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number; browserDownloadRetention: number; browserVisible: boolean; browserPermissions: WebBrowserPermissions }> {
+  initialUrlBlocklist: readonly string[],
+): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number; browserDownloadRetention: number; browserVisible: boolean; browserPermissions: WebBrowserPermissions; urlBlocklist: string[] }> {
   let maxDownloadBytes = initialMaxDownloadBytes;
   let browserInteractionApproval = initialApproval;
   let browserIdleExpiryMinutes = initialIdleExpiryMinutes;
   let browserDownloadRetention = initialDownloadRetention;
   let browserVisible = initialVisible;
   let browserPermissions = { ...initialPermissions };
+  let urlBlocklist = [...initialUrlBlocklist];
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
-    const [downloadRow, approvalRow, idleExpiryRow, retentionRow, visibilityRow, permissionsRow] = alignedSettingsRows([
+    const [downloadRow, approvalRow, idleExpiryRow, retentionRow, visibilityRow, permissionsRow, urlBlocklistRow] = alignedSettingsRows([
       ["Maximum download", formatByteSize(maxDownloadBytes)],
       ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[browserInteractionApproval]],
       ["Browser idle expiry", browserIdleExpiryMinutes === 0 ? "0 · idle close disabled" : `${browserIdleExpiryMinutes} minutes`],
       ["Download retention", browserDownloadRetention === 0 ? "0 · unlimited unsaved downloads" : `${browserDownloadRetention} unsaved per session`],
       ["Browser visibility", browserVisible ? "Headed · visible browser window" : "Headless · no window (default)"],
       ["Browser permissions", browserPermissionsSummary(browserPermissions)],
+      ["URL blocklist", urlBlocklistSummary(urlBlocklist)],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Web settings",
@@ -55,12 +58,30 @@ export async function selectWebSettings(
         { key: "retention", label: retentionRow },
         { key: "visibility", label: visibilityRow },
         { key: "permissions", label: permissionsRow },
+        { key: "urlBlocklist", label: urlBlocklistRow },
         { key: "back", label: "Back" },
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions };
+    if (!choice || choice === "back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions, urlBlocklist };
     lastKey = choice;
+    if (choice === "urlBlocklist") {
+      await notify(ui, URL_BLOCKLIST_NOTICE, "info");
+      const entered = await editSettingText(
+        ui,
+        "Blocked URL patterns (one regular expression per line; leave empty to block nothing)",
+        urlBlocklist.join("\n"),
+      );
+      // Cancel keeps the staged list exactly as it was, like every other field.
+      if (entered === undefined) continue;
+      const parsed = parseUrlBlocklistLines(entered);
+      if (parsed.error) {
+        await notify(ui, parsed.error, "error");
+        continue;
+      }
+      urlBlocklist = parsed.sources;
+      continue;
+    }
     if (choice === "visibility") {
       await notify(ui, "Headless (default) keeps the QA browser without a window. Headed shows a real browser window with a native address bar. Saving a changed visibility applies it immediately to the live browser: the browser is replaced and its tabs, active page, and in-memory cookies/localStorage/IndexedDB are restored best-effort (never lossless; failures and redirects are reported). With no open browser it applies at the next BrowserOpen. The model's tools stay exactly the same either way.", "info");
       const selected = await retainedChoice(ui, "Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
@@ -130,6 +151,53 @@ export async function selectWebSettings(
     }
     maxDownloadBytes = mebibytes * 1024 * 1024;
   }
+}
+
+/** One-line state of the shared acquisition URL blocklist for the Web row. */
+function urlBlocklistSummary(sources: readonly string[]): string {
+  if (sources.length === 0) return "none \u00b7 nothing blocked";
+  return `${sources.length} pattern${sources.length === 1 ? "" : "s"} \u00b7 WebFetch and BrowserExtract denied`;
+}
+
+/** What the shared URL blocklist does, stated before it is edited. */
+const URL_BLOCKLIST_NOTICE =
+  "Each line is one JavaScript regular-expression source matched anywhere in the URL \u2014 no /.../ delimiters, "
+  + "no flags, and nothing is implicitly anchored, so aliyuncs also matches https://bucket.example.aliyuncs.com/object. "
+  + "Surrounding whitespace is trimmed from every line, since a leading or trailing space in a URL pattern is almost "
+  + "never intended; the trimmed line is then matched with ordinary regex semantics and nothing else is changed, so a "
+  + "space you really want is written as regex syntax \u2014 final\\x20test or final[ ]test matches a URL containing "
+  + "\u2018final test\u2019. "
+  + "Each entry is judged against the complete URL only \u2014 the URL as supplied, or a redirect destination with its "
+  + "fragment \u2014 with no second look at a fragmentless form, so /private-page$ does not match "
+  + "https://x.test/private-page#top while #top$ does. "
+  + "The same list denies WebFetch and BrowserExtract before they request or render a matching URL, including every "
+  + "redirect destination; interactive browser tools and page subresources are unaffected. Blank lines are ignored. "
+  + "Saving a changed list discards the current session's cached pages. This is a weak convenience guard, not a "
+  + "security boundary: shell commands and scripts can still reach any destination.";
+
+/**
+ * Parse the settings editor's one-pattern-per-line text into blocklist
+ * sources. Blank lines are ignored and every remaining line is trimmed. An
+ * entry that is not a valid JavaScript regular expression is reported
+ * actionably and nothing is staged, so a typo can never silently weaken the
+ * configured policy; `normalizeConfig` stays the authority at Save.
+ */
+function parseUrlBlocklistLines(text: string): { sources: string[]; error?: string } {
+  const sources: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const source = line.trim();
+    if (source.length === 0) continue;
+    try {
+      new RegExp(source);
+    } catch (error) {
+      return {
+        sources,
+        error: `"${source}" is not a valid JavaScript regular expression: ${error instanceof Error ? error.message : String(error)}. The URL blocklist was not changed.`,
+      };
+    }
+    sources.push(source);
+  }
+  return { sources };
 }
 
 /** One-line state of the a-la-carte browser permissions for the Web row. */

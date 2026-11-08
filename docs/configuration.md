@@ -831,6 +831,7 @@ See [Runtime dispatch](scheduled-tasks.md#runtime-dispatch) on the Scheduled tas
 {
   "web": {
     "enabled": true,
+    "urlBlocklist": [],
     "browserInteractionApproval": "ask",
     "browserVisible": false,
     "browserIdleExpiryMinutes": 15,
@@ -861,6 +862,50 @@ See [Runtime dispatch](scheduled-tasks.md#runtime-dispatch) on the Scheduled tas
   }
 }
 ```
+
+`web.urlBlocklist` is an array of ordinary JavaScript regular-expression sources
+(default **empty**: nothing is blocked). One shared list guards both acquisition
+tools: `WebFetch` and `BrowserExtract` deny a URL that matches any entry, and each
+entry is searched anywhere in the URL, so anchoring, character classes, and
+alternation are exactly what the configured source expresses. Every entry is judged
+against the complete URL only — the URL as supplied, or the complete destination a
+redirect `Location` forms (a relative `Location` resolved against the URL being
+redirected from, joined with that navigation's fragment when the `Location` names
+none) — and never
+against a fragmentless derivative of it, so an anchored entry such as `/private-page$`
+does not match `https://x.test/private-page#top` while `#top$` does, and an unanchored
+`/private-page` matches either. Entries are written
+without `/.../` delimiters and with no flags, so matching stays case-sensitive;
+surrounding whitespace is trimmed from every entry — a leading or trailing space in a
+URL pattern would almost never be intended — and the trimmed source is then matched with
+ordinary regex semantics and no other transformation, so a space you really want is
+written as regex syntax (`final\x20test` or `final[ ]test` matches a URL containing
+`final test`); a blank entry or an invalid expression
+rejects configuration loading (startup recovery omits only the invalid entry, with
+a warning). A denied acquisition is an explicit tool outcome for both tools: no
+page is fetched or rendered, and no fallback to the other tool is suggested. The
+supplied URL is checked before any request or browser launch, and every redirect
+destination is checked before that hop is followed, so a blocked endpoint receives
+no request at all; on a redirect, the destination judged is the complete URL the
+navigation itself forms, so the fragment on the URL you supplied never joins a later
+hop — that URL is judged on its own, and the chain starts without it — while a fragment
+a redirect's own `Location` introduces stays on the chain and is judged with the later
+hops whose `Location` names no fragment. That is the behavior observed in native
+Chromium, and the plain HTTP path matches it exactly.
+The fragment never goes on the wire and the cache key stays fragmentless, so neither
+is ever a second regex input. Changing the list discards cached acquisitions, so a
+page cached under an earlier policy cannot be served after it is blocked; saving an
+unchanged list leaves the cache intact. An acquisition already in flight when the list
+changes is discarded instead of served from a policy it was never validated against, and
+it is reported as a policy change you can retry — no additional request is made
+automatically. The guard applies to acquisition only —
+interactive `Browser*` tools, page subresources, and child-frame documents are
+unaffected — and it is a convenience guard rather than a security boundary: anything
+that reaches the network outside these tools (shell, `codemode`, raw sockets) is
+outside its reach.
+Edit it through `/review-settings` → **Tools** → **Web** → **URL blocklist** (one
+expression per line), then **Save changes**; see
+[Web tools](web-tools.md#url-blocklist).
 
 `web.browserIdleExpiryMinutes` is a non-negative safe integer number of minutes
 (default **15**). Edit it through `/review-settings` → **Tools** → **Web** → **Browser idle

@@ -123,6 +123,53 @@ Chromium provisioning follows the install-time rules described in
 `PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` and the `npx playwright install chromium`
 recovery path.
 
+## URL blocklist
+
+One shared `web.urlBlocklist` guard applies to both acquisition tools. `WebFetch` and
+`BrowserExtract` deny the same URLs: a match is an explicit denied tool outcome for
+either tool, no page is fetched or rendered, and the result does not recommend trying
+the other tool — the same list denies it there too. Each entry is an ordinary
+JavaScript regular-expression source searched anywhere in the URL, written without
+`/.../` delimiters and with no flags; see
+[Web fields](configuration.md#web-fields) for validation and editing.
+
+What is judged is always one complete URL: the URL exactly as supplied, or the complete
+destination a redirect `Location` forms — a relative `Location` resolved against the URL
+being redirected from, joined with that navigation's fragment when the `Location` names
+none. Regex rules are the whole contract and nothing guesses around them, so no
+fragmentless or otherwise normalized derivative is ever judged a second time — `/object$`
+does not match `https://fixture.test/object#top`, `#top$` does, and an unanchored
+`/object` matches both. The fragment still never goes on the wire, and the cache key stays
+fragmentless; neither becomes an extra policy input.
+
+Surrounding whitespace is trimmed from every configured entry, because a leading or
+trailing space in a URL pattern would almost never be intended; the trimmed source is
+then matched with ordinary regex semantics and nothing else is transformed. A space that
+is genuinely wanted stays in the pattern as regex syntax, for example `final\x20test` or
+`final[ ]test` matches a URL containing `final test`.
+
+The supplied URL is checked before any request or browser launch, and every redirect
+destination is checked before that hop is followed, so a blocked endpoint receives no
+request at all — on the plain HTTP path and through Chromium's own redirects, where each
+hop is judged as the complete URL Chromium itself forms for it. The fragment on the URL
+you supplied never joins a later destination: that URL is judged on its own, and
+the redirect chain starts without it. A fragment that a redirect's own `Location`
+introduces does stay on the chain, so a later hop whose `Location` names no fragment is
+judged with it — behavior observed in native Chromium and matched exactly by the plain
+HTTP path. A redirect chain that stays on allowed hosts renders and extracts normally.
+Changing the list discards cached acquisitions, so a document cached before a URL was
+blocked is never served afterwards; saving an unchanged list keeps the cache intact. An
+acquisition already in flight when the list changes is discarded rather than served from a
+policy it was not validated against, and it is reported as a policy change to retry — no
+further request is made on your behalf.
+
+The guard is scoped to the acquisition navigation itself. Interactive `Browser*` tools,
+page subresources such as scripts, styles, and images, and child-frame documents stay
+outside it, and the existing URL, DNS-pinning, public-network, and egress-broker checks
+keep applying underneath it. It is a convenience guard, not a security boundary: work
+that reaches the network outside these tools (shell, `codemode`, raw sockets) is not
+covered.
+
 ## Interactive browser
 
 The bounded interactive browser — session/tab lifecycle, the `Browser*` tool surface,

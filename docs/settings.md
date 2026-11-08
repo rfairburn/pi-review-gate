@@ -509,13 +509,20 @@ location and the root **Tools** row summary change.
   `/skill:pi-review-gate-completion`; toggling this setting does not edit Pi's native
   settings or uninstall the skill. See
   [Availability and completion guidance](user-questions.md#availability-and-completion-guidance).
-- **Web** includes maximum acquisition size and **Browser interaction approval**:
+- **Web** includes maximum acquisition size, the **URL blocklist** — one JavaScript
+  regular-expression source per line, surrounding whitespace on each line trimmed (write a
+  space you really want as regex syntax, such as `final\x20test` or `final[ ]test`), blank
+  lines ignored, an invalid expression
+  reported instead of staged, and an empty list blocking nothing — and
+  **Browser interaction approval**:
   **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
   approval is required and rejects without UI; Accept supplies automatic approval
   without prompting; Deny rejects the approval-required branch. Already-permitted
   observations and structurally proven local actions remain permitted in every mode.
   Saves apply immediately to subsequent local approval decisions and acquisitions
-  without restarting. Newly launched Pi workers load the saved policy; running workers
+  without restarting; saving a changed URL blocklist applies it to `WebFetch` and
+  `BrowserExtract` together and discards cached acquisitions, while saving an
+  unchanged list leaves the cache intact. Newly launched Pi workers load the saved policy; running workers
   keep the configuration loaded at launch. Research roles still cannot click or use
   form-action tools. It also opens the **Browser permissions** submenu (#27) with
   the independently selectable capability toggles — model credential entry and

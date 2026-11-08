@@ -128,6 +128,14 @@ export interface WebConfig {
   browserVisible: boolean;
   /** Independently selectable managed-browser permissions (issue #27); all off by default. */
   browserPermissions: WebBrowserPermissions;
+  /**
+   * Shared acquisition URL blocklist (issue #620): one ordinary JavaScript
+   * regular-expression source per entry — no `/.../` delimiters, no flags, no
+   * implicit anchoring — searched anywhere in the URL. The same list is applied
+   * by `WebFetch` and `BrowserExtract`, including redirect destinations,
+   * before any request or render. Empty by default, so nothing is denied.
+   */
+  urlBlocklist: string[];
   search: WebSearchConfig;
   fetch: WebFetchConfig;
 }
@@ -650,6 +658,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
     browserIdleExpiryMinutes: 15,
     browserDownloadRetention: 8,
     browserPermissions: { ...DEFAULT_BROWSER_PERMISSIONS },
+    urlBlocklist: [],
     search: { provider: "ddgs", timeoutMs: 20_000, maxResults: 10 },
     fetch: {
       timeoutMs: 30_000,
@@ -1091,6 +1100,7 @@ function normalizeWeb(value: unknown): WebConfig {
     browserPermissions: value.browserPermissions === undefined
       ? { ...DEFAULT_BROWSER_PERMISSIONS }
       : normalizeBrowserPermissions(value.browserPermissions),
+    urlBlocklist: normalizeUrlBlocklist(value.urlBlocklist),
     search: {
       provider,
       timeoutMs: positiveIntegerOrDefault(search.timeoutMs, defaults.search.timeoutMs, "web.search.timeoutMs"),
@@ -1125,6 +1135,34 @@ function normalizeWeb(value: unknown): WebConfig {
       userAgent: userAgent.trim(),
     },
   };
+}
+
+/**
+ * Validation for the shared acquisition URL blocklist (issue #620). One
+ * ordinary JavaScript regular-expression source per entry: surrounding
+ * whitespace is trimmed, blank entries are rejected rather than silently
+ * dropped, and every entry must compile as a `RegExp` — an entry the matcher
+ * cannot honor would silently weaken the configured policy, so it rejects
+ * configuration loading instead. Startup recovery (see `recoverConfig`) still
+ * omits an individual invalid entry with a warning under the existing
+ * array-entry convention.
+ */
+function normalizeUrlBlocklist(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("web.urlBlocklist must be an array of regular-expression strings");
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") throw new Error(`web.urlBlocklist[${index}] must be a regular-expression string`);
+    const source = entry.trim();
+    if (source.length === 0) throw new Error(`web.urlBlocklist[${index}] must be a non-empty regular-expression source`);
+    try {
+      new RegExp(source);
+    } catch (error) {
+      throw new Error(
+        `web.urlBlocklist[${index}] is not a valid JavaScript regular expression: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return source;
+  });
 }
 
 /**

@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.ViewConfiguration
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -359,15 +360,18 @@ class TerminalOverlayPlacementComponentTest {
         compose.onNodeWithText("Esc").assertIsDisplayed()
         assertTrue("A floating panel keeps terminal focus", fixture.surface!!.hasFocus())
 
-        // A completed move and a completed resize are both remembered. The width can only
-        // shrink from a natural full-width panel, so the drag narrows and lengthens.
+        // A completed move and a completed resize are both remembered. A floating panel
+        // never shrinks below its own logical footprint, so the frame is first grown and
+        // the measured resize then takes a genuinely non-uniform bite out of that
+        // enlarged frame: narrower and taller at the same time.
         dragBy("Conversation A", dx = -60f, dy = -120f)
+        resizeKeysPanel(dx = 150f, dy = 150f)
         val moved = keysPanelBounds()
         resizeKeysPanel(dx = -120f, dy = 120f)
         val resized = keysPanelBounds()
         compose.runOnIdle {
-            assertEquals("The pop-out, the completed move, and the completed resize are three saves",
-                3, fixture.commits)
+            assertEquals("The pop-out, the completed move, and two completed resizes are four saves",
+                4, fixture.commits)
             assertNotNull(fixture.placement.keysPortrait)
             assertNotNull(fixture.placement.keysPortraitLayout.floatingSize)
         }
@@ -383,7 +387,7 @@ class TerminalOverlayPlacementComponentTest {
         val dockedAgain = awaitInput(fixture)
         val dockedAgainPane = compose.runOnIdle { paneBounds(fixture) }
         compose.runOnIdle {
-            assertEquals("Pop in is a docking save", 4, fixture.commits)
+            assertEquals("Pop in is a docking save", 5, fixture.commits)
             assertEquals(true, fixture.placement.keysPortraitLayout.docked)
             assertNotNull("Pop in must not clear the remembered position", fixture.placement.keysPortrait)
             assertNotNull("Pop in must not clear the remembered size",
@@ -398,7 +402,7 @@ class TerminalOverlayPlacementComponentTest {
         compose.waitForIdle()
         val restored = keysPanelBounds()
         compose.runOnIdle {
-            assertEquals(5, fixture.commits)
+            assertEquals(6, fixture.commits)
             assertEquals("Position and size survive docking", resized.left, restored.left, 2f)
             assertEquals(resized.top, restored.top, 2f)
             assertEquals(resized.width, restored.width, 2f)
@@ -424,7 +428,7 @@ class TerminalOverlayPlacementComponentTest {
         val anchor = compose.runOnIdle { requireNotNull(fixture.surface?.currentInputProof()) }
         val touches = recordSurfaceTouches(fixture)
 
-        resizeKeysPanel(dx = -60f, dy = -80f)
+        resizeKeysPanel(dx = 60f, dy = 80f)
         dragBy("Conversation A", dx = 40f, dy = 40f)
         compose.runOnIdle {
             assertEquals("Floating gestures never ask for a new grid", requests, fixture.viewports.size)
@@ -477,6 +481,310 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
+     * The first pop-out of a panel that has never been placed or resized. It must be a
+     * window the operator can actually pick up: detached from the bottom edge with free
+     * space beside it rather than full-width and bottom-anchored where the docked band was,
+     * and moved by the same header long-press that moves the Back/Switch/Keyboard/Keys
+     * strip. Both the pop-out and the move are real injected touches. Only that panel
+     * moves. Handing the docked reservation back is itself a real reflow with a genuinely
+     * new proof, so the invariance the move must not disturb is measured from the settled
+     * floating state, not from the docked one it already replaced: the pane keeps the area,
+     * grid, measured font, and proof it settled on, the completed drag is the only further
+     * save, and neither gesture invents a size the user never resized.
+     */
+    @Test fun firstPopOutIsDetachedAndMovesByItsOwnHeaderLongPress() {
+        val fixture = Fixture()
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val stablePane = compose.runOnIdle { paneBounds(fixture) }
+        compose.onNodeWithText("Keys").performClick()
+        awaitInput(fixture)
+        val dockedPane = compose.runOnIdle { paneBounds(fixture) }
+        val dockedRequests = compose.runOnIdle { fixture.viewports.size }
+        val dockedProof = compose.runOnIdle { requireNotNull(fixture.surface?.currentInputProof()) }
+        val touches = recordSurfaceTouches(fixture)
+        compose.runOnIdle {
+            assertNull("Nothing has been placed yet", fixture.placement.keysPortrait)
+            assertNull("Nothing has been resized yet", fixture.placement.keysPortraitLayout.floatingSize)
+        }
+
+        // The initial corner pop-out is a real injected touch, not a synthesized click.
+        tapControlByTouch("Pop keys out")
+        compose.runOnIdle {
+            assertEquals("Pop out changes docking only", 1, fixture.commits)
+            assertEquals(false, fixture.placement.keysPortraitLayout.docked)
+            assertNull("A pop-out invents no remembered position", fixture.placement.keysPortrait)
+            assertNull("A pop-out invents no remembered size", fixture.placement.keysPortraitLayout.floatingSize)
+            assertTrue("The initial corner pop-out is a real touch and never reaches the " +
+                "terminal: $touches", touches.isEmpty())
+        }
+        // Popping out hands the docked reservation back to the pane, which is a real resize
+        // with a genuinely new proof. The pop-out is over once the pane is back to the area
+        // it had before Keys ever opened and a newer proof has been committed; that settled
+        // floating state is the baseline the move must not disturb.
+        compose.waitUntil(10_000) {
+            val observed = compose.runOnIdle {
+                paneBounds(fixture) to fixture.surface?.currentInputProof()?.commitSequence
+            }
+            observed.first == stablePane && (observed.second ?: 0L) > dockedProof.commitSequence
+        }
+        val released = awaitInput(fixture)
+        val pane = compose.runOnIdle { paneBounds(fixture) }
+        val requests = compose.runOnIdle { fixture.viewports.size }
+        val grid = compose.runOnIdle { fixture.viewports.last() }
+        val fontPx = compose.runOnIdle { requireNotNull(fixture.surface).textSizePx }
+        val frame = floatingKeysFrameBounds()
+        val density = compose.activity.resources.displayMetrics.density
+        val controlsBefore = boundsOf("Back")
+        val statusBefore = boundsOf("Synthetic status notice")
+        compose.runOnIdle {
+            assertTrue("Popping out releases the docked reservation, and that is a real " +
+                "reflow: $dockedPane vs $pane, $dockedRequests requests vs $requests",
+                dockedPane.bottom < pane.bottom && requests > dockedRequests)
+            assertEquals("A floating panel reserves nothing", stablePane, pane)
+            assertTrue("The released reservation produced a genuinely new proof: " +
+                "${dockedProof.commitSequence} vs ${released.commitSequence}",
+                released.commitSequence > dockedProof.commitSequence)
+        }
+        // Detached rather than bottom-anchored, and genuinely narrower than the pane with
+        // free space on both sides: room to move, not a second full-width band.
+        assertTrue("A never-placed panel must be detached from the bottom edge: $frame vs $pane",
+            pane.bottom - frame.bottom >= 48f * density)
+        assertTrue("A never-placed panel must be narrower than the pane it floats over: " +
+            "$frame vs $pane", frame.width < pane.width() * 0.95f)
+        assertTrue("A never-placed panel must leave free space on both sides: $frame vs $pane",
+            frame.left > pane.left.toFloat() && frame.right < pane.right.toFloat())
+
+        // The existing header long-press is the move handle, driven by a real injected
+        // touch — the same interaction that moves the control strip.
+        dragBy("Conversation A", dx = 0f, dy = -120f)
+        val moved = floatingKeysFrameBounds()
+        compose.runOnIdle {
+            assertTrue("The header long-press must actually move the detached panel: " +
+                "$frame vs $moved", moved.top < frame.top - 20f)
+            assertEquals("Moving Keys must not drag Controls", controlsBefore, boundsOf("Back"))
+            assertEquals("Moving Keys must not drag Status", statusBefore, boundsOf("Synthetic status notice"))
+            assertEquals("A floating move never reflows the pane", pane, paneBounds(fixture))
+            assertEquals("A floating move never asks for a new grid", requests, fixture.viewports.size)
+            assertEquals(grid, fixture.viewports.last())
+            assertEquals("A floating move never changes the measured font", fontPx,
+                requireNotNull(fixture.surface).textSizePx, 0f)
+            assertEquals("A completed move is the only save after the pop-out", 2, fixture.commits)
+            assertNotNull("The move is numeric placement data", fixture.placement.keysPortrait)
+            assertNull("A move never invents a floating size",
+                fixture.placement.keysPortraitLayout.floatingSize)
+            assertEquals(released, fixture.surface?.currentInputProof())
+            assertTrue(fixture.surface!!.verifyReceipt(released))
+            assertTrue("A floating move never reaches the terminal surface: $touches", touches.isEmpty())
+            assertTrue(fixture.keys.isEmpty() && fixture.pastes == 0)
+            assertTrue(fixture.intents.isEmpty())
+        }
+    }
+
+    /**
+     * One logical Keys layout, stretched by independent horizontal and vertical factors.
+     * Every key's rectangle and size, normalized into the panel's own frame, must be
+     * identical before and after a deliberately non-uniform resize: nothing re-wraps into
+     * another row, each key grows by its own axis's factor, and the contents still tile the
+     * frame edge to edge instead of letterboxing inside it. The pane never reflows. Then a
+     * real injected touch on that scaled panel reaches the key it names, exactly once, and
+     * never the terminal underneath.
+     */
+    @Test fun nonUniformResizeScalesOneLogicalLayoutAndScaledTouchesStillLand() {
+        val fixture = Fixture()
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        compose.onNodeWithText("Keys").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithContentDescription("Pop keys out").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithText("More keys").performClick()
+        awaitInput(fixture)
+        val pane = compose.runOnIdle { paneBounds(fixture) }
+        val requests = compose.runOnIdle { fixture.viewports.size }
+        val anchor = compose.runOnIdle { requireNotNull(fixture.surface?.currentInputProof()) }
+        val touches = recordSurfaceTouches(fixture)
+
+        val labels = listOf("Ctrl", "Alt", "Shift", "Paste", "Fewer keys", "Esc", "Tab",
+            "Shift+Tab", "Home", "End", "PgUp", "PgDn", "←", "↑", "↓", "→", "Ins", "Del",
+            "F1", "F6", "F12")
+        // Every key plus both interior corner controls — the docking toggle and the real 48dp
+        // grip container — because they belong to the same scaled layout and must scale with
+        // it exactly as the keys do.
+        val probes = linkedMapOf<String, () -> ComposeRect>()
+        labels.forEach { label -> probes[label] = { controlNode(label).boundsInWindow } }
+        probes["docking control"] = { controlNode("Dock keys").boundsInWindow }
+        probes["resize grip container"] = { gripContainer().boundsInWindow }
+        val beforeFrame = floatingKeysFrameBounds()
+        val before = probes.mapValues { (_, read) -> normalizedRect(read(), beforeFrame) }
+        val beforeAbsolute = probes.mapValues { (_, read) -> read() }
+        val beforeRows = keyRows(labels)
+
+        // A deliberately non-uniform frame: widen it by half the free space and lengthen it
+        // by a fixed amount, so the two axes move by clearly different factors.
+        resizeKeysPanel(
+            dx = ((pane.width() - beforeFrame.width) / 2f).coerceAtMost(200f),
+            dy = ((pane.height() - beforeFrame.height) / 2f).coerceAtMost(300f),
+        )
+
+        val afterFrame = floatingKeysFrameBounds()
+        val widthFactor = afterFrame.width / beforeFrame.width
+        val heightFactor = afterFrame.height / beforeFrame.height
+        assertTrue("The frame must grow on both axes: $beforeFrame vs $afterFrame",
+            widthFactor > 1.02f && heightFactor > 1.02f)
+        assertTrue("The resize must be non-uniform: width x$widthFactor vs height x$heightFactor",
+            kotlin.math.abs(widthFactor - heightFactor) > 0.05f)
+        val after = probes.mapValues { (_, read) -> normalizedRect(read(), afterFrame) }
+        probes.keys.forEach { name ->
+            assertEquals("$name must hold its normalized position and size across a " +
+                "non-uniform resize: ${before.getValue(name)} vs ${after.getValue(name)}",
+                0f, before.getValue(name).maximumDeviation(after.getValue(name)), 0.02f)
+            val absolute = probes.getValue(name).invoke()
+            assertEquals("$name must scale by the frame's own horizontal factor",
+                widthFactor, absolute.width / beforeAbsolute.getValue(name).width, 0.05f)
+            assertEquals("$name must scale by the frame's own vertical factor",
+                heightFactor, absolute.height / beforeAbsolute.getValue(name).height, 0.05f)
+        }
+        assertEquals("A non-uniform resize must not re-wrap a single key into another row",
+            beforeRows, keyRows(labels))
+        // Filled rather than letterboxed: the scrollable viewport spans the grown frame's
+        // whole width, and the viewport plus the grip's own band tile its whole height.
+        val viewport = keysPanelBounds()
+        val grip = gripContainer().boundsInWindow
+        assertEquals("The scaled viewport must span the frame's whole width: $viewport vs $afterFrame",
+            afterFrame.width, viewport.width, 1f)
+        assertEquals("The scaled viewport and grip band must tile the frame's height: " +
+            "$viewport vs $grip vs $afterFrame", afterFrame.height, viewport.height + grip.height, 2f)
+        compose.runOnIdle {
+            assertEquals("Only the pop-out and the completed resize save", 2, fixture.commits)
+            assertEquals("A non-uniform resize never reflows the pane", pane, paneBounds(fixture))
+            assertEquals("A non-uniform resize never asks for a new grid", requests, fixture.viewports.size)
+            assertEquals(anchor, fixture.surface?.currentInputProof())
+        }
+
+        // A real injected touch on the scaled panel must land on the key it names, at its
+        // scaled position, and must not leak through to the terminal.
+        compose.onNodeWithText("PgDn").performScrollTo().assertIsDisplayed()
+        tapByTouch("PgDn")
+        compose.runOnIdle {
+            assertEquals(listOf(TerminalControlKey.PAGE_DOWN), fixture.keys.map { it.key })
+            assertEquals("A scaled Keys touch never reaches the terminal surface", 0, fixture.inputs)
+            assertEquals("A scaled Keys tap grants no new proof", anchor,
+                requireNotNull(fixture.surface).currentInputProof())
+            assertTrue("No touch landed on the terminal: $touches", touches.isEmpty())
+        }
+    }
+
+    /**
+     * A scaled panel's own detectors report pointer deltas in the layout's logical units, so
+     * both gestures have to be converted back through the same factors. Measured on a panel
+     * held at a clearly non-unit scale — the scale is read off how much a key button grew,
+     * never assumed — a physical header drag moves the panel by the pointer's own travel and
+     * a physical grip drag changes the frame by the pointer's own travel, in each axis,
+     * rather than by a magnified or shrunken transformation of it. The vertical axis is the
+     * magnification-sensitive one on a phone-width panel: a floating frame cannot grow much
+     * wider than the pane, so its factor there stays close to one.
+     */
+    @Test fun moveAndResizeGesturesTrackThePointerUnderNonUnitScale() {
+        val fixture = Fixture()
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        compose.onNodeWithText("Keys").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithContentDescription("Pop keys out").performClick()
+        awaitInput(fixture)
+        val pane = compose.runOnIdle { paneBounds(fixture) }
+        val unscaled = floatingKeysFrameBounds()
+        val unscaledKey = controlNode("Esc").boundsInWindow
+
+        // Grow the frame by half the free space on each axis, so both factors are clearly
+        // above one on any phone while the grip stays inside the window.
+        resizeKeysPanel(
+            dx = ((pane.width() - unscaled.width) / 2f).coerceAtMost(200f),
+            dy = ((pane.height() - unscaled.height) / 2f).coerceAtMost(420f),
+        )
+        val scaled = floatingKeysFrameBounds()
+        val scaledKey = controlNode("Esc").boundsInWindow
+        val scaleX = scaledKey.width / unscaledKey.width
+        val scaleY = scaledKey.height / unscaledKey.height
+        assertTrue("The panel must be held at a non-unit scale: x$scaleX, y$scaleY",
+            scaleY > 1.2f && scaleX >= 1f)
+        // Every injected move now carries its share of the requested travel, so the only
+        // travel a panel cannot apply is what its own detector consumes before it arms.
+        // That is accounted for, not widened: the header's long-press move never applies
+        // the whole steps before its accumulated physical distance passes the platform
+        // slop, and the grip's detector consumes exactly one slop of the path in the
+        // layout's own logical units. Both start from the genuine ViewConfiguration value
+        // Compose reads and from scale factors measured off this panel, and the residual
+        // left is only the permille round trip a completed gesture is committed through.
+        val slopPx = touchSlopPx()
+        val roundingPx = commitRoundingPx()
+        val moveSteps = 8
+        // Half the free space was just taken by the grow, so a third of it keeps every
+        // gesture clear of the clamp to the visible extent. Each travel is floored to whole
+        // steps so every injected move is an exact pixel delta: the overlay applies each
+        // event's delta rounded to a pixel, and whole steps keep that application from
+        // accumulating rounding of its own.
+        val moveX = kotlin.math.floor(((pane.width() - scaled.width) / 3f).coerceAtMost(60f) / moveSteps) * moveSteps
+        val moveY = kotlin.math.floor(((pane.height() - scaled.height) / 3f).coerceAtMost(220f) / moveSteps) * moveSteps
+        val headerLoss = headerArmingLossPx(Offset(moveX, moveY), moveSteps, slopPx)
+
+        val beforeMove = floatingKeysFrameBounds()
+        dragBy("Conversation A", dx = moveX, dy = moveY, steps = moveSteps)
+        val afterMove = floatingKeysFrameBounds()
+        assertTrue("A header drag must move a scaled panel by its own vertical travel less " +
+            "what its detector consumes before arming ($beforeMove vs $afterMove, travel " +
+            "$moveY, arming loss ${headerLoss.y}, slop $slopPx)",
+            kotlin.math.abs((afterMove.top - beforeMove.top) - (moveY - headerLoss.y)) <= roundingPx)
+        assertTrue("A header drag must move a scaled panel by its own horizontal travel less " +
+            "what its detector consumes before arming ($beforeMove vs $afterMove, travel " +
+            "$moveX, arming loss ${headerLoss.x}, slop $slopPx)",
+            kotlin.math.abs((afterMove.left - beforeMove.left) - (moveX - headerLoss.x)) <= roundingPx)
+        assertEquals("A move must not resize the scaled frame", scaled.width, afterMove.width, 2f)
+        assertEquals("A move must not resize the scaled frame", scaled.height, afterMove.height, 2f)
+        compose.runOnIdle {
+            assertEquals("The pop-out, the grow, and the completed move are three saves",
+                3, fixture.commits)
+            assertNotNull(fixture.placement.keysPortrait)
+        }
+
+        // The grip sits inside the same scaled layout, so its deltas arrive scaled too:
+        // shrinking the grown frame must still track the pointer, axis by axis. The slop
+        // that detector arms on is measured in the layout's units, so the scale that turns
+        // it into physical travel is read off the panel again here — the factors in force
+        // when the gesture arms — rather than reused from the grow above.
+        val shrinkX = ((scaled.width - unscaled.width) / 2f).coerceAtMost(120f)
+        val shrinkY = ((scaled.height - unscaled.height) / 2f).coerceAtMost(240f)
+        val keyBeforeShrink = controlNode("Esc").boundsInWindow
+        val shrinkScaleX = keyBeforeShrink.width / unscaledKey.width
+        val shrinkScaleY = keyBeforeShrink.height / unscaledKey.height
+        val shrinkTravel = Offset(-shrinkX, -shrinkY)
+        val gripLoss = gripArmingLossPx(shrinkTravel, shrinkScaleX, shrinkScaleY, slopPx)
+        val beforeResize = floatingKeysFrameBounds()
+        resizeKeysPanel(dx = -shrinkX, dy = -shrinkY, steps = 12)
+        val afterResize = floatingKeysFrameBounds()
+        assertTrue("The resize must actually shrink the grown frame: $beforeResize vs $afterResize",
+            afterResize.height < beforeResize.height - 20f)
+        assertTrue("A grip drag must change the frame by its own vertical travel less the " +
+            "logical slop its detector consumes ($beforeResize vs $afterResize, travel " +
+            "$shrinkY, arming loss ${-gripLoss.y} at scale x$shrinkScaleX/y$shrinkScaleY, " +
+            "slop $slopPx)",
+            kotlin.math.abs((afterResize.height - beforeResize.height) -
+                (shrinkTravel.y - gripLoss.y)) <= roundingPx)
+        assertTrue("A grip drag must change the frame by its own horizontal travel less the " +
+            "logical slop its detector consumes ($beforeResize vs $afterResize, travel " +
+            "$shrinkX, arming loss ${-gripLoss.x} at scale x$shrinkScaleX/y$shrinkScaleY, " +
+            "slop $slopPx)",
+            kotlin.math.abs((afterResize.width - beforeResize.width) -
+                (shrinkTravel.x - gripLoss.x)) <= roundingPx)
+        compose.runOnIdle {
+            assertEquals("The completed resize is the only new save", 4, fixture.commits)
+            assertNotNull(fixture.placement.keysPortraitLayout.floatingSize)
+            assertTrue(fixture.keys.isEmpty() && fixture.pastes == 0)
+        }
+    }
+
+    /**
      * A corner-grip drag delivered as twenty real motion events. The panel must follow the
      * pointer's total movement: an implementation that applied each per-event delta to the
      * size the gesture started from would move it by roughly one step instead, and the
@@ -491,22 +799,49 @@ class TerminalOverlayPlacementComponentTest {
         compose.onNodeWithContentDescription("Pop keys out").performClick()
         awaitInput(fixture)
         val pane = compose.runOnIdle { paneBounds(fixture) }
-        val before = keysPanelBounds()
+        // A floating panel stops shrinking at its own logical footprint, which is the frame
+        // a never-resized panel shows, so the frame is grown first and the measured drag
+        // then takes a proportional bite out of that growth: only there does the travel have
+        // a shrink to apply rather than a clamp.
+        val footprint = floatingKeysFrameBounds()
+        val footprintKey = controlNode("Esc").boundsInWindow
+        resizeKeysPanel(dx = 200f, dy = 260f)
+        val before = floatingKeysFrameBounds()
+        val beforeKey = controlNode("Esc").boundsInWindow
+        val shrinkX = ((before.width - footprint.width) * 0.6f).coerceAtMost(150f)
+        val shrinkY = ((before.height - footprint.height) * 0.6f).coerceAtMost(200f)
 
-        resizeKeysPanel(dx = -150f, dy = -200f, steps = 20)
+        // The slop the 20-event detector consumes before it arms is measured in the grown
+        // panel's own logical units, so its physical cost is taken from the scale factors
+        // read off this panel rather than assumed. What is left after that accounting is
+        // only the permille round trip the finished size is committed through.
+        val slopPx = touchSlopPx()
+        val roundingPx = commitRoundingPx()
+        val travel = Offset(-shrinkX, -shrinkY)
+        val loss = gripArmingLossPx(
+            travel,
+            beforeKey.width / footprintKey.width,
+            beforeKey.height / footprintKey.height,
+            slopPx,
+        )
 
-        val after = keysPanelBounds()
-        // The slop the drag detector consumes before it arms, plus pixel rounding, is the
-        // only difference allowed between the pointer's travel and the panel's growth.
-        val tolerance = 8f * compose.activity.resources.displayMetrics.density + 2f
+        resizeKeysPanel(dx = -shrinkX, dy = -shrinkY, steps = 20)
+
+        val after = floatingKeysFrameBounds()
+        assertTrue("The measured drag must actually shrink the grown frame: $before vs $after",
+            after.width < before.width - 20f && after.height < before.height - 20f)
         val widthDelta = before.width - after.width
         val heightDelta = before.height - after.height
-        assertTrue("A 20-event resize must apply its whole horizontal travel ($before vs $after)",
-            kotlin.math.abs(widthDelta - 150f) <= tolerance)
-        assertTrue("A 20-event resize must apply its whole vertical travel ($before vs $after)",
-            kotlin.math.abs(heightDelta - 200f) <= tolerance)
+        assertTrue("A 20-event resize must apply its horizontal travel less the slop its " +
+            "detector consumes ($before vs $after, travel $shrinkX, arming loss ${-loss.x}, " +
+            "slop $slopPx)",
+            kotlin.math.abs(widthDelta - (shrinkX + loss.x)) <= roundingPx)
+        assertTrue("A 20-event resize must apply its vertical travel less the slop its " +
+            "detector consumes ($before vs $after, travel $shrinkY, arming loss ${-loss.y}, " +
+            "slop $slopPx)",
+            kotlin.math.abs(heightDelta - (shrinkY + loss.y)) <= roundingPx)
         compose.runOnIdle {
-            assertEquals("Only the completed drag saves", 2, fixture.commits)
+            assertEquals("The grow and the completed drag are two saves", 3, fixture.commits)
             assertNotNull(fixture.placement.keysPortraitLayout.floatingSize)
             assertEquals("A floating resize never reflows the pane", pane, paneBounds(fixture))
         }
@@ -514,12 +849,15 @@ class TerminalOverlayPlacementComponentTest {
 
     /**
      * A deliberately short host is how this suite produces a reduced visible extent without
-     * pretending to a real platform IME. A floating Keys panel that was never resized must
-     * be capped to that extent instead of measuring its natural height past it, so its
-     * lower keys and its grip stay inside the area the layout actually leaves. The cap is
-     * display-only: the remembered floating size stays absent and nothing is saved.
+     * pretending to a real platform IME. A floating Keys panel that was never resized lays
+     * its one logical layout out at the extent the pane actually leaves, so it never
+     * measures past that extent and its contents still fill the frame it was given: the
+     * scrollable viewport and the grip's own reserved band tile the frame from edge to edge
+     * instead of leaving a blank strip, and what does not fit stays scroll-reachable inside
+     * it. Adapting to the reduced extent is display-only: the remembered floating size
+     * stays absent and nothing is saved.
      */
-    @Test fun naturalFloatingKeysAreCappedToTheVisibleExtentAndNeverSaveAnAdaptedSize() {
+    @Test fun neverResizedFloatingKeysFillTheVisibleExtentAndNeverSaveAnAdaptedSize() {
         val fixture = Fixture()
         compose.setContent { Box(Modifier.fillMaxWidth().height(200.dp)) { fixture.Content() } }
         awaitInput(fixture)
@@ -531,42 +869,43 @@ class TerminalOverlayPlacementComponentTest {
         awaitInput(fixture)
         val visible = compose.runOnIdle { paneBounds(fixture) }
 
-        val panel = keysPanelBounds()
-        val grip = compose.onNodeWithContentDescription("Resize keys panel")
-            .assertIsDisplayed().fetchSemanticsNode().boundsInWindow
-        // The cap has to bind for anything below to be evidence. A panel that was never
-        // resized is only capped when its own content is taller than the extent it was
-        // capped to, and that is measured here rather than assumed: a panel whose content
-        // fits the extent it was given cannot move that content, so a scroll that leaves
-        // the header where it was means the cap never bound and every assertion below
-        // would pass without the layout having done any work.
-        assertTrue("A natural panel's viewport must not measure past the visible extent: $panel vs $visible",
-            panel.height <= visible.height() + 1f && panel.bottom <= visible.bottom + 1f)
-        // The grip sits at the panel's own bottom edge, so it is the honest measure of how
-        // far the panel actually reaches: nothing of it may sit behind the occlusion.
-        assertTrue("A natural panel's bottom must stay inside the visible extent: $grip vs $visible",
-            grip.bottom <= visible.bottom + 1f && grip.right <= visible.right + 1f)
+        val frame = floatingKeysFrameBounds()
+        val viewport = keysPanelBounds()
+        val grip = gripContainer().boundsInWindow
+        // The reduced extent has to bind for anything below to be evidence, and it is
+        // measured rather than assumed: a panel fitted to a 200dp host cannot be taller
+        // than it, and the scroll below proves content really sits past that viewport.
+        assertTrue("A never-resized panel must not measure past the visible extent: $frame vs $visible",
+            frame.height <= visible.height() + 1f && frame.bottom <= visible.bottom + 1f)
+        assertTrue("A never-resized panel stays inside the visible width: $frame vs $visible",
+            frame.right <= visible.right + 1f && frame.left >= visible.left - 1f)
+        // Filled, not letterboxed: the scrollable viewport and the grip's own band tile the
+        // frame's whole height, and the grip sits on the frame's own bottom edge.
+        assertEquals("The viewport and the grip band must tile the frame's height: " +
+            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+        assertEquals("The grip sits on the frame's bottom edge: $grip vs $frame",
+            frame.bottom, grip.bottom, 1f)
+        assertEquals("The frame and its viewport share one leading edge: $frame vs $viewport",
+            frame.left, viewport.left, 1f)
+        // The content is taller than the extent it was fitted to, so its own scroll is what
+        // keeps the rest reachable inside that frame — measured, not assumed.
         val headerBeforeCapScroll = boundsOf("Conversation A")
         keysPanelScrollNode().performTouchInput { swipeUp() }
         compose.waitForIdle()
         val headerAfterCapScroll = boundsOf("Conversation A")
-        assertTrue("The natural panel's content must overflow the capped extent, so scrolling " +
-            "it moves: $headerBeforeCapScroll vs $headerAfterCapScroll",
+        assertTrue("A panel taller than the extent it was fitted to must scroll inside it: " +
+            "$headerBeforeCapScroll vs $headerAfterCapScroll",
             headerAfterCapScroll.bottom < headerBeforeCapScroll.bottom)
-        // A binding cap lands the panel on the constraint instead of merely short of it.
-        assertEquals("A binding cap lands the panel on the visible extent, not merely under it: " +
-            "$grip vs $visible", visible.bottom.toFloat(), grip.bottom, 1f)
-        // Capped is not truncated: what the cap hides stays scroll-reachable inside the
-        // constrained area with a complete target, rather than sitting behind it.
+        // Fitted is not truncated: what the extent hides stays scroll-reachable inside it
+        // with a complete target, rather than sitting behind it.
         compose.onNodeWithText("→").performScrollTo().assertIsDisplayed()
         assertTouchTarget("→")
-        // Its lowest action stays reachable inside the capped area rather than behind it.
         compose.onNodeWithText("Paste").performScrollTo().assertIsDisplayed()
         assertTouchTarget("Paste")
         compose.runOnIdle {
             assertTrue("Docking reserved, and popping out returned it: $fullPane vs $dockedPane vs $visible",
                 dockedPane.bottom < fullPane.bottom && visible == fullPane)
-            assertNull("A display-only cap never writes a floating size",
+            assertNull("Fitting the visible extent never writes a floating size",
                 fixture.placement.keysPortraitLayout.floatingSize)
             assertEquals("Only the deliberate pop-out saves; adapting to the reduced extent saves nothing",
                 1, fixture.commits)
@@ -574,11 +913,18 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
-     * The floating panel reserves the resize grip's own 48dp below its scrollable viewport,
-     * so even a narrow panel scrolled to its very last row keeps every key's complete 48dp
-     * target clear of the grip, and a real injected tap still reaches that key.
+     * The resize grip belongs to the floating panel's one scaled layout, so it keeps its
+     * corner and its reserved band at any frame size: on a grown, scaled panel the grip
+     * still sits below the scrollable viewport, covers no key, and every key and interior
+     * control keeps a complete 48dp physical target — measured on the scaled panel, not
+     * asserted from a constant. A real injected tap still reaches its key and never the
+     * terminal underneath. A grown frame on a full host never has to scroll, so the other
+     * half of "at any scroll position" — that a panel taller than the extent it was fitted
+     * to genuinely has to scroll, and keeps the same clearance once it does — is witnessed
+     * on a measured short host in
+     * [shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader].
      */
-    @Test fun floatingGripReservesItsOwnBandSoEveryKeyKeepsAClear48dpTarget() {
+    @Test fun floatingGripKeepsItsCornerAndEveryKeyTargetStaysClearOfIt() {
         val fixture = Fixture()
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
@@ -588,35 +934,31 @@ class TerminalOverlayPlacementComponentTest {
         awaitInput(fixture)
         compose.onNodeWithText("More keys").performClick()
         awaitInput(fixture)
-        // Shrink the floating panel until its viewport has to scroll to show the last row.
-        resizeKeysPanel(dx = -220f, dy = -260f)
+        // A grown frame is the honest case: grip and keys scale together, so what follows
+        // is measured on a scaled panel rather than only on a scale-1 one.
+        resizeKeysPanel(dx = 150f, dy = 150f)
 
+        val frame = floatingKeysFrameBounds()
         val viewport = keysPanelBounds()
-        val grip = compose.onNodeWithContentDescription("Resize keys panel")
-            .assertIsDisplayed().fetchSemanticsNode().boundsInWindow
+        val grip = gripContainer().boundsInWindow
         assertTrue("The grip occupies its own band below the scrollable viewport: $grip vs $viewport",
             grip.top >= viewport.bottom - 1f)
-
-        // The resize must have made scrolling necessary, or the clear-target claim below
-        // would be about a panel that never had to scroll. The last row genuinely starts
-        // outside the shrunk viewport, and the scroll is what brings it in.
-        compose.onNodeWithText("F12").assertExists().assertIsNotDisplayed()
-        val headerBeforeScroll = boundsOf("Conversation A")
-        compose.onNodeWithText("F12").performScrollTo().assertIsDisplayed()
-        val headerAfterScroll = boundsOf("Conversation A")
-        assertTrue("Scrolling to the last row must actually move the panel's content: " +
-            "$headerBeforeScroll vs $headerAfterScroll", headerAfterScroll.bottom < headerBeforeScroll.bottom)
-        val last = compose.onNodeWithText("F12").fetchSemanticsNode()
-        val density = compose.activity.resources.displayMetrics.density
-        val keyTouch = last.touchBoundsInRoot.translate(
-            last.boundsInWindow.topLeft - last.boundsInRoot.topLeft,
-        )
-        assertTrue("The last key keeps a complete 48dp target: $keyTouch",
-            keyTouch.width >= 48f * density && keyTouch.height >= 48f * density)
-        val keyBounds = last.boundsInWindow
-        assertFalse("The grip must never cover a key: $keyBounds vs $grip",
-            keyBounds.left < grip.right && keyBounds.right > grip.left &&
-                keyBounds.top < grip.bottom && keyBounds.bottom > grip.top)
+        assertEquals("A scaled panel's viewport and grip band still tile its frame: " +
+            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+        listOf("Esc", "→", "F12").forEach { label ->
+            val key = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed()
+                .fetchSemanticsNode()
+            val keyBounds = key.boundsInWindow
+            val keyTouch = key.touchBoundsInRoot.translate(
+                keyBounds.topLeft - key.boundsInRoot.topLeft,
+            )
+            val minimum = 48f * compose.activity.resources.displayMetrics.density
+            assertTrue("$label keeps a complete 48dp target on the scaled panel: $keyTouch",
+                keyTouch.width >= minimum && keyTouch.height >= minimum)
+            assertFalse("The grip must never cover a key: $keyBounds vs $grip",
+                keyBounds.left < grip.right && keyBounds.right > grip.left &&
+                    keyBounds.top < grip.bottom && keyBounds.bottom > grip.top)
+        }
 
         tapByTouch("F12")
         compose.runOnIdle {
@@ -626,15 +968,146 @@ class TerminalOverlayPlacementComponentTest {
     }
 
     /**
-     * A floating panel dragged past its resize clamp — the tightest case for the docking
-     * toggle. The clamp is demonstrated by measurement, not by a policy number: the panel
-     * really shrinks, a second overshoot cannot shrink it further, and the scrollable
-     * viewport that is left still holds one complete 48dp target. The toggle belongs to
-     * the panel header, so it scrolls and clips with that header instead of standing
-     * still: after the header is scrolled away it moves with it, and a trailing key keeps
-     * its whole 48dp target and still takes a real injected tap.
+     * Two witnesses a scaled panel must not lose: that scrolling was genuinely required,
+     * and that the corner docking toggle belongs to the panel header.
+     *
+     * A measured short host is how this suite forces that condition. A floating panel
+     * stops shrinking at the measured footprint of its one logical layout, so shrinking
+     * the frame can no longer push content out of view — only an extent shorter than that
+     * footprint can, and it does so without pretending to a real platform IME. The last
+     * function key therefore starts outside the viewport the panel was fitted to, the
+     * header really moves when the panel is scrolled to it, and the complete 48dp target
+     * and the grip-band clearance below are measured on a panel that first had to scroll
+     * before that row appeared on screen at all.
+     *
+     * The toggle is then measured against its own header across one real swipe. Its travel
+     * is read from unclipped origins, because `SemanticsNode.boundsInWindow` is clipped to
+     * the bounds of every ancestor: once the toggle rides its header out of the clip box
+     * it lives in, its rectangle no longer reports where it went. The clipped rectangle is
+     * used for what only it can show — that the visible portion is being cut away — while
+     * the origins show that the toggle travels with its header and leaves the panel's own
+     * top edge with it, so it can never stay pinned where key rows scroll up underneath
+     * it. No frame size, header height, or slop allowance is assumed anywhere here.
      */
-    @Test fun minimumFloatingViewportScrollsItsDockingControlWithTheHeader() {
+    @Test fun shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader() {
+        val fixture = Fixture()
+        // The same measured short host this suite already uses for a reduced visible
+        // extent: the panel is fitted to what the pane leaves, never to a rule.
+        compose.setContent { Box(Modifier.fillMaxWidth().height(200.dp)) { fixture.Content() } }
+        awaitInput(fixture)
+        val visible = compose.runOnIdle { paneBounds(fixture) }
+        compose.onNodeWithText("Keys").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithContentDescription("Pop keys out").performClick()
+        awaitInput(fixture)
+        compose.onNodeWithText("More keys").performScrollTo().performClick()
+        awaitInput(fixture)
+
+        val frame = floatingKeysFrameBounds()
+        val viewport = keysPanelBounds()
+        val grip = gripContainer().boundsInWindow
+        // The short host has to bind, or nothing below is evidence about scrolling.
+        assertTrue("A never-resized panel must not measure past the visible extent: $frame vs $visible",
+            frame.height <= visible.height() + 1f && frame.bottom <= visible.bottom + 1f)
+        assertEquals("The viewport and the grip band must tile the frame's height: " +
+            "$viewport vs $grip vs $frame", frame.height, viewport.height + grip.height, 2f)
+
+        // Scrolling is genuinely required, and measured that way: the last function key is
+        // in the layout and starts outside the viewport the panel was fitted to. The header
+        // is tracked by its unclipped origin, which keeps reporting the content's travel
+        // even where a clipped rectangle would only report what is left on screen.
+        compose.onNodeWithText("F12").assertExists().assertIsNotDisplayed()
+        val headerTopBeforeScroll = compose.onAllNodesWithText("Conversation A").onFirst()
+            .fetchSemanticsNode().positionInWindow.y
+        compose.onNodeWithText("F12").performScrollTo().assertIsDisplayed()
+        val headerTopAfterScroll = compose.onAllNodesWithText("Conversation A").onFirst()
+            .fetchSemanticsNode().positionInWindow.y
+        assertTrue("Scrolling to the last row must actually move the panel's content: header " +
+            "top $headerTopBeforeScroll -> $headerTopAfterScroll",
+            headerTopAfterScroll < headerTopBeforeScroll)
+
+        // So every clear-target claim above is about a panel that really had to scroll.
+        val last = compose.onNodeWithText("F12").fetchSemanticsNode()
+        val lastBounds = last.boundsInWindow
+        val lastTouch = last.touchBoundsInRoot.translate(lastBounds.topLeft - last.boundsInRoot.topLeft)
+        val minimum = 48f * compose.activity.resources.displayMetrics.density
+        assertTrue("The last key keeps a complete 48dp target after a real scroll: $lastTouch",
+            lastTouch.width >= minimum && lastTouch.height >= minimum)
+        assertFalse("The grip must never cover a key, at any scroll position: $lastBounds vs $grip",
+            lastBounds.left < grip.right && lastBounds.right > grip.left &&
+                lastBounds.top < grip.bottom && lastBounds.bottom > grip.top)
+
+        tapByTouch("F12")
+        compose.runOnIdle {
+            assertEquals(TerminalControlKey.F12, fixture.keys.last().key)
+            assertEquals("A floating panel's tap never reaches the terminal surface", 0, fixture.inputs)
+            assertNull("Fitting and scrolling a panel never write a floating size",
+                fixture.placement.keysPortraitLayout.floatingSize)
+            assertEquals("Only the deliberate pop-out saves", 1, fixture.commits)
+        }
+
+        // Back to the header's own end of the content, so the swipe below has real
+        // distance to travel and its effect is measured rather than inferred.
+        compose.onNodeWithText("Conversation A").performScrollTo()
+        compose.waitForIdle()
+        val frameBeforeToggleScroll = floatingKeysFrameBounds()
+        val headerBeforeToggle = compose.onAllNodesWithText("Conversation A").onFirst()
+            .fetchSemanticsNode().positionInWindow.y
+        val controlBeforeToggle = controlNode("Dock keys")
+        val controlBeforeTop = controlBeforeToggle.positionInWindow.y
+        val controlBeforeVisible = controlBeforeToggle.boundsInWindow.height
+        keysPanelScrollNode().performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        val frameAfterToggleScroll = floatingKeysFrameBounds()
+        val panelTop = keysPanelScrollNode().fetchSemanticsNode().positionInWindow.y
+        val headerAfterToggle = compose.onAllNodesWithText("Conversation A").onFirst()
+            .fetchSemanticsNode().positionInWindow.y
+        val controlAfterToggle = controlNode("Dock keys")
+        val controlAfterTop = controlAfterToggle.positionInWindow.y
+        val controlAfterVisible = controlAfterToggle.boundsInWindow.height
+
+        assertEquals("Scrolling the panel must not move its frame: $frameBeforeToggleScroll " +
+            "vs $frameAfterToggleScroll", frameBeforeToggleScroll.top, frameAfterToggleScroll.top, 1f)
+        assertEquals("Scrolling the panel must not move its frame: $frameBeforeToggleScroll " +
+            "vs $frameAfterToggleScroll", frameBeforeToggleScroll.left, frameAfterToggleScroll.left, 1f)
+        assertTrue("The swipe must actually scroll the panel's content: header top " +
+            "$headerBeforeToggle -> $headerAfterToggle", headerAfterToggle < headerBeforeToggle)
+        assertTrue("The docking control must scroll with the header it belongs to: top " +
+            "$controlBeforeTop -> $controlAfterTop", controlAfterTop < controlBeforeTop)
+        assertTrue("The docking control must travel with its header rather than stand still " +
+            "while key rows scroll up underneath it: header moved " +
+            "${headerAfterToggle - headerBeforeToggle}, control moved " +
+            "${controlAfterTop - controlBeforeTop}",
+            kotlin.math.abs((controlAfterTop - controlBeforeTop) -
+                (headerAfterToggle - headerBeforeToggle)) <= 1f)
+        assertTrue("A scrolled docking control must leave the panel's own top edge with its " +
+            "header — the edge its clip box cuts it at — rather than stay pinned inside the " +
+            "frame over the content that scrolled past it: control top $controlAfterTop, " +
+            "panel top $panelTop", controlAfterTop < panelTop)
+        // What only the clipped rectangle can show: the visible portion of the toggle is
+        // cut away as its header scrolls up, while the frame it belongs to does not move.
+        assertTrue("The panel's own scroll must clip the docking control away: visible " +
+            "height $controlBeforeVisible -> $controlAfterVisible",
+            controlAfterVisible < controlBeforeVisible)
+        compose.runOnIdle {
+            assertEquals("Scrolling and presenting the toggle saves nothing", 1, fixture.commits)
+            assertEquals("Scrolling a floating panel never reflows the pane", visible, paneBounds(fixture))
+            assertEquals("The swipe reaches no key: only the deliberate tap above pressed one",
+                1, fixture.keys.size)
+            assertTrue(fixture.pastes == 0)
+        }
+    }
+
+    /**
+     * The floating panel's resize floor is the measured footprint of its one logical
+     * layout, not a named constant. Starting from a deliberately enlarged frame — a shrink
+     * from the never-resized footprint would be clamped away and prove nothing — the panel
+     * really shrinks, a second overshoot cannot shrink it further, and at that floor every
+     * measured interactive target (key buttons, the corner docking toggle, and the resize
+     * grip itself) still holds a complete 48dp physical target. A real injected tap still
+     * reaches a key and never the terminal.
+     */
+    @Test fun floatingResizeFloorStopsShrinkingAndKeepsEveryTargetAtLeast48dp() {
         val fixture = Fixture()
         compose.setContent { fixture.Content() }
         awaitInput(fixture)
@@ -644,45 +1117,46 @@ class TerminalOverlayPlacementComponentTest {
         awaitInput(fixture)
         compose.onNodeWithText("More keys").performClick()
         awaitInput(fixture)
-        val density = compose.activity.resources.displayMetrics.density
-        val natural = keysPanelBounds()
-        // Overshoot the drag so the size clamp lands the panel on its floor, while the
+        // Enlarge first, so the shrink below is real rather than a clamp doing nothing.
+        resizeKeysPanel(dx = 250f, dy = 250f)
+        val enlarged = floatingKeysFrameBounds()
+
+        // Overshoot the drag so the floor lands the panel on its own footprint while the
         // injected pointer stays inside the window.
-        resizeKeysPanel(dx = -800f, dy = -600f)
+        resizeKeysPanel(dx = -900f, dy = -700f)
+        val floored = floatingKeysFrameBounds()
+        assertTrue("The resize must actually shrink the enlarged panel: $enlarged vs $floored",
+            floored.height < enlarged.height - 1f && floored.width < enlarged.width - 1f)
+        resizeKeysPanel(dx = -900f, dy = -700f)
+        val again = floatingKeysFrameBounds()
+        assertEquals("A second overshoot drag cannot go below the floor: $floored vs $again",
+            floored.height, again.height, 2f)
+        assertEquals("A second overshoot drag cannot go below the floor: $floored vs $again",
+            floored.width, again.width, 2f)
 
+        // What that floor guarantees is real physical size, read off the panel itself.
+        listOf("Ctrl", "Esc", "F12").forEach { label ->
+            compose.onNodeWithText(label).performScrollTo()
+            assertTouchTarget(label)
+        }
+        // The interior corner controls scale with the layout too, so the floor is what
+        // keeps them whole. Neither sits inside the panel's scroll container: the grip is
+        // its own band below the viewport, and the docking toggle rides that container's
+        // scroll offset so it travels and clips with the header instead of standing still —
+        // the witness for that behavior is
+        // [shortHostFloatingKeysScrollsForRealAndItsDockingControlGoesWithTheHeader]. What
+        // this floor guarantees here is complete physical size: the toggle measured as its
+        // own target, the grip as its real 48dp container rather than the 24dp glyph
+        // inside it.
+        assertTouchTarget("Dock keys")
+        val gripBounds = gripContainer().boundsInWindow
+        val minimumTarget = 48f * compose.activity.resources.displayMetrics.density
+        assertTrue("The resize grip keeps a complete 48dp target at the floor: $gripBounds",
+            gripBounds.width >= minimumTarget && gripBounds.height >= minimumTarget)
+        // The layout is still the one logical layout tiled by its viewport and grip band.
         val viewport = keysPanelBounds()
-        assertTrue("The resize must actually shrink the panel: $natural vs $viewport",
-            viewport.height < natural.height - 1f)
-        // The floor is measured, not assumed: a second overshoot cannot go below it, so
-        // the extent asserted below really is the smallest this panel can be.
-        resizeKeysPanel(dx = -800f, dy = -600f)
-        val floored = keysPanelBounds()
-        assertEquals("A second overshoot drag cannot go below the clamp: $viewport vs $floored",
-            viewport.height, floored.height, 2f)
-        // What that floor guarantees is usable extent: the scrollable viewport left under
-        // the panel's own reserved grip band still holds one complete 48dp target. The
-        // grip band belongs to the panel, not to a pane rule.
-        assertTrue("The clamped viewport must still hold one complete 48dp target: $floored",
-            floored.height >= 48f * density)
-
-        val controlBefore = compose.onNodeWithContentDescription("Dock keys")
-            .fetchSemanticsNode().boundsInWindow
-        keysPanelScrollNode().performTouchInput { swipeUp() }
-        val controlAfter = compose.onNodeWithContentDescription("Dock keys")
-            .fetchSemanticsNode().boundsInWindow
-        assertTrue("The docking control must scroll with the header it belongs to: " +
-            "$controlBefore vs $controlAfter", controlAfter.bottom < controlBefore.bottom)
-
-        compose.onNodeWithText("F12").performScrollTo().assertIsDisplayed()
-        val key = compose.onNodeWithText("F12").fetchSemanticsNode()
-        val keyBounds = key.boundsInWindow
-        val keyTouch = key.touchBoundsInRoot.translate(keyBounds.topLeft - key.boundsInRoot.topLeft)
-        assertTrue("A trailing key keeps a complete 48dp target in the minimum viewport: $keyTouch",
-            keyTouch.width >= 48f * density && keyTouch.height >= 48f * density)
-        assertFalse("The docking control must never stand over a key row its header scrolled " +
-            "past: $keyBounds vs $controlAfter",
-            keyBounds.left < controlAfter.right && keyBounds.right > controlAfter.left &&
-                keyBounds.top < controlAfter.bottom && keyBounds.bottom > controlAfter.top)
+        assertEquals("The floored frame is still tiled by its viewport and grip band: " +
+            "$viewport vs $gripBounds vs $floored", floored.height, viewport.height + gripBounds.height, 2f)
 
         tapByTouch("F12")
         compose.runOnIdle {
@@ -1062,7 +1536,7 @@ class TerminalOverlayPlacementComponentTest {
             // carry across the recreations below.
             placementPhase("portrait-shape") {
                 dragBy("Conversation A", dx = -60f, dy = -90f)
-                resizeKeysPanel(dx = -120f, dy = 120f)
+                resizeKeysPanel(dx = 120f, dy = 140f)
                 awaitInput(fixture)
             }
             portraitPosition = compose.runOnIdle { fixture.placement.keysPortrait }
@@ -1121,7 +1595,7 @@ class TerminalOverlayPlacementComponentTest {
                 // A completed move and a completed resize give landscape its own numbers:
                 // a position and a size, each independent of what portrait saved.
                 dragBy("Conversation A", dx = -50f, dy = -60f)
-                resizeKeysPanel(dx = -140f, dy = 140f)
+                resizeKeysPanel(dx = 140f, dy = 120f)
                 awaitInput(fixture)
             }
             landscapePosition = compose.runOnIdle { fixture.placement.keysLandscape }
@@ -1595,6 +2069,70 @@ class TerminalOverlayPlacementComponentTest {
     private fun keysPanelBounds(): ComposeRect =
         keysPanelScrollNode().fetchSemanticsNode().boundsInWindow
 
+    /**
+     * The floating panel's real 48dp resize-grip container — the pointer-input box, not the
+     * 24dp glyph inside it. The tag is the one `TerminalScreen` puts on that container.
+     */
+    private fun gripContainer(): SemanticsNode =
+        compose.onNodeWithTag("terminal-keys-resize-grip").assertIsDisplayed().fetchSemanticsNode()
+
+    /**
+     * The floating Keys panel's own frame: the outer bounds its contents tile. The
+     * scrollable viewport carries its top and leading edges and the 48dp grip container,
+     * aligned to the opposite corner, carries its bottom and trailing edges, so the union is
+     * the frame the panel was resized to rather than a fixture's guess at it.
+     */
+    private fun floatingKeysFrameBounds(): ComposeRect {
+        val viewport = keysPanelBounds()
+        val grip = gripContainer().boundsInWindow
+        return ComposeRect(
+            left = minOf(viewport.left, grip.left),
+            top = minOf(viewport.top, grip.top),
+            right = maxOf(viewport.right, grip.right),
+            bottom = maxOf(viewport.bottom, grip.bottom),
+        )
+    }
+
+    /**
+     * A control's window rectangle normalized into the floating panel's own frame, so the
+     * same logical position reads the same at any frame size and any independent per-axis
+     * scale. A re-wrap or a letterbox inside the frame moves these numbers.
+     */
+    private fun normalizedRect(bounds: ComposeRect, frame: ComposeRect): NormRect = NormRect(
+        left = (bounds.left - frame.left) / frame.width,
+        top = (bounds.top - frame.top) / frame.height,
+        width = bounds.width / frame.width,
+        height = bounds.height / frame.height,
+    )
+
+    /**
+     * Which keys share a row, in top-to-bottom order, read from normalized positions so a
+     * scaled layout reports the same rows it had unscaled. This is the reflow witness: a
+     * re-wrapped panel moves a key into another row.
+     */
+    private fun keyRows(labels: List<String>): List<List<String>> {
+        val frame = floatingKeysFrameBounds()
+        val tops = labels.associateWith { (controlNode(it).boundsInWindow.top - frame.top) / frame.height }
+        return labels.sortedBy { tops.getValue(it) }
+            .fold(mutableListOf<MutableList<String>>()) { rows, label ->
+                val top = tops.getValue(label)
+                val row = rows.firstOrNull { kotlin.math.abs(tops.getValue(it.first()) - top) <= 0.01f }
+                if (row != null) row += label else rows += mutableListOf(label)
+                rows
+            }
+    }
+
+    /** A rectangle in fractions of the floating panel's own frame. */
+    private data class NormRect(val left: Float, val top: Float, val width: Float, val height: Float) {
+        /** The largest single-component difference between two normalized rectangles. */
+        fun maximumDeviation(other: NormRect): Float = maxOf(
+            kotlin.math.abs(left - other.left),
+            kotlin.math.abs(top - other.top),
+            kotlin.math.abs(width - other.width),
+            kotlin.math.abs(height - other.height),
+        )
+    }
+
     /** True when [node] sits inside [container]'s semantics subtree. */
     private fun ownsNode(container: SemanticsNode, node: SemanticsNode): Boolean =
         container.id == node.id || container.children.any { ownsNode(it, node) }
@@ -1621,6 +2159,18 @@ class TerminalOverlayPlacementComponentTest {
         root.performTouchInput { click(point - origin) }
     }
 
+    /**
+     * Real pointer injection for a control that presents as text or as an icon description,
+     * so an icon-only corner control is pressed by an actual touch rather than a synthesized
+     * click.
+     */
+    private fun tapControlByTouch(label: String) {
+        val point = controlNode(label).boundsInRoot.center
+        val root = compose.onRoot()
+        val origin = root.fetchSemanticsNode().boundsInRoot.topLeft
+        root.performTouchInput { click(point - origin) }
+    }
+
     /** Real pointer injection at an absolute window point. */
     private fun tapAt(point: Offset) {
         val root = compose.onRoot()
@@ -1633,32 +2183,26 @@ class TerminalOverlayPlacementComponentTest {
      * long-press detector arms before movement; repeated moves cross the touch slop so
      * a child button's click is cancelled exactly once a drag is recognized.
      */
-    private fun dragBy(label: String, dx: Float, dy: Float) {
-        dispatchDrag(label, dx, dy, MotionEvent.ACTION_UP)
+    private fun dragBy(label: String, dx: Float, dy: Float, steps: Int = 6) {
+        dispatchDrag(label, dx, dy, MotionEvent.ACTION_UP, steps)
     }
 
     private fun cancelDragBy(label: String, dx: Float, dy: Float) {
-        dispatchDrag(label, dx, dy, MotionEvent.ACTION_CANCEL)
+        dispatchDrag(label, dx, dy, MotionEvent.ACTION_CANCEL, steps = 6)
     }
 
-    private fun dispatchDrag(label: String, dx: Float, dy: Float, endAction: Int) {
-        dispatchDragAt(boundsOf(label).center, dx, dy, endAction)
+    private fun dispatchDrag(label: String, dx: Float, dy: Float, endAction: Int, steps: Int) {
+        dispatchDragAt(boundsOf(label).center, dx, dy, endAction, steps)
     }
 
     /** A completed corner-grip drag: the panel follows and only then is the size saved. */
     private fun resizeKeysPanel(dx: Float, dy: Float, steps: Int = 6) {
-        val center = compose.onNodeWithContentDescription("Resize keys panel")
-            .assertIsDisplayed()
-            .fetchSemanticsNode()
-            .boundsInWindow
+        val center = gripContainer().boundsInWindow
         dispatchDragAt(center.center, dx, dy, MotionEvent.ACTION_UP, steps)
     }
 
     private fun cancelResizeKeysPanel(dx: Float, dy: Float) {
-        val center = compose.onNodeWithContentDescription("Resize keys panel")
-            .assertIsDisplayed()
-            .fetchSemanticsNode()
-            .boundsInWindow
+        val center = gripContainer().boundsInWindow
         dispatchDragAt(center.center, dx, dy, MotionEvent.ACTION_CANCEL)
     }
 
@@ -1673,10 +2217,75 @@ class TerminalOverlayPlacementComponentTest {
             val eventTime = SystemClock.uptimeMillis()
             val x = start.x + dx * step / steps
             val y = start.y + dy * step / steps
-            val action = if (step == steps) endAction else MotionEvent.ACTION_MOVE
-            compose.runOnIdle { dispatchTouch(root, action, downTime, eventTime, x, y) }
+            compose.runOnIdle { dispatchTouch(root, MotionEvent.ACTION_MOVE, downTime, eventTime, x, y) }
+        }
+        // The requested travel is completed by the last MOVE above, and the terminal up or
+        // cancel is delivered at that same point. Compose ends a drag on the release event
+        // without reporting its position change: `drag` and `awaitDragOrCancellation` hand
+        // the up change straight to `onDragEnd`, and both `detectDragGestures` and
+        // `detectDragGesturesAfterLongPress` go through that loop. Delivering the last
+        // increment only in the terminal event would therefore make every gesture one step
+        // shorter than the travel it names, which is exactly what the travel checks here
+        // measure. Zero movement on the terminal event keeps the requested total real while
+        // the event sequence, the long-press timeout, and the idleness handling stay as
+        // they were.
+        compose.runOnIdle {
+            dispatchTouch(root, endAction, downTime, SystemClock.uptimeMillis(), start.x + dx, start.y + dy)
         }
         compose.waitForIdle()
+    }
+
+    /**
+     * The platform slop the drag detectors actually compare against. Compose reads exactly
+     * [android.view.ViewConfiguration.getScaledTouchSlop] through its own
+     * `ViewConfiguration.touchSlop`, so this is the value a detector arms on and not a
+     * guessed allowance. The events this suite injects are touchscreen-sourced, so no
+     * mouse-slop adjustment participates.
+     */
+    private fun touchSlopPx(): Float = ViewConfiguration.get(compose.activity).scaledTouchSlop.toFloat()
+
+    /**
+     * The pointer travel a corner-grip drag cannot report, in physical pixels.
+     *
+     * `detectDragGestures` arms on the platform slop compared against the displacement the
+     * detector accumulated in the scaled layout's own units, and the arming event reports
+     * `total − slop · unit(total)`: exactly one slop of the path is discarded before any
+     * `dragAmount` exists. The gesture multiplies every reported delta back through the
+     * same per-axis factors, so that discarded logical slop costs `slop × travel ÷
+     * |travel ÷ scale|` on each axis — scale-aware because the slop is logical while the
+     * pointer, and the frame it resizes, are physical.
+     */
+    private fun gripArmingLossPx(travel: Offset, scaleX: Float, scaleY: Float, slopPx: Float): Offset {
+        val logicalLength = kotlin.math.hypot(travel.x / scaleX, travel.y / scaleY)
+        if (logicalLength == 0f) return Offset.Zero
+        return Offset(slopPx * travel.x / logicalLength, slopPx * travel.y / logicalLength)
+    }
+
+    /**
+     * The pointer travel a header long-press move cannot report, in physical pixels.
+     *
+     * `detectDragGesturesAfterLongPress` reports every move once the long press has armed
+     * and consumes no slop of its own, but the overlay only begins applying once its
+     * accumulated physical distance passes the platform slop, and the first applied event
+     * carries only its own delta. The whole steps before that one are therefore never
+     * applied, so they are subtracted here rather than hidden inside a widened tolerance.
+     */
+    private fun headerArmingLossPx(travel: Offset, steps: Int, slopPx: Float): Offset {
+        val stepLength = kotlin.math.hypot(travel.x, travel.y) / steps
+        val dropped = kotlin.math.floor(slopPx / stepLength).toInt().coerceIn(0, steps - 1)
+        return Offset(travel.x * dropped / steps, travel.y * dropped / steps)
+    }
+
+    /**
+     * The only difference left between a gesture's accounted travel and the panel's
+     * measured response: a completed move or resize is committed as permille of the stable
+     * layer and resolved back to whole pixels. The bound is taken from the display's own
+     * extent, which is never smaller than the stable layer or the free space the permille
+     * is taken against, plus a pixel for integer layout rounding.
+     */
+    private fun commitRoundingPx(): Float {
+        val display = compose.activity.resources.displayMetrics
+        return maxOf(display.widthPixels, display.heightPixels) / 1000f + 2f
     }
 
     private fun dispatchTouch(

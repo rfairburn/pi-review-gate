@@ -146,8 +146,10 @@ public data class TerminalKeysLayout(
  * `null` means "this slot has never been moved" and therefore keeps its existing
  * layout default. Defaults are deliberately not frozen coordinates: the status
  * notice keeps its existing place directly below the controls slot even when the
- * controls strip is moved somewhere else, and the Keys panel keeps its existing
- * bottom-center slot. An explicit position is remembered across restarts.
+ * controls strip is moved somewhere else, and the floating Keys panel keeps the middle of
+ * the free space so a panel that was never placed is detached from the bottom edge with
+ * room to move. An explicit position is remembered across restarts and a default is never
+ * written over one.
  *
  * The two Keys layouts are the docking state and remembered floating size in each
  * orientation, remembered per orientation alongside their own positions. They are
@@ -266,7 +268,11 @@ public object TerminalOverlayGeometry {
      *
      * Controls keep the top-end slot, the notice keeps its top-end slot immediately
      * below the controls slot measured by [controlsSlotHeight] (not its current
-     * position), and Keys keeps the bottom-center slot. Moving one overlay therefore
+     * position), and a floating Keys panel keeps the middle of the free space. A panel
+     * that has never been placed is therefore detached from the bottom edge with room to
+     * move on every side rather than anchored where a docked band sits, and that default
+     * is a display value only: it never becomes a remembered position, and an explicit
+     * remembered position still resolves exactly as before. Moving one overlay therefore
      * never moves another.
      */
     public fun resolveDefault(
@@ -285,7 +291,7 @@ public object TerminalOverlayGeometry {
                 x = freeWidth,
                 y = controlsSlotHeight.coerceIn(0, freeHeight),
             )
-            TerminalOverlay.KEYS -> TerminalOverlayPoint(x = freeWidth / 2, y = freeHeight)
+            TerminalOverlay.KEYS -> TerminalOverlayPoint(x = freeWidth / 2, y = freeHeight / 2)
         }
     }
 

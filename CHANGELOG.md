@@ -63,7 +63,15 @@ dates.
   Keys keeps an icon-only corner toggle that changes docking only — never opening,
   closing, or showing the keyboard — and floating Keys moves by the existing header
   long-press and resizes from a corner grip, painting below the control strip and the
-  notice area so it cannot swallow a control tap. Docking, floating size, and position
+  notice area so it cannot swallow a control tap. A floating panel that was never placed
+  now appears detached from the bottom edge with room beside it and below it, instead of
+  filling the width where the docked band was, and it is still moved by that same header
+  long-press; the default is presentation only and never becomes a remembered position.
+  Floating contents are one logical Keys layout stretched into the frame by independent
+  horizontal and vertical factors, so any frame shape is filled with no re-wrapped rows and
+  no blank letterbox, while text, buttons, padding, spacing, and the corner controls scale
+  together; the frame stops shrinking at that layout's own footprint, so keys, the corner
+  toggle, and the grip keep a complete 48 dp physical target. Docking, floating size, and position
   are remembered per orientation in the existing version-2 placement document and
   survive docking; only a completed drag, resize, or docking toggle saves, and cancelled
   gestures, rotations, keyboard changes, and ordinary frames save nothing. Whether Keys

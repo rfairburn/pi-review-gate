@@ -48,8 +48,11 @@ internal object TerminalDockGeometry {
     }
 
     /**
-     * Keep one floating size inside the available layer and never below one usable
-     * viewport. This is a display clamp only: it never rewrites a remembered size.
+     * Keep one floating size inside the available layer and never below the panel's own
+     * logical footprint, which is where a scaled panel stops shrinking so every logical
+     * touch target keeps its real physical size. This is a display clamp only: it never
+     * rewrites a remembered size, and the floor it applies is the footprint the panel
+     * measured, not a constant.
      */
     fun clampFloatingSize(size: IntSize, maximum: IntSize, minimum: IntSize): IntSize {
         val widthFloor = minimum.width.coerceAtMost(maximum.width)

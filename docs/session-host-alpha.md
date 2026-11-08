@@ -1525,8 +1525,19 @@ Floating Keys paints below the control strip and the notice area, so an overlapp
 never swallows a Back, Switch, keyboard, or Keys tap.
 Floating, the panel overlays the pane and reserves nothing; it moves by the same header
 long-press and resizes from a corner grip, and its remembered size is a fraction of the
-stable layer extent. A floating panel is never measured past the pane's own visible area,
-and the grip's own 48dp is reserved below the panel's scrollable viewport so it covers
+stable layer extent. A panel that has never been placed appears detached from the bottom
+edge, with free space beside it and below it, so it reads as a window and has room to move;
+that default is presentation only, never written as a position, and a remembered position
+always resolves exactly as before. The floating panel holds one interactive Keys layout,
+measured at its own reference width and at the height the visible area leaves it, and
+stretches it into the frame with independent horizontal and vertical factors: text, buttons,
+padding, spacing, and the interior corner controls all scale together, so a frame of any
+shape is filled edge to edge with no re-wrapped rows and no blank letterbox, and the layout
+never re-wraps while you resize. The frame stops shrinking at that logical footprint, so
+every key, the corner toggle, and the grip keep a complete 48 dp physical target however
+far a grip drag overshoots; the floor is the footprint the panel measured, not a fixed
+number. A floating panel is never measured past the pane's own visible area, and the grip's
+own 48dp is reserved below the panel's scrollable viewport so it covers
 no key. One icon-only corner control switches
 docking: it never opens or closes the panel and never shows or hides the on-screen
 keyboard, and because it belongs to the panel header it scrolls and clips with that header

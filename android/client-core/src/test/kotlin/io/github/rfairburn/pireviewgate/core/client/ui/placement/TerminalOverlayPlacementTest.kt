@@ -787,7 +787,19 @@ class TerminalOverlayPlacementTest {
             TerminalOverlay.KEYS, stableWidth = 1000, stableHeight = 800,
             overlayWidth = 1000, overlayHeight = 200, controlsSlotHeight = 0,
         )
-        assertEquals(TerminalOverlayPoint(0, 600), keys)
+        assertEquals(TerminalOverlayPoint(0, 300), keys)
+        // A never-placed floating panel is detached from the bottom edge with free space
+        // on every side, rather than anchored where a docked band sits. The default is a
+        // display value: it is not a remembered position and writes nothing.
+        val detached = TerminalOverlayGeometry.resolveDefault(
+            TerminalOverlay.KEYS, stableWidth = 1000, stableHeight = 800,
+            overlayWidth = 400, overlayHeight = 200, controlsSlotHeight = 0,
+        )
+        assertEquals(TerminalOverlayPoint(300, 300), detached)
+        assertTrue(detached.y + 200 < 800,
+            "A default panel must leave free space below it: $detached")
+        assertTrue(detached.x + 400 < 1000,
+            "A default panel must leave free space beside it: $detached")
 
         // Moving the controls slot is not an input here, so the status default stays put.
         val statusAfterControlsMove = TerminalOverlayGeometry.resolveDefault(

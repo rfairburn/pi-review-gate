@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chromium, type Browser, type BrowserContext, type Response } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page, type Response } from "playwright";
 import { isBlockedAddress, type AddressAdmission } from "./ip";
 import {
   DEFAULT_EGRESS_BUDGETS,
@@ -11,6 +11,7 @@ import {
 } from "./egress-broker";
 import type { BrowserOmissions, DownloadedText, NetworkOptions, ValidatedUrl } from "./network";
 import { defaultHostResolver, validatePublicUrl } from "./network";
+import { UrlBlocklistDeniedError, type UrlAccessStage, type UrlGuard } from "./url-blocklist";
 
 const PASSIVE_RESOURCE_TYPES = new Set(["image", "media", "font"]);
 const LOCAL_BROWSER_PROTOCOLS = new Set(["about:", "blob:", "data:"]);
@@ -78,6 +79,10 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
   // and external signal as everything else — a stalled resolver can never
   // hang the render outside the total-time cap.
   const renderStartedAt = Date.now();
+  // The shared blocklist judges the raw supplied URL — fragment and all —
+  // before any validation or browser launch, so a denied URL never reaches
+  // Chromium at all.
+  options.urlGuard?.(url, "initial");
   const requested = await validateInitialPublicUrl(url, options);
   const remainingMs = options.timeoutMs - (Date.now() - renderStartedAt);
   if (remainingMs <= 0) throw new Error(`Browser rendering timed out after ${options.timeoutMs}ms.`);
@@ -154,6 +159,25 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
     });
 
     const page = await context.newPage();
+    // Redirect destinations are Chromium-internal, and Playwright's route
+    // layer only sees the FIRST URL of a redirect, so the shared blocklist is
+    // enforced on the page's own Chromium Fetch interception instead: every
+    // main-frame Document request — the initial navigation and each redirect
+    // hop — is paused before Chromium sends it and failed there. The
+    // Document-only pattern keeps page subresources outside the blocklist.
+    if (options.urlGuard) {
+      // The caller's supplied string travels with the guard so the initial hop
+      // keeps its own complete policy input; Chromium's canonical form of it is
+      // never judged.
+      await enableMainDocumentBlocklistGuard(
+        context,
+        page,
+        { canonicalHref: requested.href, suppliedUrl: url },
+        options.urlGuard,
+        brokerAuth,
+        failRender,
+      );
+    }
     let latestMainNavigation: Response | null = null;
     let mainDocumentFinished = false;
     let mainFrameNavigationRequests = 0;
@@ -215,6 +239,13 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
       controller.signal,
     );
     const finalUrl = browserFinalUrl(page.url());
+    // Every main-frame Document request of this render — the initial navigation
+    // and each redirect hop Chromium itself formed — was already judged by the
+    // pre-request interception above, before Chromium sent it. The page's URL
+    // after the render is deliberately NOT a policy input: it can name a URL no
+    // request ever used (a script's history.replaceState or a same-document
+    // fragment change), and judging it after access is outside the contract of
+    // checking the supplied URL and each actual redirect destination.
     const finalResponse = latestMainNavigation ?? response;
     assertSuccessfulBrowserNavigation(finalResponse?.status(), finalResponse?.url() ?? finalUrl);
     const text = await abortable(page.content(), controller.signal);
@@ -331,6 +362,94 @@ export async function renderWithChromium(url: string, options: NetworkOptions): 
       }
     }
   }
+}
+
+/**
+ * Enforce the shared acquisition blocklist on Chromium's own request path
+ * (issue #620). Playwright documents that a route handler runs for the FIRST
+ * URL of a redirect only, so `context.route` cannot see a redirect
+ * destination; page-scoped Chromium Fetch interception at the Request stage
+ * does, and it pauses each hop before Chromium sends it. Only main-frame
+ * Document requests are guarded: subresources and child frames stay outside
+ * this feature. The acquisition route keeps its guard installed for the whole
+ * render, so an entry added by a live settings update applies to the hops that
+ * have not been sent yet; while the list is empty the check denies nothing.
+ * The initial hop is judged against the caller's supplied URL rather than
+ * Chromium's canonicalized request URL, so the two acquisition tools cannot
+ * disagree about one input because a URL parser normalized it first.
+ *
+ * Chromium delivers an authorization challenge to one Fetch client only, so
+ * enabling this second client takes over the per-render broker challenge that
+ * Playwright would otherwise answer. The challenge is therefore answered here
+ * with the same per-render credentials Playwright holds, once per request id;
+ * a repeated challenge is cancelled, and a challenge from anything other than
+ * the proxy never receives those credentials.
+ */
+async function enableMainDocumentBlocklistGuard(
+  context: BrowserContext,
+  page: Page,
+  initial: { readonly canonicalHref: string; readonly suppliedUrl: string },
+  guard: UrlGuard,
+  proxyCredentials: { username: string; password: string },
+  onDeny: (error: Error) => void,
+): Promise<void> {
+  const session = await context.newCDPSession(page);
+  const frameTree = await session.send("Page.getFrameTree");
+  const mainFrameId = frameTree.frameTree.frame.id;
+  const answeredChallenges = new Set<string>();
+  // The first intercepted main-frame Document request IS the navigation the
+  // caller asked for; every later one is a destination Chromium itself formed.
+  let firstMainDocument = true;
+  session.on("Fetch.authRequired", (event) => {
+    const firstAttempt = !answeredChallenges.has(event.requestId);
+    answeredChallenges.add(event.requestId);
+    const provide = firstAttempt && event.authChallenge?.source === "Proxy";
+    void session.send("Fetch.continueWithAuth", {
+      requestId: event.requestId,
+      authChallengeResponse: provide
+        ? {
+          response: "ProvideCredentials",
+          username: proxyCredentials.username,
+          password: proxyCredentials.password,
+        }
+        : { response: "CancelAuth" },
+    }).catch(() => undefined);
+  });
+  session.on("Fetch.requestPaused", (event) => {
+    void (async () => {
+      if (event.resourceType === "Document" && event.frameId === mainFrameId) {
+        // For the initial hop the policy input is the caller's complete supplied
+        // string. For every later main-frame Document request, CDP reports the
+        // navigation URL WITHOUT its fragment and the fragment separately as
+        // `urlFragment`, so the two are joined into the one COMPLETE destination
+        // Chromium is requesting, and that single string is what the configured
+        // patterns judge. A canonicalized or fragmentless derivative of a URL
+        // that was already judged is never a second policy input.
+        const isInitial = firstMainDocument && event.request.url === initial.canonicalHref;
+        firstMainDocument = false;
+        const navigationUrl = isInitial
+          ? initial.suppliedUrl
+          : `${event.request.url}${event.request.urlFragment ?? ""}`;
+        const stage: UrlAccessStage = isInitial ? "initial" : "redirect";
+        try {
+          guard(navigationUrl, stage);
+        } catch (error) {
+          // Record the denial before the hop is failed, so the render reports
+          // the typed blocklist denial instead of a generic navigation error.
+          onDeny(error instanceof UrlBlocklistDeniedError
+            ? error
+            : new Error(`URL blocklist check failed for ${boundedBrowserUrl(navigationUrl)}.`, { cause: error }));
+          await session.send("Fetch.failRequest", { requestId: event.requestId, errorReason: "BlockedByClient" }).catch(() => undefined);
+          return;
+        }
+      }
+      await session.send("Fetch.continueRequest", { requestId: event.requestId }).catch(() => undefined);
+    })();
+  });
+  await session.send("Fetch.enable", {
+    handleAuthRequests: true,
+    patterns: [{ urlPattern: "*", requestStage: "Request", resourceType: "Document" }],
+  });
 }
 
 /**

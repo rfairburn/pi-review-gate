@@ -126,6 +126,15 @@ import {
   type HostShortcutConfigReadResult,
 } from "./host-shortcuts-store";
 import {
+  readAppearanceConfig,
+  writeAppearanceConfig,
+  type AppearanceConfigReadResult,
+} from "./appearance-store";
+import {
+  DEFAULT_SIDEBAR_APPEARANCE,
+  type SidebarAppearance,
+} from "./sidebar-theme";
+import {
   MAX_ROSTER_ENTRIES,
   ROSTER_STORE_VERSION,
   isLocalRosterEntry,
@@ -852,6 +861,16 @@ interface MainDependencies {
     bindings: HostShortcutBindings,
     legacyToggleOverride?: string,
   ) => HostShortcutBindings;
+  /**
+   * The host's OWN appearance settings (#613): the same per-native-agent
+   * session-host scope as the host shortcuts. Pi's own theme and configuration
+   * are never read or written.
+   */
+  readonly readAppearanceConfig: (agentDir: string) => AppearanceConfigReadResult;
+  readonly writeAppearanceConfig: (
+    agentDir: string,
+    appearance: SidebarAppearance,
+  ) => SidebarAppearance;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
@@ -976,10 +995,23 @@ function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): num
 
 /**
  * The ONE terminal-ownership state Main holds for a pressed mouse button. The
- * three states are mutually exclusive per button, which is what makes
+ * states are mutually exclusive per button, which is what makes
  * `mouseButtonOwnership` the only held-button authority (see its declaration).
+ *
+ * `"scrollbar"` is the held thumb drag of the roster's drawn scrollbar lane
+ * (#613): like the session-card gesture it owns its button's motion and release
+ * for the whole gesture wherever the pointer travels, and it upgrades outer
+ * reporting only for that one gesture. `"retired-scrollbar"` is the same
+ * abandoned-press fence for that gesture. Both retired fences outlive their
+ * gesture only until that button's matching release, a replacement press, or
+ * teardown, so a release can never reach a child without its press.
  */
-type MouseButtonOwnership = "host" | "session" | "retired-session";
+type MouseButtonOwnership =
+  | "host"
+  | "session"
+  | "retired-session"
+  | "scrollbar"
+  | "retired-scrollbar";
 
 function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
   if (mouse.wheel) return undefined;
@@ -1301,6 +1333,8 @@ function productionDependencies(): MainDependencies {
     openHostState: openProductionHostState,
     readHostShortcutConfig,
     writeHostShortcutConfig,
+    readAppearanceConfig,
+    writeAppearanceConfig,
     createTerminal: () => new ProcessTerminal(),
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
@@ -1374,6 +1408,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let configuredHostShortcuts: HostShortcutBindings = DEFAULT_HOST_SHORTCUTS;
   let effectiveHostShortcuts: HostShortcutBindings = DEFAULT_HOST_SHORTCUTS;
   let hostShortcutAgentDir: string | undefined;
+  /** The host's own resolved appearance and any bounded read-refusal notice. */
+  let configuredAppearance: SidebarAppearance = DEFAULT_SIDEBAR_APPEARANCE;
+  let appearanceNotice: string | undefined;
   const legacyToggleOverride = snapshot.toggleKey !== undefined;
   // The ONE content source this host displays (issue #389 display phase): a
   // local manager row, or one exact remote owner run/row. Every deliberate
@@ -1562,6 +1599,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    *   release of such a press must never reach a local or remote child without
    *   its press, so the fence outlives the gesture until that matching release,
    *   a replacement press of that button, or terminal teardown.
+   * - "scrollbar" / "retired-scrollbar": the same two states for the roster's
+   *   drawn scrollbar lane (#613). A captured thumb press owns its button for
+   *   the whole drag, and a lane gesture Main abandoned keeps fencing that
+   *   button until its matching release, so neither the drag nor its release
+   *   can reach a local or remote session. The lane moves only the roster's own
+   *   list window; it activates nothing.
    * Because a button has exactly one state, a release consumes one entry and no
    * consumer has to keep overlapping holders synchronized. Only the three
    * terminal button ids can ever be present, so the derived reads below scan a
@@ -1575,6 +1618,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function sessionPointerHeldButton(): number | undefined {
     for (const [button, owner] of mouseButtonOwnership) {
       if (owner === "session") return button;
+    }
+    return undefined;
+  }
+
+  /**
+   * The button of Main's one live scrollbar-thumb drag (#613), derived from the
+   * same store. A button has exactly one owner, so a held card drag and a held
+   * lane drag can never both claim it, and neither gesture has a second mirror
+   * of its state to keep in sync.
+   */
+  function scrollbarPointerHeldButton(): number | undefined {
+    for (const [button, owner] of mouseButtonOwnership) {
+      if (owner === "scrollbar") return button;
     }
     return undefined;
   }
@@ -2459,13 +2515,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     }
 
-    // A captured session-card press needs MOTION for the drag to exist (#477).
-    // For the lifetime of that one gesture the host pane's press-only capture is
-    // raised to drag reporting with cell SGR encoding, applied AFTER the local
-    // and remote native choices so a child's stronger drag/any request is never
-    // downgraded. Releasing or cancelling the gesture returns to the reporting
-    // these same rules ask for; nothing here changes wheel behaviour.
-    if (desiredTracking !== undefined && sessionPointerHeldButton() !== undefined) {
+    // A captured session-card press OR a captured scrollbar-thumb drag needs
+    // MOTION for the gesture to exist (#477, #613). For the lifetime of that ONE
+    // gesture the host pane's press-only capture is raised to drag reporting
+    // with cell SGR encoding, applied AFTER the local and remote native choices
+    // so a child's stronger drag/any request is never downgraded. Releasing or
+    // cancelling the gesture returns to the reporting these same rules ask for;
+    // nothing here changes wheel behaviour, and no any-event (1003) hover
+    // capture is ever requested for the lane.
+    if (desiredTracking !== undefined
+      && (sessionPointerHeldButton() !== undefined || scrollbarPointerHeldButton() !== undefined)) {
       if (desiredTracking < 1002) desiredTracking = 1002;
       useSgr = true;
     }
@@ -2911,6 +2970,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           // unfinished press or drag; Main follows it on this frame boundary to
           // restore the ordinary mouse reporting and stop any edge hold.
           reconcileSessionPointerGesture();
+          // The same boundary for the scrollbar lane: a render that drew no track
+          // (the list stopped overflowing, the roster hid, an overlay replaced it)
+          // or whose content/usable range changed under a held grab ends the drag,
+          // so the outer terminal never stays in temporary drag reporting and the
+          // pressed button never stays claimed by a gesture that no longer exists.
+          reconcileScrollbarGesture();
           if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
             && isCurrentPeerConsentFrame(peerFrame)
             && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
@@ -3009,6 +3074,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // a press and the outer terminal in temporary drag reporting until the next
     // motion or release happens to arrive. The pressed button stays fenced.
     cancelSessionPointerGesture();
+    cancelScrollbarGesture();
     writer?.invalidate?.();
   }
 
@@ -4142,9 +4208,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // A pane change that stops drawing the roster — hide, a replacing
       // confirmation, a narrow overlay form — abandons an in-flight session
       // gesture: nothing is committed or activated, and the ordinary mouse
-      // reporting returns to what the existing rules ask for.
+      // reporting returns to what the existing rules ask for. The scrollbar lane
+      // is drawn by that same roster, so its held drag ends here too.
       if (sessionPointerHeldButton() !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
         cancelSessionPointerGesture();
+      }
+      if (scrollbarPointerHeldButton() !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
+        cancelScrollbarGesture();
       }
       layout = next;
       noteRemoteSavedLayout(next);
@@ -4456,6 +4526,104 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     scheduleRedraw();
   }
 
+  /**
+   * One motion packet of the held scrollbar drag. Like the card drag it always
+   * goes to the Sidebar method of the presentation this host actually WROTE, and
+   * the pointer may be anywhere on the screen: the lane follows it and clamps to
+   * the ends of the range that frame painted. A map that no longer describes the
+   * drawn roster retires the drag and keeps fencing the pressed button; nothing
+   * here activates, selects, focuses, or forwards.
+   */
+  function routeScrollbarPointerMotion(mouse: ParsedMouseInput): void {
+    const shown = displayedMousePresentation;
+    const pane = shown?.layout.sidebar;
+    if (scrollbarPointerHeldButton() === undefined || shown === undefined || pane === undefined
+      || !sessionPointerMapsAreCurrent(shown)) {
+      // No usable written map (a reflow, a hide, or an invalidation revoked it
+      // mid-drag): end the Sidebar drag, restore the ordinary mouse reporting,
+      // and keep fencing the pressed button.
+      cancelScrollbarGesture();
+      return;
+    }
+    if (!shown.sidebar.moveScrollbarAt(
+      mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows,
+    )) {
+      // The Sidebar holds no live drag for this token (the roster hid, an overlay
+      // replaced it, or the lane stopped overflowing). Consume the packet; never
+      // fall back to activation for a gesture the lane already owned.
+      retireScrollbarGesture();
+      return;
+    }
+    scheduleRedraw();
+  }
+
+  /**
+   * One release of the held scrollbar drag: exactly once. The release itself
+   * moves nothing — the viewport keeps whatever the last motion packet set — and
+   * no coordinate of it is interpreted: a release inside the roster pane, over
+   * the native pane, or outside the terminal grid ends the same drag. The
+   * pressed button's single ownership entry is removed here, so no fence
+   * outlives the release it was waiting for, and nothing is activated or
+   * forwarded either way.
+   */
+  function routeScrollbarPointerRelease(): void {
+    const gesture = scrollbarPointerHeldButton();
+    if (gesture !== undefined) mouseButtonOwnership.delete(gesture);
+    if (gesture === undefined) return;
+    const shown = displayedMousePresentation;
+    const pane = shown?.layout.sidebar;
+    if (shown !== undefined && pane !== undefined && sessionPointerMapsAreCurrent(shown)) {
+      shown.sidebar.endScrollbarAt();
+    } else {
+      sidebar?.cancelScrollbarDrag();
+    }
+    // The temporary drag reporting comes back down to what the local and remote
+    // rules ask for; a child's stronger request is left exactly as it was.
+    syncOuterMouseModes();
+    scheduleRedraw();
+  }
+
+  /**
+   * Ends Main's record of a lane drag whose Sidebar interaction is already over,
+   * and returns the outer capture to the ordinary reporting. The pressed button
+   * stays host-fenced (retired), so a physical release of a drag Main abandoned
+   * still cannot reach a child without its press.
+   */
+  function retireScrollbarGesture(): void {
+    const button = scrollbarPointerHeldButton();
+    if (button === undefined) return;
+    mouseButtonOwnership.set(button, "retired-scrollbar");
+    syncOuterMouseModes();
+  }
+
+  /**
+   * Abandons an in-flight lane drag for a lifecycle change (a reflow including a
+   * roundtrip to the same size, hide or coverage, TTY handoff, shutdown). The
+   * Sidebar drops its grab, the button stays fenced, and the roster's viewport
+   * and every selection/routing fact stay exactly as they were.
+   */
+  function cancelScrollbarGesture(): void {
+    const button = scrollbarPointerHeldButton();
+    if (button === undefined) return;
+    mouseButtonOwnership.set(button, "retired-scrollbar");
+    sidebar?.cancelScrollbarDrag();
+    syncOuterMouseModes();
+  }
+
+  /**
+   * The Sidebar retires a lane drag on its own when the roster hides, an overlay
+   * replaces it, or its content stops overflowing. Main follows that decision on
+   * the frame boundary: it keeps fencing the pressed button and restores the
+   * ordinary mouse reporting.
+   */
+  function reconcileScrollbarGesture(): void {
+    const button = scrollbarPointerHeldButton();
+    if (button === undefined) return;
+    if (sidebar?.scrollbarDragActive === true) return;
+    mouseButtonOwnership.set(button, "retired-scrollbar");
+    syncOuterMouseModes();
+  }
+
   function handleMouseInput(data: string, mouse: ParsedMouseInput): void {
     if (shutdownRequested || externalEditorActive || !sidebar || !layout) return;
     const presentation = displayedMousePresentation;
@@ -4467,7 +4635,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // abandoned ends that stale fence; the new press belongs to whichever route
     // takes it below.
     if (isMouseButtonPress(mouse) && buttonId !== undefined
-      && mouseButtonOwnership.get(buttonId) === "retired-session") {
+      && (mouseButtonOwnership.get(buttonId) === "retired-session"
+        || mouseButtonOwnership.get(buttonId) === "retired-scrollbar")) {
       mouseButtonOwnership.delete(buttonId);
     }
     // A session-card press Main is holding owns its button's motion and release
@@ -4483,6 +4652,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (buttonId === heldGestureButton || ambiguousButtonRelease) {
         if (mouse.release) routeSessionPointerRelease(mouse);
         else if (mouse.motion) routeSessionPointerMotion(mouse);
+        return;
+      }
+    }
+    // A scrollbar-thumb drag Main is holding owns its button's motion and release
+    // for the whole gesture, wherever the pointer travelled (#613): no fragment
+    // of it reaches a local or remote session, no release activates a row or
+    // moves focus, selection, or the Main content owner, and no packet reaches a
+    // form, picker, or popup. A wheel report is never this drag's release: it
+    // carries no button id, so wheel keeps its existing route and the pressed
+    // button stays fenced.
+    const heldLaneButton = scrollbarPointerHeldButton();
+    if (heldLaneButton !== undefined) {
+      const ambiguousButtonRelease = buttonId === undefined && mouse.release && !mouse.wheel;
+      if (buttonId === heldLaneButton || ambiguousButtonRelease) {
+        if (mouse.release) routeScrollbarPointerRelease();
+        else if (mouse.motion) routeScrollbarPointerMotion(mouse);
         return;
       }
     }
@@ -4544,6 +4729,42 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // activation path. A valid press over an action row, diagnostic row, or
       // session card is untouched: those maps are current.
       if (isLeftMousePress(mouse) && rosterOwnsPointer && !sessionPointerMapsAreCurrent(presentation)) return;
+      // The drawn scrollbar lane is checked BEFORE any row or session-pointer
+      // target (#613): a press on the lane this written frame painted belongs to
+      // the viewport, never to a card. A thumb press begins a held drag — the
+      // button moves from the ordinary host-pane state to the lane gesture, the
+      // same pattern the card drag uses, so motions outside the pane keep driving
+      // the same window and the release cannot reach a child. A bare-track press
+      // jumps that same window and is not held. Either way nothing is activated,
+      // no highlight, focus, visibility, or Main content owner moves, no
+      // right-hand form, picker, or popup is cancelled or receives bytes, and no
+      // packet is forwarded. A lane with no painted track (a fitting list, a
+      // tiny/hidden/overlaid roster, a stale map) falls through untouched.
+      if (isLeftMousePress(mouse) && rosterOwnsPointer && presentation !== undefined && !hitMapPending
+        && hitLayout.sidebar !== undefined && buttonId !== undefined
+        && sessionPointerMapsAreCurrent(presentation)) {
+        const laneColumn = mouse.x - hitLayout.sidebar.column;
+        const laneRow = mouse.y - hitLayout.sidebar.row;
+        if (presentation.sidebar.beginScrollbarAt(
+          laneColumn, laneRow, hitLayout.sidebar.cols, hitLayout.sidebar.rows,
+        )) {
+          mouseButtonOwnership.set(buttonId, "scrollbar");
+          // Press-only capture reports no motion, so the drag needs the outer
+          // terminal to report it for the lifetime of this one gesture. The
+          // upgrade never downgrades a child's or remote owner's stronger request.
+          syncOuterMouseModes();
+          // The held thumb is drawn with the block glyph, so the operator can see
+          // which thumb their button owns.
+          scheduleRedraw();
+          return;
+        }
+        if (presentation.sidebar.jumpScrollbarAt(
+          laneColumn, laneRow, hitLayout.sidebar.cols, hitLayout.sidebar.rows,
+        )) {
+          scheduleRedraw();
+          return;
+        }
+      }
       if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending && rosterOwnsPointer
         && hitLayout.sidebar !== undefined && buttonId !== undefined
         && sessionPointerMapsAreCurrent(presentation)
@@ -4681,7 +4902,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function handleTerminalResize(): void {
     // A reflow — including one that returns to the previous size before anything
     // is repainted — retires the in-flight session gesture with its written maps.
+    // The scrollbar lane is bound to the same written geometry, so a held thumb
+    // drag ends here rather than driving a window against rows the reflow removed.
     cancelSessionPointerGesture();
+    cancelScrollbarGesture();
     invalidatePeerConsentDisplay();
     invalidatePeerRepairDisplay();
     invalidateSavedDeleteConfirmationDisplay();
@@ -4732,8 +4956,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     remoteSavedPickerFrame = undefined;
     // No ordinary host-pane ownership survives a TTY handoff. The abandoned
     // session press keeps its retired fence — its own state in the one store —
-    // so its release still cannot reach a child without its press.
+    // so its release still cannot reach a child without its press. The same
+    // fence applies to an abandoned scrollbar-thumb drag.
     cancelSessionPointerGesture();
+    cancelScrollbarGesture();
     clearHostButtonOwnership();
     const controller = new AbortController();
     externalEditorAbort = controller;
@@ -7640,6 +7866,33 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         return;
       }
+      case "theme-save": {
+        if (!sidebar) return;
+        if (hostShortcutAgentDir === undefined) {
+          sidebar.failThemeSave(action.requestId,
+            "The native Pi agent directory is unavailable; appearance was not saved");
+          scheduleRedraw();
+          return;
+        }
+        try {
+          const saved = dependencies.writeAppearanceConfig(hostShortcutAgentDir, { theme: action.theme });
+          configuredAppearance = saved;
+          appearanceNotice = undefined;
+          // Persistence succeeded, so the new palette goes live immediately in
+          // this host's own panes: no restart, and nothing is written to a
+          // child, to a native Pi theme, or to Pi's configuration.
+          sidebar.completeThemeSave(action.requestId, saved.theme);
+          scheduleRedraw();
+        } catch (error) {
+          // A refused write keeps the previously saved appearance active and
+          // leaves the existing settings file exactly as it was.
+          sidebar.failThemeSave(action.requestId, error instanceof Error
+            ? error.message
+            : "Appearance settings could not be saved; the previous appearance remains active");
+          scheduleRedraw();
+        }
+        return;
+      }
       case "saved-open": {
         if (!manager || !sidebar) return;
         if (negotiationReady) launchSavedOpen(action.requestId, action.file, action.sessionId);
@@ -7992,6 +8245,23 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
       if (readResult.status === "unavailable") throw new HostShortcutStartupFailure(readResult.message);
       configuredHostShortcuts = normalizeHostShortcutBindings(readResult.bindings);
+      // The host's own appearance (#613) lives in the same per-agent
+      // session-host scope. Absence selects the documented default without
+      // creating a file. Unlike keybindings, an unreadable appearance file
+      // cannot break input ownership, so it refuses NOTHING at startup: the
+      // default stays active, the file is left untouched, and the bounded
+      // refusal is shown inside the Theme pane where the operator can act.
+      let appearanceResult: AppearanceConfigReadResult;
+      try {
+        appearanceResult = dependencies.readAppearanceConfig(hostShortcutAgentDir);
+      } catch {
+        appearanceResult = {
+          status: "unavailable",
+          message: "Session host refused: appearance settings could not be safely read. The file was left untouched; fix or move it before restarting.",
+        };
+      }
+      if (appearanceResult.status === "loaded") configuredAppearance = appearanceResult.appearance;
+      else if (appearanceResult.status === "unavailable") appearanceNotice = appearanceResult.message;
     }
     if (typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
       // Created lazily on disk: no file exists until a diagnostic is recorded.
@@ -8119,6 +8389,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       configuredShortcuts: configuredHostShortcuts,
       legacyToggleOverride,
       settingsAvailable: hostShortcutAgentDir !== undefined,
+      // The host's own palette; never Pi's saved theme and never a child's.
+      theme: configuredAppearance.theme,
+      ...(appearanceNotice === undefined ? {} : { themeNotice: appearanceNotice }),
       workspaceBasePath: snapshot.startupCwd,
       createTextField,
       createSavedQueryInput: () => {

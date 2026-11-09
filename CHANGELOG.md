@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.257]
+## [0.1.0-dev.265]
 
 ### Added
 
@@ -111,6 +111,177 @@ dates.
 - Android Saved now requests one fresh List after an exact confirmed successful
   Delete on the still-current picker (#508). Old rows remain non-actionable until
   the owner's complete result arrives; refusal or uncertainty never triggers a retry.
+
+## [0.1.0-dev.264]
+
+### Changed
+
+- **Ordinary `Subtasks*` failures are scoped to their own target and bounded** (#626): a
+  failed `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch`,
+  `SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`, `SubtasksForceMerge`, or
+  `SubtasksMarkClean` call now returns the durable state of the execution (and exact task) the
+  request actually named instead of every associated group's inventory. Activity rows and
+  settled command records are limited and the nested executor result, dispatch, review, and
+  state-history bodies are omitted in the model-visible text and the structured details alike,
+  while the current state, outcome, failure, live controls, artifact paths, checkpoint bundle,
+  conflict truth, recovery guidance, and an `interrupt_with_merge` request's exact stop/merge
+  settlement stay truthful; that settlement is still computed from the owning record before any
+  projection. The current landing status and failure/recovery facts are preserved out of the
+  nested result and stated in the text — `recovery_required` with its failure reason, failed
+  path, rollback error, and recovery manifest path — because an incomplete rollback can
+  otherwise leave a worker's own success summary as the only outcome a failed call reports while
+  the main workspace stays partially modified. Each failure discloses its retained and omitted counts and the exact existing
+  follow-up read: `SubtasksInspect` with `offset`/`lines` for older rows of the retained
+  activity window (`offset` is an array index into that window, not an activity sequence
+  number) and `evidence: {index, limit}` for actual tool-call rows. Durable records are never
+  trimmed, an unknown or ambiguous target reports that no scoped snapshot is available instead
+  of replaying unrelated executions or silently selecting one (a request naming no handle still
+  gets the sole associated execution when exactly one exists, and `SubtasksStart` or
+  `SubtasksMarkClean` never gets an inferred one), and successful results,
+  read-only evidence-selector containment (#61), and interrupt settlement truth (#191) are
+  unchanged.
+
+## [0.1.0-dev.263]
+
+### Added
+
+- **Shared URL blocklist** (#620): `web.urlBlocklist` supplies one empty-by-default
+  list of JavaScript regular-expression sources for `WebFetch` and `BrowserExtract`.
+  Expressions search the complete supplied URL and each actual redirect destination
+  before access. Surrounding whitespace is trimmed from entries; anchors otherwise
+  retain their regex meaning. Matches explicitly deny the operation without an
+  extraction fallback. The existing Web
+  settings editor accepts one expression per line, with session-only and persistent
+  apply options. Changed lists invalidate acquisition caches. Existing network safety
+  stays intact; interactive browser tools and page subresources are outside this
+  convenience guard, which is not a security boundary.
+
+## [0.1.0-dev.262]
+
+### Changed
+
+- **`AskUserQuestion` no longer caps question text at 2,000 characters** (#396):
+  the question-only ceiling is gone from both the advertised tool schema and the
+  controller's registration validation, and no other number replaces it. A long,
+  self-contained question — just past 2,000 characters, or a substantially larger
+  multiline Unicode one — is admitted and kept in full through registration, the
+  pending list, the shared popup, and settlement, matching the long-form content
+  policy `YouShouldKnow` already follows. The delivered async answer now quotes the
+  accepted question in full instead of a 200-character clipped quote, like the sync
+  result already did. Nothing is hidden behind a preview: the shared popup keeps
+  scrolling, so the whole question stays readable with its choices,
+  **Type something…**, and **Decline** rows reachable below it. Choice count and
+  label limits, empty/whitespace and non-string rejection, originating-session
+  routing, async/sync modes, decline semantics, and the existing scroll behavior are
+  unchanged.
+
+## [0.1.0-dev.261]
+
+### Fixed
+
+- **A scrolled pending list keeps its place while entries come and go** (#615):
+  scrolling a long shared pending list with the pointer wheel or
+  **Shift+Alt+Up/Down** / **Ctrl+Alt+PageUp/PageDown** no longer snaps back to the
+  selected entry when the controller updates while the list is open — another
+  question or notice is registered, or another one is answered or closed.
+  The list still refreshes with that live state, and
+  every reveal stays where it was: opening the list or returning to it shows the
+  selected entry, **Up/Down** bring a newly selected entry into view, a pointer
+  press still selects without scrolling, resize still re-reveals the list
+  selection, and when the selected entry is resolved or closed the list falls
+  back to the first live entry and reveals it. Keyboard scroll keys and their
+  bounds, the fixed hint, answer choices and notice actions, free-text editor
+  ownership, popup routing, and the persistent panel are unchanged, and the
+  question/notice detail views never move the conversation behind the popup.
+
+## [0.1.0-dev.260]
+
+### Fixed
+
+- **Reviewer visibility on in-place subtask rows** (#314): an in-place task that
+  enters review now names its reviewers in the subtask indicator exactly like an
+  execute task does — the existing shared `· reviewers <labels> (<phase>)` segment
+  on the task's row — instead of showing only its executor. The labels are the
+  ones the worker emits for its frozen reviewer set, projected through the same
+  shared review-status path the wave pipeline already uses; nothing is guessed
+  from current configuration and no new label format was introduced. Running
+  executor labels and immutable invocation identity stay unchanged, and the
+  existing multiple/unknown/empty reviewer presentation is preserved. This is presentation data only: no in-place
+  lifecycle, routing, outcome, review semantics, or model selection changed.
+
+## [0.1.0-dev.259]
+
+### Fixed
+
+- **Checkpoint capture cancellation** (#617): intentional review aborts during
+  evidence capture follow the cancellation lifecycle rather than surfacing as an
+  unexpected checkpoint error. Cancelled captures never become valid checkpoints
+  or passing reviews; retained baselines, evidence, and review obligations survive
+  for the next prompt's fresh capture. Owned Git capture processes must settle,
+  while genuine capture failures and unconfirmed cleanup remain fail-closed.
+  Cancellation after recovery invocation preparation preserves actual reviewer
+  settlement diagnostics and durable checkpoint ownership rather than claiming
+  cleanup or retiring a checkpoint before its replacement state is saved.
+
+## [0.1.0-dev.258]
+
+### Added
+
+- **Live sidebar themes and an interactive overflow scrollbar** (#613): Dark and
+  Light Pi-styled palettes are saved in the session host's own per-agent settings
+  and applied without restarting sessions, including remote-only rosters with no
+  local Pi session. Pi's saved theme and child-session themes are untouched. An
+  overflowing roster keeps its themed scrollbar visible while idle, with direct
+  mouse navigation through the existing viewport; fitting content has no scrollbar.
+  Selection, focus, status text, wheel/keyboard navigation, and session routing
+  retain their existing meanings.
+
+### Changed
+
+- **One sidebar Settings menu** (#613) contains Theme, Network, and Host shortcuts,
+  replacing the separate Network and Host shortcuts roster actions while preserving
+  their existing capabilities, defaults, permissions, and actions. Settings appears
+  above Quit host.
+- **Sidebar colors are Pi's own** (#613): every sidebar foreground role now uses
+  the exact authored foreground of Pi 1.5.0's built-in Dark and Light themes
+  (body text, muted, dim, accent, success, error, warning, Markdown link,
+  scrollbar track and thumb), converted once through the pinned Pi TUI colour
+  API, instead of generic ANSI 30–37/90–97 substitutions. A positively idle agent
+  now reads in Pi's muted grey, distinct from the ordinary `agent` word and from
+  a running agent's Pi success green; waiting and pending input keep one warning
+  hue and its bold; unknown and exited states use Pi's dim colour. The
+  background stays the terminal default, the host still picks Dark or Light for
+  its own sidebar only (Pi's saved theme is never read, synchronized, or
+  restarted for), no terminal colour detection was added, and the wording,
+  state classification, navigation precedence, and layout are unchanged. The
+  copied values are MIT-attributed in NOTICE and
+  LICENSES/MIT-pi-theme-colors.txt.
+- **Sidebar activity counts and remote host names** (#613): each independent
+  number on a card's background row (`bg tasks`, `shells`) is banded by how much
+  work that session intends — 0 in Pi's muted grey, 1-2 in Pi's success green
+  (bold), 3-6 in Pi's warning colour (bold), 7 or more in Pi's error red (bold),
+  uncapped — so a busy card reads hotter. That red is activity intensity only:
+  it never reclassifies the row's status, notice, or lifecycle, and a busy card
+  never reads as failed. The `bg tasks` and `shells` labels, the spaces and the
+  `|` separator, and any `unknown` value stay in the pane's normal text colour,
+  and the row's wording, counts, and honest unknown handling are unchanged on
+  local and remote cards alike. Only the friendly hostname on a remote card's
+  indented owner line takes Pi's own cyan variable colour, unbolded as before;
+  the indentation, the `host` word, and `[stale]` stay ordinary text, and the
+  clipping that keeps `[stale]` ahead of a long name is unchanged. Both colours
+  are Pi 1.5.0 authored foregrounds (now eleven copied tokens) through the same
+  pinned conversion: the generated colour set stays closed, and no colour
+  detection, setting, action, or routing changed.
+- **Sidebar presentation** (#613) preserves the terminal's default background rather
+  than forcing a black or white base fill, colors observed agent states and pending
+  input independently, and keeps the active conversation's own title colour visible
+  while the separate keyboard-navigation highlight moves to another card. Status
+  text, state classification, session ownership, and scrollbar behavior are
+  unchanged.
+
+## [0.1.0-dev.257]
+
+### Fixed
 
 - **Escape inside `/review-settings` no longer cancels a running review** (#419):
   Pi dispatches extension terminal-input listeners BEFORE the focused component, so an

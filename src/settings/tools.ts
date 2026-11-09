@@ -94,6 +94,8 @@ export interface ToolSettingsWebState {
   browserDownloadRetention: number;
   browserVisible: boolean;
   browserPermissions: WebBrowserPermissions;
+  /** Shared acquisition URL blocklist (issue #620); empty blocks nothing. */
+  urlBlocklist: string[];
 }
 
 /** Staged state of the Tools submenu; draft-only until the root Save. */
@@ -186,8 +188,12 @@ export function webToolSummary(web: {
   maxDownloadBytes: number;
   browserVisible: boolean;
   browserPermissions: Pick<WebBrowserPermissions, "yolo">;
+  urlBlocklist?: readonly string[];
 }): string {
-  return `${formatByteSize(web.maxDownloadBytes)} max download · ${web.browserVisible ? "headed" : "headless"} browser${web.browserPermissions.yolo ? " · YOLO ON" : ""}`;
+  // The blocklist state is shown only when it is actually configured, so the
+  // default (empty) summary stays exactly as it was.
+  const blocked = (web.urlBlocklist ?? []).length;
+  return `${formatByteSize(web.maxDownloadBytes)} max download · ${web.browserVisible ? "headed" : "headless"} browser${web.browserPermissions.yolo ? " · YOLO ON" : ""}${blocked > 0 ? ` · ${blocked} blocked URL pattern${blocked === 1 ? "" : "s"}` : ""}`;
 }
 
 /** The root Tools row summary: both deny counts, the deferred-tool state, and the Web summary. */
@@ -388,6 +394,7 @@ export async function selectToolSettings(
       state.web.browserDownloadRetention,
       state.web.browserVisible,
       state.web.browserPermissions,
+      state.web.urlBlocklist,
     );
     state.web = {
       maxDownloadBytes: web.maxDownloadBytes,
@@ -396,6 +403,7 @@ export async function selectToolSettings(
       browserDownloadRetention: web.browserDownloadRetention,
       browserVisible: web.browserVisible,
       browserPermissions: web.browserPermissions,
+      urlBlocklist: web.urlBlocklist,
     };
   }
 }

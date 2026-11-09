@@ -102,3 +102,22 @@ provenance are reproduced in LICENSES/MIT-pi-theme-colors.txt. Only the color
 values are embedded; no Pi code is included. The same notice is packaged
 inside the installed Android application at
 app/src/main/assets/licenses/MIT-pi-theme-colors.txt.
+
+--------------------------------------------------------------------------
+Attribution to Pi Coding Agent (built-in theme colours)
+--------------------------------------------------------------------------
+
+This product includes the built-in Dark and Light theme foreground colour values
+from Pi Coding Agent v1.5.0, copied from its packages/coding-agent/src/modes/
+interactive/theme/dark.json and light.json into the host-owned colour table in
+src/session-host/sidebar-theme-colors.ts, which the session-host sidebar
+palettes in src/session-host/sidebar-theme.ts use:
+
+Pi Coding Agent (https://github.com/earendil-works/pi)
+Copyright 2025 Mario Zechner
+
+Licensed under the MIT License; the full text and the exact upstream source
+files are in LICENSES/MIT-pi-theme-colors.txt. Only the authored
+colour values are copied: the colour conversion itself is imported from the
+pinned pi-session-host-tui dependency and is not copied, and no Pi theme loader,
+configuration, or running Pi is used.

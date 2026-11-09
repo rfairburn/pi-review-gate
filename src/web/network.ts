@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 import { Agent, request, type Dispatcher } from "undici";
 import { isBlockedAddress } from "./ip";
 import type { BrokerDial } from "./egress-broker";
+import type { UrlGuard } from "./url-blocklist";
 import { isRecord } from "../record-guard";
 
 export interface NetworkOptions {
@@ -35,6 +36,18 @@ export interface NetworkOptions {
    * exactly one validated public address (IPv4 preferred).
    */
   brokerDial?: BrokerDial;
+  /**
+   * Acquisition-only shared URL blocklist guard (issue #620). When present, it
+   * is consulted once with the supplied URL exactly as given before any
+   * validation, DNS, or connect, and once with each redirect destination's
+   * complete URL — a `Location` resolved against the navigation URL, carrying a
+   * fragment only when the `Location` names one or the chain already carries
+   * one — before that hop is dialed; a denied URL throws
+   * `UrlBlocklistDeniedError`. No normalized or fragmentless derivative is ever
+   * judged. Interactive browsing never receives it, and an absent guard leaves
+   * acquisition behavior unchanged.
+   */
+  urlGuard?: UrlGuard;
 }
 
 /** Bounded omission diagnostics disclosed by a BrowserExtract render. */
@@ -90,6 +103,10 @@ export interface SearchResponse {
 export async function downloadText(url: string, options: NetworkOptions): Promise<DownloadedText> {
   const resolve = options.resolveHostname ?? defaultHostResolver;
   const createDispatcher = options.createDispatcher ?? createPinnedAgent;
+  // The shared blocklist judges the raw supplied URL — fragment and all —
+  // before any validation or request. Validation canonicalizes a separate
+  // fragmentless form for the wire, and that form is never a policy input.
+  options.urlGuard?.(url, "initial");
   const requested = await validatePublicUrl(url, resolve);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${options.timeoutMs}ms.`)), options.timeoutMs);
@@ -99,6 +116,16 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
   const dispatchers: Dispatcher[] = [];
   try {
     let current = requested;
+    // The complete navigation URL of the hop being followed, fragment included.
+    // It starts at the validated canonical form rather than the caller's raw
+    // string: the raw string was already judged above, before validation, and
+    // the navigation actually performed is the canonical one — Chromium is
+    // likewise pointed at `requested.href`, so its chain state starts without
+    // any fragment the caller supplied. Each later `Location` is resolved
+    // against THIS URL, which is how Chromium forms every redirect hop it
+    // requests. `current` stays the canonical fragmentless form that actually
+    // goes on the wire.
+    let currentNavigationUrl = requested.href;
     let method = options.method ?? "GET";
     let body = options.body;
     for (let redirects = 0; redirects <= 5; redirects += 1) {
@@ -148,7 +175,15 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
         // unread body surfaces as UND_ERR_ABORTED on the stream, which is
         // intentionally swallowed.
         response.body.destroy();
-        current = await validatePublicUrl(new URL(location, current.href).href, resolve);
+        // The next hop is judged as its COMPLETE navigation URL — the Location
+        // resolved against the URL being navigated, with a fragment only when
+        // the Location names one — and it is denied before it is validated,
+        // resolved, or dialed. The fragmentless canonical form below is only
+        // the wire target, never a second regex input.
+        const destination = redirectNavigationUrl(location, currentNavigationUrl);
+        options.urlGuard?.(destination, "redirect");
+        current = await validatePublicUrl(destination, resolve);
+        currentNavigationUrl = destination;
         if (response.statusCode === 303 || ((response.statusCode === 301 || response.statusCode === 302) && method === "POST")) {
           method = "GET";
           body = undefined;
@@ -184,6 +219,40 @@ export async function downloadText(url: string, options: NetworkOptions): Promis
     // destroyed even when validation, connection, or body reading throws.
     await Promise.allSettled(dispatchers.map((dispatcher) => dispatcher.destroy()));
   }
+}
+
+/**
+ * Resolve one redirect `Location` against the URL being navigated, the way the
+ * navigation itself resolves it: relative to the serialized current navigation
+ * URL, and — only when the Location names no fragment component at all —
+ * carrying that navigation URL's fragment forward, including an explicitly empty
+ * one. That is the observed behavior of the real acquisition route: native
+ * Chromium requests a hop whose Location introduced `#keep`, then requests the
+ * next hop of the same chain — whose Location named no fragment — with that
+ * `#keep` still attached to the navigation, and reports it as the hop's own
+ * `urlFragment`. What never enters a destination is a fragment of the URL the
+ * caller supplied, because the chain's navigation state starts at the canonical
+ * fragmentless form (see the caller of this function).
+ *
+ * A Location that names a fragment, even the bare `#`, wins: the bare `#` clears
+ * what the chain carried. The fragment never travels on the wire, so the Location
+ * and the chain are the only places a fragment can enter a redirect destination,
+ * and this complete URL is what the blocklist judges before the hop is followed.
+ */
+function redirectNavigationUrl(location: string, from: string): string {
+  // The navigation URL is taken through the URL parser once, so both the
+  // relative resolution and the carried fragment are serialized forms.
+  const baseHref = new URL(from).href;
+  const destination = new URL(location, baseHref).href;
+  // A canonical href carries `#` only as its fragment delimiter, so its
+  // presence — not the `hash` getter, which reports the empty string for both
+  // an absent and an explicitly empty fragment — decides whether the Location
+  // named a fragment component.
+  if (destination.includes("#")) return destination;
+  // The base's fragment component starts at its first `#` and is copied whole,
+  // so an explicitly empty base fragment (`…#`) is carried as `…#`.
+  const hash = baseHref.indexOf("#");
+  return hash < 0 ? destination : `${destination}${baseHref.slice(hash)}`;
 }
 
 export interface DdgsRawResult {

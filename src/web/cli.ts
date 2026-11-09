@@ -3,6 +3,7 @@ import { loadConfig, normalizeConfig, type ReviewGateConfig, type WebConfig } fr
 import { renderWithChromium } from "./browser";
 import { WebPageCache } from "./cache";
 import { searchDdgs } from "./network";
+import { compileUrlBlocklist } from "./url-blocklist";
 
 interface CliRequest {
   id?: string;
@@ -25,8 +26,11 @@ type CliConfig = ReviewGateConfig & { web: WebConfig };
 
 async function main(): Promise<void> {
   const config = cliConfig();
-  const cache = new WebPageCache(config.web.fetch);
-  const browserCache = new WebPageCache(config.web.fetch, renderWithChromium);
+  // The standalone CLI is the same acquisition implementation, so it applies
+  // the same shared URL blocklist as the tools (issue #620).
+  const urlBlocklist = compileUrlBlocklist(config.web.urlBlocklist);
+  const cache = new WebPageCache(config.web.fetch, undefined, urlBlocklist);
+  const browserCache = new WebPageCache(config.web.fetch, renderWithChromium, urlBlocklist);
   process.on("exit", () => {
     cache.cleanupSync();
     browserCache.cleanupSync();

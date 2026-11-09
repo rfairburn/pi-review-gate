@@ -8,8 +8,8 @@
  * Pi 1.5.0's public `showExtensionCustom`: it invokes the factory with the
  * live TUI, shows the returned component through the public
  * `tui.showOverlay(component, overlayOptions)`, and hides that overlay when
- * the factory's completion callback runs. Every keyboard byte sequence (and
- * the one SGR wheel report) enters through the terminal's input callback, so
+ * the factory's completion callback runs. Every keyboard byte sequence and
+ * SGR wheel/press/release report enters through the terminal's input callback, so
  * the native renderer's own raw input listener, overlay compositing, and
  * focus dispatch decide where each event goes.
  *
@@ -24,7 +24,9 @@
  * clamps and keeps content reachable, a wheel report inside the popup's own
  * rectangle scrolls that popup (and never the transcript behind it) while a
  * wheel report outside it scrolls the transcript and leaves the popup alone,
- * and ordinary answer delivery, close, and reopen are unchanged.
+ * and ordinary answer delivery, close, and reopen are unchanged. The #615
+ * regressions preserve explicit list scrolling across controller updates and
+ * compare long question/notice scrolling at identical synthetic geometry.
  */
 
 import assert from "node:assert/strict";
@@ -38,6 +40,7 @@ import { activate } from "../src/index";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
 import { __resetActiveNativeEditorFieldForTest, setNativeEditorHost } from "../src/native-editor-bridge";
 import { questionShortcutLabel } from "../src/user-question/index";
+import { longFormMarkers, longFormQuestion } from "./long-question-fixtures";
 import { setUserQuestionTuiHost } from "../src/user-question/pi-tui-host";
 import {
   createBridgeUi,
@@ -54,9 +57,13 @@ import {
 const COLUMNS = 80;
 const ROWS = 24;
 const RESIZED_ROWS = 14;
+/** Synthetic short-terminal geometry that makes the pending list overflow. */
+const SHORT_ROWS = 12;
 const CTRL_ALT_UP = "\x1b[1;7A";
 const SHIFT_ALT_DOWN = "\x1b[1;4B";
 const SHIFT_ALT_UP = "\x1b[1;4A";
+const CTRL_ALT_PAGE_UP = "\x1b[5;7~";
+const CTRL_ALT_PAGE_DOWN = "\x1b[6;7~";
 const ENTER = "\r";
 const UP = "\x1b[A";
 const DOWN = "\x1b[B";
@@ -72,6 +79,15 @@ const EDITING_HINT = "Enter submit · Esc back to options to scroll";
 /** SGR wheel report (1-based terminal coordinates). */
 function wheel(direction: "up" | "down", x: number, y: number): string {
   return `\x1b[<${direction === "up" ? 64 : 65};${x + 1};${y + 1}M`;
+}
+
+/** SGR left-button press and release on one terminal cell (0-based x/y). */
+function leftPress(x: number, y: number): string {
+  return `\x1b[<0;${x + 1};${y + 1}M`;
+}
+
+function leftRelease(x: number, y: number): string {
+  return `\x1b[<0;${x + 1};${y + 1}m`;
 }
 
 /**
@@ -183,6 +199,246 @@ async function until(predicate: () => boolean, ms = 2000): Promise<void> {
   }
 }
 
+/** One rendered popup, located through the native overlay bounds. */
+interface PopupView {
+  bounds: { row: number; col: number; width: number; height: number };
+  /** Plain interior rows between the frame's padding rows. */
+  interior: string[];
+  /** Scrolled body rows (interior minus the blank separator and the fixed hint). */
+  body: string[];
+  /** First terminal row of the fixed hint. */
+  hintRow: number;
+}
+
+/**
+ * The shared native popup harness: the production extension registration
+ * (`activate` → the registered shortcut handler → the shared custom overlay
+ * factory) over the pinned real `TuiAltScreen`, with a live native transcript
+ * underneath. Every keyboard byte sequence and SGR wheel report enters through
+ * the terminal's own input callback. One harness serves every native popup
+ * regression in this file; tests add their own pending entries and assertions.
+ */
+interface NativePopupHarness {
+  dir: string;
+  terminal: VirtualTerminal;
+  tui: TuiAltScreen;
+  transcript: Text;
+  tools: Map<string, any>;
+  sent: string[];
+  instances: FakeBridgeEditor[];
+  sessionManager: { id: string };
+  overlays: Array<{ handle: OverlayHandle; options: OverlayOptions | undefined }>;
+  open(): Promise<{ closed: Promise<unknown> }>;
+  screen(): string[];
+  current(): OverlayHandle;
+  view(hint: string, rows?: number): PopupView;
+  selected(popup: PopupView, needle: string): boolean;
+  natural(contentRows: number, hint: string): number;
+  wrappedRows(text: string): number;
+  askQuestion(id: string, question: string, choices: string[]): Promise<void>;
+  askQuestionWithAbort(
+    id: string,
+    question: string,
+    choices: string[],
+    signal: AbortSignal,
+  ): Promise<unknown>;
+  addNotice(id: string, title: string, body: string, context?: string): Promise<void>;
+  dispose(): Promise<void>;
+}
+
+async function startNativePopupHarness(options: { rows?: number } = {}): Promise<NativePopupHarness> {
+  const rows = options.rows ?? ROWS;
+  previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
+  previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
+  previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  // Hermetic top-level surface, as in the entrypoint tests.
+  delete process.env.PI_REVIEW_GATE_DISABLED;
+  delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-native-popup-"));
+  const terminal = new VirtualTerminal(COLUMNS, rows);
+  const tui = new TuiAltScreen(terminal);
+  assert.equal(tui.mode, "fullscreen", "the pinned native renderer is the fullscreen alternate-screen TUI");
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    maxCorrectionCycles: 3,
+    implementationGuidanceAfterCorrectionAttempts: 1,
+    maxPatchBytes: 200_000,
+    maxFileBytes: 1_048_576,
+    maxSnapshotBytes: 52_428_800,
+    retainBundles: "never",
+    review: { activeReviewers: [] },
+  }), "utf8");
+  process.env.PI_REVIEW_GATE_CONFIG = configPath;
+  const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const tools = new Map<string, any>();
+  const shortcuts = new Map<string, { handler: (ctx: unknown) => unknown }>();
+  const sent: string[] = [];
+  await activate({
+    on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, [...(hooks.get(name) ?? []), handler]); },
+    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerCommand() {},
+    registerShortcut(shortcut: string, options: { handler: (ctx: unknown) => unknown }) { shortcuts.set(shortcut, options); },
+    notify() {},
+    sendUserMessage(message: string) { sent.push(message); return Promise.resolve(); },
+    ui: { setStatus() {} },
+  });
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  // The running pi-tui's own width helpers and raw key matcher, as the
+  // production host loader would resolve them inside Pi.
+  setUserQuestionTuiHost({ matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi });
+  const sessionManager = { id: "native-popup-session" };
+  const sessionContext = { cwd: dir, ui: { setWidget() {} }, sessionManager, mode: "tui" };
+  for (const handler of hooks.get("session_start") ?? []) await handler({ cwd: dir }, sessionContext);
+
+  // A long native transcript underneath; it stays live while the popup is open.
+  const transcript = new Text(Array.from({ length: 200 }, (_, index) => `Transcript line ${index + 1}`).join("\n"), 0, 0);
+  tui.addChild(transcript);
+  tui.start();
+  tui.renderNow(true);
+
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+    bg: (_color: string, text: string) => `${SURFACE_BG}${text}\x1b[49m`,
+  };
+  const overlays: Array<{ handle: OverlayHandle; options: OverlayOptions | undefined }> = [];
+  const open = async (): Promise<{ closed: Promise<unknown> }> => {
+    const bridge = createBridgeUi({ keybindings: getKeybindings(), draft: "chat draft", drivers: [] });
+    // Mirror Pi 1.5.0 InteractiveMode.showExtensionCustom for overlays.
+    const custom = (factory: (...args: unknown[]) => unknown, options?: {
+      overlay?: boolean;
+      overlayOptions?: OverlayOptions;
+      onHandle?: (handle: OverlayHandle) => void;
+    }) => new Promise((resolve) => {
+      let handle: OverlayHandle | undefined;
+      let closed = false;
+      const done = (result: unknown) => {
+        if (closed) return;
+        closed = true;
+        handle?.hide();
+        resolve(result);
+      };
+      Promise.resolve(factory(tui, theme, getKeybindings(), done)).then((component) => {
+        if (closed) return;
+        assert.equal(options?.overlay, true, "the shared popup is a public custom overlay");
+        handle = tui.showOverlay(component as never, options?.overlayOptions);
+        overlays.push({ handle, options: options?.overlayOptions });
+        options?.onHandle?.(handle);
+      });
+    });
+    const before = overlays.length;
+    const opening = shortcuts.get("ctrl+alt+up")!.handler({
+      ui: { ...bridge.ui, custom },
+      sessionManager,
+      isIdle: () => true,
+    }) as Promise<unknown>;
+    await until(() => overlays.length > before);
+    return { closed: opening };
+  };
+  const screen = (): string[] => {
+    tui.renderNow(true);
+    return tui.getScreenLines();
+  };
+  const current = (): OverlayHandle => overlays.at(-1)!.handle;
+  const wrappedRows = (text: string): number => wrapTextWithAnsi(text, COLUMNS - 2).length;
+  /** Pre-#413 natural frame: two rules, two padding rows, content, a blank separator, and the hint. */
+  const natural = (contentRows: number, hint: string): number => 2 + 2 + contentRows + 1 + wrappedRows(hint);
+
+  /**
+   * Locate the popup through the native overlay bounds and check the compact
+   * appearance: the frame (rules, padding, theme surface) only within its
+   * centered, margin-bounded rectangle; outside it, the native transcript
+   * rows without any popup surface.
+   */
+  const view = (hint: string, viewRows = rows): PopupView => {
+    const lines = screen();
+    assert.equal(lines.length, viewRows);
+    const bounds = current().getBounds();
+    assert.ok(bounds, "the native overlay reports its rendered rectangle");
+    assert.equal(bounds.col, 0);
+    assert.equal(bounds.width, COLUMNS, "the popup keeps the full conversation width");
+    assert.ok(bounds.height <= viewRows - 2, "the popup stays within its one-row top and bottom margins");
+    assert.equal(bounds.row, 1 + Math.floor((viewRows - 2 - bounds.height) / 2), "the popup stays centered inside its margins");
+    const plain = lines.map(stripAnsi);
+    for (const [index, line] of lines.entries()) {
+      const inside = index >= bounds.row && index < bounds.row + bounds.height;
+      if (inside) {
+        assert.ok(line.includes(SURFACE_BG) && !/Transcript line/u.test(plain[index]!), `popup row ${index} carries the native theme surface`);
+      } else {
+        assert.ok(!line.includes(SURFACE_BG), `row ${index} outside the popup has no popup surface fill`);
+        assert.match(plain[index]!, /Transcript line \d+/u, `row ${index} outside the popup shows the native transcript`);
+      }
+    }
+    const frame = plain.slice(bounds.row, bounds.row + bounds.height);
+    assert.match(frame[0]!, /^─+$/u, "the frame starts with its top rule");
+    assert.match(frame.at(-1)!, /^─+$/u, "the frame ends with its bottom rule");
+    assert.equal(frame[1]!.trim(), "", "a blank padding row follows the top rule");
+    assert.equal(frame.at(-2)!.trim(), "", "a blank padding row precedes the bottom rule");
+    const interior = frame.slice(2, -2).map((line) => line.slice(1).trimEnd());
+    const hintRows = wrappedRows(hint);
+    const hintText = interior.slice(-hintRows).join(" ").replace(/\s+/gu, " ").trim();
+    assert.equal(hintText, hint, `the fixed keyboard hint closes the frame: ${interior.join(" | ")}`);
+    assert.equal(interior.at(-hintRows - 1), "", "a blank separator sits between the body and the fixed hint");
+    return {
+      bounds,
+      interior,
+      body: interior.slice(0, -hintRows - 1),
+      hintRow: bounds.row + 2 + interior.length - hintRows,
+    };
+  };
+  const selected = (popup: PopupView, needle: string): boolean =>
+    popup.body.some((line) => line.trimStart().startsWith("> ") && line.includes(needle));
+
+  const askQuestion = async (id: string, question: string, choices: string[]): Promise<void> => {
+    await tools.get("AskUserQuestion")!.execute(id, { question, choices }, undefined, undefined, { sessionManager });
+  };
+  const askQuestionWithAbort = (id: string, question: string, choices: string[], signal: AbortSignal): Promise<unknown> =>
+    tools.get("AskUserQuestion")!.execute(
+      id,
+      { question, choices, mode: "sync" },
+      signal,
+      undefined,
+      { sessionManager },
+    );
+  const addNotice = async (id: string, title: string, body: string, context?: string): Promise<void> => {
+    await tools.get("YouShouldKnow")!.execute(
+      id,
+      { title, body, ...(context === undefined ? {} : { context }) },
+      undefined,
+      undefined,
+      { sessionManager },
+    );
+  };
+
+  return {
+    dir,
+    terminal,
+    tui,
+    transcript,
+    tools,
+    sent,
+    instances,
+    sessionManager,
+    overlays,
+    open,
+    screen,
+    current,
+    view,
+    selected,
+    natural,
+    wrappedRows,
+    askQuestion,
+    askQuestionWithAbort,
+    addNotice,
+    dispose: async () => {
+      tui.stop();
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 test("synthetic popup wrap witness: one contiguous rendered run carries the wrapped path", () => {
   // Synthetic rows only: this pins the frame-witness helper, not a native host
   // rendering result.
@@ -210,165 +466,10 @@ test("synthetic popup wrap witness: one contiguous rendered run carries the wrap
 });
 
 test("native fullscreen: the compact popup keeps its natural size over the live transcript and scrolls by keyboard and pointer-owned wheel", async () => {
-  previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
-  previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
-  previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
-  // Hermetic top-level surface, as in the entrypoint tests.
-  delete process.env.PI_REVIEW_GATE_DISABLED;
-  delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-native-popup-"));
-  const terminal = new VirtualTerminal(COLUMNS, ROWS);
-  const tui = new TuiAltScreen(terminal);
+  const harness = await startNativePopupHarness();
+  const { terminal, transcript, sent, instances, overlays, open, screen, view, selected, natural, wrappedRows, askQuestion, addNotice } = harness;
   try {
-    assert.equal(tui.mode, "fullscreen", "the pinned native renderer is the fullscreen alternate-screen TUI");
-    const configPath = join(dir, "review-gate.json");
-    await writeFile(configPath, JSON.stringify({
-      enabled: true,
-      maxCorrectionCycles: 3,
-      implementationGuidanceAfterCorrectionAttempts: 1,
-      maxPatchBytes: 200_000,
-      maxFileBytes: 1_048_576,
-      maxSnapshotBytes: 52_428_800,
-      retainBundles: "never",
-      review: { activeReviewers: [] },
-    }), "utf8");
-    process.env.PI_REVIEW_GATE_CONFIG = configPath;
-    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    const tools = new Map<string, any>();
-    const shortcuts = new Map<string, { handler: (ctx: unknown) => unknown }>();
-    const sent: string[] = [];
-    await activate({
-      on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, [...(hooks.get(name) ?? []), handler]); },
-      registerTool(tool: any) { tools.set(tool.name, tool); },
-      registerCommand() {},
-      registerShortcut(shortcut: string, options: { handler: (ctx: unknown) => unknown }) { shortcuts.set(shortcut, options); },
-      notify() {},
-      sendUserMessage(message: string) { sent.push(message); return Promise.resolve(); },
-      ui: { setStatus() {} },
-    });
-    const instances: FakeBridgeEditor[] = [];
-    setNativeEditorHost(fakeHost(instances));
-    // The running pi-tui's own width helpers and raw key matcher, as the
-    // production host loader would resolve them inside Pi.
-    setUserQuestionTuiHost({ matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi });
-    const sessionManager = { id: "native-popup-session" };
-    const sessionContext = { cwd: dir, ui: { setWidget() {} }, sessionManager, mode: "tui" };
-    for (const handler of hooks.get("session_start") ?? []) await handler({ cwd: dir }, sessionContext);
-
-    // A long native transcript underneath; it is updated while the popup is open.
-    const transcript = new Text(Array.from({ length: 200 }, (_, index) => `Transcript line ${index + 1}`).join("\n"), 0, 0);
-    tui.addChild(transcript);
-    tui.start();
-    tui.renderNow(true);
-
-    const askQuestion = async (id: string, question: string, choices: string[]): Promise<void> => {
-      await tools.get("AskUserQuestion")!.execute(id, { question, choices }, undefined, undefined, { sessionManager });
-    };
     await askQuestion("q1", "Short question?", ["Keep the lane"]);
-
-    const theme = {
-      fg: (_color: string, text: string) => text,
-      bold: (text: string) => text,
-      bg: (_color: string, text: string) => `${SURFACE_BG}${text}\x1b[49m`,
-    };
-    const overlays: Array<{ handle: OverlayHandle; options: OverlayOptions | undefined }> = [];
-    let openCount = 0;
-    const open = async (): Promise<{ closed: Promise<unknown> }> => {
-      const bridge = createBridgeUi({ keybindings: getKeybindings(), draft: "chat draft", drivers: [] });
-      // Mirror Pi 1.5.0 InteractiveMode.showExtensionCustom for overlays.
-      const custom = (factory: (...args: unknown[]) => unknown, options?: {
-        overlay?: boolean;
-        overlayOptions?: OverlayOptions;
-        onHandle?: (handle: OverlayHandle) => void;
-      }) => new Promise((resolve) => {
-        let handle: OverlayHandle | undefined;
-        let closed = false;
-        const done = (result: unknown) => {
-          if (closed) return;
-          closed = true;
-          handle?.hide();
-          resolve(result);
-        };
-        Promise.resolve(factory(tui, theme, getKeybindings(), done)).then((component) => {
-          if (closed) return;
-          assert.equal(options?.overlay, true, "the shared popup is a public custom overlay");
-          handle = tui.showOverlay(component as never, options?.overlayOptions);
-          overlays.push({ handle, options: options?.overlayOptions });
-          options?.onHandle?.(handle);
-        });
-      });
-      const before = overlays.length;
-      const opening = shortcuts.get("ctrl+alt+up")!.handler({
-        ui: { ...bridge.ui, custom },
-        sessionManager,
-        isIdle: () => true,
-      }) as Promise<unknown>;
-      await until(() => overlays.length > before);
-      openCount += 1;
-      return { closed: opening };
-    };
-    const screen = (): string[] => {
-      tui.renderNow(true);
-      return tui.getScreenLines();
-    };
-    const current = (): OverlayHandle => overlays.at(-1)!.handle;
-    const wrappedRows = (text: string): number => wrapTextWithAnsi(text, COLUMNS - 2).length;
-    /** Pre-#413 natural frame: two rules, two padding rows, content, a blank separator, and the hint. */
-    const natural = (contentRows: number, hint: string): number => 2 + 2 + contentRows + 1 + wrappedRows(hint);
-
-    interface PopupView {
-      bounds: { row: number; col: number; width: number; height: number };
-      /** Plain interior rows between the frame's padding rows. */
-      interior: string[];
-      /** Scrolled body rows (interior minus the blank separator and the fixed hint). */
-      body: string[];
-      /** First terminal row of the fixed hint. */
-      hintRow: number;
-    }
-    /**
-     * Locate the popup through the native overlay bounds and check the compact
-     * appearance: the frame (rules, padding, theme surface) only within its
-     * centered, margin-bounded rectangle; outside it, the native transcript
-     * rows without any popup surface.
-     */
-    const view = (hint: string, rows = ROWS): PopupView => {
-      const lines = screen();
-      assert.equal(lines.length, rows);
-      const bounds = current().getBounds();
-      assert.ok(bounds, "the native overlay reports its rendered rectangle");
-      assert.equal(bounds.col, 0);
-      assert.equal(bounds.width, COLUMNS, "the popup keeps the full conversation width");
-      assert.ok(bounds.height <= rows - 2, "the popup stays within its one-row top and bottom margins");
-      assert.equal(bounds.row, 1 + Math.floor((rows - 2 - bounds.height) / 2), "the popup stays centered inside its margins");
-      const plain = lines.map(stripAnsi);
-      for (const [index, line] of lines.entries()) {
-        const inside = index >= bounds.row && index < bounds.row + bounds.height;
-        if (inside) {
-          assert.ok(line.includes(SURFACE_BG) && !/Transcript line/u.test(plain[index]!), `popup row ${index} carries the native theme surface`);
-        } else {
-          assert.ok(!line.includes(SURFACE_BG), `row ${index} outside the popup has no popup surface fill`);
-          assert.match(plain[index]!, /Transcript line \d+/u, `row ${index} outside the popup shows the native transcript`);
-        }
-      }
-      const frame = plain.slice(bounds.row, bounds.row + bounds.height);
-      assert.match(frame[0]!, /^─+$/u, "the frame starts with its top rule");
-      assert.match(frame.at(-1)!, /^─+$/u, "the frame ends with its bottom rule");
-      assert.equal(frame[1]!.trim(), "", "a blank padding row follows the top rule");
-      assert.equal(frame.at(-2)!.trim(), "", "a blank padding row precedes the bottom rule");
-      const interior = frame.slice(2, -2).map((line) => line.slice(1).trimEnd());
-      const hintRows = wrappedRows(hint);
-      const hintText = interior.slice(-hintRows).join(" ").replace(/\s+/gu, " ").trim();
-      assert.equal(hintText, hint, `the fixed keyboard hint closes the frame: ${interior.join(" | ")}`);
-      assert.equal(interior.at(-hintRows - 1), "", "a blank separator sits between the body and the fixed hint");
-      return {
-        bounds,
-        interior,
-        body: interior.slice(0, -hintRows - 1),
-        hintRow: bounds.row + 2 + interior.length - hintRows,
-      };
-    };
-    const selected = (popup: PopupView, needle: string): boolean =>
-      popup.body.some((line) => line.trimStart().startsWith("> ") && line.includes(needle));
     const listHeader = `Pending input (1) · ${questionShortcutLabel()} to close`;
     assert.equal(wrappedRows(listHeader), 1);
 
@@ -412,13 +513,11 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     terminal.send(CTRL_ALT_UP);
     await firstOpening;
     assert.ok(screen().every((line) => !line.includes(SURFACE_BG)), "closing leaves no popup surface behind");
-    await tools.get("YouShouldKnow")!.execute("n1", {
-      title: "Long notice",
-      body: Array.from({ length: 40 }, (_, index) => `Notice body row ${String(index + 1).padStart(2, "0")}`).join("\n"),
-      context: "Context first row\nCONTEXT-END",
-    }, undefined, undefined, { sessionManager });
+    await addNotice("n1", "Long notice",
+      Array.from({ length: 40 }, (_, index) => `Notice body row ${String(index + 1).padStart(2, "0")}`).join("\n"),
+      "Context first row\nCONTEXT-END");
     const shortNoticeBody = "One short notice row.";
-    await tools.get("YouShouldKnow")!.execute("n2", { title: "Short notice", body: shortNoticeBody }, undefined, undefined, { sessionManager });
+    await addNotice("n2", "Short notice", shortNoticeBody);
 
     const { closed: secondOpening } = await open();
     popup = view(LIST_MIXED_HINT);
@@ -603,11 +702,399 @@ test("native fullscreen: the compact popup keeps its natural size over the live 
     assert.equal(popup.bounds.height, natural(2 + 3, LIST_MIXED_HINT), "the reopened list is sized to its three one-row entries");
     terminal.send(CTRL_ALT_UP);
     await reopened;
-    assert.equal(openCount, 4);
+    assert.equal(overlays.length, 4);
     assert.equal(sent.length, 1, "only the confirmed answer reached the model");
   } finally {
-    tui.stop();
-    await rm(dir, { recursive: true, force: true });
+    await harness.dispose();
+  }
+});
+
+test("native fullscreen: an explicit pending-list scroll survives unrelated controller updates (#615)", async () => {
+  const harness = await startNativePopupHarness({ rows: SHORT_ROWS });
+  const { terminal, sent, open, screen, view, selected, askQuestion, askQuestionWithAbort, addNotice } = harness;
+  /** The pending entry each body row shows, in list order ("q3", "n4", …). */
+  const entryIds = (popup: PopupView): string[] => popup.body.flatMap((line) => {
+    const match = /^\s*>?\s*([qn]\d+):/u.exec(line);
+    return match ? [match[1]!] : [];
+  });
+  const listHeader = (count: number): string => `Pending input (${count}) · ${questionShortcutLabel()} to close`;
+  const showsEntry = (popup: PopupView, id: string): boolean => popup.body.some((line) => line.includes(`${id}:`));
+  const showsSelectedEntry = (popup: PopupView, id: string): boolean => selected(popup, `${id}:`);
+  const selectedEntryId = (popup: PopupView): string | undefined => {
+    for (const line of popup.body) {
+      const match = /^\s*>\s*([qn]\d+):/u.exec(line);
+      if (match) return match[1];
+    }
+    return undefined;
+  };
+  // Live count of registered pending entries, so every header assertion reads
+  // the same state the popup does instead of a hand-maintained number.
+  let pendingCount = 0;
+  const registerQuestion = async (id: string, question: string, choices: string[]): Promise<void> => {
+    await askQuestion(id, question, choices);
+    pendingCount += 1;
+  };
+  const registerNotice = async (id: string, title: string, body: string): Promise<void> => {
+    await addNotice(id, title, body);
+    pendingCount += 1;
+  };
+
+  try {
+    // Twelve pending entries through the production tools: six questions and
+    // six notices, so one list geometry owns both entry kinds.
+    for (let index = 1; index <= 6; index += 1) {
+      await registerQuestion(`tc-q${index}`, `Choose the lane for ${index}?`, ["Alpha", "Beta"]);
+      await registerNotice(`tc-n${index}`, `Notice ${index}`, `Notice ${index} body.`);
+    }
+    const { closed: opening } = await open();
+
+    let popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.equal(popup.bounds.height, SHORT_ROWS - 2, "a twelve-entry list is capped inside the one-row margins");
+    assert.equal(popup.body[0], listHeader(pendingCount));
+    assert.ok(showsSelectedEntry(popup, "q1"), "the implicit first selection is revealed on open");
+    assert.ok(!showsEntry(popup, "n6"), "the last entry starts out of view");
+
+    // --- keyboard scrolling moves the list one line at a time ---
+    const idsBeforeScroll = new Set(entryIds(popup));
+    for (let step = 0; step < 4; step += 1) {
+      const before = popup;
+      terminal.send(SHIFT_ALT_DOWN);
+      const next = view(LIST_MIXED_HINT, SHORT_ROWS);
+      assert.equal(next.hintRow, before.hintRow, "the fixed hint does not move while the list scrolls");
+      assert.deepEqual(next.body.slice(0, -1), before.body.slice(1), "each Shift+Alt+Down moves the list exactly one line");
+      popup = next;
+    }
+    assert.ok(entryIds(popup).some((id) => !idsBeforeScroll.has(id)), "keyboard scrolling brings later entries into view");
+    assert.ok(!showsSelectedEntry(popup, "q1"), "the selected first entry is now scrolled out of the viewport");
+
+    // --- the reported defect (#615): registering an entry while scrolled used
+    // to re-reveal the selection and snap the viewport back to the top ---
+    const screenBeforeRegister = screen();
+    await registerNotice("tc-n7", "Late notice", "Late notice body.");
+    const afterRegister = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.deepEqual(afterRegister.body, popup.body,
+      "a new pending entry leaves the scrolled list viewport exactly where the reader put it");
+    assert.ok(!showsEntry(afterRegister, "n7"), "the new entry does not jump into the viewport");
+    assert.deepEqual(outsideBoundsRows(screen(), afterRegister.bounds), outsideBoundsRows(screenBeforeRegister, afterRegister.bounds),
+      "the native transcript behind the popup never moved");
+    popup = afterRegister;
+
+    // --- repeated controller updates interleaved with wheel scrolling ---
+    const wheelCell = 10;
+    const wheelRow = popup.bounds.row + 3;
+    for (let round = 0; round < 3; round += 1) {
+      await registerNotice(`tc-extra-${round}`, `Extra notice ${round}`, `Extra body ${round}.`);
+      const afterUpdate = view(LIST_MIXED_HINT, SHORT_ROWS);
+      assert.deepEqual(afterUpdate.body, popup.body, `a controller update between wheel steps ${round} keeps the list position`);
+      terminal.send(wheel("down", wheelCell, wheelRow));
+      const afterWheel = view(LIST_MIXED_HINT, SHORT_ROWS);
+      assert.deepEqual(afterWheel.body.slice(0, -1), afterUpdate.body.slice(1),
+        `the list still moves exactly one line after controller update ${round}`);
+      popup = afterWheel;
+    }
+
+    // --- the wheel reaches both ends of the grown list, in both directions ---
+    const seenWhileWheeling = new Set<string>(entryIds(popup));
+    for (let step = 0; step < 60 && !showsEntry(popup, "n10"); step += 1) {
+      terminal.send(wheel("down", wheelCell, wheelRow));
+      popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+      for (const id of entryIds(popup)) seenWhileWheeling.add(id);
+    }
+    assert.ok(showsEntry(popup, "n10"), "the wheel reaches the last registered notice");
+    assert.ok([...seenWhileWheeling].some((id) => id.startsWith("q")), "the wheel reaches question entries of the list");
+    assert.ok([...seenWhileWheeling].some((id) => id.startsWith("n")), "the wheel reaches notice entries of the list");
+    const atWheelEnd = popup.interior;
+    terminal.send(wheel("down", wheelCell, wheelRow));
+    assert.deepEqual(view(LIST_MIXED_HINT, SHORT_ROWS).interior, atWheelEnd, "a wheel past the list end is claimed and changes nothing");
+    for (let step = 0; step < 60; step += 1) terminal.send(wheel("up", wheelCell, wheelRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.equal(popup.body[0], listHeader(pendingCount), "the wheel returns the list to its beginning, with the live entry count");
+    assert.ok(showsSelectedEntry(popup, "q1"), "the first entry is visible again at the beginning");
+    const atWheelStart = popup.interior;
+    terminal.send(wheel("up", wheelCell, wheelRow));
+    assert.deepEqual(view(LIST_MIXED_HINT, SHORT_ROWS).interior, atWheelStart, "a wheel before the list beginning is claimed and changes nothing");
+
+    // --- a pointer press selects without revealing, and a held press that is
+    // cancelled by a wheel still does not pull the viewport back later ---
+    for (let step = 0; step < 3; step += 1) terminal.send(wheel("down", wheelCell, wheelRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    const pressedEntry = entryIds(popup)[0]!;
+    assert.notEqual(pressedEntry, "q1", "the row to press shows a different entry than the selected one");
+    const pressRow = popup.bounds.row + 2;
+    terminal.send(leftPress(5, pressRow));
+    const afterPress = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.equal(selectedEntryId(afterPress), pressedEntry, "a press on a visible list row selects that entry");
+    assert.deepEqual(entryIds(afterPress), entryIds(popup), "the press alone did not move the list viewport");
+    terminal.send(wheel("down", wheelCell, wheelRow));
+    terminal.send(leftRelease(5, pressRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.equal(entryIds(popup)[0], entryIds(afterPress)[1],
+      "the wheel that cancels the held press still moves the list exactly one line");
+    await registerNotice("tc-after-press", "After press", "After press body.");
+    assert.deepEqual(view(LIST_MIXED_HINT, SHORT_ROWS).body, popup.body,
+      "a controller update after a press and a wheel keeps the list where the reader left it");
+
+    // --- Ctrl+Alt+PageDown/PageUp page the same offset, both directions ---
+    // Move away from the beginning first: while the header row is visible, a
+    // changed entry count is a real content change, not a viewport move.
+    for (let step = 0; step < 3; step += 1) terminal.send(wheel("down", wheelCell, wheelRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.ok(!popup.body[0].startsWith("Pending input"), "the header row has scrolled out of the list viewport");
+    for (const direction of ["down", "up"] as const) {
+      const key = direction === "down" ? CTRL_ALT_PAGE_DOWN : CTRL_ALT_PAGE_UP;
+      const before = view(LIST_MIXED_HINT, SHORT_ROWS);
+      terminal.send(key);
+      const afterKey = view(LIST_MIXED_HINT, SHORT_ROWS);
+      assert.deepEqual(direction === "down" ? afterKey.body.slice(0, -1) : before.body.slice(0, -1),
+        direction === "down" ? before.body.slice(1) : afterKey.body.slice(1),
+        `Ctrl+Alt+Page${direction === "down" ? "Down" : "Up"} moves the list exactly one line`);
+      await registerNotice(`tc-page-${direction}`, `Page notice ${direction}`, "Page body.");
+      const afterUpdate = view(LIST_MIXED_HINT, SHORT_ROWS);
+      assert.deepEqual(afterUpdate.body, afterKey.body, `Ctrl+Alt+Page${direction === "down" ? "Down" : "Up"} keeps the position across a controller update`);
+    }
+
+    // --- selection navigation still reveals the selected entry ---
+    for (let step = 0; step < 10; step += 1) terminal.send(DOWN);
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    const navigated = entryIds(popup).find((id) => showsSelectedEntry(popup, id));
+    assert.ok(navigated !== undefined, "Down keeps the selected entry inside the viewport while navigating");
+
+    // An arrow key whose reveal is immediately cancelled by a wheel must not
+    // have that reveal applied by a controller update that arrives later.
+    const topBeforeCancelledWheel = entryIds(popup)[0];
+    terminal.send(DOWN);
+    terminal.send(wheel("up", wheelCell, wheelRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.notEqual(entryIds(popup)[0], topBeforeCancelledWheel, "the wheel after the arrow key moved the list");
+    await registerNotice("tc-after-cancelled-reveal", "After cancelled reveal", "Cancelled reveal body.");
+    assert.deepEqual(view(LIST_MIXED_HINT, SHORT_ROWS).body, popup.body,
+      "a controller update does not apply a reveal the wheel already cancelled");
+
+    // --- the selected record disappearing still reveals the fallback ---
+    const abort = new AbortController();
+    const syncWait = askQuestionWithAbort("tc-sync", "Which abort lane?", ["Abort"], abort.signal);
+    pendingCount += 1;
+    for (let step = 0; step < 30 && !showsSelectedEntry(popup, "q7"); step += 1) {
+      terminal.send(DOWN);
+      popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    }
+    assert.ok(showsSelectedEntry(popup, "q7"), "the waiting sync question is selected and revealed");
+    for (let step = 0; step < 4; step += 1) terminal.send(wheel("up", wheelCell, wheelRow));
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.ok(!showsSelectedEntry(popup, "q7"), "the selected sync question is scrolled out of the viewport");
+    abort.abort();
+    await syncWait;
+    pendingCount -= 1;
+    popup = view(LIST_MIXED_HINT, SHORT_ROWS);
+    assert.ok(!popup.body.some((line) => line.includes("q7:")), "the aborted sync question left the pending list");
+    assert.ok(showsSelectedEntry(popup, "q1"), "the fallback selection is revealed when the selected record disappears");
+
+    // --- the answer view's choices and the notice view's actions are unchanged ---
+    terminal.send(ENTER);
+    let detail = view(ANSWER_HINT, SHORT_ROWS);
+    assert.equal(detail.body[0], "q1:", "the selected question opens at its beginning");
+    for (let step = 0; step < 30 && !detail.body.some((line) => line.includes("1. Alpha")); step += 1) {
+      terminal.send(SHIFT_ALT_DOWN);
+      detail = view(ANSWER_HINT, SHORT_ROWS);
+    }
+    assert.ok(detail.body.some((line) => line.includes("> 1. Alpha")), "the question's choices are still reachable");
+    terminal.send(ESCAPE);
+    terminal.send(DOWN); // the notice after q1 (list order: q1, n1, …)
+    terminal.send(ENTER);
+    detail = view(NOTICE_HINT, SHORT_ROWS);
+    for (let step = 0; step < 30
+      && !(detail.body.some((line) => line.includes("More details")) && detail.body.some((line) => line.includes("Close"))); step += 1) {
+      terminal.send(SHIFT_ALT_DOWN);
+      detail = view(NOTICE_HINT, SHORT_ROWS);
+    }
+    assert.ok(detail.body.some((line) => line.includes("More details")), "the notice's More details action is still reachable");
+    assert.ok(detail.body.some((line) => line.includes("Close")), "and its Close action too");
+    terminal.send(ESCAPE);
+
+    // --- resize keeps its existing semantics, then the fix still holds ---
+    const selectionBeforeResize = selectedEntryId(view(LIST_MIXED_HINT, SHORT_ROWS));
+    assert.ok(selectionBeforeResize, "a list entry is selected before the resize");
+    for (let step = 0; step < 4; step += 1) terminal.send(SHIFT_ALT_DOWN);
+    assert.ok(!showsSelectedEntry(view(LIST_MIXED_HINT, SHORT_ROWS), selectionBeforeResize),
+      "the selection is scrolled out of view before resize re-reveals it");
+    terminal.resize(ROWS);
+    popup = view(LIST_MIXED_HINT, ROWS);
+    assert.equal(popup.bounds.height, ROWS - 2, "the resized list follows the new margin-bounded height");
+    assert.equal(selectedEntryId(popup), selectionBeforeResize,
+      "resize keeps re-revealing the list selection with its existing semantics");
+    for (let step = 0; step < 3; step += 1) terminal.send(SHIFT_ALT_DOWN);
+    popup = view(LIST_MIXED_HINT, ROWS);
+    await registerNotice("tc-after-resize", "After resize", "After resize body.");
+    assert.deepEqual(view(LIST_MIXED_HINT, ROWS).body, popup.body, "the preserved scroll survives a resize to a new geometry");
+    for (let step = 0; step < 60 && !showsEntry(popup, "n14"); step += 1) {
+      terminal.send(SHIFT_ALT_DOWN);
+      popup = view(LIST_MIXED_HINT, ROWS);
+    }
+    assert.ok(showsEntry(popup, "n14"), "content added after a resize is reachable by scrolling");
+
+    // --- close and reopen routing: a fresh popup starts at its beginning ---
+    terminal.send(CTRL_ALT_UP);
+    await opening;
+    assert.ok(screen().every((line) => !line.includes(SURFACE_BG)), "closing leaves no popup surface behind");
+    const { closed: reopened } = await open();
+    popup = view(LIST_MIXED_HINT, ROWS);
+    assert.equal(popup.body[0], listHeader(pendingCount), "the reopened list reads the live pending state");
+    assert.ok(showsSelectedEntry(popup, "q1"), "the reopened popup starts at its beginning with the first entry revealed");
+    terminal.send(CTRL_ALT_UP);
+    await reopened;
+    assert.equal(sent.length, 0, "no scroll, controller update, resize, or navigation sent anything to the model");
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("native fullscreen: a long question and a long notice scroll identically by wheel and both documented keyboard chords (#615)", async () => {
+  const harness = await startNativePopupHarness({ rows: SHORT_ROWS });
+  const { terminal, sent, open, screen, view, current, askQuestion, addNotice } = harness;
+
+  // The same paragraph text through both tools — one long question and one
+  // long notice — rendered at one identical geometry, so any difference
+  // between the two runs is that tool's own scroll behaviour and nothing else.
+  const sharedText = Array.from({ length: 8 }, (_, index) =>
+    `Paragraph ${index + 1} of 8: align the retry budget for the payment worker with the checkout queue before the release ships to production.`).join("\n\n");
+  const paragraphMarkers = Array.from({ length: 8 }, (_, index) => `Paragraph ${index + 1} of 8`);
+  const shows = (popup: PopupView, marker: string): boolean => popup.body.some((line) => line.includes(marker));
+
+  /**
+   * Drive one detail view through the whole documented scroll matrix at this
+   * geometry: every control moves the rendered body rows exactly one line in
+   * both directions, the fixed hint and the native transcript behind the popup
+   * never move, both bounds stay claimed and inert, and every paragraph plus
+   * the trailing choices or actions becomes reachable with every control.
+   * Returns the presses each control needed to traverse the content.
+   */
+  const exerciseDetail = (hint: string, header: string, trailing: string[]): Record<string, number> => {
+    const bounds = current().getBounds()!;
+    assert.equal(bounds.height, SHORT_ROWS - 2, "the detail view is capped inside the one-row margins");
+    assert.equal(bounds.width, COLUMNS, "the detail view keeps the full conversation width");
+    const wheelRow = bounds.row + 3;
+    const controls = [
+      {
+        name: "the pointer wheel",
+        down: (): void => { terminal.send(wheel("down", 10, wheelRow)); },
+        up: (): void => { terminal.send(wheel("up", 10, wheelRow)); },
+      },
+      {
+        name: "Shift+Alt+Down/Up",
+        down: (): void => { terminal.send(SHIFT_ALT_DOWN); },
+        up: (): void => { terminal.send(SHIFT_ALT_UP); },
+      },
+      {
+        name: "Ctrl+Alt+PageDown/PageUp",
+        down: (): void => { terminal.send(CTRL_ALT_PAGE_DOWN); },
+        up: (): void => { terminal.send(CTRL_ALT_PAGE_UP); },
+      },
+    ];
+    const background = outsideBoundsRows(screen(), bounds);
+
+    let popup = view(hint, SHORT_ROWS);
+    assert.equal(popup.body[0], header, "the detail view opens at its own header");
+    assert.ok(!shows(popup, paragraphMarkers.at(-1)!), "the detail view opens before its last paragraph");
+
+    // One line each way for every control, away from both bounds.
+    for (let step = 0; step < 3; step += 1) terminal.send(wheel("down", 10, wheelRow));
+    popup = view(hint, SHORT_ROWS);
+    for (const control of controls) {
+      const before = view(hint, SHORT_ROWS);
+      control.down();
+      const moved = view(hint, SHORT_ROWS);
+      assert.deepEqual(moved.body.slice(0, -1), before.body.slice(1), `${control.name} moves the body exactly one line`);
+      assert.equal(moved.hintRow, before.hintRow, `${control.name} leaves the fixed hint in place`);
+      assert.deepEqual(outsideBoundsRows(screen(), moved.bounds), background,
+        `${control.name} never moves the native transcript behind the popup`);
+      control.up();
+      const back = view(hint, SHORT_ROWS);
+      assert.deepEqual(moved.body.slice(0, -1), back.body.slice(1), `${control.name} moves back exactly one line`);
+      assert.deepEqual(back.body, before.body, `${control.name} returns the body to the same rows`);
+    }
+
+    // Full traversal with every control, both directions, from a clamped start.
+    // Each press is measured against the rows rendered just before it, and the
+    // paragraphs that came into view are collected, so reachability is read off
+    // the screen rather than inferred.
+    const traverse = (send: () => void): { moves: number; seen: Set<string> } => {
+      const seen = new Set<string>();
+      const collect = (at: PopupView): void => {
+        for (const marker of [...paragraphMarkers, ...trailing]) if (shows(at, marker)) seen.add(marker);
+      };
+      collect(view(hint, SHORT_ROWS));
+      let moves = 0;
+      for (; ;) {
+        const before = view(hint, SHORT_ROWS);
+        send();
+        const after = view(hint, SHORT_ROWS);
+        collect(after);
+        if (after.body.join("\n") === before.body.join("\n")) return { moves, seen };
+        moves += 1;
+        if (moves > 80) return assert.fail(`${hint} never clamped while scrolling`);
+      }
+    };
+    const traversed: Record<string, number> = {};
+    for (const control of controls) {
+      traverse(control.up); // rewind to the content beginning (clamps)
+      const down = traverse(control.down);
+      const atEnd = view(hint, SHORT_ROWS);
+      for (const marker of [...paragraphMarkers, ...trailing]) {
+        assert.ok(down.seen.has(marker), `${control.name} brings "${marker}" into view`);
+      }
+      assert.ok(shows(atEnd, trailing.at(-1)!), `${control.name} reaches the last "${trailing.at(-1)!}" row at the content end`);
+      control.down();
+      assert.deepEqual(view(hint, SHORT_ROWS).body, atEnd.body,
+        `${control.name} past the content end is claimed and changes nothing`);
+      const up = traverse(control.up);
+      assert.equal(up.moves, down.moves, `${control.name} returns over the same range`);
+      assert.ok(up.seen.has(paragraphMarkers[0]!), `${control.name} passed the first paragraph on the way back`);
+      const atStart = view(hint, SHORT_ROWS);
+      assert.equal(atStart.body[0], header, `${control.name} returns to the content beginning`);
+      control.up();
+      assert.deepEqual(view(hint, SHORT_ROWS).body, atStart.body,
+        `${control.name} before the content beginning is claimed and changes nothing`);
+      assert.deepEqual(outsideBoundsRows(screen(), atStart.bounds), background,
+        `${control.name} left the native transcript behind the popup untouched across the whole traversal`);
+      traversed[control.name] = down.moves;
+    }
+    return traversed;
+  };
+
+  try {
+    await askQuestion("tc-long-q", sharedText, ["Alpha", "Beta"]);
+    await addNotice("tc-long-n", "Long notice", sharedText);
+    const { closed: opening } = await open();
+    view(LIST_MIXED_HINT, SHORT_ROWS);
+
+    // --- the long question's answer view ---
+    terminal.send(ENTER);
+    const question = view(ANSWER_HINT, SHORT_ROWS);
+    const questionSteps = exerciseDetail(ANSWER_HINT, "q1:", ["1. Alpha", "2. Beta", "Type something…", "Decline"]);
+
+    // --- the same matrix on the long notice, at the identical geometry ---
+    terminal.send(ESCAPE);
+    terminal.send(DOWN);
+    terminal.send(ENTER);
+    const noticeBounds = current().getBounds()!;
+    assert.deepEqual({ width: noticeBounds.width, height: noticeBounds.height, row: noticeBounds.row },
+      { width: question.bounds.width, height: question.bounds.height, row: question.bounds.row },
+      "the long notice is laid out at the identical geometry as the long question");
+    const noticeSteps = exerciseDetail(NOTICE_HINT, "n1: Long notice", ["More details", "Close"]);
+
+    // Within each view every control drives the same range, so no control or
+    // tool owns a scroll behaviour of its own.
+    assert.ok(Object.values(questionSteps).every((steps) => steps > 0), "the long question scrolls for every control");
+    assert.ok(Object.values(noticeSteps).every((steps) => steps > 0), "the long notice scrolls for every control");
+    assert.equal(new Set(Object.values(questionSteps)).size, 1, "every control traverses the long question over the same range");
+    assert.equal(new Set(Object.values(noticeSteps)).size, 1, "every control traverses the long notice over the same range");
+
+    terminal.send(CTRL_ALT_UP);
+    await opening;
+    assert.ok(screen().every((line) => !line.includes(SURFACE_BG)), "closing leaves no popup surface behind");
+    assert.equal(sent.length, 0, "no scroll control sent anything to the model");
+  } finally {
+    await harness.dispose();
   }
 });
 
@@ -915,5 +1402,104 @@ test("native fullscreen: async native image pastes redraw the popup and preserve
   } finally {
     tui.stop();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * #396 on the installed native renderer: a question that the removed
+ * 2,000-character ceiling rejected is admitted by the real registered tool and
+ * then read through the real `TuiAltScreen` overlay — the composited screen is
+ * the only witness. Every paragraph must be reachable by the existing shared
+ * scroll controls, the choices, free-text row, and Decline stay reachable, and
+ * the answer is delivered with the complete question text.
+ */
+test("native fullscreen: a formerly rejected long question is readable in full and answerable over the live transcript (#396)", async () => {
+  const harness = await startNativePopupHarness({ rows: SHORT_ROWS });
+  const { terminal, sent, open, screen, view, askQuestion } = harness;
+  const paragraphs = 30;
+  const question = longFormQuestion(paragraphs);
+  assert.ok(question.length > 4_000, `the fixture is substantially larger than the removed ceiling (${question.length})`);
+
+  /** Scroll back to the content beginning, whatever the current offset is. */
+  const rewind = (): void => {
+    for (let step = 0; step < 600; step += 1) {
+      const before = view(ANSWER_HINT, SHORT_ROWS).body.join("\n");
+      terminal.send(SHIFT_ALT_UP);
+      if (view(ANSWER_HINT, SHORT_ROWS).body.join("\n") === before) return;
+    }
+    assert.fail("the long question never clamped while rewinding");
+  };
+
+  try {
+    await askQuestion("tc-396", question, ["Alpha lane", "Beta lane"]);
+    const { closed: opening } = await open();
+    view(LIST_ANSWER_HINT, SHORT_ROWS);
+
+    terminal.send(ENTER); // open the question's answer view
+    const first = view(ANSWER_HINT, SHORT_ROWS);
+    assert.equal(first.body[0], "q1:", "the answer view opens at the beginning of the long question");
+    assert.ok(!first.body.some((line) => line.includes("Alpha lane")), "the choices start below the visible fold");
+    assert.equal(first.bounds.height, SHORT_ROWS - 2, "the long question is capped inside the one-row margins");
+    const background = outsideBoundsRows(screen(), first.bounds);
+
+    const controls = [
+      { name: "the pointer wheel", down: (): void => { terminal.send(wheel("down", 10, first.bounds.row + 3)); } },
+      { name: "Shift+Alt+Down", down: (): void => { terminal.send(SHIFT_ALT_DOWN); } },
+      { name: "Ctrl+Alt+PageDown", down: (): void => { terminal.send(CTRL_ALT_PAGE_DOWN); } },
+    ];
+    const seen = new Set<string>();
+    for (const control of controls) {
+      rewind();
+      assert.equal(view(ANSWER_HINT, SHORT_ROWS).body[0], "q1:", `${control.name} starts from the content beginning`);
+      let steps = 0;
+      for (; steps < 600; steps += 1) {
+        const before = view(ANSWER_HINT, SHORT_ROWS).body;
+        for (const line of before) seen.add(line);
+        control.down();
+        const after = view(ANSWER_HINT, SHORT_ROWS).body;
+        if (after.join("\n") === before.join("\n")) break; // at the content end: claimed and inert
+        assert.deepEqual(after.slice(0, -1), before.slice(1), `${control.name} moves the body exactly one line`);
+      }
+      assert.ok(steps > 20, `${control.name} traverses the long question over ${steps} one-line steps`);
+      const atEnd = view(ANSWER_HINT, SHORT_ROWS);
+      assert.ok(atEnd.body.some((line) => line.includes("Decline")), `${control.name} reaches the trailing rows`);
+      assert.deepEqual(outsideBoundsRows(screen(), atEnd.bounds), background,
+        `${control.name} never moved the native transcript behind the popup`);
+    }
+
+    const rendered = [...seen].join("\n");
+    for (const marker of longFormMarkers(paragraphs)) {
+      assert.ok(rendered.includes(marker), `paragraph ${marker} is readable in the native popup`);
+    }
+    assert.ok(rendered.includes("1. Alpha lane") && rendered.includes("2. Beta lane"), "both choices are reachable");
+    assert.ok(rendered.includes("Type something…"), "the free-text row is reachable below the choices");
+    assert.ok(rendered.includes("Decline (no answer will be sent)"), "Decline is reachable below the free-text row");
+    assert.equal(sent.length, 0, "reading and scrolling sent nothing to the model");
+    terminal.send(ESCAPE); // back to the shared list
+    assert.ok(view(LIST_ANSWER_HINT, SHORT_ROWS).body.some((line) => line.includes("q1:")),
+      "the long question is still pending while it is being read");
+    terminal.send(ENTER); // re-open the answer view
+
+    // Scrolling never moved the selection, so Enter confirms the highlighted
+    // first choice and delivers the complete question text.
+    terminal.send(ENTER);
+    await opening;
+    assert.deepEqual(sent, [`Answer to pending question "${question}": Alpha lane`],
+      "the delivered answer carries the complete question, not a clipped quote");
+
+    // Decline on another long question still sends nothing.
+    await askQuestion("tc-396-decline", question, ["Alpha lane"]);
+    const { closed: reopening } = await open();
+    view(LIST_ANSWER_HINT, SHORT_ROWS);
+    terminal.send(ENTER);
+    view(ANSWER_HINT, SHORT_ROWS);
+    for (let step = 0; step < 3; step += 1) terminal.send(DOWN); // to the Decline row
+    assert.ok(view(ANSWER_HINT, SHORT_ROWS).body.some((line) => line.startsWith("> Decline")),
+      "Decline is the highlighted row");
+    terminal.send(ENTER);
+    await reopening;
+    assert.equal(sent.length, 1, "declining a long question fabricates no answer");
+  } finally {
+    await harness.dispose();
   }
 });

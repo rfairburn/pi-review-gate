@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { UserQuestionController, formatAnswerDelivery } from "../src/user-question/controller";
+import { createUserQuestionTool } from "../src/user-question/tool";
+import { JUST_OVER_REMOVED_CAP, LARGE_QUESTION_PARAGRAPHS, longFormQuestion } from "./long-question-fixtures";
 
 interface FakeHost {
   sent: Array<{ message: string; options?: { deliverAs?: "steer" | "followUp" } }>;
@@ -261,9 +263,16 @@ test("invalid questions and choices are rejected before registration", () => {
   const host = fakeHost();
   const { controller } = makeController(host);
   controller.beginSession(SESSION_A);
-  for (const question of ["", "   ", "x".repeat(2001)]) {
+  // Empty and whitespace-only questions stay invalid; a non-string is rejected
+  // rather than thrown (#396 removed only the question-only 2,000 ceiling).
+  for (const question of ["", "   "]) {
     const result = controller.register({ toolCallId: "t", question, mode: "async" }, SESSION_A);
     assert.equal(result.ok, false, JSON.stringify(question));
+    if (!result.ok) assert.equal(result.reason, "invalid");
+  }
+  for (const question of [42, null, undefined, {}, ["a?"]] as unknown as string[]) {
+    const result = controller.register({ toolCallId: "t", question, mode: "async" }, SESSION_A);
+    assert.equal(result.ok, false, String(question));
     if (!result.ok) assert.equal(result.reason, "invalid");
   }
   for (const choices of [["ok", ""], ["a".repeat(301)], new Array(13).fill("x"), [42], "not-an-array" as unknown as string[]]) {
@@ -323,11 +332,118 @@ test("state change notifications track the pending count", () => {
   assert.deepEqual(changes, [0, 1, 0]);
 });
 
-test("formatAnswerDelivery bounds the quoted question", () => {
+test("formatAnswerDelivery quotes the accepted question in full (#396)", () => {
   const short = formatAnswerDelivery("Which database?", "SQLite");
   assert.equal(short, 'Answer to pending question "Which database?": SQLite');
-  const longQuestion = "q".repeat(300);
-  const bounded = formatAnswerDelivery(longQuestion, "yes");
-  assert.ok(bounded.length < 300 + 60);
-  assert.match(bounded, /…/);
+  const longQuestion = longFormQuestion(30);
+  const delivered = formatAnswerDelivery(longQuestion, "yes");
+  assert.equal(delivered, `Answer to pending question "${longQuestion}": yes`);
+  assert.equal(delivered.includes("…"), false, "no ellipsis replaces any part of the accepted question");
+  assert.equal(delivered.includes(longQuestion), true, "the complete question reaches the model in the settlement message");
+});
+
+test("long-form questions pass admission and are retained in full (#396)", () => {
+  const host = fakeHost();
+  const { controller } = makeController(host);
+  controller.beginSession(SESSION_A);
+
+  // Just over the removed 2,000-character ceiling, and a substantially larger
+  // multiline Unicode question: both are ordinary questions now.
+  const justOver = JUST_OVER_REMOVED_CAP;
+  const large = longFormQuestion(LARGE_QUESTION_PARAGRAPHS);
+  assert.ok(justOver.length > 2_000 && justOver.length < 2_200, `the just-over fixture is ${justOver.length} characters`);
+  assert.ok(large.length > 12_000, `the multiline/Unicode fixture is substantially larger (${large.length})`);
+
+  const first = controller.register({ toolCallId: "t1", question: justOver, mode: "async" }, SESSION_A);
+  assert.ok(first.ok, "a 2,001-character question is admitted");
+  const second = controller.register(
+    { toolCallId: "t2", question: `  \n${large}\n  `, choices: ["Alpha", "Beta"], mode: "async" },
+    SESSION_A,
+  );
+  assert.ok(second.ok, "a substantially larger multiline/Unicode question is admitted");
+  if (!first.ok || !second.ok) return;
+
+  // Normalization is ends-only: the accepted text survives in full, in order,
+  // with every embedded newline, combining mark, and emoji untouched.
+  assert.equal(first.question.question, justOver);
+  assert.equal(second.question.question, large);
+  assert.equal(second.question.question.length, large.length);
+  assert.equal(controller.get(second.question.id)!.question, large, "pending storage keeps the complete question");
+});
+
+test("async settlement delivers the complete long question with the answer (#396)", async () => {
+  const host = fakeHost();
+  const { controller } = makeController(host);
+  controller.beginSession(SESSION_A);
+  const question = longFormQuestion(40);
+  const registered = controller.register(
+    { toolCallId: "t1", question, choices: ["Alpha"], mode: "async" },
+    SESSION_A,
+  );
+  assert.ok(registered.ok);
+  if (!registered.ok) return;
+
+  const result = controller.submitAnswer(registered.question.id, "Alpha", { isIdle: () => true });
+  assert.equal(result.status, "delivered");
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(host.sent.length, 1);
+  assert.equal(host.sent[0]!.message, `Answer to pending question "${question}": Alpha`);
+  assert.equal(host.sent[0]!.message.includes("…"), false, "nothing in the delivered answer is elided");
+});
+
+test("sync settlement returns the complete long question to the waiting call (#396)", async () => {
+  const host = fakeHost();
+  const { controller } = makeController(host);
+  controller.beginSession(SESSION_A);
+  const question = longFormQuestion(40);
+  const registered = controller.register(
+    { toolCallId: "t1", question, choices: ["Alpha"], mode: "sync" },
+    SESSION_A,
+  );
+  assert.ok(registered.ok);
+  if (!registered.ok) return;
+  const waiting = controller.waitForAnswer(registered.question.id);
+  controller.submitAnswer(registered.question.id, "Alpha");
+  const wait = await waiting;
+  assert.deepEqual(wait, { outcome: "answered", answer: "Alpha", wasChoice: true });
+
+  // The tool maps that wait result into the model-facing text; assert the full
+  // question survives there too (no question-only quote bound on either path).
+  const tool = createUserQuestionTool(controller, { shortcutLabel: "Ctrl+Alt+Up" });
+  const running = tool.execute(
+    "call-2",
+    { question, mode: "sync" },
+    undefined,
+    undefined,
+    { sessionManager: SESSION_A },
+  );
+  const waitingRecord = controller.listPending().find((record) => !("kind" in record) && record.mode === "sync");
+  assert.ok(waitingRecord, "the sync tool call registered its question and holds the wait");
+  controller.submitAnswer(waitingRecord!.id, "go");
+  const settled = await running;
+  assert.deepEqual(settled.content, [{ type: "text", text: `The user answered "${question}": go` }]);
+  assert.equal(String((settled.details as Record<string, unknown>).answer), "go");
+});
+
+test("a stale or foreign session still cannot settle a long question (#396)", async () => {
+  const host = fakeHost();
+  const { controller } = makeController(host);
+  controller.beginSession(SESSION_A);
+  const question = longFormQuestion(20);
+  const registered = controller.register({ toolCallId: "t1", question, mode: "async" }, SESSION_A);
+  assert.ok(registered.ok);
+  if (!registered.ok) return;
+
+  // Registration from another session's context is rejected outright.
+  const foreign = controller.register({ toolCallId: "t2", question, mode: "async" }, SESSION_B);
+  assert.equal(foreign.ok, false);
+  if (!foreign.ok) assert.equal(foreign.reason, "identity-mismatch");
+
+  // And after the session is replaced, the old question cannot be answered or
+  // declined into the new session.
+  controller.beginSession(SESSION_B);
+  assert.equal(controller.submitAnswer(registered.question.id, "Alpha").status, "rejected");
+  assert.equal(controller.submitDecline(registered.question.id).status, "rejected");
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(host.sent.length, 0, "nothing is delivered into another session");
 });

@@ -32,7 +32,7 @@ import test from "node:test";
 
 import { SidebarController, type SidebarAction, type SidebarItem } from "../src/session-host/sidebar";
 import type { PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
-import { NETWORK_ACTION, ROSTER_ACTIONS } from "./helpers/session-host-native-roster-witness";
+import { NETWORK_ACTION, ROSTER_ACTIONS, SETTINGS_ACTION } from "./helpers/session-host-native-roster-witness";
 
 import {
   KEYS,
@@ -127,24 +127,20 @@ function renderedTitleOf(entry: RosterEntry | undefined): string | undefined {
   return entry !== undefined && entry.kind === "native" ? entry.title : undefined;
 }
 
-/** The optional settings action the renderer may append after "Quit host". */
-const HOST_SHORTCUTS_ACTION = "Host shortcuts";
 const [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION] = ROSTER_ACTIONS;
 
 /**
- * Every action tail the production renderer can draw: the three required
- * actions in their fixed order, the optional Network row only between
- * "New session" and "Quit host" (a network snapshot is attached to the host),
- * and the optional settings action only as the final row (settings are
- * available). A legacy no-snapshot host and a current snapshot-attached host
- * are both legal, so the witness accepts exactly these four complete
- * sequences and no other combination of rows.
+ * Every action tail the production renderer can draw (#613): the three required
+ * actions in their fixed order, with the ONE optional grouped Settings row only
+ * between New session and the final Quit host. There is no top-level Network
+ * row any more — Network is a Settings submenu — so a Network row anywhere is a
+ * malformed tail. A host with no settings entry point and a host with one are
+ * both legal, so the witness accepts exactly these two complete sequences and
+ * no other combination.
  */
 const LEGAL_ROSTER_ACTION_TAILS: readonly (readonly string[])[] = [
   [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
-  [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
-  [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION],
-  [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+  [SAVED_ACTION, NEW_SESSION_ACTION, SETTINGS_ACTION, QUIT_HOST_ACTION],
 ];
 
 /** True only for an exact complete legal tail: same labels, same order, same count. */
@@ -456,18 +452,16 @@ test("public SidebarController stops a positively idle live row directly without
   "the public controller requests the exact-row stop directly and leaves fresh-idle revalidation to the parent");
 });
 
-test("the action-tail witness accepts only the four complete legal tails and rejects malformed ones", () => {
-  // Regression for the stale count/prefix expectation that assumed "Host
-  // shortcuts" was the only optional row: the same host now also draws the
-  // optional Network row at its own renderer position, so the witness is an
-  // exact complete-sequence match rather than a length tolerance.
+test("the action-tail witness accepts only the two complete legal tails and rejects malformed ones", () => {
+  // The tail witness stays an exact complete-sequence match rather than a
+  // length tolerance: #613 removed the optional Network row and places the
+  // optional Settings row before the final Quit host, so any other order or
+  // longer tail is refused here instead of passing on length alone.
   const legal: readonly (readonly string[])[] = [
     [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, SETTINGS_ACTION, QUIT_HOST_ACTION],
   ];
-  assert.deepEqual(LEGAL_ROSTER_ACTION_TAILS, legal, "the witness lists exactly the four legal tails");
+  assert.deepEqual(LEGAL_ROSTER_ACTION_TAILS, legal, "the witness lists exactly the two legal tails");
   for (const tail of legal) {
     assert.equal(isLegalRosterActionTail(tail), true, `accepts [${tail.join(" > ")}]`);
     assert.doesNotThrow(() => assertLegalRosterActionTail(tail, `legal tail [${tail.join(" > ")}]`));
@@ -490,11 +484,12 @@ test("the action-tail witness accepts only the four complete legal tails and rej
     [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, NETWORK_ACTION],
     [SAVED_ACTION, NETWORK_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
     [NETWORK_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION, NETWORK_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, HOST_SHORTCUTS_ACTION, QUIT_HOST_ACTION],
-    [HOST_SHORTCUTS_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, HOST_SHORTCUTS_ACTION, QUIT_HOST_ACTION],
-    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, HOST_SHORTCUTS_ACTION, HOST_SHORTCUTS_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, SETTINGS_ACTION, NETWORK_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, SETTINGS_ACTION],
+    [SAVED_ACTION, SETTINGS_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SETTINGS_ACTION, SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, SETTINGS_ACTION, SETTINGS_ACTION, QUIT_HOST_ACTION],
+    [SAVED_ACTION, NEW_SESSION_ACTION, NETWORK_ACTION, SETTINGS_ACTION, QUIT_HOST_ACTION],
     [SAVED_ACTION, NEW_SESSION_ACTION, QUIT_HOST_ACTION, "Peers"],
     [SAVED_ACTION, NEW_SESSION_ACTION, "network", QUIT_HOST_ACTION],
     [SAVED_ACTION, NEW_SESSION_ACTION, "Networks", QUIT_HOST_ACTION],
@@ -573,9 +568,11 @@ test("the action-tail witness accepts exactly what the public renderer draws for
       assert.deepEqual(labels, [
         SAVED_ACTION,
         NEW_SESSION_ACTION,
-        ...(withNetwork ? [NETWORK_ACTION] : []),
+        // #613: ONE grouped row, present when any entry point it offers is
+        // available — the agent directory for Theme/Host shortcuts, or the
+        // attached snapshot for Network. No top-level Network row exists.
+        ...(settingsAvailable || withNetwork ? [SETTINGS_ACTION] : []),
         QUIT_HOST_ACTION,
-        ...(settingsAvailable ? [HOST_SHORTCUTS_ACTION] : []),
       ], `the exact rendered sequence for ${flags}`);
       assert.deepEqual(parsed.actions.map((entry) => entry.position),
         parsed.actions.map((_, index) => parsed.cards.length + index),
@@ -739,9 +736,11 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.equal(renderedTitleOf(rosterAfterCreation[1]), nameB);
   const actionTailAfterCreation = parsedRosterAfterCreation.actions.map((entry) => entry.label);
   assertLegalRosterActionTail(actionTailAfterCreation,
-    "the rendered roster has one complete legal action tail: required actions in order, optional Network only between New session and Quit host, optional Host shortcuts only last");
-  assert.deepEqual(actionTailAfterCreation.filter((label) => label !== NETWORK_ACTION && label !== HOST_SHORTCUTS_ACTION),
+    "the rendered roster has one complete legal action tail: required actions in order, optional Settings only between New session and the final Quit host");
+  assert.deepEqual(actionTailAfterCreation.filter((label) => label !== SETTINGS_ACTION),
     [...ROSTER_ACTIONS], "every required action is present once and in order whatever optional rows the host drew");
+  assert.equal((actionTailAfterCreation as readonly string[]).includes(NETWORK_ACTION), false,
+    "no top-level Network row is drawn after the #613 grouping");
   assert.deepEqual(parsedRosterAfterCreation.actions.map((entry) => rosterAfterCreation[entry.position]?.label),
     parsedRosterAfterCreation.actions.map((entry) => entry.label),
   "action navigation positions correlate to the actual rendered entry array");

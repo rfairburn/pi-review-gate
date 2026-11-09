@@ -50,3 +50,30 @@ bd6f48c5a6099a01585e63151577757c9931a125 (src/session-host/sidebar-theme.ts
 and src/session-host/sidebar-theme-colors.ts at that commit). Only these color
 values are embedded; no Pi theme file, theme loader, color conversion code, or
 other part of Pi is included, and the Android client has no Pi dependency.
+
+--------------------------------------------------------------------------
+
+This license applies to the built-in Dark and Light theme foreground colour
+values copied from Pi Coding Agent, packages/coding-agent/src/modes/
+interactive/theme/, into the host-owned colour table in
+src/session-host/sidebar-theme-colors.ts (used by
+src/session-host/sidebar-theme.ts for the session-host sidebar palettes):
+
+- v1.5.0 dark.json (the `text`, `muted`, `dim`, `accent`, `success`, `error`,
+  `warning`, `mdLink`, `syntaxVariable`, `scrollbarTrack`, and `scrollbarThumb`
+  foreground values, each recorded here as the value its shared `vars` entry
+  resolves to):
+  https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/dark.json
+- v1.5.0 light.json (the same eleven foreground values for the built-in light
+  appearance):
+  https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/light.json
+
+Pi's own theme documentation explicitly invites copying the built-in themes as
+the complete values to use and adjust:
+https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/docs/themes.md
+
+Copyright (c) 2025 Mario Zechner. Only the authored colour values are copied.
+The colour conversion (OKHSL to terminal foreground output) is imported from the
+pinned pi-session-host-tui dependency (@earendil-works/pi-tui, also MIT,
+Copyright Mario Zechner) and is not copied here, and no Pi theme loader,
+configuration, or runtime is used.

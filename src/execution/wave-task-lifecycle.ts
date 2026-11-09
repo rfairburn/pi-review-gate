@@ -38,6 +38,7 @@ import type { BackgroundFaultHooks } from "./background-controller";
 import { landedReviewStatusOf, type LandedReviewStatus } from "./force-merge-salvage";
 import {
   applyExecutorIdentity,
+  applyReviewStatus,
   applySettledExecutorIdentity,
   synchronizeEventSnapshot,
   transitionEventSnapshot,
@@ -541,36 +542,26 @@ function waveContinuationProgress(group: BackgroundExecutionGroup, task: Backgro
   deps.indicator.update();
 }
 
+/**
+ * Wave progress → the shared reviewer-status projection (#314). The wave
+ * update carries reviewer labels and the worker phase either per-worker or in
+ * its aggregate per-task status record; the merge semantics themselves live in
+ * one shared helper so every kind reads identically.
+ */
 function updateReviewStatus(
   task: BackgroundTaskRecord,
   update: WaveProgressUpdate,
   next: BackgroundTaskState | undefined,
 ): void {
   const taskStatus = update.taskStatuses?.find((candidate) => candidate.taskId === task.taskId);
-  const reviewers = update.subtask?.reviewers
-    ?? taskStatus?.reviewer?.split(",").map((reviewer) => reviewer.trim()).filter(Boolean);
-  const subtaskPhase = update.subtask?.phase;
-  const isReviewActivity = subtaskPhase !== undefined
-    && ["reviewing", "correcting", "confirming"].includes(subtaskPhase);
-  const phase = next === "accepted"
-    ? "accepted"
-    : isReviewActivity
-      ? subtaskPhase
-      : task.reviewStatus?.phase ?? taskStatus?.phase;
-  if (!task.reviewStatus && !reviewers?.length && phase !== "reviewing") return;
-  task.reviewStatus ??= {
-    phase: phase ?? task.state,
-    reviewers: [],
-    activity: [],
-    updatedAt: new Date().toISOString(),
-  };
-  if (reviewers?.length) task.reviewStatus.reviewers = [...reviewers];
-  if (phase) task.reviewStatus.phase = phase;
-  if (isReviewActivity || next === "accepted") {
-    if (task.reviewStatus.activity.at(-1) !== update.message) task.reviewStatus.activity.push(update.message);
-    if (task.reviewStatus.activity.length > 20) task.reviewStatus.activity.splice(0, task.reviewStatus.activity.length - 20);
-  }
-  task.reviewStatus.updatedAt = new Date().toISOString();
+  applyReviewStatus(task, {
+    message: update.message,
+    reviewers: update.subtask?.reviewers
+      ?? taskStatus?.reviewer?.split(",").map((reviewer) => reviewer.trim()).filter(Boolean),
+    workerPhase: update.subtask?.phase,
+    statusPhase: taskStatus?.phase,
+    accepted: next === "accepted",
+  });
 }
 
 function messageOf(error: unknown): string {

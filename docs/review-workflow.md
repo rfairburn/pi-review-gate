@@ -617,6 +617,24 @@ stating that a review would have run there but was canceled by the user, so pass
 remains unambiguous. The next review keeps the same evidence bundle but starts fresh
 reviewer sessions.
 
+Cancellation also applies while checkpoint evidence is being captured, before any
+reviewer starts. An interrupted capture is not a completed checkpoint, a passing
+review, or a reason to switch to tool-only evidence. The existing window and exchange
+baselines, retained evidence, and outstanding review obligations stay open. The next
+prompt continues from those baselines with a fresh cancellation signal and a new
+capture, so changes retained from the cancelled turn remain subject to review.
+Owned Git capture processes must settle before capture cancellation completes;
+unconfirmed process or checkpoint cleanup and genuine capture failures remain visible
+and fail closed, even if cancellation was requested concurrently.
+
+When recovery establishes a completed checkpoint from an existing tool-only basis,
+reversible rollback ends before invocation preparation can persist that checkpoint.
+Cancellation after preparation retains the actual invocation's process-settlement
+result, diagnostics, bundle reference, and completed checkpoint owner; it never
+substitutes a no-reviewer cleanup result. Persisted checkpoint owners are retired
+only after a successful durable save, so a failed later save cannot invalidate the
+last saved baseline. Earlier tool-only evidence keeps its original coverage limits.
+
 If the terminal input interception cannot be installed in the current context, the
 extension says so once and points at the `/review-cancel` command instead of failing
 silently. `/review-cancel` explicitly cancels whichever automatic or command-driven

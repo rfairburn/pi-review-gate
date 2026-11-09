@@ -105,6 +105,12 @@ export interface ReviewSettingsSelection {
   browserVisible?: boolean;
   /** Complete a-la-carte browser permission object (issue #27); persisted as a whole. */
   webBrowserPermissions?: WebBrowserPermissions;
+  /**
+   * Complete shared acquisition URL blocklist (issue #620), persisted as a
+   * whole: one list applied identically by WebFetch and BrowserExtract, so no
+   * per-tool copy is stored.
+   */
+  webUrlBlocklist?: string[];
   /** Independent YouShouldKnow availability and completion-guidance toggles. */
   youShouldKnow?: YouShouldKnowConfig;
   /**
@@ -234,7 +240,7 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
   ui.subtasksViewExpanded = selection.subtasksViewExpanded;
   parsed.ui = ui;
-  if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined) {
+  if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined || selection.webUrlBlocklist !== undefined) {
     const web = isRecord(parsed.web) ? { ...parsed.web } : {};
     if (selection.webMaxDownloadBytes !== undefined) {
       const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
@@ -258,6 +264,12 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
       // the individual values beneath it, so no field is dropped or invented.
       // Strict validation runs in normalizeConfig before the atomic write.
       web.browserPermissions = { ...selection.webBrowserPermissions };
+    }
+    if (selection.webUrlBlocklist !== undefined) {
+      // The complete list is written, including an empty one, so clearing the
+      // blocklist in settings actually clears it on disk. normalizeConfig
+      // validates every entry before the atomic write.
+      web.urlBlocklist = [...selection.webUrlBlocklist];
     }
     parsed.web = web;
   }

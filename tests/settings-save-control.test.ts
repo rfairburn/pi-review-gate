@@ -125,6 +125,7 @@ test("Ctrl+S inside a nested permissions submenu propagates staged fields intact
     web.browserDownloadRetention,
     web.browserVisible,
     web.browserPermissions,
+    web.urlBlocklist,
   );
   assert.equal(control.saveRequested, true);
   assert.equal(staged.browserPermissions.modelCamera, true, "nested staged permission survives normal returns");

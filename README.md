@@ -55,7 +55,14 @@ receipts of exactly what the model was told.
   restoration ([Recovery](docs/recovery.md)).
 - **Session host sidebar** — manage multiple independent native Pi sessions from one
   terminal's left sidebar roster, each row an ordinary native Pi session that
-  carries the review gate with its own workspace, conversation, and lifecycle
+  carries the review gate with its own workspace, conversation, and lifecycle.
+  Sidebar Settings groups themes, Network, and Host shortcuts; application-owned
+  themes use Pi's own built-in Dark/Light foreground colours and apply live,
+  independently of the sessions' own themes, over the terminal's default
+  background. Status colors distinguish agent state and pending input, background
+  activity counts read hotter as a session's intended work grows (activity only, never an
+  error state), a remote card's owner hostname uses Pi's cyan, and the
+  active conversation remains marked while browsing the sidebar
   ([Session host](docs/session-host-alpha.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only
   request format (multi-file create/update/rename/delete with sequential application and

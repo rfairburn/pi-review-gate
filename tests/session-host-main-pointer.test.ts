@@ -955,7 +955,7 @@ test("blank space inside the list ends the session list, and the host action row
     const screen = await emittedScreen(output, harness);
     const rowA = screenRowOf(screen, "Native native-1");
     const savedRow = screenRowOf(screen, "Saved conversations");
-    const settingsRow = screenRowOf(screen, "Host shortcuts");
+    const settingsRow = screenRowOf(screen, "Settings");
     assert.ok(savedRow > 0 && settingsRow > 0, "the action rows stay drawn after every session card");
     const endRow = screen.lines.findIndex((line, index) => index > settingsRow
       && line.replace(SGR, "").slice(0, SIDEBAR_COLS).trim() === "");

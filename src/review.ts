@@ -206,9 +206,54 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   }
   // Unified Git and raw baselines settle against one frozen after-checkpoint.
   // Legacy baselines retain their original fail-closed settlement paths.
-  const settled = await settleReviewEvidence(input);
+  let settled: SettledBaseline;
   try {
-    return { ...await runReviewSettled(input, settled), evidenceMethod: settled.evidenceMethod, evidenceCoverageNotice: settled.evidenceCoverageNotice };
+    settled = await settleReviewEvidence(input, { deferRecoveredBaselinePromotion: true });
+  } catch (error) {
+    // A deliberate cancellation of this run — its own signal plus an
+    // abort-classified cause — is the expected lifecycle outcome, not an
+    // extension failure: report the existing aborted run result so the owning
+    // flow runs its cancellation path. Genuine capture, integrity, and release
+    // failures still throw, including one that raced the same abort.
+    if (!isProvenCancellation(input.signal, error)) throw error;
+    return cancelledReviewOutput();
+  }
+  // Deliberate settlement boundary — not an error classifier. The run's own
+  // signal belongs to the review cancellation controller, and every path that
+  // aborts it is an intentional cancellation (terminal Escape, /review-cancel,
+  // a cancelled parent run, or session shutdown). A cancelled run never
+  // continues into a review decision: a no-review outcome would let the owner
+  // settle or close the window as though a pass had completed.
+  if (input.signal?.aborted) {
+    // The cancelled run never owns the frozen after-checkpoint. A staged
+    // recovery (tool-baseline branch) restores its original window/exchange
+    // bases before releasing; release failures stay visible either way.
+    if (settled.cancelSettlement) await settled.cancelSettlement();
+    else if (settled.releaseOrphan) await settled.releaseOrphan();
+    return cancelledReviewOutput();
+  }
+  try {
+    const output = await runReviewSettled(input, settled);
+    return { ...output, evidenceMethod: settled.evidenceMethod, evidenceCoverageNotice: settled.evidenceCoverageNotice };
+  } catch (error) {
+    // The staged recovery is reversible only until its explicit pre-invocation
+    // commitment boundary. Once bundle/preparation/invocation starts, the
+    // recovered baseline stays under ordinary window/persistence ownership and
+    // the actual aborted invocation result is returned above; no later error
+    // may release it or synthesize a zero-reviewer cancellation.
+    if (settled.cancelSettlement) {
+      if (error instanceof PreInvocationRecoveryCancelled) {
+        const cancelled = await settled.cancelSettlement();
+        if (cancelled) return cancelledReviewOutput();
+        throw error;
+      }
+      // Every genuine failure still inside the reversible precommit interval
+      // must restore the original bases and release the private capture before
+      // its own error is rethrown. After commitment this is a no-op: the
+      // recovered owner stays under normal window/persistence ownership.
+      return rethrowAfterRelease(error, async () => { await settled.cancelSettlement!(); });
+    }
+    throw error;
   } finally {
     // No completed pass owns the frozen after-checkpoint on any earlier exit
     // (no-change, abort, error): release the ephemeral pin. A failed release
@@ -287,23 +332,41 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     && responseExchange.userRequests.length === 0;
   const capturedPassActivity = input.capturedPassActivity === true || (input.requireNewToolActivity === true && passResponse
     && hasCapturedPrimaryActivity(input.evidence, responseExchange.evidenceEvents, input.cwd, settled.evidenceRoot ?? input.cwd, responseExchange.sequence));
+  const throwIfPreInvocationRecoveryCancelled = (): void => {
+    if (!settled.cancelSettlement) return;
+    try {
+      input.signal?.throwIfAborted();
+    } catch (error) {
+      if (isProvenCancellation(input.signal, error)) throw new PreInvocationRecoveryCancelled();
+      throw error;
+    }
+  };
+  // A staged Tool-baseline recovery is not published to the canonical window
+  // until this run leaves its reversible pre-invocation interval. No-review
+  // outcomes are unchanged: after their artifact synchronization they check
+  // the owned signal, then establish the recovered basis before return.
+  const completeWithoutInvocation = <T extends ReviewRunOutput>(output: T): T => {
+    throwIfPreInvocationRecoveryCancelled();
+    settled.promoteBaseline?.();
+    return output;
+  };
   if (input.requireNewToolActivity === true && passResponse && !capturedPassActivity) {
     await syncUnreviewedExchangeArtifacts();
-    return { changed: false, changes, noReviewReason: "no_new_reviewable_activity" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_new_reviewable_activity" });
   }
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges && !capturedPassActivity) {
     await syncUnreviewedExchangeArtifacts();
-    return {
+    return completeWithoutInvocation({
       changed: false,
       changes,
       noReviewReason: reviewResponseMode === "deferred"
         ? "unchanged_deferred_response"
         : "unchanged_review_response",
-    };
+    });
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
   if (settled.evidenceMethod === "snapshot" && changes.length === 0 && !isCorrectionValidation && !hasExactChanges && !capturedPassActivity && input.evidence?.requiresReview !== true) {
-    return { changed: false, changes, noReviewReason: "no_initial_changes" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_initial_changes" });
   }
   // #465: an evidence method, its warning, an assistant summary, or known
   // read-only observations are not work. Primary Tools only review needs
@@ -311,7 +374,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // outstanding correction — the same no-change rule snapshots apply.
   if (settled.primaryToolChangeGate && changes.length === 0 && sideEffectChanges.length === 0 && !isCorrectionValidation && !capturedPassActivity
     && input.evidence?.requiresReview !== true && !(input.evidence?.events ?? []).some(isReviewableToolObservation)) {
-    return { changed: false, changes, noReviewReason: "no_initial_changes" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_initial_changes" });
   }
   // #461: automatic Primary review also needs a new qualifying tool call since
   // the last recorded review. This only narrows the checks above: workspace
@@ -320,9 +383,32 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // window, its evidence and any unresolved feedback stay open, unreviewed.
   if (input.requireNewToolActivity === true && !capturedPassActivity && !hasNewQualifyingToolCall(input.window)) {
     await syncUnreviewedExchangeArtifacts();
-    return { changed: false, changes, noReviewReason: "no_new_tool_activity" };
+    return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_new_tool_activity" });
   }
-  if (settled.reviewMethodNotice) await input.notify?.(settled.reviewMethodNotice);
+  if (settled.reviewMethodNotice) {
+    try {
+      await input.notify?.(settled.reviewMethodNotice);
+    } catch (error) {
+      // Only an abort this run can prove was thrown by the pre-invocation
+      // warning is normalized. A genuine callback failure that merely races
+      // the same abort keeps its own error, after the still-private recovered
+      // descriptor is restored and released.
+      if (settled.cancelSettlement && isProvenCancellation(input.signal, error)) {
+        throw new PreInvocationRecoveryCancelled();
+      }
+      if (settled.cancelSettlement) {
+        return rethrowAfterRelease(error, async () => { await settled.cancelSettlement!(); });
+      }
+      throw error;
+    }
+  }
+  // Deliberate owned-signal boundary after the delayed recovery warning and
+  // before any bundle or persistence preparation. The recovered descriptor is
+  // still private to this run here, so rollback can restore and release it
+  // without touching durable ownership. Past this point it is committed and a
+  // cancellation reports the actual invocation outcome instead.
+  throwIfPreInvocationRecoveryCancelled();
+  settled.promoteBaseline?.();
 
   // When exactChange is present, use the exact Git commit patch as authoritative.
   const patchResult = settled.evidenceMethod === "snapshot" && input.exactChange !== undefined
@@ -574,18 +660,28 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   }
   // A reviewer question uses a frozen ephemeral after-checkpoint, releasing
   // it after artifacts are written without transferring window ownership.
-  const collected = await collectCurrentChanges({
-    cwd: input.cwd,
-    checkpointScope: input.checkpointScope,
-    before: input.before,
-    config: input.config,
-    evidence: input.evidence,
-    evidencePolicy: input.evidencePolicy,
-    evidenceCaptureFailure: input.evidenceCaptureFailure,
-    signal: input.signal,
-    notify: input.notify,
-    window: input.window,
-  });
+  // A proven cancellation during that settlement is the same expected
+  // lifecycle outcome as a review run: no reviewer was launched, so report the
+  // existing aborted answer instead of an extension error. Genuine capture,
+  // integrity, and release failures still throw.
+  let collected: CurrentChanges;
+  try {
+    collected = await collectCurrentChanges({
+      cwd: input.cwd,
+      checkpointScope: input.checkpointScope,
+      before: input.before,
+      config: input.config,
+      evidence: input.evidence,
+      evidencePolicy: input.evidencePolicy,
+      evidenceCaptureFailure: input.evidenceCaptureFailure,
+      signal: input.signal,
+      notify: input.notify,
+      window: input.window,
+    });
+  } catch (error) {
+    if (!isProvenCancellation(input.signal, error)) throw error;
+    return { changes: [], result: abortedResult([]), bundleRetained: false };
+  }
   try {
     return { ...await runAskReviewerSettled(input, collected), evidenceMethod: collected.evidenceMethod, evidenceCoverageNotice: collected.evidenceCoverageNotice };
   } finally {
@@ -1261,7 +1357,10 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
 // inputs keep the existing settle semantics unchanged.
 
 /** The policy is copied at invocation entry. It never follows a live settings toggle. */
-async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBaseline> {
+async function settleReviewEvidence(
+  input: ReviewRunInput,
+  options: { deferRecoveredBaselinePromotion?: boolean } = {},
+): Promise<SettledBaseline> {
   input.signal?.throwIfAborted();
   const policy = { ...(input.evidencePolicy ?? primaryEvidencePolicy(input.config)) };
   const beforeKind = isReviewBaseline(input.before) ? input.before.kind : "snapshot";
@@ -1281,7 +1380,7 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
   }
   const toolBaseline = isReviewBaseline(input.before) && input.before.kind === "tool" ? input.before : undefined;
   if (toolBaseline && toolBaseline.cwd !== input.cwd) throw new Error("review gate: tool evidence basis root mismatch");
-  const tools = async (fallback: boolean, basis?: ReviewBaseline, coverageNotice?: string, userNote?: string): Promise<SettledBaseline> => {
+  const tools = async (fallback: boolean, basis?: ReviewBaseline, coverageNotice?: string, userNote?: string, deferBaselinePromotion = false): Promise<SettledBaseline> => {
     input.signal?.throwIfAborted();
     // A session-latched Primary fallback is ordinary Tools only labeled with
     // its provenance (#465); it never retries capture.
@@ -1294,10 +1393,13 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
     if (!input.evidence?.events.length) coverageNotice = [coverageNotice, "No structured tool observations were collected for this assessment; supplied summaries and context are claims, not verified actions or evidence of no effects."].filter(Boolean).join(" ");
     const baseline: ReviewBaseline = basis ?? { kind: "tool", cwd: input.cwd, capturedAt: new Date().toISOString(), ...(fallback || policy.sessionFallback ? { fallback: true } : {}) };
     // Preserve a valid historical basis; never reset current work or write config here.
-    if (input.window) {
+    // A staged recovery defers this mutation until its cancellation boundary succeeds.
+    const promoteBaseline = (): void => {
+      if (!input.window) return;
       input.window.baseline = baseline;
       if (input.window.activeExchange && input.window.activeExchange.baseline?.kind !== baseline.kind) input.window.activeExchange.baseline = baseline;
-    }
+    };
+    if (!deferBaselinePromotion) promoteBaseline();
     const methodNotice = `${evidenceMethodNotice(method)}${coverageNotice ? ` ${coverageNotice}` : ""}`;
     // Primary (#465): a concise local user warning. A fallback transition warns
     // whether or not work needs review; a session-latched fallback already
@@ -1311,6 +1413,7 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
     return { evidenceMethod: method, evidenceCoverageNotice: coverageNotice, workspaceChanges: [], exchangeWorkspaceChanges: [],
       snapshotOmissions: [], snapshotOmissionsTruncated: false, ownershipTransferred: false,
       reviewedBaseline: input.window?.activeExchange?.baseline ?? baseline,
+      ...(deferBaselinePromotion && input.window ? { promoteBaseline } : {}),
       ...(primary && !fallback && !policy.sessionFallback ? { reviewMethodNotice: `${PRIMARY_TOOLS_ONLY_USER_WARNING}${userNote ? ` ${userNote}` : ""}` } : {}),
       ...(primary ? { primaryToolChangeGate: true as const } : {}) };
   };
@@ -1328,14 +1431,14 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
         if (!baseline) continue;
         if (baseline.kind !== "checkpoint" || baseline.cwd !== input.cwd) throw new Error("review gate: mixed or wrong-root exchange baseline");
         const loaded = await loadReviewCheckpoint(input.cwd, baseline.descriptor, { signal: input.signal, scope: input.checkpointScope });
-        if (loaded.status !== "ok") throw checkpointFailure("verifying baseline", loaded);
+        if (loaded.status !== "ok") throw settleCheckpointFailure("verifying baseline", loaded, input.signal);
       }
     } else if (git) {
       for (const baseline of [git, input.window?.activeExchange?.baseline]) {
         if (!baseline) continue;
         if (baseline.kind !== "git" || baseline.cwd !== input.cwd) throw new Error("review gate: mixed or wrong-root exchange baseline");
         const loaded = await loadGitCheckpoint(input.cwd, baseline.descriptor, { signal: input.signal });
-        if (loaded.status !== "ok") throw gitReviewFailure("verifying the Git review baseline", loaded);
+        if (loaded.status !== "ok") throw settleGitFailure("verifying the Git review baseline", loaded, input.signal);
       }
     }
     return tools(true, isReviewBaseline(input.before) ? input.before : { kind: "snapshot", snapshot: input.before });
@@ -1347,16 +1450,73 @@ async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBasel
     const captured = await captureReviewCheckpoint(input.cwd, randomUUID(), { scope: input.checkpointScope, signal: input.signal });
     if (captured.status !== "ok") {
       if (policy.snapshotFailureFallback && !input.signal?.aborted && isEligibleReviewCaptureFailure(captured)) return tools(true, toolBaseline);
-      throw checkpointFailure("retrying snapshot evidence", captured);
+      throw settleCheckpointFailure("retrying snapshot evidence", captured, input.signal);
     }
     const baseline: UnifiedReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: input.cwd, capturedAt: new Date().toISOString(), toolOnlyHistory: true };
     const release = () => releaseCheckpoint(input.cwd, captured.value, input.checkpointScope);
+    // The recovered basis is staged until the warning/cancellation boundary
+    // succeeds. Until promotion, the original tool window/exchange identities
+    // are untouched; any cancellation restores them and releases this capture.
+    const originalWindowBaseline = input.window?.baseline;
+    const originalExchange = input.window?.activeExchange;
+    const originalExchangeBaseline = originalExchange?.baseline;
+    const originalExchangeCount = input.window?.exchanges.length;
+    const originalRequestIndex = input.window?.nextExchangeRequestIndex;
+    const restoreOriginalBaselines = (): void => {
+      const window = input.window;
+      if (!window) return;
+      if (window.baseline === baseline) window.baseline = originalWindowBaseline;
+      // The delayed Primary warning runs after completeActiveExchange. Undo
+      // only this staged recovery's derived completion, keeping the original
+      // exchange and retained evidence available to the next prompt.
+      if (originalExchange && !window.activeExchange
+        && window.exchanges.length === originalExchangeCount! + 1
+        && window.exchanges.at(-1)?.sequence === originalExchange.sequence) {
+        window.exchanges.pop();
+        window.activeExchange = originalExchange;
+        window.nextExchangeRequestIndex = originalRequestIndex!;
+      }
+      const exchange = window.activeExchange;
+      if (exchange === originalExchange && exchange?.baseline === baseline) exchange.baseline = originalExchangeBaseline;
+    };
+    // The recovered descriptor and its promoted basis stay private to this run
+    // until the caller commits them at the pre-invocation boundary. A shared
+    // persistence save cannot observe a descriptor that a later rollback is
+    // still allowed to release.
+    let recoveryCommitted = false;
+    let recoveryCancelled = false;
+    let staged: SettledBaseline | undefined;
+    const commitRecoveredBaseline = (): void => {
+      if (recoveryCommitted) return;
+      if (recoveryCancelled) throw new Error("review gate: a cancelled recovery baseline cannot be committed");
+      if (!staged?.promoteBaseline) throw new Error("review gate: staged recovery promotion is unavailable");
+      staged.promoteBaseline();
+      recoveryCommitted = true;
+    };
+    const cancelSettlement = async (): Promise<boolean> => {
+      if (recoveryCommitted || recoveryCancelled) return false;
+      recoveryCancelled = true;
+      restoreOriginalBaselines();
+      await release();
+      return true;
+    };
     try {
-      const settled = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE);
-      return { ...settled, reviewedBaseline: baseline, releaseOrphan: input.window ? undefined : release, ownershipTransferred: Boolean(input.window) };
+      staged = await tools(false, baseline, `Snapshot capture recovered; a NEW baseline was established for subsequent captures. ${TOOL_ONLY_HISTORY_NOTICE}`, PRIMARY_SNAPSHOT_RECOVERED_USER_NOTE, true);
+      input.signal?.throwIfAborted();
+      const ownershipTransferred = Boolean(input.window);
+      const deferred = ownershipTransferred && options.deferRecoveredBaselinePromotion === true;
+      if (ownershipTransferred && !deferred) commitRecoveredBaseline();
+      return {
+        ...staged,
+        reviewedBaseline: baseline,
+        releaseOrphan: ownershipTransferred ? undefined : release,
+        ownershipTransferred,
+        ...(ownershipTransferred ? { cancelSettlement } : {}),
+        ...(deferred ? { promoteBaseline: commitRecoveredBaseline } : {}),
+      };
     } catch (error) {
-      if (!input.window) return rethrowAfterRelease(error, release);
-      throw error;
+      restoreOriginalBaselines();
+      return rethrowAfterRelease(error, release);
     }
   }
   try {
@@ -1396,6 +1556,12 @@ interface SettledBaseline {
   reviewedBaseline?: ReviewBaseline;
   /** Releases the ephemeral after-checkpoint pin (Git only). Throws on failure — never hides an orphaned pin. */
   releaseOrphan?: () => Promise<void>;
+  /** Staged recovery only: one-way publication of the recovered basis at the
+   * pre-invocation commitment boundary. */
+  promoteBaseline?: () => void;
+  /** Staged recovery only: restore the pre-recovery bases and release before
+   * commitment. Resolves false after commitment (or a completed rollback). */
+  cancelSettlement?: () => Promise<boolean>;
   /** Tool-method notice sent only once an actual review proceeds (#465). */
   reviewMethodNotice?: string;
   /** Primary tool-method review requires reviewable change evidence (#465). */
@@ -1428,6 +1594,89 @@ function checkpointFailure(context: string, result: { reason?: string; detail?: 
   return new Error(`review gate: ${context} failed (${result.reason ?? "unknown"}): ${result.detail ?? "checkpoint unavailable"}; refusing snapshot fallback`);
 }
 
+/**
+ * Internal marker for a cancellation this run proved while settling evidence.
+ * `runReview` converts it into the existing aborted run output, so a deliberate
+ * cancel never escapes as an extension failure; genuine failures keep their own
+ * error and never become this.
+ */
+class ReviewRunCancelled extends Error {
+  constructor() {
+    super("review gate: the review was cancelled while capturing review evidence");
+    this.name = "ReviewRunCancelled";
+  }
+}
+
+/**
+ * Narrow internal marker for the deliberate cancellation boundary that runs
+ * after the delayed recovery warning and before invocation preparation. It is
+ * only constructed by that boundary, so a later failure that happens to carry
+ * the same signal reason can never trigger release of a committed recovery.
+ */
+class PreInvocationRecoveryCancelled extends Error {
+  constructor() {
+    super("review gate: the recovered review basis was cancelled before invocation preparation");
+    this.name = "PreInvocationRecoveryCancelled";
+  }
+}
+
+/** The capture helper's abort-classified exception under this run's signal. */
+function isCaptureAbort(signal: AbortSignal | undefined, error: unknown): boolean {
+  if (!signal?.aborted) return false;
+  if (error === signal.reason) return true;
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * True only for a cancellation this layer can prove: the run's own signal is
+ * aborted AND the cause is abort-classified — a typed checkpoint outcome whose
+ * reason is `aborted`, or the exact reason object that signal carries (what
+ * `AbortSignal.throwIfAborted()` rethrows). `signal.aborted` alone is never
+ * enough and no message text is ever matched, so a genuine Git, integrity, or
+ * release failure that merely raced the same abort stays visible.
+ */
+function isProvenCancellation(signal: AbortSignal | undefined, cause: unknown): boolean {
+  if (!signal?.aborted) return false;
+  // The settle layer's own marker is only ever constructed by
+  // `settleCheckpointFailure`/`settleGitFailure` after this same proof.
+  if (cause instanceof ReviewRunCancelled) return true;
+  // `signal.throwIfAborted()` rethrows the signal's exact owner-set reason
+  // when it runs before a checkpoint operation is entered.
+  if (cause !== undefined && cause === signal.reason) return true;
+  return isAbortClassifiedResult(cause);
+}
+
+/** A checkpoint operation's own typed cancellation outcome. */
+function isAbortClassifiedResult(value: unknown): boolean {
+  return typeof value === "object" && value !== null
+    && (value as { status?: unknown }).status === "failed"
+    && (value as { reason?: unknown }).reason === "aborted";
+}
+
+/**
+ * Fail-closed settle error for a read/capture/compare outcome, except for a
+ * cancellation this run proved: that is reported as the typed cancellation the
+ * owning run turns into its aborted result. Release and cleanup outcomes never
+ * route through here — they always stay failures.
+ */
+function settleCheckpointFailure(context: string, result: { reason?: string; detail?: string }, signal?: AbortSignal): Error {
+  return isProvenCancellation(signal, result) ? new ReviewRunCancelled() : checkpointFailure(context, result);
+}
+
+/** Git-variant counterpart of `settleCheckpointFailure`. */
+function settleGitFailure(context: string, outcome: { reason?: string; detail?: string }, signal?: AbortSignal): Error {
+  return isProvenCancellation(signal, outcome) ? new ReviewRunCancelled() : gitReviewFailure(context, outcome);
+}
+
+/**
+ * The existing aborted-run convention for a cancellation that landed before any
+ * reviewer was launched: nothing is certified, so no reviewed baseline,
+ * certificate, partial evidence, or bundle is reported, and process settlement
+ * is positively trivial because no reviewer process was ever started.
+ */
+function cancelledReviewOutput(): ReviewRunOutput {
+  return { changed: true, changes: [], result: abortedResult([]), bundleRetained: false };
+}
 async function releaseCheckpoint(cwd: string, descriptor: ReviewCheckpointDescriptor, scope: ReviewCheckpointScope | undefined): Promise<void> {
   const result = await releaseReviewCheckpoint(cwd, descriptor, { scope });
   if (result.status !== "ok") throw checkpointFailure("releasing after-checkpoint", result);
@@ -1473,7 +1722,7 @@ async function settleCheckpointReview(input: {
   if (exchange && (exchange.kind !== "checkpoint" || exchange.cwd !== cwd)) throw new Error("review gate: mixed or wrong-root exchange baseline");
   for (const descriptor of [before.descriptor, ...(exchange && !sameCheckpoint(exchange.descriptor, before.descriptor) ? [exchange.descriptor] : [])]) {
     const loaded = await loadReviewCheckpoint(cwd, descriptor, options);
-    if (loaded.status !== "ok") throw checkpointFailure("verifying baseline", loaded);
+    if (loaded.status !== "ok") throw settleCheckpointFailure("verifying baseline", loaded, input.signal);
   }
   const checkpointRoot = before.descriptor.kind === "git"
     ? await reviewCheckpointWorkspaceRoot(cwd, before.descriptor)
@@ -1493,7 +1742,14 @@ async function settleCheckpointReview(input: {
         maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes, ...(input.signal ? { signal: input.signal } : {}),
       }));
     } catch (error) {
-      if (input.signal?.aborted) throw error;
+      if (input.signal?.aborted) {
+        // createPathSnapshot uses capture.ts's abort helper, which turns a
+        // non-Error signal reason (for example "escape") into a new AbortError.
+        // Normalize only that abort-classified cause; a genuine snapshot
+        // failure that raced this same abort remains visible.
+        if (isCaptureAbort(input.signal, error)) throw new ReviewRunCancelled();
+        throw error;
+      }
     }
   }
   const captured = await captureReviewCheckpoint(cwd, randomUUID(), options);
@@ -1501,18 +1757,18 @@ async function settleCheckpointReview(input: {
     if (isEligibleReviewCaptureFailure(captured) && !input.signal?.aborted) {
       throw new ReviewEvidenceCaptureFailure("review-evidence after-checkpoint acquisition failed");
     }
-    throw checkpointFailure("capturing after-checkpoint", captured);
+    throw settleCheckpointFailure("capturing after-checkpoint", captured, input.signal);
   }
   const descriptor = captured.value;
   const releaseOrphan = () => releaseCheckpoint(cwd, descriptor, input.scope);
   try {
     const windowResult = await compareReviewCheckpoints(cwd, before.descriptor, descriptor, options);
-    if (windowResult.status !== "ok") throw checkpointFailure("comparing window", windowResult);
+    if (windowResult.status !== "ok") throw settleCheckpointFailure("comparing window", windowResult, input.signal);
     const windowDelta = checkpointDelta(windowResult.value.changes, config);
     let exchangeDelta = windowDelta;
     if (exchange && !sameCheckpoint(exchange.descriptor, before.descriptor)) {
       const result = await compareReviewCheckpoints(cwd, exchange.descriptor, descriptor, options);
-      if (result.status !== "ok") throw checkpointFailure("comparing exchange", result);
+      if (result.status !== "ok") throw settleCheckpointFailure("comparing exchange", result, input.signal);
       exchangeDelta = checkpointDelta(result.value.changes, config);
     }
     return {
@@ -1596,13 +1852,13 @@ async function settleGitReview(input: {
   // state created.
   const beforeLoaded = await loadGitCheckpoint(cwd, before.descriptor, options);
   if (beforeLoaded.status !== "ok") {
-    throw gitReviewFailure("verifying the Git review baseline", beforeLoaded);
+    throw settleGitFailure("verifying the Git review baseline", beforeLoaded, signal);
   }
   const exchangeBaseline = input.exchangeBefore?.kind === "git" ? input.exchangeBefore : undefined;
   if (exchangeBaseline && !sameGitDescriptor(exchangeBaseline.descriptor, before.descriptor)) {
     const exchangeLoaded = await loadGitCheckpoint(cwd, exchangeBaseline.descriptor, options);
     if (exchangeLoaded.status !== "ok") {
-      throw gitReviewFailure("verifying the Git exchange baseline", exchangeLoaded);
+      throw settleGitFailure("verifying the Git exchange baseline", exchangeLoaded, signal);
     }
   }
   // Arm exactly ONE new checkpoint with a unique safe per-generation id.
@@ -1610,7 +1866,7 @@ async function settleGitReview(input: {
   const armed = await armGitCheckpoint(cwd, windowId, options ?? {});
   if (armed.status !== "ok") {
     if (isEligibleReviewCaptureFailure(armed) && !signal?.aborted) throw new ReviewEvidenceCaptureFailure("Git review-evidence acquisition failed");
-    throw gitReviewFailure("arming the Git after-checkpoint", armed);
+    throw settleGitFailure("arming the Git after-checkpoint", armed, signal);
   }
   const afterDescriptor = armed.value.descriptor;
   const releaseOrphan = (): Promise<void> => releaseGitReviewPin(cwd, afterDescriptor);
@@ -1618,7 +1874,7 @@ async function settleGitReview(input: {
     // Frozen-to-frozen window comparison against the single after descriptor.
     const windowReport = await compareGitCheckpoints(cwd, before.descriptor, afterDescriptor, options ?? {}, true);
     if (windowReport.status !== "ok") {
-      throw gitReviewFailure("comparing the Git review baseline to the frozen after-checkpoint", windowReport);
+      throw settleGitFailure("comparing the Git review baseline to the frozen after-checkpoint", windowReport, signal);
     }
     // buildGitReviewDelta is a documented fail-closed thrower (invalid limits,
     // malformed comparison report, duplicate changed path); the catch below
@@ -1636,7 +1892,7 @@ async function settleGitReview(input: {
     if (exchangeBaseline && !sameGitDescriptor(exchangeBaseline.descriptor, before.descriptor)) {
       const exchangeReport = await compareGitCheckpoints(cwd, exchangeBaseline.descriptor, afterDescriptor, options ?? {}, true);
       if (exchangeReport.status !== "ok") {
-        throw gitReviewFailure("comparing the Git exchange baseline to the frozen after-checkpoint", exchangeReport);
+        throw settleGitFailure("comparing the Git exchange baseline to the frozen after-checkpoint", exchangeReport, signal);
       }
       const exchangeDelta = buildGitReviewDelta(exchangeReport.value, {
         maxFileBytes: config.maxFileBytes,

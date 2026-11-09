@@ -5,6 +5,7 @@ import { UserQuestionController } from "../src/user-question/controller";
 import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
 import type { QuestionSelectionCopy, QuestionUiTheme } from "../src/user-question/components";
 import { visibleTerminalText } from "../src/tool-result-text";
+import { longFormMarkers, longFormQuestion } from "./long-question-fixtures";
 
 /** Raw sequence used by the fakes for the approved chord (Kitty-style). */
 const CHORD = "\x1b[1;64A";
@@ -2568,4 +2569,82 @@ test("mouse: a wheel while editing retires a pressed choice, keeps the draft, an
   assert.equal(fixture.field!.inputLog.length, inputsBefore, "no pointer bytes reached the native field");
   assert.equal(fixture.sent.length, 0, "nothing was submitted");
   assert.equal(fixture.done.length, 0, "the popup stays open");
+});
+
+/**
+ * #396: the shared popup must present a question that the removed 2,000-character
+ * ceiling rejected in full — every paragraph reachable through the existing
+ * shared scroll viewport, with the choices, the free-text row, and Decline still
+ * reachable and each routed to its existing answer path.
+ */
+test("a long question scrolls to its complete text in the shared popup and routes answer, free text, and decline (#396)", async () => {
+  const rows = 12;
+  const width = 60;
+  const paragraphs = 60;
+  const question = longFormQuestion(paragraphs);
+  assert.ok(question.length > 8_000, `the fixture is substantially larger than the removed ceiling (${question.length})`);
+  const settle = (): Promise<void> => new Promise((resolvePromise) => setImmediate(resolvePromise));
+
+  // --- full readability, then a choice answered from the scrolled end ---
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  register(fixture, question, { choices: ["Alpha", "Beta"] });
+  fixture.component.handleInput(ENTER); // open the answer view
+  const body = (): string[] =>
+    splitFixedHint(frameInterior(fixture.component.render(width)), ANSWER_KEY_HINT, rows).body;
+
+  const opening = body();
+  assert.equal(opening[0], "q1:", "the long question opens at its beginning, not at the first choice");
+  assert.ok(!opening.some((line) => line.includes("1. Alpha")), "the choices start below the visible fold");
+
+  const seen = new Set<string>(opening);
+  let steps = 0;
+  for (; steps < 500; steps += 1) {
+    const before = body().join("\n");
+    fixture.component.handleInput(SHIFT_ALT_DOWN);
+    const after = body();
+    for (const line of after) seen.add(line);
+    if (after.join("\n") === before) break;
+  }
+  assert.ok(steps > 20, `the long question scrolls over ${steps} one-line steps`);
+  const rendered = [...seen].join("\n");
+  for (const marker of longFormMarkers(paragraphs)) {
+    assert.ok(rendered.includes(marker), `paragraph ${marker} is reachable by scrolling`);
+  }
+  assert.ok(rendered.includes("1. Alpha") && rendered.includes("2. Beta"), "both choices scroll into view after the question");
+  assert.ok(rendered.includes("Type something…"), "the free-text row is reachable below the choices");
+  assert.ok(rendered.includes("Decline (no answer will be sent)"), "Decline is reachable below the free-text row");
+  assert.equal(fixture.sent.length, 0, "reading and scrolling send nothing");
+  assert.equal(fixture.controller.listPending().length, 1, "the long question stays pending while it is read");
+
+  // Scrolling never moved the selection, so Enter still confirms the highlighted
+  // choice — here from the very end of the scrolled content.
+  fixture.component.handleInput(ENTER);
+  await settle();
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0]!.message, `Answer to pending question "${question}": Alpha`,
+    "the delivered answer carries the complete question, not a clipped quote");
+
+  // --- free text on the same long question ---
+  const typed = makeFixture({ getViewportRows: () => rows });
+  register(typed, question, { choices: ["Alpha"] });
+  typed.component.handleInput(ENTER);
+  typed.component.handleInput(DOWN); // Type something…
+  typed.component.handleInput(ENTER); // native editing
+  typed.component.handleInput("ship it");
+  typed.component.handleInput(ENTER); // submit the whole draft
+  await settle();
+  assert.equal(typed.sent.length, 1);
+  assert.equal(typed.sent[0]!.message, `Answer to pending question "${question}": ship it`);
+
+  // --- decline on the same long question sends nothing ---
+  const declined = makeFixture({ getViewportRows: () => rows });
+  register(declined, question, { choices: ["Alpha"] });
+  declined.component.handleInput(ENTER);
+  declined.component.handleInput(DOWN);
+  declined.component.handleInput(DOWN); // Decline row
+  declined.component.handleInput(ENTER);
+  await settle();
+  assert.deepEqual(declined.done, [{ kind: "submitted", result: { status: "declined", empty: true } }]);
+  assert.equal(declined.sent.length, 0, "declining a long question fabricates no answer");
+  assert.equal(declined.controller.listPending().length, 0);
 });

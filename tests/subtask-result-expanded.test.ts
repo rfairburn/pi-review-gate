@@ -578,11 +578,14 @@ test("genuine failure envelopes expand with diagnostic, source workspace, recove
   try {
     const start = toolFor(tools, "SubtasksStart").execute as ExecuteTool;
     const steer = toolFor(tools, "SubtasksSteer").execute as ExecuteTool;
-    await start("err-start", {
+    const started = await start("err-start", {
       tasks: [{ title: "ERR-GROUP-WORK", instructions: "bounded work", acceptanceCriteria: ["done"] }],
     }, undefined, undefined, {});
+    // Issue #626: the durable state a failure replays is the scoped snapshot of
+    // the execution the request actually named, so this request targets the
+    // started group with a task handle that does not exist in it.
     const failed = await steer("err-steer", {
-      executionId: "exec-missing", taskId: "task-missing", instructions: "hello",
+      executionId: started.details.executionId, taskId: "task-missing", instructions: "hello",
     }, undefined, undefined, {});
     assert.equal(failed.isError, true);
     const text = joined(failed, {}, 300);
@@ -593,6 +596,24 @@ test("genuine failure envelopes expand with diagnostic, source workspace, recove
     assert.match(text, /SubtasksInspect/);
     assert.match(text, /Durable execution state as of the failure/);
     assert.match(text, /ERR-GROUP-WORK/);
+    // The structured twin of the model-visible scope disclosure (#626).
+    assert.equal(failed.details.failureScope.resolved, true);
+    assert.equal(failed.details.failureScope.executionId, started.details.executionId);
+    assert.equal(typeof failed.details.failureScope.note, "string");
+
+    // A target no execution owns returns no durable state at all — it never
+    // falls back to replaying the other groups this session holds.
+    const unresolved = await steer("err-steer-unscoped", {
+      executionId: "exec-missing", taskId: "task-missing", instructions: "hello",
+    }, undefined, undefined, {});
+    assert.equal(unresolved.isError, true);
+    const unresolvedText = joined(unresolved, {}, 300);
+    assert.match(unresolvedText, /SubtasksSteer · failed/);
+    assert.match(unresolvedText, /diagnostic: /);
+    assert.doesNotMatch(unresolvedText, /Durable execution state as of the failure/);
+    assert.doesNotMatch(unresolvedText, /ERR-GROUP-WORK/);
+    assert.equal(unresolved.details.failureScope.resolved, false);
+    assert.deepEqual(unresolved.details.executions, []);
   } finally {
     await manager.shutdown();
     await manager.detach();

@@ -11,7 +11,12 @@ session switches, `/new`, or forks.
 The model calls `AskUserQuestion` with:
 
 - `question` — one focused question, shown verbatim in the pending-question
-  list and rendered as Markdown in its answer view.
+  list and rendered as Markdown in its answer view. There is no question-only
+  length ceiling: the accepted text is retained in full, and the shared popup
+  scrolls, so a long question stays completely readable with its choices,
+  **Type something…**, and **Decline** rows still reachable below it. Include the
+  context needed to answer without earlier chat; keep it relevant and sanitized
+  rather than a transcript.
 - `choices` (optional) — up to 12 suggested answers. You may always type a
   free-text answer instead of picking one, or decline.
 - `mode` — `async` (default) or `sync`.
@@ -123,6 +128,15 @@ within the content's start and end.
 - A long question or notice opens at its beginning, not at the first choice.
   **Up/Down** still change the selection and bring the selected choice or
   action into view, also when pressed at the first or last row.
+- **A scrolled pending list keeps its place.** While the list is open, the
+  controller keeps changing: another question or notice is registered, or another
+  one is answered or closed. The list
+  refreshes with that live state and keeps the viewport where the wheel or
+  scroll keys left it, so a later entry can be read in peace. The reveals you
+  would expect stay exactly as they were: opening the list or returning to it
+  shows the selected entry, **Up/Down** bring the newly selected entry into
+  view, and if the selected entry is resolved or closed the list falls back to
+  the first live entry and reveals it.
 - While you edit a free-text answer, every key belongs to the native text field,
   so the popup scroll shortcuts are not consumed; the hint says to press Esc to
   return to the options first. Editing input brings the field's cursor row back
@@ -364,7 +378,9 @@ arrows select · Enter confirm · Esc back
 
 - **Async answer** — delivered as an ordinary user message to the session
   that asked: queued as steering while the agent is busy, sent normally when
-  it is idle. The run is never interrupted or aborted to deliver an answer.
+  it is idle. The message quotes the accepted question in full, so the answer
+  stays tied to the exact question it resolves. The run is never interrupted or
+  aborted to deliver an answer.
 - **Async decline** — the question simply leaves the pending set. No message
   is sent to the model: declining implies no answer, and none is fabricated.
 - **Sync answer / decline** — returned directly to the waiting tool call (see

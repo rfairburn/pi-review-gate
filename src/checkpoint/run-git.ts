@@ -169,6 +169,13 @@ export function runGit(
   // -c overrides (they would change the very value being probed).
   const argv = ["--no-pager", "--no-replace-objects", ...(spec.probeConfig ? [] : configArgv(hasAlternateIndex, spec.frozenAutocrlf)), ...args];
   return new Promise<GitRunOutput>((resolvePromise, reject) => {
+    // A signal that is already aborted never spawns: starting an owned child
+    // only to kill it would leak a Git writer into the cancelled turn and
+    // report the cancellation before its close was ever awaited.
+    if (spec.signal?.aborted) {
+      reject(abortError(args));
+      return;
+    }
     let child: ChildProcess;
     try {
       child = spawn(gitPath, argv, {
@@ -201,24 +208,36 @@ export function runGit(
     };
 
     const timer = setTimeout(() => {
+      if (aborted) {
+        // The cancellation kill is already in flight; the operation deadline
+        // (never extended here) is up without the child's close event. That is
+        // real settlement uncertainty, not the expected cancellation.
+        finish(cleanupUnconfirmedError(args, spec.timeoutMs));
+        return;
+      }
       timedOut = true;
       kill();
       finish(new GitCheckpointError(`git ${args[0] ?? ""} timed out after ${spec.timeoutMs}ms`, "git_failed"));
     }, spec.timeoutMs);
 
     const onAbort = (): void => {
+      if (settled) return;
       aborted = true;
       kill();
-      finish(new GitCheckpointError(`git ${args[0] ?? ""} was aborted`, "aborted"));
+      // The expected cancellation is reported only by the child's close event
+      // below, so a cancelled run never claims settlement while its owned
+      // process could still be writing. The existing operation deadline bounds
+      // that wait; if it expires, the timer reports cleanup uncertainty.
     };
-    if (spec.signal?.aborted) {
-      finish(new GitCheckpointError(`git ${args[0] ?? ""} was aborted`, "aborted"));
-      return;
-    }
     spec.signal?.addEventListener("abort", onAbort, { once: true });
+    // Re-check after registration: an abort between the pre-spawn check and
+    // this listener would otherwise be lost and the owned child allowed to run.
+    if (spec.signal?.aborted) onAbort();
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      if (settled) return;
+      // Once cancellation owns settlement, late bytes from an inherited pipe
+      // owner cannot replace the expected abort with an overflow classification.
+      if (settled || aborted) return;
       if (stdout.length + chunk.length > spec.maxBytes) {
         kill();
         finish(new GitCheckpointError(
@@ -241,7 +260,13 @@ export function runGit(
     });
 
     child.on("close", (code) => {
-      if (settled || timedOut || aborted) return;
+      if (settled || timedOut) return;
+      if (aborted) {
+        // Positive settlement of the killed child: now the cancellation is a
+        // truthful expected outcome.
+        finish(abortError(args));
+        return;
+      }
       if (code === null) {
         finish(new GitCheckpointError(`git ${args[0] ?? ""} was killed by a signal`, "git_failed"));
         return;
@@ -249,6 +274,20 @@ export function runGit(
       finish(null, { stdout, stderr: stderr.toString("utf8"), code });
     });
   });
+}
+
+/** The typed cancellation of an owned Git child. */
+function abortError(args: readonly string[]): GitCheckpointError {
+  return new GitCheckpointError(`git ${args[0] ?? ""} was aborted`, "aborted");
+}
+
+/** A cancellation whose owned child never reported close within the operation
+ * deadline. Never `aborted`: the caller must keep this visible as a failure. */
+function cleanupUnconfirmedError(args: readonly string[], timeoutMs: number): GitCheckpointError {
+  return new GitCheckpointError(
+    `git ${args[0] ?? ""} was aborted but its close event was not observed within the ${timeoutMs}ms operation deadline; the owned process may still be live`,
+    "cleanup_unconfirmed",
+  );
 }
 
 function configArgv(disableSplitIndex = false, frozenAutocrlf?: string): string[] {
@@ -281,6 +320,11 @@ export async function runGitWithInput(
     || (typeof extraEnv.GIT_INDEX_FILE === "string" && extraEnv.GIT_INDEX_FILE.length > 0);
   const argv = ["--no-pager", "--no-replace-objects", ...configArgv(hasAlternateIndex, spec.frozenAutocrlf), ...args];
   return new Promise<GitRunOutput>((resolvePromise, reject) => {
+    // Never spawn for a signal that is already aborted (see runGit).
+    if (spec.signal?.aborted) {
+      reject(abortError(args));
+      return;
+    }
     let child: ChildProcess;
     try {
       child = spawn(gitPath, argv, { cwd, env: { ...hardenedEnv(), ...spec.extraEnv, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
@@ -291,6 +335,7 @@ export async function runGitWithInput(
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let settled = false;
+    let aborted = false;
     const finish = (error: GitCheckpointError | null, output?: GitRunOutput): void => {
       if (settled) return;
       settled = true;
@@ -300,20 +345,27 @@ export async function runGitWithInput(
       else resolvePromise(output!);
     };
     const timer = setTimeout(() => {
+      if (aborted) {
+        finish(cleanupUnconfirmedError(args, spec.timeoutMs));
+        return;
+      }
       try { child.kill("SIGKILL"); } catch { /* already dead */ }
       finish(new GitCheckpointError(`git ${args[0] ?? ""} timed out after ${spec.timeoutMs}ms`, "git_failed"));
     }, spec.timeoutMs);
     const onAbort = (): void => {
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      finish(new GitCheckpointError(`git ${args[0] ?? ""} was aborted`, "aborted"));
-    };
-    if (spec.signal?.aborted) {
-      finish(new GitCheckpointError(`git ${args[0] ?? ""} was aborted`, "aborted"));
-      return;
-    }
-    spec.signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout?.on("data", (chunk: Buffer) => {
       if (settled) return;
+      aborted = true;
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      // Reported by the close event below; the operation deadline bounds it.
+    };
+    spec.signal?.addEventListener("abort", onAbort, { once: true });
+    // Close the pre-spawn-check/listener-registration race exactly as runGit
+    // does; a signal that turned aborted meanwhile must still kill its child.
+    if (spec.signal?.aborted) onAbort();
+    child.stdout?.on("data", (chunk: Buffer) => {
+      // As in runGit, cancellation owns settlement; late inherited-pipe bytes
+      // must not turn the abort into an output-overflow failure.
+      if (settled || aborted) return;
       if (stdout.length + chunk.length > spec.maxBytes) {
         try { child.kill("SIGKILL"); } catch { /* already dead */ }
         finish(new GitCheckpointError(
@@ -330,6 +382,10 @@ export async function runGitWithInput(
     child.on("error", (error) => finish(new GitCheckpointError(`failed to run git: ${messageOf(error)}`, "git_failed")));
     child.on("close", (code) => {
       if (settled) return;
+      if (aborted) {
+        finish(abortError(args));
+        return;
+      }
       if (code === null) { finish(new GitCheckpointError(`git ${args[0] ?? ""} was killed by a signal`, "git_failed")); return; }
       finish(null, { stdout, stderr: stderr.toString("utf8"), code });
     });

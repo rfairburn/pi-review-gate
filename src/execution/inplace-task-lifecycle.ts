@@ -28,6 +28,7 @@ import { runInplaceLifecycle, type InPlaceLifecycleResult, type InPlaceLifecycle
 import type { WaveResult, WaveTaskResult } from "./wave-controller";
 import {
   applyExecutorIdentity,
+  applyReviewStatus,
   synchronizeEventSnapshot,
   transitionEventSnapshot,
 } from "./task-lifecycle-helpers";
@@ -202,6 +203,14 @@ export function inPlaceProgress(
         ? "running"
         : undefined;
   const previous = next ? transitionTaskState(task, next) : task.state;
+  // #314: the in-place worker emits the same reviewer labels as the wave
+  // worker, so the same shared projection makes a reviewing in-place row read
+  // identically in the indicator (presentation only — no lifecycle input).
+  applyReviewStatus(task, {
+    message: update.message,
+    reviewers: update.reviewers,
+    workerPhase: update.phase,
+  });
   deps.activity.add(task, `inplace:${update.phase}`, update.message);
   applyExecutorIdentity(task, update as import("./types").SubtaskProgressUpdate);
   if (isDispatchCapture && update.dispatch) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
 import { createUserQuestionTool, USER_QUESTION_TOOL_NAME } from "../src/user-question/tool";
+import { JUST_OVER_REMOVED_CAP, LARGE_QUESTION_PARAGRAPHS, longFormQuestion } from "./long-question-fixtures";
 
 const SESSION_MANAGER = { id: "S" };
 
@@ -35,7 +36,14 @@ test("the tool exposes the approved schema surface", () => {
   assert.deepEqual(parameters.properties.mode.enum, ["async", "sync"]);
   assert.equal(parameters.properties.mode.default, "async");
   assert.equal(parameters.properties.choices.maxItems, 12);
+  assert.equal(parameters.properties.choices.items.maxLength, 300);
   assert.ok(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length > 0);
+
+  // #396: the question-only 2,000-character ceiling is gone from the advertised
+  // schema and was not replaced by another field-level number.
+  assert.equal(parameters.properties.question.minLength, 1);
+  assert.equal("maxLength" in parameters.properties.question, false,
+    "the question property carries no maximum length");
 });
 
 test("async mode returns a pending handle immediately without waiting", async () => {
@@ -186,4 +194,38 @@ test("invalid input is rejected with an explicit diagnostic", async () => {
   assert.equal(details.status, "rejected");
   assert.equal(details.reason, "invalid");
   assert.equal(controller.listPending().length, 0);
+
+  // A non-string question is a rejection, never a thrown TypeError.
+  for (const question of [42, null, undefined, {}]) {
+    const rejected = await tool.execute("call-x", { question }, undefined, undefined, SESSION);
+    const rejectedDetails = rejected.details as Record<string, unknown>;
+    assert.equal(rejectedDetails.status, "rejected", String(question));
+    assert.equal(rejectedDetails.reason, "invalid", String(question));
+  }
+  assert.equal(controller.listPending().length, 0, "no invalid question is registered");
+});
+
+test("a formerly rejected long question registers pending with its full text (#396)", async () => {
+  const { controller, tool } = makeFixture();
+  const questions = [JUST_OVER_REMOVED_CAP, longFormQuestion(LARGE_QUESTION_PARAGRAPHS)];
+  for (const [index, question] of questions.entries()) {
+    const result = await tool.execute(
+      `call-${index}`,
+      { question, choices: ["Alpha", "Beta"] },
+      undefined,
+      undefined,
+      SESSION,
+    );
+    const details = result.details as Record<string, unknown>;
+    assert.equal(details.status, "pending", `a ${question.length}-character question is admitted`);
+    assert.equal(details.mode, "async");
+
+    // The model-facing pending handle quotes the accepted question in full.
+    const text = String((result.content as Array<Record<string, unknown>>)[0]!.text);
+    assert.ok(text.includes(question), "the pending result carries the complete question, not a clipped preview");
+    assert.equal(text.includes("…"), false, "nothing is elided in the pending result");
+
+    // And the pending record keeps it byte for byte for presentation.
+    assert.equal(controller.get(String(details.id))!.question, question);
+  }
 });

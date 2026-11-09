@@ -15,7 +15,7 @@ type AttemptOutcome =
   /** Refused by another policy after this guard admitted the call, unrecorded. */
   | "policy-blocked"
   /** The composed protection seam refuses the admitted call (#557). */
-  | "policy-refusal" | "policy-malformed" | "policy-timeout";
+  | "policy-refusal" | "policy-malformed" | "policy-timeout" | "policy-invalidated";
 type StartLiveness = "active" | "unknown" | "inactive";
 type NativeBatchResult = {
   decisions: Array<{ block: boolean; reason?: string }>;
@@ -72,8 +72,8 @@ function nativePiHarness(options: {
      * is what the entrypoint passes for a confirmed pre-execution auditor
      * timeout (#557).
      */
-    markPolicyBlocked(toolCallId: string, toolName: string, reason: string, auditTimeout = false) {
-      return preflight.markPolicyBlocked(toolCallId, toolName, reason, auditTimeout);
+    markPolicyBlocked(toolCallId: string, toolName: string, reason: string, auditTimeout = false, auditInvalidated = false) {
+      return preflight.markPolicyBlocked(toolCallId, toolName, reason, auditTimeout, auditInvalidated);
     },
     /** Simulates pi 1.0's nested seam: tool_execution_start then tool_call, each carrying parentToolCallId. */
     async emitNestedCall(
@@ -215,14 +215,16 @@ function composePolicyRefusal(
   outcome: AttemptOutcome,
 ): boolean {
   if (outcome === "policy-blocked") return true;
-  if (outcome !== "policy-refusal" && outcome !== "policy-malformed" && outcome !== "policy-timeout") return false;
+  if (outcome !== "policy-refusal" && outcome !== "policy-malformed" && outcome !== "policy-timeout" && outcome !== "policy-invalidated") return false;
   const auditTimeout = outcome === "policy-timeout";
-  const reason = auditTimeout
+  const reason = outcome === "policy-invalidated"
+    ? "Tool protection: audit invalidated — policy changed. The proposed call was not run; a fresh proposal will be audited."
+    : auditTimeout
     ? `Tool protection: audit unavailable — Auditor timed out after 10000ms. The proposed ${call.name} call was not run.`
     : outcome === "policy-malformed"
       ? `Tool protection: invalid auditor response — tool protection decision payload is empty. The proposed ${call.name} call was not run.`
       : `Tool protection: FAIL — the auditor denied this ${call.name} call. The call did not run.`;
-  const recorded = runtime.markPolicyBlocked(call.id, call.name, reason, auditTimeout);
+  const recorded = runtime.markPolicyBlocked(call.id, call.name, reason, auditTimeout, outcome === "policy-invalidated");
   assert.ok(recorded, `the composed seam records the refusal on admitted call ${call.id}`);
   return true;
 }
@@ -1727,4 +1729,34 @@ test("a nested audit timeout inside a retry chain still blocks after two actual 
     result.childDecisions[3]?.reason,
     "Duplicate bash blocked after repeated failures: nested call 4 (bash) in this codemode script follows two identical executions that failed; this call did not run. Review any existing command result and the current workspace state.",
   );
+});
+
+test("policy invalidation releases a same-batch read without hiding its eventual success", async () => {
+  const runtime = nativePiHarness();
+  const input = { path: "synthetic.txt" };
+  const result = await dispatchNativeBatch(runtime,
+    [call("invalidated", "read", input), call("fresh", "read", input)],
+    ["policy-invalidated", "success"], { refuseDuringPreflight: true });
+  assert.deepEqual(result.decisions.map((decision) => decision.block), [false, false]);
+  assert.equal(result.ran.length, 1);
+  assert.equal(result.toolResults, 1);
+  const duplicate = await onlyDecisionBatch(runtime, [call("again", "read", input)]);
+  assert.equal(duplicate.decisions[0]?.block, true);
+});
+
+test("nested policy invalidation preserves the two-execution failure ceiling", async () => {
+  const runtime = nativePiHarness();
+  const input = { path: "synthetic.txt" };
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-invalidated", "await tools.read({ path: 'synthetic.txt' });"),
+    children: [
+      { call: call("cm-invalidated/1", "read", input), outcome: "error" },
+      { call: call("cm-invalidated/2", "read", input), outcome: "policy-invalidated" },
+      { call: call("cm-invalidated/3", "read", input), outcome: "error" },
+      { call: call("cm-invalidated/4", "read", input) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, false, true]);
+  assert.equal(result.childResults.length, 2);
+  assert.match(result.childDecisions[3]!.reason!, /after repeated failures/);
 });

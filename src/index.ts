@@ -312,8 +312,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
           name,
           protectionDecision.reason,
           protectionDecision.auditTimeout === true,
+          protectionDecision.auditInvalidated === true,
         );
-        // The host action stays exactly `{block, reason}`: the audit-timeout
+        // The host action stays exactly `{block, reason}`: the retryable-audit
         // marker is this extension's own accounting signal, never host input.
         return { block: true as const, reason: protectionDecision.reason };
       }
@@ -1199,8 +1200,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         name,
         protectionDecision.reason,
         protectionDecision.auditTimeout === true,
+        protectionDecision.auditInvalidated === true,
       );
-      // The host action stays exactly `{block, reason}`: the audit-timeout
+      // The host action stays exactly `{block, reason}`: the retryable-audit
       // marker is this extension's own accounting signal, never host input.
       return { block: true as const, reason: protectionDecision.reason };
     }

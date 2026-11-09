@@ -1024,6 +1024,7 @@ test("a policy change or session reset during the wait invalidates a late PASS",
     release();
     const decision = await pending;
     assert.equal(decision?.block, true, `${mode} invalidates the late decision`);
+    assert.equal(decision?.auditInvalidated, mode === "config" ? true : undefined);
     assert.match(decision!.reason, /invalidated/);
     assert.equal(auditor.calls.length, 1, "no replay or second auditor");
   }
@@ -4001,6 +4002,7 @@ test("every binding that breaks while the record is being written blocks the cal
     harness.release();
     const decision = await pending;
     assert.equal(decision?.block, true, "a policy change during recording invalidates the decision");
+    assert.equal(decision?.auditInvalidated, true);
     assert.match(decision!.reason, /invalidated/);
     assert.equal(harness.drafts[0]!.outcome.status, "invalidated");
   }
@@ -5433,3 +5435,65 @@ test("activate: a nested pre-execution audit timeout runs nothing and the script
     await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const mode of ["config", "cwd"] as const) {
+  for (const verdict of ["PASS", "FAIL"] as const) {
+    test(`retryable ${mode} invalidation reaches a fresh ${verdict} audit`, async () => {
+      const host = fakeHost();
+      const guard = new NativeToolCallPreflight();
+      guard.registerLifecycleHooks(host.pi);
+      const config = enabledConfig();
+      let cwd = "/synthetic/before";
+      const auditor = auditorQueue([
+        async () => {
+          if (mode === "config") config.toolProtection!.level = "workspace";
+          else cwd = "/synthetic/after";
+          return { output: '{"decision":"PASS"}', durationMs: 1 };
+        },
+        { output: JSON.stringify({ decision: verdict, reason: "current policy" }) },
+      ]);
+      const coordinator = createToolProtectionCoordinator({
+        config: () => config, cwd: () => cwd, role: "primary",
+        runAuditor: auditor.run as unknown as typeof import("../src/tool-protection/runner").runProtectionAuditor,
+      });
+      const input = { path: "synthetic.txt", offset: 1, limit: 160 };
+      const executed: string[] = [];
+      const submit = async (id: string) => {
+        await host.emit("message_end", { message: { role: "assistant", content: [
+          { type: "toolCall", id, name: "read", arguments: input },
+        ] } });
+        const args = callArgs(id, "read", input);
+        const duplicate = guard.preflight(args);
+        if (duplicate) return duplicate;
+        const refusal = await coordinator.admitToolCall(args);
+        if (refusal) {
+          // Same composed boundary as the native entrypoint: no callback runs
+          // until both guards admit this exact proposal.
+          guard.markPolicyBlocked(id, "read", refusal.reason, refusal.auditTimeout === true,
+            refusal.auditInvalidated === true);
+          return refusal;
+        }
+        executed.push(id);
+        await host.emit("tool_result", resultEvent(id, "read"));
+        return undefined;
+      };
+      const first = await submit("invalidated");
+      assert.equal(first?.block, true);
+      assert.match(first!.reason, /fresh proposal will be audited/);
+      assert.deepEqual(executed, []);
+      const second = await submit("retry");
+      assert.equal(auditor.calls.length, 2, "retry must reach the auditor again");
+      assert.equal(auditor.calls[1]!.cwd, cwd);
+      if (mode === "config") assert.match(auditor.calls[1]!.prompt, /workspace/);
+      if (verdict === "PASS") {
+        assert.equal(second, undefined);
+        assert.deepEqual(executed, ["retry"]);
+      } else {
+        assert.match(second!.reason, /current policy/);
+        assert.deepEqual(executed, []);
+      }
+      assert.equal((await submit("duplicate"))?.block, true);
+      assert.equal(auditor.calls.length, 2, "success and policy denial still block duplicates");
+    });
+  }
+}

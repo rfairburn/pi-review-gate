@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.264]
+
+### Fixed
+
+- A read refused because its protection policy or working directory changed during
+  an audit can be proposed again for a fresh audit (#629). The invalidated call
+  remains blocked and recorded; policy denials, execution history, and liveness
+  checks still prevent ordinary duplicates.
+
 ## [0.1.0-dev.263]
 
 ### Added

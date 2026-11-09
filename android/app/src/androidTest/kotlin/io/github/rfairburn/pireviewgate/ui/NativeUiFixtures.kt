@@ -173,6 +173,10 @@ internal class NativeUiFixture(initial: ClientUiState) {
     val receipts = CopyOnWriteArrayList<FrameCommitReceipt>()
     val packets = CopyOnWriteArrayList<EncodedUiPacket>()
     val refusals = CopyOnWriteArrayList<InputUnavailableReason>()
+    /** The not-sent notice each recorded packet carried, in packet order. */
+    val refusalNotices = CopyOnWriteArrayList<TerminalInputRefusal>()
+    /** Runs on main right after a packet is recorded, as a caller's intake could. */
+    var afterInput: (() -> Unit)? = null
     val viewports = CopyOnWriteArrayList<Pair<Int, Int>>()
 
     // Overlay placement is hoisted above the route exactly as production hoists it: the
@@ -261,6 +265,12 @@ internal class NativeUiFixture(initial: ClientUiState) {
             val verified = surface?.verifyReceipt(receipt) == true
             check(verified) { "Packet attributed to an obsolete receipt" }
             packets.add(EncodedUiPacket(kind, bytes.copyOf(), receipt, verified))
+        }
+        override fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt,
+            refusal: TerminalInputRefusal) {
+            onInput(kind, bytes, receipt)
+            refusalNotices.add(refusal)
+            afterInput?.invoke()
         }
         override fun onInputUnavailable(reason: InputUnavailableReason) {
             refusals.add(reason)

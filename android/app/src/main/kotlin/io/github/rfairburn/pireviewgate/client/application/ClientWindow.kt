@@ -409,24 +409,29 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
                 receipt.publishSequence, receipt.geometry, receipt.resizeEpoch, receipt.policyGeneration,
                 ContentPaneRect(0, 0, receipt.drawnColumns, receipt.drawnRows), receipt.inputGeneration))
         }
-        override fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt) {
-            val view = view() ?: return
+        override fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt) =
+            onInput(kind, bytes, receipt, TerminalInputRefusal.NONE)
+        override fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt,
+            refusal: TerminalInputRefusal) {
+            // Every path that drops the packet tells the connection that typed it, so it does
+            // not keep text the owner never received as context. Nothing is retried.
+            val view = view() ?: return refusal.refused()
             val epochAtIntake = inputEpoch.get()
             val guard = currentProof(view, receipt, epochAtIntake)
-            if (!guard.isStillCurrent()) { app.report("Input not sent: current written frame required"); return }
-            val source = receipt.source ?: return
-            val packet = decodeUtf8(bytes) ?: run { app.report("Input not sent: invalid UTF-8 packet"); return }
+            if (!guard.isStillCurrent()) { app.report("Input not sent: current written frame required"); return refusal.refused() }
+            val source = receipt.source ?: return refusal.refused()
+            val packet = decodeUtf8(bytes) ?: run { app.report("Input not sent: invalid UTF-8 packet"); return refusal.refused() }
             // PasteEncoder already added delimiters using THIS receipt's modes. The endpoint
             // expects its BODY, not another encoded paste. Remove exactly the known wrapper.
             val body = if (kind == NativeIoInputKind.PASTE && receipt.modes.bracketedPaste) {
                 val prefix = "\u001b[200~"; val suffix = "\u001b[201~"
                 if (!packet.startsWith(prefix) || !packet.endsWith(suffix) || packet.length < prefix.length + suffix.length) {
-                    app.report("Paste not sent: invalid renderer packet"); return
+                    app.report("Paste not sent: invalid renderer packet"); return refusal.refused()
                 }
                 packet.substring(prefix.length, packet.length - suffix.length)
             } else packet
             val request = ContentInputRequest(source, receipt.modes, kind, body)
-            app.submitNativeInput(HostId.parse(receipt.hostId), receipt.selectionGeneration, request, guard)
+            app.submitNativeInput(HostId.parse(receipt.hostId), receipt.selectionGeneration, request, guard, refusal::refused)
         }
         override fun onInputUnavailable(reason: InputUnavailableReason) {
             if (view() != null) app.report("Terminal input unavailable: ${reason.name}")

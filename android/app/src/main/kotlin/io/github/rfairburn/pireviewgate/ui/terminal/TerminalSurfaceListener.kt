@@ -84,6 +84,24 @@ enum class InputUnavailableReason {
 }
 
 /**
+ * How a caller says that one handed-off input packet was not sent after all.
+ *
+ * The notice is bound to the input method connection and the context generation the
+ * packet was typed under. If either one has moved on, the notice does nothing, so it can
+ * never clear or retarget a newer connection. It holds the connection weakly and outlives
+ * nothing. It is not a retry, and it carries no text. UI thread only.
+ */
+fun interface TerminalInputRefusal {
+	/** The packet this notice came with was refused or may not have been sent. */
+	fun refused()
+
+	companion object {
+		/** For packets that no input method context depends on. */
+		val NONE: TerminalInputRefusal = TerminalInputRefusal { }
+	}
+}
+
+/**
  * Everything the surface can tell its caller.
  *
  * The surface owns rendering and keystroke encoding. It opens no socket, reads
@@ -113,6 +131,18 @@ interface TerminalSurfaceListener {
 	 * itself: if the caller does not forward it, the keystroke is simply lost.
 	 */
 	fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt)
+
+	/**
+	 * [onInput], plus [refusal] for a caller that later learns this packet was not sent.
+	 *
+	 * The surface calls this one. By default it forwards to [onInput], so a caller that does
+	 * not track refusals behaves exactly as before. Handing a packet off is not delivery: the
+	 * caller may still refuse it, or hear that it was not sent. Telling [refusal] then lets the
+	 * input method connection that typed the packet stop treating it as context. Nothing is
+	 * retried or replayed.
+	 */
+	fun onInput(kind: NativeIoInputKind, bytes: ByteArray, receipt: FrameCommitReceipt, refusal: TerminalInputRefusal) =
+		onInput(kind, bytes, receipt)
 
 	/**
 	 * Input was attempted or a fence dropped, for [reason].

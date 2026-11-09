@@ -529,7 +529,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		listener?.onInput(NativeIoInputKind.PASTE, packet, committed)
+		emitInput(NativeIoInputKind.PASTE, packet, committed)
 		return true
 	}
 
@@ -1409,28 +1409,62 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		return emitBatch(packets, committed)
 	}
 
+	/** How far one input-method edit got. */
+	internal enum class ImeEditDelivery {
+		/** Every packet was handed to the listener. */
+		DELIVERED,
+
+		/** Nothing left, and the reason was reported. */
+		REFUSED,
+
+		/** The batch stopped part-way. Some of it left and the rest never will. */
+		PARTIAL,
+	}
+
 	/**
-	 * Send [count] backspaces, or none at all.
+	 * Send [deletions] backspaces and then [text], as one prepared batch or not at all.
 	 *
-	 * The batch is atomic for the same reason a commit is: a modified backspace this
-	 * child cannot be given does not turn into a partial deletion of what the user
-	 * asked to remove. A request beyond [ImeCommitEncoder.MAX_DELETION_REQUEST] is
-	 * refused whole for the same reason — the deletions the owner can carry are sent,
-	 * and the rest is never quietly dropped on the floor while the caller is told true.
+	 * This is the one path for input-method edits: commits, kept compositions, deletions,
+	 * and corrections that delete a changed suffix before typing its replacement. Both
+	 * parts are encoded against one committed receipt, with any latched chip folded in,
+	 * before anything leaves. If a part is above its ceiling
+	 * ([ImeCommitEncoder.MAX_DELETION_REQUEST] backspaces or a commit's code points) or has
+	 * no spelling for this child, nothing leaves, and the refusal is reported exactly as a
+	 * commit's or a deletion's always was. No representable prefix is sent.
+	 *
+	 * The packets then go out in order. The standing proof is re-checked before every
+	 * packet after the first, and so is [stillValid]. A refusal the caller learns about
+	 * mid-batch therefore stops the rest too. Handing a batch to the listener is not atomic
+	 * remote execution. [ImeEditDelivery.PARTIAL] says that some of it left, and nothing is
+	 * replayed.
 	 */
-	internal fun submitBackspace(count: Int): Boolean {
-		if (count <= 0) return false
-		if (count > ImeCommitEncoder.MAX_DELETION_REQUEST) {
+	internal fun submitImeEdit(deletions: Int, text: String, stillValid: () -> Boolean): ImeEditDelivery {
+		if (deletions <= 0 && text.isEmpty()) return ImeEditDelivery.DELIVERED
+		if (ImeCommitEncoder.isOversized(text) || deletions > ImeCommitEncoder.MAX_DELETION_REQUEST) {
 			reportUnavailable(InputUnavailableReason.COMMIT_TOO_LARGE)
-			return false
+			return ImeEditDelivery.REFUSED
 		}
-		val committed = currentInputReceipt() ?: return false
-		val packets = ImeCommitEncoder.encodeBackspaces(count, mobileModifiers.modifiers, committed.modes)
-		if (packets == null) {
-			reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
-			return false
+		val committed = currentInputReceipt() ?: return ImeEditDelivery.REFUSED
+		val modifiers = mobileModifiers.modifiers
+		val packets = ArrayList<ByteArray>()
+		if (deletions > 0) {
+			val backspaces = ImeCommitEncoder.encodeBackspaces(deletions, modifiers, committed.modes)
+			if (backspaces == null) {
+				reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
+				return ImeEditDelivery.REFUSED
+			}
+			packets.addAll(backspaces)
 		}
-		return emitBatch(packets, committed)
+		if (text.isNotEmpty()) {
+			val typed = ImeCommitEncoder.encode(text, modifiers, committed.modes)
+			if (typed == null) {
+				reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
+				return ImeEditDelivery.REFUSED
+			}
+			packets.addAll(typed)
+		}
+		val delivered = emitPackets(packets, committed, stillValid)
+		return if (delivered == packets.size) ImeEditDelivery.DELIVERED else ImeEditDelivery.PARTIAL
 	}
 
 	/** Send one Enter, with any latched chip folded in, against the committed frame. */
@@ -1441,8 +1475,27 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		listener?.onInput(NativeIoInputKind.KEYBOARD, packet, committed)
+		emitInput(NativeIoInputKind.KEYBOARD, packet, committed)
 		return true
+	}
+
+	/**
+	 * True when [event] is a plain Backspace: no chip held and no Shift, Alt, Ctrl, or Meta.
+	 * When one leaves, it removes exactly one character before the cursor, so the input
+	 * method connection can account for it instead of forgetting its context.
+	 */
+	internal fun isPlainBackspace(event: KeyEvent): Boolean =
+		event.keyCode == KeyEvent.KEYCODE_DEL && mobileModifiers.modifiers == 0 &&
+			hardwareModifiers(event) and PLAIN_BACKSPACE_EXCLUDED_MODIFIERS == 0
+
+	/**
+	 * Tell the input method where the selection and composition now are.
+	 *
+	 * This is a notification only. It is never awaited, and nothing is sent because of it.
+	 */
+	internal fun updateImeSelection(selectionStart: Int, selectionEnd: Int, compositionStart: Int, compositionEnd: Int) {
+		context.getSystemService(InputMethodManager::class.java)
+			?.updateSelection(this, selectionStart, selectionEnd, compositionStart, compositionEnd)
 	}
 
 	/**
@@ -1502,7 +1555,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			if (!quietOnRefusal) reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		listener?.onInput(NativeIoInputKind.KEYBOARD, packet, committed)
+		emitInput(NativeIoInputKind.KEYBOARD, packet, committed)
 		return true
 	}
 
@@ -1976,7 +2029,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.MOUSE_REPORTING_OFF)
 			return false
 		}
-		listener?.onInput(NativeIoInputKind.MOUSE, packet, committed)
+		emitInput(NativeIoInputKind.MOUSE, packet, committed)
 		return true
 	}
 
@@ -2082,13 +2135,35 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * pixels this surface no longer stands behind, so the batch stops, the stop is
 	 * reported, and the caller is told the batch did not complete.
 	 */
-	private fun emitBatch(packets: List<ByteArray>, committed: FrameCommitReceipt): Boolean {
-		val delivered = InputBatchDelivery.emitInOrder(
+	private fun emitBatch(packets: List<ByteArray>, committed: FrameCommitReceipt): Boolean =
+		emitPackets(packets, committed) { true } == packets.size
+
+	/** [emitBatch], also stopping once [stillValid] fails. Returns how many packets left. */
+	private fun emitPackets(packets: List<ByteArray>, committed: FrameCommitReceipt, stillValid: () -> Boolean): Int =
+		InputBatchDelivery.emitInOrder(
 			packets,
-			stillCurrent = { proofStillCurrent(committed) },
-			emit = { packet -> listener?.onInput(NativeIoInputKind.KEYBOARD, packet, committed) },
+			stillCurrent = { proofStillCurrent(committed) && stillValid() },
+			emit = { packet -> emitInput(NativeIoInputKind.KEYBOARD, packet, committed) },
 		)
-		return delivered == packets.size
+
+	/**
+	 * How many packets this surface has handed to its listener.
+	 *
+	 * The input method connection compares this with the packets it accounted for itself.
+	 * A key, paste, pointer report, or Enter it did not produce makes it forget its context
+	 * instead of trusting text the remote line may no longer hold. UI thread only.
+	 */
+	internal var inputEmissions: Long = 0L
+		private set
+
+	/**
+	 * The only place a packet leaves the surface. It is counted, and it carries the notice
+	 * that lets the caller tell the current input method connection the packet was not sent.
+	 */
+	private fun emitInput(kind: NativeIoInputKind, packet: ByteArray, committed: FrameCommitReceipt) {
+		inputEmissions += 1
+		val refusal = activeConnection?.refusalNotice() ?: TerminalInputRefusal.NONE
+		listener?.onInput(kind, packet, committed, refusal)
 	}
 
 	private fun proofStillCurrent(committed: FrameCommitReceipt): Boolean {
@@ -2156,6 +2231,10 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		private const val MAX_SURFACE_BITMAP_BYTES = 32L * 1024 * 1024
 		private const val LOWER_A = 97
 		private const val MOTION_BIT = 32
+
+		/** Modifiers that make a Backspace mean something other than deleting one character. */
+		private const val PLAIN_BACKSPACE_EXCLUDED_MODIFIERS = KeyboardModifiers.SHIFT or KeyboardModifiers.ALT or
+			KeyboardModifiers.CTRL or KeyboardModifiers.META
 
 		private val FUNCTION_KEYS: Map<Int, TerminalFunctionKey> = mapOf(
 			KeyEvent.KEYCODE_DPAD_UP to TerminalFunctionKey.UP,

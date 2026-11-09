@@ -6,6 +6,7 @@ import android.content.res.Configuration
 import android.graphics.Rect
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.os.SystemClock
@@ -773,6 +774,369 @@ class TerminalSurfaceComponentTest {
                 bitmap.recycle()
                 pane.release()
             }
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * IME edit ledger: synthetic callback sequences. They prove app state and
+     * byte order only; what Gboard really calls is established by hand on a device.
+     * ------------------------------------------------------------------ */
+
+    private fun newConnection(fixture: NativeUiFixture) = compose.runOnIdle {
+        fixture.surface!!.onCreateInputConnection(EditorInfo()) as TerminalInputConnection
+    }
+
+    /** Every recorded packet as text, with backspace and Enter spelled by the real encoders. */
+    private fun transcript(fixture: NativeUiFixture, proof: FrameCommitReceipt): List<String> {
+        val backspace = requireNotNull(ImeCommitEncoder.encodeBackspaces(1, 0, proof.modes)).single()
+        val enter = requireNotNull(ImeCommitEncoder.encodeEnter(0, proof.modes))
+        return fixture.packets.map {
+            assertEquals(NativeIoInputKind.KEYBOARD, it.kind)
+            assertEquals(proof, it.receipt)
+            assertTrue(it.verifiedAtCapture)
+            when {
+                it.bytes.contentEquals(backspace) -> "<BS>"
+                it.bytes.contentEquals(enter) -> "<ENTER>"
+                else -> String(it.bytes, Charsets.UTF_8)
+            }
+        }
+    }
+
+    private fun cursorOf(connection: TerminalInputConnection) = connection.reportedSelection[1]
+
+    @Test fun imeLedgerCorrectsTheCurrentWordWithExactTranscriptsAndNoDuplicates() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            // i -> I: the working path is unchanged.
+            assertTrue(connection.setComposingText("i", 1))
+            assertTrue(fixture.packets.isEmpty())
+            assertTrue(connection.commitText("I", 1))
+            assertTrue(connection.commitText(" ", 1))
+            assertEquals(listOf("I", " "), transcript(fixture, proof))
+            fixture.packets.clear()
+
+            // An unsent composition corrected on commit: sent once, no backspaces.
+            for (prefix in listOf("d", "do", "don", "dont")) assertTrue(connection.setComposingText(prefix, 1))
+            assertTrue(fixture.packets.isEmpty())
+            assertEquals("I dont", connection.getTextBeforeCursor(100, 0).toString())
+            assertTrue(connection.commitText("don't", 1))
+            assertTrue(connection.commitText(" ", 1))
+            assertEquals(listOf("don't", " "), transcript(fixture, proof))
+            fixture.packets.clear()
+
+            // A sent word re-marked and replaced: exactly don't, never dontdon't.
+            assertTrue(connection.setComposingText("dont", 1))
+            assertTrue(connection.finishComposingText())
+            val end = cursorOf(connection)
+            assertEquals("I don't dont", connection.getTextBeforeCursor(100, 0).toString())
+            assertTrue(connection.setComposingRegion(end - 4, end))
+            assertEquals(listOf(end, end, end - 4, end), connection.reportedSelection)
+            assertTrue(connection.commitText("don't ", 1))
+            assertEquals(listOf("dont", "<BS>", "'t "), transcript(fixture, proof))
+            assertEquals("I don't don't ", connection.contextText)
+            fixture.packets.clear()
+
+            // A candidate tapped after a pause, through each tail range API.
+            assertTrue(connection.commitText("dont", 1))
+            var at = cursorOf(connection)
+            assertTrue(connection.replaceText(at - 4, at, "don't", 1, null))
+            assertTrue(connection.commitText("dont", 1))
+            at = cursorOf(connection)
+            assertTrue(connection.setSelection(at - 4, at))
+            assertEquals("dont", connection.getSelectedText(0).toString())
+            assertTrue(connection.commitText("don't", 1))
+            assertEquals(listOf("dont", "<BS>", "'t", "dont", "<BS>", "'t"), transcript(fixture, proof))
+            assertTrue(connection.contextText.endsWith("don'tdon't"))
+            // The inherited Editable never acquired any of it.
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
+    @Test fun imeLedgerDeletionsCountKnownCodePointsAndRefuseUnsupportedRanges() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val face = "😀"
+        compose.runOnIdle {
+            assertTrue(connection.commitText("a$face", 1))
+            fixture.packets.clear()
+            // Two UTF-16 units of known emoji are one character, so one backspace.
+            assertTrue(connection.deleteSurroundingText(2, 0))
+            assertEquals(listOf("<BS>"), transcript(fixture, proof))
+            fixture.packets.clear()
+            assertTrue(connection.commitText(face, 1))
+            fixture.packets.clear()
+            assertTrue(connection.deleteSurroundingTextInCodePoints(1, 0))
+            assertEquals(listOf("<BS>"), transcript(fixture, proof))
+            assertEquals("a", connection.contextText)
+            fixture.packets.clear()
+            // One known character, then two the ledger never knew: unchanged pass-through.
+            assertTrue(connection.deleteSurroundingText(3, 0))
+            assertEquals(listOf("<BS>", "<BS>", "<BS>"), transcript(fixture, proof))
+            fixture.packets.clear()
+
+            // Ranges that split a pair or do not end at the cursor send nothing.
+            assertTrue(connection.commitText("b$face", 1))
+            fixture.packets.clear()
+            val end = cursorOf(connection)
+            val reports = connection.selectionReports
+            assertFalse(connection.setComposingRegion(end - 1, end))
+            assertFalse(connection.replaceText(end - 1, end, "x", 1, null))
+            assertFalse(connection.setSelection(end - 3, end - 2))
+            assertFalse(connection.setComposingRegion(end - 3, end - 2))
+            assertTrue(fixture.packets.isEmpty())
+            assertEquals("Each refusal re-reports the true state", reports + 4, connection.selectionReports)
+            assertEquals(listOf(end, end, -1, -1), connection.reportedSelection)
+            assertEquals("b$face", connection.getTextBeforeCursor(10, 0).toString())
+
+            // The ceiling bounds the backspaces that would leave: here two known characters
+            // (three units) plus the unknown remainder would be 33, so none leave.
+            assertFalse(connection.deleteSurroundingText(ImeCommitEncoder.MAX_DELETION_REQUEST + 2, 0))
+            assertEquals(InputUnavailableReason.COMMIT_TOO_LARGE, fixture.refusals.last())
+            assertTrue(fixture.packets.isEmpty())
+            assertEquals("Known text stays known after a refusal", "b$face", connection.contextText)
+
+            // With a selection active, the platform deletes before the selection, not at the
+            // cursor. That is not supported in either unit: nothing leaves, the selection
+            // stays, and the true state is re-reported.
+            assertTrue(connection.commitText(" cd", 1))
+            fixture.packets.clear()
+            val tail = cursorOf(connection)
+            assertTrue(connection.setSelection(tail - 2, tail))
+            val beforeDelete = connection.selectionReports
+            assertFalse(connection.deleteSurroundingText(1, 0))
+            assertFalse(connection.deleteSurroundingTextInCodePoints(1, 0))
+            assertTrue(fixture.packets.isEmpty())
+            assertEquals(beforeDelete + 2, connection.selectionReports)
+            assertEquals(listOf(tail - 2, tail, -1, -1), connection.reportedSelection)
+            assertEquals("cd", connection.getSelectedText(0).toString())
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
+    @Test fun imeLedgerCommitCeilingAppliesToTheSuppliedTextNotOnlyItsDiff() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val max = ImeCommitEncoder.MAX_COMMIT_CODEPOINTS
+        compose.runOnIdle {
+            assertTrue(connection.commitText("a".repeat(max), 1))
+            fixture.packets.clear()
+            fixture.refusals.clear()
+            val end = cursorOf(connection)
+            // A replacement one past the ceiling shares all but one character with the
+            // known text, so its diff alone would be tiny. It is still refused whole.
+            assertTrue(connection.setSelection(end - max, end))
+            assertFalse(connection.commitText("a".repeat(max + 1), 1))
+            assertEquals(InputUnavailableReason.COMMIT_TOO_LARGE, fixture.refusals.last())
+            assertFalse(connection.replaceText(end - max, end, "a".repeat(max + 1), 1, null))
+            assertEquals(listOf(InputUnavailableReason.COMMIT_TOO_LARGE, InputUnavailableReason.COMMIT_TOO_LARGE),
+                fixture.refusals.toList())
+            assertTrue(connection.setComposingRegion(end - max, end))
+            assertFalse(connection.commitText("a".repeat(max + 1), 1))
+            assertEquals("", connection.composingText)
+            assertTrue(fixture.packets.isEmpty())
+            assertEquals("a".repeat(max), connection.contextText)
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
+    @Test fun imeLedgerReadersBatchNotificationsAndEditorInfoStayCoherent() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val info = EditorInfo()
+        val connection = compose.runOnIdle {
+            fixture.surface!!.onCreateInputConnection(info) as TerminalInputConnection
+        }
+        compose.runOnIdle {
+            assertEquals(android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE, info.inputType)
+            assertEquals(EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN, info.imeOptions)
+            assertEquals(0, info.initialSelStart)
+            assertEquals(0, info.initialSelEnd)
+
+            // Empty context answers exactly what an empty editor does.
+            assertEquals("", connection.getTextBeforeCursor(10, 0).toString())
+            assertEquals("", connection.getTextAfterCursor(10, 0).toString())
+            assertNull(connection.getSelectedText(0))
+            val caps = android.text.TextUtils.CAP_MODE_SENTENCES
+            assertEquals(caps, connection.getCursorCapsMode(caps))
+
+            // Sends leave at call time; a batch edit holds back only the notification.
+            assertTrue(connection.beginBatchEdit())
+            val reports = connection.selectionReports
+            assertTrue(connection.commitText("Hi.", 1))
+            assertEquals(listOf("Hi."), transcript(fixture, proof))
+            assertTrue(connection.setComposingText("x", 1))
+            assertEquals(reports, connection.selectionReports)
+            assertFalse(connection.endBatchEdit())
+            assertEquals(reports + 1, connection.selectionReports)
+            assertEquals(listOf(4, 4, 3, 4), connection.reportedSelection)
+
+            assertTrue(connection.commitText(" ", 1))
+            assertEquals(caps, connection.getCursorCapsMode(caps))
+            assertTrue(connection.commitText("ok ", 1))
+            assertEquals(0, connection.getCursorCapsMode(caps))
+            val surrounding = requireNotNull(connection.getSurroundingText(3, 3, 0))
+            assertEquals("ok ", surrounding.text.toString())
+            assertEquals(3, surrounding.selectionStart)
+            assertEquals(3, surrounding.selectionEnd)
+            assertEquals(4, surrounding.offset)
+            assertTrue(connection.setComposingText("go", 1))
+            val snapshot = requireNotNull(connection.takeSnapshot())
+            assertEquals(7, snapshot.compositionStart)
+            assertEquals(9, snapshot.compositionEnd)
+            assertEquals(9, snapshot.surroundingText.offset + snapshot.surroundingText.selectionEnd)
+
+            // A newline is Enter, exactly once, and the context starts over after it.
+            fixture.packets.clear()
+            assertTrue(connection.commitText("a\nb", 1))
+            assertEquals(listOf("a", "<ENTER>", "b"), transcript(fixture, proof))
+            assertEquals("b", connection.contextText)
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
+    @Test fun imeLedgerForgetsContextForForeignInputButKeepsTheUnsentComposition() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(connection.commitText("dont", 1))
+            assertTrue(connection.setComposingText("ab", 1))
+            // A key the ledger did not produce.
+            assertTrue(surface.submitKey(TerminalKey(codepoint = 9)))
+            assertEquals("ab", connection.composingText)
+            assertEquals("ab", connection.getTextBeforeCursor(10, 0).toString())
+            assertEquals("", connection.contextText)
+            fixture.packets.clear()
+            assertTrue(connection.commitText("ab ", 1))
+            assertEquals(listOf("ab "), transcript(fixture, proof))
+            fixture.packets.clear()
+
+            // A plain forwarded Backspace is followed, one character.
+            assertTrue(connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL)))
+            assertTrue(fixture.packets.isNotEmpty())
+            assertEquals("ab", connection.contextText)
+            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL))
+            assertEquals("ab", connection.getTextBeforeCursor(10, 0).toString())
+            fixture.packets.clear()
+
+            // Paste is not context.
+            assertTrue(surface.submitPastedText("fixed synthetic paste"))
+            assertEquals("", connection.getTextBeforeCursor(10, 0).toString())
+            fixture.packets.clear()
+
+            // With a chip held, commits leave as before and are never treated as context.
+            assertTrue(connection.commitText("dont", 1))
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertEquals("", connection.contextText)
+            assertTrue(surface.clearMobileModifiers())
+            fixture.packets.clear()
+
+            // The editor action still drops the composition and sends one Enter.
+            assertTrue(connection.commitText("ls", 1))
+            assertTrue(connection.setComposingText("pending", 1))
+            assertTrue(connection.performEditorAction(EditorInfo.IME_ACTION_DONE))
+            assertEquals(listOf("ls", "<ENTER>"), transcript(fixture, proof))
+            assertEquals("", connection.composingText)
+            assertEquals("", connection.getTextBeforeCursor(10, 0).toString())
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
+    @Test fun imeLedgerRefusalsAreCorrelatedToTheirOwnConnectionAndContextOnly() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            assertTrue(connection.commitText("xy", 1))
+            val first = fixture.refusalNotices.last()
+            assertTrue(connection.commitText("z", 1))
+            assertEquals("xyz", connection.contextText)
+            // A late not-sent report forgets the context that still holds that text.
+            first.refused()
+            assertEquals("", connection.contextText)
+            assertTrue(connection.commitText("q", 1))
+            // The same report again belongs to an older context and changes nothing.
+            first.refused()
+            assertEquals("q", connection.contextText)
+            fixture.packets.clear()
+
+            // A refusal during the hand-off stops the correction and keeps nothing.
+            assertTrue(connection.commitText("dont", 1))
+            val end = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(end - 4, end))
+            fixture.packets.clear()
+            fixture.afterInput = { fixture.refusalNotices.last().refused() }
+            assertFalse(connection.commitText("don't", 1))
+            fixture.afterInput = null
+            assertEquals("The batch stopped after the refused packet", listOf("<BS>"), transcript(fixture, proof))
+            assertEquals("", connection.contextText)
+            assertEquals("", connection.composingText)
+            fixture.packets.clear()
+        }
+        // A notice from a retired connection never touches its replacement.
+        val replacement = compose.runOnIdle {
+            val old = fixture.refusalNotices.last()
+            val next = fixture.surface!!.onCreateInputConnection(EditorInfo()) as TerminalInputConnection
+            assertTrue(next.commitText("kept", 1))
+            old.refused()
+            assertEquals("kept", next.contextText)
+            assertFalse(connection.commitText("stale", 1))
+            next
+        }
+        compose.runOnIdle { assertEquals("kept", replacement.contextText) }
+    }
+
+    @Test fun imeLedgerSurvivesSameContextOutputAndDiesWithRetirement() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            assertTrue(connection.commitText("dont", 1))
+            repeat(3) { installBinding(fixture, contentOnlyPublish(requireNotNull(fixture.binding))) }
+            assertEquals("Ordinary output never wipes the context", "dont", connection.contextText)
+            fixture.packets.clear()
+            val end = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(end - 4, end))
+            assertTrue(connection.commitText("don't", 1))
+            assertEquals(listOf("<BS>", "'t"), transcript(fixture, proof))
+            fixture.packets.clear()
+
+            // A proof retired in the middle of a correction stops it there and only the
+            // original connection's context goes with it.
+            assertTrue(connection.commitText(" dont", 1))
+            val at = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(at - 4, at))
+            fixture.packets.clear()
+            fixture.afterInput = {
+                fixture.afterInput = null
+                fixture.surface!!.invalidateCommittedFrame(InputUnavailableReason.POLICY_RETIRED)
+            }
+            assertFalse(connection.commitText("don't", 1))
+            assertEquals(1, fixture.packets.size)
+            assertEquals("", connection.contextText)
+            assertFalse(connection.commitText("stale", 1))
+            assertEquals("", connection.getTextBeforeCursor(10, 0).toString())
+            fixture.surface!!.invalidate()
+        }
+        awaitInput(fixture)
+        val fresh = newConnection(fixture)
+        compose.runOnIdle {
+            assertEquals("A new connection starts with no context", "", fresh.getTextBeforeCursor(10, 0).toString())
+            assertEquals(0, requireNotNull(fresh.editable).length)
         }
     }
 

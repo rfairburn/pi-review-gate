@@ -11,6 +11,8 @@ import io.github.rfairburn.pireviewgate.core.client.ui.*
 import io.github.rfairburn.pireviewgate.core.client.runtime.TerminalTarget as RuntimeTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.TerminalTarget as UiTerminalTarget
 import io.github.rfairburn.pireviewgate.core.hosts.*
+import io.github.rfairburn.pireviewgate.core.input.InputSettlementBook
+import io.github.rfairburn.pireviewgate.core.input.OrderedInputAdmission
 import io.github.rfairburn.pireviewgate.core.presentation.*
 import io.github.rfairburn.pireviewgate.core.protocol.roster.*
 import kotlinx.coroutines.*
@@ -116,9 +118,15 @@ class ClientApplicationController private constructor(
     fun cancelAddressEdit() { addressEdit.cancel() }
     private data class InputScope(val host: HostId, val selection: Long)
     private data class InputKey(val host: HostId, val selection: Long, val id: String, val ordinal: Long)
-    private val admittingInputs = mutableMapOf<InputScope, Int>()
-    private val acceptedInputs = mutableSetOf<InputKey>()
-    private val earlyInputs = LinkedHashMap<InputKey, ContentSendOutcome>()
+    private class NativeInput(val request: ContentInputRequest, val proof: RosterUiProof)
+    /** At most 64 native inputs admitting or awaiting settlement; each keeps its not-sent notice. */
+    private val nativeInputs = InputSettlementBook<InputScope, InputKey, ContentSendOutcome, () -> Unit>(64) {
+        InputScope(it.host, it.selection)
+    }
+    /** One consumer, so native inputs reach admission in the order the surface handed them off. */
+    private val nativeAdmission = OrderedInputAdmission<NativeInput, ContentInputAdmission>(scope, Dispatchers.Default) {
+        runtime.submitInput(it.request, it.proof)
+    }
     var window: ClientWindow? = null
         private set
 
@@ -570,43 +578,44 @@ class ClientApplicationController private constructor(
     fun observedModifiers(next: TerminalModifiers) { if (modifiers != next) { modifiers = next; refresh() } }
     fun report(message: String) { notice.value = message }
 
-    /** App-owned so Activity recreation cannot lose an accepted input's settlement. */
-    fun submitNativeInput(host: HostId, selection: Long, request: ContentInputRequest, proof: RosterUiProof) {
-        if (acceptedInputs.size + admittingInputs.values.sum() >= 64) { report("Input not sent: busy"); return }
+    /**
+     * App-owned so Activity recreation cannot lose an accepted input's settlement.
+     *
+     * Admission is queued here, in call order, before anything suspends: the backspace and
+     * text of one IME correction reach the lane in the order they were typed. Only admission
+     * is ordered; nothing waits for a send to settle. [notSent] runs on Main when this input
+     * is known not to have been submitted, or its outcome is unknown, so its origin can stop
+     * relying on it. It is never a retry.
+     */
+    fun submitNativeInput(host: HostId, selection: Long, request: ContentInputRequest, proof: RosterUiProof,
+        notSent: () -> Unit = {}) {
         val inputScope = InputScope(host, selection)
-        admittingInputs[inputScope] = (admittingInputs[inputScope] ?: 0) + 1
+        if (!nativeInputs.reserve(inputScope)) { report("Input not sent: busy"); notSent(); return }
+        val admitting = nativeAdmission.submit(NativeInput(request, proof))
         scope.launch {
             try {
-                when (val admission = withContext(Dispatchers.Default) { runtime.submitInput(request, proof) }) {
-                    is ContentInputAdmission.Refused -> report("Input not sent: ${admission.reason.name}")
+                when (val admission = admitting.await()) {
+                    is ContentInputAdmission.Refused -> { report("Input not sent: ${admission.reason.name}"); notSent() }
                     is ContentInputAdmission.Accepted -> {
                         val key = InputKey(host, selection, admission.inputId, admission.ordinal)
-                        val early = earlyInputs.remove(key)
-                        if (early == null) acceptedInputs.add(key) else reportInputOutcome(early)
+                        nativeInputs.admitted(key, notSent)?.let { early -> reportInputOutcome(early, notSent) }
                     }
                 }
             } finally {
-                val remaining = (admittingInputs[inputScope] ?: 1) - 1
-                if (remaining == 0) {
-                    admittingInputs.remove(inputScope)
-                    earlyInputs.keys.removeAll { it.host == host && it.selection == selection }
-                } else admittingInputs[inputScope] = remaining
+                nativeInputs.release(inputScope)
             }
         }
     }
     private fun settleInput(key: InputKey, outcome: ContentSendOutcome) {
-        if (acceptedInputs.remove(key)) reportInputOutcome(outcome)
-        else if ((admittingInputs[InputScope(key.host, key.selection)] ?: 0) > 0) {
-            check(earlyInputs.size < 64)
-            earlyInputs[key] = outcome
-        }
+        nativeInputs.settle(key, outcome)?.let { notSent -> reportInputOutcome(outcome, notSent) }
     }
-    private fun reportInputOutcome(outcome: ContentSendOutcome) {
+    private fun reportInputOutcome(outcome: ContentSendOutcome, notSent: () -> Unit) {
         report(when (outcome) {
             ContentSendOutcome.Submitted -> "Input submitted locally"
             ContentSendOutcome.Unknown -> "Input outcome unknown; not retried"
             is ContentSendOutcome.NotSent -> "Input not sent: ${outcome.reason.name}"
         })
+        if (outcome != ContentSendOutcome.Submitted) notSent()
     }
     fun refreshPermission() { refresh() }
 

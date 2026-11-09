@@ -558,11 +558,13 @@ class TerminalOverlayPlacementComponentTest {
         // touch — the same interaction that moves the control strip.
         dragBy("Conversation A", dx = 0f, dy = -120f)
         val moved = floatingKeysFrameBounds()
+        val controlsAfterMove = boundsOf("Back")
+        val statusAfterMove = boundsOf("Synthetic status notice")
         compose.runOnIdle {
             assertTrue("The header long-press must actually move the detached panel: " +
                 "$frame vs $moved", moved.top < frame.top - 20f)
-            assertEquals("Moving Keys must not drag Controls", controlsBefore, boundsOf("Back"))
-            assertEquals("Moving Keys must not drag Status", statusBefore, boundsOf("Synthetic status notice"))
+            assertEquals("Moving Keys must not drag Controls", controlsBefore, controlsAfterMove)
+            assertEquals("Moving Keys must not drag Status", statusBefore, statusAfterMove)
             assertEquals("A floating move never reflows the pane", pane, paneBounds(fixture))
             assertEquals("A floating move never asks for a new grid", requests, fixture.viewports.size)
             assertEquals(grid, fixture.viewports.last())

@@ -1105,33 +1105,47 @@ export class ExecutionToolManager {
           true,
         );
       }
-      const inspections = safeList(this.controller);
+      // Issue #626: an ordinary failure is scoped to the execution/task the
+      // request actually targeted, and its historical arrays are bounded in the
+      // metadata as well as the text. The durable records keep everything; the
+      // existing SubtasksInspect activity (offset/lines) and evidence
+      // (index/limit) reads retrieve it, so no separate browsing surface is
+      // added, and unrelated executions are never replayed.
+      const target = resolveFailureTarget(this.controller, normalized);
       const recovery = recoveryFor(normalized.action, diagnostic);
       const sourceWorkspace = this.controller.criticalPrompt()
         ? { disposition: "conflicted", instruction: this.controller.criticalPrompt()! }
         : { disposition: "unchanged_or_independently_landed", instruction: "Inspect task-specific landing state before claiming changes are in main." };
       // Issue #191: an interrupt_with_merge whose merge threw still reports the
-      // truthful stop settlement of this exact request beside the failure.
-      const interruptOwner = normalized.action === "interrupt"
-        ? inspections.find((inspection) => inspection.tasks.some((task) => task.taskId === normalized.taskId))
-        : undefined;
-      const interruptSettlement = interruptOwner
+      // truthful stop settlement of this exact request beside the failure. It is
+      // computed from the owning inspection BEFORE the bounded failure projection
+      // below, so the settlement sees this request's full command and interrupt
+      // activity rather than the projected tail.
+      const interruptSettlement = target.resolved && normalized.action === "interrupt" && normalized.taskId
         ? interruptSettlementOf({
-          inspection: interruptOwner,
-          taskId: normalized.taskId!,
+          inspection: target.inspection,
+          taskId: normalized.taskId,
           instructionId,
           mode: normalized.interruptMode!,
           actor: "model",
           requestError: diagnostic,
         })
         : undefined;
+      const snapshot = target.resolved ? projectFailureSnapshot(target.inspection, instructionId) : undefined;
       const failureSummary = [
         `${toolName} failed: ${diagnostic}`,
         ...(interruptSettlement ? [formatInterruptSettlementForTool(interruptSettlement)] : []),
         `Source workspace: ${sourceWorkspace.disposition}. ${sourceWorkspace.instruction}`,
+        ...(target.resolved ? failureLandingWarningLines(target.inspection) : []),
         "Recovery guidance:",
         ...recovery.map((item) => `- ${item.action}: ${item.instruction}`),
-        ...inspections.map((inspection) => formatInspectionForModel(`Durable execution state for ${inspection.executionId}:`, inspection, true)),
+        ...(target.resolved
+          ? [
+            ...(target.note ? [`Note: ${target.note}`] : []),
+            ...failureScopeLines(target, snapshot!),
+            formatInspectionForModel(`Durable execution state for ${target.executionId} (scoped to this request's target):`, snapshot!.inspection, true),
+          ]
+          : [`No scoped durable snapshot: ${target.reason}. A failure never replays unrelated executions; retry with the exact executionId${normalized.taskId ? ` and taskId ${normalized.taskId}` : ""} returned by SubtasksStart/SubtasksAdd, or inspect a known taskId for its durable record.`]),
       ].join("\n");
       return result(failureSummary, {
         action: normalized.action,
@@ -1139,8 +1153,9 @@ export class ExecutionToolManager {
         executionId: normalized.executionId,
         taskId: normalized.taskId,
         recovery,
-        executions: inspections,
+        executions: snapshot ? [snapshot.inspection] : [],
         sourceWorkspace,
+        failureScope: describeFailureScope(target, snapshot),
       }, true);
     }
   }
@@ -1712,6 +1727,319 @@ function evidenceRecoveryHint(taskId: string | undefined): string {
 
 function safeList(controller: BackgroundExecutionController): BackgroundInspection[] {
   try { return controller.list(); } catch { return []; }
+}
+
+/**
+ * Issue #626: presentation bounds for one ordinary shared failure result. These
+ * limit only what a failed call replays; they never trim the durable task
+ * records. What a failure view omits stays canonical and is retrieved with the
+ * existing read-only routes: `SubtasksInspect {executionId, taskId, offset,
+ * lines}` for older activity rows and `SubtasksInspect {executionId, taskId,
+ * evidence: {index, limit}}` for the task's actual tool-call evidence.
+ */
+const FAILURE_ACTIVITY_ROWS = 3;
+const FAILURE_COMMAND_ROWS = 5;
+const FAILURE_TASK_ROWS = 5;
+
+/** Durable task fields a failure snapshot never replays: the full nested
+ * executor result bodies, the dispatch records, the review body, and the
+ * unbounded history arrays. Each remains canonical on the task record. */
+const FAILURE_OMITTED_TASK_FIELDS = [
+  "result",
+  "researchResult",
+  "inplaceResult",
+  "dispatch",
+  "initialDispatch",
+  "reviewStatus",
+  "stateHistory",
+  "timingAccumulator",
+] as const;
+
+/** A projected failure-snapshot task: the canonical record minus the omitted
+ * nested bodies and bounded history, plus the compact current `landing` facts
+ * preserved from `result.landing` when the task has a landing outcome. */
+type FailureSnapshotTask = BackgroundInspection["tasks"][number] & { landing?: FailureLandingFacts };
+type FailureSnapshotInspection = Omit<BackgroundInspection, "tasks"> & { tasks: FailureSnapshotTask[] };
+/** The canonical nested landing outcome carried on `result.landing`. */
+type CanonicalLanding = NonNullable<NonNullable<FailureSnapshotTask["result"]>["landing"]>;
+
+/**
+ * The CURRENT landing status and failure/recovery facts of one task. These are
+ * not a historical result body: a `recovery_required` landing means rollback
+ * failed and the source workspace may be partially modified, and the recorded
+ * task summary (often the worker's own success wording) plus an unset
+ * `task.error` can leave that warning living only in `result.landing` and in
+ * activity rows a bounded failure tail does not carry.
+ */
+interface FailureLandingFacts {
+  readonly status: CanonicalLanding["status"];
+  readonly failureReason?: string;
+  readonly failedAtPath?: string;
+  readonly rollbackError?: string;
+  readonly manifestPath?: string;
+  readonly appliedPaths?: string[];
+  readonly conflictMaterialized?: boolean;
+}
+
+function failureLandingFacts(task: BackgroundInspection["tasks"][number]): FailureLandingFacts | undefined {
+  const landing = task.result?.landing;
+  if (!landing) return undefined;
+  return {
+    status: landing.status,
+    ...(landing.failureReason !== undefined ? { failureReason: landing.failureReason } : {}),
+    ...(landing.failedAtPath !== null && landing.failedAtPath !== undefined ? { failedAtPath: landing.failedAtPath } : {}),
+    ...(landing.rollbackError !== undefined ? { rollbackError: landing.rollbackError } : {}),
+    ...(landing.manifestPath !== undefined ? { manifestPath: landing.manifestPath } : {}),
+    ...(landing.appliedPaths && landing.appliedPaths.length > 0 ? { appliedPaths: landing.appliedPaths } : {}),
+    ...(landing.conflictMaterialized !== undefined ? { conflictMaterialized: landing.conflictMaterialized } : {}),
+  };
+}
+
+/**
+ * Current landing/recovery warnings for the failure text, read from the COMPLETE
+ * owning inspection rather than the bounded snapshot: a task window exists to cap
+ * replayed history, never to hide that a task in the very execution the request
+ * targeted left an incomplete rollback in the source workspace. A
+ * `recovery_required` landing is always stated, because it means main may be
+ * partially modified and manual recovery is required; any other non-landed status
+ * is stated too, since it is a live workspace-safety fact rather than history. A
+ * completed landing is not repeated here — it stays in the structured snapshot.
+ */
+function failureLandingWarningLines(inspection: BackgroundInspection): string[] {
+  const lines: string[] = [];
+  for (const task of inspection.tasks) {
+    const landing = failureLandingFacts(task);
+    if (!landing || landing.status === "landed") continue;
+    if (landing.status === "recovery_required") {
+      const details = [
+        `landing failed at ${landing.failedAtPath ?? "(path unrecorded)"}: ${landing.failureReason ?? "(no failure reason recorded)"}`,
+        `rollback failed: ${landing.rollbackError ?? "(no rollback error recorded)"}`,
+        ...(landing.appliedPaths ? [`paths may remain applied in main: ${landing.appliedPaths.join(", ")}`] : []),
+        `recovery manifest: ${landing.manifestPath ?? "(unrecorded)"}`,
+      ].join("; ");
+      lines.push(`Landing recovery REQUIRED for ${task.taskId} — the source workspace may be partially modified and rollback did not complete. ${details}. Inspect the main workspace and follow that manifest before claiming a clean state; the recorded task summary is not proof that the workspace is clean.`);
+      continue;
+    }
+    const details = [
+      ...(landing.failureReason ? [`failure: ${landing.failureReason}`] : []),
+      ...(landing.failedAtPath ? [`failed at: ${landing.failedAtPath}`] : []),
+      ...(landing.rollbackError ? [`rollback error: ${landing.rollbackError}`] : []),
+      ...(landing.manifestPath ? [`manifest: ${landing.manifestPath}`] : []),
+    ].join("; ");
+    lines.push(`Landing status for ${task.taskId}: ${landing.status}${details ? ` — ${details}` : ""}. Inspect the main workspace before claiming the requested changes are present or correct.`);
+  }
+  return lines;
+}
+
+/** The one execution a failed request actually targeted, resolved through the
+ * synchronous, non-mutating public inspection surface only. `inspectTask` is
+ * deliberately never called here: it can run recovery backfill and save, and a
+ * failed mutation must not gain durable side effects from formatting. */
+type FailureTarget =
+  | {
+    readonly resolved: true;
+    readonly executionId: string;
+    readonly taskId?: string;
+    readonly inspection: BackgroundInspection;
+    /** Set when the requested task handle is not in the named execution. */
+    readonly note?: string;
+  }
+  | { readonly resolved: false; readonly reason: string };
+
+interface FailureSnapshot {
+  readonly inspection: FailureSnapshotInspection;
+  readonly tasksIncluded: number;
+  readonly tasksOmitted: number;
+  readonly activityRowsIncluded: number;
+  readonly activityRowsOmitted: number;
+  readonly activityWindowRows: number;
+  readonly commandsIncluded: number;
+  readonly commandsOmitted: number;
+  /** Tasks whose current landing/recovery facts were preserved. */
+  readonly landingFactsPreserved: number;
+}
+
+/** Resolve the execution (and exact task, when the request named one) that owns
+ * the failed request: the explicit `executionId` first, then the task handle
+ * (including a continue bundle's own task id) located by an id-only ownership
+ * scan whose records are never emitted, then — for an operation on an existing
+ * execution that named no handle at all — the sole associated execution. An
+ * unknown or ambiguous target is reported as unavailable, with the refusal that
+ * actually happened as the reason: it never falls back to the whole session
+ * inventory and never silently picks an unrelated task or group. */
+function resolveFailureTarget(controller: BackgroundExecutionController, normalized: NormalizedInput): FailureTarget {
+  const taskId = normalized.taskId ?? normalized.bundle?.taskId;
+  const executionId = normalized.executionId;
+  if (executionId) {
+    if (taskId) {
+      try {
+        return { resolved: true, executionId, taskId, inspection: controller.inspect(executionId, taskId) };
+      } catch (error) {
+        try {
+          // The request did name this execution, so its current state stays
+          // in scope; the unknown handle is disclosed rather than guessed.
+          return {
+            resolved: true,
+            executionId,
+            inspection: controller.inspect(executionId),
+            note: `requested task ${taskId} is not in execution ${executionId}: ${messageOf(error)}`,
+          };
+        } catch (groupError) {
+          return { resolved: false, reason: messageOf(groupError) };
+        }
+      }
+    }
+    try {
+      return { resolved: true, executionId, inspection: controller.inspect(executionId) };
+    } catch (error) {
+      return { resolved: false, reason: messageOf(error) };
+    }
+  }
+  if (taskId) {
+    const owners = safeList(controller)
+      .filter((inspection) => inspection.tasks.some((task) => task.taskId === taskId))
+      .map((inspection) => inspection.executionId);
+    if (owners.length !== 1) {
+      return {
+        resolved: false,
+        reason: owners.length === 0
+          ? `no execution associated with this conversation owns task ${taskId}`
+          : `task handle ${taskId} is owned by ${owners.length} executions, so the target is ambiguous`,
+      };
+    }
+    try {
+      return { resolved: true, executionId: owners[0]!, taskId, inspection: controller.inspect(owners[0]!, taskId) };
+    } catch (error) {
+      return { resolved: false, reason: messageOf(error) };
+    }
+  }
+  // The request named no handle. An operation on an EXISTING execution is valid
+  // that way when exactly one execution is associated, so its state stays safely
+  // resolvable through the same synchronous sole-group resolution the controller
+  // itself performs (`inspect(undefined)`). An ambiguous set keeps the
+  // controller's own refusal as the unresolved reason: nothing is guessed, and
+  // the session inventory is never replayed instead. New-group (`start`) and
+  // session-wide (`mark_clean`) failures own no existing execution and are never
+  // given an inferred one.
+  if (normalized.action !== "start" && normalized.action !== "mark_clean") {
+    try {
+      const inspection = controller.inspect(undefined);
+      return { resolved: true, executionId: inspection.executionId, inspection };
+    } catch (error) {
+      return { resolved: false, reason: messageOf(error) };
+    }
+  }
+  return {
+    resolved: false,
+    reason: normalized.action === "start"
+      ? "SubtasksStart admits a new execution, so no existing execution owns this request"
+      : "SubtasksMarkClean is a session-wide operation, so no single execution owns this request",
+  };
+}
+
+/** Project one owning inspection into the bounded failure-only view: the exact
+ * task when known (otherwise the most recently updated tasks of that one
+ * execution), each with the current state/outcome/controls/artifact/bundle
+ * facts, a short recent activity tail, this request's own and any still
+ * unsettled command records, and no nested result, dispatch, or review bodies. */
+function projectFailureSnapshot(inspection: BackgroundInspection, instructionId: string | undefined): FailureSnapshot {
+  const order = new Map(inspection.tasks.map((task, index) => [task.taskId, index]));
+  const selected = inspection.tasks.length <= FAILURE_TASK_ROWS
+    ? [...inspection.tasks]
+    : [...inspection.tasks]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || (order.get(left.taskId)! - order.get(right.taskId)!))
+      .slice(0, FAILURE_TASK_ROWS)
+      .sort((left, right) => order.get(left.taskId)! - order.get(right.taskId)!);
+  let activityRowsIncluded = 0;
+  let activityRowsOmitted = 0;
+  let activityWindowRows = 0;
+  let commandsIncluded = 0;
+  let commandsOmitted = 0;
+  let landingFactsPreserved = 0;
+  const tasks = selected.map((task): FailureSnapshotTask => {
+    const recentActivity = task.activity.slice(-FAILURE_ACTIVITY_ROWS);
+    const keptCommands = task.commands.filter((command, index) =>
+      command.status === "queued" || command.status === "delivered"
+      || index >= task.commands.length - FAILURE_COMMAND_ROWS
+      || (instructionId !== undefined
+        && (command.instructionId === instructionId || command.instructionId === `${instructionId}-force-merge`)),
+    );
+    activityRowsIncluded += recentActivity.length;
+    activityRowsOmitted += task.activity.length - recentActivity.length;
+    activityWindowRows += task.activity.length;
+    commandsIncluded += keptCommands.length;
+    commandsOmitted += task.commands.length - keptCommands.length;
+    // The current landing/recovery facts are preserved BEFORE the nested result
+    // body is dropped: they describe the source workspace as it stands now, so
+    // a bounded failure view must never lose them.
+    const landing = failureLandingFacts(task);
+    if (landing) landingFactsPreserved += 1;
+    const compact = { ...task, activity: recentActivity, commands: keptCommands, ...(landing ? { landing } : {}) } as unknown as Record<string, unknown>;
+    for (const field of FAILURE_OMITTED_TASK_FIELDS) delete compact[field];
+    return compact as unknown as FailureSnapshotTask;
+  });
+  return {
+    inspection: { ...inspection, tasks } as FailureSnapshotInspection,
+    tasksIncluded: tasks.length,
+    tasksOmitted: inspection.tasks.length - tasks.length,
+    activityRowsIncluded,
+    activityRowsOmitted,
+    activityWindowRows,
+    commandsIncluded,
+    commandsOmitted,
+    landingFactsPreserved,
+  };
+}
+
+/** Truthful scope and bounds disclosure for a scoped failure snapshot, with the
+ * exact follow-up call that retrieves what was omitted. `offset` is named as an
+ * array index into the retained window (never an activity sequence number), and
+ * the example stays inside the existing text's last-three-row rendering so a
+ * requested row is actually shown. */
+function failureScopeLines(target: Extract<FailureTarget, { resolved: true }>, snapshot: FailureSnapshot): string[] {
+  const bounds = [
+    `${snapshot.activityRowsIncluded} recent activity row(s) of the ${snapshot.activityWindowRows} held by the durable window read here (a retained cap, not the task's lifetime total)`,
+    ...(snapshot.tasksOmitted > 0 ? [`${snapshot.tasksIncluded} of ${snapshot.tasksIncluded + snapshot.tasksOmitted} task record(s) in this execution`] : []),
+    ...(snapshot.commandsOmitted > 0 ? [`${snapshot.commandsIncluded} command record(s), ${snapshot.commandsOmitted} older settled one(s) omitted`] : []),
+    "full nested result, dispatch, and review bodies stay durable and are omitted here (the current landing status and failure/recovery facts are preserved)",
+  ].join("; ");
+  const taskHandle = target.taskId ?? "<one task handle listed above>";
+  return [
+    `Failure snapshot: execution ${target.executionId}${target.taskId ? ` · task ${target.taskId}` : ""} — this request's target only; no other associated execution is replayed.`,
+    `Bounded history: ${bounds}.`,
+    `Retrieve older detail with two separate existing calls (evidence navigation is mutually exclusive with offset/lines): activity — SubtasksInspect { "executionId": "${target.executionId}", "taskId": "${taskHandle}", "offset": 0, "lines": 3 } reads the retained activity window oldest-first by array index (offset is an array index, not an activity sequence number) and returns that task's full current record; tool-call evidence — SubtasksInspect { "executionId": "${target.executionId}", "taskId": "${taskHandle}", "evidence": { "index": 0, "limit": 20 } } with no offset or lines.`,
+  ];
+}
+
+/** Structured twin of the disclosure above, in the same failure result. */
+function describeFailureScope(target: FailureTarget, snapshot: FailureSnapshot | undefined): Record<string, unknown> {
+  if (!target.resolved || !snapshot) {
+    return { resolved: false, reason: target.resolved ? "no snapshot projected" : target.reason, executions: 0 };
+  }
+  return {
+    resolved: true,
+    executionId: target.executionId,
+    ...(target.taskId ? { taskId: target.taskId } : {}),
+    ...(target.note ? { note: target.note } : {}),
+    bounds: { activityRowsPerTask: FAILURE_ACTIVITY_ROWS, tasks: FAILURE_TASK_ROWS, commandsPerTask: FAILURE_COMMAND_ROWS },
+    included: {
+      executions: 1,
+      tasks: snapshot.tasksIncluded,
+      activityRows: snapshot.activityRowsIncluded,
+      commands: snapshot.commandsIncluded,
+      landingFacts: snapshot.landingFactsPreserved,
+    },
+    omitted: {
+      tasks: snapshot.tasksOmitted,
+      activityRows: snapshot.activityRowsOmitted,
+      commands: snapshot.commandsOmitted,
+      nestedTaskFields: [...FAILURE_OMITTED_TASK_FIELDS],
+    },
+    retrieval: {
+      activity: "SubtasksInspect {executionId, taskId, offset, lines}: offset is an array index into the retained activity window, oldest first; it is not an activity sequence number.",
+      evidence: "SubtasksInspect {executionId, taskId, evidence: {index, limit}}: this task's actual tool-call evidence. Send it as its own call — evidence navigation is mutually exclusive with offset/lines.",
+    },
+  };
 }
 
 interface ThemeLike {

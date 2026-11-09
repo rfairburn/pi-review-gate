@@ -110,12 +110,32 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   is never inferred from group size, and an omitted ID fails immediately with a concise
   actionable diagnostic in both activity and evidence modes. The execution-wide overview
   remains available without a task handle: start and add results list every task handle
-  in the group, operations that fail after input validation return the complete group
-  inspection — except read-only evidence-navigation selector failures (a mistyped
-  `entryId`, unknown `callId`, malformed or expired `cursor`, or out-of-range `index`),
-  which return a concise task-scoped diagnostic with a bounded navigation hint and never
-  other executions' state — and `/subtasks` and `/subtasks-view` show all groups and
-  active tasks.
+  in the group. An operation that fails after input validation returns a snapshot scoped to
+  the execution (and exact task) the request actually named — or, when it named neither, the
+  sole associated execution for operations that act on an existing one (several associated
+  executions are reported as unresolved rather than guessed) — never the other groups this
+  session holds, and never its whole durable history. The current state, outcome, failure,
+  live controls, artifact paths, checkpoint bundle, conflict truth, recovery guidance, and
+  unsettled commands are included, with a short recent activity tail; older activity rows and
+  the full nested executor result, dispatch, and review bodies stay durable and are omitted
+  from both the model-visible text and the structured details. The current landing status and
+  failure/recovery facts are preserved out of that nested result and stated in the failure text
+  — `recovery_required` with its failure reason, failed path, rollback error, and recovery
+  manifest path — because an incomplete rollback can otherwise leave a worker's own success
+  summary as the only outcome a failed call reports while the main workspace stays partially
+  modified. The failure names its retained
+  and omitted counts and the exact existing follow-up reads, which are two separate calls
+  because evidence navigation is mutually exclusive with `offset`/`lines`: `SubtasksInspect`
+  with `offset`/`lines` reads older rows of the retained activity window (`offset` is an array
+  index into that window, not an activity sequence number) and returns the task's full current
+  record, while `SubtasksInspect` with `evidence: {index, limit}` and no `offset`/`lines` reads
+  its actual tool-call rows. Durable records are
+  never trimmed by a failure result. A target no execution owns reports that no scoped
+  snapshot is available instead of replaying unrelated groups or silently selecting one.
+  Read-only evidence-navigation selector failures (a mistyped `entryId`, unknown `callId`,
+  malformed or expired `cursor`, or out-of-range `index`) keep their concise task-scoped
+  diagnostic with a bounded navigation hint and never other executions' state — and
+  `/subtasks` and `/subtasks-view` show all groups and active tasks.
 - `SubtasksWatch` optionally arms one future checkpoint for an active execution. It
   returns immediately, replaces any prior watch for that execution, and wakes once with
   active-task state, timing, recent activity, executor identity, and available controls

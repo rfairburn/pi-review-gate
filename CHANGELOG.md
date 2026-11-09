@@ -15,6 +15,35 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.264]
+
+### Changed
+
+- **Ordinary `Subtasks*` failures are scoped to their own target and bounded** (#626): a
+  failed `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch`,
+  `SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`, `SubtasksForceMerge`, or
+  `SubtasksMarkClean` call now returns the durable state of the execution (and exact task) the
+  request actually named instead of every associated group's inventory. Activity rows and
+  settled command records are limited and the nested executor result, dispatch, review, and
+  state-history bodies are omitted in the model-visible text and the structured details alike,
+  while the current state, outcome, failure, live controls, artifact paths, checkpoint bundle,
+  conflict truth, recovery guidance, and an `interrupt_with_merge` request's exact stop/merge
+  settlement stay truthful; that settlement is still computed from the owning record before any
+  projection. The current landing status and failure/recovery facts are preserved out of the
+  nested result and stated in the text — `recovery_required` with its failure reason, failed
+  path, rollback error, and recovery manifest path — because an incomplete rollback can
+  otherwise leave a worker's own success summary as the only outcome a failed call reports while
+  the main workspace stays partially modified. Each failure discloses its retained and omitted counts and the exact existing
+  follow-up read: `SubtasksInspect` with `offset`/`lines` for older rows of the retained
+  activity window (`offset` is an array index into that window, not an activity sequence
+  number) and `evidence: {index, limit}` for actual tool-call rows. Durable records are never
+  trimmed, an unknown or ambiguous target reports that no scoped snapshot is available instead
+  of replaying unrelated executions or silently selecting one (a request naming no handle still
+  gets the sole associated execution when exactly one exists, and `SubtasksStart` or
+  `SubtasksMarkClean` never gets an inferred one), and successful results,
+  read-only evidence-selector containment (#61), and interrupt settlement truth (#191) are
+  unchanged.
+
 ## [0.1.0-dev.263]
 
 ### Added

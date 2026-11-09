@@ -4,6 +4,10 @@ import { isRecord } from "./record-guard";
 
 const CODEMODE_TOOL_NAME = "codemode";
 
+function isRetryableAuditOutcome(outcome: string | undefined): boolean {
+  return outcome === "audit-timeout" || outcome === "audit-invalidated";
+}
+
 const OWNED_NATIVE_TOOL_NAMES = new Set([
   "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -23,8 +27,9 @@ interface NestedCallRecord {
    * decision deadline, so the proposed operation is known never to have started
    * (#557). It is still a refusal — admission stays `blocked` — but it is not an
    * executed attempt and it does not spend the identity's repeated-use allowance.
+   * `audit-invalidated` has the same accounting for a confirmed policy/cwd change.
    */
-  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout";
+  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout" | "audit-invalidated";
   started: boolean;
   returnedErrorObserved: boolean;
   executionStartObserved: boolean;
@@ -51,8 +56,8 @@ interface ToolCallMember {
   fingerprint?: string;
   position: number;
   admission?: "allowed" | "blocked";
-  /** See `NestedCallRecord.outcome`: `audit-timeout` ran nothing (#557). */
-  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout";
+  /** See `NestedCallRecord.outcome`: retryable audit refusals ran nothing (#557, #629). */
+  outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout" | "audit-invalidated";
   started: boolean;
   returnedErrorObserved: boolean;
   retryAttempt: boolean;
@@ -198,7 +203,7 @@ export class NativeToolCallPreflight {
     // not do stays readable from the recorded members of this batch. The most
     // recent earlier member carrying this identity is the one that holds it.
     const precedingInBatch = duplicateInBatch ? precedingSameBatchMember(group, member) : undefined;
-    if (duplicateInBatch && precedingInBatch?.outcome !== "audit-timeout") {
+    if (duplicateInBatch && !isRetryableAuditOutcome(precedingInBatch?.outcome)) {
       this.markBlocked(member);
       const earlierResultObserved = group.members.some((candidate) =>
         candidate.position < member.position
@@ -222,8 +227,8 @@ export class NativeToolCallPreflight {
 
     const preceding = precedingInBatch ?? this.findPreviousMember(member.fingerprint);
     if (preceding) {
-      if (preceding.outcome === "audit-timeout") {
-        // A confirmed pre-execution auditor timeout started nothing, so it neither
+      if (isRetryableAuditOutcome(preceding.outcome)) {
+        // A confirmed pre-execution timeout or policy/cwd invalidation ran nothing, so it neither
         // spends this identity's repeated-use allowance nor earns a retry
         // entitlement: the proposal is admitted for a fresh audit under the
         // liveness checks that already ran above. The retry lineage the timed-out
@@ -326,8 +331,8 @@ export class NativeToolCallPreflight {
         };
       }
       const predecessor = precedingNestedRecord(tree, record);
-      if (predecessor?.outcome === "audit-timeout") {
-        // Same contract as the direct path (#557): the timed-out nested call ran
+      if (predecessor && isRetryableAuditOutcome(predecessor.outcome)) {
+        // Same contract as the direct path (#557, #629): this retryable audit refusal ran
         // nothing, so it spends no repeated-use allowance and earns no retry
         // entitlement, while the retry lineage it carried stays attached so an
         // earlier executed nested failure keeps counting.
@@ -482,9 +487,10 @@ export class NativeToolCallPreflight {
    * deadline (#557): the proposed operation is known never to have started, so
    * the recorded outcome becomes `audit-timeout` and a later identical proposal
    * is re-audited instead of being blocked as repeated use. Every other refusal
-   * — a `FAIL`, a malformed or unavailable auditor, cancellation, an invalidated
-   * audit — keeps the ordinary blocked accounting, and no refusal here grants
-   * execution or earns a retry entitlement.
+   * — a `FAIL`, a malformed or unavailable auditor, cancellation, a session or
+   * proposal invalidation — keeps the ordinary blocked accounting, and no refusal
+   * here grants execution or earns a retry entitlement. Confirmed policy/cwd invalidation
+   * uses `auditInvalidated` with the same non-execution accounting.
    *
    * Returns the native block decision for the composed `tool_call` observer, or
    * `undefined` when this guard has no matching admitted record (the caller
@@ -495,9 +501,10 @@ export class NativeToolCallPreflight {
     toolName: string,
     reason: string,
     auditTimeout = false,
+    auditInvalidated = false,
   ): { block: true; reason: string } | undefined {
     if (!toolCallId || !toolName) return undefined;
-    const outcome = auditTimeout ? "audit-timeout" : "blocked";
+    const outcome = auditTimeout ? "audit-timeout" : auditInvalidated ? "audit-invalidated" : "blocked";
     const member = this.membersById.get(toolCallId);
     if (member && member.id === toolCallId && member.name === toolName && member.admission === "allowed") {
       this.markBlocked(member, outcome);
@@ -683,8 +690,8 @@ export class NativeToolCallPreflight {
   }
 
   private markBlocked(
-    call: { admission?: "allowed" | "blocked"; outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout"; started: boolean },
-    outcome: "blocked" | "audit-timeout" = "blocked",
+    call: { admission?: "allowed" | "blocked"; outcome: "unknown" | "success" | "error" | "blocked" | "audit-timeout" | "audit-invalidated"; started: boolean },
+    outcome: "blocked" | "audit-timeout" | "audit-invalidated" = "blocked",
   ): void {
     call.admission = "blocked";
     call.outcome = outcome;
@@ -706,9 +713,9 @@ export class NativeToolCallPreflight {
     // executed or refused-result evidence, so it represents this identity only when
     // nothing else about it was accounted for (#557). A genuine denial, a malformed
     // or unavailable auditor, or a guard block in the same group must never be
-    // shadowed by a timed-out sibling.
+    // shadowed by a sibling with a retryable audit refusal.
     return matching.find((member) => member.admission === "allowed")
-      ?? matching.find((member) => member.outcome !== "audit-timeout")
+      ?? matching.find((member) => !isRetryableAuditOutcome(member.outcome))
       ?? matching[0];
   }
 
@@ -859,17 +866,17 @@ function isCodemodeScriptCall(member: ToolCallMember): boolean {
 }
 
 function precedingNestedRecord(tree: NestedTree, record: NestedCallRecord): NestedCallRecord | undefined {
-  let timedOutCandidate: NestedCallRecord | undefined;
+  let retryableAuditCandidate: NestedCallRecord | undefined;
   for (let index = tree.children.length - 2; index >= 0; index -= 1) {
     const candidate = tree.children[index]!;
     if (candidate.fingerprint !== record.fingerprint) continue;
     // Same selection rule as the direct path (#557): an executed or refused
-    // sibling carries the accounting; a timed-out attempt only speaks for the
+    // sibling carries the accounting; a retryable audit refusal only speaks for the
     // identity when nothing else does.
-    if (candidate.outcome !== "audit-timeout") return candidate;
-    timedOutCandidate ??= candidate;
+    if (!isRetryableAuditOutcome(candidate.outcome)) return candidate;
+    retryableAuditCandidate ??= candidate;
   }
-  return timedOutCandidate;
+  return retryableAuditCandidate;
 }
 
 /**
@@ -881,15 +888,15 @@ function precedingNestedRecord(tree: NestedTree, record: NestedCallRecord): Nest
  * discarding the batch's recorded history (#557).
  */
 function precedingSameBatchMember(group: ToolCallGroup, member: ToolCallMember): ToolCallMember | undefined {
-  let timedOutCandidate: ToolCallMember | undefined;
+  let retryableAuditCandidate: ToolCallMember | undefined;
   for (let index = group.members.length - 1; index >= 0; index -= 1) {
     const candidate = group.members[index]!;
     if (candidate.position >= member.position) continue;
     if (candidate.fingerprint !== member.fingerprint) continue;
-    if (candidate.outcome !== "audit-timeout") return candidate;
-    timedOutCandidate ??= candidate;
+    if (!isRetryableAuditOutcome(candidate.outcome)) return candidate;
+    retryableAuditCandidate ??= candidate;
   }
-  return timedOutCandidate;
+  return retryableAuditCandidate;
 }
 
 /** Bounded, printable display for an observed parent call id in feedback. */

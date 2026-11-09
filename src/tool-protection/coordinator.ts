@@ -483,6 +483,8 @@ export interface ToolProtectionRefusal {
   block: true;
   reason: string;
   auditTimeout?: true;
+  /** Confirmed policy/cwd invalidation before execution; retry requires a fresh audit. */
+  auditInvalidated?: true;
 }
 
 interface NestedAggregate {
@@ -830,8 +832,8 @@ export class ToolProtectionCoordinator {
       // `disclosure` accompanies the refusal for the user only. It is never part
       // of the refusal evidence supplied to a later audit, and it never changes
       // the verdict or the reason the call was refused.
-      const refuse = (reason: string, disclosure?: string, auditTimeout?: true): ToolProtectionRefusal =>
-        this.refuseCall(call, reason, disclosure, auditTimeout);
+      const refuse = (reason: string, disclosure?: string, auditTimeout?: true, auditInvalidated?: true): ToolProtectionRefusal =>
+        this.refuseCall(call, reason, disclosure, auditTimeout, auditInvalidated);
       if (loadError !== undefined) {
         return refuse(
           `Tool protection: unavailable — ${loadError} The proposed ${event.toolName} call was not run.`,
@@ -997,15 +999,15 @@ export class ToolProtectionCoordinator {
       const invalidation = this.invalidationOf(event.callId, token, stateKey, bindingKey, signal);
       if (invalidation) {
         this.pending.delete(event.callId);
-        this.noteGateRefusalEvidence(event.toolName, event.callId, invalidation, false);
+        this.noteGateRefusalEvidence(event.toolName, event.callId, invalidation.reason, false);
         const warning = await this.retainAuditorSession({
           ...recordRequest,
           outcome: {
             status: signal?.aborted === true ? "cancelled" : "invalidated",
-            error: invalidation,
+            error: invalidation.reason,
           },
         });
-        return refuse(invalidation, warning);
+        return refuse(invalidation.reason, warning, undefined, invalidation.retryable);
       }
       // The host input object is mutable. Bind to what is still proposed when
       // the await finishes, not merely to the fingerprint stored before it.
@@ -1071,7 +1073,8 @@ export class ToolProtectionCoordinator {
         const opened = settings.retainAuditorSessions
           ? await this.openAuditorRecord(recordRequest)
           : undefined;
-        const lateBreak = this.invalidationOf(event.callId, token, stateKey, bindingKey, signal)
+        const lateInvalidation = this.invalidationOf(event.callId, token, stateKey, bindingKey, signal);
+        const lateBreak = lateInvalidation?.reason
           ?? this.proposalDrifted(args, event, fingerprint, systemPrompt?.prompt);
         this.pending.delete(event.callId);
         if (lateBreak !== undefined) {
@@ -1082,7 +1085,7 @@ export class ToolProtectionCoordinator {
             status: /audit cancelled/i.test(lateBreak) ? "cancelled" : "invalidated",
             error: lateBreak,
           });
-          return refuse(lateBreak, warning);
+          return refuse(lateBreak, warning, undefined, lateInvalidation?.retryable);
         }
         const annotation: AnnotationRecord = {
           kind: "pass",
@@ -1146,11 +1149,14 @@ export class ToolProtectionCoordinator {
     reason: string,
     disclosure?: string,
     auditTimeout?: true,
+    auditInvalidated?: true,
   ): ToolProtectionRefusal {
     const refusal = block(disclosure === undefined ? reason : `${reason}\n${disclosure}`);
     const action: ToolProtectionRefusal = auditTimeout === true
       ? { block: true, reason: refusal.reason, auditTimeout: true }
-      : refusal;
+      : auditInvalidated === true
+        ? { block: true, reason: refusal.reason, auditInvalidated: true }
+        : refusal;
     const level = this.currentState().settings.level;
     if (call.parentToolCallId) {
       this.recordDecision(call, rootCallId(call.parentToolCallId), {
@@ -1261,16 +1267,16 @@ export class ToolProtectionCoordinator {
     stateKey: string,
     bindingKey: string,
     signal: AbortSignal | undefined,
-  ): string | undefined {
+  ): { reason: string; retryable?: true } | undefined {
     const pending = this.pending.get(callId);
     if (!pending || pending.token !== token || pending.bindingKey !== bindingKey) {
-      return "Tool protection: audit invalidated — the session, branch or native batch this proposal belonged to changed while the auditor was deciding. The proposed call was not run.";
+      return { reason: "Tool protection: audit invalidated — the session, branch or native batch this proposal belonged to changed while the auditor was deciding. The proposed call was not run." };
     }
     if (signal?.aborted) {
-      return "Tool protection: audit cancelled — the operation was cancelled while the auditor was deciding. The proposed call was not run.";
+      return { reason: "Tool protection: audit cancelled — the operation was cancelled while the auditor was deciding. The proposed call was not run." };
     }
     if (this.stateKey() !== stateKey) {
-      return "Tool protection: audit invalidated — the protection configuration or working directory changed while the auditor was deciding, so the decision no longer applies to the current policy. The proposed call was not run; a fresh proposal will be audited under the new policy.";
+      return { reason: "Tool protection: audit invalidated — the protection configuration or working directory changed while the auditor was deciding, so the decision no longer applies to the current policy. The proposed call was not run; a fresh proposal will be audited under the new policy.", retryable: true };
     }
     return undefined;
   }

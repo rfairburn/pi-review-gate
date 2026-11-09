@@ -34,6 +34,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.*
 import io.github.rfairburn.pireviewgate.core.input.ImeCommitEncoder
+import io.github.rfairburn.pireviewgate.core.input.KeyboardEncoder
 import io.github.rfairburn.pireviewgate.core.input.KeyboardModifiers
 import io.github.rfairburn.pireviewgate.core.input.TerminalFunctionKey
 import io.github.rfairburn.pireviewgate.core.input.TerminalKey
@@ -1143,6 +1144,430 @@ class TerminalSurfaceComponentTest {
     private fun terminalFixture(sourced: Boolean) = NativeUiFixture(NativeUiFixtures.sessions().copy(
         route = ClientRoute.Terminal(NativeUiFixtures.terminal()),
     )).apply { binding = NativeUiFixtures.binding(sourced) }
+
+    /* -------------------------------------------------------------------- *
+     * Ctrl release and the input method's predictive context.
+     *
+     * A Ctrl chip that goes back down after a Ctrl keystroke asks the input method for
+     * fresh context, and nothing else. The queued cases below drive the command queue AOSP
+     * really uses, through [ImeCommandQueue], so the ordering between an input method's
+     * command and the user's chip tap is decided in the test rather than by a looper race.
+     *
+     * What these cases still cannot show is what a real keyboard makes of the request, or
+     * how often the cancellation window is hit in real use. No latency and no failure rate
+     * is asserted from these mocks, and a direct InputConnection call models only this
+     * surface's own behaviour, never the platform's cancellation.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * A test-only model of the app-side command queue between an input method and its
+     * [android.view.inputmethod.InputConnection]. A command is stamped with the platform's
+     * command-session id when the input method issues it, that id moves forward the moment
+     * this app asks the input method to invalidate its context, and a command whose session
+     * went stale is dropped when it finally runs. That mirrors AOSP's
+     * `RemoteInputConnectionImpl`: `scheduleInvalidateInput()` increments `mCurrentSessionId`
+     * synchronously, and every cancellable command returns `// cancelled` once its posted
+     * runnable sees `header.mSessionId != mCurrentSessionId.get()`.
+     *
+     * It is a model of that ordering, not the platform: it exists so the queued cases are
+     * deterministic in instrumentation. It claims nothing about Gboard and nothing about how
+     * often the window is hit on a real device.
+     */
+    private class ImeCommandQueue {
+        private var session = 0
+        private val pending = ArrayList<Pair<Int, () -> Unit>>()
+
+        /** Commands that ran because their session was still current when they reached it. */
+        var delivered = 0
+            private set
+
+        /** Commands the platform would have cancelled: issued in an older session. */
+        var cancelled = 0
+            private set
+
+        /** The input method issues a command: stamped now, executed on the app's thread later. */
+        fun issue(command: () -> Unit) { pending += session to command }
+
+        /** This app asked the input method for fresh context, so the session moved forward. */
+        fun invalidated() { session += 1 }
+
+        /** The app's thread runs what is queued. A stale session is cancelled, never retried. */
+        fun drain() {
+            while (pending.isNotEmpty()) {
+                val (issuedIn, command) = pending.removeAt(0)
+                if (issuedIn != session) cancelled += 1
+                else {
+                    command()
+                    delivered += 1
+                }
+            }
+        }
+    }
+
+    @Test fun ctrlReleaseWhileTheCommandIsStillQueuedAsksForNothingAndThatCommandStillLeavesOnce() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val queue = ImeCommandQueue()
+        var delivered = false
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            // The input method issues the commit in the current session. It has not reached
+            // the InputConnection yet, so no Ctrl keystroke has handed off.
+            queue.issue { delivered = connection.commitText("c", 1) }
+            val askedBefore = surface.imeContextInvalidations
+            // The user taps Ctrl OFF before that request runs.
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > askedBefore) queue.invalidated()
+            assertEquals("Nothing handed off during this hold, so nothing is asked of the IME",
+                0, surface.imeContextInvalidations)
+            assertTrue(fixture.packets.isEmpty())
+            // No ask means no session bump, so the platform has nothing to cancel and the
+            // command runs. It leaves once, with no retry and no extra input, as plain text:
+            // the chip was already released, and this change binds no press timestamp.
+            queue.drain()
+            assertTrue("The queued command still reaches the InputConnection", delivered)
+            assertEquals(1, queue.delivered)
+            assertEquals(0, queue.cancelled)
+            val packet = fixture.packets.single()
+            assertEquals(NativeIoInputKind.KEYBOARD, packet.kind)
+            assertArrayEquals(byteArrayOf('c'.code.toByte()), packet.bytes)
+            assertTrue(packet.verifiedAtCapture)
+            assertEquals(0, surface.imeContextInvalidations)
+        }
+    }
+
+    @Test fun ctrlReleaseAfterAHandedOffCommandAsksForFreshContextOnceAndSendsNothingItself() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val ctrlC = requireNotNull(ImeCommitEncoder.encode("c", KeyboardModifiers.CTRL, proof.modes)).single()
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            val refusalsBefore = fixture.refusals.size
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertEquals("The command left with Ctrl held", 1, fixture.packets.size)
+            assertArrayEquals(ctrlC, fixture.packets.single().bytes)
+            // Counted after that handoff: the release itself must add nothing to it.
+            val emissions = surface.inputEmissions
+            assertEquals("Nothing is asked of the IME while the chip is still held",
+                0, surface.imeContextInvalidations)
+
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+
+            assertEquals("One Ctrl-to-plain release asks once", 1, surface.imeContextInvalidations)
+            assertEquals("The request sends no packet of its own", emissions, surface.inputEmissions)
+            assertEquals("The only bytes that left are still the original Ctrl+C bytes", 1, fixture.packets.size)
+            assertArrayEquals(ctrlC, fixture.packets.single().bytes)
+            assertEquals("The request reports no failure either", refusalsBefore, fixture.refusals.size)
+            assertEquals("", connection.composingText)
+
+            // A second hold that types nothing earns nothing: the ask is one-shot per hold.
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertEquals(1, surface.imeContextInvalidations)
+            assertEquals(1, fixture.packets.size)
+        }
+    }
+
+    @Test fun ctrlReleaseAfterAHandedOffCommandBumpsThePlatformSessionAndCancelsWhatIsStillQueuedInIt() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val queue = ImeCommandQueue()
+        val ctrlC = requireNotNull(ImeCommitEncoder.encode("c", KeyboardModifiers.CTRL, proof.modes)).single()
+        var secondDelivered = false
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            val emissions = surface.inputEmissions
+            // The user's next keystroke is issued in the same session and has not run yet.
+            queue.issue { secondDelivered = connection.commitText("d", 1) }
+            val askedBefore = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > askedBefore) queue.invalidated()
+            assertEquals(1, surface.imeContextInvalidations)
+            queue.drain()
+            // The guard proves a Ctrl keystroke handed off. It cannot prove the queue was
+            // empty, and AOSP does not pretend otherwise: the ask moves the platform's
+            // command session forward, and a command still waiting in the older session is
+            // cancelled there instead of running. That is the residual tradeoff this
+            // candidate accepts, and this is the case that measures it.
+            assertFalse("The old-session command is cancelled by the platform's session bump",
+                secondDelivered)
+            assertEquals(0, queue.delivered)
+            assertEquals(1, queue.cancelled)
+            // What already left is untouched: the bump cannot recall a packet that handed
+            // off, and nothing is replayed, retried, or added.
+            assertEquals(emissions, surface.inputEmissions)
+            assertEquals(1, fixture.packets.size)
+            assertArrayEquals(ctrlC, fixture.packets.single().bytes)
+        }
+    }
+
+    @Test fun ordinaryTypingQueuedAroundTheResetIsCancelledButTypingInTheRefreshedSessionLeavesOnce() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val queue = ImeCommandQueue()
+        var queuedBefore = false
+        var typedAfter = false
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            fixture.packets.clear()
+            // Ordinary typing already issued when the release lands: an older session.
+            queue.issue { queuedBefore = connection.commitText("te", 1) }
+            val askedBefore = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > askedBefore) queue.invalidated()
+            assertEquals(1, surface.imeContextInvalidations)
+            // Ordinary typing issued in the refreshed session, after the bump.
+            queue.issue { typedAfter = connection.commitText("test", 1) }
+            queue.drain()
+            assertFalse("Typing queued in the older session is cancelled, not hidden",
+                queuedBefore)
+            assertTrue("Typing in the refreshed session is delivered normally", typedAfter)
+            assertEquals(1, queue.delivered)
+            assertEquals(1, queue.cancelled)
+            // The one word that leaves does so once, through the normal path, and becomes
+            // context as it always did. The request itself sent nothing.
+            val typed = fixture.packets.single()
+            assertEquals(NativeIoInputKind.KEYBOARD, typed.kind)
+            assertArrayEquals("test".toByteArray(Charsets.UTF_8), typed.bytes)
+            assertTrue(typed.verifiedAtCapture)
+            assertEquals("test", connection.contextText)
+            assertEquals(1, surface.imeContextInvalidations)
+        }
+    }
+
+    @Test fun noOpShiftAndAltAndRemainingChipReleasesNeverAskForFreshContext() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val shiftA = requireNotNull(ImeCommitEncoder.encode("a", KeyboardModifiers.SHIFT, proof.modes)).single()
+        val ctrlC = requireNotNull(ImeCommitEncoder.encode("c", KeyboardModifiers.CTRL, proof.modes)).single()
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertFalse("Nothing was held, so this release changes nothing",
+                surface.clearMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+
+            // A Shift handoff with a Shift-only release is not a Ctrl command boundary.
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.SHIFT))
+            assertTrue(connection.commitText("a", 1))
+            assertEquals(1, fixture.packets.size)
+            assertArrayEquals(shiftA, fixture.packets.single().bytes)
+            assertTrue(surface.setMobileModifiers(0))
+            assertEquals(0, surface.imeContextInvalidations)
+
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.ALT))
+            assertTrue(surface.clearMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+
+            // Ctrl off while another chip stays lit has not ended the hold, and the last
+            // chip going afterwards is not a Ctrl release either.
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertArrayEquals(ctrlC, fixture.packets.last().bytes)
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL or KeyboardModifiers.SHIFT))
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertEquals(KeyboardModifiers.SHIFT, surface.selectedMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.SHIFT))
+            assertEquals(0, surface.imeContextInvalidations)
+
+            // And all of those keystrokes still left exactly as they always did.
+            assertEquals(2, fixture.packets.size)
+            assertArrayEquals(shiftA, fixture.packets[0].bytes)
+            assertArrayEquals(ctrlC, fixture.packets[1].bytes)
+        }
+    }
+
+    @Test fun aLifecycleChipClearAcquiresNoRefreshOfItsOwn() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            // The client lets go of the chips when it retires a terminal. That is not the
+            // user releasing Ctrl, so it asks the input method for nothing.
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertTrue(surface.clearMobileModifiers())
+            assertEquals(0, surface.selectedMobileModifiers())
+            assertEquals("A clear the user did not choose asks nothing of the IME",
+                0, surface.imeContextInvalidations)
+
+            // The surface also lets go of them on its own once focus goes.
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            // The surface lets go of the chips for its own reasons. That must not acquire a
+            // refresh of its own, and the hold's keystroke stops proving anything.
+            surface.clearFocus()
+            assertEquals(0, surface.selectedMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+            assertFalse(surface.clearMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+        }
+    }
+
+    @Test fun aCtrlReleaseAfterTheConnectionWasReplacedUnderTheHoldAsksForNothing() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val connection = newConnection(fixture)
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertEquals("The command left before the connection was replaced", 1, fixture.packets.size)
+            // A configuration change replaces the connection underneath the still-held chip.
+            surface.dispatchConfigurationChanged(Configuration(surface.resources.configuration))
+            assertEquals("Replacing the connection asks the IME for nothing",
+                0, surface.imeContextInvalidations)
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertEquals("A keystroke handed off for a retired connection proves nothing",
+                0, surface.imeContextInvalidations)
+            assertEquals(0, surface.selectedMobileModifiers())
+            assertEquals(1, fixture.packets.size)
+        }
+    }
+
+    @Test fun aSecondCtrlHoldIsAnsweredOnlyByItsOwnHandedOffKeystroke() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val queue = ImeCommandQueue()
+        var pendingDelivered = false
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            // First hold: a real Ctrl keystroke, then Ctrl goes while Shift stays lit.
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL or KeyboardModifiers.SHIFT))
+            var asked = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > asked) queue.invalidated()
+            assertEquals(KeyboardModifiers.SHIFT, surface.selectedMobileModifiers())
+            assertEquals(0, surface.imeContextInvalidations)
+
+            // Ctrl is held again — a fresh hold, with nothing typed in it — and a keystroke
+            // of the first hold is still queued in the current session.
+            assertTrue(surface.setMobileModifiers(KeyboardModifiers.CTRL or KeyboardModifiers.SHIFT))
+            queue.issue { pendingDelivered = connection.commitText("d", 1) }
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.SHIFT))
+            assertEquals(KeyboardModifiers.CTRL, surface.selectedMobileModifiers())
+            asked = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > asked) queue.invalidated()
+            assertEquals("A release answers only for the Ctrl hold it ended",
+                0, surface.imeContextInvalidations)
+            queue.drain()
+            assertTrue("Nothing bumped the session, so the queued command runs", pendingDelivered)
+            assertEquals(1, queue.delivered)
+            assertEquals(0, queue.cancelled)
+        }
+    }
+
+    @Test fun aConnectionReplacedAtTheSameEpochStripsTheOldConnectionsHandedOffKeystroke() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        awaitInput(fixture)
+        val queue = ImeCommandQueue()
+        val first = newConnection(fixture)
+        var pendingDelivered = false
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(first.commitText("c", 1))
+            // The input method reconnects: a different connection at the SAME generation.
+            val replacement = surface.onCreateInputConnection(EditorInfo()) as TerminalInputConnection
+            assertNotSame(first, replacement)
+            queue.issue { pendingDelivered = replacement.commitText("d", 1) }
+            val asked = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > asked) queue.invalidated()
+            assertEquals("The replacement handed nothing off, so its pending edits stay alone",
+                0, surface.imeContextInvalidations)
+            queue.drain()
+            assertTrue("No session bump, so the replacement's own command runs", pendingDelivered)
+            assertEquals(1, queue.delivered)
+            assertEquals(0, queue.cancelled)
+        }
+    }
+
+    @Test fun anUnmodifiedHardwareKeyEarnsNoResetForAPendingCtrlCommand() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val queue = ImeCommandQueue()
+        var pendingDelivered = false
+        val plainArrow = requireNotNull(
+            KeyboardEncoder.encode(TerminalKey(functionKey = TerminalFunctionKey.UP), proof.modes),
+        )
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            // A physical arrow arrives through the platform's own dispatch. It carries no
+            // hardware Ctrl, and a lit chip is deliberately not folded into it: this packet
+            // is not a Ctrl keystroke however the chip looks on screen.
+            val press = KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP, 0)
+            assertTrue(surface.onKeyDown(KeyEvent.KEYCODE_DPAD_UP, press))
+            val arrow = fixture.packets.single()
+            assertEquals(NativeIoInputKind.KEYBOARD, arrow.kind)
+            assertArrayEquals(plainArrow, arrow.bytes)
+            // The first real Ctrl command is still queued, in the current session.
+            queue.issue { pendingDelivered = connection.commitText("c", 1) }
+            val asked = surface.imeContextInvalidations
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            if (surface.imeContextInvalidations > asked) queue.invalidated()
+            assertEquals("An unmodified keystroke cannot qualify a pending Ctrl command for cancellation",
+                0, surface.imeContextInvalidations)
+            queue.drain()
+            assertTrue(pendingDelivered)
+            assertEquals(1, queue.delivered)
+            assertEquals(0, queue.cancelled)
+        }
+    }
+
+    @Test fun anUnsentCompositionIsPreservedAndBlocksTheRefreshThePlatformWouldOtherwiseFlush() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val ctrlC = requireNotNull(ImeCommitEncoder.encode("c", KeyboardModifiers.CTRL, proof.modes)).single()
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+            assertTrue(connection.commitText("c", 1))
+            assertEquals(1, fixture.packets.size)
+            // The next word is being composed while the chip is still held: local, unsent.
+            assertTrue(connection.setComposingText("te", 1))
+            assertEquals("te", connection.composingText)
+            assertEquals("Composing sends nothing", 1, fixture.packets.size)
+
+            assertTrue(surface.toggleMobileModifier(KeyboardModifiers.CTRL))
+
+            assertEquals("An unsent composition blocks the request: the platform's own cleanup" +
+                " calls finishComposingText(), which would send it", 0, surface.imeContextInvalidations)
+            assertEquals("te", connection.composingText)
+            assertEquals("The composition was never flushed into the terminal", 1, fixture.packets.size)
+            assertArrayEquals(ctrlC, fixture.packets.single().bytes)
+        }
+    }
 
     private fun awaitInput(fixture: NativeUiFixture): FrameCommitReceipt {
         var committed: FrameCommitReceipt? = null

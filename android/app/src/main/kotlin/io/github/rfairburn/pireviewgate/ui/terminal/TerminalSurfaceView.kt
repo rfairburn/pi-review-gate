@@ -236,6 +236,25 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	private var activeConnection: TerminalInputConnection? = null
 	private var inputConnectionEpoch = 0L
 
+	/**
+	 * The connection generation of the newest keyboard packet that really left with Ctrl in
+	 * its encoding mask, or [NO_CTRL_HANDOFF] when none did during the Ctrl hold being tracked.
+	 *
+	 * A Ctrl release to plain asks the input method for fresh predictive context only when
+	 * this hold really produced a modified keystroke: the request exists to retire a
+	 * suggestion left over from that keystroke, and with no keystroke there is nothing to
+	 * retire. It is recorded at the one place a packet leaves, from what that packet was
+	 * actually encoded with, so "handed off" means the bytes are already with the caller —
+	 * Android cannot recall a packet that left, and the request is never asked for a command
+	 * that has not left yet.
+	 *
+	 * This proves a handoff happened. It never proves the input method has no further
+	 * request waiting in this process. It belongs to one Ctrl hold and one connection: it is
+	 * spent when Ctrl is let go, cleared when a new Ctrl hold starts, and cleared when the
+	 * connection is replaced — including a replacement at the same generation.
+	 */
+	private var ctrlHandoffEpoch = NO_CTRL_HANDOFF
+
 	/** Pointer bookkeeping for the two-finger wheel; one finger keeps its existing path. */
 	private val touchGesture = TwoFingerWheelGesture()
 
@@ -584,11 +603,18 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 *
 	 * The change is reported through [TerminalSurfaceListener.onMobileModifiersChanged]
 	 * so a root screen and the surface cannot drift apart.
+	 *
+	 * Letting go of the last Ctrl chip after a Ctrl keystroke that actually left also asks
+	 * the input method for fresh predictive context. That is a hint and sends nothing; see
+	 * [notifyImeContextStale] for exactly when it is asked and what it cannot claim.
 	 */
 	fun setMobileModifiers(modifiers: Int): Boolean {
 		val before = mobileModifiers.modifiers
 		if (!mobileModifiers.set(modifiers)) return false
-		if (mobileModifiers.modifiers != before) reportMobileModifiers()
+		if (mobileModifiers.modifiers != before) {
+			reportMobileModifiers()
+			afterUserModifierChange(before, mobileModifiers.modifiers)
+		}
 		return true
 	}
 
@@ -596,7 +622,10 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	fun toggleMobileModifier(bits: Int): Boolean {
 		val before = mobileModifiers.modifiers
 		if (!mobileModifiers.toggle(bits)) return false
-		if (mobileModifiers.modifiers != before) reportMobileModifiers()
+		if (mobileModifiers.modifiers != before) {
+			reportMobileModifiers()
+			afterUserModifierChange(before, mobileModifiers.modifiers)
+		}
 		return true
 	}
 
@@ -606,15 +635,87 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * True when one was held. The surface also does this on its own whenever the
 	 * target changes or the surface leaves the foreground, so a Ctrl meant for one
 	 * session never arrives at the next.
+	 *
+	 * This is also how the client lets go of the chips when a terminal is retired, so it
+	 * deliberately never asks the input method for anything: a hold that ended for a reason
+	 * other than the user's own release of the Ctrl chip earns nothing, and its keystroke
+	 * stops proving anything for a later release.
 	 */
 	fun clearMobileModifiers(): Boolean {
 		if (!mobileModifiers.clear()) return false
+		ctrlHandoffEpoch = NO_CTRL_HANDOFF
 		reportMobileModifiers()
 		return true
 	}
 
 	/** The chips being held, a subset of [SUPPORTED_MOBILE_MODIFIERS]. */
 	fun selectedMobileModifiers(): Int = mobileModifiers.modifiers
+
+	/** How many Ctrl releases asked the input method for fresh context. For tests. */
+	internal var imeContextInvalidations = 0
+		private set
+
+	/**
+	 * Record what the user did to the chips, and let exactly one transition do more than
+	 * report it: Ctrl let go, and nothing left held.
+	 *
+	 * The Ctrl bit, not the whole mask, decides the hold's lifetime. A change that keeps
+	 * Ctrl held — Shift or Alt joining or leaving — keeps the observation, because that hold
+	 * is still the same one. A change that ends Ctrl spends it, so a later Ctrl hold can
+	 * never be answered by an earlier hold's keystroke. A change that starts Ctrl begins a
+	 * fresh hold that has observed nothing. And only a release that leaves nothing held is
+	 * the plain-input boundary this asks about: a Shift-only or Alt-only release, and a chip
+	 * the user keeps holding, behave exactly as they did before. Nothing here waits, delays,
+	 * replays, resends, or invents a keystroke.
+	 */
+	private fun afterUserModifierChange(before: Int, after: Int) {
+		if (before == after) return
+		val heldCtrl = before and KeyboardModifiers.CTRL != 0
+		val holdsCtrl = after and KeyboardModifiers.CTRL != 0
+		if (heldCtrl == holdsCtrl) return
+		if (holdsCtrl) {
+			ctrlHandoffEpoch = NO_CTRL_HANDOFF
+			return
+		}
+		// Ctrl was let go. Whatever that hold produced is accounted for here, and only a
+		// release that leaves no chip held is the plain-input boundary this asks about.
+		val observedAt = ctrlHandoffEpoch
+		ctrlHandoffEpoch = NO_CTRL_HANDOFF
+		if (after != 0) return
+		if (observedAt != inputConnectionEpoch) return
+		notifyImeContextStale()
+	}
+
+	/**
+	 * Tell the input method that the text it is predicting from is no longer what this
+	 * surface holds, so a suggestion left over from a Ctrl keystroke stops being offered as
+	 * the next word. This is [InputMethodManager.invalidateInput] and nothing else: it
+	 * sends no text, no Enter, and no keystroke, and it never restarts or hides anything.
+	 *
+	 * It is asked for only from a transition that earned it, and only while the checks below
+	 * hold, because of what the platform does with it. In this app's own process, AOSP's
+	 * `RemoteInputConnectionImpl` — in the Android 13 source this app's minimum API level
+	 * matches, and unchanged in current AOSP `main` — answers an invalidation by moving its
+	 * command-session id forward, which silently discards an IME command already queued to
+	 * this process, and then calls `beginBatchEdit()`, `finishComposingText()`,
+	 * `endBatchEdit()`, and `takeSnapshot()` on the live connection, falling back to
+	 * `restartInput()` when it cannot hand over the new context. So:
+	 *  - a connection must exist and still be the live, eligible one for this surface; and
+	 *  - nothing may be composed but unsent, because that `finishComposingText()` would send
+	 *    it. Text the user is still correcting is never ours to inject, and a flush timed to
+	 *    someone else's chip release is not the user asking for it.
+	 *
+	 * Whether the keyboard then replaces its suggestions stays the platform's and the input
+	 * method's decision. This only asks, once, and only for a hold that produced a keystroke.
+	 */
+	private fun notifyImeContextStale() {
+		if (!isConnectionCurrent(inputConnectionEpoch)) return
+		val connection = activeConnection ?: return
+		if (connection.composingText.isNotEmpty()) return
+		val manager = context.getSystemService(InputMethodManager::class.java) ?: return
+		imeContextInvalidations += 1
+		manager.invalidateInput(this)
+	}
 
 	/** Close the image decode thread. The surface stays usable for text. */
 	fun release() {
@@ -1354,6 +1455,9 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		// A new connection replaces the previous one outright: the old object must
 		// stop delivering, or a stale one could commit latent text at the same epoch.
 		activeConnection?.invalidate()
+		// The replacement is a different connection even at the same generation, so what the
+		// old one handed off proves nothing about this one: no Ctrl release answers for it.
+		ctrlHandoffEpoch = NO_CTRL_HANDOFF
 		val connection = TerminalInputConnection(this, inputConnectionEpoch)
 		activeConnection = connection
 		outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
@@ -1406,7 +1510,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		return emitBatch(packets, committed)
+		return emitBatch(packets, committed, mobileModifiers.modifiers and KeyboardModifiers.CTRL != 0)
 	}
 
 	/** How far one input-method edit got. */
@@ -1463,7 +1567,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			}
 			packets.addAll(typed)
 		}
-		val delivered = emitPackets(packets, committed, stillValid)
+		val delivered = emitPackets(packets, committed, modifiers and KeyboardModifiers.CTRL != 0, stillValid)
 		return if (delivered == packets.size) ImeEditDelivery.DELIVERED else ImeEditDelivery.PARTIAL
 	}
 
@@ -1475,7 +1579,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		emitInput(NativeIoInputKind.KEYBOARD, packet, committed)
+		emitInput(NativeIoInputKind.KEYBOARD, packet, committed, mobileModifiers.modifiers and KeyboardModifiers.CTRL != 0)
 		return true
 	}
 
@@ -1555,7 +1659,7 @@ class TerminalSurfaceView @JvmOverloads constructor(
 			if (!quietOnRefusal) reportUnavailable(InputUnavailableReason.ENCODER_REFUSED)
 			return false
 		}
-		emitInput(NativeIoInputKind.KEYBOARD, packet, committed)
+		emitInput(NativeIoInputKind.KEYBOARD, packet, committed, key.modifiers and KeyboardModifiers.CTRL != 0)
 		return true
 	}
 
@@ -2135,15 +2239,20 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 * pixels this surface no longer stands behind, so the batch stops, the stop is
 	 * reported, and the caller is told the batch did not complete.
 	 */
-	private fun emitBatch(packets: List<ByteArray>, committed: FrameCommitReceipt): Boolean =
-		emitPackets(packets, committed) { true } == packets.size
+	private fun emitBatch(packets: List<ByteArray>, committed: FrameCommitReceipt, encodedWithCtrl: Boolean): Boolean =
+		emitPackets(packets, committed, encodedWithCtrl) { true } == packets.size
 
 	/** [emitBatch], also stopping once [stillValid] fails. Returns how many packets left. */
-	private fun emitPackets(packets: List<ByteArray>, committed: FrameCommitReceipt, stillValid: () -> Boolean): Int =
+	private fun emitPackets(
+		packets: List<ByteArray>,
+		committed: FrameCommitReceipt,
+		encodedWithCtrl: Boolean,
+		stillValid: () -> Boolean,
+	): Int =
 		InputBatchDelivery.emitInOrder(
 			packets,
 			stillCurrent = { proofStillCurrent(committed) && stillValid() },
-			emit = { packet -> emitInput(NativeIoInputKind.KEYBOARD, packet, committed) },
+			emit = { packet -> emitInput(NativeIoInputKind.KEYBOARD, packet, committed, encodedWithCtrl) },
 		)
 
 	/**
@@ -2159,9 +2268,22 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	/**
 	 * The only place a packet leaves the surface. It is counted, and it carries the notice
 	 * that lets the caller tell the current input method connection the packet was not sent.
+	 *
+	 * [encodedWithCtrl] is what the caller really encoded this packet with, never what a chip
+	 * happens to be lit. A directly dispatched hardware key deliberately carries only the
+	 * platform's own modifier bits, so a lit Ctrl chip does not make it a Ctrl keystroke, and
+	 * only a packet that left with Ctrl in its mask can be the handoff a Ctrl release answers
+	 * for. Every Ctrl-bearing keyboard handoff names it; paste, pointer reports, and
+	 * unmodified keystrokes keep the default and earn nothing.
 	 */
-	private fun emitInput(kind: NativeIoInputKind, packet: ByteArray, committed: FrameCommitReceipt) {
+	private fun emitInput(
+		kind: NativeIoInputKind,
+		packet: ByteArray,
+		committed: FrameCommitReceipt,
+		encodedWithCtrl: Boolean = false,
+	) {
 		inputEmissions += 1
+		if (kind == NativeIoInputKind.KEYBOARD && encodedWithCtrl) ctrlHandoffEpoch = inputConnectionEpoch
 		val refusal = activeConnection?.refusalNotice() ?: TerminalInputRefusal.NONE
 		listener?.onInput(kind, packet, committed, refusal)
 	}
@@ -2194,8 +2316,12 @@ class TerminalSurfaceView @JvmOverloads constructor(
 	 *
 	 * Only a change the user could see is reported, and only the chips are dropped: the
 	 * frame stays on screen, and a later publish of the same target never reaches here.
+	 *
+	 * A hold that ended for a reason the user did not choose also loses any claim its
+	 * keystrokes had on a later refresh: this path never acquires reset effects of its own.
 	 */
 	private fun clearMobileModifiersForTarget() {
+		ctrlHandoffEpoch = NO_CTRL_HANDOFF
 		if (mobileModifiers.clear()) reportMobileModifiers()
 	}
 
@@ -2221,6 +2347,9 @@ class TerminalSurfaceView @JvmOverloads constructor(
 		 * or reported.
 		 */
 		const val SUPPORTED_MOBILE_MODIFIERS = MobileModifierLatch.SUPPORTED
+
+		/** No Ctrl-masked keystroke has handed off during the chip hold being tracked. */
+		private const val NO_CTRL_HANDOFF = -1L
 
 		private const val DEFAULT_FOREGROUND = 0xFFE8E8E8.toInt()
 		private const val DEFAULT_BACKGROUND = 0xFF101010.toInt()

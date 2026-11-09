@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.ui
 
+import android.content.res.Configuration
 import android.view.WindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.github.rfairburn.pireviewgate.core.client.ui.*
 import io.github.rfairburn.pireviewgate.ui.client.NonTerminalStatusSlot
@@ -519,6 +521,28 @@ class NativeScreensComponentTest {
         // The route keeps its own 16dp leading inset rather than the list routes' 12dp.
         compose.runOnIdle { fixture.state = fixture.state.copy(route = ClientRoute.Settings) }
         assertBandUnderHeader("Back", "Automatic reconnect", settingsPadding, "Settings", contentIsControl = false)
+    }
+
+    /**
+     * The status-bar icons must always ask for the dark contrast that matches this app's fixed
+     * light window background, never the light contrast the edge-to-edge helper derives from the
+     * system night flag. The debug host applies the same window policy as the production root, so
+     * this reads the flag back from the real window's own insets controller — the same per-window
+     * request the platform is given. Nothing here claims anything about rendered pixels; the
+     * reported night mask only shows whether the run actually exercised dark mode, which is the
+     * configuration the contrast used to follow instead of the app's own background.
+     */
+    @Test
+    fun statusBarContrastFollowsTheFixedLightWindowBackgroundAndNotSystemNightMode() {
+        val window = compose.activity.window
+        val lightStatusBars = WindowCompat.getInsetsController(window, window.decorView)
+            .isAppearanceLightStatusBars
+        val nightMask = compose.activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        assertTrue(
+            "the fixed light window background always needs dark status icons: light-status flag = " +
+                "$lightStatusBars, uiMode night mask = $nightMask",
+            lightStatusBars,
+        )
     }
 
     /**

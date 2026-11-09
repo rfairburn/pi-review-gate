@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import io.github.rfairburn.pireviewgate.client.application.ClientWindow
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientRoute
@@ -31,6 +32,11 @@ class ClientActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // The window background and the app's Material palette are fixed light on every route,
+        // while enableEdgeToEdge() derives the status contrast from the system night flag: on a
+        // phone in dark mode that draws white icons over our light strip. Status contrast only —
+        // the helper keeps edge-to-edge geometry, the consumed insets and the navigation bar.
+        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = true
         val appOwner = application as PiReviewGateApplication
         setContent {
             val controller by appOwner.controller.collectAsState()

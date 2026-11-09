@@ -322,7 +322,8 @@ internal fun TerminalModifiers.bits(): Int =
     (if (ctrl) KeyboardModifiers.CTRL else 0) or (if (alt) KeyboardModifiers.ALT else 0) or
         (if (shift) KeyboardModifiers.SHIFT else 0) or (if (meta) KeyboardModifiers.META else 0)
 
-private fun TerminalKeyRequest.asRendererKey(): TerminalKey {
+/** The one Keys-panel request to renderer key mapping the fixture's real dispatch uses. */
+internal fun TerminalKeyRequest.asRendererKey(): TerminalKey {
     val bits = modifiers.bits()
     return when (key) {
         TerminalControlKey.ESCAPE -> TerminalKey(codepoint = 27, modifiers = bits)

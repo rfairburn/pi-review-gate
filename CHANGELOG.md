@@ -15,6 +15,39 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.271]
+
+### Changed
+
+- **Support Pi 1.5.1 as the managed default (#637)**: the launcher's provisioned
+  managed Pi fallback, the pinned `pi-session-host-tui` TUI dependency, the locked
+  CI Pi agent-core and full-runtime fixtures, and the current native-acceptance
+  guidance all move from Pi 1.5.0 to Pi 1.5.1. Precedence is unchanged: an explicit
+  `--pi-executable`, `PI_REVIEW_GATE_PI_BIN`, `PI_AGENT`, or npm-global/`PATH`
+  selection still wins and is never replaced by the managed default, and the
+  session-host minimum stable Pi CLI version stays 1.0.4. A managed cache recorded
+  for the previous default is no longer used implicitly for the new default, while
+  an explicit selection of that older version keeps resolving it. Pi 1.3.0, 1.4.0,
+  and 1.5.0 stay supported and audited; the bundled clipboard-provenance adapter
+  certifies 1.5.1 only after source verification that its shipped
+  `dist/utils/clipboard.js`, selection copy frames, bundled Main copy-command alias,
+  and 100,000-character encoded OSC 52 bound match the audited 1.5.0 contract, so
+  any other runtime still fails closed. Copied provenance that 1.5.1 does not change
+  is left at Pi v1.5.0: the sidebar theme colour table, the saved-session search
+  grammar, and the scrollbar geometry.
+
+### Tests
+
+- **Supply Pi 1.5.1's constructor-owned overlay state in the native host stand-ins
+  (#637)**: the interactive-mode stand-ins built with `Object.create` now provide
+  the `extensionOverlays` registry and `nextBlockingOverlayId` counter that Pi
+  1.5.1's `showExtensionCustom` overlay path writes to. Without them the popup
+  factory failed inside the host, its Escape lease never registered, and one
+  Escape cancelled the in-flight review instead of dismissing the popup. The
+  stand-ins already supplied the same class of constructor-owned dialog stack and
+  extension terminal-input subscriptions; production sessions construct the real
+  `InteractiveMode` and are unaffected.
+
 ## [0.1.0-dev.270]
 
 ### Fixed

@@ -445,11 +445,11 @@ test("the deny picker keeps fuzzy tool-name search on the native grammar", (t) =
   const agentPackage = findInstalledAgentDirs().find((path) => {
     try {
       const manifest = JSON.parse(readFileSync(join(path, "package.json"), "utf8"));
-      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.5.0";
+      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.5.1";
     } catch { return false; }
   });
   if (!agentPackage) {
-    skipOrFail(t, "no installed Pi 1.5.0 for native search grammar parity");
+    skipOrFail(t, "no installed Pi 1.5.1 for native search grammar parity");
     return;
   }
   // Reference-only import of the native selector search; production never

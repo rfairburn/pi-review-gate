@@ -1918,20 +1918,20 @@ test("saved-file deletion matches trash-first status/gone semantics and revalida
 async function loadNativeSessionSelectorSearch(
   t: TestContext,
 ): Promise<NativeSessionSelectorSearch | undefined> {
-  let reason = "no installed Pi 1.5.0 native session-selector search module is available";
+  let reason = "no installed Pi 1.5.1 native session-selector search module is available";
   for (const agentDir of findInstalledAgentDirs()) {
     try {
       const manifest = JSON.parse(await readFile(join(agentDir, "package.json"), "utf8")) as {
         name?: unknown;
         version?: unknown;
       };
-      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.5.0") continue;
+      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.5.1") continue;
       const searchModulePath = join(agentDir, "dist", "modes", "interactive", "components", "session-selector-search.js");
       if (!existsSync(searchModulePath)) continue;
       const loaded = createRequire(join(agentDir, "package.json"))(searchModulePath) as Partial<NativeSessionSelectorSearch>;
       if (typeof loaded.filterAndSortSessions === "function") return loaded as NativeSessionSelectorSearch;
     } catch {
-      reason = "the installed Pi 1.5.0 native session-selector search module could not be loaded";
+      reason = "the installed Pi 1.5.1 native session-selector search module could not be loaded";
     }
   }
   skipOrFail(t, reason);
@@ -1939,7 +1939,7 @@ async function loadNativeSessionSelectorSearch(
 }
 
 /**
- * The branded catalog's search equals the pinned Pi 1.5.0 native relevance
+ * The branded catalog's search equals the pinned Pi 1.5.1 native relevance
  * search: each field (name, id, complete message text, cwd) is matched
  * separately, ids and message text match only as exact substrings, names and
  * the working directory still match fuzzily, and the tier of the best field
@@ -1947,7 +1947,7 @@ async function loadNativeSessionSelectorSearch(
  * tests/session-host-native-search-parity.test.ts, where the fields are
  * controlled instead of living under a long fixture path.
  */
-test("branded saved catalog search matches the actual pinned Pi 1.5.0 native matcher", async (t) => {
+test("branded saved catalog search matches the actual pinned Pi 1.5.1 native matcher", async (t) => {
   const nativeSearch = await loadNativeSessionSelectorSearch(t);
   if (!nativeSearch) return;
 

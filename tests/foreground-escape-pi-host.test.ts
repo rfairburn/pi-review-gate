@@ -45,7 +45,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const agentRoot = findInstalledAgentDirs()[0]!;
   const requireHost = createRequire(join(agentRoot, "package.json"));
   const manifest = requireHost("./package.json");
-  if (manifest.version !== "1.5.0") { skipOrFail(t, "this dispatch regression requires Pi 1.5.0"); return undefined; }
+  if (manifest.version !== "1.5.1") { skipOrFail(t, "this dispatch regression requires Pi 1.5.1"); return undefined; }
   const { InteractiveMode } = requireHost("./dist/modes/interactive/interactive-mode.js");
   const themeModule = requireHost("./dist/modes/interactive/theme/theme.js");
   themeModule.setThemeInstance(REAL_IDENTITY_THEME);
@@ -64,11 +64,16 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const mode = Object.create(InteractiveMode.prototype);
   mode.ui = screen;
   mode.keybindings = keybindings;
-  // Object.create skips InteractiveMode's class-field initializers. Pi 1.5.0
-  // setCustomEditorComponent reads this.extensionDialogs.length, so the stand-in
-  // must supply the constructor-owned dialog stack a real mode always has; this
-  // test's popup is a ui.showOverlay, which never pushes an editor-slot dialog.
+  // Object.create skips InteractiveMode's class-field initializers. Pi 1.5.1
+  // setCustomEditorComponent reads this.extensionDialogs.length, and Pi 1.5.1's
+  // showExtensionCustom overlay path registers every handle in this
+  // extensionOverlays (with nextBlockingOverlayId numbering a blocked overlay),
+  // so the stand-in must supply the constructor-owned state a real mode always
+  // has; this test's popup is a ui.showOverlay, which never pushes an
+  // editor-slot dialog.
   mode.extensionDialogs = [];
+  mode.extensionOverlays = new Map();
+  mode.nextBlockingOverlayId = 0;
   mode.extensionTerminalInputSubscriptions = new Set();
   mode.editorContainer = new tui.Container();
   mode.defaultEditor = new agent.CustomEditor(screen, themeModule.getEditorTheme(), keybindings);

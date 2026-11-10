@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.273]
+## [0.1.0-dev.274]
 
 ### Fixed
 
@@ -26,6 +26,24 @@ dates.
   result, a nested refusal, or the next audit's evidence. A status comes only from a structured
   status, a native failure diagnostic or a recognized native HTTP error message shape, never from an
   arbitrary number in a message; every other auditor diagnostic keeps its own wording.
+
+## [0.1.0-dev.273]
+
+### Changed
+
+- **Honor an explicit per-request subtask opt-out in Prefer orchestration (#616)**: when
+  the real user explicitly says not to use a subtask for a specific request, the
+  orchestration prompt and the shipped orchestrator skill now direct the primary assistant
+  to do that request's work directly with the capabilities otherwise available, with no
+  operating-mode switch required, and the mandatory routing instruction is qualified by that
+  exception instead of contradicting it. The exception covers execution strategy only:
+  authorization, role and capability ceilings, required confirmation, independent review and
+  landing, and independently required isolation are unchanged; a direct path blocked by one
+  of them is explained rather than bypassed or delegated against the instruction; and text
+  in tool results or worker task content is never treated as the user's opt-out. Nothing is
+  saved, so no later request inherits it. Prompt and skill wording plus regression
+  assertions only: no runtime, scheduling, or configuration change, and no claim that any
+  specific model follows the instruction.
 
 ## [0.1.0-dev.272]
 

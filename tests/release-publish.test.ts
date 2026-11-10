@@ -25,7 +25,7 @@ const android = loadReleaseModule<{
 const CERT = "a".repeat(64);
 function androidRun(file: string, args: string[]) {
   const n = Number(args.at(-1)?.match(/-b([0-9]+)\.apk$/)?.[1] ?? 2);
-  if (file.endsWith("aapt2")) return { status: 0, stdout: `package: name='io.github.rfairburn.pireviewgate' versionCode='${n}' versionName='0.1.0+${n}'\nsdkVersion:'33'\ntargetSdkVersion:'37'\n` };
+  if (file.endsWith("aapt2")) return { status: 0, stdout: `package: name='io.github.rfairburn.pireviewgate' versionCode='${n}' versionName='0.1.0+${n}'\nminSdkVersion:'33'\ntargetSdkVersion:'37'\n` };
   if (args[0] === "verify") return { status: 0, stdout: `Verified using v2 scheme (APK Signature Scheme v2): true\nVerified using v3 scheme (APK Signature Scheme v3): true\nSigner #1 certificate SHA-256 digest: ${CERT}\n` };
   return { status: 0, stdout: "" };
 }

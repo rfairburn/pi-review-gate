@@ -1490,9 +1490,8 @@ Leaving or changing that picker cancels this read continuation, not the reported
 Delete outcome. Prepare-only, refused, unconfirmed, and uncertain outcomes do not
 trigger it, and Delete is never retried. Canceling the post-delete read retires its
 pending status without issuing another request; late replies cannot revive it.
-This is part of the experimental
-[Android phone client](#android-phone-client-experimental) behavior described later
-on this page.
+This is part of the [Android application](#android-application) behavior described
+later on this page.
 
 **Fences and outcomes.** Requests come from the picker frame, or confirmation, that the
 writer actually wrote. Resume and delete-prepare need the written picker; a confirmed
@@ -1511,12 +1510,15 @@ regranted, reconnected, or claimed cancelled automatically. Refusals and uncerta
 appear as brief, fixed, non-modal notices without raw errors or payloads, and they
 never steal focus.
 
-### Android phone client (experimental)
+### Android application
 
-The Android client remains experimental: it is not daily-use or release-ready, and
-device and runtime acceptance remain pending. This phase is
-client-only and changes no production host, backend, or protocol behavior. It includes
-the Saved delete refresh above.
+The Android application is the phone client for this session host. It connects directly to a
+host that has hosting turned on and shows that host's roster, session cards, Saved picker, and
+terminal; it runs no Pi session, worker, or hosting on the phone. The application is client-only and
+changes no production host, backend, or protocol behavior. Its device and runtime acceptance is
+incomplete: real-host Saved full-catalog, search, resume, network, and lifecycle acceptance is
+not established, and no full parity with the desktop sidebar or daily-use certification is
+claimed. It includes the Saved delete refresh above.
 
 **Terminal input.** A single-finger tap on the terminal delivers one clean host
 left-click and does not open the IME. A real drag still reaches the host as
@@ -1524,6 +1526,19 @@ selection/drag input, a two-finger vertical swipe still produces the owner's own
 reports, and the existing committed-frame, ownership, focus, and input fences remain
 unchanged. Stream retirement handles late internal notifications without abandoning
 accepted input settlements.
+
+**Immediate-send correction context.** Terminal input leaves immediately, so the keyboard had
+nothing to read back when the user corrected the current word. Each terminal input connection
+now keeps a bounded record of the text it actually handed off, and the input method reads that
+back as the text just before the remote cursor. A committed correction to a word that was
+already sent sends only the changed suffix: backspaces for the differing code points, then the
+new text. Nothing is invented — no injected Space, Enter, or cursor movement, and no retyped
+earlier word — and the user's own Space and Enter keep working. Text that never left the phone
+is never deleted remotely. What the connection remembers is an assumption about the remote
+line, not proof of what the host applied: a submitted write is still only a transport handoff.
+Non-ledger input or context changes retire the assumed text context, and a composition that
+re-marks already-sent text is then dropped rather than edited. Keyboard flags, ordering, proof,
+and lifecycle fences are unchanged.
 
 **Create and Close.** Create submits once from the exact drawn form. After the
 correlated owner `started` answer, the client closes only that exact form and may
@@ -1534,6 +1549,16 @@ owner row. When the owner actually answers `CONFIRMATION_REQUIRED`, the phone cl
 opens a distinct second confirmation entirely in its own UI. It never automatically
 resends `confirmed = true`, requires no desktop step, and performs no optimistic row
 removal or Saved-conversation deletion.
+
+**Rename.** A Rename is addressed to the row's stable native identity — host, owner run, and
+row id, fenced by that row's native conversation id and epoch — not to ordinary mutable roster
+metadata such as the roster revision or the title the last frame drew. A roster republish while
+the form is open therefore no longer makes a deliberate Rename unsubmitable, while the
+connection, the acknowledged rename capability, the current roster, the exact owner run, the
+row's presence and liveness, and the native tuple still admit or refuse it. Only the owner's
+positive `RENAMED` answer closes the submitted form, and only that exact form: nothing renames
+a row optimistically, retargets it to another row, or retries, and a row whose native
+conversation moved is refused rather than renamed elsewhere.
 
 **Session cards.** A compact card title is one line and width-ellipsized; the full
 title stays available in details and accessibility text. Cards show the delivered
@@ -1554,8 +1579,9 @@ Open/closed overlay state, modifier latches, and dismissed status notices are no
 persisted: they live only as long as one instance of the terminal screen, so a rotation
 keeps an open Keys panel and a dismissed notice exactly as they are, while leaving the
 terminal and entering it again — or restarting the app — starts closed with nothing
-dismissed. Existing Back/reset behavior remains, and no new keyboard
-implementation is added.
+dismissed. Existing Back/reset behavior remains, and no new input method is added: the
+terminal's own input connection only tracks the text it handed off (see
+**Immediate-send correction context** above).
 
 **Keys docking.** The Keys panel has one two-state layout per orientation, remembered in
 the same cosmetic placement document as its position. Docked — the default — it is a real
@@ -1607,6 +1633,21 @@ rotation, a keyboard change, and an ordinary frame save nothing and never normal
 remembered value. Position and remembered size survive docking. There is no docked-height
 control, no automatic collapse, and no new persistence field.
 
+**Fresh predictive context.** Every on-screen Keys key and every accepted paste ask the input
+method once for fresh predictive context, immediately after their own accepted handoff in that
+same press — no release, round trip, or timer is waited for, and a refused key or paste asks
+nothing. Releasing a Ctrl, Alt, or Shift chip asks the same thing whether or not the hold typed
+anything and whether or not another chip stays lit; one action that releases several chips asks
+exactly once. The ask is an input invalidation only: it sends no text and no keystroke, and it
+is made only while the live, eligible connection still belongs to this surface and no known
+composition is still unsent. The application does not flush or discard unsent composition to
+force a refresh. Whether the keyboard then replaces its suggestions stays the platform's
+and the input method's decision, and an input-method command already queued to this app can be
+dropped by that handling. Ordinary input-method typing, hardware keys, and lifecycle clearing
+ask nothing. `More keys` and `Fewer keys` add no ask of their own, while their existing terminal
+retirement and any real geometry change can still restart the input context; that is unchanged
+here.
+
 **Saved first reply timeout.** The phone client's Settings screen accepts a positive
 finite whole number of seconds for the Saved first reply, default 60. New LIST and
 SEARCH requests capture the setting when issued, including the automatic refresh after
@@ -1631,6 +1672,12 @@ document, and a failed save publishes nothing. It changes presentation only: inp
 delivery, clipboard, storage, trust, identity, and proof behavior are unchanged, and no
 notice producer is reset, cleared, filtered, or replayed. Soft-keyboard visibility and
 the Keys dock layout are separate concerns from this flag.
+
+**Status-bar contrast.** The window background and the app's palette are fixed light on every
+route, so dark status-bar icons are now requested explicitly instead of contrast being derived
+from the system night flag, which could draw light icons over the light strip on a phone in dark
+mode. Status-bar icon contrast only: system bar colors, navigation, edge-to-edge geometry, and
+the consumed insets are unchanged.
 
 ## Focus, display, and status
 

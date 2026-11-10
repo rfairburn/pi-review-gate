@@ -64,6 +64,13 @@ receipts of exactly what the model was told.
   error state), a remote card's owner hostname uses Pi's cyan, and the
   active conversation remains marked while browsing the sidebar
   ([Session host](docs/session-host-alpha.md)).
+- **Android application** — a native Pi Review Gate app for Android 13 (API 33) and newer that
+  connects directly to a session host with hosting turned on, showing that host's roster,
+  session cards, Saved picker, and terminal; nothing but the client runs on the phone.
+  Android-enabled numbered prereleases publish it beside the Node package as the
+  `pi-review-gate-bN.apk` asset
+  ([Android application](docs/session-host-alpha.md#android-application),
+  [Releases](docs/releases.md)).
 - **`ApplyPatch` tool** — the canonical OpenAI/Codex apply_patch envelope as its only
   request format (multi-file create/update/rename/delete with sequential application and
   explicit partial-failure reporting), native edit/write path access, atomic staged

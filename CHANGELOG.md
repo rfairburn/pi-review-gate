@@ -27,7 +27,7 @@ dates.
 
 ### Changed
 
-- **Experimental Android phone feedback (#508)**: terminal taps send clean host
+- **Android application (#508)**: terminal taps send clean host
   left-clicks without opening the keyboard; drag, selection, wheel input, and proof
   fences remain. Retiring a terminal stream handles late notifications without
   abandoning input settlements. Create closes its exact form after owner-confirmed `started` and
@@ -105,12 +105,45 @@ dates.
   nothing. It is presentation only: input, source/frame commit, coverage, focus, ABA,
   selection, grid, protocol, receipt, delivery, cancellation, no-retry, and clipboard
   behavior are unchanged, and no notice producer is reset, cleared, or replayed.
+- **Android keeps the keyboard's current-word correction usable after immediate send
+  (#508)**: each terminal input connection now keeps a bounded record of the text it actually
+  handed off, and the input method reads it back as the text just before the remote cursor. A
+  committed correction to a word already sent sends only the changed suffix — backspaces for the
+  differing code points, then the new text. No Space, Enter, or cursor movement is injected and
+  no earlier word is retyped, while the user's own Space and Enter still work, and text that
+  never left the phone is never deleted remotely. The remembered text is an assumption about the
+  remote line, never proof of what the host applied, and non-ledger input or context changes
+  retire the assumed text context. Keyboard flags, ordering, proof, and lifecycle fences are
+  unchanged.
+- **Android asks the input method for fresh predictive context (#508)**: every on-screen Keys
+  key and accepted paste, and each Ctrl, Alt, or Shift chip the user releases, ask once. A Keys
+  key or paste asks immediately after its own accepted handoff in the same press — a refused key
+  or paste asks nothing — while a released chip needs no accepted handoff, asks even when another
+  chip stays lit, and asks once per user action. The ask sends no text and is skipped unless the
+  live eligible connection still belongs to this surface and no known composition is still
+  unsent. The app does not flush text the user is correcting to force a refresh. Whether the keyboard changes its
+  suggestions stays the platform's and the input method's decision, and an input-method command
+  already queued to the app can be dropped by that handling. Ordinary input-method typing,
+  hardware keys, and lifecycle clearing ask nothing; `More keys` and `Fewer keys` add no ask of
+  their own, while their existing terminal retirement and a real geometry change can still
+  restart the input context, unchanged here.
 
 ### Fixed
 
 - Android Saved now requests one fresh List after an exact confirmed successful
   Delete on the still-current picker (#508). Old rows remain non-actionable until
   the owner's complete result arrives; refusal or uncertainty never triggers a retry.
+- Android Rename now stays addressed to its own row (#508): submission is fenced by the row's
+  stable native identity — host, owner run, and row id, with that row's native conversation id
+  and epoch as the real fence — rather than the roster revision or the last-drawn title, so an
+  ordinary roster republish while the form is open no longer blocks a deliberate Rename. Only
+  the owner's positive `RENAMED` closes the submitted form; nothing renames a row optimistically,
+  retargets it, or retries, and a changed native conversation is still refused.
+- Android status-bar icons stay readable against the app's fixed light window (#508): dark
+  status-bar icons are requested explicitly instead of contrast being derived from the system night
+  flag, which could draw light icons over the light strip on a phone in dark mode. Icon contrast
+  only — system bar colors, navigation, edge-to-edge geometry, and the consumed insets are
+  unchanged.
 
 ## [0.1.0-dev.264]
 

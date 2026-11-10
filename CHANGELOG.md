@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.268]
+
+### Tests
+
+- **Synchronize the Android bounded-retirement settlement test (#508)**: wait within the
+  existing bounded harness budget for the asynchronously collected create-settlement event,
+  then retain the `Unknown` outcome assertion. Check `DETACHED` and zero armed deadlines
+  before that wait, preserving their return-time guarantees. The 1 ms retirement grace,
+  cleanup, shared harness and production behavior are unchanged. This corrects a test-side
+  synchronization gap; the retained CI summary does not establish the exact failed assertion.
+
 ## [0.1.0-dev.267]
 
 ### Fixed

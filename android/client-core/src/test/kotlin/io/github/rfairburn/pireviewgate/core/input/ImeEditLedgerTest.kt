@@ -245,12 +245,236 @@ class ImeEditLedgerTest {
 		assertEquals("ab ", ledger.knownText)
 		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
 		ledger.send(ledger.setComposingRegion(0, 2))
-		// Shrinking a re-marked word sends nothing until it is kept.
-		assertEquals(0 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		// Shrinking a re-marked word past its sent tail deletes what fell out at once. The
+		// backspace is a keystroke the input method already consumed locally: deferred, it is
+		// lost outright when the composition ends at Enter, at a floor, or with a key.
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
 		assertEquals("a", ledger.composingText)
-		assertEquals(2, ledger.remarkedLength)
-		assertEquals(1 to "", ledger.send(ledger.finishComposingText()))
+		assertEquals("the composition covers exactly the tail that is still sent", 1, ledger.remarkedLength)
+		// The deletion already left, so keeping the composition sends nothing more for it.
+		assertEquals(0 to "", ledger.send(ledger.finishComposingText()))
 		assertEquals("a", ledger.knownText)
+	}
+
+	@Test
+	fun `an explicit backspace on a re-marked sent word leaves once and is never lost or repeated`() {
+		val ledger = typed("dont")
+		ledger.send(ledger.setComposingRegion(0, 4))
+		assertEquals(4, ledger.remarkedLength)
+		// One backspace, no text, no Space, no Enter, nothing retyped.
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("don", ledger.knownText)
+		assertEquals("don", ledger.composingText)
+		assertEquals("don", ledger.document)
+		assertEquals("don", ledger.textBeforeCursor(10))
+		assertEquals(3, ledger.remarkedLength)
+		// Keeping the composition now owes nothing: the deletion is not sent twice.
+		assertEquals(0 to "", ledger.send(ledger.finishComposingText()))
+		assertEquals("don", ledger.knownText)
+		assertFalse(ledger.hasComposition)
+	}
+
+	@Test
+	fun `shrinking a re-marked tail leaves the earlier word and its spacing alone`() {
+		val ledger = typed("ab cd")
+		ledger.send(ledger.setComposingRegion(3, 5))
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("ab c", ledger.knownText)
+		assertEquals("ab c", ledger.document)
+		assertEquals("ab c", ledger.textBeforeCursor(10))
+		assertEquals(1, ledger.remarkedLength)
+		// The Enter route drops the composition; the shortened line is what stays sent.
+		ledger.dropComposition()
+		assertFalse(ledger.hasComposition)
+		assertEquals("ab c", ledger.document)
+	}
+
+	@Test
+	fun `deleting only what a re-marked composition grew past the sent tail sends nothing`() {
+		val ledger = typed("dont")
+		ledger.send(ledger.setComposingRegion(0, 4))
+		assertEquals(0 to "", ledger.send(ledger.setComposingText("donts")))
+		assertEquals("donts", ledger.composingText)
+		assertEquals(4, ledger.remarkedLength)
+		// The grown 's' was never sent: deleting it sends nothing and the sent tail stays.
+		assertEquals(0 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("dont", ledger.knownText)
+		assertEquals("dont", ledger.composingText)
+		assertEquals(4, ledger.remarkedLength)
+		// The next backspace reaches the sent word and leaves as one backspace.
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("don", ledger.knownText)
+		assertEquals(3, ledger.remarkedLength)
+	}
+
+	@Test
+	fun `a candidate that shrinks the composition keeps deferring until the composition ends`() {
+		val ledger = typed("dont")
+		ledger.send(ledger.setComposingRegion(0, 4))
+		// A candidate is text the input method may still change, not a keystroke: nothing
+		// leaves while it composes, and the shortened word is taken from K when it ends.
+		assertEquals(0 to "", ledger.send(ledger.setComposingText("don")))
+		assertEquals("dont", ledger.knownText)
+		assertEquals("don", ledger.composingText)
+		assertEquals(1 to "", ledger.send(ledger.finishComposingText()))
+		assertEquals("don", ledger.knownText)
+	}
+
+	@Test
+	fun `a floor after the shrink neither repeats nor discards the deletion that already left`() {
+		val ledger = typed("dont")
+		ledger.send(ledger.setComposingRegion(0, 4))
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		val generation = ledger.generation
+		ledger.floor()
+		assertEquals(generation + 1, ledger.generation)
+		assertFalse(ledger.hasComposition)
+		assertEquals("", ledger.knownText)
+		// A fresh context invents nothing for a word it no longer knows.
+		assertTrue(ledger.deleteBefore(1, inCodePoints = false)!!.let { it.deletions == 1 && it.text.isEmpty() })
+		assertEquals(0 to "ok", ledger.send(ledger.commitText("ok")))
+		assertEquals("ok", ledger.knownText)
+	}
+
+	@Test
+	fun `shrinking a re-marked word across a surrogate pair deletes whole characters in either unit`() {
+		// The emoji is two UTF-16 units and one remote character: one backspace, counted right.
+		typed("a$face").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 3))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = true)))
+			assertEquals("a", ledger.knownText)
+			assertEquals("a", ledger.composingText)
+			assertEquals("a", ledger.document)
+		}
+		typed("a$face").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 3))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals("a", ledger.knownText)
+			assertEquals("a", ledger.document)
+		}
+		// Only the trailing character falls out. The pair stays covered whole and unsplit.
+		typed("$face" + "b").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 3))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals(face, ledger.knownText)
+			assertEquals(face, ledger.composingText)
+			assertEquals(face, ledger.document)
+			assertEquals("reading back never splits the pair", face, ledger.textBeforeCursor(2))
+		}
+		// A count that bisects the pair takes the whole character and empties the composition.
+		typed(face).let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 2))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals("", ledger.knownText)
+			assertFalse(ledger.hasComposition)
+		}
+	}
+
+	@Test
+	fun `a candidate that changed scalar widths is deleted by one backspace, not by its width`() {
+		// The candidate "xab" re-marks the sent "😀ab": fewer UTF-16 units, same code points.
+		// Its own change stays deferred, and one backspace deletes one sent character.
+		typed("${face}ab").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 4))
+			assertEquals(0 to "", ledger.send(ledger.setComposingText("xab")))
+			assertEquals("${face}ab", ledger.knownText)
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals("${face}a", ledger.knownText)
+			assertEquals("xa", ledger.composingText)
+			assertEquals("xa", ledger.document)
+			// The candidate's own change is still owed, and only now that it is committed.
+			assertEquals(2 to "xa", ledger.send(ledger.finishComposingText()))
+			assertEquals("xa", ledger.knownText)
+		}
+		typed("${face}ab").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 4))
+			ledger.send(ledger.setComposingText("xab"))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = true)))
+			assertEquals("${face}a", ledger.knownText)
+			assertEquals("xa", ledger.composingText)
+		}
+		// A candidate whose units are shorter than the sent pair's: the backspace is not lost.
+		typed("${face}b").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 3))
+			assertEquals(0 to "", ledger.send(ledger.setComposingText("ab")))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals(face, ledger.knownText)
+			assertEquals("a", ledger.composingText)
+			assertEquals("a", ledger.document)
+		}
+		typed("${face}b").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 3))
+			ledger.send(ledger.setComposingText("ab"))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = true)))
+			assertEquals(face, ledger.knownText)
+			assertEquals("a", ledger.composingText)
+		}
+		// The other direction: a candidate wider than the sent text in UTF-16 units.
+		typed("ab").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 2))
+			assertEquals(0 to "", ledger.send(ledger.setComposingText("${face}b")))
+			assertEquals("ab", ledger.knownText)
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+			assertEquals("a", ledger.knownText)
+			assertEquals(face, ledger.composingText)
+			assertEquals(face, ledger.document)
+			assertEquals(face, ledger.textBeforeCursor(4))
+		}
+		typed("ab").let { ledger ->
+			ledger.send(ledger.setComposingRegion(0, 2))
+			ledger.send(ledger.setComposingText("${face}b"))
+			assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = true)))
+			assertEquals("a", ledger.knownText)
+			assertEquals(face, ledger.composingText)
+		}
+	}
+
+	@Test
+	fun `a deletion never flushes the deferred change a candidate left behind`() {
+		val ledger = typed("dont")
+		ledger.send(ledger.setComposingRegion(0, 4))
+		assertEquals(0 to "", ledger.send(ledger.setComposingText("do")))
+		assertEquals("dont", ledger.knownText)
+		// One keystroke, one backspace: the candidate's shorter text is not sent along with it.
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("don", ledger.knownText)
+		assertEquals("d", ledger.composingText)
+		// Emptying the composition must not flush the candidate's earlier deferred change.
+		assertEquals(1 to "", ledger.send(ledger.deleteBefore(1, inCodePoints = false)))
+		assertEquals("do", ledger.knownText)
+		assertTrue(ledger.finishComposingText().sendsNothing)
+	}
+
+	@Test
+	fun `emptying a shortened candidate emits only the explicit deletion in either unit`() {
+		for (inCodePoints in listOf(false, true)) {
+			val ledger = typed("dont")
+			ledger.send(ledger.setComposingRegion(0, 4))
+			assertEquals(0 to "", ledger.send(ledger.setComposingText("do")))
+			assertEquals(2 to "", ledger.send(ledger.deleteBefore(2, inCodePoints)))
+			assertEquals("do", ledger.knownText)
+			assertFalse(ledger.hasComposition)
+			assertTrue(ledger.finishComposingText().sendsNothing)
+			ledger.dropComposition()
+			assertEquals("do", ledger.document)
+		}
+	}
+
+	@Test
+	fun `deleting past a shortened candidate does not flush its deferred change`() {
+		for (inCodePoints in listOf(false, true)) {
+			for (prefix in listOf("", "ab ")) {
+				val ledger = typed(prefix + "dont")
+				ledger.send(ledger.setComposingRegion(prefix.length, prefix.length + 4))
+				assertEquals(0 to "", ledger.send(ledger.setComposingText("do")))
+				assertEquals(3 to "", ledger.send(ledger.deleteBefore(3, inCodePoints)))
+				assertEquals(prefix + "d", ledger.knownText)
+				assertFalse(ledger.hasComposition)
+				assertTrue(ledger.finishComposingText().sendsNothing)
+				ledger.dropComposition()
+				assertEquals(prefix + "d", ledger.document)
+			}
+		}
 	}
 
 	@Test

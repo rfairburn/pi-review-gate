@@ -113,8 +113,11 @@ dates.
   no earlier word is retyped, while the user's own Space and Enter still work, and text that
   never left the phone is never deleted remotely. The remembered text is an assumption about the
   remote line, never proof of what the host applied, and non-ledger input or context changes
-  retire the assumed text context. Keyboard flags, ordering, proof, and lifecycle fences are
-  unchanged.
+  retire the assumed text context. Explicit backspaces into re-marked, already-sent text leave
+  once when requested rather than being lost when Enter or another key retires the composition.
+  Uncommitted candidate changes remain deferred, and deletions follow code-point boundaries even
+  when a candidate changes UTF-16 widths. Keyboard flags, ordering, proof, and lifecycle fences
+  are unchanged.
 - **Android asks the input method for fresh predictive context (#508)**: every on-screen Keys
   key and accepted paste, and each Ctrl, Alt, or Shift chip the user releases, ask once. A Keys
   key or paste asks immediately after its own accepted handoff in the same press — a refused key

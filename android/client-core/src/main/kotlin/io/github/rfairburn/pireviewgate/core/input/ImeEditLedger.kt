@@ -238,6 +238,17 @@ class ImeEditLedger {
 	 * the known text passes through unchanged as before: that many backspaces for text the
 	 * ledger never knew.
 	 *
+	 * When the composition absorbs the whole deletion but no longer covers as much of the
+	 * re-marked tail of K as it did, the code points this deletion took out of that tail were
+	 * already sent. They leave now, one backspace each, so the deletion cannot be lost when
+	 * the composition later ends without a commit. Never more than this one deletion removed,
+	 * and never a composition's own UTF-16 length read as an offset into K: a candidate that
+	 * changed the composition's scalar widths keeps its own debt deferred, and deleting only
+	 * what the composition had grown past the sent tail still sends nothing.
+	 * A deletion that reaches past such a composition answers the same way: what leaves is
+	 * this request's own share — the composition's code points, the known prefix it consumed,
+	 * and the remainder the ledger never knew — and the rest of K stays believed sent.
+	 *
 	 * Null while a selection is active. The platform deletes before the selection start,
 	 * not at the cursor, and reaching that text would mean deleting the selection remotely
 	 * and retyping it. That is not supported, so nothing changes and the selection stays.
@@ -247,6 +258,8 @@ class ImeEditLedger {
 		if (selectionStart >= 0) return null
 		val wasComposing = hasComposition
 		val prefixEnd = if (wasComposing) composeStart else known.length
+		val composingBefore = composition.composingText
+		val composingPointsBefore = composingBefore.codePointCount(0, composingBefore.length)
 		val remainder = if (inCodePoints) {
 			composition.deleteSurroundingInCodePoints(count, 0)
 		} else {
@@ -254,7 +267,8 @@ class ImeEditLedger {
 		}
 		if (remainder <= 0) {
 			val doc = known.substring(0, prefixEnd) + composition.composingText
-			return plan(doc, if (composition.hasComposition) prefixEnd else -1)
+			val start = if (composition.hasComposition) prefixEnd else -1
+			return plan(doc, start, composingPointsBefore = composingPointsBefore)
 		}
 		val prefix = known.substring(0, prefixEnd)
 		val keptPrefix: String
@@ -276,6 +290,27 @@ class ImeEditLedger {
 		} else {
 			keptPrefix = ""
 			unknown = remainder - prefix.length
+		}
+		val current = known.toString()
+		if (wasComposing &&
+			composingPointsBefore < current.codePointCount(prefixEnd, current.length)
+		) {
+			// Consume this request, not the candidate's earlier deferred deletion.
+			val deletions = (composingPointsBefore.toLong() +
+				prefix.codePointCount(keptPrefix.length, prefix.length) + unknown)
+				.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+			val knownPoints = current.codePointCount(0, current.length)
+			val keep = current.offsetByCodePoints(current.length, -minOf(deletions, knownPoints))
+			return ImeEditPlan(
+				deletions = deletions,
+				text = "",
+				known = current.substring(0, keep),
+				composeStart = 0,
+				composing = "",
+				unknownDeletions = (deletions - knownPoints).coerceAtLeast(0),
+				generation = generation,
+				noChange = false,
+			)
 		}
 		return plan(keptPrefix, -1, unknown)
 	}
@@ -387,12 +422,51 @@ class ImeEditLedger {
 	 * and the composition re-marks the rest of K. Otherwise the shared code-point prefix
 	 * stays, every later known code point gets one backspace, and the rest of the target
 	 * is typed. [unknownDeletions] backspaces for text before K are added unchanged.
+	 *
+	 * [composingPointsBefore] is the composition's code-point count as an explicit deletion
+	 * found it, and only [deleteBefore] supplies it: every other writer, including a candidate
+	 * replacement, passes -1 and keeps deferring exactly as before. When that deletion left the
+	 * composition covering fewer of the re-marked tail's code points than it covered before,
+	 * the difference was already sent and leaves now, one backspace each, so the keystroke
+	 * cannot be lost when the composition later ends without a commit. It is never more than
+	 * this deletion removed, and the mapping goes through K's own code-point boundaries rather
+	 * than reading the composition's UTF-16 length as an offset into K, so a candidate that
+	 * changed the composition's scalar widths is neither over-deleted nor split across a
+	 * surrogate pair, and that candidate's own change stays deferred. A deletion that empties
+	 * the composition is answered the same way rather than by the whole-tail diff below:
+	 * what leaves is still only this keystroke's share, and the rest of K stays believed sent.
 	 */
-	private fun plan(newDocument: String, newComposeStart: Int, unknownDeletions: Int = 0): ImeEditPlan {
+	private fun plan(
+		newDocument: String,
+		newComposeStart: Int,
+		unknownDeletions: Int = 0,
+		composingPointsBefore: Int = -1,
+	): ImeEditPlan {
 		val committed = if (newComposeStart < 0) newDocument else newDocument.substring(0, newComposeStart)
 		val composing = if (newComposeStart < 0) "" else newDocument.substring(newComposeStart)
 		val current = known.toString()
-		if (unknownDeletions == 0 && composing.isNotEmpty() && current.startsWith(committed)) {
+		if (unknownDeletions == 0 &&
+			(composing.isNotEmpty() || composingPointsBefore >= 0) && current.startsWith(committed)
+		) {
+			if (composingPointsBefore >= 0) {
+				val sentTailPoints = current.codePointCount(committed.length, current.length)
+				val coveredBefore = minOf(composingPointsBefore, sentTailPoints)
+				val coveredNow = minOf(composing.codePointCount(0, composing.length), sentTailPoints)
+				val fallenOut = coveredBefore - coveredNow
+				if (fallenOut > 0) {
+					val keep = current.offsetByCodePoints(current.length, -fallenOut)
+					return ImeEditPlan(
+						deletions = fallenOut,
+						text = "",
+						known = current.substring(0, keep),
+						composeStart = committed.length,
+						composing = composing,
+						unknownDeletions = 0,
+						generation = generation,
+						noChange = false,
+					)
+				}
+			}
 			return ImeEditPlan(0, "", current, committed.length, composing, 0, generation, noChange = false)
 		}
 		val shared = commonPrefix(current, committed)

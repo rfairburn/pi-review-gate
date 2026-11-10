@@ -920,6 +920,83 @@ class TerminalSurfaceComponentTest {
         }
     }
 
+    /**
+     * A backspace that shrinks a re-marked word the connection already sent leaves as exactly
+     * one backspace, and stays effective when that composition later ends by the input method's
+     * own Enter or by a foreign key that makes the ledger forget its context. Nothing is
+     * flushed, retyped, or repeated, no earlier word is touched, and deleting only what the
+     * composition grew past the sent word still sends nothing.
+     */
+    @Test fun explicitBackspaceOnAReMarkedSentWordLeavesOnceAndSurvivesEnterAndForeignInput() {
+        val fixture = terminalFixture(sourced = true)
+        compose.setContent { fixture.Content() }
+        val proof = awaitInput(fixture)
+        val connection = newConnection(fixture)
+        val face = "\uD83D\uDE00"
+        compose.runOnIdle {
+            val surface = fixture.surface!!
+            // "dont" is sent, then re-marked by the input method, which sends nothing.
+            assertTrue(connection.commitText("dont", 1))
+            val end = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(end - 4, end))
+            fixture.packets.clear()
+            assertTrue(connection.deleteSurroundingText(1, 0))
+            assertEquals("one backspace, no text, no Space, no Enter", listOf("<BS>"), transcript(fixture, proof))
+            assertEquals("don", connection.contextText)
+            assertEquals("don", connection.composingText)
+            assertEquals("don", connection.getTextBeforeCursor(10, 0).toString())
+            assertEquals("the composition covers exactly the shortened sent tail",
+                listOf(end - 1, end - 1, end - 4, end - 1), connection.reportedSelection)
+            fixture.packets.clear()
+            assertTrue(connection.performEditorAction(EditorInfo.IME_ACTION_DONE))
+            assertEquals(listOf("<ENTER>"), transcript(fixture, proof))
+            assertEquals("", connection.composingText)
+            assertEquals("Enter starts a new context", "", connection.getTextBeforeCursor(10, 0).toString())
+            fixture.packets.clear()
+            assertTrue(connection.commitText("dont", 1))
+            fixture.packets.clear()
+            val at = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(at - 4, at))
+            assertTrue(connection.deleteSurroundingTextInCodePoints(1, 0))
+            assertEquals(listOf("<BS>"), transcript(fixture, proof))
+            assertEquals("don", connection.contextText)
+            fixture.packets.clear()
+            val tab = requireNotNull(KeyboardEncoder.encode(TerminalKey(codepoint = 9), proof.modes))
+            assertTrue(surface.submitKey(TerminalKey(codepoint = 9)))
+            assertArrayEquals(tab, fixture.packets.single().bytes)
+            fixture.packets.clear()
+            assertTrue(connection.commitText("x", 1))
+            assertEquals(listOf("x"), transcript(fixture, proof))
+            assertEquals("x", connection.contextText)
+            assertEquals("", connection.composingText)
+            fixture.packets.clear()
+            assertTrue(connection.commitText("dont", 1))
+            val word = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(word - 4, word))
+            assertTrue(connection.setComposingText("donts", 1))
+            fixture.packets.clear()
+            assertTrue(connection.deleteSurroundingText(1, 0))
+            assertEquals("the unsent extension is not a remote deletion", 0, fixture.packets.size)
+            // Only the unsent "s" went. Everything believed sent, including the "x" the
+            // foreign key left behind, stays sent: the prefix is never rewritten.
+            assertEquals("xdont", connection.contextText)
+            assertEquals("dont", connection.composingText)
+            assertTrue(connection.performEditorAction(EditorInfo.IME_ACTION_DONE))
+            assertEquals(listOf("<ENTER>"), transcript(fixture, proof))
+            fixture.packets.clear()
+            assertTrue(connection.commitText("a$face", 1))
+            val tail = cursorOf(connection)
+            assertTrue(connection.setComposingRegion(tail - 3, tail))
+            fixture.packets.clear()
+            assertTrue(connection.deleteSurroundingTextInCodePoints(1, 0))
+            assertEquals(listOf("<BS>"), transcript(fixture, proof))
+            assertEquals("a", connection.contextText)
+            assertEquals("a", connection.composingText)
+            assertEquals("a", connection.getTextBeforeCursor(10, 0).toString())
+            assertEquals(0, requireNotNull(connection.editable).length)
+        }
+    }
+
     @Test fun imeLedgerCommitCeilingAppliesToTheSuppliedTextNotOnlyItsDiff() {
         val fixture = terminalFixture(sourced = true)
         compose.setContent { fixture.Content() }

@@ -195,7 +195,9 @@ async function installSdk({ platform = false, env = process.env, fetchImpl = glo
   const sdkmanager = path.join(commands, "22.0", "bin", "sdkmanager");
   const sdkEnv = { ...env, ANDROID_HOME: home, ANDROID_SDK_ROOT: home, ANDROID_USER_HOME: path.join(env.RUNNER_TEMP, "android-user") };
   run(sdkmanager, ["--licenses"], { env: sdkEnv, input: "y\n".repeat(100) });
-  run(sdkmanager, ["build-tools;37.0.0", ...(platform ? ["platforms;android-37"] : [])], { env: sdkEnv });
+  // sdkmanager package identifiers are the vendor's exact strings: the API 37
+  // platform package is 'platforms;android-37.0', so the bare path is refused.
+  run(sdkmanager, ["build-tools;37.0.0", ...(platform ? ["platforms;android-37.0"] : [])], { env: sdkEnv });
   fs.appendFileSync(env.GITHUB_ENV, `ANDROID_HOME=${home}\nANDROID_SDK_ROOT=${home}\nANDROID_USER_HOME=${sdkEnv.ANDROID_USER_HOME}\n`);
 }
 async function checkArtifact({ env = process.env, fetchImpl = globalThis.fetch }) {

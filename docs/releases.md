@@ -134,7 +134,11 @@ release disappears, the publisher fails read-only rather than rebuilding. Otherw
   and unsigned release build, and inspects package/version/SDK identity and absence of
   signatures/debuggability. Gradle 9.6.1 retains its wrapper checksum; AGP 9.3.1,
   Kotlin 2.4.21, Temurin JDK 21.0.9+10, command-line tools 22.0 (checksum-pinned
-  official archive), and SDK Build Tools 37.0.0 are pinned. No signing secret is available.
+  official archive), and SDK Build Tools 37.0.0 are pinned. Provisioning names each
+  vendor's exact package string: that JDK is requested as `21.0.9+10.0.LTS` (the Temurin
+  selector for the same 21.0.9 build 10, recorded in provenance under the canonical
+  `21.0.9+10` label), and the platform package is `platforms;android-37.0` for the
+  numeric compile/target SDK 37. No signing secret is available.
 - Only the unsigned APK and public metadata cross to the protected `android-release`
   environment, by same-run immutable artifact ID and digest, not name or latest success.
   Metadata binds repository, push SHA, run ID/attempt, input digest/size, version, and

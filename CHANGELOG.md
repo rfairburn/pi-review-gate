@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.266]
+
+### Fixed
+
+- Numbered releases provision the Android toolchain with the vendor's exact package
+  identifiers. The release builder, signer, and publisher now request Temurin
+  `21.0.9+10.0.LTS` — the selector for the same pinned JDK 21.0.9 build 10, which
+  provenance continues to record under the canonical `21.0.9+10` label — and SDK
+  provisioning installs the published `platforms;android-37.0` package for the numeric
+  compile/target SDK 37. The previous short `21.0.9+10` label was rejected by the pinned
+  setup action's exact build-metadata comparison, so a cold release job failed before any
+  build, and the bare `platforms;android-37` identifier is not a published SDK package.
+  Application identity, minimum/target SDK, Gradle/AGP/Kotlin versions, the pinned SDK
+  archive URL and checksum, secret isolation, and all-six-asset atomic publication are
+  unchanged.
+
 ## [0.1.0-dev.265]
 
 ### Added

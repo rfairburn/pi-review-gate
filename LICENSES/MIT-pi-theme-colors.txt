@@ -22,6 +22,37 @@ SOFTWARE.
 
 --------------------------------------------------------------------------
 
+This license applies to the session-card status color values embedded in the
+Android phone client's
+android/client-core/src/main/kotlin/io/github/rfairburn/pireviewgate/core/client/ui/SessionCardStatusStyle.kt
+(io.github.rfairburn.pireviewgate.core.client.ui.SessionCardStatusStyle). They
+are derived from the dark and light themes of Pi Coding Agent v1.5.0:
+
+  https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/dark.json
+  https://github.com/earendil-works/pi/blob/v1.5.0/packages/coding-agent/src/modes/interactive/theme/light.json
+  Copyright (c) 2025 Mario Zechner
+
+The muted, dim, success, error, warning, and mdLink theme tokens were resolved
+to the 24-bit sRGB foreground colors Pi v1.5.0 renders for them in truecolor
+mode:
+
+  token     dark      light
+  muted     #9da5a9   #677176
+  dim       #7e888e   #879095
+  success   #68b78d   #337e58
+  error     #ea7f81   #c8253d
+  warning   #cd9a22   #8f6802
+  mdLink    #69add0   #2f7899
+
+The assignment of these tokens to card status values follows the public
+pi-review-gate desktop sidebar at commit
+bd6f48c5a6099a01585e63151577757c9931a125 (src/session-host/sidebar-theme.ts
+and src/session-host/sidebar-theme-colors.ts at that commit). Only these color
+values are embedded; no Pi theme file, theme loader, color conversion code, or
+other part of Pi is included, and the Android client has no Pi dependency.
+
+--------------------------------------------------------------------------
+
 This license applies to the built-in Dark and Light theme foreground colour
 values copied from Pi Coding Agent, packages/coding-agent/src/modes/
 interactive/theme/, into the host-owned colour table in

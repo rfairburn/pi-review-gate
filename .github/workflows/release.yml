@@ -1,34 +1,14 @@
-# Reusable numbered prerelease builder.
-#
-# The caller CI workflow invokes this only on push events to refs/heads/main
-# with `needs: [verify, full-tests]`. This workflow independently enforces the
-# same trust boundary: reusable workflow_call runs inherit the caller's
-# original event context (github.event / github.sha come from the triggering
-# push), so the job-level `if` plus the scripts' own env validation pin the
-# exact pushed commit. Every checkout uses that exact SHA; main is never
-# checked out at a floating ref. There is no workflow_run privilege chain, no
-# custom PAT, no GitHub App, and no workflows:write grant: the only write
-# permission anywhere is `contents: write` on the publish job, scoped to
-# release and tag creation.
-
+# Exact-main-SHA producer; CI's existing complete verification set stays upstream.
 name: Release
-
 on:
   workflow_call:
-
 permissions:
   contents: read
-
-# One pending publication group per exact target SHA. Distinct main commits
-# therefore never share or drop each other's builds, and retries of the same
-# SHA are serialized with cancel-in-progress: false.
 concurrency:
   group: release-publish-${{ github.sha }}
   cancel-in-progress: false
-
 env:
   PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
-
 jobs:
   verify:
     name: Verify exact commit (read-only)
@@ -42,13 +22,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out the exact pushed commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Set up Node 24
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.22.1
           cache: npm
@@ -59,8 +37,8 @@ jobs:
       - name: Fast tests
         run: npm run test:fast
 
-  release:
-    name: Publish numbered prerelease (b<N> of the exact commit)
+  plan:
+    name: Resolve exact producer inputs (read-only)
     needs: verify
     if: >-
       github.event_name == 'push' &&
@@ -68,10 +46,163 @@ jobs:
       github.ref_type == 'branch' &&
       github.repository == 'rfairburn/pi-review-gate'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      outcome: ${{ steps.plan.outputs.outcome }}
+      n: ${{ steps.plan.outputs.n }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.22.1
+      - run: git fetch origin +refs/heads/main:refs/remotes/origin/main
+      - id: plan
+        run: node scripts/release/publish.cjs --inspect
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  android-build:
+    name: Build unsigned Android and full core (read-only)
+    needs: [verify, plan]
+    if: >-
+      needs.plan.outputs.outcome == 'build-draft' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      unsigned_sha256: ${{ steps.metadata.outputs.unsigned_sha256 }}
+      metadata_sha256: ${{ steps.metadata.outputs.metadata_sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.22.1
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '21.0.9+10'
+      - name: Install locked SDK and platform before the source build
+        run: node scripts/release/android.cjs sdk platform
+      - name: Build release without credentials; run full JVM core tests
+        working-directory: android
+        run: ./gradlew --no-daemon :client-core:test :app:assembleRelease -PreleaseNumber="$RELEASE_N"
+        env:
+          RELEASE_N: ${{ needs.plan.outputs.n }}
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle
+      - name: Validate unsigned APK and bind metadata to this run attempt
+        id: metadata
+        run: node scripts/release/android.cjs unsigned android/app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/unsigned"
+        env:
+          RELEASE_N: ${{ needs.plan.outputs.n }}
+      - name: Transfer only unsigned APK and public metadata
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-unsigned-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unsigned/unsigned.apk
+            ${{ runner.temp }}/unsigned/unsigned.json
+          if-no-files-found: error
+          retention-days: 1
+
+  android-sign:
+    name: Sign Android (isolated protected environment)
+    needs: [plan, android-build]
+    if: >-
+      needs.plan.outputs.outcome == 'build-draft' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    environment: android-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      signed_sha256: ${{ steps.sign.outputs.signed_sha256 }}
+      signed_metadata_sha256: ${{ steps.sign.outputs.signed_metadata_sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.22.1
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '21.0.9+10'
+      - name: Install locked public tools before exposing secrets
+        run: node scripts/release/android.cjs sdk
+      - name: Check immutable same-run unsigned artifact identity
+        run: node scripts/release/android.cjs check-artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.android-build.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.android-build.outputs.artifact_digest }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.android-build.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/unsigned
+      - name: Sign and verify; remove private key in finally
+        id: sign
+        run: node scripts/release/android.cjs sign "$RUNNER_TEMP/unsigned" "$RUNNER_TEMP/signed"
+        env:
+          RELEASE_N: ${{ needs.plan.outputs.n }}
+          EXPECTED_UNSIGNED_SHA256: ${{ needs.android-build.outputs.unsigned_sha256 }}
+          EXPECTED_METADATA_SHA256: ${{ needs.android-build.outputs.metadata_sha256 }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
+      - name: Transfer only verified public release assets
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-signed-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/signed/pi-review-gate-b${{ needs.plan.outputs.n }}.apk
+            ${{ runner.temp }}/signed/ANDROID_SHA256SUMS
+            ${{ runner.temp }}/signed/android-provenance.json
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish numbered prerelease (b<N> of the exact commit)
+    needs: [verify, plan, android-build, android-sign]
+    # Only published verification may accept skipped build/sign jobs.
+    if: >-
+      !cancelled() &&
+      needs.verify.result == 'success' && needs.plan.result == 'success' &&
+      ((needs.plan.outputs.outcome == 'verify-published' && needs.android-build.result == 'skipped' && needs.android-sign.result == 'skipped') ||
+       (needs.plan.outputs.outcome == 'build-draft' && needs.android-build.result == 'success' && needs.android-sign.result == 'success')) &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.repository == 'rfairburn/pi-review-gate'
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      # Minimal write grant: GitHub release and tag management only.
       contents: write
+      actions: read
     steps:
       - name: Check out the exact pushed commit (full history for first-parent numbering)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -80,22 +211,43 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Fetch the current main tip (read-only, for first-parent verification)
-        # Eligibility requires the target to be on current main's strict
-        # first-parent history. This updates a remote-tracking ref only; it
-        # never checks out or builds floating main.
         run: git fetch origin +refs/heads/main:refs/remotes/origin/main
-      - name: Set up Node 24
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.22.1
           cache: npm
-      - name: Install dependencies
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '21.0.9+10'
+      - name: Install locked public APK verification tools
+        run: node scripts/release/android.cjs sdk
+      - name: Check immutable same-run signed artifact identity
+        if: needs.plan.outputs.outcome == 'build-draft'
+        run: node scripts/release/android.cjs check-artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.android-sign.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.android-sign.outputs.artifact_digest }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.plan.outputs.outcome == 'build-draft'
+        with:
+          artifact-ids: ${{ needs.android-sign.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/signed
+      - name: Install dependencies only for an unpublished draft
+        if: needs.plan.outputs.outcome == 'build-draft'
         run: npm ci
       - name: Verify release eligibility (exact SHA, merged main PR, first-parent distance)
         run: node scripts/release/eligibility.cjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Build, package, and publish the numbered prerelease
+      - name: Publish all six verified assets atomically, or verify published read-only
         run: node scripts/release/publish.cjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_PLAN_OUTCOME: ${{ needs.plan.outputs.outcome }}
+          ANDROID_RELEASE_DIR: ${{ runner.temp }}/signed
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+          EXPECTED_SIGNED_SHA256: ${{ needs.android-sign.outputs.signed_sha256 }}
+          EXPECTED_SIGNED_METADATA_SHA256: ${{ needs.android-sign.outputs.signed_metadata_sha256 }}

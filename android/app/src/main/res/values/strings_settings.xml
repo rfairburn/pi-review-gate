@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="setting_saved_first_reply_timeout">Saved first reply timeout</string>
+    <string name="setting_saved_first_reply_timeout_body">How long a Saved list or search waits for the owner\'s first reply. The default is 60 seconds.</string>
+    <string name="setting_saved_first_reply_timeout_field">First reply timeout (seconds)</string>
+    <string name="setting_saved_first_reply_timeout_save">Save timeout</string>
+    <string name="setting_saved_first_reply_timeout_invalid">Enter a whole number of seconds from 1 to %1$d.</string>
+</resources>

@@ -340,9 +340,26 @@ test("native saved search reads synthetic global files through the public SDK an
   assert.equal(JSON.stringify(catalog).includes("FullNameTail"), false, "the full name beyond the caption limit never becomes a public row field");
 
   // Modification-time ties keep the native relevance tie-break: the two rows
-  // named "Rollout" score the same, so the newer one leads.
-  const tied = searchSavedSessions(catalog, "Rollout");
-  assert.deepEqual(tied.map((row) => row.id), ["tie-newer", "message-only"], "ties rank by modified descending, as native does");
+  // named "Rollout" score the same, so the newer one leads. Every row's
+  // recorded working directory is an absolute path inside this run's scratch
+  // root, and that path can itself fuzzy-match the token, so other rows can
+  // legitimately join the result. The full ordered result still has to equal
+  // native's, and both named rows must actually be present for their relative
+  // order to prove anything (an absent row would index as -1).
+  const tieQuery = "Rollout";
+  const tied = searchSavedSessions(catalog, tieQuery);
+  const expectedTied = native.filterAndSortSessions(nativeInput, tieQuery, "relevance");
+  const tieOrder = tied.map((row) => row.id);
+  assert.deepEqual(tieOrder, expectedTied.map((info) => info.id), `query ${JSON.stringify(tieQuery)}`);
+  const [newerAt, olderAt] = ["tie-newer", "message-only"].map((id) => tieOrder.indexOf(id));
+  assert.ok(newerAt >= 0 && olderAt >= 0, "both rows named Rollout are in the results");
+  assert.ok(newerAt < olderAt, "ties rank by modified descending, as native does");
+  // The two rows genuinely score the same, so their relative order really is
+  // the modification-time tie-break and not a score difference.
+  const parsedTie = parseSavedSearchQuery(tieQuery);
+  const tieScores = ["tie-newer", "message-only"].map((id) =>
+    matchSavedSessionFields(fieldsOf(nativeInput.find((info) => info.id === id)!), parsedTie));
+  assert.deepEqual(tieScores[0], tieScores[1], "the two rows named Rollout score the same");
 });
 
 test("the pinned TUI fuzzy scorer is the scorer of the Pi release being matched", (t) => {

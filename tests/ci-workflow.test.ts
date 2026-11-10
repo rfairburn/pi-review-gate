@@ -577,10 +577,10 @@ function reusableReleaseWorkflowMirrorsTheBoundary(): void {
   // Independent enforcement of the same trust boundary (reusable runs inherit the
   // caller's original event context, so the condition pins the triggering push).
   const expectedCondition = "github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_type == 'branch' && github.repository == 'rfairburn/pi-review-gate'";
-  const conditions = [...source.matchAll(/if: >-\n((?:.*\n)*?)(?:    runs-on:)/g)].map((match) => flattened(match[1]));
-  assert.ok(conditions.length >= 2, "both the verify and publish jobs must re-validate the boundary");
-  for (const condition of conditions) {
-    assert.equal(condition, expectedCondition);
+  for (const job of ["verify", "plan", "android-build", "android-sign", "release"]) {
+    const block = blockOf(source, job, 2);
+    const condition = flattened(block.match(/    if: >-\n((?:      .*\n)+)/)?.[1] ?? "");
+    assert.ok(condition.includes(expectedCondition), `${job} must repeat the exact push/main/repository boundary`);
   }
   assert.doesNotMatch(source, /workflow_run/, "no workflow_run privilege chain");
   const concurrency = blockOf(source, "concurrency", 0);
@@ -596,13 +596,18 @@ function reusableReleaseWorkflowMirrorsTheBoundary(): void {
   assert.match(jobPermissions(verify) ?? "", /^      contents:\s*read$/m,
     "the builder's verify job stays read-only");
   const publish = blockOf(source, "release", 2);
-  assert.match(publish, /needs: verify/);
+  assert.match(publish, /needs: \[verify, plan, android-build, android-sign\]/);
   assert.match(jobPermissions(publish) ?? "", /^      contents:\s*write$/m,
     "the publish job is the only write grant, scoped to release and tag management");
-  // Same immutable action pins as CI, so the builder cannot drift to floating refs.
+  // Shared pins match CI; Android-only actions use verified immutable pins.
   const ciPins = pinnedActions(readWorkflow());
+  const androidPins = new Set([
+    "actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165",
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+  ]);
   for (const reference of pinnedActions(source)) {
-    assert.ok(ciPins.has(reference), `${reference} must match a SHA pinned in ci.yml`);
+    assert.ok(ciPins.has(reference) || androidPins.has(reference), `${reference} must match an independently verified immutable action pin`);
     assert.doesNotMatch(source, new RegExp(`uses: \\S+@v\\d`), "no floating version tags");
   }
   assert.ok(pinnedActions(source).size >= 2, "checkout and setup-node must be SHA-pinned in the builder");
@@ -620,6 +625,68 @@ test("release caller passes no secrets and carries the only write grant", () => 
 
 test("reusable release builder independently enforces the same trust boundary", () => {
   reusableReleaseWorkflowMirrorsTheBoundary();
+});
+
+test("Android release isolates unsigned build, protected signing, and immutable transfer", () => {
+  const source = withoutComments(readReleaseWorkflow());
+  const build = blockOf(source, "android-build", 2);
+  const signer = blockOf(source, "android-sign", 2);
+  const publisher = blockOf(source, "release", 2);
+  assert.match(build, /needs: \[verify, plan\]/);
+  assert.match(build, /:client-core:test :app:assembleRelease -PreleaseNumber=/);
+  assert.doesNotMatch(build, /secrets\.|contents: write/);
+  assert.match(signer, /needs: \[plan, android-build\]/);
+  assert.match(signer, /environment: android-release/);
+  assert.doesNotMatch(signer, /npm |gradlew|cache:|contents: write/);
+  assert.match(signer, /artifact-ids: \$\{\{ needs.android-build.outputs.artifact_id \}\}/);
+  assert.match(publisher, /artifact-ids: \$\{\{ needs.android-sign.outputs.artifact_id \}\}/);
+  for (const block of [signer, publisher]) {
+    assert.match(block, /node scripts\/release\/android.cjs check-artifact/);
+    assert.match(block, /ARTIFACT_DIGEST: \$\{\{ needs.android-(build|sign).outputs.artifact_digest \}\}/);
+    assert.doesNotMatch(block, /run-id:|pattern:|overwrite:|continue-on-error/);
+  }
+  for (const secret of ["ANDROID_SIGNING_KEYSTORE_BASE64", "ANDROID_SIGNING_PASSWORD", "ANDROID_SIGNING_ALIAS"]) {
+    assert.equal((source.match(new RegExp(`secrets\\.${secret}`, "g")) ?? []).length, 1);
+    assert.ok(signer.includes(`secrets.${secret}`));
+    assert.ok(!publisher.includes(`secrets.${secret}`));
+  }
+  assert.ok(signer.indexOf("android.cjs sdk") < signer.indexOf("secrets.ANDROID_SIGNING"));
+  assert.doesNotMatch(source, /secrets: inherit|\.p12|\.keystore|path: \$\{\{ runner.temp \}\}\s*$/m);
+  assert.match(releaseJobBlock(), /actions: read/, "caller must permit read-only immutable artifact lookup");
+});
+
+test("Android failures/skips cannot publish; only already-published verification skips builds", () => {
+  const publisher = blockOf(withoutComments(readReleaseWorkflow()), "release", 2);
+  const expression = flattened(publisher.match(/    if: >-\n((?:      .*\n)+)/)?.[1] ?? "");
+  assert.match(expression, /needs.verify.result == 'success' && needs.plan.result == 'success'/);
+  const evaluate = (outcome: string, build: string, sign: string, verify = "success", plan = "success") => {
+    const values: Record<string, string> = {
+      "needs.verify.result": verify, "needs.plan.result": plan,
+      "needs.plan.outputs.outcome": outcome, "needs.android-build.result": build,
+      "needs.android-sign.result": sign, "github.event_name": "push",
+      "github.ref": "refs/heads/main", "github.ref_type": "branch", "github.repository": "rfairburn/pi-review-gate",
+    };
+    const substituted = expression.replace(/!cancelled\(\)/g, "true").replace(/needs\.[\w.-]+|github\.[\w.]+/g, (key) => {
+      assert.ok(key in values, `unexpected workflow expression ${key}`);
+      return JSON.stringify(values[key]);
+    });
+    return Function(`return (${substituted})`)() as boolean;
+  };
+  assert.equal(evaluate("build-draft", "success", "success"), true);
+  assert.equal(evaluate("verify-published", "skipped", "skipped"), true);
+  for (const outcome of ["build-draft", "verify-published"]) {
+    for (const bad of ["failure", "cancelled", "skipped"]) {
+      if (outcome === "build-draft" || bad !== "skipped") {
+        assert.equal(evaluate(outcome, bad, "success"), false);
+        assert.equal(evaluate(outcome, "success", bad), false);
+      }
+      assert.equal(evaluate(outcome, "success", "success", bad), false);
+      assert.equal(evaluate(outcome, "success", "success", "success", bad), false);
+    }
+  }
+  assert.equal(evaluate("unknown", "success", "success"), false);
+  assert.match(publisher, /RELEASE_PLAN_OUTCOME: \$\{\{ needs.plan.outputs.outcome \}\}/);
+  assert.match(publisher, /if: needs.plan.outputs.outcome == 'build-draft'\n        run: npm ci/);
 });
 
 // --- Native Windows session-host alpha matrix caller (issue #211) ----------
@@ -1177,8 +1244,8 @@ test("Windows shell and the reusable release builder select the exact patched No
   assert.match(shell, /^          node-version: 24\.22\.1$/m);
   const release = withoutComments(readReleaseWorkflow());
   const selections = [...release.matchAll(/^\s*node-version: (\S+)$/gm)].map((match) => match[1]);
-  assert.deepEqual(selections, ["24.22.1", "24.22.1"],
-    "both builder jobs must select the exact patched Node 24 floor");
+  assert.deepEqual(selections, Array(5).fill("24.22.1"),
+    "every builder, signer, planner, and publisher job must select the exact patched Node 24 floor");
 });
 
 test("activation tests keep the default runtime role in CI", () => {

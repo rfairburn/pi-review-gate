@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "outDir": "../../dist-test",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "fixture.ts",
+    "../../src/session-host/network/peer-host.ts"
+  ]
+}

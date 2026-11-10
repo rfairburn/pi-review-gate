@@ -35,6 +35,7 @@ const { resolveEligibility, summarizeGITHUBOutput } = require("./eligibility.cjs
 // resolved at invocation time; tests stub the boundary through this object.
 const packagingModule = require("./packaging.cjs");
 const changelog = require("./changelog.cjs");
+const android = require("./android.cjs");
 const {
   PROVENANCE_SCHEMA,
   buildProvenance,
@@ -48,6 +49,7 @@ const {
 const PACKAGE_NAME = "pi-review-gate";
 const MARKER_SCHEMA = "pi-review-gate-release-identity/1";
 const TARBALL_ASSET_SUFFIX = ".tgz";
+const PRODUCER_CONTRACT = "node-and-android/1";
 
 // ---------------------------------------------------------------------------
 // Identity marker and release bodies
@@ -208,17 +210,18 @@ async function assertTagRefMatches({ api, tag, target }) {
 // Locate the release for a tag the way GitHub actually exposes releases:
 // GET /releases/tags/{tag} returns only PUBLISHED releases (an interrupted
 // draft 404s there), so drafts are found through the authenticated release
-// listing, which includes them. The listing is bounded (see listReleases) and
-// at most one draft may exist per tag; anything ambiguous fails closed.
+// listing, which includes them. A published release may also become visible
+// there after a by-tag 404. The listing is bounded (see listReleases) and at
+// most one release may exist per tag; anything ambiguous fails closed.
 async function findReleaseByTag({ api, tag }) {
   const byTag = await api.getReleaseByTag(tag);
   if (byTag) return byTag;
   const releases = await api.listReleases();
-  const drafts = releases.filter((release) => release && release.tag_name === tag && release.draft === true);
-  if (drafts.length > 1) {
-    throw new ReleaseError(`multiple draft releases found for tag ${tag}; failing closed`);
+  const matches = releases.filter((release) => release && release.tag_name === tag);
+  if (matches.length > 1) {
+    throw new ReleaseError(`multiple releases found for tag ${tag}; failing closed`);
   }
-  return drafts[0] ?? null;
+  return matches[0] ?? null;
 }
 
 async function resolveOrCreateDraftRelease({ api, eligibility, notesBlock }) {
@@ -303,8 +306,8 @@ async function findOrphanedOwnedDraft({ api, eligibility }) {
 // Assets
 // ---------------------------------------------------------------------------
 
-function expectedAssetNames(tarballFilename) {
-  return ["SHA256SUMS", "provenance.json", tarballFilename];
+function expectedAssetNames(tarballFilename, n) {
+  return ["SHA256SUMS", "provenance.json", tarballFilename, ...(n === undefined ? [] : android.names(n))];
 }
 
 async function downloadAndHash(api, asset) {
@@ -358,9 +361,9 @@ async function syncDraftAssets({ api, release, assets }) {
 // must additionally carry EXACTLY the collapsed changes block derived from
 // the exact source changelog — removing, editing, or duplicating notes on a
 // published release fails closed instead of masquerading as legacy.
-async function verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock }) {
+async function verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock, legacyVerifyOnly = false, env = process.env, scratch, androidRun, draft = false }) {
   const problems = [];
-  if (release.draft !== false) problems.push("release is not published");
+  if (release.draft !== draft) problems.push(draft ? "release is not a draft" : "release is not published");
   if (release.prerelease !== true) problems.push("release is not marked prerelease");
   if (release.tag_name !== eligibility.tag) problems.push("tag name mismatch");
   const body = typeof release.body === "string" ? release.body : "";
@@ -377,8 +380,10 @@ async function verifyPublishedRelease({ api, release, eligibility, tarballFilena
   }
   const assets = release.assets ?? [];
   const names = new Set(assets.map((asset) => asset.name));
-  for (const expected of expectedAssetNames(tarballFilename)) {
+  for (const expected of expectedAssetNames(tarballFilename, legacyVerifyOnly ? undefined : eligibility.n)) {
+    const matches = assets.filter((asset) => asset.name === expected);
     if (!names.has(expected)) problems.push(`published asset missing: ${expected}`);
+    if (matches.length > 1) problems.push(`duplicate asset: ${expected}`);
   }
   if (problems.length > 0) {
     throw new ReleaseError(`published release verification failed:\n  - ${problems.join("\n  - ")}`);
@@ -425,6 +430,23 @@ async function verifyPublishedRelease({ api, release, eligibility, tarballFilena
     }
     if (JSON.stringify(embedded) !== JSON.stringify(provenance)) {
       throw new ReleaseError("provenance embedded in the published release body differs from the published provenance asset");
+    }
+  }
+  if (!legacyVerifyOnly) {
+    for (const downloaded of [provenanceAsset, sumsAsset, tarballAsset]) {
+      if (downloaded.asset.size !== downloaded.size) throw new ReleaseError(`asset ${downloaded.asset.name} downloaded size mismatch`);
+    }
+    const buffers = {};
+    for (const name of android.names(eligibility.n)) {
+      const downloaded = await downloadAndHash(api, byName.get(name));
+      if (downloaded.asset.size !== downloaded.size) throw new ReleaseError(`Android asset size mismatch: ${name}`);
+      buffers[name] = downloaded.buffer;
+    }
+    const temporary = scratch ?? fs.mkdtempSync(path.join(os.tmpdir(), "release-apk-"));
+    try {
+      android.verifyAssets({ buffers, eligibility, scratch: temporary, env, run: androidRun });
+    } finally {
+      if (!scratch) fs.rmSync(temporary, { recursive: true, force: true });
     }
   }
   return { verified: true, tarballSha256: tarballSha };
@@ -593,8 +615,9 @@ function deriveReleaseNotes({ projectRoot, repoRoot, eligibility, policyAnchor }
 // Orchestration
 // ---------------------------------------------------------------------------
 
-async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildArtifacts, baseline, policyAnchor }) {
+async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildArtifacts, baseline, policyAnchor, legacyVerifyOnly = false, inspectOnly = false, androidRun }) {
   const anchor = policyAnchor ?? POLICY_ADOPTION_ANCHOR;
+  const contract = legacyVerifyOnly ? "node-only/1" : PRODUCER_CONTRACT;
   const context = assertReleaseEventContext(env);
   const eligibility = await resolveEligibility({ env, fetchImpl, repoRoot: projectRoot, baseline });
   if (eligibility.target !== context.target) {
@@ -612,19 +635,42 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
   const { notesBlock } = deriveReleaseNotes({ projectRoot, repoRoot: projectRoot, eligibility, policyAnchor: anchor });
   const api = createApi({ fetchImpl, token: env.GITHUB_TOKEN, repository: REPOSITORY });
 
-  const tag = await ensureTag({ api, tag: eligibility.tag, target: eligibility.target });
-  // Draft-aware lookup: the tag endpoint alone would miss an interrupted draft.
+  // Discover before ANY write: even a missing tag on a published retry must
+  // fail read-only, never be recreated. Legacy mode can only verify, not produce.
   const existing = await findReleaseByTag({ api, tag: eligibility.tag });
+  if (legacyVerifyOnly) {
+    // Positive recognition of the original producer's explicit three-asset
+    // contract, read from the eligible target's immutable source (not from a
+    // release body or a caller assertion). Unknown/new producers never downgrade.
+    const producer = git(["show", `${eligibility.target}:scripts/release/publish.cjs`], { repoRoot: projectRoot });
+    if (!/function expectedAssetNames\(tarballFilename\)\s*\{\s*return \["SHA256SUMS", "provenance.json", tarballFilename\];\s*\}/.test(producer)) {
+      throw new ReleaseError("target producer does not declare the legacy Node-only asset contract");
+    }
+  }
+  if (env.RELEASE_PLAN_OUTCOME === "verify-published" && existing?.draft !== false) {
+    throw new ReleaseError("published plan cannot rebuild or mutate a missing/unpublished release");
+  }
+  if (legacyVerifyOnly && (!existing || existing.draft !== false)) {
+    throw new ReleaseError("legacy Node-only contract is verify-only and requires an already-published release");
+  }
+  if (!legacyVerifyOnly) android.version(eligibility.n);
+  if (inspectOnly) {
+    if (existing?.draft === false) await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
+    return { outcome: existing?.draft === false ? "verify-published" : "build-draft", contract, n: eligibility.n, version: eligibility.version, tag: eligibility.tag, target: eligibility.target };
+  }
+  const verifyOptions = { legacyVerifyOnly, env, scratch: scratchRoot, androidRun };
 
   if (existing && existing.draft === false) {
     // Immutable boundary: published releases are verified only, never touched.
-    const verification = await verifyPublishedRelease({ api, release: existing, eligibility, tarballFilename, expectedNotesBlock: notesBlock });
+    await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
+    const verification = await verifyPublishedRelease({ api, release: existing, eligibility, tarballFilename, expectedNotesBlock: notesBlock, ...verifyOptions });
     // Read-only identity cross-check: the published release must still be
     // bound to a tag ref at the exact source SHA. Failing closed here mutates
     // nothing; it only refuses to certify a compromised identity.
     await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
     return {
       outcome: "already-published",
+      contract,
       tag: eligibility.tag,
       version: eligibility.version,
       target: eligibility.target,
@@ -634,6 +680,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
     };
   }
 
+  const tag = await ensureTag({ api, tag: eligibility.tag, target: eligibility.target });
   if (!existing) {
     // No readable release for this tag. Before creating anything, refuse to
     // duplicate an orphaned owned draft: a draft carrying the exact identity
@@ -666,9 +713,11 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       // A concurrent run published between our discovery and creation: the
       // immutable boundary applies immediately — verify only. No artifact
       // build, no PATCH, no upload, no delete may touch a published release.
-      const verification = await verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock: notesBlock });
+      await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
+      const verification = await verifyPublishedRelease({ api, release, eligibility, tarballFilename, expectedNotesBlock: notesBlock, ...verifyOptions });
       return {
         outcome: "already-published",
+        contract,
         tag: eligibility.tag,
         version: eligibility.version,
         target: eligibility.target,
@@ -687,6 +736,13 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       projectRoot,
       scratch,
     });
+    // Android assets are built/signed in separate jobs, never here. Missing
+    // inputs are fatal; neither injected Node builders nor retries can omit them.
+    if (!/^[a-f0-9]{64}$/.test(env.EXPECTED_SIGNED_SHA256 ?? "") || !/^[a-f0-9]{64}$/.test(env.EXPECTED_SIGNED_METADATA_SHA256 ?? "")) {
+      throw new ReleaseError("signed Android artifact and metadata digests from the signer job are required");
+    }
+    const androidAssets = android.loadAssets({ directory: env.ANDROID_RELEASE_DIR, eligibility, env, run: androidRun });
+    build.assets.push(...androidAssets);
     await api.updateRelease(release.id, {
       // Re-assert the bound tag and source on EVERY draft mutation: a live
       // API probe (issue #13) confirmed that a draft PATCH omitting tag_name
@@ -706,6 +762,11 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       throw new ReleaseError("draft release lost its owned identity before publication; failing closed");
     }
     const sync = await syncDraftAssets({ api, release: refreshed, assets: build.assets });
+    // Download and verify the entire six-asset contract while still a draft.
+    // This includes the actual APK signature, identity, digest, and size.
+    const completeDraft = await api.getRelease(release.id);
+    if (!isOwnedDraft(completeDraft, eligibility)) throw new ReleaseError("draft identity changed during asset sync");
+    await verifyPublishedRelease({ api, release: completeDraft, eligibility, tarballFilename, expectedNotesBlock: notesBlock, ...verifyOptions, scratch, draft: true });
     // Publication boundary: re-verify the tag ref still points at the exact
     // target immediately before the publish PATCH, and re-assert the bound
     // tag/source in the publish payload itself.
@@ -727,9 +788,12 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       eligibility,
       tarballFilename: build.tarballFilename,
       expectedNotesBlock: notesBlock,
+      ...verifyOptions,
+      scratch,
     });
     return {
       outcome: "published",
+      contract,
       tag: eligibility.tag,
       version: eligibility.version,
       target: eligibility.target,
@@ -746,6 +810,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
 }
 
 module.exports = {
+  PRODUCER_CONTRACT,
   assertTagRefMatches,
   bodyWithoutNotes,
   changelogPolicyAdopted,
@@ -774,11 +839,13 @@ if (require.main === module) {
     env: process.env,
     fetchImpl: globalThis.fetch,
     projectRoot: process.cwd(),
+    inspectOnly: process.argv.includes("--inspect"),
+    legacyVerifyOnly: process.argv.includes("--verify-legacy-node-only"),
   })
     .then((summary) => {
       const output = process.env.GITHUB_OUTPUT;
       if (output) {
-        fs.appendFileSync(output, `tag=${summary.tag}\nversion=${summary.version}\ntarget=${summary.target}\noutcome=${summary.outcome}\n`);
+        fs.appendFileSync(output, `tag=${summary.tag}\nversion=${summary.version ?? ""}\ntarget=${summary.target}\noutcome=${summary.outcome}\nn=${summary.n ?? ""}\ncontract=${summary.contract ?? PRODUCER_CONTRACT}\n`);
       }
       process.stdout.write(`release ${summary.outcome}: ${summary.tag} (${summary.version}) from ${summary.target}\n`);
     })

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Client-only manifest: the phone connects out to a review-gate host and hosts
+  nothing, so no Pi, worker, server, or gateway permission or component belongs
+  here. The application owns connections; each launcher Activity owns only its window.
+
+  Backup and device-to-device transfer are switched off: the client's saved hosts,
+  endpoints, connection history, and remembered server keys are private local state,
+  and copying or restoring them would move or roll back trust without the operator
+  choosing it. See res/xml/data_extraction_rules.xml.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <application
+        android:name=".PiReviewGateApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+        <activity
+            android:name=".ClientActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

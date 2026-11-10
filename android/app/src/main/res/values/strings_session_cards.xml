@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Session card background labels. Counts use activity-intent observations only;
+  an unreported count is "unknown", never 0.
+-->
+<resources>
+    <string name="session_card_background_tasks_label">bg tasks</string>
+    <string name="session_card_background_shells_label">bg shells</string>
+    <string name="session_card_count_unknown">unknown</string>
+    <!--
+      Status chips: a neutral label followed by the observed value. Only the value
+      is painted with the desktop status color, so each label stays its own string.
+    -->
+    <string name="session_card_agent_label">Agent</string>
+    <string name="session_card_agent_state_label">Agent state</string>
+    <string name="session_card_input_label">Input</string>
+    <string name="session_card_input_state_label">Input state</string>
+    <string name="session_card_value_running">running</string>
+    <string name="session_card_value_waiting">waiting</string>
+    <string name="session_card_value_idle">idle</string>
+    <string name="session_card_value_pending">pending</string>
+    <string name="session_card_value_none">none</string>
+    <string name="session_card_value_unknown">unknown</string>
+    <!-- Spoken while a card is being dragged; the drag itself is local until release. -->
+    <string name="session_card_dragging">Moving</string>
+</resources>

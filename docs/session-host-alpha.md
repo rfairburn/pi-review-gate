@@ -1480,6 +1480,19 @@ be deleted. Live, unknown, or current-file conversations owned by the owner's ch
 are refused, as are pending reservations and canonical-path, header, or file-identity
 replacements. Every removal is performed only by the owner.
 
+On Android, an exact owner-confirmed successful Delete retires that obsolete Saved
+result's action authority and automatically requests one fresh List for the same
+still-current owner, picker, and query. While that read is pending, the last received
+rows and total stay displayed with Requesting status. Only a complete owner reply
+supplies the actual new result, including zero or a nonzero total; deletion itself
+never implies an empty result.
+Leaving or changing that picker cancels this read continuation, not the reported
+Delete outcome. Prepare-only, refused, unconfirmed, and uncertain outcomes do not
+trigger it, and Delete is never retried. Canceling the post-delete read retires its
+pending status without issuing another request; late replies cannot revive it.
+This is part of the [Android application](#android-application) behavior described
+later on this page.
+
 **Fences and outcomes.** Requests come from the picker frame, or confirmation, that the
 writer actually wrote. Resume and delete-prepare need the written picker; a confirmed
 delete needs the written confirmation. Each uses a one-shot proof that is re-proved
@@ -1496,6 +1509,175 @@ loss after a write may have been invoked is `unknown`. Nothing is retried, repla
 regranted, reconnected, or claimed cancelled automatically. Refusals and uncertainty
 appear as brief, fixed, non-modal notices without raw errors or payloads, and they
 never steal focus.
+
+### Android application
+
+The Android application is the phone client for this session host. It connects directly to a
+host that has hosting turned on and shows that host's roster, session cards, Saved picker, and
+terminal; it runs no Pi session, worker, or hosting on the phone. The application is client-only and
+changes no production host, backend, or protocol behavior. Its device and runtime acceptance is
+incomplete: real-host Saved full-catalog, search, resume, network, and lifecycle acceptance is
+not established, and no full parity with the desktop sidebar or daily-use certification is
+claimed. It includes the Saved delete refresh above.
+
+**Terminal input.** A single-finger tap on the terminal delivers one clean host
+left-click and does not open the IME. A real drag still reaches the host as
+selection/drag input, a two-finger vertical swipe still produces the owner's own wheel
+reports, and the existing committed-frame, ownership, focus, and input fences remain
+unchanged. Stream retirement handles late internal notifications without abandoning
+accepted input settlements.
+
+**Immediate-send correction context.** Terminal input leaves immediately, so the keyboard had
+nothing to read back when the user corrected the current word. Each terminal input connection
+now keeps a bounded record of the text it actually handed off, and the input method reads that
+back as the text just before the remote cursor. A committed correction to a word that was
+already sent sends only the changed suffix: backspaces for the differing code points, then the
+new text. Nothing is invented — no injected Space, Enter, or cursor movement, and no retyped
+earlier word — and the user's own Space and Enter keep working. Text that never left the phone
+is never deleted remotely. What the connection remembers is an assumption about the remote
+line, not proof of what the host applied: a submitted write is still only a transport handoff.
+Non-ledger input or context changes retire the assumed text context, and a composition that
+re-marks already-sent text is then dropped rather than edited. Keyboard flags, ordering, proof,
+and lifecycle fences are unchanged.
+
+**Create and Close.** Create submits once from the exact drawn form. After the
+correlated owner `started` answer, the client closes only that exact form and may
+activate only the matching row in the owner's current roster. Later user navigation,
+background or focus loss, or a connection or owner-run change cancels the deferred
+activation permanently. Nothing is retried or invented. Close addresses the stable
+owner row. When the owner actually answers `CONFIRMATION_REQUIRED`, the phone client
+opens a distinct second confirmation entirely in its own UI. It never automatically
+resends `confirmed = true`, requires no desktop step, and performs no optimistic row
+removal or Saved-conversation deletion.
+
+**Rename.** A Rename is addressed to the row's stable native identity — host, owner run, and
+row id, fenced by that row's native conversation id and epoch — not to ordinary mutable roster
+metadata such as the roster revision or the title the last frame drew. A roster republish while
+the form is open therefore no longer makes a deliberate Rename unsubmitable, while the
+connection, the acknowledged rename capability, the current roster, the exact owner run, the
+row's presence and liveness, and the native tuple still admit or refuse it. Only the owner's
+positive `RENAMED` answer closes the submitted form, and only that exact form: nothing renames
+a row optimistically, retargets it to another row, or retries, and a row whose native
+conversation moved is refused rather than renamed elsewhere.
+
+**Session cards.** A compact card title is one line and width-ellipsized; the full
+title stays available in details and accessibility text. Cards show the delivered
+owner activity: a tool name, `Working`, or `Ready`, not full shell command text.
+Native noninteractive activity-intent counts appear as `activeTasks` and
+`activeShells` bubbles: an explicit `0` stays zero, a missing count stays unknown, and
+the ownership counts are never substituted. There are no job lists or count popups.
+
+**Overlay placement.** The controls strip, status area, and a floating Keys panel keep
+three independent positions, remembered separately for portrait and landscape across app
+restarts. Each moves by long-press drag on its own surface, with no extra grip. The
+compact keyboard icon and Keys entry keep their existing actions and 48 dp touch
+accessibility. Placement data is cosmetic and isolated from host, trust, identity, and
+settings state. Malformed or unreadable placement content restores defaults with a
+warning, then resumes saving and overwrites only that invalid cosmetic data; ordinary
+path, ownership, and permission protections remain, and write failures are reported.
+Open/closed overlay state, modifier latches, and dismissed status notices are not
+persisted: they live only as long as one instance of the terminal screen, so a rotation
+keeps an open Keys panel and a dismissed notice exactly as they are, while leaving the
+terminal and entering it again — or restarting the app — starts closed with nothing
+dismissed. Existing Back/reset behavior remains, and no new input method is added: the
+terminal's own input connection only tracks the text it handed off (see
+**Immediate-send correction context** above).
+
+**Keys docking.** The Keys panel has one two-state layout per orientation, remembered in
+the same cosmetic placement document as its position. Docked — the default — it is a real
+bottom band: the terminal pane keeps the area that is left, so opening it is an ordinary
+native resize that goes through the surface's existing measurement, viewport request,
+commit, and input fences. A band reserves its own measured height, and it never takes the
+area the control strip itself measures: the strip is measured against the space currently
+available to the layout — never against the pane the band has already shrunk — and the
+band is capped by what that measurement leaves. While a band is composed the strip keeps
+the constraint it has always carried: it leaves the band one usable Keys viewport out of
+the current space and is capped and scrollable itself, so it scrolls its own controls into
+view when that cap binds and the pane keeps at least the strip's measured footprint. That
+bound is only as strong as the footprint itself: once the space available to the layout is
+no larger than that one usable Keys viewport the strip's own cap reaches zero, and a zero
+measured footprint then leaves the band the whole available extent, so the pane can be
+squeezed out entirely — no reachable pane is promised at an arbitrarily tiny extent. With
+room for both natural sizes nothing is
+capped and the band keeps the height it always measured. Both numbers describe the strip
+and the Keys viewport, never the terminal pane: there is no fixed pane minimum and no split
+of the layer.
+Floating Keys paints below the control strip and the notice area, so an overlapping panel
+never swallows a Back, Switch, keyboard, or Keys tap.
+Floating, the panel overlays the pane and reserves nothing; it moves by the same header
+long-press and resizes from a corner grip, and its remembered size is a fraction of the
+stable layer extent. A panel that has never been placed appears detached from the bottom
+edge, with free space beside it and below it, so it reads as a window and has room to move;
+that default is presentation only, never written as a position, and a remembered position
+always resolves exactly as before. The floating panel holds one interactive Keys layout,
+measured at its own reference width and at the height the visible area leaves it, and
+stretches it into the frame with independent horizontal and vertical factors: text, buttons,
+padding, spacing, and the interior corner controls all scale together, so a frame of any
+shape is filled edge to edge with no re-wrapped rows and no blank letterbox, and the layout
+never re-wraps while you resize. The frame stops shrinking at half that logical footprint on
+each axis, so every floating key, the corner toggle, and the grip keep at least half their
+logical size — a complete 24 dp physical target for a target laid out at 48 dp — however far
+a grip drag overshoots; the floor is half the footprint the panel measured, not a fixed
+number, and it belongs to the floating panel alone: a docked band's targets are never scaled
+and keep their full 48 dp. A floating panel is never measured past the pane's own visible
+area, and the grip reserves no strip of its own: it is the trailing element of the panel's
+last key row, so it covers no key, never wraps into an empty row by itself, and scrolls into
+view with that row when the panel is shorter than its content. One icon-only corner control switches
+docking: it never opens or closes the panel and never shows or hides the on-screen
+keyboard, and because it belongs to the panel header it scrolls and clips with that header
+rather than standing over key rows the header has scrolled past. A docked keyboard reserves the occluding inset the platform actually reports,
+so a floating keyboard that reports no occlusion reserves nothing; the safety insets
+(system bars, cutout, waterfall) and the keyboard inset are each subtracted once, never
+twice. Only a completed drag, resize, or docking toggle is saved; a cancelled gesture, a
+rotation, a keyboard change, and an ordinary frame save nothing and never normalize a
+remembered value. Position and remembered size survive docking. There is no docked-height
+control, no automatic collapse, and no new persistence field.
+
+**Fresh predictive context.** Every on-screen Keys key and every accepted paste ask the input
+method once for fresh predictive context, immediately after their own accepted handoff in that
+same press — no release, round trip, or timer is waited for, and a refused key or paste asks
+nothing. Releasing a Ctrl, Alt, or Shift chip asks the same thing whether or not the hold typed
+anything and whether or not another chip stays lit; one action that releases several chips asks
+exactly once. The ask is an input invalidation only: it sends no text and no keystroke, and it
+is made only while the live, eligible connection still belongs to this surface and no known
+composition is still unsent. The application does not flush or discard unsent composition to
+force a refresh. Whether the keyboard then replaces its suggestions stays the platform's
+and the input method's decision, and an input-method command already queued to this app can be
+dropped by that handling. Ordinary input-method typing, hardware keys, and lifecycle clearing
+ask nothing. `More keys` and `Fewer keys` add no ask of their own, while their existing terminal
+retirement and any real geometry change can still restart the input context; that is unchanged
+here.
+
+**Saved first reply timeout.** The phone client's Settings screen accepts a positive
+finite whole number of seconds for the Saved first reply, default 60. New LIST and
+SEARCH requests capture the setting when issued, including the automatic refresh after
+an exact successful delete. The wait is local only and is not sent to the owner. The
+separate 30-second idle bound that begins after a transfer starts, and other operation
+deadlines, caps, cancellation, late-result fencing, and no-automatic-retry behavior,
+are unchanged. A Saved LIST that changes from pending to unknown is not proven to be
+caused or fixed by this timeout, and no new diagnostics are part of this phase. No
+pagination scope, clipboard acceptance, or new permission is implied.
+
+**Debug input messaging.** A saved app-wide `Debug input messaging` setting, off by
+default, controls the whole diagnostic status and notice area. Off draws none of it: no
+status slot on the non-terminal routes (its reserved height goes back to the content
+below it), no terminal notice overlay with its readiness and placement-warning text,
+dismiss control, and drag region, and no copy of the raw status in the Keys panel — and
+the hidden overlay or hidden copy reserves no space anywhere, including inside a docked
+Keys band. On returns the same messages and the
+existing per-text dismiss behavior. The preference is stored in the same strict
+version-1 settings document, where an absent key means off and only an explicit `true`
+is written; a non-boolean value, a null, or an unknown key still refuses the whole
+document, and a failed save publishes nothing. It changes presentation only: input,
+delivery, clipboard, storage, trust, identity, and proof behavior are unchanged, and no
+notice producer is reset, cleared, filtered, or replayed. Soft-keyboard visibility and
+the Keys dock layout are separate concerns from this flag.
+
+**Status-bar contrast.** The window background and the app's palette are fixed light on every
+route, so dark status-bar icons are now requested explicitly instead of contrast being derived
+from the system night flag, which could draw light icons over the light strip on a phone in dark
+mode. Status-bar icon contrast only: system bar colors, navigation, edge-to-edge geometry, and
+the consumed insets are unchanged.
 
 ## Focus, display, and status
 

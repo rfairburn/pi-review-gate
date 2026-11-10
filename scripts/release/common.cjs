@@ -195,7 +195,11 @@ function createApi({ fetchImpl, token, repository }) {
     // drafts are 404 here and must be located via listReleases instead.
     async getReleaseByTag(tag) {
       const result = await jsonRequest("GET", `/releases/tags/${encodeURIComponent(tag)}`);
-      return result.status === 200 ? result.json : null;
+      if (result.status === 404) return null;
+      if (result.status !== 200) {
+        throw new ReleaseError(`GitHub API get release by tag failed: ${describeApiError(result, result.text)}`);
+      }
+      return result.json;
     },
     // Authenticated release listing, which (unlike the tag endpoint) includes
     // draft releases. Bounded pagination: at most maxPages pages of perPage.

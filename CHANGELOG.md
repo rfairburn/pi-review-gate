@@ -15,6 +15,139 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.265]
+
+### Added
+
+- Numbered prereleases require a CI-signed Android APK, separate Android checksum
+  and provenance, and the unchanged Node assets, verified together before atomic
+  publication. Signing uses a user-managed key in the isolated `android-release`
+  environment; Android failures block the whole release. Published retries are
+  read-only, and historical Node-only releases retain their original contract.
+
+### Changed
+
+- **Android application (#508)**: terminal taps send clean host
+  left-clicks without opening the keyboard; drag, selection, wheel input, and proof
+  fences remain. Retiring a terminal stream handles late notifications without
+  abandoning input settlements. Create closes its exact form after owner-confirmed `started` and
+  opens only the matching current row unless superseded. Close tolerates ordinary
+  metadata refreshes and presents any owner-required second confirmation in mobile,
+  never automatically resending, removing rows optimistically, or deleting Saved data.
+- Compact session titles use one-line width ellipsis with full accessibility text.
+  Cards show delivered owner activity (a tool name, `Working`, or `Ready`) and
+  noninteractive activity-intent count bubbles. Each bubble's number alone follows the
+  desktop bands (0 muted, 1-2 green, 3-6 yellow, 7 or more red — the red is activity
+  intensity only, never an error status), counted independently in the current dark or
+  light theme; labels and unknown counts stay neutral, zero and unknown stay distinct,
+  and there is no ownership-count substitution or job popups. Controls, status, and
+  Keys move independently by long-press drag, with separate portrait/landscape positions saved
+  across restarts. Compact controls retain their actions and touch targets without
+  reflowing the terminal. Invalid cosmetic placement warns and can be replaced by a
+  later save; host settings, trust, identity, and storage protections are unchanged.
+- The mobile terminal now uses one dock-aware layout instead of a fullscreen overlay with
+  short-layer rescue rules. A visible bottom-docked Keys band and a keyboard inset the
+  platform actually reports as occluding take real pane area, so opening docked Keys is an
+  ordinary native resize through the existing measurement, viewport, commit, and input
+  fences; a floating Keys panel or a keyboard reporting no occlusion reserves nothing, and
+  the safety insets and keyboard inset are each subtracted once. A band never takes the
+  area the control strip itself measures: the strip is measured against the currently
+  available space rather than the already-shrunk pane, and the band is capped by what that
+  measurement leaves, so the pane keeps at least the strip's measured footprint — no fixed
+  pane minimum and no split of the layer, and no promise of a usable pane at an arbitrarily
+  tiny available extent: once the available space is no larger than that one usable Keys
+  viewport the strip's own cap reaches zero, and a zero measured footprint then leaves the
+  band the whole available extent, so the pane can be squeezed out entirely. While a band
+  is composed the strip keeps the constraint it already carried: it leaves the band one
+  usable Keys viewport and is capped and scrollable itself.
+  Keys keeps an icon-only corner toggle that changes docking only — never opening,
+  closing, or showing the keyboard — and floating Keys moves by the existing header
+  long-press and resizes from a corner grip, painting below the control strip and the
+  notice area so it cannot swallow a control tap. A floating panel that was never placed
+  now appears detached from the bottom edge with room beside it and below it, instead of
+  filling the width where the docked band was, and it is still moved by that same header
+  long-press; the default is presentation only and never becomes a remembered position.
+  Floating contents are one logical Keys layout stretched into the frame by independent
+  horizontal and vertical factors, so any frame shape is filled with no re-wrapped rows and
+  no blank letterbox, while text, buttons, padding, spacing, and the corner controls scale
+  together; the frame stops shrinking at half that layout's own footprint on each axis, so
+  floating keys, the corner toggle, and the grip keep at least half their logical size — a
+  real 24 dp for a target laid out at 48 dp — however far a grip drag overshoots, while a
+  docked band's targets are never scaled and keep their full 48 dp. The floating resize grip
+  is inline at the trailing end of the panel's last key row and shares that row's scroll, so
+  no blank footer strip is reserved below the panel's viewport, the handle never wraps into a
+  row of its own, and it scrolls in with that row on a short host. Docking, floating size, and position
+  are remembered per orientation in the existing version-2 placement document and
+  survive docking; only a completed drag, resize, or docking toggle saves, and cancelled
+  gestures, rotations, keyboard changes, and ordinary frames save nothing. Whether Keys
+  is open and which notice was dismissed belong to one instance of the terminal screen and
+  to no saved bundle or placement document: a rotation keeps them, while leaving and
+  re-entering the terminal, or restarting, starts closed with nothing dismissed. Keys
+  toggle, expansion, Back priority, modifiers, Paste, special, arrow, and function keys,
+  docked 48 dp targets, scroll reachability, and the Debug input messaging zero-area behavior
+  are unchanged. Real on-screen keyboard float/dock behavior is not claimed here: it needs
+  emulator and device evidence.
+- Android Settings now configures the local Saved LIST/SEARCH first-reply timeout
+  (positive whole seconds, default 60), captured by each new read, including confirmed
+  delete refresh. The 30-second begun-transfer idle bound, other deadlines, and
+  cancellation/no-retry rules are unchanged. Canceling a post-delete refresh clears
+  its stale pending status without making another request. This does not establish the cause of
+  observed unknown outcomes or complete device/runtime acceptance.
+- Android now has a saved `Debug input messaging` preference, off by default, that
+  controls the whole app-wide diagnostic status/notice area. Off draws none of it: no
+  non-terminal status slot (its reserved height returns to the content below), no
+  terminal notice overlay with its readiness and placement-warning text, dismiss
+  control, and drag region, and no Keys-panel copy of the raw status — and the hidden
+  overlay reserves no Keys space either. On returns the same messages with the existing
+  dismiss behavior. The flag rides the same strict version-1 settings document (an
+  absent key means off, only `true` is written, non-boolean or unknown keys still
+  refuse the document), is saved before it is published, and a failed save changes
+  nothing. It is presentation only: input, source/frame commit, coverage, focus, ABA,
+  selection, grid, protocol, receipt, delivery, cancellation, no-retry, and clipboard
+  behavior are unchanged, and no notice producer is reset, cleared, or replayed.
+- **Android keeps the keyboard's current-word correction usable after immediate send
+  (#508)**: each terminal input connection now keeps a bounded record of the text it actually
+  handed off, and the input method reads it back as the text just before the remote cursor. A
+  committed correction to a word already sent sends only the changed suffix — backspaces for the
+  differing code points, then the new text. No Space, Enter, or cursor movement is injected and
+  no earlier word is retyped, while the user's own Space and Enter still work, and text that
+  never left the phone is never deleted remotely. The remembered text is an assumption about the
+  remote line, never proof of what the host applied, and non-ledger input or context changes
+  retire the assumed text context. Explicit backspaces into re-marked, already-sent text leave
+  once when requested rather than being lost when Enter or another key retires the composition.
+  Uncommitted candidate changes remain deferred, and deletions follow code-point boundaries even
+  when a candidate changes UTF-16 widths. Keyboard flags, ordering, proof, and lifecycle fences
+  are unchanged.
+- **Android asks the input method for fresh predictive context (#508)**: every on-screen Keys
+  key and accepted paste, and each Ctrl, Alt, or Shift chip the user releases, ask once. A Keys
+  key or paste asks immediately after its own accepted handoff in the same press — a refused key
+  or paste asks nothing — while a released chip needs no accepted handoff, asks even when another
+  chip stays lit, and asks once per user action. The ask sends no text and is skipped unless the
+  live eligible connection still belongs to this surface and no known composition is still
+  unsent. The app does not flush text the user is correcting to force a refresh. Whether the keyboard changes its
+  suggestions stays the platform's and the input method's decision, and an input-method command
+  already queued to the app can be dropped by that handling. Ordinary input-method typing,
+  hardware keys, and lifecycle clearing ask nothing; `More keys` and `Fewer keys` add no ask of
+  their own, while their existing terminal retirement and a real geometry change can still
+  restart the input context, unchanged here.
+
+### Fixed
+
+- Android Saved now requests one fresh List after an exact confirmed successful
+  Delete on the still-current picker (#508). Old rows remain non-actionable until
+  the owner's complete result arrives; refusal or uncertainty never triggers a retry.
+- Android Rename now stays addressed to its own row (#508): submission is fenced by the row's
+  stable native identity — host, owner run, and row id, with that row's native conversation id
+  and epoch as the real fence — rather than the roster revision or the last-drawn title, so an
+  ordinary roster republish while the form is open no longer blocks a deliberate Rename. Only
+  the owner's positive `RENAMED` closes the submitted form; nothing renames a row optimistically,
+  retargets it, or retries, and a changed native conversation is still refused.
+- Android status-bar icons stay readable against the app's fixed light window (#508): dark
+  status-bar icons are requested explicitly instead of contrast being derived from the system night
+  flag, which could draw light icons over the light strip on a phone in dark mode. Icon contrast
+  only — system bar colors, navigation, edge-to-edge geometry, and the consumed insets are
+  unchanged.
+
 ## [0.1.0-dev.264]
 
 ### Changed

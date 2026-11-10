@@ -18,6 +18,27 @@ const publish = loadReleaseModule<PublishModule & {
   isOwnedDraft(release: unknown, eligibility: Eligibility): boolean;
 }>("publish.cjs");
 const changelog = loadReleaseModule<ChangelogModule>("changelog.cjs");
+const android = loadReleaseModule<{
+  SCHEMA: string; TOOLCHAIN: Record<string, unknown>;
+  identity(eligibility: Eligibility): Record<string, unknown>;
+}>("android.cjs");
+const CERT = "a".repeat(64);
+function androidRun(file: string, args: string[]) {
+  const n = Number(args.at(-1)?.match(/-b([0-9]+)\.apk$/)?.[1] ?? 2);
+  if (file.endsWith("aapt2")) return { status: 0, stdout: `package: name='io.github.rfairburn.pireviewgate' versionCode='${n}' versionName='0.1.0+${n}'\nsdkVersion:'33'\ntargetSdkVersion:'37'\n` };
+  if (args[0] === "verify") return { status: 0, stdout: `Verified using v2 scheme (APK Signature Scheme v2): true\nVerified using v3 scheme (APK Signature Scheme v3): true\nSigner #1 certificate SHA-256 digest: ${CERT}\n` };
+  return { status: 0, stdout: "" };
+}
+function fakeAndroidAssets(eligibility: Eligibility) {
+  const apk = Buffer.from(`signed APK fixture for ${eligibility.target}`);
+  const sha256 = common.sha256Buffer(apk);
+  const provenance = { schema: android.SCHEMA, source: android.identity(eligibility), unsigned: { sha256: "b".repeat(64), size: 12 }, signed: { sha256, size: apk.length }, certificateSha256: CERT, toolchain: android.TOOLCHAIN };
+  return [
+    { filename: `pi-review-gate-b${eligibility.n}.apk`, buffer: apk },
+    { filename: "ANDROID_SHA256SUMS", buffer: Buffer.from(`${sha256}  pi-review-gate-b${eligibility.n}.apk\n`) },
+    { filename: "android-provenance.json", buffer: Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`) },
+  ].map((asset) => ({ ...asset, sha256: common.sha256Buffer(asset.buffer), size: asset.buffer.length }));
+}
 
 const TARGET = "c".repeat(40);
 const TOKEN = "test-token";
@@ -32,6 +53,8 @@ function baseEnv(overrides: Partial<Record<string, string>> = {}): Record<string
     GITHUB_REPOSITORY: "rfairburn/pi-review-gate",
     GITHUB_SHA: TARGET,
     GITHUB_TOKEN: TOKEN,
+    ANDROID_HOME: "/mock-sdk",
+    ANDROID_SIGNING_CERT_SHA256: CERT,
     ...overrides,
   };
 }
@@ -86,6 +109,7 @@ function makeRepo(opts: {
   c1Changelog?: string;
   sideChangelog?: string;
   mergeChangelog?: string;
+  producerSource?: string;
 } = {}): SyntheticRepo {
   const root = mkdtempSync(join(tmpdir(), "release-publish-"));
   git(root, "init", "--initial-branch=main");
@@ -98,8 +122,15 @@ function makeRepo(opts: {
       input: changelogContent,
       encoding: "utf8",
     }).trim();
+    let entries = `100644 blob ${blob}\tCHANGELOG.md\n`;
+    if (opts.producerSource) {
+      const producer = execFileSync("git", ["-C", root, "hash-object", "-w", "--stdin"], { input: opts.producerSource, encoding: "utf8" }).trim();
+      const releaseTree = execFileSync("git", ["-C", root, "mktree"], { input: `100644 blob ${producer}\tpublish.cjs\n`, encoding: "utf8" }).trim();
+      const scriptsTree = execFileSync("git", ["-C", root, "mktree"], { input: `040000 tree ${releaseTree}\trelease\n`, encoding: "utf8" }).trim();
+      entries += `040000 tree ${scriptsTree}\tscripts\n`;
+    }
     const tree = execFileSync("git", ["-C", root, "mktree"], {
-      input: `100644 blob ${blob}\tCHANGELOG.md\n`,
+      input: entries,
       encoding: "utf8",
     }).trim();
     const args = ["commit-tree", tree, "-m", message];
@@ -499,20 +530,32 @@ function publishWith(repo: SyntheticRepo, github: MockGithub, overrides: {
   buildArtifacts?: (options: { eligibility: Eligibility }) => Promise<ReturnType<typeof fakeBuildArtifacts>>;
   policyAnchor?: string;
   detailSha?: string;
+  legacyVerifyOnly?: boolean;
+  inspectOnly?: boolean;
+  androidRun?: typeof androidRun;
 } = {}): Promise<PublishSummary> {
   const eligible = overrides.eligible ?? true;
   // List-shaped association + detailed record, as the real endpoints return.
   github.pullRequests = eligible ? [listItem(7)] : [];
   github.details = eligible ? { 7: detailPr(7, overrides.detailSha ?? repo.mergeCommit) } : {};
+  const scratch = mkdtempSync(join(tmpdir(), "release-publish-scratch-"));
+  const androidEligibility = overrides.env?.GITHUB_SHA === repo.mainChild
+    ? { ...eligibilityFor(repo), n: 1, tag: "b1", version: "0.1.0-dev.1", target: repo.mainChild }
+    : eligibilityFor(repo);
+  const androidAssets = fakeAndroidAssets(androidEligibility);
+  for (const asset of androidAssets) writeFileSync(join(scratch, asset.filename), asset.buffer);
   return publish.publishRelease({
-    env: overrides.env ?? baseEnv({ GITHUB_SHA: repo.mergeCommit }),
+    env: { ...baseEnv({ GITHUB_SHA: repo.mergeCommit }), EXPECTED_SIGNED_SHA256: androidAssets[0].sha256, EXPECTED_SIGNED_METADATA_SHA256: androidAssets[2].sha256, ...overrides.env, ANDROID_RELEASE_DIR: scratch },
+    legacyVerifyOnly: overrides.legacyVerifyOnly,
+    inspectOnly: overrides.inspectOnly,
+    androidRun: overrides.androidRun ?? androidRun,
     fetchImpl: github.fetch.bind(github),
     projectRoot: repo.root,
     baseline: repo.baseline,
     // Default: the target IS the adoption anchor, i.e. a legacy build — this
     // keeps every pre-notes orchestration test on the old body format.
     policyAnchor: overrides.policyAnchor ?? repo.mergeCommit,
-    scratchRoot: mkdtempSync(join(tmpdir(), "release-publish-scratch-")),
+    scratchRoot: scratch,
     buildArtifacts: overrides.buildArtifacts ?? ((options: { eligibility: Eligibility }) => {
       if (overrides.buildRecorder) overrides.buildRecorder.built = true;
       return Promise.resolve(fakeBuildArtifacts(options.eligibility));
@@ -520,14 +563,14 @@ function publishWith(repo: SyntheticRepo, github: MockGithub, overrides: {
   });
 }
 
-// Seed a fully consistent PUBLISHED release (tag + body + all three verified
+// Seed a fully consistent PUBLISHED release (tag + body + all six verified
 // assets). With `corrupt`, the published tarball bytes no longer match the
 // published SHA256SUMS/provenance.
 function seedPublishedRelease(github: MockGithub, repo: SyntheticRepo, releaseId: number, corrupt = false) {
   const eligibility = eligibilityFor(repo);
   const build = fakeBuildArtifacts(eligibility);
   github.tags.set("refs/tags/b2", repo.mergeCommit);
-  const assets = build.assets.map((asset, index) => {
+  const assets = [...build.assets, ...fakeAndroidAssets(eligibility)].map((asset, index) => {
     const id = releaseId * 10 + index;
     const content = corrupt && asset.filename.endsWith(".tgz") ? Buffer.from("corrupted published bytes") : asset.buffer;
     github.assetContents.set(id, content);
@@ -559,7 +602,7 @@ test("fresh publish: draft created, all assets uploaded and verified, then publi
     assert.equal(summary.target, repo.mergeCommit);
     assert.equal(summary.mode, "created-draft");
     assert.equal(summary.tagCreated, true);
-    assert.deepEqual(summary.assets?.uploaded.sort(), ["SHA256SUMS", "pi-review-gate-0.1.0-dev.2.tgz", "provenance.json"]);
+    assert.deepEqual(summary.assets?.uploaded.sort(), publish.expectedAssetNames("pi-review-gate-0.1.0-dev.2.tgz", 2).sort());
     assert.deepEqual(summary.assets?.replaced, []);
     // Tag pinned to the exact SHA.
     assert.equal(github.tags.get("refs/tags/b2"), repo.mergeCommit);
@@ -636,7 +679,7 @@ test("incomplete owned draft resumes via bounded release listing without creatin
     const summary = await publishWith(repo, github);
     assert.equal(summary.outcome, "published");
     assert.equal(summary.mode, "resume-draft");
-    assert.deepEqual(summary.assets?.uploaded.sort(), ["SHA256SUMS", "pi-review-gate-0.1.0-dev.2.tgz", "provenance.json"]);
+    assert.deepEqual(summary.assets?.uploaded.sort(), publish.expectedAssetNames("pi-review-gate-0.1.0-dev.2.tgz", 2).sort());
     // The draft was located through the authenticated listing...
     assert.ok(
       github.requests.some((request) => request.method === "GET" && new URL(request.url).pathname === "/repos/rfairburn/pi-review-gate/releases"),
@@ -646,7 +689,7 @@ test("incomplete owned draft resumes via bounded release listing without creatin
     assert.equal(github.releases.size, 1);
     const release = github.releaseByTag("b2");
     assert.equal(release?.draft, false);
-    assert.equal(release?.assets.length, 3);
+    assert.equal(release?.assets.length, 6);
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }
@@ -672,7 +715,7 @@ test("mismatched owned-draft asset is narrowly replaced; byte-identical assets a
     assert.equal(summary.outcome, "published");
     assert.deepEqual(summary.assets?.replaced, ["pi-review-gate-0.1.0-dev.2.tgz"]);
     assert.deepEqual(summary.assets?.kept, ["SHA256SUMS"]);
-    assert.deepEqual(summary.assets?.uploaded, ["provenance.json"]);
+    assert.deepEqual(summary.assets?.uploaded, ["provenance.json", "pi-review-gate-b2.apk", "ANDROID_SHA256SUMS", "android-provenance.json"]);
     const publishedTarball = github.assetContent("b2", "pi-review-gate-0.1.0-dev.2.tgz");
     assert.equal(common.sha256Buffer(publishedTarball ?? Buffer.alloc(0)), build.assets[0]?.sha256);
   } finally {
@@ -1549,6 +1592,68 @@ test("a target that is an ancestor of the adoption anchor stays on the legacy pa
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }
+});
+
+test("new producer never verifies Node-only published assets; explicit old-source legacy mode is read-only", async () => {
+  const repo = makeRepo({ producerSource: 'function expectedAssetNames(tarballFilename) { return ["SHA256SUMS", "provenance.json", tarballFilename]; }' });
+  const github = new MockGithub();
+  try {
+    seedPublishedRelease(github, repo, 42);
+    const release = github.releases.get(42)!;
+    release.assets = release.assets.filter((asset) => !asset.name.endsWith(".apk") && !asset.name.startsWith("android-") && asset.name !== "ANDROID_SHA256SUMS");
+    await assert.rejects(publishWith(repo, github), /published asset missing:.*apk/);
+    const buildRecorder = { built: false };
+    const summary = await publishWith(repo, github, { legacyVerifyOnly: true, buildRecorder });
+    assert.equal(summary.outcome, "already-published");
+    assert.equal(buildRecorder.built, false);
+    assert.equal(github.requests.filter((request) => request.method !== "GET").length, 0);
+    release.draft = true;
+    await assert.rejects(publishWith(repo, github, { legacyVerifyOnly: true }), /verify-only/);
+    assert.equal(github.requests.filter((request) => request.method !== "GET").length, 0);
+  } finally { rmSync(repo.root, { recursive: true, force: true }); }
+});
+
+test("new target source cannot be downgraded to legacy verification", async () => {
+  const repo = makeRepo({ producerSource: 'function expectedAssetNames(tarballFilename, n) { return ["SHA256SUMS", "provenance.json", tarballFilename, ...android.names(n)]; }' });
+  const github = new MockGithub();
+  try {
+    seedPublishedRelease(github, repo, 42);
+    await assert.rejects(publishWith(repo, github, { legacyVerifyOnly: true }), /does not declare the legacy/);
+    assert.equal(github.requests.filter((request) => request.method !== "GET").length, 0);
+  } finally { rmSync(repo.root, { recursive: true, force: true }); }
+});
+
+test("all six assets are downloaded before the draft publication PATCH", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    await publishWith(repo, github);
+    const release = github.releaseByTag("b2")!;
+    const publishIndex = github.requests.findIndex((request) => request.method === "PATCH" && JSON.parse(request.body ?? "{}").draft === false);
+    assert.ok(publishIndex > 0);
+    for (const asset of release.assets) {
+      assert.ok(github.requests.slice(0, publishIndex).some((request) => request.method === "GET" && request.url.endsWith(`/releases/assets/${asset.id}`)), `asset ${asset.name} must be verified before publish`);
+    }
+    assert.equal(release.assets.length, 6);
+    const built = { built: false };
+    github.requests = [];
+    await publishWith(repo, github, { buildRecorder: built });
+    assert.equal(built.built, false);
+    assert.equal(github.requests.filter((request) => request.method !== "GET").length, 0);
+  } finally { rmSync(repo.root, { recursive: true, force: true }); }
+});
+
+test("Android verification failure blocks publication and published plans cannot rebuild", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  try {
+    await assert.rejects(publishWith(repo, github, { androidRun: () => { throw new Error("APK verification failed"); } }), /APK verification failed/);
+    assert.equal(github.releaseByTag("b2")?.draft, true);
+    assert.equal(github.requests.filter((request) => request.method === "PATCH" && JSON.parse(request.body ?? "{}").draft === false).length, 0);
+    github.requests = [];
+    await assert.rejects(publishWith(repo, github, { env: { RELEASE_PLAN_OUTCOME: "verify-published" } }), /published plan cannot rebuild/);
+    assert.equal(github.requests.filter((request) => request.method !== "GET").length, 0);
+  } finally { rmSync(repo.root, { recursive: true, force: true }); }
 });
 
 // --- Production artifact build: install-identity gate ------------------------

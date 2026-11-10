@@ -29,8 +29,49 @@ function badge(overrides = {}) {
   const values = { package: "io.github.rfairburn.pireviewgate", code: 257, name: "0.1.0+257", min: 33, target: 37, ...overrides };
   return `package: name='${values.package}' versionCode='${values.code}' versionName='${values.name}'\nminSdkVersion:'${values.min}'\ntargetSdkVersion:'${values.target}'\n${values.debug ? "application-debuggable" : ""}`;
 }
-function signature(digest = cert, v2 = true, v3 = true) {
-  return `Verified using v2 scheme (APK Signature Scheme v2): ${v2}\nVerified using v3 scheme (APK Signature Scheme v3): ${v3}\nSigner #1 certificate SHA-256 digest: ${digest}\n`;
+// SDK 37 labels the independent verification runs differently. Include public-key
+// digests to distinguish them from certificate records; source stamps are tested below.
+const SIGNER_LABEL = { v3: "V3.0 Signer:", v2: "V2 Signer:" };
+// The source stamp identity is printed in the same shape but is not an APK signer.
+const SOURCE_STAMP_LABEL = "Source Stamp Signer:";
+const isV2Verify = (args) => args.includes("--min-sdk-version");
+const isUnsignedInput = (args) => args.at(-1).endsWith("unsigned.apk");
+const isSignedVerify = (args) => !isV2Verify(args) && !isUnsignedInput(args);
+const phaseOf = (args) => (isV2Verify(args) ? "v2" : "v3");
+const recordLine = (label, digest) => `${label} certificate SHA-256 digest: ${digest}\n`;
+const numberedLabel = (role, number) => `${SIGNER_LABEL[role].slice(0, -1)} #${number}:`;
+// Output with every `certificate SHA-256 digest:` record line removed, leaving the other
+// real signer output (including the public-key digest line) untouched.
+const dropRecords = (stdout) => stdout.split("\n").filter((line) => !line.includes(" certificate SHA-256 digest:")).join("\n");
+function verifyHeaders(role, v2 = role === "v2", v3 = role === "v3") {
+  return `Verified using v2 scheme (APK Signature Scheme v2): ${v2}\nVerified using v3 scheme (APK Signature Scheme v3): ${v3}\nNumber of signers: 1`;
+}
+function signerRecords(role, digest = cert) {
+  const label = SIGNER_LABEL[role];
+  return [
+    `${label} certificate DN: CN=Mock Release, O=pi-review-gate`,
+    `${label} certificate SHA-256 digest: ${digest}`,
+    `${label} certificate SHA-1 digest: ${"b".repeat(40)}`,
+    `${label} certificate MD5 digest: ${"c".repeat(32)}`,
+    `${label} key algorithm: RSA`,
+    `${label} key size (bits): 4096`,
+    `${label} public key SHA-256 digest: ${"d".repeat(64)}`,
+  ].join("\n");
+}
+function signature(digest = cert, v2 = true, v3 = true, role = "v3") {
+  return `${verifyHeaders(role, v2, v3)}\n${signerRecords(role, digest)}\n`;
+}
+// Accepted stdout for exactly one correctly pinned signer of one phase.
+function phaseSignature(role, digest = cert) {
+  return signature(digest, role === "v2", role === "v3", role);
+}
+// Dispatch one stdout per verification phase: `make` receives the phase whose output it
+// must produce, so a shape can be applied to the default v3 run, the forced v2 run, or both.
+function phaseRun(make, changes = {}) {
+  return (file, args) => {
+    if (file.endsWith("aapt2")) return { status: 0, stdout: badge(changes) };
+    return { status: 0, stdout: make(phaseOf(args)) };
+  };
 }
 function metadata() {
   const unsigned = Buffer.from("unsigned APK fixture; not a real APK/key");
@@ -63,8 +104,8 @@ function memorySigner(t, options = {}) {
     calls.push({ file, args, env: settings.env });
     if (file.endsWith("aapt2")) return { status: 0, stdout: badge(options.badge) };
     if (args[0] === "verify") {
-      const v2Only = args.includes("--min-sdk-version");
-      return { status: args.at(-1).endsWith("unsigned.apk") ? 1 : 0, stdout: signature(options.cert, v2Only, !v2Only) };
+      const role = phaseOf(args);
+      return { status: isUnsignedInput(args) ? 1 : 0, stdout: signature(options.cert, role === "v2", role === "v3", role) };
     }
     if (args[0] === "sign") {
       if (options.toolFailure) throw new Error("mock tool failure");
@@ -172,13 +213,18 @@ test("SDK provisioning requests the exact 37.0 platform package only when platfo
 });
 
 test("APK verification refuses wrong package/version/SDK, debug, unsigned and wrong certificate", () => {
-  const run = (changes = {}, sig = signature()) => (file) => ({ status: 0, stdout: file.endsWith("aapt2") ? badge(changes) : sig });
+  const run = (changes = {}, make = (role) => phaseSignature(role)) => phaseRun(make, changes);
   android.inspectApk("fixture.apk", eligibility, { env, cert, run: run() });
   for (const change of [{ package: "other" }, { code: 1 }, { name: "0.1.0" }, { min: 32 }, { target: 36 }, { debug: true }]) {
     assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: run(change) }));
   }
-  for (const sig of ["", signature("b".repeat(64)), signature().replace("v3): true", "v3): false"), signature() + `Signer #2 certificate SHA-256 digest: ${cert}\n`]) {
-    assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: run({}, sig) }));
+  for (const make of [
+    () => "",
+    (role) => phaseSignature(role, "b".repeat(64)),
+    (role) => phaseSignature(role).replace("v3): true", "v3): false"),
+    (role) => phaseSignature(role) + recordLine(numberedLabel(role, 2), cert),
+  ]) {
+    assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: run({}, make) }));
   }
   assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, signed: false, run: run() }), /must be unsigned/);
 });
@@ -194,7 +240,7 @@ test("aapt2 badging SDK fields retain exact bounds for unsigned and signed APKs"
           assert.deepEqual(args, ["dump", "badging", "fixture.apk"]);
           return { status: 0, stdout: badging };
         }
-        return { status: signed ? 0 : 1, stdout: signature() };
+        return { status: signed ? 0 : 1, stdout: phaseSignature(phaseOf(args)) };
       },
     });
     assert.doesNotThrow(() => inspect(badge()));
@@ -208,10 +254,15 @@ test("aapt2 badging SDK fields retain exact bounds for unsigned and signed APKs"
 
 test("minSdk 33 APK verifies v3 normally and v2 independently over SDK 24–27", () => {
   const calls = [];
+  const records = [];
   const run = (file, args) => {
     calls.push(args);
     if (file.endsWith("aapt2")) return { status: 0, stdout: badge() };
-    if (args[0] === "verify") return { status: 0, stdout: args.includes("--min-sdk-version") ? signature(cert, true, false) : signature(cert, false, true) };
+    if (args[0] === "verify") {
+      const stdout = phaseSignature(phaseOf(args));
+      records.push([...stdout.matchAll(/^(.*) certificate SHA-256 digest:/gm)].map((match) => match[1]));
+      return { status: 0, stdout };
+    }
     return { status: 0, stdout: "" };
   };
   android.inspectApk("fixture.apk", eligibility, { env, cert, run });
@@ -219,20 +270,76 @@ test("minSdk 33 APK verifies v3 normally and v2 independently over SDK 24–27",
     ["verify", "--verbose", "--print-certs", "fixture.apk"],
     ["verify", "--verbose", "--print-certs", "--min-sdk-version", "24", "--max-sdk-version", "27", "fixture.apk"],
   ]);
+  // Each independent verification reports exactly one certificate record under the label
+  // that run can produce: `V3.0 Signer:` for the default run, `V2 Signer:` for the forced
+  // SDK 24–27 run. Both are accepted against the configured public certificate.
+  assert.deepEqual(records, [["V3.0 Signer:"], ["V2 Signer:"]]);
   // The manifest still must declare minimum SDK 33 (checked by aapt2).
   assert.equal(android.version(257).minSdk, 33);
   for (const failed of ["normal", "v2"]) {
     for (const failure of ["status", "scheme", "certificate"]) {
       const failingRun = (file, args) => {
         const result = run(file, args);
-        if (args[0] !== "verify" || args.includes("--min-sdk-version") !== (failed === "v2")) return result;
+        if (args[0] !== "verify" || (phaseOf(args) === "v2") !== (failed === "v2")) return result;
         if (failure === "status") return { ...result, status: 1 };
-        if (failure === "scheme") return { status: 0, stdout: signature(cert, false, false) };
-        return { status: 0, stdout: signature("b".repeat(64)) };
+        if (failure === "scheme") return { status: 0, stdout: signature(cert, false, false, phaseOf(args)) };
+        return { status: 0, stdout: phaseSignature(phaseOf(args), "b".repeat(64)) };
       };
       assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: failingRun }), /signature|certificate/);
     }
   }
+});
+
+// Every rejected certificate shape is built for the phase under test while the other phase
+// keeps its valid record, so a shape that only one of the two verifications would accept
+// still fails closed. The static code stays APK_CERT_MISMATCH except where the unchanged
+// certificate() normalization itself rejects a short-but-hexadecimal value.
+const CERT_SHAPES = [
+  { name: "wrong pinned digest", build: (role) => phaseSignature(role, "b".repeat(64)) },
+  { name: "no certificate record", build: (role) => `${verifyHeaders(role)}\n` },
+  { name: "legacy unprefixed grammar", build: (role) => phaseSignature(role).replaceAll(SIGNER_LABEL[role], "Signer #1") },
+  { name: "wrong-role scheme label", build: (role) => signature(cert, role === "v2", role === "v3", role === "v3" ? "v2" : "v3") },
+  { name: "unknown signer label", build: (role) => phaseSignature(role).replaceAll(SIGNER_LABEL[role], "Weird Signer:") },
+  { name: "numbered second signer", build: (role) => phaseSignature(role) + recordLine(numberedLabel(role, 2), cert) },
+  { name: "numbered multiple signer output", build: (role) => phaseSignature(role).replace("Number of signers: 1", "Number of signers: 2").replaceAll(SIGNER_LABEL[role], numberedLabel(role, 1)) + recordLine(numberedLabel(role, 2), cert) },
+  { name: "duplicate certificate record", build: (role) => phaseSignature(role) + recordLine(SIGNER_LABEL[role], cert) },
+  { name: "v3.1 rotation records", build: (role) => phaseSignature(role) + recordLine("V3.1 Signer: (minSdkVersion=33, maxSdkVersion=34)", cert) },
+  { name: "v3.2 hybrid records", build: (role) => phaseSignature(role) + recordLine("V3.2 Hybrid Classical Signer", cert) },
+  { name: "public key digest only", build: (role) => dropRecords(phaseSignature(role)) },
+  { name: "source stamp identity only", build: (role) => `${dropRecords(phaseSignature(role))}${recordLine(SOURCE_STAMP_LABEL, cert)}` },
+  { name: "digest forged on a new line inside a certificate DN", build: (role) => phaseSignature(role, "b".repeat(64)).replace("certificate DN: CN=Mock Release, O=pi-review-gate", `certificate DN: CN=attacker\n${recordLine(SIGNER_LABEL[role], cert).trimEnd()}`) },
+  { name: "extra numbered signer with a non-digest value", build: (role) => phaseSignature(role) + recordLine(numberedLabel(role, 2), "not-a-digest") },
+  { name: "extra numbered signer with an empty digest", build: (role) => phaseSignature(role) + recordLine(numberedLabel(role, 2), "") },
+  { name: "extra unlabelled certificate record", build: (role) => phaseSignature(role) + `certificate SHA-256 digest: ${cert}\n` },
+  { name: "extra malformed record delimiter", build: (role) => phaseSignature(role) + `${SIGNER_LABEL[role]}certificate SHA-256 digest: not-a-digest\n` },
+  { name: "extra unknown-label signer", build: (role) => phaseSignature(role) + recordLine("Weird Signer:", cert) },
+  { name: "sole empty digest", build: (role) => phaseSignature(role).replace(recordLine(SIGNER_LABEL[role], cert), recordLine(SIGNER_LABEL[role], "")) },
+  { name: "sole non-digest value", build: (role) => phaseSignature(role).replace(recordLine(SIGNER_LABEL[role], cert), recordLine(SIGNER_LABEL[role], "not-a-digest")) },
+  // A short-but-hexadecimal value still reaches the unchanged certificate() normalization,
+  // which fails closed with its existing message instead of a new diagnostic code.
+  { name: "sole truncated hexadecimal digest", build: (role) => phaseSignature(role).replace(recordLine(SIGNER_LABEL[role], cert), recordLine(SIGNER_LABEL[role], "abcd")), message: /invalid public certificate/ },
+];
+for (const shape of CERT_SHAPES) {
+  for (const phase of ["v3", "v2"]) {
+    test(`certificate shape "${shape.name}" fails closed in the ${phase} verification phase`, () => {
+      const run = phaseRun((role) => (role === phase ? shape.build(role) : phaseSignature(role)));
+      assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run }), shape.message ?? /APK signing certificate mismatch/);
+    });
+  }
+}
+
+test("one correctly pinned signer is accepted per phase in upper-case and colon digest forms and beside a source stamp identity", () => {
+  const colon = cert.toUpperCase().match(/.{2}/g).join(":");
+  for (const phase of ["v3", "v2"]) {
+    for (const [form, digest] of [["upper-case", cert.toUpperCase()], ["colon-separated upper-case", colon]]) {
+      const run = phaseRun((role) => (role === phase ? phaseSignature(role, digest) : phaseSignature(role)));
+      assert.doesNotThrow(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run }), `the ${phase} phase keeps accepting the ${form} digest form`);
+    }
+  }
+  // The source stamp identity is not an APK signer: it stays separate and ignored, whether
+  // or not the APK carries one.
+  const withStamp = phaseRun((role) => phaseSignature(role) + recordLine(SOURCE_STAMP_LABEL, "e".repeat(64)));
+  assert.doesNotThrow(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: withStamp }));
 });
 
 for (const lookupStatus of [403, 500, 404]) {
@@ -435,9 +542,6 @@ const passThroughVerify = (m, selector, stdout) => (file, args, settings) => {
   if (args[0] !== "verify" || !selector(args)) return result;
   return { status: 0, stdout };
 };
-const isUnsignedInput = (args) => args.at(-1).endsWith("unsigned.apk");
-const isSignedVerify = (args) => !args.includes("--min-sdk-version") && !isUnsignedInput(args);
-const isV2Verify = (args) => args.includes("--min-sdk-version");
 
 const SIGNER_FAILURE_CASES = [
   { code: "CONFIG_EVENT_CONTEXT", message: /GITHUB_EVENT_NAME/, prepare: (m) => { m.signingEnv.GITHUB_EVENT_NAME = "pull_request"; } },
@@ -459,14 +563,31 @@ const SIGNER_FAILURE_CASES = [
   { code: "APK_SDK_MISMATCH", message: /APK SDK mismatch/, options: { badge: { min: 32 } } },
   { code: "APK_DEBUG_REFUSED", message: /debug APK refused/, options: { badge: { debug: true } } },
   { code: "APK_NOT_UNSIGNED", message: /build input must be unsigned/, run: (m) => passThroughVerify(m, isUnsignedInput, "") },
-  { code: "APK_V3_UNVERIFIED", message: /requires a verified v3 signature/, run: (m) => passThroughVerify(m, isSignedVerify, signature(cert, true, false)) },
-  { code: "APK_V2_UNVERIFIED", message: /requires a verified v2 signature/, run: (m) => passThroughVerify(m, isV2Verify, signature(cert, false, true)) },
+  { code: "APK_V3_UNVERIFIED", message: /requires a verified v3 signature/, run: (m) => passThroughVerify(m, isSignedVerify, signature(cert, true, false, "v3")) },
+  { code: "APK_V2_UNVERIFIED", message: /requires a verified v2 signature/, run: (m) => passThroughVerify(m, isV2Verify, signature(cert, false, true, "v2")) },
   { code: "APK_CERT_MISMATCH", message: /APK signing certificate mismatch/, options: { cert: "b".repeat(64) } },
   { code: "CONFIG_RUNNER_TEMP", message: /RUNNER_TEMP is required/, prepare: (m) => { m.signingEnv.RUNNER_TEMP = ""; } },
   // An uncoded foreign failure inside the unsigned-input stage still resolves to that
   // stage's static code, and its original message is preserved unchanged.
   { code: "INPUT_UNSIGNED_APK", message: /mock aapt2 host failure/, run: (m) => (file, args, settings) => { if (file.endsWith("aapt2")) throw new Error("mock aapt2 host failure"); return m.run(file, args, settings); } },
 ];
+
+// Records are inventoried before any digest validation, so one additional signer record
+// with a non-digest value, an empty digest, or an unknown label fails closed beside an
+// otherwise valid pinned record — in each verification phase separately.
+for (const [selector, phase] of [[isSignedVerify, "v3"], [isV2Verify, "v2"]]) {
+  for (const extra of [
+    recordLine(numberedLabel(phase, 2), "not-a-digest"),
+    recordLine(numberedLabel(phase, 2), ""),
+    recordLine("Weird Signer:", cert),
+  ]) {
+    SIGNER_FAILURE_CASES.push({
+      code: "APK_CERT_MISMATCH",
+      message: /APK signing certificate mismatch/,
+      run: (m) => passThroughVerify(m, selector, phaseSignature(phase) + extra),
+    });
+  }
+}
 
 for (const testCase of SIGNER_FAILURE_CASES) {
   test(`signer gate failure resolves to the static ${testCase.code} code without leaking input`, (t) => {
@@ -663,7 +784,13 @@ fi
 case "$last" in
   *unsigned.apk) exit 1 ;;
 esac
-printf "Verified using v2 scheme (APK Signature Scheme v2): true\\nVerified using v3 scheme (APK Signature Scheme v3): true\\nSigner #1 certificate SHA-256 digest: %s\\n" "$FAKE_CERT"
+forced=""
+for argument in "$@"; do if [ "$argument" = "--min-sdk-version" ]; then forced=1; fi; done
+if [ -n "$forced" ]; then
+  printf "Verified using v2 scheme (APK Signature Scheme v2): true\\nVerified using v3 scheme (APK Signature Scheme v3): false\\nNumber of signers: 1\\nV2 Signer: certificate SHA-256 digest: %s\\n" "$FAKE_CERT"
+else
+  printf "Verified using v2 scheme (APK Signature Scheme v2): false\\nVerified using v3 scheme (APK Signature Scheme v3): true\\nNumber of signers: 1\\nV3.0 Signer: certificate SHA-256 digest: %s\\n" "$FAKE_CERT"
+fi
 exit 0
 `;
 

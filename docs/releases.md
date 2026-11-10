@@ -229,6 +229,14 @@ normalized by the verifier. This is a **certificate** digest, not the PKCS12 fil
 Missing/invalid configuration fails closed. No debug key, new key, global keystore, or
 client Android Keystore identity is used as a fallback.
 
+The normal `apksigner verify` run must verify v3; an independent SDK 24–27 run must verify
+v2. Each requires exactly one APK certificate record with the pinned Build Tools 37.0.0
+label (`V3.0 Signer:` and `V2 Signer:`, respectively) and the configured normalized digest.
+Records are counted before digest validation: extra, malformed, unknown, rotation and
+hybrid signer records fail closed. The separate source stamp identity is not an APK signer
+and remains ignored. A Build Tools change requires re-deriving this pinned format; there
+is no fallback parser.
+
 Keep this same signing key for normal app updates: with the unchanged application ID,
 Android can update the installation without intentionally resetting app data, mTLS
 identity, or pins. This pipeline does not implement reset/re-enrollment or claim a

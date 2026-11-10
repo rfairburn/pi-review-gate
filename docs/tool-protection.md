@@ -116,6 +116,20 @@ it does not stop.
   nested refusal are reported to you and to the acting model at either
   `toolProtection.debug` value. A native tool error that follows a `PASS` stays a native
   tool error; this gate never restates it as an audit `FAIL`.
+- A provider HTTP failure is reported as a compact host-authored summary: the failing
+  audit stage and the reliable HTTP status (for example `HTTP 504`), or the honest
+  statement that the provider returned an error response without a status. Its error
+  message, response body and headers are never included, in whole or in part — no
+  stripped HTML and no leading excerpt — because that payload would otherwise land in the
+  acting model's context, in a nested refusal, and in the next audit's evidence. A status
+  is reported only where the transport reported one — a structured status, a native
+  failure diagnostic, or a recognized native HTTP error message shape — never from an
+  arbitrary number in a message. An opaque provider phrase is never read as a
+  cancellation or a timeout: a cancellation is reported only when the transport itself
+  marks one. Every other auditor failure — an ordinary provider error message, a local
+  setup failure, an unusable model registry — keeps its own diagnostic wording. Either
+  way the refusal still states that the proposed call did not run, and the audit stays
+  fail-closed: no retry, no fallback auditor, no PASS.
 - An auditor-session save warning is always shown to you and never changes a verdict: a
   recording problem does not turn a `PASS` into a `FAIL` or hide a decision that was made.
 - A routine `PASS` and a `NOT AUDITED` result add no audit text to what the acting model
@@ -225,6 +239,12 @@ conversation, so you can browse it later.
   during the wait — including while the record itself was being written — are recorded too,
   with the real host status and no invented verdict. A record whose invocation never reached
   a transport says plainly that the request was never sent.
+- A provider HTTP failure is recorded as the terminal assistant message the transport
+  actually produced. Where the provider supplied error text or the transport attached a
+  structured failure diagnostic, that detail is saved verbatim and stays privately
+  inspectable; where the transport produced none, the record has none, because nothing is
+  reconstructed. The acting model still receives only the compact summary, whether this
+  setting is On or Off.
 - The outcome entry states that PASS/FAIL is this gate's pre-execution verdict, not a claim
   that the tool ran or succeeded. Custom entries of this kind are never part of model
   context, and the gate never opens, lists, or reads a saved audit: viewing a record

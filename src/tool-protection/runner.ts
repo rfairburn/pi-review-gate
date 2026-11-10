@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { STATUS_CODES } from "node:http";
 import type {
   ActiveReviewerSelection,
   ExternalAgentConfig,
@@ -546,10 +547,11 @@ async function runPiInProcessDecision(
     });
   } catch (error) {
     request.signal?.removeEventListener("abort", onAbort);
-    return refused(
-      failure(`Pi auditor in-process launch failed: ${errorMessage(error)}`, startedAt),
-      `Pi auditor in-process launch failed: ${errorMessage(error)}`,
-    );
+    // A launch that threw can carry an upstream HTTP failure inside its message
+    // (#623), so only an evidenced HTTP failure is reduced here. Any other
+    // launch diagnostic keeps the wording the host registry reported.
+    const detail = piTransportLine("in-process launch failed", error, errorMessage(error));
+    return refused(failure(detail, startedAt), detail);
   }
 
   // Every path below already reached the host's dispatch, so the record can
@@ -586,7 +588,11 @@ async function runPiInProcessDecision(
   }
   if (outcome.kind === "error") {
     controller.abort();
-    return observed(failure(`Pi auditor in-process decision failed: ${errorMessage(outcome.error)}`, startedAt));
+    // Same boundary as the provider error event: an evidenced HTTP failure
+    // never forwards the thrown value's text; everything else keeps it.
+    return observed(
+      failure(piTransportLine("in-process decision failed", outcome.error, errorMessage(outcome.error)), startedAt),
+    );
   }
   if (outcome.value.error) return observed(failure(outcome.value.error, startedAt), outcome.value.message);
   if (outcome.value.toolCall || messageHasToolCall(outcome.value.message)) {
@@ -637,7 +643,7 @@ function resolvePiModel(registry: ProtectionAuditorPiModelRegistry, selected: st
   try {
     all = registry.getAll();
   } catch (error) {
-    return { error: `Pi auditor model registry is unavailable: ${errorMessage(error)}` };
+    return { error: piTransportLine("model registry is unavailable", error, errorMessage(error)) };
   }
 
   const separator = selected.indexOf("/");
@@ -654,7 +660,7 @@ function resolvePiModel(registry: ProtectionAuditorPiModelRegistry, selected: st
       const found = registry.find(provider, modelId);
       if (found) return { model: found };
     } catch (error) {
-      return { error: `Pi auditor model registry lookup failed: ${errorMessage(error)}` };
+      return { error: piTransportLine("model registry lookup failed", error, errorMessage(error)) };
     }
     return {
       error: `Pi auditor model was not found for explicit provider/model: ${selected}. No other model was chosen.`,
@@ -682,7 +688,7 @@ function resolvePiModel(registry: ProtectionAuditorPiModelRegistry, selected: st
       const found = registry.find(provider, modelId);
       if (found) return { model: found };
     } catch (error) {
-      return { error: `Pi auditor model registry lookup failed: ${errorMessage(error)}` };
+      return { error: piTransportLine("model registry lookup failed", error, errorMessage(error)) };
     }
   }
   return { error: `Pi auditor model was not found in the supplied registry: ${selected}.` };
@@ -690,6 +696,10 @@ function resolvePiModel(registry: ProtectionAuditorPiModelRegistry, selected: st
 
 interface PiDecisionConsumption {
   message?: unknown;
+  /**
+   * Model-facing failure text for a terminal provider error event. The terminal
+   * message itself is reported to the retention sink separately and untouched.
+   */
   error?: string;
   toolCall: boolean;
 }
@@ -702,10 +712,46 @@ async function consumePiDecisionStream(stream: AsyncIterable<unknown>): Promise<
     if (type.startsWith("toolcall")) toolCall = true;
     if (type === "done") return { message: event.message, toolCall };
     if (type === "error") {
-      return { message: event.error, toolCall, error: piStreamErrorMessage(event.error) };
+      // The terminal message goes to the retention sink untouched, so a private
+      // record keeps whatever detail the transport actually exposed. Only the
+      // model-facing text is reduced, and only for an evidenced HTTP failure
+      // (#623): any other provider diagnostic keeps its own wording.
+      if (nativeAbortReason(event)) {
+        // The installed SDK marks an aborted stream with `reason: "aborted"`,
+        // and its terminal message carries the same value in `stopReason`. That
+        // host metadata — never an upstream word — is what classifies a
+        // cancellation, and it is the same host line every other confirmed
+        // cancellation of this audit uses.
+        return { message: event.error, toolCall, error: "Auditor was aborted." };
+      }
+      const http = readHttpTransportFailure(event.error);
+      return {
+        message: event.error,
+        toolCall,
+        error: http === undefined
+          ? piStreamErrorMessage(event.error)
+          : httpFailureLine("provider request failed", http.status),
+      };
     }
   }
   return { toolCall };
+}
+
+/**
+ * Whether one native terminal event says this request was cancelled.
+ *
+ * Evidence (Pi 1.5.0, `@earendil-works/pi-ai`): `api/pi-messages.js`
+ * `createErrorEvent()` sets `reason: "aborted"` together with the terminal
+ * message's `stopReason: "aborted"`, and the Anthropic route reaches the same
+ * shape from its own `APIUserAbortError`. Only those two explicit fields are
+ * read; a message that merely mentions an abort, or an opaque word such as
+ * `terminated`, proves nothing and stays an ordinary diagnostic.
+ */
+function nativeAbortReason(event: Record<string, unknown>): boolean {
+  if (event.reason === "aborted") return true;
+  // A host-supplied registry may omit the event reason; the terminal message's
+  // own `stopReason` carries the same value.
+  return event.reason === undefined && assistantStopReason(event.error) === "aborted";
 }
 
 function piStreamErrorMessage(value: unknown): string {
@@ -713,6 +759,290 @@ function piStreamErrorMessage(value: unknown): string {
     return value.errorMessage.trim();
   }
   return "Pi auditor provider ended with an error.";
+}
+
+/**
+ * An evidenced provider HTTP failure. `status` is present only when the
+ * transport reported one as a number.
+ */
+interface HttpTransportFailure {
+  status?: number;
+}
+
+/**
+ * Decide whether one provider failure came from a failed HTTP response, and take
+ * its status when the transport reported one (#623). Each accepted shape below is
+ * read from the installed runtime (Pi 1.5.0, `@earendil-works/pi-ai` and the SDKs
+ * it pins); nothing is guessed.
+ *
+ * - A thrown SDK error carries a structured status: `statusCode` (Mistral),
+ *   `status` (`openai`, `@google/genai`), `$metadata.httpStatusCode`, or
+ *   `$response.statusCode` (Bedrock) — the fields `utils/error-body.js` probes.
+ * - `api/pi-messages.js` and `api/bedrock-converse-stream.js` attach a
+ *   `*_response_failure` diagnostic whose `details.status` is the numeric response
+ *   status. Only that diagnostic counts: the SDK's other diagnostics
+ *   (`provider_transport_failure`, `anthropic_input_transformations`, …) describe
+ *   a fallback or a transformation, not a failed response, and must never silence
+ *   a useful diagnostic.
+ * - The failed body also reaches the message text in the shape the producing route
+ *   composes it — `${status} ${statusText}: ${body}` (`pi-messages`),
+ *   `${status}: ${body}` or `${prefix} (${status}): ${body}` (`error-body.js`),
+ *   `${status} ${msg}` and its provider-prefixed wrapper (the native SDK composed
+ *   message, see `nativeApiFailure`), or the `@google/genai`
+ *   `{error:{message,code,status}}` envelope. Each anchored shape is read only where
+ *   it is produced — a reason phrase must match Node's own HTTP registry
+ *   (punctuation ignored, since the registry and the wire differ on hyphens) and a
+ *   route tag must name the route that composes it — and only its status is taken.
+ *
+ * Deliberately not inferred: no number is read out of the middle of a message
+ * (`429 requests queued: …` on a route that composes no status line stays the
+ * diagnostic it is), an absent status is never guessed, and no upstream word is
+ * read as a cause. The acknowledged limit is a bare-prose body on a route that
+ * composes no status and attaches no failure diagnostic: it is indistinguishable
+ * from a provider diagnostic and is forwarded, which is the trade that keeps
+ * ordinary diagnostics intact. `undefined` means "not evidenced as an HTTP
+ * failure", which leaves the caller's existing diagnostic exactly as useful as
+ * it was.
+ */
+function readHttpTransportFailure(source: unknown): HttpTransportFailure | undefined {
+  if (!isRecord(source)) return undefined;
+  const status = structuredHttpStatus(source);
+  if (status !== undefined) return { status };
+  if (Array.isArray(source.diagnostics)) {
+    for (const entry of source.diagnostics) {
+      if (!isRecord(entry) || typeof entry.type !== "string" || !RESPONSE_FAILURE_DIAGNOSTIC.test(entry.type)) continue;
+      const details = entry.details;
+      // The diagnostic proves the failed response; its status is read for that
+      // one number only. Its other fields carry a request URL and body text,
+      // which are never read here.
+      return { status: isRecord(details) ? structuredHttpStatus(details) : undefined };
+    }
+  }
+  const text = nonEmptyText(source.errorMessage) ?? nonEmptyText(source.message);
+  if (text === undefined) return undefined;
+  const envelope = googleHttpErrorEnvelope(source.api, text);
+  if (envelope !== undefined) return envelope;
+  const native = nativeApiFailure(source.api, source.provider, text);
+  if (native !== undefined) return native;
+  const composed = composedHttpFailure(text);
+  if (composed !== undefined) return composed;
+  // An HTML document inside the text is a gateway's error page: an HTTP
+  // response body even when no status survived alongside it.
+  return HTML_ERROR_PAGE.test(text) ? {} : undefined;
+}
+
+/**
+ * The `@google/genai` HTTP error envelope, honoured only on the two terminal
+ * messages that route produces.
+ *
+ * Evidence (installed `@google/genai` 2.21.0, `throwErrorIfNotOK()`): for any
+ * non-2xx response the SDK serializes `{error:{message,code,status}}` — taking
+ * `code` from `response.status` and `status` from `response.statusText` when the
+ * body is not JSON — and throws it as `ApiError.message`. pi-ai's
+ * `api/google-generative-ai.js` and `api/google-vertex.js` then set
+ * `errorMessage = formatProviderError(normalizeProviderError(error))`, which
+ * returns that JSON text unchanged because the SDK error carries no body field,
+ * so the outer numeric status is dropped and the envelope is all that remains.
+ * The `api` tag is what makes this narrow: the same JSON text on any other
+ * route, or an incomplete envelope, stays the diagnostic it is.
+ */
+const GOOGLE_HTTP_API_IDS = new Set(["google-generative-ai", "google-vertex"]);
+
+function googleHttpErrorEnvelope(api: unknown, text: string): HttpTransportFailure | undefined {
+  if (typeof api !== "string" || !GOOGLE_HTTP_API_IDS.has(api)) return undefined;
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // Not the SDK's serialized envelope: ordinary wording continues unchanged.
+    return undefined;
+  }
+  if (!isRecord(body) || !isRecord(body.error)) return undefined;
+  const code = body.error.code;
+  if (!isHttpStatusCode(code) || code < 400) return undefined;
+  if (typeof body.error.status !== "string" || typeof body.error.message !== "string") return undefined;
+  return { status: code };
+}
+
+/** `api/pi-messages.js` and `api/bedrock-converse-stream.js` failure diagnostics. */
+const RESPONSE_FAILURE_DIAGNOSTIC = /^[a-z0-9_]*response_failure$/;
+
+/** An nginx-style gateway error page, as `pi-messages` embeds a raw body. */
+const HTML_ERROR_PAGE = /<(!doctype\s+)?html[\s>/]|<\/html\s*>/i;
+
+/**
+ * `api/pi-messages.js`: `${status} ${statusText}: ${body}`. The phrase is only
+ * accepted when it is Node's own reason phrase for that status, so a provider
+ * sentence that happens to open with a number and a colon is not read as a
+ * gateway status line.
+ */
+const GATEWAY_STATUS_LINE = /^(\d{3}) ([^:\r\n]{1,48}):(?=\s)/;
+
+/**
+ * `utils/error-body.js`: `${status}: ${body}`, or with its optional provider
+ * prefix `${prefix} (${status}): ${body}`.
+ */
+const NORMALIZED_STATUS_LINE = /^(?:([A-Za-z][A-Za-z .+-]{0,47}) \((\d{3})\)|(\d{3})):(?=\s)/;
+
+/**
+ * A JSON response body folded in right after a leading status, which `pi-messages`
+ * keeps raw and `APIError.makeMessage()` stringifies. The document marker proves
+ * the fold on any route; prose there is not evidence.
+ */
+const FOLDED_RESPONSE_BODY = /^(\d{3}) (?=[<{\[])/;
+
+/**
+ * The routes whose terminal `errorMessage` copies the native SDK composed message:
+ * `api/anthropic-messages.js` assigns `error.message` verbatim, and the OpenAI
+ * routes keep it through `formatProviderError()` — unchanged where they pass no
+ * prefix (`openai-completions`), or wrapped as `<prefix> (${status}): …` where they
+ * do (`openai-responses`, `azure-openai-responses`). `openai-codex-responses`
+ * composes its own wording and is deliberately absent.
+ */
+const NATIVE_API_ERROR_API_IDS = new Set([
+  "anthropic-messages",
+  "openai-completions",
+  "openai-responses",
+  "azure-openai-responses",
+]);
+
+/**
+ * The leading status of `@anthropic-ai/sdk` 0.129.0 and `openai` 7.19.0
+ * `APIError.makeMessage()`: `${status} ${msg}`, where `msg` is a non-JSON
+ * response body copied verbatim — arbitrary plain text with no document marker.
+ * The number is the failed response's own status (`makeStatusError()` is reached
+ * only for a `!response.ok` response), so it is reliable and the text after it is
+ * never read. A failed response reports 400 or above, so a lower number sitting at
+ * the start of prose is not evidence of one.
+ */
+const NATIVE_STATUS_LINE = /^(\d{3}) /;
+
+/**
+ * `api/openai-responses.js` prefixes its message with
+ * `${provider === "openai" ? "OpenAI" : provider} API error`, and
+ * `formatProviderError()` applies that prefix even when the SDK message already
+ * carries the body — `proxy2 API error (504): 504 <raw body>` — so a provider tag
+ * with a digit or an underscore, or longer than `NORMALIZED_STATUS_LINE` allows,
+ * is not read there. The prefix is rebuilt from the terminal message's own
+ * `provider` tag; no provider-name pattern is guessed. Azure's constant prefix is
+ * already accepted by `NORMALIZED_STATUS_LINE`.
+ */
+function openaiResponsesErrorPrefix(api: unknown, provider: unknown): string | undefined {
+  if (api !== "openai-responses") return undefined;
+  if (typeof provider !== "string" || provider.length === 0) return undefined;
+  return `${provider === "openai" ? "OpenAI" : provider} API error`;
+}
+
+/** The `(<status>):` the route composes right after its provider prefix. */
+const NATIVE_WRAPPED_STATUS = /^\((\d{3})\):(?=\s)/;
+
+/**
+ * The native SDK composed message on the routes proven to copy it, in both forms
+ * they produce: `${status} ${msg}`, and — where the route supplies a provider
+ * prefix — `<provider prefix> (${status}): …`, whose number is pi-ai's own
+ * composition of the SDK's structured status field. Only the status is read.
+ */
+function nativeApiFailure(api: unknown, provider: unknown, text: string): HttpTransportFailure | undefined {
+  if (typeof api !== "string" || !NATIVE_API_ERROR_API_IDS.has(api)) return undefined;
+  const prefix = openaiResponsesErrorPrefix(api, provider);
+  if (prefix !== undefined && text.startsWith(`${prefix} `)) {
+    const wrapped = NATIVE_WRAPPED_STATUS.exec(text.slice(prefix.length + 1));
+    if (wrapped !== null && isHttpStatusCode(Number(wrapped[1]))) return { status: Number(wrapped[1]) };
+  }
+  const bare = NATIVE_STATUS_LINE.exec(text);
+  const status = bare === null ? undefined : Number(bare[1]);
+  if (status !== undefined && isHttpStatusCode(status) && status >= 400) return { status };
+  return undefined;
+}
+
+/** One of the SDK-composed status lines, or nothing. */
+function composedHttpFailure(text: string): HttpTransportFailure | undefined {
+  const gateway = GATEWAY_STATUS_LINE.exec(text);
+  if (gateway !== null) {
+    const status = Number(gateway[1]);
+    if (isHttpStatusCode(status) && isKnownReasonPhrase(status, gateway[2] ?? "")) return { status };
+  }
+  const normalized = NORMALIZED_STATUS_LINE.exec(text);
+  if (normalized !== null) {
+    const status = Number(normalized[2] ?? normalized[3]);
+    if (isHttpStatusCode(status)) return { status };
+  }
+  const folded = FOLDED_RESPONSE_BODY.exec(text);
+  if (folded !== null) {
+    const status = Number(folded[1]);
+    if (isHttpStatusCode(status)) return { status };
+  }
+  return undefined;
+}
+
+/**
+ * Node's own HTTP reason phrases, which is what a real status line carries.
+ * Compared with punctuation ignored, because the registry and the wire differ
+ * on trivia: Node reports `"Gateway Timeout"` where HTTP/1.1 and nginx emit
+ * `"Gateway Time-out"`. This still rejects a provider sentence that merely
+ * follows a number.
+ */
+function isKnownReasonPhrase(status: number, phrase: string): boolean {
+  const expected = (STATUS_CODES as Record<number, string | undefined>)[status];
+  if (expected === undefined) return false;
+  const normalize = (text: string): string => text.toLowerCase().replace(/[^a-z0-9]/gu, "");
+  return normalize(expected) === normalize(phrase);
+}
+
+/** The SDK's own status fields, in the order `utils/error-body.js` probes them. */
+function structuredHttpStatus(source: Record<string, unknown>): number | undefined {
+  const candidates: unknown[] = [source.statusCode, source.status];
+  const metadata = source.$metadata;
+  if (isRecord(metadata)) candidates.push(metadata.httpStatusCode);
+  const response = source.$response;
+  if (isRecord(response)) candidates.push(response.statusCode);
+  for (const candidate of candidates) {
+    if (isHttpStatusCode(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function isHttpStatusCode(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599;
+}
+
+function nonEmptyText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+/** The compact host-authored phrase for one evidenced provider HTTP failure. */
+function httpFailurePhrase(status: number | undefined): string {
+  return status === undefined
+    ? "the provider returned an error response but reported no HTTP status"
+    : `HTTP ${status}`;
+}
+
+function httpFailureLine(stage: string, status: number | undefined): string {
+  return `Pi auditor ${stage} (${httpFailurePhrase(status)}).`;
+}
+
+/**
+ * One model-facing line for a Pi transport problem. An evidenced provider HTTP
+ * failure becomes the compact host summary — the upstream error message,
+ * response body and headers never appear, in whole or in part, because that
+ * payload would otherwise land in the acting model's context, in a nested
+ * refusal, and in the next audit's evidence. Every other failure keeps the
+ * caller's own detail text, so an ordinary provider, registry, or launch
+ * diagnostic stays exactly as useful as it was.
+ */
+function piTransportLine(stage: string, error: unknown, detail: string): string {
+  const http = readHttpTransportFailure(error);
+  return http === undefined ? `Pi auditor ${stage}: ${detail}` : httpFailureLine(stage, http.status);
+}
+
+/**
+ * The same single rule for a model-facing catch outside this module (#623): the
+ * replacement phrase for an evidenced provider HTTP failure, or `undefined` when
+ * the value is not evidenced as one and keeps its own message.
+ */
+export function httpFailureSummary(error: unknown): string | undefined {
+  const http = readHttpTransportFailure(error);
+  return http === undefined ? undefined : httpFailurePhrase(http.status);
 }
 
 function assistantText(message: unknown): string {

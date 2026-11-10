@@ -103,6 +103,7 @@ import {
 } from "./display";
 import { parseProtectionDecision } from "./decision";
 import {
+  httpFailureSummary,
   protectionAuditorCacheKey,
   runProtectionAuditor,
   type ProtectionAuditorObservation,
@@ -966,7 +967,12 @@ export class ToolProtectionCoordinator {
         // retention On it is recorded too, keeping any transport observation the
         // runner managed to report, and the refusal keeps its real reason.
         this.pending.delete(event.callId);
-        const detail = errorMessage(error);
+        // An auditor transport failure can also surface here — as a host model
+        // registry throw, or from a supplied auditor seam. The runner's single
+        // HTTP rule applies, so an evidenced provider HTTP failure cannot get its
+        // upstream payload back into the refusal, the retained evidence, or the
+        // record through this catch; any other failure keeps its own message.
+        const detail = httpFailureSummary(error) ?? errorMessage(error);
         this.noteGateRefusalEvidence(event.toolName, event.callId, `auditor invocation threw: ${detail}`, false);
         const warning = await this.retainAuditorSession({
           call,
@@ -1120,8 +1126,10 @@ export class ToolProtectionCoordinator {
       return refuse(reason, warning);
     } catch (error) {
       // Fail closed on any unexpected coordinator defect. Never dispatch a call
-      // this layer could not evaluate.
-      const reason = `Tool protection: audit unavailable — the gate could not evaluate this proposal (${errorMessage(error)}). The proposed call was not run.`;
+      // this layer could not evaluate. The same #623 rule applies: an evidenced
+      // provider HTTP failure is reduced, any other defect keeps its message.
+      const detail = httpFailureSummary(error) ?? errorMessage(error);
+      const reason = `Tool protection: audit unavailable — the gate could not evaluate this proposal (${detail}). The proposed call was not run.`;
       if (!event) return block(reason);
       this.pending.delete(event.callId);
       return this.refuseCall(event, reason);

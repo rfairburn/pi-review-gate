@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.273]
+
+### Fixed
+
+- **Keep audit-provider HTTP payloads out of the acting model (#623)**: an evidenced provider HTTP
+  failure on the in-process Pi auditor route now reports a compact host-authored summary — the
+  failing stage plus the reliable HTTP status, or the plain statement that none was reported —
+  instead of the provider's error message, so no upstream body reaches the acting model's tool
+  result, a nested refusal, or the next audit's evidence. A status comes only from a structured
+  status, a native failure diagnostic or a recognized native HTTP error message shape, never from an
+  arbitrary number in a message; every other auditor diagnostic keeps its own wording.
+
 ## [0.1.0-dev.272]
 
 ### Fixed

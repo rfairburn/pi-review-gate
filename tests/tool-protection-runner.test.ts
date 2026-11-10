@@ -327,6 +327,8 @@ test("Pi in-process auditor returns provider errors and missing output as errors
     { type: "error", reason: "error", error: { errorMessage: "synthetic provider error" } },
   ]);
   const errorResult = await runProtectionAuditor(request({ modelRegistry: errorRegistry }));
+  // #623 narrows only evidenced provider HTTP failures. An ordinary provider
+  // diagnostic keeps the wording the transport reported.
   assert.match(errorResult.error ?? "", /synthetic provider error/);
 
   const emptyRegistry = fakePiRegistry(syntheticPiModels, [piDone("   ")]);
@@ -358,6 +360,8 @@ test("Pi in-process auditor launch failure is an explicit error without another 
   };
   const result = await runProtectionAuditor(request({ modelRegistry: registry }), dependencies);
   assert.equal(launched, false);
+  // #623 narrows only evidenced provider HTTP failures, so a plain launch
+  // failure keeps the thrown diagnostic exactly as the host reported it.
   assert.match(result.error ?? "", /in-process launch failed: synthetic auth failure/);
 });
 

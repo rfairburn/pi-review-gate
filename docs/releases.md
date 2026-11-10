@@ -148,7 +148,13 @@ release disappears, the publisher fails read-only rather than rebuilding. Otherw
   dependency-free helper decodes the user-managed PKCS12 into a mode-0700 temporary
   directory (key mode 0600), aligns first, then signs with APK v2 and v3; v4 is disabled
   for the standalone APK. Passwords enter `apksigner` through environment input, not
-  literal arguments. Tool diagnostics and secret aliases are not logged. Key material
+  literal arguments. Tool diagnostics and secret aliases are not logged. If the sign step
+  fails, its public output stays the generic redacted line plus one annotation whose text is
+  a single code from a closed fixed allowlist: the failed configuration gate, identity or
+  digest binding, verification check, or align/sign/verify stage the helper can attribute, and
+  one generic code otherwise. Exception text, tool output, arguments, and secret values remain
+  redacted, and the annotation adds no check, retry, or fallback — it is an operator pointer,
+  not a claim that every tool or credential cause is identifiable. Key material
   is removed in `finally`; ephemeral runners are the cancellation backstop. No key or
   temporary signing directory is cached or uploaded.
 - Only the verified APK, Android checksum, and Android provenance leave the signer.

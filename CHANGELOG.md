@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.267]
+
+### Fixed
+
+- Android release validation reads the pinned `aapt2` badging field
+  `minSdkVersion`, rather than legacy `aapt`'s `sdkVersion` field. This prevents
+  correctly built release APKs from being rejected before unsigned metadata is
+  emitted. The minimum SDK 33 and target SDK 37 checks, exact source/run binding,
+  signing isolation, and atomic six-asset publication remain unchanged.
+
 ## [0.1.0-dev.266]
 
 ### Fixed

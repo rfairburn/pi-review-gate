@@ -45,7 +45,7 @@ function inspectApk(apk, eligibility, { env = process.env, run = runTool, signed
   const badging = run(tool.aapt2, ["dump", "badging", apk], { env }).stdout;
   const pkg = badging.match(/^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'/m);
   if (!pkg || pkg[1] !== expected.applicationId || pkg[2] !== String(expected.versionCode) || pkg[3] !== expected.versionName) fail("APK package/version mismatch");
-  if (!badging.includes(`sdkVersion:'${expected.minSdk}'`) || !badging.includes(`targetSdkVersion:'${expected.targetSdk}'`)) fail("APK SDK mismatch");
+  if (!badging.includes(`minSdkVersion:'${expected.minSdk}'`) || !badging.includes(`targetSdkVersion:'${expected.targetSdk}'`)) fail("APK SDK mismatch");
   if (/application-debuggable/m.test(badging)) fail("debug APK refused");
   const verified = run(tool.apksigner, ["verify", "--verbose", "--print-certs", apk], { env, allowFailure: !signed });
   if (!signed) {

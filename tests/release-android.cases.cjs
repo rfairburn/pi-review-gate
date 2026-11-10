@@ -24,7 +24,7 @@ const env = {
 };
 function badge(overrides = {}) {
   const values = { package: "io.github.rfairburn.pireviewgate", code: 257, name: "0.1.0+257", min: 33, target: 37, ...overrides };
-  return `package: name='${values.package}' versionCode='${values.code}' versionName='${values.name}'\nsdkVersion:'${values.min}'\ntargetSdkVersion:'${values.target}'\n${values.debug ? "application-debuggable" : ""}`;
+  return `package: name='${values.package}' versionCode='${values.code}' versionName='${values.name}'\nminSdkVersion:'${values.min}'\ntargetSdkVersion:'${values.target}'\n${values.debug ? "application-debuggable" : ""}`;
 }
 function signature(digest = cert, v2 = true, v3 = true) {
   return `Verified using v2 scheme (APK Signature Scheme v2): ${v2}\nVerified using v3 scheme (APK Signature Scheme v3): ${v3}\nSigner #1 certificate SHA-256 digest: ${digest}\n`;
@@ -178,6 +178,29 @@ test("APK verification refuses wrong package/version/SDK, debug, unsigned and wr
     assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, cert, run: run({}, sig) }));
   }
   assert.throws(() => android.inspectApk("fixture.apk", eligibility, { env, signed: false, run: run() }), /must be unsigned/);
+});
+
+test("aapt2 badging SDK fields retain exact bounds for unsigned and signed APKs", () => {
+  // Pinned aapt2 emits minSdkVersion; sdkVersion is the legacy aapt label.
+  // Both are successful tool output, so mocked success must use the real format.
+  for (const signed of [false, true]) {
+    const inspect = (badging) => android.inspectApk("fixture.apk", eligibility, {
+      env, cert, signed,
+      run: (file, args) => {
+        if (file.endsWith("aapt2")) {
+          assert.deepEqual(args, ["dump", "badging", "fixture.apk"]);
+          return { status: 0, stdout: badging };
+        }
+        return { status: signed ? 0 : 1, stdout: signature() };
+      },
+    });
+    assert.doesNotThrow(() => inspect(badge()));
+    for (const badging of [
+      badge({ min: 32 }), badge({ target: 36 }),
+      badge().replace("minSdkVersion:'33'", ""),
+      badge().replace("minSdkVersion:'33'", "sdkVersion:'33'"),
+    ]) assert.throws(() => inspect(badging), /APK SDK mismatch/);
+  }
 });
 
 test("minSdk 33 APK verifies v3 normally and v2 independently over SDK 24–27", () => {

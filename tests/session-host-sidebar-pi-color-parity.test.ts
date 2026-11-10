@@ -353,6 +353,14 @@ interface PinnedThemeFiles {
   readonly packageVersion: string;
 }
 
+/**
+ * Pi releases whose shipped `dark.json`/`light.json` were audited against this
+ * colour copy: v1.5.0 is the authored source, and 1.5.1 ships byte-identical
+ * theme files (compared directly between the published 1.5.0 and 1.5.1
+ * `@earendil-works/pi-coding-agent` packages).
+ */
+const PI_THEME_PARITY_AUDITED_VERSIONS: readonly string[] = Object.freeze(["1.5.0", "1.5.1"]);
+
 /** Read the pinned installed Pi package's built-in theme files (read-only). */
 function pinnedPiThemeFiles(): PinnedThemeFiles | { reason: string } {
   const pinned = process.env.PI_REVIEW_GATE_INSTALLED_AGENT?.trim();
@@ -404,8 +412,15 @@ test("the copied tokens and every converted sidebar foreground match real Pi 1.5
     t.skip(resolved.reason);
     return;
   }
-  assert.equal(resolved.packageVersion, PI_THEME_COLOR_PROVENANCE.version,
-    "the vendored colour copy is pinned to the exact installed Pi version");
+  // The copy names Pi v1.5.0 as its authored source (PI_THEME_COLOR_PROVENANCE).
+  // A newer pinned runtime is accepted only while its shipped built-in theme
+  // files are audited for this copy: Pi 1.5.1's `dist/modes/interactive/theme/
+  // dark.json` and `light.json` are byte-identical to v1.5.0's, so the authored
+  // provenance and the copied strings stay unchanged while the parity below
+  // still runs against the runtime actually installed. Any other installed
+  // release fails closed until its theme files are audited.
+  assert.ok(PI_THEME_PARITY_AUDITED_VERSIONS.includes(resolved.packageVersion),
+    `the vendored colour copy is audited for Pi ${PI_THEME_PARITY_AUDITED_VERSIONS.join(" and ")}, not the installed Pi ${resolved.packageVersion}`);
 
   for (const theme of SIDEBAR_THEME_IDS) {
     const themeJson: PiThemeJson = resolved.themeJson[theme];

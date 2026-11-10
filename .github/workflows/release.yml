@@ -92,7 +92,8 @@ jobs:
       - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
         with:
           distribution: temurin
-          java-version: '21.0.9+10'
+          # Exact Temurin vendor selector for the pinned JDK 21.0.9+10 build.
+          java-version: '21.0.9+10.0.LTS'
       - name: Install locked SDK and platform before the source build
         run: node scripts/release/android.cjs sdk platform
       - name: Build release without credentials; run full JVM core tests
@@ -148,7 +149,8 @@ jobs:
       - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
         with:
           distribution: temurin
-          java-version: '21.0.9+10'
+          # Exact Temurin vendor selector for the pinned JDK 21.0.9+10 build.
+          java-version: '21.0.9+10.0.LTS'
       - name: Install locked public tools before exposing secrets
         run: node scripts/release/android.cjs sdk
       - name: Check immutable same-run unsigned artifact identity
@@ -219,7 +221,8 @@ jobs:
       - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
         with:
           distribution: temurin
-          java-version: '21.0.9+10'
+          # Exact Temurin vendor selector for the pinned JDK 21.0.9+10 build.
+          java-version: '21.0.9+10.0.LTS'
       - name: Install locked public APK verification tools
         run: node scripts/release/android.cjs sdk
       - name: Check immutable same-run signed artifact identity

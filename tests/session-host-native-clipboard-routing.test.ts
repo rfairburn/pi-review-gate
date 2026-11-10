@@ -247,6 +247,134 @@ test("clipboard fixture readiness requires this producer's public startup and ob
 });
 
 /**
+ * Wait for a popup region read from a genuinely flushed frame.
+ *
+ * `ChangeSignal.waitFor` is notification-driven: its predicate can match a
+ * frame produced by one parsed child chunk while that child's next chunk is
+ * still queued. A `flush()` afterwards parses the queued chunk, so a region read
+ * from the frame it leaves behind describes a DIFFERENT frame — the retained
+ * full-suite failure dereferenced exactly such a vanished match. Every value the
+ * popup loop acts on (the pair and the absolute rows it selects) has to come
+ * from one frame read after the queue drained, so the wait is re-run against the
+ * flushed frame inside one unchanged absolute deadline.
+ *
+ * Nothing is cached, forced, or relaxed: a match a flush removed is waited out
+ * for a later matching flushed frame, and a run that never lands one fails with
+ * the same bounded deadline error a plain `waitFor` raises.
+ */
+async function waitForFlushedRegion<T>(
+  signal: ChangeSignal,
+  flush: () => Promise<void>,
+  read: () => T | undefined,
+  timeoutMs: number,
+  description: string,
+): Promise<T> {
+  const deadlineAt = Date.now() + timeoutMs;
+  for (;;) {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) throw new Error(`${description}: deadline exceeded`);
+    await signal.waitFor(() => read() !== undefined, remainingMs, description);
+    await flush();
+    const matched = read();
+    if (matched !== undefined) return matched;
+  }
+}
+
+/**
+ * Pure synchronization regression for the popup loop in the real-runtime proof
+ * below: no native session, no PTY, no clipboard, no model. A real in-memory
+ * `TerminalSurface` is wired to a `ChangeSignal` exactly like the real popup
+ * pane (`onChange` -> `notify`), and the child's removing chunk is queued while
+ * the notification frame still matches — the one interleaving a
+ * notification-driven wait cannot survive. The child's later frame is queued
+ * only after the wait observes the post-flush miss, so coverage never depends on
+ * a timer or on event-loop speed.
+ */
+test("popup region reads wait for a flushed frame instead of dereferencing a notification frame a later write replaced", async () => {
+  const signal = new ChangeSignal();
+  const pane = new TerminalSurface(80, 24, { onReply: () => undefined, onChange: () => signal.notify() });
+  const rule = "─".repeat(40);
+  // `top` is a frame line index; ANSI cursor addressing is 1-based.
+  const band = (top: number): string =>
+    `\x1b[${top + 1};1H${rule}\x1b[${top + 2};1HPROBE466-A body row\x1b[${top + 3};1HPROBE466-B body row\x1b[${top + 4};1H${rule}`;
+  const erase = (top: number): string =>
+    `\x1b[${top + 1};1H${"x".repeat(40)}\x1b[${top + 2};1H${"y".repeat(40)}\x1b[${top + 3};1H${"z".repeat(40)}\x1b[${top + 4};1H${"w".repeat(40)}`;
+  const readBand = (): { top: number; bottom: number } | undefined => {
+    const lines = pane.frame().lines.map(stripGeneratedSgr);
+    for (let top = 1; top < lines.length; top += 1) {
+      if (lines[top]!.slice(0, rule.length) !== rule) continue;
+      const bottom = lines.findIndex((line, row) => row > top && line.slice(0, rule.length) === rule);
+      if (bottom <= top) continue;
+      const body = lines.slice(top + 1, bottom).join("\n");
+      if (body.includes("PROBE466-A") && body.includes("PROBE466-B")) return { top, bottom };
+    }
+    return undefined;
+  };
+  try {
+    pane.write(band(5));
+    await pane.flush();
+    assert.deepEqual(readBand(), { top: 5, bottom: 8 }, "the flushed frame shows the drawn band");
+
+    // The retained failure, reproduced deterministically. The removing chunk is
+    // queued while the notification frame still matches: the wait observes the
+    // match, the flush that follows parses the removal, and the frame read
+    // afterwards no longer matches — where the old `region()!` dereferenced
+    // undefined.
+    pane.write(erase(5));
+    assert.notEqual(readBand(), undefined, "the queued removal is still unparsed, so the band remains on screen");
+    await signal.waitFor(() => readBand() !== undefined, 2_000, "notification frame still shows the band");
+    await pane.flush();
+    assert.equal(readBand(), undefined, "the match one notification observed is gone from the flushed frame");
+
+    // The same interleaving through the wait, coordinated without any delay: the
+    // later band is queued only as a consequence of observing the miss after the
+    // first flush, so the retry path runs no matter how fast or slow the event
+    // loop is, and the assertions below prove it did.
+    pane.write(band(9));
+    await pane.flush();
+    assert.deepEqual(readBand(), { top: 9, bottom: 12 }, "the redrawn band is flushed before the wait starts");
+    let flushes = 0;
+    let missingPostFlushReads = 0;
+    let postFlushReadDue = false;
+    const flushedRead = (): { top: number; bottom: number } | undefined => {
+      const matched = readBand();
+      if (postFlushReadDue) {
+        postFlushReadDue = false;
+        if (matched === undefined) {
+          missingPostFlushReads += 1;
+          // The child's next frame arrives because this flush lost the match.
+          // The write cannot parse before the caller's synchronous read of this
+          // same value returns, so this iteration is guaranteed to re-wait.
+          pane.write(band(15));
+        }
+      }
+      return matched;
+    };
+    const flush = async (): Promise<void> => {
+      await pane.flush();
+      flushes += 1;
+      postFlushReadDue = true;
+    };
+    pane.write(erase(9));
+    const settled = await waitForFlushedRegion(signal, flush, flushedRead, 5_000, "visible framed band");
+    assert.deepEqual(settled, { top: 15, bottom: 18 },
+      "the region comes from a later matching flushed frame, not the vanished notification frame");
+    assert.deepEqual(readBand(), settled, "the returned coordinates describe the frame still on screen");
+    assert.equal(missingPostFlushReads, 1, "the first flush really lost the match the notification observed");
+    assert.ok(flushes >= 2, "the region came from a second flushed frame, so the retry path was exercised");
+
+    // The bound is real and no failure is swallowed: with no later matching
+    // flushed frame the wait rejects with the ordinary deadline error.
+    pane.write(erase(15));
+    await pane.flush();
+    await assert.rejects(waitForFlushedRegion(signal, () => pane.flush(), readBand, 250, "a band that never returns"),
+      /a band that never returns: deadline exceeded$/);
+  } finally {
+    pane.dispose();
+  }
+});
+
+/**
  * Real bundled CLI/PTY proof. No physical clipboard is read or written.
  *
  * The last leg additionally runs one explicitly opted-in (`nativeInputOriginFraming:
@@ -996,9 +1124,11 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     };
     const shown = new Set<string>();
     for (let index = 0; index < 2; index += 1) {
-      await signal.waitFor(() => region() !== undefined, 20_000, at("popup", "visible framed question or notice body", popupPane));
-      await popupPane.flush();
-      const visible = region()!;
+      // The pair and the absolute rows selected below come from one frame read
+      // after the pane's queue drained, never from a notification frame a later
+      // child write replaced. Same predicate, same 20s bound, same label.
+      const visible = await waitForFlushedRegion(signal, () => popupPane.flush(), region, 20_000,
+        at("popup", "visible framed question or notice body", popupPane));
       shown.add(visible.pair[0]);
       const before = helperRecords().length;
       popupInput("\x1b[17~");

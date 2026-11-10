@@ -98,6 +98,76 @@ test("Gradle release properties fail closed on CI without changing ordinary debu
   assert.equal(android.TOOLCHAIN.buildTools, "37.0.0");
 });
 
+// actions/setup-java compares a requested version carrying build metadata with
+// semver.compareBuild, so the canonical `21.0.9+10` label is never satisfied by the
+// vendor's `21.0.9+10.0.LTS` release. The workflow must therefore name the full
+// vendor selector while provenance keeps recording the canonical label.
+test("every release-job JDK selection names the full Temurin vendor selector for the pinned build", () => {
+  const workflow = fs.readFileSync(path.join(process.cwd(), ".github", "workflows", "release.yml"), "utf8");
+  const selectors = [...workflow.matchAll(/^\s*java-version: (\S+)$/gm)].map((match) => match[1].replace(/'/g, ""));
+  assert.ok(selectors.length > 0, "the release workflow must provision the pinned JDK");
+  for (const selector of selectors) {
+    assert.equal(selector, "21.0.9+10.0.LTS", "no floating major, latest, or short-label JDK selection is allowed");
+    assert.equal(selector.replace(/\.0\.LTS$/, ""), android.TOOLCHAIN.jdk,
+      "the vendor selector and the canonical toolchain label must name the same JDK 21.0.9 build 10");
+  }
+});
+
+const SDK_ARCHIVE_URL = "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip";
+const SDK_ARCHIVE_SHA256 = "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583";
+
+// Pure mock seam: no SDK download, install, or vendor call. It proves only which
+// package identifiers the provisioning helper requests and that the pinned archive
+// checksum gate still runs before any sdkmanager invocation.
+test("SDK provisioning requests the exact 37.0 platform package only when platform is requested", async (t) => {
+  const archive = Buffer.from("mock command-line tools archive bytes; never downloaded");
+  const realSha256 = sha256Buffer;
+  t.mock.method(common, "sha256Buffer", (buffer) => (Buffer.compare(buffer, archive) === 0 ? SDK_ARCHIVE_SHA256 : realSha256(buffer)));
+  // android.cjs destructures sha256Buffer at require time, so reload it over the mocked module.
+  const androidPath = require.resolve("../scripts/release/android.cjs");
+  const previous = require.cache[androidPath];
+  delete require.cache[androidPath];
+  t.after(() => { require.cache[androidPath] = previous; });
+  const provision = require(androidPath);
+  t.mock.method(fs, "writeFileSync", () => undefined);
+  t.mock.method(fs, "mkdirSync", () => undefined);
+  t.mock.method(fs, "renameSync", () => undefined);
+  const envFile = [];
+  t.mock.method(fs, "appendFileSync", (file, text) => { envFile.push({ file, text }); });
+  const provisioningEnv = { ...env, GITHUB_ENV: path.join(env.RUNNER_TEMP, "mock-github-env") };
+  const arrayBuffer = () => archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength);
+  for (const platform of [true, false]) {
+    const calls = [];
+    const urls = [];
+    const run = (file, args, settings) => { calls.push({ file, args, env: settings.env, input: settings.input }); return { status: 0, stdout: "" }; };
+    await provision.installSdk({ platform, env: provisioningEnv, fetchImpl: async (url) => { urls.push(url); return { ok: true, arrayBuffer }; }, run });
+    assert.deepEqual(urls, [SDK_ARCHIVE_URL], "the checksum-pinned official command-line tools archive stays pinned");
+    const sdkmanager = calls.filter((call) => call.file.endsWith("sdkmanager"));
+    assert.deepEqual(sdkmanager.map((call) => call.args), [["--licenses"], ["build-tools;37.0.0", ...(platform ? ["platforms;android-37.0"] : [])]],
+      "only the pinned build tools and, when asked, the exact published API 37.0 platform package are requested");
+    assert.equal(sdkmanager[0].input, "y\n".repeat(100));
+    assert.equal(calls[0].file, "unzip");
+    for (const call of sdkmanager.slice(1)) {
+      assert.equal(call.env.ANDROID_HOME, path.join(env.RUNNER_TEMP, "android-sdk"));
+      assert.ok(call.env.ANDROID_SDK_ROOT && call.env.ANDROID_USER_HOME, "provisioning keeps the isolated SDK roots");
+    }
+    assert.match(envFile.at(-1).text, /ANDROID_HOME=/);
+    assert.match(envFile.at(-1).text, /ANDROID_SDK_ROOT=/);
+    assert.match(envFile.at(-1).text, /ANDROID_USER_HOME=/);
+  }
+  // The numeric API level, build tools version, and every gate stay pinned.
+  assert.equal(android.TOOLCHAIN.compileSdk, 37);
+  assert.equal(android.TOOLCHAIN.buildTools, "37.0.0");
+  assert.equal(android.version(257).targetSdk, 37);
+  assert.equal(android.version(257).minSdk, 33);
+  const never = () => { throw new Error("no tool may run after a failed provisioning gate"); };
+  await assert.rejects(android.installSdk({ platform: true, env: provisioningEnv, fetchImpl: async () => ({ ok: false, arrayBuffer }), run: never }), /download failed/);
+  await assert.rejects(android.installSdk({ platform: true, env: provisioningEnv, fetchImpl: async () => ({ ok: true, arrayBuffer }), run: never }), /checksum mismatch/);
+  for (const missing of ["RUNNER_TEMP", "GITHUB_ENV"]) {
+    await assert.rejects(android.installSdk({ platform: true, env: { ...provisioningEnv, [missing]: "" }, fetchImpl: async () => { throw new Error("must not fetch"); }, run: never }), /provisioning context missing/);
+  }
+});
+
 test("APK verification refuses wrong package/version/SDK, debug, unsigned and wrong certificate", () => {
   const run = (changes = {}, sig = signature()) => (file) => ({ status: 0, stdout: file.endsWith("aapt2") ? badge(changes) : sig });
   android.inspectApk("fixture.apk", eligibility, { env, cert, run: run() });

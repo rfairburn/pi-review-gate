@@ -458,10 +458,10 @@ jobs:
     # this job when a needed job failed or was skipped, and the explicit `if`
     # re-pins the trust boundary (original push event, refs/heads/main, this
     # repository). PRs, manual dispatches, and foreign repositories can never
-    # reach the publisher. No secrets are passed: the callee reads the event's
-    # GITHUB_TOKEN from the `github.token` context, so `secrets: inherit` stays
-    # unused and the job grants exactly `contents: write` — the only write
-    # permission anywhere in this workflow.
+    # reach the publisher. GITHUB_TOKEN comes from `github.token`; only the
+    # three named Android signing secrets are forwarded, never inherited.
+    # The callee requires those names and retains its protected signing job.
+    # contents: write remains the only write grant anywhere in this workflow.
     name: Publish numbered prerelease
     needs: [verify, full-tests, windows-launcher, windows-shell, windows-session-host]
     if: >-
@@ -473,3 +473,9 @@ jobs:
       # Read immutable same-run Android artifact metadata in the callee.
       actions: read
     uses: ./.github/workflows/release.yml
+    # Forward exactly these environment-owned names, with no other secrets or
+    # inputs. Credentials remain step-local in the protected callee signer.
+    secrets:
+      ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+      ANDROID_SIGNING_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+      ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}

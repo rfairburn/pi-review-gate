@@ -2,6 +2,16 @@
 name: Release
 on:
   workflow_call:
+    # Require exactly these forwarded names, never broad inheritance or inputs.
+    # Required checks forwarding presence, not non-empty or valid credentials;
+    # the protected signer's existing value and cryptographic checks still apply.
+    secrets:
+      ANDROID_SIGNING_KEYSTORE_BASE64:
+        required: true
+      ANDROID_SIGNING_PASSWORD:
+        required: true
+      ANDROID_SIGNING_ALIAS:
+        required: true
 permissions:
   contents: read
 concurrency:

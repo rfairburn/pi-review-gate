@@ -481,8 +481,8 @@ test("both real-host @ picker cases honor the required-host CI gate", () => {
 // --- Release publisher integration ------------------------------------------
 // CI is the sole caller of the reusable prerelease builder. These assertions pin
 // the caller's trust boundary: correct event/ref/repository, both required check
-// jobs upstream, GitHub's implicit success() guard intact, no inherited secrets,
-// and a single narrowly-scoped write grant.
+// jobs upstream, a closed three-name secret forwarding allowlist (never
+// `secrets: inherit`), and a single narrowly-scoped write grant.
 
 const RELEASE_JOB = "release";
 
@@ -557,12 +557,155 @@ function callerRunsOnlyAfterAllRequiredChecks(): void {
   }
 }
 
-function callerPassesNoSecrets(): void {
-  const source = withoutComments(readWorkflow());
-  assert.doesNotMatch(source, /secrets:\s*inherit/,
-    "the callee needs only the event's GITHUB_TOKEN (github.token context); inheriting caller secrets would widen the blast radius");
-  assert.doesNotMatch(releaseJobBlock(), /^    (secrets|with):/m,
-    "the caller job must not pass secrets or inputs to the reusable publisher");
+/**
+ * The closed allowlist of secret names the CI caller may forward to the reusable
+ * publisher: exactly the three the protected `android-release` signing step reads.
+ * Declaring and forwarding these names is the approved interface — the caller
+ * still passes no other secret and no input, so `secrets: inherit` and every
+ * other name stay forbidden.
+ */
+const ANDROID_SIGNING_SECRET_NAMES = [
+  "ANDROID_SIGNING_KEYSTORE_BASE64",
+  "ANDROID_SIGNING_PASSWORD",
+  "ANDROID_SIGNING_ALIAS",
+];
+
+/** The caller's exact contiguous `secrets:` mapping, as it must appear verbatim. */
+const callerSecretMappingLines = ANDROID_SIGNING_SECRET_NAMES
+  .map((name) => `      ${name}: \${{ secrets.${name} }}`)
+  .join("\n");
+
+/** The callee's exact contiguous `on.workflow_call.secrets` declaration block. */
+const calleeSecretDeclarationLines = ANDROID_SIGNING_SECRET_NAMES
+  .map((name) => `      ${name}:\n        required: true`)
+.join("\n");
+
+/**
+ * The COMPLETE nested `secrets:` mapping text written at `keyIndent` spaces
+ * inside `container`, taken through the blank-line-aware `blockOf` helper: a
+ * YAML mapping continues across empty lines, so every deeper-indented line —
+ * including an entry separated from the approved ones by a blank line — is part
+ * of the extracted block. Trailing blank lines are trimmed for exact comparison.
+ */
+function secretsMappingText(container: string, keyIndent: number): string {
+  return blockOf(container, "secrets", keyIndent).replace(/\s+$/, "");
+}
+
+/**
+ * Every entry name declared directly inside a secrets mapping block, in any
+ * case and in either block or inline flow style, so an extra or renamed entry
+ * cannot hide in text an extractor would otherwise ignore.
+ */
+function mappingEntryNames(block: string): string[] {
+  return [...block.matchAll(/^      ([^\s:][^:]*):/gm)].map((match) => match[1].trim());
+}
+
+/** The caller release job's complete `secrets:` mapping, as [name, expression]. */
+function callerSecretMapping(source: string): [string, string][] {
+  const block = secretsMappingText(blockOf(source, RELEASE_JOB, 2), 4);
+  const entries = [...block.matchAll(/^      ([^\s:][^:]*): (.+)$/gm)]
+    .map((match) => [match[1].trim(), match[2].trim()] as [string, string]);
+  assert.equal(entries.length, block.split("\n").length,
+    "every line of the caller's secrets block must be one flat `name: value` mapping entry");
+  return entries;
+}
+
+/**
+ * The callee's complete `on.workflow_call.secrets` mapping text. Both levels use
+ * the blank-line-aware `blockOf` helper, so neither `workflow_call` nor the
+ * `secrets:` mapping can be truncated at an empty line.
+ */
+function calleeSecretsBlockText(source: string): string {
+  const on = blockOf(source, "on", 0);
+  const call = blockOf(on, "workflow_call", 2);
+  assert.deepEqual([...call.matchAll(/^    ([a-z_]+):/gm)].map((match) => match[1]), ["secrets"],
+    "on.workflow_call must declare only secrets: — no inputs and no other call surface");
+  return secretsMappingText(call, 4);
+}
+
+/** A declaration body normalized for comparison: 8-space indent stripped, blanks trimmed. */
+function dedentDeclaration(body: string): string {
+  return body
+    .split("\n")
+    .map((line) => line.replace(/^ {8}/, "").replace(/\s+$/, ""))
+    .join("\n")
+    .replace(/\n+$/, "");
+}
+
+/**
+ * The callee's consumed entries, as [name, declaration body]. Every declared
+ * entry name is enumerated (any case or style), and a name whose value is not a
+ * block body is counted as an entry without one, so nothing passes unconsumed.
+ */
+function calleeSecretDeclarations(source: string): [string, string][] {
+  const block = calleeSecretsBlockText(source);
+  const names = mappingEntryNames(block);
+  assert.deepEqual([...names].sort(), [...ANDROID_SIGNING_SECRET_NAMES].sort(),
+    "on.workflow_call.secrets must declare exactly the three approved names — no omission and no extra name in any case or flow style");
+  const bodies = [...block.matchAll(/^      ([^\s:][^:]*):\n((?:        .*\n?)*)/gm)]
+    .map((match) => [match[1].trim(), dedentDeclaration(match[2])] as [string, string]);
+  assert.equal(bodies.length, names.length,
+    "every declared secrets entry must be a block-style `name:` key carrying its own declaration body");
+  return bodies;
+}
+
+/**
+ * Caller side of the approved interface: exactly the three names, each forwarded
+ * through its own exact named reference, with no inheritance, no extra secret,
+ * and no input. Takes the source so the negative controls can mutate it.
+ */
+function assertCallerSecretAllowlist(source: string): void {
+  const clean = withoutComments(source);
+  assert.doesNotMatch(clean, /secrets:\s*inherit/,
+    "inheriting caller secrets would widen the callee's blast radius beyond the three approved names");
+  // The whole mapping is compared, not a recognized prefix of it: an appended,
+  // renamed, lowercased, duplicated, or reformatted entry fails here.
+  assert.equal(secretsMappingText(blockOf(clean, RELEASE_JOB, 2), 4), callerSecretMappingLines,
+    "the caller's complete secrets mapping must be exactly the three pinned named forwardings");
+  assert.equal((clean.match(/^    secrets:$/gm) ?? []).length, 1,
+    "the release caller job is the only job in ci.yml that may pass secrets");
+  assert.doesNotMatch(blockOf(clean, RELEASE_JOB, 2), /^    with:/m,
+    "the caller must pass no inputs: the reusable publisher declares none");
+  const names = callerSecretMapping(clean).map(([name]) => name);
+  assert.deepEqual([...names].sort(), [...ANDROID_SIGNING_SECRET_NAMES].sort(),
+    "the caller must forward exactly the three approved secret names — no omission, no extra name");
+  assert.equal(new Set(names).size, ANDROID_SIGNING_SECRET_NAMES.length, "no duplicate forwarded name");
+  for (const name of ANDROID_SIGNING_SECRET_NAMES) {
+    const entry = callerSecretMapping(clean).find(([key]) => key === name);
+    assert.ok(entry, `the caller must forward ${name}`);
+    assert.equal(entry[1], `\${{ secrets.${name} }}`,
+      `the caller must forward ${name} through its own exact named reference, not another name's or a non-secret expression`);
+  }
+  const references = [...clean.matchAll(/\bsecrets\.[A-Z0-9_]+/g)].map((match) => match[0]);
+  assert.deepEqual([...new Set(references)].sort(), ANDROID_SIGNING_SECRET_NAMES.map((name) => `secrets.${name}`).sort(),
+    "no other secret reference may appear anywhere in ci.yml");
+}
+
+/**
+ * Callee side of the approved interface: the reusable publisher declares exactly
+ * the three names, each `required: true`. Forwarding presence is what GitHub
+ * validates here; the signer's own all-three non-empty gate stays the value check.
+ */
+function assertCalleeSecretDeclarations(source: string): void {
+  const clean = withoutComments(source);
+  assert.doesNotMatch(clean, /secrets:\s*inherit/, "the reusable builder must never inherit caller secrets");
+  // Complete-mapping comparison first: the extracted block must equal the pinned
+  // declarations byte for byte, so no declaration form the extractor does not
+  // recognize can slip past the name and `required` checks below.
+  assert.equal(calleeSecretsBlockText(clean), calleeSecretDeclarationLines,
+    "on.workflow_call.secrets must contain exactly the three pinned required declarations — no omission, no extra or reformatted entry");
+  for (const [name, body] of calleeSecretDeclarations(clean)) {
+    assert.equal(body, "required: true",
+      `${name} must be declared exactly required: true, so an unforwarded name fails the call instead of resolving empty`);
+  }
+}
+
+function callerForwardsOnlySigningSecrets(): void {
+  assertCallerSecretAllowlist(readWorkflow());
+}
+
+function calleeDeclaresRequiredSigningSecrets(): void {
+  assertCalleeSecretDeclarations(readReleaseWorkflow());
 }
 
 function rootReadOnlyAndWriteOnlyPublisher(): void {
@@ -635,8 +778,8 @@ test("release caller publishes only correct main pushes after all required check
   callerRunsOnlyAfterAllRequiredChecks();
 });
 
-test("release caller passes no secrets and carries the only write grant", () => {
-  callerPassesNoSecrets();
+test("release caller forwards exactly the three signing secret names and carries the only write grant", () => {
+  callerForwardsOnlySigningSecrets();
   rootReadOnlyAndWriteOnlyPublisher();
 });
 
@@ -644,6 +787,66 @@ test("reusable release builder independently enforces the same trust boundary", 
   reusableReleaseWorkflowMirrorsTheBoundary();
 });
 
+test("reusable release builder declares exactly the three required signing secrets", () => {
+  calleeDeclaresRequiredSigningSecrets();
+});
+
+// Negative controls for the approved forwarding interface. Every mutation is
+// derived from the real workflow text and must be rejected by the same assertion
+// the real file passes, so neither side of the contract can hold vacuously: a
+// dropped name, an extra name in any case, an entry in inline flow style, a
+// crossed or non-secret reference, a loosened `required`, a misplaced
+// declaration, an added input, or broad inheritance all fail here. The mutations
+// are pure string edits on in-memory copies: no file is written and no workflow
+// is executed.
+function rejectMutations(label: string, original: string, cases: [string, string][], check: (source: string) => void): void {
+  assert.doesNotThrow(check.bind(null, original), `the real ${label} must satisfy its own contract`);
+  for (const [caseLabel, mutated] of cases) {
+    assert.notEqual(mutated, original, `the ${label}/${caseLabel} control must actually change the text before it is rejected`);
+    assert.throws(() => check(mutated), `the ${label} contract must reject ${caseLabel}`);
+  }
+}
+
+test("the caller secret allowlist rejects omissions, extras, crossed references, and inheritance", () => {
+  const ci = readWorkflow();
+  const secretsBlock = `    secrets:\n${callerSecretMappingLines}`;
+  assert.ok(ci.includes(secretsBlock), "the caller mapping must be the pinned contiguous block");
+  rejectMutations("caller", ci, [
+    ["a dropped forwarded name", ci.replace(`      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_ALIAS }}\n`, "")],
+    ["an extra forwarded name", ci.replace(secretsBlock, `${secretsBlock}\n      ANDROID_SIGNING_CERT_SHA256: \${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}`)],
+    ["an extra lowercase forwarded name", ci.replace(secretsBlock, `${secretsBlock}\n      extra_secret: \${{ secrets.extra_secret }}`)],
+    ["an appended inline flow-style forwarded entry", ci.replace(secretsBlock, `${secretsBlock}\n      EXTRA_SECRET: { value: secret }`)],
+    ["an extra forwarding after a blank line", ci.replace(secretsBlock, `${secretsBlock}\n\n      extra_secret: \${{ secrets.extra_secret }}`)],
+    ["an inline flow forwarding after a blank line", ci.replace(secretsBlock, `${secretsBlock}\n\n      EXTRA_SECRET: { value: secret }`)],
+    ["an approved name reformatted to inline flow style", ci.replace(`      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_ALIAS }}`, "      ANDROID_SIGNING_ALIAS: { value: alias }")],
+    ["a duplicate forwarded name", ci.replace(secretsBlock, `${secretsBlock}\n      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_ALIAS }}`)],
+    ["a crossed name mapping", ci.replace(`      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_ALIAS }}`, `      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_PASSWORD }}`)],
+    ["a non-secret forwarded value", ci.replace(`      ANDROID_SIGNING_ALIAS: \${{ secrets.ANDROID_SIGNING_ALIAS }}`, `      ANDROID_SIGNING_ALIAS: \${{ vars.ANDROID_SIGNING_ALIAS }}`)],
+    ["broad inheritance instead of named forwarding", ci.replace(secretsBlock, "    secrets: inherit")],
+    ["a removed secrets block", ci.replace(`${secretsBlock}\n`, "")],
+    ["an added input alongside the secrets", ci.replace("    uses: ./.github/workflows/release.yml", "    with:\n      release-number: main\n    uses: ./.github/workflows/release.yml")],
+  ], assertCallerSecretAllowlist);
+});
+
+test("the reusable publisher's secret declarations reject omissions, extras, loosened required, and added inputs", () => {
+  const release = readReleaseWorkflow();
+  const declarationBlock = `    secrets:\n${calleeSecretDeclarationLines}`;
+  assert.ok(release.includes(declarationBlock), "the callee declarations must be the pinned contiguous block");
+  rejectMutations("callee", release, [
+    ["a dropped declaration", release.replace(`      ANDROID_SIGNING_ALIAS:\n        required: true\n`, "")],
+    ["an extra declared name", release.replace(declarationBlock, `${declarationBlock}\n      ANDROID_SIGNING_CERT_SHA256:\n        required: true`)],
+    ["an appended lowercase declaration", release.replace(declarationBlock, `${declarationBlock}\n      extra_secret:\n        required: false`)],
+    ["an appended inline flow-style declaration", release.replace(declarationBlock, `${declarationBlock}\n      EXTRA_SECRET: { required: false }`)],
+    ["an extra declaration after a blank line", release.replace(declarationBlock, `${declarationBlock}\n\n      extra_secret:\n        required: false`)],
+    ["an inline flow declaration after a blank line", release.replace(declarationBlock, `${declarationBlock}\n\n      EXTRA_SECRET: { required: false }`)],
+    ["an approved name reformatted to inline flow style", release.replace("      ANDROID_SIGNING_ALIAS:\n        required: true", "      ANDROID_SIGNING_ALIAS: { required: true }")],
+    ["a loosened required", release.replace(`      ANDROID_SIGNING_ALIAS:\n        required: true`, `      ANDROID_SIGNING_ALIAS:\n        required: false`)],
+    ["a declaration without required", release.replace(`      ANDROID_SIGNING_ALIAS:\n        required: true`, "      ANDROID_SIGNING_ALIAS:")],
+    ["a declaration moved beside workflow_call", release.replace(declarationBlock, "  secrets:\n    ANDROID_SIGNING_KEYSTORE_BASE64:\n      required: true")],
+    ["an added inputs block", release.replace(declarationBlock, `    inputs:\n      release-number:\n        type: string\n${declarationBlock}`)],
+    ["broad inheritance in the callee", release.replace(declarationBlock, "    secrets: inherit")],
+  ], assertCalleeSecretDeclarations);
+});
 test("Android release isolates unsigned build, protected signing, and immutable transfer", () => {
   const source = withoutComments(readReleaseWorkflow());
   const build = blockOf(source, "android-build", 2);

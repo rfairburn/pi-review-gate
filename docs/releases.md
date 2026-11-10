@@ -213,6 +213,16 @@ Upload these environment secrets through GitHub's UI:
 - `ANDROID_SIGNING_PASSWORD`: the shared store/entry password.
 - `ANDROID_SIGNING_ALIAS`: `release` for the command above.
 
+The CI caller forwards exactly these three environment-secret names to the reusable
+release builder (`jobs.release.secrets` in `ci.yml`); the builder declares them as required
+`workflow_call` secrets. No other secrets or inputs are forwarded, and broad
+`secrets: inherit` is forbidden. Only the protected `android-release` signing job exports
+these credentials, in its signing step. `required: true` checks that the caller forwarded
+the names, **not** that their values are non-empty or valid: the signer's existing value
+and cryptographic checks remain necessary. This addresses the documented forwarding gap
+associated with build 269's `CONFIG_SECRETS_MISSING` failure; actual credential validity
+and signing success still require verification.
+
 Set the public repository Actions variable `ANDROID_SIGNING_CERT_SHA256` to the
 certificate's 64 hexadecimal SHA-256 digits; colon-separated fingerprints and case are
 normalized by the verifier. This is a **certificate** digest, not the PKCS12 file digest.

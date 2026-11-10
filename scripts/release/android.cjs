@@ -100,6 +100,14 @@ function tools(env) {
   const root = path.join(env.ANDROID_HOME, "build-tools", TOOLCHAIN.buildTools);
   return { apksigner: path.join(root, "apksigner"), zipalign: path.join(root, "zipalign"), aapt2: path.join(root, "aapt2") };
 }
+// SDK 37 uses scheme-specific signer labels, not the legacy grammar assumed before.
+// Inventory candidate lines before validating labels or values, including unlabelled or
+// malformed records. The captured prefix includes the delimiter's space; only the exact
+// source stamp identity is excluded because it is not an APK signer.
+const CERT_RECORD = /^(.*)certificate SHA-256 digest:(.*)$/gm;
+const CERT_SOURCE_STAMP_PREFIX = "Source Stamp Signer: ";
+// Retain the old value grammar and certificate() normalization/error classification.
+const CERT_RECORD_VALUE = /^ ([a-fA-F0-9:]+)\s*$/;
 function inspectApk(apk, eligibility, { env = process.env, run = runTool, signed = true, cert } = {}) {
   const expected = version(eligibility.n);
   const tool = tools(env);
@@ -118,9 +126,13 @@ function inspectApk(apk, eligibility, { env = process.env, run = runTool, signed
   // independently over its pre-v3 SDK range without changing the APK's SDKs.
   const v2Verified = run(tool.apksigner, ["verify", "--verbose", "--print-certs", "--min-sdk-version", "24", "--max-sdk-version", "27", apk], { env, stage: "TOOL_APKSIGNER_VERIFY_V2" });
   if (v2Verified.status !== 0 || !/Verified using v2 scheme .*: true/.test(v2Verified.stdout)) fail("APK requires a verified v2 signature", "APK_V2_UNVERIFIED");
-  for (const result of [verified, v2Verified]) {
-    const digests = [...result.stdout.matchAll(/^Signer #\d+ certificate SHA-256 digest: ([a-fA-F0-9:]+)\s*$/gm)];
-    if (digests.length !== 1 || certificate(digests[0][1]) !== certificate(cert)) fail("APK signing certificate mismatch", "APK_CERT_MISMATCH");
+  // Each independent verification must report exactly one APK signer, under the label its
+  // own run can produce, and that signer's digest must normalize to the public certificate.
+  // Records are inventoried and counted before any digest validation, so a valid record
+  // accompanied by a malformed or additional signer fails closed as a mismatch.
+  for (const [result, role] of [[verified, "V3.0 Signer:"], [v2Verified, "V2 Signer:"]]) {
+    const records = [...result.stdout.matchAll(CERT_RECORD)].filter((record) => record[1] !== CERT_SOURCE_STAMP_PREFIX);
+    if (records.length !== 1 || records[0][1] !== `${role} ` || !CERT_RECORD_VALUE.test(records[0][2]) || certificate(records[0][2]) !== certificate(cert)) fail("APK signing certificate mismatch", "APK_CERT_MISMATCH");
   }
   run(tool.zipalign, ["-c", "-P", "16", "4", apk], { env, stage: "TOOL_ZIPALIGN_CHECK" });
 }

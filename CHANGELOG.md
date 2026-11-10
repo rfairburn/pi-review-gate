@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.272]
+
+### Fixed
+
+- **Parse pinned SDK 37 certificate output (#508)**: recognize `V3.0 Signer:` in normal
+  verification and `V2 Signer:` in the independent SDK 24–27 check, replacing an unmatched
+  legacy format. Both runs still require one pinned APK signer; extra, malformed and unknown
+  records fail closed, while the separate source stamp identity remains ignored. Digest
+  normalization, failure codes, credential isolation, cleanup and atomic publication are
+  unchanged. Actual release signing and device acceptance remain unproven.
+
 ## [0.1.0-dev.271]
 
 ### Changed

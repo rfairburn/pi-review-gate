@@ -24,3 +24,15 @@ test("all three packaged operating-mode segments load independently", () => {
   assert.doesNotMatch(segments.execute, /including a single bounded phase/);
   assert.doesNotMatch(segments["plan-research"], /including a single bounded phase/);
 });
+
+test("the explicit per-request subtask opt-out stays confined to the orchestration segment", () => {
+  // Issue 616: honoring an explicit user opt-out is Prefer-orchestration posture
+  // guidance. The other mode prompts keep their own unchanged instructions, and the
+  // orchestration segment still states the default mandatory routing.
+  const segments = loadOperatingModeSegments(join(__dirname, "..", "..", "scripts"));
+  assert.match(segments.orchestrate, /not to use a subtask for a specific request/);
+  assert.match(segments.orchestrate, /Absent that explicit per-request opt-out, route substantive implementation/);
+  for (const mode of ["execute", "plan-research"] as const) {
+    assert.doesNotMatch(segments[mode], /per-request opt-out|not to use a subtask/);
+  }
+});

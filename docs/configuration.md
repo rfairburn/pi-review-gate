@@ -175,7 +175,10 @@ Choose **Operating mode** in `/review-settings`, then **Save changes**:
 
 - **Prefer execution**: favor focused direct implementation; delegate when useful.
 - **Prefer orchestration** (default): favor bounded delegation; the primary assistant
-  remains responsible for integration and verification.
+  remains responsible for integration and verification. If you explicitly tell it not to
+  use a subtask for a specific request, it honors that for that request and works
+  directly with the tools it already has — no mode switch is needed, and the choice is
+  not saved or applied to later requests.
 - **Plan/research**: local read-only investigation and planning. Write-capable tools,
   arbitrary shell, execution-subtask controls, and the `codemode` script transport are
   removed from the active tool schemas, authorized inventory, and `tool_search`

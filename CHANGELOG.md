@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.269]
+
+### Added
+
+- **Static Android signer failure annotations (#508)**: CLI `sign` failures now add one
+  GitHub error annotation containing a closed-list static code beside the unchanged generic
+  error line. Codes distinguish configuration, input bindings, verification checks and tool
+  stages; unrecognized failures use a fixed fallback. Exception text, tool output, arguments,
+  paths and secret values remain redacted. Release checks, credential isolation, key cleanup,
+  atomic publication and other CLI modes are unchanged. This adds diagnostics only, not a
+  signing fix or release-acceptance claim.
+
 ## [0.1.0-dev.268]
 
 ### Tests

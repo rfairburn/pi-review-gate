@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.270]
+
+### Fixed
+
+- **Forward only the three Android signing-secret names (#508)**: the CI caller now
+  forwards the keystore, password and alias names, and the reusable builder declares
+  those three as required secrets. This addresses the documented forwarding gap
+  associated with b269's `CONFIG_SECRETS_MISSING` failure. Broad inheritance and other
+  inputs remain forbidden; protected signing, permissions, validation, cleanup and
+  atomic publication are unchanged. Required declarations check forwarding, not value
+  validity. Actual signing and device acceptance remain unproven.
+
 ## [0.1.0-dev.269]
 
 ### Added

@@ -834,9 +834,15 @@ class RosterHostLaneTest {
         // discarding it along with the lane.
         assertTrue(harness.runtime.detachHost(HostId.parse(HOST_A)))
 
-        harness.assertSettled(RosterOperationKind.CREATE) { it is RosterRequestResult.Unknown }
+        // Check the return-time phase and timer cleanup before yielding to the collector.
         assertEquals(HostLanePhase.DETACHED, harness.hostState(HOST_A)!!.lane)
         assertEquals(0, harness.time.armedCount(), "a bounded retirement cancels every arm")
+
+        // Event collection is asynchronous. Await the witness, then check its outcome below.
+        harness.awaitUntil("the bounded retirement settled the accepted create") {
+            harness.settledOperations().any { it.kind == RosterOperationKind.CREATE }
+        }
+        harness.assertSettled(RosterOperationKind.CREATE) { it is RosterRequestResult.Unknown }
         harness.closeRuntime()
     }
 

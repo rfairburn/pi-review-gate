@@ -1,25 +1,26 @@
 # Delegated execution and background tasks
 
-This page owns delegated execution: the subtask tools, worker resources and routes,
-capture and landing behavior, conflicts, steering, notifications, background shell
-tools, and the external executor protocol. Field defaults live in
-[Configuration](configuration.md); crash and restart behavior lives in
+This page owns delegated execution: the subtask tools, worker resources and
+routes, capture and landing behavior, conflicts, steering, notifications,
+background shell tools, and the external executor protocol. Field defaults live
+in [Configuration](configuration.md); crash and restart behavior lives in
 [Recovery](recovery.md).
 
 The `execute` and `research` kinds require a Git executable on `PATH`: subtask
-capture, isolated worktrees, landing, recovery, and diff3 conflict materialization
-invoke Git and fail closed without it. The `inplace` kind does not require Git or a
-repository. See [Getting started](getting-started.md#prerequisites).
+capture, isolated worktrees, landing, recovery, and diff3 conflict
+materialization invoke Git and fail closed without it. The `inplace` kind does
+not require Git or a repository. See
+[Getting started](getting-started.md#prerequisites).
 
 ## Native Pi duplicate-call preflight
 
-For native Pi assistant tool-call groups, review-gate compares the exact submitted tool
-name and JSON argument values before any member runs. A later identical member in the
-same group is blocked, as is an identical call in the immediately preceding tool group.
-Distinct calls remain eligible, including a one-member group and one `SubtasksStart`
-request containing several independent tasks. If a batch cannot be safely correlated,
-every member is blocked before execution; feedback identifies the member without
-repeating its arguments.
+For native Pi assistant tool-call groups, review-gate compares the exact
+submitted tool name and JSON argument values before any member runs. A later
+identical member in the same group is blocked, as is an identical call in the
+immediately preceding tool group. Distinct calls remain eligible, including a
+one-member group and one `SubtasksStart` request containing several independent
+tasks. If a batch cannot be safely correlated, every member is blocked before
+execution; feedback identifies the member without repeating its arguments.
 
 One identical retry is allowed only when Pi observed the earlier operation start and
 its matching result explicitly reported an error. That retry is the last automatic
@@ -27,35 +28,37 @@ attempt: after two observed failures a third call is blocked as repeated failure
 the retry returned without an error, an additional call is blocked as a repeated call.
 Unknown results and preflight-policy blocks do not count as operation failures.
 
-`ShellStart` and `SubtasksStart` have an additional liveness check: an identical start
-is blocked while its earlier job or group remains active, even across intervening tool
-groups and regardless of the earlier start result's error flag. Unknown liveness blocks
-the new start rather than risking a duplicate spawn: for `ShellStart`, any running job
-without a recorded start identity keeps liveness unknown; for `SubtasksStart`, an
-unavailable or failing liveness lookup fails closed the same way. The guard never
-interrupts or cancels existing work. After work settles, a nonadjacent repeat is allowed.
-A blocked `ShellStart` creates no second job. A blocked `SubtasksStart` member
-creates no group or tasks and incurs no new worker usage. Its feedback describes
-the identical start and observed liveness without assuming why it was submitted.
-An older or restored active `SubtasksStart` group without a recorded start-call
-fingerprint is unidentifiable rather than unknown: it cannot match
-the submitted fingerprint and does not by itself block an otherwise admissible new
-start. The accepted duplicate risk is disclosed, not hidden: because that legacy group's
-original submitted identity is unavailable, an identical new start can duplicate its
+`ShellStart` and `SubtasksStart` have an additional liveness check: an identical
+start is blocked while its earlier job or group remains active, even across
+intervening tool groups and regardless of the earlier start result's error flag.
+Unknown liveness blocks the new start rather than risking a duplicate spawn: for
+`ShellStart`, any running job without a recorded start identity keeps liveness
+unknown; for `SubtasksStart`, an unavailable or failing liveness lookup fails
+closed the same way. The guard never interrupts or cancels existing work. After
+work settles, a nonadjacent repeat is allowed. A blocked `ShellStart` creates no
+second job. A blocked `SubtasksStart` member creates no group or tasks and
+incurs no new worker usage. Its feedback describes the identical start and
+observed liveness without assuming why it was submitted. An older or restored
+active `SubtasksStart` group without a recorded start-call fingerprint is
+unidentifiable rather than unknown: it cannot match the submitted fingerprint
+and does not by itself block an otherwise admissible new start. The accepted
+duplicate risk is disclosed, not hidden: because that legacy group's original
+submitted identity is unavailable, an identical new start can duplicate its
 still-active work; the new start is not proven distinct or safe. A blocked
-`SubtasksInspect` takes no new snapshot; repeated polling is discouraged in favor
-of event-driven completion notifications or a decision-relevant, one-shot
+`SubtasksInspect` takes no new snapshot; repeated polling is discouraged in
+favor of event-driven completion notifications or a decision-relevant, one-shot
 `SubtasksWatch` callback.
 
-This is a native Pi extension-hook guard in the primary and Pi executor runtimes. It
-does not intercept calls made by an external API harness or wrapper such as
-`multi_tool_use.parallel` unless that wrapper dispatches them as native Pi tool calls.
-Calls nested inside a native tool are likewise native Pi tool calls — including the
-tool calls a `codemode` script issues, which Pi forwards through the same
-`tool_call`/`tool_result` hooks correlated to the parent script call — so this guard
-and the review-evidence capture apply to them as well; scripts are not a bypass, and a
-failed script does not undo the calls that already ran
-(see [Native Pi tools](native-pi-tools.md#codemode-calls-inside-the-gate)).
+This is a native Pi extension-hook guard in the primary and Pi executor
+runtimes. It does not intercept calls made by an external API harness or wrapper
+such as `multi_tool_use.parallel` unless that wrapper dispatches them as native
+Pi tool calls. Calls nested inside a native tool are likewise native Pi tool
+calls — including the tool calls a `codemode` script issues, which Pi forwards
+through the same `tool_call`/`tool_result` hooks correlated to the parent script
+call — so this guard and the review-evidence capture apply to them as well;
+scripts are not a bypass, and a failed script does not undo the calls that
+already ran (see
+[Native Pi tools](native-pi-tools.md#codemode-calls-inside-the-gate)).
 
 ## Subtask tools
 
@@ -64,21 +67,20 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
 `SubtasksContinue`, `SubtasksSteer`, `SubtasksInterrupt`, `SubtasksForceMerge`, and
 `SubtasksMarkClean`. No singular or snake_case compatibility tool is registered.
 
-- `SubtasksStart` accepts an optional immutable group-level `kind`: `execute` (the
-  default), `research`, or `inplace` (#220, described below).
-- `SubtasksStart` also accepts an optional top-level `workspace` string selecting
-  the group's target. For `execute` groups this is an existing, explicitly
-  authorized development checkout or Git worktree used as the capture and
-  landing destination; for `inplace` groups it is the existing directory the
+- `SubtasksStart` accepts an optional immutable group-level `kind`: `execute`
+  (the default), `research`, or `inplace` (#220, described below).
+- `SubtasksStart` also accepts an optional top-level `workspace` string
+  selecting the group's target. For `execute` groups this is an existing,
+  explicitly authorized development checkout or Git worktree used as the capture
+  and landing destination; for `inplace` groups it is the existing directory the
   workers run and write in directly — any directory the explicit launch
-  authorizes, including an empty one and one outside any Git repository.
-  Omitted or blank uses the parent
-  session's working directory, preserving the default behavior; relative paths
-  resolve against that same parent session's working directory, never against
-  the process cwd. A leading `~` or `~/...` expands against the user's home
-  first (the same Pi-native rule as the built-in file tools); every other
-  spelling, including `~user`, is not reinterpreted and fails closed when it
-  does not name an existing directory. The target is
+  authorizes, including an empty one and one outside any Git repository. Omitted
+  or blank uses the parent session's working directory, preserving the default
+  behavior; relative paths resolve against that same parent session's working
+  directory, never against the process cwd. A leading `~` or `~/...` expands
+  against the user's home first (the same Pi-native rule as the built-in file
+  tools); every other spelling, including `~user`, is not reinterpreted and
+  fails closed when it does not name an existing directory. The target is
   resolved once at start (it must already exist; the extension never creates,
   clones, checks out, or repurposes directories) and persisted with the group:
   `SubtasksAdd` inherits the group's target, and steering never retargets it.
@@ -90,107 +92,119 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   into a target other than the parent session's workspace never enters the
   parent review baseline.
 - Start and add accept 1–128 bounded task definitions per call and return stable
-  execution/task handles immediately. A submission batch is independent of how many
-  workers run at once and of the separate per-execution unsettled admission cap (see
+  execution/task handles immediately. A submission batch is independent of how
+  many workers run at once and of the separate per-execution unsettled admission
+  cap (see
   [Worker resources, routes, and concurrency](#worker-resources-routes-and-concurrency)).
-  Work continues in the background up to the configured global and
-  per-model capacities.
+  Work continues in the background up to the configured global and per-model
+  capacities.
 - Each task owns its capture, worktree, session, checkpoint, review, and landing
   outcome; there is no wave-wide shared base or all-workers integration barrier.
-- Research tasks skip review and landing, validate that their private worktree stayed
-  unchanged, and finish as `reported` with a durable report path.
-- `SubtasksContinue` accepts either an associated task handle or a verified reattachment
-  bundle. By default continuation strictly requires a verified recovery checkpoint: a
-  missing, invalid, or unverifiable checkpoint blocks continuation, and the checkpoint is
-  re-verified before the executor runs. An explicit `inPlace: true` on a stopped execute
-  task is the one exception — it continues the task in exactly its retained managed
-  worktree without a verified checkpoint (see
+- Research tasks skip review and landing, validate that their private worktree
+  stayed unchanged, and finish as `reported` with a durable report path.
+- `SubtasksContinue` accepts either an associated task handle or a verified
+  reattachment bundle. By default continuation strictly requires a verified
+  recovery checkpoint: a missing, invalid, or unverifiable checkpoint blocks
+  continuation, and the checkpoint is re-verified before the executor runs. An
+  explicit `inPlace: true` on a stopped execute task is the one exception — it
+  continues the task in exactly its retained managed worktree without a verified
+  checkpoint (see
   [Steering, continuation, and failure handling](#steering-continuation-and-failure-handling)).
-- `SubtasksInspect` requires an explicit `taskId`, even for single-task executions; it
-  is never inferred from group size, and an omitted ID fails immediately with a concise
-  actionable diagnostic in both activity and evidence modes. The execution-wide overview
-  remains available without a task handle: start and add results list every task handle
-  in the group. An operation that fails after input validation returns a snapshot scoped to
-  the execution (and exact task) the request actually named — or, when it named neither, the
-  sole associated execution for operations that act on an existing one (several associated
-  executions are reported as unresolved rather than guessed) — never the other groups this
-  session holds, and never its whole durable history. The current state, outcome, failure,
-  live controls, artifact paths, checkpoint bundle, conflict truth, recovery guidance, and
-  unsettled commands are included, with a short recent activity tail; older activity rows and
-  the full nested executor result, dispatch, and review bodies stay durable and are omitted
-  from both the model-visible text and the structured details. The current landing status and
-  failure/recovery facts are preserved out of that nested result and stated in the failure text
-  — `recovery_required` with its failure reason, failed path, rollback error, and recovery
-  manifest path — because an incomplete rollback can otherwise leave a worker's own success
-  summary as the only outcome a failed call reports while the main workspace stays partially
-  modified. The failure names its retained
-  and omitted counts and the exact existing follow-up reads, which are two separate calls
-  because evidence navigation is mutually exclusive with `offset`/`lines`: `SubtasksInspect`
-  with `offset`/`lines` reads older rows of the retained activity window (`offset` is an array
-  index into that window, not an activity sequence number) and returns the task's full current
-  record, while `SubtasksInspect` with `evidence: {index, limit}` and no `offset`/`lines` reads
-  its actual tool-call rows. Durable records are
-  never trimmed by a failure result. A target no execution owns reports that no scoped
-  snapshot is available instead of replaying unrelated groups or silently selecting one.
-  Read-only evidence-navigation selector failures (a mistyped `entryId`, unknown `callId`,
-  malformed or expired `cursor`, or out-of-range `index`) keep their concise task-scoped
-  diagnostic with a bounded navigation hint and never other executions' state — and
-  `/subtasks` and `/subtasks-view` show all groups and active tasks.
-- `SubtasksWatch` optionally arms one future checkpoint for an active execution. It
-  returns immediately, replaces any prior watch for that execution, and wakes once with
-  active-task state, timing, recent activity, executor identity, and available controls
-  if work is still active at the deadline. An earlier completion, failure, conflict, or
-  recovery notification cancels the watch; another checkpoint must be explicitly
-  rearmed, so this never becomes a polling loop or recurring heartbeat.
+- `SubtasksInspect` requires an explicit `taskId`, even for single-task
+  executions; it is never inferred from group size, and an omitted ID fails
+  immediately with a concise actionable diagnostic in both activity and evidence
+  modes. The execution-wide overview remains available without a task handle:
+  start and add results list every task handle in the group. An operation that
+  fails after input validation returns a snapshot scoped to the execution (and
+  exact task) the request actually named — or, when it named neither, the sole
+  associated execution for operations that act on an existing one (several
+  associated executions are reported as unresolved rather than guessed) — never
+  the other groups this session holds, and never its whole durable history. The
+  current state, outcome, failure, live controls, artifact paths, checkpoint
+  bundle, conflict truth, recovery guidance, and unsettled commands are
+  included, with a short recent activity tail; older activity rows and the full
+  nested executor result, dispatch, and review bodies stay durable and are
+  omitted from both the model-visible text and the structured details. The
+  current landing status and failure/recovery facts are preserved out of that
+  nested result and stated in the failure text — `recovery_required` with its
+  failure reason, failed path, rollback error, and recovery manifest path —
+  because an incomplete rollback can otherwise leave a worker's own success
+  summary as the only outcome a failed call reports while the main workspace
+  stays partially modified. The failure names its retained and omitted counts
+  and the exact existing follow-up reads, which are two separate calls because
+  evidence navigation is mutually exclusive with `offset`/`lines`:
+  `SubtasksInspect` with `offset`/`lines` reads older rows of the retained
+  activity window (`offset` is an array index into that window, not an activity
+  sequence number) and returns the task's full current record, while
+  `SubtasksInspect` with `evidence: {index, limit}` and no `offset`/`lines`
+  reads its actual tool-call rows. Durable records are never trimmed by a
+  failure result. A target no execution owns reports that no scoped snapshot is
+  available instead of replaying unrelated groups or silently selecting one.
+  Read-only evidence-navigation selector failures (a mistyped `entryId`, unknown
+  `callId`, malformed or expired `cursor`, or out-of-range `index`) keep their
+  concise task-scoped diagnostic with a bounded navigation hint and never other
+  executions' state — and `/subtasks` and `/subtasks-view` show all groups and
+  active tasks.
+- `SubtasksWatch` optionally arms one future checkpoint for an active execution.
+  It returns immediately, replaces any prior watch for that execution, and wakes
+  once with active-task state, timing, recent activity, executor identity, and
+  available controls if work is still active at the deadline. An earlier
+  completion, failure, conflict, or recovery notification cancels the watch;
+  another checkpoint must be explicitly rearmed, so this never becomes a polling
+  loop or recurring heartbeat.
 
 User analogs are available as `/subtasks` and the `/subtask-*` commands for inspect,
 add, steer, interrupt, force-merge, and mark-clean. The commands that accept explicit
 handles (inspect, steer, interrupt, and force-merge) also open interactive pickers when
 handles are omitted; `/subtask-add` and `/subtask-mark-clean` take no execution handle.
 
-`/subtask-add` also accepts human submission without JSON (#120). Plain text after the
-command — `/subtask-add investigate why the notification appears twice` — immediately
+`/subtask-add` also accepts human submission without JSON (#120). Plain text
+after the command —
+`/subtask-add investigate why the notification appears twice` — immediately
 submits exactly one task in a new execution group: the text becomes the task's
 instructions (leading and trailing whitespace trimmed by the established command
-argument handling; interior whitespace is preserved as written), and everything else
-uses the `SubtasksStart` defaults (the `execute` kind, the current session workspace,
-and the established model/role routing), with no further input requested. The title
-derives from the prompt and the single default acceptance criterion restates the
-instructions, so no additional task requirements are invented.
+argument handling; interior whitespace is preserved as written), and everything
+else uses the `SubtasksStart` defaults (the `execute` kind, the current session
+workspace, and the established model/role routing), with no further input
+requested. The title derives from the prompt and the single default acceptance
+criterion restates the instructions, so no additional task requirements are
+invented.
 
-The whole nonblank argument is the raw prompt text: text beginning with an existing
-execution id, JSON-only arguments, arrays, and prose or pasted code containing JSON
-are all submitted verbatim as the instructions — never parsed as submission JSON,
-never rejected, and never interpreted as task metadata (`/subtask-add
+The whole nonblank argument is the raw prompt text: text beginning with an
+existing execution id, JSON-only arguments, arrays, and prose or pasted code
+containing JSON are all submitted verbatim as the instructions — never parsed as
+submission JSON, never rejected, and never interpreted as task metadata
+(`/subtask-add
 {"title":"example","instructions":"quoted sample"}` creates one new group whose
 task instructions are that literal JSON text with default metadata). The human
 command performs no execution-handle detection and has no explicit JSON form;
 structured task submission stays on the model-facing `SubtasksStart` and
 `SubtasksAdd` APIs, which keep their interfaces and batching unchanged.
 
-With no arguments, `/subtask-add` opens a staged multi-field form: choose **Create a
-new execution group** (choosing the `execute`, `research`, or `inplace` kind and, for
-in-place, the directory its worker writes in directly — otherwise an optional
-target workspace, blank meaning the current session workspace) or **Add to an
-existing execution group** (picking a group by its id, kind, and workspace; the added
-task inherits that immutable kind and target). The form collects a required title,
-instructions, and one or more acceptance criteria (one per line) plus optional
-relevant context, validates them, and stages everything behind an explicit final
-submission step: the staged destination, kind, workspace, and task fields are shown
-for confirmation, nothing is dispatched until the staged submission is explicitly
-confirmed, and cancellation — at any earlier stage or at that final step — creates
-neither a task nor a group. For execute groups a workspace is an existing, explicitly
+With no arguments, `/subtask-add` opens a staged multi-field form: choose
+**Create a new execution group** (choosing the `execute`, `research`, or
+`inplace` kind and, for in-place, the directory its worker writes in directly —
+otherwise an optional target workspace, blank meaning the current session
+workspace) or **Add to an existing execution group** (picking a group by its id,
+kind, and workspace; the added task inherits that immutable kind and target).
+The form collects a required title, instructions, and one or more acceptance
+criteria (one per line) plus optional relevant context, validates them, and
+stages everything behind an explicit final submission step: the staged
+destination, kind, workspace, and task fields are shown for confirmation,
+nothing is dispatched until the staged submission is explicitly confirmed, and
+cancellation — at any earlier stage or at that final step — creates neither a
+task nor a group. For execute groups a workspace is an existing, explicitly
 authorized development checkout or Git worktree used as the group's capture and
-landing destination; each task still executes in its own managed isolated worktree.
-For in-place groups the workspace is the directory the worker writes in directly.
-In the interactive Pi TUI the form's text fields open through the same shared
-native editor bridge as every other extension-owned field (issue #26): the
-host's own main-prompt editor with an editable prefill, native path completion
-for relative/`~/...` tokens, and native filesystem suggestions for first-line
-leading-`/` tokens (`/`, `/se`, a nested absolute path) — never slash-command
-items, so a nonexistent token lists nothing and no command is offered or
-executed. On non-interactive hosts the public multi-line editor (with the legacy
-single-line input behind it) is used unchanged.
+landing destination; each task still executes in its own managed isolated
+worktree. For in-place groups the workspace is the directory the worker writes
+in directly. In the interactive Pi TUI the form's text fields open through the
+same shared native editor bridge as every other extension-owned field (issue #26):
+the host's own main-prompt editor with an editable prefill, native path
+completion for relative/`~/...` tokens, and native filesystem suggestions for
+first-line leading-`/` tokens (`/`, `/se`, a nested absolute path) — never
+slash-command items, so a nonexistent token lists nothing and no command is
+offered or executed. On non-interactive hosts the public multi-line editor (with
+the legacy single-line input behind it) is used unchanged.
 
 Successful human submissions share the scheduler's bounded, redacted model launch
 notice, ordered before dependent outcomes. Immediate submissions redact the original
@@ -199,344 +213,373 @@ existing UI title are unchanged. No full instruction dump is added to launch not
 
 ## Worker review evidence selection
 
-The **Isolated worktree** and **InPlace** rows under `/review-settings` → **Reviewers** →
-**Evidence methods** default to **Tools + workspace changes**; Enter cycles to
-**Tools only**. They select review evidence
-independently of the worker kind, reviewer set, and automatic-review toggles. They
-are stored as `review.evidence.worktreeToolOnly` and `inplaceToolOnly`; the independent
+The **Isolated worktree** and **InPlace** rows under `/review-settings` →
+**Reviewers** → **Evidence methods** default to **Tools + workspace changes**;
+Enter cycles to **Tools only**. They select review evidence independently of the
+worker kind, reviewer set, and automatic-review toggles. They are stored as
+`review.evidence.worktreeToolOnly` and `inplaceToolOnly`; the independent
 `snapshotFailureFallback` setting defaults On. See
 [Configuration](configuration.md#review-evidence-methods).
 
-Workers capture applicable evidence and fallback policy at firing/queue admission.
-Each new model `SubtasksStart`/`SubtasksAdd` task or human submission captures independently;
-scheduled subtasks capture at actual firing/admission, not schedule creation. Already
-queued and running tasks retain that policy through corrections, retries, and
-continuations; later Add tasks capture the then-current live choice. No in-flight task
-is reconfigured, and evidence policy does not freeze all routes or reviewer selections.
+Workers capture applicable evidence and fallback policy at firing/queue
+admission. Each new model `SubtasksStart`/`SubtasksAdd` task or human submission
+captures independently; scheduled subtasks capture at actual firing/admission,
+not schedule creation. Already queued and running tasks retain that policy
+through corrections, retries, and continuations; later Add tasks capture the
+then-current live choice. No in-flight task is reconfigured, and evidence policy
+does not freeze all routes or reviewer selections.
 
-In tool-only review, supported observed tool edits to `SCRIPT` and their retained
-content/results reach the reviewer even while an independent generator changes
-`REPORT`. Post-pass `REPORT` additions alone do not retrigger review without new
-observed changes. This is not a universal authorship guarantee: event support and
-capture limits still apply, and binary executors have no structured tool events.
-Missing observations do not block review: show collected evidence with adapter/capture
-limits and clearly provenance-labelled claims/context, never proof of clean work or no
-effects. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
-contamination, not bounded tool/path/content observations or read-only reviewer inspection.
-Snapshot-preferring captured policy retries capture on later cycles/continuations;
-fallback is not sticky and warns prominently on every occurrence. Later capture cannot
-invent earlier coverage or discard retained current-work tool evidence. The
+In tool-only review, supported observed tool edits to `SCRIPT` and their
+retained content/results reach the reviewer even while an independent generator
+changes `REPORT`. Post-pass `REPORT` additions alone do not retrigger review
+without new observed changes. This is not a universal authorship guarantee:
+event support and capture limits still apply, and binary executors have no
+structured tool events. Missing observations do not block review: show collected
+evidence with adapter/capture limits and clearly provenance-labelled
+claims/context, never proof of clean work or no effects. Tool-only omits only
+filesystem/Git review snapshots subject to outside-writer contamination, not
+bounded tool/path/content observations or read-only reviewer inspection.
+Snapshot-preferring captured policy retries capture on later
+cycles/continuations; fallback is not sticky and warns prominently on every
+occurrence. Later capture cannot invent earlier coverage or discard retained
+current-work tool evidence. The
 [review workflow](review-workflow.md#review-evidence-methods) owns that evidence
-contract and the warning-bearing fallback, including allowed first-baseline fallback
-for InPlace before work.
+contract and the warning-bearing fallback, including allowed first-baseline
+fallback for InPlace before work.
 
 Tool-only review never replaces the isolated input capture needed to construct a
-worker workspace, nor its verified candidate checkpoint or landing inputs. Even with
-fallback On, shared stages needed for checkpoint or landing may remain blocking;
-there is no promise that all isolated snapshot failures can fall back. Missing/corrupt
-persisted evidence, cancellation, and review execution errors remain blocking. InPlace
-writes and side effects still occur immediately: selecting evidence changes neither
-post-hoc review nor the absence of rollback.
+worker workspace, nor its verified candidate checkpoint or landing inputs. Even
+with fallback On, shared stages needed for checkpoint or landing may remain
+blocking; there is no promise that all isolated snapshot failures can fall back.
+Missing/corrupt persisted evidence, cancellation, and review execution errors
+remain blocking. InPlace writes and side effects still occur immediately:
+selecting evidence changes neither post-hoc review nor the absence of rollback.
 
 ## In-place subtask kind
 
-The `inplace` kind (#220) is a third, explicitly selected worker kind alongside `execute`
-and `research`. It exists for work that genuinely must happen in one specific existing
-directory — the primary workspace, a checkout prepared for a ticket, or an empty folder.
-Git is never required: the selected workspace may be non-Git, and the worker may create a
-repository there when the task genuinely calls for one.
+The `inplace` kind (#220) is a third, explicitly selected worker kind alongside
+`execute` and `research`. It exists for work that genuinely must happen in one
+specific existing directory — the primary workspace, a checkout prepared for a
+ticket, or an empty folder. Git is never required: the selected workspace may be
+non-Git, and the worker may create a repository there when the task genuinely
+calls for one.
 
 Launch paths and semantics:
 
-- Selectable wherever `kind` is: the model-facing `SubtasksStart`/`SubtasksAdd` schema,
-  the `/subtask-add` staged form, and scheduled task entries (which pass their kind
-  through the same start path, including their worker pin and review override). An
-  in-place group's selected workspace is the directory its workers run and write in
-  directly, resolved once at start exactly like an execute group's target. This root
-  selects the executor cwd and workspace-snapshot scope; it is not a filesystem
-  boundary, and tools may still act on paths outside it.
-- The executor runs with the same authorized file/CLI/API capabilities an execute worker
-  receives, except that it cannot launch subtasks: every `Subtasks*`-prefixed tool is
-  removed from its durable tool catalog. In-place workers draw from the write-capable
-  executor pool (the `execute` priority route and per-entry worker pins); no separate
-  route is configured for them. When the selected workspace contains the system temp
-  directory, the group's artifact root is created at the nearest writable directory
-  outside the workspace instead (recorded as the group's storage base and validated by
-  the guarded cleanup) so task artifacts never live inside the selected directory; a
+- Selectable wherever `kind` is: the model-facing `SubtasksStart`/`SubtasksAdd`
+  schema, the `/subtask-add` staged form, and scheduled task entries (which pass
+  their kind through the same start path, including their worker pin and review
+  override). An in-place group's selected workspace is the directory its workers
+  run and write in directly, resolved once at start exactly like an execute
+  group's target. This root selects the executor cwd and workspace-snapshot
+  scope; it is not a filesystem boundary, and tools may still act on paths
+  outside it.
+- The executor runs with the same authorized file/CLI/API capabilities an
+  execute worker receives, except that it cannot launch subtasks: every
+  `Subtasks*`-prefixed tool is removed from its durable tool catalog. In-place
+  workers draw from the write-capable executor pool (the `execute` priority
+  route and per-entry worker pins); no separate route is configured for them.
+  When the selected workspace contains the system temp directory, the group's
+  artifact root is created at the nearest writable directory outside the
+  workspace instead (recorded as the group's storage base and validated by the
+  guarded cleanup) so task artifacts never live inside the selected directory; a
   workspace that contains every candidate location is refused at launch.
 - There is no wave capture, no managed worker worktree, no candidate commit, no
-  integration, and no landing. Writes and external side effects happen where the worker
-  performs them and are never gated, rolled back, or landed by this extension.
+  integration, and no landing. Writes and external side effects happen where the
+  worker performs them and are never gated, rolled back, or landed by this
+  extension.
 - In-place tasks have no mergeable checkpoint, so `SubtasksForceMerge`,
   `SubtasksMarkClean`, and interrupt-with-merge are refused for them; ordinary
-  `SubtasksContinue` resumes a stopped task in the same workspace (with an explicit
-  disclosure that prior writes were not verified or rolled back), and the controller
-  re-queued auto-resume after an application restart works the same way.
-- In-place executors use the configured `execute` route's existing retry and pool
-  failover policy. After same-adapter recovery is exhausted, a replacement may take
-  over only after every child started during that assignment has reported exit and
-  every tracked process group is confirmed absent where supported. It continues in
-  the same selected workspace against the original launch baseline; no new baseline
-  or wave capture, workspace reset, checkpoint, rollback, or landing occurs. The
-  replacement starts a fresh session and
-  is told that prior direct writes and external effects may already have happened, so
-  it must inspect current state rather than assume the previous attempt left nothing.
+  `SubtasksContinue` resumes a stopped task in the same workspace (with an
+  explicit disclosure that prior writes were not verified or rolled back), and
+  the controller re-queued auto-resume after an application restart works the
+  same way.
+- In-place executors use the configured `execute` route's existing retry and
+  pool failover policy. After same-adapter recovery is exhausted, a replacement
+  may take over only after every child started during that assignment has
+  reported exit and every tracked process group is confirmed absent where
+  supported. It continues in the same selected workspace against the original
+  launch baseline; no new baseline or wave capture, workspace reset, checkpoint,
+  rollback, or landing occurs. The replacement starts a fresh session and is
+  told that prior direct writes and external effects may already have happened,
+  so it must inspect current state rather than assume the previous attempt left
+  nothing.
 
 Attribution and review:
 
-- In default snapshot mode, at dispatch the task records a bounded content snapshot
-  of the selected workspace plus the observed Git HEAD when the root is inside a
-  repository (and nothing when it is
-  not), and persists that launch baseline durably (write-once) in the task's artifact
-  directory before any executor runs. Every continuation restores and verifies that
-  same basis — a persisted basis that is missing after prior execution, malformed,
-  fails its integrity check, or is rooted elsewhere fails closed instead of silently
-  re-baselining, so writes made before a pause stay inside the original attribution
-  window. This detects integrity
-  mismatches; it is not a guarantee against a writer who can rewrite both the artifact
-  and its integrity metadata.
+- In default snapshot mode, at dispatch the task records a bounded content
+  snapshot of the selected workspace plus the observed Git HEAD when the root is
+  inside a repository (and nothing when it is not), and persists that launch
+  baseline durably (write-once) in the task's artifact directory before any
+  executor runs. Every continuation restores and verifies that same basis — a
+  persisted basis that is missing after prior execution, malformed, fails its
+  integrity check, or is rooted elsewhere fails closed instead of silently
+  re-baselining, so writes made before a pause stay inside the original
+  attribution window. This detects integrity mismatches; it is not a guarantee
+  against a writer who can rewrite both the artifact and its integrity metadata.
 - When a terminal result was never stored (for example because its publication failed
   after the executor ran), an explicit continuation still recovers from the durable
   operation record: the retained executor session when it is compatible with the
   current assignment, and the next monotonic turn number — always against the original
   baseline. A missing or incompatible session falls back to a disclosed fresh session
   in the same workspace; a failed critical operation still refuses continuation.
-- The missing-baseline refusal holds even when no stored result exists: after any
-  recorded prior execution, a missing persisted evidence basis fails closed instead of
-  re-capturing over an already-modified workspace. A genuinely first dispatch captures
-  the selected basis. With fallback explicitly enabled, failure of that first
-  review-baseline snapshot before work may establish a durable, disclosed tool-only
-  basis instead; it never invents a snapshot or repairs lost evidence.
-- In snapshot mode, a task's own reviewer reviews the content-anchored recorded delta
-  of that workspace since launch — the same workspace-snapshot review scope direct orchestrator work would
-  receive in that workspace — and follows the ordinary correction loop
-  (`needs_changes` resumes the same worker there). Identity binds status, path, and
-  CONTENT (file hashes and snapshot-entry metadata): a turn that rewrites the content
-  of an already-changed path is always observable, no-progress detection cannot be
-  fooled by a same-path content rewrite. A passing verdict is bound to the reviewed
-  content plus the bounded external-observation revision and truncation state; a pass
-  confirmation re-enters review only for new originating-task captured reviewable
-  activity under the post-pass rule below, not for workspace drift alone. For no-progress
-  detection, a new external observation also distinguishes correction cycles when the
-  workspace delta is unchanged; it is evidence of an observed path, not proof of a particular external content change. The observation revision detects
-  new evidence, not a verified file diff. Each durable cycle record carries the reviewed
-  workspace identity's hash instead of a fabricated commit identity. Cycle numbering is
-  allocated from the task's durable review artifacts (records and unpublished markers), so a paused-then-continued task
-  never recycles a settled cycle number, and publication of a genuinely new cycle never
-  silently accepts an existing record: a numbered collision fails the task closed as a
-  review error.
-- Initial/new-window automatic InPlace reviews and `needs_changes` corrections retain
-  the [automatic review trigger](review-workflow.md#automatic-review-trigger): when every
-  turn since the preceding review ran on a structured tool-event stream, they also need
-  new qualifying tool activity. Filesystem changes alone settle unreviewed before any
-  review or unresolved after `needs_changes`. Turns without structured events keep the
-  existing eligibility and correction caps, and an unknown retained review boundary
-  never settles as clean or accepted.
-- Within the same passing-review confirmation/follow-up loop, **every InPlace adapter**
-  follows the same [post-pass rule as Primary](review-workflow.md#passing-review-confirmations-and-follow-ups):
-  only new originating-task captured reviewable activity re-enters review. A qualifying
-  call alone plus sibling/process/workspace drift is insufficient. Unchanged
-  confirmations, repeated finals, read-only/nonreviewable calls, and already-reviewed
-  evidence do not retrigger review. Workspace-only or `.pi-review-gate/checkpoints/`-only
-  churn retains the identifiable earlier pass with an explicit attribution warning:
-  **the pass covers previously reviewed evidence only; later unattributed changes are
-  not approved, and the current workspace is not certified**. A genuine new captured
-  own reviewable edit or relevant new observed outside-root mutation candidate still
-  re-enters review; the latter needs no proof of an external file diff. Missing,
-  unsupported, or incomplete capture remains best effort with disclosed limits, not
-  proof of no activity, a snapshot-only fallback trigger, or a new blocker. Existing
-  capture/integrity failures remain blocking under their ordinary rules.
-- User-selected `run-as-binary` InPlace executors still forward no structured tool calls
-  (none are inferred). After a pass, the final pass-response turn still runs and its
-  result is returned to the orchestrator as final **unreviewed** evidence, but its
-  filesystem changes do not start another review. The pass covers only the delta it
-  reviewed, not the latest workspace state. Newer steering or continuation instructions
-  are new work. Initial/correction eligibility, manual review, and isolated `execute`
-  review and landing are unchanged.
-- The recorded delta is a change-since-launch record, not proof of authorship: changes
-  by concurrent writers appear indistinguishably from the worker's own. Reviewers are
-  instructed not to credit unattributable changes to the worker, not to present unrelated
-  concurrent changes as reviewed worker output, and to disclose uncertain attribution
-  explicitly. Snapshot-policy omissions (ignored directories, oversized files) are
-  disclosed the same way.
-- The selected root bounds only the workspace snapshot, not tool reach. Structured
-  Pi RPC, Claude Agent SDK, and Codex app-server tool events are forwarded as bounded
-  evidence. When those events identify an absolute mutation path outside the selected
-  root, that path is shown separately as an external side-effect candidate and reaches
-  the task's reviewer even when the selected-root delta is empty. Its pre-state is
-  explicitly unverified because parent-side event delivery may race the mutation; a
-  bounded after-turn observation is not a diff and does not prove which writer caused
-  the state. The observation revision is persisted with the evidence across
-  continuations. The run-as-binary adapter does not expose structured tool events, and all
-  adapters may omit actions: missing events never establish that no external effect
-  occurred. Tool observations and candidate paths are bounded and persisted with the
-  task evidence for continuations. Discard-output writes to `/dev/null` are excluded
-  from path candidates; the original command remains in tool history. Destructive
-  operations on that path remain evidence candidates.
-- In snapshot mode, `no_changes` means only that the bounded selected-root snapshot
-  contains no recorded workspace delta since launch. In tool-only mode, absence of
-  observed changes is not proof of an unchanged filesystem. Neither means that no
-  external side effect occurred. Detailed evidence retains the selected basis,
-  snapshot exclusions where applicable, and tool-observation limits.
-- A review verdict is explicitly post-hoc: a passing verdict applies to the selected
-  evidence basis (the recorded workspace delta in snapshot mode, retained observed-tool
-  evidence in tool-only mode); it never represents a pre-write gate, a rollback,
-  or an undo of network, API, process, or out-of-workspace side effects, and settled
-  in-place tasks never claim their writes were undone. In snapshot mode, routine
-  completion messages report status, review outcome, and named workspace changes since
-  launch. A separate **Additional observed paths outside workspace** list supplements that snapshot
-  evidence. Detailed attribution and observation limits remain in the review context
-  and evidence rather than repeated in routine notices.
+- The missing-baseline refusal holds even when no stored result exists: after
+  any recorded prior execution, a missing persisted evidence basis fails closed
+  instead of re-capturing over an already-modified workspace. A genuinely first
+  dispatch captures the selected basis. With fallback explicitly enabled,
+  failure of that first review-baseline snapshot before work may establish a
+  durable, disclosed tool-only basis instead; it never invents a snapshot or
+  repairs lost evidence.
+- In snapshot mode, a task's own reviewer reviews the content-anchored recorded
+  delta of that workspace since launch — the same workspace-snapshot review
+  scope direct orchestrator work would receive in that workspace — and follows
+  the ordinary correction loop (`needs_changes` resumes the same worker there).
+  Identity binds status, path, and CONTENT (file hashes and snapshot-entry
+  metadata): a turn that rewrites the content of an already-changed path is
+  always observable, no-progress detection cannot be fooled by a same-path
+  content rewrite. A passing verdict is bound to the reviewed content plus the
+  bounded external-observation revision and truncation state; a pass
+  confirmation re-enters review only for new originating-task captured
+  reviewable activity under the post-pass rule below, not for workspace drift
+  alone. For no-progress detection, a new external observation also
+  distinguishes correction cycles when the workspace delta is unchanged; it is
+  evidence of an observed path, not proof of a particular external content
+  change. The observation revision detects new evidence, not a verified file
+  diff. Each durable cycle record carries the reviewed workspace identity's hash
+  instead of a fabricated commit identity. Cycle numbering is allocated from the
+  task's durable review artifacts (records and unpublished markers), so a
+  paused-then-continued task never recycles a settled cycle number, and
+  publication of a genuinely new cycle never silently accepts an existing
+  record: a numbered collision fails the task closed as a review error.
+- Initial/new-window automatic InPlace reviews and `needs_changes` corrections
+  retain the
+  [automatic review trigger](review-workflow.md#automatic-review-trigger): when
+  every turn since the preceding review ran on a structured tool-event stream,
+  they also need new qualifying tool activity. Filesystem changes alone settle
+  unreviewed before any review or unresolved after `needs_changes`. Turns
+  without structured events keep the existing eligibility and correction caps,
+  and an unknown retained review boundary never settles as clean or accepted.
+- Within the same passing-review confirmation/follow-up loop, **every InPlace
+  adapter** follows the same
+  [post-pass rule as Primary](review-workflow.md#passing-review-confirmations-and-follow-ups):
+  only new originating-task captured reviewable activity re-enters review. A
+  qualifying call alone plus sibling/process/workspace drift is insufficient.
+  Unchanged confirmations, repeated finals, read-only/nonreviewable calls, and
+  already-reviewed evidence do not retrigger review. Workspace-only or
+  `.pi-review-gate/checkpoints/`-only churn retains the identifiable earlier
+  pass with an explicit attribution warning: **the pass covers previously
+  reviewed evidence only; later unattributed changes are not approved, and the
+  current workspace is not certified**. A genuine new captured own reviewable
+  edit or relevant new observed outside-root mutation candidate still re-enters
+  review; the latter needs no proof of an external file diff. Missing,
+  unsupported, or incomplete capture remains best effort with disclosed limits,
+  not proof of no activity, a snapshot-only fallback trigger, or a new blocker.
+  Existing capture/integrity failures remain blocking under their ordinary
+  rules.
+- User-selected `run-as-binary` InPlace executors still forward no structured
+  tool calls (none are inferred). After a pass, the final pass-response turn
+  still runs and its result is returned to the orchestrator as final
+  **unreviewed** evidence, but its filesystem changes do not start another
+  review. The pass covers only the delta it reviewed, not the latest workspace
+  state. Newer steering or continuation instructions are new work.
+  Initial/correction eligibility, manual review, and isolated `execute` review
+  and landing are unchanged.
+- The recorded delta is a change-since-launch record, not proof of authorship:
+  changes by concurrent writers appear indistinguishably from the worker's own.
+  Reviewers are instructed not to credit unattributable changes to the worker,
+  not to present unrelated concurrent changes as reviewed worker output, and to
+  disclose uncertain attribution explicitly. Snapshot-policy omissions (ignored
+  directories, oversized files) are disclosed the same way.
+- The selected root bounds only the workspace snapshot, not tool reach.
+  Structured Pi RPC, Claude Agent SDK, and Codex app-server tool events are
+  forwarded as bounded evidence. When those events identify an absolute mutation
+  path outside the selected root, that path is shown separately as an external
+  side-effect candidate and reaches the task's reviewer even when the
+  selected-root delta is empty. Its pre-state is explicitly unverified because
+  parent-side event delivery may race the mutation; a bounded after-turn
+  observation is not a diff and does not prove which writer caused the state.
+  The observation revision is persisted with the evidence across continuations.
+  The run-as-binary adapter does not expose structured tool events, and all
+  adapters may omit actions: missing events never establish that no external
+  effect occurred. Tool observations and candidate paths are bounded and
+  persisted with the task evidence for continuations. Discard-output writes to
+  `/dev/null` are excluded from path candidates; the original command remains in
+  tool history. Destructive operations on that path remain evidence candidates.
+- In snapshot mode, `no_changes` means only that the bounded selected-root
+  snapshot contains no recorded workspace delta since launch. In tool-only mode,
+  absence of observed changes is not proof of an unchanged filesystem. Neither
+  means that no external side effect occurred. Detailed evidence retains the
+  selected basis, snapshot exclusions where applicable, and tool-observation
+  limits.
+- A review verdict is explicitly post-hoc: a passing verdict applies to the
+  selected evidence basis (the recorded workspace delta in snapshot mode,
+  retained observed-tool evidence in tool-only mode); it
+  never represents a pre-write gate, a rollback, or an undo of network, API,
+  process, or out-of-workspace side effects, and settled in-place tasks never
+  claim their writes were undone. In snapshot mode, routine completion messages
+  report status, review outcome, and named workspace changes since launch. A
+  separate **Additional observed paths outside workspace** list supplements that
+  snapshot evidence. Detailed attribution and observation limits remain in the
+  review context and evidence rather than repeated in routine notices.
 - When existing policy invokes review, completed worker summaries—including the
   initial turn—reach the reviewer through the normal bounded, redacted evidence
-  and request channels. The summaries are persisted with task evidence for retries
-  and restored context; a summary-only deliverable needs no extra report file.
-  Summary capture alone does not introduce an observed change or change retry limits;
-  review eligibility follows the selected evidence method.
-- Durable per-cycle reviewer records are written under the task's artifact directory as
-  `reviews/inplace/cycle-NNNN.json` in an in-place record shape that carries the
-  attribution basis instead of a fabricated commit identity. Subtask evidence indexes
-  these records; a failing publication still leaves the bounded unpublished marker
-  instead of silently presenting an older readable cycle as current.
-- Settled in-place tasks end `reported` (like research groups). In snapshot mode they
-  include the review outcome, workspace path, and a bounded named list of
-  changed-since-launch paths in the
-  summary. A failed, timed-out, or interrupted lifecycle also re-checks the recorded
-  workspace delta at settlement — writes the worker already performed are reflected in the
-  durable result, durable summaries, and notices instead of a false no-changes claim;
-  if the delta cannot be inspected, result and notices report it as unknown
-  (`attributionError`) rather than zero. With
-  subtask review disabled they settle as completed-unreviewed in place — no verdict is
-  fabricated, and nothing is attributed beyond the recorded delta.
+  and request channels. The summaries are persisted with task evidence for
+  retries and restored context; a summary-only deliverable needs no extra report
+  file. Summary capture alone does not introduce an observed change or change
+  retry limits; review eligibility follows the selected evidence method.
+- Durable per-cycle reviewer records are written under the task's artifact
+  directory as `reviews/inplace/cycle-NNNN.json` in an in-place record shape
+  that carries the attribution basis instead of a fabricated commit identity.
+  Subtask evidence indexes these records; a failing publication still leaves the
+  bounded unpublished marker instead of silently presenting an older readable
+  cycle as current.
+- Settled in-place tasks end `reported` (like research groups). In snapshot mode
+  they include the review outcome, workspace path, and a bounded named list of
+  changed-since-launch paths in the summary. A failed, timed-out, or interrupted
+  lifecycle also re-checks the recorded workspace delta at settlement — writes
+  the worker already performed are reflected in the durable result, durable
+  summaries, and notices instead of a false no-changes claim; if the delta
+  cannot be inspected, result and notices report it as unknown
+  (`attributionError`) rather than zero. With subtask review disabled they
+  settle as completed-unreviewed in place — no verdict is fabricated, and
+  nothing is attributed beyond the recorded delta.
 
 ## Pi worker settlement and browser ownership
 
-Pi workers keep one live browser across their completed turns, including resumed turns
-while background work remains active. The extension publishes a version-2 authenticated
-**model-settlement receipt**, not a browser-quiescence receipt. It binds the child PID,
-child/session identity, and monotonic settlement generation; signatures and one-shot
-consumption prevent stale or forged completion. Legacy zero-browser-resource receipts
-and bootstrap names are not compatible. RPC `agent_end` and process exit alone are
-still insufficient evidence of successful model settlement. On a Windows
-`.cmd`-rooted launch, the first receipt's descendant-proof refusal keeps its
-original wording and appends one fixed sanitized stage code naming the bounded
-lineage stage that refused — no query output, path, or PID is included
+Pi workers keep one live browser across their completed turns, including resumed
+turns while background work remains active. The extension publishes a version-2
+authenticated **model-settlement receipt**, not a browser-quiescence receipt. It
+binds the child PID, child/session identity, and monotonic settlement
+generation; signatures and one-shot consumption prevent stale or forged
+completion. Legacy zero-browser-resource receipts and bootstrap names are not
+compatible. RPC `agent_end` and process exit alone are still insufficient
+evidence of successful model settlement. On a Windows `.cmd`-rooted launch, the
+first receipt's descendant-proof refusal keeps its original wording and appends
+one fixed sanitized stage code naming the bounded lineage stage that refused —
+no query output, path, or PID is included
 ([launcher internals](development.md#launcher-behavior)).
 
-Terminal worker shutdown closes the browser, and the parent adapter awaits process exit
-before returning completion for capture/review. After closing stdin, it allows a separate
-15-second terminal cleanup deadline (covering the browser's 5-second close phase,
-5-second late-containment drain, and exit overhead), independent of the model execution
-deadline. Exceeding that deadline fails completion and escalates process termination.
-Task interruption through `SubtasksInterrupt` is terminal rather than a claim that a
-settled turn has no live browser. Native turn interruption through
-`SubtasksSteer` with `interrupt: true` keeps the task and browser alive. Executor extension reload or session
-replacement is unsupported: shutdown retires the receipt identity, and the erased
-bootstrap is not reconstructed from environment, session history, or old receipts.
-The replacement runtime blocks tools and cannot acknowledge completion; restart that
-worker with a fresh parent-issued identity. Normal top-level Pi reload remains supported
-and closes its old browser before creating a new runtime.
+Terminal worker shutdown closes the browser, and the parent adapter awaits
+process exit before returning completion for capture/review. After closing
+stdin, it allows a separate 15-second terminal cleanup deadline (covering the
+browser's 5-second close phase, 5-second late-containment drain, and exit
+overhead), independent of the model execution deadline. Exceeding that deadline
+fails completion and escalates process termination. Task interruption through
+`SubtasksInterrupt` is terminal rather than a claim that a settled turn has no
+live browser. Native turn interruption through `SubtasksSteer` with
+`interrupt: true` keeps the task and browser alive. Executor extension reload or
+session replacement is unsupported: shutdown retires the receipt identity, and
+the erased bootstrap is not reconstructed from environment, session history, or
+old receipts. The replacement runtime blocks tools and cannot acknowledge
+completion; restart that worker with a fresh parent-issued identity. Normal
+top-level Pi reload remains supported and closes its old browser before creating
+a new runtime.
 
 ## Worker resources, routes, and concurrency
 
 Fresh tasks scan their `execution.routes.execute` or `execution.routes.research`
 ordering and use the first referenced resource with remaining shared capacity.
 The two priorities are independent ordered subsets: either route can exclude a
-resource, and per-route reasoning lets the same local model use different effort without
-creating a second capacity bucket. A missing or empty route means no models for that
-role — the catalog never supplies a default order, so a resource that is not listed in
-a role's route is not used by that role.
+resource, and per-route reasoning lets the same local model use different effort
+without creating a second capacity bucket. A missing or empty route means no
+models for that role — the catalog never supplies a default order, so a resource
+that is not listed in a role's route is not used by that role.
 
-`execution.workerResources` is an object keyed by stable resource ID; each value holds
-the selection and the shared `maxConcurrent` capacity. `externalAgents` is likewise an
-object keyed by agent ID. Ordered behavior lives only in the route arrays, which are
-lists of `{ resourceId, thinkingLevel? }` references. Only the keyed object form of
-both catalogs is accepted: the former legacy array forms are no longer imported or
-converted ([#116](https://github.com/rfairburn/pi-review-gate/issues/116)). Strict
+`execution.workerResources` is an object keyed by stable resource ID; each value
+holds the selection and the shared `maxConcurrent` capacity. `externalAgents` is
+likewise an object keyed by agent ID. Ordered behavior lives only in the route
+arrays, which are lists of `{ resourceId, thinkingLevel? }` references. Only the
+keyed object form of both catalogs is accepted: the former legacy array forms
+are no longer imported or converted
+([#116](https://github.com/rfairburn/pi-review-gate/issues/116)). Strict
 validation rejects them, and startup recovery reports them and continues without
-converting or rewriting the stored file. To migrate a legacy array config, back it
-up, load it with the published conversion-capable prerelease
-[b164](https://github.com/rfairburn/pi-review-gate/releases/tag/b164), explicitly
-save once through `/review-settings` there, and then upgrade; see
-[Removed legacy array catalogs](configuration.md#removed-legacy-array-catalogs) for
-the full steps. In `/review-settings`
-the worker-resource catalog displays alphabetically and edits by key with no reorder
-controls; ordering is set only in the two priority routes. Edit Claude/Codex external
-agent definitions separately under **External workers**; renaming an agent updates
-resource selections while retaining resource IDs and route order. Supported editors
-use human-readable Model/Reasoning choices and timeouts,
-with automatic `claude`/`codex` commands and fixed native protocols, not executable,
-argument-list, or protocol-override menus, and no environment key/value editing or
-counts. Manual JSON `env` configuration remains fully supported and is preserved by
-Apply, rename, and other edits while the roles remain enabled. Only Create/Apply normalizes that definition:
-legacy effort migrates; other arguments, custom executable paths, and native protocol
-overrides are removed with scoped warnings. Untouched legacy JSON remains compatible. Model-specific effort and every enabled
-role's inheritance must be valid before Apply; incompatible choices require explicit
-resolution, never fallback. CLI default delegates to CLI settings, not off, and an
-explicit role default suppresses inherited Shared effort. Custom/pinned model values
-can be kept. Max is not Extra High (`xhigh`); Codex Ultra means automatic task delegation and is
-only offered where supported. Catalogs are release-maintained, not live discovery
-or a guarantee of installed CLI/account access; no provider is started by the menu.
+converting or rewriting the stored file. To migrate a legacy array config, back
+it up, load it with the published conversion-capable prerelease
+[b164](https://github.com/rfairburn/pi-review-gate/releases/tag/b164),
+explicitly save once through `/review-settings` there, and then upgrade; see
+[Removed legacy array catalogs](configuration.md#removed-legacy-array-catalogs)
+for the full steps. In `/review-settings` the worker-resource catalog displays
+alphabetically and edits by key with no reorder controls; ordering is set only
+in the two priority routes. Edit Claude/Codex external agent definitions
+separately under **External workers**; renaming an agent updates resource
+selections while retaining resource IDs and route order. Supported editors use
+human-readable Model/Reasoning choices and timeouts, with automatic
+`claude`/`codex` commands and fixed native protocols, not executable,
+argument-list, or protocol-override menus, and no environment key/value editing
+or counts. Manual JSON `env` configuration remains fully supported and is
+preserved by Apply, rename, and other edits while the roles remain enabled. Only
+Create/Apply normalizes that definition: legacy effort migrates; other
+arguments, custom executable paths, and native protocol overrides are removed
+with scoped warnings. Untouched legacy JSON remains compatible. Model-specific
+effort and every enabled role's inheritance must be valid before Apply;
+incompatible choices require explicit resolution, never fallback. CLI default
+delegates to CLI settings, not off, and an explicit role default suppresses
+inherited Shared effort. Custom/pinned model values can be kept. Max is not
+Extra High (`xhigh`); Codex Ultra means automatic task delegation and is only
+offered where supported. Catalogs are release-maintained, not live discovery or
+a guarantee of installed CLI/account access; no provider is started by the menu.
 
-Every supported editor offers **Delete** directly beside **Apply**/**Cancel**, using
-the original identity despite unapplied local edits; newly staged definitions are
-also deletable. Unsupported types offer only **Delete**/**Back**. The staged cascade
-removes affected resources/routes and primary/subtask/scheduled reviewer references;
-invalidated schedules are disabled, with only invalid pins or emptied reviewer
-overrides reset to inheritance. Notices explain cleanup and defaults used on later
-re-enable. Root **Save changes** (or Ctrl+S) persists the whole draft, **Cancel**
-discards it, and root Escape applies it to the running session only. Missing native
-CLIs on `PATH` warn without blocking Save, even for selected workers; runtime failures
-remain errors. See [External worker management](configuration.md#manage-existing-external-workers)
-and [Native reasoning effort](configuration.md#native-reasoning-effort).
-An explicit **Add Resource** that newly enrolls a worker in a supported role's
+Every supported editor offers **Delete** directly beside **Apply**/**Cancel**,
+using the original identity despite unapplied local edits; newly staged
+definitions are also deletable. Unsupported types offer only
+**Delete**/**Back**. The staged cascade removes affected resources/routes and
+primary/subtask/scheduled reviewer references; invalidated schedules are
+disabled, with only invalid pins or emptied reviewer overrides reset to
+inheritance. Notices explain cleanup and defaults used on later re-enable. Root
+**Save changes** (or Ctrl+S) persists the whole draft, **Cancel** discards it,
+and root Escape applies it to the running session only. Missing native CLIs on
+`PATH` warn without blocking Save, even for selected workers; runtime failures
+remain errors. See
+[External worker management](configuration.md#manage-existing-external-workers)
+and [Native reasoning effort](configuration.md#native-reasoning-effort). An
+explicit **Add Resource** that newly enrolls a worker in a supported role's
 priority route places that entry in slot 1, with the model's default reasoning.
-Adding C to `[A, B]` gives `[C, A, B]`; adding D afterward gives
-`[D, C, A, B]`. Execution and Research routes are independent. Existing entries
-retain their relative order and model/reasoning pairing; reconciliation neither
-duplicates nor promotes them. Eligibility, membership checks, stable resource IDs,
-duplicate guards, and manual route ordering are unchanged. Add-time enrollment and
-the existing changed-final-model reconciliation still happen at their current
-points: if a resource added during the visit changes model before leaving the pool
-editor, enrollment and reasoning are re-derived from the final selection —
-enrolling it in any supported route it is not yet listed in. An explicit exclusion
-made through a priority route sticks: a resource that exists when the pool editor
-opens is never enrolled into a route it was excluded from just because its model
-changed later, and ordinary edits to existing resources do not reorder routes or
-auto-enroll them. Opening or saving settings never enrolls preexisting resources
-into missing or empty priorities and does not reorder routes. Slot 1 is a priority
-preference only; existing capacity limits, scheduler selection, and failover
-continue to determine which worker runs. Settings apply/save/cancel behavior is
-unchanged.
+Adding C to `[A, B]` gives `[C, A, B]`; adding D afterward gives `[D, C, A, B]`.
+Execution and Research routes are independent. Existing entries retain their
+relative order and model/reasoning pairing; reconciliation neither duplicates
+nor promotes them. Eligibility, membership checks, stable resource IDs,
+duplicate guards, and manual route ordering are unchanged. Add-time enrollment
+and the existing changed-final-model reconciliation still happen at their
+current points: if a resource added during the visit changes model before
+leaving the pool editor, enrollment and reasoning are re-derived from the final
+selection — enrolling it in any supported route it is not yet listed in. An
+explicit exclusion made through a priority route sticks: a resource that exists
+when the pool editor opens is never enrolled into a route it was excluded from
+just because its model changed later, and ordinary edits to existing resources
+do not reorder routes or auto-enroll them. Opening or saving settings never
+enrolls preexisting resources into missing or empty priorities and does not
+reorder routes. Slot 1 is a priority preference only; existing capacity limits,
+scheduler selection, and failover continue to determine which worker runs.
+Settings apply/save/cancel behavior is unchanged.
 
-For Pi-scoped selections, when `/review-settings` switches a resource to a different
-model, the previous model's
-reasoning is discarded for that resource's retained route entries — the model and its
-reasoning go hand in hand, even when the new model supports the prior level — and each
-entry takes the new model's own configured or pinned reasoning, otherwise that model's
-supported default (the single valid level for single-level models and `off` for models
-without configurable reasoning). Switching to an external agent drops the Pi reasoning
-override because the agent owns its configuration, and other resources' route overrides
-are untouched, so a model switch never leaves an unsupported or stale level behind and
-needs no second manual configuration step.
+For Pi-scoped selections, when `/review-settings` switches a resource to a
+different model, the previous model's reasoning is discarded for that resource's
+retained route entries — the model and its reasoning go hand in hand, even when
+the new model supports the prior level — and each entry takes the new model's
+own configured or pinned reasoning, otherwise that model's supported default
+(the single valid level for single-level models and `off` for models without
+configurable reasoning). Switching to an external agent drops the Pi reasoning
+override because the agent owns its configuration, and other resources' route
+overrides are untouched, so a model switch never leaves an unsupported or stale
+level behind and needs no second manual configuration step.
 
-`config.execution.maxWorkers` controls concurrent workers (1–128, default 4); there is no
-parallelism toggle or per-tool override. It is one session-wide worker budget shared by
-every group, and each `workerResources` entry's `maxConcurrent` (1–128) is that
-resource's own shared capacity across groups. Task count is independent, and excess
-tasks queue. Three limits are separate: how many task definitions a single
-`SubtasksStart` or `SubtasksAdd` call may submit (1–128, a submission batch), how many
-workers actually run at once (bounded by `maxWorkers` and the selected resource's
-remaining capacity), and how many tasks one execution may admit while they have not
-yet settled (128). Sequential top-offs after earlier tasks settle remain unbounded, so
-several submission batches can exceed that unsettled admission cap over the life of an
-execution even though at most 128 tasks are unsettled at once. `maxWorkers` bounds
-delegated workers only; reviewer concurrency is unchanged and is not drawn from that
-pool. The sum of resource
-capacities may exceed `maxWorkers`; it describes available fallback capacity, not the
-number of workers that must run. Thus a one-slot local primary cannot run one execution
-and one research worker at the same time, while lower-priority cloud entries can absorb
-overflow.
+`config.execution.maxWorkers` controls concurrent workers (1–128, default 4);
+there is no parallelism toggle or per-tool override. It is one session-wide
+worker budget shared by every group, and each `workerResources` entry's
+`maxConcurrent` (1–128) is that resource's own shared capacity across groups.
+Task count is independent, and excess tasks queue. Three limits are separate:
+how many task definitions a single `SubtasksStart` or `SubtasksAdd` call may
+submit (1–128, a submission batch), how many workers actually run at once
+(bounded by `maxWorkers` and the selected resource's remaining capacity), and
+how many tasks one execution may admit while they have not yet settled (128).
+Sequential top-offs after earlier tasks settle remain unbounded, so several
+submission batches can exceed that unsettled admission cap over the life of an
+execution even though at most 128 tasks are unsettled at once. `maxWorkers`
+bounds delegated workers only; reviewer concurrency is unchanged and is not
+drawn from that pool. The sum of resource capacities may exceed `maxWorkers`; it
+describes available fallback capacity, not the number of workers that must run.
+Thus a one-slot local primary cannot run one execution and one research worker
+at the same time, while lower-priority cloud entries can absorb overflow.
 
 Worker routes and reviewers are independent:
 
@@ -549,114 +592,122 @@ Worker routes and reviewers are independent:
 
 ## Task construction and parallelism
 
-The orchestrator role favors beneficial parallelism and bounded, coherent subtasks
-without making worker utilization a goal or assuming which model will be assigned to
-a task. The shipped skills carry the role detail: the orchestrator skill
-(`skills/pi-review-gate-orchestrator/SKILL.md`) holds the full orchestration policy, the execution
-skill (`skills/pi-review-gate-execution/SKILL.md`) explains the primary-execution/delegated-executor
-boundary and the worker workspace contract, and the research skill
-(`skills/pi-review-gate-research/SKILL.md`) explains the enforced read-only boundary; this page
-summarizes the decision points that apply to every execution
-or research group.
+The orchestrator role favors beneficial parallelism and bounded, coherent
+subtasks without making worker utilization a goal or assuming which model will
+be assigned to a task. The shipped skills carry the role detail: the
+orchestrator skill (`skills/pi-review-gate-orchestrator/SKILL.md`) holds the
+full orchestration policy, the execution skill
+(`skills/pi-review-gate-execution/SKILL.md`) explains the
+primary-execution/delegated-executor boundary and the worker workspace contract,
+and the research skill (`skills/pi-review-gate-research/SKILL.md`) explains the
+enforced read-only boundary; this page summarizes the decision points that apply
+to every execution or research group.
 
 **Deciding on parallelism.** At the start of substantive work, identify actual
-dependencies and independent ready work. While work runs or a dependency clears, ask
-whether another already-authorized task with a concrete useful output and known
-consumer can proceed independently. Parallelize when the expected time or
-primary-context benefit outweighs dispatch, review, and integration costs; independent
-evidence gathering is useful when it answers a concrete unresolved question, and
-duplicating an active investigation or reviewing a tree that will be replaced is not.
-Available capacity is an opportunity, not a utilization target: there is no minimum
-task count, required research companion, or obligation to manufacture work to avoid
-idleness, and waiting or serial execution is correct when no useful independent work
-is ready. Prefer non-overlapping ownership, but justified controlled overlap with
-distinct responsibilities and an explicit integration order is acceptable; ordinary
+dependencies and independent ready work. While work runs or a dependency clears,
+ask whether another already-authorized task with a concrete useful output and
+known consumer can proceed independently. Parallelize when the expected time or
+primary-context benefit outweighs dispatch, review, and integration costs;
+independent evidence gathering is useful when it answers a concrete unresolved
+question, and duplicating an active investigation or reviewing a tree that will
+be replaced is not. Available capacity is an
+opportunity, not a utilization target: there is no minimum task count, required
+research companion, or obligation to manufacture work to avoid idleness, and
+waiting or serial execution is correct when no useful independent work is ready.
+Prefer non-overlapping ownership, but justified controlled overlap with distinct
+responsibilities and an explicit integration order is acceptable; ordinary
 conflicts are an integration responsibility — resolve both accepted intents and
 validate the combined result rather than force-merging blindly.
 
-**Bounded task construction.** Default to one concrete, coherent outcome per subtask
-with explicit boundaries, necessary context, invariants, and observable acceptance
-criteria. Minimize simultaneous unresolved decisions without assuming advance
-knowledge of worker model assignment; a smaller-model success should follow from good
-task construction, not from model selection or routing changes. Resolve architectural
-uncertainty before dispatching implementation slices that depend on it, keep each
-change with the focused tests and documentation necessary to establish its coherent
-outcome, keep genuinely dependent source-writing slices sequential, and parallelize
-independent slices only when their shared contracts are settled. Do not fragment
-tightly coupled work merely to create more tasks.
+**Bounded task construction.** Default to
+one concrete, coherent outcome per subtask with explicit boundaries, necessary
+context, invariants, and observable acceptance criteria. Minimize simultaneous
+unresolved decisions without assuming advance knowledge of worker model
+assignment; a smaller-model success should follow from good task construction,
+not from model selection or routing changes. Resolve architectural uncertainty
+before dispatching implementation slices that depend on it, keep each change
+with the focused tests and documentation necessary to establish its coherent
+outcome, keep genuinely dependent source-writing slices sequential, and
+parallelize independent slices only when their shared contracts are settled. Do
+not fragment tightly coupled work merely to create more tasks.
 
 **Reassessment from observation.** Use observed progress, expanding scope, and
 repeated review cycles to decide whether to inspect, clarify, or split remaining
-work. Prolonged work without a verifiable result is a reason to reassess — not an
-automatic cancellation or a rigid elapsed-time or task-size limit — and rescoping
-preserves completed work and accepted invariants.
+work. Prolonged work without a verifiable result is a reason to reassess — not
+an automatic cancellation or a rigid elapsed-time or task-size limit — and
+rescoping preserves completed work and accepted invariants.
 
-**Representative scenarios.** The deterministic checks in this repository validate
-that the policy is present on the shipped surfaces and that the applicable mechanics
-(independent capture and landing, top-off, one-shot watch) behave as described; they
+**Representative scenarios.** The deterministic checks in this repository
+validate that the policy is present on the shipped surfaces and that the
+applicable mechanics (independent capture and landing, top-off, one-shot watch)
+behave as described; they
 do not prove a model consistently chooses beneficial parallelism. Representative
 evaluations of the intended behavior:
 
 1. *Positive:* independent accepted implementation or concrete research launched
    concurrently when worthwhile.
 2. *Positive:* dependent edits kept sequential while useful independent work proceeds.
-3. *Positive:* continuation onto the next ready accepted item after an intermediate
-   landing, without expanding accepted scope or inventing follow-ups.
-4. *Negative:* declining slot-filling, redundant research, speculative artifacts, and
+3. *Positive:* continuation onto the next ready accepted item after an
+   intermediate landing, without expanding accepted scope or inventing
+   follow-ups.
+4. *Negative:*
+   declining slot-filling, redundant research, speculative artifacts, and
    premature review of changing work.
 5. *Positive:* a broad assignment decomposed into coherent outcomes after shared
    contracts are established, without relying on worker model identity.
 6. *Positive:* keeping a tightly coupled small change and its tests in one task
    rather than over-fragmenting it.
-7. *Positive:* justified controlled overlap with an integration order, resolved so
-   both accepted intents survive and the combined result is validated.
+7. *Positive:* justified controlled overlap with an integration order, resolved
+   so both accepted intents survive and the combined result is validated.
 8. *Positive:* reassessment based on observed lack of progress or review churn,
    without polling loops or automatic time-limit cancellation.
-9. *Positive:* legitimate waiting when nothing useful is ready or user authority or
-   answers are required.
+9. *Positive:* legitimate waiting when nothing useful is ready or user authority
+   or answers are required.
 
 ## Capture and ignore policy
 
-Each dispatched task captures the source workspace independently. Non-ignored untracked
-files are included. Git-ignored files are excluded from capture and landing. This means
-dependencies installed in `node_modules`, secrets in `.env`, and other ignored paths are
-not captured or landed. If your task depends on files that are git-ignored, the worker
-will not see them. Files known to Git through `HEAD` or the index are always captured
-regardless of repository size.
+Each dispatched task captures the source workspace independently. Non-ignored
+untracked files are included. Git-ignored files are excluded from capture and
+landing. This means dependencies installed in `node_modules`, secrets in `.env`,
+and other ignored paths are not captured or landed. If your task depends on
+files that are git-ignored, the worker will not see them. Files known to Git
+through `HEAD` or the index are always captured regardless of repository size.
 On Windows, private Git capture ignores unreliable worktree-only executable-bit
-differences while retaining staged index modes and current worktree content;
-its root identity uses an opened directory's volume ID when path stat omits it,
-and landing and recovery verify that same identity. Windows root path and both
+differences while retaining staged index modes and current worktree content; its
+root identity uses an opened directory's volume ID when path stat omits it, and
+landing and recovery verify that same identity. Windows root path and both
 opened-handle stats use exact integers, including NTFS inode/volume values above
-JavaScript's safe-number range. Capture JSON and version-1 authenticated recovery
-manifests retain safe positive components as numbers; larger unsigned 64-bit
-components use canonical decimal strings (no leading zeros). Adjacent large inode
-values remain distinct; malformed or unsafe numeric identities fail closed rather
-than being rounded or guessed. Existing safe numeric records and their HMAC
-encoding remain compatible, but older builds cannot consume new exact-large
-records: use a build supporting this encoding for their reload/recovery.
-POSIX safe-number root identity and worktree mode handling are unchanged. Landing
-stages temporary files beside their destination on the same volume; recovery
-validates those native paths before acting.
+JavaScript's safe-number range. Capture JSON and version-1 authenticated
+recovery manifests retain safe positive components as numbers; larger unsigned
+64-bit components use canonical decimal strings (no leading zeros). Adjacent
+large inode values remain distinct; malformed or unsafe numeric identities fail
+closed rather than being rounded or guessed. Existing safe numeric records and
+their HMAC encoding remain compatible, but older builds cannot consume new
+exact-large records: use a build supporting this encoding for their
+reload/recovery. POSIX safe-number root identity and worktree mode handling are
+unchanged. Landing stages temporary files beside their destination on the same
+volume; recovery validates those native paths before acting.
 
 For a non-Git workspace, source inventory uses
-`git ls-files --others --exclude-standard -z` with a temporary Git directory and the
-selected workspace as its worktree. The command retains a 64 MiB output-buffer limit
-and a 15-second timeout, separate from the file-content snapshot budget. An output
-buffer overflow fails capture before worker startup; its diagnostic identifies the
-command, selected workspace (with control characters visibly escaped), limit, and
-original overflow code. It identifies stdout or stderr only when the original failure
-names that stream, without including inventory output, file contents, or the original
-stack. Choose a narrower workspace—the intended project directory—and retry. Capture
-does not truncate a successful inventory, skip eligible files, or increase these limits;
-the temporary inventory repository is cleaned up on success and failure. Other command
-failures and cancellation retain their existing handling.
+`git ls-files --others --exclude-standard -z` with a temporary Git directory and
+the selected workspace as its worktree. The command retains a 64 MiB
+output-buffer limit and a 15-second timeout, separate from the file-content
+snapshot budget. An output buffer overflow fails capture before worker startup;
+its diagnostic identifies the command, selected workspace (with
+control characters visibly escaped), limit, and original overflow code. It
+identifies stdout or stderr only when the original failure names that stream,
+without including inventory output, file contents, or the original stack. Choose
+a narrower workspace—the intended project directory—and retry. Capture does not
+truncate a successful inventory, skip eligible files, or increase these limits;
+the temporary inventory repository is cleaned up on success and failure. Other
+command failures and cancellation retain their existing handling.
 
-During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
-untracked files (50 MiB by default). This private task capture, candidate review, and
-landing path remains separate from the parent review checkpoint. Parent review uses a
-single durable Git or non-Git checkpoint and compares its frozen after-state against
-distinct window and exchange baselines (see [Review windows and
+During task capture, `maxSnapshotBytes` limits only the cumulative size of
+non-ignored untracked files (50 MiB by default). This private task capture,
+candidate review, and landing path remains separate from the parent review
+checkpoint. Parent review uses a single durable Git or non-Git checkpoint and
+compares its frozen after-state against distinct window and exchange baselines
+(see [Review windows and
 evidence](review-workflow.md#review-windows-and-evidence)). When the parent Pi
 session runs below a Git repository's top level, its parent checkpoint still
 covers the whole repository. Starting a same-workspace execute subtask verifies
@@ -664,45 +715,45 @@ that top-level checkpoint before private capture; this does not change the
 session or worker cwd, or the delegated capture and landing target.
 
 When capture rejects one source entry before any worker starts — a non-ignored
-untracked file that pushes the total over `maxSnapshotBytes`, an unsupported entry
-type, or a symlink with an absolute or escaping target — the task fails with a
-typed capture rejection whose summary begins "Capture rejected before worker
-started" and names the triggering path and actual capture root. This failed task
-outcome arrives asynchronously after `SubtasksStart` admission, not as a crash or a
-generic controller failure. Its recovery diagnostic offers exactly two explicit
-choices, each naming that path: start a new task whose workspace has an actual
-capture root that excludes the path, or explicitly start an `inplace` task in the
-same workspace, reviewed under the existing InPlace evidence setting. A Git
-workspace is captured from its repository top level, so a subdirectory of the same
-repository still captures the path. Nothing is launched, converted, or retried
-automatically, and no resume or interrupt advice is given for the worker that
-never started. Other capture failures and cancellation keep their existing
-handling.
+untracked file that pushes the total over `maxSnapshotBytes`, an unsupported
+entry type, or a symlink with an absolute or escaping target — the task fails
+with a typed capture rejection whose summary begins
+"Capture rejected before worker started" and names the triggering path and
+actual capture root. This failed task outcome arrives asynchronously after
+`SubtasksStart` admission, not as a crash or a generic controller failure. Its
+recovery diagnostic offers exactly two explicit choices, each naming that path:
+start a new task whose workspace has an actual capture root that excludes the
+path, or explicitly start an `inplace` task in the same workspace, reviewed
+under the existing InPlace evidence setting. A Git workspace is captured from
+its repository top level, so a subdirectory of the same repository still
+captures the path. Nothing is launched, converted, or retried automatically, and
+no resume or interrupt advice is given for the worker that never started. Other
+capture failures and cancellation keep their existing handling.
 
 ## Landing and source preservation
 
 **Independent landing**: As soon as one task is accepted, it acquires the short
-source-mutation lease, replans against current main (the group's selected workspace,
-or the parent session's working directory when no `workspace` was supplied), and
-attempts to land. It does not wait for, integrate with, or roll back a sibling. A
-completed landing immediately frees capacity, and `SubtasksAdd` can top the execution
-group back up. The landed changes remain uncommitted; source HEAD, index, staging
-state, and stash are preserved.
+source-mutation lease, replans against current main (the group's selected
+workspace, or the parent session's working directory when no `workspace` was
+supplied), and attempts to land. It does not wait for, integrate with, or roll
+back a sibling. A completed landing immediately frees capacity, and
+`SubtasksAdd` can top the execution group back up. The landed changes remain
+uncommitted; source HEAD, index, staging state, and stash are preserved.
 
-**Automatic review layers**: the review around landing is configured per layer in
-`/review-settings` (see
+**Automatic review layers**: the review around landing is configured per layer
+in `/review-settings` (see
 [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import)).
-`review.subtaskEnabled` controls the private pre-landing subtask review. At the landing
-boundary, an independently reviewed landing advances parent checkpoint bookkeeping
-only for its eligible repository-relative landed paths; edits made by the parent,
-including siblings above a nested session cwd, remain reviewable against their
-window baseline.
-With `review.reviewLandedChanges` on, a landing into the parent session's own workspace
-that did **not** already complete a successful subtask review keeps its diff in the
-parent's review window as ordinary evidence instead of being checkpointed out,
-reviewed at the primary model's normal idle settlement. A landing that already
-completed a successful subtask review keeps the existing checkpoint/bypass handling.
-Landings into a foreign workspace target never enter the parent review window.
+`review.subtaskEnabled` controls the private pre-landing subtask review. At the
+landing boundary, an independently reviewed landing advances parent checkpoint
+bookkeeping only for its eligible repository-relative landed paths; edits made
+by the parent, including siblings above a nested session cwd, remain reviewable
+against their window baseline. With `review.reviewLandedChanges` on, a landing
+into the parent session's own workspace that did **not** already complete a
+successful subtask review keeps its diff in the parent's review window as
+ordinary evidence instead of being checkpointed out, reviewed at the primary
+model's normal idle settlement. A landing that already completed a successful
+subtask review keeps the existing checkpoint/bypass handling. Landings into a
+foreign workspace target never enter the parent review window.
 
 **Bounded correction outcomes** (#538): an isolated `execute` task names the
 guard that actually ended its correction loop. Only exhaustion of the configured
@@ -721,226 +772,235 @@ call is not executed. Initial review eligibility, summary-only pass
 acknowledgement, InPlace behavior, retry and model policy, and explicit in-place
 continuation are unchanged.
 
-**Source preservation**: Landing never changes source HEAD, index, staging state, or
-stash. Final filesystem mutations are serialized and rollback-protected. Absolute
-source-workspace paths in task and correction text are remapped to the worker worktree,
-and executor `PWD` is set to its actual isolated cwd. Clean worktrees are removed after
-completion; dirty or conflicted worktrees are preserved for diagnosis. This is worktree
-and instruction isolation, not an OS sandbox — see
+**Source preservation**: Landing never changes source HEAD, index, staging
+state, or stash. Final filesystem mutations are serialized and
+rollback-protected. Absolute source-workspace paths in task and correction text
+are remapped to the worker worktree, and executor `PWD` is set to its actual
+isolated cwd. Clean worktrees are removed after completion; dirty or conflicted
+worktrees are preserved for diagnosis. This is worktree and instruction
+isolation, not an OS sandbox — see
 [Security model](security-model.md#isolation-limits).
 
-**Worker workspace contract**: Each managed worktree is a detached-HEAD worktree at a
-synthetic captured base commit whose tree already includes the target workspace's
-uncommitted content. The named issue branch belongs to the target capture/landing
-checkout: prepare it there, pass that checkout as the execution group's `workspace`,
-and reference the branch in worker task text as context only — never as a checkout or
-commit instruction, and never by handing workers the repository's own branch and commit
-conventions as working instructions. Workers must not check out, create, switch, or
-delete branches in their managed worktrees or alter Git worktree ownership metadata;
-the harness owns capture, checkpointing, and landing, and worker prompts carry this
-contract authoritatively. Checking out a branch whose commit differs from the current one
-inside a managed worktree resets its tree to that branch's committed state and can drop
-captured content that tree lacks, while conflicting local edits make the checkout refuse
-rather than discarding them (same-commit branch creation changes only HEAD attachment);
-checkpoint validation fails closed on such a worktree. An explicit in-place continuation
-(see [Steering, continuation, and failure handling](#steering-continuation-and-failure-handling))
-reuses exactly the task's retained managed worktree while it still satisfies that
-contract, and refuses one that no longer does — a missing, moved, or symlinked folder, an
-attached HEAD, or a worktree that does not belong to the wave's private repository — and
-it never recreates, copies,
-resets, checks out, or cleans the folder. Recovery steps for an already damaged worktree
-live in the shipped orchestrator skill's recovery runbook
+**Worker workspace contract**: Each managed worktree is a detached-HEAD worktree
+at a synthetic captured base commit whose tree already includes the target
+workspace's uncommitted content. The named issue branch
+belongs to the target capture/landing checkout: prepare it there, pass that
+checkout as the execution group's `workspace`, and reference the branch in
+worker task text as context only — never as a checkout or commit instruction,
+and never by handing workers the repository's own branch and commit conventions
+as working instructions. Workers must not check out, create, switch, or delete
+branches in their managed worktrees or alter Git worktree ownership metadata;
+the harness owns capture, checkpointing, and landing, and worker prompts carry
+this contract authoritatively. Checking out a branch whose commit differs from
+the current one inside a managed worktree resets its tree to that branch's
+committed state and can drop captured content that tree lacks, while conflicting
+local edits make the checkout refuse rather than discarding them (same-commit
+branch creation changes only HEAD attachment); checkpoint validation fails
+closed on such a worktree. An explicit in-place continuation (see
+[Steering, continuation, and failure handling](#steering-continuation-and-failure-handling))
+reuses exactly the task's retained managed worktree while it still satisfies
+that contract, and refuses one that no longer does — a missing, moved, or
+symlinked folder, an attached HEAD, or a worktree that does not belong to the
+wave's private repository — and it never recreates, copies, resets, checks out,
+or cleans the folder. Recovery steps for an already damaged worktree live in the
+shipped orchestrator skill's recovery runbook
 (`skills/pi-review-gate-orchestrator/references/recovery.md`).
 
 ## Conflicts and gates
 
-A clean accepted task lands immediately. On a three-way conflict, clean paths are
-applied and ordinary diff3 markers are materialized for the conflicting text paths in
-the target workspace. A durable critical gate then blocks every later landing into
-that target, identifies the owning task and paths in `SubtasksInspect`, and injects a
-priority instruction on every matching orchestrator turn. When separate groups target
-different repositories, each target keeps its own independent gate: concurrent
-conflicts retain their own block, inspection entry, and cleanup, and resolving one
-target never releases another target's block. After resolving the files, use
-`SubtasksMarkClean`; it verifies that markers are gone in every outstanding gate
-before clearing any of them, checkpoints each resolution (only for gates on the
-parent session's own workspace), clears the gates, and wakes queued landings.
+A clean accepted task lands immediately. On a three-way conflict, clean paths
+are applied and ordinary diff3 markers are materialized for the conflicting text
+paths in the target workspace. A durable critical gate then blocks every later
+landing into that target, identifies the owning task and paths in
+`SubtasksInspect`, and injects a priority instruction on every matching
+orchestrator turn. When separate groups target different repositories, each
+target keeps its own independent gate: concurrent conflicts retain their own
+block, inspection entry, and cleanup, and resolving one target never releases
+another target's block. After resolving the files, use `SubtasksMarkClean`; it
+verifies that markers are gone in every outstanding gate before clearing any of
+them, checkpoints each resolution (only for gates on the parent session's own
+workspace), clears the gates, and wakes queued landings.
 
-**Interrupt and force merge**: `SubtasksInterrupt` explicitly chooses failure or merge
-disposition. A normal cancellation uses `interrupt_as_failure`; `interrupt_with_merge`
-must be requested explicitly. `SubtasksForceMerge` operates only on a stopped task; it
-lands the task's verified checkpoint when one exists, and otherwise salvages an
-identified snapshot of the worker's actual work (explicit salvage below). Force merge is
-mechanical salvage of all identified work, not a `SubtasksContinue` substitute: it never
-resumes the stopped executor, requires no verified checkpoint, and asserts no review
-status.
-An explicit force-merge always merges all identified work in one call: clean paths
-apply and ordinary text conflicts install diff3 markers in main (`mergeAnyhow` is
-accepted for caller compatibility only and controls nothing). A conflict that cannot
-carry text markers (binary, symlink/type change, oversized side, or worker-side
-deletion) is preserved in place instead of aborting the merge: the target stays intact
-and any available worker version is saved alongside at a collision-safe
-`<path>.worker-<blob>` name, while a worker-side deletion records its intent without
-fabricating bytes; both are named in the gate and manifest for manual resolution.
-Ordinary reviewed landing does not preserve these — it refuses the whole transfer
-before any mutation and names the limit. Both `interrupt_with_merge` and every direct force merge are mechanical
-landing attempts,
-not verification that the requested changes are present or correct. The main workspace
-must always be inspected manually afterward, including when the task's authoritative
-state is `landed`.
+**Interrupt and force merge**: `SubtasksInterrupt` explicitly chooses failure or
+merge disposition. A normal cancellation uses `interrupt_as_failure`;
+`interrupt_with_merge` must be requested explicitly. `SubtasksForceMerge`
+operates only on a stopped task; it lands the task's verified checkpoint when
+one exists, and otherwise salvages an identified snapshot of the worker's actual
+work (explicit salvage below). Force merge is mechanical salvage of all
+identified work, not a `SubtasksContinue` substitute: it never resumes the
+stopped executor, requires no verified checkpoint, and asserts no review status.
+An explicit force-merge always merges all identified work in one call: clean
+paths apply and ordinary text conflicts install diff3 markers in main
+(`mergeAnyhow` is accepted for caller compatibility only and controls nothing).
+A conflict that cannot carry text markers (binary, symlink/type change,
+oversized side, or worker-side deletion) is preserved in place instead of
+aborting the merge: the target stays intact and any available worker version is
+saved alongside at a collision-safe `<path>.worker-<blob>` name, while a
+worker-side deletion records its intent without fabricating bytes; both are
+named in the gate and manifest for manual resolution. Ordinary reviewed landing
+does not preserve these — it refuses the whole transfer before any mutation and
+names the limit. Both `interrupt_with_merge` and every direct force merge are
+mechanical landing attempts, not verification that the requested changes are
+present or correct. The main workspace must always be inspected manually
+afterward, including when the task's authoritative state is `landed`.
 
-**Interrupt feedback for the model** (#191): `/subtask-interrupt` still reports its
-result in the UI. It also queues one context note in the session that ran the command,
-which the next model request sees outside any tool result. The note steers instead of
-waiting for a natural stop: a streaming session delivers it at that turn's next
-supported boundary, and an idle session starts a turn. It includes the line
-`User intent: interrupted by user; do not restart without
-authorization.` That line states what the user asked for, not that anything stopped.
-The note reports the actual settlement separately, read from the request's own
-command records:
+**Interrupt feedback for the model** (#191): `/subtask-interrupt` still reports
+its result in the UI. It also queues one context note in the session that ran
+the command, which the next model request sees outside any tool result. The note
+steers instead of waiting for a natural stop: a streaming session delivers it at
+that turn's next supported boundary, and an idle session starts a turn. It
+includes the line `User intent: interrupted by user; do not restart without
+authorization.` That line states what the user asked for, not that anything
+stopped. The note reports the actual settlement separately, read from the
+request's own command records:
 
-- the stop was acknowledged, stopped the current queued attempt before its executor
-  startup, was not confirmed, or was rejected without effect. A stop before startup
-  describes only that queued attempt: a queued continuation may follow earlier
-  attempts whose work, session, or checkpoint is retained, and the note never infers
-  otherwise
-- for `interrupt_with_merge`: the merge was acknowledged, failed, pending, or not
-  attempted; or it is unrecorded when the request failed after the stop was
-  acknowledged without any merge record, so whether a merge was attempted is unknown
-  and no landing is confirmed
+- the stop was acknowledged, stopped the current queued attempt before its
+  executor startup, was not confirmed, or was rejected without effect. A stop
+  before startup describes only that queued attempt: a queued continuation may
+  follow earlier attempts whose work, session, or checkpoint is retained, and
+  the note never infers otherwise
+- for `interrupt_with_merge`: the merge was acknowledged, failed, pending, or
+  not attempted; or it is unrecorded when the request failed after the stop was
+  acknowledged without any merge record, so whether a merge was attempted is
+  unknown and no landing is confirmed
 - the task's current state and authoritative outcome
 
 An execute `interrupt_with_merge` queues the intent line first. Any landing or
-conflict notification that the merge triggers therefore reaches the model after the
-user's intent. Research and in-place tasks remain failure-only. The note is redacted
-and bounded. Nothing is queued after the owning session ends or when the host rejects
-the send. A model `SubtasksInterrupt` result gains the same settlement lines labeled
-with the model origin, including when the merge throws. Other interruptions, such as
-shutdown or `SubtasksSteer` with `interrupt: true`, keep their existing reporting.
-The note is feedback only: it adds no restart lock, automatic restart, or
-authorization rule.
+conflict notification that the merge triggers therefore reaches the model after
+the user's intent. Research and in-place tasks remain failure-only. The note is
+redacted and bounded. Nothing is queued after the owning session ends or when
+the host rejects the send. A model `SubtasksInterrupt` result gains the same
+settlement lines labeled with the model origin, including when the merge throws.
+Other interruptions, such as shutdown or `SubtasksSteer` with `interrupt: true`,
+keep their existing reporting. The note is feedback only: it adds no restart
+lock, automatic restart, or authorization rule.
 
 ### Explicit salvage
 
-When a stopped task has no ordinary verified checkpoint — for
-example after an attached-HEAD checkpoint failure, interruption before normalization,
-a failed critical operation state, or another ordinary lifecycle inconsistency — an
-explicit `SubtasksForceMerge` still salvages an identified snapshot of the worker's
-actual work: retained commits, staged and unstaged edits, and task-created files. The
-retained worker worktree is the authoritative source while it exists; only after it has
-been cleaned up are surviving refs in the private repository considered. That
-repository is shared by every task of the group, so a ref is selected only when
-durable checkpoint-failure evidence attributes it to this task, or when it is the sole
-candidate and no sibling task can own it; otherwise the candidates are surfaced and
-nothing is transferred. Salvage captures without mutating the worktree or its index,
-and transfers only
-evidence-backed content: work whose ownership cannot be proven — and baseline files
-that a divergent checkout simply did not carry — is preserved in the target and
-reported as unrecovered or ambiguous, never guessed; a file present only in the
-captured baseline is never treated as a worker deletion. The landing reuses the
-ordinary conflict gate, force-merge marker materialization, and rollback protection. Salvage
-records forced-salvage provenance durably on the task command and the operation record,
-asserts no review status, fabricates no normal checkpoint, publishes no continuation
-bundle for unverified work, and never auto-lands deferred work afterward. When no
-recoverable work can be identified, or when several sources remain ambiguous,
-force-merge reports an explicit unresolved status instead of transferring anything.
+When a stopped task has no ordinary verified checkpoint — for example after an
+attached-HEAD checkpoint failure, interruption before normalization, a failed
+critical operation state, or another ordinary lifecycle inconsistency — an
+explicit `SubtasksForceMerge` still salvages an identified snapshot of the
+worker's actual work: retained commits, staged and unstaged edits, and
+task-created files. The retained worker worktree is the authoritative source
+while it exists; only after it has been cleaned up are surviving refs in the
+private repository considered. That repository is shared by every task of the
+group, so a ref is selected only when durable checkpoint-failure evidence
+attributes it to this task, or when it is the sole candidate and no sibling task
+can own it; otherwise the candidates are surfaced and nothing is transferred.
+Salvage captures without mutating the worktree or its index, and transfers only
+evidence-backed content: work whose ownership cannot be proven — and baseline
+files that a divergent checkout simply did not carry — is preserved in the
+target and reported as unrecovered or ambiguous, never guessed; a file present
+only in the captured baseline is never treated as a worker deletion. The landing
+reuses the ordinary conflict gate, force-merge marker materialization, and
+rollback protection. Salvage records forced-salvage provenance durably on the
+task command and the operation record, asserts no review status, fabricates no
+normal checkpoint, publishes no continuation bundle for unverified work, and
+never auto-lands deferred work afterward. When no recoverable work can be
+identified, or when several sources remain ambiguous, force-merge reports an
+explicit unresolved status instead of transferring anything.
 
 ## Steering, continuation, and failure handling
 
-`SubtasksSteer` is valid while a task is queued, starting, in a live executor turn, or
-being reviewed. Queued instructions are durable, live instructions use the adapter's
-acknowledged transport, and a steer during review cancels that review and resumes the
-executor with the changed request before a fresh review. If the current adapter cannot
-steer a long-running command, the instruction waits for that next executor handoff
-instead of being reported as rejected. The no-argument `/subtask-steer` command
-picks a task interactively, then asks whether to **Steer without interrupting the
-active turn** (listed first) or **Interrupt the active turn, then steer** before
-any instruction is entered (#309). The choice is sent as the existing `interrupt`
-flag described below (`false` or `true`), with the same task, workspace, review
-gates, transport statuses, and fail-closed handling as `SubtasksSteer`. Dismissing
-the task picker, the mode choice, or the instruction field (or submitting a blank
+`SubtasksSteer` is valid while a task is queued, starting, in a live executor
+turn, or being reviewed. Queued instructions are durable, live instructions use
+the adapter's acknowledged transport, and a steer during review cancels that
+review and resumes the executor with the changed request before a fresh review.
+If the current adapter cannot steer a long-running command, the instruction
+waits for that next executor handoff instead of being reported as rejected. The
+no-argument `/subtask-steer` command picks a task interactively, then asks
+whether to **Steer without interrupting the active turn** (listed first) or
+**Interrupt the active turn, then steer** before any instruction is entered
+(#309). The choice is sent as the existing `interrupt` flag described below
+(`false` or `true`), with the same task, workspace, review gates, transport
+statuses, and fail-closed handling as `SubtasksSteer`. Dismissing the task
+picker, the mode choice, or the instruction field (or submitting a blank
 instruction) returns without steering or interrupting anything. The explicit
-`/subtask-steer <executionId> <taskId> <instruction>` form is unchanged: it opens no
-prompts and sends no `interrupt` flag, so it keeps normal steering. The command
-collects the instruction through the same shared
-native editor field as every other extension-owned text field (issue #26): the
-host's own main-prompt editor in the interactive Pi TUI — including the native
-filesystem suggestions for first-line leading-`/` tokens, never slash-command
-items — and the established single-line input first, editor behind a cancelled
-input, on non-interactive hosts.
+`/subtask-steer <executionId> <taskId> <instruction>` form is unchanged: it
+opens no prompts and sends no `interrupt` flag, so it keeps normal steering. The
+command collects the instruction through the same shared native editor field as
+every other extension-owned text field (issue #26): the host's own main-prompt
+editor in the interactive Pi TUI — including the native filesystem suggestions
+for first-line leading-`/` tokens, never slash-command items — and the
+established single-line input first, editor behind a cancelled input, on
+non-interactive hosts.
 
-A successful human steer (explicit or interactive) also sends one bounded, redacted
-acceptance notice to its originating session's model with the execution/task/request
-ids, submitted instruction excerpt, and durable request status. Queued or transport-
-acknowledged is not proof that the worker has applied the instruction or completed
-work. The notice uses non-aborting steering delivery: a busy parent receives it at
-its next supported boundary; an idle parent wakes. Dependent outcome notifications
-wait for the notice delivery attempt. Cancelled, empty, rejected, or failed requests
-send no success notice, and retired-session notices are suppressed. An unavailable
-or unacknowledged model channel is reported best-effort without undoing an accepted
-request. Model-facing `SubtasksSteer`, worker controls, and ordinary quiet/noisy
+A successful human steer (explicit or interactive) also sends one bounded,
+redacted acceptance notice to its originating session's model with the
+execution/task/request ids, submitted instruction excerpt, and durable request
+status. Queued or transport- acknowledged is not proof that the worker has
+applied the instruction or completed work. The notice uses non-aborting steering
+delivery: a busy parent receives it at its next supported boundary; an idle
+parent wakes. Dependent outcome notifications wait for the notice delivery
+attempt. Cancelled, empty, rejected, or failed requests send no success notice,
+and retired-session notices are suppressed. An unavailable or unacknowledged
+model channel is reported best-effort without undoing an accepted request.
+Model-facing `SubtasksSteer`, worker controls, and ordinary quiet/noisy
 lifecycle policy remain unchanged.
 
-`SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false` preserves
-the behavior above). When `true` on a live executor turn, the adapter first aborts the
-active **turn** and then delivers the instructions to the same task, session, and
-workspace; the acknowledgement covers the verified interruption plus transport
-acceptance of the replacement turn — it never awaits the replacement turn's
-completion, so a follow-up steer can target the still-running replacement. The flag
-never cancels, lands, or terminates the task, and `SubtasksInterrupt` keeps its
-separate terminal semantics. Queued or starting tasks retain the instructions for
-startup or the next executor handoff without claiming a native interruption.
-An available idle executor can accept the instructions without interrupting a turn;
-steering during review uses the existing review-to-executor handoff. Adapters that cannot interrupt an in-flight turn report a concrete
-unsupported status as a failed steering acknowledgement instead of acknowledging a
-queued delivery as an interruption.
+`SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false`
+preserves the behavior above). When `true` on a live executor turn, the adapter
+first aborts the active **turn** and then delivers the instructions to the same
+task, session, and workspace; the acknowledgement covers the verified
+interruption plus transport acceptance of the replacement turn — it never awaits
+the replacement turn's completion, so a follow-up steer can target the
+still-running replacement. The flag never cancels, lands, or terminates the
+task, and `SubtasksInterrupt` keeps its separate terminal semantics. Queued or
+starting tasks retain the instructions for startup or the next executor handoff
+without claiming a native interruption. An available idle executor can accept
+the instructions without interrupting a turn; steering during review uses the
+existing review-to-executor handoff. Adapters that cannot interrupt an in-flight
+turn report a concrete unsupported status as a failed steering acknowledgement
+instead of acknowledging a queued delivery as an interruption.
 
-Claude activity reporting distinguishes positively correlated owned interruptions
-from failures. Interrupting steering and explicit Interrupt can report `model turn
+Claude activity reporting distinguishes positively correlated owned
+interruptions from failures. Interrupting steering and explicit Interrupt can
+report `model turn
 interrupted` after native acknowledgement and abort evidence. A diagnostic-only
 `error_during_execution` result without a terminal reason additionally requires
 an interrupt receipt excluding the target from `still_queued`; queued survivors
 are not treated as interrupted. Without a receipt, an explicit abort terminal
-reason is required. Results arriving before acknowledgement or lacking sufficient
-evidence keep a failure label rather than guessing the cause. Genuine failures
-include available subtype and structured error details; an API status is shown
-only when supplied. This changes progress reporting, not execution outcomes,
-retries, cancellation, or review gates. Raw adapter output remains buffered for
-settlement artifacts; live activity supplies bounded summaries, not full raw logs.
+reason is required. Results arriving before acknowledgement or lacking
+sufficient evidence keep a failure label rather than guessing the cause. Genuine
+failures include available subtype and structured error details; an API status
+is shown only when supplied. This changes progress reporting, not execution
+outcomes, retries, cancellation, or review gates. Raw adapter output remains
+buffered for settlement artifacts; live activity supplies bounded summaries, not
+full raw logs.
 
 A Claude explicit Interrupt settles on its own terms rather than on earlier
-steering (#310). After the native interrupt, any terminal result ends the run, even
-when non-interrupting steering had moved the completion target. The native
-acknowledgement and that result share a five-second bound, after which the session
-is closed regardless, so the interrupt never waits for the executor timeout. Steering
-the interrupt receipt lists in `still_queued` would otherwise run afterward, so the
-session closes at the receipt instead; steering sent during or after the interruption
-reports non-delivery. The acknowledgement follows owned Claude CLI process-group
-termination (SIGTERM, then SIGKILL) verified gone. A missing, rejected, or timed-out
-native acknowledgement or unverified shutdown is reported as a failed acknowledgement
-with its diagnostic, and an unverified shutdown is added to the run failure. The task
-still waits for this quiescence. An unverified shutdown is never reported as
-quiescence: the operation becomes `failed_critical` with an `executor_shutdown`
-incident, keeps its writer ownership, takes no cancellation checkpoint, and the
-interrupt command fails without acknowledgement, so `interrupt_with_merge` does not
-merge.
+steering (#310). After the native interrupt, any terminal result ends the run,
+even when non-interrupting steering had moved the completion target. The native
+acknowledgement and that result share a five-second bound, after which the
+session is closed regardless, so the interrupt never waits for the executor
+timeout. Steering the interrupt receipt lists in `still_queued` would otherwise
+run afterward, so the session closes at the receipt instead; steering sent
+during or after the interruption reports non-delivery. The acknowledgement
+follows owned Claude CLI process-group termination (SIGTERM, then SIGKILL)
+verified gone. A missing, rejected, or timed-out native acknowledgement or
+unverified shutdown is reported as a failed acknowledgement with its diagnostic,
+and an unverified shutdown is added to the run failure. The task still waits for
+this quiescence. An unverified shutdown is never reported as quiescence: the
+operation becomes `failed_critical` with an `executor_shutdown` incident, keeps
+its writer ownership, takes no cancellation checkpoint, and the interrupt
+command fails without acknowledgement, so `interrupt_with_merge` does not merge.
 
 Codex terminal stop (#425), whether an explicit Interrupt or an abort signal,
 starts owned app-server teardown immediately. It sends at most one best-effort
-native `turn/interrupt` while the channel is usable, without waiting for its reply
-or a terminal notification before SIGTERM. SIGKILL still follows after two
+native `turn/interrupt` while the channel is usable, without waiting for its
+reply or a terminal notification before SIGTERM. SIGKILL still follows after two
 seconds if cleanup has not closed. Close/drain is bounded to seven seconds from
 terminal teardown; lifecycle callback settlement has a separate five-second
 bound. Missing close evidence or pending/rejected persistence is reported as
 unconfirmed, never as verified child exit. Recovery retains writer ownership and
-takes no checkpoint while a started child's exit publication is unconfirmed.
-The complete exit callback must fulfill before that lifecycle is released.
-If a lifecycle operation-record write remains pending, terminal publication
-stays ordered behind it but is not awaited again by recovery or result
-finalization; persistence is explicitly unconfirmed and ownership remains active.
-A later publication completion never silently releases that ownership or retries
-the task.
-A native acknowledgement alone is not quiescence: a successful Interrupt
+takes no checkpoint while a started child's exit publication is unconfirmed. The
+complete exit callback must fulfill before that lifecycle is released. If a
+lifecycle operation-record write remains pending, terminal publication stays
+ordered behind it but is not awaited again by recovery or result finalization;
+persistence is explicitly unconfirmed and ownership remains active. A later
+publication completion never silently releases that ownership or retries the
+task. A native acknowledgement alone is not quiescence: a successful Interrupt
 acknowledgement requires both native reply/terminal-turn evidence and observed
 owned-child close; a missing reply can therefore report failed acknowledgement
 even though teardown closed the child.
@@ -948,52 +1008,54 @@ even though teardown closed the child.
 Terminal cancellation and timeout fence new/replacement Codex work, including
 continuations of an in-flight interrupt-steer handoff. Steering already accepted
 by the server still reports that acceptance truthfully; completed turn results
-and retained output remain available.
-Even if the best-effort interrupt hits a closed input pipe, responses to
-previously sent requests remain routable until child close or the drain bound;
-ordinary nonterminal input-channel failures retain their existing failure behavior.
-Without terminal teardown,
+and retained output remain available. Even if the best-effort interrupt hits a
+closed input pipe, responses to previously sent requests remain routable until
+child close or the drain bound; ordinary nonterminal input-channel failures
+retain their existing failure behavior. Without terminal teardown,
 `SubtasksSteer` with `interrupt: true` keeps its same-task, same-thread/session
 replacement behavior. These bounds do not add retries, configuration, a framing
 limit, or any guarantee that local pipe destruction killed descendants.
 
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
-through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.
+through explicit `SubtasksForceMerge` from their retained worktree or surviving
+refs.
 
-**Explicit in-place continuation**: A checkpoint staging or verification failure happens
-before review of that turn, and its failure and recovery diagnostics return to the orchestrator
-like any other failed operation — this is distinct from a normal landing refusal or
-conflict, which is only reachable after a candidate has been accepted for landing (and,
-when the subtask review layer is enabled, reviewed). When
-a stopped execute task has no verified recovery checkpoint (for example after such a
-failure), an explicit `SubtasksContinue` with
-`inPlace: true` reuses the task's exact retained managed worktree — never recreated,
-copied, reset, checked out, or cleaned — after a strictly read-only preflight that
-verifies writer quiescence, that the folder is the task's own managed worktree, its
-detached HEAD against the task's candidate lineage, and that no landing recovery is
-outstanding (landing rollback recovery is never bypassed). The strict default is
-unchanged: ordinary `SubtasksContinue` still requires a verified checkpoint, and a
-repeated in-place staging failure leaves no new checkpoint, a fresh checkpoint incident,
-and the retained folder for another explicit attempt. The continuation turn is told the
-truth about the reused folder: its current state is neither checkpoint-verified nor
-reviewed, a failed staging attempt may have staged entries in the Git index (inspect
-rather than assume either is unchanged), and a fresh executor session does not restore
-the previous session's conversation or hidden state. The later candidate is treated like
-any other: it must be checkpoint-verified and pass the normal configured review and
-landing gates before it lands; with `review.subtaskEnabled` off, no synthetic review is
-added and judgment about the result stays with the orchestrator as for any unreviewed
-landing.
+**Explicit in-place continuation**: A checkpoint staging or verification failure
+happens before review of that turn, and its failure and recovery diagnostics
+return to the orchestrator like any other failed operation — this is distinct
+from a normal landing refusal or conflict, which is only reachable after a
+candidate has been accepted for landing (and, when the subtask review layer is
+enabled, reviewed). When a stopped execute task has no verified recovery
+checkpoint (for example after such a failure), an explicit `SubtasksContinue`
+with `inPlace: true` reuses the task's exact retained managed worktree — never
+recreated, copied, reset, checked out, or cleaned — after a strictly read-only
+preflight that verifies writer quiescence, that the folder is the task's own
+managed worktree, its detached HEAD against the task's candidate lineage, and
+that no landing recovery is outstanding (landing rollback recovery is never
+bypassed). The strict default is unchanged: ordinary `SubtasksContinue` still
+requires a verified checkpoint, and a repeated in-place staging failure leaves
+no new checkpoint, a fresh checkpoint incident, and the retained folder for
+another explicit attempt. The continuation turn is told the truth about the
+reused folder: its current state is neither checkpoint-verified nor reviewed, a
+failed staging attempt may have staged entries in the Git index (inspect rather
+than assume either is unchanged), and a fresh executor session does not restore
+the previous session's conversation or hidden state. The later candidate is
+treated like any other: it must be checkpoint-verified and pass the normal
+configured review and landing gates before it lands; with
+`review.subtaskEnabled` off, no synthetic review is added and judgment about the
+result stays with the orchestrator as for any unreviewed landing.
 
-**Failures, retry, and recovery**: Executor failures are checkpointed to a protected
-recovery ref before bounded retry. If same-executor recovery is exhausted, a verified
-checkpoint may be handed to the next lower-priority pool entry; that adapter starts a
-new native session in the same isolated worktree, so different providers and CLI
-harnesses can take over without pretending to share conversation state. A failover is
-announced explicitly in the activity stream, recorded durably in the operation's
-assignment history, and every later turn — corrections, steering, pass confirmation,
-and continuations — follows the successor that actually served the previous turn. The
-full recovery story — compaction lifecycle, protected refs, restart behavior, and the
+**Failures, retry, and recovery**: Executor failures are checkpointed to a
+protected recovery ref before bounded retry. If same-executor recovery is
+exhausted, a verified checkpoint may be handed to the next lower-priority pool
+entry; that adapter starts a new native session in the same isolated worktree,
+so different providers and CLI harnesses can take over without pretending to
+share conversation state. A failover is announced explicitly in the activity
+stream, recorded durably in the operation's assignment history, and every later
+turn — corrections, steering, pass confirmation, and continuations — follows the
+successor that actually served the previous turn. The full recovery story —
+compaction lifecycle, protected refs, restart behavior, and the
 `recoverLandingManifest` API — is owned by [Recovery](recovery.md).
 
 **Input-channel failures**: A Codex app-server executor child can close its stdin read
@@ -1006,243 +1068,259 @@ failure story above, while already-delivered turn results remain authoritative a
 cancellation and child settlement keep their existing behavior. This describes
 containment of a dead stdin transport, not a broader crash or resilience guarantee.
 
-Every failed or non-landed execution-tool operation returns the complete group and task
-inspection: durable handles, current source disposition, commands and acknowledgements,
-incidents, checkpoint/bundle data, artifact paths, conflicts, and concrete recovery
-actions. The one exception is a read-only evidence-navigation selector failure on a
-valid, authorized `taskId` (a mistyped `entryId`, unknown `callId`, malformed or expired
-`cursor`, or out-of-range `index`): that error returns a concise task-scoped diagnostic
-with a bounded navigation hint and never the unrelated executions' inventory, IDs,
-titles, artifact paths, or recovery history. Otherwise this state remains inspectable
-after compaction or an exact-session restart. Only `landed` means that worker changes
-reached the source workspace.
+Every failed or non-landed execution-tool operation returns the complete group
+and task inspection: durable handles, current source disposition, commands and
+acknowledgements, incidents, checkpoint/bundle data, artifact paths, conflicts,
+and concrete recovery actions. The one exception is a read-only
+evidence-navigation selector failure on a valid, authorized `taskId` (a mistyped
+`entryId`, unknown `callId`, malformed or expired `cursor`, or out-of-range
+`index`): that error returns a concise task-scoped diagnostic with a bounded
+navigation hint and never the unrelated executions' inventory, IDs, titles,
+artifact paths, or recovery history. Otherwise this state remains inspectable
+after compaction or an exact-session restart. Only `landed` means that worker
+changes reached the source workspace.
 
 ## Subtask evidence
 
-The indexed executor-evidence interface for `SubtasksInspect` — what evidence indexes,
-provenance separation, redaction, find/cursor/deep-read navigation, and review-cycle
-records — is owned by [Subtask evidence](subtask-evidence.md).
+The indexed executor-evidence interface for `SubtasksInspect` — what evidence
+indexes, provenance separation, redaction, find/cursor/deep-read navigation, and
+review-cycle records — is owned by [Subtask evidence](subtask-evidence.md).
 
 ## Notifications and UI
 
-The default **Quiet** notification mode keeps ordinary running and reviewing transitions
-in passive UI telemetry while still notifying for every task completion (a landing or a
-report), failure, conflict, or recovery requirement, except synchronous landings confirmed
-by the orchestrator's own tool result (see below). **Noisy** additionally starts turns for
-running and reviewing transitions. In quiet mode, each failed, conflicted, or
-recovery-required task wakes the orchestrator, as does each completed task — `LANDED` for
-execute tasks and `REPORTED` for research tasks and in-place tasks that settled in place —
-other than the synchronous tool-confirmed landings described below, while ordinary
-`RUNNING` and `REVIEWING` transitions remain passive UI telemetry; noisy mode additionally
-wakes on those two interactive states.
+The default **Quiet** notification mode keeps ordinary running and reviewing
+transitions in passive UI telemetry while still notifying for every task
+completion (a landing or a report), failure, conflict, or recovery requirement,
+except synchronous landings confirmed by the orchestrator's own tool result (see
+below). **Noisy** additionally starts turns for running and reviewing
+transitions. In quiet mode, each failed, conflicted, or recovery-required task
+wakes the orchestrator, as does each completed task — `LANDED` for execute tasks
+and `REPORTED` for research tasks and in-place tasks that settled in place —
+other than the synchronous tool-confirmed landings described below, while
+ordinary `RUNNING` and `REVIEWING` transitions remain passive UI telemetry;
+noisy mode additionally wakes on those two interactive states.
 
-Every task completion is reported immediately with its still-active siblings so the
-orchestrator can top off freed capacity without waiting for the entire execution. The one
-exception is a synchronous landing triggered by the orchestrator itself — `SubtasksForceMerge`,
-`SubtasksInterrupt` with `interrupt_with_merge`, or a gate cleared by `SubtasksMarkClean`:
-its direct tool result already confirms that landing and carries the same group aggregate
-(complete verdict or not-yet-complete siblings plus top-off opportunity), so no separate
-completion notification follows for it. Each completion reports the COMPLETE verdict or
-not-yet-complete sibling list, plus the estimated top-off opportunity after already-queued
-work when scheduling information is available. Use `SubtasksInspect` for the durable
-execution revision and task timing rather than expecting them in completion notifications.
-Internal `CAPTURING`, `ACCEPTED`,
-`WAITING_TO_LAND`, and `LANDING` progress remains durable and user-visible without
-starting model turns.
+Every task completion is reported immediately with its still-active siblings so
+the orchestrator can top off freed capacity without waiting for the entire
+execution. The one exception is a synchronous landing triggered by the
+orchestrator itself — `SubtasksForceMerge`, `SubtasksInterrupt` with
+`interrupt_with_merge`, or a gate cleared by `SubtasksMarkClean`: its direct
+tool result already confirms that landing and carries the same group aggregate
+(complete verdict or not-yet-complete siblings plus top-off opportunity), so no
+separate completion notification follows for it. Each completion reports the
+COMPLETE verdict or not-yet-complete sibling list, plus the estimated top-off
+opportunity after already-queued work when scheduling information is available.
+Use `SubtasksInspect` for the durable execution revision and task timing rather
+than expecting them in completion notifications. Internal `CAPTURING`,
+`ACCEPTED`, `WAITING_TO_LAND`, and `LANDING` progress remains durable and
+user-visible without starting model turns.
 
-The persistent widget shows active tasks below the editor and distinguishes a task
-assigned for executor startup from one still waiting for capacity and from active work.
-`/subtasks-view` toggles the expanded panel, and the same expanded/collapsed preference
-is available in `/review-settings`. This is a global UI preference rather than
-conversation state. The expanded view lists only active tasks (up to 16), while its
-combined newest-ten activity feed may temporarily retain events from tasks that have
-already landed.
+The persistent widget shows active tasks below the editor and distinguishes a
+task assigned for executor startup from one still waiting for capacity and from
+active work. `/subtasks-view` toggles the expanded panel, and the same
+expanded/collapsed preference is available in `/review-settings`. This is a
+global UI preference rather than conversation state. The expanded view lists
+only active tasks (up to 16), while its combined newest-ten activity feed may
+temporarily retain events from tasks that have already landed.
 
-Each activity line in that feed renders as `task title · phase · message`. Because the
-recorded message already carries the owning task's `task-…` ID prefix, **Subtask task
-IDs** in `/review-settings` controls whether that redundant prefix is displayed: it
-defaults to **Hidden**, so the example line reads
-`Diagnose full-suite hang · working · model turn completed`, and **Shown** restores the
-`task-…: ` prefix. The switch is presentation only and never rewrites the recorded
-event — the durable activity message, the task ID in every model-facing tool result,
-inspect output, evidence, and control parameter, and the notification a task delivers
-all keep the full identity, and only that exact leading prefix of the event's own task
-ever leaves the display.
+Each activity line in that feed renders as `task title · phase · message`.
+Because the recorded message already carries the owning task's `task-…` ID
+prefix, **Subtask task IDs** in `/review-settings` controls whether that
+redundant prefix is displayed: it defaults to **Hidden**, so the example line
+reads `Diagnose full-suite hang · working · model turn completed`, and **Shown**
+restores the `task-…: ` prefix. The switch is presentation only and never
+rewrites the recorded event — the durable activity message, the task ID in
+every model-facing tool result, inspect output, evidence, and control
+parameter, and the notification a task delivers all keep the full identity,
+and only that exact leading prefix of the event's own task ever leaves the
+display.
 
-Every model-facing `SubtasksStart`, `SubtasksAdd`, and `SubtasksInspect` result includes
-the stable task UUIDs, states, recent activity, and full artifact paths needed for
-control and deeper `rg` inspection. Start/add results also show assigned-starting versus
-capacity-waiting tasks and a point-in-time scheduler snapshot without claiming startup
-has completed. A partial landing event identifies the landed paths and every sibling
-that has not landed; only the final event invites aggregate verification. Completion,
-failure, meaningful state changes, and workspace conflicts are delivered proactively;
-polling loops are neither required nor recommended, but purposeful `SubtasksInspect`
-calls are always supported.
+Every model-facing `SubtasksStart`, `SubtasksAdd`, and `SubtasksInspect` result
+includes the stable task UUIDs, states, recent activity, and full artifact paths
+needed for control and deeper `rg` inspection. Start/add results also show
+assigned-starting versus capacity-waiting tasks and a point-in-time scheduler
+snapshot without claiming startup has completed. A partial landing event
+identifies the landed paths and every sibling that has not landed; only the
+final event invites aggregate verification. Completion, failure, meaningful
+state changes, and workspace conflicts are delivered proactively; polling loops
+are neither required nor recommended, but purposeful `SubtasksInspect` calls are
+always supported.
 
-**Compact expandable presentation:** the extension's automatic notification messages
-render through one shared, presentation-only expansion core (the same mechanism
-behind tool-result expansion, [Development → Shared native presentation
+**Compact expandable presentation:** the extension's automatic notification
+messages render through one shared, presentation-only expansion core (the same
+mechanism behind tool-result expansion,
+[Development → Shared native presentation
 expansion](development.md#shared-native-presentation-expansion)): the subtask
-event notification leads with the task title, the actual outcome (reported, landed,
-failed, conflicted, or recovery-required), aggregate progress when available, and a
-separate full, usable report-reference line, plus immediate actionable failure,
-conflict, and recovery detail; the background-shell wake leads with the job identity,
-wake reason, and exit status where reported; the watch notification leads with
-execution-level active work, explicitly a checkpoint rather than a completion or
-failure. Every notification renders in the host's native custom-message card theme —
-the themed `customMessageBg` background with its one-cell padding boundary and the
-`customMessageText`/`customMessageLabel` token styling (resolved at render time, never
-hard-coded) — in both collapsed and expanded states, so a notification never blends
-with surrounding assistant text. The native expansion key (ctrl+o by default) toggles
-all expandable rows;
-clicking a notification in fullscreen mode expands/contracts only that item — card
-content and card edge locations included.
-Expansion reveals all of the notification's current text and nothing beyond it —
-no linked report or log is fetched and nothing is re-run — and collapsing restores
-the compact view. Expansion never changes what the model received,
-delivery, wake, or scheduling behavior, and an unrecognized historical notification
-falls back to its full retained text. A row that falls back to the full text carries
-no expand/collapse hint at all (there is no compact view to restore), while a
-recognized row keeps the native hint in both states. Recovery-required failure
-notifications compact to their error, notice, and every recovery action whether the
-curated diagnostic was delivered as structured message details or only inside the
-retained notification text; data that is unknown, malformed, or internally
-inconsistent stays full-text rather than being summarized from unrelated content.
+event notification leads with the task title, the actual outcome (reported,
+landed, failed, conflicted, or recovery-required), aggregate progress when
+available, and a separate full, usable report-reference line, plus immediate
+actionable failure, conflict, and recovery detail; the background-shell wake
+leads with the job identity, wake reason, and exit status where reported; the
+watch notification leads with execution-level active work, explicitly a
+checkpoint rather than a completion or failure. Every notification renders in
+the host's native custom-message card theme — the themed `customMessageBg`
+background with its one-cell padding boundary and the
+`customMessageText`/`customMessageLabel` token styling (resolved at render time,
+never hard-coded) — in both collapsed and expanded states, so a notification
+never blends with surrounding assistant text. The native expansion key (ctrl+o
+by default) toggles all expandable rows; clicking a notification in fullscreen
+mode expands/contracts only that item — card content and card edge locations
+included. Expansion reveals all of the notification's current text and nothing
+beyond it — no linked report or log is fetched and nothing is re-run — and
+collapsing restores the compact view. Expansion never changes what the model
+received, delivery, wake, or scheduling behavior, and an unrecognized historical
+notification falls back to its full retained text. A row that falls back to the
+full text carries no expand/collapse hint at all (there is no compact view to
+restore), while a recognized row keeps the native hint in both states.
+Recovery-required failure notifications compact to their error, notice, and
+every recovery action whether the curated diagnostic was delivered as structured
+message details or only inside the retained notification text; data that is
+unknown, malformed, or internally inconsistent stays full-text rather than being
+summarized from unrelated content.
 
-**Scheduled runs:** when the process-local scheduler switch is On, a due schedule
-entry starts through this same background subtask path — no model or orchestrator
-launch turn begins the run. Scheduled executions appear in the widget and receive
-the ordinary owner-scoped notifications described above, so their outcomes are
-delivered exactly like any other execution's. After a successful dispatch, the top-level
-model also receives a launch notice through the same shared mechanism as a human
-`/subtask-add` — origin metadata, identical delivery lane, bounds, and causal
-ordering included. Subtask outcome notifications wait for the bounded notice
-attempt; if the model send remains unacknowledged, delivery is reported as
-uncertain and the notice may arrive later, so model-visible ordering cannot be
-guaranteed in that case. An overlap skip (a due occurrence
-while an earlier run of the same entry is still active) wakes the owning
-orchestrator with the schedule identity, the exact due time, and the active task
-handles. A due occurrence whose minute passed before its own dispatch could be
-admitted (a previous occurrence of the same entry had not yet settled) and no
-run is active is reported as not-run; it is never caught up. Configuration,
-per-entry inheritance, and daylight-saving semantics live in [Scheduled task
+**Scheduled runs:** when the process-local scheduler switch is On, a due
+schedule entry starts through this same background subtask path — no model or
+orchestrator launch turn begins the run. Scheduled executions appear in the
+widget and receive the ordinary owner-scoped notifications described above, so
+their outcomes are delivered exactly like any other execution's. After a
+successful dispatch, the top-level model also receives a launch notice through
+the same shared mechanism as a human `/subtask-add` — origin metadata, identical
+delivery lane, bounds, and causal ordering included. Subtask outcome
+notifications wait for the bounded notice attempt; if the model send remains
+unacknowledged, delivery is reported as uncertain and the notice may arrive
+later, so model-visible ordering cannot be guaranteed in that case. An overlap
+skip (a due occurrence while an earlier run of the same entry is still active)
+wakes the owning orchestrator with the schedule identity, the exact due time,
+and the active task handles. A due occurrence whose minute passed before its own
+dispatch could be admitted (a previous occurrence of the same entry had not yet
+settled) and no run is active is reported as not-run; it is never caught up.
+Configuration, per-entry inheritance, and daylight-saving semantics live in
+[Scheduled task
 fields](scheduled-tasks.md#scheduled-task-fields). Entries can instead target a
 turn of the existing orchestrator — see [Schedule
-destinations](scheduled-tasks.md#schedule-destinations) — in which case no subtask
-starts for the occurrence.
+destinations](scheduled-tasks.md#schedule-destinations) — in which case no
+subtask starts for the occurrence.
 
 ## Review-readiness deferral
 
-The same top-level review-readiness gate covers background shell jobs and execution and
-research subtasks: automatic review of the primary orchestrator is deferred while any
-job is alive or any task is queued, capturing, running, reviewing, accepted, waiting to
-land, or landing. Normal task completion and failure notifications steer at Pi's next
-supported boundary rather than waiting for the current turn's natural stop; only after
-no background task remains active may that turn enter automatic review.
+The same top-level review-readiness gate covers background shell jobs and
+execution and research subtasks: automatic review of the primary orchestrator is
+deferred while any job is alive or any task is queued, capturing, running,
+reviewing, accepted, waiting to land, or landing. Normal task completion and
+failure notifications steer at Pi's next supported boundary rather than waiting
+for the current turn's natural stop; only after no background task remains
+active may that turn enter automatic review.
 
 ## Background shell tools
 
 The extension provides `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
-`ShellStop` directly through Pi. Background jobs run in this platform's fixed shell —
-Bash as its own detached process group on macOS/Linux, PowerShell on Windows — wake the
-agent on configured output or exit events, survive ordinary turn settlement, and are
-reaped when the Pi session ends. At the top level, review-gate consumes the shell
-controller's typed lifecycle state and defers automatic review while any job is alive.
-The last job's ordinary exit wake resumes the orchestrator without a duplicate aggregate
-notification; jobs with exit waking disabled still receive a review-readiness wake. A Pi
-executor likewise keeps its RPC session alive while tracked background work runs,
-accepts steering during that interval, and performs a final inspection turn before
-review. Executor timeouts are suspended while verified background work remains active
-(a POSIX process group or Windows owned job); external or unparseable `ShellStart`
-success responses fail closed.
+`ShellStop` directly through Pi. Background jobs run in this platform's fixed
+shell — Bash as its own detached process group on macOS/Linux, PowerShell on
+Windows — wake the agent on configured output or exit events, survive ordinary
+turn settlement, and are reaped when the Pi session ends. At the top level,
+review-gate consumes the shell controller's typed lifecycle state and defers
+automatic review while any job is alive. The last job's ordinary exit wake
+resumes the orchestrator without a duplicate aggregate notification; jobs with
+exit waking disabled still receive a review-readiness wake. A Pi executor
+likewise keeps its RPC session alive while tracked background work runs, accepts
+steering during that interval, and performs a final inspection turn before
+review. Executor timeouts are suspended while verified background work remains
+active (a POSIX process group or Windows owned job); external or unparseable
+`ShellStart` success responses fail closed.
 
-A Claude Code executor keeps its Agent SDK streaming session open for the same purpose
-through the SDK's authoritative `background_tasks_changed` level signal rather than
-through its own process bookkeeping. While that level reports any live native
-background task — Bash `run_in_background` commands and background subagents alike — a
-successful turn result is held rather than treated as final, and the session keeps
-accepting steering and interruption. Once the level reports no live task, the adapter
-requests one inspection turn so the worker reads the completed task results before
-normal settlement, so a job that drained before the turn result arrived is still
-inspected without repeating the follow-up indefinitely; a later turn that replaces or
-interrupts that inspection before it completes earns a replacement inspection, so
-normal success always follows a completed inspection. A failed turn result stays
-terminal and is never replaced by a later turn, and a drain that arrives while steering
-owns completion keeps its obligation until that target's own result is handled. Unlike
-the Pi executor, the configured
-executor timeout is not suspended: it remains the absolute bound on the whole run, so
-background work that never completes ends the run as a timeout, and the existing
-cancellation and interruption semantics are unchanged.
+A Claude Code executor keeps its Agent SDK streaming session open for the same
+purpose through the SDK's authoritative `background_tasks_changed` level signal
+rather than through its own process bookkeeping. While that level reports any
+live native background task — Bash `run_in_background` commands and background
+subagents alike — a successful turn result is held rather than treated as final,
+and the session keeps accepting steering and interruption. Once the level
+reports no live task, the adapter requests one inspection turn so the worker
+reads the completed task results before normal settlement, so a job that drained
+before the turn result arrived is still inspected without repeating the
+follow-up indefinitely; a later turn that replaces or interrupts that inspection
+before it completes earns a replacement inspection, so normal success always
+follows a completed inspection. A failed turn result stays terminal and is never
+replaced by a later turn, and a drain that arrives while steering owns
+completion keeps its obligation until that target's own result is handled.
+Unlike the Pi executor, the configured executor timeout is not suspended: it
+remains the absolute bound on the whole run, so background work that never
+completes ends the run as a timeout, and the existing cancellation and
+interruption semantics are unchanged.
 
-That level signal is authoritative and per-process, and earlier evidence never covers a later
-launch: each background launch is verified only by a membership update reported at or after
-it started. A successful native background launch with no such update, malformed membership
-evidence, or a stream that ends while background work is still outstanding fails closed: the
-run is reported as a protocol failure instead of normalizing on a result that predates the
-unfinished work. A rejected background launch is not treated as in flight, no other tool is
-inferred to background work, and native background state is never reconstructed from model
-prose. A terminal result that cannot be correlated to the current completion target — a
-foreign or untagged result — is buffered rather than treated as that target's outcome, and
-the configured timeout remains the absolute bound when no correlated result arrives.
+That level signal is authoritative and per-process, and earlier evidence never
+covers a later launch: each background launch is verified only by a membership
+update reported at or after it started. A successful native background launch
+with no such update, malformed membership evidence, or a stream that ends while
+background work is still outstanding fails closed: the run is reported as a
+protocol failure instead of normalizing on a result that predates the unfinished
+work. A rejected background launch is not treated as in flight, no other tool is
+inferred to background work, and native background state is never reconstructed
+from model prose. A terminal result that cannot be correlated to the current
+completion target — a foreign or untagged result — is buffered rather than
+treated as that target's outcome, and the configured timeout remains the
+absolute bound when no correlated result arrives.
 
-An exit wake remains outstanding until its custom message is observed. If a Pi run
-settles first, one hidden recovery turn resumes drainage of Pi's retained follow-up
-queue; the extension does not enqueue a duplicate completion or clear unrelated
-messages. A direct cancellation of the recovery turn is honored. When the lifecycle
-does not reveal whether the preceding run was intentionally canceled, delivery is
-favored over guessing model intent. Canceling recovery does not automatically start
-another attempt for the same exit. The completed job remains available through
-`ShellList` and `ShellLog`.
-Routine match, stall, and milestone wakes remain best-effort and are not recovered.
+An exit wake remains outstanding until its custom message is observed. If a Pi
+run settles first, one hidden recovery turn resumes drainage of Pi's retained
+follow-up queue; the extension does not enqueue a duplicate completion or clear
+unrelated messages. A direct cancellation of the recovery turn is honored. When
+the lifecycle does not reveal whether the preceding run was intentionally
+canceled, delivery is favored over guessing model intent. Canceling recovery
+does not automatically start another attempt for the same exit. The completed
+job remains available through `ShellList` and `ShellLog`. Routine match, stall,
+and milestone wakes remain best-effort and are not recovered.
 
-The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash on
-macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
-`powershell.exe`, matching Pi's native powershell-tool discovery; there is no shell
-selection in arguments or configuration. If neither executable resolves on a Windows
-host, `ShellStart` fails with a clear error before starting any job. Windows commands
-use Pi's non-interactive, profile-free PowerShell invocation and best-effort UTF-8
-console-output initialization. Before the user command runs, a watchdog of the same
-PowerShell edition establishes a Windows Job Object with kill-on-close protection.
-The watchdog holds ownership even if the original shell exits before its descendants;
-`ShellStop`, session shutdown, and host disappearance terminate the owned job rather
-than targeting a potentially reused shell PID. If ownership cannot be established,
-the user command does not run. Missing or unreadable ownership evidence after root
-exit keeps readiness blocked rather than reporting completion.
+The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash
+on macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
+`powershell.exe`, matching Pi's native powershell-tool discovery; there is no
+shell selection in arguments or configuration. If neither executable resolves on
+a Windows host, `ShellStart` fails with a clear error before starting any job.
+Windows commands use Pi's non-interactive, profile-free PowerShell invocation
+and best-effort UTF-8 console-output initialization. Before the user command
+runs, a watchdog of the same PowerShell edition establishes a Windows Job Object
+with kill-on-close protection. The watchdog holds ownership even if the original
+shell exits before its descendants; `ShellStop`, session shutdown, and host
+disappearance terminate the owned job rather than targeting a potentially reused
+shell PID. If ownership cannot be established, the user command does not run.
+Missing or unreadable ownership evidence after root exit keeps readiness blocked
+rather than reporting completion.
 
-For interactive commands, Pi ships its native `bash` tool on every platform and an
-optional `powershell` tool on Windows; review-gate treats `powershell` like `bash`
-wherever it handles shell commands — side-effect evidence and worker shell-tool
-authorization — subject to actual host availability and authorization: a host that has
-not registered or authorized `powershell` never exposes it, and neither name widens a
-tool catalog on its own. Wherever both are authorized, both start active in the
-top-level baseline and in a new delegated worker's initial-active subset. Pi registers
-its builtin `powershell` on every platform but can run it only on Windows with
-`pwsh.exe` or `powershell.exe` on PATH, so review-gate authorizes that builtin only
-where this host contract holds; elsewhere it is withheld from discovery, the baseline,
-and new worker catalogs. See
+For interactive commands, Pi ships its native `bash` tool on every platform and
+an optional `powershell` tool on Windows; review-gate treats `powershell` like
+`bash` wherever it handles shell commands — side-effect evidence and worker
+shell-tool authorization — subject to actual host availability and
+authorization: a host that has not registered or authorized `powershell` never
+exposes it, and neither name widens a tool catalog on its own. Wherever both are
+authorized, both start active in the top-level baseline and in a new delegated
+worker's initial-active subset. Pi registers its builtin `powershell` on every
+platform but can run it only on Windows with `pwsh.exe` or `powershell.exe` on
+PATH, so review-gate authorizes that builtin only where this host contract
+holds; elsewhere it is withheld from discovery, the baseline, and new worker
+catalogs. See
 [Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry)
 for how the builtin is identified and when host support is checked.
 
-Each Shell tool result carries structured display metadata (command, job lifecycle,
-log range and drop counts, stdin delivery state) in the result's render-only details,
-and Pi's shared tool-result expansion (`expandableResult`, ctrl+o by default) shows it:
-the collapsed card is the actionable job/outcome summary — for `ShellLog` the tail of
-the returned range with an earlier-lines omission count — and expanding the row renders
-the complete actual inputs and meaningful retained results the call recorded: the full
-recorded command from the original call arguments, the complete returned log range with
-its truncation markers, the actual stdin input, and the retained stop-all target
-snapshot, plus job lifecycle and wake configuration provenance. Expansion is
-display-only: nothing is re-read, re-fetched, or reconstructed from live job state, and
-restored sessions render exactly what was recorded. Structured details are absent on
-older recorded results; expansion then degrades to the retained text preview (bounded
-collapsed, complete expanded) without inventing content.
+Each Shell tool result carries structured display metadata (command, job
+lifecycle, log range and drop counts, stdin delivery state) in the result's
+render-only details, and Pi's shared tool-result expansion (`expandableResult`,
+ctrl+o by default) shows it: the collapsed card is the actionable job/outcome
+summary — for `ShellLog` the tail of the returned range with an earlier-lines
+omission count — and expanding the row renders the complete actual inputs and
+meaningful retained results the call recorded: the full recorded command from
+the original call arguments, the complete returned log range with its truncation
+markers, the actual stdin input, and the retained stop-all target snapshot, plus
+job lifecycle and wake configuration provenance. Expansion is display-only:
+nothing is re-read, re-fetched, or reconstructed from live job state, and
+restored sessions render exactly what was recorded. Structured details are
+absent on older recorded results; expansion then degrades to the retained text
+preview (bounded collapsed, complete expanded) without inventing content.
 
 ## External harness protocol
 
-The `run-as-binary` adapter uses the versioned `pi-review-executor-jsonl-v1` protocol.
-It sends the prompt on stdin and sets `PI_REVIEW_EXECUTOR_OPERATION` (`start` or
-`resume`), `PI_REVIEW_EXECUTOR_SESSION_ID`, and `PI_REVIEW_EXECUTOR_PROTOCOL`. The
-process emits newline-delimited JSON:
+The `run-as-binary` adapter uses the versioned `pi-review-executor-jsonl-v1`
+protocol. It sends the prompt on stdin and sets `PI_REVIEW_EXECUTOR_OPERATION`
+(`start` or `resume`), `PI_REVIEW_EXECUTOR_SESSION_ID`, and
+`PI_REVIEW_EXECUTOR_PROTOCOL`. The process emits newline-delimited JSON:
 
 ```jsonl
 {"type":"session","sessionId":"stable-session-id"}
@@ -1256,37 +1334,38 @@ login/configuration; see [Security model](security-model.md#secrets-and-authenti
 
 ## Research-task tool restriction
 
-Pi enforces the read-only tool intersection through `--tools`. Launch-authorized native
-read-only discovery (`grep`, `find`, `ls`) is part of the durable initial-active
-subset, so Pi research workers can enumerate paths, search contents, and read matches
-from the first request without a `tool_search` activation step. The structured
-read-only Git history tool `GitRead` belongs to that same subset: whenever the parent's
-authorization carries it, Pi research workers have it active from the first request,
-with no `tool_search` step. Execute-kind tasks never receive `GitRead` — the durable
-catalog excludes it even when the parent's active set includes it — and an explicit
-child catalog naming it for an execute task fails closed at subset validation.
-Codex uses its
-read-only sandbox and rejects configuration that could weaken the research profile;
-it may run native Git reads under that sandbox but does not receive this structured
-tool. Claude maps the same authorized capability names onto its native `Grep`/`Glob`
-inside an explicit read-only tool allowlist and permission callback while disabling
-user settings, skills, plugins, and MCP; it has no equivalent structured Git-history
-tool. Every adapter also receives a private worktree
-check that quarantines any detected write. Generic binary adapters are ineligible for
-research because their protocol does not acknowledge the restriction. Research
-subtasks never receive `ApplyPatch`, and they never receive an arbitrary shell in
-either native form (`bash` or `powershell`). Native MCP and codemode surfaces on
-delegated Pi workers follow the same role boundary: research workers never carry the
-`codemode` transport or any MCP tool name — no callable MCP tools and no default MCP
-exposure for research, no `readOnlyHint` opt-in, and no researcher override (a supplied
-catalog cannot add either back, so there is no restricted-researcher script path),
-while an execute worker carries `codemode` only
-when the parent's captured authorization did — no separate worker-side enablement.
-Codemode scripts are bounded by the worker's registered tools, never a capability
-grant: names outside the captured ceiling or removed by explicit restrictions are
-unreachable from scripts as well, MCP annotations are treated as unverified hints and
-never as a presumption of safety, and registration or re-enablement never widens the
-worker's immutable captured ceiling. Defaults and dynamic reconciliation are owned by
+Pi enforces the read-only tool intersection through `--tools`. Launch-authorized
+native read-only discovery (`grep`, `find`, `ls`) is part of the durable
+initial-active subset, so Pi research workers can enumerate paths, search
+contents, and read matches from the first request without a `tool_search`
+activation step. The structured read-only Git history tool `GitRead` belongs to
+that same subset: whenever the parent's authorization carries it, Pi research
+workers have it active from the first request, with no `tool_search` step.
+Execute-kind tasks never receive `GitRead` — the durable catalog excludes it
+even when the parent's active set includes it — and an explicit child catalog
+naming it for an execute task fails closed at subset validation. Codex uses its
+read-only sandbox and rejects configuration that could weaken the research
+profile; it may run native Git reads under that sandbox but does not receive
+this structured tool. Claude maps the same authorized capability names onto its
+native `Grep`/`Glob` inside an explicit read-only tool allowlist and permission
+callback while disabling user settings, skills, plugins, and MCP; it has no
+equivalent structured Git-history tool. Every adapter also receives a private
+worktree check that quarantines any detected write. Generic binary adapters are
+ineligible for research because their protocol does not acknowledge the
+restriction. Research subtasks never receive `ApplyPatch`, and they never
+receive an arbitrary shell in either native form (`bash` or `powershell`).
+Native MCP and codemode surfaces on delegated Pi workers follow the same role
+boundary: research workers never carry the `codemode` transport or any MCP tool
+name — no callable MCP tools and no default MCP exposure for research, no
+`readOnlyHint` opt-in, and no researcher override (a supplied catalog cannot add
+either back, so there is no restricted-researcher script path), while an execute
+worker carries `codemode` only when the parent's captured authorization did — no
+separate worker-side enablement. Codemode scripts are bounded by the worker's
+registered tools, never a capability grant: names outside the captured ceiling
+or removed by explicit restrictions are unreachable from scripts as well, MCP
+annotations are treated as unverified hints and never as a presumption of
+safety, and registration or re-enablement never widens the worker's immutable
+captured ceiling. Defaults and dynamic reconciliation are owned by
 [Native Pi tools](native-pi-tools.md#delegated-pi-workers-the-fixed-captured-ceiling).
 Enforcement details are owned by
 [Security model](security-model.md#read-only-enforcement).
@@ -1294,18 +1373,20 @@ Enforcement details are owned by
 ## Artifacts
 
 Pi workers keep their complete native histories in Pi's own environment-resolved
-session store, not these temporary artifacts. Existing per-turn `process-result.json`
-records contain `sessionId` and `sessionFile`; durable Pi session records also carry
-`file` for exact continuation/compaction. Evidence reads those files in place with its
-existing bounds. Native token/cost and compaction records remain Pi-owned. Ordinary
-Pi session browsing/resume applies, including its working-directory filters.
+session store, not these temporary artifacts. Existing per-turn
+`process-result.json` records contain `sessionId` and `sessionFile`; durable Pi
+session records also carry `file` for exact continuation/compaction. Evidence
+reads those files in place with its existing bounds. Native token/cost and
+compaction records remain Pi-owned. Ordinary Pi session browsing/resume applies,
+including its working-directory filters.
 
 Each task produces a `waveRoot` containing its operation record, bounded
-executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and stable
-refs. Its execution group has a separate integrity-checked manifest and is associated
-with the exact parent conversation sidecar. On later captures, completed non-recovery
-roots older than `waveArtifactTtlMs` are garbage-collected (30 days by default; `0`
-disables collection). Conflict, integration-error, and recovery-required roots are never
-removed by this GC, and `retainBundles: "always"` disables age-based wave GC while the
-application is running. Application shutdown still removes settled artifacts;
-recoverable unlanded checkpoints remain protected (see [Recovery](recovery.md)).
+executor/reviewer protocol streams, worktree/checkpoint metadata, manifest, and
+stable refs. Its execution group has a separate integrity-checked manifest and
+is associated with the exact parent conversation sidecar. On later captures,
+completed non-recovery roots older than `waveArtifactTtlMs` are
+garbage-collected (30 days by default; `0` disables collection). Conflict,
+integration-error, and recovery-required roots are never removed by this GC, and
+`retainBundles: "always"` disables age-based wave GC while the application is
+running. Application shutdown still removes settled artifacts; recoverable
+unlanded checkpoints remain protected (see [Recovery](recovery.md)).

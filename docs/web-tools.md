@@ -4,28 +4,29 @@ This page owns the native web research tools: `WebSearch`, `WebFetch`,
 `BrowserExtract`, their cache behavior, and the standalone web CLI. The bounded
 interactive browser session is owned by the [Browser guide](browser.md), and its
 interaction-approval policy and capability permissions by [Browser approvals and
-permissions](browser-permissions.md). Config fields and
-defaults live in [Configuration](configuration.md#web-fields); hardening details live in
-the [Security model](security-model.md#web-egress-hardening).
+permissions](browser-permissions.md). Config fields and defaults live in
+[Configuration](configuration.md#web-fields); hardening details live in the
+[Security model](security-model.md#web-egress-hardening).
 
 ## WebSearch
 
-`WebSearch` uses the API-key-free DDGS metasearch library. It passes the requested
-result count directly to DDGS, retries one empty or failed attempt, canonicalizes
-duplicate URLs, reports optional provider-supplied dates and weak snippets without
-inventing missing data, and supports `excludeDomains`. The launcher provisions the
-pinned Python dependency in a per-user cache environment and every Pi process invokes it
-on demand.
+`WebSearch` uses the API-key-free DDGS metasearch library. It passes the
+requested result count directly to DDGS, retries one empty or failed attempt,
+canonicalizes duplicate URLs, reports optional provider-supplied dates and weak
+snippets without inventing missing data, and supports `excludeDomains`. The
+launcher provisions the pinned Python dependency in a per-user cache environment
+and every Pi process invokes it on demand.
 
-The Python bridge is deliberately not configurable: production always resolves the
-packaged `scripts/ddgs-search.py` relative to the loaded extension and invokes it with
-Python's isolated mode (`-I`). The legacy `PI_REVIEW_GATE_DDGS_HELPER` variable is
-ignored, so an inherited value cannot substitute an arbitrary helper. The launcher and
-web CLI wrapper export `PI_REVIEW_GATE_DDGS_PYTHON` to point at their isolated venv;
-direct extension invocation without those wrappers may set that interpreter override
-itself — this is required when DDGS is installed only via `PYTHONPATH` or user
-site-packages, because isolated mode ignores both, so the override must point at an
-interpreter whose own environment contains DDGS.
+The Python bridge is deliberately not configurable: production always resolves
+the packaged `scripts/ddgs-search.py` relative to the loaded extension and
+invokes it with Python's isolated mode (`-I`). The legacy
+`PI_REVIEW_GATE_DDGS_HELPER` variable is ignored, so an inherited value cannot
+substitute an arbitrary helper. The launcher and web CLI wrapper export
+`PI_REVIEW_GATE_DDGS_PYTHON` to point at their isolated venv; direct extension
+invocation without those wrappers may set that interpreter override itself —
+this is required when DDGS is installed only via `PYTHONPATH` or user
+site-packages, because isolated mode ignores both, so the override must point at
+an interpreter whose own environment contains DDGS.
 
 `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME` (or `HOME` when the former is unset)
 select the venv/cache location. The default venv lives in a user-writable cache by
@@ -34,52 +35,56 @@ not safe inputs to accept from an untrusted repository, task, or process environ
 see [Security model](security-model.md#trust-boundaries).
 
 DDGS setup fails closed: the shared launcher preparer provisions exactly
-`ddgs==9.16.1` (Python 3.10 or newer), resolves its dependencies through pip with
-`--upgrade --upgrade-strategy eager`, requires binary distributions,
-avoids pip's reusable download cache, and runs every Python invocation in isolated
-mode (`-I`) so a reviewed repository's local modules cannot shadow the interpreter or
-pip. Setup verifies the installed DDGS distribution version and runs `pip check`;
-any installation or repair is followed by a fresh full validation before readiness is
-recorded. Current launches check that readiness state and the expected installed paths
-without spawning Python or repeating `pip check`. Explicitly invoking
-`scripts/ensure-ddgs.sh` still performs setup validation. The version constraint and
-these checks are defense in depth, not cryptographic integrity: transitive dependencies
-and artifacts are not fully hash-pinned. The configured PyPI/index source and local pip configuration
-therefore remain part of the trusted setup boundary.
+`ddgs==9.16.1` (Python 3.10 or newer), resolves its dependencies through pip
+with `--upgrade --upgrade-strategy eager`, requires binary distributions, avoids
+pip's reusable download cache, and runs every Python invocation in isolated mode
+(`-I`) so a reviewed repository's local modules cannot shadow the interpreter or
+pip. Setup verifies the installed DDGS distribution version and runs
+`pip check`; any installation or repair is followed by a fresh full validation
+before readiness is recorded. Current launches check that readiness state and
+the expected installed paths without spawning Python or repeating `pip check`.
+Explicitly invoking `scripts/ensure-ddgs.sh` still performs setup validation.
+The version constraint and these checks are defense in depth, not cryptographic
+integrity: transitive dependencies and artifacts are not fully hash-pinned. The
+configured PyPI/index source and local pip configuration therefore remain part
+of the trusted setup boundary.
 
-DDGS 9.16.1 also changes upstream engine behavior: its Google engine is disabled,
-and Startpage extraction/filtering is narrower. The local bridge still uses
-`backend="auto"` with the same request/result contract; upstream provider availability
-and search results may differ.
+DDGS 9.16.1 also changes upstream engine behavior: its Google engine is
+disabled, and Startpage extraction/filtering is narrower. The local bridge still
+uses `backend="auto"` with the same request/result contract; upstream provider
+availability and search results may differ.
 
 ## WebFetch
 
-`WebFetch` downloads and indexes the complete selected HTML page, PDF, or non-HTML
-text response, but returns only a bounded structural range. Its result includes
-`nextIndex` when more blocks remain. HTML results include a whole-page table inventory,
-possible site-pagination URLs, and `dynamic_content_suspected`; PDF results preserve
-page numbers, expose document metadata, and identify likely scanned/image-only files
-when little or no text can be extracted.
+`WebFetch` downloads and indexes the complete selected HTML page, PDF, or
+non-HTML text response, but returns only a bounded structural range. Its result
+includes `nextIndex` when more blocks remain. HTML results include a whole-page
+table inventory, possible site-pagination URLs, and `dynamic_content_suspected`;
+PDF results preserve page numbers, expose document metadata, and identify likely
+scanned/image-only files when little or no text can be extracted.
 
-- Responses declared as non-HTML text (for example `application/json` or `text/plain`)
-  are indexed verbatim as bounded text blocks with the declared content type disclosed:
-  JSON and plain-text payloads stay readable and searchable, and angle-bracket sequences
-  in them are never interpreted as markup — including raw HTML source served as
-  `text/plain`, which remains literal text. BrowserExtract's rendered output is always
-  parsed as HTML regardless of the main response's declared type, and bodies with a
-  missing content type that begin like an HTML document are parsed as HTML; other
-  HTML-declared responses without parseable structure fall back to the same verbatim
-  text indexing when they carry readable text.
+- Responses declared as non-HTML text (for example `application/json` or
+  `text/plain`) are indexed verbatim as bounded text blocks with the declared
+  content type disclosed: JSON and plain-text payloads stay readable and
+  searchable, and angle-bracket sequences in them are never interpreted as
+  markup — including raw HTML source served as `text/plain`, which remains
+  literal text. BrowserExtract's rendered output is always parsed as HTML
+  regardless of the main response's declared type, and bodies with a missing
+  content type that begin like an HTML document are parsed as HTML; other
+  HTML-declared responses without parseable structure fall back to the same
+  verbatim text indexing when they carry readable text.
 - Empty bodies, undecodable (non-text) bodies, comment-only or otherwise
   structure-less HTML, and pages made only of non-renderable markup fail with an
-  explicit bounded diagnostic instead of a silent empty result or an internal parser
-  error; script-only shells report the usual `dynamic_content_suspected` escalation.
+  explicit bounded diagnostic instead of a silent empty result or an internal
+  parser error; script-only shells report the usual `dynamic_content_suspected`
+  escalation.
 
 - Use `find` on that same `WebFetch` URL to locate text anywhere in the indexed
-  document; an accompanying `index` starts the case-insensitive search at that block.
-- Continue at a returned match, table, or `nextIndex`; while the document remains
-  cached, no second network request is made. A site-pagination URL is a different
-  document and therefore a new fetch.
+  document; an accompanying `index` starts the case-insensitive search at that
+  block.
+- Continue at a returned match, table, or `nextIndex`; while the document
+  remains cached, no second network request is made. A site-pagination URL is a
+  different document and therefore a new fetch.
 - When reading a table index, `columns` projects exact case-insensitive header names in
   the requested order; `#N` selects a 1-based column when headers are duplicated or
   inconvenient. Each selector is one copyable value — a standalone ordinal such as `#1`,
@@ -89,79 +94,84 @@ when little or no text can be extracted.
   directly, and the failure points at correcting `columns` for the requested document:
   a rejected selector is not evidence that the page needs BrowserExtract or a different
   source.
-- PDFs use the same `url`, `find`, `index`, `nextIndex`, `maxChars`, and `refresh`
-  flow; table-column projection is currently HTML-only. PDF detection uses both the
-  HTTP content type and file magic, and password-protected, corrupt, or oversized
-  documents fail explicitly.
+- PDFs use the same `url`, `find`, `index`, `nextIndex`, `maxChars`, and
+  `refresh` flow; table-column projection is currently HTML-only. PDF detection
+  uses both the HTTP content type and file magic, and password-protected,
+  corrupt, or oversized documents fail explicitly.
 
 ## BrowserExtract (rendered-page extraction)
 
-`BrowserExtract` is the rendered-page extraction fallback. Use it only after `WebFetch`
-reports `dynamic_content_suspected` or plausibly fails because the result requires
-JavaScript rendering, asynchronous page population, browser-managed cookies/bootstrap,
-or browser-style delivery. Missing expected primary content is also sufficient reason to
-try it: a false suspicion flag means no static heuristic fired, not that the page is
-proven complete.
+`BrowserExtract` is the rendered-page extraction fallback. Use it only after
+`WebFetch` reports `dynamic_content_suspected` or plausibly fails because the
+result requires JavaScript rendering, asynchronous page population,
+browser-managed cookies/bootstrap, or browser-style delivery. Missing expected
+primary content is also sufficient reason to try it: a false suspicion flag
+means no static heuristic fired, not that the page is proven complete.
 
-It launches an isolated headless Playwright Chromium process for an uncached URL,
-captures the rendered HTML, closes Chromium, and exposes the same `find`, `index`,
-`nextIndex`, table inventory, and `columns` operations as `WebFetch`. It does not click,
-type, authenticate, interactively scroll, capture screenshots, or maintain a browser
-session; it is not an interactive browser or vision tool.
+It launches an isolated headless Playwright Chromium process for an uncached
+URL, captures the rendered HTML, closes Chromium, and exposes the same `find`,
+`index`, `nextIndex`, table inventory, and `columns` operations as `WebFetch`.
+It does not click, type, authenticate, interactively scroll, capture
+screenshots, or maintain a browser session; it is not an interactive browser or
+vision tool.
 
 Every Chromium request routes through a per-render loopback egress broker. The
-containment design — forced proxying, default-deny host resolution, per-destination
-validation, budget enforcement, and fail-closed rules — is owned by
-[Security model](security-model.md#egress-broker-containment). Pages requiring ordinary
-cross-host scripts, styles, API calls, or redirects render normally through
-independently validated public destinations. Images, media, and fonts are intentionally
-omitted by the route policy and this never fails the render; the result discloses
-bounded omission diagnostics instead.
+containment design — forced proxying, default-deny host resolution,
+per-destination validation, budget enforcement, and fail-closed rules — is owned
+by [Security model](security-model.md#egress-broker-containment). Pages
+requiring ordinary cross-host scripts, styles, API calls, or redirects render
+normally through independently validated public destinations. Images, media, and
+fonts are intentionally omitted by the route policy and this never fails the
+render; the result discloses bounded omission diagnostics instead.
 
 Chromium provisioning follows the install-time rules described in
 [Getting started](getting-started.md#installation), including
-`PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` and the `npx playwright install chromium`
-recovery path.
+`PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` and the
+`npx playwright install chromium` recovery path.
 
 ## URL blocklist
 
-One shared `web.urlBlocklist` guard applies to both acquisition tools. `WebFetch` and
-`BrowserExtract` deny the same URLs: a match is an explicit denied tool outcome for
-either tool, no page is fetched or rendered, and the result does not recommend trying
-the other tool — the same list denies it there too. Each entry is an ordinary
-JavaScript regular-expression source searched anywhere in the URL, written without
-`/.../` delimiters and with no flags; see
+One shared `web.urlBlocklist` guard applies to both acquisition tools.
+`WebFetch` and `BrowserExtract` deny the same URLs: a match is an explicit
+denied tool outcome for either tool, no page is fetched or rendered, and the
+result does not recommend trying the other tool — the same list denies it there
+too. Each entry is an ordinary JavaScript regular-expression source searched
+anywhere in the URL, written without `/.../` delimiters and with no flags; see
 [Web fields](configuration.md#web-fields) for validation and editing.
 
-What is judged is always one complete URL: the URL exactly as supplied, or the complete
-destination a redirect `Location` forms — a relative `Location` resolved against the URL
-being redirected from, joined with that navigation's fragment when the `Location` names
-none. Regex rules are the whole contract and nothing guesses around them, so no
-fragmentless or otherwise normalized derivative is ever judged a second time — `/object$`
-does not match `https://fixture.test/object#top`, `#top$` does, and an unanchored
-`/object` matches both. The fragment still never goes on the wire, and the cache key stays
+What is judged is always one complete URL: the URL exactly as supplied, or the
+complete destination a redirect `Location` forms — a relative `Location`
+resolved against the URL being redirected from, joined with that navigation's
+fragment when the `Location` names none. Regex rules are the whole contract and
+nothing guesses around them, so no fragmentless or otherwise normalized
+derivative is ever judged a second time — `/object$` does not match
+`https://fixture.test/object#top`, `#top$` does, and an unanchored `/object`
+matches both. The fragment still never goes on the wire, and the cache key stays
 fragmentless; neither becomes an extra policy input.
 
-Surrounding whitespace is trimmed from every configured entry, because a leading or
-trailing space in a URL pattern would almost never be intended; the trimmed source is
-then matched with ordinary regex semantics and nothing else is transformed. A space that
-is genuinely wanted stays in the pattern as regex syntax, for example `final\x20test` or
-`final[ ]test` matches a URL containing `final test`.
+Surrounding whitespace is trimmed from every configured entry, because a leading
+or trailing space in a URL pattern would almost never be intended; the trimmed
+source is then matched with ordinary regex semantics and nothing else is
+transformed. A space that is genuinely wanted stays in the pattern as regex
+syntax, for example `final\x20test` or `final[ ]test` matches a URL containing
+`final test`.
 
-The supplied URL is checked before any request or browser launch, and every redirect
-destination is checked before that hop is followed, so a blocked endpoint receives no
-request at all — on the plain HTTP path and through Chromium's own redirects, where each
-hop is judged as the complete URL Chromium itself forms for it. The fragment on the URL
-you supplied never joins a later destination: that URL is judged on its own, and
-the redirect chain starts without it. A fragment that a redirect's own `Location`
-introduces does stay on the chain, so a later hop whose `Location` names no fragment is
-judged with it — behavior observed in native Chromium and matched exactly by the plain
-HTTP path. A redirect chain that stays on allowed hosts renders and extracts normally.
-Changing the list discards cached acquisitions, so a document cached before a URL was
-blocked is never served afterwards; saving an unchanged list keeps the cache intact. An
-acquisition already in flight when the list changes is discarded rather than served from a
-policy it was not validated against, and it is reported as a policy change to retry — no
-further request is made on your behalf.
+The supplied URL is checked before any request or browser launch, and every
+redirect destination is checked before that hop is followed, so a blocked
+endpoint receives no request at all — on the plain HTTP path and through
+Chromium's own redirects, where each hop is judged as the complete URL Chromium
+itself forms for it. The fragment on the URL you supplied never joins a later
+destination: that URL is judged on its own, and the redirect chain starts
+without it. A fragment that a redirect's own `Location` introduces does stay on
+the chain, so a later hop whose `Location` names no fragment is judged with it —
+behavior observed in native Chromium and matched exactly by the plain HTTP path.
+A redirect chain that stays on allowed hosts renders and extracts normally.
+Changing the list discards cached acquisitions, so a document cached before a
+URL was blocked is never served afterwards; saving an unchanged list keeps the
+cache intact. An acquisition already in flight when the list changes is
+discarded rather than served from a policy it was not validated against, and it
+is reported as a policy change to retry — no further request is made on your
+behalf.
 
 The guard is scoped to the acquisition navigation itself. Interactive `Browser*` tools,
 page subresources such as scripts, styles, and images, and child-frame documents stay
@@ -172,8 +182,8 @@ covered.
 
 ## Interactive browser
 
-The bounded interactive browser — session/tab lifecycle, the `Browser*` tool surface,
-resource and timing limits, and teardown semantics — is owned by
+The bounded interactive browser — session/tab lifecycle, the `Browser*` tool
+surface, resource and timing limits, and teardown semantics — is owned by
 [Browser guide](browser.md#interactive-browser).
 
 ### Browser visibility
@@ -183,8 +193,8 @@ by [Browser guide: Browser visibility](browser.md#browser-visibility).
 
 ### Browser interaction approval
 
-The per-action interaction-approval policy (Ask / Automatically Accept / Automatically
-Deny) is owned by
+The per-action interaction-approval policy (Ask / Automatically Accept /
+Automatically Deny) is owned by
 [Browser approvals and permissions](browser-permissions.md#browser-interaction-approval).
 
 ### Browser permissions (issue #27)
@@ -212,6 +222,6 @@ For independent manual testing, use the same implementation outside Pi:
 ./scripts/pi-review-web.sh browser-extract https://example.com/javascript-application --find 'Rendered result'
 ```
 
-The CLI emits versioned JSON. `batch` accepts NDJSON and keeps one cache alive across
-all requests in that process, which is useful for independently proving that indexed
-continuation is a cache hit.
+The CLI emits versioned JSON. `batch` accepts NDJSON and keeps one cache alive
+across all requests in that process, which is useful for independently proving
+that indexed continuation is a cache hit.

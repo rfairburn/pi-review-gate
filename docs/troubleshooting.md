@@ -1,153 +1,168 @@
 # Troubleshooting
 
-Symptom-to-fix entries for common problems. Each entry links to the page that owns the
-underlying behavior.
+Symptom-to-fix entries for common problems. Each entry links to the page that
+owns the underlying behavior.
 
 ## Setup and launch
 
 - **The gate does not activate.**
   - `PI_REVIEW_GATE_DISABLED=1` (or `true`/`yes`) disables the whole extension,
     including delegated execution. The launcher warns loudly when it is set.
-  - No config file was found on a direct `pi -e` load. Set `PI_REVIEW_GATE_CONFIG`, or
-    create one of the two persistent paths — `~/.pi/agent/review-gate.json` (the Pi
-    agent directory default, following `PI_CODING_AGENT_DIR`) first, then the
-    `~/.config/pi-review-gate/config.json` fallback. The launcher deliberately ignores an
-    exported `PI_REVIEW_GATE_CONFIG`; it creates a zero-model default config at the
-    default location on first launch instead of failing. See
+  - No config file was found on a direct `pi -e` load. Set
+    `PI_REVIEW_GATE_CONFIG`, or create one of the two persistent paths —
+    `~/.pi/agent/review-gate.json` (the Pi agent directory default, following
+    `PI_CODING_AGENT_DIR`) first, then the
+    `~/.config/pi-review-gate/config.json` fallback. The launcher deliberately
+    ignores an exported `PI_REVIEW_GATE_CONFIG`; it creates a zero-model default
+    config at the default location on first launch instead of failing. See
     [Configuration](configuration.md#config-discovery).
   - The config file is malformed JSON, not a JSON object, or unreadable. Startup
-    does not fail and the original file is never overwritten: the extension reports a
-    warning, continues ordinary initialization with built-in zero-model defaults (no
-    reviewers or workers selected), and — when the document parses but carries invalid
-    fields — field-wise recovery keeps every valid sibling setting while reporting
-    selections that cannot be resolved as unavailable instead of inventing
-    replacements. Those defaults select no reviewers or workers; recovery is not a
-    successful review or an implicit model choice. This is distinct from strict
-    validation, which still applies to explicit configuration writes and
-    `/review-settings` Save (an invalid config is never written; the write or save
-    fails with an actionable error), and from the launcher's first-launch
-    default-config publication, which fails closed on its own errors without touching
-    anything else (next entry). See
+    does not fail and the original file is never overwritten: the extension
+    reports a warning, continues ordinary initialization with built-in
+    zero-model defaults (no reviewers or workers selected), and — when the
+    document parses but carries invalid fields — field-wise recovery keeps every
+    valid sibling setting while reporting selections that cannot be resolved as
+    unavailable instead of inventing replacements. Those defaults select no
+    reviewers or workers; recovery is not a successful review or an implicit
+    model choice. This is distinct from strict validation, which still applies
+    to explicit configuration writes and `/review-settings` Save (an invalid
+    config is never written; the write or save fails with an actionable error),
+    and from the launcher's first-launch default-config publication, which fails
+    closed on its own errors without touching anything else (next entry). See
     [Configuration](configuration.md#config-discovery).
 - **First launch reports it could not create the default config.** The launcher
-  initializes the default config in the Pi agent directory (`~/.pi/agent/review-gate.json`,
-  following `PI_CODING_AGENT_DIR`) only when neither persistent path exists, and fails
-  closed without touching anything else. `could not create directory`
-  or `could not create a temporary file` means your user cannot write to the target
-  location under `$HOME`; fix permissions (or provide a writable `HOME`).
-  `exists but is not a directory` or `exists but is not a regular file` means something
-  else occupies the Pi agent directory, the fallback gate directory, or the config
-  file; move or rename it.
+  initializes the default config in the Pi agent directory
+  (`~/.pi/agent/review-gate.json`, following `PI_CODING_AGENT_DIR`) only when
+  neither persistent path exists, and fails closed without touching anything
+  else. `could not create directory` or `could not create a temporary file`
+  means your user cannot write to the target location under `$HOME`; fix
+  permissions (or provide a writable `HOME`). `exists but is not a directory` or
+  `exists but is not a regular file` means something else occupies the Pi agent
+  directory, the fallback gate directory, or the config file; move or rename it.
   Then re-run, or create a config manually at either persistent path. See
   [Getting started](getting-started.md#launching).
-- **`pi-review-gate: the packaged extension output is missing`.** The launcher is running
-  from an installed package whose compiled output is incomplete or absent. Reinstall the
-  package; a source checkout prepares automatically and needs no manual build.
+- **`pi-review-gate: the packaged extension output is missing`.** The launcher
+  is running from an installed package whose compiled output is incomplete or
+  absent. Reinstall the package; a source checkout prepares automatically and
+  needs no manual build.
 
 ## Session host
 
-- **`pi-review-sessions: an interactive stdin and stdout are required.`** The host needs a
-  real terminal with both stdin and stdout attached; it refuses a piped, redirected, or
-  otherwise non-interactive launch. Run it from an interactive terminal
-  (`./scripts/pi-review-sessions.sh`, `scripts\pi-review-sessions.cmd`, or the installed
-  `pi-review-sessions` command). See
+- **`pi-review-sessions: an interactive stdin and stdout are required.`** The
+  host needs a real terminal with both stdin and stdout attached; it refuses a
+  piped, redirected, or otherwise non-interactive launch. Run it from an
+  interactive terminal (`./scripts/pi-review-sessions.sh`,
+  `scripts\pi-review-sessions.cmd`, or the installed `pi-review-sessions`
+  command). See
   [Requirements and launch](session-host-alpha.md#requirements-and-launch).
 - **`pi-review-sessions: Node <version> is below the <floor> security minimum for its
-  release line`.** The installed `pi-review-sessions` command runs the shared launcher with
-  the Node that invoked it, so it needs a supported Node already on `PATH`. Upgrade Node on
-  `PATH`, or use the source `.sh`/`.cmd` entry points, which retain a supported `PATH` Node
-  or bootstrap the checksum-pinned official Node 22.23.4 archive into an isolated per-agent
-  cache. Either way, update Node yourself and restart already-running hosts and sessions.
-  See [Requirements and launch](session-host-alpha.md#requirements-and-launch).
-- **A second host refuses to start because one host already owns that Pi agent directory.**
-  One host owns a given agent directory at a time through the exclusive ownership record
-  under `<agentDir>/session-host/`; the diagnostic names the agent directory and the
-  ownership record, and ownership is never stolen, verified around, or repaired. Close the
-  other host, or run the second host against a different `PI_CODING_AGENT_DIR`. See
+  release line`.** The installed `pi-review-sessions` command runs the shared
+  launcher with the Node that invoked it, so it needs a supported Node already
+  on `PATH`. Upgrade Node on `PATH`, or use the source `.sh`/`.cmd` entry
+  points, which retain a supported `PATH` Node or bootstrap the checksum-pinned
+  official Node 22.23.4 archive into an isolated per-agent cache. Either way,
+  update Node yourself and restart already-running hosts and sessions. See
+  [Requirements and launch](session-host-alpha.md#requirements-and-launch).
+- **A second host refuses to start because one host already owns that Pi agent
+  directory.** One host owns a given agent directory at a time through the
+  exclusive ownership record under `<agentDir>/session-host/`; the diagnostic
+  names the agent directory and the ownership record, and ownership is never
+  stolen, verified around, or repaired. Close the other host, or run the second
+  host against a different `PI_CODING_AGENT_DIR`. See
   [One owning host, one session manager](session-host-alpha.md#one-owning-host-one-session-manager).
-- **The host rejects a startup option such as `--continue`, `--resume`, `--session`, or
-  `--fork`.** Parent startup arguments that would attach a new instance to an existing
-  conversation or storage root are rejected before any setup, and the diagnostic names the
-  option, never its value. Launch the host without them and resume a conversation through
-  the host's own Saved picker instead. See
+- **The host rejects a startup option such as `--continue`, `--resume`,
+  `--session`, or `--fork`.** Parent startup arguments that would attach a new
+  instance to an existing conversation or storage root are rejected before any
+  setup, and the diagnostic names the option, never its value. Launch the host
+  without them and resume a conversation through the host's own Saved picker
+  instead. See
   [Requirements and launch](session-host-alpha.md#requirements-and-launch) and
   [Saved conversations on a connected owner](session-host-alpha.md#saved-conversations-on-a-connected-owner).
-- **`pi-review-sessions: unsupported role context (PI_REVIEW_GATE_RUNTIME_ROLE)`.** The host
-  refuses to start inside a review-gate worker or executor role context. Launch it from an
-  ordinary terminal rather than from a gate-managed session.
-- **The host exits with `the alpha session host supports macOS/Linux and Windows source
-  admission only.`** That is the launcher's current (unchanged) diagnostic wording. It means
-  the host ran on a platform outside macOS/Linux plus the Windows source-admission path.
-  macOS and Linux remain the supported host platforms, and the Windows paths stay validation
-  paths rather than a support claim. See
+- **`pi-review-sessions: unsupported role context (PI_REVIEW_GATE_RUNTIME_ROLE)`.**
+  The host refuses to start inside a review-gate worker or executor role
+  context. Launch it from an ordinary terminal rather than from a gate-managed
+  session.
+- **The host exits with
+  `the alpha session host supports macOS/Linux and Windows source
+  admission only.`** That is the launcher's current (unchanged) diagnostic
+  wording. It means the host ran on a platform outside macOS/Linux plus the
+  Windows source-admission path. macOS and Linux remain the supported host
+  platforms, and the Windows paths stay validation paths rather than a support
+  claim. See
   [Known limitation: Windows runtime acceptance](session-host-alpha.md#known-limitation-windows-runtime-acceptance).
 
 ## Reviews
 
-- **Escape does not cancel a running review.** If terminal input interception cannot be
-  installed in the current context, the extension says so once and points at
-  `/review-cancel`, the guaranteed hard stop. Modified Escape (shift/alt/ctrl) and
-  key-release events are intentionally ignored. See
+- **Escape does not cancel a running review.** If terminal input interception
+  cannot be installed in the current context, the extension says so once and
+  points at `/review-cancel`, the guaranteed hard stop. Modified Escape
+  (shift/alt/ctrl) and key-release events are intentionally ignored. See
   [Review workflow](review-workflow.md#cancellation).
-- **A reviewer fails with a sandbox startup error.** Codex runs a local no-op sandbox
-  preflight; a platform sandbox startup failure is reported as an explicit reviewer
-  error, never mislabeled as a verdict-schema failure, and before any model turn is
-  spent. Check the harness installation.
-- **Reviewer output looks garbled but a verdict still appears.** Strict parsing runs
-  first; a narrow fallback recovers the same schema only for actionable non-passing
-  results with unescaped multiline Markdown. A passing verdict is never accepted through
-  repair. See
+- **A reviewer fails with a sandbox startup error.** Codex runs a local no-op
+  sandbox preflight; a platform sandbox startup failure is reported as an
+  explicit reviewer error, never mislabeled as a verdict-schema failure, and
+  before any model turn is spent. Check the harness installation.
+- **Reviewer output looks garbled but a verdict still appears.** Strict parsing
+  runs first; a narrow fallback recovers the same schema only for actionable
+  non-passing results with unescaped multiline Markdown. A passing verdict is
+  never accepted through repair. See
   [Review workflow](review-workflow.md#reviewer-execution).
 - **The correction cap was reached.** The complete pass is transmitted with correction
   classified as deferred; use `/review-continue` to authorize another correction round.
   See [Review workflow](review-workflow.md#corrections-guidance-and-the-correction-cap).
-- **Queued review inputs appear after a restart.** Queued inputs are never reordered
-  automatically: use `/review-now` to finish the review and release them, or
-  `/review-clear` to cancel them. See [Recovery](recovery.md#session-scoped-restart-recovery).
+- **Queued review inputs appear after a restart.** Queued inputs are never
+  reordered automatically: use `/review-now` to finish the review and release
+  them, or `/review-clear` to cancel them. See
+  [Recovery](recovery.md#session-scoped-restart-recovery).
 
 ## Web tools
 
-- **`BrowserExtract` reports a setup action instead of a render.** Chromium was not
-  provisioned (possibly because `PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1` was set at
-  install). Run `npx playwright install chromium` in the package environment and retry;
-  if the skip variable was set, unset it before reinstalling. See
-  [Getting started](getting-started.md#installation).
+- **`BrowserExtract` reports a setup action instead of a render.** Chromium was
+  not provisioned (possibly because `PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM=1`
+  was set at install). Run `npx playwright install chromium` in the package
+  environment and retry; if the skip variable was set, unset it before
+  reinstalling. See [Getting started](getting-started.md#installation).
 - **A fetch fails on a page you expected to work.** Non-2xx navigations, oversized
   rendered HTML, oversized downloads, and any egress-ledger audit failure fail the
   render closed by design; password-protected, corrupt, or oversized PDFs fail
   explicitly. See [Security model](security-model.md#web-egress-hardening) and
   [Web tools](web-tools.md).
-- **Images or fonts are missing from an extracted page.** Images, media, and fonts are
-  intentionally omitted by the route policy; this never fails the render and bounded
-  omission diagnostics are disclosed. See
+- **Images or fonts are missing from an extracted page.** Images, media, and
+  fonts are intentionally omitted by the route policy; this never fails the
+  render and bounded omission diagnostics are disclosed. See
   [Security model](security-model.md#egress-broker-containment).
-- **Older `BrowserOpen` builds fail on content-rich pages with `category=budget_exhausted`.**
-  Interactive mode no longer inherits extraction's cumulative 16-host, connection,
-  request or byte quotas. Check the loaded extension version rather than adding site
-  exceptions or bypassing SSRF checks. Extraction retains its separate limits.
-  Current interactive capacity refusals affect only excess connections and appear as
-  session-wide `brokerCapacityRefusals` in diagnostic results. Genuine security denials
-  remain fatal. See [Security model](security-model.md#egress-broker-containment) and
+- **Older `BrowserOpen` builds fail on content-rich pages with
+  `category=budget_exhausted`.** Interactive mode no longer inherits
+  extraction's cumulative 16-host, connection, request or byte quotas. Check the
+  loaded extension version rather than adding site exceptions or bypassing SSRF
+  checks. Extraction retains its separate limits. Current interactive capacity
+  refusals affect only excess connections and appear as session-wide
+  `brokerCapacityRefusals` in diagnostic results. Genuine security denials
+  remain fatal. See
+  [Security model](security-model.md#egress-broker-containment) and
   [Web tools](web-tools.md).
-- **Browser handles report tool-inactivity expiry.** Reopen with `BrowserOpen`; prior
-  page state is lost. Configure the minute value under `/review-settings` →
-  Web → Browser idle expiry (0 disables idle close). Background page traffic cannot
-  keep a timed session alive.
-- **A dynamic site's capture fails with `phase=capture; category=document_changed`.**
-  A main or child-frame navigation changes the capability generation; stale evidence
-  is rejected and the session is closed, not returned or automatically replayed.
-  Reopen explicitly and observe bounded page settling before a fresh capture. Public CNN QA reproduced advertising child-frame navigation during initial
-  capture; a fixed post-open observation window allowed capture, but its ad/video tiles
-  still showed site errors. Successful opening is not proof every third-party widget
-  works. Use bounded console/network observations without disabling generation, CSP,
-  CORS, TLS or egress guards.
+- **Browser handles report tool-inactivity expiry.** Reopen with `BrowserOpen`;
+  prior page state is lost. Configure the minute value under `/review-settings`
+  → Web → Browser idle expiry (0 disables idle close). Background page traffic
+  cannot keep a timed session alive.
+- **A dynamic site's capture fails with
+  `phase=capture; category=document_changed`.** A main or child-frame navigation
+  changes the capability generation; stale evidence is rejected and the session
+  is closed, not returned or automatically replayed. Reopen explicitly and
+  observe bounded page settling before a fresh capture. Public CNN QA reproduced
+  advertising child-frame navigation during initial capture; a fixed post-open
+  observation window allowed capture, but its ad/video tiles still showed site
+  errors. Successful opening is not proof every third-party widget works. Use
+  bounded console/network observations without disabling generation, CSP, CORS,
+  TLS or egress guards.
 - **DDGS provisioning fails during install or launch.** `scripts/ensure-ddgs.sh`
-  requires the pinned `ddgs==9.16.1`, binary distributions, and a clean `pip check`; the
-  configured PyPI/index source and local pip configuration are part of the trusted setup
-  boundary. The launcher creates and validates the venv at startup and fails closed:
-  creating or repairing it needs Python 3.10 or newer (with `venv`/`pip`) and
-  package-index access, but a valid cached environment is only validated, so launches
-  can succeed offline. See [Web tools](web-tools.md#websearch) and
+  requires the pinned `ddgs==9.16.1`, binary distributions, and a clean
+  `pip check`; the configured PyPI/index source and local pip configuration are
+  part of the trusted setup boundary. The launcher creates and validates the
+  venv at startup and fails closed: creating or repairing it needs Python 3.10
+  or newer (with `venv`/`pip`) and package-index access, but a valid cached
+  environment is only validated, so launches can succeed offline. See
+  [Web tools](web-tools.md#websearch) and
   [Getting started](getting-started.md#prerequisites).
 
 ## Delegated execution and landing
@@ -158,38 +173,41 @@ underlying behavior.
   [Getting started](getting-started.md#prerequisites). Ordinary reviews without
   delegated execution fall back to filesystem capture, so Git is not required for them.
 
-- **A landing is blocked by a conflict gate.** Resolve the materialized diff3 markers in
-  main, then run `SubtasksMarkClean` (or `/subtask-mark-clean`) to verify, checkpoint,
-  clear the gate, and wake queued landings. See
+- **A landing is blocked by a conflict gate.** Resolve the materialized diff3
+  markers in main, then run `SubtasksMarkClean` (or `/subtask-mark-clean`) to
+  verify, checkpoint, clear the gate, and wake queued landings. See
   [Delegated execution](delegated-execution.md#conflicts-and-gates).
 - **Recovery returned `manual_required`.** Follow the manual recovery steps:
-  identify conflicting paths from the manifest, compare destination vs. backup, decide,
-  then remove `.pi-backup-*` and remaining `.pi-landing-tmp-*` artifacts. See
-  [Recovery](recovery.md#manual-recovery-steps).
+  identify conflicting paths from the manifest, compare destination vs. backup,
+  decide, then remove `.pi-backup-*` and remaining `.pi-landing-tmp-*`
+  artifacts. See [Recovery](recovery.md#manual-recovery-steps).
 - **A task reports `completed_unreviewed`.** Delegated execution ran with no reviewer
   selected. This is a valid configuration (reviewers and routes are independent). See
   [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
 - **The worker cannot see a file your task needs.** Git-ignored files (including
   `node_modules` and `.env`) are excluded from capture and landing. See
   [Delegated execution](delegated-execution.md#capture-and-ignore-policy).
-- **A force-merged task looks wrong.** Force merges and `interrupt_with_merge` are
-  mechanical landing attempts, not verification; always inspect the main workspace
-  manually afterward, even when the authoritative state is `landed`. See
+- **A force-merged task looks wrong.** Force merges and `interrupt_with_merge`
+  are mechanical landing attempts, not verification; always
+  inspect the main workspace manually afterward, even when the authoritative
+  state is `landed`. See
   [Delegated execution](delegated-execution.md#conflicts-and-gates).
-- **Background shell tool output is missing.** Jobs are detached process groups that
-  survive turn settlement and are reaped when the Pi session ends; use `ShellList` and
-  `ShellLog` to inspect them. See
+- **Background shell tool output is missing.** Jobs are detached process groups
+  that survive turn settlement and are reaped when the Pi session ends; use
+  `ShellList` and `ShellLog` to inspect them. See
   [Delegated execution](delegated-execution.md#background-shell-tools).
 
 ## Development and tests
 
-- **Resource-sensitive or ordering-sensitive test failures.** Use the full serial
-  fallback: `npm run build:test` followed by `npm run test:run:serial` instead of the
-  concurrent run. See [Development](development.md#build-and-test-commands).
+- **Resource-sensitive or ordering-sensitive test failures.** Use the full
+  serial fallback: `npm run build:test` followed by `npm run test:run:serial`
+  instead of the concurrent run. See
+  [Development](development.md#build-and-test-commands).
 - **Package smoke fails on a missing file.** `npm run test:package` asserts that
-  required files — including the public `docs/` tree — are packed. Check the `files`
-  list in `package.json`. See [Development](development.md#static-checks-and-docs-validation).
-- **Docs validation reports a broken link or anchor.** `node scripts/check-docs.cjs`
-  validates relative links, local anchors, reachability, referenced paths, and fenced
-  JSON in `README.md` and `docs/`. Fix the target or the link; anchors use GitHub-style
-  heading slugs.
+  required files — including the public `docs/` tree — are packed. Check the
+  `files` list in `package.json`. See
+  [Development](development.md#static-checks-and-docs-validation).
+- **Docs validation reports a broken link or anchor.**
+  `node scripts/check-docs.cjs` validates relative links, local anchors,
+  reachability, referenced paths, and fenced JSON in `README.md` and `docs/`.
+  Fix the target or the link; anchors use GitHub-style heading slugs.

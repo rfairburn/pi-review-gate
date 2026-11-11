@@ -26,6 +26,8 @@ import {
   BrowserFailureError,
   BrowserRecoveryError,
   BrowserSessionClosedError,
+  BrowserWaitCancellationError,
+  BrowserWaitFailureError,
   InteractiveBrowserManager,
   normalizeBrowserPressKey,
   type BrowserClipboardOperation,
@@ -1653,6 +1655,45 @@ function interactiveBrowserFailure(name: string, error: unknown): Error {
   if (error instanceof BrowserSessionClosedError && error.closure?.kind === "idle_expiry") {
     return new Error(`${name} failed: browser session expired from tool inactivity; cleanup was confirmed. Use BrowserOpen to reopen; previous state is lost. Do not replay uncertain actions automatically.`);
   }
+  if (error instanceof BrowserSessionClosedError) {
+    // Issue #632: an authenticated handle for a session this manager already
+    // closed is reported from the authoritative closure record instead of the
+    // generic "closed, unknown, or owned elsewhere" collapse, with the one
+    // recovery step that works in that state. Only the fixed closure kind and,
+    // when the manager computed one, its safe fixed cause category are surfaced;
+    // the closure's free-text cause stays internal because it can carry Chromium
+    // or page text, and no operating-system process death is ever claimed.
+    const cause = error.closure?.category ? `; category=${error.closure.category}` : "";
+    return new Error(
+      `${name} failed: the browser session is closed (${error.closure?.kind ?? "reason_unavailable"}${cause}); `
+      + "its tabs, refs, and page state are gone. Use BrowserOpen to start a new browser for this Pi session; no observation tool can recover a closed session.",
+    );
+  }
+  if (error instanceof BrowserWaitFailureError) {
+    // Issue #632: BrowserWait observes the page and cannot change it, so its
+    // bounded outcomes never carry page-effect or rollback uncertainty. The
+    // unsettled kinds are the genuine fail-closed containment outcomes and say
+    // so, with the recovery that matches the confirmed closure state.
+    if (error.kind === "unsettled_contained" || error.kind === "unsettled_unconfirmed") {
+      return new Error(
+        `${name} failed: the bounded read-only observation did not settle, so the browser session was contained fail-closed. `
+        + (error.kind === "unsettled_unconfirmed"
+          ? "Teardown could not be confirmed and browser resources may remain; recover by restarting the Pi session (terminal restart or reload) before further browser use."
+          : "Cleanup was confirmed; use BrowserOpen to start a new browser for this Pi session."),
+      );
+    }
+    return new Error(`${name} failed: ${error.kind === "document_changed"
+      ? "the observed document changed during the wait, so the condition result was rejected. The call cannot change the page; take a fresh BrowserSnapshot and retry with the same session and tab handles"
+      : error.kind === "tab_unavailable"
+        ? "the observed tab closed during the bounded observation while the browser session stayed live. The call cannot change the page; that tab handle is gone, so use BrowserTabs operation=list on this session to see which owned tabs remain"
+      : error.kind === "session_unavailable"
+        ? "the observed page's browser session became unavailable during the bounded observation. The call cannot change the page; use BrowserOpen to start a new browser for this Pi session"
+      : error.kind === "session_unavailable_unconfirmed"
+        ? "the observed page or its browser session became unavailable during the bounded observation, and session teardown could not be confirmed, so browser resources may remain. The call cannot change the page; recover by restarting the Pi session (terminal restart or reload) before further browser use"
+      : error.kind === "condition_error"
+        ? "the bounded read-only observation settled with an error instead of a condition result. The call cannot change the page, so no page effect occurred and no rollback applies; the browser session and its tab handles were retained"
+        : "deadline exceeded; the bounded observation did not return a result within its deadline. The call cannot change the page, so no page effect occurred and no rollback applies; the browser session and its tab handles were retained"}.`);
+  }
   if (error instanceof BrowserFailureError) {
     const effect = PRE_NAVIGATION_FAILURE_PHASES.has(error.phase)
       ? "No page effects occurred."
@@ -1661,6 +1702,15 @@ function interactiveBrowserFailure(name: string, error: unknown): Error {
       `${name} failed: phase=${error.phase}; category=${error.category}. ` +
       `${BROWSER_FAILURE_HINTS[error.category]} ${effect} No rollback is claimed.`,
     );
+  }
+  if (error instanceof BrowserWaitCancellationError) {
+    // Issue #632: external cancellation of the read-only BrowserWait observation.
+    // Containment and the structured recovery metadata are the existing
+    // cancellation metadata; only the sentence differs, because a wait cannot
+    // change the page. An unconfirmed teardown stays stated with restart recovery.
+    return new Error(error.recovery.cleanup === "unconfirmed"
+      ? `${name} was cancelled during its bounded read-only observation, and session teardown could not be confirmed, so browser resources may remain. The call cannot change the page, so no page effect occurred and no rollback applies; this browser manager is fail-closed: recover by restarting the Pi session (terminal restart or reload) before further browser use.`
+      : `${name} was cancelled during its bounded read-only observation. The call cannot change the page, so no page effect occurred and no rollback applies. Session teardown was confirmed; use BrowserOpen to start a new browser for this Pi session.`);
   }
   if (error instanceof BrowserRecoveryError) {
     const recovery = error.recovery;

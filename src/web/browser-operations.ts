@@ -30,11 +30,13 @@ export class OperationDeadline {
   private readonly timer: NodeJS.Timeout;
   private readonly externalSignal?: AbortSignal;
   private readonly onExternalAbort?: () => void;
+  private ownDeadlineElapsed = false;
 
   constructor(private readonly name: string, private readonly durationMs: number, externalSignal?: AbortSignal) {
     this.signal = this.controller.signal;
     this.deadlineAt = Date.now() + durationMs;
     this.timer = setTimeout(() => {
+      this.ownDeadlineElapsed = true;
       this.controller.abort(new Error(`${name} exceeded its ${durationMs}ms total deadline.`));
     }, durationMs);
     this.timer.unref?.();
@@ -51,10 +53,20 @@ export class OperationDeadline {
     const remaining = this.deadlineAt - Date.now();
     if (remaining <= 0) {
       const error = new Error(`${this.name} exceeded its ${this.durationMs}ms total deadline.`);
+      this.ownDeadlineElapsed = true;
       this.controller.abort(error);
       throw error;
     }
     return remaining;
+  }
+
+  /**
+   * True only once this deadline's own timer or remaining-time check tripped.
+   * External cancellation never sets it, so a caller can tell its own finite
+   * deadline apart from a close/shutdown/caller cancellation (issue #632).
+   */
+  get elapsedByOwnDeadline(): boolean {
+    return this.ownDeadlineElapsed;
   }
 
   run<T>(operation: Promise<T>, phase: string): Promise<T> {

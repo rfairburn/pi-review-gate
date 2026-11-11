@@ -1097,7 +1097,13 @@ test("BrowserWait exposes only bounded observational conditions and cancellation
   const controller = new AbortController();
   const waiting = fixture.manager.wait(opened.session, opened.tab, { condition: "duration", durationMs: 500 }, 1_000, controller.signal);
   controller.abort(new Error("cancel wait fixture"));
-  await assert.rejects(waiting, /effect status is unknown/);
+  // Issue #632: a cancelled read-only observation keeps the containment policy but
+  // never claims page-effect or rollback uncertainty.
+  await assert.rejects(waiting, (error: Error) => {
+    assert.match(error.message, /^BrowserWait was cancelled/);
+    assert.doesNotMatch(error.message, /effect status is unknown|no rollback is claimed/);
+    return true;
+  });
   assert.equal(fixture.manager.activeSessionCount(), 0);
 });
 

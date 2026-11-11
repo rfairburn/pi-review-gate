@@ -5,6 +5,7 @@ import { BrowserIdleLease, validateIdleExpiryMinutes } from "./browser-idle-life
 import { BrowserOwnershipError, prepareOwnedBrowser } from "./browser-owned-process";
 import {
   chromium,
+  errors as playwrightErrors,
   type Browser,
   type BrowserContext,
   type CDPSession,
@@ -57,6 +58,7 @@ import {
   BrowserRecoveryError,
   BrowserSessionClosedError,
   BrowserValidationError,
+  BrowserWaitFailureError,
   DEADLINE_ERROR_PATTERN,
   browserFailure,
   cancellationKind,
@@ -72,6 +74,7 @@ import {
   operationTeardownUncertainError,
   openCancellationError,
   unconfirmedOpenCleanupError,
+  waitCancellationError,
   type BrowserClosureReason,
   type BrowserFailureCategory,
   type BrowserFailurePhase,
@@ -216,6 +219,8 @@ export {
   BrowserFailureError,
   BrowserRecoveryError,
   BrowserSessionClosedError,
+  BrowserWaitCancellationError,
+  BrowserWaitFailureError,
 } from "./browser-errors.js";
 export type {
   BrowserClipboardCapability,
@@ -226,6 +231,7 @@ export type {
   BrowserFileTransferCapability,
   BrowserRecoveryKind,
   BrowserRecoveryMetadata,
+  BrowserWaitFailureKind,
 } from "./browser-errors.js";
 export { BrowserDiagnosticQuota, DiagnosticRing } from "./browser-diagnostics.js";
 export { interactiveRouteDecision } from "./browser-url-policy.js";
@@ -2690,13 +2696,47 @@ export class InteractiveBrowserManager {
       const operation = new OperationDeadline("BrowserWait", timeoutMs, operationSignal);
       const started = this.now();
       const generation = tab.generation;
+      // Issue #632: the single observation promise this wait starts, retained so
+      // the body can settle it before leaving. Every allowlisted condition reads
+      // the page only, so when this wait's OWN deadline wins the race with the
+      // page-side timeout the body drains the observation inside the existing
+      // cleanup budget instead of letting the generic pending-work containment
+      // tear a healthy session down. A genuinely wedged read still leaves the
+      // work tracked, so containment below stays fail-closed.
+      let observation: Promise<unknown> | undefined;
+      let observationSettled = false;
+      const runObservation = <T>(promise: Promise<T>, phase: string): Promise<T> => {
+        observation = promise;
+        void promise.then(
+          () => { observationSettled = true; },
+          () => { observationSettled = true; },
+        );
+        return operation.run(promise, phase);
+      };
+      // Only manager-inspected authoritative state may claim a retained session.
+      const sessionRetained = () => !operationSignal.aborted && !session.fatalError && !session.teardown
+        && this.sessions.get(session.handle) === session && session.browser.isConnected() && !tab.page.isClosed();
+      // Directly inspectable authoritative loss evidence. It is the only state
+      // that may report an unavailable session, and it never claims retention.
+      const sessionUnavailable = () => session.fatalError !== undefined || session.teardown !== undefined
+        || !session.browser.isConnected() || tab.page.isClosed();
+      // Issue #632: one loss report per state, never a choice of two recoveries.
+      // Whole-browser/session loss is recovered only by BrowserOpen (or a Pi
+      // session restart when containment cannot confirm teardown, below); one
+      // closed observed tab inside a still-live session is recovered only by
+      // BrowserTabs operation=list on that live session.
+      const wholeSessionLoss = () => session.fatalError !== undefined || session.teardown !== undefined
+        || !session.browser.isConnected();
+      const lossFailure = (cause?: Error) => wholeSessionLoss()
+        ? new BrowserWaitFailureError("session_unavailable", "BrowserWait ended because its browser session became unavailable.", { cause })
+        : new BrowserWaitFailureError("tab_unavailable", "BrowserWait ended because the observed tab closed while the owning browser session stayed live.", { cause });
       try {
         switch (request.condition) {
           case "ref": {
             if (!request.ref || !["attached", "detached", "visible", "hidden"].includes(request.state)) {
               throw new Error("BrowserWait ref condition requires a current ref and an allowlisted state.");
             }
-            await operation.run(this.currentRefLocator(tab, request.ref).waitFor({
+            await runObservation(this.currentRefLocator(tab, request.ref).waitFor({
               state: request.state,
               timeout: operation.remainingMs(),
             }), "semantic ref state wait");
@@ -2707,7 +2747,7 @@ export class InteractiveBrowserManager {
               throw new Error(`BrowserWait text must contain 1-${this.limits.maxWaitTextChars} characters.`);
             }
             const visibleMatches = tab.page.getByText(request.text, { exact: false }).filter({ visible: true });
-            await operation.run(visibleMatches.first().waitFor({
+            await runObservation(visibleMatches.first().waitFor({
               // Presence means at least one visible literal-text match;
               // absence means no visible match anywhere in the locator set.
               state: request.present ? "attached" : "hidden",
@@ -2720,7 +2760,7 @@ export class InteractiveBrowserManager {
               throw new Error(`BrowserWait URL value must contain 1-${this.limits.maxWaitPatternChars} characters.`);
             }
             const matches = urlWaitMatcher(request.match, request.url);
-            await operation.run(tab.page.waitForURL((url) => matches(url.href), {
+            await runObservation(tab.page.waitForURL((url) => matches(url.href), {
               timeout: operation.remainingMs(),
               waitUntil: "commit",
             }), "URL wait");
@@ -2730,7 +2770,7 @@ export class InteractiveBrowserManager {
             if (request.state !== "commit" && request.state !== "domcontentloaded" && request.state !== "load") {
               throw new Error("BrowserWait navigation state must be commit, domcontentloaded, or load.");
             }
-            await operation.run(tab.page.waitForNavigation({
+            await runObservation(tab.page.waitForNavigation({
               waitUntil: request.state,
               timeout: operation.remainingMs(),
             }), "navigation completion wait");
@@ -2739,23 +2779,42 @@ export class InteractiveBrowserManager {
             if (request.state !== "domcontentloaded" && request.state !== "load") {
               throw new Error("BrowserWait load state must be domcontentloaded or load.");
             }
-            await operation.run(tab.page.waitForLoadState(request.state, { timeout: operation.remainingMs() }), "load completion wait");
+            await runObservation(tab.page.waitForLoadState(request.state, { timeout: operation.remainingMs() }), "load completion wait");
             break;
           case "network_quiet":
-            await operation.run(tab.page.waitForLoadState("networkidle", { timeout: operation.remainingMs() }), "bounded network quiet wait");
+            await runObservation(tab.page.waitForLoadState("networkidle", { timeout: operation.remainingMs() }), "bounded network quiet wait");
             break;
           case "duration":
             if (!Number.isInteger(request.durationMs) || request.durationMs < 1 || request.durationMs > Math.min(2_000, timeoutMs)) {
               throw new Error(`BrowserWait durationMs must be an integer from 1-${Math.min(2_000, timeoutMs)}.`);
             }
-            await operation.run(tab.page.waitForTimeout(request.durationMs), "short duration wait");
+            await runObservation(tab.page.waitForTimeout(request.durationMs), "short duration wait");
             break;
           default:
             throw new Error("BrowserWait condition is not allowlisted.");
         }
         throwIfAborted(operation.signal);
+        // Issue #632: a settled observation may only become a result while this
+        // manager still inspects a live session and tab. The check runs on every
+        // success path, independently of any document epoch change: a closed
+        // observed tab or a gone browser is never returned as a satisfied wait
+        // carrying a dead handle, and never reaches operate() as a generic fatal
+        // error with page-effect uncertainty wording. External cancellation keeps
+        // its existing containment policy and stays ahead of the loss report.
+        if (operationSignal.aborted) throw asError(operation.signal.reason);
+        if (sessionUnavailable()) throw lossFailure();
         if (tab.generation !== generation && request.condition !== "url" && request.condition !== "navigation" && request.condition !== "load" && request.condition !== "network_quiet") {
-          throw new Error("Browser document changed while waiting; condition result rejected.");
+          // Issue #632: `document_changed` is the one outcome that tells the caller
+          // to retry with the same session and tab handles, so it is issued only
+          // after the authoritative liveness inspection above proved them live.
+          if (sessionRetained()) {
+            throw new BrowserWaitFailureError("document_changed", "Browser document changed while waiting; condition result rejected.");
+          }
+          // Fail-closed fallback: retention is not provable and no loss is
+          // inspectable, so no same-handle claim escapes. The manager only
+          // deregisters a session inside teardown, which the loss check above
+          // already reports.
+          throw new Error("BrowserWait could not confirm the owning session and tab after a document change.");
         }
         return {
           session: session.handle,
@@ -2766,10 +2825,50 @@ export class InteractiveBrowserManager {
           elapsedMs: Math.max(0, this.now() - started),
           url: publicPageUrl(tab.page.url()),
         };
+      } catch (error) {
+        const failure = asError(error);
+        // Already manager-classified (document epoch change, or a failed bounded
+        // drain below): never re-wrapped, so the tool boundary keeps the kind.
+        if (failure instanceof BrowserWaitFailureError) throw failure;
+        // External cancellation keeps the existing containment and cancellation
+        // policy untouched.
+        if (operationSignal.aborted) throw failure;
+        if (observation !== undefined && sessionUnavailable()) {
+          throw lossFailure(failure);
+        }
+        if (observation !== undefined && !observationSettled && operation.elapsedByOwnDeadline) {
+          // A read-only observation cannot change the page. Give it the existing
+          // bounded cleanup budget to settle before leaving the operation body,
+          // so the wait's own deadline is never mistaken for unsettled page work.
+          try {
+            await boundedCleanup(observation.then(() => undefined, () => undefined), this.limits.cleanupMs, "read-only wait observation drain");
+            observationSettled = true;
+          } catch {
+            // Still unsettled after the bounded drain: leave the work tracked so
+            // operate() contains the session fail-closed.
+            throw new BrowserWaitFailureError("unsettled", `BrowserWait exceeded its ${timeoutMs}ms total deadline.`, { cause: failure });
+          }
+          if (sessionUnavailable()) {
+            throw lossFailure(failure);
+          }
+        }
+        if (observation !== undefined && observationSettled && sessionRetained()) {
+          // The observation settled and the manager still owns a live session and
+          // tab: this is a bounded read-only outcome, not page-effect or rollback
+          // uncertainty. No page or Playwright exception text is carried out.
+          // Every allowlisted condition caps its page-side timeout at this
+          // operation's remaining budget, so Playwright's own typed timeout
+          // means the observation ran out the deadline rather than settling on a
+          // page error. The typed class is consulted, never exception text.
+          throw operation.elapsedByOwnDeadline || failure instanceof playwrightErrors.TimeoutError
+            ? new BrowserWaitFailureError("deadline", `BrowserWait exceeded its ${timeoutMs}ms total deadline.`, { cause: failure })
+            : new BrowserWaitFailureError("condition_error", `BrowserWait read-only observation settled without a condition result: ${bounded(failure.message, 500)}`, { cause: failure });
+        }
+        throw failure;
       } finally {
         operation.dispose();
       }
-    });
+    }, false, { readOnlyObservation: true });
   }
 
   async history(
@@ -3439,6 +3538,11 @@ export class InteractiveBrowserManager {
     signal: AbortSignal | undefined,
     body: (operationSignal: AbortSignal) => Promise<T>,
     fatalOnError = false,
+    /** Issue #632: the body is a read-only observation (`BrowserWait`). Containment,
+     * the cancellation guard, and every structured recovery field are unchanged; only
+     * the cancellation sentence differs, because a read-only observation cannot have
+     * page or network effects. */
+    observation: { readOnlyObservation?: boolean } = {},
   ): Promise<T> {
     this.assertAcceptingOperations();
     this.assertUsable(session);
@@ -3478,7 +3582,14 @@ export class InteractiveBrowserManager {
         // A deadline race is not cancellation. Keep serialization held until
         // browser/broker containment and pending command settlement complete.
         const deadline = failure.message.match(/\bBrowser[A-Za-z]+ exceeded its \d{1,8}ms total deadline\./)?.[0];
-        const uncertain = new Error(`${deadline ? `${deadline} ` : ""}Browser operation left work in flight; effect status is unknown and no rollback is claimed.`);
+        // Issue #632: a wedged BrowserWait observation is the one in-flight case
+        // that cannot have changed the page. Containment is still the answer, but
+        // the report names the observation and the recovery that works in that
+        // state instead of page-effect or rollback uncertainty.
+        const readOnlyObservation = failure instanceof BrowserWaitFailureError;
+        const uncertain = new Error(readOnlyObservation
+          ? `${deadline ? `${deadline} ` : ""}BrowserWait's read-only observation did not settle, so the session was contained.`
+          : `${deadline ? `${deadline} ` : ""}Browser operation left work in flight; effect status is unknown and no rollback is claimed.`);
         let teardownConfirmed = false;
         try {
           await this.failAndWait(session, uncertain);
@@ -3487,21 +3598,57 @@ export class InteractiveBrowserManager {
         } catch {
           // Teardown or the bounded in-flight drain could not be confirmed.
         }
-        if (!teardownConfirmed) throw new Error(`${uncertain.message} Session teardown is unconfirmed.`);
+        if (!teardownConfirmed) {
+          if (observation.readOnlyObservation) {
+            // A cancelled read-only observation keeps the unconfirmed teardown and
+            // its restart recovery, but never page-effect or rollback uncertainty.
+            const cancelled = cancellationKind(operationSignal);
+            throw cancelled
+              ? waitCancellationError(cancelled, bodyStarted ? "unknown" : "not_started", "unconfirmed")
+              : new BrowserWaitFailureError("unsettled_unconfirmed", `${uncertain.message} Session teardown is unconfirmed.`);
+          }
+          throw new Error(`${uncertain.message} Session teardown is unconfirmed.`);
+        }
         const cancellation = cancellationKind(operationSignal);
         // In-flight work at abort time proves the command dispatched: report
         // structured post-dispatch cancellation, never parsed exception text.
-        if (cancellation) throw operationCancellationError(cancellation, "dispatched");
-        throw new Error(`${uncertain.message} Session teardown is confirmed.`);
+        // A read-only observation keeps that metadata and only the sentence.
+        if (cancellation) throw observation.readOnlyObservation
+          ? waitCancellationError(cancellation, "dispatched", "confirmed")
+          : operationCancellationError(cancellation, "dispatched");
+        throw readOnlyObservation
+          ? new BrowserWaitFailureError("unsettled_contained", `${uncertain.message} Session teardown is confirmed.`)
+          : new Error(`${uncertain.message} Session teardown is confirmed.`);
       }
       if ((fatalOnError && !(failure instanceof BrowserValidationError) && !this.settledNavigationFailures.has(failure)) || operationSignal.aborted || session.fatalError) {
         try {
           await this.failAndWait(session, session.fatalError ?? failure);
         } catch {
+          // Issue #632: a settled read-only observation never becomes page-effect
+          // or rollback uncertainty, even when fatal containment cannot confirm
+          // quiescence. Only manager-inspected loss state may say so, and the
+          // outcome stays typed so the tool boundary keeps observation wording
+          // with the restart recovery that applies.
+          const cancellation = cancellationKind(operationSignal);
+          if (observation.readOnlyObservation && cancellation) {
+            // The unconfirmed teardown and its restart recovery stay stated; only
+            // the page-effect uncertainty claim is dropped for a read-only wait.
+            throw waitCancellationError(cancellation, bodyStarted ? "unknown" : "not_started", "unconfirmed");
+          }
+          if (failure instanceof BrowserWaitFailureError
+            && (session.fatalError !== undefined || !session.browser.isConnected())) {
+            throw new BrowserWaitFailureError(
+              "session_unavailable_unconfirmed",
+              "BrowserWait's read-only observation ended because the observed page or its browser session became unavailable; session teardown could not be confirmed.",
+              { cause: failure },
+            );
+          }
           throw operationTeardownUncertainError();
         }
         const cancellation = cancellationKind(operationSignal);
-        if (cancellation) throw operationCancellationError(cancellation, bodyStarted ? "unknown" : "not_started");
+        if (cancellation) throw observation.readOnlyObservation
+          ? waitCancellationError(cancellation, bodyStarted ? "unknown" : "not_started", "confirmed")
+          : operationCancellationError(cancellation, bodyStarted ? "unknown" : "not_started");
       }
       throw failure;
     } finally {
@@ -3546,7 +3693,17 @@ export class InteractiveBrowserManager {
     const closure: BrowserClosureReason = closureOverride
       ? closureOverride
       : session.fatalError
-        ? { kind: session.fatalError instanceof BrowserIdleExpiredError ? "idle_expiry" : "fatal_error", message: bounded(session.fatalError.message, 500) }
+        ? {
+          kind: session.fatalError instanceof BrowserIdleExpiredError ? "idle_expiry" : "fatal_error",
+          message: bounded(session.fatalError.message, 500),
+          // Issue #632: the safe manager-computed cause travels with the closure so a
+          // later call on the same handle can name it beside the kind. Only the fixed
+          // enum value is carried; the free-text message stays internal because it can
+          // carry Chromium or page text, and no OS process death is ever claimed.
+          ...(session.fatalError instanceof BrowserFailureError
+            ? { category: session.fatalError.category }
+            : {}),
+        }
         : cause
           ? { kind: "session_shutdown", message: "Pi session shutdown, replacement, or reload." }
           : { kind: "explicit_close", message: "BrowserClose was called." };

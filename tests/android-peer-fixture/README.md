@@ -21,9 +21,9 @@ node_modules/.bin/tsc -p tests/android-peer-fixture/tsconfig.json
 
 The tracked fixture compiles through the repository's `tsconfig.test.json` as
 well, so `npm run build:test` produces
-`dist-test/tests/android-peer-fixture/fixture.js`.
-If dependencies stay in a separate staging directory, export
-`NODE_PATH=<stage>/node_modules` for both the fixture and the suite runner.
+`dist-test/tests/android-peer-fixture/fixture.js`. If dependencies stay in a
+separate staging directory, export `NODE_PATH=<stage>/node_modules` for both the
+fixture and the suite runner.
 
 ## Run
 
@@ -54,8 +54,8 @@ The runner validates the exact serial as an owned review-gate AVD, installs the
 two APKs, pre-grants `ACCESS_LOCAL_NETWORK` on the fixture app (reported as
 `PREGRANTED`), runs the storage/identity checks, performs the two-phase identity
 setup, then runs the pin-mismatch and both-lane mTLS checks against owned
-fixture processes. It never boots or stops an emulator and never uses ADB without
-`-s <serial>`.
+fixture processes. It never boots or stops an emulator and never uses ADB
+without `-s <serial>`.
 
 ```sh
 node tests/android-peer-fixture/run-api-suite.cjs \

@@ -87,7 +87,7 @@ test("clipboard provenance resolves only the exact audited CLI and peer TUI vers
   const writePeerManifest = (version: string): void => writeFileSync(peerManifest,
     JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/tui-alt-screen.js" }));
 
-  for (const version of ["1.3.0", "1.4.0", "1.5.0", "1.5.1"]) {
+  for (const version of ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"]) {
     writeFileSync(file, JSON.stringify({ ...manifest, version }));
     writePeerManifest(version);
     const runtime = resolveNativeClipboardRuntime(cli);
@@ -95,7 +95,7 @@ test("clipboard provenance resolves only the exact audited CLI and peer TUI vers
     assert.equal(runtime?.supported, true, `exact audited Pi ${version} is supported`);
     assert.equal(runtime?.tuiRoot, peerRoot, `exact audited pi-tui ${version} source is recognized`);
   }
-  for (const version of ["1.4.1", "1.5.2", "1.6.0", "2.0.0"]) {
+  for (const version of ["1.4.1", "1.5.3", "1.6.0", "2.0.0"]) {
     writeFileSync(file, JSON.stringify({ ...manifest, version }));
     assert.equal(resolveNativeClipboardRuntime(cli)?.supported, false, `Pi ${version} is not silently certified`);
   }
@@ -124,7 +124,7 @@ test("native producer provenance accepts actual native selection and Main copy p
     `Error\n    at async InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true);
   assert.equal(isNativeClipboardOrigin(runtime, sites,
     `Error\n    at async _InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true,
-    "actual bundled Pi 1.3.0, 1.4.0, 1.5.0, and 1.5.1 Main class alias is source-verified");
+    "actual bundled Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1, and 1.5.2 Main class alias is source-verified");
   const unbundled = selectionStack.replace(/TuiAltScreen.copyTextToClipboard \(.+?:30:10\)/,
     `TuiAltScreen.copyTextToClipboard (${pathToFileURL(join(runtime.tuiRoot!, "dist", "tui-alt-screen.js")).href}:30:10)`);
   assert.equal(isNativeClipboardOrigin(runtime, sites, unbundled), true);
@@ -492,7 +492,7 @@ interface ProducerRun {
 test("the shipped audited runtime's own copy producer passes the provenance gate natively",
   { timeout: 120_000 }, (t) => {
     if (process.platform === "win32") { t.skip("native Windows clipboard provenance stays experimental"); return; }
-    const auditedVersions = ["1.3.0", "1.4.0", "1.5.0", "1.5.1"];
+    const auditedVersions = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"];
     const installed = findInstalledAgentDirs().find((path) => {
       try { return auditedVersions.includes(JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version); } catch { return false; }
     });

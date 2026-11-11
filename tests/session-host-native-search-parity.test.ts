@@ -41,7 +41,7 @@ import { skipOrFail } from "./bridge-fakes";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 
 /** The exact Pi release whose native session matcher the catalog follows. */
-const PI_SEARCH_VERSION = "1.5.1";
+const PI_SEARCH_VERSION = "1.5.2";
 
 /** One native selector session, in the public SDK `SessionInfo` shape. */
 interface NativeSearchSession {

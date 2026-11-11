@@ -189,7 +189,7 @@ const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipbo
  * the runtimes the production provenance adapter audits. Listing a release here never
  * certifies it: the child's own stack provenance still has to verify.
  */
-const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1"] as const;
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"] as const;
 type Witness = Record<string, unknown>;
 interface CopyFixtureIdentity {
   readonly nonce: string;
@@ -405,7 +405,7 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   }
   const tuiManifest = JSON.parse(readFileSync(join(tuiRoot, "package.json"), "utf8")) as { name: string; version: string };
   assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
-  assert.equal(tuiManifest.version, "1.5.1");
+  assert.equal(tuiManifest.version, "1.5.2");
   const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
   const root = realpathSync(mkdtempSync("/tmp/prg-copy-"));

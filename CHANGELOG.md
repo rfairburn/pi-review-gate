@@ -15,6 +15,31 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.276]
+
+### Changed
+
+- **Pin the release builder's artifact transfer actions to Node.js 24 releases (#649)**:
+  the unsigned-build, protected-signing, and publish jobs of the numbered-prerelease
+  builder now use `actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9`
+  (`v7.0.2`) and `actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333`
+  (`v8.0.2`), whose exact-commit `action.yml` manifests both declare `runs.using: node24`,
+  so the pinned actions stop emitting Node.js 20 deprecation warnings instead of relying
+  on GitHub forcing a newer runtime under them. Nothing else about the transfer changes:
+  the same run-scoped artifact names, the same exact unsigned `unsigned.apk` and
+  `unsigned.json` and signed APK, `ANDROID_SHA256SUMS`, and `android-provenance.json`
+  selections, `if-no-files-found: error`, one-day retention, the `artifact-id` and
+  `artifact-digest` outputs the immutable same-run identity check consumes, and the
+  by-ID download into the same `runner.temp` directories with `merge-multiple: true`, so
+  the unpacked files still land flat where `scripts/release/android.cjs` reads them. One
+  upstream default tightens in the same direction as the existing gate: a downloaded
+  archive whose SHA-256 does not match the server-reported digest now fails the step
+  rather than only warning, so a corrupted transfer stops the run before signing or
+  publication. Job permissions, the protected signing environment and its secret
+  isolation, job conditions and dependencies, the release eligibility guards, and
+  publication authority are unchanged, and no real signing or publication was performed
+  to validate the pins.
+
 ## [0.1.0-dev.275]
 
 ### Changed

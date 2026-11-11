@@ -94,9 +94,42 @@ and semantic:
   text becoming present/absent, an HTTP(S) URL exact/prefix/safe-RE2 match, DOM/load
   completion, Playwright-observable network quiet, or a duration of at most two
   seconds. Text presence requires at least one visible literal match across the page;
-  absence requires that no visible match remains. The total deadline is at most ten
-  seconds and is shared by every phase;
-  this is not a polling or workflow-orchestration tool.
+  absence requires that no visible match remains. The observation deadline is at most ten
+  seconds and is shared by every phase of the observation; this is not a polling or
+  workflow-orchestration tool. That deadline bounds the observation itself, not the whole
+  call: when it expires, a page-side observation still in flight is first given the separate
+  existing bounded cleanup allowance (five seconds by default) to settle, so the call's total
+  user-visible wall clock can run past the ten-second observation deadline by that allowance,
+  and other browser tools report the session busy until the allowance ends.
+  Wait text is literal: a typographic apostrophe is a different string from an
+  ASCII apostrophe, and neither satisfies a match for the other. A wait outcome is
+  observational, so it never claims a page effect or a rollback, including when the wait is
+  cancelled externally. A satisfied wait,
+  an expired deadline, a settled observation error, and a document change during the
+  wait each return exactly one bounded outcome and retain the live browser session
+  and its exact session and tab handles, so `BrowserTabs`, `BrowserSnapshot`,
+  `BrowserScreenshot`, and normal interaction continue against the same page state.
+  Every reported outcome, including a satisfied one, is checked against authoritative
+  session and tab state first, so a wait never returns a handle this manager already
+  knows is gone.
+  The document-change outcome is the one that tells the caller to retry with the same
+  handles, so the manager issues it only after inspecting authoritative session and tab
+  liveness; if the session or the observed tab actually went away, the truthful loss report
+  takes priority.
+  When the wait's own deadline expires, its page-side observation is first given the
+  existing bounded cleanup allowance to settle. Only an observation still unsettled
+  after that allowance, genuine loss of the owned browser, or external cancellation
+  contains the session fail-closed; that report names the read-only observation and
+  the recovery that applies there — `BrowserOpen` once cleanup is confirmed, or
+  restarting the Pi session when containment could not confirm it — instead of
+  page-effect or rollback uncertainty. Genuine loss keeps the same one-recovery-per-state
+  rule: whole-browser or session loss is recovered only by `BrowserOpen`, while a single
+  closed observed tab in a still-live session is recovered only by listing that live session's
+  tabs with `BrowserTabs operation=list`. A later call on an authenticated handle of a closed
+  session reports the authoritative closure kind together with its safe manager-computed cause
+  category (for example `browser_process_failure`); raw browser, page, or network text stays
+  internal, and an authoritative disconnect is never reported as proof that the
+  operating-system process died.
 - `BrowserHistory` lists at most 32 browser-owned HTTP(S) history entries or performs
   back, forward, or reload. Fixed internal Chromium history commands distinguish
   pushState, replaceState, identical URLs, and page-initiated traversal; no caller CDP

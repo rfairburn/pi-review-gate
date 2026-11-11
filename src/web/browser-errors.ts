@@ -13,6 +13,14 @@ import { asError, bounded } from "./browser-primitives.js";
 export interface BrowserClosureReason {
   kind: "explicit_close" | "session_shutdown" | "fatal_error" | "idle_expiry" | "visibility_reconfigure";
   message: string;
+  /**
+   * Issue #632: the safe manager-computed cause of a fatal closure, when the
+   * manager computed one. Fixed enum values only — never page, Playwright, or
+   * network text — and never a claim that the operating-system process died:
+   * an authoritative browser disconnect is loss of the session, not process
+   * evidence.
+   */
+  category?: BrowserFailureCategory;
 }
 
 /** Typed capture rejection; page text cannot manufacture this classification. */
@@ -64,6 +72,22 @@ export class BrowserRecoveryError extends Error {
   constructor(message: string, readonly recovery: BrowserRecoveryMetadata) {
     super(message);
     this.name = "BrowserRecoveryError";
+  }
+}
+
+/**
+ * Issue #632: external cancellation (BrowserClose, Pi session shutdown, a
+ * visibility change, or the caller) of a read-only `BrowserWait` observation.
+ * The containment policy and the structured recovery metadata are exactly
+ * `operationCancellationError`'s and `operationTeardownUncertainError`'s; only
+ * the fixed sentence differs, because a read-only observation cannot have
+ * changed the page: it names no page or network effect and claims no rollback, and
+ * it still states an unconfirmed teardown with restart recovery.
+ */
+export class BrowserWaitCancellationError extends BrowserRecoveryError {
+  constructor(message: string, recovery: BrowserRecoveryMetadata) {
+    super(message, recovery);
+    this.name = "BrowserWaitCancellationError";
   }
 }
 
@@ -172,6 +196,42 @@ export function cancellationKind(signal: AbortSignal): BrowserCancellationKind |
 export class BrowserClipboardOutcomeError extends Error {}
 
 export class BrowserValidationError extends Error {}
+
+/**
+ * Issue #632: one bounded outcome of a read-only `BrowserWait` observation.
+ * A wait only reads the page, so these outcomes never describe page-effect or
+ * rollback uncertainty; the tool boundary renders fixed observation text from
+ * the kind. The manager only issues `deadline`, `condition_error`, and
+ * `document_changed` after it proved the owning session and tab stayed live,
+ * and only issues the unsettled kinds after the fail-closed containment path.
+ * `unsettled` is the internal hand-off kind: containment always replaces it
+ * with `unsettled_contained` or `unsettled_unconfirmed` before it escapes.
+ * Each loss kind carries the one recovery that works in that state:
+ * `session_unavailable` is whole-browser/session loss recovered by `BrowserOpen`,
+ * `tab_unavailable` is one closed observed tab inside a still-live session
+ * recovered by `BrowserTabs operation=list` on that session, and
+ * `session_unavailable_unconfirmed` means containment could not confirm
+ * quiescence, so the Pi session must be restarted. Each keeps observation
+ * wording: a settled read-only observation is never described as unsettled page
+ * work, and no loss kind offers a choice of two recoveries.
+ */
+export type BrowserWaitFailureKind =
+  | "deadline"
+  | "condition_error"
+  | "document_changed"
+  | "tab_unavailable"
+  | "session_unavailable"
+  | "session_unavailable_unconfirmed"
+  | "unsettled"
+  | "unsettled_contained"
+  | "unsettled_unconfirmed";
+
+export class BrowserWaitFailureError extends Error {
+  constructor(readonly kind: BrowserWaitFailureKind, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "BrowserWaitFailureError";
+  }
+}
 
 export function invalidSessionHandleError(): BrowserRecoveryError {
   return new BrowserRecoveryError(
@@ -304,6 +364,34 @@ export function operationCancellationError(cancellation: BrowserCancellationKind
   return new BrowserRecoveryError(
     `Browser operation was cancelled${by}; effect status is unknown and no rollback is claimed. Session teardown was confirmed; use BrowserOpen to start a new browser session.`,
     { kind: "cancelled", phase: "unknown", cleanup: "confirmed", recovery: "reopen" },
+  );
+}
+
+/**
+ * Issue #632: cancellation of the read-only `BrowserWait` observation. The
+ * recovery metadata is identical to `operationCancellationError`'s (confirmed
+ * teardown) or `operationTeardownUncertainError`'s (unconfirmed teardown), so
+ * the containment policy and every structured field stay unchanged; only the
+ * fixed sentence differs, because a wait cannot change the page.
+ */
+export function waitCancellationError(
+  cancellation: BrowserCancellationKind,
+  phase: "not_started" | "dispatched" | "unknown",
+  teardown: "confirmed" | "unconfirmed",
+): BrowserWaitCancellationError {
+  const by = cancellation === "shutdown"
+    ? " by Pi session shutdown/replacement/reload"
+    : cancellation === "close" ? " by BrowserClose"
+    : cancellation === "visibility" ? " by a browser visibility settings change" : "";
+  if (teardown === "unconfirmed") {
+    return new BrowserWaitCancellationError(
+      `BrowserWait was cancelled${by} during its bounded read-only observation; the call cannot change the page, so no page effect occurred and no rollback applies. Session teardown could not be confirmed and browser resources may remain: recover by restarting the Pi session (terminal restart or reload) before further browser use.`,
+      { kind: "unconfirmed_cleanup", phase: "unknown", cleanup: "unconfirmed" },
+    );
+  }
+  return new BrowserWaitCancellationError(
+    `BrowserWait was cancelled${by} during its bounded read-only observation; the call cannot change the page, so no page effect occurred and no rollback applies. Session teardown was confirmed; use BrowserOpen to start a new browser for this Pi session.`,
+    { kind: "cancelled", phase, cleanup: "confirmed", recovery: "reopen" },
   );
 }
 

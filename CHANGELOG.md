@@ -15,6 +15,43 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.274]
+
+### Fixed
+
+- **Bounded `BrowserWait` keeps a healthy session usable (#632)**: a wait whose own
+  deadline wins the race with the page-side timeout now drains that read-only
+  observation inside the existing bounded cleanup allowance and returns one bounded
+  outcome, instead of leaving the observation tracked so generic pending-work
+  containment tore a live browser session down. Satisfied waits, expired deadlines,
+  settled observational errors, and a document change during a wait retain the
+  session and its exact session and tab handles, so `BrowserTabs`, `BrowserSnapshot`,
+  `BrowserScreenshot`, and normal interaction continue against the same page state.
+  Every reported outcome, including a satisfied one, is checked against authoritative
+  session and tab state first, so a wait never hands back a handle the manager already
+  knows is gone.
+  Their reports now describe the read-only observation — no page effect and no
+  rollback claim — and that observation-only wording also covers external
+  cancellation, while the containment policy and structured cancellation metadata are
+  unchanged. Genuine loss now names one recovery per state: whole-browser/session loss
+  points only at `BrowserOpen`, and one closed observed tab in a still-live session
+  points only at `BrowserTabs operation=list` on that session. A closed session's
+  authoritative closure record also carries its safe manager-computed cause category
+  (for example `browser_process_failure`) beside the closure kind for later calls,
+  never raw browser text and never a claim about the operating-system process. The
+  same-handle retry claim of a document-change outcome is issued only after the
+  manager inspects authoritative session and tab liveness, so real loss is reported
+  truthfully instead. A still-unsettled observation after the
+  bounded drain, genuine owned-browser loss, and external cancellation keep the
+  existing fail-closed containment policy: fatal loss that settles the observation
+  keeps observation-only wording, with `BrowserOpen` recovery once cleanup is
+  confirmed and restart guidance when containment could not confirm it, and a
+  page-side timeout that wins the race is reported as the wait's own bounded
+  deadline rather than as an observational error. The public docs now distinguish the
+  at-most-ten-second observation deadline from the separate bounded cleanup allowance
+  that can extend the call's total wall clock. Literal wait-text matching is
+  unchanged.
+
 ## [0.1.0-dev.273]
 
 ### Changed

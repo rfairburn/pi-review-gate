@@ -57,7 +57,7 @@ const SESSION_HOST_HELP_MARKERS = [
 
 // Fresh-consumer runtime pins (mirror the package.json dependency pins).
 const SESSION_HOST_RUNTIME_PINS = {
-  "pi-session-host-tui": { name: "@earendil-works/pi-tui", version: "1.5.1" },
+  "pi-session-host-tui": { name: "@earendil-works/pi-tui", version: "1.5.2" },
   "@xterm/headless": { version: "6.0.0" },
   "@xterm/addon-unicode11": { version: "0.9.0" },
 };

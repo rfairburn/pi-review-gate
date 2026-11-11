@@ -13,7 +13,7 @@
  * the v2 capsule wire shape, and that the default one-argument install stays the
  * legacy bridge. The one `nativeParser` case additionally feeds the bridge's own
  * emitted chunks into the ACTUAL pinned public `StdinBuffer` from
- * `pi-session-host-tui` (`@earendil-works/pi-tui@1.5.1`), so it does observe real
+ * `pi-session-host-tui` (`@earendil-works/pi-tui@1.5.2`), so it does observe real
  * native parser state — but it is not the full native Pi UI, a real native
  * PTY/Windows/SSH child, the broker or viewer plumbing, or any physical clipboard.
  */
@@ -851,7 +851,7 @@ test("the ACTUAL pinned native StdinBuffer never sees a stale viewer paste prefi
     assert.ok(report.feeds.every((value) => value === true), "every physical read is consumed");
 
     // The ACTUAL native parser is asserted FIRST and exactly, with no normalization
-    // of anything the parser reported: the real pinned pi-tui 1.5.1 StdinBuffer
+    // of anything the parser reported: the real pinned pi-tui 1.5.2 StdinBuffer
     // (not a reimplementation and not a patched native class) must report
     // exactly the next paste body and exactly the next keyboard input — no buffered
     // A prefix, no stray marker, no contamination of any kind. The old per-fragment

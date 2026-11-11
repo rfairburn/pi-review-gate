@@ -60,7 +60,7 @@ const nodePty = nodeRequire("@lydell/node-pty") as {
  * additive: an unlisted installed runtime is never used, and the launcher's own source
  * must still state the inherited-stdio launch this adapter recognizes.
  */
-const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1"];
+const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"];
 
 function installedRuntimeRoot(): string | undefined {
   for (const dir of findInstalledAgentDirs()) {

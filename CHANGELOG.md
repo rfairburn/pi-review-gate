@@ -15,6 +15,31 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.275]
+
+### Changed
+
+- **Support Pi 1.5.2 as the managed default (#647)**: the launcher's provisioned
+  managed Pi fallback, the pinned `pi-session-host-tui` TUI dependency, the locked
+  CI Pi agent-core and full-runtime fixtures, and the current native-acceptance
+  guidance all move from Pi 1.5.1 to Pi 1.5.2. Precedence is unchanged: an explicit
+  `--pi-executable`, `PI_REVIEW_GATE_PI_BIN`, `PI_AGENT`, or npm-global/`PATH`
+  selection still wins and is never replaced by the managed default, and the
+  session-host minimum stable Pi CLI version stays 1.0.4. A managed cache recorded
+  for the previous default is no longer used implicitly for the new default, while
+  an explicit selection of that older version keeps resolving it. Pi 1.3.0, 1.4.0,
+  1.5.0, and 1.5.1 stay supported and audited; the bundled clipboard-provenance
+  adapter certifies 1.5.2 only after source verification that its shipped
+  `dist/utils/clipboard.js`, selection copy frames, bundled Main copy-command alias,
+  and 100,000-character encoded OSC 52 bound match the audited contract, so any
+  other runtime still fails closed. Copied provenance that 1.5.2 does not change is
+  left at Pi v1.5.0: the sidebar theme colour table, the saved-session search
+  grammar, and the scrollbar geometry. The published 1.5.2 coding-agent change is
+  the missing-session-cwd `Continue`/`Fork`/`Cancel` chooser plus an Anthropic OAuth
+  client version, and the published `@earendil-works/pi-tui` and
+  `@earendil-works/pi-agent-core` 1.5.2 trees are byte-identical to 1.5.1, so no
+  gate behaviour moves.
+
 ## [0.1.0-dev.274]
 
 ### Fixed

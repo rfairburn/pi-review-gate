@@ -324,7 +324,7 @@ function readManifest(path: string): Record<string, unknown> | null | undefined 
  * 100,000-character encoded OSC 52 bound. Any version outside this set stays
  * `supported: false` and fails closed.
  */
-const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1"]);
+const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"]);
 
 /** Bounded inspection of the actual CLI's package, never an ambient SDK instance. */
 export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRuntime | undefined {
@@ -394,7 +394,7 @@ export function isNativeClipboardOrigin(
       return path !== undefined && (nativeSource(runtime, frame.scriptName)
         || (runtime.tuiRoot !== undefined && path === join(runtime.tuiRoot, "dist", "tui-alt-screen.js")));
     });
-  // The shipped 1.3.0, 1.4.0, 1.5.0, and 1.5.1 bundles name their self-referencing class _InteractiveMode;
+  // The shipped 1.3.0, 1.4.0, 1.5.0, 1.5.1, and 1.5.2 bundles name their self-referencing class _InteractiveMode;
   // the unbundled public SDK uses InteractiveMode. Both were source-verified.
   const mainCopy = frames.some((frame) => (frame.functionName === "InteractiveMode.handleCopyCommand"
     || frame.functionName === "_InteractiveMode.handleCopyCommand") && nativeSource(runtime, frame.scriptName));

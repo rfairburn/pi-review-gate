@@ -2362,7 +2362,7 @@ test("a valid cached runtime is reused without any npm invocation", async (t) =>
 // historical 1.3.0 pin and the release that was the managed default immediately
 // before the current one.
 const STALE_MANAGED_PI_VERSION = "1.3.0";
-const PREVIOUS_MANAGED_PI_VERSION = "1.5.0";
+const PREVIOUS_MANAGED_PI_VERSION = "1.5.1";
 
 /**
  * Write exactly the record a previous build's writer produced for its own

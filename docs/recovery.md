@@ -1,159 +1,175 @@
 # Recovery
 
-This page owns crash recovery for landing manifests, session-scoped restart recovery,
-executor retry and failover, and what shutdown preserves or removes. Conflict resolution
-steps for the live gate live in
+This page owns crash recovery for landing manifests, session-scoped restart
+recovery, executor retry and failover, and what shutdown preserves or removes.
+Conflict resolution steps for the live gate live in
 [Delegated execution](delegated-execution.md#conflicts-and-gates).
 
 ## Session-host roster recovery
 
-The `pi-review-sessions` session host keeps one ordered sidebar roster in the canonical
-Pi agent directory (`PI_CODING_AGENT_DIR`, otherwise Pi's ordinary `~/.pi/agent`) and
-restores it automatically at startup from any launch directory. Restoration is not
-process recovery: no existing or detached process is discovered, adopted, or revived.
-Each remembered entry is restarted only when a fresh saved-conversation listing admits
-that exact conversation in the exact remembered workspace, and then as a new independently
-owned child. Entries that are unsaved, missing, ambiguous, replaced, workspace-changed,
-unsafe, refused, or never observed to have a conversation are
-not restarted and are never replaced by a fresh session; they stay visible at their
-remembered roster position as bounded
-error rows with a truthful reason until deliberately removed, and activating one never
-changes the active input owner. A row that never reported any conversation metadata stays
-remembered rather than disappearing. Quit stops owned children
-without forgetting the roster, explicit removal forgets exactly one entry, and exclusive
-ownership of the agent directory is released only once owned shutdown settled with positive
-child-state evidence. Malformed
-or unreadable roster state is reported and preserved untouched, so a damaged read never
-erases a valid roster; a symlinked, FIFO, or otherwise unsafe roster or ownership entry is
-refused without ever being opened or read.
+The `pi-review-sessions` session host keeps one ordered sidebar roster in the
+canonical Pi agent directory (`PI_CODING_AGENT_DIR`, otherwise Pi's ordinary
+`~/.pi/agent`) and restores it automatically at startup from any launch
+directory. Restoration is not process recovery: no existing or detached process
+is discovered, adopted, or revived. Each remembered entry is restarted only when
+a fresh saved-conversation listing admits that exact conversation in the exact
+remembered workspace, and then as a new independently owned child. Entries that
+are unsaved, missing, ambiguous, replaced, workspace-changed, unsafe, refused,
+or never observed to have a conversation are not restarted and are never
+replaced by a fresh session; they stay visible at their remembered roster
+position as bounded error rows with a truthful reason until deliberately
+removed, and activating one never changes the active input owner. A row that
+never reported any conversation metadata stays remembered rather than
+disappearing. Quit stops owned children without forgetting the roster, explicit
+removal forgets exactly one entry, and exclusive ownership of the agent
+directory is released only once owned shutdown settled with positive child-state
+evidence. Malformed or unreadable roster state is reported and preserved
+untouched, so a damaged read never erases a valid roster; a symlinked, FIFO, or
+otherwise unsafe roster or ownership entry is refused without ever being opened
+or read.
 
 ### Session-host activity status recovery
 
-Sidebar activity counts are live-runtime telemetry, never saved-conversation or roster
-state. Loading a saved conversation creates a new owning runtime rather than attaching to
-the former process; when that load admits or resumes no work, its first successful
-loaded/Ready presentation reports known idle agent status and zero background activity,
-and former counts, busy state, or unknown telemetry are not replayed. Work that actually
-starts or resumes is tracked from current lifecycle observations.
+Sidebar activity counts are live-runtime telemetry, never saved-conversation or
+roster state. Loading a saved conversation creates a new owning runtime rather
+than attaching to the former process; when that load admits or resumes no work,
+its first successful loaded/Ready presentation reports known idle agent status
+and zero background activity, and former counts, busy state, or unknown
+telemetry are not replayed. Work that actually starts or resumes is tracked from
+current lifecycle observations.
 
-Independent recovery discards only the affected stale ephemeral telemetry understanding
-and asks the owning client for its complete authoritative current census from live
-sources. A healthy client re-establishes its actual zero or nonzero value, including
-after repeated later episodes and without a new prompt, task, manual refresh, or client
-restart. That live-source census is separate from historical cleanup uncertainty, and an
-explicit source refresh re-observes every source even when some are cached. Recovery is
-event-driven over one bounded authenticated host-to-client request per attempt; it adds
-no periodic or global polling. Durable task/group/review/recovery records,
-ownership/security identities, and stop/remove safeguards are preserved, unreachable or
-incomplete live evidence stays unknown, and recovery never coerces a status to zero,
-erases a lost owner's retained state, restarts a client, purges a cache, or reconstructs
-arbitrary destroyed source state. See
+Independent recovery discards only the affected stale ephemeral telemetry
+understanding and asks the owning client for its complete authoritative current
+census from live sources. A healthy client re-establishes its actual zero or
+nonzero value, including after repeated later episodes and without a new prompt,
+task, manual refresh, or client restart. That live-source census is separate
+from historical cleanup uncertainty, and an explicit source refresh re-observes
+every source even when some are cached. Recovery is event-driven over one
+bounded authenticated host-to-client request per attempt; it adds no periodic or
+global polling. Durable task/group/review/recovery records, ownership/security
+identities, and stop/remove safeguards are preserved, unreachable or incomplete
+live evidence stays unknown, and recovery never coerces a status to zero, erases
+a lost owner's retained state, restarts a client, purges a cache, or
+reconstructs arbitrary destroyed source state. See
 [Session host — Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity).
 
 ### Session-host Network storage refusal
 
-An unsafe, unreadable, damaged, or missing-initialized Network document leaves only
-Network unavailable; local sessions and the roster are unaffected. The Network pane shows
-a fixed reason and mitigation, never defaults, and nothing is reset or regenerated. An
-access-permission refusal can be repaired only through the explicit confirmation in
+An unsafe, unreadable, damaged, or missing-initialized Network document leaves
+only Network unavailable; local sessions and the roster are unaffected. The
+Network pane shows a fixed reason and mitigation, never defaults, and nothing is
+reset or regenerated. An access-permission refusal can be repaired only through
+the explicit confirmation in
 [Repairing Network storage permissions](session-host-alpha.md#repairing-network-storage-permissions),
-after which the host must be restarted. Retiring a possibly exposed key is the separate
+after which the host must be restarted. Retiring a possibly exposed key is the
+separate
 [manual identity replacement](session-host-alpha.md#manually-replacing-the-network-identity).
 
 ## Session-scoped restart recovery
 
-The extension does not globally scan the filesystem for arbitrary landing manifests at
-startup. Review and execution associations restore only when the same Pi conversation
-and session file are resumed from the matching cwd. Review and execution recovery state
-is scoped to the exact Pi conversation. The normal restart flow — launching into a
-temporary/default session and then running `/resume <session>` — loads the selected
-conversation in a fresh extension runtime and restores only that conversation's
-integrity-checked sidecar state. The temporary startup session is shut down and cannot
-leak its review window or execution associations into the resumed session.
+The extension does not globally scan the filesystem for arbitrary landing
+manifests at startup. Review and execution associations restore only when the
+same Pi conversation and session file are resumed from the matching cwd. Review
+and execution recovery state is scoped to the exact Pi conversation. The normal
+restart flow — launching into a temporary/default session and then running
+`/resume <session>` — loads the selected conversation in a fresh extension
+runtime and restores only that conversation's integrity-checked sidecar state.
+The temporary startup session is shut down and cannot leak its review window or
+execution associations into the resumed session.
 
-A failed session-sidecar publication attempts to remove only the unpublished temporary
-file created by that write. Cleanup is best-effort: removal failure never hides the
-publication error, and the previous committed sidecar, pre-existing collisions, and
-other writers' temporary files are preserved. Successful publication and restore are
-unchanged; this is not post-crash cleanup of unknown retained files.
+A failed session-sidecar publication attempts to remove only the unpublished
+temporary file created by that write. Cleanup is best-effort: removal failure
+never hides the publication error, and the previous committed sidecar,
+pre-existing collisions, and other writers' temporary files are preserved.
+Successful publication and restore are unchanged; this is not post-crash cleanup
+of unknown retained files.
 
-Restored state includes review baselines/evidence, pending model deliveries, execution
-groups, operation bundles, task definitions, activity, commands, incidents, checkpoints,
-and conflict gates. A live or uncertain owner blocks another writer; a confirmed-dead
-writer can be reconciled into a freshly reverified checkpoint before an explicit
-continuation. A stopped task with a durable bundle is then queued for continuation, and
-that continuation reconciles verified in-progress or recovery-required landing manifests
-before allowing further source mutation. Continuation itself stays checkpoint-verified
-by default; the explicit `inPlace: true` exception for a checkpoint staging or
+Restored state includes review baselines/evidence, pending model deliveries,
+execution groups, operation bundles, task definitions, activity, commands,
+incidents, checkpoints, and conflict gates. A live or uncertain owner blocks
+another writer; a confirmed-dead writer can be reconciled into a freshly
+reverified checkpoint before an explicit continuation. A stopped task with a
+durable bundle is then queued for continuation, and that continuation reconciles
+verified in-progress or recovery-required landing manifests before allowing
+further source mutation. Continuation itself stays checkpoint-verified by
+default; the explicit `inPlace: true` exception for a checkpoint staging or
 verification failure is owned by
 [Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling).
 
-Restored review windows reconcile to the current reviewer configuration. The persisted
-sidecar records which review settings produced it; when those settings changed before
-the reload, the window continues with the currently configured reviewers instead of
-blocking for a manual clear. The preserved baseline, accumulated evidence, and completed
-history are never rewritten: historical results keep the identity of the configuration
-that ran them, and resolvable reviewers under the new settings review the same
-evidence. A label/count-only notice reports the reconciliation (no prompts or secrets).
-The same reconciliation applies in-session: saving new reviewer settings through
-`/review-settings` immediately reconciles open review windows, so a window frozen with
-an outdated or empty selection does not wait for a reload; an in-flight review finishes
-under its original selection and later reviews use the new one. Genuine corruption still
-fails closed during restore: integrity, conversation, and cwd validation reject the
-sidecar before any state is applied. Superseded-format sidecars are likewise never
-guessed at: persisted snapshots predating the omission ledger fail restore with an
-actionable diagnostic while the file is preserved untouched, and sidecars whose
-persisted review window lacks the reviewer-selection digest likewise fail restore with
-an actionable diagnostic while the file is preserved untouched (records without a
-review window remain restorable).
+Restored review windows reconcile to the current reviewer configuration. The
+persisted sidecar records which review settings produced it; when those settings
+changed before the reload, the window continues with the currently configured
+reviewers instead of blocking for a manual clear. The preserved baseline,
+accumulated evidence, and completed history are never rewritten: historical
+results keep the identity of the configuration that ran them, and resolvable
+reviewers under the new settings review the same evidence. A label/count-only
+notice reports the reconciliation (no prompts or secrets). The same
+reconciliation applies in-session: saving new reviewer settings through
+`/review-settings` immediately reconciles open review windows, so a window
+frozen with an outdated or empty selection does not wait for a reload; an
+in-flight review finishes under its original selection and later reviews use the
+new one. Genuine corruption still fails closed during restore: integrity,
+conversation, and cwd validation reject the sidecar before any state is applied.
+Superseded-format sidecars are likewise never guessed at: persisted snapshots
+predating the omission ledger fail restore with an actionable diagnostic while
+the file is preserved untouched, and sidecars whose persisted review window
+lacks the reviewer-selection digest likewise fail restore with an actionable
+diagnostic while the file is preserved untouched (records without a review
+window remain restorable).
 
-Queued inputs from a review interrupted by restart are not reordered automatically: use
-`/review-now` to finish the review and release them, or `/review-clear` to cancel them
-(see [Review workflow](review-workflow.md#commands)). Queued inputs recorded before
-durable delivery tracking have no active delivery record, so they cannot be released
-through `/review-now`; recovery notices identify them separately, and their contents
-stay preserved until cancelled with `/review-clear`.
+Queued inputs from a review interrupted by restart are not reordered
+automatically: use `/review-now` to finish the review and release them, or
+`/review-clear` to cancel them (see
+[Review workflow](review-workflow.md#commands)). Queued inputs recorded before
+durable delivery tracking have no active delivery record, so they cannot be
+released through `/review-now`; recovery notices identify them separately, and
+their contents stay preserved until cancelled with `/review-clear`.
 
-Manifests outside that exact restored association remain explicit recovery operations
-through `recoverLandingManifest()`. A different conversation, session file, or cwd never
-silently adopts them.
+Manifests outside that exact restored association remain explicit recovery
+operations through `recoverLandingManifest()`. A different conversation, session
+file, or cwd never silently adopts them.
 
 ## Review evidence failure and fallback
 
-The optional `review.evidence.snapshotFailureFallback` setting defaults **On**; an
-explicit `false` stays Off. A snapshot capture failure remains blocking unless the failed
-operation qualifies as review-evidence capture only. With fallback explicitly Off, an
-eligible Primary review-baseline failure warns that review is disabled for that turn
-and the work continues unreviewed, with no Tools only substitute or reviewed result;
-other failures with Off still block. When eligible and On, fallback
-uses retained current tool evidence with a durable, truthful tool-only basis and a
-prominent warning identifying the originating review context (for Primary, a local
-user-only warning that never becomes model input or starts a model turn; for workers,
-also delivered to the worker's implementing model); reviewer input discloses the same
-basis and missing snapshot coverage. A menu description, log entry, or optional notice alone is not the warning.
-A fallback is not approval, reconstructed snapshot coverage, or a successful recovery
-checkpoint. See [Review workflow](review-workflow.md#snapshot-failure-fallback).
+The optional `review.evidence.snapshotFailureFallback` setting defaults **On**;
+an explicit `false` stays Off. A snapshot capture failure remains blocking
+unless the failed operation qualifies as review-evidence capture only. With
+fallback explicitly Off, an eligible Primary review-baseline failure warns that
+review is disabled for that turn and the work continues unreviewed, with no
+Tools only substitute or reviewed result; other failures with Off still block.
+When eligible and On, fallback uses retained current tool evidence with a
+durable, truthful tool-only basis and a prominent warning identifying the
+originating review context (for Primary, a local user-only warning that never
+becomes model input or starts a model turn; for workers, also delivered to the
+worker's implementing model); reviewer input discloses the same basis and
+missing snapshot coverage. A menu description, log entry, or optional notice
+alone is not the warning. A fallback is not approval, reconstructed snapshot
+coverage, or a successful recovery checkpoint. See
+[Review workflow](review-workflow.md#snapshot-failure-fallback).
 
-Enabled fallback is allowed on the **first Primary or InPlace review-baseline capture
-before work**. That initial failure can establish a durable tool-only basis with the
-warning instead of blocking solely for the unavailable review snapshot. It must not be
-confused with losing an existing basis after execution: missing, corrupt, unverifiable,
-or mismatched persisted evidence remains blocking, including an InPlace continuation
-with no terminal result. Never delete a baseline to try to activate fallback or silently
-re-baseline over prior work.
+Enabled fallback is allowed on the **first Primary or InPlace review-baseline
+capture before work**. That initial failure can establish a durable tool-only
+basis with the warning instead of blocking solely for the unavailable review
+snapshot. It must not be confused with losing an existing basis after execution:
+missing, corrupt, unverifiable, or mismatched persisted evidence remains
+blocking, including an InPlace continuation with no terminal result. Never
+delete a baseline to try to activate fallback or silently re-baseline over prior
+work.
 
 An eligible Primary fallback makes Primary act as Tools only for the rest of the
-session: no later capture retries or repeated warnings, and no automatic review for
-no-change or read-only turns. To try snapshots again within the session, use
-`/review-clear` (it also discards the current review window); the next prompt captures
-once under the configured preference. A new session also resumes it. Worker fallback is
-not sticky: when captured worker policy prefers snapshots, retry capture on later
-cycles/continuations and warn prominently on each actual worker fallback. A later
-successful baseline cannot fabricate earlier coverage or discard retained current-work
-tool evidence. Missing/unavailable structured observations do not block degraded review:
-show as much retained evidence as collected, disclose adapter/capture limits, and permit
-assessment of clearly provenance-labelled claims/context. Absence of observations is not
-proof of clean work or no effects; it is distinct from the blocking integrity failures below.
+session: no later capture retries or repeated warnings, and no automatic review
+for no-change or read-only turns. To try snapshots again within the session, use
+`/review-clear` (it also discards the current review window); the next prompt
+captures once under the configured preference. A new session also resumes it.
+Worker fallback is not sticky: when captured worker policy prefers snapshots,
+retry capture on later cycles/continuations and warn prominently on each actual
+worker fallback. A later successful baseline cannot fabricate earlier coverage
+or discard retained current-work tool evidence. Missing/unavailable structured
+observations do not block degraded review: show as much retained evidence as
+collected, disclose adapter/capture limits, and permit assessment of clearly
+provenance-labelled claims/context. Absence of observations is not proof of
+clean work or no effects; it is distinct from the blocking integrity failures
+below.
 
 The following remain governed by their ordinary fail-closed rules, not fallback:
 
@@ -168,23 +184,24 @@ its durable role cannot be replaced by tool history. Do not retry by treating ev
 snapshot-related error as eligible. Ordinary reviewer aggregation is unchanged; fallback
 never converts an execution error into a verdict or suppresses any reviewer's result.
 
-Retained evidence keeps its truthful recorded basis. Workers capture applicable evidence
-and fallback policy at firing/queue admission: each Start/Add task independently, scheduled
-tasks at actual firing, not schedule creation. Live changes do not switch already queued
-or running tasks through corrections, retries, or continuations; later Add tasks capture
-the then-current live choice. This does not freeze all routes or reviewer selections.
-For Primary, applying **Tools + workspace changes → Tools only** deliberately resets
-the current evidence with a prominent warning; **Tools only → Tools + workspace changes**
-keeps evidence and establishes a new snapshot baseline, not retroactive coverage.
-This is distinct from reviewer-selection reconciliation above. See
+Retained evidence keeps its truthful recorded basis. Workers capture applicable
+evidence and fallback policy at firing/queue admission: each Start/Add task
+independently, scheduled tasks at actual firing, not schedule creation. Live
+changes do not switch already queued or running tasks through corrections,
+retries, or continuations; later Add tasks capture the then-current live choice.
+This does not freeze all routes or reviewer selections. For Primary, applying
+**Tools + workspace changes → Tools only** deliberately resets the current
+evidence with a prominent warning; **Tools only → Tools + workspace changes**
+keeps evidence and establishes a new snapshot baseline, not retroactive
+coverage. This is distinct from reviewer-selection reconciliation above. See
 [Settings](settings.md#evidence-methods) for apply/save/cancel behavior.
 
 ## Crash recovery for landing manifests
 
-When a wave landing is in progress, a recovery manifest is written atomically under
-`<waveRoot>/landing/manifest-<txId>.json` before any filesystem mutations. If the
-process dies mid-landing, the manifest remains in `in_progress` or `recovery_required`
-state with backup artifacts preserved.
+When a wave landing is in progress, a recovery manifest is written atomically
+under `<waveRoot>/landing/manifest-<txId>.json` before any filesystem mutations.
+If the process dies mid-landing, the manifest remains in `in_progress` or
+`recovery_required` state with backup artifacts preserved.
 
 ### Manifest location
 
@@ -194,21 +211,21 @@ Recovery manifests live in the wave root directory:
 <waveRoot>/landing/manifest-<uuid>.json
 ```
 
-The wave root is the parent of the private bare Git repository created during capture.
-Each manifest is scoped to a single transaction via a unique UUID.
+The wave root is the parent of the private bare Git repository created during
+capture. Each manifest is scoped to a single transaction via a unique UUID.
 
 The wave root's own capture record — `<waveRoot>/capture.json`, reloaded by
-continuation, landing, and recovery — is published through the shared durable atomic
-writer: the complete record is staged in an owned same-directory temporary file,
-file-synced, and atomically renamed onto its final name before a successful capture
-returns, so a reader sees either the complete record or none. Directory sync stays
-best-effort, and a missing, truncated, mismatched, or unsupported record stays
-refused rather than repaired.
+continuation, landing, and recovery — is published through the shared durable
+atomic writer: the complete record is staged in an owned same-directory
+temporary file, file-synced, and atomically renamed onto its final name before a
+successful capture returns, so a reader sees either the complete record or none.
+Directory sync stays best-effort, and a missing, truncated, mismatched, or
+unsupported record stays refused rather than repaired.
 
 ### Recovery API
 
-The `recoverLandingManifest(manifestPath)` function in `src/execution/wave-landing.ts`
-recovers a crashed landing transaction:
+The `recoverLandingManifest(manifestPath)` function in
+`src/execution/wave-landing.ts` recovers a crashed landing transaction:
 
 ```typescript
 import { recoverLandingManifest } from "../src/execution/wave-landing";
@@ -224,27 +241,27 @@ const result = await recoverLandingManifest("/path/to/manifest.json");
 
 ### Recovery behavior
 
-- **Source root identity**: Recovery verifies the source root's dev+ino matches the
-  manifest. If the directory was replaced or moved, recovery is rejected.
-- **Path confinement**: All destination, temp, and backup paths must reside within the
-  source root. Path-escaping manifests are rejected.
-- **Concurrent modifications**: If a destination was modified after the transaction
-  installed it, recovery preserves both the newer destination and the original backup,
-  marking the manifest `recovery_required`.
+- **Source root identity**: Recovery verifies the source root's dev+ino matches
+  the manifest. If the directory was replaced or moved, recovery is rejected.
+- **Path confinement**: All destination, temp, and backup paths must reside
+  within the source root. Path-escaping manifests are rejected.
+- **Concurrent modifications**: If a destination was modified after the
+  transaction installed it, recovery preserves both the newer destination and
+  the original backup, marking the manifest `recovery_required`.
 - **Idempotency**: Running recovery twice on the same manifest is safe. The first call
   restores paths and marks the manifest `rolled_back`; the second call cleans stale
   temps.
-- **No Git mutation**: Recovery never invokes Git staging, reset, or apply commands. It
-  only manipulates filesystem artifacts.
-- **Artifact preservation on manual_required**: When recovery detects a concurrent
-  modification and returns `manual_required`, ALL artifacts (temps, backups,
-  destinations, directories) are preserved for diagnosis. No cleanup occurs until the
-  user resolves the conflict.
+- **No Git mutation**: Recovery never invokes Git staging, reset, or apply
+  commands. It only manipulates filesystem artifacts.
+- **Artifact preservation on manual_required**: When recovery detects a
+  concurrent modification and returns `manual_required`, ALL artifacts (temps,
+  backups, destinations, directories) are preserved for diagnosis. No cleanup
+  occurs until the user resolves the conflict.
 - **Created directories caveat**: Post-crash recovery never removes
-  `manifest.createdDirs` entries because the manifest is untrusted and there is no
-  durable proof an empty directory was transaction-created. Harmless empty directories
-  may remain after recovery. Live in-process rollback (during `executeWaveLanding`)
-  continues removing its trusted in-memory `createdDirs`.
+  `manifest.createdDirs` entries because the manifest is untrusted and there is
+  no durable proof an empty directory was transaction-created. Harmless empty
+  directories may remain after recovery. Live in-process rollback (during
+  `executeWaveLanding`) continues removing its trusted in-memory `createdDirs`.
 
 ### Manual recovery steps
 
@@ -258,54 +275,60 @@ When recovery returns `manual_required`:
 
 ## Executor retry, failover, and compaction
 
-Executor failures are checkpointed to a protected recovery ref before bounded retry
-(configured by the retry policy, see
-[Configuration](configuration.md#delegated-execution-fields)). If same-executor recovery
-is exhausted, a verified checkpoint may be handed to the next lower-priority pool entry.
-That adapter starts a new native session in the same isolated worktree, so different
-providers and CLI harnesses can take over without pretending to share conversation
-state. Durable diagnostics include the complete executor assignment history, and every
-failover is announced explicitly in the activity stream; later turns — corrections,
-steering, pass confirmation, and continuations — always follow the successor that
-actually served the previous turn.
+Executor failures are checkpointed to a protected recovery ref before bounded
+retry (configured by the retry policy, see
+[Configuration](configuration.md#delegated-execution-fields)). If same-executor
+recovery is exhausted, a verified checkpoint may be handed to the next
+lower-priority pool entry. That adapter starts a new native session in the same
+isolated worktree, so different providers and CLI harnesses can take over
+without pretending to share conversation state. Durable diagnostics include the
+complete executor assignment history, and every failover is announced explicitly
+in the activity stream; later turns — corrections, steering, pass confirmation,
+and continuations — always follow the successor that actually served the
+previous turn.
 
 A persisted executor session is resumed only when the durable record proves
-compatibility with the effective assignment: the recorded selection must match, and
-for external agents — whose id is a mutable catalog handle — the id must still resolve
-to the same adapter/command/model fingerprint recorded at session creation. A changed
-assignment, an unverifiable legacy record (no recorded selection or fingerprint), or a
-re-pointed agent id therefore starts a new session from the verified checkpoint with an
-explicit announcement instead of silently resuming an incompatible session.
+compatibility with the effective assignment: the recorded selection must match,
+and for external agents — whose id is a mutable catalog handle — the id must
+still resolve to the same adapter/command/model fingerprint recorded at session
+creation. A changed assignment, an unverifiable legacy record (no recorded
+selection or fingerprint), or a re-pointed agent id therefore starts a new
+session from the verified checkpoint with an explicit announcement instead of
+silently resuming an incompatible session.
 
 Compaction is a lifecycle transition: an interrupted Pi session is reopened by exact
 UUID, explicitly compacted through Pi RPC, and only then prompted to continue.
 
-Non-landed results include the worktree, session, attempts, incidents, changed paths,
-verified checkpoint, hashed artifact inventory, current bundle, and safe next actions
-(see [Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling)).
+Non-landed results include the worktree, session, attempts, incidents, changed
+paths, verified checkpoint, hashed artifact inventory, current bundle, and safe
+next actions (see
+[Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling)).
 A restarted task warns when its prior runtime configuration differs.
 
 ## Worker worktree branch-checkout damage
 
-Worker prompts carry an authoritative workspace contract: a managed worktree is a
-detached-HEAD worktree at a synthetic captured base (which already contains the target
-workspace's uncommitted content), the task's named issue branch belongs to the target
-capture/landing checkout, and the harness owns checkpointing and landing. A worker that
-nonetheless checks out a branch inside its managed worktree has its HEAD attached and, when the branch's commit differs from the current
-commit, its tree reset to that branch's committed state (same-commit branch creation
-changes only HEAD attachment); checkpoint validation fails closed and
-blocks review or landing for that worktree.
+Worker prompts carry an authoritative workspace contract: a managed worktree is
+a detached-HEAD worktree at a synthetic captured base (which already contains
+the target workspace's uncommitted content), the task's named issue branch
+belongs to the target capture/landing checkout, and
+the harness owns checkpointing and landing. A worker that nonetheless checks out
+a branch inside its managed worktree has its HEAD attached and, when the
+branch's commit differs from the current commit, its tree reset to that branch's
+committed state (same-commit branch creation changes only HEAD attachment);
+checkpoint validation fails closed and blocks review or landing for that
+worktree.
 
-There is no automatic repair for this case. The shipped orchestrator skill's recovery
-runbook documents verified, current-capability manual salvage: verify the quiesced
-writer and worktree identity, pin retained commits and stashed uncommitted content to
-create-only refs in the wave's private repository, export the retained material for
-explicit user-authorized manual application in the target checkout (read-only for the
-worktree), and restore detachment without changing the working tree only when attempting
-normal continuation. Detachment alone does not create, verify, or
-revalidate any durable checkpoint, and content already destroyed by the checkout is
-reported as lost rather than guessed at. See the shipped orchestrator skill's recovery
-runbook (`skills/pi-review-gate-orchestrator/references/recovery.md`) and
+There is no automatic repair for this case. The shipped orchestrator skill's
+recovery runbook documents verified, current-capability manual salvage: verify
+the quiesced writer and worktree identity, pin retained commits and stashed
+uncommitted content to create-only refs in the wave's private repository, export
+the retained material for explicit user-authorized manual application in the
+target checkout (read-only for the worktree), and restore detachment without
+changing the working tree only when attempting normal continuation. Detachment
+alone does not create, verify, or revalidate any durable checkpoint, and content
+already destroyed by the checkout is reported as lost rather than guessed at.
+See the shipped orchestrator skill's recovery runbook
+(`skills/pi-review-gate-orchestrator/references/recovery.md`) and
 [Delegated execution](delegated-execution.md#landing-and-source-preservation).
 
 ## What shutdown preserves and removes
@@ -318,47 +341,51 @@ diagnosis ([Delegated execution](delegated-execution.md#landing-and-source-prese
 
 ## Explicit salvage of worker work without a checkpoint
 
-Some failed tasks never produce an ordinary verified checkpoint: the executor left the
-worktree on an attached branch, was interrupted before normalization, or the operation
-ended in a failed critical state. A stopped execute task with no verified checkpoint,
-such as after checkpoint staging or verification failure, can instead be resumed through an explicit
-`SubtasksContinue` with `inPlace: true`, but only while its retained managed worktree is
-intact, on a detached HEAD, and passes the read-only in-place preflight (writer, task,
-wave, HEAD, and landing-recovery safety — see
+Some failed tasks never produce an ordinary verified checkpoint: the executor
+left the worktree on an attached branch, was interrupted before normalization,
+or the operation ended in a failed critical state. A stopped execute task with
+no verified checkpoint, such as after checkpoint staging or verification
+failure, can instead be resumed through an explicit `SubtasksContinue` with
+`inPlace: true`, but only while its retained managed worktree is intact, on a
+detached HEAD, and passes the read-only in-place preflight (writer, task, wave,
+HEAD, and landing-recovery safety — see
 [Delegated execution](delegated-execution.md#steering-continuation-and-failure-handling));
-an ordinary `SubtasksContinue` still cannot resume an unverified task, but an explicit
-`SubtasksForceMerge` can still salvage an identified snapshot of the worker's
-actual work — retained commits, staged and unstaged edits, and task-created files —
-without requiring any ordinary lifecycle eligibility.
+an ordinary `SubtasksContinue` still cannot resume an unverified task, but an
+explicit `SubtasksForceMerge` can still salvage an identified snapshot of the
+worker's actual work — retained commits, staged and unstaged edits, and
+task-created files — without requiring any ordinary lifecycle eligibility.
 
 - **Source identification.** While the worker worktree is retained it is the
-  authoritative source. After clean-worktree cleanup, surviving refs in the private
-  repository are enumerated; a ref is a candidate only when part of its delta against
-  the captured base is provably worker-created (proven by object identity against the
-  target repository, not by branch name or timestamp). Because that repository is
-shared by every task of the group, a ref is selected only when durable
-checkpoint-failure incident evidence attributes it to this task, or when it is the
-sole candidate and no sibling task can own it. Otherwise the candidates are surfaced
-and nothing is transferred.
-- **Attribution.** The captured base is synthetic and includes the target's uncommitted
-  files, which no source branch can contain. A path present in the base but absent from
-  the source's own history is a baseline-only file abandoned by the checkout — never an
-  assumed worker deletion. When the source derives from the captured base, every delta
-  is session-local; otherwise committed changes are attributed only when every commit
-  that touched the path since the shared ancestor was created during the task's
-  session. Ambiguous paths are excluded and reported.
-- **What salvage does not do.** It captures without mutating the worktree or its index,
-  asserts no review status, fabricates no normal checkpoint, publishes no continuation
-  bundle for unverified work, changes no ordinary lifecycle state, and never auto-lands
-delayed work afterward. Forced-salvage provenance (source, transferred paths, and the
-  baseline-only/ambiguous exclusions) is recorded durably on the task command and as an
-operation incident so the source evidence explains what happened to it.
-- **Landing semantics.** The salvaged candidate lands through the ordinary tree-diff
-  landing path: the same conflict gate, force-merge marker materialization, rollback
-  protection, and manual-inspection requirement. Conflicting target content is preserved
-  or materialized as markers — never silently overwritten. Forced-salvage provenance is
-recorded in every outcome, including a conflicted force-merge landing that transfers
-the non-conflicting paths.
+  authoritative source. After clean-worktree cleanup, surviving refs in the
+  private repository are enumerated; a ref is a candidate only when part of its
+  delta against the captured base is provably worker-created (proven by object
+  identity against the target repository, not by branch name or timestamp).
+  Because that repository is shared by every task of the group, a ref is
+  selected only when durable checkpoint-failure incident evidence attributes it
+  to this task, or when it is the sole candidate and no sibling task can own it.
+  Otherwise the candidates are surfaced and nothing is transferred.
+- **Attribution.** The captured base is synthetic and includes the target's
+  uncommitted files, which no source branch can contain. A path present in the
+  base but absent from the source's own history is a baseline-only file
+  abandoned by the checkout — never an assumed worker deletion. When the source
+  derives from the captured base, every delta is session-local; otherwise
+  committed changes are attributed only when every commit that touched the path
+  since the shared ancestor was created during the task's session. Ambiguous
+  paths are excluded and reported.
+- **What salvage does not do.** It captures without mutating the worktree or its
+  index, asserts no review status, fabricates no normal checkpoint, publishes no
+  continuation bundle for unverified work, changes no ordinary lifecycle state,
+  and never auto-lands delayed work afterward. Forced-salvage provenance
+  (source, transferred paths, and the baseline-only/ambiguous exclusions) is
+  recorded durably on the task command and as an operation incident so the
+  source evidence explains what happened to it.
+- **Landing semantics.** The salvaged candidate lands through the ordinary
+  tree-diff landing path: the same conflict gate, force-merge marker
+  materialization, rollback protection, and manual-inspection requirement.
+  Conflicting target content is preserved or materialized as markers — never
+  silently overwritten. Forced-salvage provenance is recorded in every outcome,
+  including a conflicted force-merge landing that transfers the non-conflicting
+  paths.
 
 The full product semantics live in
 [Delegated execution](delegated-execution.md#explicit-salvage).

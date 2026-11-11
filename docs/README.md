@@ -1,15 +1,16 @@
 # pi-review-gate documentation
 
-`pi-review-gate` is an external [pi](https://github.com/badlogic/pi-mono) extension that
-reviews code changes after an agent turn and sends the complete classified review pass
-back to the implementing model. The project also runs several independent native Pi
-sessions side by side in one terminal through the recommended `pi-review-sessions` session
-host, and provides delegated background execution, native web research tools, durable
-evidence bundles, and crash recovery.
+`pi-review-gate` is an external [pi](https://github.com/badlogic/pi-mono)
+extension that reviews code changes after an agent turn and sends the complete
+classified review pass back to the implementing model. The project also runs
+several independent native Pi sessions side by side in one terminal through the
+recommended `pi-review-sessions` session host, and provides delegated background
+execution, native web research tools, durable evidence bundles, and crash
+recovery.
 
-Start at the root [README](../README.md) for a product overview, prerequisites, and a
-minimal setup. Each page below is the single canonical owner of its topic; pages link to
-each other instead of duplicating detail.
+Start at the root [README](../README.md) for a product overview, prerequisites,
+and a minimal setup. Each page below is the single canonical owner of its topic;
+pages link to each other instead of duplicating detail.
 
 ## Documentation map
 
@@ -39,31 +40,38 @@ each other instead of duplicating detail.
 
 - **Evaluate the project:** root [README](../README.md), then
   [Getting started](getting-started.md).
-- **Launch and run Pi sessions:** [Getting started](getting-started.md#launching) for the
-  entry points, then [Session host](session-host-alpha.md) for the recommended sidebar
-  host and its limits.
+- **Launch and run Pi sessions:**
+  [Getting started](getting-started.md#launching) for the entry points, then
+  [Session host](session-host-alpha.md) for the recommended sidebar host and its
+  limits.
 - **Configure reviews day to day:** [Settings menu](settings.md),
-  [Configuration](configuration.md) for raw fields, then [Review workflow](review-workflow.md).
+  [Configuration](configuration.md) for raw fields, then
+  [Review workflow](review-workflow.md).
 - **Run background workers:** [Delegated execution](delegated-execution.md),
   [Subtask evidence](subtask-evidence.md), then [Recovery](recovery.md).
 - **Schedule work:** [Scheduled tasks](scheduled-tasks.md) with the
   [Settings menu](settings.md) for staged setup.
-- **Research and browse:** [Web tools](web-tools.md), [Browser guide](browser.md),
-  then [Browser approvals and permissions](browser-permissions.md) before enabling capabilities.
-- **Ask for user decisions or read notices:** [User questions and notices](user-questions.md).
+- **Research and browse:** [Web tools](web-tools.md),
+  [Browser guide](browser.md), then
+  [Browser approvals and permissions](browser-permissions.md) before enabling
+  capabilities.
+- **Ask for user decisions or read notices:**
+  [User questions and notices](user-questions.md).
 - **Assess risk:** [Security model](security-model.md).
 - **Extend or verify the codebase:** [Development](development.md).
 
 ## Reference material in the repository
 
-- Runnable config examples: [examples/](../examples) (single- and multi-reviewer,
-  delegated execution, and a deterministic fake reviewer for testing).
-- Attribution and license texts: [NOTICE](../NOTICE), [LICENSE](../LICENSE),
-  and [LICENSES/](../LICENSES).
+- Runnable config examples: [examples/](../examples) (single- and
+  multi-reviewer, delegated execution, and a deterministic fake reviewer for
+  testing).
+- Attribution and license texts: [NOTICE](../NOTICE), [LICENSE](../LICENSE), and
+  [LICENSES/](../LICENSES).
 - The shipped skills provisioned with the package:
   [skills/pi-review-gate-orchestrator/SKILL.md](../skills/pi-review-gate-orchestrator/SKILL.md),
   [skills/pi-review-gate-execution/SKILL.md](../skills/pi-review-gate-execution/SKILL.md),
-  [skills/pi-review-gate-research/SKILL.md](../skills/pi-review-gate-research/SKILL.md), and
+  [skills/pi-review-gate-research/SKILL.md](../skills/pi-review-gate-research/SKILL.md),
+  and
   [skills/pi-review-gate-completion/SKILL.md](../skills/pi-review-gate-completion/SKILL.md).
 
 ## Governance and contribution
@@ -73,9 +81,10 @@ each other instead of duplicating detail.
 - [SECURITY](../SECURITY.md) — private vulnerability reporting route.
 - [CHANGELOG](../CHANGELOG.md) — notable changes per build, with the preserved
   pre-adoption aggregate history.
-- [Releases](releases.md) — how each validated merge is published as a numbered prerelease,
-  and how a failed publication is recovered.
-- Issue and pull request templates, code ownership, and external review guidance live in
-  the source-only `.github/` directory of the checkout (not shipped in the npm package);
-  see the [review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
+- [Releases](releases.md) — how each validated merge is published as a numbered
+  prerelease, and how a failed publication is recovered.
+- Issue and pull request templates, code ownership, and external review guidance
+  live in the source-only `.github/` directory of the checkout (not shipped in
+  the npm package); see the
+  [review guidance](https://github.com/rfairburn/pi-review-gate/blob/main/.github/REVIEW_GUIDANCE.md)
   for reviewer expectations.

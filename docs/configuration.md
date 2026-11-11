@@ -1,56 +1,61 @@
 # Configuration
 
-This page owns the raw configuration reference: config discovery, kill switches, every
-JSON field with its default, operating modes and the mode-cycle hotkey, reviewer
-selections, catalogs, and imports, scoped tool-denial lists, delegated-execution
-defaults, Web fields, and legacy
-compatibility. The staged `/review-settings` menu is documented on the
-[Settings menu](settings.md#review-settings) page, and the scheduled-task feature guide
-lives on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields). Runtime behavior
+This page owns the raw configuration reference: config discovery, kill switches,
+every JSON field with its default, operating modes and the mode-cycle hotkey,
+reviewer selections, catalogs, and imports, scoped tool-denial lists,
+delegated-execution defaults, Web fields, and legacy compatibility. The staged
+`/review-settings` menu is documented on the
+[Settings menu](settings.md#review-settings) page, and the scheduled-task
+feature guide lives on
+[Scheduled tasks](scheduled-tasks.md#scheduled-task-fields). Runtime behavior
 described only briefly here is owned by the linked page.
 
 ## Config discovery
 
 - `PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json` selects the config file explicitly.
 - Without an explicit selection, two fixed implicit candidates are checked in order:
-  1. `review-gate.json` in the Pi agent directory — `~/.pi/agent/review-gate.json` by
-     default (`%USERPROFILE%\.pi\agent\review-gate.json` on Windows), following Pi's
+  1. `review-gate.json` in the Pi agent directory —
+     `~/.pi/agent/review-gate.json` by default
+     (`%USERPROFILE%\.pi\agent\review-gate.json` on Windows), following Pi's
      native `PI_CODING_AGENT_DIR` override when set.
-  2. `~/.config/pi-review-gate/config.json` — an implicit compatibility fallback.
-  There is no third implicit location, and nothing is copied or migrated between the
-  two candidates.
+  2. `~/.config/pi-review-gate/config.json` — an implicit compatibility
+  fallback. There is no third implicit location, and nothing is copied or
+  migrated between the two candidates.
 - The persistent launcher (`scripts/pi-review-gate.sh`) deliberately ignores an
-  inherited `PI_REVIEW_GATE_CONFIG` (it re-resolves and re-exports the variable itself)
-  so an inherited value from a parent pi session cannot silently redirect the gate
-  elsewhere. It selects the first existing candidate above — a config that exists only
-  at the fallback location remains selected unchanged. When neither exists, it
-  initializes a private zero-model default config at the default location — explicitly
-  empty reviewer and worker selections, never overwriting or replacing anything that is
-  already there — and continues normal startup.
+  inherited `PI_REVIEW_GATE_CONFIG` (it re-resolves and re-exports the variable
+  itself) so an inherited value from a parent pi session cannot silently
+  redirect the gate elsewhere. It selects the first existing candidate above — a
+  config that exists only at the fallback location remains selected unchanged.
+  When neither exists, it initializes a private zero-model default config at the
+  default location — explicitly empty reviewer and worker selections, never
+  overwriting or replacing anything that is already there — and continues normal
+  startup.
 - With no config file found on a direct `pi -e` load (no `PI_REVIEW_GATE_CONFIG` and
   neither persistent path), `enabled` defaults to `false`, so automatic review does not
   run — but the extension still loads `WebSearch`, `WebFetch`, `ApplyPatch`, and the
   background shell. Model-facing subtask tools require at least one resolvable configured
   worker resource. Only `PI_REVIEW_GATE_DISABLED` disables the whole extension.
-- The config file must be a JSON object. Startup reports invalid settings and uses
-  defaults for those settings while retaining valid values. An unreadable or
-  unparseable document uses built-in defaults; the file is never overwritten.
+- The config file must be a JSON object. Startup reports invalid settings and
+  uses defaults for those settings while retaining valid values. An unreadable
+  or unparseable document uses built-in defaults; the file is never overwritten.
 
 ## Kill switches
 
-- `PI_REVIEW_GATE_DISABLED=1` (truthy values `1`, `true`, `yes`) is the environment kill
-  switch: it disables the whole extension, including delegated execution. The launcher
-  warns loudly when it is set instead of silently swallowing it.
-- Top-level `enabled: false` is the automatic-review master switch only. It does **not**
-  disable configured worker routes or the optional `toolProtection` gate, which is
-  controlled only by its own `level`.
-- Clearing every reviewer for a review layer in `/review-settings` disables that layer's
-  automatic review without disabling delegated execution. The preserved review window
-  stays open (deferring each review with a notice) until reviewers are configured again
-  or the window is cleared explicitly; it never turns into a pass. Manual primary
-  review commands remain available while primary reviewers stay selected (see
-  [Review layers](#review-layers-and-the-legacy-activereviewers-import)); the stored
-  automatic-review toggles never gate them.
+- `PI_REVIEW_GATE_DISABLED=1` (truthy values `1`, `true`, `yes`) is the
+  environment kill switch: it disables the whole extension, including delegated
+  execution. The launcher warns loudly when it is set instead of silently
+  swallowing it.
+- Top-level `enabled: false` is the automatic-review master switch only. It does
+  **not** disable configured worker routes or the optional `toolProtection`
+  gate, which is controlled only by its own `level`.
+- Clearing every reviewer for a review layer in `/review-settings` disables that
+  layer's automatic review without disabling delegated execution. The preserved
+  review window stays open (deferring each review with a notice) until reviewers
+  are configured again or the window is cleared explicitly; it never turns into
+  a pass. Manual primary review commands remain available while primary
+  reviewers stay selected (see
+  [Review layers](#review-layers-and-the-legacy-activereviewers-import)); the
+  stored automatic-review toggles never gate them.
 
 ## Top-level fields
 
@@ -74,59 +79,64 @@ described only briefly here is owned by the linked page.
 
 ## Tool denial fields
 
-`tools` is a separate optional top-level object with two independent exact-name deny
-lists. Both default to empty arrays when missing, including when the object or config
-file predates these settings; an empty list denies nothing. Present lists must be
-arrays of literal tool names — a non-array, a non-string, an empty string, or a
-whitespace-padded name rejects that list with a startup warning and recovery to the
-empty default for that list only, while the other list and unrelated JSON keys are
-preserved. Names are matched exactly and are never trimmed, prefix-matched, or
-pattern-expanded; duplicates collapse to their first occurrence.
+`tools` is a separate optional top-level object with two independent exact-name
+deny lists. Both default to empty arrays when missing, including when the object
+or config file predates these settings; an empty list denies nothing. Present
+lists must be arrays of literal tool names — a non-array, a non-string, an empty
+string, or a whitespace-padded name rejects that list with a startup warning and
+recovery to the empty default for that list only, while the other list and
+unrelated JSON keys are preserved. Names are matched exactly and are never
+trimmed, prefix-matched, or pattern-expanded; duplicates collapse to their first
+occurrence.
 
-`tool_search` is the reserved review-gate discovery loader and is never a candidate in
-either list. A raw `tool_search` entry is rejected instead of accepted: an explicit
-configuration write fails strict validation, and startup recovery reports an actionable
-warning and omits the entry while preserving the other entries and the other list, so
-the reserved loader is never denied. The candidate universe for both lists is every
-otherwise-discoverable tool except `tool_search` itself.
+`tool_search` is the reserved review-gate discovery loader and is never a
+candidate in either list. A raw `tool_search` entry is rejected instead of
+accepted: an explicit configuration write fails strict validation, and startup
+recovery reports an actionable warning and omits the entry while preserving the
+other entries and the other list, so the reserved loader is never denied. The
+candidate universe for both lists is every otherwise-discoverable tool except
+`tool_search` itself.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `tools.topLevelDeny` | `[]` | Exact tool names denied for the primary/top-level agent. A denied name is withheld before admission, so it is absent from the startup inventory and `tool_search` and is never declared or executed in the top-level session. It never removes a name from a newly captured executor, and unchecking it restores only that tool's ordinary eligibility. |
 | `tools.executorDeny` | `[]` | Exact tool names denied for newly captured/delegated executors. A denied name is withheld at catalog capture, so it is absent from a new execute/inplace worker's `--tools` catalog, startup inventory, `tool_search`, and direct/nested calls. Already-admitted queued or running tasks and their continuation turns keep their captured authority, and research tasks are unaffected. It never removes a name from the top-level session. |
 
-The two lists are independent: neither cascades to the other, and a denial in one never
-widens authority in the other. Both only narrow. Pi's own
-`--tools`/`--exclude-tools`/`--no-tools`, the operating mode, launch and role ceilings,
-and the existing feature settings (for example `youShouldKnow.enabled`) stay
-authoritative; unchecking a denial restores only that tool's ordinary eligibility and
-never grants authority another control withheld. The lists disable no plugin, sandbox no
-effect, and add no wildcard policy. For the staged **Top-level tools** and **Executor
-tools** selectors, apply/save/cancel timing, and the bounded metadata-visibility limit
-(Pi's own native callable metadata may still expose a denied name to `ctx.tools` and
-codemode wrappers, while no denied call executes and the scoped denial explanation is
-added only where the host establishes the cause — a call refused at the `tool_call`
-admission check, a direct call clarified at Pi's `message_end` seam, or a nested call Pi
-recorded on the wrapper's tool result; an early native rejection with no recorded
-invocation keeps Pi's own truthful error, and a delegated executor omission is explained
-from its fixed captured catalog rather than the current deny configuration), see
-[Scoped tool denial](native-pi-tools.md#scoped-tool-denial-top-level-and-executor) and
-the [Settings menu](settings.md#scoped-tool-denial).
+The two lists are independent: neither cascades to the other, and a denial in
+one never widens authority in the other. Both only narrow. Pi's own
+`--tools`/`--exclude-tools`/`--no-tools`, the operating mode, launch and role
+ceilings, and the existing feature settings (for example
+`youShouldKnow.enabled`) stay authoritative; unchecking a denial restores only
+that tool's ordinary eligibility and never grants authority another control
+withheld. The lists disable no plugin, sandbox no effect, and add no wildcard
+policy. For the staged **Top-level tools** and **Executor tools** selectors,
+apply/save/cancel timing, and the bounded metadata-visibility limit (Pi's own
+native callable metadata may still expose a denied name to `ctx.tools` and
+codemode wrappers, while no denied call executes and the scoped denial
+explanation is added only where the host establishes the cause — a call refused
+at the `tool_call` admission check, a direct call clarified at Pi's
+`message_end` seam, or a nested call Pi recorded on the wrapper's tool result;
+an early native rejection with no recorded invocation keeps Pi's own truthful
+error, and a delegated executor omission is explained from its fixed captured
+catalog rather than the current deny configuration), see
+[Scoped tool denial](native-pi-tools.md#scoped-tool-denial-top-level-and-executor)
+and the [Settings menu](settings.md#scoped-tool-denial).
 
-Both lists are staged under the [Tools subsection](settings.md#tools-subsection): root
-Escape applies them to the current session without writing the file, Cancel discards
-the staged edits, and Save persists them. Top-level denials take effect at the next
-applicable model set write, without interrupting an in-flight run or reloading;
-executor denials apply to new admissions only.
+Both lists are staged under the
+[Tools subsection](settings.md#tools-subsection): root Escape applies them to
+the current session without writing the file, Cancel discards the staged edits,
+and Save persists them. Top-level denials take effect at the next applicable
+model set write, without interrupting an in-flight run or reloading; executor
+denials apply to new admissions only.
 
 ## Tool protection fields
 
-`toolProtection` is one optional top-level block for the pre-execution
-decision gate ([Tool protection](tool-protection.md)). Absence of the block is **Off**
-for every configuration that predates it; there is no separate enable flag, and one
-shared level applies to the primary agent and newly launched Pi executors. A present
-block must state `level`. `off` is a level, not a toggle: it removes only this added
-gate.
+`toolProtection` is one optional top-level block for the pre-execution decision
+gate ([Tool protection](tool-protection.md)). Absence of the block is **Off**
+for every configuration that predates it; there is no separate enable flag, and
+one shared level applies to the primary agent and newly launched Pi executors. A
+present block must state `level`. `off` is a level, not a toggle: it removes
+only this added gate.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -139,11 +149,11 @@ gate.
 | `retainAuditorSessions` | `false` | Optional, opt-in saving of each actual auditor invocation as an ordinary saved Pi session you can browse; see [Keeping auditor sessions](tool-protection.md#keeping-auditor-sessions-optional). An absent field is Off, so a block or a parent launch pin that predates it keeps the previous behavior. Only the JSON booleans `true`/`false` are accepted — `"true"`, `1`, and `null` are rejected. It changes no decision input, no permission, and no verdict, and a saved audit is never read back into a later decision. |
 | `debug` | `false` | Optional, default-off presentation switch for this gate's own audit output; see [What each call reports](tool-protection.md#what-each-call-reports). An absent field defaults to Off, including in a stored block or a parent launch pin that predates the field, so routine `PASS` and `NOT AUDITED` audit lines use the new quiet presentation rather than the former always-visible annotations. Only the JSON booleans `true`/`false` are accepted — `"true"`, `1`, and `null` are rejected. Off hides the routine `PASS` and `NOT AUDITED` audit lines; On shows them to you only, and a `PASS` line carries no auditor reason because a `PASS` reply is reasonless. It is never model-facing, records nothing, starts no model or provider call, and changes no level, scope, decision, timeout, or context budget; auditor sessions stay governed by `retainAuditorSessions`. A `FAIL`, an audit error, and a nested refusal stay reported at either value, and an auditor-session save warning stays visible to you. |
 
-Explicit writes validate strictly: a non-Off level without an auditor, a `selected`
-scope with no names, a non-whole or out-of-range number, a non-boolean
-`retainAuditorSessions` or `debug`, or an unknown level or scope is rejected. Unknown
-keys inside the block are ignored. An absent block and an explicit `{"level":"off"}` both
-mean Off.
+Explicit writes validate strictly: a non-Off level without an auditor, a
+`selected` scope with no names, a non-whole or out-of-range number, a
+non-boolean `retainAuditorSessions` or `debug`, or an unknown level or scope is
+rejected. Unknown keys inside the block are ignored. An absent block and an
+explicit `{"level":"off"}` both mean Off.
 
 A malformed stored block is not recovered as an implicit Off. Startup reports a warning
 and keeps the derived `toolProtectionError`; protected calls stay blocked until a valid
@@ -151,22 +161,23 @@ configuration is saved, while other settings still load. The file is never rewri
 
 ## YouShouldKnow settings
 
-`youShouldKnow` is a separate optional top-level object; its two fields are staged as
-**YouShouldKnow notices** and **Completion guidance** under the
-[Tools subsection](settings.md#tools-subsection), and the stored `youShouldKnow` object
-is unchanged by the move. Both fields default to `true`
-when missing, including when the object or config file predates these settings. Present
-field values must be JSON booleans; invalid fields recover independently to `true` with
-startup warnings.
+`youShouldKnow` is a separate optional top-level object; its two fields are
+staged as **YouShouldKnow notices** and **Completion guidance** under the
+[Tools subsection](settings.md#tools-subsection), and the stored `youShouldKnow`
+object is unchanged by the move. Both fields default to `true` when missing,
+including when the object or config file predates these settings. Present field
+values must be JSON booleans; invalid fields recover independently to `true`
+with startup warnings.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `youShouldKnow.enabled` | `true` | Controls whether new `YouShouldKnow` notices are available through authorized tool discovery and calls. It only narrows the role/mode/launch authorization ceiling; it never grants authority. Turning it off does not remove existing pending notices, their **More details**/**Close** actions, or `AskUserQuestion`. |
 | `youShouldKnow.completionGuidance` | `true` | Controls whether the extension may supply its automatic completion prompt. The prompt appears only when this and `youShouldKnow.enabled` are `true` and `YouShouldKnow` is in the live authorized discovery ceiling; current activation is not required. Turning guidance off neither disables the tool nor blocks an otherwise-authorized call. |
 
-Both settings are independently staged in `/review-settings`; root Escape applies them to
-the current session without writing the file, Cancel discards the staged edits, and Save
-persists them. See [User questions and notices](user-questions.md#availability-and-completion-guidance)
+Both settings are independently staged in `/review-settings`; root Escape
+applies them to the current session without writing the file, Cancel discards
+the staged edits, and Save persists them. See
+[User questions and notices](user-questions.md#availability-and-completion-guidance)
 for runtime behavior and Pi skill-routing limits.
 
 ## Operating modes
@@ -174,90 +185,97 @@ for runtime behavior and Pi skill-routing limits.
 Choose **Operating mode** in `/review-settings`, then **Save changes**:
 
 - **Prefer execution**: favor focused direct implementation; delegate when useful.
-- **Prefer orchestration** (default): favor bounded delegation; the primary assistant
-  remains responsible for integration and verification. If you explicitly tell it not to
-  use a subtask for a specific request, it honors that for that request and works
-  directly with the tools it already has — no mode switch is needed, and the choice is
-  not saved or applied to later requests.
-- **Plan/research**: local read-only investigation and planning. Write-capable tools,
-  arbitrary shell, execution-subtask controls, and the `codemode` script transport are
-  removed from the active tool schemas, authorized inventory, and `tool_search`
-  results. Launch-authorized native read-only discovery (`grep`, `find`, `ls`) stays
-  active in every mode. The structured
-  read-only Git history tool `GitRead` is active only in this mode: available from the
-  first request (no `tool_search` step) and removed from the active set, inventory,
-  and search results in every other mode. When changes are needed, the assistant asks
-  you to switch modes; there is no GitHub-writing exception.
+- **Prefer orchestration** (default): favor bounded delegation; the primary
+  assistant remains responsible for integration and verification. If you
+  explicitly tell it not to use a subtask for a specific request, it honors that
+  for that request and works directly with the tools it already has — no mode
+  switch is needed, and the choice is not saved or applied to later requests.
+- **Plan/research**: local read-only investigation and planning. Write-capable
+  tools, arbitrary shell, execution-subtask controls, and the `codemode` script
+  transport are removed from the active tool schemas, authorized inventory, and
+  `tool_search` results. Launch-authorized native read-only discovery (`grep`,
+  `find`, `ls`) stays active in every mode. The structured read-only Git history
+  tool `GitRead` is active only in this mode: available from the first request
+  (no `tool_search` step) and removed from the active set, inventory, and search
+  results in every other mode. When changes are needed, the assistant asks you
+  to switch modes; there is no GitHub-writing exception.
 
-The next normal run in the same conversation receives the replacement mode prompt:
-no `/new`, reload, or restart is needed. Shared safety and review instructions and user
-append prompts remain. An in-flight run retains its prompt, and already-running subtasks
-retain their captured instructions and authority. Cancelling settings leaves the mode
-unchanged. Entering Plan/research removes forbidden tools even when they were already
-loaded. Returning to a write-capable mode rebuilds the tool set from what Pi's registry
-permits at that moment — the baseline plus discovery candidates, including natively
-reconciled MCP/codemode registrations (see
+The next normal run in the same conversation receives the replacement mode
+prompt: no `/new`, reload, or restart is needed. Shared safety and review
+instructions and user append prompts remain. An in-flight run retains its
+prompt, and already-running subtasks retain their captured instructions and
+authority. Cancelling settings leaves the mode unchanged. Entering Plan/research
+removes forbidden tools even when they were already loaded. Returning to a
+write-capable mode rebuilds the tool set from what Pi's registry permits at that
+moment — the baseline plus discovery candidates, including natively reconciled
+MCP/codemode registrations (see
 [Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry))
-— never from the pre-mode loadout: excluded, hidden, withdrawn, or setting-disabled tools
-stay absent. Loaded read-only tools stay loaded in Plan/research; forbidden tools loaded
-with `tool_search` before the switch need `tool_search` again.
+— never from the pre-mode loadout: excluded, hidden, withdrawn, or
+setting-disabled tools stay absent. Loaded read-only tools stay loaded in
+Plan/research; forbidden tools loaded with `tool_search` before the switch need
+`tool_search` again.
 
 Prompt files live in `scripts/orchestrator-system-prompt.md`,
 `scripts/execution-system-prompt.md`, and `scripts/planning-system-prompt.md`.
-The extension selects the mode segment rather than the launcher permanently appending
-orchestration instructions. Native `grep`, `find`, and `ls` stay active in all modes
-whenever Pi's tool registry permits them. `--no-builtin-tools` only changes initial
-activity, so it does not keep this trio inactive; use `--exclude-tools` or an explicit
-`--tools` allowlist to exclude them. Planning gains no arbitrary shell, but it does
-activate the structured read-only `GitRead` history tool; outside plan/research,
-`GitRead` is neither active nor discoverable (see [Security model](security-model.md#read-only-enforcement)).
+The extension selects the mode segment rather than the launcher permanently
+appending orchestration instructions. Native `grep`, `find`, and `ls` stay
+active in all modes whenever Pi's tool registry permits them.
+`--no-builtin-tools` only changes initial activity, so it does not keep this
+trio inactive; use `--exclude-tools` or an explicit `--tools` allowlist to
+exclude them. Planning gains no arbitrary shell, but it does activate the
+structured read-only `GitRead` history tool; outside plan/research, `GitRead` is
+neither active nor discoverable (see
+[Security model](security-model.md#read-only-enforcement)).
 
 ### Direct mode-cycle hotkey
 
-Pressing the configured hotkey (default `alt+m`) advances the operating mode one step
-in the canonical order — `execute` → `orchestrate` → `plan-research` → `execute`,
-wrapping at the end — with no selector and no confirmation popup. It uses the same
-persisted `operatingMode` field, the same shared transition, and the same persistence
-path as the **Operating mode** selector, and the existing `operating mode:` status
-indicator updates in place. The hotkey works in every mode, including Plan/research,
-and applies from the next turn like any mode change; already-running subtasks keep
-their captured instructions. There is no model-facing tool for changing modes, and no
-mode state is stored anywhere besides the canonical config field.
+Pressing the configured hotkey (default `alt+m`) advances the operating mode one
+step in the canonical order — `execute` → `orchestrate` → `plan-research` →
+`execute`, wrapping at the end — with no selector and no confirmation popup. It
+uses the same persisted `operatingMode` field, the same shared transition, and
+the same persistence path as the **Operating mode** selector, and the existing
+`operating mode:` status indicator updates in place. The hotkey works in every
+mode, including Plan/research, and applies from the next turn like any mode
+change; already-running subtasks keep their captured instructions. There is no
+model-facing tool for changing modes, and no mode state is stored anywhere
+besides the canonical config field.
 
-The hotkey is editable under **Mode cycle hotkey** in `/review-settings`. Values must
-use a single key, optionally prefixed with modifiers (`ctrl`, `shift`, `alt`,
-`super`) — for example `alt+m`, `ctrl+shift+r`, or `f6`. Avoid binding ordinary
-unmodified typing keys unless you intend to replace their normal input behavior. If the chosen key is already a built-in Pi binding, the
-settings menu rejects it by name and asks for a different key, so the built-in action
-keeps working; at startup a config file that carries an occupied key is named in a
-warning and the hotkey is simply not registered. Conflicts with other extensions are
-not detectable here — Pi reports those itself at startup — and the extension does not
-claim otherwise. The binding itself is captured when the extension loads, so a changed
-hotkey takes effect after `/reload`, just like `keybindings.json`; the persisted mode
-change itself never needs a reload.
+The hotkey is editable under **Mode cycle hotkey** in `/review-settings`. Values
+must use a single key, optionally prefixed with modifiers (`ctrl`, `shift`,
+`alt`, `super`) — for example `alt+m`, `ctrl+shift+r`, or `f6`. Avoid binding
+ordinary unmodified typing keys unless you intend to replace their normal input
+behavior. If the chosen key is already a built-in Pi binding, the settings menu
+rejects it by name and asks for a different key, so the built-in action keeps
+working; at startup a config file that carries an occupied key is named in a
+warning and the hotkey is simply not registered. Conflicts with other extensions
+are not detectable here — Pi reports those itself at startup — and the extension
+does not claim otherwise. The binding itself is captured when the extension
+loads, so a changed hotkey takes effect after `/reload`, just like
+`keybindings.json`; the persisted mode change itself never needs a reload.
 
 ## Reviewers
 
-Reviewers run in parallel against the same review bundle. Review-gate waits for every
-reviewer and applies a simple gate: any `needs_changes` verdict means changes are
-required; when no reviewer requests changes, at least one completed `pass` is accepted
-even if another reviewer has an infrastructure error; and the gate errors only when no
-reviewer completes a usable review. Mixed pass/error results are classified as
-`pass_with_warnings`, retain their evidence, and return every reviewer result to the
-orchestrator. Each reviewer also appears once in the implementing-model transmission.
-Results from every reviewer are transmitted, including passing assessments, non-blocking
-observations, guidance, disagreements, and reviewer errors. Blocking findings are
-identified as required corrections; passing and non-blocking material remains visible
-without becoming mandatory work.
+Reviewers run in parallel against the same review bundle. Review-gate waits for
+every reviewer and applies a simple gate: any `needs_changes` verdict means
+changes are required; when no reviewer requests changes, at least one completed
+`pass` is accepted even if another reviewer has an infrastructure error; and the
+gate errors only when no reviewer completes a usable review. Mixed pass/error
+results are classified as `pass_with_warnings`, retain their evidence, and
+return every reviewer result to the orchestrator. Each reviewer also appears
+once in the implementing-model transmission. Results from every reviewer are
+transmitted, including passing assessments, non-blocking observations, guidance,
+disagreements, and reviewer errors. Blocking findings are identified as required
+corrections; passing and non-blocking material remains visible without becoming
+mandatory work.
 
-A reviewer selection that no longer resolves (removed, renamed, or currently unscoped)
-never blocks the rest of the review: every resolvable reviewer still runs, and each
-unresolvable selection appears in the results as an explicit bounded
-`reviewer_unavailable` error outcome instead of a hidden or resurrected reviewer.
-Duplicated selections run once. When no configured reviewer is currently usable, the
-gate defers the review with an actionable notice and keeps the preserved review window
-open until a reviewer can run; it never clears the window or turns the situation into a
-pass.
+A reviewer selection that no longer resolves (removed, renamed, or currently
+unscoped) never blocks the rest of the review: every resolvable reviewer still
+runs, and each unresolvable selection appears in the results as an explicit
+bounded `reviewer_unavailable` error outcome instead of a hidden or resurrected
+reviewer. Duplicated selections run once. When no configured reviewer is
+currently usable, the gate defers the review with an actionable notice and keeps
+the preserved review window open until a reviewer can run; it never clears the
+window or turns the situation into a pass.
 
 Multi-reviewer example:
 
@@ -292,19 +310,21 @@ Multi-reviewer example:
 
 Reviewer adapters:
 
-- `codex-cli`, `claude-cli`, and the Pi model adapter run as read-only agentic reviewers
-  so they can inspect the workspace and retained review bundle before deciding. The
-  enforcement details are owned by [Security model](security-model.md#read-only-enforcement).
-- `generic-cli` (and `run-as-binary` for executors) remain prompt-only unless the
-  configured command provides its own safe read-only behavior.
+- `codex-cli`, `claude-cli`, and the Pi model adapter run as read-only agentic
+  reviewers so they can inspect the workspace and retained review bundle before
+  deciding. The enforcement details are owned by
+  [Security model](security-model.md#read-only-enforcement).
+- `generic-cli` (and `run-as-binary` for executors) remain prompt-only unless
+  the configured command provides its own safe read-only behavior.
 
 Reviewer selections use discriminated references. Pi internal models are
-runtime-discovered and use the exact canonical `provider/model` value plus a role-owned
-`thinkingLevel` whose allowed levels come from that scoped model's runtime metadata
-(including its `thinkingLevelMap`; unsupported extended levels such as `max` are not
-offered). These settings never inherit the controlling session's thinking level. Legacy
-internal selections without a `thinkingLevel` continue to use `high`; saving them
-through `/review-settings` materializes an explicit model-supported level.
+runtime-discovered and use the exact canonical `provider/model` value plus a
+role-owned `thinkingLevel` whose allowed levels come from that scoped model's
+runtime metadata (including its `thinkingLevelMap`; unsupported extended levels
+such as `max` are not offered). These settings never inherit the controlling
+session's thinking level. Legacy internal selections without a `thinkingLevel`
+continue to use `high`; saving them through `/review-settings` materializes an
+explicit model-supported level.
 
 ```json
 {
@@ -317,15 +337,16 @@ through `/review-settings` materializes an explicit model-supported level.
 }
 ```
 
-That block shows the selection layer only, not a standalone config: it assumes an
-`externalAgents.codex-sol` catalog entry (see [The `externalAgents` catalog](#the-externalagents-catalog))
-and, for live resolution, that the Pi model is currently scoped.
+That block shows the selection layer only, not a standalone config: it assumes
+an `externalAgents.codex-sol` catalog entry (see
+[The `externalAgents` catalog](#the-externalagents-catalog)) and, for live
+resolution, that the Pi model is currently scoped.
 
 ### Review layers and the legacy `activeReviewers` import
 
-Issue #175 splits automatic review into two independently controlled layers, both
-configured from the **Review** submenu in `/review-settings` and stored under the
-existing `review` object:
+Issue #175 splits automatic review into two independently controlled layers,
+both configured from the **Review** submenu in `/review-settings` and stored
+under the existing `review` object:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -335,32 +356,34 @@ existing `review` object:
 | `review.subtaskEnabled` | `true` | Automatic subtask review is on: ordinary accepted subtask landings go through the subtask reviewer set before landing. Off lets subtasks land without their own review; their changes still follow `review.reviewLandedChanges`. |
 | `review.reviewLandedChanges` | `false` | Landings into the primary review window that did **not** already complete a successful subtask review stay pending in that window's diff as ordinary primary review evidence instead of being checkpointed out. Inactive while automatic primary review is off (landed changes are checkpointed out as before). |
 
-Both layers may be saved Off, including a configuration that performs no automatic
-review at all. The selected primary reviewer set remains available to manual
-`/review-now` and `/ask-reviewer`: the toggles control automatic review only
-and never gate those commands. While automatic primary review is off, the primary review
-window/baseline stays tracked across quick iterations so a later manual review can
-inspect those changes; suppressing the automatic run never records a synthetic PASS.
-There are no model-controlled paths to these settings: the submenu is staged by a
-human like every other settings section, and the reviewer sets are drawn from the
-existing reviewer catalog above (no second definition catalog and no model controls).
+Both layers may be saved Off, including a configuration that performs no
+automatic review at all. The selected primary reviewer set remains available to
+manual `/review-now` and `/ask-reviewer`: the toggles control automatic review
+only and never gate those commands. While automatic primary review is off, the
+primary review window/baseline stays tracked across quick iterations so a later
+manual review can inspect those changes; suppressing the automatic run never
+records a synthetic PASS. There are no model-controlled paths to these settings:
+the submenu is staged by a human like every other settings section, and the
+reviewer sets are drawn from the existing reviewer catalog above (no second
+definition catalog and no model controls).
 
-**Landed changes.** With `review.reviewLandedChanges` on, a landing into the parent
-session's own workspace that did **not** already complete a successful subtask review
-— an unreviewed subtask merge, or an unreviewed exceptional-path landing such as
-explicit force-merge/salvage or `SubtasksMarkClean` resolved-conflict handling where
-the landing path supports it — keeps its diff in the primary review window as ordinary
-evidence instead of being checkpointed out. A landing that already completed a
-successful subtask review advances parent checkpoint bookkeeping for its independently
-reviewed paths at the landing boundary, without checkpointing away unrelated parent
-edits; it is not re-reviewed in the primary window. The private subtask capture,
-candidate review, and landing are unchanged. Primary review always settles at the
-primary model's normal idle point, exactly like any other primary exchange; a landing never
-triggers an immediate review. The existing conflict and salvage recovery warnings and
-fail-closed gates are unchanged: a forced merge is still a mechanical landing attempt,
-not verification. Landings into a target other than the parent session's workspace
-never enter the parent review window
-(see [Delegated execution](delegated-execution.md#conflicts-and-gates)). With the
+**Landed changes.** With `review.reviewLandedChanges` on, a landing into the
+parent session's own workspace that did **not** already complete a successful
+subtask review — an unreviewed subtask merge, or an unreviewed exceptional-path
+landing such as explicit force-merge/salvage or `SubtasksMarkClean`
+resolved-conflict handling where the landing path supports it — keeps its diff
+in the primary review window as ordinary evidence instead of being checkpointed
+out. A landing that already completed a successful subtask review advances
+parent checkpoint bookkeeping for its independently reviewed paths at the
+landing boundary, without checkpointing away unrelated parent edits; it is not
+re-reviewed in the primary window. The private subtask capture, candidate
+review, and landing are unchanged. Primary review always settles at the primary
+model's normal idle point, exactly like any other primary exchange; a landing
+never triggers an immediate review. The existing conflict and salvage recovery
+warnings and fail-closed gates are unchanged: a forced merge is still a
+mechanical landing attempt, not verification. Landings into a target other than
+the parent session's workspace never enter the parent review window (see
+[Delegated execution](delegated-execution.md#conflicts-and-gates)). With the
 option off — or while automatic primary review is off — landed changes are
 checkpointed out of the window as before.
 
@@ -369,15 +392,15 @@ single set is imported in memory on every load: the same selections become both
 effective sets (primary and subtask) and both menus display them immediately, while
 the stored file stays byte-identical — loading never rewrites it. The lifecycle:
 
-- **Save (even with no manual edit)** persists the effective split fields and removes
-  the `review.activeReviewers` key, so a saved record never keeps a second canonical
-  reviewer set. Manual edits win over the imported values.
+- **Save (even with no manual edit)** persists the effective split fields and
+  removes the `review.activeReviewers` key, so a saved record never keeps a
+  second canonical reviewer set. Manual edits win over the imported values.
 - **Cancel or Esc** leaves the file untouched, but the imported sets remain effective
   for the running session; re-loading the unchanged file re-imports identically.
-- A config that already stores the split fields honors its saved choices and never
-  re-imports the legacy copy. A record that carries both uses the split fields and
-  ignores the obsolete copy without a rewrite (the same doubled-record precedence as
-  the pre-cutover fields below).
+- A config that already stores the split fields honors its saved choices and
+  never re-imports the legacy copy. A record that carries both uses the split
+  fields and ignores the obsolete copy without a rewrite (the same
+  doubled-record precedence as the pre-cutover fields below).
 
 The split state is derived through one shared accessor, `effectiveReviewSettings(config)`,
 whose fields match the stored `review.*` fields one-for-one (`primaryReviewers`,
@@ -385,27 +408,28 @@ whose fields match the stored `review.*` fields one-for-one (`primaryReviewers`,
 automatic review consumes layer-specific values from a single canonical source.
 
 Pi and the selected provider own reasoning effort and token-budget behavior;
-review-gate does not impose a second output-side thinking cap. Reviewer and executor
-selections remain separate from the orchestrator. Native external harness reasoning
-uses optional `reasoningEffort` fields on each
+review-gate does not impose a second output-side thinking cap. Reviewer and
+executor selections remain separate from the orchestrator. Native external
+harness reasoning uses optional `reasoningEffort` fields on each
 `externalAgents` entry and its `execution`/`review` roles (see
-[Native reasoning effort](#native-reasoning-effort)). Untouched legacy Claude/Codex
-argument-based settings remain compatible; arbitrary binary adapters may still use
-their own arguments or environment variables.
+[Native reasoning effort](#native-reasoning-effort)). Untouched legacy
+Claude/Codex argument-based settings remain compatible; arbitrary binary
+adapters may still use their own arguments or environment variables.
 
 ### Review evidence methods
 
-The optional `review.evidence` object selects evidence independently for three review
-contexts. All four fields are JSON booleans. The three tool-only fields default to
-**false** and `snapshotFailureFallback` defaults to **true**, including when the object
-is absent in an older config. For each of the three tool-only fields,
-`false` displays **Tools + workspace changes** (whole-workspace snapshot/diff review
-evidence); `true` displays **Tools only** (without that whole-workspace evidence).
-Both methods retain bounded tool calls/results, observed file content and per-file
-tool-observation diffs, task/assistant context, and reviewer read access.
-The fourth field independently controls fallback, displayed as **Off** / **On**
-(default **On**; an explicit `false` stays Off and is never rewritten). These are not operating
-modes, automatic-review switches, or reviewer selections.
+The optional `review.evidence` object selects evidence independently for three
+review contexts. All four fields are JSON booleans. The three tool-only fields
+default to **false** and `snapshotFailureFallback` defaults to **true**,
+including when the object is absent in an older config. For each of the three
+tool-only fields, `false` displays **Tools + workspace changes**
+(whole-workspace snapshot/diff review evidence); `true` displays **Tools only**
+(without that whole-workspace evidence). Both methods retain bounded tool
+calls/results, observed file content and per-file tool-observation diffs,
+task/assistant context, and reviewer read access. The fourth field independently
+controls fallback, displayed as **Off** / **On** (default **On**; an explicit
+`false` stays Off and is never rewritten). These are not operating modes,
+automatic-review switches, or reviewer selections.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -414,54 +438,58 @@ modes, automatic-review switches, or reviewer selections.
 | `review.evidence.inplaceToolOnly` | `false` | `true` selects Tools only for InPlace review; direct writes and external effects remain post-hoc and are never rolled back. |
 | `review.evidence.snapshotFailureFallback` | `true` | Use warning-bearing Tools only (snapshot-failure fallback) review when a qualifying review-evidence snapshot capture fails; not a durability or review-error bypass. With `false`, a qualifying Primary baseline failure warns that review is disabled and the turn continues unreviewed ([details](review-workflow.md#snapshot-failure-fallback)). |
 
-Present invalid fields recover independently to their defaults with startup warnings; explicit
-configuration writes validate strictly. Evidence settings have one canonical stored
-representation, `review.evidence`, resolved separately from reviewer selection by
-`effectiveReviewEvidenceSettings(config)`; there is no mirrored compatibility state.
+Present invalid fields recover independently to their defaults with startup
+warnings; explicit configuration writes validate strictly. Evidence settings
+have one canonical stored representation, `review.evidence`, resolved separately
+from reviewer selection by `effectiveReviewEvidenceSettings(config)`; there is
+no mirrored compatibility state.
 
-Use `/review-settings` → **Reviewers** → **Evidence methods**. Root Escape applies
-for the session; Save/Ctrl+S persists; Cancel discards this visit's edits, preserving
-any earlier session-only choices. Only an effective Primary **Tools + workspace changes →
-Tools only** transition resets its current evidence, with a prominent warning.
-**Tools only → Tools + workspace changes** retains evidence and starts a
-new snapshot baseline; unchanged values, other-scope changes, and navigation do not
-reset Primary evidence. Workers pin applicable evidence and fallback policy at firing/queue
-admission, including already queued tasks through corrections, retries, and continuations.
-Each new Start/Add task captures independently; scheduled tasks capture at actual firing,
-not schedule creation. Later Add tasks use the then-current live choice, without changing
-in-flight tasks or freezing all routing/reviewer selections. An eligible Primary fallback
-shows one local user-only warning and makes Primary act as Tools only for the rest of
-the session, without capture retries or any change to this configuration;
-`/review-clear` or a new session lets the next prompt try snapshots again. Automatic
-Primary tool-only review runs only for reviewable change evidence, not for no-change or
-read-only turns. Snapshot-preferring captured worker policy retries capture on later
-cycles/continuations and warns on every worker fallback. Missing structured observations
-do not block degraded worker review with disclosed limits and retained evidence. See
-[Settings](settings.md#evidence-methods) for the transaction and
-[Review workflow](review-workflow.md#review-evidence-methods) for evidence limits,
-first-baseline fallback, warnings, and blocking failures.
+Use `/review-settings` → **Reviewers** → **Evidence methods**. Root Escape
+applies for the session; Save/Ctrl+S persists; Cancel discards this visit's
+edits, preserving any earlier session-only choices. Only an effective Primary
+**Tools + workspace changes → Tools only** transition resets its current
+evidence, with a prominent warning. **Tools only → Tools + workspace changes**
+retains evidence and starts a new snapshot baseline; unchanged values,
+other-scope changes, and navigation do not reset Primary evidence. Workers pin
+applicable evidence and fallback policy at firing/queue admission, including
+already queued tasks through corrections, retries, and continuations. Each new
+Start/Add task captures independently; scheduled tasks capture at actual firing,
+not schedule creation. Later Add tasks use the then-current live choice, without
+changing in-flight tasks or freezing all routing/reviewer selections. An
+eligible Primary fallback shows one local user-only warning and makes Primary
+act as Tools only for the rest of the session, without capture retries or any
+change to this configuration; `/review-clear` or a new session lets the next
+prompt try snapshots again. Automatic Primary tool-only review runs only for
+reviewable change evidence, not for no-change or read-only turns.
+Snapshot-preferring captured worker policy retries capture on later
+cycles/continuations and warns on every worker fallback. Missing structured
+observations do not block degraded worker review with disclosed limits and
+retained evidence. See [Settings](settings.md#evidence-methods) for the
+transaction and [Review workflow](review-workflow.md#review-evidence-methods)
+for evidence limits, first-baseline fallback, warnings, and blocking failures.
 
 ### The `externalAgents` catalog
 
-`externalAgents` is one configured catalog shared by both menus: an object keyed by
-stable agent ID, where each value has an optional `review` role, `execution` role, or
-both. Role sections can override shared environment, model, and reasoning effort,
-plus the global role timeout, so one harness can use different limits for review and execution. Raw JSON
-also supports legacy arguments and adapter-specific protocols; these are not native
-Claude/Codex editor controls. An inactive external definition does not need to be
-installed. Missing Claude Code or Codex CLI
-binaries produce a warning when settings are saved, including for selected workers,
-but do not prevent saving; those workers will fail until their CLI is installed or
-available on `PATH` for definitions created or applied through the native editor.
-Untouched custom commands remain compatible. Runtime command failures remain errors.
-Other adapters retain their existing executable validation. Pi-scoped internal models
-are never copied into the external catalog.
+`externalAgents` is one configured catalog shared by both menus: an object keyed
+by stable agent ID, where each value has an optional `review` role, `execution`
+role, or both. Role sections can override shared environment, model, and
+reasoning effort, plus the global role timeout, so one harness can use different
+limits for review and execution. Raw JSON also supports legacy arguments and
+adapter-specific protocols; these are not native Claude/Codex editor controls.
+An inactive external definition does not need to be installed. Missing Claude
+Code or Codex CLI binaries produce a warning when settings are saved, including
+for selected workers, but do not prevent saving; those workers will fail until
+their CLI is installed or available on `PATH` for definitions created or applied
+through the native editor. Untouched custom commands remain compatible. Runtime
+command failures remain errors. Other adapters retain their existing executable
+validation. Pi-scoped internal models are never copied into the external
+catalog.
 
 Only the canonical keyed object form is accepted. The former legacy array form
 (entries carrying their own `id`) is no longer imported or converted; see
-[Removed legacy array catalogs](#removed-legacy-array-catalogs) for the behavior and
-the migration path through a published conversion-capable release. The worker catalog
-follows the same shape; see
+[Removed legacy array catalogs](#removed-legacy-array-catalogs) for the behavior
+and the migration path through a published conversion-capable release. The
+worker catalog follows the same shape; see
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
 
 ### Create external workers in the settings menu
@@ -478,84 +506,89 @@ remains valid schema honored at runtime — and Apply, rename, and unrelated sta
 edits preserve existing shared/role environment entries while the roles remain
 enabled (disabling a role drops that role's overrides, including its environment).
 
-Create/Apply automatically stores `command: "claude"` or `command: "codex"` and uses
-the existing fixed native transport. There are no **Application executable**, literal
-argument-list, or protocol-override controls. Generic/binary creation is not offered;
-existing unsupported definitions are listed with **Delete** and **Back** only.
-Authenticate through the CLI's own login/configuration; do not enter credentials
-into the settings file. No editor row offers environment editing or displays
-environment values or entry counts.
+Create/Apply automatically stores `command: "claude"` or `command: "codex"` and
+uses the existing fixed native transport. There are no **Application
+executable**, literal argument-list, or protocol-override controls.
+Generic/binary creation is not offered; existing unsupported definitions are
+listed with **Delete** and **Back** only. Authenticate through the CLI's own
+login/configuration; do not enter credentials into the settings file. No editor
+row offers environment editing or displays environment values or entry counts.
 Existing read-only research and review safeguards are unchanged.
 
-Creating a definition only adds it to the settings draft. Before saving, explicitly
-add it through **Worker resources** for execution, or select it in the primary and/or
-subtask reviewer sets under **Reviewers** for review. Only configured roles appear
-in their supported selectors. Creating, listing, or editing a definition
-never enrolls it in a resource or reviewer pool or invokes a provider.
-**Save changes** saves the definitions together
-with explicit resource, route, and reviewer selections; reopening/reloading retains
-them. **Cancel** discards the current edits; leaving the root menu with Escape applies
+Creating a definition only adds it to the settings draft. Before saving,
+explicitly add it through **Worker resources** for execution, or select it in
+the primary and/or subtask reviewer sets under **Reviewers** for review. Only
+configured roles appear in their supported selectors. Creating, listing, or
+editing a definition never enrolls it in a resource or reviewer pool or invokes
+a provider. **Save changes** saves the definitions together with explicit
+resource, route, and reviewer selections; reopening/reloading retains them.
+**Cancel** discards the current edits; leaving the root menu with Escape applies
 them to the running session only, without saving them (see
-[Settings menu](settings.md#review-settings)).
-Untouched definitions and unrelated configuration are preserved; conflicting
-catalog changes by another writer are rejected rather than overwritten. Missing
-Claude Code or Codex CLI binaries warn rather than block Save, whether the definition
-is selected or inactive. The warning identifies affected workers and explains that
-they cannot run until their executable is available. Saving does not install a CLI,
+[Settings menu](settings.md#review-settings)). Untouched definitions and
+unrelated configuration are preserved; conflicting catalog changes by another
+writer are rejected rather than overwritten. Missing Claude Code or Codex CLI
+binaries warn rather than block Save, whether the definition is selected or
+inactive. The warning identifies affected workers and explains that they cannot
+run until their executable is available. Saving does not install a CLI,
 authenticate it, or convert a failed run into success.
 
 #### Manage existing external workers
 
-Existing and newly created **Claude Code** and **Codex CLI** definitions are editable,
-including their ID, adapter, roles, models, reasoning effort, and
+Existing and newly created **Claude Code** and **Codex CLI** definitions are
+editable, including their ID, adapter, roles, models, reasoning effort, and
 timeouts. Environment variables are edited only in the JSON file: manual `env`
-configuration remains fully supported and is preserved by Apply, rename, and other
-edits while the roles remain enabled. A missing binary does not make a supported type read-only. **Keep current**
-preserves custom or pinned shared/role model strings until an explicit replacement
-or unset choice. Model or adapter changes must resolve incompatible reasoning
-explicitly; Apply never silently resets it.
+configuration remains fully supported and is preserved by Apply, rename, and
+other edits while the roles remain enabled. A missing binary does not make a
+supported type read-only. **Keep current** preserves custom or pinned
+shared/role model strings until an explicit replacement or unset choice. Model
+or adapter changes must resolve incompatible reasoning explicitly; Apply never
+silently resets it.
 
-Only the definition being created or edited is normalized on **Create**/**Apply**.
-The editor imports recognized legacy Claude `["--effort", "high"]` or Codex
-`["-c", "model_reasoning_effort=\"high\""]` arguments into structured `reasoningEffort`.
-Valid levels are migrated; identical duplicates are canonicalized with a warning,
-while conflicting or unverified levels require an explicit valid choice. All other
-advanced arguments, native protocol overrides, and custom executable paths are
-removed from that edited definition in favor of automatic native settings. Before
-staging at Apply, clear warnings identify the definition, Shared/execution/review
-scope, and counts/categories of affected options, not raw arguments, environment
-values, secrets, or paths. Root Cancel still discards the staged normalization.
-Opening, Back, Cancel, or root Save of unrelated changes never normalizes untouched
-native or unsupported entries from the current catalog. Legacy JSON
-arguments, custom commands, environment, timeouts, and models remain compatible in
-untouched configurations; this is not a global removal of argument or environment
-fields, and Apply itself preserves the edited definition's existing shared/role
-environment entries while its roles remain enabled.
+Only the definition being created or edited is normalized on
+**Create**/**Apply**. The editor imports recognized legacy Claude
+`["--effort", "high"]` or Codex `["-c", "model_reasoning_effort=\"high\""]`
+arguments into structured `reasoningEffort`. Valid levels are migrated;
+identical duplicates are canonicalized with a warning, while conflicting or
+unverified levels require an explicit valid choice. All other advanced
+arguments, native protocol overrides, and custom executable paths are removed
+from that edited definition in favor of automatic native settings. Before
+staging at Apply, clear warnings identify the definition,
+Shared/execution/review scope, and counts/categories of affected options, not
+raw arguments, environment values, secrets, or paths. Root Cancel still discards
+the staged normalization. Opening, Back, Cancel, or root Save of unrelated
+changes never normalizes untouched native or unsupported entries from the
+current catalog. Legacy JSON arguments, custom commands, environment, timeouts,
+and models remain compatible in untouched configurations; this is not a global
+removal of argument or environment fields, and Apply itself preserves the edited
+definition's existing shared/role environment entries while its roles remain
+enabled.
 
 Renaming updates resource selections and primary, subtask, and scheduled reviewer
 references together. Resource IDs, route order, and scheduled resource pins remain
 unchanged: these refer to the same resource, not directly to the renamed definition.
 Invalid or duplicate IDs do not partially change the catalog or its references.
 
-Every supported definition has **Delete** directly alongside **Apply** and **Cancel**
-in its existing editor, with no extra action submenu. Delete targets the original
-selected identity even after an unapplied local ID rename, ignoring other unapplied
-edits. A newly created staged definition is also deletable. For unsupported adapter
-types, opening an entry offers only **Delete** and **Back**; there is no editor or
-separate viewer. **Delete** removes that definition, resources
-selecting it, their route entries, and primary/subtask/scheduled reviewer references.
-If a scheduled task loses its pinned resource or its explicit reviewer set becomes
-empty, the task is disabled and only the invalid pin or review override resets to
-inheritance. Other task settings and remaining reviewers are retained. The menu
-reports removed references, disabled tasks, and inheritance resets; a later explicit
-re-enable uses the configured defaults rather than the deleted worker.
+Every supported definition has **Delete** directly alongside **Apply** and
+**Cancel** in its existing editor, with no extra action submenu. Delete targets
+the original selected identity even after an unapplied local ID rename, ignoring
+other unapplied edits. A newly created staged definition is also deletable. For
+unsupported adapter types, opening an entry offers only **Delete** and **Back**;
+there is no editor or separate viewer. **Delete** removes that definition,
+resources selecting it, their route entries, and primary/subtask/scheduled
+reviewer references. If a scheduled task loses its pinned resource or its
+explicit reviewer set becomes empty, the task is disabled and only the invalid
+pin or review override resets to inheritance. Other task settings and remaining
+reviewers are retained. The menu reports removed references, disabled tasks, and
+inheritance resets; a later explicit re-enable uses the configured defaults
+rather than the deleted worker.
 
 Edits, renames, and deletion cascades are staged until root **Save changes** (or
 Ctrl+S). Root **Cancel** discards them; root Escape applies them to the running
-session only, without saving them (see [Settings menu](settings.md#review-settings)).
-Saving rejects conflicting catalog changes
-rather than overwriting another writer's definition. These controls do not add guided
-configuration for generic executables or change runtime adapter safeguards.
+session only, without saving them (see
+[Settings menu](settings.md#review-settings)). Saving rejects conflicting
+catalog changes rather than overwriting another writer's definition. These
+controls do not add guided configuration for generic executables or change
+runtime adapter safeguards.
 
 #### Release-maintained CLI model catalogs
 
@@ -578,44 +611,46 @@ not Pi-scoped model names or live provider discovery:
 | Codex CLI | GPT-5.5 | `gpt-5.5` |
 
 Unset/inherited model choices leave selection to existing configuration and CLI
-defaults. There is no manual-model fallback in creation. Existing custom or pinned
-strings, including mutable aliases, can be kept without replacement.
+defaults. There is no manual-model fallback in creation. Existing custom or
+pinned strings, including mutable aliases, can be kept without replacement.
 
 The lists are verified against the official
-[Claude Code model configuration](https://code.claude.com/docs/en/model-config) and
-[Codex models](https://developers.openai.com/codex/models) documentation and maintained
-with review-gate releases. Catalog data and verification provenance live in
-`src/settings/external-agent-models.ts`; the Codex catalog was verified against
-Codex CLI 0.160.0 on 2026-10-05. Release maintenance must recheck those upstream sources
-and update catalog values and verification provenance when supported choices change.
-A catalog entry is a known CLI selection, not proof of account access: availability
-and alias resolution depend on CLI version, authentication, provider, plan, and
-organization policy. Settings do not probe a provider, start one, or authenticate
-on your behalf, and a release catalog does not guarantee support by the installed
-CLI or account entitlement.
+[Claude Code model configuration](https://code.claude.com/docs/en/model-config)
+and [Codex models](https://developers.openai.com/codex/models) documentation and
+maintained with review-gate releases. Catalog data and verification provenance
+live in `src/settings/external-agent-models.ts`; the Codex catalog was verified
+against Codex CLI 0.160.0 on 2026-10-05. Release maintenance must recheck those
+upstream sources and update catalog values and verification provenance when
+supported choices change. A catalog entry is a known CLI selection, not proof of
+account access: availability and alias resolution depend on CLI version,
+authentication, provider, plan, and organization policy. Settings do not probe a
+provider, start one, or authenticate on your behalf, and a release catalog does
+not guarantee support by the installed CLI or account entitlement.
 
 #### Native reasoning effort
 
-Optional `reasoningEffort` is stored at Shared and/or `execution`/`review` scope.
-An absent role field inherits Shared. An explicit role `"default"` suppresses any
-inherited effort and supplies no app-owned effort: **CLI default** means the CLI's
-own settings, not off or no thinking. Shared `"default"` or no shared effort also
-delegates to the CLI.
+Optional `reasoningEffort` is stored at Shared and/or `execution`/`review`
+scope. An absent role field inherits Shared. An explicit role `"default"`
+suppresses any inherited effort and supplies no app-owned effort: **CLI
+default** means the CLI's own settings, not off or no thinking. Shared
+`"default"` or no shared effort also delegates to the CLI.
 
 Reasoning choices come from the selected/effective model's bundled capabilities,
 not generic Pi thinking levels. Native levels include `low`, `medium`, `high`,
-`xhigh`, and `max` only where supported; **Max** is distinct from **Extra High** (`xhigh`).
-Codex **Ultra — automatic task delegation** is offered only for models whose
-capabilities include `ultra`. Claude Haiku 4.5 has no effort control beyond CLI
-default. Mutable aliases, unknown strings, and unset CLI-default models preserve
-their model value but offer only CLI default reasoning because new levels cannot
-be verified. There is no generic `off` or `minimal` choice.
+`xhigh`, and `max` only where supported; **Max** is distinct from **Extra High**
+(`xhigh`). Codex **Ultra — automatic task delegation** is offered only for
+models whose capabilities include `ultra`. Claude Haiku 4.5 has no effort
+control beyond CLI default. Mutable aliases, unknown strings, and unset
+CLI-default models preserve their model value but offer only CLI default
+reasoning because new levels cannot be verified. There is no generic `off` or
+`minimal` choice.
 
 Create/Apply validates every effective enabled role, including inherited Shared
-effort against a role-specific model. Existing invalid, unverified, or conflicting
-effort, or a model change that invalidates a level, blocks Create/Apply until you
-explicitly choose a known model with compatible effort or CLI default. Compatible
-existing effort is preserved; there is no silent reset or fallback.
+effort against a role-specific model. Existing invalid, unverified, or
+conflicting effort, or a model change that invalidates a level, blocks
+Create/Apply until you explicitly choose a known model with compatible effort or
+CLI default. Compatible existing effort is preserved; there is no silent reset
+or fallback.
 
 ```json
 {
@@ -642,186 +677,197 @@ existing effort is preserved; there is no silent reset or fallback.
 
 Here execution inherits High; review uses CLI default without inheriting High.
 Runtime centrally generates canonical Claude `["--effort", "high"]` or Codex
-`["-c", "model_reasoning_effort=\"high\""]` arguments with only one effective effort.
-This does not change native transport or safety enforcement.
+`["-c", "model_reasoning_effort=\"high\""]` arguments with only one effective
+effort. This does not change native transport or safety enforcement.
 
 ### Pre-cutover configuration fields
 
 The pre-cutover fields `decider`, `reviewers`, `enabledReviewerIds`,
 `execution.activeExecutor`, `execution.executorPool`, and
-`execution.externalExecutors` are no longer accepted. A config that carries
-only one of them fails strict validation. Startup warns and omits unsupported fields;
-it does not convert them into reviewer or worker selections. Use `externalAgents`
-plus `review.primaryReviewers`/`review.subtaskReviewers`, or `execution.workerResources`. There is no migration: a record
-that carries both the old and the new shape uses the canonical fields and ignores the
-old copies, and `/review-settings` saves never rewrite stored records into either
-pre-cutover shape. Reviewer and executor selections that cannot be resolved against the current
-catalog remain reported (as unavailable selections) instead of being dropped or
-silently disabling review.
+`execution.externalExecutors` are no longer accepted. A config that carries only
+one of them fails strict validation. Startup warns and omits unsupported fields;
+it does not convert them into reviewer or worker selections. Use
+`externalAgents` plus `review.primaryReviewers`/`review.subtaskReviewers`, or
+`execution.workerResources`. There is no migration: a record that carries both
+the old and the new shape uses the canonical fields and ignores the old copies,
+and `/review-settings` saves never rewrite stored records into either
+pre-cutover shape. Reviewer and executor selections that cannot be resolved
+against the current catalog remain reported (as unavailable selections) instead
+of being dropped or silently disabling review.
 
-Startup recovery reports invalid fields and continues normal tool initialization.
-Valid settings, including configured workers and reviewers, survive unrelated errors.
-Nested scalar settings use their existing defaults. Invalid selection, agent, resource,
-or route entries are omitted individually rather than inventing a replacement model,
-command, or authorization reference; valid sibling entries remain. Model/reasoning
-pairs stay together. An unreadable document uses built-in defaults, which contain no
-reviewer or worker selections; this is not a successful review. Explicit configuration
-writes still validate strictly. The environment kill switch and worker tool ceilings
-remain authoritative.
+Startup recovery reports invalid fields and continues normal tool
+initialization. Valid settings, including configured workers and reviewers,
+survive unrelated errors. Nested scalar settings use their existing defaults.
+Invalid selection, agent, resource, or route entries are omitted individually
+rather than inventing a replacement model, command, or authorization reference;
+valid sibling entries remain. Model/reasoning pairs stay together. An unreadable
+document uses built-in defaults, which contain no reviewer or worker selections;
+this is not a successful review. Explicit configuration writes still validate
+strictly. The environment kill switch and worker tool ceilings remain
+authoritative.
 
 ### Removed legacy array catalogs
 
-`externalAgents` and `execution.workerResources` accept only the canonical object
-form keyed by stable ID. The deprecated legacy array form of either catalog (agent
-entries carrying their own `id`; resource entries carrying a `resourceId` or using a
-generated identity) is no longer imported or converted ([#116](https://github.com/rfairburn/pi-review-gate/issues/116)),
-and there is no replacement automatic conversion:
+`externalAgents` and `execution.workerResources` accept only the canonical
+object form keyed by stable ID. The deprecated legacy array form of either
+catalog (agent entries carrying their own `id`; resource entries carrying a
+`resourceId` or using a generated identity) is no longer imported or converted
+([#116](https://github.com/rfairburn/pi-review-gate/issues/116)), and there is
+no replacement automatic conversion:
 
 - Strict validation rejects an array catalog instead of converting it.
-- Startup recovery (above) reports an array catalog as an unsupported field, uses
-  that catalog's default (no entries), and continues with the remaining valid
-  settings. Priority entries that referenced the array's resources are omitted, and
-  reviewer selections naming its agents are reported as unavailable selections; no
-  replacement worker, reviewer, or model is chosen.
+- Startup recovery (above) reports an array catalog as an unsupported field,
+  uses that catalog's default (no entries), and continues with the remaining
+  valid settings. Priority entries that referenced the array's resources are
+  omitted, and reviewer selections naming its agents are reported as unavailable
+  selections; no replacement worker, reviewer, or model is chosen.
 - Loading never converts, rewrites, or deletes the stored file, so the original
   arrays remain on disk until something explicitly writes the file.
-- A `/review-settings` Save in a release without the import writes only the catalogs
-  that release loaded; it never carries unsupported arrays forward. Migrate (below)
-  before saving settings there, and keep a backup.
+- A `/review-settings` Save in a release without the import writes only the
+  catalogs that release loaded; it never carries unsupported arrays forward.
+  Migrate (below) before saving settings there, and keep a backup.
 
 Canonical catalogs and their consumers are unchanged: the ordered
 `execution.routes.execute` and `execution.routes.research` priorities and their
 per-entry reasoning, the ordered `review.primaryReviewers` and
-`review.subtaskReviewers` lists, resource IDs and the shared `maxConcurrent` capacity,
-and the rule that a missing or empty priority means no models for that role.
+`review.subtaskReviewers` lists, resource IDs and the shared `maxConcurrent`
+capacity, and the rule that a missing or empty priority means no models for that
+role.
 
-**Migrating a legacy array config.** Convert it with a published release that still
-imports the array form, save it there, and only then upgrade. The prerelease
+**Migrating a legacy array config.** Convert it with a published release that
+still imports the array form, save it there, and only then upgrade. The
+prerelease
 [b164 (`pi-review-gate@0.1.0-dev.164`)](https://github.com/rfairburn/pi-review-gate/releases/tag/b164)
 is a published conversion-capable release: its installed package was verified to
 load both array catalogs and to write canonical objects on an explicit Save.
 
 1. Back up the config file, for example `cp review-gate.json review-gate.json.bak`.
 2. Download `pi-review-gate-0.1.0-dev.164.tgz` and `SHA256SUMS` from the b164
-   release, verify the tarball (`shasum -a 256 -c SHA256SUMS`), and install it in an
-   empty directory (`npm install ./pi-review-gate-0.1.0-dev.164.tgz`).
+   release, verify the tarball (`shasum -a 256 -c SHA256SUMS`), and install it
+   in an empty directory (`npm install ./pi-review-gate-0.1.0-dev.164.tgz`).
 3. Load the old config with that release, for example
    `PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json pi -e <dir>/node_modules/pi-review-gate/dist/src/index.js`.
-   Run it with the Pi models and Claude/Codex CLIs the config references available,
-   because Save validates every selection as usual. Loading converts in memory only;
-   the file is not changed yet.
+   Run it with the Pi models and Claude/Codex CLIs the config references
+   available, because Save validates every selection as usual. Loading converts
+   in memory only; the file is not changed yet.
 4. Open `/review-settings`, check **Worker resources**, **Execution priority**,
    **Research priority**, and **Reviewers**, then choose **Save changes** (or
-   Ctrl+S). Root Escape applies to the session only and **Cancel** discards; neither
-   writes the file. A settings Save keeps Pi reasoning on priority entries, not on
-   the worker resource itself (`selection.thinkingLevel`), so set the reasoning you
-   rely on for each Pi priority entry before saving.
+   Ctrl+S). Root Escape applies to the session only and **Cancel** discards;
+   neither writes the file. A settings Save keeps Pi reasoning on priority
+   entries, not on the worker resource itself (`selection.thinkingLevel`), so
+   set the reasoning you rely on for each Pi priority entry before saving.
 5. Confirm that the saved file stores both `externalAgents` and
-   `execution.workerResources` as objects. Resource entries without a `resourceId`
-   keep their established generated IDs (`external-<agentId>` or
-   `pi-<base64url model>`), which the saved priorities reference; a missing priority
-   may be written as `[]`, which still means no models.
+   `execution.workerResources` as objects. Resource entries without a
+   `resourceId` keep their established generated IDs (`external-<agentId>` or
+   `pi-<base64url model>`), which the saved priorities reference; a missing
+   priority may be written as `[]`, which still means no models.
 6. Upgrade to the newer release. The saved canonical config loads without
    conversion. Keep the backup until you have confirmed the upgraded setup.
 
 If you already upgraded without converting, run these steps with b164 on the
-unchanged file. If you saved settings in the newer release in the meantime, run them
-on your backup instead.
+unchanged file. If you saved settings in the newer release in the meantime, run
+them on your backup instead.
 
 ## Delegated execution fields
 
 The `execution` block (`workerResources`, `routes`, `maxWorkers`,
-`subtaskNotifications`, `deferredPiTools`, `retryPolicy`) and the reviewer/execution route matrix are
-documented with the behavior they control in
+`subtaskNotifications`, `deferredPiTools`, `retryPolicy`) and the
+reviewer/execution route matrix are documented with the behavior they control in
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency),
 including the keyed-catalog shape; the legacy array import is removed (see
-[Removed legacy array catalogs](#removed-legacy-array-catalogs)).
-A complete end-to-end example is `examples/delegated-execution.json`.
+[Removed legacy array catalogs](#removed-legacy-array-catalogs)). A complete
+end-to-end example is `examples/delegated-execution.json`.
 
 Defaults: `execution.maxWorkers` is `4` (allowed range 1–128) and
-`execution.subtaskNotifications` defaults to `quiet`. `execution.deferredPiTools`
-defaults to `true`. A newly captured executor also applies the exact-name
-`tools.executorDeny` list at admission (see [Tool denial fields](#tool-denial-fields)).
-The default retry policy is
+`execution.subtaskNotifications` defaults to `quiet`.
+`execution.deferredPiTools` defaults to `true`. A newly captured executor also
+applies the exact-name `tools.executorDeny` list at admission (see
+[Tool denial fields](#tool-denial-fields)). The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,
 `maxSameIncidentRepeats: 2`.
 
 ## Native Pi tool surfaces (MCP and codemode)
 
-On the supported Pi versions (see [Getting started](getting-started.md#prerequisites)),
-review-gate integrates with Pi's native MCP and codemode surfaces without taking any of
-them over. The concise rules:
+On the supported Pi versions (see
+[Getting started](getting-started.md#prerequisites)), review-gate integrates
+with Pi's native MCP and codemode surfaces without taking any of them over. The
+concise rules:
 
-- Sessions started through the review-gate launcher forward your arguments unchanged
-  and pass no `--tools` value of their own; the review-gate default there is
-  availability, not activation: the registered `codemode` tool is admitted to the
-  session's authorized catalog where Pi's registry carries it and no explicit
-  restriction removed it — the same for a manual extension-only load. Explicit Pi
-  `--tools`/`--exclude-tools`/`--no-tools` restrictions remain authoritative and are
-  never broadened.
+- Sessions started through the review-gate launcher forward your arguments
+  unchanged and pass no `--tools` value of their own; the review-gate default
+  there is availability, not activation: the registered `codemode` tool is
+  admitted to the session's authorized catalog where Pi's registry carries it
+  and no explicit restriction removed it — the same for a manual extension-only
+  load. Explicit Pi `--tools`/`--exclude-tools`/`--no-tools` restrictions remain
+  authoritative and are never broadened.
 - `codemode` follows the ordinary deferred-tools toggle
   (`execution.deferredPiTools`): with the default On it is discoverable through
-  `tool_search` but never part of the initial-active subset, so the model loads it
-  before use; with the toggle Off ordinary permitted tools, including `codemode`,
-  load without review-gate deferral. Native MCP exposure and Pi's loading choices
-  still apply: Off does not force codemode/deferred MCP tools into direct declarations.
-  Plan/research sessions and research roles exclude it entirely — and, alongside it,
-  all MCP tools are off for research by default: the read-only role boundary admits no
-  MCP tool names through the direct, script, or deferred channels, so there is no
-  default MCP exposure or callable MCP tool there, no `readOnlyHint` opt-in, and no
-  researcher override; the toggle never grants a research-forbidden tool.
+  `tool_search` but never part of the initial-active subset, so the model loads
+  it before use; with the toggle Off ordinary permitted tools, including
+  `codemode`, load without review-gate deferral. Native MCP exposure and Pi's
+  loading choices still apply: Off does not force codemode/deferred MCP tools
+  into direct declarations. Plan/research sessions and research roles exclude it
+  entirely — and, alongside it, all MCP tools are off for research by default:
+  the read-only role boundary admits no MCP tool names through the direct,
+  script, or deferred channels, so there is no default MCP exposure or callable
+  MCP tool there, no `readOnlyHint` opt-in, and no researcher override; the
+  toggle never grants a research-forbidden tool.
 - The `tools.topLevelDeny` and `tools.executorDeny` exact-name lists are an additional,
   independent narrowing layer over these native surfaces: a denied name is withheld from
   the primary or from newly captured executors respectively — never from both by
   cascade — and a denied call is refused on every script channel rather than re-added.
   See [Tool denial fields](#tool-denial-fields).
-- Delegated Pi workers inherit `codemode` only through the parent's captured worker
-  catalog; the captured worker ceiling never widens after capture, and withdrawn or
-  hidden names become absent and unusable within it. Review-gate adds no MCP server
-  manager, project-trust grant, credential flow, exposure editor, or annotation-based
-  permission policy: server configuration, trust, credentials, exposure, and
-  permissions stay with Pi. Enabled, permitted MCP tools are discoverable through
-  `tool_search`; disabled, hidden, or withdrawn names are not. Review-gate's guards
-  and existing evidence policy apply to
-  MCP and codemode calls like any other tool call.
+- Delegated Pi workers inherit `codemode` only through the parent's captured
+  worker catalog; the captured worker ceiling never widens after capture, and
+  withdrawn or hidden names become absent and unusable within it. Review-gate
+  adds no MCP server manager, project-trust grant, credential flow, exposure
+  editor, or annotation-based permission policy: server configuration, trust,
+  credentials, exposure, and permissions stay with Pi. Enabled, permitted MCP
+  tools are discoverable through `tool_search`; disabled, hidden, or withdrawn
+  names are not. Review-gate's guards and existing evidence policy apply to MCP
+  and codemode calls like any other tool call.
 
-Behavior details — the builtin `tool_search` replacement, in-session reconciliation,
-and the nested-call guards — are owned by
+Behavior details — the builtin `tool_search` replacement, in-session
+reconciliation, and the nested-call guards — are owned by
 [Native Pi tools](native-pi-tools.md#one-loader-replaces-pis-builtin-tool-search).
 
 ## Scheduled task fields
 
-`scheduledTasks` is an unordered catalog keyed by each task's stable identity; every
-schedule entry is stored exactly once in this catalog, and the cron timer and dispatch
-that run these entries are part of the scheduled-run runtime. The complete field
-reference — catalog shape and defaults, inheritance and overrides, schedule destinations,
-scheduled instruction images, local time and daylight saving, settings behavior and
-process visibility, and runtime dispatch — is owned by the
-[Scheduled tasks](scheduled-tasks.md#scheduled-task-fields) page.
+`scheduledTasks` is an unordered catalog keyed by each task's stable identity;
+every schedule entry is stored exactly once in this catalog, and the cron timer
+and dispatch that run these entries are part of the scheduled-run runtime. The
+complete field reference — catalog shape and defaults, inheritance and
+overrides, schedule destinations, scheduled instruction images, local time and
+daylight saving, settings behavior and process visibility, and runtime dispatch
+— is owned by the [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields)
+page.
 
 ### Inheritance and overrides
 
-See [Inheritance and overrides](scheduled-tasks.md#inheritance-and-overrides) on the
-Scheduled tasks page.
+See [Inheritance and overrides](scheduled-tasks.md#inheritance-and-overrides) on
+the Scheduled tasks page.
 
 ### Schedule destinations
 
-See [Schedule destinations](scheduled-tasks.md#schedule-destinations) on the Scheduled
-tasks page.
+See [Schedule destinations](scheduled-tasks.md#schedule-destinations) on the
+Scheduled tasks page.
 
 ### Scheduled instruction images
 
-See [Scheduled instruction images](scheduled-tasks.md#scheduled-instruction-images) on
-the Scheduled tasks page.
+See
+[Scheduled instruction images](scheduled-tasks.md#scheduled-instruction-images)
+on the Scheduled tasks page.
 
 ### Local time and daylight saving
 
-See [Local time and daylight saving](scheduled-tasks.md#local-time-and-daylight-saving)
+See
+[Local time and daylight saving](scheduled-tasks.md#local-time-and-daylight-saving)
 on the Scheduled tasks page.
 
 ### Settings behavior and process visibility
 
-See [Settings behavior and process visibility](scheduled-tasks.md#settings-behavior-and-process-visibility)
+See
+[Settings behavior and process visibility](scheduled-tasks.md#settings-behavior-and-process-visibility)
 on the Scheduled tasks page.
 
 ### Runtime dispatch
@@ -868,104 +914,107 @@ See [Runtime dispatch](scheduled-tasks.md#runtime-dispatch) on the Scheduled tas
 
 `web.urlBlocklist` is an array of ordinary JavaScript regular-expression sources
 (default **empty**: nothing is blocked). One shared list guards both acquisition
-tools: `WebFetch` and `BrowserExtract` deny a URL that matches any entry, and each
-entry is searched anywhere in the URL, so anchoring, character classes, and
-alternation are exactly what the configured source expresses. Every entry is judged
-against the complete URL only — the URL as supplied, or the complete destination a
-redirect `Location` forms (a relative `Location` resolved against the URL being
-redirected from, joined with that navigation's fragment when the `Location` names
-none) — and never
-against a fragmentless derivative of it, so an anchored entry such as `/private-page$`
-does not match `https://x.test/private-page#top` while `#top$` does, and an unanchored
-`/private-page` matches either. Entries are written
-without `/.../` delimiters and with no flags, so matching stays case-sensitive;
-surrounding whitespace is trimmed from every entry — a leading or trailing space in a
-URL pattern would almost never be intended — and the trimmed source is then matched with
-ordinary regex semantics and no other transformation, so a space you really want is
-written as regex syntax (`final\x20test` or `final[ ]test` matches a URL containing
-`final test`); a blank entry or an invalid expression
-rejects configuration loading (startup recovery omits only the invalid entry, with
-a warning). A denied acquisition is an explicit tool outcome for both tools: no
+tools: `WebFetch` and `BrowserExtract` deny a URL that matches any entry, and
+each entry is searched anywhere in the URL, so anchoring, character classes, and
+alternation are exactly what the configured source expresses. Every entry is
+judged against the complete URL only — the URL as supplied, or the complete
+destination a redirect `Location` forms (a relative `Location` resolved against
+the URL being redirected from, joined with that navigation's fragment when the
+`Location` names none) — and never against a fragmentless derivative of it, so
+an anchored entry such as `/private-page$` does not match
+`https://x.test/private-page#top` while `#top$` does, and an unanchored
+`/private-page` matches either. Entries are written without `/.../` delimiters
+and with no flags, so matching stays case-sensitive; surrounding whitespace is
+trimmed from every entry — a leading or trailing space in a URL pattern would
+almost never be intended — and the trimmed source is then matched with ordinary
+regex semantics and no other transformation, so a space you really want is
+written as regex syntax (`final\x20test` or `final[ ]test` matches a URL
+containing `final test`); a blank entry or an invalid expression rejects
+configuration loading (startup recovery omits only the invalid entry, with a
+warning). A denied acquisition is an explicit tool outcome for both tools: no
 page is fetched or rendered, and no fallback to the other tool is suggested. The
 supplied URL is checked before any request or browser launch, and every redirect
-destination is checked before that hop is followed, so a blocked endpoint receives
-no request at all; on a redirect, the destination judged is the complete URL the
-navigation itself forms, so the fragment on the URL you supplied never joins a later
-hop — that URL is judged on its own, and the chain starts without it — while a fragment
-a redirect's own `Location` introduces stays on the chain and is judged with the later
-hops whose `Location` names no fragment. That is the behavior observed in native
-Chromium, and the plain HTTP path matches it exactly.
-The fragment never goes on the wire and the cache key stays fragmentless, so neither
-is ever a second regex input. Changing the list discards cached acquisitions, so a
-page cached under an earlier policy cannot be served after it is blocked; saving an
-unchanged list leaves the cache intact. An acquisition already in flight when the list
-changes is discarded instead of served from a policy it was never validated against, and
-it is reported as a policy change you can retry — no additional request is made
-automatically. The guard applies to acquisition only —
-interactive `Browser*` tools, page subresources, and child-frame documents are
-unaffected — and it is a convenience guard rather than a security boundary: anything
-that reaches the network outside these tools (shell, `codemode`, raw sockets) is
-outside its reach.
-Edit it through `/review-settings` → **Tools** → **Web** → **URL blocklist** (one
+destination is checked before that hop is followed, so a blocked endpoint
+receives no request at all; on a redirect, the destination judged is the
+complete URL the navigation itself forms, so the fragment on the URL you
+supplied never joins a later hop — that URL is judged on its own, and the chain
+starts without it — while a fragment a redirect's own `Location` introduces
+stays on the chain and is judged with the later hops whose `Location` names no
+fragment. That is the behavior observed in native Chromium, and the plain HTTP
+path matches it exactly. The fragment never goes on the wire and the cache key
+stays fragmentless, so neither is ever a second regex input. Changing the list
+discards cached acquisitions, so a page cached under an earlier policy cannot be
+served after it is blocked; saving an unchanged list leaves the cache intact. An
+acquisition already in flight when the list changes is discarded instead of
+served from a policy it was never validated against, and it is reported as a
+policy change you can retry — no additional request is made automatically. The
+guard applies to acquisition only — interactive `Browser*` tools, page
+subresources, and child-frame documents are unaffected — and it is a convenience
+guard rather than a security boundary: anything that reaches the network outside
+these tools (shell, `codemode`, raw sockets) is outside its reach. Edit it
+through `/review-settings` → **Tools** → **Web** → **URL blocklist** (one
 expression per line), then **Save changes**; see
 [Web tools](web-tools.md#url-blocklist).
 
 `web.browserIdleExpiryMinutes` is a non-negative safe integer number of minutes
-(default **15**). Edit it through `/review-settings` → **Tools** → **Web** → **Browser idle
-expiry**, then **Save changes**. **0 disables idle close**: the session never closes
-for inactivity and stays open until an explicit `BrowserClose`, shutdown, replacement,
-or unrecoverable failure. Fractions, negative, and nonfinite values are rejected.
-The browser lifecycle contract is renewed by browser-tool activity and by detectable
-genuine human input in the live page (browser-trusted pointer presses, keyboard input,
-and wheel scrolling, authenticated so page script cannot forge it), not by background
-page requests, scripts, or WebSockets, and does not expire during an active browser
-operation. For hands-on human use of a visible browser, prefer setting the timeout to
-`0` so it cannot disappear mid-interaction. Both initial tool registration and live
-settings updates apply this persisted value to the managed browser in both directions
-(timed ↔ disabled). Expired handles explicitly require `BrowserOpen`; no lost state is
-silently recreated.
+(default **15**). Edit it through `/review-settings` → **Tools** → **Web** →
+**Browser idle expiry**, then **Save changes**. **0 disables idle close**: the
+session never closes for inactivity and stays open until an explicit
+`BrowserClose`, shutdown, replacement, or unrecoverable failure. Fractions,
+negative, and nonfinite values are rejected. The browser lifecycle contract is
+renewed by browser-tool activity and by detectable genuine human input in the
+live page (browser-trusted pointer presses, keyboard input, and wheel scrolling,
+authenticated so page script cannot forge it), not by background page requests,
+scripts, or WebSockets, and does not expire during an active browser operation.
+For hands-on human use of a visible browser, prefer setting the timeout to `0`
+so it cannot disappear mid-interaction. Both initial tool registration and live
+settings updates apply this persisted value to the managed browser in both
+directions (timed ↔ disabled). Expired handles explicitly require `BrowserOpen`;
+no lost state is silently recreated.
 
-`web.browserDownloadRetention` is a non-negative safe integer (default
-**8**). Edit it through `/review-settings` → **Tools** → **Web** → **Download retention**,
-then **Save changes**. It is the maximum number of unsaved downloads retained per
-interactive-browser session: while the cap is reached, a new download cancels and
-releases the oldest retained one (after a live lowering, the next arrival drains
-down to the new cap and may release more than one). Saved files are never
-counted or affected, and
-the ordinary save, tab/session-close, and capability-revocation cleanups always
-apply. **0 disables count-based eviction entirely**: every pending download stays
-retained until it is saved, its tab or session closes, or the capability is
-revoked. Fractions, negative, and nonfinite values are rejected. A changed value
-takes effect when the next download arrives — a live lowering never deletes
-already-retained pending downloads merely because the setting was edited — and
-both initial tool registration and live settings updates apply this persisted
-value to the managed browser.
+`web.browserDownloadRetention` is a non-negative safe integer (default **8**).
+Edit it through `/review-settings` → **Tools** → **Web** → **Download
+retention**, then **Save changes**. It is the maximum number of unsaved
+downloads retained per interactive-browser session: while the cap is reached, a
+new download cancels and releases the oldest retained one (after a live
+lowering, the next arrival drains down to the new cap and may release more than
+one). Saved files are never counted or affected, and the ordinary save,
+tab/session-close, and capability-revocation cleanups always apply. **0 disables
+count-based eviction entirely**: every pending download stays retained until it
+is saved, its tab or session closes, or the capability is revoked. Fractions,
+negative, and nonfinite values are rejected. A changed value takes effect when
+the next download arrives — a live lowering never deletes already-retained
+pending downloads merely because the setting was edited — and both initial tool
+registration and live settings updates apply this persisted value to the managed
+browser.
 
 `web.browserVisible` is a boolean (default **false**). Edit it through
-`/review-settings` → **Tools** → **Web** → **Browser visibility**, then **Save changes**. **false**
-keeps the default headless QA browser (no window); **true** launches the interactive
-browser headed — a real browser window with a native address bar the human can use
-directly. The model's tool set and exposure are identical in both modes; there is no
-model-facing visibility control, no persistent profile, and no remote-control port in
-either mode. Saving a changed value applies it immediately to the live browser through
-a controlled close/reopen replacement (tabs, active page, and memory-only session
-state restored best-effort with truthful loss/redirect reporting; the model-facing
-handles are replaced and the old ones are rejected). With no open browser it applies
-at the next `BrowserOpen`, and saving the already-active value restarts nothing.
-Cancel in the settings menu never relaunches. For hands-on human use of a headed
-window, prefer also setting `browserIdleExpiryMinutes` to `0`. See
-[Browser guide](browser.md#browser-visibility) for the full replacement semantics and
-their limits.
+`/review-settings` → **Tools** → **Web** → **Browser visibility**, then
+**Save changes**. **false** keeps the default headless QA browser (no window);
+**true** launches the interactive browser headed — a real browser window with a
+native address bar the human can use directly. The model's tool set and exposure
+are identical in both modes; there is no model-facing visibility control, no
+persistent profile, and no remote-control port in either mode. Saving a changed
+value applies it immediately to the live browser through a controlled
+close/reopen replacement (tabs, active page, and memory-only session state
+restored best-effort with truthful loss/redirect reporting; the model-facing
+handles are replaced and the old ones are rejected). With no open browser it
+applies at the next `BrowserOpen`, and saving the already-active value restarts
+nothing. Cancel in the settings menu never relaunches. For hands-on human use of
+a headed window, prefer also setting `browserIdleExpiryMinutes` to `0`. See
+[Browser guide](browser.md#browser-visibility) for the full replacement
+semantics and their limits.
 
 `web.browserInteractionApproval` accepts exactly `"ask"` (default),
-`"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid values
-(including `null`, booleans, and display labels such as `"Ask"`) reject configuration
-loading rather than silently granting approval. This policy applies only to the
-confirmation-required branch of authorized native `BrowserClick`, `BrowserFill`,
-`BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`,
-and `BrowserClipboard`; it does not turn off hard-denied
-actions, role authorization, SSRF controls, ref/target/value-digest revalidation, or
-value-secrecy protections. See [approval behavior](browser-permissions.md#browser-interaction-approval).
+`"automatically-accept"`, or `"automatically-deny"`. Omission uses Ask; invalid
+values (including `null`, booleans, and display labels such as `"Ask"`) reject
+configuration loading rather than silently granting approval. This policy
+applies only to the confirmation-required branch of authorized native
+`BrowserClick`, `BrowserFill`, `BrowserType`, `BrowserSelect`, `BrowserPress`,
+`BrowserUpload`, `BrowserDownloadSave`, and `BrowserClipboard`; it does not turn
+off hard-denied actions, role authorization, SSRF controls,
+ref/target/value-digest revalidation, or value-secrecy protections. See
+[approval behavior](browser-permissions.md#browser-interaction-approval).
 
 `web.browserPermissions` holds the independently selectable managed-browser
 permission toggles from
@@ -981,32 +1030,33 @@ unrestricted level ladder and no role scheme.
   through `BrowserDownloadSave`, wherever the model's existing host write
   authority reaches (relative paths resolve to the session working directory;
   absolute paths are not fenced by the browser). File selection and side effects
-  follow the configured `web.browserInteractionApproval` policy, and no mandatory
-  human picker is introduced; while either is disabled (the default) the
-  corresponding tool is denied before any approval prompt.
-- `modelClipboard` lets the model read or replace text on the browser
-  clipboard of an owned tab through `BrowserClipboard`. It is text-only — no
-  binary or image formats and no file paste — and always follows the configured
-  `web.browserInteractionApproval` policy; while disabled (the default) the
-  tool is denied before any approval prompt. Headless Chromium uses its
-  per-instance virtual clipboard; headed desktop Chromium reaches the host
-  system clipboard, and each result reports which scope was used.
+  follow the configured `web.browserInteractionApproval` policy, and no
+  mandatory human picker is introduced; while either is disabled (the default)
+  the corresponding tool is denied before any approval prompt.
+- `modelClipboard` lets the model read or replace text on the browser clipboard
+  of an owned tab through `BrowserClipboard`. It is text-only — no binary or
+  image formats and no file paste — and always follows the configured
+  `web.browserInteractionApproval` policy; while disabled (the default) the tool
+  is denied before any approval prompt. Headless Chromium uses its per-instance
+  virtual clipboard; headed desktop Chromium reaches the host system clipboard,
+  and each result reports which scope was used.
 - `modelCamera`, `modelMicrophone`, and `modelGeolocation` are enforced as real
-per-origin device permission grants issued when a session tab commits a top-level
-HTTP(S) navigation to an origin; while disabled (the default) no device grant is
-issued for any origin, and disabling clears the capability's grants from live
-sessions (an unconfirmable engine clear fails the affected session closed and
-is reported through the save rather than claimed applied; a clear that does
-not settle within the browser cleanup deadline is likewise reported as still
-in flight — never confirmed applied — and its session is closed to contain any
-retained grants, with the closure status reported through the save). They grant capability, not forced activation, and actual
-capture still depends on host hardware, operating-system privacy prompts, and
-position sources.
+per-origin device permission grants issued when a session tab commits a
+top-level HTTP(S) navigation to an origin; while disabled (the default) no
+device grant is issued for any origin, and disabling clears the capability's
+grants from live sessions (an unconfirmable engine clear fails the affected
+session closed and is reported through the save rather than claimed applied; a
+clear that does not settle within the browser cleanup deadline is likewise
+reported as still in flight — never confirmed applied — and its session is
+closed to contain any retained grants, with the closure status reported through
+the save). They grant capability, not forced activation, and actual capture
+still depends on host hardware, operating-system privacy prompts, and position
+sources.
 - `modelServiceWorkers` and `modelPopupRestrictionOverride` grant capability
 only: they do not force service-worker registration or popup activation. Service
 workers are blocked at context creation by default and allowed when enabled;
-because the mode is pinned at launch, a saved change replaces a live browser in a
-controlled way (tabs, storage state, and granted permissions restored
+because the mode is pinned at launch, a saved change replaces a live browser in
+a controlled way (tabs, storage state, and granted permissions restored
 best-effort with every loss reported). The popup override lifts the four-tab
 session limit for page-created popups while enabled; disabling it closes nothing
 already adopted.
@@ -1047,68 +1097,69 @@ cloud-metadata destinations are refused before any request or dial; while
 enabled, they are admitted with the same resolve-once-and-pin validation as
 public addresses. Saved changes apply to live sessions without a restart;
 disabling revokes only established local connections and refuses subsequent
-local admissions. `WebFetch` and `BrowserExtract` remain public-only.
-Model uploads (`modelUploads`) and model download saving
-(`modelDownloadSaving`) are enforced by `BrowserUpload` and
-`BrowserDownloadSave`: while disabled, those tools are denied before any
-approval prompt with a precise error naming the disabled permission; while
-enabled, they proceed through the ordinary interaction-approval flow with
-one-use revalidated permits. Saved changes apply to the live session;
-revoking download saving cancels and drops every retained pending download
-immediately. Model clipboard read/write (`modelClipboard`) is enforced by
-`BrowserClipboard`: while disabled, both operations are denied before any
-approval prompt with a precise error naming the disabled permission; while
-enabled, they proceed through the ordinary interaction-approval flow with
+local admissions. `WebFetch` and `BrowserExtract` remain public-only. Model
+uploads (`modelUploads`) and model download saving (`modelDownloadSaving`) are
+enforced by `BrowserUpload` and `BrowserDownloadSave`: while disabled, those
+tools are denied before any approval prompt with a precise error naming the
+disabled permission; while enabled, they proceed through the ordinary
+interaction-approval flow with one-use revalidated permits. Saved changes apply
+to the live session; revoking download saving cancels and drops every retained
+pending download immediately. Model clipboard read/write (`modelClipboard`) is
+enforced by `BrowserClipboard`: while disabled, both operations are denied
+before any approval prompt with a precise error naming the disabled permission;
+while enabled, they proceed through the ordinary interaction-approval flow with
 one-use revalidated permits and a real per-origin browser permission grant for
-the approved operation's origin (headless Chromium uses its per-instance
-virtual clipboard; headed desktop Chromium reaches the host system
-clipboard). Saved changes apply to the live session; revoking it clears every
-issued clipboard permission grant, and an unconfirmable engine clear fails the
-affected session closed (reported through the save) instead of being claimed
+the approved operation's origin (headless Chromium uses its per-instance virtual
+clipboard; headed desktop Chromium reaches the host system clipboard). Saved
+changes apply to the live session; revoking it clears every issued clipboard
+permission grant, and an unconfirmable engine clear fails the affected session
+closed (reported through the save) instead of being claimed applied; a clear
+that does not settle within the browser cleanup deadline is likewise reported as
+still in flight — never confirmed applied — and its session is closed to contain
+any retained grants, with the closure status reported through the save. Camera
+(`modelCamera`), microphone (`modelMicrophone`), and geolocation
+(`modelGeolocation`) are enforced as real per-origin device permission grants:
+while disabled, no device grant is issued for any origin; while enabled, a grant
+scoped to that origin only is issued when one of the session's tabs commits a
+top-level HTTP(S) navigation there, re-evaluating the current effective policy
+at every commit. Saved changes apply to the live session immediately: disabling
+clears every issued grant for that capability at once while leaving the other
+enabled capabilities' grants intact (an unconfirmable engine clear fails the
+affected session closed and is reported through the save rather than claimed
 applied; a clear that does not settle within the browser cleanup deadline is
-likewise reported as still in flight — never confirmed applied — and its
-session is closed to contain any retained grants, with the closure status
-reported through the save. Camera (`modelCamera`),
-microphone (`modelMicrophone`), and geolocation (`modelGeolocation`) are
-enforced as real per-origin device permission grants: while disabled, no
-device grant is issued for any origin; while enabled, a grant scoped to that
-origin only is issued when one of the session's tabs commits a top-level
-HTTP(S) navigation there, re-evaluating the current effective policy at every
-commit. Saved changes apply to the live session immediately: disabling clears
-every issued grant for that capability at once while leaving the other enabled
-capabilities' grants intact (an unconfirmable engine clear fails the affected
-session closed and is reported through the save rather than claimed applied; a
-clear that does not settle within the browser cleanup deadline is likewise
-reported as still in flight — never confirmed applied — and its session is
-closed to contain any retained grants, with the closure status reported
-through the save), and enabling takes effect from the next applicable navigation commit. Actual capture still depends on host hardware,
-operating-system privacy prompts, and position sources; the manager grants
-permission state only and reports failures truthfully. Service workers
-(`modelServiceWorkers`) are enforced at context creation — blocked by default,
-allowed when enabled — and because Chromium pins that mode at launch, a saved
-change replaces a live browser in a controlled way (tabs, storage state, and
-granted permissions restored best-effort with every loss reported) while all
-service-worker traffic still egresses only through the authenticated broker.
-The popup restriction override (`modelPopupRestrictionOverride`) lifts the
-four-tab session limit for page-created popups while enabled; disabling it
-closes nothing already adopted and only refuses further over-limit adoptions.
-Full semantics, including the service-worker WebSocket admission limitation,
-are documented in [Browser approvals and permissions](browser-permissions.md#browser-permissions-issue-27).
-The effective policy is computed by `effectiveBrowserPolicy` in `src/web/browser-capabilities.ts`;
-YOLO-approved actions are automatic approvals and must never be reported as human-confirmed.
+likewise reported as still in flight — never confirmed applied — and its session
+is closed to contain any retained grants, with the closure status reported
+through the save), and enabling takes effect from the next applicable navigation
+commit. Actual capture still depends on host hardware, operating-system privacy
+prompts, and position sources; the manager grants permission state only and
+reports failures truthfully. Service workers (`modelServiceWorkers`) are
+enforced at context creation — blocked by default, allowed when enabled — and
+because Chromium pins that mode at launch, a saved change replaces a live
+browser in a controlled way (tabs, storage state, and granted permissions
+restored best-effort with every loss reported) while all service-worker traffic
+still egresses only through the authenticated broker. The popup restriction
+override (`modelPopupRestrictionOverride`) lifts the four-tab session limit for
+page-created popups while enabled; disabling it closes nothing already adopted
+and only refuses further over-limit adoptions. Full semantics, including the
+service-worker WebSocket admission limitation, are documented in
+[Browser approvals and permissions](browser-permissions.md#browser-permissions-issue-27).
+The effective policy is computed by `effectiveBrowserPolicy` in
+`src/web/browser-capabilities.ts`; YOLO-approved actions are automatic approvals
+and must never be reported as human-confirmed.
 
-These are the defaults; every value can be overridden under `web`. The Python bridge for
-`WebSearch` is deliberately not configurable. Tool behavior and the trusted environment
-boundaries are owned by [Web tools](web-tools.md) and
+These are the defaults; every value can be overridden under `web`. The Python
+bridge for `WebSearch` is deliberately not configurable. Tool behavior and the
+trusted environment boundaries are owned by [Web tools](web-tools.md) and
 [Security model](security-model.md#web-egress-hardening).
 
 ## `/review-settings`
 
-The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
-page: its sixteen ordinary rows, the conditional **Scheduler runtime** row,
-Escape/Cancel/Save/Ctrl+S apply and persistence semantics, and the shared native
-text-field behavior. Raw field values and defaults stay in this reference — see
-[Top-level fields](#top-level-fields),
-[Operating modes](#operating-modes), [Reviewers](#reviewers), and
-[Web fields](#web-fields) — and scheduled-task semantics are owned by
+The staged settings menu is documented on the
+[Settings menu](settings.md#review-settings) page: its sixteen ordinary rows,
+the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
+persistence semantics, and the shared native text-field behavior. Raw field
+values and defaults stay in this reference — see
+[Top-level fields](#top-level-fields), [Operating modes](#operating-modes),
+[Reviewers](#reviewers), and [Web fields](#web-fields) — and scheduled-task
+semantics are owned by
 [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).

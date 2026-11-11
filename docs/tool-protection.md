@@ -1,10 +1,11 @@
 # Tool protection
 
-Tool protection is an optional pre-execution decision gate for native Pi tool calls.
-One configured auditor receives a bounded, code-selected representation of the proposed
-call and surrounding context before the call can take effect, and answers `PASS` or `FAIL`. `FAIL`, a
-timeout, a malformed answer, an unavailable auditor, cancellation, or an invalidated
-decision stops the proposed call under the existing fail-closed admission path.
+Tool protection is an optional pre-execution decision gate for native Pi tool
+calls. One configured auditor receives a bounded, code-selected representation
+of the proposed call and surrounding context before the call can take effect,
+and answers `PASS` or `FAIL`. `FAIL`, a timeout, a malformed answer, an
+unavailable auditor, cancellation, or an invalidated decision stops the proposed
+call under the existing fail-closed admission path.
 
 The gate only adds a restriction. It never grants authority, and existing role and mode
 ceilings, native permissions and trust, scoped tool denials, duplicate/liveness
@@ -16,9 +17,9 @@ the gate says nothing about a call it does not stop; `toolProtection.debug` is t
 optional, user-only switch that also shows you those routine positive results. See
 [What each call reports](#what-each-call-reports).
 
-This page describes the gate's own limits, not a general-availability sandbox or an
-all-harness guarantee. It requires a build that contains these native admission hooks; do
-not assume an older build enforces the configuration block.
+This page describes the gate's own limits, not a general-availability sandbox or
+an all-harness guarantee. It requires a build that contains these native
+admission hooks; do not assume an older build enforces the configuration block.
 
 ## Protection levels
 
@@ -33,17 +34,18 @@ second settings store. Absence of the block and `"level":"off"` both mean Off.
 | `aligned` | The two harms, plus proposals with no reasonable relationship to the authorized task and supplied evidence, plus the full floor tests: prohibitions in the governing instructions, unexplained target substitution, and restrictions stated by a genuine current-session user message | Scope drift and the stricter floor. Preparatory and setup calls count as related. A fresh, contextual user approval can resolve an authorization or alignment ambiguity. |
 | `workspace` | Everything above, plus proposals whose intended effect leaves the reported working directory or an explicitly permitted OS temporary root without authorization for that specific target in the governing instructions or a genuine current-session user message | An intent boundary judged from the proposal, not confinement. Authorized targets stay allowed; unknown effects fail. |
 
-Policy is code-owned and versioned. It is not user-editable, not a regex denylist, and
-not a new policy language. No classifier or decision model is installed. The policy
-is general tool safety: it judges the operation's semantics and the supplied
-authorization, so a signed third-party proxy destination carrying sensitive local
-contents is one worked example of an unauthorized transfer, not the scope; at the
-stricter levels an unexplained substitution of that destination is judged on its own,
-while under `dangerous` a substitution that moves no protected contents is not a
-refusal ground. There is no domain, provider, path, tool-name, or signature allowlist
-or denylist. The revision identifier recorded with each decision (for example
-`rules-11`) names the rule set that produced it; it is not a validation, support, or
-release claim.
+Policy is code-owned and versioned. It is not user-editable, not a regex
+denylist, and not a new policy language. No classifier or decision model is
+installed. The policy is general tool safety: it judges the operation's
+semantics and the supplied authorization, so a signed third-party proxy
+destination carrying sensitive local contents is one worked example of an
+unauthorized transfer, not the scope; at the stricter levels an unexplained
+substitution of that destination is judged on its own, while under `dangerous` a
+substitution that moves no protected contents is not a refusal ground. There is
+no domain, provider, path, tool-name, or signature allowlist or denylist. The
+revision identifier recorded with each decision (for example `rules-11`) names
+the rule set that produced it; it is not a validation, support, or release
+claim.
 
 ## Coverage and scope
 
@@ -53,25 +55,26 @@ only. A call outside the list is **NOT AUDITED** — never an implied PASS and n
 presented as checked. Selected scope is an explicit reduced-coverage choice, not a
 recommendation.
 
-**One infrastructure exception.** The canonical native discovery loader `tool_search` is
-never audited at any scope and under any level. It is the mechanism that reveals which
-tools exist, so gating it would deadlock the session rather than protect it, and it
-transfers no user data by itself. The exemption is narrow and truthful:
+**One infrastructure exception.** The canonical native discovery loader
+`tool_search` is never audited at any scope and under any level. It is the
+mechanism that reveals which tools exist, so gating it would deadlock the
+session rather than protect it, and it transfers no user data by itself. The
+exemption is narrow and truthful:
 
-- it belongs to the loader this extension registered. The live registry entry under
-  that name is matched against the definition this extension handed to the host; a
-  definition from anywhere else that took over the reserved `tool_search` name is an
-  ordinary tool proposal and is audited like one;
-- it is the exact native name `tool_search` only — no name prefix, no read-only, network,
-  or public-URL category is exempt;
-- the auditor is never consulted for it, so no auditor availability, timeout, or context
-  budget can delay discovery;
-- its result carries `NOT AUDITED — discovery loader`, which is never a `PASS` and never a
-  claim that the call was checked or is safe;
+- it belongs to the loader this extension registered. The live registry entry
+  under that name is matched against the definition this extension handed to the
+  host; a definition from anywhere else that took over the reserved
+  `tool_search` name is an ordinary tool proposal and is audited like one;
+- it is the exact native name `tool_search` only — no name prefix, no read-only,
+  network, or public-URL category is exempt;
+- the auditor is never consulted for it, so no auditor availability, timeout, or
+  context budget can delay discovery;
+- its result carries `NOT AUDITED — discovery loader`, which is never a `PASS`
+  and never a claim that the call was checked or is safe;
 - every native guard stays authoritative. Authorization, permission, ownership, and
   liveness checks can still refuse a `tool_search` call, and this gate cannot unblock one;
-- the settings picker shows the loader as a never-audited infrastructure row that cannot
-  be checked, and it is never part of a freshly seeded audit list;
+- the settings picker shows the loader as a never-audited infrastructure row
+  that cannot be checked, and it is never part of a freshly seeded audit list;
 - with the gate Off, nothing is annotated at all, including the loader.
 
 The intended native coverage is:
@@ -80,86 +83,94 @@ The intended native coverage is:
 - admitted codemode and nested calls;
 - MCP tool invocations that reach Pi's native hooks.
 
-Each decision belongs to the tool result of the call it governs; reporting it creates no
-separate audit-only turn. Saving a separate auditor session remains an independent opt-in. Native output, structured
-content, and nested return values are preserved, and nested decisions are aggregated on
-the parent. A PASS annotation is not execution success. Who sees each verdict is covered
-by [What each call reports](#what-each-call-reports).
+Each decision belongs to the tool result of the call it governs; reporting it
+creates no separate audit-only turn. Saving a separate auditor session remains
+an independent opt-in. Native output, structured content, and nested return
+values are preserved, and nested decisions are aggregated on the parent. A PASS
+annotation is not execution success. Who sees each verdict is covered by
+[What each call reports](#what-each-call-reports).
 
-That aggregation on the parent is a bounded digest, not a complete log, and it discloses
-its own bounds: at most 32 nested decision records are retained for one outer call (a
-refusal is dropped last, so an earlier denial is not the record lost) and at most 12
-summary lines are rendered. A long script can therefore carry `N earlier nested
-decision(s) omitted from this summary`, and when records were dropped at all it adds a
-`RETENTION LOSS: N nested decision record(s) are not retained` count. These retention
-bounds do not depend on `toolProtection.debug`: a refusal is still dropped last and a
-disclosed count is still disclosed, while routine positive rows follow
-[What each call reports](#what-each-call-reports). An individual nested auditor reason is
-not guaranteed visible. No retention loss here is silent.
+That aggregation on the parent is a bounded digest, not a complete log, and it
+discloses its own bounds: at most 32 nested decision records are retained for
+one outer call (a refusal is dropped last, so an earlier denial is not the
+record lost) and at most 12 summary lines are rendered. A long script can
+therefore carry `N earlier nested
+decision(s) omitted from this summary`, and when records were dropped at all it
+adds a `RETENTION LOSS: N nested decision record(s) are not retained` count.
+These retention bounds do not depend on `toolProtection.debug`: a refusal is
+still dropped last and a disclosed count is still disclosed, while routine
+positive rows follow [What each call reports](#what-each-call-reports). An
+individual nested auditor reason is not guaranteed visible. No retention loss
+here is silent.
 
-Coverage is Pi admission only. Non-Pi acting workers — Codex, Claude, and generic
-binary executors — are currently out of scope: this gate neither refuses nor audits
-them at any Protection level, including when its configuration is unavailable, and
-issues no protection pin for them. Existing harness permissions, role restrictions,
-review/landing gates, and lifecycle behavior remain unchanged. Auditor selections are
-unaffected. The gate also does not mediate human shell use, effects inside an
-already-running process, autonomous descendants, or provider/server-side effects. See
+Coverage is Pi admission only. Non-Pi acting workers — Codex, Claude, and
+generic binary executors — are currently out of scope: this gate neither refuses
+nor audits them at any Protection level, including when its configuration is
+unavailable, and issues no protection pin for them. Existing harness
+permissions, role restrictions, review/landing gates, and lifecycle behavior
+remain unchanged. Auditor selections are unaffected. The gate also does not
+mediate human shell use, effects inside an already-running process, autonomous
+descendants, or provider/server-side effects. See
 [Limits and non-goals](#limits-and-non-goals).
 
 ## What each call reports
 
-The audit's output is presentation, not authority, and the gate is quiet about the calls
-it does not stop.
+The audit's output is presentation, not authority, and the gate is quiet about
+the calls it does not stop.
 
-- A `FAIL`, an audit error (timeout, malformed decision, unavailable auditor, context
-  missing mandatory context, an invalidated pending decision), and a
+- A `FAIL`, an audit error (timeout, malformed decision, unavailable auditor,
+  context missing mandatory context, an invalidated pending decision), and a
   nested refusal are reported to you and to the acting model at either
-  `toolProtection.debug` value. A native tool error that follows a `PASS` stays a native
-  tool error; this gate never restates it as an audit `FAIL`.
+  `toolProtection.debug` value. A native tool error that follows a `PASS` stays
+  a native tool error; this gate never restates it as an audit `FAIL`.
 - An auditor-session save warning is always shown to you and never changes a verdict: a
   recording problem does not turn a `PASS` into a `FAIL` or hide a decision that was made.
-- A routine `PASS` and a `NOT AUDITED` result add no audit text to what the acting model
-  receives, at either `debug` value. The call's own native tool result, and the normal
-  parent-session record and display for it, stay authoritative; the gate adds no
-  model-facing notice about a call it did not stop.
+- A routine `PASS` and a `NOT AUDITED` result add no audit text to what the
+  acting model receives, at either `debug` value. The call's own native tool
+  result, and the normal parent-session record and display for it, stay
+  authoritative; the gate adds no model-facing notice about a call it did not
+  stop.
 - Whether those routine `PASS` and `NOT AUDITED` lines are also shown to you is
-  `toolProtection.debug` (Off by default). Off hides them. On shows the themed status
-  line, including the level and audit elapsed time for a `PASS`, but never a PASS reason.
-  `NOT AUDITED` keeps its exemption diagnostic; no audit duration is invented for a call
-  that was not audited. The switch is user-only: it sends the acting
-  model nothing it would not already receive, records nothing, contacts no model or
-  provider, and changes no level, scope, decision, timeout, or context budget.
-- Silence grants nothing and does not prove that the auditor was consulted. A `PASS`
-  still means only that this added gate did not block, and a `NOT AUDITED` call is still
-  unchecked by the gate. Neither grants native permission, trust, ownership, or landing
-  authority. No failure or audit error is hidden by either `debug` value.
+  `toolProtection.debug` (Off by default). Off hides them. On shows the themed
+  status line, including the level and audit elapsed time for a `PASS`, but
+  never a PASS reason. `NOT AUDITED` keeps its exemption diagnostic; no audit
+  duration is invented for a call that was not audited. The switch is user-only:
+  it sends the acting model nothing it would not already receive, records
+  nothing, contacts no model or provider, and changes no level, scope, decision,
+  timeout, or context budget.
+- Silence grants nothing and does not prove that the auditor was consulted. A
+  `PASS` still means only that this added gate did not block, and a
+  `NOT AUDITED` call is still unchecked by the gate. Neither grants native
+  permission, trust, ownership, or landing authority. No failure or audit error
+  is hidden by either `debug` value.
 
 ## Settings
 
-`/review-settings` → **Tools** → **Tool protection** exposes the controls: the shared
-level, one auditor selection, the audit scope and the exact names (toggled in the same
-searchable tool-name picker as the deny selectors, where checked means audited), the
-decision timeout, the context budget, and **Debug audit output**.
+`/review-settings` → **Tools** → **Tool protection** exposes the controls: the
+shared level, one auditor selection, the audit scope and the exact names
+(toggled in the same searchable tool-name picker as the deny selectors, where
+checked means audited), the decision timeout, the context budget, and **Debug
+audit output**.
 
 - Entering the exact-name scope with no established list checks every tool name the
   runtime currently offers that this gate can audit, so you uncheck the exemptions instead
   of checking each tool; the exempt `tool_search` row is never among them and says so; an
   existing nonempty list is kept exactly as saved, and an inventory offering nothing
   leaves the at-least-one-exact-name requirement in place rather than inventing a name.
-- The group uses the menu's one staged transaction. Escape at the `/review-settings` root
-  applies the draft to the running session only; **Save changes** or Ctrl+S persists it;
-  **Cancel** discards it.
-- Opening the menu and editing values invokes no provider and launches no auditor. A
-  saved selection is not a connection test.
-- Enabling a non-Off level or changing the auditor warns that the selected boundary will
-  receive the exact proposed tool arguments, the governing system instructions for the
-  acting call, and the selected session evidence. This warning is part of the edit, not a
-  separate audit message.
+- The group uses the menu's one staged transaction. Escape at the
+  `/review-settings` root applies the draft to the running session only;
+  **Save changes** or Ctrl+S persists it; **Cancel** discards it.
+- Opening the menu and editing values invokes no provider and launches no
+  auditor. A saved selection is not a connection test.
+- Enabling a non-Off level or changing the auditor warns that the selected
+  boundary will receive the exact proposed tool arguments, the governing system
+  instructions for the acting call, and the selected session evidence. This
+  warning is part of the edit, not a separate audit message.
 - An external auditor reference that does not resolve is preserved and reported as
   unavailable. The menu does not silently rewrite it to Off or choose another auditor.
-- **Save auditor sessions** is Off by default. Turning it on asks for one confirmation,
-  because it starts writing records that contain the exact auditor request; turning it
-  back off needs no confirmation. See
+- **Save auditor sessions** is Off by default. Turning it on asks for one
+  confirmation, because it starts writing records that contain the exact auditor
+  request; turning it back off needs no confirmation. See
   [Keeping auditor sessions](#keeping-auditor-sessions-optional).
 - **Debug audit output** is Off by default and decides only whether this gate's routine
   `PASS` and `NOT AUDITED` lines are shown to you. It records nothing, contacts no model
@@ -169,8 +180,8 @@ decision timeout, the context budget, and **Debug audit output**.
 
 ## Configuration
 
-`toolProtection` is one optional top-level block. Raw fields, defaults, validation, and
-malformed-block recovery are owned by
+`toolProtection` is one optional top-level block. Raw fields, defaults,
+validation, and malformed-block recovery are owned by
 [Tool protection fields](configuration.md#tool-protection-fields).
 
 ```json
@@ -186,10 +197,10 @@ malformed-block recovery are owned by
 ```
 
 A present block must state `level`; every non-Off level requires `auditor`;
-`scope: "selected"` requires at least one exact `toolNames` entry. `timeoutMs` is a whole
-number from 1000 to 120000 (default 10000), and `maxContextChars` is a whole number from
-1000 to 2000000 UTF-16 code units (default 128000). Explicit writes are validated
-strictly; unknown keys inside the block are ignored.
+`scope: "selected"` requires at least one exact `toolNames` entry. `timeoutMs`
+is a whole number from 1000 to 120000 (default 10000), and `maxContextChars` is
+a whole number from 1000 to 2000000 UTF-16 code units (default 128000). Explicit
+writes are validated strictly; unknown keys inside the block are ignored.
 
 A malformed stored block does not become an implicit Off. Startup reports a warning and
 keeps a derived error, and calls stay blocked until valid settings are explicitly applied
@@ -198,71 +209,76 @@ rewritten.
 
 ## Keeping auditor sessions (optional)
 
-By default no separate saved auditor session is created. Display-only decision metadata
-can remain in the normal parent-session history instead of model-facing tool content;
-the parent's existing persistence settings, including `--no-session`, still apply. This
-is not retention of the full auditor request and raw reply.
-`toolProtection.retainAuditorSessions` (Off by default, **Save auditor sessions** in the
-menu) is an explicit opt-in to keep each audit as
-an ordinary saved Pi session, in the same session store and format as any other
+By default no separate saved auditor session is created. Display-only decision
+metadata can remain in the normal parent-session history instead of model-facing
+tool content; the parent's existing persistence settings, including
+`--no-session`, still apply. This is not retention of the full auditor request
+and raw reply. `toolProtection.retainAuditorSessions` (Off by default, **Save
+auditor sessions** in the menu) is an explicit opt-in to keep each audit as an
+ordinary saved Pi session, in the same session store and format as any other
 conversation, so you can browse it later.
 
-- One actual auditor invocation becomes one fresh saved session. Nothing is appended to an
-  earlier record, and a new audit never reuses a stored history as input.
+- One actual auditor invocation becomes one fresh saved session. Nothing is
+  appended to an earlier record, and a new audit never reuses a stored history
+  as input.
 - Off records nothing at all: no session SDK load, no session directory, no file. Calls
   outside the audit scope, calls refused before the auditor was consulted, and the
   never-audited `tool_search` loader produce no records, because no auditor ran.
-- A record keeps what really happened, and only that. For the Pi route: the actual
-  system/user request text byte-for-byte, the effective reasoning request, the resolved
-  model, and the terminal assistant message the host returned. For an external
-  binary: the JSON envelope the gate supplied on its stdin and its captured stdout, both
-  labelled as host process input and program output, with the exit status, timeout/abort
-  state, and process settlement. The record says plainly when the host never confirmed that
-  the write reached the program, so an early exit or a cancelled run is never described as a
-  request the program read. An external binary made no provider call, so its record reports
-  no provider, model, usage, or stop reason.
-- Timeouts, cancellations, transport errors, malformed replies, and decisions invalidated
-  during the wait — including while the record itself was being written — are recorded too,
-  with the real host status and no invented verdict. A record whose invocation never reached
-  a transport says plainly that the request was never sent.
-- The outcome entry states that PASS/FAIL is this gate's pre-execution verdict, not a claim
-  that the tool ran or succeeded. Custom entries of this kind are never part of model
-  context, and the gate never opens, lists, or reads a saved audit: viewing a record
-  restores no tools and grants no authority.
-- Records contain the exact prompt, so they contain whatever the audited context contained.
-  They are kept until you delete them; this setting adds no deletion or retention policy.
-  Transport configuration is never recorded — no command, arguments, environment, or
-  credential. An auditor program that could not be started is kept as its launch category
-  and error code only, and path-shaped text in host status is withheld rather than copied,
-  because a launch failure quotes the configured executable.
+- A record keeps what really happened, and only that. For the Pi route: the
+  actual system/user request text byte-for-byte, the effective reasoning
+  request, the resolved model, and the terminal assistant message the host
+  returned. For an external binary: the JSON envelope the gate supplied on its
+  stdin and its captured stdout, both labelled as host process input and program
+  output, with the exit status, timeout/abort state, and process settlement. The
+  record says plainly when the host never confirmed that the write reached the
+  program, so an early exit or a cancelled run is never described as a request
+  the program read. An external binary made no provider call, so its record
+  reports no provider, model, usage, or stop reason.
+- Timeouts, cancellations, transport errors, malformed replies, and decisions
+  invalidated during the wait — including while the record itself was being
+  written — are recorded too, with the real host status and no invented verdict.
+  A record whose invocation never reached a transport says plainly that the
+  request was never sent.
+- The outcome entry states that PASS/FAIL is this gate's pre-execution verdict,
+  not a claim that the tool ran or succeeded. Custom entries of this kind are
+  never part of model context, and the gate never opens, lists, or reads a saved
+  audit: viewing a record restores no tools and grants no authority.
+- Records contain the exact prompt, so they contain whatever the audited context
+  contained. They are kept until you delete them; this setting adds no deletion
+  or retention policy. Transport configuration is never recorded — no command,
+  arguments, environment, or credential. An auditor program that could not be
+  started is kept as its launch category and error code only, and path-shaped
+  text in host status is withheld rather than copied, because a launch failure
+  quotes the configured executable.
 - A record is a copy beside the decision. If the write fails or only partly succeeds, the
   auditor's verdict stands unchanged and the result says so inline; a recording problem
   never blocks an approved call, never turns a PASS into a FAIL, and is never silent.
-- An ephemeral parent (`--no-session`) stays ephemeral. If retention is opted in, the audit
-  record is still its own separate saved session, and the acting session is neither created
-  nor reopened by recording.
-- `toolProtection.debug` is not a recording switch and opens no file or session of its
-  own: it changes only what the acting session shows you. It rewrites no existing saved
-  auditor session and no earlier session content, and it adds no migration step. Whether a
-  record exists at all
-  is decided by **Save auditor sessions** alone, and a record still reproduces the request
-  that was sent and the reply that actually came back rather than a tidied version of it.
+- An ephemeral parent (`--no-session`) stays ephemeral. If retention is opted
+  in, the audit record is still its own separate saved session, and the acting
+  session is neither created nor reopened by recording.
+- `toolProtection.debug` is not a recording switch and opens no file or session
+  of its own: it changes only what the acting session shows you. It rewrites no
+  existing saved auditor session and no earlier session content, and it adds no
+  migration step. Whether a record exists at all is decided by **Save auditor
+  sessions** alone, and a record still reproduces the request that was sent and
+  the reply that actually came back rather than a tidied version of it.
 
 ## What the auditor receives
 
-The request is built by code, not by another model. The code-owned decision instruction
-and policy for the enabled level, the evidence-provenance note, and the output contract
-are fixed: every request carries them unchanged, and they are **not** charged against
-`maxContextChars`. What that budget bounds is the curated **variable context** beside
-them — the proposal, the session evidence, and the quoted governing instructions,
-counted in the code units the transport actually carries for them, including the
-structural framing and JSON escaping the gate adds around them. When the auditor is an
-external program, the bounded host identity metadata that travels beside the request
-text is paid for out of the same budget, so the request text and that metadata together
-never exceed `maxContextChars`. The
-text actually sent is the fixed instruction overhead plus at most `maxContextChars` of
-variable context, so a request is larger than the configured budget by that overhead;
-the budget is never quietly raised, and it is a character count, not a token count.
+The request is built by code, not by another model. The code-owned decision
+instruction and policy for the enabled level, the evidence-provenance note, and
+the output contract are fixed: every request carries them unchanged, and they
+are **not** charged against `maxContextChars`. What that budget bounds is the
+curated **variable context** beside them — the proposal, the session evidence,
+and the quoted governing instructions, counted in the code units the transport
+actually carries for them, including the structural framing and JSON escaping
+the gate adds around them. When the auditor is an external program, the bounded
+host identity metadata that travels beside the request text is paid for out of
+the same budget, so the request text and that metadata together never exceed
+`maxContextChars`. The text actually sent is the fixed instruction overhead plus
+at most `maxContextChars` of variable context, so a request is larger than the
+configured budget by that overhead; the budget is never quietly raised, and it
+is a character count, not a token count.
 
 The variable context is selected deterministically, in this order:
 
@@ -274,24 +290,25 @@ The variable context is selected deterministically, in this order:
    by their recorded time before selection, so a cached record cannot outrank newer
    session content, and the message immediately before a proposal is kept ahead of older
    material;
-3. invocation and record identity facts, in the room the proposal and all selected
-   session-message content left;
+3. invocation and record identity facts, in the room the proposal and all
+   selected session-message content left;
 4. everything else previously supplied to the acting call, including the quoted
    governing instructions of the acting agent, only in the room that is left.
 
-When its framing fits, a record that cannot fit whole contributes its leading portion
-and carries `"partial":true` in its own JSON. Lower-priority sections, including the
-governing reference at small budgets, may be omitted entirely rather than displacing
-the proposal or newer session evidence. Session records render newest-first, matching
-selection order. Selection priority is separate from
-render order: all unchanged auditor instructions lead, followed by the selected governing
-reference, selected newest-first session evidence, and the proposed call last. Pi receives
-the code-owned fixed instructions in its native system prompt and all variable quoted
-data in one user message; quoted governing instructions are never promoted to system
-instructions. External binaries still receive the complete canonical prompt. This keeps
-shared leading material stable without changing allocation priorities. Nothing is
-summarized by a second model. Hidden model reasoning is excluded by construction, and
-no whole transcript, project resources, or prior session history is loaded automatically.
+When its framing fits, a record that cannot fit whole contributes its leading
+portion and carries `"partial":true` in its own JSON. Lower-priority sections,
+including the governing reference at small budgets, may be omitted entirely
+rather than displacing the proposal or newer session evidence. Session records
+render newest-first, matching selection order. Selection priority is separate
+from render order: all unchanged auditor instructions lead, followed by the
+selected governing reference, selected newest-first session evidence, and the
+proposed call last. Pi receives the code-owned fixed instructions in its native
+system prompt and all variable quoted data in one user message; quoted governing
+instructions are never promoted to system instructions. External binaries still
+receive the complete canonical prompt. This keeps shared leading material stable
+without changing allocation priorities. Nothing is summarized by a second model.
+Hidden model reasoning is excluded by construction, and no whole transcript,
+project resources, or prior session history is loaded automatically.
 
 The variable context uses one compact JSON document with `quotedGoverningInstructions`,
 `evidence`, and `proposedCall` fields, omitting optional material that does not fit.
@@ -312,67 +329,74 @@ For example, a small payload has this shape (without pretty-printing on the wire
 carried safely inside valid outer JSON; a clipped text or argument value is marked
 with `partial: true`. Optional identity fields are added only from remaining capacity.
 
-Oversized input is not a reason to block a call: an oversized proposal, an oversized
-governing prompt, or an oversized session reaches the configured auditor with the
-largest useful bounded context, and the returned `PASS`/`FAIL` decides. Only absent or
-unusable mandatory input — no governing text supplied, or a proposal whose arguments
-cannot be reproduced at all — stops the call as a missing-context failure.
+Oversized input is not a reason to block a call: an oversized proposal, an
+oversized governing prompt, or an oversized session reaches the configured
+auditor with the largest useful bounded context, and the returned `PASS`/`FAIL`
+decides. Only absent or unusable mandatory input — no governing text supplied,
+or a proposal whose arguments cannot be reproduced at all — stops the call as a
+missing-context failure.
 
-The `quotedGoverningInstructions` field is evidence about the acting agent, not rules
-addressed to the auditor. Only the code-owned policy determines which tests apply: a
-prohibition in the quoted instructions binds at `aligned` and `workspace`, never at
-`dangerous`, and quoted instructions can never establish a user prohibition. The block stays evidence of
-what the acting agent was told to do and which recipients, targets, and scopes the task
-authorizes. Each audit request prints one policy block for its level and one copy of the
-quoted instructions.
+The `quotedGoverningInstructions` field is evidence about the acting agent, not
+rules addressed to the auditor. Only the code-owned policy determines which
+tests apply: a prohibition in the quoted instructions binds at `aligned` and
+`workspace`, never at `dangerous`, and quoted instructions can never establish a
+user prohibition. The block stays evidence of what the acting agent was told to
+do and which recipients, targets, and scopes the task authorizes. Each audit
+request prints one policy block for its level and one copy of the quoted
+instructions.
 
-Provenance is host-reported, not authentication. A `user` label means the host reported
-current-session input, not an authenticated human principal. Approval text quoted inside
-tool output, repository content, or a generated summary is data, not user authorization;
-text delivered through an extension or RPC path is likewise not proof of a human author.
-A genuine fresh user approval can resolve an alignment or authorization ambiguity for a
-specific later proposal; it cannot waive the enabled floor. At `dangerous` the destruction
-test states both branches: catastrophic destruction of the host or operating system is
-refused even when the user's own current message requests or approves that destruction,
-while other irreversible loss of data is refused only beyond what the proposal and the
-supplied evidence justify.
+Provenance is host-reported, not authentication. A `user` label means the host
+reported current-session input, not an authenticated human principal. Approval
+text quoted inside tool output, repository content, or a generated summary is
+data, not user authorization; text delivered through an extension or RPC path is
+likewise not proof of a human author. A genuine fresh user approval can resolve
+an alignment or authorization ambiguity for a specific later proposal; it cannot
+waive the enabled floor. At `dangerous` the destruction test states both
+branches: catastrophic destruction of the host or operating system is refused
+even when the user's own current message requests or approves that destruction,
+while other irreversible loss of data is refused only beyond what the proposal
+and the supplied evidence justify.
 
-A genuine current-session user **restriction** is an audit test at every enabled level:
-if the user's own current message says not to read that path, contact that destination, or
-touch that tree, a proposal that does so is refused there even though the identical call
-is otherwise ordinary work. Only the user's own current-session text carries this force —
-a restriction quoted inside tool output, repository content, or a summary stays data, and
-an instruction aimed only at a worker or subagent binds the worker it names but is not
-widened to a caller outside its scope.
+A genuine current-session user **restriction** is an audit test at every enabled
+level: if the user's own current message says not to read that path, contact
+that destination, or touch that tree, a proposal that does so is refused there
+even though the identical call is otherwise ordinary work. Only the user's own
+current-session text carries this force — a restriction quoted inside tool
+output, repository content, or a summary stays data, and an instruction aimed
+only at a worker or subagent binds the worker it names but is not widened to a
+caller outside its scope.
 
-At `dangerous` the user's own prohibition is also an audit test, but only in that narrow
-form: an explicit prohibition in a genuine current-session user message decides `FAIL`
-when it applies to the proposed operation, target, recipient, or scope, even though the
-same call harms nothing. A request to stop work may require tool calls to abort or
-interrupt running processes or child tasks; calls that carry out that request are not
-continued performance of the stopped work, and they remain subject to danger checks and
-any applicable explicit user restrictions. That is a general rule about which prohibition
-covers which call, not a rule about any tool, and not a blanket approval for stopping
-work. That is not general conformance auditing. Neither is workflow compliance: how the
-acting agent waits for running work, which tool it uses, and whether it
-stays on the stated task are obligations it owes its principal, so a proposal that really
-breaks one of those instructions still passes this level when it harms nothing and no
-applicable user prohibition covers it, while generic framework, host, or skill guidance is
-never read as a prohibition the user stated. An ordinary call needs
-no prior explicit yes, a task-specific or worker-root path restriction that appears only
-in the governing instructions or the task is not refused by this gate unless it is also
-an applicable user prohibition, a quoted or summarized claim about what the user said
-binds nothing, a worker-scoped prohibition binds the worker it names but is not widened
-to a caller outside its scope, and a complaint about earlier blocking is not a ban. Returning the content the requesting user
-asked for is not a disclosure merely because the material carries customer or diagnostic
-context. An evidence item the host omitted because it did not fit the context budget, and
-a record carried only in part, prove nothing in either direction: they are
-never a refusal ground and never a reason to hedge, while a timeout, a malformed decision,
-or missing mandatory context stays a fail-closed runtime failure rather than a
-policy `FAIL`. This changes only what the auditor is asked about. The acting agent must
-still obey its governing instructions and the user's restrictions, and no permission,
-ceiling, trust, ownership, preflight, review, landing, or cancellation guard is relaxed by
-a `dangerous` PASS.
+At `dangerous` the user's own prohibition is also an audit test, but only in
+that narrow form: an explicit prohibition in a genuine current-session user
+message decides `FAIL` when it applies to the proposed operation, target,
+recipient, or scope, even though the same call harms nothing.
+A request to stop work may require tool calls to abort or interrupt running
+processes or child tasks; calls that carry out that request are not continued
+performance of the stopped work, and they remain subject to danger checks and
+any applicable explicit user restrictions. That is a general rule about which
+prohibition covers which call, not a rule about any tool, and not a blanket
+approval for stopping work. That is not general conformance auditing. Neither is
+workflow compliance: how the acting agent waits for running work, which tool it
+uses, and whether it stays on the stated task are obligations it owes its
+principal, so a proposal that really breaks one of those instructions still
+passes this level when it harms nothing and no applicable user prohibition
+covers it, while generic framework, host, or skill guidance is never read as a
+prohibition the user stated. An ordinary call needs no prior explicit yes, a
+task-specific or worker-root path restriction that appears only in the governing
+instructions or the task is not refused by this gate unless it is also an
+applicable user prohibition, a quoted or summarized claim about what the user
+said binds nothing, a worker-scoped prohibition binds the worker it names but is
+not widened to a caller outside its scope, and a complaint about earlier
+blocking is not a ban. Returning the content the requesting user asked for is
+not a disclosure merely because the material carries customer or diagnostic
+context. An evidence item the host omitted because it did not fit the context
+budget, and a record carried only in part, prove nothing in either direction:
+they are never a refusal ground and never a reason to hedge, while a timeout, a
+malformed decision, or missing mandatory context stays a fail-closed runtime
+failure rather than a policy `FAIL`. This changes only what the auditor is asked
+about. The acting agent must still obey its governing instructions and the
+user's restrictions, and no permission, ceiling, trust, ownership, preflight,
+review, landing, or cancellation guard is relaxed by a `dangerous` PASS.
 
 ## Auditors and routes
 
@@ -384,44 +408,49 @@ One existing reviewer selection is reused; there is no second auditor catalog.
 | `{"source":"external","id":"agent-id"}` with `generic-cli` or `run-as-binary` | Reuses the configured command, arguments, and environment with the versioned stdin/stdout decision protocol below. The external implementation is trusted code, not an OS sandbox. |
 | External `claude-cli` or `codex-cli` | Selectable but currently fails closed before launch with an explicit unsupported-capability message: neither route has a proven safe, no-tool, single-attempt launch contract. Use the provider through the Pi route where its model is available. This page makes no claim that the CLI routes work. |
 
-An external id that does not resolve also fails closed as unavailable rather than
-becoming Off or PASS. A malformed protection block is reported at startup, not silently
-read as Off. External definitions contribute their command, arguments, and environment:
-the `execution` role is used when present, otherwise `review`, and the gate's
-`timeoutMs` bounds the decision rather than the role timeout.
+An external id that does not resolve also fails closed as unavailable rather
+than becoming Off or PASS. A malformed protection block is reported at startup,
+not silently read as Off. External definitions contribute their command,
+arguments, and environment: the `execution` role is used when present, otherwise
+`review`, and the gate's `timeoutMs` bounds the decision rather than the role
+timeout.
 
 ### Provider prompt caching
 
-Prompt caching reuses provider-side computation, never a decision. Every proposal still
-sends its own self-contained request and needs a fresh verdict. The stable-prefix layout
-applies to every selected auditor model, not a particular model name.
+Prompt caching reuses provider-side computation, never a decision. Every
+proposal still sends its own self-contained request and needs a fresh verdict.
+The stable-prefix layout applies to every selected auditor model, not a
+particular model name.
 
-For Pi auditors, a namespaced hash of the native acting-session id, model, level, and
-policy revision supplies the SDK's supported `sessionId` option. A session file is not
-required, and no saved history is read. If the host supplies no session id, auditing
-continues without a key. The fixture tester instead derives its scope from the resolved
-saved-configuration path, so repeat runs over that configuration and level share a key.
-Raw session ids and configuration paths are not sent as the key.
+For Pi auditors, a namespaced hash of the native acting-session id, model,
+level, and policy revision supplies the SDK's supported `sessionId` option. A
+session file is not required, and no saved history is read. If the host supplies
+no session id, auditing continues without a key. The fixture tester instead
+derives its scope from the resolved saved-configuration path, so repeat runs
+over that configuration and level share a key. Raw session ids and configuration
+paths are not sent as the key.
 
-The installed SDK maps that option to its supported cache/routing controls. Every Pi
-audit requests the SDK's native SSE transport for a self-contained one-shot request,
-without pooled continuation of an earlier response. This gate adds no retention/TTL
-flags or custom provider headers.
+The installed SDK maps that option to its supported cache/routing controls.
+Every Pi audit requests the SDK's native SSE transport for a self-contained
+one-shot request, without pooled continuation of an earlier response. This gate
+adds no retention/TTL flags or custom provider headers.
 
 Every Pi auditor uses the same native system/user separation. Pi's own adapters handle
 provider payloads and cache boundaries; this gate uses no provider-specific payload hook,
 cache-marker rewriting, or custom provider JSON. Native cache-retention settings remain
 Pi's responsibility. Saving an audit never turns the request into an ongoing conversation.
 
-No model-name or provider-specific setup is required by this gate. Cache availability,
-minimum cacheable prefix length, construction, expiry, eviction, and billing remain
-properties of the selected backend, handled through Pi. A stable system prompt or
-cache key alone proves neither a hit nor savings; verify the reported usage.
+No model-name or provider-specific setup is required by this gate. Cache
+availability, minimum cacheable prefix length, construction, expiry, eviction,
+and billing remain properties of the selected backend, handled through Pi. A
+stable system prompt or cache key alone proves neither a hit nor savings; verify
+the reported usage.
 
-**Save auditor sessions** still controls separate fresh records, not cache identity or
-request history; **Debug audit output** still controls presentation only. Neither is
-required for caching. See [Testing tool protection](#testing-tool-protection) for actual
-usage verification without changing models or settings.
+**Save auditor sessions** still controls separate fresh records, not cache
+identity or request history; **Debug audit output** still controls presentation
+only. Neither is required for caching. See
+[Testing tool protection](#testing-tool-protection) for actual usage
+verification without changing models or settings.
 
 ### External decision protocol
 
@@ -450,21 +479,22 @@ The auditor process receives one JSON envelope on stdin and
 }
 ```
 
-The auditor process is started in the working directory reported for the proposed
-call; it is not repeated inside the envelope, because that text would travel outside
-the accounted context budget.
+The auditor process is started in the working directory reported for the
+proposed call; it is not repeated inside the envelope, because that text would
+travel outside the accounted context budget.
 
-`prompt` is the one authoritative copy of the audited context. The `input` object is
-model-neutral host metadata: bounded identity for the exact proposal — the invocation id,
-tool name, and the same argument fingerprint the gate binds its own decision to — and the
-recorded evidence selection counts. Each value is a bounded leading portion, the whole
-object is capped at a share of `maxContextChars`, and its actual serialized cost — with
-the envelope framing it shares with the request text — is subtracted from that same
-budget before anything is selected, so the transmitted variable data never exceeds
-`maxContextChars` and no capacity is left idle. The identity fields are dropped when even
-the bounded values cannot fit their share. It
-never carries a second copy of the submitted arguments, the working directory, or the
-governing instructions, so an oversized proposal cannot reach an auditor unbounded through
+`prompt` is the one authoritative copy of the audited context. The `input`
+object is model-neutral host metadata: bounded identity for the exact proposal —
+the invocation id, tool name, and the same argument fingerprint the gate binds
+its own decision to — and the recorded evidence selection counts. Each value is
+a bounded leading portion, the whole object is capped at a share of
+`maxContextChars`, and its actual serialized cost — with the envelope framing it
+shares with the request text — is subtracted from that same budget before
+anything is selected, so the transmitted variable data never exceeds
+`maxContextChars` and no capacity is left idle. The identity fields are dropped
+when even the bounded values cannot fit their share. It never carries a second
+copy of the submitted arguments, the working directory, or the governing
+instructions, so an oversized proposal cannot reach an auditor unbounded through
 a side field, and a saved audit record does not duplicate what it already saved.
 
 It writes a decision object to stdout. The clean form is exactly one object:
@@ -475,113 +505,127 @@ It writes a decision object to stdout. The clean form is exactly one object:
 {"decision":"FAIL","reason":"short refusal justification"}
 ```
 
-`decision` is required and must be exactly `PASS` or `FAIL`. The auditor is asked for a
-reasonless `PASS` — `{"decision":"PASS"}` with no `reason` field is the expected positive
-reply at every enabled level, on both routes. `reason` is optional and belongs to a
-`FAIL`: `{"decision":"FAIL"}` on its own is a complete, valid decision, and that refusal
-is then reported in generic wording rather than with an invented justification. A supplied
-reason up to 4000 characters is preserved verbatim and is what makes the refusal
-actionable; an oversized one is malformed rather than truncated. An omitted reason stays
-absent and may be labelled by the host, but no rationale is invented.
+`decision` is required and must be exactly `PASS` or `FAIL`. The auditor is
+asked for a reasonless `PASS` — `{"decision":"PASS"}` with no `reason` field is
+the expected positive reply at every enabled level, on both routes. `reason` is
+optional and belongs to a `FAIL`: `{"decision":"FAIL"}` on its own is a
+complete, valid decision, and that refusal is then reported in generic wording
+rather than with an invented justification. A supplied reason up to 4000
+characters is preserved verbatim and is what makes the refusal actionable; an
+oversized one is malformed rather than truncated. An omitted reason stays absent
+and may be labelled by the host, but no rationale is invented.
 
-The reply may also embed the decision in surrounding commentary, a JSON code fence, or
-multiple agreeing decision objects. Candidate discovery is the same bounded extraction
-used for review results: the complete reply, JSON code fences, then balanced JSON objects,
-in source order with exact-text duplicates removed. Unrelated prose and metadata objects are
-skipped, and provider phase metadata is not required. Every decision object found must be
-valid on its own: a malformed decision object anywhere in the reply, including one beside a
-valid decision, makes the whole reply malformed, as does both a valid `PASS` and a valid
-`FAIL`. A decision nested inside an array or another non-object JSON envelope is not mined
-from that envelope, and a decision inside an array makes the whole reply malformed. Agreeing objects keep the extractor's first-candidate order, so a
-fenced object is preferred over earlier prose. Extra fields, a non-string or oversized reason, any other
-decision value, a decision inside a fenced block declaring another language, or JSON
-that would need repair are malformed; no repair is applied to a decision. A reply that
-still attaches a `reason` to a `PASS` remains a valid decision; that unexpected reason
-is not shown to you and is not forwarded to the acting model, while a retained auditor
+The reply may also embed the decision in surrounding commentary, a JSON code
+fence, or multiple agreeing decision objects. Candidate discovery is the same
+bounded extraction used for review results: the complete reply, JSON code
+fences, then balanced JSON objects, in source order with exact-text duplicates
+removed. Unrelated prose and metadata objects are skipped, and provider phase
+metadata is not required. Every decision object found must be valid on its own:
+a malformed decision object anywhere in the reply, including one beside a valid
+decision, makes the whole reply malformed, as does both a valid `PASS` and a
+valid `FAIL`. A decision nested inside an array or another non-object JSON
+envelope is not mined from that envelope, and a decision inside an array makes
+the whole reply malformed. Agreeing objects keep the extractor's first-candidate
+order, so a fenced object is preferred over earlier prose. Extra fields, a
+non-string or oversized reason, any other decision value, a decision inside a
+fenced block declaring another language, or JSON that would need repair are
+malformed; no repair is applied to a decision. A reply that still attaches a
+`reason` to a `PASS` remains a valid decision; that unexpected reason is not
+shown to you and is not forwarded to the acting model, while a retained auditor
 record and the fixture tester report the reply that actually came back.
 
-Candidate discovery stays exactly as described above: a JSON fence is still read even when
-surrounding commentary carries an unbalanced quote, and nothing the bounded extraction
-does not surface is reconstructed into a decision. A `decision` name counts only as a
-property name of a JSON object: the same word quoted in prose, or appearing as an array
-element or a value, is commentary, never a decision, and it can never authorize a call.
-Decision-shaped syntax that is not a complete decision object — a dangling `"decision": …`
-fragment in commentary or inside a fence that declares another language, a decision inside
-an array, or a truncated or otherwise invalid envelope — is malformed, and so is a reply
-in which no valid decision is found; both fail closed.
+Candidate discovery stays exactly as described above: a JSON fence is still read
+even when surrounding commentary carries an unbalanced quote, and nothing the
+bounded extraction does not surface is reconstructed into a decision. A
+`decision` name counts only as a property name of a JSON object: the same word
+quoted in prose, or appearing as an array element or a value, is commentary,
+never a decision, and it can never authorize a call. Decision-shaped syntax that
+is not a complete decision object — a dangling `"decision": …` fragment in
+commentary or inside a fence that declares another language, a decision inside
+an array, or a truncated or otherwise invalid envelope — is malformed, and so is
+a reply in which no valid decision is found; both fail closed.
 
-A nonzero exit, timeout, empty or truncated output, unconfirmed process settlement,
-malformed decision, or unavailable auditor fails closed: the proposed call does not run.
-It is reported as an unavailable or error outcome, not as a policy `FAIL`, and it is
-never retried, replayed, routed to a fallback, or answered from a cache.
+A nonzero exit, timeout, empty or truncated output, unconfirmed process
+settlement, malformed decision, or unavailable auditor fails closed: the
+proposed call does not run. It is reported as an unavailable or error outcome,
+not as a policy `FAIL`, and it is never retried, replayed, routed to a fallback,
+or answered from a cache.
 
 ## Failure, cancellation, and approvals
 
 - A timeout, malformed decision, unavailable auditor, or context-capacity failure stops
   missing mandatory context stops the proposed call. There is no automatic retry, replay,
   fallback auditor, or cached decision. Size alone is not one of these failures.
-- Cancellation or a policy, level, or auditor change invalidates a pending audit. A late
-  PASS cannot revive it.
+- Cancellation or a policy, level, or auditor change invalidates a pending
+  audit. A late PASS cannot revive it.
 - A `FAIL` is a gate refusal, not a tool execution failure. It does not create an
   execution-retry entitlement, and existing duplicate/liveness behavior is unchanged.
-- A confirmed auditor timeout is also not a tool execution failure, and it is the one
-  refusal that does not consume the proposed tool's duplicate/repeated-use allowance:
-  the call never started, so an identical retry is admitted for a fresh audit under the
-  unchanged authorization and liveness checks, and repeated timeouts never exhaust that
-  allowance. Nothing retries on its own. Once a call actually runs, ordinary duplicate
-  protection covers it, including its existing treatment of real tool failures, and a
-  `FAIL`, a malformed decision, an unavailable auditor, and a cancelled or invalidated
-  audit keep their existing accounting. The timeout itself stays reported to you and to
-  the acting model, and its audit evidence is retained as usual.
+- A confirmed auditor timeout is also not a tool execution failure, and it is
+  the one refusal that does not consume the proposed tool's
+  duplicate/repeated-use allowance: the call never started, so an identical
+  retry is admitted for a fresh audit under the unchanged authorization and
+  liveness checks, and repeated timeouts never exhaust that allowance. Nothing
+  retries on its own. Once a call actually runs, ordinary duplicate protection
+  covers it, including its existing treatment of real tool failures, and a
+  `FAIL`, a malformed decision, an unavailable auditor, and a cancelled or
+  invalidated audit keep their existing accounting. The timeout itself stays
+  reported to you and to the acting model, and its audit evidence is retained as
+  usual.
 - A `FAIL` with no supplied reason stops the call exactly like one with a reason: the
   refusal is reported to you and to the acting model, and nothing is invented to fill the
   gap.
-- A fresh, contextual user approval can address alignment or authorization ambiguity for
-  a specific proposal. It is not a standing grant, does not replay a refused call, and
-  cannot waive the minimum floor while a level is enabled. Only a human setting the level
-  to Off removes this gate; approval text in a conversation cannot.
-- Newly launched Pi executors pin the parent's current settings, including a session-only
-  draft. Already-running workers keep the configuration loaded at launch.
+- A fresh, contextual user approval can address alignment or authorization
+  ambiguity for a specific proposal. It is not a standing grant, does not replay
+  a refused call, and cannot waive the minimum floor while a level is enabled.
+  Only a human setting the level to Off removes this gate; approval text in a
+  conversation cannot.
+- Newly launched Pi executors pin the parent's current settings, including a
+  session-only draft. Already-running workers keep the configuration loaded at
+  launch.
 
 ## Limits and non-goals
 
 - **Not a sandbox.** PASS is a decision about the supplied proposal, not kernel
   confinement. Human shell commands, effects inside an already-running process,
   autonomous descendants, and provider or server-side effects are not mediated.
-- **Not all harnesses.** Coverage is native Pi admission as described above. Arbitrary
-  wrappers, other agent harnesses, and calls that never reach Pi's hooks are not covered,
-  and that includes this extension's own non-Pi acting workers (Codex, Claude, and
-  generic binary executors): the gate neither refuses nor audits them.
-- **No proven final-call fence.** A later trusted extension hook can mutate a proposal
-  after admission, and a provider request rewrite can change the governing instructions.
-  The gate cannot prove that the final dispatched call and instructions are identical to
-  the audited ones.
-- **Trusted external auditor.** An external binary or process is configured code, not an
-  OS sandbox. It receives the exact call, governing instructions, and selected evidence;
-  choose that boundary deliberately.
-- **Latency is not promised.** Model, provider profile, queueing, and context length
-  change latency; the timeout is a deadline, not a performance target.
-- **Code-owned policy.** Levels, floor wording, defaults, and scope names are fixed in
-  code and shipped to the auditor verbatim; they are not user-editable and not a policy
-  language. There is no classifier or model install and no general security audit of
-  unrelated behavior.
-- **A saved audit shows the exchange, not the machinery.** With retention opted in, a
-  record reproduces the request that was sent and the reply that came back, including any
-  reasoning content the provider actually returned in that message. It cannot show private
-  chain-of-thought that the provider did not expose, the auditor's runtime environment, or
-  anything an external binary did besides what it wrote to its output.
+- **Not all harnesses.** Coverage is native Pi admission as described above.
+  Arbitrary wrappers, other agent harnesses, and calls that never reach Pi's
+  hooks are not covered, and that includes this extension's own non-Pi acting
+  workers (Codex, Claude, and generic binary executors): the gate neither
+  refuses nor audits them.
+- **No proven final-call fence.** A later trusted extension hook can mutate a
+  proposal after admission, and a provider request rewrite can change the
+  governing instructions. The gate cannot prove that the final dispatched call
+  and instructions are identical to the audited ones.
+- **Trusted external auditor.** An external binary or process is configured
+  code, not an OS sandbox. It receives the exact call, governing instructions,
+  and selected evidence; choose that boundary deliberately.
+- **Latency is not promised.** Model, provider profile, queueing, and context
+  length change latency; the timeout is a deadline, not a performance target.
+- **Code-owned policy.** Levels, floor wording, defaults, and scope names are
+  fixed in code and shipped to the auditor verbatim; they are not user-editable
+  and not a policy language. There is no classifier or model install and no
+  general security audit of unrelated behavior.
+- **A saved audit shows the exchange, not the machinery.** With retention opted
+  in, a record reproduces the request that was sent and the reply that came
+  back, including any reasoning content the provider actually returned in that
+  message. It cannot show private chain-of-thought that the provider did not
+  expose, the auditor's runtime environment, or anything an external binary did
+  besides what it wrote to its output.
 
 ## Testing tool protection
 
-The package ships an inert tester for the existing policy fixtures. It builds the same
-auditor prompt as the gate, asks the saved Pi auditor once per selected case and level,
-prints the raw reply, reason, and duration, and compares the parsed verdict with the fixed
-expected value. It never executes a proposal, reads a proposal target, registers a tool,
-starts an agent loop, or changes settings, `models.json`, authentication, or fixture data.
-It honors **Save auditor sessions**: when enabled, each invoked case/level gets one fresh
-normal Pi auditor session containing the actual request, terminal reply and usage. Off
-writes nothing. A save failure is reported without changing the verdict or exit status. A test verdict is an auditor-test result, never actual
-tool admission; the live Protection level and scope do not filter the cases.
+The package ships an inert tester for the existing policy fixtures. It builds
+the same auditor prompt as the gate, asks the saved Pi auditor once per selected
+case and level, prints the raw reply, reason, and duration, and compares the
+parsed verdict with the fixed expected value. It never executes a proposal,
+reads a proposal target, registers a tool, starts an agent loop, or changes
+settings, `models.json`, authentication, or fixture data. It honors **Save
+auditor sessions**: when enabled, each invoked case/level gets one fresh normal
+Pi auditor session containing the actual request, terminal reply and usage. Off
+writes nothing. A save failure is reported without changing the verdict or exit
+status. A test verdict is an auditor-test result, never actual tool admission;
+the live Protection level and scope do not filter the cases.
 
 ```sh
 pi-review-tool-test --list
@@ -593,48 +637,53 @@ pi-review-tool-test --case all --level all --json
 ```
 
 From a source checkout after building, use
-`node scripts/pi-review-tool-test.cjs` with the same arguments. `--list` and `--help`
-make no model or authentication call. `--json --list` emits valid JSON; a run's `--json`
-report keeps each raw reply and separates setup, transport, and malformed-reply errors
-from a policy `FAIL`. Use `--config PATH` to read a different saved review-gate file and
-`--pi-package PATH` to select an installed `@earendil-works/pi-coding-agent` package root.
-Resolution otherwise uses normal Node package resolution (including Pi's import-only
-package exports), the `pi` entry on `PATH`, or the current managed Pi install; the tester
-never provisions or updates Pi.
+`node scripts/pi-review-tool-test.cjs` with the same arguments. `--list` and
+`--help` make no model or authentication call. `--json --list` emits valid JSON;
+a run's `--json` report keeps each raw reply and separates setup, transport, and
+malformed-reply errors from a policy `FAIL`. Use `--config PATH` to read a
+different saved review-gate file and `--pi-package PATH` to select an installed
+`@earendil-works/pi-coding-agent` package root. Resolution otherwise uses normal
+Node package resolution (including Pi's import-only package exports), the `pi`
+entry on `PATH`, or the current managed Pi install; the tester never provisions
+or updates Pi.
 
-A run's JSON results optionally include `usage`: the terminal assistant message's native
-Pi SDK usage object, unchanged. No usage is invented when the terminal message or its
-usage is unavailable; a reported `cacheRead: 0` means no reported cached read, not a
-positive cache hit. SDK cost values are catalog estimates, not verified provider bills.
-Human-readable output and exit codes are unchanged.
+A run's JSON results optionally include `usage`: the terminal assistant
+message's native Pi SDK usage object, unchanged. No usage is invented when the
+terminal message or its usage is unavailable; a reported `cacheRead: 0` means no
+reported cached read, not a positive cache hit. SDK cost values are catalog
+estimates, not verified provider bills. Human-readable output and exit codes are
+unchanged.
 
-To verify provider caching, deliberately repeat a selected fixture with `--json`, the
-same saved configuration and level, and inspect each result's `usage.cacheRead`. A
-positive count is actual reported cache use, unlike a cache key or a mocked test. Compare
-it with `usage.input` and `usage.cacheWrite`: the cached share of input is
-`cacheRead / (input + cacheRead + cacheWrite)`. A tiny positive count does not establish
-that the whole fixed prefix was cached. Each repeat is a fresh charged request, not an
-automatic warmup or a cached verdict. Provider cache construction can take time, and a
-second request with a different suffix need not hit yet.
+To verify provider caching, deliberately repeat a selected fixture with
+`--json`, the same saved configuration and level, and inspect each result's
+`usage.cacheRead`. A positive count is actual reported cache use, unlike a cache
+key or a mocked test. Compare it with `usage.input` and `usage.cacheWrite`: the
+cached share of input is `cacheRead / (input + cacheRead + cacheWrite)`. A tiny
+positive count does not establish that the whole fixed prefix was cached. Each
+repeat is a fresh charged request, not an automatic warmup or a cached verdict.
+Provider cache construction can take time, and a second request with a different
+suffix need not hit yet.
 
 Requirements and caveats:
 
 - **Saved model and default reasoning.** The tester uses the auditor model and
-  `thinkingLevel` saved in `toolProtection.auditor`, with normal Pi `models.json` and
-  provider authentication. When the saved selection omits reasoning, the existing
-  reviewer default (`high`) applies. It does not substitute an ordinary reviewer, use a
-  live session-only selection, read conversation history, or rewrite your saved choices.
-- **Pi-backed auditors only.** An external auditor is refused before any program is
-  launched. There is no fallback, retry, verdict cache, or replay.
-- **Explicit runs only.** `--case` and `--level` are both required to run; both accept
-  `all`. Each selected case/level is requested once, sequentially. Requests can incur
-  provider charges, so run them deliberately.
-- **Safe synthetic data.** The eighteen fixture proposals are inert data: destructive commands
-  and transfers are described, never executed. Do not replace them with live destructive
-  commands or real credentials, customer data, private paths, or session transcripts.
+  `thinkingLevel` saved in `toolProtection.auditor`, with normal Pi
+  `models.json` and provider authentication. When the saved selection omits
+  reasoning, the existing reviewer default (`high`) applies. It does not
+  substitute an ordinary reviewer, use a live session-only selection, read
+  conversation history, or rewrite your saved choices.
+- **Pi-backed auditors only.** An external auditor is refused before any program
+  is launched. There is no fallback, retry, verdict cache, or replay.
+- **Explicit runs only.** `--case` and `--level` are both required to run; both
+  accept `all`. Each selected case/level is requested once, sequentially.
+  Requests can incur provider charges, so run them deliberately.
+- **Safe synthetic data.** The eighteen fixture proposals are inert data:
+  destructive commands and transfers are described, never executed. Do not
+  replace them with live destructive commands or real credentials, customer
+  data, private paths, or session transcripts.
 
-The manual candidate checks below exercise the real gate and its settings. They are
-separate from the inert fixture tester.
+The manual candidate checks below exercise the real gate and its settings. They
+are separate from the inert fixture tester.
 
 ### 1. Build a scratch candidate
 
@@ -670,16 +719,17 @@ cat > "$scratch/review-gate.json" <<'JSON'
 JSON
 ```
 
-Start with Off, then choose an available fast auditor and an enabled Protection level
-through `/review-settings` → **Tools** → **Tool protection**. `enabled: false` suppresses
-automatic post-execution review noise; it does not disable tool protection.
+Start with Off, then choose an available fast auditor and an enabled Protection
+level through `/review-settings` → **Tools** → **Tool protection**.
+`enabled: false` suppresses automatic post-execution review noise; it does not
+disable tool protection.
 
-`PI_CODING_AGENT_DIR` below points at the scratch agent directory so sessions and Pi
-settings stay out of your live directory. If you want real auditor inference, provide the
-provider's usual environment credential or deliberately log in within that scratch
-session. Do not copy credential files into the scratch tree or print them, and do not log
-them. Actual
-inference and user authentication are your deliberate test, not evidence recorded here.
+`PI_CODING_AGENT_DIR` below points at the scratch agent directory so sessions
+and Pi settings stay out of your live directory. If you want real auditor
+inference, provide the provider's usual environment credential or deliberately
+log in within that scratch session. Do not copy credential files into the
+scratch tree or print them, and do not log them. Actual inference and user
+authentication are your deliberate test, not evidence recorded here.
 
 ### 3. Run direct Pi
 
@@ -697,44 +747,49 @@ Do not use `scripts/pi-review-gate.sh` for this test: the launcher re-resolves
 
 - **Off baseline.** Set `level` to `off` (or remove the block) and repeat a harmless
   scratch `read` or `write`. Expect ordinary behavior with no audit annotation.
-- **Dangerous plus a fast Pi auditor.** Set `level` to `dangerous`, restart, and run a
-  harmless scratch `read` or `write`. Expect the call to run with its ordinary native
-  result and, at the default **Debug audit output** Off, no audit line for the PASS and no
-  audit text added for the acting model. Then turn **Debug audit output** On (root Escape
-  applies it to this scratch session) and repeat: expect the themed
-  `Tool protection: PASS` line with the level and elapsed time and no auditor reason,
-  because a PASS is reasonless. Record elapsed time for information only.
-- **Quiet output never hides a failure.** With **Debug audit output** Off and the inert
-  FAIL stub below, expect the refusal to reach you and the acting model anyway, with
-  either a supplied reason or the generic wording when none was supplied. A native tool
-  error after a PASS stays a native tool error, not an audit `FAIL`.
-- **Selected coverage.** Set `scope` to `selected` with
-  `"toolNames":["write"]` (use the exact native name your build exposes). A `read` is not
-  audited and is never treated as a pass: with **Debug audit output** On it shows
-  `NOT AUDITED`, and with it Off nothing extra is shown about it, while `write` is
-  audited either way. Restore `all` afterward.
-- **Discovery loader.** With any non-Off level, ask for a tool that is not yet active so
-  `tool_search` runs. Expect it to work with no auditor call; with **Debug audit output**
-  On the result carries the `NOT AUDITED — discovery loader` line, which is never a pass.
-  Expect a native refusal to stay refused.
-- **Budget and timeout.** Set `maxContextChars` to `1000` and run a harmless call. Expect
-  the call to reach the auditor rather than a size refusal: the budget decides how much
-  of the proposal, session evidence, and quoted governing instructions is sent, the
-  proposal's leading operation data is kept first, and a record that does not fit is sent
-  as its leading portion and marked `"partial":true`. The fixed policy, decision,
-  provenance, and output instructions are sent in addition to that budget, so a small
-  budget trims what the auditor sees instead of stopping the call. For a
-  deterministic timeout, use the inert fake auditor below with `FAKE_AUDITOR_DELAY_MS`
-  longer than `timeoutMs` (for example 5000 with `timeoutMs: 1000`); a fast auditor that
-  finishes within the deadline is a valid PASS, not a failure. Restore the defaults
-  afterward.
-- **Unavailable auditor.** Set an external auditor id with no matching definition.
-  Expect an explicit unavailable error and no call run, not Off or PASS.
-- **Malformed block.** Remove `level` or use an invalid value and restart. Expect a
-  startup warning and protected calls blocked until the configuration is fixed, while
-  other settings still load.
-- **Inert FAIL fixture.** Use the stub below instead of asking a model to propose a
-  destructive command or an exfiltration URL.
+- **Dangerous plus a fast Pi auditor.** Set `level` to `dangerous`, restart, and
+  run a harmless scratch `read` or `write`. Expect the call to run with its
+  ordinary native result and, at the default **Debug audit output** Off, no
+  audit line for the PASS and no audit text added for the acting model. Then
+  turn **Debug audit output** On (root Escape applies it to this scratch
+  session) and repeat: expect the themed `Tool protection: PASS` line with the
+  level and elapsed time and no auditor reason, because a PASS is reasonless.
+  Record elapsed time for information only.
+- **Quiet output never hides a failure.** With **Debug audit output** Off and
+  the inert FAIL stub below, expect the refusal to reach you and the acting
+  model anyway, with either a supplied reason or the generic wording when none
+  was supplied. A native tool error after a PASS stays a native tool error, not
+  an audit `FAIL`.
+- **Selected coverage.** Set `scope` to `selected` with `"toolNames":["write"]`
+  (use the exact native name your build exposes). A `read` is not audited and is
+  never treated as a pass: with **Debug audit output** On it shows
+  `NOT AUDITED`, and with it Off nothing extra is shown about it, while `write`
+  is audited either way. Restore `all` afterward.
+- **Discovery loader.** With any non-Off level, ask for a tool that is not yet
+  active so `tool_search` runs. Expect it to work with no auditor call; with
+  **Debug audit output** On the result carries the
+  `NOT AUDITED — discovery loader` line, which is never a pass. Expect a native
+  refusal to stay refused.
+- **Budget and timeout.** Set `maxContextChars` to `1000` and run a harmless
+  call. Expect the call to reach the auditor rather than a size refusal: the
+  budget decides how much of the proposal, session evidence, and quoted
+  governing instructions is sent, the proposal's leading operation data is kept
+  first, and a record that does not fit is sent as its leading portion and
+  marked `"partial":true`. The fixed policy, decision, provenance, and output
+  instructions are sent in addition to that budget, so a small budget trims what
+  the auditor sees instead of stopping the call. For a deterministic timeout,
+  use the inert fake auditor below with `FAKE_AUDITOR_DELAY_MS` longer than
+  `timeoutMs` (for example 5000 with `timeoutMs: 1000`); a fast auditor that
+  finishes within the deadline is a valid PASS, not a failure. Restore the
+  defaults afterward.
+- **Unavailable auditor.** Set an external auditor id with no matching
+  definition. Expect an explicit unavailable error and no call run, not Off or
+  PASS.
+- **Malformed block.** Remove `level` or use an invalid value and restart.
+  Expect a startup warning and protected calls blocked until the configuration
+  is fixed, while other settings still load.
+- **Inert FAIL fixture.** Use the stub below instead of asking a model to
+  propose a destructive command or an exfiltration URL.
 
 ### 5. Inert fake auditor
 
@@ -775,17 +830,18 @@ JS
 }
 ```
 
-Replace the argument with the real absolute path to the scratch file; JSON does not
-expand `$scratch`. With `FAKE_AUDITOR_DECISION` unset or set to any value other than
-`PASS`, the stub returns a `FAIL` with a short reason; drop the `reason` field from its
-reply to exercise a decision-only `FAIL`, which is still a complete valid decision. Set
-`FAKE_AUDITOR_DECISION=PASS` in the launching shell for the PASS path. Set
-`FAKE_AUDITOR_DELAY_MS` to a value longer than `toolProtection`'s
-`timeoutMs` (for example 5000 with `timeoutMs: 1000`) to exercise the deadline
-deterministically; the delay is a local timer and performs no other work. Use a harmless
-scratch `read` or `write` as the proposal; this exercises the refusal, pass, and timeout
-paths without a real destructive or exfiltration action. Never test the blocker by
-actually running a destructive command or sending data to a live third-party endpoint.
+Replace the argument with the real absolute path to the scratch file; JSON does
+not expand `$scratch`. With `FAKE_AUDITOR_DECISION` unset or set to any value
+other than `PASS`, the stub returns a `FAIL` with a short reason; drop the
+`reason` field from its reply to exercise a decision-only `FAIL`, which is still
+a complete valid decision. Set `FAKE_AUDITOR_DECISION=PASS` in the launching
+shell for the PASS path. Set `FAKE_AUDITOR_DELAY_MS` to a value longer than
+`toolProtection`'s `timeoutMs` (for example 5000 with `timeoutMs: 1000`) to
+exercise the deadline deterministically; the delay is a local timer and performs
+no other work. Use a harmless scratch `read` or `write` as the proposal; this
+exercises the refusal, pass, and timeout paths without a real destructive or
+exfiltration action. Never test the blocker by actually running a destructive
+command or sending data to a live third-party endpoint.
 
 Delete only your own scratch tree when finished:
 

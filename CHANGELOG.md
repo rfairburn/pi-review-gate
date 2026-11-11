@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.278]
+
+### Added
+
+- **Android Light / Dark appearance (#642)**: the phone client's Settings screen now offers a
+  Light / Dark choice for the app's own surfaces. Light is the default and stays in effect until
+  a choice is saved; selecting an option persists it locally in the same strict version-1 settings
+  document — an absent key means light, only an explicit `"dark"` is written, any other spelling,
+  case, or JSON type still refuses the whole document, and a failed save publishes nothing — and
+  the saved choice is restored when the application restarts. One Material appearance boundary
+  paints the app's screens, dialogs, sheets, and controls with the saved choice, including the
+  session-card status palette those cards pick from the surface they are drawn on, whose two
+  existing variants stay distinct either way, and the diagnostic status band, whose notice paints
+  with the selected appearance's own content color rather than an inherited default; status-bar
+  icon contrast and the window's own backing follow the same choice, and the light appearance
+  keeps the background its theme supplied. The two settings options form one selectable group, and
+  each label and its radio are a single accessible control. There is deliberately no
+  follow-system, automatic, or time-based mode and no custom palette. Presentation only: connection, pairing, host protocol, session, input, storage, and
+  trust behavior are unchanged, no terminal is opened or retired by a switch, and host-provided
+  terminal colors — the surface's own foreground and background defaults and every received
+  palette or truecolor cell — are never derived from the app appearance. No host-side change and
+  no new protocol message.
+
 ## [0.1.0-dev.277]
 
 ### Changed

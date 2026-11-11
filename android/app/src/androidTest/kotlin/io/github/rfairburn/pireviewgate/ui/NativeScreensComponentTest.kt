@@ -524,22 +524,23 @@ class NativeScreensComponentTest {
     }
 
     /**
-     * The status-bar icons must always ask for the dark contrast that matches this app's fixed
-     * light window background, never the light contrast the edge-to-edge helper derives from the
-     * system night flag. The debug host applies the same window policy as the production root, so
-     * this reads the flag back from the real window's own insets controller — the same per-window
-     * request the platform is given. Nothing here claims anything about rendered pixels; the
-     * reported night mask only shows whether the run actually exercised dark mode, which is the
-     * configuration the contrast used to follow instead of the app's own background.
+     * The status-bar icons must always ask for the contrast that matches the appearance this
+     * app is showing, never the contrast the edge-to-edge helper derives from the system night
+     * flag. With no saved choice that is the shipped light default and its dark icons, which is
+     * the policy the debug host applies at creation exactly as the production root does before a
+     * saved appearance is projected. The reported night mask only shows whether the run actually
+     * exercised dark mode, which is the configuration the contrast used to follow instead of the
+     * app's own background. [AppAppearanceComponentTest] covers the saved-choice path itself.
+     * Nothing here claims anything about rendered pixels.
      */
     @Test
-    fun statusBarContrastFollowsTheFixedLightWindowBackgroundAndNotSystemNightMode() {
+    fun statusBarContrastFollowsTheAppAppearanceDefaultAndNotSystemNightMode() {
         val window = compose.activity.window
         val lightStatusBars = WindowCompat.getInsetsController(window, window.decorView)
             .isAppearanceLightStatusBars
         val nightMask = compose.activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
         assertTrue(
-            "the fixed light window background always needs dark status icons: light-status flag = " +
+            "the light default always needs dark status icons: light-status flag = " +
                 "$lightStatusBars, uiMode night mask = $nightMask",
             lightStatusBars,
         )

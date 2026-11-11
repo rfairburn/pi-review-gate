@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.client.ui
 
+import io.github.rfairburn.pireviewgate.core.hosts.AppAppearance
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.hosts.Endpoint
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkRequestToken
@@ -304,6 +305,17 @@ public sealed interface ClientIntent {
      * replays what a notice producer last reported.
      */
     public data class SetDebugInputMessagingEnabled(public val enabled: Boolean) : ClientIntent
+
+    /**
+     * Change the remembered appearance of the app's own surfaces.
+     *
+     * Light is the shipped default and stays in effect until a choice is saved.
+     * The choice paints the app's screens, dialogs, and controls; it grants no
+     * input, delivery, clipboard, storage, or proof authority and revokes none. It
+     * never recolors host-provided terminal content: the terminal's received
+     * palette and its own defaults are not derived from this value.
+     */
+    public data class SetAppearance(public val appearance: AppAppearance) : ClientIntent
 
     // ---- terminal transient affordances -----------------------------------
 

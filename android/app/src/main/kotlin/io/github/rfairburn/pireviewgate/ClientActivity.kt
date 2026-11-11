@@ -6,7 +6,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -16,8 +15,11 @@ import androidx.core.view.WindowCompat
 import io.github.rfairburn.pireviewgate.client.application.ClientWindow
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientRoute
+import io.github.rfairburn.pireviewgate.core.hosts.AppAppearance
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermission
 import io.github.rfairburn.pireviewgate.permissions.LocalNetworkPermissionRationaleDialog
+import io.github.rfairburn.pireviewgate.ui.client.ClientTheme
+import io.github.rfairburn.pireviewgate.ui.client.ClientWindowAppearance
 import io.github.rfairburn.pireviewgate.ui.client.NonTerminalStatusSlot
 import io.github.rfairburn.pireviewgate.ui.client.RootUIScreen
 
@@ -32,10 +34,12 @@ class ClientActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        // The window background and the app's Material palette are fixed light on every route,
-        // while enableEdgeToEdge() derives the status contrast from the system night flag: on a
-        // phone in dark mode that draws white icons over our light strip. Status contrast only —
-        // the helper keeps edge-to-edge geometry, the consumed insets and the navigation bar.
+        // Until a saved appearance is projected, the app shows its shipped light default,
+        // while enableEdgeToEdge() would derive the status contrast from the system night
+        // flag: on a phone in dark mode that draws white icons over our light strip. The
+        // default is asked for here, and ClientWindowAppearance re-asks for the contrast of
+        // the saved appearance as soon as one is known. Status contrast only — the helper
+        // keeps edge-to-edge geometry, the consumed insets and the navigation bar.
         WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = true
         val appOwner = application as PiReviewGateApplication
         setContent {
@@ -43,7 +47,9 @@ class ClientActivity : ComponentActivity() {
             val failed by appOwner.startupFailed.collectAsState()
             val app = controller
             if (app == null) {
-                MaterialTheme {
+                // Nothing is saved yet and a refused graph cannot say more, so this surface
+                // keeps the shipped light default rather than guessing a stored choice.
+                ClientTheme(appearance = AppAppearance.DEFAULT) {
                     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp)) {
                         Text(stringResource(if (failed) R.string.client_startup_refused else R.string.client_startup_loading))
                     }
@@ -75,15 +81,25 @@ class ClientActivity : ComponentActivity() {
                 // Saved presentation preference only: it decides whether the app's
                 // diagnostic status and notice surfaces are drawn, and nothing else.
                 val debugInputMessaging = capturedFrame.settings.debugInputMessagingEnabled
+                // The saved appearance paints every app-owned surface and the window
+                // decorations that belong to it. It is a presentation preference: the
+                // terminal's colors come from the host and are untouched by a switch.
+                val appearance = capturedFrame.settings.appearance
+                ClientWindowAppearance(appearance)
                 Column(Modifier.fillMaxSize().then(if (terminalRoute) Modifier else Modifier.statusBarsPadding())) {
                     // A fixed-height, noninteractive status slot never moves a pending form
                     // when an admission/settlement arrives. No owner fact is inferred. With
                     // debugging off the slot composes nothing, reserved height included.
                     if (!terminalRoute) {
-                        NonTerminalStatusSlot(
-                            status = status,
-                            debugInputMessagingEnabled = debugInputMessaging,
-                        )
+                        // The slot is drawn above RootUIScreen, so it takes the same appearance
+                        // boundary explicitly rather than a default palette: its notice paints
+                        // with the saved scheme's content color on the surface that scheme chose.
+                        ClientTheme(appearance = appearance) {
+                            NonTerminalStatusSlot(
+                                status = status,
+                                debugInputMessagingEnabled = debugInputMessaging,
+                            )
+                        }
                     }
                     // Same call site on every route, so RootUIScreen's remembered list
                     // positions survive entering and leaving the terminal.
@@ -106,8 +122,12 @@ class ClientActivity : ComponentActivity() {
                     }
                 }
                 rationale?.let { token ->
-                    LocalNetworkPermissionRationaleDialog(window.permissionObservation(), token.endpoint.displayText(),
-                        onContinue = { window.continueRationale(token) }, onNotNow = { window.cancelConnect(token.hostId) })
+                    // This dialog is drawn outside RootUIScreen, so it takes the same
+                    // appearance boundary explicitly rather than a default palette.
+                    ClientTheme(appearance = appearance) {
+                        LocalNetworkPermissionRationaleDialog(window.permissionObservation(), token.endpoint.displayText(),
+                            onContinue = { window.continueRationale(token) }, onNotNow = { window.cancelConnect(token.hostId) })
+                    }
                 }
             }
         }

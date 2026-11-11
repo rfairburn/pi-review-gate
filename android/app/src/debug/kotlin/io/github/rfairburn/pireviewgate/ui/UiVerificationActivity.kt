@@ -13,8 +13,8 @@ class UiVerificationActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Match ClientActivity's real edge-to-edge root on both API baselines.
         enableEdgeToEdge()
-        // Same fixed light backing window and the same status-only contrast override as
-        // ClientActivity, so this host exercises the production window configuration.
+        // Same initial window policy as ClientActivity on both API baselines: the shipped light
+        // appearance default, its dark status icons, and the same status-only contrast override.
         WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = true
         contentForRecreation?.let { content -> setContent { content() } }
     }

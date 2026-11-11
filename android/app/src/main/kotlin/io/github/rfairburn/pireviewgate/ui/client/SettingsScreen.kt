@@ -7,12 +7,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -21,8 +24,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -32,6 +38,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientStorageState
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.SavedFirstReplyTimeoutEditor
+import io.github.rfairburn.pireviewgate.core.hosts.AppAppearance
 import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.hosts.StorageFailureReason
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionObservation
@@ -40,11 +47,12 @@ import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkPermissionS
 /**
  * The settings screen.
  *
- * Only what this client actually is: a viewer. It exposes the four remembered global
+ * Only what this client actually is: a viewer. It exposes the five remembered global
  * preferences with their source defaults — automatic reconnect off, this viewer's
- * remote native input and copy on, a 60-second Saved first-reply timeout, and whole-app
- * diagnostic status/notice messaging off — plus this device's own identity fingerprint
- * when it is known and the state of its private storage.
+ * remote native input and copy on, a 60-second Saved first-reply timeout, whole-app
+ * diagnostic status/notice messaging off, and the app's own appearance light — plus
+ * this device's own identity fingerprint when it is known and the state of its
+ * private storage.
  *
  * There is deliberately no hosting control, no incoming-connection grant or revoke,
  * no listener control, and no owner-side history or policy control: this client hosts
@@ -84,6 +92,10 @@ fun SettingsScreen(
         SavedFirstReplyTimeoutRow(
             currentSeconds = state.settings.savedFirstReplyTimeoutSeconds,
             onSave = { onIntent(ClientIntent.SetSavedFirstReplyTimeoutSeconds(it)) },
+        )
+        AppearanceRow(
+            selected = state.settings.appearance,
+            onSelect = { onIntent(ClientIntent.SetAppearance(it)) },
         )
 
         SectionTitle(stringResource(R.string.settings_identity_section))
@@ -155,6 +167,84 @@ private fun SavedFirstReplyTimeoutRow(
         ) {
             Text(stringResource(R.string.setting_saved_first_reply_timeout_save))
         }
+    }
+}
+
+/**
+ * The saved appearance of the app's own surfaces.
+ *
+ * Selecting an option emits that one preference; the drawn selection is what was
+ * saved rather than what was tapped, so the options move when the producer
+ * republishes the stored value. Light is the shipped default and stays in effect
+ * until a choice is saved. The two options form one selectable group, and each row
+ * is the selectable control its own label belongs to, so the choice a person hears
+ * is the choice their tap sends. The choice paints this app only: the terminal's
+ * colors come from the host and are not part of any appearance.
+ */
+@Composable
+private fun AppearanceRow(
+    selected: AppAppearance,
+    onSelect: (AppAppearance) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            stringResource(R.string.setting_appearance),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.setting_appearance_body),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        androidx.compose.foundation.layout.Row(
+            horizontalArrangement = Arrangement.spacedBy(24.dp),
+            modifier = Modifier.selectableGroup(),
+        ) {
+            AppearanceOption(
+                label = stringResource(R.string.setting_appearance_light),
+                appearance = AppAppearance.LIGHT,
+                selected = selected,
+                onSelect = onSelect,
+            )
+            AppearanceOption(
+                label = stringResource(R.string.setting_appearance_dark),
+                appearance = AppAppearance.DARK,
+                selected = selected,
+                onSelect = onSelect,
+            )
+        }
+    }
+}
+
+/**
+ * One appearance option: the label and its radio are one selectable control.
+ *
+ * The row owns the selection, the radio role, and the tap, and it merges the label
+ * and the indicator into that one control, so an announced option always names which
+ * appearance its tap selects. The indicator is never a second independent target.
+ */
+@Composable
+private fun AppearanceOption(
+    label: String,
+    appearance: AppAppearance,
+    selected: AppAppearance,
+    onSelect: (AppAppearance) -> Unit,
+) {
+    val isSelected = appearance == selected
+    androidx.compose.foundation.layout.Row(
+        modifier = Modifier
+            .selectable(
+                selected = isSelected,
+                role = Role.RadioButton,
+                onClick = { onSelect(appearance) },
+            )
+            // Explicit rather than incidental: this control owns its label text.
+            .semantics(mergeDescendants = true) { /* the label belongs to this control */ },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        RadioButton(selected = isSelected, onClick = null)
+        Text(label, style = MaterialTheme.typography.bodyLarge)
     }
 }
 

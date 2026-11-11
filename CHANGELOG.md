@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.276]
+
+### Added
+
+- **Non-Git workspace startup warning (#292)**: a session that starts in a workspace Git
+  reports as outside any repository now shows one user-visible warning beside the existing
+  loaded notice — "Warning: Evidence capture works best in a Git worktree. Capture may be
+  degraded in this workspace." It is informational only: capture, review, fallback, and
+  delegated-execution behavior are unchanged, no repository is created, and nothing is
+  blocked or required. The notice appears once per session start (launch, reload, a new
+  session, resume, or fork) and never per prompt or tool call, and only for a positively
+  non-Git workspace: a Git root, any directory inside one, a linked worktree, and a
+  repository with an unborn `HEAD` stay silent, and a workspace Git cannot classify —
+  unavailable Git, malformed or inaccessible metadata, or an ambient repository redirect —
+  is never labelled non-Git. Detection is one bounded read-only discovery probe of the live
+  session directory with a two-second budget; probe or notice failures do not prevent startup,
+  and a session that ends while the probe is in flight receives nothing.
+
 ## [0.1.0-dev.275]
 
 ### Changed

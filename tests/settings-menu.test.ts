@@ -65,7 +65,7 @@ function tuiUi(harness: TuiSettingsHarness): RetainedUi {
 
 // Root menu row indices (16 sections; the optional Scheduler runtime row adds
 // one more row only when the host provides the switch, then Save + Cancel).
-const ROOT = { resources: 2, externalAgents: 3, routeExecute: 4, reviewers: 6, tools: 13, save: 16 } as const;
+const ROOT = { resources: 2, externalAgents: 3, routeExecute: 4, reviewers: 6, tools: 13, save: 17 } as const;
 // Tools submenu row indices.
 const TOOLS = { deferred: 2, web: 5 } as const;
 // Web settings row indices.
@@ -604,7 +604,7 @@ for (const withScheduler of [false, true]) test(`external workers stays directly
   assert.equal(rows.filter(row => row.startsWith("External workers")).length, 1);
   assert.equal(rows.findIndex(row => row.startsWith("External workers")), rows.findIndex(row => row.startsWith("Worker resources")) + 1);
   assert.equal(rows.filter(row => row.startsWith("Scheduler runtime")).length, withScheduler ? 1 : 0);
-  assert.equal(rows.length, withScheduler ? 19 : 18);
+  assert.equal(rows.length, withScheduler ? 20 : 19);
   assert.deepEqual(rows.slice(-2), ["Save changes", "Cancel"]);
   assert.equal(await readFile(configPath, "utf8"), before);
 });
@@ -646,12 +646,12 @@ test("plain-select hosts keep the legacy label flow for web permissions (fallbac
   assert.equal(saved.web.browserPermissions.modelCamera, true);
   // The root menu includes external worker creation, ending with Save/Cancel.
   const rootOptions = menus[0]!.options;
-  assert.equal(rootOptions.length, 18);
+  assert.equal(rootOptions.length, 19);
   assert.ok(rootOptions[ROOT.externalAgents]!.startsWith("External workers"));
   assert.ok(rootOptions[ROOT.tools]!.startsWith("Tools"));
   assert.ok(rootOptions[ROOT.tools]!.includes("50 MiB max download · headless browser"));
-  assert.equal(rootOptions[16], "Save changes");
-  assert.equal(rootOptions[17], "Cancel");
+  assert.equal(rootOptions[17], "Save changes");
+  assert.equal(rootOptions[18], "Cancel");
   // The permissions menu kept the legacy 11 fields + YOLO + Back order.
   const permMenu = menus.find((menu) => menu.title === "Browser permissions")!;
   assert.equal(permMenu.options.length, 13);

@@ -565,6 +565,7 @@ const ROOT_SETTING_LABELS = [
   "Subtask notifications",
   "Tools",
   "Subtasks view",
+  "Subtask task IDs",
   "Scheduled tasks",
 ] as const;
 

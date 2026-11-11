@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its sixteen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
 the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
 persistence semantics, and the shared native text-field behavior. Raw field values and
 defaults are owned by the [Configuration](configuration.md) reference, and scheduled-task
@@ -8,12 +8,13 @@ semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with sixteen ordinary rows —
+`/review-settings` opens one staged settings transaction with seventeen ordinary rows —
 Operating mode, Mode cycle hotkey, Worker resources, External workers, Execution
 priority, Research priority, Reviewers, Timeouts, Review policy, Retention,
-Global concurrency, Retry policy, Subtask notifications, Tools, Subtasks view, and
-Scheduled tasks — plus a conditional **Scheduler runtime** row when the host runtime
-supplies the live switch (the ordinary extension entry point always does):
+Global concurrency, Retry policy, Subtask notifications, Tools, Subtasks view,
+Subtask task IDs, and Scheduled tasks — plus a conditional **Scheduler runtime** row
+when the host runtime supplies the live switch (the ordinary extension entry point
+always does):
 
 - **Operating mode** stages the primary assistant posture; **Save changes** persists it
   ([Operating modes](configuration.md#operating-modes)).
@@ -114,6 +115,11 @@ supplies the live switch (the ordinary extension entry point always does):
   **Tool protection** group. Denials only narrow existing authority, and
   the two lists never cascade to each other. See [Tools subsection](#tools-subsection).
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
+- **Subtask task IDs** stores the **Hidden**/**Shown** preference for the task-ID prefix
+  on the live panel's subtask activity lines globally (**Hidden** by default; see
+  [Delegated execution](delegated-execution.md#notifications-and-ui)). It is
+  presentation only: the durable activity event, the task's identity in records and
+  evidence, and every model-facing result keep the task ID unchanged.
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
   per independent scheduled task, keyed by its stable identity, with name,
   five-field Unix cron schedule in machine-local time, execute/research/inplace kind,

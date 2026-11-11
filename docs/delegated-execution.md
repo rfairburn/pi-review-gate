@@ -1058,6 +1058,17 @@ conversation state. The expanded view lists only active tasks (up to 16), while 
 combined newest-ten activity feed may temporarily retain events from tasks that have
 already landed.
 
+Each activity line in that feed renders as `task title · phase · message`. Because the
+recorded message already carries the owning task's `task-…` ID prefix, **Subtask task
+IDs** in `/review-settings` controls whether that redundant prefix is displayed: it
+defaults to **Hidden**, so the example line reads
+`Diagnose full-suite hang · working · model turn completed`, and **Shown** restores the
+`task-…: ` prefix. The switch is presentation only and never rewrites the recorded
+event — the durable activity message, the task ID in every model-facing tool result,
+inspect output, evidence, and control parameter, and the notification a task delivers
+all keep the full identity, and only that exact leading prefix of the event's own task
+ever leaves the display.
+
 Every model-facing `SubtasksStart`, `SubtasksAdd`, and `SubtasksInspect` result includes
 the stable task UUIDs, states, recent activity, and full artifact paths needed for
 control and deeper `rg` inspection. Start/add results also show assigned-starting versus

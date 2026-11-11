@@ -55,8 +55,9 @@ const TEST_TIMEOUT_MS = 30_000;
 const down = (count: number): string[] => Array.from({ length: count }, () => KEY_DOWN);
 const typed = (text: string): string[] => [...text];
 
-/** Root row indices of the /review-settings menu (see settings-menu.test.ts). */
-const ROOT = { tools: 13, save: 16, cancel: 17 } as const;
+/** Root row indices of the /review-settings menu (see settings-menu.test.ts):
+ * seventeen ordinary rows (0-16), then Save changes (17) and Cancel (18). */
+const ROOT = { tools: 13, save: 17, cancel: 18 } as const;
 /** Tools submenu row indices. */
 const TOOLS = { topLevel: 0, toolProtection: 6, rows: 8 } as const;
 /** Tool protection submenu rows with `scope: "selected"` (names row present). */

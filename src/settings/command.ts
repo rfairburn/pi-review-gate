@@ -247,6 +247,10 @@ async function runSettingsMenu(
   const retainedAuditedToolNames: readonly string[] = [...toolProtection.toolNames];
   let youShouldKnow = { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) };
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
+  // #229: presentation-only activity-line preference, staged like the view
+  // preference. Off (the default) hides just the redundant generated owning-task
+  // prefix on subtask activity lines; task identity stays in every record.
+  let showSubtaskTaskIds = input.config.ui?.showSubtaskTaskIds === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
   let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
   let browserIdleExpiryMinutes = input.config.web!.browserIdleExpiryMinutes ?? DEFAULT_CONFIG.web!.browserIdleExpiryMinutes;
@@ -465,6 +469,7 @@ async function runSettingsMenu(
       toolNames: [...toolProtection.toolNames],
     },
     subtasksViewExpanded,
+    showSubtaskTaskIds,
     scheduledTasks: catalogForApply,
     scheduledTasksStagedFrom,
     scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
@@ -524,6 +529,7 @@ async function runSettingsMenu(
       { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
       { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions, urlBlocklist: webUrlBlocklist } }) },
       { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
+      { key: "subtaskTaskIds", label: "Subtask task IDs", value: showSubtaskTaskIds ? "Shown" : "Hidden" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
       ...(input.schedulerRuntime
         ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
@@ -731,6 +737,10 @@ async function runSettingsMenu(
     }
     if (choice === "subtasksView") {
       subtasksViewExpanded = !subtasksViewExpanded;
+      continue;
+    }
+    if (choice === "subtaskTaskIds") {
+      showSubtaskTaskIds = !showSubtaskTaskIds;
       continue;
     }
     if (choice === "scheduled") {

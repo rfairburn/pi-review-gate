@@ -74,7 +74,12 @@ export interface SubtaskWidgetSnapshot {
   conflictPaths?: string[];
   /** Active tasks across all groups; the widget sorts and bounds them. */
   tasks: SubtaskWidgetTaskSnapshot[];
-  recent: Array<{ title: string; event: BackgroundActivityEvent }>;
+  /**
+   * Newest activity events across all tasks. Each entry carries the stable id
+   * of the task the event belongs to, so the owning-task display prefix can be
+   * recognized (#229) without ever guessing from message text.
+   */
+  recent: Array<{ taskId: string; title: string; event: BackgroundActivityEvent }>;
 }
 
 export interface SubtaskWidgetRender {
@@ -119,10 +124,31 @@ function buildExpandedWidgetLines(snapshot: SubtaskWidgetSnapshot, config: Revie
   const recent = snapshot.recent;
   lines.push("  Recent activity (10 newest events across all tasks):");
   if (recent.length === 0) lines.push("    no activity recorded yet");
-  for (const { title, event } of recent) {
-    lines.push(`    ${title} · ${event.phase} · ${clipActivity(event.message)}`);
+  // #229 presentation only: the generated `<taskId>: ` activity prefix repeats
+  // the task the line already names by title. The preference hides just that
+  // leading prefix for the event's own task; the durable event text, the title,
+  // the phase, and every other surface stay exactly as recorded.
+  const showTaskIds = config.ui?.showSubtaskTaskIds === true;
+  for (const { taskId, title, event } of recent) {
+    const message = showTaskIds ? event.message : withoutOwningTaskIdPrefix(event.message, taskId);
+    lines.push(`    ${title} · ${event.phase} · ${clipActivity(message)}`);
   }
   return lines;
+}
+
+/**
+ * Drop only the generated owning-task activity prefix — the event's own task id
+ * followed by `": "` at the very start of the message — for display. The match
+ * is anchored to that exact id, so task-looking text elsewhere in real activity
+ * content, including another task's id, is never stripped, and a message that
+ * is nothing but the prefix keeps its text rather than rendering empty.
+ */
+function withoutOwningTaskIdPrefix(message: string, taskId: string): string {
+  if (!taskId) return message;
+  const prefix = `${taskId}: `;
+  if (!message.startsWith(prefix)) return message;
+  const rest = message.slice(prefix.length);
+  return rest.trim() ? rest : message;
 }
 
 function buildCompactWidgetLine(snapshot: SubtaskWidgetSnapshot): string {

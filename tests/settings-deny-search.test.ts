@@ -102,8 +102,9 @@ const typed = (text: string): string[] => [...text];
 /** A bounded per-test deadline: a scripted UI test must fail, not hang. */
 const TEST_TIMEOUT_MS = 30_000;
 
-/** Root row indices of the /review-settings menu (see settings-menu.test.ts). */
-const ROOT = { tools: 13, save: 16, cancel: 17 } as const;
+/** Root row indices of the /review-settings menu (see settings-menu.test.ts):
+ * seventeen ordinary rows (0-16), then Save changes (17) and Cancel (18). */
+const ROOT = { tools: 13, save: 17, cancel: 18 } as const;
 /** Tools submenu row indices. */
 const TOOLS = { topLevel: 0, executor: 1 } as const;
 

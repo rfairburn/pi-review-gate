@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.279]
+
+### Added
+
+- **Optional task IDs in subtask activity (#229)**: the expanded live panel now hides
+  the owning task's leading ID prefix by default. **Subtask task IDs** in
+  `/review-settings` switches it between **Hidden** and **Shown**, preserving the
+  title, phase, message content, task state, and model labels. Canonical task IDs,
+  recorded activity, evidence, controls, and notification behavior are unchanged.
+
 ## [0.1.0-dev.278]
 
 ### Added

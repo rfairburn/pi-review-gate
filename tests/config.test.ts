@@ -238,6 +238,20 @@ test("normalizeConfig preserves the global subtasks view preference", () => {
   );
 });
 
+test("normalizeConfig defaults subtask activity task IDs off and preserves an explicit choice", () => {
+  // Absent means off: a config predating #229 gains no key and hides the prefix.
+  assert.equal(normalizeConfig({ enabled: true }).ui?.showSubtaskTaskIds, undefined);
+  assert.equal(normalizeConfig({ enabled: true, ui: {} }).ui?.showSubtaskTaskIds, undefined);
+  assert.equal(normalizeConfig({ enabled: true, ui: { showSubtaskTaskIds: false } }).ui?.showSubtaskTaskIds, false);
+  const shown = normalizeConfig({ enabled: true, ui: { showSubtaskTaskIds: true } });
+  assert.equal(shown.ui?.showSubtaskTaskIds, true);
+  assert.equal(materializeReviewConfig(shown, []).ui, undefined, "UI state is not frozen into a conversation review window");
+  assert.throws(
+    () => normalizeConfig({ enabled: true, ui: { showSubtaskTaskIds: "yes" } }),
+    /ui\.showSubtaskTaskIds must be a boolean/,
+  );
+});
+
 test("deferred Pi-native tools default on and require a boolean override", () => {
   assert.equal(deferredPiToolsEnabled(normalizeConfig({ enabled: true })), true);
   assert.equal(normalizeConfig({ enabled: true, execution: {} }).execution?.deferredPiTools, true);

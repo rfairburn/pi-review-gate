@@ -188,7 +188,7 @@ async function runNativeImageFlow(
       editor.insertTextAtCursor(options.paste);
     },
     drivers: [
-      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+      keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
       async (component: { handleInput?(data: string): void }): Promise<void> => {

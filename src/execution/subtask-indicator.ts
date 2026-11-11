@@ -95,7 +95,7 @@ export class SubtaskIndicator {
         // per-target ownership stays in inspect and the persisted snapshot.
         conflictPaths: this.source.conflictGatePaths(),
         tasks,
-        recent: this.source.recentActivity().map((entry) => ({ title: entry.title, event: entry.event })),
+        recent: this.source.recentActivity().map((entry) => ({ taskId: entry.taskId, title: entry.title, event: entry.event })),
       }, this.source.config());
       if (rendered.component) {
         ctx.ui.setWidget("review-gate-subtasks", rendered.component, { placement: "belowEditor" });

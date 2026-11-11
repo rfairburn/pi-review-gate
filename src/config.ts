@@ -553,6 +553,13 @@ export type ScheduledTaskCatalog = Record<string, ScheduledTaskEntryConfig>;
 
 export interface ReviewGateUiConfig {
   subtasksViewExpanded?: boolean;
+  /**
+   * #229: show the redundant owning-task ID prefix on the expanded live panel's
+   * subtask activity lines. Absent or false hides only that generated display
+   * prefix; the durable activity event, the task's identity everywhere else,
+   * and every model-facing result keep it unchanged.
+   */
+  showSubtaskTaskIds?: boolean;
 }
 
 /**
@@ -1235,9 +1242,15 @@ function normalizeUi(value: unknown): ReviewGateUiConfig {
   if (value.subtasksViewExpanded !== undefined && typeof value.subtasksViewExpanded !== "boolean") {
     throw new Error("ui.subtasksViewExpanded must be a boolean");
   }
+  if (value.showSubtaskTaskIds !== undefined && typeof value.showSubtaskTaskIds !== "boolean") {
+    throw new Error("ui.showSubtaskTaskIds must be a boolean");
+  }
   return {
     ...(value.subtasksViewExpanded !== undefined
       ? { subtasksViewExpanded: value.subtasksViewExpanded }
+      : {}),
+    ...(value.showSubtaskTaskIds !== undefined
+      ? { showSubtaskTaskIds: value.showSubtaskTaskIds }
       : {}),
   };
 }

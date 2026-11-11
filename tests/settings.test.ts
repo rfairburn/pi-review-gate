@@ -535,6 +535,58 @@ test("subtasks view is staged and saved as a global review setting", async () =>
   assert.equal(config.ui?.subtasksViewExpanded, true);
 });
 
+test("subtask task IDs default off and are staged and saved as a global review setting", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtask-task-ids-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    ui: { subtasksViewExpanded: false },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  // The shipped default is off: no ui key means the prefix stays hidden.
+  assert.equal(config.ui?.showSubtaskTaskIds, undefined);
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Subtask task IDs", "Hidden"),
+    "Save changes",
+  ]));
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.ui.showSubtaskTaskIds, true);
+  assert.equal(config.ui?.showSubtaskTaskIds, true, "the live config carries the saved choice");
+  // Only the owned preference changed; the sibling view preference is intact.
+  assert.equal(saved.ui.subtasksViewExpanded, false);
+
+  // Reopening shows the saved choice, and toggling it back off persists off.
+  const reopened = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const secondHarness = commandHarness();
+  registerReviewSettings({ pi: secondHarness.pi, config: reopened, configPath });
+  await secondHarness.handler("", contextWithSelections([
+    rootSettingsRow("Subtask task IDs", "Shown"),
+    "Save changes",
+  ]));
+
+  const savedOff = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(savedOff.ui.showSubtaskTaskIds, false);
+  assert.equal(reopened.ui?.showSubtaskTaskIds, false);
+
+  // Session-only apply (root Escape) installs the choice live and writes nothing.
+  const beforeEscape = await readFile(configPath, "utf8");
+  const sessionConfig = normalizeConfig(JSON.parse(beforeEscape));
+  const sessionHarness = commandHarness();
+  registerReviewSettings({ pi: sessionHarness.pi, config: sessionConfig, configPath });
+  await sessionHarness.handler("", contextWithSelections([
+    rootSettingsRow("Subtask task IDs", "Hidden"),
+    undefined,
+  ]));
+
+  assert.equal(sessionConfig.ui?.showSubtaskTaskIds, true, "Escape applies the staged choice to the live config");
+  assert.equal(await readFile(configPath, "utf8"), beforeEscape, "Escape never writes the settings file");
+});
+
 test("subtask notification mode is staged and saved with quiet as the default", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtask-notifications-"));
   const configPath = join(dir, "review-gate.json");
@@ -1961,6 +2013,7 @@ const ROOT_SETTING_LABELS = [
   "Subtask notifications",
   "Tools",
   "Subtasks view",
+  "Subtask task IDs",
   "Scheduled tasks",
 ] as const;
 

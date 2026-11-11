@@ -265,7 +265,7 @@ test("renderSubtaskWidget expanded view sorts by recency, bounds the list, and r
   const rendered = renderSubtaskWidget({
     expanded: true,
     tasks,
-    recent: [{ title: "Task 0", event: { sequence: 1, at: "2024-01-01T00:00:00.000Z", phase: "running", message: "a  long\nmessage that is quite long but under the bound" } }],
+    recent: [{ taskId: "task-0", title: "Task 0", event: { sequence: 1, at: "2024-01-01T00:00:00.000Z", phase: "running", message: "a  long\nmessage that is quite long but under the bound" } }],
   }, config);
   assert.ok(rendered.component);
   const componentLines = rendered.component!().render(400);

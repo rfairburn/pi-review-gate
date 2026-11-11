@@ -219,7 +219,7 @@ test("prior session-only catalog edit and alreadyRun edit persist on a reopen Ct
     [...down(2), KEY_ENTER], // model picker: Unset, Keep current → Opus 5.5
     [...down(3), KEY_ENTER], // edit re-show (model) → Apply edit
     [...down(2), KEY_ENTER], // list re-show → Back
-    [...down(12), KEY_ENTER], // root re-show (External workers) → Scheduled tasks
+    [...down(13), KEY_ENTER], // root re-show (External workers) → Scheduled tasks (row 16)
     [KEY_ENTER], // task list → Once
     [...down(10), KEY_ENTER], // entry editor → Already run
     [...down(2), KEY_ENTER], // entry re-show (Already run) → Back

@@ -77,6 +77,12 @@ export interface ReviewSettingsSelection {
   subtaskNotifications: SubtaskNotificationMode;
   deferredPiTools?: boolean;
   subtasksViewExpanded: boolean;
+  /**
+   * #229: show the redundant owning-task ID prefix on subtask activity lines.
+   * Defaults off; only the settings menu stages it, so a caller that never
+   * stages it leaves an existing stored value untouched.
+   */
+  showSubtaskTaskIds?: boolean;
   /** Complete scheduled-task catalog (issue #26); persisted as a whole. */
   scheduledTasks?: ScheduledTaskCatalog;
   /**
@@ -239,6 +245,7 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   }
   const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
   ui.subtasksViewExpanded = selection.subtasksViewExpanded;
+  if (selection.showSubtaskTaskIds !== undefined) ui.showSubtaskTaskIds = selection.showSubtaskTaskIds;
   parsed.ui = ui;
   if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined || selection.webUrlBlocklist !== undefined) {
     const web = isRecord(parsed.web) ? { ...parsed.web } : {};

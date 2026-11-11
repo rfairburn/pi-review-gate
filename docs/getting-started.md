@@ -350,6 +350,27 @@ pi -e /path/to/pi-review-gate/dist/src/index.js
 
 Launcher internals are documented in [Development](development.md#launcher-behavior).
 
+### Startup workspace notice
+
+Evidence capture works best in a Git worktree. When a session starts in a workspace that
+Git reports as outside any repository, the gate shows one visible warning beside its usual
+loaded notice:
+
+> Warning: Evidence capture works best in a Git worktree. Capture may be degraded in this workspace.
+
+The warning is informational. It appears once per session start — launch, reload, a new
+session, resume, or fork — and never per prompt or tool call, and it changes nothing: no
+repository is created, nothing is blocked or required, and the capture paths described in
+[Review workflow](review-workflow.md) and [Delegated execution](delegated-execution.md)
+keep running exactly as documented. Only a workspace Git positively reports as outside a
+repository is warned about. A Git root, any directory inside one, a linked worktree, and a
+repository with no commits yet are all recognized as Git worktrees, and a workspace Git
+cannot classify — because Git is unavailable or its metadata is malformed or inaccessible —
+receives no warning at all. Detection is one bounded read-only discovery probe of the live
+session directory with a two-second budget; probe or notice failures do not prevent startup.
+The notice uses Pi's warning notification channel: it is visible in the TUI and forwarded
+to RPC clients for display. Print and JSON modes have no notification UI.
+
 ## What happens on your first review
 
 1. An agent turn completes. The extension captures the workspace diff, side effects, and

@@ -202,6 +202,11 @@ fun NoticeText(text: String, modifier: Modifier = Modifier) {
  * no layout. With it on the existing fixed-height, noninteractive slot returns
  * unchanged, which is what keeps a pending form from moving when an admission or
  * settlement notice arrives.
+ *
+ * The notice asks for the selected scheme's own onSurface content color rather than
+ * inheriting a default one, so it stays readable on the surface the saved appearance
+ * is painting behind it. Height, insets, and non-interactivity are the same under
+ * either appearance.
  */
 @Composable
 fun NonTerminalStatusSlot(
@@ -220,6 +225,7 @@ fun NonTerminalStatusSlot(
             text = status ?: "",
             maxLines = 2,
             style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
         )
     }
 }

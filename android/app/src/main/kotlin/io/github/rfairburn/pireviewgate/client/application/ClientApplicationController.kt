@@ -416,6 +416,7 @@ class ClientApplicationController private constructor(
                 hosts = HostCatalog.of(hosts.map { it.host }),
                 savedFirstReplyTimeoutSeconds = registryState.savedFirstReplyTimeoutSeconds,
                 debugInputMessagingEnabled = registryState.debugInputMessagingEnabled,
+                appearance = registryState.appearance,
             ), hosts, state.value.rowOrder, saved, dialogs,
             when (val identity = registryState.identity) {
                 is DeviceIdentityObservation.Ready -> ClientIdentityState.Ready(identity.fingerprint)
@@ -1041,6 +1042,19 @@ class ClientApplicationController private constructor(
                         if (lifetime.isStillCurrent()) registry.setDebugInputMessagingEnabled(intent.enabled) else null
                     } }
                     report(result?.let { commandText("Debug messaging", it) } ?: "Debug messaging not saved: intent no longer current")
+                }
+            }
+            is ClientIntent.SetAppearance -> {
+                // A display preference only, like diagnostic messaging: nothing here
+                // retires a terminal, marks a policy change pending, disables input,
+                // reconnects anything, or touches a host-provided color. Only the
+                // durable preference and its projection move.
+                val lifetime = window?.freezeIntentLifetime() ?: return
+                scope.launch {
+                    val result = preferenceLock.withLock { withContext(Dispatchers.IO) {
+                        if (lifetime.isStillCurrent()) registry.setAppearance(intent.appearance) else null
+                    } }
+                    report(result?.let { commandText("Appearance", it) } ?: "Appearance not saved: intent no longer current")
                 }
             }
             is ClientIntent.SetTerminalKeyboardVisible -> window?.keyboard(intent.visible)

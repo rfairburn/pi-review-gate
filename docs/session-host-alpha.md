@@ -1673,11 +1673,29 @@ delivery, clipboard, storage, trust, identity, and proof behavior are unchanged,
 notice producer is reset, cleared, filtered, or replayed. Soft-keyboard visibility and
 the Keys dock layout are separate concerns from this flag.
 
-**Status-bar contrast.** The window background and the app's palette are fixed light on every
-route, so dark status-bar icons are now requested explicitly instead of contrast being derived
-from the system night flag, which could draw light icons over the light strip on a phone in dark
-mode. Status-bar icon contrast only: system bar colors, navigation, edge-to-edge geometry, and
-the consumed insets are unchanged.
+**Appearance.** The phone client's Settings screen offers a **Light / Dark** choice for the
+app's own surfaces. Light is the default, and it is what the app paints with until a choice is
+saved. Selecting an option saves it locally in the same strict version-1 settings document,
+where an absent key means light and only an explicit `"dark"` is written; any other spelling,
+case, or JSON type refuses the whole document, and a failed save publishes nothing, so the
+drawn selection always shows what is stored rather than what was tapped. The saved choice
+survives an app restart and repaints the app's screens, dialogs, sheets, and controls — the
+session-card status palette included, which keeps its two existing variants distinct on either
+surface, and the diagnostic status band included, whose notice paints with the selected
+appearance's own content color rather than an inherited default. It is presentation only: it grants and revokes nothing, changes no connection,
+pairing, session, input, storage, or trust behavior, opens or retires no terminal, and never
+recolors host-provided terminal content — the terminal's received palette and its own
+foreground and background defaults are not derived from it. There is deliberately no
+follow-system, automatic, or time-based mode and no custom palette, and no host-side change or
+new protocol message is involved.
+
+**Status-bar contrast.** The app paints the strip below the status bar itself, so status-bar
+icon contrast is asked for explicitly from the saved appearance — dark icons for the light
+default, light icons for dark — instead of being derived from the system night flag, which
+could draw light icons over a light strip on a phone in dark mode. The window's own backing
+follows that same choice, and the light appearance keeps the background its theme supplied.
+Status-bar icon contrast and that backing only: system bar colors, navigation, edge-to-edge
+geometry, and the consumed insets are unchanged.
 
 ## Focus, display, and status
 

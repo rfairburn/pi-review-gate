@@ -9,7 +9,7 @@ import kotlinx.serialization.json.JsonPrimitive
  *
  * ```
  * {"version":1,"autoReconnect":false,"viewerRemoteInputEnabled":false,
- *  "debugInputMessagingEnabled":true,"savedFirstReplyTimeoutSeconds":120,
+ *  "debugInputMessagingEnabled":true,"savedFirstReplyTimeoutSeconds":120,"appearance":"dark",
  *  "hosts":[{"id":"...","label":"...","host":"...","port":8443,
  *            "previouslyConnected":true,"reconnectSuppressed":false}]}
  * ```
@@ -32,6 +32,10 @@ import kotlinx.serialization.json.JsonPrimitive
  *   absent key means 60, a present key must be a positive whole number inside the
  *   document's existing nine-digit integer width, and the default is never written.
  *   Zero is refused rather than meaning infinite, and nothing is clamped.
+ * - `appearance` is optional only at its default of `"light"`. An absent key means
+ *   light, a present key must be one exact lower-case variant name, and the default
+ *   is never written. Any other spelling, case, or JSON type refuses the document
+ *   rather than becoming a default.
  * - Ports are JSON numbers in `1..65535` (a quoted port is refused); ids, labels,
  *   and hosts are bounds-checked; a duplicate id refuses the whole document.
  *
@@ -51,6 +55,7 @@ public object NetworkSettingsDocumentCodec {
     private const val KEY_VIEWER_REMOTE_INPUT = "viewerRemoteInputEnabled"
     private const val KEY_DEBUG_INPUT_MESSAGING = "debugInputMessagingEnabled"
     private const val KEY_SAVED_FIRST_REPLY_TIMEOUT = "savedFirstReplyTimeoutSeconds"
+    private const val KEY_APPEARANCE = "appearance"
     private const val KEY_HOSTS = "hosts"
 
     private const val HOST_KEY_ID = "id"
@@ -66,6 +71,7 @@ public object NetworkSettingsDocumentCodec {
         KEY_VIEWER_REMOTE_INPUT,
         KEY_DEBUG_INPUT_MESSAGING,
         KEY_SAVED_FIRST_REPLY_TIMEOUT,
+        KEY_APPEARANCE,
         KEY_HOSTS,
     )
     private val HOST_KEYS = setOf(
@@ -140,6 +146,16 @@ public object NetworkSettingsDocumentCodec {
             NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS
         }
 
+        // Optional only at its default: absent is light, present must name a variant exactly.
+        val appearance = if (KEY_APPEARANCE in root) {
+            val name = root[KEY_APPEARANCE].asStringOrNull()
+                ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
+            AppAppearance.fromWireName(name)
+                ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
+        } else {
+            NetworkSettings.DEFAULT_APPEARANCE
+        }
+
         val rawHosts = root[KEY_HOSTS].asArrayOrNull()
             ?: return SettingsDecodeResult.Invalid(StorageFailureReason.MALFORMED)
         if (rawHosts.size > HostCatalog.MAX_HOSTS) {
@@ -164,6 +180,7 @@ public object NetworkSettingsDocumentCodec {
                 hosts = HostCatalog.of(hosts),
                 savedFirstReplyTimeoutSeconds = savedFirstReplyTimeoutSeconds,
                 debugInputMessagingEnabled = debugInputMessagingEnabled,
+                appearance = appearance,
             ),
         )
     }
@@ -191,6 +208,11 @@ public object NetworkSettingsDocumentCodec {
             if (settings.savedFirstReplyTimeoutSeconds != NetworkSettings.DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS) {
                 append(",\"").append(KEY_SAVED_FIRST_REPLY_TIMEOUT)
                     .append("\":").append(settings.savedFirstReplyTimeoutSeconds)
+            }
+            // Sparse default: the shipped light appearance writes no key at all.
+            if (settings.appearance != NetworkSettings.DEFAULT_APPEARANCE) {
+                append(",\"").append(KEY_APPEARANCE).append("\":")
+                    .append(JsonPrimitive(settings.appearance.wireName))
             }
             append(",\"").append(KEY_HOSTS).append("\":[")
             settings.hosts.hosts.forEachIndexed { index, host ->

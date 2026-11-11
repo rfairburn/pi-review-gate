@@ -3,7 +3,7 @@ package io.github.rfairburn.pireviewgate.core.hosts
 /**
  * The client's complete durable network configuration.
  *
- * It holds every configured host plus the four remembered global preferences. A
+ * It holds every configured host plus the five remembered global preferences. A
  * hosting/listen configuration and owner-side policies are deliberately absent: this
  * client dials out and hosts nothing, so an enabled-listener or owner-policy field
  * would be a setting with no effect.
@@ -18,6 +18,8 @@ package io.github.rfairburn.pireviewgate.core.hosts
  *   only whether the app's diagnostic status/notice area is presented.
  * - [savedFirstReplyTimeoutSeconds] is 60 by default; a stored document omits the
  *   field at that default and writes a positive whole-second value otherwise.
+ * - [appearance] is [AppAppearance.LIGHT] by default; a stored document omits the
+ *   field at that default and writes the exact name of the chosen variant otherwise.
  *
  * A genuinely absent document is not "defaults": the store reports `null` so the
  * caller can show defaults without creating anything. A present-but-invalid
@@ -30,6 +32,7 @@ public data class NetworkSettings(
     val hosts: HostCatalog = HostCatalog.EMPTY,
     val savedFirstReplyTimeoutSeconds: Int = DEFAULT_SAVED_FIRST_REPLY_TIMEOUT_SECONDS,
     val debugInputMessagingEnabled: Boolean = DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED,
+    val appearance: AppAppearance = DEFAULT_APPEARANCE,
 ) {
     init {
         require(isValidSavedFirstReplyTimeoutSeconds(savedFirstReplyTimeoutSeconds)) {
@@ -65,6 +68,18 @@ public data class NetworkSettings(
          * document.
          */
         public const val MAX_SAVED_FIRST_REPLY_TIMEOUT_SECONDS: Int = 999_999_999
+
+        /**
+         * The app's own Material appearance, light by default.
+         *
+         * Presentation only: it selects the appearance the app's screens, dialogs,
+         * and controls are painted with. Host-provided terminal colors, the
+         * terminal's own defaults, and every connection, input, storage, and trust
+         * rule ignore it.
+         *
+         * Declared above [DEFAULTS] because constructing that value reads this one.
+         */
+        public val DEFAULT_APPEARANCE: AppAppearance = AppAppearance.LIGHT
 
         /** In-memory defaults for a client that has never saved anything. */
         public val DEFAULTS: NetworkSettings = NetworkSettings()
@@ -129,6 +144,16 @@ public data class NetworkSettings(
     /** One global preference changed; nothing else moves. */
     public fun withSavedFirstReplyTimeoutSeconds(seconds: Int): NetworkSettings =
         copy(savedFirstReplyTimeoutSeconds = seconds)
+
+    /**
+     * One global preference changed; nothing else moves.
+     *
+     * Presentation only: the app's own surfaces are painted with the chosen
+     * appearance. It changes no host-provided color, no received or default terminal
+     * palette, and no connection, input, storage, or trust behavior.
+     */
+    public fun withAppearance(appearance: AppAppearance): NetworkSettings =
+        copy(appearance = appearance)
 
     /** This setting's local deadline in milliseconds. */
     public val savedFirstReplyTimeoutMs: Long

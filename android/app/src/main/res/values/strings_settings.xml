@@ -5,4 +5,8 @@
     <string name="setting_saved_first_reply_timeout_field">First reply timeout (seconds)</string>
     <string name="setting_saved_first_reply_timeout_save">Save timeout</string>
     <string name="setting_saved_first_reply_timeout_invalid">Enter a whole number of seconds from 1 to %1$d.</string>
+    <string name="setting_appearance">Appearance</string>
+    <string name="setting_appearance_body">The look of this app\'s own screens, dialogs, and controls. Terminal colors come from the host and are unchanged.</string>
+    <string name="setting_appearance_light">Light</string>
+    <string name="setting_appearance_dark">Dark</string>
 </resources>

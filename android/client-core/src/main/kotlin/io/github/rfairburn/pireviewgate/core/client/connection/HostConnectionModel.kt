@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.client.connection
 
+import io.github.rfairburn.pireviewgate.core.hosts.AppAppearance
 import io.github.rfairburn.pireviewgate.core.hosts.Endpoint
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
@@ -237,4 +238,15 @@ public data class ConnectionRegistrySnapshot(
      * clipboard, storage, and proof authority never consult it.
      */
     public val debugInputMessagingEnabled: Boolean = NetworkSettings.DEFAULT_DEBUG_INPUT_MESSAGING_ENABLED,
+
+    /**
+     * Saved app appearance, light by default.
+     *
+     * Purely presentational: it selects the Material appearance the app's own
+     * screens, dialogs, and controls are painted with. Host-provided terminal colors
+     * and the terminal's own defaults never read it, and it grants or revokes no
+     * input, delivery, clipboard, storage, trust, or proof authority. Absent saved
+     * configuration reports the shipped light default.
+     */
+    public val appearance: AppAppearance = NetworkSettings.DEFAULT_APPEARANCE,
 )

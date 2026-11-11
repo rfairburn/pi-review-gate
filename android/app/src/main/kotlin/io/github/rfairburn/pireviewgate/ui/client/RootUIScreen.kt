@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -93,7 +92,10 @@ fun RootUIScreen(
     val savedListState = androidx.compose.foundation.lazy.rememberLazyListState()
 
     UiCommitScope {
-        MaterialTheme {
+        // The saved appearance is the only palette decision this screen makes: every
+        // route, dialog, sheet, and control below it inherits it. The terminal's own
+        // colors come from the host and never read it.
+        ClientTheme(appearance = state.settings.appearance) {
             reportCoverage(state, onIntent)
             handleBack(state, onIntent)
 

@@ -61,6 +61,7 @@ import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./act
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { createPrimaryEvidenceSettings, sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
+import { sendNonGitWorkspaceWarning } from "./activation/non-git-workspace";
 import { capturePrimaryOperationBoundary, primaryEvidencePolicy, retainPrimaryToolAfter, settlePrimaryOperationBoundary } from "./review-evidence";
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
@@ -942,6 +943,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     scheduledRuntime.attach();
     await sessionPersistence.persist();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
+    // #292: one informational user-only warning beside the loaded notice when
+    // THIS live session's cwd is positively outside any Git worktree. The probe
+    // is a single bounded read-only Git discovery call, never capture, and every
+    // indeterminate outcome (missing Git, malformed or inaccessible metadata,
+    // a timeout, an ambient repository redirect) stays silent. The retirement
+    // guard drops a warning whose session ended while the probe was in flight,
+    // and a throwing notice transport is swallowed by the helper, so startup
+    // never blocks and capture, review, and fallback behavior are untouched.
+    await sendNonGitWorkspaceWarning({
+      cwd: currentCwd,
+      target: context ?? pi,
+      isCurrent: () => sessionActive && sessionEpoch === restoreSessionEpoch,
+    });
 
     // The hosted child's one-shot initial request is dispatched only after this
     // session's checkpoint scope, restored state, and deferred-tool boundary are

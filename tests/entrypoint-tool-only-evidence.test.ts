@@ -9,6 +9,7 @@ import { normalizeConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { runReview } from "../src/review";
 import { ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE } from "../src/review-evidence";
+import { NON_GIT_WORKSPACE_WARNING } from "../src/activation/non-git-workspace";
 import { BackgroundExecutionController } from "../src/execution/background-controller";
 import { isActiveTaskState } from "../src/execution/task-state";
 import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
@@ -100,7 +101,10 @@ async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = 
     const modelInputs: unknown[] = [];
     const localNotice = (message: string, type?: unknown) => {
       rt.notices.push(message);
-      if (type === "warning") warnings.push(message);
+      // #292: the informational non-Git workspace startup notice is not an
+      // evidence warning; it stays in rt.notices and is pinned by
+      // tests/entrypoint-non-git-workspace-warning.test.ts.
+      if (type === "warning" && message !== NON_GIT_WORKSPACE_WARNING) warnings.push(message);
     };
     rt.ctx.ui.notify = localNotice as typeof rt.ctx.ui.notify;
     rt.pi.notify = localNotice as typeof rt.pi.notify;

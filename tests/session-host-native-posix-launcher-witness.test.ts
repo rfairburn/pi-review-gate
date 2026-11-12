@@ -49,10 +49,21 @@ function hostFrame(right: readonly string[]): string {
   return rows.join("\n");
 }
 
-/** A complete New form whose Workspace row draws `fieldValue`; `undefined` drops that row. */
+/** The Workspace label as drawn; its trailing space is where the Editor's field column starts. */
+const WORKSPACE_LABEL = "> Workspace: ";
+/** The pinned public Editor draws its own horizontal rules at that field column. */
+const EDITOR_FIELD_COLUMNS = 40;
+const EDITOR_RULE = " ".repeat(WORKSPACE_LABEL.length) + "─".repeat(EDITOR_FIELD_COLUMNS);
+
+/** The Workspace field exactly as the public native Editor draws it: top rule, labelled body row, bottom rule. */
+function editorBox(fieldValue: string): string[] {
+  return [EDITOR_RULE, `${WORKSPACE_LABEL}${fieldValue}`, EDITOR_RULE];
+}
+
+/** A complete New form whose Workspace field draws `fieldValue`; `undefined` drops that field. */
 function newFormFrame(fieldValue: string | undefined, options: { readonly pending?: boolean } = {}): string {
   const pane = [" New session ", "  Host: [ Local ]"];
-  if (fieldValue !== undefined) pane.push(`> Workspace: ${fieldValue}`);
+  if (fieldValue !== undefined) pane.push(...editorBox(fieldValue));
   if (options.pending === true) pane.push(" Starting (request 1) ");
   pane.push(NEW_FORM_FOOTER);
   return hostFrame(pane);
@@ -151,7 +162,8 @@ test("the launcher witness keeps the shared New-form branch positive in both dir
   assert.equal(pending?.kind, "pending-create");
   assert.equal(requiresSecondWorkspaceEnter(pending), false);
 
-  // Only the exact completed owned folder in a completely drawn form authorises
+  // Only the exact completed owned folder in a completely drawn form — with the
+  // public native Editor's own top and bottom rules drawn around it — authorises
   // the one further Enter, and the matched frame is the branch's own evidence.
   const completion = observeWorkspaceSubmitWitness(newFormFrame(COMPLETED), {
     completedPath: COMPLETED,
@@ -161,4 +173,16 @@ test("the launcher witness keeps the shared New-form branch positive in both dir
   assert.ok(completion !== undefined && completion.kind === "owned-folder-completion");
   assert.equal(completion.frame.includes("> Workspace:"), true,
     "the witness carries the frame that proved the completion, never a later transient one");
+  // A repaint that kept the labelled row but lost the Editor's bottom rule is the
+  // same frame the POSIX driver's own bordered assertion rejects, so it is never
+  // a completion witness either; the caller keeps waiting for a settled frame.
+  const lostBottomRule = newFormFrame(COMPLETED).split("\n");
+  const labelledRow = lostBottomRule.findIndex((line) => line.includes("> Workspace:"));
+  lostBottomRule.splice(labelledRow + 1, 1);
+  const partialEditor = lostBottomRule.join("\n");
+  assert.equal(partialEditor.includes("> Workspace:"), true);
+  assert.equal(observeWorkspaceSubmitWitness(partialEditor, {
+    completedPath: COMPLETED,
+    freshStart: freshStartFor([], []),
+  }), undefined, "a labelled row without the complete Editor box is never a completion witness");
 });

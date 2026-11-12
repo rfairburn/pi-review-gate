@@ -18,6 +18,7 @@ import test from "node:test";
 import {
   captureStartIdentities,
   completeNewFormDrawn,
+  nativeEditorBodyShowsCompletion,
   newFormFooterDrawn,
   newFormPendingCreateDrawn,
   newFormWorkspaceValue,
@@ -52,6 +53,34 @@ function rawHostFrame(rows: readonly string[]): string {
   return rows.join("\n");
 }
 
+/** The Workspace label as drawn, its trailing space being the Editor's field column. */
+const WORKSPACE_LABEL = "> Workspace: ";
+/**
+ * The pinned public Editor draws its own horizontal rules at its field column,
+ * so the field body always sits between two of them.
+ */
+const EDITOR_FIELD_COLUMNS = 40;
+const EDITOR_INDENT = " ".repeat(WORKSPACE_LABEL.length);
+const EDITOR_RULE_LINE = "─".repeat(EDITOR_FIELD_COLUMNS);
+const EDITOR_RULE = EDITOR_INDENT + EDITOR_RULE_LINE;
+
+/**
+ * The New form's Workspace field exactly as the public native Editor draws it:
+ * its own top rule, then the labelled editable row (the label sits immediately
+ * left of the field column, never beside a rule), then its own bottom rule.
+ */
+function editorBox(fieldValue: string): string[] {
+  return [EDITOR_RULE, `${WORKSPACE_LABEL}${fieldValue}`, EDITOR_RULE];
+}
+
+/**
+ * A New form whose Workspace field is one specific drawn Editor box, so a single
+ * geometry defect can be isolated from everything else about the frame.
+ */
+function formWithEditor(box: readonly string[]): string {
+  return hostFrame([" New session ", "  Host: [ Local ]", ...box, NEW_FORM_FOOTER]);
+}
+
 /**
  * A frame shaped like the real wide New form: the form's own header, the fixed
  * Local Host line, the labelled Workspace row, and the New form's footer.
@@ -63,7 +92,7 @@ function newFormFrame(fieldValue: string | undefined, options: {
   readonly pending?: boolean;
 } = {}): string {
   const pane = [" New session ", "  Host: [ Local ]"];
-  if (fieldValue !== undefined) pane.push(`> Workspace: ${fieldValue}`);
+  if (fieldValue !== undefined) pane.push(...editorBox(fieldValue));
   if (options.pending === true) pane.push(" Starting (request 1) ");
   if (options.footer !== false) pane.push(NEW_FORM_FOOTER);
   return hostFrame(pane);
@@ -105,6 +134,8 @@ test("positive witnesses recognize the exact completed owned folder in a complet
   assert.equal(completeNewFormDrawn(frame), true, "the fixture frame is a complete New form");
   assert.equal(newFormFooterDrawn(frame), true);
   assert.equal(newFormWorkspaceValue(frame), COMPLETED, "the labelled row's value is read beside its label");
+  assert.equal(nativeEditorBodyShowsCompletion(frame, COMPLETED), true,
+    "the fixture draws the public Editor's top rule, labelled body row, and bottom rule");
   const witness = observeWorkspaceSubmitWitness(frame, noFreshStart);
   assert.equal(witness?.kind, "owned-folder-completion");
   assert.ok(witness !== undefined && witness.kind === "owned-folder-completion");
@@ -131,6 +162,62 @@ test("positive witnesses recognize the exact completed owned folder in a complet
   assert.equal(wrongPane.includes("> Workspace:"), true);
   assert.equal(completeNewFormDrawn(wrongPane), false, "the roster pane never draws the New form");
   assert.equal(observeWorkspaceSubmitWitness(wrongPane, noFreshStart), undefined);
+});
+
+test("a completion witness needs the complete bordered Editor body, not just a labelled row", () => {
+  // Every frame below is a COMPLETELY drawn New form whose labelled Workspace row
+  // holds the exact completed owned folder — exactly the evidence this witness
+  // used to accept, and exactly the frame the real acceptance run captured mid
+  // repaint. What is broken is the public native Editor's own box, so the frame
+  // cannot prove what the field really holds: the witness yields nothing, the
+  // caller keeps waiting for a settled frame, no second Enter is authorised, and
+  // no Editor-parse error escapes the readiness predicate.
+  const box = editorBox(COMPLETED);
+  const unwrappedPaneRow = (row: string): string => " ".repeat(ROSTER_COLUMNS) + "│" + row;
+  const cases: readonly { readonly name: string; readonly frame: string }[] = [
+    // The CI race: the labelled row was repainted, the bottom rule was not.
+    { name: "missing bottom rule", frame: formWithEditor([box[0]!, box[1]!]) },
+    // A body row that stops short of the Editor's own field column.
+    {
+      name: "clipped body row",
+      frame: rawHostFrame([" Session host ", ...[" New session ", "  Host: [ Local ]", ...box, NEW_FORM_FOOTER]
+        .map(unwrappedPaneRow)]),
+    },
+    // A scrolled Editor replaces its top rule with its own scroll indicator.
+    {
+      name: "scroll-indicator top border",
+      frame: formWithEditor([`${EDITOR_INDENT}↑ …workspace-alpha/`, box[1]!, box[2]!]),
+    },
+    // Two labelled field boxes in one frame never resolve to "the first one".
+    { name: "ambiguous borders", frame: formWithEditor([...box, ...box]) },
+    // The exact path followed by stale content in the same visible body.
+    { name: "stale content after the path", frame: formWithEditor([box[0]!, box[1]!, `${EDITOR_INDENT}stale`, box[2]!]) },
+  ];
+  for (const { name, frame } of cases) {
+    assert.equal(completeNewFormDrawn(frame), true, `${name}: the New form itself is completely drawn`);
+    assert.equal(newFormWorkspaceValue(frame), COMPLETED, `${name}: the labelled row holds the exact completion`);
+    assert.equal(nativeEditorBodyShowsCompletion(frame, COMPLETED), false,
+      `${name}: an incomplete, clipped, or ambiguous Editor body is not completion evidence`);
+    assert.equal(observeWorkspaceSubmitWitness(frame, noFreshStart), undefined,
+      `${name}: the frame proves nothing, so the caller keeps waiting`);
+    assert.equal(requiresSecondWorkspaceEnter(observeWorkspaceSubmitWitness(frame, noFreshStart)), false,
+      `${name}: no further Enter is authorised by a broken Editor box`);
+  }
+
+  // Every other Editor-box parse failure is swallowed the same way instead of
+  // escaping a bounded frame wait: the superseded layout with the label beside
+  // the top rule, and a frame with no Editor box at all.
+  const supersededBox = [
+    `${WORKSPACE_LABEL}${EDITOR_RULE_LINE}`,
+    `${EDITOR_INDENT}${COMPLETED}`,
+    `${EDITOR_INDENT}${EDITOR_RULE_LINE}`,
+  ];
+  const superseded = rawHostFrame([" Session host ",
+    ...[" New session ", "  Host: [ Local ]", ...supersededBox, NEW_FORM_FOOTER].map(unwrappedPaneRow)]);
+  for (const frame of [superseded, formWithEditor([COMPLETED]), EDITOR_RULE_LINE]) {
+    assert.equal(observeWorkspaceSubmitWitness(frame, noFreshStart), undefined,
+      "an unparseable Editor box is never a witness and never throws out of the wait");
+  }
 });
 
 test("positive witnesses recognize the host's real pending-create row as a submission", () => {

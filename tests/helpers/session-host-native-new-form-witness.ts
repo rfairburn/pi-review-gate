@@ -17,23 +17,36 @@
  * Every witness here is therefore positive: the host's own pending-create row, a
  * start the child itself freshly reported for this exact workspace (fenced
  * against every identity that already existed), or the exact completed owned
- * folder drawn in a complete New form. An empty, partial, or marker-missing
- * redraw yields no witness at all, so the caller keeps waiting instead of acting
- * on a frame that proved nothing, and the caller branches on the witness it
- * captured rather than on a later transient frame.
+ * folder drawn in a complete New form whose public native Editor box is itself
+ * completely drawn. An empty, partial, or marker-missing redraw yields no
+ * witness at all, so the caller keeps waiting instead of acting on a frame that
+ * proved nothing, and the caller branches on the witness it captured rather than
+ * on a later transient frame.
  *
- * This module is deliberately a leaf: it depends on nothing but the shared
- * roster geometry, so both the native Main harness and the native CLI Main
- * scenario can share one completion semantics. (The stricter bordered-Editor
- * New-open witness in `session-host-native-saved-main-harness.ts` cannot be
- * imported here: that harness imports the native Main harness, and a witness
- * module must not close that cycle.)
+ * The completion witness reads the field through the SAME shared native Editor
+ * rule parser the POSIX and Windows launchers assert with afterwards
+ * (`borderedEditorContentMatches` in
+ * `session-host-native-windows-contracts.ts`), so the frame that authorises the
+ * one intended second Enter is by construction a frame on which that later
+ * assertion holds. Without it, a repaint that still drew the labelled Workspace
+ * row but had not yet redrawn the Editor's own bottom rule was a positive
+ * completion witness, and the caller's own bordered assertion then failed on the
+ * frame it had already accepted.
+ *
+ * This module stays a leaf for cycle purposes: it depends on the shared roster
+ * geometry and on that shared Editor-rule module, which imports nothing but the
+ * production sidebar and terminal surface — never a Main harness. (The stricter
+ * bordered-Editor New-open witness in
+ * `session-host-native-saved-main-harness.ts` still cannot be imported here:
+ * that harness imports the native Main harness, and a witness module must not
+ * close that cycle.)
  *
  * These are synthetic test-UI readiness witnesses only. They say what the drawn
  * Main frame and a fixture's own journal showed to this driver; they are never a
  * provider's activity or status, and they add no key, retry, or sleep anywhere.
  */
 import { NATIVE_PANE_START } from "./session-host-native-roster-witness";
+import { borderedEditorContentMatches } from "./session-host-native-windows-contracts";
 
 /** The drawn New form's editable Workspace row, exactly as `SidebarController` labels it. */
 export const NEW_FORM_WORKSPACE_MARKER = "> Workspace:";
@@ -123,6 +136,30 @@ export function newFormPendingCreateDrawn(frame: string): boolean {
 }
 
 /**
+ * True only when the frame draws the public native Editor's COMPLETE bordered
+ * content body for the Workspace field — its own top rule, its labelled
+ * editable rows, and its own bottom rule — and that whole body reads as exactly
+ * `completedPath`. A labelled row that merely shows the path is not enough: an
+ * Editor box whose bottom rule has not been repainted yet, whose body row is
+ * clipped at the pane edge, whose value is truncated, or which is ambiguous
+ * because two labelled field boxes were drawn proves nothing about what the
+ * field actually holds.
+ *
+ * The shared parser throws on those incomplete boxes. A readiness predicate runs
+ * inside a bounded frame wait, where a throw would turn a frame that simply has
+ * not finished repainting into a hard acceptance failure, so every parse failure
+ * is caught here and read as "this frame proved nothing" — the caller keeps
+ * waiting, and never assumes a submission.
+ */
+export function nativeEditorBodyShowsCompletion(frame: string, completedPath: string): boolean {
+  try {
+    return borderedEditorContentMatches(frame, NEW_FORM_WORKSPACE_MARKER, completedPath);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True only for a COMPLETELY drawn New form: its own form-pane header row, a
  * labelled Workspace row drawn below it, and its own footer hints on screen. The
  * left roster's identically named `New session` action is not the form pane, and
@@ -181,12 +218,14 @@ export function captureStartIdentities(records: readonly StartEventCandidate[]):
  *
  * The witnesses are checked in that order of consequence: the host's own
  * pending-create row, then a freshly reported start for this exact workspace,
- * and only then the exact completed owned folder inside a complete New form, so
- * a start the real host already took can never be outranked by a form frame that
- * is merely still on screen — the second Enter is never sent into a child that
- * has taken input ownership. Anything else — an empty frame, a partial repaint,
- * a frame that simply lost the Workspace row, a field holding another path or an
- * error — returns nothing and the caller keeps waiting.
+ * and only then the exact completed owned folder inside a complete New form
+ * whose native Editor box is itself completely drawn, so a start the real host
+ * already took can never be outranked by a form frame that is merely still on
+ * screen — the second Enter is never sent into a child that has taken input
+ * ownership. Anything else — an empty frame, a partial repaint, a frame that
+ * simply lost the Workspace row, a frame whose Editor box is missing its bottom
+ * rule or whose body is clipped, truncated, or ambiguous, a field holding
+ * another path or an error — returns nothing and the caller keeps waiting.
  */
 export function observeWorkspaceSubmitWitness<TFreshStart>(
   frame: string,
@@ -200,7 +239,9 @@ export function observeWorkspaceSubmitWitness<TFreshStart>(
   if (newFormPendingCreateDrawn(frame)) return { kind: "pending-create", frame };
   const start = options.freshStart();
   if (start !== undefined) return { kind: "fresh-start", frame, start };
-  if (completeNewFormDrawn(frame) && newFormWorkspaceValue(frame) === options.completedPath) {
+  if (completeNewFormDrawn(frame)
+    && newFormWorkspaceValue(frame) === options.completedPath
+    && nativeEditorBodyShowsCompletion(frame, options.completedPath)) {
     return { kind: "owned-folder-completion", frame, completedPath: options.completedPath };
   }
   return undefined;
@@ -208,10 +249,10 @@ export function observeWorkspaceSubmitWitness<TFreshStart>(
 
 /**
  * The only witness that may cause the one intended second Enter: the form is
- * still completely drawn and its field now holds the exact completed owned
- * folder. A pending create or a freshly reported start means the real host
- * already took the submission, so a further Enter would land in the child that
- * has taken input ownership and is never sent.
+ * still completely drawn and its field's complete native Editor body holds the
+ * exact completed owned folder. A pending create or a freshly reported start
+ * means the real host already took the submission, so a further Enter would land
+ * in the child that has taken input ownership and is never sent.
  */
 export function requiresSecondWorkspaceEnter<T>(
   witness: WorkspaceSubmitWitness<T> | undefined,

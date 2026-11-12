@@ -190,6 +190,14 @@ import {
 } from "./field-editor";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
 import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  isSessionBackend,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+  type SessionBackend,
+} from "./session-backend";
+import {
   asHostKeyId,
   assertHostShortcutsDistinct,
   DEFAULT_HOST_SHORTCUTS,
@@ -257,6 +265,14 @@ export interface SidebarItem {
    * is never activatable: Enter must not change focus or input ownership.
    */
   readonly unavailable?: boolean;
+  /**
+   * Which provider backend this row belongs to (issue #277). Absence means the
+   * review-gate-managed Pi child, exactly as for every row drawn before native
+   * CLI hosting; a value outside the closed backend set is dropped, never
+   * guessed. This is display identity ONLY: a native row never reports a Pi
+   * native conversation, and its agent/input/activity telemetry stays unknown.
+   */
+  readonly backend?: SessionBackend;
   /** true/false when observed; null means unknown (never rendered as false). */
   readonly busy: boolean | null;
   readonly pendingInput: boolean | null;
@@ -472,10 +488,19 @@ export type SidebarAction =
   | { readonly type: "saved-cancel"; readonly requestId: number }
   /** Deliberately open one listed conversation as a new independently owned child. */
   | { readonly type: "saved-open"; readonly requestId: number; readonly file: string; readonly sessionId: string }
+  /**
+   * One deliberate LOCAL New submission. `backend` and `nativeCliTarget` are
+   * present only when the operator actually chose a native provider in the New
+   * form's Provider line; an ordinary Pi submission keeps the exact existing
+   * `{ requestId, workspace }` shape, and absence means Pi. The target is the
+   * unchanged selected target id, never a command, path, or argument.
+   */
   | {
       readonly type: "create";
       readonly requestId: number;
       readonly workspace: string;
+      readonly backend?: NativeCliBackend;
+      readonly nativeCliTarget?: string;
     }
   /**
    * One deliberate REMOTE New submission: exactly the destination host, the
@@ -636,6 +661,20 @@ export interface SidebarSavedPickerPresentation {
 /** The completed owner window facts the sidebar accepts (the wire's `window` fact set). */
 export type SidebarRemoteSavedWindowFacts = Extract<OwnerSavedWindowFacts, { readonly kind: "window" }>;
 
+/**
+ * One selectable native provider target the New form's Provider line can offer
+ * (issue #277). Main derived it from the operator's already-normalized
+ * review-gate configuration; the sidebar displays `label` and echoes `id` plus
+ * `backend` back on a deliberate submission and never resolves, launches, or
+ * reinterprets anything. `label` is a provider/target NAME only — never a
+ * command, path, argument, or environment value.
+ */
+export interface SidebarNativeCliTarget {
+  readonly id: string;
+  readonly backend: NativeCliBackend;
+  readonly label: string;
+}
+
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
   readonly toggleKey?: string;
@@ -658,6 +697,13 @@ export interface SidebarControllerOptions {
   readonly initialWorkspace?: string;
   /** Host-startup cwd used by the native path completer for relative input. */
   readonly workspaceBasePath?: string;
+  /**
+   * The native provider targets this host can actually offer in the New form's
+   * Provider line. Absence or an empty list draws NO Provider line at all: the
+   * New form keeps its exact pre-native geometry, every submission stays the
+   * ordinary Pi create, and a native request therefore cannot be made.
+   */
+  readonly nativeCliTargets?: readonly SidebarNativeCliTarget[];
   /** Optional Main-owned factory; production supplies current native keybindings and external-editor ownership. */
   readonly createTextField?: (options: SidebarFieldFactoryOptions) => SidebarFieldFactoryResult;
   /** Main supplies native global keybindings and owns the safe Input manager bridge. */
@@ -793,6 +839,13 @@ export interface SidebarMousePresentation {
    * list refuses, so an invisible or since-changed control can never act.
    */
   activateFormHostAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Activates only the Provider line the captured New-form render actually drew
+   * (issue #277), with the same written-geometry rule as the Host line. Optional
+   * so a presentation captured before native provider hosting stays valid; a
+   * form that drew no Provider line simply reports no target.
+   */
+  activateFormProviderAt?(column: number, row: number, cols: number, rows: number): boolean;
   /**
    * Begins ONE session-card pointer interaction against the roster this render
    * actually drew. True only when the coordinate is a completely drawn session
@@ -1421,6 +1474,53 @@ function newFormHostOptionKey(option: { readonly kind: "local" | "remote"; reado
 }
 
 /**
+ * One provider choice the New form's Provider line can name: the Pi default
+ * first, then every native target this host offers. `targetId` is present only
+ * for a native choice, and `label` is the drawn NAME of that choice.
+ */
+interface NewFormProviderOption {
+  readonly backend: SessionBackend;
+  readonly targetId?: string;
+  readonly label: string;
+}
+
+/** Stable identity of one provider choice: Pi, or one exactly selected target. */
+function newFormProviderOptionKey(option: { readonly backend: SessionBackend; readonly targetId?: string }): string {
+  return option.backend === "pi" ? "pi" : `native:${option.targetId ?? ""}`;
+}
+
+/**
+ * Sanitize the native provider targets Main supplied for this host. A malformed
+ * entry (a backend outside the closed set, an id the manager itself would
+ * refuse at create, or a blank label) is dropped rather than guessed, and a
+ * duplicated id keeps only its first occurrence, so one drawn choice never
+ * names two targets. The id rule is the manager's shared one, so the New form
+ * never draws a provider choice that could only ever fail to start.
+ */
+function normalizeNativeCliTargets(value: unknown): readonly SidebarNativeCliTarget[] {
+  if (!Array.isArray(value)) return [];
+  const targets: SidebarNativeCliTarget[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    if (!isNativeCliBackend(record.backend)) continue;
+    if (!isNativeCliTargetId(record.id)) continue;
+    if (seen.has(record.id)) continue;
+    const label = typeof record.label === "string"
+      ? sanitizeBounded(record.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS).trim()
+      : "";
+    seen.add(record.id);
+    targets.push(Object.freeze({
+      id: record.id,
+      backend: record.backend,
+      label: label.length > 0 ? label : sessionBackendDisplayLabel(record.backend),
+    }));
+  }
+  return Object.freeze(targets);
+}
+
+/**
  * The exact New-form frame one render actually drew, retained so a NEW form
  * submission can require the writer's own receipt for it instead of relying on
  * any later render, DTO, or selection. `written` becomes true only when Main's
@@ -1538,6 +1638,21 @@ interface DisplayedFormHostRow {
   readonly valueEnd: number;
   readonly optionKey: string;
   /** New-form generation, or the Saved picker id that drew the line. */
+  readonly formGeneration: number;
+}
+
+/**
+ * The New form's Provider line drawn completely, with the same written-geometry
+ * binding as the Host line: a press can only cycle or focus the provider
+ * control this render actually drew, for the option list it actually drew.
+ */
+interface DisplayedFormProviderRow {
+  readonly cols: number;
+  readonly rows: number;
+  readonly row: number;
+  readonly valueStart: number;
+  readonly valueEnd: number;
+  readonly optionKey: string;
   readonly formGeneration: number;
 }
 
@@ -1815,6 +1930,7 @@ function mouseAuthorizationKey(
   consent: DisplayedPeerConsent | undefined,
   consentRendered: boolean,
   formHost: DisplayedFormHostRow | undefined,
+  formProvider: DisplayedFormProviderRow | undefined,
   settings: DisplayedSettingsRows | undefined,
   theme: DisplayedSettingsRows | undefined,
 ): string {
@@ -1856,6 +1972,13 @@ function mouseAuthorizationKey(
     formHost: formHost === undefined ? null : [
       formHost.pane, formHost.cols, formHost.rows, formHost.row, formHost.valueStart, formHost.valueEnd,
       formHost.optionKey, formHost.formGeneration,
+    ],
+    // The New form's Provider line is the same kind of written pointer target:
+    // its drawn row, value span, and exact option list belong to this identity.
+    formProvider: formProvider === undefined ? null : [
+      formProvider.cols, formProvider.rows, formProvider.row,
+      formProvider.valueStart, formProvider.valueEnd,
+      formProvider.optionKey, formProvider.formGeneration,
     ],
     // The grouped Settings submenu and the Theme pane are ordinary written
     // menus: their drawn rows and exact wording belong to this same identity,
@@ -2070,6 +2193,10 @@ export const REMOTE_SAVED_UNCERTAIN_NOTICE =
 /** The one Host line of the New form names Local until the operator changes it. */
 const NEW_FORM_LOCAL_HOST_LABEL = "Local";
 const NEW_FORM_HOST_PREFIX = "Host: ";
+/** The New form's one provider selection line (only when the host offers one). */
+const NEW_FORM_PROVIDER_PREFIX = "Provider: ";
+/** The drawn label of the default provider choice. */
+const NEW_FORM_PI_PROVIDER_LABEL = "Pi";
 /** Native-session card heights: title, status, background (+2 activity). */
 const CARD_COLLAPSED_ROWS = 3;
 const CARD_EXPANDED_ROWS = 5;
@@ -2686,10 +2813,28 @@ function remoteSessionStatusFacts(row: SidebarRemoteRosterRow): SessionStatusFac
 interface CardTitleFacts {
   readonly label: string;
   readonly nativeSession?: { readonly name: string } | null;
+  /** Absence (or `pi`) keeps the existing label/native-name title. */
+  readonly backend?: SessionBackend;
+  readonly lifecycle?: SidebarItem["lifecycle"];
+  readonly unavailable?: boolean;
 }
 
-/** Canonical card title: validated native name, else the row label. */
+/**
+ * Canonical card title: validated native name, else the row label. A native
+ * CLI row is titled by its STABLE provider label and nothing else (issue #277):
+ * it has no Pi conversation name to show, so the card can never display an
+ * invented provider conversation name or fall back to Pi-flavoured text. A
+ * remembered native row that is not a live session also says so in its title,
+ * so an unavailable slot can never be mistaken for a working provider session.
+ */
 function cardTitle(item: CardTitleFacts): string {
+  if (isNativeCliBackend(item.backend)) {
+    const provider = sessionBackendDisplayLabel(item.backend);
+    const title = item.unavailable === true || item.lifecycle === "error"
+      ? `${provider} (unavailable)`
+      : provider;
+    return sanitizeBounded(title, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
+  }
   return sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
 }
 
@@ -2757,6 +2902,7 @@ function copyItem(item: SidebarItem): SidebarItem {
     lifecycle: item.lifecycle,
     ...(typeof item.hasLiveProcess === "boolean" ? { hasLiveProcess: item.hasLiveProcess } : {}),
     ...(item.unavailable === true ? { unavailable: true } : {}),
+    ...(isSessionBackend(item.backend) ? { backend: item.backend } : {}),
     busy: item.busy,
     pendingInput: item.pendingInput,
     inputSurface: item.inputSurface,
@@ -3283,8 +3429,34 @@ export class SidebarController {
     | { readonly kind: "remote"; readonly hostId: string; readonly label: string } = { kind: "local" };
   /** True only while the New form's Host line owns the form's keyboard focus. */
   private formHostFocused = false;
+  /**
+   * True only while the New form's Provider line owns the form's keyboard focus
+   * (the control is only reachable when the host offered native targets).
+   */
+  private formProviderFocused = false;
+  /**
+   * True only while the last complete New-form render had no row to spare for
+   * the Provider line this host offers. A control the operator cannot see must
+   * not hold the form's one keyboard focus, so this gates both acquiring and
+   * keeping it. A freshly opened form starts unsuppressed: nothing is on screen
+   * yet, and a keystroke batch delivered before the first render must keep the
+   * exact focus ring it had before native provider hosting.
+   */
+  private formProviderRowSuppressed = false;
+  /**
+   * The New form's one provider choice. It is Pi at EVERY form opening, exactly
+   * like the Host line is Local, and a native choice never survives a reopen.
+   */
+  private newFormProvider: { readonly backend: SessionBackend; readonly targetId?: string } = { backend: "pi" };
+  /**
+   * The native provider targets Main supplied for this host, already sanitized.
+   * An empty list means this host offers no native session at all, so the New
+   * form draws no Provider line.
+   */
+  private readonly nativeCliTargets: readonly SidebarNativeCliTarget[];
   /** The Host line the last complete New-form render drew, or undefined. */
   private formHostDisplay: DisplayedFormHostRow | undefined;
+  private formProviderDisplay: DisplayedFormProviderRow | undefined;
   /** The New-form frame the last complete render drew (writer receipt pending). */
   private createFormCandidate: CreateFormCandidate | undefined;
   private createFormTokenSequence = 1;
@@ -3572,6 +3744,7 @@ export class SidebarController {
     this.onInvalidate = options.onInvalidate;
     this._visible = options.initialVisible ?? true;
     this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
+    this.nativeCliTargets = normalizeNativeCliTargets(options.nativeCliTargets);
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
     this.now = options.now ?? (() => Date.now());
@@ -5033,6 +5206,7 @@ export class SidebarController {
     const displayedPeerRows = this.peerDisplay;
     const displayedPeerConsent = this.peerConsentDisplay;
     const displayedFormHost = this.formHostDisplay;
+    const displayedFormProvider = this.formProviderDisplay;
     const displayedSettingsRows = this.settingsDisplay;
     const displayedThemeRows = this.themeDisplay;
     return Object.freeze({
@@ -5043,6 +5217,7 @@ export class SidebarController {
         displayedPeerConsent,
         this.peerConsentRendered,
         displayedFormHost,
+        displayedFormProvider,
         displayedSettingsRows,
         displayedThemeRows,
       ),
@@ -5070,6 +5245,8 @@ export class SidebarController {
         this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows),
       activateFormHostAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows),
+      activateFormProviderAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activateFormProviderAtFrom(displayedFormProvider, column, row, cols, rows),
       // Session-card pointer reorder. Each callback stays bound to the roster
       // maps THIS render drew, so Main drives them with the presentation whose
       // frame it actually wrote and no packet can resolve against a newer order.
@@ -5085,6 +5262,7 @@ export class SidebarController {
       // maps dispatch to exactly the surface the operator saw (or to neither).
       activateFormRowAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows)
+          || this.activateFormProviderAtFrom(displayedFormProvider, column, row, cols, rows)
           || (displayedSavedRows !== undefined
             ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
             : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows))
@@ -6130,7 +6308,46 @@ export class SidebarController {
       this.cycleNewFormHost(1);
       return true;
     }
+    // A label click hands the form's one focus to the Host line: the Provider
+    // line's focus is cleared in the same act, so the two controls are never
+    // both focused and the drawn marker always matches the control the keys act
+    // on (the same mutual exclusion the keyboard focus ring keeps).
     this.formHostFocused = true;
+    this.formProviderFocused = false;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Activates only the New form's Provider line that the captured render drew,
+   * with the Host line's exact written-geometry discipline: the drawn value span
+   * cycles the provider, any other column on that drawn row only focuses it, and
+   * a different row, pane geometry, form generation, or provider option list
+   * refuses. A form that drew no Provider line has no record and always refuses.
+   */
+  private activateFormProviderAtFrom(
+    shown: DisplayedFormProviderRow | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (shown === undefined) return false;
+    if (!this._visible || this._focus !== "form" || !this.newFormProviderAvailable()
+      || this.pendingCreate !== undefined) return false;
+    if (!validHitGeometry(column, row, cols, rows)) return false;
+    if (shown.cols !== cols || shown.rows !== rows || shown.row !== row) return false;
+    if (this.formGeneration !== shown.formGeneration) return false;
+    if (shown.optionKey !== this.newFormProviderOptionsKey()) return false;
+    if (column >= shown.valueStart && column < shown.valueEnd) {
+      this.cycleNewFormProvider(1);
+      return true;
+    }
+    // Symmetric with the Host line: one drawn label click focuses exactly one
+    // control and clears the other, so the visible focus and the key routing
+    // cannot disagree.
+    this.formProviderFocused = true;
+    this.formHostFocused = false;
     this.onInvalidate?.();
     return true;
   }
@@ -6991,10 +7208,20 @@ export class SidebarController {
         // A remembered conversation that owns no process never becomes the Main
         // input owner: refusing here leaves focus and input ownership exactly
         // where they were instead of handing the child input to a sibling.
-        this.noticeError = "This remembered conversation is unavailable; remove it to forget it";
+        this.noticeError = isNativeCliBackend(entry.item.backend)
+          // A remembered native row is a placeholder only (#277): this host
+          // never resumes a provider conversation, so the refusal names why.
+          ? `${sessionBackendDisplayLabel(entry.item.backend)} sessions are not restored; open New to start one`
+          : "This remembered conversation is unavailable; remove it to forget it";
         return;
       }
       if (entry.item.lifecycle === "exited") {
+        if (isNativeCliBackend(entry.item.backend)) {
+          // An exited native row has no Pi saved conversation to restart, so no
+          // resume request is emitted and no Pi catalog is ever consulted.
+          this.noticeError = `A ${sessionBackendDisplayLabel(entry.item.backend)} row cannot be resumed; open New to start one`;
+          return;
+        }
         if (this.pendingRowResume) { this.noticeError = "This conversation is already starting"; return; }
         const requestId = this.nextRequestId++;
         this.pendingRowResume = { requestId, id: entry.item.id };
@@ -7051,6 +7278,12 @@ export class SidebarController {
       return;
     }
     const nativeSession = entry.item.nativeSession;
+    if (isNativeCliBackend(entry.item.backend)) {
+      // A native CLI row has no Pi conversation to rename, ever: the refusal is
+      // truthful instead of waiting for a native name that can never arrive.
+      this.noticeError = `${sessionBackendDisplayLabel(entry.item.backend)} rows have no renameable Pi session name`;
+      return;
+    }
     if (!nativeSession) {
       this.noticeError = "Native conversation name is unavailable until status is observed";
       return;
@@ -7438,12 +7671,15 @@ export class SidebarController {
     // bypassed while a real paste is in progress or a carry is outstanding.
     if (!this.formPasteActive && this.formPasteCarry.length === 0
       && this.formKind === "new" && matchesShiftTab(data)
-      && this.handleNewFormHostKey(data)) return;
+      && this.handleNewFormSelectionKey(data)) return;
     if (this.routeBracketedPaste(data)) {
       // A pasted body is opaque to host actions, and it can never edit a field
-      // the operator is not typing in: while the New form's Host line owns the
-      // focus the chunk is consumed instead of reaching the hidden editor.
-      if (this.formKind !== "new" || !this.formHostFocused) this.formField?.handleInput(data);
+      // the operator is not typing in: while one of the New form's host-owned
+      // selection controls owns the focus the chunk is consumed instead of
+      // reaching the hidden editor.
+      if (this.formKind !== "new" || (!this.formHostFocused && !this.formProviderFocused)) {
+        this.formField?.handleInput(data);
+      }
       return;
     }
     // Fence the held Escape that canceled only a host-owned form across focus
@@ -7491,11 +7727,12 @@ export class SidebarController {
     // input. The field still receives the press first, so its completion-list
     // precedence and the reserved-toggle priority are unchanged.
     if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
-    // The New form's Host line is one host-owned selection control: Shift+Tab
-    // reaches it, Tab (or one fresh Escape) returns to the ordinary workspace
-    // editor, and its cycle keys act only while IT holds the form's focus.
-    // Nothing here changes the path editor's own keys while it has the focus.
-    if (this.handleNewFormHostKey(data)) return;
+    // The New form's Host and Provider lines are host-owned selection controls:
+    // Shift+Tab reaches them, Tab (or one fresh Escape) returns to the ordinary
+    // workspace editor, and their cycle keys act only while the control itself
+    // holds the form's focus. Nothing here changes the path editor's own keys
+    // while it has the focus.
+    if (this.handleNewFormSelectionKey(data)) return;
     if (this.formField) {
       // Capture the exact canonical key id while the field synchronously
       // handles this packet, so a multi-binding submit fences the binding that
@@ -8687,6 +8924,15 @@ export class SidebarController {
     const wasRemote = this.newFormHost.kind === "remote";
     this.newFormHost = { kind: "local" };
     this.formHostFocused = false;
+    // And every New form opens on the Pi provider, whatever the previous form
+    // offered or selected. A native choice is never a remembered default.
+    this.newFormProvider = { backend: "pi" };
+    this.formProviderFocused = false;
+    // A fresh form is assumed to fit its Provider line until one of its own
+    // renders says otherwise, so a keystroke batch delivered before that first
+    // render never meets a stale suppression from an earlier, differently sized
+    // form.
+    this.formProviderRowSuppressed = false;
     if (wasRemote) this.workspaceDraft = "";
     this._focus = "form";
     this.createFormField(this.workspaceDraft);
@@ -8821,7 +9067,14 @@ export class SidebarController {
     }
     if (matchesKey(data, "tab") || matchesShiftTab(data)) {
       if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        // Shift+Tab continues the form's focus ring into the Provider line when
+        // this form draws one; Tab (and a form without a Provider line) returns
+        // exactly to the ordinary workspace editor as before. A line the current
+        // layout suppressed is not a control the ring can stop on.
         this.formHostFocused = false;
+        this.formProviderFocused = matchesShiftTab(data)
+          && this.newFormProviderAvailable()
+          && !this.formProviderRowSuppressed;
         this.onInvalidate?.();
       }
       return true;
@@ -8837,6 +9090,122 @@ export class SidebarController {
     if (matchesKey(data, "up") || matchesKey(data, "left")) this.cycleNewFormHost(-1);
     else if (matchesKey(data, "down") || matchesKey(data, "right")) this.cycleNewFormHost(1);
     return true;
+  }
+
+  // --- New form Provider line: Pi by default, one host-owned selection. ---
+
+  /**
+   * True only while this form actually draws a Provider line: a host that
+   * supplied no native target draws the exact pre-native New form, so no native
+   * request can be made and every existing gesture keeps its exact meaning.
+   */
+  private newFormProviderAvailable(): boolean {
+    return this.formKind === "new" && this.nativeCliTargets.length > 0;
+  }
+
+  /**
+   * The provider choices this form can name: Pi first (the default), then every
+   * native target this host offers, in the order Main supplied them. Nothing is
+   * filtered by a first-match or capability guess: an offered target is offered.
+   */
+  private newFormProviderOptions(): NewFormProviderOption[] {
+    const options: NewFormProviderOption[] = [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }];
+    for (const target of this.nativeCliTargets) {
+      options.push({ backend: target.backend, targetId: target.id, label: target.label });
+    }
+    return options;
+  }
+
+  /** Stable identity of the Provider line's current choice. */
+  private newFormProviderKey(): string {
+    return newFormProviderOptionKey(this.newFormProvider);
+  }
+
+  /** The drawn identity of the whole provider option list plus its choice. */
+  private newFormProviderOptionsKey(): string {
+    return JSON.stringify([
+      this.newFormProviderOptions().map((option) => [
+        newFormProviderOptionKey(option), option.backend, option.label,
+      ]),
+      this.newFormProviderKey(),
+    ]);
+  }
+
+  /** The bounded display label of the current provider choice. */
+  private currentNewFormProviderLabel(): string {
+    const key = this.newFormProviderKey();
+    const option = this.newFormProviderOptions().find((candidate) => newFormProviderOptionKey(candidate) === key);
+    return option === undefined ? NEW_FORM_PI_PROVIDER_LABEL : option.label;
+  }
+
+  /**
+   * One ACTUAL provider choice. Reselecting the same choice is a no-op; a
+   * different one changes only this form's provider selection — the workspace
+   * draft, its caret, and the Host choice all stay exactly as they were, and no
+   * action is emitted by a selection alone.
+   */
+  private selectNewFormProvider(option: NewFormProviderOption): void {
+    if (!this.newFormProviderAvailable() || this.pendingCreate !== undefined) return;
+    if (newFormProviderOptionKey(option) === this.newFormProviderKey()) return;
+    this.newFormProvider = option.targetId === undefined
+      ? { backend: option.backend }
+      : { backend: option.backend, targetId: option.targetId };
+    this.formError = undefined;
+  }
+
+  /** Cycle the one provider selection; never a submit, launch, or fallback. */
+  private cycleNewFormProvider(direction: 1 | -1): void {
+    if (!this.newFormProviderAvailable() || this.pendingCreate !== undefined) return;
+    const options = this.newFormProviderOptions();
+    if (options.length < 2) return;
+    const key = this.newFormProviderKey();
+    const index = options.findIndex((option) => newFormProviderOptionKey(option) === key);
+    const next = index < 0
+      ? options[0]
+      : options[((index + direction) % options.length + options.length) % options.length];
+    if (next !== undefined) this.selectNewFormProvider(next);
+  }
+
+  /**
+   * One key while the Provider line owns the form's focus. Only its own
+   * cycle/leave gestures act; every other press is consumed so it can never
+   * edit the workspace underneath the control the operator is using.
+   */
+  private handleNewFormProviderKey(data: string): boolean {
+    if (!this.newFormProviderAvailable() || !this.formProviderFocused) return false;
+    // A Provider line this pane cannot fit never owns the keyboard: the press
+    // belongs to the workspace the operator can actually see, so the stale focus
+    // is released here and the key is routed on to the ordinary field.
+    if (this.formProviderRowSuppressed) {
+      this.formProviderFocused = false;
+      return false;
+    }
+    if (matchesKey(data, "tab") || matchesShiftTab(data)) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.formProviderFocused = false;
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (isKeyRelease(data) || isKeyRepeat(data)) return true;
+    if (matchesKey(data, "escape")) {
+      this.formProviderFocused = false;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "left")) this.cycleNewFormProvider(-1);
+    else if (matchesKey(data, "down") || matchesKey(data, "right")) this.cycleNewFormProvider(1);
+    return true;
+  }
+
+  /**
+   * Route one form key to whichever host-owned selection control currently owns
+   * the form's focus. The Provider line is checked first so its keys can never
+   * be mistaken for the Host line's (and vice versa).
+   */
+  private handleNewFormSelectionKey(data: string): boolean {
+    if (this.formProviderFocused) return this.handleNewFormProviderKey(data);
+    return this.handleNewFormHostKey(data);
   }
 
   /**
@@ -8877,6 +9246,7 @@ export class SidebarController {
   invalidateCreateFormPresentation(): void {
     this.createFormCandidate = undefined;
     this.formHostDisplay = undefined;
+    this.formProviderDisplay = undefined;
   }
 
   /**
@@ -9767,6 +10137,17 @@ export class SidebarController {
 
   private submitCreate(submission: SessionHostFieldSubmission): void {
     if (this.pendingCreate || this.formKind !== "new") return;
+    const providerBackend = this.newFormProvider.backend;
+    const providerTargetId = this.newFormProvider.targetId;
+    if (providerBackend !== "pi" && this.newFormHostIsRemote()) {
+      // Native provider sessions are a LOCAL capability only. The operator's
+      // explicit provider choice is never silently converted into a Pi request
+      // for a remote destination (nor a remote request into a local one): the
+      // form states the conflict and emits nothing.
+      this.formError = `${sessionBackendDisplayLabel(providerBackend)} is local only; choose Local or Pi`;
+      this.onInvalidate?.();
+      return;
+    }
     if (this.newFormHostIsRemote()) {
       this.submitCreateOnPeer(submission);
       return;
@@ -9796,7 +10177,16 @@ export class SidebarController {
     this.formSubmitClaim = submitKey === undefined
       ? undefined
       : (data: string) => matchesKey(data, submitKey);
-    this.emit({ type: "create", requestId, workspace });
+    this.emit({
+      type: "create",
+      requestId,
+      workspace,
+      // An ordinary Pi submission keeps the exact existing action shape; the
+      // provider identity travels only for an explicit native choice.
+      ...(providerBackend === "pi" ? {} : { backend: providerBackend }),
+      ...(providerBackend === "pi" || providerTargetId === undefined
+        ? {} : { nativeCliTarget: providerTargetId }),
+    });
   }
 
   /**
@@ -9902,6 +10292,7 @@ export class SidebarController {
     this.formKind = undefined;
     this.formError = undefined;
     this.formHostFocused = false;
+    this.formProviderFocused = false;
     this.invalidateFormPanePresentations();
     if (this._focus !== "form") return; // the request no longer owns the pane
     this._focus = "main";
@@ -10034,6 +10425,7 @@ export class SidebarController {
     this.pendingShortcutSave = undefined;
     this.peerFieldTarget = undefined;
     this.formHostFocused = false;
+    this.formProviderFocused = false;
     this.invalidateFormPanePresentations();
     this.disposeFormField();
     this.formKind = undefined;
@@ -12660,9 +13052,17 @@ export class SidebarController {
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols || !this.formField) {
       return this.renderTooSmall(cols, rows);
     }
+    // Only a COMPLETE render may leave a pointer/activation map behind: a
+    // too-small or wrapped-refusal fallback must not keep an earlier New form's
+    // Provider row authorizable, nor claim a control the operator cannot see.
+    this.formProviderDisplay = undefined;
     // The New form's one Host line takes the single spacer row the form has
     // always reserved below the editor, so the editable body keeps exactly its
-    // previous row budget at every geometry; Edit is untouched.
+    // previous row budget at every geometry; Edit is untouched. The Provider
+    // line is accounted for the same way and NEVER joins this budget: the native
+    // field is rendered with exactly the rows the New form gave it before native
+    // provider hosting, at every geometry, so the pinned Editor's viewport,
+    // scroll window, and completion room cannot shift when a host offers one.
     const hostRows = newForm ? 1 : 0;
     const fixedRows = editing
       ? 1 + 2 + 1 + 1 + noticeLines.length + footerLines.length
@@ -12675,19 +13075,17 @@ export class SidebarController {
     const fieldWidth = Math.max(1, cols - prefixWidth);
     const fieldFrame = this.formField.render(fieldWidth, fieldRows);
     if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
-    const labeledRows = labeledFieldRows(
-      fieldFrame,
-      Math.min(fieldRows, fieldFrame.lines.length),
-      prefix,
-      prefixWidth,
-      cols,
-    );
+    const drawnFieldRows = Math.min(fieldRows, fieldFrame.lines.length);
+    const labeledRows = labeledFieldRows(fieldFrame, drawnFieldRows, prefix, prefixWidth, cols);
     if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
 
     const lines = [wrapRow(header, cols, this.paint("header"))];
     let hostRow: number | undefined;
     let hostValueStart = 0;
     let hostValueEnd = 0;
+    let providerRow: number | undefined;
+    let providerValueStart = 0;
+    let providerValueEnd = 0;
     if (newForm) {
       // One fixed Host line, drawn with the pane's ordinary marker/label style
       // and clipped exactly like every other bounded host-owned row.
@@ -12707,15 +13105,53 @@ export class SidebarController {
     }
     const fieldTopRow = lines.length;
     lines.push(...labeledRows);
-    lines.push(
-      this.pendingCreate !== undefined
-        ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
-        : this.pendingRename !== undefined
-          ? wrapRow(" Saving native name... ", cols)
-          : this.formError !== undefined
-            ? wrapRow(` ! ${this.formError} `, cols)
-            : "",
-    );
+    const statusLine = this.pendingCreate !== undefined
+      ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
+      : this.pendingRename !== undefined
+        ? wrapRow(" Saving native name... ", cols)
+        : this.formError !== undefined
+          ? wrapRow(` ! ${this.formError} `, cols)
+          : undefined;
+    // The Provider line takes the single spacer row the New form has always kept
+    // below the editor whenever that row carries no real pending/error status,
+    // so the ordinary editable New form keeps its exact pre-native row count.
+    // A status that IS present always keeps its own row, and the line is drawn
+    // only while the pane has one filler row left to give: the field's budget,
+    // the pending/error status, and the footer are never displaced by a provider
+    // control, and a pane with nothing left to give simply draws no provider.
+    const providerRows = newForm && this.newFormProviderAvailable()
+      && fieldRows - drawnFieldRows - (statusLine === undefined ? 0 : 1) >= 0
+      ? 1
+      : 0;
+    // A Provider line this host offers but this pane cannot fit is a layout
+    // suppression, not an absent control: the form's single keyboard focus may
+    // never sit on a row the operator cannot see. Recording that here, and
+    // releasing any focus it already held, hands ownership straight back to the
+    // workspace editor in this same render — losing the space while the control
+    // was focused cannot leave an invisible control swallowing keys.
+    this.formProviderRowSuppressed = newForm && providerRows === 0 && this.newFormProviderAvailable();
+    if (this.formProviderRowSuppressed) this.formProviderFocused = false;
+    if (providerRows === 1) {
+      // One fixed Provider line in the same ordinary marker/label style, drawn
+      // after the field so the Editor's own rules keep their drawn rows.
+      const providerPrefix = this.formProviderFocused
+        ? `> ${NEW_FORM_PROVIDER_PREFIX}`
+        : `  ${NEW_FORM_PROVIDER_PREFIX}`;
+      const providerPrefixWidth = Math.min(visibleWidth(providerPrefix), cols - 1);
+      const providerAvailable = Math.max(1, cols - providerPrefixWidth);
+      const providerValue = truncateToWidth(
+        `[ ${this.currentNewFormProviderLabel()} ]`,
+        providerAvailable,
+        "...",
+        true,
+      );
+      providerRow = lines.length;
+      providerValueStart = providerPrefixWidth;
+      providerValueEnd = providerPrefixWidth + Math.max(1, visibleWidth(providerValue));
+      lines.push(wrapRow(`${providerPrefix}${providerValue}`, cols));
+    }
+    if (statusLine !== undefined) lines.push(statusLine);
+    else if (providerRows === 0) lines.push("");
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols, this.paint("hint")));
@@ -12731,6 +13167,19 @@ export class SidebarController {
         valueStart: hostValueStart,
         valueEnd: hostValueEnd,
         optionKey: this.newFormHostOptionsKey(),
+        formGeneration: this.formGeneration,
+      })
+      : undefined;
+    // The Provider line's written geometry is retained by the same rule: only a
+    // completely drawn line, for this generation and this option list, can act.
+    this.formProviderDisplay = newForm && providerRow !== undefined
+      ? Object.freeze({
+        cols,
+        rows,
+        row: providerRow,
+        valueStart: providerValueStart,
+        valueEnd: providerValueEnd,
+        optionKey: this.newFormProviderOptionsKey(),
         formGeneration: this.formGeneration,
       })
       : undefined;
@@ -12760,7 +13209,9 @@ export class SidebarController {
       // that drawn control; the workspace body keeps its label and geometry.
       cursor: newForm && this.formHostFocused && hostRow !== undefined
         ? { column: Math.min(hostValueEnd, cols - 1), row: hostRow }
-        : fieldCursor,
+        : newForm && this.formProviderFocused && providerRow !== undefined
+          ? { column: Math.min(providerValueEnd, cols - 1), row: providerRow }
+          : fieldCursor,
     };
   }
 

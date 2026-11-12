@@ -24,6 +24,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
+import { isSessionBackend, type SessionBackend } from "./session-backend";
 
 /**
  * Global session-host roster store and single-host ownership (#331).
@@ -69,7 +70,10 @@ import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protoc
  * sidebar placement entry a host actually draws:
  *
  * - a remembered LOCAL slot, whose payload shape is exactly the version-1
- *   `RosterEntry` shape (no identity wrapper around it), and
+ *   `RosterEntry` shape (no identity wrapper around it), plus the optional
+ *   closed-set `backend` identity issue #277 added. An absent `backend` is Pi,
+ *   so a version-2 document that never hosted a native row is byte-for-byte the
+ *   document this host wrote before native CLI hosting.
  * - a remote presentation identity (#477): the owner-side durable slot, or the
  *   legacy owner-run-plus-row tuple, plus the local saved-destination handle.
  *   A remote entry carries presentation identity ONLY — no remote status, no
@@ -165,6 +169,17 @@ export interface RosterEntry {
   readonly name?: string;
   /** Last observed native persistence evidence for this binding. */
   readonly persistence?: RosterPersistence;
+  /**
+   * Which provider backend this remembered slot belongs to (issue #277).
+   * Absence means `pi`, exactly as for every roster written before native CLI
+   * hosting; a value outside the closed backend set refuses the whole document.
+   *
+   * This is IDENTITY ONLY. A native slot never carries a provider conversation
+   * id (there is no such observation), and restoring a native slot never starts
+   * anything: it comes back as a bounded unavailable placeholder. Nothing here
+   * persists an executable, command, argument, environment, or target secret.
+   */
+  readonly backend?: SessionBackend;
 }
 
 /**
@@ -344,6 +359,9 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
     if (entry.workspace !== undefined && !isValidRosterWorkspace(entry.workspace)) return undefined;
     if (entry.name !== undefined && !isValidRosterName(entry.name)) return undefined;
     if (entry.persistence !== undefined && !isPersistence(entry.persistence)) return undefined;
+    // The closed backend set only: an unknown provider identity is a malformed
+    // document, never a value normalized to Pi or to the first known backend.
+    if (entry.backend !== undefined && !isSessionBackend(entry.backend)) return undefined;
     seen.add(entry.slotId);
     localEntries += 1;
     entries.push({
@@ -352,6 +370,7 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
       ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
       ...(entry.name !== undefined ? { name: entry.name } : {}),
       ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
+      ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
     });
   }
   // The remembered active entry is a LOCAL slot; a remote card never owns this

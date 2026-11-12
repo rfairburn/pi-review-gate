@@ -24,6 +24,7 @@ import type {
   SessionViewerUpdateResult,
   ShutdownResult,
 } from "../../src/session-host/instances";
+import { sessionBackendDisplayLabel } from "../../src/session-host/session-backend";
 import type {
   SessionHostFrameDisposition,
   SessionHostFrameWriterOptions,
@@ -428,9 +429,15 @@ export class FakeManager {
     const surface = new FakeSurface(initial.cols, initial.rows, `frame:${id}`);
     this.surfaces.set(id, surface);
     this.geometry.set(id, { cols: initial.cols, rows: initial.rows });
+    // A native CLI row carries its provider label and no Pi conversation
+    // identity, exactly like the real manager's row (issue #277).
+    const nativeBackend = options.backend === "claude" || options.backend === "codex"
+      ? options.backend
+      : undefined;
     this.views.push({
       id,
-      label: "(session starting)",
+      label: nativeBackend === undefined ? "(session starting)" : sessionBackendDisplayLabel(nativeBackend),
+      ...(nativeBackend === undefined ? {} : { backend: nativeBackend }),
       workspace: options.workspace,
       agentDir: `/private-profile/${id}`,
       lifecycle: "starting",
@@ -465,6 +472,18 @@ export class FakeManager {
       this.views[index] = { ...view, lifecycle: "error", hasLiveProcess: false, error: "synthetic-secret-native-error" };
     } else {
       this.spawnCount += 1;
+      if (view.backend !== undefined && view.backend !== "pi") {
+        // A native row stays honestly nameless: no Pi session identity arrives.
+        this.views[index] = {
+          ...view,
+          label: sessionBackendDisplayLabel(view.backend),
+          nativeSession: null,
+          lifecycle: "alive",
+          hasLiveProcess: true,
+        };
+        this.onChange?.(id);
+        return id;
+      }
       const nativeSession: SessionHostNativeSession = {
         sessionId: `conversation-${id}`,
         epoch: 1,
@@ -660,6 +679,12 @@ export function createHarness(
       if (harness) harness.manager = manager;
       return manager as never;
     },
+    // The synthetic host never resolves a real provider CLI and never reads the
+    // operator's real review-gate configuration: it offers no native target, so
+    // the New form keeps its exact pre-native layout and every create stays Pi.
+    // Focused provider tests override this seam with an explicit target list and
+    // launcher (issue #277).
+    nativeCliHosting: () => ({ targets: [] }),
     createSidebar: (sidebarOptions) => {
       events.push("sidebar.construct");
       sidebar = new SidebarController(sidebarOptions);

@@ -23,6 +23,7 @@ import type { StatusBroker } from "../src/session-host/broker";
 import type { ProfilePreparer } from "../src/session-host/profiles";
 import { SidebarController } from "../src/session-host/sidebar";
 import { listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
+import { sessionBackendDisplayLabel } from "../src/session-host/session-backend";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
 import {
@@ -62,6 +63,8 @@ const ENTER = "\r";
 const DELETE = `${ESC}[3~`;
 const UP = `${ESC}[A`;
 const DOWN = `${ESC}[B`;
+const SHIFT_TAB = `${ESC}[Z`;
+const TAB = "\t";
 const SCRATCH_ROOT = join(realpathSync(tmpdir()), "prg-session-host-roster-main-tests");
 const SESSION_TIMESTAMP = "2025-01-01T00:00:00.000Z";
 
@@ -151,6 +154,9 @@ class FakeWriter {
 interface FakeCreateOptions {
   workspace: string;
   savedSession?: { sessionId: string };
+  /** The explicit native provider selection a New submission carried (#277). */
+  backend?: "pi" | "claude" | "codex";
+  nativeCliTarget?: string;
 }
 
 /** Minimal frame/input-mode surface so live rows can genuinely receive routed input. */
@@ -214,14 +220,25 @@ class FakeManager {
     this.writes.push({ id, data });
   }
 
-  create(options: { workspace: string; savedSession?: { sessionId: string } }): Promise<string> {
+  create(options: {
+    workspace: string;
+    savedSession?: { sessionId: string };
+    backend?: "pi" | "claude" | "codex";
+    nativeCliTarget?: string;
+  }): Promise<string> {
     this.createOptions.push({ ...options });
     const id = `row-${this.nextId++}`;
     const workspace = realpathSync(options.workspace);
     const sessionId = options.savedSession?.sessionId ?? `conv-${basename(workspace)}`;
+    // A native CLI row is an ordinary provider child: it has a provider label
+    // and NO Pi conversation identity to report (issue #277).
+    const nativeBackend = options.backend === "claude" || options.backend === "codex"
+      ? options.backend
+      : undefined;
     this.views.push({
       id,
-      label: "(session starting)",
+      label: nativeBackend === undefined ? "(session starting)" : sessionBackendDisplayLabel(nativeBackend),
+      ...(nativeBackend === undefined ? {} : { backend: nativeBackend }),
       workspace,
       agentDir: "/synthetic-agent",
       lifecycle: "starting",
@@ -232,6 +249,16 @@ class FakeManager {
       activity: [],
       nativeSession: null,
     });
+    if (nativeBackend !== undefined && this.options.nativeCliLaunch !== undefined) {
+      // The real manager asks the host's injected launcher for the exact
+      // interactive descriptor before it spawns; this fake records that request
+      // so a wiring test can see the backend, target, and workspace that arrive.
+      void Promise.resolve(this.options.nativeCliLaunch(nativeBackend, {
+        workspace,
+        env: { ...(this.options.env ?? {}) },
+        ...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
+      })).catch(() => undefined);
+    }
     this.onChange?.(id);
     const pending = this.finishCreate(id, sessionId, ++this.createCallCount);
     this.pendingCreates.add(pending);
@@ -255,6 +282,15 @@ class FakeManager {
     }
     if (this.neverReportsIdentity) {
       this.views[index] = { ...view, label: "(session name unavailable)", lifecycle: "alive", hasLiveProcess: true, nativeSession: null };
+    } else if (view.backend !== undefined && view.backend !== "pi") {
+      // A native row stays honestly nameless: it never receives a Pi session id.
+      this.views[index] = {
+        ...view,
+        label: sessionBackendDisplayLabel(view.backend),
+        lifecycle: "alive",
+        hasLiveProcess: true,
+        nativeSession: null,
+      };
     } else {
       const nativeSession: SessionHostNativeSession = {
         sessionId,
@@ -2045,6 +2081,183 @@ test("two visible rows naming the same durable slot refuse an ambiguous placemen
     assert.deepEqual(manager.views.map((view) => view.id), ["row-1"], "the local session is untouched");
     assert.equal(sidebar.activeMainOwnerID, "row-1", "the displayed local owner is untouched");
     assert.equal(await quit(harness), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Native provider hosting (issue #277 host-UI slice)
+//
+// The New form's Provider line creates a real native row whose identity the
+// remembered roster keeps. Across a host restart that slot comes back ONLY as a
+// bounded unavailable placeholder: this host never spawns a Pi session for it,
+// never starts a fresh provider conversation, and never adopts some newest
+// provider session. The store, ownership record, and catalog here are the real
+// implementations against a fresh temporary agent directory.
+// ---------------------------------------------------------------------------
+
+/** Submit the New form with the first native provider choice selected. */
+function submitNativeNew(harness: Harness, workspace: string, cycles = 1): void {
+  harness.terminal.emitInput(ENTER); // New session
+  harness.terminal.emitInput("\x15"); // clear any retained draft
+  harness.terminal.emitInput(SHIFT_TAB); // the form's Host line
+  harness.terminal.emitInput(SHIFT_TAB); // the form's Provider line
+  for (let index = 0; index < cycles; index += 1) harness.terminal.emitInput(DOWN);
+  harness.terminal.emitInput(TAB); // back to the workspace field
+  harness.terminal.emitInput(workspace);
+  harness.terminal.emitInput(ENTER);
+}
+
+test("a native New row is launched through the host's provider, remembered by backend, and restored as an unavailable placeholder only", async () => {
+  const root = makeRoot("native-provider");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspace = join(root, "ws");
+  mkdirSync(workspace);
+  const launchCalls: { backend: string; workspace: string; targetId?: string }[] = [];
+  // Counts every Pi saved-conversation listing this host asks for, so a
+  // native-only restoration can be proven to read no Pi history at all.
+  let catalogCalls = 0;
+  const countCatalog = async (): Promise<SavedSessionCatalog> => {
+    catalogCalls += 1;
+    return emptyCatalog(agentDir);
+  };
+  const hosting: MainTestDependencies["nativeCliHosting"] = () => ({
+    targets: [
+      { id: "claude", backend: "claude", label: "Claude Code (default)" },
+      { id: "external:review-box", backend: "codex", label: "review-box (Codex CLI)" },
+    ],
+    launch: async (backend, request) => {
+      launchCalls.push({ backend, workspace: request.workspace, targetId: request.targetId });
+      return { file: "/synthetic/claude", args: [], env: { ...request.env }, cwd: request.workspace };
+    },
+  });
+  try {
+    const first = createHarness(agentDir, countCatalog, {}, { nativeCliHosting: hosting });
+    const manager = await ready(first);
+    assert.equal(typeof manager.options.nativeCliLaunch, "function",
+      "the host injects one native interactive launcher into the manager it opened");
+    assert.ok(first.sidebar?.items.every((item) => item.backend === undefined),
+      "no row exists yet, so no provider identity is displayed");
+
+    submitNativeNew(first, workspace);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions.at(-1), {
+      workspace: realpathSync(workspace),
+      backend: "claude",
+      nativeCliTarget: "claude",
+    }, "the explicit provider choice reaches the owned create unchanged");
+    assert.deepEqual(launchCalls, [{
+      backend: "claude",
+      workspace: realpathSync(workspace),
+      targetId: "claude",
+    }], "the host's launcher receives exactly the selected backend, target, and workspace");
+    const nativeRow = manager.views.at(-1);
+    assert.equal(nativeRow?.backend, "claude", "the row carries its own provider identity");
+    assert.equal(nativeRow?.nativeSession, null, "a native row never reports a Pi conversation identity");
+    assert.equal(
+      first.sidebar?.items.find((item) => item.id === nativeRow?.id)?.label,
+      "Claude",
+      "the drawn card is titled by the provider, not by an invented conversation name",
+    );
+    assert.equal(await quit(first), 0);
+
+    const stored = readRosterStore(agentDir);
+    assert.equal(stored.status, "loaded");
+    const rememberedNative = stored.status === "loaded" ? rememberedSlots(stored.roster)[0] : undefined;
+    assert.equal(rememberedNative?.backend, "claude", "the remembered slot keeps the provider identity");
+    assert.equal(rememberedNative?.workspace, realpathSync(workspace), "and the selected workspace");
+    assert.equal(rememberedNative?.sessionId, undefined,
+      "no provider conversation id is ever invented for a native slot");
+
+    // Host 2: the remembered native slot must come back as a placeholder. A Pi
+    // catalog is not consulted at all: there is no Pi conversation to find.
+    const second = createHarness(agentDir, countCatalog, {}, { nativeCliHosting: hosting });
+    const secondManager = await ready(second);
+    await nextTurn();
+    assert.equal(catalogCalls, 0,
+      "a roster of only remembered native slots never scans Pi saved conversations");
+    assert.equal(secondManager.createCallCount, 0,
+      "restoration starts neither a Pi session nor a fresh native conversation");
+    assert.deepEqual(launchCalls.length, 1, "no native launch happens during restoration");
+    const placeholder = second.sidebar?.items.find((item) => item.id === "roster-error:row-1");
+    assert.ok(placeholder, "the remembered native slot stays visible as a bounded placeholder row");
+    assert.equal(placeholder?.unavailable, true);
+    assert.equal(placeholder?.lifecycle, "error");
+    assert.equal(placeholder?.hasLiveProcess, false);
+    assert.equal(placeholder?.backend, "claude", "the placeholder still names its provider");
+    assert.equal(placeholder?.label, "Claude (unavailable)");
+    assert.match(placeholder?.activity.join(" ") ?? "", /Claude sessions are not restored/);
+    assert.ok(drawnRoster(second.sidebar!).join("\n").includes("Claude (unavailable)"),
+      "the drawn card states the provider and its unavailability");
+
+    // The placeholder is a remembered slot, so removal forgets it and nothing else.
+    second.terminal.emitInput(UP); // New session -> Saved conversations
+    second.terminal.emitInput(UP); // -> the remembered native placeholder
+    second.terminal.emitInput(DELETE);
+    await nextTurn();
+    const afterRemoval = readRosterStore(agentDir);
+    assert.equal(afterRemoval.status, "loaded");
+    assert.deepEqual(
+      afterRemoval.status === "loaded" ? rememberedSlots(afterRemoval.roster) : [],
+      [],
+      "removing the placeholder forgets the slot without launching anything else",
+    );
+    assert.equal(secondManager.createCallCount, 0);
+    assert.equal(await quit(second), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an ordinary Pi New submission still persists no backend field and restores through the saved conversation", async () => {
+  const root = makeRoot("native-provider-pi-default");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const workspace = join(root, "ws");
+  mkdirSync(workspace);
+  const launchCalls: string[] = [];
+  // The same catalog guard must NOT skip a roster that holds a Pi slot.
+  let catalogCalls = 0;
+  const countPiCatalog = async (): Promise<SavedSessionCatalog> => {
+    catalogCalls += 1;
+    return catalogFor(agentDir, [{ id: "conv-ws", cwd: realpathSync(workspace) }]);
+  };
+  const hosting: MainTestDependencies["nativeCliHosting"] = () => ({
+    targets: [{ id: "claude", backend: "claude", label: "Claude Code (default)" }],
+    launch: async (backend) => {
+      launchCalls.push(backend);
+      return { file: "/synthetic/claude", args: [], env: {}, cwd: workspace };
+    },
+  });
+  try {
+    const first = createHarness(agentDir, () => emptyCatalog(agentDir), {}, { nativeCliHosting: hosting });
+    const manager = await ready(first);
+    submitFirstNew(first, workspace);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions.at(-1), { workspace: realpathSync(workspace) },
+      "the default New submission stays the exact existing Pi create");
+    assert.deepEqual(launchCalls, [], "a Pi row never touches the native launcher");
+    assert.equal(manager.views.at(-1)?.backend, undefined);
+    assert.equal(await quit(first), 0);
+
+    const stored = readRosterStore(agentDir);
+    assert.equal(stored.status, "loaded");
+    const piSlot = stored.status === "loaded" ? rememberedSlots(stored.roster)[0] : undefined;
+    assert.equal(piSlot?.backend, undefined, "a Pi slot publishes no backend field at all");
+    assert.equal("backend" in (piSlot ?? {}), false, "and not even an undefined one");
+
+    writeSavedConversation(agentDir, "conv-ws", realpathSync(workspace));
+    const second = createHarness(agentDir, countPiCatalog, {}, { nativeCliHosting: hosting });
+    const secondManager = await ready(second);
+    assert.ok(catalogCalls >= 1,
+      "one remembered Pi slot still reads the saved-conversation catalog exactly once");
+    assert.deepEqual(secondManager.createOptions.map((options) => options.savedSession?.sessionId), ["conv-ws"],
+      "the remembered Pi slot restores exactly as before");
+    assert.equal(secondManager.createOptions.at(-1)?.backend, undefined);
+    assert.deepEqual(launchCalls, []);
+    assert.equal(await quit(second), 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

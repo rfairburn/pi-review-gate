@@ -15,6 +15,41 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.281]
+
+### Added
+
+- **Native Claude Code and Codex sidebar rows (#277)**: the session host can now start
+  a real, full-screen interactive Claude Code or Codex CLI session as its own sidebar
+  row beside the Pi sessions, through the same owned PTY and terminal surfaces. The
+  New-session form gains a **Provider** line that still names **Pi** every time it
+  opens, and the **Workspace** field and its initial focus are unchanged. Choosing a
+  native provider while the Host line names a connected destination is refused in the
+  form with nothing sent (`<provider> is local only; choose Local or Pi`), a remembered
+  native row that cannot start returns titled `<Provider> (unavailable)`, and every new
+  session selects its native target again because the target id, executable, arguments,
+  and environment are not persisted. A native target is the built-in default or an
+  explicit shared `externalAgents` entry — its command, base arguments, and base
+  environment — never the reviewer or executor role overlay, its model, or its
+  reasoning, and the command is located by the same discovery the settings
+  availability probe uses (an explicit path, a relative wrapper anchored to the chosen
+  workspace, `PATH` order, Windows `PATHEXT`, and the trusted parent
+  `SystemRoot\System32\cmd.exe` for a `.cmd`/`.bat` shim). A missing binary, or a
+  shared argument that names a headless or service mode, an approval, sandbox, or
+  hook-trust bypass, an existing-session attach, or a workspace-scope change, is a
+  refusal with no silent strip and no fallback; Codex adds only `--no-daemon`, never
+  `--no-alt-screen` and never an approval flag. The child keeps the CLI's own
+  configuration, authentication, and state directories, and the host writes nothing to
+  the operator's provider settings, hooks, plugins, or trust stores. A native row carries
+  no review gate, tool protection, or subtask capture/review/landing guarantee: its card
+  reports only host-owned facts (liveness, input, resize, exit) and leaves busy/idle,
+  pending input, and task and shell counts unknown, with no terminal scraping and no
+  idle inference. Native rows are created locally only; `SessionSpawn`, remote
+  owner-create, the Saved picker, and the standalone launchers are unchanged. This is
+  initial hosting: real-provider interactive behavior remains unverified, Windows remains
+  an unsupported validation target, and the guide states what evidence exists — see
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md).
+
 ## [0.1.0-dev.280]
 
 ### Added

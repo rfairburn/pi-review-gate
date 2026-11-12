@@ -18,6 +18,16 @@ owner's [saved conversations](#saved-conversations-on-a-connected-owner). It
 does this without adopting, migrating, or synchronizing them: the owning host
 keeps every process.
 
+The host's own sessions are Pi sessions, and it can also host a real full native
+interactive **Claude Code** or **Codex CLI** session as its own sidebar row beside
+them. Pi stays the default: every New-session form opens on Pi, and a native row is
+always an explicit local choice. That hosting is initial — the launch and process
+handling is covered by real PTY tests whose children are synthetic programs and the
+form and roster behavior by UI-level tests, while a real provider's own TUI behavior
+remains unverified. How a native row
+starts, what its row may honestly display, and a safe owned staging tryout are owned
+by [Native Claude Code and Codex sessions](native-sidebar-agents.md).
+
 This page documents the host as it ships, not a blanket compatibility guarantee. The host
 design uses Pi's public `ProcessTerminal` input and terminal-negotiation path with custom
 generated frame composition; it is not a `TuiAltScreen` renderer. Native wrapper,
@@ -526,11 +536,22 @@ position as a bounded error entry. Restoration runs before any deliberate user
 action is admitted, and the remembered active entry becomes the active Main
 input owner only when no deliberate user action happened while restoration was
 still running, so a slow restoration can never take over a user's own focus or
-action. Each **New session** has one explicit **Workspace** field and one
-**Host** line; there is no separate host display-label field. The Host line
-names **Local** every time the form opens: a Local submission asks only for an
-explicit existing workspace directory, keeps the native path editor and its
-completion, and immediately makes the created child the active Main input owner
+action. Each **New session** has one explicit **Workspace** field, one **Provider**
+line, and one **Host** line; there is no separate host display-label field. The
+Provider line names **Pi** every time the form opens, so a native
+**Claude Code**/**Codex CLI** row is always a deliberate choice (see
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). `Shift+Tab`
+moves **Workspace** → **Host** → **Provider**, `Tab` from **Provider** returns to
+**Workspace**, and `Up`/`Down` cycle the displayed choice on the focused line; a click
+on the **Provider** label focuses it, and a click on its value cycles from the
+presentation currently drawn. The **Provider** line appears only while that host
+offers native targets and the pane has one row to spare that displaces neither the
+Workspace field's budget, a pending or error status, nor the hint footer; when it is
+not drawn, keyboard focus and pointer activation skip it entirely. The Host line names
+**Local** every time the form opens: a Local submission asks only for an explicit
+existing workspace directory, keeps the
+native path editor and its completion, and immediately makes the created child the
+active Main input owner
 without a second row Enter, with the sidebar still visible. A previous remote
 choice is never carried forward, an actual Host change clears the Workspace
 value, and choosing the same Host again is a no-op, so no per-host history is
@@ -761,6 +782,57 @@ The host itself does not require Git merely to start a session. It adds no
 question-only, no-worktree, or capture-bypass mode: the normal review,
 evidence-capture, and delegated-execution policies still apply to native
 activity.
+
+### Native Claude Code and Codex rows
+
+Alongside its Pi rows, the host can start a real full native interactive **Claude
+Code** or **Codex CLI** session as its own sidebar row: the operator's own CLI as an
+ordinary PTY child with one workspace, one frame, and one owned handle, selected on
+the New-session form's **Provider** line, which **defaults to Pi every time the
+form opens**. Choosing a native provider changes nothing else about the form — the
+**Workspace** field and its initial focus behave exactly as before.
+
+A native row is deliberately a plain provider child rather than a Pi child:
+
+- It gets no status registration, no Pi bootstrap/preload/startup-payload/title
+  environment, no input framing, and no native clipboard receiver, so every provider
+  field in its card stays truthfully unknown and only the owned PTY's own exit
+  settles the row. Local keyboard input is forwarded raw to the owning row.
+- Its command, base arguments, and base environment come from the built-in default
+  for that backend or from an explicit shared
+  [`externalAgents`](configuration.md#the-externalagents-catalog) entry — never from
+  the `review`/`execution` role overlays, their models, or their reasoning. The
+  command is located by the same discovery the settings availability probe uses, and
+  a missing binary or a configured argument that names a headless or service mode, an
+  approval, sandbox, or hook-trust bypass, an existing-session attach, or a
+  workspace-scope change is a refusal: never silently stripped, retried another way,
+  or replaced with another target. Codex adds only `--no-daemon`.
+- Its configuration, authentication, and conversation state stay in the provider's
+  own directories. The host writes nothing to the operator's provider settings, hooks,
+  plugins, or trust stores, and the host's Pi agent directory keeps holding only Pi
+  data plus this host's roster and ownership record.
+- It carries no review gate, no tool protection, and none of the subtask
+  capture/review/landing guarantees, and it is never presented as a review-gate-managed
+  worker.
+- Native rows are created **locally only**. Choosing a native provider while the
+  **Host** line names a connected destination is refused in the form: nothing is sent,
+  and it shows `<provider> is local only; choose Local or Pi`. `SessionSpawn`, remote
+  owner-create, the Saved picker, and the standalone launchers keep creating Pi
+  sessions unchanged, and a native row contributes nothing to the saved-conversation
+  censuses. A remote viewer cannot type into a native row: that row has no registration
+  to fence an input scope against.
+- Each new session selects its native target again: the chosen target id, its
+  executable, arguments, and environment are not persisted, so a later form cannot
+  silently reuse them.
+- A remembered native row keeps its own backend and workspace and returns as a
+  truthful **unavailable placeholder** titled `<Provider> (unavailable)` when it cannot
+  be started — never as a Pi row and never bound to an arbitrary recent provider
+  conversation. Rename, saved-conversation open, and exited-row resume are unavailable
+  for a native row, because they are Pi APIs; resume happens in-pane through the
+  provider's own control.
+
+Provider-by-provider capability evidence and a safe owned staging tryout are on
+[Native Claude Code and Codex sessions](native-sidebar-agents.md).
 
 ### One owning host, one session manager
 
@@ -2031,6 +2103,15 @@ deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership
 count.
 
+A native **Claude Code** or **Codex CLI** row keeps every one of those rules, with
+nothing provider-side to observe: the host owns its process, so lifecycle and exit
+are real, while agent busy/idle, a pending question or approval, and every task and
+shell count stay `unknown` for that row's whole life. The host never scrapes the
+terminal to guess a provider's state and never infers idle from a missing PID, a
+quiet period, or an output gap, so a native row never shows a fabricated idle, zero,
+or pending state
+([Native Claude Code and Codex sessions](native-sidebar-agents.md#what-the-host-owns-and-what-it-never-infers)).
+
 Loaded sessions establish activity from fresh, complete observations of their
 exact owning sources at startup/restore and safe event-driven resynchronization
 points. A freshly loaded saved conversation initializes a new owning runtime; it
@@ -3076,6 +3157,8 @@ child-process handle, including a row marked error; the row's lifecycle badge
 alone does not determine whether a handle is live. It then asks each active
 authenticated status registration to request native shutdown, when that public
 control is available, and waits only within the existing bounded grace window. A
+native Claude Code or Codex row has no such registration, so no request is attempted
+there: the host signals the handle it owns and waits for that handle's actual exit. A
 `requested` acknowledgement means the request was accepted; it is not proof of
 PTY exit or successful graceful termination. The host therefore treats only the
 owned PTY's actual exit event as confirmation. On POSIX, unavailable or failed

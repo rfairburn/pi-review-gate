@@ -1,17 +1,27 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { realpathSync, statSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
+import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
 import { NativeAgentRegistry, PreparedProfile, ProfilePreparer } from "./profiles";
 import {
+  NODE_OPTIONS_RESTORE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
   NativeLaunchDescriptor,
   composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
 } from "./launch";
+import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  resolveSessionBackend,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+  type SessionBackend,
+} from "./session-backend";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
@@ -160,6 +170,21 @@ import {
  *   can neither resurrect a detached surface nor overwrite a later selection.
  *   Nothing here grants or withholds input: input remains addressed-only and every
  *   existing displayed-owner fence stays where it is.
+ *
+ * - Per-row backend identity (issue 277 core slice): every row belongs to one
+ *   closed backend (src/session-host/session-backend.ts), and an absent backend
+ *   means Pi. A native CLI row (Claude or Codex) is an ordinary provider PTY
+ *   child: its launch descriptor comes only from the host-injected
+ *   {@linkcode InstanceManagerOptions.nativeCliLaunch} provider, it gets NO
+ *   status registration, no Pi bootstrap/preload/startup-payload/title
+ *   environment, no input framing, and no native clipboard receiver, so every
+ *   provider field stays truthfully unknown and only the owned PTY's own exit
+ *   settles the row. Its workspace is validated and canonicalized here without
+ *   any Pi agent-directory setup. Local input is forwarded raw, exactly as for
+ *   a legacy unframed row; the viewer input seam refuses it because that row has
+ *   no registration to fence a scope against. A known native CLI row owns no Pi
+ *   conversation, so it contributes nothing to the saved-conversation censuses,
+ *   while an unknown Pi row keeps refusing exactly as before.
  *
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
@@ -653,6 +678,12 @@ export interface NativeInstanceView {
 	readonly label: string;
 	readonly workspace: string;
 	readonly agentDir: string;
+	/**
+	 * The backend this row was created with, present only when the creation was
+	 * explicit. Absence means Pi, exactly as for every row written before native
+	 * CLI hosting. A native CLI row never reports a Pi native conversation.
+	 */
+	readonly backend?: SessionBackend;
 	readonly lifecycle: InstanceLifecycle;
 	readonly busy: boolean | null;
 	readonly pendingInput: boolean | null;
@@ -696,7 +727,54 @@ export interface CreateInstanceOptions {
 	savedSession?: SavedSessionAdmission;
 	/** Fresh model-request child only: the exact title and prompt to deliver at native session start. */
 	initialRequest?: { readonly title: string; readonly prompt: string };
+	/**
+	 * Which backend this row belongs to. Absence means `pi` (every existing caller
+	 * and every older row). A native CLI backend (`claude`, `codex`) launches the
+	 * provider's own interactive CLI through the host-injected
+	 * {@linkcode InstanceManagerOptions.nativeCliLaunch} provider instead of the
+	 * Pi launch composition, and therefore never receives a status registration,
+	 * Pi bootstrap, preload, startup payload, title token, or input framing.
+	 */
+	backend?: SessionBackend;
+	/**
+	 * Native CLI rows only: the operator's explicit configured launch-target
+	 * selection, forwarded unchanged to the launch provider as
+	 * {@linkcode NativeCliLaunchRequest.targetId}. This manager never persists,
+	 * resolves, or interprets it, and never selects a target itself. Combining it
+	 * with a Pi backend is refused before anything is posted.
+	 */
+	nativeCliTarget?: string;
 }
+
+/**
+ * One native CLI launch request from this manager to the host's launch provider.
+ * `workspace` is the row's already-validated canonical workspace (the child cwd
+ * the manager will spawn with), and `env` is a fresh copy of the manager's
+ * environment snapshot that neither the provider nor the manager mutates.
+ * `targetId` is the unchanged operator selection when one was given.
+ */
+export interface NativeCliLaunchRequest {
+	readonly workspace: string;
+	readonly env: NodeJS.ProcessEnv;
+	readonly targetId?: string;
+}
+
+/**
+ * The host-injected provider that turns one native CLI backend selection into a
+ * complete interactive launch descriptor. Provider discovery, argv composition,
+ * configured-target resolution, and provider-side environment sanitization all
+ * belong to the provider; the manager only validates the returned descriptor,
+ * requires its cwd to be this row's selected canonical workspace, and spawns it
+ * verbatim. It may be asynchronous. It runs BEFORE the synchronous spawn stretch,
+ * and the manager races it against its own shutdown/disposal notification: a
+ * provider that never answers can never hold the host away from stopping its
+ * existing children, and an answer that arrives later is discarded rather than
+ * spawned. A provider must therefore tolerate being abandoned.
+ */
+export type NativeCliLaunch = (
+	backend: NativeCliBackend,
+	request: NativeCliLaunchRequest,
+) => NativeLaunchDescriptor | Promise<NativeLaunchDescriptor>;
 
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
@@ -756,6 +834,16 @@ export interface InstanceManagerOptions {
 	 * accident.
 	 */
 	nativeInputOriginFraming?: boolean;
+	/**
+	 * Host-injected launch provider for the native CLI backends (issue 277). It is
+	 * required only when a row is created with a native backend; a manager without
+	 * it keeps every existing Pi behavior and refuses a native creation before it
+	 * posts a row. The manager never composes, repairs, or extends what the
+	 * provider returns beyond validating it, and it never injects its own
+	 * bootstrap, preload, startup-payload, or title environment into a native
+	 * child.
+	 */
+	nativeCliLaunch?: NativeCliLaunch;
 }
 
 export interface ShutdownOptions {
@@ -788,6 +876,12 @@ interface ManagedInstance {
 	workspace: string;
 	agentDir: string;
 	lifecycle: InstanceLifecycle;
+	/**
+	 * The creation's explicit backend, or undefined for an unrecorded (Pi) row.
+	 * Only ever `claude`/`codex` here: a Pi row keeps the unchanged launch path and
+	 * needs no second marker.
+	 */
+	backend?: SessionBackend;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
@@ -1376,6 +1470,105 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	return { title: request.title, prompt: request.prompt };
 }
 
+/**
+ * Bounds for one operator's opaque native CLI launch-target selection. The
+ * target-id bound itself is owned by `session-backend.ts`, where the sidebar's
+ * ingestion reads the same value; this re-export only keeps the manager's own
+ * historical import path working.
+ */
+export { MAX_NATIVE_CLI_TARGET_CHARS } from "./session-backend";
+/** Upper bound for one native CLI launch descriptor's argument array. */
+export const MAX_NATIVE_CLI_ARGS = 256;
+
+/**
+ * The host's own capability environment keys. They are never injected into a
+ * native CLI child and never forwarded to one: provider-side sanitization stays
+ * with the launch provider, while these host-owned tokens never leak past this
+ * module's own spawn seam.
+ */
+const HOST_CAPABILITY_ENV_KEYS: readonly string[] = Object.freeze([
+	SESSION_HOST_BOOTSTRAP_ENV,
+	SESSION_HOST_STARTUP_REQUEST_ENV,
+	SESSION_HOST_TITLE_COLUMNS_ENV,
+	NODE_OPTIONS_RESTORE_ENV,
+]);
+
+function validateNativeCliTarget(value: unknown): string {
+	if (!isNativeCliTargetId(value)) {
+		throw new Error(`session-host: the native CLI launch target must be bounded single-line text`);
+	}
+	return value;
+}
+
+/**
+ * Validate and canonicalize the workspace one native CLI row was explicitly
+ * given. This is the whole setup an ordinary provider child needs: an existing
+ * absolute directory, canonically resolved so the descriptor cwd is
+ * cwd-independent. No Pi agent directory, config, profile, or skill work happens
+ * here or anywhere else on this path.
+ */
+function canonicalNativeWorkspace(workspace: string): string {
+	if (!isAbsolute(workspace)) {
+		throw new Error(`session-host: the native CLI workspace must be an absolute path: ${workspace}`);
+	}
+	let directory: ReturnType<typeof statSync>;
+	try {
+		directory = statSync(workspace);
+	} catch {
+		throw new Error(`session-host: the native CLI workspace is not an existing directory: ${workspace}`);
+	}
+	if (!directory.isDirectory()) {
+		throw new Error(`session-host: the native CLI workspace is not a directory: ${workspace}`);
+	}
+	return realpathSync(workspace);
+}
+
+/**
+ * Validate one native CLI launch descriptor the provider composed, against this
+ * row's own selected canonical workspace, and return a private copy. The
+ * descriptor is the full interactive launch: one executable plus its argv and
+ * environment, applied verbatim at spawn. Requiring the cwd to be exactly the
+ * selected workspace is what keeps one row = one workspace true for a child the
+ * manager did not compose; anything else about the provider's argv or environment
+ * is the provider's own decision.
+ */
+function validatedNativeCliDescriptor(value: unknown, workspace: string): NativeLaunchDescriptor {
+	if (!isPlainRecord(value)) {
+		throw new Error("session-host: the native CLI launch provider returned no launch descriptor");
+	}
+	const file = value.file;
+	if (typeof file !== "string" || file.length === 0 || /[\u0000-\u001f\u007f-\u009f]/.test(file)) {
+		throw new Error("session-host: the native CLI launch descriptor must name exactly one executable file");
+	}
+	const args = value.args;
+	if (!Array.isArray(args) || args.length > MAX_NATIVE_CLI_ARGS
+		|| args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+		throw new Error(`session-host: the native CLI launch descriptor requires at most ${MAX_NATIVE_CLI_ARGS} string arguments`);
+	}
+	const env = value.env;
+	if (!isPlainRecord(env)
+		|| Object.values(env).some((entry) => entry !== undefined && typeof entry !== "string")) {
+		throw new Error("session-host: the native CLI launch descriptor requires an environment of string values");
+	}
+	const cwd = value.cwd;
+	if (typeof cwd !== "string" || !isAbsolute(cwd) || realpathSync(cwd) !== workspace) {
+		throw new Error("session-host: the native CLI launch descriptor does not target this row's selected workspace");
+	}
+	return { file, args: [...args], env: { ...env } as NodeJS.ProcessEnv, cwd };
+}
+
+/** A fresh child environment with this host's own capability tokens removed. */
+function nativeCliChildEnv(descriptorEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env = { ...descriptorEnv };
+	for (const key of HOST_CAPABILITY_ENV_KEYS) delete env[key];
+	return env;
+}
+
+/** True only for a row whose recorded backend is a native CLI backend. */
+function isNativeCliRow(record: ManagedInstance): boolean {
+	return isNativeCliBackend(record.backend);
+}
+
 /** The caller's final guard: only an exact `true` authorizes; a throw refuses. */
 function callerAuthorized(authorize: SavedMutationAuthorization): boolean {
 	try {
@@ -1413,6 +1606,7 @@ export class InstanceManager {
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
+	readonly #nativeCliLaunch?: NativeCliLaunch;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/** Registered viewing surfaces (#474): the only store of viewer facts. */
@@ -1422,6 +1616,15 @@ export class InstanceManager {
 	#stopping = false;
 	#disposed = false;
 	#disposePromise?: Promise<void>;
+	/**
+	 * One-shot notification that this manager began shutting down or being disposed.
+	 * It exists so an unbounded pre-spawn wait — the native CLI launch provider —
+	 * can settle without holding `shutdown()`/`dispose()` away from the owned stop
+	 * ladder. It releases no resource, signals no process, and is never a claim that
+	 * anything settled: it only lets an unspawned creation stop waiting.
+	 */
+	#shutdownNotice?: Promise<void>;
+	#shutdownNoticeResolve?: () => void;
 
 	constructor(options: InstanceManagerOptions) {
 		if (!options || typeof options !== "object") {
@@ -1471,6 +1674,10 @@ export class InstanceManager {
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
+		if (options.nativeCliLaunch !== undefined && typeof options.nativeCliLaunch !== "function") {
+			throw new Error("session-host: nativeCliLaunch must be a function or absent");
+		}
+		this.#nativeCliLaunch = options.nativeCliLaunch;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
 
@@ -1481,6 +1688,7 @@ export class InstanceManager {
 			const view: NativeInstanceView & { exitCode?: number; error?: string } = {
 				id: record.id,
 				label: record.label,
+				...(record.backend === undefined ? {} : { backend: record.backend }),
 				nativeSession: record.nativeSession ? Object.freeze(nativeSessionForPresentation(record.nativeSession)) : null,
 				...(record.lastNativeSession ? { lastNativeSession: Object.freeze(nativeSessionForPresentation(record.lastNativeSession)) } : {}),
 				workspace: record.workspace,
@@ -1704,7 +1912,15 @@ export class InstanceManager {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
-		const label = options?.label === undefined ? "(session starting)" : validateLabel(options.label);
+		const backend = resolveSessionBackend(options?.backend);
+		const nativeCliTarget = options?.nativeCliTarget === undefined
+			? undefined
+			: validateNativeCliTarget(options.nativeCliTarget);
+		// A native CLI row has no observable native conversation name, so it carries a
+		// stable provider label instead of a name that never arrives.
+		const label = options?.label === undefined
+			? (isNativeCliBackend(backend) ? sessionBackendDisplayLabel(backend) : "(session starting)")
+			: validateLabel(options.label);
 		if (typeof options?.workspace !== "string" || options.workspace === "") {
 			throw new Error("session-host: create requires an explicit workspace directory");
 		}
@@ -1725,6 +1941,27 @@ export class InstanceManager {
 		if (initialRequest !== undefined && savedSession !== undefined) {
 			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
+		// A native CLI row is an ordinary provider child, so every Pi-specific launch
+		// input is refused here — before any row, reservation, or callback exists —
+		// and a native request is never quietly served as a Pi launch. A Pi row never
+		// gets a configured native launch target either: an explicit operator choice
+		// that cannot apply is refused rather than silently ignored.
+		if (isNativeCliBackend(backend)) {
+			if (this.#nativeCliLaunch === undefined) {
+				throw new Error("session-host: this host has no native CLI launch provider, so the requested backend cannot start");
+			}
+			if (profile !== undefined) {
+				throw new Error("session-host: a native CLI row never uses a Pi profile directory");
+			}
+			if (savedSession !== undefined) {
+				throw new Error("session-host: a native CLI row never opens a Pi saved conversation");
+			}
+			if (initialRequest !== undefined) {
+				throw new Error("session-host: a native CLI row never receives a Pi startup request");
+			}
+		} else if (nativeCliTarget !== undefined) {
+			throw new Error("session-host: a native CLI launch target is only valid for a native CLI backend");
+		}
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
 		// cannot both spawn, including pending creations of siblings.
@@ -1740,6 +1977,7 @@ export class InstanceManager {
 			workspace: options.workspace,
 			agentDir: "",
 			lifecycle: "starting",
+			...(options.backend === undefined ? {} : { backend }),
 			busy: null,
 			pendingInput: null,
 			inputSurface: false,
@@ -1773,7 +2011,13 @@ export class InstanceManager {
 		};
 		this.#records.set(id, record);
 		this.#safeChanged(id);
-		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession, initialRequest });
+		const launch = this.#launchInstance(record, {
+			workspace: options.workspace,
+			profile,
+			savedSession,
+			initialRequest,
+			...(nativeCliTarget === undefined ? {} : { nativeCliTarget }),
+		});
 		this.#inflightCreates.add(launch);
 		try {
 			await launch;
@@ -1813,7 +2057,9 @@ export class InstanceManager {
 	 * fencing: separately tagged current ID/file observations, exact admitted
 	 * reservations (including pending creations), and historical ID-only
 	 * launch fences. Data only — no process discovery, scan, daemon, or lock.
-	 * Exited and removed rows contribute nothing.
+	 * Exited and removed rows contribute nothing, and so does every row this
+	 * manager knows to be a native CLI child: a Claude or Codex row never loads,
+	 * reserves, or rebinds a Pi conversation, so it is not evidence about one.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
 		return this.#ownedSessionCensus();
@@ -1828,6 +2074,11 @@ export class InstanceManager {
 	#ownedSessionCensus(): OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
+			// A known native CLI row owns no Pi conversation at all: it contributes
+			// neither a current binding nor an unknown-binding placeholder, so a
+			// provider child never blocks a Pi saved conversation. An unknown Pi row
+			// still contributes exactly what it did before.
+			if (isNativeCliRow(record)) continue;
 			const live = Boolean(record.pty && !record.ptyExited);
 			if (!live && record.savedReservation === undefined) continue;
 			if (record.savedReservation !== undefined) {
@@ -1869,6 +2120,7 @@ export class InstanceManager {
 	#savedDeletionCensus(): OwnedLiveSession[] {
 		const sessions = this.#ownedSessionCensus();
 		for (const record of this.#records.values()) {
+			if (isNativeCliRow(record)) continue;
 			if (record.pty && !record.ptyExited && !record.nativeSession) {
 				sessions.push({});
 				break;
@@ -2723,6 +2975,9 @@ export class InstanceManager {
 		validateShutdownMs(graceMs, "graceMs");
 		validateShutdownMs(killMs, "killMs");
 		this.#stopping = true;
+		// An in-flight pre-spawn wait (a native CLI launch provider) stops waiting
+		// here, so a provider that never answers cannot postpone this stop ladder.
+		this.#publishShutdownNotice();
 		// A stopping manager admits no startup input again, in any row.
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		// Late async creates settle or abort here; none can spawn after stop.
@@ -2752,6 +3007,8 @@ export class InstanceManager {
 
 	async #runDispose(): Promise<void> {
 		this.#stopping = true;
+		// Same abort as shutdown(): disposal never waits on an unresolved provider.
+		this.#publishShutdownNotice();
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
@@ -2796,6 +3053,26 @@ export class InstanceManager {
 		}
 	}
 
+	/**
+	 * The current shutdown/disposal notification, resolved as soon as this manager
+	 * has begun either. A creation that starts after that point is already aborted.
+	 */
+	#awaitShutdownNotice(): Promise<void> {
+		if (this.#shutdownNotice === undefined) {
+			let resolve: () => void = () => undefined;
+			this.#shutdownNotice = new Promise<void>((fulfill) => { resolve = fulfill; });
+			this.#shutdownNoticeResolve = resolve;
+		}
+		if (this.#stopping) this.#shutdownNoticeResolve?.();
+		return this.#shutdownNotice;
+	}
+
+	/** Publish the notification once, immediately after the stopping latch is set. */
+	#publishShutdownNotice(): void {
+		this.#awaitShutdownNotice();
+		this.#shutdownNoticeResolve?.();
+	}
+
 	#sidebarTitleColumnsSnapshot(): number | undefined {
 		try {
 			const columns = this.#getSidebarTitleColumns?.();
@@ -2804,6 +3081,205 @@ export class InstanceManager {
 				: undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * The manager's own shared native Pi root, read only for native-row ownership
+	 * bookkeeping. It comes from the injected setup preparer's canonical root when
+	 * that preparer publishes one (production's native registry). Nothing is
+	 * admitted, prepared, initialized, or released here, and the recorded value
+	 * never says where the provider keeps its own configuration: a native row's
+	 * provider state stays entirely the provider's own.
+	 */
+	#hostAgentDir(): string {
+		const preparer = this.#profilePreparer as { readonly agentDir?: unknown };
+		const agentDir = preparer?.agentDir;
+		return typeof agentDir === "string" ? agentDir : "";
+	}
+
+	/**
+	 * Launch one native CLI row (issue 277 core slice): an ordinary interactive
+	 * provider child running in this row's explicitly selected workspace.
+	 *
+	 * What this path deliberately never does is the point of it: no setup admission
+	 * and no Pi agent-directory initialization, no Pi launch composition, no status
+	 * registration (so no bootstrap token exists for this child anywhere), no
+	 * startup payload, no preload/NODE_OPTIONS or title-columns environment, no
+	 * input framing, and no native clipboard receiver. The injected provider owns
+	 * the executable, argv, and provider-side environment sanitization; the manager
+	 * contributes nothing to the child's environment except the removal of its own
+	 * host capability tokens.
+	 *
+	 * Everything else is the same ownership machinery as a Pi row: the row is
+	 * already posted, the provider is resolved BEFORE the synchronous spawn stretch
+	 * and this manager's shutdown latch is rechecked after that await so a
+	 * concurrent stop never spawns, ownership of the exact PTY handle is recorded
+	 * before any child callback can fire, and that handle's own exit event remains
+	 * the only settlement witness.
+	 */
+	async #launchNativeCliInstance(
+			record: ManagedInstance,
+			options: { workspace: string; backend: NativeCliBackend; targetId?: string },
+		): Promise<void> {
+		try {
+			// 1. The selected workspace is the only setup fact this row needs: an
+			// existing absolute directory, canonicalized. No provider configuration,
+			// agent directory, profile, or skill work happens on this path.
+			const workspace = canonicalNativeWorkspace(options.workspace);
+			record.workspace = workspace;
+			record.agentDir = this.#hostAgentDir();
+			this.#safeChanged(record.id);
+
+			await yieldCheckpoint();
+			if (this.#stopping) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+
+			// 2. Resolve the provider's full interactive descriptor before the spawn
+			// stretch. The provider receives a fresh copy of this manager's environment
+			// snapshot (never mutated) plus the unchanged operator target selection.
+			//
+			// The provider lives outside this module and may take arbitrarily long, so
+			// its resolution is raced against this manager's shutdown notification:
+			// `shutdown()`/`dispose()` must reach the owned stop ladder for the
+			// manager's other children even when a provider never answers. Both outcome
+			// handlers are attached to the provider promise itself, so a late
+			// fulfillment is simply discarded and a late rejection can never surface as
+			// an unhandled rejection. Nothing below the race can spawn before #stopping
+			// is rechecked, and the spawn stretch itself never yields.
+			const launch = this.#nativeCliLaunch;
+			if (launch === undefined) {
+				// create() refused this combination already; a manager reconfigured after
+				// posting the row still never falls back to a Pi launch.
+				throw new Error("session-host: this host has no native CLI launch provider");
+			}
+			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
+				workspace,
+				env: { ...this.#env },
+				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
+			}));
+			const outcome = await Promise.race([
+				pendingProvider.then(
+					(descriptor) => ({ kind: "provided" as const, descriptor }),
+					() => ({ kind: "failed" as const }),
+				),
+				this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+			]);
+			// The provider ran across an await: a stop that began meanwhile takes this
+			// launch, so no child is ever created after the host began shutting down,
+			// and a provider that answers later can never resurrect this creation.
+			if (this.#stopping || this.#disposed) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+			if (outcome.kind !== "provided") {
+				throw new Error(outcome.kind === "aborted"
+					? "shutting down; native CLI launch aborted before any child existed"
+					: "session-host: the native CLI launch provider did not produce a descriptor");
+			}
+			const descriptor = validatedNativeCliDescriptor(outcome.descriptor, workspace);
+
+			// 3. Synchronous spawn stretch: nothing yields until the handlers and the
+			// terminal surface are attached, so ownership is recorded before any child
+			// callback can fire. The descriptor is applied verbatim.
+			let pty: InstancePty | undefined;
+			try {
+				pty = this.#ptyFactory({
+					file: descriptor.file,
+					args: descriptor.args,
+					env: nativeCliChildEnv(descriptor.env),
+					cwd: descriptor.cwd,
+					cols: record.cols,
+					rows: record.rows,
+				});
+				record.pty = pty;
+				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+				if (record.ptyExited) {
+					this.#disposeExitListener(record);
+					if (this.#records.get(record.id) !== record) {
+						// An exit observer may synchronously close the row while onExit()
+						// registers its listener: allocate nothing else for a detached record.
+						return;
+					}
+				}
+				record.surface = new TerminalSurface(record.cols, record.rows, {
+					onReply: (data) => this.#onQueryReply(record, undefined, data),
+					onChange: () => this.#safeChanged(record.id),
+					onBackpressure: (paused) => this.#onBackpressure(record, paused),
+					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+					graphicsBudget: this.#graphicsBudget,
+				});
+				if (!record.ptyExited) {
+					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+				}
+				if (!record.ptyExited) {
+					record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
+					if (record.ptyExited) {
+						// An injected/fake event source may emit synchronously while listener
+						// registration is returning; never revive its row.
+						this.#disposeDataListener(record);
+					} else if (record.lifecycle === "starting") {
+						record.lifecycle = "alive";
+					}
+				}
+			} catch {
+				if (pty) {
+					// The child exists but could not be wired: keep ownership and initiate a
+					// bounded graceful owned stop rather than leaving an untracked process.
+					record.error = publicInstanceError("ptySetup");
+					record.lifecycle = "error";
+					if (!record.exitDisposable && !record.ptyExited) {
+						try {
+							record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+						} catch {
+							// Without an exit event, ownership remains held fail-closed.
+						}
+					}
+					if (record.ptyExited) {
+						this.#disposeExitListener(record);
+					}
+					try {
+						record.dataDisposable?.dispose();
+					} catch {
+						// Continue toward an owned stop even if listener cleanup fails.
+					}
+					record.dataDisposable = undefined;
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+					this.#safeChanged(record.id);
+					if (record.ptyExited) {
+						this.#releaseRegistration(record);
+						this.#releaseProfile(record);
+					} else {
+						void this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS).catch(() => {});
+					}
+					return;
+				}
+				// Failed spawn before any child exists: nothing was ever acquired.
+				record.error = publicInstanceError("ptySetup");
+				record.lifecycle = "error";
+				this.#releaseRegistration(record);
+				this.#releaseProfile(record);
+				this.#safeChanged(record.id);
+				return;
+			}
+			if (this.#records.get(record.id) === record) {
+				this.#safeChanged(record.id);
+			}
+		} catch {
+			// Pre-spawn failure or a stop-aborted launch: no child ever existed, and a
+			// native row owns no registration, profile admission, startup payload, or
+			// saved-session reservation, so the row simply reports the bounded error.
+			record.error = publicInstanceError("launchPreparation");
+			record.lifecycle = "error";
+			this.#releaseRegistration(record);
+			this.#releaseProfile(record);
+			this.#safeChanged(record.id);
 		}
 	}
 
@@ -2817,8 +3293,20 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string } },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string },
 		): Promise<void> {
+		const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
+		if (nativeBackend !== undefined) {
+			// One dispatch point, chosen from the row's own recorded backend: a native
+			// CLI row never reaches the Pi setup, descriptor, registration, or framing
+			// path below, and a Pi row's launch is unchanged.
+			await this.#launchNativeCliInstance(record, {
+				workspace: options.workspace,
+				backend: nativeBackend,
+				...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
+			});
+			return;
+		}
 		let stagedStartup: ReturnType<typeof stageSessionHostStartupRequest> | undefined;
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
@@ -3067,7 +3555,7 @@ export class InstanceManager {
 		this.#failRunningInstance(record, "ptyRead");
 	}
 
-	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration, data: string): void {
+	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration | undefined, data: string): void {
 		if (this.#records.get(record.id) !== record || this.#disposed) {
 			return;
 		}

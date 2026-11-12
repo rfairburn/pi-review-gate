@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isNativeCliBackend } from "./session-backend";
 import {
   isValidNativeSessionId,
   type SessionSpawnInput,
@@ -161,12 +162,18 @@ export function isDuplicateOwnedLaunchFailure(error: unknown): boolean {
  * deletion-safety data. Historical duplicate evidence does not establish the
  * current binding of a live child whose reporter disconnected or became
  * unavailable, so that case is represented by an entry with no binding at all.
+ *
+ * A row this host recorded as a native CLI child is excluded from that
+ * unknown-binding placeholder: a Claude or Codex row never loads, reserves, or
+ * rebinds a Pi conversation, so its absent Pi binding is not uncertainty about
+ * one. A row with no recorded backend stays Pi, so an unknown Pi child keeps
+ * refusing exactly as before.
  */
 export function savedDeletionOwnedSessions(manager: OwningHostManager): readonly OwnedLiveSession[] {
   const owned = manager.ownedLiveSessions();
   // Historical duplicate evidence does not establish the current binding of
   // a live child whose reporter disconnected or became unavailable.
-  return manager.list().some((view) => view.hasLiveProcess && !view.nativeSession)
+  return manager.list().some((view) => view.hasLiveProcess && !view.nativeSession && !isNativeCliBackend(view.backend))
     ? [...owned, {}]
     : owned;
 }

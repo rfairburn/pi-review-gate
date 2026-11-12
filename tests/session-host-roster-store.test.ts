@@ -15,6 +15,7 @@ import {
   ROSTER_STORE_LEGACY_VERSION,
   ROSTER_STORE_VERSION,
   hostOwnershipPath,
+  isLocalRosterEntry,
   isValidRosterName,
   openHostState,
   parseStoredRoster,
@@ -22,6 +23,7 @@ import {
   rosterStorePath,
   sessionHostStateDir,
   writeRosterStore,
+  type RosterEntry,
   type StoredRoster,
 } from "../src/session-host/roster-store";
 
@@ -784,6 +786,96 @@ test("the 64 remembered-slot allowance is local-only and independent of remote p
     assert.match(refused.status === "unavailable" ? refused.reason : "", /exceeds the .* supported size/);
     assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries.length, 400,
       "an oversized document is left exactly as it was found");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Optional provider backend (issue #277 host-UI slice)
+//
+// The remembered LOCAL slot may carry ONE closed provider identity. Absence is
+// Pi and publishes nothing at all, so every document this host wrote before
+// native CLI hosting stays byte-identical; an unknown value is a malformed
+// document, never a value normalized to Pi or to the first known backend.
+// ---------------------------------------------------------------------------
+
+function localSlot(roster: StoredRoster | undefined, index = 0): RosterEntry | undefined {
+  const entry = roster?.entries[index];
+  return entry !== undefined && isLocalRosterEntry(entry) ? entry : undefined;
+}
+
+test("the remembered roster keeps the optional closed provider backend and refuses anything else", () => {
+  // Absence is Pi: no field is invented, and the existing payload is unchanged.
+  const plain = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", sessionId: "conv-1", workspace: "/ws", name: "Pi", persistence: "saved" }],
+  });
+  assert.ok(plain);
+  assert.equal("backend" in (localSlot(plain) ?? {}), false, "a Pi slot publishes no backend field at all");
+
+  // Every closed member round-trips; the field order stays after persistence.
+  for (const backend of ["pi", "claude", "codex"] as const) {
+    const parsed = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend }],
+    });
+    assert.equal(localSlot(parsed)?.backend, backend);
+  }
+
+  // A native slot needs no conversation id, and none is invented for it.
+  const native = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "codex" }],
+  });
+  assert.equal(native?.entries.length, 1);
+  assert.equal(localSlot(native)?.sessionId, undefined, "no provider conversation id is ever invented");
+
+  // Anything outside the closed set refuses the WHOLE document.
+  for (const backend of ["kittens", "", null, 1, true, "Claude"]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend }],
+    }), undefined, `backend ${JSON.stringify(backend)} is not a provider identity`);
+  }
+  // One malformed entry poisons the document even beside a valid one.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude" },
+      { slotId: "s2", workspace: "/ws", backend: "first-match" },
+    ],
+  }), undefined);
+
+  // Publication validates too: an invalid backend never reaches the store.
+  const root = makeRoot("backend");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend: "claude-codex" as never }],
+    }));
+    assert.equal(readRosterStore(agentDir).status, "absent", "the refused publication wrote nothing");
+
+    writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude" }],
+    });
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.equal(localSlot(loaded.status === "loaded" ? loaded.roster : undefined)?.backend, "claude");
+
+    // A damaged backend on disk is reported truthfully and left untouched.
+    writeFileSync(rosterStorePath(agentDir), JSON.stringify({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "who-knows" }],
+    }), "utf8");
+    const damaged = readRosterStore(agentDir);
+    assert.equal(damaged.status, "unavailable");
+    assert.match(damaged.status === "unavailable" ? damaged.reason : "", /malformed/);
+    assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries[0].backend, "who-knows",
+      "a damaged roster is never rewritten or silently repaired");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -23,6 +23,7 @@ import {
   type InstanceManagerOptions,
   type InstanceStatusRegistration,
   type InstanceStatusUpdate,
+  type NativeCliLaunch,
   type NativeInstanceView,
   type ShutdownResult,
   type StatusRegistrar,
@@ -186,6 +187,7 @@ import {
   type SidebarItem,
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
+  type SidebarNativeCliTarget,
   type SidebarRemoteCloseRow,
   type SidebarRemoteEditRow,
   type SidebarSavedPickerPresentation,
@@ -193,6 +195,13 @@ import {
 } from "./sidebar";
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
+import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
+import {
+  isNativeCliBackend,
+  sessionBackendDisplayLabel,
+  type SessionBackend,
+} from "./session-backend";
+import { loadConfig } from "../config";
 import {
   HostClipboardDiagnosticCollector,
   TerminalDiagnosticsWarning,
@@ -818,6 +827,20 @@ interface MainDependencies {
   };
   readonly createManager: (options: InstanceManagerOptions) => OwningHostManager;
   /**
+   * Native interactive CLI hosting (issue #277): the provider targets the New
+   * form offers and the launcher this host's manager calls for a native row.
+   * Production derives BOTH from the ONE already-normalized review-gate
+   * configuration through the existing config load/resolution path — no second
+   * parser, no new setting, and no config, command, argument, or environment
+   * value is ever logged. A host with no usable hosting offers no target and
+   * injects no launcher: the New form then draws no Provider line, every
+   * creation stays the ordinary Pi launch, and a native request cannot exist.
+   */
+  readonly nativeCliHosting: (env: NodeJS.ProcessEnv) => {
+    readonly targets: readonly SidebarNativeCliTarget[];
+    readonly launch?: NativeCliLaunch;
+  };
+  /**
    * The presentation-independent owning-session operation boundary (#473): it
    * opens the host's one authoritative manager and owns the UI-independent row
    * operations. Focused tests may wrap the production factory to observe the
@@ -939,6 +962,13 @@ interface RosterRecord {
   workspace?: string;
   name?: string;
   persistence?: "saved" | "unsaved" | "unknown";
+  /**
+   * The provider backend this slot's row was created with, present only for an
+   * explicit native row. Absence is Pi. Identity only: a native slot carries no
+   * provider conversation id, no executable, and no environment, and it can
+   * only ever be restored as a bounded unavailable placeholder.
+   */
+  backend?: SessionBackend;
   /** Bounded truthful reason this remembered conversation is not restorable. */
   unavailableReason?: string;
 }
@@ -1295,6 +1325,9 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     agentDir: view.agentDir,
     lifecycle: view.lifecycle,
     hasLiveProcess: view.hasLiveProcess,
+    // The row's own recorded backend, when it has one: the sidebar never
+    // infers a provider from state, output, or missing telemetry.
+    ...(view.backend === undefined ? {} : { backend: view.backend }),
     busy: view.busy,
     pendingInput: view.pendingInput,
     inputSurface: view.inputSurface,
@@ -1325,6 +1358,18 @@ function productionDependencies(): MainDependencies {
       return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
     },
     createManager: (options) => new InstanceManager(options),
+    // One normalized configuration, one resolution path: the selectable native
+    // targets and the launcher both come from the same `ReviewGateConfig` the
+    // rest of the product uses, so this host process never offers a target list
+    // the launcher was not built from. That is configuration parity inside one
+    // process, not executable-availability parity: each launch still resolves
+    // the command against its own workspace and composed child environment, and
+    // can still refuse on its argument, backend, platform, or trusted-cmd.exe
+    // policy.
+    nativeCliHosting: (env) => {
+      const config = loadConfig(env).config;
+      return { targets: listNativeCliTargets(config), launch: createNativeCliLauncher(config) };
+    },
     createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
     createPeerCoordinator,
@@ -1412,6 +1457,24 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let configuredAppearance: SidebarAppearance = DEFAULT_SIDEBAR_APPEARANCE;
   let appearanceNotice: string | undefined;
   const legacyToggleOverride = snapshot.toggleKey !== undefined;
+  /**
+   * This host's native provider hosting, resolved once from the operator's
+   * already-normalized review-gate configuration: the targets the New form may
+   * offer and the launcher the manager calls for a native row. A failure here
+   * is not fatal and never reaches the child or the transcript — it simply means
+   * this host offers no native session at all, so the New form keeps its exact
+   * pre-native layout and every creation stays the ordinary Pi launch.
+   */
+  let nativeCliTargets: readonly SidebarNativeCliTarget[] = [];
+  let nativeCliLaunch: NativeCliLaunch | undefined;
+  try {
+    const hosting = dependencies.nativeCliHosting(snapshot.env);
+    nativeCliTargets = hosting.targets;
+    nativeCliLaunch = hosting.launch;
+  } catch {
+    nativeCliTargets = [];
+    nativeCliLaunch = undefined;
+  }
   // The ONE content source this host displays (issue #389 display phase): a
   // local manager row, or one exact remote owner run/row. Every deliberate
   // selection — local or remote — advances `contentSelectionGeneration`, so a
@@ -3123,14 +3186,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function toRosterErrorItem(record: RosterRecord): SidebarItem {
     const name = record.name;
+    const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
     return {
       id: rosterErrorItemId(record.slotId),
-      label: name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)",
+      // A remembered native row is titled by its provider and the fact that it
+      // is unavailable: there is no provider conversation name to invent, and
+      // this row is never a Pi conversation this host could restart.
+      label: nativeBackend === undefined
+        ? (name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)")
+        : `${sessionBackendDisplayLabel(nativeBackend)} (unavailable)`,
       workspace: record.workspace ?? "",
       agentDir: "",
       lifecycle: "error",
       hasLiveProcess: false,
       unavailable: true,
+      ...(record.backend === undefined ? {} : { backend: record.backend }),
       busy: null,
       pendingInput: null,
       inputSurface: false,
@@ -3187,6 +3257,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       record.rowId = view.id;
       record.unavailableReason = undefined;
       if (view.workspace.length > 0) record.workspace = view.workspace;
+      // The row's own recorded backend, never a guess: an unrecorded row keeps
+      // no backend field, so the persisted roster stays byte-identical for Pi.
+      if (view.backend !== undefined) record.backend = view.backend;
       const observed = view.nativeSession ?? view.lastNativeSession;
       if (observed !== undefined && observed !== null && isValidNativeSessionId(observed.sessionId)) {
         record.sessionId = observed.sessionId;
@@ -3468,6 +3541,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         ...(record.workspace !== undefined && isValidRosterWorkspace(record.workspace) ? { workspace: record.workspace } : {}),
         ...(record.name !== undefined && isValidRosterName(record.name) ? { name: record.name } : {}),
         ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
+        ...(record.backend === undefined ? {} : { backend: record.backend }),
       });
     }
     const localId = localActiveId();
@@ -3535,6 +3609,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
           ...(entry.name !== undefined ? { name: entry.name } : {}),
           ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
+          ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
         });
       }
     }
@@ -3594,7 +3669,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const controller = new AbortController();
     restoreAbort = controller;
     let catalog: SavedSessionCatalog | undefined;
-    if (typeof agentDir === "string" && agentDir !== "" && activePi !== undefined && activePi.file && activePi.version) {
+    // A remembered native slot has no Pi conversation to look for (#277), so a
+    // roster made ONLY of native slots never starts the Pi saved-conversation
+    // scan at all: its unavailable placeholders appear without reading unrelated
+    // Pi history. As soon as one remembered slot could be a Pi conversation, the
+    // existing single catalog snapshot is taken exactly as before.
+    const needsPiCatalog = remembered.some((entry) => !isNativeCliBackend(entry.backend));
+    if (needsPiCatalog
+      && typeof agentDir === "string" && agentDir !== "" && activePi !== undefined && activePi.file && activePi.version) {
       try {
         catalog = await dependencies.listSavedCatalog({
           agentDir,
@@ -3615,6 +3697,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       let createOptions: CreateInstanceOptions | undefined;
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
+      // A remembered native row is never started again automatically (#277):
+      // this host has no provider conversation identity to resume, no saved
+      // provider file to search, and no authority to adopt the newest provider
+      // session. It comes back as a bounded unavailable placeholder, and it is
+      // never quietly served as a new Pi session or a fresh native conversation.
+      if (isNativeCliBackend(entry.backend)) {
+        reason = `${sessionBackendDisplayLabel(entry.backend)} sessions are not restored; open New to start one`;
+        return { entry, createOptions, reason };
+      }
       // The remembered workspace is part of the contract: a conversation whose
       // current header resolves elsewhere is never silently launched there.
       const rememberedWorkspace = canonicalExistingDirectory(entry.workspace);
@@ -5050,7 +5141,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function launchCreate(action: Extract<SidebarAction, { type: "create" }>): void {
     if (!manager || shutdownRequested || !negotiationReady) return;
-    const createOptions: CreateInstanceOptions = { workspace: action.workspace };
+    // The New form's explicit provider choice travels unchanged: the manager
+    // validates the backend and target, and the host's injected native launcher
+    // owns discovery, argv, and environment. An absent backend is the ordinary
+    // Pi create, exactly as before.
+    const createOptions: CreateInstanceOptions = {
+      workspace: action.workspace,
+      ...(action.backend === undefined ? {} : { backend: action.backend }),
+      ...(action.nativeCliTarget === undefined ? {} : { nativeCliTarget: action.nativeCliTarget }),
+    };
     let task!: Promise<void>;
     task = (async () => {
       try {
@@ -5363,6 +5462,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       sidebar.failRowResume(requestId, message);
       scheduleRedraw();
     };
+    // A native CLI row has no Pi saved conversation to restart (#277): the
+    // request is refused truthfully BEFORE any saved-conversation listing or
+    // Pi restart admission runs, and the exited placeholder is left untouched.
+    const resumedBackend = hostService.readRow(oldId)?.backend;
+    if (isNativeCliBackend(resumedBackend)) {
+      fail(`${sessionBackendDisplayLabel(resumedBackend)} rows cannot be resumed; open New to start one`);
+      return;
+    }
     const controller = record.controller;
     // Capture the exact current exited binding before the read-only listing.
     const before = hostService.readExitedResumeTarget(oldId);
@@ -8399,6 +8506,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         return createNativeSavedQueryInput(activeSessionSetup.nativeAgentDir);
       },
       initialVisible: true,
+      // The native provider targets this host can actually offer in the New
+      // form's Provider line (empty means: draw no Provider line at all).
+      nativeCliTargets,
       onAction: handleSidebarAction,
       // The sidebar's read-only view of this host's ONE canonical mixed order
       // (#477): the current runtime identities of the cards it is drawing, in
@@ -8435,6 +8545,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // the created row; manager onChange only refreshes the roster.
       onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
+      // The host-injected native interactive launcher (issue #277). A row whose
+      // backend is Claude or Codex launches through it with the provider's own
+      // native approvals, and never through the Pi descriptor, registration,
+      // bootstrap, or framing path. Absent hosting leaves the manager exactly as
+      // before: a native creation is refused before any row exists.
+      ...(nativeCliLaunch === undefined ? {} : { nativeCliLaunch }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

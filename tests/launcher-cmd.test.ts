@@ -53,6 +53,8 @@ const helperModule = require(helperPath) as {
   resolvePiChildSpawnSpec: (command: string, args: string[], env: NodeJS.ProcessEnv, platform: string) =>
     | { ok: true; file: string; args: string[]; windowsVerbatimArguments?: true }
     | { ok: false; kind: string; error: string };
+  /** The one trusted Windows cmd.exe authority, shared with the launch adapter. */
+  resolveTrustedWindowsCmd: (parentEnvironment?: NodeJS.ProcessEnv) => string | null;
   selectReviewGateConfig: (candidates: string[]) => { status: number; path?: string };
 };
 
@@ -2376,6 +2378,56 @@ test("shared Windows Pi resolver fails closed when parent SystemRoot or its cmd.
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+});
+
+// The exported trusted interpreter resolver is the product's only one: the
+// native interactive CLI launch adapter consumes it instead of carrying a
+// second detector. Only the cmd.exe existence seam is faked here; nothing is
+// spawned and no real Windows path is required.
+test("the exported trusted cmd resolver reads only a parent SystemRoot and defaults to process.env", () => {
+  const source = `
+    const fs = require("node:fs");
+    const helper = require(${JSON.stringify(helperPath)});
+    const realStatSync = fs.statSync;
+    const trusted = "Z:\\\\Trusted Windows Root\\\\System32\\\\cmd.exe";
+    fs.statSync = function (candidate, ...args) {
+      if (typeof candidate === "string" && /(?:^|[\\\\/])System32[\\\\/]cmd\\.exe$/i.test(candidate)) {
+        return { isFile: () => candidate === trusted };
+      }
+      return realStatSync.call(this, candidate, ...args);
+    };
+    const shadows = { PATH: "D:\\\\evil", ComSpec: "D:\\\\evil\\\\cmd.exe", SystemRoot: "C:\\\\child-controlled-root" };
+    const results = {
+      exported: typeof helper.resolveTrustedWindowsCmd,
+      absoluteRoot: helper.resolveTrustedWindowsCmd({ ...shadows, SystemRoot: "Z:\\\\Trusted Windows Root" }),
+      mixedCaseKey: helper.resolveTrustedWindowsCmd({ sYsTeMrOoT: "Z:\\\\Trusted Windows Root" }),
+      noSystemRoot: helper.resolveTrustedWindowsCmd({ PATH: "D:\\\\evil", ComSpec: "D:\\\\evil\\\\cmd.exe" }),
+      relativeRoot: helper.resolveTrustedWindowsCmd({ SystemRoot: "relative\\\\Windows" }),
+      driveRelativeRoot: helper.resolveTrustedWindowsCmd({ SystemRoot: "Q:Windows" }),
+      rootlessShare: helper.resolveTrustedWindowsCmd({ SystemRoot: "\\\\\\\\server" }),
+      unusableCmd: helper.resolveTrustedWindowsCmd({ SystemRoot: "Q:\\\\OtherRoot" }),
+    };
+    for (const key of Object.keys(process.env)) {
+      if (key.toLowerCase() === "systemroot") delete process.env[key];
+    }
+    results.beforeDefault = helper.resolveTrustedWindowsCmd();
+    process.env.SystemRoot = "Z:\\\\Trusted Windows Root";
+    results.defaultReadsProcessEnv = helper.resolveTrustedWindowsCmd();
+    process.stdout.write(JSON.stringify(results));
+  `;
+  const result = spawnSync(process.execPath, ["-e", source], { encoding: "utf8", env: process.env });
+  assert.equal(result.status, 0, `isolated trusted resolver failed: ${result.stderr}`);
+  const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+  assert.equal(parsed.exported, "function");
+  assert.equal(parsed.absoluteRoot, "Z:\\Trusted Windows Root\\System32\\cmd.exe",
+    "the parent's absolute SystemRoot is the only interpreter source, even beside PATH and ComSpec shadows");
+  assert.equal(parsed.mixedCaseKey, "Z:\\Trusted Windows Root\\System32\\cmd.exe",
+    "the parent environment name match stays case-insensitive");
+  for (const key of ["noSystemRoot", "relativeRoot", "driveRelativeRoot", "rootlessShare", "unusableCmd", "beforeDefault"]) {
+    assert.equal(parsed[key], null, `${key} must refuse rather than select another interpreter`);
+  }
+  assert.equal(parsed.defaultReadsProcessEnv, "Z:\\Trusted Windows Root\\System32\\cmd.exe",
+    "with no argument the resolver still reads the parent's own process.env");
 });
 
 test("launcher initialization rejects a destination occupied by a directory", async () => {

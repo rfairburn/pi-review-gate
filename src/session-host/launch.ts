@@ -493,8 +493,13 @@ export function snapshotNativeEnvironment(
   return snapshot;
 }
 
-/** Reject real worker authorization, then remove stale host-only capabilities before any probe/child. */
-function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
+/**
+ * Reject real worker authorization, then remove stale host-only capabilities
+ * before any probe/child. The sanitizer is provider-neutral (it names only
+ * pi-review-gate capabilities), so the native interactive CLI launch
+ * descriptors reuse this one implementation instead of a second copy.
+ */
+export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
   if (env[RUNTIME_ROLE_ENV]) {
     throw new Error(
       `pi-review-gate: refusing to prepare a native launch while ${RUNTIME_ROLE_ENV} is set; runtime role authorization comes only from the delegated execution adapter.`,

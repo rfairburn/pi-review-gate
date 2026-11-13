@@ -113,9 +113,10 @@ boundaries; [Development](development.md) owns verification commands.
   command string exists on that path — the host generates it from the resolved
   executable plus the exact argv it would otherwise have spawned, and that
   host-generated string is the only command text `cmd.exe` is ever handed. What a
-  real `cmd.exe` delivers from it is no longer an open design question: it is what
-  the dedicated Windows acceptance cases are wired to observe, and no such run has
-  been reported yet ([Evidence basis](#evidence-basis)).
+  real `cmd.exe` delivers from it is no longer an open design question: the
+  dedicated Windows acceptance cases observed it on real Windows runners at both
+  current Node pins, and the boundary of that observation is stated in
+  [Evidence basis](#evidence-basis).
 - **On Windows a `.cmd`/`.bat` shim is launched as one batch command line, and a
   direct executable never goes through `cmd.exe`.** The batch child is the trusted
   `SystemRoot\System32\cmd.exe` resolved from the **parent** environment, invoked
@@ -140,9 +141,9 @@ boundaries; [Development](development.md) owns verification commands.
   CLI process inherits the environment. Percent expansion is a single pass per
   line, which is what makes the quoted text identical to what the shared quoting
   produces for an argument whose percent cmd left alone; that single-pass behavior
-  on a real Windows host is exactly what the acceptance cases below are wired to
-  observe, and this page asserts nothing about it. No argument is refused,
-  expanded, or reclassified to make the batch path work, and the shipped
+  on a real Windows host is what the acceptance cases below observed on both
+  current Node pins, with the clean-run boundary stated there. No argument is
+  refused, expanded, or reclassified to make the batch path work, and the shipped
   launcher's own Pi batch path keeps its previous `/d /s /c` invocation unchanged.
   A resolved executable that is not a `.cmd` or `.bat` shim — a direct `.exe`,
   including one configured with a `node wrapper.js` argument prefix — keeps its
@@ -218,10 +219,12 @@ Each claim below carries one of five labels:
 - **Implemented, exercised with synthetic children** — host code covered by real
   PTY tests whose child processes are purpose-built Node programs, not provider
   CLIs.
-- **Wired into native CI, not yet run** — a test tier that drives the production
-  path on a real host platform and fails rather than skips when a prerequisite is
-  missing, but whose native run has not been observed. It pins the acceptance
-  contract; it reports no outcome.
+- **Wired into native CI, observed without an accepted clean run** — a test tier
+  that drives the production path on a real host platform and fails rather than
+  skips when a prerequisite is missing. Its scenario assertions have been observed
+  passing on real Windows runners, but no completed run — those assertions passing
+  *and* the test command terminating normally on its own — has been reported. It
+  pins the acceptance contract and reports those observations and nothing more.
 - **Unknown** — no evidence, or evidence too weak to state a fact.
 
 | Provider | Documentation reviewed | Installed-binary probe |
@@ -321,25 +324,37 @@ What the host-side runtime evidence actually is:
   exists. Both existing native Windows CI jobs — **Windows launcher
   (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — run those
   two files as their own step, so publication is gated on them.
-- **Wired into native CI, not yet run — no run of those cases has been observed,
-  so nothing here reports a Windows result.** They are the enforcement, not the
-  evidence. Only a successful native run — those CI steps on a real Windows
-  runner, or a manual run on a real Windows
-  machine — establishes that `cmd.exe` delivers the composed command line verbatim
-  into the child's own argv, that a percent carrier expands once and is cleared
-  before the CLI process inherits the environment, and that the Windows stop ladder
-  settles the CLI process and not merely the wrapper it owns. Until such a run is
-  reported, the honest reading is *evidence pending*, not *Windows unsupported*:
-  an operator's ordinary Windows Pi use stays valid operational evidence of the
-  platform, while this new native-provider behavior needs its own actual CI or
-  manual evidence and has claimed none.
+- **Those cases have run on real Windows runners and their scenario assertions
+  passed, and no completed accepted run of them exists yet.** In one real-Windows
+  CI run on both existing native Windows jobs — **Windows launcher
+  (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — all seven
+  real-ConPTY cases and all three delivery cases reported their assertions
+  passing: `cmd.exe` delivered the composed command line into the child's own
+  argv, a percent carrier expanded once and was gone before the CLI process
+  inherited the environment, the bang literals stayed literal, and the Windows
+  stop ladder settled the CLI process the shim started rather than only the
+  wrapper the manager owns. Every spawned handle exited and each stayed bound to
+  the row that owned it. What that run did not produce is the other half of a
+  clean result: the Node test commands did not terminate on their own afterwards,
+  and those jobs were cancelled. That records the observed scenario behavior; it
+  is not an accepted Windows pass, and the fake-handle and descriptor tests alone
+  are not proof. The shipped default PTY factory now captures the pinned addon's
+  owned ConPTY reader and requires its observed settlement after that
+  handle's own exit, so the native cases must confirm that release end to end, and
+  no Windows run of them after that integration has been reported. Only a run with
+  the assertions passing *and* the test command terminating normally on its own
+  closes this boundary. The honest reading stays *evidence pending*, not *Windows
+  unsupported*: an operator's ordinary Windows Pi use stays valid operational
+  evidence of the platform, and the generic session-host Windows runtime
+  acceptance is real evidence, not a reason to exclude Windows.
 - What those cases still do not touch on Windows: a real provider binary's own
   startup, auth, model, question, approval, and resume behavior — every child
   there is a synthetic Node program behind a synthetic batch shim, and no provider
   configuration, credential, or conversation is read or written — physical-terminal
   behavior, and the paired-owner network path, which those local rows do not
   exercise. The generic session-host Windows limitations — physical wheel and
-  pane-confined selection, and complete graceful settlement — stay owned by
+  pane-confined selection, and the rest of the remaining scope listed there —
+  stay owned by
   [Session host](session-host-alpha.md#known-limitation-windows-runtime-acceptance)
   and are not resolved here.
 - Provider documentation also moves quickly — Codex's documentation host has
@@ -509,7 +524,16 @@ cannot, the field stays `unknown`.
   `@lydell/node-pty` spawn in place of argv. On Windows that factory also selects
   the ConPTY DLL bundled with the pinned package (`useConptyDll: true`) instead of
   the system ConPTY, so the shipped source path uses the same transport
-  the acceptance cases do; POSIX options are unchanged.
+  the acceptance cases do; POSIX options are unchanged. On that same Windows
+  request the factory captures the addon's own output reader for the handle it
+  just created, releases it through the addon's own drain and dispose path only
+  after that handle reports its genuine exit, revalidates the captured ownership
+  chain before invoking anything, and requires the addon's reader Worker
+  settlement to be positively observed — a release it cannot confirm stays a
+  cleanup failure at host disposal instead of becoming success. A native row is
+  spawned by that same factory, so its reader release is required on the same
+  terms as a Pi row's; the native acceptance cases still have to confirm it end to
+  end ([Evidence basis](#evidence-basis)).
 
 ## Trying one in an owned inactive stage
 

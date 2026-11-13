@@ -136,8 +136,17 @@ dates.
   a missing Windows prerequisite fails those cases instead of skipping them. Every
   child there is a synthetic Node program behind a synthetic batch shim: no provider
   CLI, credential, or model call. This is the acceptance contract for the Windows
-  path — the native runs of these new cases have not been observed yet, so this
-  entry records the coverage and no Windows result.
+  path, and those cases have since run on both Windows jobs: every scenario
+  assertion passed there, including real `cmd.exe` delivery of the composed command
+  line, the once-expanded and cleared percent carrier, and the stop ladder settling
+  the CLI process rather than only the wrapper the manager owns, with every spawned
+  handle exiting and staying bound to its owning row. That run is not an accepted
+  Windows pass: the Node test commands did not terminate on their own afterwards
+  and the jobs were cancelled, so the required boundary is a run whose assertions
+  pass *and* whose test command ends normally. These rows now spawn on top of the
+  previously released owned-ConPTY reader settlement, which the native cases still
+  have to confirm end to end, and no Windows run of them after that integration has
+  been reported.
 
 ### Changed
 

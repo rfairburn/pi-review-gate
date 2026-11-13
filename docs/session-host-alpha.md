@@ -38,77 +38,95 @@ Component, mock, or socket tests alone do not prove compatibility with a real
 native Pi wrapper, and same-host network tests do not establish two-machine,
 operator, or platform readiness for the cross-machine features. macOS and Linux
 are the intended POSIX host platforms; intended platform scope is not evidence
-that end-to-end runtime compatibility has been proven. Windows startup, public
-named-pipe, and pinned node-pty ConPTY source paths are validation paths only;
-they are not Windows runtime support or readiness evidence. Manual Windows
-validation has observed mouse clicks working, but that observation does not
-certify sidebar single-click activation, native Main click-to-focus, other
-physical input, or complete host-process shutdown (see below). Device-attributes
-negotiation also requires complete runtime acceptance; its narrow witness
-investigation is tracked in
+that end-to-end runtime compatibility has been proven. Windows is not an
+unsupported validation target: the host's generic Windows Pi runtime path has
+passed real runtime acceptance on native Windows runners at both current Node
+pins — 22.23.4 and 24.22.1 — on the pinned Pi 1.5.2. The genuine native Main
+case (startup, two live Pi sessions, the public Quit confirmation,
+original-process and outer-PTY settlement, and full terminal restoration) and
+both cold hosted-source wrapper legs (cmd and direct PowerShell) ran to
+completion with no skip, as did the owned bundled-ConPTY reader settlement
+case, and the mouse-tracking/SGR and device-attributes protocol witnesses that
+live inside those cases passed with them. Every missing prerequisite there is a
+hard failure rather than a skip. The narrow device-attributes witness
+investigation stays tracked in
 https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
-Windows-host follow-up. All remaining Windows sidebar/host runtime acceptance
-stays deferred to https://github.com/rfairburn/pi-review-gate/issues/345: the
-real native Main case (startup, public Quit confirmation,
-original-process/kernel settlement/restoration) and both cold hosted-source
-wrapper legs (cmd and direct PowerShell) are retained in the suite but
-explicitly skipped, so green CI does not certify Windows runtime support; the
-Windows sidebar/host remains an unsupported validation target. CI now calls the
-separate session-host acceptance matrix in
+Windows-host follow-up. That acceptance is measured scope, not a blanket
+certification: it covers the host's own Pi sessions on the tested Node and Pi
+pins, and it says nothing about other Windows builds or terminal emulators,
+physical input beyond what the limitation below lists, true two-machine
+operation, or a real Claude Code or Codex TUI. Remaining Windows sidebar/host
+runtime acceptance stays tracked at
+https://github.com/rfairburn/pi-review-gate/issues/345. CI runs the separate
+session-host acceptance matrix in
 `.github/workflows/session-host-alpha.yml` — emitting the stable check names
 **Windows session host alpha (Node 22.23.4)** and **Windows session host alpha
 (Node 24.22.1)** — read-only on every enforced trigger and requires its results
-before publishing a numbered prerelease. That reuse changes no deferral: the
-genuine native Main case and both cold hosted-source wrapper legs above are
-registered with an unconditional skip, so they stay deferred under #345 even
-inside that matrix, and a green matrix job is not proof that those cases
-executed. What the matrix does run on native Windows runners is its non-deferred
-tiers — the named-pipe broker/reporter/protocol components, the pure Windows
-helper contracts, the real pinned-provider workspace completion case, the
-Network storage real-Main cases, and the launcher witness/deadline regressions —
-with every missing prerequisite a hard failure for those tiers. The unresolved
-shutdown and physical-input limitations below are unchanged.
+before publishing a numbered prerelease. Inside that matrix the real-Main,
+Network storage, reader-settlement, and cold wrapper-leg steps run under the
+acceptance opt-in CI sets, so a completed green matrix job means those cases
+executed and passed there rather than being skipped. What the matrix also runs
+on native Windows runners is its other enforced tiers — the named-pipe
+broker/reporter/protocol components, the pure Windows helper contracts, the
+real pinned-provider workspace completion case, and the launcher
+witness/deadline regressions — with every missing prerequisite a hard failure
+for those tiers. The unresolved physical-input limitations below are unchanged.
 
 ## Known limitation: Windows runtime acceptance
 
-Bundled-ConPTY diagnostics have observed genuine native mouse-tracking/SGR
-requests and device-attributes negotiation. Their assertions are retained in the
-explicitly skipped runtime cases; those protocol observations do not certify
-physical wheel or selection behavior. Manual Windows validation has observed
-mouse clicks working, and that observation is limited to clicks:
+The host's generic Windows Pi runtime path is accepted by evidence rather than
+deferral. On native Windows runners at Node 22.23.4 and Node 24.22.1, with the
+pinned Pi 1.5.2, the real public Main case with two live Pi sessions and the
+public Quit confirmation, both cold hosted-source wrapper legs (cmd and direct
+PowerShell), and the owned bundled-ConPTY reader settlement case each passed
+with zero skips, keeping their original-process and outer-PTY exit and full
+terminal-restoration assertions. Complete graceful shutdown is therefore
+established for that tested path rather than assumed: the host captures the
+pinned addon's own ConPTY output reader at spawn, calls that addon's own drain
+and dispose path only after that exact terminal reports its genuine exit,
+revalidates the captured ownership chain before invoking anything, and treats a
+reader whose settlement it never observed as a cleanup failure instead of
+success. No forced exit, process kill, or synthesized result stands in for that
+positive evidence. That proof covers the tested Node and Pi pins on the runners'
+Windows terminals; it says nothing about other Windows builds or terminal
+emulators, or about a real Claude Code or Codex TUI.
+
+Physical input remains the open limitation here, and it stays bounded.
+Bundled-ConPTY diagnostics observed genuine native mouse-tracking/SGR requests
+and device-attributes negotiation inside the runtime cases that now run; those
+protocol observations do not certify physical wheel or selection behavior.
+Manual Windows validation has observed mouse clicks working, and that
+observation is limited to clicks:
 wheel/conversation scrolling and pane-confined selection still require
 interactive validation, rather than editor-history navigation or selection
 crossing host panes. Sidebar single-click activation and native Main
-click-to-focus are described below, but neither certifies Windows runtime
-behavior (#323, #345). Conversation wheel/trackpad scrolling remains outside
+click-to-focus are described below, but neither certifies Windows physical-input
+behavior (#323). Conversation wheel/trackpad scrolling remains outside
 this change and separate under #332; scroll-smoothness tuning remains separate
 work. A cosmetic child-pane flicker on pointer movement and clicks has been
 observed; it is not breakage and not a release blocker (#343). Native
 Pi/review-gate startup latency on Windows has been present since before this
-release and is unrelated to it (#344).
-
-Complete graceful shutdown is also unresolved: native child exits and a returned
-Main status do not establish original Main and outer/wrapper process settlement.
-Current diagnostics have not established that complete settlement; the pinned
-ConPTY lifecycle is an investigation lead, not proof of the exact retained
-resource or its cause. The genuine Main and cold CMD/direct-PowerShell runtime
-cases remain deferred under
-https://github.com/rfairburn/pi-review-gate/issues/345. Result files, passing
-subtests, or forced exits cannot replace positive original-process exit and full
-terminal-restoration evidence. Green CI does not certify Windows runtime
-support.
+release and is unrelated to it (#344). Windows sidebar/host runtime acceptance
+beyond the evidence above stays tracked at
+https://github.com/rfairburn/pi-review-gate/issues/345.
 
 ## Requirements and launch
 
 - **Host platform:** same-machine POSIX macOS or Linux remains the documented
-  runtime scope. Windows source paths now admit the same-machine host and public
-  ConPTY flow for validation, but Windows is not supported/readiness-certified
-  until real Windows runtime evidence on the patched Node 22 and 24 lines
-  passes. Earlier Windows evidence on Node 22.19.0 and 24.x is historical: it
-  predates the current security floors and is not a patched-runtime run. That
-  runtime acceptance stays deferred under
-  https://github.com/rfairburn/pi-review-gate/issues/345. The ordinary
-  standalone Windows launcher remains unchanged.
+  POSIX runtime scope. Windows now has real runtime evidence on the patched
+  Node 22 and 24 lines: on native Windows runners with the pinned Pi 1.5.2, the
+  real public Main case with two live Pi sessions and the public Quit
+  confirmation, both cold hosted-source wrapper legs (cmd and direct
+  PowerShell), and the owned bundled-ConPTY reader settlement case all passed
+  with no skip at Node 22.23.4 and Node 24.22.1, with every missing
+  prerequisite a hard failure. That is the measured scope: it does not certify
+  other Windows builds or terminal emulators, the physical-input gaps listed
+  under the known limitation above, true two-machine operation, or a real
+  Claude Code or Codex TUI, and the remaining acceptance stays tracked at
+  https://github.com/rfairburn/pi-review-gate/issues/345. Earlier Windows
+  evidence on Node 22.19.0 and 24.x is historical: it predates the current
+  security floors and is not a patched-runtime run. The ordinary standalone
+  Windows launcher remains unchanged.
 - **Node.js:** at or above its release line's security floor: 22.23.4 or newer
   on Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26 (see
   [Node.js security floors](getting-started.md#nodejs-security-floors)). The
@@ -141,9 +159,10 @@ run the standalone launchers with unchanged behavior.
 The Windows session-host source path selects the Microsoft ConPTY implementation
 bundled with the pinned `@lydell/node-pty` package through its public
 `useConptyDll` option, rather than Windows' inbox ConPTY. The real Windows
-acceptance fixtures request the same public option. This selection alone is not
-runtime support evidence; the acceptance deferrals and limitations above still
-apply. POSIX PTYs and the ordinary standalone launchers are unchanged.
+acceptance fixtures request the same public option, and the runtime acceptance
+above ran on it. This selection alone is not runtime support evidence; the
+measured scope and the remaining limitations above still apply. POSIX PTYs and
+the ordinary standalone launchers are unchanged.
 
 The Windows validation path uses plain Node named pipes with the existing
 per-instance token authorization and the platform's default pipe ACL behavior.
@@ -160,8 +179,9 @@ generations are reclaimed best effort with confined, unchanged filesystem
 identities; a cleanup problem warns and the launch continues, because cache
 capacity never stops startup. No custom Win32 pipe application, TLS/PSK layer,
 taskkill tree scan, or private process helper is part of the design. These
-source paths do not make the host Windows-supported; that claim remains gated on
-the native evidence above.
+source paths establish no guarantee of their own beyond the native runtime
+evidence above, which covers the host's Pi sessions on the tested Node and Pi
+pins.
 
 The host must launch Pi through its actual supported Node CLI entry, not through an
 arbitrary shell command. By default, `pi-review-sessions` looks for `pi` on `PATH`,
@@ -2146,7 +2166,7 @@ rather than silently guessing. Workspace/project `.pi/settings.json` overrides
 are deliberately not loaded, so this adds no project-code or trust grant. The
 command is parsed as literal arguments and run as a directly owned, shell-free
 child; Windows `.cmd`/batch and command-shell shims are unsupported. This
-editor-command support does not make the host Windows-supported: Windows
+editor-command path adds no Windows privacy guarantee: Windows
 temporary-file privacy follows Node and the operating system's default ACLs,
 without a custom-ACL or same-user sandbox guarantee. The editor uses a bounded
 temporary file; unsafe, oversized, or failed results are not applied. Use the

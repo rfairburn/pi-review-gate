@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
@@ -63,17 +64,27 @@ import type { TerminalSurface } from "../src/session-host/terminal-surface";
  *   provider TUI's rendering, prompts, or telemetry, and nothing reads or writes
  *   any provider's real configuration, credentials, keychain, or conversations.
  * - The wrapper distinction is real and stays visible: the owned PTY handle's
- *   pid is the `cmd.exe` wrapper, while the reported `pid`/`ppid` pair shows the
- *   actual CLI process the shim started underneath it.
+ *   own process is the `cmd.exe` wrapper, while the reported `pid`/`ppid` pair
+ *   shows the actual CLI process the shim started underneath it. The owned
+ *   identity is observed from the pinned handle itself, which reports 0 until
+ *   its ConPTY output worker has connected and the real pid afterwards.
  * - Windows lifecycle semantics are asserted as Windows semantics. The manager
- *   sends no POSIX signal on Windows; a confirmed Stop settles on the owned
- *   handle's forced kill and its observed exit event, never on a SIGTERM
- *   assumption.
+ *   requests no POSIX signal on Windows — proven from the calls actually made on
+ *   the real handle — and a confirmed Stop settles on the owned handle's forced
+ *   kill and its observed exit event, never on a SIGTERM assumption. A console
+ *   child can still be notified by the operating system that its own terminal
+ *   closed (Node reports that notification to the child as SIGHUP); that is
+ *   distinguished here from a signal the manager requested.
  *
  * Resource ownership: every spawned handle is recorded, and the harness refuses
  * to delete its fixture tree until every handle has an observed exit event of
  * its own. A failed case retains its fixture directory under the system temp
- * directory (never inside the repository) and prints the path.
+ * directory (never inside the repository) and prints the path. Because a real
+ * Windows run of this file once printed every case result and then never
+ * settled, the file also prints one active-resource witness after its last case
+ * (see the `after` hook at the end of this file): it reports what this file's own
+ * handles were asked to do and what Node still had outstanding, without forcing
+ * any process, listener, or timer closed.
  */
 
 const isWindows = process.platform === "win32";
@@ -244,17 +255,126 @@ function writeBatchShim(shimPath: string, bodyPath: string): void {
   writeFileSync(shimPath, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`, "utf8");
 }
 
+/**
+ * A thin witness around the REAL handle the production default factory returned.
+ *
+ * This is not a transport substitute: every call goes straight to the pinned
+ * `@lydell/node-pty` object, event registrations are made on that object, and
+ * `pid` stays a live getter over the pinned handle's own identity. The wrapper
+ * exists because "the manager requests no POSIX kill signal on Windows" is a
+ * claim about what the real handle was ASKED to do, and the only honest witness
+ * for that is the argument list it actually received. It also records whether
+ * any output arrived after a kill, which is the pinned implementation's own
+ * precondition for shutting its ConPTY output worker down on the
+ * `useConptyDll` path (see the file-level resource witness at the end).
+ */
+class RecordingPty implements InstancePty {
+  /** One entry per `kill()` call on the real handle, preserving its arity. */
+  readonly killCalls: unknown[][] = [];
+  /** True once the real handle reported output after its first kill. */
+  dataAfterKill = false;
+  #real: InstancePty;
+  #killed = false;
+
+  constructor(real: InstancePty) {
+    this.#real = real;
+  }
+
+  get pid(): number {
+    return this.#real.pid;
+  }
+
+  get cols(): number {
+    return this.#real.cols;
+  }
+
+  get rows(): number {
+    return this.#real.rows;
+  }
+
+  onData(listener: (data: string) => void): { dispose(): void } {
+    return this.#real.onData((data) => {
+      if (this.#killed) this.dataAfterKill = true;
+      listener(data);
+    });
+  }
+
+  onExit(listener: (event: { exitCode: number; signal?: number }) => void): { dispose(): void } {
+    return this.#real.onExit(listener);
+  }
+
+  on(eventName: "error", listener: (error: Error) => void): unknown {
+    return this.#real.on?.(eventName, listener);
+  }
+
+  removeListener(eventName: "error", listener: (error: Error) => void): unknown {
+    return this.#real.removeListener?.(eventName, listener);
+  }
+
+  write(data: string | Buffer): void {
+    this.#real.write(data);
+  }
+
+  resize(columns: number, rows: number): void {
+    this.#real.resize(columns, rows);
+  }
+
+  pause(): void {
+    this.#real.pause();
+  }
+
+  resume(): void {
+    this.#real.resume();
+  }
+
+  kill(signal?: string): void {
+    // Arity is the witness: the manager's Windows escalation is the pinned
+    // no-argument kill, while a POSIX signal request would carry one.
+    const arity = (arguments as { length: number }).length;
+    this.killCalls.push(arity === 0 ? [] : [signal]);
+    this.#killed = true;
+    if (arity === 0) {
+      this.#real.kill();
+      return;
+    }
+    this.#real.kill(signal);
+  }
+}
+
+/** Every real ConPTY handle this file created, for the file-level resource witness. */
+const nativeHandleWitness: { label: string; handle: RealHandle }[] = [];
+
 /** One real owned handle plus the exit event this file witnessed for it. */
 interface RealHandle {
   readonly descriptor: InstanceSpawnDescriptor;
-  readonly pty: InstancePty;
-  readonly pid: number;
+  /** The opaque owned ConPTY handle, kept only to witness what it was asked to do. */
+  readonly pty: RecordingPty;
+  /**
+   * The owned handle's ORIGINAL process identity, bound from the pinned public
+   * `pid` getter once it reports one (see {@link observeOwnedPid}). It is
+   * deliberately NOT snapshotted at spawn time: the pinned Windows
+   * implementation initializes that getter to 0 and only assigns the pid its
+   * native `connect()` reported once the ConPTY output worker has connected, so
+   * a 0 at spawn means "identity not reported yet", never "no process".
+   */
+  handlePid?: number;
+  /**
+   * True once a case sampled this handle's own process identity through
+   * {@link observeOwnedPid}. Together with `handlePid` this keeps three states
+   * apart in the resource witness: an identity this file bound, a pinned handle
+   * it sampled that never reported one, and a handle no case ever sampled — the
+   * last of which says nothing about the pinned implementation.
+   */
+  identitySampled?: boolean;
   /**
    * The CLI process the fixture reported starting underneath this handle. For a
-   * batch child that is NOT `pid`: the owned handle is the cmd.exe wrapper, and
-   * settlement of the wrapper alone proves nothing about the CLI process.
+   * batch child that is NOT `handlePid`: the owned handle is the cmd.exe
+   * wrapper, and settlement of the wrapper alone proves nothing about the CLI
+   * process.
    */
   childPid?: number;
+  /** Whether this fixture's own child reported the console-close notification. */
+  consoleCloseNotice?: boolean;
   exit?: { exitCode: number; signal?: number };
 }
 
@@ -297,6 +417,28 @@ interface Harness {
   readonly manager: InstanceManager;
   readonly registrar: RecordingRegistrar;
   readonly handles: RealHandle[];
+  /** This file's own `onExit` registrations on the real handles, for its own cleanup. */
+  readonly exitRegistrations: { dispose(): void }[];
+}
+
+/**
+ * The canonical identity production gives an owned path.
+ *
+ * `createNativeCliLauncher` canonicalizes the executable it located with the
+ * async `node:fs/promises` `realpath`. That overload is the native (libuv)
+ * resolution, so on Windows it also expands an 8.3 short component: a runner's
+ * `os.tmpdir()` spells its own profile directory `C:\Users\RUNNER~1`, and the
+ * shim the launcher located comes back as `C:\Users\runneradmin\...`, while
+ * `fs.realpathSync` is Node's JavaScript walk that follows only reparse points
+ * and keeps each component's given spelling. The same directory therefore
+ * legitimately appears in both forms in one real run. Every path this fixture
+ * owns — and every path it expects the launcher to report for it — is
+ * canonicalized with the SAME resolution production applies, so each comparison
+ * is one identity against itself and never a spelling accident, while still
+ * comparing whole paths rather than basenames.
+ */
+async function canonicalNativePath(path: string): Promise<string> {
+  return await realpath(path);
 }
 
 /**
@@ -306,9 +448,11 @@ interface Harness {
  * own exit, and a fixture PATH/PATHEXT/HOME so no user configuration,
  * credential, or real provider install is reachable.
  */
-function makeHarness(label: string, options: HarnessOptions = {}): Harness {
+async function makeHarness(label: string, options: HarnessOptions = {}): Promise<Harness> {
   const { systemRoot, cmdExe } = requireWindowsPrerequisites();
-  const root = realpathSync(mkdtempSync(join(tmpdir(), `prg-native-cli-win-${label}-`)));
+  // Canonicalized with the same resolution the launcher applies to the file it
+  // spawns, so every expectation built from this root names that identity.
+  const root = await canonicalNativePath(mkdtempSync(join(tmpdir(), `prg-native-cli-win-${label}-`)));
   const harnessConfig = typeof options.config === "function" ? options.config(root) : options.config;
 
   const packageRoot = join(root, "package");
@@ -379,6 +523,7 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
   const launcher = createNativeCliLauncher(harnessConfig ?? normalizeConfig({ enabled: true }));
   const registrar = new RecordingRegistrar();
   const handles: RealHandle[] = [];
+  const exitRegistrations: { dispose(): void }[] = [];
   const defaultFactory = createDefaultPtyFactory();
   const manager = new InstanceManager({
     packageRoot,
@@ -388,17 +533,19 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
     args: [],
     nativeCliLaunch: (backend, request) => launcher(backend, request),
     ptyFactory: (descriptor) => {
-      // The production default factory: the pinned real @lydell/node-pty ConPTY.
-      const pty = defaultFactory(descriptor);
-      const handle: RealHandle = { descriptor, pty, pid: pty.pid };
+      // The production default factory: the pinned real @lydell/node-pty ConPTY,
+      // wrapped only to witness the calls and events on that real handle.
+      const pty = new RecordingPty(defaultFactory(descriptor));
+      const handle: RealHandle = { descriptor, pty };
       handles.push(handle);
-      pty.onExit((event) => {
+      nativeHandleWitness.push({ label, handle });
+      exitRegistrations.push(pty.onExit((event) => {
         handle.exit = { exitCode: event.exitCode, ...(event.signal === undefined ? {} : { signal: event.signal }) };
-      });
+      }));
       return pty;
     },
   });
-  return { root, bin, synth, workspaceAlpha, workspaceBeta, cmdExe, manager, registrar, handles };
+  return { root, bin, synth, workspaceAlpha, workspaceBeta, cmdExe, manager, registrar, handles, exitRegistrations };
 }
 
 const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -450,6 +597,25 @@ async function frameStaysWithout(manager: InstanceManager, id: string, pattern: 
     const text = flatFrame(surface);
     assert.ok(!pattern.test(text), `${what}; sibling frame was:\n${text}`);
     if (Date.now() >= deadline) return;
+    await sleep(25);
+  }
+}
+
+/**
+ * Observe, without requiring it, the console-close notification a Windows
+ * console child reports after its own terminal goes away.
+ *
+ * Whether the child gets that notification is the platform's choice, so it is
+ * only recorded for the resource witness. What a case decides is the opposite
+ * half: that the notification is never one of the POSIX stop signals, and that
+ * the manager requested no signal of any kind (see the real-handle kill witness).
+ */
+async function observeConsoleClosure(manager: InstanceManager, id: string, timeoutMs = 1500): Promise<boolean> {
+  const surface = surfaceOf(manager, id);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (/SIGNAL SIGHUP/.test(flatFrame(surface))) return true;
+    if (Date.now() >= deadline) return false;
     await sleep(25);
   }
 }
@@ -532,6 +698,43 @@ function noteChildPid(handle: RealHandle, frame: string): number {
   return pid;
 }
 
+/**
+ * Bind the owned handle's ORIGINAL process identity by observing the pinned
+ * public getter, before the case touches the row.
+ *
+ * In the pinned `@lydell/node-pty@1.2.0-beta.15` Windows implementation the
+ * `Terminal` base initializes `_pid` to 0 and exposes it as a live getter;
+ * `WindowsPtyAgent` starts with `innerPid = 0` and only assigns the pid its
+ * native `connect()` returned once the ConPTY output worker has connected, and
+ * `WindowsTerminal` re-reads `agent.innerPid` at that point (its
+ * `ready_datapipe` handler is commented "Update pid now that the agent has
+ * connected"). So a `pid` of 0 immediately after `spawn()` is the pinned
+ * implementation's initial unready state — not an unavailable identity and not a
+ * process. This harness therefore waits for the real handle to report its own
+ * identity and fails truthfully if it never does; it never adopts 0 as a pid,
+ * never probes pid 0, and keeps the owned handle's identity separate from the
+ * `pid`/`ppid` pair the fixture reports for the CLI process underneath it.
+ */
+async function observeOwnedPid(handle: RealHandle, what: string, timeoutMs = 10_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  handle.identitySampled = true;
+  for (;;) {
+    const reported = handle.pty.pid;
+    if (Number.isSafeInteger(reported) && reported > 0) {
+      handle.handlePid = reported;
+      return reported;
+    }
+    assert.ok(Date.now() < deadline, `${what}: the pinned ConPTY handle never reported a process identity within ${timeoutMs}ms (its public pid getter stayed ${reported})`);
+    await sleep(25);
+  }
+}
+
+/** How an owned handle's identity is named in a diagnostic: never a bare 0, and never a claim about a handle this file never sampled. */
+function ownedIdentity(handle: RealHandle): string {
+  if (handle.handlePid !== undefined) return String(handle.handlePid);
+  return handle.identitySampled === true ? "sampled but never reported an identity" : "identity never sampled";
+}
+
 /** True while a process with this pid still exists on this host. */
 function processAlive(pid: number): boolean {
   try {
@@ -555,7 +758,7 @@ function processAlive(pid: number): boolean {
  * retained path. The case's own failure is always the one reported.
  */
 async function withHarness(label: string, options: HarnessOptions, body: (harness: Harness) => Promise<void>): Promise<void> {
-  const harness = makeHarness(label, options);
+  const harness = await makeHarness(label, options);
   let caseFailed = false;
   let bodyError: unknown;
   const failFirst = (error: Error): void => {
@@ -584,7 +787,7 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
     while (harness.handles.some((handle) => handle.exit === undefined) && Date.now() < deadline) await sleep(50);
     const unsettled = harness.handles.filter((handle) => handle.exit === undefined);
     if (unsettled.length > 0) {
-      failFirst(new Error(`session-host native CLI Windows fixture: owned child exits were never observed for pid(s) ${unsettled.map((handle) => handle.pid).join(", ")}`));
+      failFirst(new Error(`session-host native CLI Windows fixture: owned child exits were never observed for handle(s) ${unsettled.map((handle) => ownedIdentity(handle)).join(", ")}`));
     }
     // The CLI processes underneath the wrappers, observed within the same bound.
     const reportedChildren = harness.handles.filter((handle) => handle.childPid !== undefined);
@@ -592,11 +795,23 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
     while (surviving().length > 0 && Date.now() < deadline) await sleep(50);
     const survivingNow = surviving();
     if (survivingNow.length > 0) {
-      failFirst(new Error(`session-host native CLI Windows fixture: SHUTDOWN INTEGRATION SEAM — the owned PTY wrapper handles settled, but the CLI processes they started are still running: ${survivingNow.map((handle) => `cli pid ${handle.childPid} under wrapper pid ${handle.pid}`).join("; ")}. A forced kill that reaches only the batch wrapper leaves the hosted CLI alive; this is reported as an unresolved shutdown seam for the generic stop ladder rather than being masked here.`));
+      failFirst(new Error(`session-host native CLI Windows fixture: SHUTDOWN INTEGRATION SEAM — the owned PTY wrapper handles settled, but the CLI processes they started are still running: ${survivingNow.map((handle) => `cli pid ${handle.childPid} under wrapper ${ownedIdentity(handle)}`).join("; ")}. A forced kill that reaches only the batch wrapper leaves the hosted CLI alive; this is reported as an unresolved shutdown seam for the generic stop ladder rather than being masked here.`));
+    }
+    // Test-owned listener cleanup: every exit witness this file registered on a
+    // real handle is recorded above, so its own registration is released here.
+    // Nothing in the pinned public handle is force-closed from the test: the
+    // settlement of the implementation's own ConPTY resources is reported by the
+    // file-level resource witness instead of being assumed here.
+    for (const registration of harness.exitRegistrations) {
+      try {
+        registration.dispose();
+      } catch {
+        // A settled handle has nothing left to release; the wait above decided.
+      }
     }
     if (caseFailed || unsettled.length > 0) {
       console.error(`prg-native-cli-windows: retained fixture evidence at ${harness.root}`
-        + (unsettled.length > 0 ? ` with UNSETTLED owned pids ${unsettled.map((handle) => handle.pid).join(",")}` : ""));
+        + (unsettled.length > 0 ? ` with UNSETTLED owned handles ${unsettled.map((handle) => ownedIdentity(handle)).join(",")}` : ""));
     } else {
       rmSync(harness.root, { recursive: true, force: true });
     }
@@ -673,14 +888,17 @@ test("built-in claude and codex targets run their owned PATH/PATHEXT .cmd shims 
 
     // The wrapper distinction: the owned handle is cmd.exe, the CLI process is
     // the child the shim started underneath it, and that child is retained so
-    // cleanup must see it settle too.
+    // cleanup must see it settle too. Each owned identity is read from the pinned
+    // handle itself, which reports it once its ConPTY output worker connects.
+    const claudeWrapperPid = await observeOwnedPid(claudeHandle, "the claude row's owned ConPTY handle");
+    const codexWrapperPid = await observeOwnedPid(codexHandle, "the codex row's owned ConPTY handle");
     const claudeChildPid = noteChildPid(claudeHandle, claudeFrame);
     const claudeParentPid = Number(/HELLO tag=claude pid=\d+ ppid=(\d+)/.exec(claudeFrame)?.[1]);
     noteChildPid(codexHandle, codexFrame);
     assert.ok(Number.isSafeInteger(claudeParentPid) && claudeParentPid > 0, "the child reports its parent pid");
-    assert.equal(claudeParentPid, claudeHandle.pid, "the owned PTY handle is the cmd.exe wrapper that started the CLI process");
-    assert.notEqual(claudeChildPid, claudeHandle.pid, "the CLI process is not the owned wrapper pid");
-    assert.notEqual(claudeHandle.pid, codexHandle.pid, "each row owns a distinct ConPTY wrapper process");
+    assert.equal(claudeParentPid, claudeWrapperPid, "the owned PTY handle is the cmd.exe wrapper that started the CLI process");
+    assert.notEqual(claudeChildPid, claudeWrapperPid, "the CLI process is not the owned wrapper process");
+    assert.notEqual(codexWrapperPid, claudeWrapperPid, "each row owns a distinct ConPTY wrapper process");
 
     // No status registration exists for a provider row, so no census exists to ask.
     assert.deepEqual(harness.registrar.requests, []);
@@ -754,6 +972,11 @@ test("configured .cmd and .bat targets keep shared arguments, shared environment
       "PATHEXT selected the configured .bat for the other row");
     noteChildPid(cmdHandle, cmdFrame);
     noteChildPid(batHandle, batFrame);
+    // Bound each row's owned identity from the pinned handle, so the resource
+    // witness names real processes rather than the spawn-time placeholder.
+    const cmdWrapperPid = await observeOwnedPid(cmdHandle, "the configured .cmd row's owned ConPTY handle");
+    const batWrapperPid = await observeOwnedPid(batHandle, "the configured .bat row's owned ConPTY handle");
+    assert.notEqual(cmdWrapperPid, batWrapperPid, "each configured row owns its own ConPTY wrapper process");
 
     // Nothing the operator did not choose executed: the redirection operator
     // stayed data, so its command never ran.
@@ -814,6 +1037,9 @@ test("an operator argument that spells a cmd.exe environment-variable reference 
     const handle = harness.handles[0];
     assert.ok(handle);
     noteChildPid(handle, frame);
+    // Bound the owned identity from the pinned handle while the row is still
+    // untouched, so the resource witness names a real process for this fixture.
+    await observeOwnedPid(handle, "the percent-bearing row's owned ConPTY handle");
 
     // A percent cannot be typed into a cmd.exe /c command line: cmd expands
     // %NAME% while it READS the line, before quoting or tokenization, and no
@@ -824,6 +1050,9 @@ test("an operator argument that spells a cmd.exe environment-variable reference 
     // translation: the shipped quoting authority quotes the placeholder-bearing
     // token exactly as it quotes the operator's own text.
     const carrier = percentCarrierOf(handle.descriptor.env);
+    // The Codex backend's one isolation option is part of the same composed
+    // argv, so it appears in the batch command line after the configured empty
+    // operand exactly as the strict child-argv expectation below requires it.
     assert.equal(handle.descriptor.commandLine,
       expectedBatchCommandLineWithCarrier(carrier, join(harness.bin, "codex-percent.cmd"), [
         "--profile", "%PRG_SYNTH_INHERITED%",
@@ -833,6 +1062,7 @@ test("an operator argument that spells a cmd.exe environment-variable reference 
         "--path", "C:\\operator dir\\",
         "--quote", 'say "%PRG_SYNTH_INHERITED%" & hi',
         "--model", "",
+        "--no-daemon",
       ]),
       "every percent is carried by one reference, and the carrier is cleared before the shim runs");
 
@@ -901,7 +1131,7 @@ test("a direct .exe with a node wrapper.js prefix stays off cmd.exe and reaches 
     assert.equal(harness.handles.length, 1);
     const handle = harness.handles[0];
     assert.ok(handle);
-    assert.equal(handle.descriptor.file, realpathSync(process.execPath), "the direct executable is the configured .exe");
+    assert.equal(handle.descriptor.file, await canonicalNativePath(process.execPath), "the direct executable is the configured .exe, canonically identified the way the launcher identifies it");
     assert.equal(handle.descriptor.commandLine, undefined, "a direct executable is never delivered as a cmd.exe command line");
     assert.deepEqual(handle.descriptor.args, [wrapperPath, "--profile", "host profile", "--no-daemon"]);
     assert.match(frame, /HELLO tag=wrapper pid=\d+ ppid=\d+ tty=1 geo=80x24/, "the wrapper child runs on its own ConPTY terminal at the row geometry");
@@ -910,7 +1140,12 @@ test("a direct .exe with a node wrapper.js prefix stays off cmd.exe and reaches 
     assert.ok(frame.includes("PROBE=node-wrapper"), "the shared env overlay reaches the real child");
     assert.ok(frame.includes("WS workspace alpha"), "the wrapper child runs in this row's spaced workspace");
     const childPid = Number(/HELLO tag=wrapper pid=(\d+)/.exec(frame)?.[1]);
-    assert.equal(childPid, handle.pid, "for a direct executable the owned handle IS the CLI process, with no batch wrapper between them");
+    assert.ok(Number.isSafeInteger(childPid) && childPid > 0, "the direct child reported its own pid");
+    // The owned handle's identity comes from the pinned handle itself, observed
+    // before anything is asked of the row; for a direct executable it is the same
+    // process the fixture reported, with no batch wrapper in between.
+    const ownedPid = await observeOwnedPid(handle, "the direct-executable row's owned ConPTY handle");
+    assert.equal(childPid, ownedPid, "for a direct executable the owned handle IS the CLI process, with no batch wrapper between them");
     noteChildPid(handle, frame);
     assert.deepEqual(harness.registrar.requests, []);
   });
@@ -968,6 +1203,13 @@ test("native Codex receives exactly one --no-daemon in real option position and 
     noteChildPid(plainHandle, plainFrame);
     noteChildPid(promptHandle, promptFrame);
     noteChildPid(claudeHandle2, claudeFrame);
+    // Bound each owned identity from the pinned handle, so a settled run leaves
+    // no handle whose identity the harness simply never looked at.
+    const plainWrapperPid = await observeOwnedPid(plainHandle, "the default Codex row's owned ConPTY handle");
+    const promptWrapperPid = await observeOwnedPid(promptHandle, "the terminator Codex row's owned ConPTY handle");
+    const claudeWrapperPid = await observeOwnedPid(claudeHandle2, "the Claude row's owned ConPTY handle");
+    assert.equal(new Set([plainWrapperPid, promptWrapperPid, claudeWrapperPid]).size, 3,
+      "each of the three rows owns its own ConPTY wrapper process");
     assert.deepEqual(harness.registrar.requests, []);
   });
 });
@@ -976,8 +1218,23 @@ test("addressed input, a prompt answer, and resize reach only the owning ConPTY 
   await withHarness("addressed-io", {}, async (harness) => {
     const claudeId = await harness.manager.create({ workspace: harness.workspaceAlpha, backend: "claude" });
     const codexId = await harness.manager.create({ workspace: harness.workspaceBeta, backend: "codex" });
-    await untilFlat(harness.manager, claudeId, "QUESTION claude: type YES to confirm", "the claude child's own question");
-    await untilFlat(harness.manager, codexId, "QUESTION codex: type YES to confirm", "the codex child's own question");
+    const claudeReport = await untilFlat(harness.manager, claudeId, "QUESTION claude: type YES to confirm", "the claude child's own question");
+    const codexReport = await untilFlat(harness.manager, codexId, "QUESTION codex: type YES to confirm", "the codex child's own question");
+
+    // Process identity is taken from the INITIAL self-report and from the pinned
+    // handles themselves, before any input or resize below can scroll a row: each
+    // row owns its own ConPTY wrapper process, and each fixture's CLI process is
+    // retained so settlement is proven for both.
+    assert.equal(harness.handles.length, 2);
+    const [claudeHandle, codexHandle] = harness.handles;
+    assert.ok(claudeHandle && codexHandle);
+    const claudeWrapperPid = await observeOwnedPid(claudeHandle, "the addressed claude row's owned ConPTY handle");
+    const codexWrapperPid = await observeOwnedPid(codexHandle, "the addressed codex row's owned ConPTY handle");
+    assert.notEqual(claudeWrapperPid, codexWrapperPid, "each row owns a distinct ConPTY wrapper process");
+    const claudeChildPid = noteChildPid(claudeHandle, claudeReport);
+    const codexChildPid = noteChildPid(codexHandle, codexReport);
+    assert.notEqual(claudeChildPid, claudeWrapperPid, "the claude row's CLI process is not its own wrapper process");
+    assert.notEqual(codexChildPid, codexWrapperPid, "the codex row's CLI process is not its own wrapper process");
 
     // Both children asked their own question; only one row is answered.
     harness.manager.write(claudeId, "YES\r");
@@ -1001,19 +1258,6 @@ test("addressed input, a prompt answer, and resize reach only the owning ConPTY 
     harness.manager.resize(90, 20);
     await untilFlat(harness.manager, claudeId, "RESIZE 90x20", "the addressed child follows the host-wide size");
     await untilFlat(harness.manager, codexId, "RESIZE 90x20", "the sibling follows the host-wide size");
-
-    // Each row still owns its own ConPTY wrapper process, and its CLI process
-    // is retained so settlement is proven for both.
-    assert.equal(harness.handles.length, 2);
-    const [claudeHandle, codexHandle] = harness.handles;
-    assert.ok(claudeHandle && codexHandle);
-    assert.notEqual(claudeHandle.pid, codexHandle.pid);
-    const claudeReportedPid = Number(/HELLO tag=claude pid=(\d+)/.exec(flatFrame(surfaceOf(harness.manager, claudeId)))?.[1]);
-    const codexReportedPid = Number(/HELLO tag=codex pid=(\d+)/.exec(flatFrame(surfaceOf(harness.manager, codexId)))?.[1]);
-    assert.ok(Number.isSafeInteger(claudeReportedPid) && claudeReportedPid > 0, "the claude child reported its pid");
-    assert.ok(Number.isSafeInteger(codexReportedPid) && codexReportedPid > 0, "the codex child reported its pid");
-    claudeHandle.childPid = claudeReportedPid;
-    codexHandle.childPid = codexReportedPid;
   });
 });
 
@@ -1021,8 +1265,20 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
   await withHarness("windows-settlement", {}, async (harness) => {
     const exitId = await harness.manager.create({ workspace: harness.workspaceAlpha, backend: "claude" });
     const stopId = await harness.manager.create({ workspace: harness.workspaceBeta, backend: "codex" });
-    await untilFlat(harness.manager, exitId, "QUESTION claude: type YES to confirm", "the first child is up and asking");
-    await untilFlat(harness.manager, stopId, "QUESTION codex: type YES to confirm", "the second child is up and asking");
+    const exitReport = await untilFlat(harness.manager, exitId, "QUESTION claude: type YES to confirm", "the first child is up and asking");
+    const stopReport = await untilFlat(harness.manager, stopId, "QUESTION codex: type YES to confirm", "the second child is up and asking");
+
+    assert.equal(harness.handles.length, 2, "both rows own a real handle");
+    const exitHandle = harness.handles[0];
+    const stopHandle = harness.handles[1];
+    assert.ok(exitHandle && stopHandle, "both rows own a real handle");
+    // Each CLI identity is captured from its own initial self-report, and each
+    // owned identity is bound from the pinned handle, before any lifecycle action.
+    noteChildPid(exitHandle, exitReport);
+    const stopChildPid = noteChildPid(stopHandle, stopReport);
+    await observeOwnedPid(exitHandle, "the deliberate-exit row's owned ConPTY handle");
+    const stopWrapperPid = await observeOwnedPid(stopHandle, "the stopped row's owned ConPTY handle");
+    assert.notEqual(stopChildPid, stopWrapperPid, "the asserted settlement is about the CLI process, not the cmd.exe wrapper process");
 
     // 1. A deliberate child exit is reported with the child's own code.
     harness.manager.write(exitId, "EXIT 3\r");
@@ -1033,14 +1289,17 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     assert.equal(exited.lifecycle, "exited", "the manager settled the row on the real child's exit event");
     assert.equal(exited.exitCode, 3, "the child's exit code propagates through the batch shim to the row");
     assert.equal(exited.hasLiveProcess, false);
-    assert.equal(harness.handles[0]?.exit?.exitCode, 3, "this file witnessed the same exit on its own handle");
+    assert.equal(exitHandle.exit?.exitCode, 3, "this file witnessed the same exit on its own handle");
     assert.equal(harness.manager.resizeInstance(exitId, 90, 20), false, "a settled row is never resized");
 
-    // 2. An unconfirmed Stop signals nothing and changes nothing.
+    // 2. An unconfirmed Stop signals nothing and changes nothing: it makes no
+    // request at all of the real handle, and the child reports no signal.
     const refused = await harness.manager.stop(stopId, { confirmed: false });
     assert.deepEqual(refused, { status: "confirmation-required", forced: false });
     assert.equal(viewOf(harness.manager, stopId).lifecycle, "alive");
     assert.equal(harness.manager.hasLiveProcesses(), true);
+    assert.equal(stopHandle.pty.killCalls.length, 0, "an unconfirmed Stop made no kill request of any kind on the real handle");
+    await frameStaysWithout(harness.manager, stopId, /SIGNAL /, "nothing reached the Windows child while its Stop stayed unconfirmed");
 
     // 3. The operator's confirmation runs the owned stop ladder, with the
     // fixture's optional parent-death watcher OFF (asserted below, from the
@@ -1048,12 +1307,9 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     // POSIX signal at all: it waits out the grace window on the real handle,
     // then escalates with the pinned no-argument kill, and reports that
     // escalation truthfully.
-    const stopHandle = harness.handles[1];
-    assert.ok(stopHandle, "the stop row owns a real handle");
     assert.equal(stopHandle.descriptor.env.PRG_SYNTH_WATCH_PPID, undefined,
       "the fixture's parent-death watcher is disabled for this assertion, so nothing can mask a surviving CLI process");
-    const stopChildPid = noteChildPid(stopHandle, flatFrame(surfaceOf(harness.manager, stopId)));
-    assert.notEqual(stopChildPid, stopHandle.pid, "the asserted settlement is about the CLI process, not the cmd.exe wrapper pid");
+    const killRequestsBeforeStop = stopHandle.pty.killCalls.length;
     const startedAt = Date.now();
     const stopped = await harness.manager.stop(stopId, { confirmed: true });
     const elapsed = Date.now() - startedAt;
@@ -1061,12 +1317,26 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
       "a Windows confirmed Stop settles on the owned handle's forced kill, not on a signal the platform never delivers");
     assert.ok(elapsed >= DEFAULT_SHUTDOWN_GRACE_MS - 500,
       `the manager waited out its full grace window (${elapsed}ms >= ${DEFAULT_SHUTDOWN_GRACE_MS}ms grace): no early POSIX-signal exit happened on Windows`);
+    // The decisive lifecycle witness: what the manager actually asked the REAL
+    // handle. On Windows the only escalation is the pinned no-argument kill, and
+    // a SIGTERM or SIGKILL request would show up here as a kill call carrying an
+    // argument.
+    const killRequests = stopHandle.pty.killCalls.slice(killRequestsBeforeStop);
+    assert.deepEqual(killRequests.filter((request) => request.length > 0), [],
+      "the manager requested no POSIX signal on Windows: every kill it made of the real handle was the pinned no-argument owned kill");
+    assert.equal(killRequests.length, 1, "the confirmed Stop escalated exactly once, through the owned handle");
     const stoppedView = viewOf(harness.manager, stopId);
     assert.equal(stoppedView.lifecycle, "exited");
     assert.equal(stoppedView.hasLiveProcess, false);
     assert.ok(stopHandle.exit, "this file witnessed the owned handle's exit event");
     assert.equal(typeof stopHandle.exit?.exitCode, "number", "the settled handle carries an observed exit code");
-    await frameStaysWithout(harness.manager, stopId, /SIGNAL /, "no POSIX signal ever reached the Windows child");
+    // A Windows console child IS notified by the operating system when its own
+    // terminal goes away, and Node surfaces that notification to the child as
+    // SIGHUP. That is the console closing after the forced kill — not a signal
+    // the manager requested, and not the POSIX escalation this platform must
+    // never take, so SIGTERM and SIGINT stay absent from the child's own report.
+    await frameStaysWithout(harness.manager, stopId, /SIGNAL (?:SIGTERM|SIGINT)/, "no POSIX stop signal ever reached the Windows child");
+    stopHandle.consoleCloseNotice = await observeConsoleClosure(harness.manager, stopId);
 
     // 4. Settlement is proven for the CLI process the shim started, not just for
     // the wrapper handle the manager owns. If the forced kill reaches only the
@@ -1075,11 +1345,65 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     const childDeadline = Date.now() + 15_000;
     while (processAlive(stopChildPid) && Date.now() < childDeadline) await sleep(100);
     assert.ok(!processAlive(stopChildPid),
-      `SHUTDOWN INTEGRATION SEAM: the owned PTY wrapper (pid ${stopHandle.pid}) settled, but the CLI process it started (pid ${stopChildPid}) is still running after a confirmed Stop. A forced kill that reaches only cmd.exe leaves the hosted CLI alive; that is unresolved generic shutdown behavior and must not be masked by a fixture-side parent watcher.`);
+      `SHUTDOWN INTEGRATION SEAM: the owned PTY wrapper (${stopWrapperPid}) settled, but the CLI process it started (pid ${stopChildPid}) is still running after a confirmed Stop. A forced kill that reaches only cmd.exe leaves the hosted CLI alive; that is unresolved generic shutdown behavior and must not be masked by a fixture-side parent watcher.`);
 
     // 5. Nothing is left owned by this file.
     const shutdown = await harness.manager.shutdown({ graceMs: 2000, killMs: 2000 });
     assert.deepEqual(shutdown.remainingIds, []);
     assert.equal(harness.manager.hasLiveProcesses(), false);
   });
+});
+
+/**
+ * One active-resource witness for the whole file, printed after its last case.
+ *
+ * A real Windows run of this file printed every case result and then never
+ * settled, which no per-case assertion can show. This reports the facts that
+ * separate the candidate causes instead of leaving them to inference: how many
+ * owned ConPTY handles settled on an observed exit event, how many were killed
+ * with a signal argument (the manager must never ask for one on Windows), how
+ * many were killed with no output afterwards — the pinned `useConptyDll` path
+ * disposes its ConPTY output worker only when post-kill output arrives, and that
+ * worker owns a pipe server nothing in the pinned public API closes — and how
+ * each handle's own process identity ended up: bound, sampled but never
+ * reported, or never sampled by a case at all, which is stated separately
+ * because an unsampled handle says nothing about the pinned implementation. Node's
+ * own active handle and request counts complete the picture. Nothing here waits,
+ * retries, forces an exit, or changes any lifecycle.
+ */
+after(() => {
+  if (!isWindows) return;
+  const handles = nativeHandleWitness.map((entry) => entry.handle);
+  const count = (predicate: (handle: RealHandle) => boolean): number => handles.filter(predicate).length;
+  const diagnosticProcess = process as NodeJS.Process & {
+    _getActiveHandles?: () => unknown[];
+    _getActiveRequests?: () => unknown[];
+  };
+  const summarize = (values: unknown[] | undefined): string => {
+    if (values === undefined) return "unavailable";
+    const totals = new Map<string, number>();
+    for (const value of values) {
+      const kind = (value as { constructor?: { name?: string } })?.constructor?.name ?? typeof value;
+      totals.set(kind, (totals.get(kind) ?? 0) + 1);
+    }
+    return [...totals].map(([kind, total]) => `${kind}=${total}`).join(",") || "none";
+  };
+  // Which fixtures were killed with no output afterwards, by label: that is the
+  // pinned condition under which the ConPTY output worker is never disposed.
+  const unflushed = [...new Set(nativeHandleWitness
+    .filter((entry) => entry.handle.pty.killCalls.length > 0 && !entry.handle.pty.dataAfterKill)
+    .map((entry) => entry.label))];
+  console.error(`prg-native-cli-windows: resource witness for ${handles.length} owned ConPTY handle(s): `
+    + `${count((handle) => handle.exit !== undefined)} with an observed exit, `
+    + `${count((handle) => handle.exit === undefined)} without one, `
+    + `${count((handle) => handle.pty.killCalls.some((request) => request.length > 0))} killed with a signal argument (expected 0), `
+    + `${unflushed.length} fixture(s) killed with no output after the kill `
+    + `[${unflushed.join(", ") || "none"}] (the pinned useConptyDll path disposes its ConPTY output worker only on post-kill output, so each listed fixture can leave that worker thread and its pipe server alive), `
+    + `${count((handle) => handle.handlePid !== undefined)} had a bound owned identity, `
+    + `${count((handle) => handle.handlePid === undefined && handle.identitySampled === true)}/`
+    + `${count((handle) => handle.identitySampled === true)} sampled handles never reported one, `
+    + `${count((handle) => handle.identitySampled !== true)} were never sampled by a case, `
+    + `${count((handle) => handle.consoleCloseNotice === true)} reported the console-close notification; `
+    + `active libuv handles: ${summarize(diagnosticProcess._getActiveHandles?.())}; `
+    + `active libuv requests: ${summarize(diagnosticProcess._getActiveRequests?.())}`);
 });

@@ -169,13 +169,19 @@ test("the manager carries one native row's Windows command line from the launch 
   try {
     const workspace = join(root, "workspace");
     mkdirSync(workspace);
+    // Every manager resolves the canonical native Pi agent directory when it is
+    // constructed, so this fixture owns one under its own temp root and pins it
+    // with PI_CODING_AGENT_DIR. Nothing here reads or creates `~/.pi/agent`, and
+    // the case passes on a runner with no Pi state of its own.
+    const agentDir = join(root, "native-agent");
+    mkdirSync(agentDir);
     const seen: InstanceSpawnDescriptor[] = [];
     const registrar = new SilentRegistrar();
     const manager = new InstanceManager({
       packageRoot: root,
       piExecutable: "C:\\fixture\\pi.cmd",
       statusRegistrar: registrar,
-      env: {},
+      env: { PI_CODING_AGENT_DIR: agentDir },
       args: [],
       nativeCliLaunch: async (backend, request): Promise<NativeLaunchDescriptor> => backend === "codex"
         ? { file: "C:\\Windows\\System32\\cmd.exe", args: [], commandLine: BATCH_COMMAND_LINE, env: {}, cwd: request.workspace }
@@ -213,6 +219,11 @@ test("an unusable Windows command line on a native launch descriptor is refused 
   try {
     const workspace = join(root, "workspace");
     mkdirSync(workspace);
+    // Same owned native Pi agent directory as the delivery case: each refused
+    // manager resolves its agent directory at construction, and that resolution
+    // never depends on the ambient user's `~/.pi/agent`.
+    const agentDir = join(root, "native-agent");
+    mkdirSync(agentDir);
     const cases: Array<{ readonly label: string; readonly commandLine: unknown }> = [
       { label: "empty", commandLine: "" },
       { label: "control character", commandLine: `/d /s /c "C:\\fixture\\claude.cmd\u0007"` },
@@ -225,7 +236,7 @@ test("an unusable Windows command line on a native launch descriptor is refused 
         packageRoot: root,
         piExecutable: "C:\\fixture\\pi.cmd",
         statusRegistrar: new SilentRegistrar(),
-        env: {},
+        env: { PI_CODING_AGENT_DIR: agentDir },
         args: [],
         nativeCliLaunch: async (_backend, request): Promise<NativeLaunchDescriptor> => ({
           file: "C:\\Windows\\System32\\cmd.exe",

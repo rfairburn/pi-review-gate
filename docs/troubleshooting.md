@@ -60,7 +60,7 @@ owns the underlying behavior.
   launcher with the Node that invoked it, so it needs a supported Node already
   on `PATH`. Upgrade Node on `PATH`, or use the source `.sh`/`.cmd` entry
   points, which retain a supported `PATH` Node or bootstrap the checksum-pinned
-  official Node 22.23.4 archive into an isolated per-agent cache. Either way,
+  official Node 22.23.5 archive into an isolated per-agent cache. Either way,
   update Node yourself and restart already-running hosts and sessions. See
   [Requirements and launch](session-host-alpha.md#requirements-and-launch).
 - **A second host refuses to start because one host already owns that Pi agent

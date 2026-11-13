@@ -64,18 +64,38 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
 
 ### Development prerequisites
 
-- **Node.js at or above its release line's security floor, and npm:** 22.23.4 or
-  newer on Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26
+- **Node.js at or above its release line's security floor, and npm:** 22.23.5 or
+  newer on Node 22, 24.22.3 or newer on Node 24, or 26.13.1 or newer on Node 26
   (see [Node.js security floors](getting-started.md#nodejs-security-floors)).
-  The `verify` matrix runs each exact floor through the same stages, as the
-  checks **Verify (Node 22.23.4)**, **Verify (Node 24.22.1)**, and **Verify
-  (Node 26.12.1)**. The Linux full suite, the Windows shell job, and the release
-  builder use Node 24.22.1. The Windows launcher job uses Node 22.23.4. The
-  Windows session-host acceptance matrix (`session-host-alpha.yml`) emits the
-  stable check names **Windows session host alpha (Node 22.23.4)** and **Windows
-  session host alpha (Node 24.22.1)** and runs those two Node versions. Do not
-  run checks with a Node below its line's floor, and do not take earlier CI runs
-  on Node 22.19.0 or 24.x as patched-runtime evidence.
+  The `verify` matrix runs each line's exact floor through the same stages, as
+  the checks **Verify (Node 22)**, **Verify (Node 24)**, and **Verify
+  (Node 26)**. The Linux full suite, the Windows shell job, and the release
+  builder use Node 24.22.3. The Windows launcher job runs Node 22.23.5 as
+  **Windows launcher (Node 22)**. The Windows session-host acceptance matrix
+  (`session-host-alpha.yml`) runs Node 22.23.5 and 24.22.3 and emits the stable
+  check names **Windows session host alpha (Node 22)** and **Windows session
+  host alpha (Node 24)**, which CI's read-only caller contributes as the
+  qualified contexts **Session host alpha matrix / Windows session host alpha
+  (Node 22)** and **Session host alpha matrix / Windows session host alpha
+  (Node 24)**. Do not run checks with a Node below its line's floor, and do not
+  take earlier CI runs on Node 22.19.0 or 24.x as patched-runtime evidence.
+  Each check name comes from a stable per-major label that the matrix pairs
+  explicitly with that line's exact pinned runtime, so raising a line's patch or
+  minor floor changes only the pin: the required-check names, and therefore the
+  ruleset, stay unchanged, and `actions/setup-node` logs the exact version each
+  leg installed. Adding or dropping a supported major stays a separate support
+  decision that does rename checks and needs the same coordinated ruleset
+  change. The one-time migration is the exception, because these checks were
+  previously named from the pinned versions, such as **Verify (Node 22.23.4)**:
+  the operator must update the repository ruleset to require **Verify (Node 22)**,
+  **Verify (Node 24)**, **Verify (Node 26)**, **Full suite (Node 24)**,
+  **Windows launcher (Node 22)**, **Windows shell (Node 24)**, **Session host
+  alpha matrix / Windows session host alpha (Node 22)**, and **Session host
+  alpha matrix / Windows session host alpha (Node 24)** in the same window as the
+  merge. Renaming the checks without that update leaves the required contexts
+  unsatisfiable; updating protection first blocks the PR. This documentation
+  states the requirement — neither the workflow change nor this page changes the
+  live ruleset.
 - **TypeScript and type definitions** arrive as ordinary `devDependencies` via
   `npm install`; the runtime dependencies (including Playwright, undici, and the
   HTML/PDF parsing stack) are ordinary npm packages.
@@ -780,7 +800,7 @@ current.
 
 The session-host entry points share that same preparation authority and carry no
 separate build, DDGS, or skill algorithm. `scripts/pi-review-sessions.sh` keeps
-a supported Node on `PATH` or bootstraps the source-pinned official Node.js 22.23.4
+a supported Node on `PATH` or bootstraps the source-pinned official Node.js 22.23.5
 archive (macOS x64/arm64, Linux x64/arm64) into an isolated per-agent cache
 before invoking the shared launcher `scripts/pi-review-sessions.cjs`;
 `scripts\pi-review-sessions.cmd` delegates the same pinned-Node bootstrap

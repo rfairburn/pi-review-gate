@@ -131,14 +131,14 @@ told.
 ## Prerequisites
 
 - Node.js at or above its release line's security floor for package installation
-  and direct package commands: 22.23.4 or newer on Node 22, 24.22.1 or newer on
-  Node 24, or 26.12.1 or newer on Node 26. These are the October 2026 Node.js
-  security releases, which include the eMudhra intermediate-CA compromise fix.
-  Later patches in a line are accepted, and Node 26 is not required. Other
-  majors keep their existing eligibility (see
+  and direct package commands: 22.23.5 or newer on Node 22, 24.22.3 or newer on
+  Node 24, or 26.13.1 or newer on Node 26. These are the November 2026 Node.js
+  security releases, which fix 16 vulnerabilities across the 22.x, 24.x, and
+  26.x lines. Later patches in a line are accepted, and Node 26 is not required.
+  Other majors keep their existing eligibility (see
   [Node.js security floors](docs/getting-started.md#nodejs-security-floors)).
   The `.sh` and `.cmd` session-host entry points can bootstrap an isolated,
-  checksum-pinned official Node 22.23.4 runtime on supported OS/architectures
+  checksum-pinned official Node 22.23.5 runtime on supported OS/architectures
   when PATH has no supported Node; a supported PATH Node is retained. Updating
   the requirement does not update or restart Node processes that are already
   installed or running. Update Node.js yourself, then restart those processes.
@@ -217,7 +217,7 @@ scripts\pi-review-sessions.cmd    # native Windows source entry point
 
 An installed package exposes the `pi-review-sessions` command. The `.sh` and
 `.cmd` entry points retain a supported Node on PATH or bootstrap the
-source-pinned official Node.js 22.23.4 archive under an isolated per-agent cache
+source-pinned official Node.js 22.23.5 archive under an isolated per-agent cache
 when Node is missing or below its release line's security floor (macOS/Linux x64
 or arm64; Windows x64, arm64, or x86). The pinned archive digest is verified and
 freshly extracted on installation/update; a previously completed fallback

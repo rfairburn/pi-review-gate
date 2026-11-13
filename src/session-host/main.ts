@@ -1180,7 +1180,7 @@ function canonicalExistingDirectory(path: string | undefined): string | undefine
  * nearest listed lower line, so newer unlisted majors keep the existing policy
  * and releases below Node 22 are refused. Main admits stable versions only.
  */
-const NODE_LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 4], [24, 22, 1], [26, 12, 1]];
+const NODE_LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 5], [24, 22, 3], [26, 13, 1]];
 
 function stableNodeVersion(version: string): boolean {
   const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);

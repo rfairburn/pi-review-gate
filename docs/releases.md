@@ -46,12 +46,25 @@ else fails closed before any write:
   once per CI run, while its targeted `workflow_dispatch` path stays available.
   Its concurrency group uses a fixed prefix with cancellation disabled, so it
   can never cancel the calling CI run or a `main` publication run. The `verify`
-  matrix runs the exact per-line Node security floors 22.23.4, 24.22.1, and 26.12.1
+  matrix runs the exact per-line Node security floors 22.23.5, 24.22.3, and 26.13.1
   (see [Node.js security floors](getting-started.md#nodejs-security-floors)).
-  The full suite and the Windows shell job run on Node 24.22.1, and the Windows
-  launcher job runs on Node 22.23.4. Both Windows jobs gate publication, as does
-  the full suite. GitHub's implicit `success()` guard on `needs` skips
-  publication when any dependency failed or was skipped. There is no
+  The full suite and the Windows shell job run on Node 24.22.3, and the Windows
+  launcher job runs on Node 22.23.5. Both Windows jobs gate publication, as does
+  the full suite. Each required-check name comes from a stable per-major label
+  that the matrix pairs explicitly with that line's exact pinned runtime, so
+  raising a line's patch or minor floor changes only the pin and keeps every
+  required context name — and therefore the ruleset — unchanged, while
+  `actions/setup-node` logs the exact version each leg installed. Adding or
+  dropping a supported major stays a separate support decision that does rename
+  checks. The one-time migration is the exception, because these checks were
+  previously named from the pinned versions: the operator must update the
+  repository ruleset to require **Verify (Node 22)**, **Verify (Node 24)**,
+  **Verify (Node 26)**, **Full suite (Node 24)**, **Windows launcher (Node 22)**,
+  **Windows shell (Node 24)**, **Session host alpha matrix / Windows session host
+  alpha (Node 22)**, and **Session host alpha matrix / Windows session host alpha
+  (Node 24)** in the same window as the merge; nothing in this repository
+  changes that live configuration. GitHub's implicit `success()` guard on `needs`
+  skips publication when any dependency failed or was skipped. There is no
   `workflow_run` privilege chain, no custom PAT, and no GitHub App; the only
   write permission anywhere is `contents: write` on the single publish job.
   Eight verification legs sit upstream of that guard in total. The dependency is

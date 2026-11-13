@@ -54,7 +54,7 @@ launcher_package_root() {
 REVIEW_GATE_ROOT="$(launcher_package_root pi-review-web)" || exit 1
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "pi-review-web: Node.js 22.23.4 or newer (Node 24 >=24.22.1, Node 26 >=26.12.1) is required to run pi-review-web." >&2
+  echo "pi-review-web: Node.js 22.23.5 or newer (Node 24 >=24.22.3, Node 26 >=26.13.1) is required to run pi-review-web." >&2
   exit 127
 fi
 

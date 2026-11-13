@@ -15,6 +15,56 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.282]
+
+### Security
+
+- The per-line Node.js security floors rise to the November 2026 security release:
+  22.23.5 or newer on Node 22, 24.22.3 or newer on Node 24, and 26.13.1 or newer
+  on Node 26 (#669). These replace the October 2026 minimums from #489 and match
+  the [November 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/november-2026-security-releases),
+  which fix 16 vulnerabilities (7 high, 6 medium, 3 low) across the 22.x, 24.x,
+  and 26.x lines, including an `https.Agent` certificate-validation bypass through
+  cross-policy TLS session reuse, client-certificate authentication bypass during
+  TLS 1.2 renegotiation, proxy credentials disclosed in `ERR_PROXY_INVALID_CONFIG`
+  messages, and Permission Model bypass or over-grant. The package engine range is
+  `>=22.23.5 <24.0.0 || >=24.22.3 <26.0.0 || >=26.13.1`. Later patches in a line
+  stay accepted, Node 26 is still not required, and no line is added or dropped.
+  The session-host managed fallback stays on Node 22 and now bootstraps the
+  checksum-pinned official Node.js 22.23.5 archive; a fallback runtime an earlier
+  release set up on 22.23.4 is not reused. This release does not update or restart
+  Node.js installations or running processes. Update Node.js yourself, then restart
+  running Pi, review-gate, session-host, and web-tool processes.
+
+### Changed
+
+- CI now selects the new exact patched floors and names its required checks
+  stably per major (#669). The existing `verify` matrix runs Node 22.23.5,
+  24.22.3, and 26.13.1 through the same stages, with no extra full-suite stage,
+  as **Verify (Node 22)**, **Verify (Node 24)**, and **Verify (Node 26)**. The
+  Linux full suite and the Windows shell job keep **Full suite (Node 24)** and
+  **Windows shell (Node 24)** on Node 24.22.3, the release builder keeps using
+  Node 24.22.3, and the Windows launcher job runs Node 22.23.5 as **Windows
+  launcher (Node 22)**. The Windows session-host alpha matrix runs Node 22.23.5
+  and 24.22.3 as **Windows session host alpha (Node 22)** and **Windows session
+  host alpha (Node 24)**, which CI's read-only caller contributes as the
+  qualified contexts **Session host alpha matrix / Windows session host alpha
+  (Node 22)** and **Session host alpha matrix / Windows session host alpha
+  (Node 24)**. Every matrix leg now declares an explicit label/version pair, so a
+  later patch or minor floor bump changes only the pinned runtime and needs no
+  ruleset edit, while `actions/setup-node` logs the exact version each leg
+  installed; adding or dropping a supported major stays a separate support and
+  ruleset decision. These checks were previously named from the pinned versions,
+  such as **Verify (Node 22.23.4)**, so this is a one-time rename: the operator
+  must update
+  branch protection to **Verify (Node 22)**, **Verify
+  (Node 24)**, **Verify (Node 26)**, **Full suite (Node 24)**, **Windows launcher
+  (Node 22)**, **Windows shell (Node 24)**, **Session host alpha matrix / Windows
+  session host alpha (Node 22)**, and **Session host alpha matrix / Windows
+  session host alpha (Node 24)** in the same window as the merge; neither this
+  change nor any workflow edits it. Earlier CI runs on the superseded floors
+  remain historical evidence, not patched-runtime runs.
+
 ## [0.1.0-dev.281]
 
 ### Fixed

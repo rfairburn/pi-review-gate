@@ -130,3 +130,54 @@ test("Windows exit-watcher source contract: no process control, scans, or privat
   assert.match(source, /Main\/outer exit codes/);
   assert.match(source, /terminal restoration/);
 });
+
+test("Windows exit-watcher source contract: stderr-only stage markers instrument the same observation without changing it", () => {
+  // One guarded helper, one emission point, STDERR only, and a fixed vocabulary.
+  const helperStart = code.indexOf("function Write-ObserverStageMarker");
+  const helperEnd = code.indexOf("function Get-ValidatedRootPath", helperStart);
+  const helper = code.slice(helperStart, helperEnd);
+  assert.ok(helperStart > 0 && helperEnd > helperStart, "one marker helper is defined before its first use");
+  assert.match(helper, /\[System\.Console\]::Error\.WriteLine\('PRG-OBS-STAGE:' \+ \$Stage\)/);
+  assert.equal((code.match(/PRG-OBS-STAGE:/g) ?? []).length, 1, "one fixed emission point for every stage marker");
+  assert.doesNotMatch(helper, /\[System\.Console\]::Out|Write-Output|Write-Host|Start-Sleep|Thread/);
+  assert.doesNotMatch(helper, /\$Root|\$RequestNonce|\$NativePid|\$process\b|\$observerPid/,
+    "a marker carries the stage name and never a path, nonce, PID, or error text");
+
+  // One call site per stage, placed around the unchanged observation steps.
+  const entered = code.indexOf("Write-ObserverStageMarker -Stage 'script-entered'");
+  const rootValidated = code.indexOf("Write-ObserverStageMarker -Stage 'root-validated'");
+  const lookupStart = code.indexOf("Write-ObserverStageMarker -Stage 'lookup-start'");
+  const handleBound = code.indexOf("Write-ObserverStageMarker -Stage 'handle-bound'");
+  const readyPublished = code.indexOf("Write-ObserverStageMarker -Stage 'ready-published'");
+  const resultPublished = code.indexOf("Write-ObserverStageMarker -Stage 'result-published'");
+  const bodyStart = code.indexOf("if ([System.Environment]::OSVersion.Platform");
+  const rootCall = code.indexOf("$rootPath = Get-ValidatedRootPath -Candidate $Root");
+  const lookup = code.indexOf("[System.Diagnostics.Process]::GetProcessById($NativePid)");
+  const handle = code.indexOf("$heldProcessHandle = $process.Handle");
+  const readyWrite = code.indexOf("$readyPublished = $true");
+  const resultWrite = code.indexOf("$resultPublished = $true");
+
+  assert.equal((code.match(/Write-ObserverStageMarker -Stage '/g) ?? []).length, 6, "exactly six stage call sites");
+  for (const [name, index] of Object.entries({ entered, rootValidated, lookupStart, handleBound, readyPublished, resultPublished })) {
+    assert.ok(index >= 0, `${name} marker exists`);
+  }
+  assert.ok(entered < bodyStart, "script-entered precedes the observation body itself");
+  assert.ok(rootValidated > rootCall && rootValidated < lookupStart, "root-validated follows validation and precedes the lookup");
+  assert.ok(lookupStart < lookup && lookup < handleBound, "lookup-start precedes the exact-PID lookup, handle-bound follows it");
+  assert.ok(readyPublished > readyWrite, "ready-published follows the completed READY publication");
+  assert.ok(resultPublished > resultWrite, "result-published follows the completed result publication");
+
+  // Diagnosis only: the markers never enter the witness schema, its states, or a
+  // wait, and they never add a timer, retry, or deadline to the observation.
+  const payload = code.slice(code.indexOf("function New-WitnessPayload"), code.indexOf("function Write-WitnessExclusive"));
+  assert.doesNotMatch(payload, /PRG-OBS-STAGE|Write-ObserverStageMarker/, "no marker text can reach a witness payload");
+  assert.doesNotMatch(code, /terminalState\s*=\s*'PRG|PRG-OBS-STAGE[^\n]*terminalState/, "a marker is never a state");
+  assert.doesNotMatch(code, /Start-Sleep|System\.Threading\.(?:Timer|Thread)|while \(\$/, "no new wait or retry loop");
+  assert.equal((code.match(/Stopwatch\]::StartNew\(\)/g) ?? []).length, 1, "the one existing bounded wait stopwatch is unchanged");
+  assert.match(code, /\$process\.WaitForExit\(\$remainingMilliseconds\)/);
+  assert.match(code, /\[int\] \$TimeoutSeconds = 480/);
+
+  // STDOUT stays exactly as untouched as before: the only console writes are STDERR.
+  assert.doesNotMatch(code, /\[System\.Console\]::(Out|Write(?!Line))/i);
+  assert.doesNotMatch(code, /Write-Information|Write-Verbose|Write-Debug|Out-File|Tee-Object|Start-Transcript/i);
+});

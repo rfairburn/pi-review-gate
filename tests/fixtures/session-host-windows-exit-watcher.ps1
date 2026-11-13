@@ -38,6 +38,14 @@
   witnesses for assertions and cleanup only after graceful owner settlement and
   exact root identity checks.
 
+  For test-harness diagnosis only, the script writes fixed-vocabulary stage
+  markers to STDERR: script-entered, root-validated, lookup-start, handle-bound,
+  ready-published, and result-published. Each marker line is exactly
+  'PRG-OBS-STAGE:<stage>' and carries no path, nonce, PID, error text, or other
+  payload; STDOUT is never written. Markers are diagnosis only: they never
+  satisfy readiness or exit, never replace a witness, and a missing marker is
+  never evidence that the script did not start.
+
   Public API references (.NET Framework 4.8.1 reference pages, applicable to
   Windows PowerShell 5.1):
     Process.Handle: https://learn.microsoft.com/dotnet/api/system.diagnostics.process.handle?view=netframework-4.8.1
@@ -76,6 +84,24 @@ $ErrorActionPreference = 'Stop'
 # An omitted [string] parameter defaults to ''; only the bound-key test
 # distinguishes omission from an explicitly supplied empty/invalid value.
 $hasExpectedStartTime = $PSBoundParameters.ContainsKey('ExpectedStartTimeUtcTicks')
+
+function Write-ObserverStageMarker {
+    # Diagnosis only: one fixed-vocabulary line on STDERR, before and after the
+    # exact-PID observation steps, so a caller can tell which step it reached.
+    # It carries no path, nonce, PID, error text, or other payload, never writes
+    # STDOUT, and a failed marker write never changes the observation itself.
+    param([Parameter(Mandatory = $true)][string] $Stage)
+
+    if ($Stage -notmatch '\A(?:script-entered|root-validated|lookup-start|handle-bound|ready-published|result-published)\z') {
+        return
+    }
+    try {
+        [System.Console]::Error.WriteLine('PRG-OBS-STAGE:' + $Stage)
+    }
+    catch {
+        # A marker is never proof and never worth failing observation for.
+    }
+}
 
 function Get-ValidatedRootPath {
     param([Parameter(Mandatory = $true)][string] $Candidate)
@@ -219,6 +245,8 @@ $observedExitCode = $null
 $scriptExitCode = 2
 $canPublish = $false
 
+Write-ObserverStageMarker -Stage 'script-entered'
+
 try {
     if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         throw 'This fixture requires Windows.'
@@ -245,6 +273,7 @@ try {
     }
 
     $rootPath = Get-ValidatedRootPath -Candidate $Root
+    Write-ObserverStageMarker -Stage 'root-validated'
     $observerProcess = [System.Diagnostics.Process]::GetCurrentProcess()
     try {
         $observerPid = $observerProcess.Id
@@ -266,10 +295,12 @@ try {
     # GetProcessById is the sole target lookup: the caller supplies one exact
     # PID that its own spawn/journal fence has already identified.
     $terminalState = 'unavailable'
+    Write-ObserverStageMarker -Stage 'lookup-start'
     $process = [System.Diagnostics.Process]::GetProcessById($NativePid)
     # Force public handle acquisition now and retain this Process object until
     # after WaitForExit and ExitCode; later PID reuse cannot redirect that handle.
     $heldProcessHandle = $process.Handle
+    Write-ObserverStageMarker -Stage 'handle-bound'
     if ($process.HasExited) {
         throw 'Target process already exited before handle binding.'
     }
@@ -288,6 +319,7 @@ try {
         -NativeProcessId $NativePid -CreationTicks $creationTicks -State 'READY' -ObservedExitCode $null
     Write-WitnessExclusive -OriginalRoot $Root -ExpectedRoot $rootPath -Leaf $readyLeaf -Payload $readyPayload
     $readyPublished = $true
+    Write-ObserverStageMarker -Stage 'ready-published'
     $terminalState = 'failure'
 
     $deadline = [System.Diagnostics.Stopwatch]::StartNew()
@@ -336,6 +368,7 @@ if ($canPublish -and -not $resultPublished) {
         Write-WitnessExclusive -OriginalRoot $Root -ExpectedRoot $rootPath `
             -Leaf ($RequestNonce + '.result.json') -Payload $resultPayload
         $resultPublished = $true
+        Write-ObserverStageMarker -Stage 'result-published'
     }
     catch {
         $scriptExitCode = 2

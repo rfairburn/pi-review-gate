@@ -537,12 +537,19 @@ action is admitted, and the remembered active entry becomes the active Main
 input owner only when no deliberate user action happened while restoration was
 still running, so a slow restoration can never take over a user's own focus or
 action. Each **New session** has one explicit **Workspace** field, one **Provider**
-line, and one **Host** line; there is no separate host display-label field. The
+line, and one **Host** line, drawn in that order from top to bottom as **Host**,
+**Provider**, then the field; there is no separate host display-label field. The
 Provider line names **Pi** every time the form opens, so a native
 **Claude Code**/**Codex CLI** row is always a deliberate choice (see
-[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). `Shift+Tab`
-moves **Workspace** → **Host** → **Provider**, `Tab` from **Provider** returns to
-**Workspace**, and `Up`/`Down` cycle the displayed choice on the focused line; a click
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). Its
+offered choices belong to the destination currently selected on the **Host** line:
+a Local choice offers this host's own targets, a remote choice offers only that
+owner's advertised targets, and an explicit native choice is never reinterpreted
+for another destination or a replaced owner run — it is dropped and stated, never
+quietly turned into Pi. `Shift+Tab`
+moves **Workspace** → **Provider** → **Host** — or **Workspace** → **Host** directly
+when no Provider line is drawn — and `Tab` steps back down through **Provider** to
+**Workspace**; `Up`/`Down` cycle the displayed choice on the focused line; a click
 on the **Provider** label focuses it, and a click on its value cycles from the
 presentation currently drawn. The **Provider** line appears only while that host
 offers native targets and the pane has one row to spare that displaces neither the
@@ -814,13 +821,23 @@ A native row is deliberately a plain provider child rather than a Pi child:
 - It carries no review gate, no tool protection, and none of the subtask
   capture/review/landing guarantees, and it is never presented as a review-gate-managed
   worker.
-- Native rows are created **locally only**. Choosing a native provider while the
-  **Host** line names a connected destination is refused in the form: nothing is sent,
-  and it shows `<provider> is local only; choose Local or Pi`. `SessionSpawn`, remote
-  owner-create, the Saved picker, and the standalone launchers keep creating Pi
-  sessions unchanged, and a native row contributes nothing to the saved-conversation
-  censuses. A remote viewer cannot type into a native row: that row has no registration
-  to fence an input scope against.
+- Native rows are created by **this host** and by **one connected owner that
+  advertises its own native targets**. Locally, the Provider line offers this
+  host's configured targets. When the **Host** line names a connected destination,
+  the same line offers only that owner's advertised catalog — never this host's own
+  configured ids, and never a blend — and submitting sends one native owner-create
+  request instead of a Pi one (see
+  [Remote native create and host row name](#remote-native-create-and-host-row-name)).
+  An owner that advertises nothing draws no Provider line at all and keeps its
+  ordinary Pi-only behavior. `SessionSpawn`, the Saved picker, and the standalone
+  launchers keep creating Pi sessions unchanged, and a native row contributes
+  nothing to the saved-conversation censuses. An authorized remote viewer **can**
+  type into a native row: the owner hands that viewer's keys, canonical mouse
+  packets, and whole pastes to the row's PTY raw under the negotiated
+  `native-input-cli-v1` capability, exactly as its own Main types them (see
+  [Native input and copy](#native-input-and-copy)). That is terminal-process
+  control only — a hosted native source is refused by the copy route rather than
+  producing a clipboard write.
 - Each new session selects its native target again: the chosen target id, its
   executable, arguments, and environment are not persisted, so a later form cannot
   silently reuse them.
@@ -1558,6 +1575,70 @@ persistence are unchanged. `SessionSpawn` is not replaced: it stays the native,
 owner-bound tool described above. Remote New does not add or require a network
 `SessionSpawn` RPC.
 
+### Remote native create and host row name
+
+Two **independent** optional capabilities extend that same paired roster channel:
+`roster-native-v1` starts a native row on the owner, and `roster-native-name-v1`
+renames one of the owner's native rows. Each is acknowledged only when the owner
+really holds the matching provider, and one never implies the other: an owner can
+start native rows and still refuse to name them. An unnegotiated peer sees the
+pre-native wire schema exactly as before, and neither lane adds a listener, queue,
+replay cache, registry, permission kind, or stored state.
+
+**Starting a native row on an owner.** The New form's **Provider** line is scoped to
+the destination selected on the **Host** line. A Local choice offers this host's own
+configured targets; a remote choice offers only the catalog that owner advertises,
+with its own labels and ids, and this host's configured ids are never merged in or
+substituted. The choice is part of the written form the writer actually committed:
+submission requires that exact frame — its host identity, owner run, canonical
+workspace, pane geometry, and the drawn provider identity — and one request receipt
+consumed before dispatch. The request then names the exact owner run, that one
+backend, that one advertised target id, and the workspace, and the owner reuses the
+same manager, run identity, and native launch path as its own local New with only
+the workspace. No target is ever selected, activated, or focused, and a native
+remote create never becomes a Pi create.
+
+A native choice never survives into a destination it was not made for. Changing the
+**Host** line, reconnecting, a replacement owner run, or a target the owner withdrew
+makes the old choice inapplicable: it is dropped and stated, and the submission is
+refused rather than quietly reinterpreted as a Local id of the same name or as Pi.
+An owner that advertises no target draws no Provider line and keeps its ordinary
+Pi-only path, and a remote destination whose channel never negotiated the native
+lane reports one fixed unsupported notice and sends nothing.
+
+**Naming one of the owner's native rows.** A native row's host-side name is a
+different operation from renaming a Pi conversation, and the two never share a
+request. The sidebar offers it only for a row the owner itself reported as native:
+the backend travels as typed roster metadata from the owner, and nothing is ever
+inferred from a caption, a label, a missing status, or this host's local
+configuration. `e` on such a row opens the same shared Edit form, and the request
+carries only the exact owner run, the row id, the observed backend, and the bounded
+replacement caption — no Pi conversation id, session id, or title. The owner applies
+its own existing rename rule to its own row and answers with one of four distinct
+truths: renamed and saved, renamed for this run only, refused, or unknown. The
+requester states each of those separately and never claims a saved name for a
+temporary one, never edits its own caption in advance, and never falls back to the
+Pi rename, a local mutation, or a reconnect. An unknown answer stays
+`UNCERTAIN: the host may have renamed that row; verify its current name before
+retrying` and is never retried automatically. A row the owner never reported as
+native, an owner that did not acknowledge this lane, a row, backend, or run that
+moved while the form was open, and a lost reply are each refused or reported
+truthfully, and none of them reaches a Pi rename.
+
+**What this scope does not claim.** These two lanes are transport and UI, not
+provider acceptance. Remote typing into a native row already exists on its own
+authenticated, consented, host-mediated lane — `native-input-cli-v1` delivers an
+authorized viewer's keys, canonical mouse packets, and whole pastes to that row's
+PTY raw, exactly as the owner's own Main types them, and it is refused by the copy
+route rather than producing a clipboard write (see
+[Native input and copy](#native-input-and-copy)). What remains unproven, and is
+stated as pending on
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows), is
+real-provider acceptance: a real Claude Code or Codex CLI actually starting and
+behaving correctly on a paired owner over a real network, remote clipboard with a
+native row, and Windows. A native row still has no status registration and carries
+no review-gate or tool-protection guarantee.
+
 ### Saved conversations on a connected owner
 
 The Saved picker can show the complete saved-conversation catalog of one chosen
@@ -2000,7 +2081,8 @@ and its current Pi editing bindings. A New form whose Host line names a
 destination keeps the same native editing bindings but no requester filesystem
 completion, and its Workspace text is forwarded verbatim. The form's single Host
 line is one host-owned selection control: Shift+Tab moves the form focus to it,
-Tab or one fresh Escape returns to the Workspace editor, and Up/Left and
+when no Provider line is drawn (with a drawn Provider line it takes a second
+Shift+Tab), Tab or one fresh Escape returns to the Workspace editor, and Up/Left and
 Down/Right step through Local and the connected saved destinations while it
 holds that focus. Every other press there is consumed instead of editing the
 hidden Workspace text, and a bracketed paste is consumed too. A single left
@@ -2519,7 +2601,10 @@ off.
 Negotiation is explicit: `native-input-copy-v1` is offered only when Main
 supplied the callbacks, and knowing or acknowledging the identifier grants no
 authority. The separate optional `native-input-startup-v1` capability depends on
-it and is never negotiated without it (see **Startup input** below). The owner
+it and is never negotiated without it (see **Startup input** below). The separate
+optional `native-input-cli-v1` capability depends on it the same way and covers
+rows the owner hosts as a native CLI child (see **Hosted provider input**
+below). The owner
 side binds one viewer to one existing content subscription and states a
 host-written source; the viewer side only describes and submits against that
 exact source. On the child side, the bridge requests bootstrap mode `1` and
@@ -2652,6 +2737,24 @@ Pi's native trust decision and its persistence are unchanged: there is no
 automatic trust, no Pi patch, and no new API. Copy is unsupported during
 startup. An asynchronous copy begun during startup can neither become a local
 copy nor complete as a remote one after the phase ends.
+
+**Hosted provider input.** A row the owner hosts as a native CLI child (`claude`
+or `codex`) has no Pi registration, no bootstrap readiness, and no per-
+registration encoder, so when both sides negotiated `native-input-cli-v1` an
+authorized viewer's keys, canonical mouse packets, and whole pastes are handed to
+that row's PTY raw, exactly as the owner's own Main types them. The source states
+phase `native-cli` and the recorded backend, and carries no native session field
+and no registration field, under a source token domain separate from both Pi
+families. Its commitment key is private to the current process incarnation, so a
+replaced child invalidates every identical public fact rather than accepting a
+re-labelled handle; an exit, a stop, a removed row, or a retired viewer yields no
+source at all. This is terminal-process control only: it is never a claim about
+provider conversation state, it never authorizes a copy, and a hosted source is
+refused by the copy route instead of producing a clipboard write. All other fences
+above still apply, including the per-viewer Remote input/copy setting. A channel
+that never negotiated the capability publishes no hosted source, and hosted input
+sent without negotiating it is a protocol violation that writes zero bytes. Older
+and unnegotiated peers keep their existing display-only behavior.
 
 **Text copy.** Only the exact initiating viewer receives a completed copy; there
 is no owner outer-terminal or local clipboard fallback, broadcast, raw OSC 52

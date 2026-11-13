@@ -42,6 +42,7 @@
 import { isRecord } from "../../record-guard";
 import { redactSensitiveText } from "../../redaction";
 import type { InstanceLifecycle, NativeInstanceView } from "../instances";
+import { isSessionBackend, type SessionBackend } from "../session-backend";
 import {
   MAX_ACTIVITY_LINE_LENGTH,
   MAX_ACTIVITY_LINES,
@@ -130,6 +131,19 @@ export interface RemoteSessionMetadata {
   readonly exitCode?: number;
   /** Bounded, terminal-safe, redacted diagnostic text; absent when none. */
   readonly error?: string;
+  /**
+   * The owner's typed backend identity for this row, present only when the owner
+   * row reports one AND the peer negotiated the native capability. It is the
+   * closed {@link SessionBackend} set and nothing else: a viewer never infers a
+   * backend from a label, a native session, or the absence of Pi telemetry, and
+   * an unknown value is a malformed row rather than a row to guess about.
+   *
+   * Absence means the legacy Pi row exactly as every row written before native
+   * CLI hosting — it is the documented compatibility rule, not an observation
+   * this boundary invented. A peer that never negotiated the capability is never
+   * handed the field, so its strict decoder keeps the pre-native row shape.
+   */
+  readonly backend?: SessionBackend;
 }
 
 /** Owner-side projection options for one roster row. */
@@ -140,6 +154,13 @@ export interface RemoteSessionMetadataProjectionOptions {
    * false keeps the legacy row shape.
    */
   readonly rosterSlotId?: boolean;
+  /**
+   * Carry the owner's typed backend identity for this row. The owner sets this
+   * only for a peer that negotiated the native capability; absent or false keeps
+   * the legacy row shape exactly. It copies what the owner row already reports —
+   * it never derives a backend from anything else on the row.
+   */
+  readonly backend?: boolean;
 }
 
 export type RemoteSessionMetadataErrorCode = "ROSTER_ROW_INVALID" | "ROSTER_ROW_TOO_LARGE";
@@ -230,6 +251,23 @@ function readRosterSlotId(value: unknown): string | undefined {
   if (codePointCount(value) > MAX_REMOTE_ROSTER_SLOT_ID_CHARS) oversizedRow();
   if (Buffer.byteLength(value, "utf8") > MAX_REMOTE_ROSTER_SLOT_ID_BYTES) oversizedRow();
   if (UNSAFE_TEXT_RE.test(value)) invalidRow();
+  return value;
+}
+
+/**
+ * The closed backend identity, or honest absence.
+ *
+ * Absence is the legacy Pi row. Every PRESENT value must be a member of the closed
+ * {@link SessionBackend} set; nothing here normalizes, aliases, case-folds, infers,
+ * or converts a foreign value into absence, so an unknown backend — including a
+ * null — is a malformed row rather than a row silently re-typed or quietly
+ * laundered into the legacy shape. That last point is load-bearing: the viewer
+ * decides whether an owner widened the row schema without negotiating it, and a
+ * decoder that dropped the key first would hide exactly that.
+ */
+function readBackend(value: unknown): SessionBackend | undefined {
+  if (value === undefined) return undefined;
+  if (!isSessionBackend(value)) invalidRow();
   return value;
 }
 
@@ -500,6 +538,7 @@ const ALLOWED_ROW_KEYS: ReadonlySet<string> = new Set([
   "id",
   "rosterSlotId",
   "label",
+  "backend",
   "workspace",
   "lifecycle",
   "hasLiveProcess",
@@ -538,16 +577,18 @@ const REQUIRED_ROW_KEYS: readonly string[] = [
 function buildRow(
   row: object,
   rejectUnknownNativeKeys: boolean,
-  allowRosterSlotId: boolean,
+  carry: { readonly rosterSlotId: boolean; readonly backend: boolean },
 ): RemoteSessionMetadata {
   const record = row as Record<string, unknown>;
   const exitCode = readExitCode(ownField(record, "exitCode"));
   const error = readError(ownField(record, "error"));
-  const rosterSlotId = allowRosterSlotId ? readRosterSlotId(ownField(record, "rosterSlotId")) : undefined;
+  const rosterSlotId = carry.rosterSlotId ? readRosterSlotId(ownField(record, "rosterSlotId")) : undefined;
+  const backend = carry.backend ? readBackend(ownField(record, "backend")) : undefined;
   return {
     id: requiredText(ownField(record, "id"), MAX_REMOTE_ROW_ID_BYTES),
     ...(rosterSlotId === undefined ? {} : { rosterSlotId }),
     label: requiredText(ownField(record, "label"), MAX_REMOTE_LABEL_BYTES, MAX_REMOTE_LABEL_CHARS),
+    ...(backend === undefined ? {} : { backend }),
     workspace: requiredExactText(ownField(record, "workspace"), MAX_REMOTE_WORKSPACE_BYTES),
     lifecycle: readLifecycle(ownField(record, "lifecycle")),
     hasLiveProcess: readBoolean(ownField(record, "hasLiveProcess")),
@@ -575,14 +616,18 @@ function buildRow(
  * The owner's roster slot is carried only when the caller says the peer
  * negotiated it. An unrequested projection is exactly the pre-#477 row, so a
  * peer that never acknowledged the capability can never be handed an unknown
- * field by this boundary.
+ * field by this boundary. The typed backend identity is carried the same way and
+ * only ever copies what the owner row itself reports.
  */
 export function toRemoteSessionMetadata(
   view: NativeInstanceView,
   options?: RemoteSessionMetadataProjectionOptions,
 ): RemoteSessionMetadata {
   try {
-    return buildRow(view, false, options?.rosterSlotId === true);
+    return buildRow(view, false, {
+      rosterSlotId: options?.rosterSlotId === true,
+      backend: options?.backend === true,
+    });
   } catch (error) {
     if (error instanceof RemoteSessionMetadataError) throw error;
     // A hostile/odd property read must not leak raw exception detail.
@@ -606,7 +651,10 @@ export function parseRemoteSessionMetadata(value: unknown): RemoteSessionMetadat
     for (const key of REQUIRED_ROW_KEYS) {
       if (!Object.prototype.hasOwnProperty.call(record, key)) return null;
     }
-    return buildRow(record, true, true);
+    // The strict decoder accepts the optional native fields so a negotiated
+    // transfer round-trips; an un-negotiated owner never emits them, and an
+    // unknown backend value is still a malformed row rather than a guess.
+    return buildRow(record, true, { rosterSlotId: true, backend: true });
   } catch {
     return null;
   }

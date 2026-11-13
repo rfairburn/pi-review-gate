@@ -68,7 +68,8 @@ function recordingHosting(calls: LaunchCall[]) {
 function submitNativeNew(harness: ReturnType<typeof createHarness>, workspace: string, cycles: number): void {
   harness.terminal.emitInput(ENTER); // the selected New session row
   harness.terminal.emitInput("\x15"); // replace any retained draft
-  harness.terminal.emitInput(SHIFT_TAB); // the form's Host line
+  // The New form draws Host, then Provider, then Workspace: one Shift+Tab from
+  // the workspace field lands on the Provider line drawn directly above it.
   harness.terminal.emitInput(SHIFT_TAB); // the form's Provider line
   for (let index = 0; index < cycles; index += 1) harness.terminal.emitInput(DOWN);
   harness.terminal.emitInput(TAB); // back to the workspace field

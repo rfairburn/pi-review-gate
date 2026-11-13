@@ -120,6 +120,7 @@ import type {
 	NativeViewerInputRequest,
 	NativeViewerInputResult,
 	NativeViewerInputSource,
+	NativeViewerNativeCliInputSource,
 	OwningHostInventorySnapshot,
 	OwningHostInputReadinessWatch,
 	OwningHostService,
@@ -136,6 +137,7 @@ import {
 	NATIVE_TEXT_PASTE_MAX_BYTES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
@@ -146,6 +148,7 @@ import {
 	createNativeInputAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoNativeCliSource,
 	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	negotiateSessionContentHello,
@@ -156,6 +159,7 @@ import {
 	type NativeIoBuiltTransfer,
 	type NativeIoCompletedInput,
 	type NativeIoInputSource,
+	type NativeIoNativeCliSource,
 	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentBuiltTransfer,
@@ -503,6 +507,8 @@ function toNativeIoSource(lower: NativeViewerInputSource | undefined): NativeIoS
 	if (!lower) return null;
 	// A startup scope is never a conversation (copy) source, whatever else it says.
 	if (isLowerStartupSource(lower)) return null;
+	// Neither is a hosted native CLI scope: that row has no conversation to copy from.
+	if (isLowerNativeCliSource(lower)) return null;
 	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
 	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
 	return Object.freeze({
@@ -527,13 +533,49 @@ function isLowerStartupSource(lower: NativeViewerAnyInputSource): boolean {
 	return (lower as { readonly phase?: unknown }).phase === "startup";
 }
 
+/** True for the owner-private hosted native CLI variant of an input-path scope. */
+function isLowerNativeCliSource(lower: NativeViewerAnyInputSource): boolean {
+	return (lower as { readonly phase?: unknown }).phase === "native-cli";
+}
+
 /**
- * Map the owner-private current INPUT scope (conversation or startup) to the exact
- * wire shape a peer may echo. A startup scope maps to the tuple-less startup wire
+ * Map the owner-private current INPUT scope of one hosted provider CLI row to the
+ * exact wire shape a peer may echo: run, owner row, the explicit `native-cli` phase,
+ * the row's recorded backend, canonical geometry, viewer revision, and the
+ * host-minted token. The private viewer id stays owner-only, and the process
+ * incarnation the token commits to never appears at all — only the owner holds its
+ * key, so the wire can neither name nor choose a child process.
+ */
+function toNativeIoNativeCliSource(lower: NativeViewerNativeCliInputSource): NativeIoNativeCliSource | null {
+	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
+	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
+	if (lower.backend !== "claude" && lower.backend !== "codex") return null;
+	return Object.freeze({
+		hostRunId: lower.hostRunId,
+		sessionId: lower.rowId,
+		phase: "native-cli" as const,
+		backend: lower.backend,
+		geometry: Object.freeze({
+			cols: lower.geometry.cols,
+			rows: lower.geometry.rows,
+			revision: lower.geometry.revision,
+		}),
+		viewerRevision: lower.viewerRevision,
+		sourceToken: lower.sourceToken,
+	});
+}
+
+/**
+ * Map the owner-private current INPUT scope (conversation, startup, or hosted native
+ * CLI) to the exact wire shape a peer may echo. A startup scope maps to the tuple-less
+ * startup wire source and a native CLI scope to the tuple-less `native-cli` wire
  * source; nothing here fabricates a tuple, and owner-only identity stays private.
  */
 function toNativeIoInputSource(lower: NativeViewerAnyInputSource | undefined): NativeIoInputSource | null {
 	if (!lower) return null;
+	if (isLowerNativeCliSource(lower)) {
+		return toNativeIoNativeCliSource(lower as NativeViewerNativeCliInputSource);
+	}
 	if (!isLowerStartupSource(lower)) return toNativeIoSource(lower as NativeViewerInputSource);
 	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
 	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
@@ -760,6 +802,12 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * peer-sent startup source is a protocol violation.
 	 */
 	#startupInputNegotiated = false;
+	/**
+	 * True only when THIS channel ALSO negotiated hosted native CLI input (which
+	 * depends on native IO). Without it no `native-cli` source is ever published and a
+	 * peer-sent one is a protocol violation.
+	 */
+	#nativeCliInputNegotiated = false;
 	/** The one native input assembly belonging to the current subscription. */
 	#inputAssembler: NativeInputAssembler | null = null;
 	/** The open paged paste's identifier, while one is open. */
@@ -1015,6 +1063,9 @@ class OwnerBinding implements SessionContentChannelBinding {
 			// acknowledge it alone.
 			if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)) {
 				this.#startupInputNegotiated = true;
+			}
+			if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
+				this.#nativeCliInputNegotiated = true;
 			}
 		}
 		this.#state = "ready";
@@ -1468,12 +1519,14 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 */
 	#nativeIoOffer(): SessionContentNegotiationOptions | undefined {
 		if (this.#provider === null) return undefined;
-		// The strict manager seam implements startup-phase input, so it is offered
-		// beside (and only beside) native IO; an older peer simply never gets it.
+		// The strict manager seam implements startup-phase input and hosted native CLI
+		// input, so both are offered beside (and only beside) native IO; an older peer
+		// simply never gets them.
 		return {
 			supportedOptionalCapabilities: [
 				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+				SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 			],
 		};
 	}
@@ -1498,6 +1551,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 			&& isNativeIoStartupSource(frame.source) && !this.#startupInputNegotiated) {
 			// Startup data on a channel that never negotiated it is not a stale input:
 			// it is a protocol violation, refused without touching any child.
+			this.#violation();
+			return;
+		}
+		if ((frame.type === "input" || frame.type === "input_begin")
+			&& isNativeIoNativeCliSource(frame.source) && !this.#nativeCliInputNegotiated) {
+			// Hosted native CLI input on a channel that never negotiated it is treated
+			// the same way: no byte reaches any child and the lane fails closed.
 			this.#violation();
 			return;
 		}
@@ -1992,6 +2052,8 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (lower === undefined || wire === null) return null;
 		// A startup scope is a target only on a channel that negotiated startup input.
 		if (isNativeIoStartupSource(wire) && !this.#startupInputNegotiated) return null;
+		// A hosted native CLI scope is a target only on a channel that negotiated it.
+		if (isNativeIoNativeCliSource(wire) && !this.#nativeCliInputNegotiated) return null;
 		if (lower.hostRunId !== this.#subscriptionRun || lower.rowId !== this.#sessionId) return null;
 		if (!nativeIoSourceEquals(expected, wire)) return null;
 		const modes = this.#inputModes;
@@ -2131,16 +2193,23 @@ class OwnerBinding implements SessionContentChannelBinding {
 		const viewerId = this.#viewerId;
 		if (provider === null || !this.#nativeIoNegotiated || viewerId === null) return null;
 		if (snapshot.hostRunId !== this.#subscriptionRun || snapshot.sessionId !== this.#sessionId) return null;
-		// A publish that names no native conversation may state ONLY a startup source,
-		// and only on a channel that negotiated it; a v1-only peer keeps the exact
-		// tuple-less publish with no source.
-		if (snapshot.nativeSession === null && !this.#startupInputNegotiated) return null;
+		// A publish that names no native conversation may state ONLY a startup source
+		// or a hosted native CLI source, and only on a channel that negotiated that
+		// variant; a v1-only peer keeps the exact tuple-less publish with no source.
+		if (snapshot.nativeSession === null && !this.#startupInputNegotiated && !this.#nativeCliInputNegotiated) {
+			return null;
+		}
 		const wire = toNativeIoInputSource(provider.readSource(viewerId));
 		if (wire === null) return null;
 		if (wire.hostRunId !== snapshot.hostRunId || wire.sessionId !== snapshot.sessionId) return null;
 		if (isNativeIoStartupSource(wire)) {
-			// Never stamped onto a publish that carries a tuple.
-			if (snapshot.nativeSession !== null) return null;
+			// Never stamped onto a publish that carries a tuple, and never stated on a
+			// channel that did not negotiate startup input.
+			if (snapshot.nativeSession !== null || !this.#startupInputNegotiated) return null;
+		} else if (isNativeIoNativeCliSource(wire)) {
+			// Same rule for a hosted provider child: no tuple to stamp, and no source on
+			// a channel that did not negotiate native CLI input.
+			if (snapshot.nativeSession !== null || !this.#nativeCliInputNegotiated) return null;
 		} else if (snapshot.nativeSession === null
 			|| wire.nativeSession.sessionId !== snapshot.nativeSession.sessionId
 			|| wire.nativeSession.epoch !== snapshot.nativeSession.epoch) {
@@ -2220,8 +2289,10 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (!this.#authorize()) return;
 		const currentScope = this.#provider.readSource(viewerId);
 		// A startup scope is never a copy scope: no conversation exists to attribute a
-		// copy to, so nothing is routed against it.
-		if (currentScope === undefined || isLowerStartupSource(currentScope)) {
+		// copy to, so nothing is routed against it. The same holds for a hosted native
+		// CLI scope: that row has no copy producer and its input source is input-only.
+		if (currentScope === undefined || isLowerStartupSource(currentScope)
+			|| isLowerNativeCliSource(currentScope)) {
 			this.#diagnostic("copy_dropped");
 			return;
 		}

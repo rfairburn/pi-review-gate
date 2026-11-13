@@ -74,10 +74,22 @@
  * be returned to exactly the viewer whose input caused it. It is descriptive and
  * echoable, never a grant: authority stays with the host's own live-record, mode,
  * and current-fact checks, and a token can never choose a target on its own.
+ *
+ * Two further commitment families live here for input scopes that name NO Pi
+ * conversation: {@linkcode mintNativeViewerStartupScopeToken} (a framed Pi row's
+ * explicit startup phase) and
+ * {@linkcode mintNativeViewerNativeCliScopeToken} (one hosted provider CLI row's
+ * current owned PTY process incarnation). Each has its own tag, its own
+ * commitment domain, and its own key derivation, so a token of one family never
+ * parses or verifies as another. The native CLI family is the one family whose key
+ * material is NOT a Pi registration: a hosted provider child has no bootstrap and
+ * no token, so its scope key derives from an owner-private per-incarnation secret
+ * the manager mints when it takes ownership of that child's PTY and never exposes.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isValidNativeSessionId, type SessionHostBootstrap } from "./protocol";
+import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 
 /**
  * Explicit origin of one logical dispatch. `none` is host query/reply and other
@@ -1118,6 +1130,145 @@ export function verifyNativeViewerStartupScopeToken(
   const received = (token as string).slice(STARTUP_SCOPE_TAG.length + handle.viewerId.length + 1);
   if (!SCOPE_COMMITMENT_PATTERN.test(received)) return false;
   const expected = Buffer.from(startupScopeCommitment(key, facts), "latin1");
+  const actual = Buffer.from(received, "latin1");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Native CLI process-incarnation viewer scope (separate commitment family)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The immutable facts one NATIVE CLI viewer scope token commits to: the same host
+ * run, viewer identity and revision, and row as the other two families, plus the
+ * row's positively recorded provider backend and its canonical geometry and
+ * revision — and NO native conversation field, NO registration identity, and NO
+ * registration generation, because a hosted provider child has none of those.
+ *
+ * The child process this scope is bound to is NOT a fact of its own: it is carried
+ * by the key the commitment is computed under, which only the owner holds. A token
+ * therefore proves nothing to a verifier that does not already hold that owner-side
+ * secret, and it never becomes a handle on a process. Terminal TEXT changes are
+ * absent for the same reason as the other families: output on an unchanged row
+ * never moves the input owner.
+ */
+export interface NativeViewerNativeCliScopeFacts {
+  readonly hostRunId: string;
+  readonly viewerId: string;
+  readonly viewerRevision: number;
+  readonly rowId: string;
+  readonly backend: NativeCliBackend;
+  readonly cols: number;
+  readonly rows: number;
+  readonly geometryRevision: number;
+}
+
+const NATIVE_CLI_SCOPE_TAG = "nvcli1.";
+/** One canonical native CLI scope token; it can never match the other two patterns. */
+const NATIVE_CLI_SCOPE_PATTERN = /^nvcli1\.([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.([0-9a-f]{32})$/;
+const NATIVE_CLI_SCOPE_DOMAIN = "pi-review-gate/native-input-viewer-native-cli-scope/v1\0";
+/** Key-derivation domain, so this family never shares key bytes with the other two. */
+const NATIVE_CLI_SCOPE_KEY_DOMAIN = "native-cli-incarnation-scope-key\0";
+/** Minimum owner-private incarnation secret; the manager mints exactly this size. */
+const NATIVE_CLI_INCARNATION_SECRET_BYTES = 32;
+
+function isValidNativeCliScopeFacts(value: unknown): value is NativeViewerNativeCliScopeFacts {
+  if (!isRecord(value) || !exactKeys(value, [
+    "hostRunId", "viewerId", "viewerRevision", "rowId", "backend", "cols", "rows", "geometryRevision",
+  ])) {
+    return false;
+  }
+  const viewerId: unknown = value.viewerId;
+  const cols: unknown = value.cols;
+  const rows: unknown = value.rows;
+  return scopeField(value.hostRunId)
+    && typeof viewerId === "string" && SCOPE_HANDLE_PATTERN.test(viewerId)
+    && scopeOrdinal(value.viewerRevision)
+    && scopeField(value.rowId)
+    && isNativeCliBackend(value.backend)
+    && scopeOrdinal(cols) && cols >= 1
+    && scopeOrdinal(rows) && rows >= 1
+    && scopeOrdinal(value.geometryRevision);
+}
+
+/**
+ * The one key material this family accepts: an owner-private, high-entropy secret
+ * for ONE PTY process incarnation. It is never derived from a row id, a PID, a
+ * path, or a launch command, so a replacement child that reuses all of them still
+ * gets a different key, and it never crosses the wire or a public view. A secret of
+ * the wrong shape mints and verifies nothing.
+ */
+function nativeCliScopeKey(incarnationSecret: unknown): Buffer | undefined {
+  if (!Buffer.isBuffer(incarnationSecret)
+    || incarnationSecret.length < NATIVE_CLI_INCARNATION_SECRET_BYTES) {
+    return undefined;
+  }
+  return createHmac("sha256", incarnationSecret)
+    .update(KEY_DOMAIN).update(NATIVE_CLI_SCOPE_KEY_DOMAIN)
+    .digest();
+}
+
+function nativeCliScopeCommitment(key: Buffer, facts: NativeViewerNativeCliScopeFacts): string {
+  // Every validated field is printable ASCII, a decimal ordinal, or one of the two
+  // closed backend names, so the NUL separators cannot appear inside a value and the
+  // encoding cannot be re-associated.
+  return createHmac("sha256", key)
+    .update(NATIVE_CLI_SCOPE_DOMAIN)
+    .update(facts.hostRunId).update("\0")
+    .update(facts.viewerId).update("\0")
+    .update(String(facts.viewerRevision)).update("\0")
+    .update(facts.rowId).update("\0")
+    .update(facts.backend).update("\0")
+    .update(String(facts.cols)).update("\0")
+    .update(String(facts.rows)).update("\0")
+    .update(String(facts.geometryRevision))
+    .digest("hex").slice(0, SCOPE_COMMITMENT_CHARS);
+}
+
+/**
+ * Mint one host-side NATIVE CLI viewer scope token, `nvcli1.<handle>.<32 hex>`,
+ * inside the existing opaque-origin bound, or undefined when the facts are
+ * incomplete or the owner-side secret is not one. It never parses or verifies as an
+ * `nvs1` conversation scope or an `nvst1` startup scope, so it can never select a
+ * copy destination or a Pi startup phase.
+ */
+export function mintNativeViewerNativeCliScopeToken(
+  incarnationSecret: Buffer, facts: NativeViewerNativeCliScopeFacts,
+): string | undefined {
+  if (!isValidNativeCliScopeFacts(facts)) return undefined;
+  const key = nativeCliScopeKey(incarnationSecret);
+  if (key === undefined) return undefined;
+  const token = `${NATIVE_CLI_SCOPE_TAG}${facts.viewerId}.${nativeCliScopeCommitment(key, facts)}`;
+  return token.length <= NATIVE_INPUT_VIEWER_SCOPE_TOKEN_CHARS ? token : undefined;
+}
+
+/** Canonical parse of one native CLI scope token; a lookup aid that authenticates nothing. */
+export function parseNativeViewerNativeCliScopeToken(token: unknown): NativeViewerScopeHandle | undefined {
+  if (typeof token !== "string") return undefined;
+  const match = NATIVE_CLI_SCOPE_PATTERN.exec(token);
+  if (match === null) return undefined;
+  return Object.freeze({ viewerId: match[1]! });
+}
+
+/**
+ * Verify a native CLI scope token against the CURRENT facts under the CURRENT
+ * incarnation secret, in constant time. A token minted for a replaced child's
+ * secret, another run, row, backend, viewer revision, or geometry revision verifies
+ * to false. True is only evidence that these facts held for THIS process
+ * incarnation; it grants nothing, and the caller still proves its own live
+ * ownership, liveness, and modes before writing.
+ */
+export function verifyNativeViewerNativeCliScopeToken(
+  incarnationSecret: Buffer, token: unknown, facts: NativeViewerNativeCliScopeFacts,
+): boolean {
+  if (!isValidNativeCliScopeFacts(facts)) return false;
+  const handle = parseNativeViewerNativeCliScopeToken(token);
+  if (handle === undefined || handle.viewerId !== facts.viewerId) return false;
+  const key = nativeCliScopeKey(incarnationSecret);
+  if (key === undefined) return false;
+  const received = (token as string).slice(NATIVE_CLI_SCOPE_TAG.length + handle.viewerId.length + 1);
+  if (!SCOPE_COMMITMENT_PATTERN.test(received)) return false;
+  const expected = Buffer.from(nativeCliScopeCommitment(key, facts), "latin1");
   const actual = Buffer.from(received, "latin1");
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }

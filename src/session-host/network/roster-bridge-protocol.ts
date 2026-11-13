@@ -80,6 +80,24 @@
  * through the owner's next complete authoritative roster snapshot. It adds no
  * listener, manager, grant, queue, replay cache, name store, or persisted state,
  * and the roster snapshot codec and packer are untouched by it.
+ *
+ * The optional owner NATIVE lane ({@link ROSTER_BRIDGE_NATIVE_CAPABILITY}) rides
+ * that same lane under the same rules and only when both sides acknowledged it
+ * AND this owner really holds both a native create provider and an explicit
+ * native target catalog. It carries three additive facts and no new connection:
+ * the owner's advertised target catalog on the `snapshot_end` frame, so it
+ * commits with exactly the rows it belongs to; the optional typed `backend`
+ * identity on rows the owner itself reports; and the rowless
+ * `create_native_request` / `create_native_result` exchange, which names one
+ * exact owner run, one canonical workspace, and one exact advertised backend and
+ * target id, and answers with the same closed create fact set. A descriptor
+ * carries no command, argument, environment, credential, executable path, role,
+ * or approval flag, and a target the owner never advertised is never created,
+ * defaulted, or reinterpreted from a requester-side configured id. The native
+ * exchange shares the Pi create's one-in-flight slot and one monotonic
+ * per-channel attempt number, so it cannot run beside a Pi create or reuse an
+ * attempt. On a channel that did not negotiate the lane none of these keys or
+ * frames exists, so an old peer's schema and row shape are unchanged.
  */
 
 import { isRecord } from "../../record-guard";
@@ -87,9 +105,24 @@ import { isOwnerCloseFacts, type OwnerCloseFacts } from "./peer-close";
 import {
   isOwnerCreateFacts,
   isOwnerCreateWorkspace,
+  copyRemoteNativeCliTargets,
   type OwnerCreateFacts,
+  type RemoteNativeCliTarget,
 } from "./peer-create";
-import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameRequest } from "./peer-rename";
+import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  isNativeDisplayName,
+  type NativeCliBackend,
+} from "../session-backend";
+import {
+  isOwnerNativeRenameFacts,
+  isOwnerRenameFacts,
+  type OwnerNativeRenameFacts,
+  type OwnerNativeRenameRequest,
+  type OwnerRenameFacts,
+  type OwnerRenameRequest,
+} from "./peer-rename";
 import { isValidNativeSessionId, isValidRenameName } from "../protocol";
 import {
   OWNER_SAVED_ENTRY_KEYS,
@@ -162,6 +195,43 @@ export const ROSTER_BRIDGE_RENAME_CAPABILITY = "roster-rename-v1";
  */
 export const ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY = "roster-slot-v1";
 /**
+ * Optional capability for the owner's NATIVE lane: the advertised native launch
+ * target catalog, the typed backend identity on rows, and the rowless native
+ * create exchange. It states only that this owner really holds BOTH an injected
+ * native create provider AND an explicit native target catalog; it is protocol
+ * support only, never authority, never a grant, and never a claim that a given
+ * target is available to a given peer. Every native create is still authorized,
+ * run-checked, checked against the owner's OWN current advertised catalog, and
+ * re-proved by that owner before its provider is reached.
+ *
+ * On a channel that did not negotiate it, none of the three native facts exists:
+ * no catalog is published, no row carries a backend, and no native create frame
+ * is representible, so an old peer sees the exact pre-native lane. The catalog
+ * and the row identity describe the owner's own configuration and confer nothing
+ * on the viewer: a target the owner never advertised can never be created, and a
+ * requester's own configured native target id is never reinterpreted here.
+ */
+export const ROSTER_BRIDGE_NATIVE_CAPABILITY = "roster-native-v1";
+/**
+ * Optional capability for the owner's separate HOST ROW NAME exchange
+ * (`rename_native_request` / `rename_native_result`). It states only that this
+ * owner really holds a native host-name provider ALONGSIDE the native create
+ * provider and target catalog of {@link ROSTER_BRIDGE_NATIVE_CAPABILITY}; it is
+ * protocol support only, never authority, never a grant, and never a claim that a
+ * given row may be named by a given peer. Every request is still authorized,
+ * run-checked, row- and backend-checked against the owner's OWN inventory, and
+ * re-proved by that owner immediately before it mutates anything.
+ *
+ * It is negotiated SEPARATELY from the native create lane on purpose: an owner may
+ * advertise and launch native targets while never accepting a remote caption, and
+ * a channel that did not negotiate it represents no native name frame at all, so
+ * an older or capability-narrower peer sees exactly the lane it negotiated. It
+ * never changes what {@link ROSTER_BRIDGE_NATIVE_CAPABILITY} means, and the
+ * separate Pi conversation rename exchange keeps its own capability and its
+ * unchanged semantics.
+ */
+export const ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY = "roster-native-name-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -172,6 +242,8 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -399,6 +471,18 @@ export interface RosterBridgeSnapshotEndFrame {
   readonly transferId: string;
   readonly revision: number;
   readonly totalRows: number;
+  /**
+   * The owner's advertised native launch targets, present only on a channel that
+   * negotiated {@link ROSTER_BRIDGE_NATIVE_CAPABILITY} and only when this owner
+   * really holds a catalog. They are committed with THIS complete snapshot, on
+   * the same frame that commits its rows, so a viewer never holds a catalog from
+   * one owner run beside rows from another, and a partial transfer never makes
+   * one reachable. Each entry is the closed `id`/`backend`/`label` descriptor and
+   * nothing else: no command, argument, environment, credential, path, or private
+   * configuration is expressible. Absence is honest — it is neither an empty
+   * catalog nor a default target.
+   */
+  readonly nativeCliTargets?: readonly RemoteNativeCliTarget[];
 }
 
 export interface RosterBridgeUnsubscribeFrame {
@@ -469,6 +553,46 @@ export interface RosterBridgeCreateResultFrame {
 }
 
 /**
+ * One owner-routed NATIVE create request.
+ *
+ * Like the Pi create it is rowless and names this owner's exact run, one
+ * canonical workspace, and this channel's strictly increasing attempt number.
+ * It additionally names one owner-ADVERTISED native target by its exact backend
+ * and id — the two fields the owner's own published catalog carried, matched as a
+ * pair. Nothing else is expressible: no arbitrary command, argument, executable,
+ * environment, credential, role, approval flag, requester-side configured id,
+ * row id, payload, path decision, native tuple, or display fact can ride along,
+ * and the owner resolves the identity only against its own current catalog.
+ */
+export interface RosterBridgeNativeCreateRequestFrame {
+  readonly type: "create_native_request";
+  /** This requester's fresh, unpredictable correlation id. */
+  readonly requestId: string;
+  /** Exact owner run id the request names and the result must still belong to. */
+  readonly hostRunId: string;
+  /** Canonical workspace text exactly as the requester's form held it. */
+  readonly workspace: string;
+  /** Backend of the exact owner-advertised target this request names. */
+  readonly backend: NativeCliBackend;
+  /** Exact owner-advertised target id. */
+  readonly targetId: string;
+  /** Strictly increasing, positive per-channel attempt number. */
+  readonly sequence: number;
+}
+
+/**
+ * One fixed owner answer for exactly one native create request id. It reports
+ * the SAME closed fact set as the Pi create, because what the owner could
+ * positively observe about a launched child is the same question; nothing here
+ * carries a native conversation id, a target, a backend, or owner text.
+ */
+export interface RosterBridgeNativeCreateResultFrame {
+  readonly type: "create_native_result";
+  readonly requestId: string;
+  readonly outcome: OwnerCreateFacts;
+}
+
+/**
  * One owner-routed rename of exactly one row of one run, fenced to that row's
  * native conversation tuple. Every identifier is opaque and bounded, the native
  * session id and the name are validated by the canonical native validators (the
@@ -496,6 +620,41 @@ export interface RosterBridgeRenameResultFrame {
   readonly type: "rename_result";
   readonly requestId: string;
   readonly outcome: OwnerRenameFacts;
+}
+
+/**
+ * One owner-routed HOST ROW NAME of exactly one row of one run.
+ *
+ * It names this owner's exact run, one exact row of that run, the native backend
+ * this side last OBSERVED on that row, the replacement caption, and this channel's
+ * strictly increasing attempt number. It is NOT the Pi rename frame: no native
+ * conversation id or epoch is expressible here, because a native CLI row has no
+ * conversation identity to fence. The backend is checked by the host's own closed
+ * native rule and the caption by its shared native display-name rule, so this lane
+ * can never carry a caption the owner would refuse to store or address a row it
+ * cannot name. Nothing else rides along: no workspace, path, saved-session file,
+ * agent directory, alias, host, endpoint, selection, viewer, payload, error,
+ * command, executable, argument, or environment value, and no previous name.
+ */
+export interface RosterBridgeNativeRenameRequestFrame extends OwnerNativeRenameRequest {
+  readonly type: "rename_native_request";
+  /** This requester's fresh, unpredictable correlation id. */
+  readonly requestId: string;
+  /** Strictly increasing, positive per-channel attempt number. */
+  readonly sequence: number;
+}
+
+/**
+ * One fixed owner answer for exactly one host-name request id. The fact set is
+ * closed and never carries a name, a row id, a backend, or any owner text: a named
+ * row becomes visible through the next complete authoritative roster snapshot only.
+ * The two success kinds are the owner's own per-operation persistence truth and are
+ * never collapsed into one another.
+ */
+export interface RosterBridgeNativeRenameResultFrame {
+  readonly type: "rename_native_result";
+  readonly requestId: string;
+  readonly outcome: OwnerNativeRenameFacts;
 }
 
 /**
@@ -663,8 +822,12 @@ export type RosterBridgeFrame =
   | RosterBridgeCloseResultFrame
   | RosterBridgeCreateRequestFrame
   | RosterBridgeCreateResultFrame
+  | RosterBridgeNativeCreateRequestFrame
+  | RosterBridgeNativeCreateResultFrame
   | RosterBridgeRenameRequestFrame
   | RosterBridgeRenameResultFrame
+  | RosterBridgeNativeRenameRequestFrame
+  | RosterBridgeNativeRenameResultFrame
   | RosterBridgeSavedFrame
   | RosterBridgeErrorFrame;
 
@@ -674,17 +837,25 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   subscribe: new Set(["type", "subscriptionId"]),
   snapshot_begin: new Set(["type", "subscriptionId", "transferId", "hostRunId", "revision", "totalRows", "pageCount"]),
   snapshot_page: new Set(["type", "subscriptionId", "transferId", "pageIndex", "rows"]),
-  snapshot_end: new Set(["type", "subscriptionId", "transferId", "revision", "totalRows"]),
+  snapshot_end: new Set(["type", "subscriptionId", "transferId", "revision", "totalRows", "nativeCliTargets"]),
   unsubscribe: new Set(["type", "subscriptionId"]),
   unsubscribed: new Set(["type", "subscriptionId"]),
   close_request: new Set(["type", "requestId", "hostRunId", "rowId", "confirmed"]),
   close_result: new Set(["type", "requestId", "outcome"]),
   create_request: new Set(["type", "requestId", "hostRunId", "workspace", "sequence"]),
   create_result: new Set(["type", "requestId", "outcome"]),
+  create_native_request: new Set([
+    "type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence",
+  ]),
+  create_native_result: new Set(["type", "requestId", "outcome"]),
   rename_request: new Set([
     "type", "requestId", "hostRunId", "rowId", "expectedSessionId", "expectedSessionEpoch", "name", "sequence",
   ]),
   rename_result: new Set(["type", "requestId", "outcome"]),
+  rename_native_request: new Set([
+    "type", "requestId", "hostRunId", "rowId", "backend", "name", "sequence",
+  ]),
+  rename_native_result: new Set(["type", "requestId", "outcome"]),
   saved_list_request: new Set(["type", "requestId", "hostRunId", "query", "offset", "count", "sequence"]),
   saved_search_request: new Set(["type", "requestId", "hostRunId", "catalogId", "query", "offset", "count", "sequence"]),
   saved_window_request: new Set(["type", "requestId", "hostRunId", "catalogId", "resultId", "offset", "count", "sequence"]),
@@ -716,10 +887,14 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
   close_result: new Set(["requestId", "outcome"]),
   create_request: new Set(["requestId", "hostRunId", "workspace", "sequence"]),
   create_result: new Set(["requestId", "outcome"]),
+  create_native_request: new Set(["requestId", "hostRunId", "workspace", "backend", "targetId", "sequence"]),
+  create_native_result: new Set(["requestId", "outcome"]),
   rename_request: new Set([
     "requestId", "hostRunId", "rowId", "expectedSessionId", "expectedSessionEpoch", "name", "sequence",
   ]),
   rename_result: new Set(["requestId", "outcome"]),
+  rename_native_request: new Set(["requestId", "hostRunId", "rowId", "backend", "name", "sequence"]),
+  rename_native_result: new Set(["requestId", "outcome"]),
   saved_list_request: new Set(["requestId", "hostRunId", "query", "offset", "count", "sequence"]),
   saved_search_request: new Set(["requestId", "hostRunId", "catalogId", "query", "offset", "count", "sequence"]),
   saved_window_request: new Set(["requestId", "hostRunId", "catalogId", "resultId", "offset", "count", "sequence"]),
@@ -814,6 +989,64 @@ function readCapabilities(value: unknown, bounds: RosterBridgeBounds): readonly 
 function readWorkspace(value: unknown): string {
   if (!isOwnerCreateWorkspace(value)) fail("bad_frame");
   return value;
+}
+
+/**
+ * Loop guard for one advertised native target catalog: the most entries a single
+ * complete frame could POSSIBLY carry. A JSON array of N entries occupies at
+ * least `N + 2` bytes (the two brackets plus at least one byte per entry), and a
+ * catalog only ever travels inside one `snapshot_end` frame, so nothing beyond
+ * this count is representible at all. It is derived from the existing
+ * `maxFrameBytes` transport bound and is NOT a product target-count limit: the
+ * authoritative ceiling stays the encoded frame fitting `maxFrameBytes` at the
+ * frame boundary. Its only job is to keep validation work finite before that
+ * boundary is reached, so a larger owner catalog is never refused merely because
+ * it exceeds some unrelated row or page count.
+ */
+export function rosterBridgeNativeCatalogMaxEntries(
+  bounds: RosterBridgeBounds = DEFAULT_ROSTER_BRIDGE_BOUNDS,
+): number {
+  return Math.max(0, bounds.maxFrameBytes - 2);
+}
+
+/**
+ * One advertised native target catalog: closed `id`/`backend`/`label` descriptors
+ * and nothing else. The host's own shared native rules decide the target id
+ * (bounded single-line text, the same rule the manager and sidebar apply) and the
+ * backend (the closed native set), so this lane never invents a second, narrower,
+ * or wider character class for a target the owner really configured. A command,
+ * argument, environment, credential, path, or any other extra field makes the
+ * whole frame malformed rather than being ignored.
+ *
+ * The ceiling is the transport's existing complete-frame byte bound, never the
+ * lane's per-page ROW bound: a catalog describes the owner's own configured
+ * targets, not the rows of one snapshot page, so an owner with more targets than
+ * a page of rows is carried whole. Only {@link
+ * rosterBridgeNativeCatalogMaxEntries} bounds the entry count here, and it is a
+ * frame-derived loop guard, not a product limit. The copied catalog is then
+ * measured in actual UTF-8 bytes against the SAME bound: an array whose own
+ * bytes already exceed one frame could never be carried by any frame, so this
+ * exported boundary refuses it rather than handing a byte-unrepresentable catalog
+ * to a direct caller. That measurement still omits the frame's own fields, so the
+ * authoritative all-or-nothing check remains the encoded `snapshot_end` frame
+ * fitting `maxFrameBytes` at the frame boundary — this reader accepting a catalog
+ * is never a claim that it can be sent, and a catalog that cannot be carried is
+ * refused whole rather than clipped, so a viewer is never offered a truncated
+ * choice list it would read as complete. Ids are unique, entries are copied into
+ * fresh frozen objects, and nothing is sorted or dropped.
+ */
+export function readRosterBridgeNativeCliTargets(
+  value: unknown,
+  bounds: RosterBridgeBounds = DEFAULT_ROSTER_BRIDGE_BOUNDS,
+): readonly RemoteNativeCliTarget[] {
+  const copied = copyRemoteNativeCliTargets(value, rosterBridgeNativeCatalogMaxEntries(bounds));
+  if (copied === null) fail("bad_frame");
+  // The catalog's own serialized bytes against the same transport bound. This
+  // cannot refuse anything the frame boundary would have accepted: the array is
+  // part of every frame that carries it, and re-serializing freshly copied
+  // descriptors is never longer than the text it was decoded from.
+  if (Buffer.byteLength(JSON.stringify(copied), "utf8") > bounds.maxFrameBytes) fail("bad_frame");
+  return copied;
 }
 
 /**
@@ -1203,6 +1436,9 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       if (!Number.isSafeInteger(frame.totalRows) || frame.totalRows < 0 || frame.totalRows > bounds.maxSnapshotRows) {
         fail("invalid_frame");
       }
+      // Re-prove the optional native catalog with the same reader the decoder
+      // uses, so this side can never encode a catalog its peer would refuse.
+      if (frame.nativeCliTargets !== undefined) readRosterBridgeNativeCliTargets(frame.nativeCliTargets, bounds);
       return frame;
     }
     case "close_request": {
@@ -1238,6 +1474,29 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       }
       return frame;
     }
+    case "create_native_request": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      readWorkspace(frame.workspace);
+      // The backend and target id are the two fields of one owner-advertised
+      // descriptor and are checked as such, never as free text: an unknown
+      // backend or a malformed id is a bad frame, not a candidate for a default.
+      if (!isNativeCliBackend(frame.backend)) fail("invalid_frame");
+      if (!isNativeCliTargetId(frame.targetId)) fail("invalid_frame");
+      // The anti-replay scalar is the SAME channel-wide counter the Pi create
+      // uses; the high-water comparison itself belongs to the two endpoints.
+      if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      return frame;
+    }
+    case "create_native_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!isOwnerCreateFacts(frame.outcome)) fail("invalid_frame");
+      if (frame.outcome.kind === "started") {
+        readIdentifier(frame.outcome.hostRunId, bounds.maxIdentifierBytes);
+        readIdentifier(frame.outcome.rowId, bounds.maxIdentifierBytes);
+      }
+      return frame;
+    }
     case "rename_request": {
       readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
       readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
@@ -1255,6 +1514,27 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       // The fact boundary is closed: exactly one fixed kind, never a name, an id,
       // an epoch, or owner text.
       if (!isOwnerRenameFacts(frame.outcome)) fail("invalid_frame");
+      return frame;
+    }
+    case "rename_native_request": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.rowId, bounds.maxIdentifierBytes);
+      // The backend is the owner's own closed native identity and the caption is
+      // its shared native display-name rule: an unknown backend or an unusable
+      // caption is a bad frame, never a candidate for a default or a rewrite.
+      if (!isNativeCliBackend(frame.backend)) fail("invalid_frame");
+      if (!isNativeDisplayName(frame.name)) fail("invalid_frame");
+      // The anti-replay scalar must be a positive safe integer; the per-channel
+      // high-water comparison itself belongs to the two endpoints.
+      if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      return frame;
+    }
+    case "rename_native_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      // The fact boundary is closed: one fixed kind, and never a name, a row id, a
+      // backend, or owner text.
+      if (!isOwnerNativeRenameFacts(frame.outcome)) fail("invalid_frame");
       return frame;
     }
     case "saved_list_request":
@@ -1369,12 +1649,18 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
       });
     }
     case "snapshot_end": {
+      const nativeCliTargets = ownField(record, "nativeCliTargets");
       return Object.freeze({
         type,
         subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
         transferId: readIdentifier(ownField(record, "transferId"), bounds.maxIdentifierBytes),
         revision: readInteger(ownField(record, "revision"), 1, Number.MAX_SAFE_INTEGER),
         totalRows: readInteger(ownField(record, "totalRows"), 0, bounds.maxSnapshotRows),
+        // Absent is honest absence; a present catalog is copied whole or the
+        // whole frame is refused. It is never trimmed to fit.
+        ...(nativeCliTargets === undefined
+          ? {}
+          : { nativeCliTargets: readRosterBridgeNativeCliTargets(nativeCliTargets, bounds) }),
       });
     }
     case "close_request": {
@@ -1424,6 +1710,41 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
           : Object.freeze({ kind: outcome.kind }),
       });
     }
+    case "create_native_request": {
+      const backend = ownField(record, "backend");
+      const targetId = ownField(record, "targetId");
+      // Both descriptor fields are validated by the host's own closed native
+      // rules: an unknown backend or a malformed target id is refused here, so no
+      // endpoint can be handed a target this protocol cannot name exactly.
+      if (!isNativeCliBackend(backend)) fail("bad_frame");
+      if (!isNativeCliTargetId(targetId)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        workspace: readWorkspace(ownField(record, "workspace")),
+        backend,
+        targetId,
+        sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+      });
+    }
+    case "create_native_result": {
+      const outcome = ownField(record, "outcome");
+      // The same closed fact set as the Pi create, and the same refusal of
+      // anything else: no backend, target, native tuple, or owner text rides along.
+      if (!isOwnerCreateFacts(outcome)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: outcome.kind === "started"
+          ? Object.freeze({
+            kind: "started" as const,
+            hostRunId: readIdentifier(outcome.hostRunId, bounds.maxIdentifierBytes),
+            rowId: readIdentifier(outcome.rowId, bounds.maxIdentifierBytes),
+          })
+          : Object.freeze({ kind: outcome.kind }),
+      });
+    }
     case "rename_request": {
       return Object.freeze({
         type,
@@ -1441,6 +1762,35 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
       // The fact boundary is closed: one fixed kind and nothing else. A reported
       // name, native tuple, path, or owner text cannot ride along.
       if (!isOwnerRenameFacts(outcome)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: Object.freeze({ kind: outcome.kind }),
+      });
+    }
+    case "rename_native_request": {
+      const backend = ownField(record, "backend");
+      const name = ownField(record, "name");
+      // Both are validated by the host's own closed native rules: an unknown
+      // backend or an unusable caption is refused here, so no endpoint can be
+      // handed a row or a name this protocol cannot state exactly.
+      if (!isNativeCliBackend(backend)) fail("bad_frame");
+      if (!isNativeDisplayName(name)) fail("bad_frame");
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        rowId: readIdentifier(ownField(record, "rowId"), bounds.maxIdentifierBytes),
+        backend,
+        name,
+        sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+      });
+    }
+    case "rename_native_result": {
+      const outcome = ownField(record, "outcome");
+      // Closed like the Pi rename's: one fixed kind and nothing else. A reported
+      // name, row id, backend, native tuple, or owner text cannot ride along.
+      if (!isOwnerNativeRenameFacts(outcome)) fail("bad_frame");
       return Object.freeze({
         type,
         requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
@@ -1660,6 +2010,13 @@ export interface RosterBridgeBuiltTransfer {
  * front so the sender can re-check its guards immediately before each write,
  * and the whole transfer is refused (never trimmed) when it cannot be
  * represented inside the agreed bounds.
+ *
+ * An explicit {@link RosterBridgeBuiltTransferOptions.nativeCliTargets} catalog
+ * rides the `snapshot_end` frame, so it commits with exactly these rows or not at
+ * all. It is validated by the same reader the decoder applies and the encoded end
+ * frame still has to fit the frame bound: a catalog that cannot be carried
+ * refuses the whole transfer rather than publishing a shortened choice list, an
+ * empty one, or none at all.
  */
 export function buildRosterBridgeTransfer(options: {
   readonly subscriptionId: string;
@@ -1668,6 +2025,8 @@ export function buildRosterBridgeTransfer(options: {
   readonly revision: number;
   readonly rows: readonly RemoteSessionMetadata[];
   readonly bounds?: RosterBridgeBounds;
+  /** Owner-advertised native targets, or `null`/absent when this owner has none. */
+  readonly nativeCliTargets?: readonly RemoteNativeCliTarget[] | null;
 }): RosterBridgeBuiltTransfer {
   const bounds = options.bounds ?? DEFAULT_ROSTER_BRIDGE_BOUNDS;
   if (!Number.isSafeInteger(options.revision) || options.revision < 1) fail("invalid_frame");
@@ -1694,6 +2053,9 @@ export function buildRosterBridgeTransfer(options: {
     transferId: options.transferId,
     revision: options.revision,
     totalRows,
+    ...(options.nativeCliTargets === undefined || options.nativeCliTargets === null
+      ? {}
+      : { nativeCliTargets: readRosterBridgeNativeCliTargets(options.nativeCliTargets, bounds) }),
   });
   const frames: Buffer[] = [encodeRosterBridgeFrame(begin, bounds)];
   for (const page of pages) {

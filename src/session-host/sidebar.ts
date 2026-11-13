@@ -192,7 +192,9 @@ import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSessio
 import {
   isNativeCliBackend,
   isNativeCliTargetId,
+  isNativeDisplayName,
   isSessionBackend,
+  MAX_NATIVE_DISPLAY_NAME_CHARS,
   sessionBackendDisplayLabel,
   type NativeCliBackend,
   type SessionBackend,
@@ -220,6 +222,7 @@ import {
   type PeerUiAction,
   type PeerUiConsent,
   type PeerUiHost,
+  type PeerUiHostNativeCli,
   type PeerUiHostSaved,
   type PeerUiSettings,
   type PeerUiSnapshot,
@@ -232,6 +235,7 @@ import {
   type PeerUiTrustedPeer,
 } from "./peer-ui-protocol";
 import { isOwnerSavedWindowFacts, type OwnerSavedWindowFacts } from "./network/peer-saved";
+import { findRemoteNativeCliTarget } from "./network/peer-create";
 import {
   sidebarScrollbarGeometry,
   sidebarScrollbarOffsetAt,
@@ -518,6 +522,26 @@ export type SidebarAction =
       readonly hostRunId: string;
       readonly workspace: string;
     }
+  /**
+   * One deliberate REMOTE New submission of a NATIVE session on the explicitly
+   * selected owner: exactly the destination host, the exact owner run this form's
+   * Host line named, the canonical workspace text the form held (forwarded
+   * verbatim — the owner resolves it against its OWN home and cwd), and the exact
+   * OWNER-ADVERTISED backend and target id the Provider line drew. It is never a
+   * local `create`, never a Pi create, and never a requester-side configured
+   * target id reinterpreted as the owner's same-named one.
+   */
+  | {
+      readonly type: "create-native-on-peer";
+      readonly requestId: number;
+      readonly formGeneration: number;
+      readonly renderToken: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly workspace: string;
+      readonly backend: NativeCliBackend;
+      readonly targetId: string;
+    }
   | {
       readonly type: "rename";
       readonly requestId: number;
@@ -527,8 +551,20 @@ export type SidebarAction =
       readonly name: string;
     }
   /**
-   * One deliberate REMOTE rename of the OWNER's session name. It names exactly
-   * the frozen owner target and native tuple this Edit form opened on, the
+   * One deliberate host-side NAME of one native CLI row: the row id this Edit
+   * form opened on plus the complete replacement caption. It is never a Pi
+   * `rename` — no conversation identity, session id, or epoch is involved — and
+   * the caption is never sent to a provider or typed into the child's input.
+   */
+  | {
+      readonly type: "rename-native";
+      readonly requestId: number;
+      readonly id: string;
+      readonly name: string;
+    }
+  /**
+   * One deliberate REMOTE rename of the OWNER's Pi CONVERSATION name. It names
+   * exactly the frozen owner target and native tuple this Edit form opened on, the
    * operator's complete replacement name, and the frozen id of the Edit frame
    * the writer actually wrote. It is never a local `rename`, never a local item
    * id, and Main never re-derives any of it from a later roster index or label.
@@ -543,6 +579,39 @@ export type SidebarAction =
       readonly rowId: string;
       readonly nativeSessionId: string;
       readonly nativeSessionEpoch: number;
+      readonly name: string;
+    }
+  /**
+   * One deliberate `E` on a remote card whose owner row is a NATIVE CLI row. It
+   * names the drawn exact owner target and that row's OBSERVED backend, and
+   * deliberately NO native conversation tuple: a native row has none, so this
+   * intent can never be answered by a Pi conversation rename. Main independently
+   * proves the written highlight, and the owner revalidates its own row.
+   */
+  | {
+      readonly type: "edit-remote-native";
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly backend: NativeCliBackend;
+    }
+  /**
+   * One deliberate HOST ROW NAME of one OWNER native row: the frozen owner target,
+   * the backend recorded when the shared Edit form opened, the complete replacement
+   * caption, and the frozen id of the Edit frame the writer actually wrote. It is
+   * never a Pi `rename-remote` (no conversation identity is involved), never a
+   * local `rename-native`, and the caption is never sent to a provider or typed
+   * into the owner's child.
+   */
+  | {
+      readonly type: "rename-native-remote";
+      readonly requestId: number;
+      readonly formGeneration: number;
+      readonly renderToken: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly backend: NativeCliBackend;
       readonly name: string;
     }
   | { readonly type: "quit" }
@@ -759,6 +828,15 @@ export interface SidebarMousePresentation {
    * grants nothing: Main needs its own written receipt for this exact value.
    */
   readonly remoteEdit?: SidebarRemoteEditRow;
+  /**
+   * The one completely drawn remote highlight eligible for a native HOST ROW NAME:
+   * a row whose owner reports the separate native-name capability, whose observation
+   * is current with an exact owner run, and whose row reports a native CLI backend.
+   * Undefined otherwise. Optional so an older captured presentation stays
+   * representable. Like `remoteEdit` it grants nothing: Main needs its own written
+   * receipt for this exact value.
+   */
+  readonly remoteNativeEdit?: SidebarRemoteNativeEditRow;
   /** Activates only entries captured by the exact sidebar render this token represents. */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
   /**
@@ -955,6 +1033,36 @@ export interface SidebarRemoteEditRow {
   /** Observed native conversation tuple of that same drawn row. */
   readonly nativeSessionId: string;
   readonly nativeSessionEpoch: number;
+  /** Pane row and complete card height this render actually drew. */
+  readonly row: number;
+  readonly height: number;
+  /** Pane geometry the card was drawn in. */
+  readonly cols: number;
+  readonly rows: number;
+  /** Focus domain of that render; only a roster-owned highlight can act. */
+  readonly focus: SidebarFocus;
+  /** Drawn title of this same row (UI text only, never identity). */
+  readonly title: string;
+  /** Bounded owner host label (UI text only). */
+  readonly hostLabel: string;
+}
+
+/**
+ * One completely drawn remote highlight eligible for a native HOST ROW NAME,
+ * captured at render time: the minimal owner target, the row's OBSERVED native
+ * backend, and the drawn row/geometry. It is the native sibling of
+ * {@link SidebarRemoteEditRow} and carries NO native conversation tuple, because
+ * a native row has none and this record must never be filled in with an invented
+ * one. Nothing here is authority — the owner revalidates its own row — and no
+ * local id is ever present.
+ */
+export interface SidebarRemoteNativeEditRow {
+  readonly hostId: string;
+  /** Exact observed owner run; empty/absent runs never produce this record. */
+  readonly hostRunId: string;
+  readonly rowId: string;
+  /** Native backend this side OBSERVED on that same drawn row. */
+  readonly backend: NativeCliBackend;
   /** Pane row and complete card height this render actually drew. */
   readonly row: number;
   readonly height: number;
@@ -1490,6 +1598,32 @@ function newFormProviderOptionKey(option: { readonly backend: SessionBackend; re
 }
 
 /**
+ * Identity of everything one snapshot says about the native provider scope of one
+ * destination: its connection state, how current its roster observation is, the
+ * exact owner run that observation belongs to, the destination fingerprint, and the
+ * catalog of native targets it advertises. Two snapshots that differ in any of it
+ * describe different scopes; the value is only ever compared with itself across
+ * consecutive snapshots, so it is never interpreted on its own.
+ */
+function nativeProviderScopeIdentityOf(
+  snapshot: PeerUiSnapshot | undefined,
+  hostId: string,
+): string {
+  if (snapshot === undefined) return "";
+  const host = (snapshot.hosts ?? []).find((candidate) => candidate.id === hostId);
+  if (host === undefined) return JSON.stringify([snapshot.identityFingerprint, null]);
+  return JSON.stringify([
+    snapshot.identityFingerprint,
+    host.state,
+    host.roster?.state ?? null,
+    host.roster?.hostRunId ?? null,
+    host.fingerprint,
+    host.nativeCli?.supported ?? null,
+    (host.nativeCli?.targets ?? []).map((target) => [target.backend, target.id, target.label]),
+  ]);
+}
+
+/**
  * Sanitize the native provider targets Main supplied for this host. A malformed
  * entry (a backend outside the closed set, an id the manager itself would
  * refuse at create, or a blank label) is dropped rather than guessed, and a
@@ -1539,6 +1673,9 @@ interface CreateFormCandidate {
   readonly hostId: string;
   readonly hostRunId: string | null;
   readonly workspace: string;
+  /** The drawn Provider line's choice identity (`pi`, `backend:targetId`), or
+   * undefined when this form drew no Provider line at all. */
+  readonly providerKey: string | undefined;
   /** Pane geometry this candidate was composed at. */
   readonly cols: number;
   readonly rows: number;
@@ -1560,6 +1697,16 @@ type EditFormTarget =
       readonly nativeSession: SessionHostNativeSession;
       readonly currentName: string;
     }
+  /**
+   * One native CLI row: a host-side caption only, so this branch carries the row
+   * id and a reference display snapshot and NO native conversation tuple. The
+   * provider is never told the caption and no Pi rename is attempted.
+   */
+  | {
+      readonly kind: "native";
+      readonly id: string;
+      readonly currentName: string;
+    }
   | {
       readonly kind: "remote";
       readonly hostId: string;
@@ -1567,6 +1714,25 @@ type EditFormTarget =
       readonly rowId: string;
       /** Observed native conversation identity, frozen at open. */
       readonly nativeSession: { readonly sessionId: string; readonly epoch: number };
+      readonly currentName: string;
+      /** Frozen bounded owner label drawn by the form (UI text only). */
+      readonly hostLabel: string;
+    }
+  /**
+   * One OWNER native CLI row: a host-side caption on the OWNER's row and nothing
+   * else. This branch carries the frozen exact owner target, the backend this side
+   * OBSERVED on that row, and a reference display snapshot — never a Pi
+   * conversation tuple, because a native row has none and this form must never
+   * manufacture one. The caption is never sent to a provider or typed into the
+   * owner's child, and it never becomes provider conversation identity.
+   */
+  | {
+      readonly kind: "remote-native";
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      /** The backend observed on that owner row; a fence, never a guess. */
+      readonly backend: NativeCliBackend;
       readonly currentName: string;
       /** Frozen bounded owner label drawn by the form (UI text only). */
       readonly hostLabel: string;
@@ -1579,35 +1745,66 @@ type EditFormTarget =
  * frame writer reports THIS candidate as written. `name` is the drawn
  * replacement draft, so a draft-only change still mints a new candidate needing
  * its own written boundary. Local Edit has no candidate at all.
+ *
+ * The candidate is TYPED: a Pi conversation rename frame carries the observed
+ * native conversation tuple it was opened on, and a native HOST ROW NAME frame
+ * carries the row's observed backend instead. The two are never merged into one
+ * optional-everything record, so a native frame can never be answered by a Pi
+ * rename that invented a tuple, and a Pi frame can never be answered as a
+ * caption.
  */
-interface EditFormCandidate {
-  readonly token: number;
-  readonly formGeneration: number;
-  readonly hostId: string;
-  readonly hostRunId: string;
-  readonly rowId: string;
-  readonly nativeSessionId: string;
-  readonly nativeSessionEpoch: number;
-  readonly name: string;
-  readonly cols: number;
-  readonly rows: number;
-  written: boolean;
-}
+type EditFormCandidate =
+  | {
+      readonly token: number;
+      readonly kind: "pi";
+      readonly formGeneration: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly nativeSessionId: string;
+      readonly nativeSessionEpoch: number;
+      readonly name: string;
+      readonly cols: number;
+      readonly rows: number;
+      written: boolean;
+    }
+  | {
+      readonly token: number;
+      readonly kind: "native";
+      readonly formGeneration: number;
+      readonly hostId: string;
+      readonly hostRunId: string;
+      readonly rowId: string;
+      readonly backend: NativeCliBackend;
+      readonly name: string;
+      readonly cols: number;
+      readonly rows: number;
+      written: boolean;
+    };
 
 /** The frozen public description of one drawn REMOTE Edit-form candidate. */
-export interface SidebarEditFormPresentation {
+type SidebarEditFormPresentationBody =
+  | {
+      readonly kind: "pi";
+      readonly nativeSessionId: string;
+      readonly nativeSessionEpoch: number;
+    }
+  | {
+      readonly kind: "native";
+      readonly backend: NativeCliBackend;
+    };
+
+export type SidebarEditFormPresentation = {
   readonly formGeneration: number;
   readonly renderToken: number;
   readonly hostId: string;
   readonly hostRunId: string;
   readonly rowId: string;
-  readonly nativeSessionId: string;
-  readonly nativeSessionEpoch: number;
   /** The replacement name draft that frame actually displayed. */
   readonly name: string;
   readonly cols: number;
   readonly rows: number;
-}
+} & SidebarEditFormPresentationBody;
 
 /** The frozen public description of one drawn New-form candidate. */
 export interface SidebarCreateFormPresentation {
@@ -1617,6 +1814,15 @@ export interface SidebarCreateFormPresentation {
   readonly hostId: string;
   readonly hostRunId: string | null;
   readonly workspace: string;
+  /**
+   * The drawn Provider line's choice identity, in the same form the submission
+   * echoes it: `pi`, or `backend:targetId`. It is part of what the writer
+   * committed, so a native remote submission can only ever be made for the
+   * provider this operator actually SAW, and a provider change retires the
+   * previous frame's receipt instead of letting it authorize a different launch.
+   * Absent means a form that drew no Provider line at all.
+   */
+  readonly providerKey?: string;
   readonly cols: number;
   readonly rows: number;
 }
@@ -2169,6 +2375,26 @@ export const REMOTE_EDIT_UNWRITTEN_NOTICE =
   "That rename form is not the displayed form; nothing was sent";
 export const REMOTE_EDIT_CHANGED_NOTICE =
   "That remote session changed; reopen Edit before renaming";
+/**
+ * Fixed notices for the separate native HOST ROW NAME lane. They never claim an
+ * owner outcome, a retry, or a durability this side did not observe, and they
+ * never suggest a Pi conversation rename as a substitute for a native row.
+ */
+export const REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE =
+  "That owner does not offer naming a native session row; nothing was requested";
+export const REMOTE_NATIVE_NAME_NOT_DRAWN_NOTICE =
+  "Highlight a completely displayed native remote row to name it";
+export const NATIVE_REMOTE_PROVIDER_UNAVAILABLE_NOTICE =
+  "That destination does not offer native sessions; choose Local or Pi";
+export const NATIVE_PROVIDER_SCOPE_CHANGED_NOTICE =
+  "Provider choice no longer applies to this host; choose the provider again";
+/**
+ * A Provider line this host offers but this pane cannot fit was never drawn, so it
+ * is not part of what the writer committed. A native submission therefore says so
+ * instead of riding a frame that showed no provider at all.
+ */
+export const NATIVE_PROVIDER_NOT_DRAWN_NOTICE =
+  "No Provider line is drawn here; make the pane taller, then submit again";
 /**
  * Fixed, bounded notices for the selected-host Saved picker. Each states only
  * what this side knows locally; none claims an owner outcome, a retry, a
@@ -2820,19 +3046,23 @@ interface CardTitleFacts {
 }
 
 /**
- * Canonical card title: validated native name, else the row label. A native
- * CLI row is titled by its STABLE provider label and nothing else (issue #277):
- * it has no Pi conversation name to show, so the card can never display an
- * invented provider conversation name or fall back to Pi-flavoured text. A
- * remembered native row that is not a live session also says so in its title,
- * so an unavailable slot can never be mistaken for a working provider session.
+ * Canonical card title: validated native name, else the row label. A native CLI
+ * row is titled by the label this host owns for it and nothing else (issue
+ * #277): that label IS the stable provider label until the operator captions the
+ * row, and their caption afterwards. It has no Pi conversation name to show, so
+ * the card can never display an invented provider conversation name or fall back
+ * to Pi-flavoured text. A remembered native row that is not a live session also
+ * says so in its title, so an unavailable slot can never be mistaken for a
+ * working provider session.
  */
 function cardTitle(item: CardTitleFacts): string {
   if (isNativeCliBackend(item.backend)) {
     const provider = sessionBackendDisplayLabel(item.backend);
+    const label = item.label.trim();
+    const caption = label.length > 0 ? label : provider;
     const title = item.unavailable === true || item.lifecycle === "error"
-      ? `${provider} (unavailable)`
-      : provider;
+      ? `${caption} (unavailable)`
+      : caption;
     return sanitizeBounded(title, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
   }
   return sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
@@ -3033,6 +3263,11 @@ function copyPeerRosterRow(value: unknown): PeerRosterRow | null {
     backgroundShells: sanitizeCount(source.backgroundShells),
     activeTasks: sanitizeCount(source.activeTasks),
     activeShells: sanitizeCount(source.activeShells),
+    // The owner's typed backend identity, kept ONLY when the owner itself reported
+    // a native CLI backend for this row. Absence, `pi`, and any foreign value stay
+    // absent: a backend is never inferred from a caption, a native conversation, a
+    // missing status, or this host's own configuration.
+    ...(isNativeCliBackend(source.backend) ? { backend: source.backend } : {}),
     ...(displayNumber(source.exitCode) === undefined ? {} : { exitCode: displayNumber(source.exitCode) }),
     ...(displayText(source.error) === undefined ? {} : { error: displayText(source.error) }),
   };
@@ -3086,6 +3321,21 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const saved: PeerUiHostSaved | undefined = savedSupported !== undefined && savedDeleteExposed !== undefined
     ? { supported: savedSupported, deleteExposed: savedDeleteExposed }
     : undefined;
+  // Optional native-lane description: kept only when BOTH facts are well formed.
+  // A missing or malformed value is "no native choice for this destination", never
+  // a guessed capability and never this host's own configured targets.
+  const nativeValue = displayObject(source.nativeCli);
+  const nativeSupported = displayBoolean(nativeValue?.supported);
+  let nativeCli: PeerUiHostNativeCli | undefined;
+  if (nativeValue !== undefined && nativeSupported !== undefined) {
+    nativeCli = {
+      supported: nativeSupported,
+      targets: nativeSupported ? normalizeNativeCliTargets(nativeValue.targets) : [],
+    };
+  }
+  // Optional descriptive HOST ROW NAME support of the SEPARATE native lane. Absent
+  // or malformed means NOT supported; nothing is ever inferred from the roster.
+  const nativeNameSupported = displayBoolean(source.nativeNameSupported);
   if (id === undefined || id.length === 0 || label === undefined || host === undefined
     || port === undefined || state === undefined
     || fingerprint === undefined || message === undefined
@@ -3122,6 +3372,8 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
     },
     ...(saved === undefined ? {} : { saved }),
     ...(renameSupported === undefined ? {} : { renameSupported }),
+    ...(nativeCli === undefined ? {} : { nativeCli }),
+    ...(nativeNameSupported === undefined ? {} : { nativeNameSupported }),
   };
 }
 
@@ -3449,6 +3701,27 @@ export class SidebarController {
    */
   private newFormProvider: { readonly backend: SessionBackend; readonly targetId?: string } = { backend: "pi" };
   /**
+   * The Host scope a NON-Pi provider choice was made under: the Host line's
+   * choice key and the exact owner run it named at that moment. Undefined means
+   * Pi, which is always valid. It exists so a destination change, a reconnect, or
+   * an owner-run replacement can never silently reinterpret this host's own
+   * configured `external:` id as the owner's same-named configuration, and can
+   * never silently convert an explicit native choice into Pi/default.
+   */
+  private newFormProviderScope:
+    | { readonly hostKey: string; readonly hostRunId: string | null; readonly epoch: number }
+    | undefined;
+  /**
+   * Monotonic counter that advances whenever the native provider scope named by
+   * the form's Host choice changes in ANY way — connection state, roster currency,
+   * the exact owner run, the destination fingerprint, or the advertised catalog. A
+   * native choice records the value it was made under, so a scope that moved and
+   * then came back (run A -> B -> A, disconnected -> reconnected on the same run,
+   * target withdrawn -> restored) can never revive that choice: only an explicit
+   * reselection can, and a lapsed choice is never quietly submitted as Pi.
+   */
+  private newFormProviderScopeEpoch = 0;
+  /**
    * The native provider targets Main supplied for this host, already sanitized.
    * An empty list means this host offers no native session at all, so the New
    * form draws no Provider line.
@@ -3610,6 +3883,10 @@ export class SidebarController {
           readonly hostId: string;
           readonly hostRunId: string;
           readonly workspace: string;
+          /** Present only for an explicit native remote submission. */
+          readonly backend?: NativeCliBackend;
+          /** The exact owner-advertised target id, never a local configured id. */
+          readonly targetId?: string;
         };
       }
     | undefined;
@@ -4735,6 +5012,48 @@ export class SidebarController {
     });
   }
 
+  /**
+   * Open the SAME Edit editor for one exact OWNER native row, without selecting
+   * it. This is the host-name branch of the shared form: the caller names the
+   * frozen target and the backend this side OBSERVED on that row, and NO native
+   * conversation tuple is accepted or invented, because a native row has none.
+   * The CURRENT projection must still describe that exact row on that exact run
+   * with that same backend, and the owner must still be connected and report the
+   * separate native-name capability. Otherwise nothing opens: no sibling row, no
+   * older run, no Pi rename, no local fallback, and no reconnect. `currentName` is
+   * only the reference display snapshot; the owner's metadata stays the sole
+   * updated-caption source.
+   */
+  openRemoteNativeEdit(target: {
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly backend: NativeCliBackend;
+    readonly currentName: string;
+  }): boolean {
+    if (!this._visible || this._focus !== "sidebar") return false;
+    if (typeof target.hostId !== "string" || target.hostId.length === 0) return false;
+    if (typeof target.hostRunId !== "string" || target.hostRunId.length === 0) return false;
+    if (typeof target.rowId !== "string" || target.rowId.length === 0) return false;
+    if (!isNativeCliBackend(target.backend)) return false;
+    if (typeof target.currentName !== "string") return false;
+    const entry = this.findRemoteEntry(target.hostId, target.rowId);
+    const remote = entry?.remote;
+    if (remote === undefined || remote.rosterState !== "current") return false;
+    if (remote.hostRunId !== target.hostRunId) return false;
+    if (this.remoteNativeNameHost(target.hostId, target.hostRunId) === undefined) return false;
+    if (!this.remoteNativeNameRowStillProjected(target)) return false;
+    return this.openEditForm({
+      kind: "remote-native",
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      backend: target.backend,
+      currentName: sanitizeBounded(target.currentName, 256),
+      hostLabel: remote.hostLabel,
+    });
+  }
+
   /** The single Edit-open seam shared by local and remote targets: no second editor. */
   private openEditForm(target: EditFormTarget): boolean {
     this.forgetDisplayedRoster(); // narrow layouts overlay the roster
@@ -4775,7 +5094,9 @@ export class SidebarController {
     if (this.pendingRename?.requestId !== requestId || this.formKind !== "edit") return;
     // A settled refusal/unknown leaves the draft, not its consumed send receipt.
     // Only this request's form is retired; an older reply cannot touch a new one.
-    if (this.editTarget?.kind === "remote") this.invalidateEditFormPresentation();
+    if (this.editTarget?.kind === "remote" || this.editTarget?.kind === "remote-native") {
+      this.invalidateEditFormPresentation();
+    }
     this.pendingRename = undefined;
     if (this.formField) this.editDraft = this.formField.getValue();
     this.disposeFormField();
@@ -4902,7 +5223,24 @@ export class SidebarController {
       || before?.fingerprint !== after?.fingerprint
     );
     this.peerUiSnapshot = next;
-    if (targetChanged) {
+    // A native provider choice is latched to its scope, so every observed move of
+    // the chosen destination's scope advances the counter — including a move that
+    // lands back on an earlier value. Without this, a reconnect to the SAME owner
+    // run (or a withdrawn target that reappears) would leave a stale choice looking
+    // freshly valid, because the values it is compared against never changed.
+    const nativeScopeChanged = chosenHostId !== undefined
+      && nativeProviderScopeIdentityOf(previous, chosenHostId)
+        !== nativeProviderScopeIdentityOf(next, chosenHostId);
+    if (nativeScopeChanged) {
+      this.newFormProviderScopeEpoch += 1;
+    }
+    // A native provider scope that moved also retires an IN-FLIGHT native create.
+    // The epoch alone only stops a later submission: `targetChanged` deliberately
+    // excludes catalog and roster-currency moves, so without this a held or delayed
+    // ordered write could still pass Main's last-instant proof (which asks whether
+    // THIS request still owns the form) and the owner-side catalog check after the
+    // target was withdrawn and advertised again. A Pi submission is untouched.
+    if (targetChanged || (nativeScopeChanged && this.newFormProvider.backend !== "pi")) {
       // Comparing present values is not enough: a run or connection that returns
       // to its earlier value (A -> B -> A, or disconnected -> connected) must
       // never revive a receipt that was written before the transition. Retire the
@@ -5223,6 +5561,7 @@ export class SidebarController {
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       remoteEdit: this.remoteEditRowFrom(displayedRoster),
+      remoteNativeEdit: this.remoteNativeNameRowFrom(displayedRoster),
       activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
       scrollRosterAt: (column: number, row: number, cols: number, rows: number, direction: SidebarScrollDirection): boolean =>
@@ -7279,9 +7618,24 @@ export class SidebarController {
     }
     const nativeSession = entry.item.nativeSession;
     if (isNativeCliBackend(entry.item.backend)) {
-      // A native CLI row has no Pi conversation to rename, ever: the refusal is
-      // truthful instead of waiting for a native name that can never arrive.
-      this.noticeError = `${sessionBackendDisplayLabel(entry.item.backend)} rows have no renameable Pi session name`;
+      // A native CLI row has no Pi conversation to rename, ever. What E does here
+      // is name THIS host's own row: a bounded host-side caption the host stores
+      // and draws, never sent to the provider and never typed into the child. No
+      // native tuple, provider call, status registration, or keystroke is needed,
+      // and the row is never resumed or adopted by naming it.
+      if (entry.item.unavailable === true) {
+        // A remembered placeholder owns no row this host can caption; refusing
+        // here keeps a stale slot from being renamed into something live.
+        this.noticeError = "A remembered native row is not a live session to name";
+        return;
+      }
+      const current = entry.item.label.trim();
+      this.noticeError = undefined;
+      this.openEditForm({
+        kind: "native",
+        id: entry.item.id,
+        currentName: current.length > 0 ? current : sessionBackendDisplayLabel(entry.item.backend),
+      });
       return;
     }
     if (!nativeSession) {
@@ -7422,10 +7776,13 @@ export class SidebarController {
   }
 
   /**
-   * One deliberate `E` on a remote card. It emits the drawn exact owner target
-   * plus that row's OBSERVED native tuple and nothing else: no local id, no
-   * rename, no confirmation, no guess. Main independently proves the written
-   * highlight and the owner revalidates its own row and tuple.
+   * One deliberate `E` on a remote card. It emits the drawn exact owner target and
+   * nothing else: no local id, no rename, no confirmation, no guess. The row's
+   * owner-reported backend decides WHICH shared intent is emitted — a native CLI
+   * row asks for a host-side row name, every other row asks about the OWNER's Pi
+   * conversation with its observed tuple — and a row with no reported backend is
+   * never guessed into either lane. Main independently proves the written highlight
+   * and the owner revalidates its own row.
    */
   private requestRemoteEdit(): void {
     const shown = this.displayedRoster;
@@ -7433,20 +7790,35 @@ export class SidebarController {
       && shown.selectedKey === this.selectedEntryKey
       ? this.remoteEditRowFrom(shown)
       : undefined;
-    if (drawn === undefined) {
-      const entry = this.currentEntry();
-      this.noticeError = this.remoteEditRefusalNotice(entry?.remote);
+    if (drawn !== undefined) {
+      this.noticeError = undefined;
+      this.emit({
+        type: "edit-remote",
+        hostId: drawn.hostId,
+        hostRunId: drawn.hostRunId,
+        rowId: drawn.rowId,
+        nativeSessionId: drawn.nativeSessionId,
+        nativeSessionEpoch: drawn.nativeSessionEpoch,
+      });
       return;
     }
-    this.noticeError = undefined;
-    this.emit({
-      type: "edit-remote",
-      hostId: drawn.hostId,
-      hostRunId: drawn.hostRunId,
-      rowId: drawn.rowId,
-      nativeSessionId: drawn.nativeSessionId,
-      nativeSessionEpoch: drawn.nativeSessionEpoch,
-    });
+    const nativeDrawn = shown !== undefined && shown.selectedKey !== undefined
+      && shown.selectedKey === this.selectedEntryKey
+      ? this.remoteNativeNameRowFrom(shown)
+      : undefined;
+    if (nativeDrawn !== undefined) {
+      this.noticeError = undefined;
+      this.emit({
+        type: "edit-remote-native",
+        hostId: nativeDrawn.hostId,
+        hostRunId: nativeDrawn.hostRunId,
+        rowId: nativeDrawn.rowId,
+        backend: nativeDrawn.backend,
+      });
+      return;
+    }
+    const entry = this.currentEntry();
+    this.noticeError = this.remoteEditRefusalNotice(entry?.remote);
   }
 
   /**
@@ -7470,6 +7842,10 @@ export class SidebarController {
     const remote = entry.remote;
     if (remote.rosterState !== "current") return undefined;
     if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) return undefined;
+    // A native CLI row has no Pi conversation to rename: it belongs to the
+    // separate host-name lane, and the two intents are never both eligible for the
+    // same drawn card. The backend is the owner's typed fact, never inferred.
+    if (isNativeCliBackend(remote.row.backend)) return undefined;
     const native = remote.row.nativeSession;
     if (native === null || !isValidNativeSessionId(native.sessionId)
       || !Number.isSafeInteger(native.epoch) || native.epoch < 1) return undefined;
@@ -7497,6 +7873,7 @@ export class SidebarController {
     if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) {
       return REMOTE_EDIT_NO_RUN_NOTICE;
     }
+    if (isNativeCliBackend(remote.row.backend)) return this.remoteNativeNameRefusalNotice(remote);
     if (remote.row.nativeSession === null) return REMOTE_EDIT_NO_NATIVE_NOTICE;
     const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === remote.hostId);
     if (host === undefined || host.state !== "connected") return REMOTE_EDIT_TARGET_CHANGED_NOTICE;
@@ -7511,6 +7888,80 @@ export class SidebarController {
   private findRemoteEntry(hostId: string, rowId: string): SidebarEntry | undefined {
     const key = remoteRosterEntryKey(hostId, rowId);
     return this.entries.find((entry) => entry.key === key);
+  }
+
+  /**
+   * The CURRENT snapshot's description of one owner host for a native HOST ROW
+   * NAME. Only a connected destination whose current complete observation carries
+   * this exact run and reports the SEPARATE native-name capability qualifies. An
+   * absent snapshot, an older DTO that carries no run or no such capability, and a
+   * `nativeNameSupported: false` owner never do: support is never inferred from a
+   * caption, a label, an endpoint, or a past success, and the Pi rename capability
+   * is never treated as this one.
+   */
+  private remoteNativeNameHost(hostId: string, hostRunId: string): PeerUiHost | undefined {
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === hostId);
+    if (host === undefined || host.state !== "connected") return undefined;
+    if (host.nativeNameSupported !== true) return undefined;
+    if (host.roster.state !== "current") return undefined;
+    if (host.roster.hostRunId !== hostRunId) return undefined;
+    return host;
+  }
+
+  /**
+   * The native name-edit highlight of one roster render record, or undefined when
+   * that render did not draw a complete eligible native remote card as its
+   * highlight. Eligibility reads the DRAWN card plus the CURRENT snapshot's
+   * description of its owner, and it is keyed on the owner's typed backend: a
+   * stale observation, an absent or empty owner run, a row whose backend is not a
+   * native CLI backend (or is unreported), a disconnected destination, a replaced
+   * owner run, and an owner that does not report the native-name capability each
+   * produce undefined. A Pi row's native conversation tuple is never consulted
+   * here, and no backend is ever inferred from a caption or a missing status.
+   */
+  private remoteNativeNameRowFrom(shown: DisplayedRoster | undefined): SidebarRemoteNativeEditRow | undefined {
+    const key = shown?.selectedKey;
+    if (shown === undefined || key === undefined) return undefined;
+    if (shown.focus !== "sidebar" || shown.signature !== this.rosterSignature()) return undefined;
+    const region = shown.regions.get(key);
+    const entry = region?.entry;
+    if (region === undefined || entry === undefined) return undefined;
+    if (entry.kind !== "remote" || entry.remote === undefined) return undefined;
+    if (region.height !== this.entryHeight(entry)) return undefined;
+    const remote = entry.remote;
+    if (remote.rosterState !== "current") return undefined;
+    if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) return undefined;
+    if (!isNativeCliBackend(remote.row.backend)) return undefined;
+    if (this.remoteNativeNameHost(remote.hostId, remote.hostRunId) === undefined) return undefined;
+    return Object.freeze({
+      hostId: remote.hostId,
+      hostRunId: remote.hostRunId,
+      rowId: remote.row.id,
+      backend: remote.row.backend,
+      row: region.row,
+      height: region.height,
+      cols: shown.cols,
+      rows: shown.rows,
+      focus: shown.focus,
+      title: cardTitle(remote.row),
+      hostLabel: sanitizeBounded(remote.hostLabel, PEER_LABEL_MAX_CODEPOINTS),
+    });
+  }
+
+  /** The truthful bounded notice for a native host-name edit this side refuses. */
+  private remoteNativeNameRefusalNotice(remote: SidebarRemoteEntry | undefined): string {
+    if (remote === undefined) return REMOTE_EDIT_NOT_DRAWN_NOTICE;
+    if (remote.rosterState !== "current") return REMOTE_EDIT_STALE_NOTICE;
+    if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) {
+      return REMOTE_EDIT_NO_RUN_NOTICE;
+    }
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === remote.hostId);
+    if (host === undefined || host.state !== "connected") return REMOTE_EDIT_TARGET_CHANGED_NOTICE;
+    if (host.nativeNameSupported !== true) return REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE;
+    if (host.roster.state !== "current" || host.roster.hostRunId !== remote.hostRunId) {
+      return REMOTE_EDIT_TARGET_CHANGED_NOTICE;
+    }
+    return REMOTE_EDIT_NOT_DRAWN_NOTICE;
   }
 
   /**
@@ -7548,6 +7999,27 @@ export class SidebarController {
     return native !== null
       && native.sessionId === target.nativeSession.sessionId
       && native.epoch === target.nativeSession.epoch;
+  }
+
+  /**
+   * Whether the CURRENT projection still names this exact row, owner run, and
+   * native backend for an open HOST ROW NAME form. A removed or replaced row, a new
+   * owner run, a stale observation, and a row that now reports another backend (or
+   * none) all refuse; the open form is never silently retargeted to a sibling, and
+   * a backend is never inferred from a caption or a missing status.
+   */
+  private remoteNativeNameRowStillProjected(
+    target: Pick<
+      Extract<EditFormTarget, { readonly kind: "remote-native" }>,
+      "hostId" | "hostRunId" | "rowId" | "backend"
+    >,
+  ): boolean {
+    const host = this.remoteNativeNameHost(target.hostId, target.hostRunId);
+    if (host === undefined) return false;
+    const rows = host.roster.rows;
+    if (rows === null) return false;
+    const row = rows.find((candidate) => candidate.id === target.rowId);
+    return row !== undefined && row.backend === target.backend;
   }
 
   /**
@@ -8927,6 +9399,7 @@ export class SidebarController {
     // And every New form opens on the Pi provider, whatever the previous form
     // offered or selected. A native choice is never a remembered default.
     this.newFormProvider = { backend: "pi" };
+    this.newFormProviderScope = undefined;
     this.formProviderFocused = false;
     // A fresh form is assumed to fit its Provider line until one of its own
     // renders says otherwise, so a keystroke batch delivered before that first
@@ -9028,12 +9501,46 @@ export class SidebarController {
   private selectNewFormHost(option: NewFormHostOption): void {
     if (this.formKind !== "new" || this.pendingCreate !== undefined) return;
     if (newFormHostOptionKey(option) === this.newFormHostKey()) return;
+    const previousProvider = this.newFormProvider;
+    const previousScope = this.newFormProviderScope;
     this.newFormHost = option.kind === "local"
       ? { kind: "local" }
       : { kind: "remote", hostId: option.hostId, label: option.label };
     this.workspaceDraft = "";
     this.formError = undefined;
     this.createFormField("");
+    // A native provider choice belongs to the destination it was made under. The
+    // new Host cannot honestly carry it, so it is never silently reinterpreted as
+    // the other machine's same-named target and it is never quietly submitted as
+    // Pi: the choice is dropped AND the operator is told, in the same form.
+    if (previousProvider.backend !== "pi") {
+      this.newFormProvider = { backend: "pi" };
+      this.newFormProviderScope = undefined;
+      const chosenLabel = previousScope === undefined
+        ? sessionBackendDisplayLabel(previousProvider.backend)
+        : this.newFormProviderLabelFor(previousProvider);
+      this.formError = `${chosenLabel} is not available on ${this.currentNewFormHostLabel()}; the provider is Pi again`;
+    }
+  }
+
+  /** The bounded label one provider choice was drawn with, for an honest notice. */
+  private newFormProviderLabelFor(
+    provider: { readonly backend: SessionBackend; readonly targetId?: string },
+  ): string {
+    const key = newFormProviderOptionKey(provider);
+    const option = this.nativeCliTargets.find((target) => newFormProviderOptionKey({
+      backend: target.backend, targetId: target.id,
+    }) === key);
+    if (option !== undefined) return option.label;
+    const chosen = this.newFormHost;
+    const remote = chosen.kind === "remote"
+      ? (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === chosen.hostId)
+      : undefined;
+    const advertised = remote?.nativeCli?.targets?.find((target) => newFormProviderOptionKey({
+      backend: target.backend, targetId: target.id,
+    }) === key);
+    if (advertised !== undefined) return advertised.label;
+    return sessionBackendDisplayLabel(provider.backend);
   }
 
   /** Cycle the one Host selection; never a submit, connect, or retarget. */
@@ -9067,14 +9574,13 @@ export class SidebarController {
     }
     if (matchesKey(data, "tab") || matchesShiftTab(data)) {
       if (!isKeyRelease(data) && !isKeyRepeat(data)) {
-        // Shift+Tab continues the form's focus ring into the Provider line when
-        // this form draws one; Tab (and a form without a Provider line) returns
-        // exactly to the ordinary workspace editor as before. A line the current
-        // layout suppressed is not a control the ring can stop on.
+        // The ring follows the DRAWN order, which is Host, Provider, Workspace.
+        // A forward Tab therefore steps to the Provider line when this form draws
+        // one, and straight back to the workspace editor when it draws none; a
+        // backward Shift+Tab wraps around to the workspace editor. A line this
+        // layout suppressed is never a stop on the ring.
         this.formHostFocused = false;
-        this.formProviderFocused = matchesShiftTab(data)
-          && this.newFormProviderAvailable()
-          && !this.formProviderRowSuppressed;
+        this.formProviderFocused = matchesKey(data, "tab") && this.newFormProviderDrawn();
         this.onInvalidate?.();
       }
       return true;
@@ -9095,22 +9601,85 @@ export class SidebarController {
   // --- New form Provider line: Pi by default, one host-owned selection. ---
 
   /**
-   * True only while this form actually draws a Provider line: a host that
-   * supplied no native target draws the exact pre-native New form, so no native
-   * request can be made and every existing gesture keeps its exact meaning.
+   * True only while this form actually draws a Provider line: a host that offers
+   * no non-Pi choice for the CURRENTLY selected destination draws the exact
+   * pre-native New form, so no native request can be made and every existing
+   * gesture keeps its exact meaning. The offered set is always the CHOSEN host's:
+   * this host's own targets for Local, and a current supported remote owner's
+   * advertised targets for that destination — never a blend, and never this host's
+   * own configured ids offered for someone else's machine.
    */
   private newFormProviderAvailable(): boolean {
-    return this.formKind === "new" && this.nativeCliTargets.length > 0;
+    return this.formKind === "new" && this.newFormNativeTargets().length > 0;
+  }
+
+  /**
+   * The native targets the CURRENT Host choice can honestly offer.
+   *
+   * Local is this host's own configured list, exactly as before. A remote
+   * destination contributes ONLY its own current advertised catalog: a connected
+   * destination whose coordinator reports `nativeCli.supported` AND whose roster
+   * observation is CURRENT. A disconnected, stale, reconnecting, older, or
+   * native-less owner contributes nothing, so its own configured targets can never
+   * be selected for it and its Pi-only behavior is unchanged.
+   */
+  private newFormNativeTargets(): readonly SidebarNativeCliTarget[] {
+    const chosen = this.newFormHost;
+    if (chosen.kind === "local") return this.nativeCliTargets;
+    const host = (this.peerUiSnapshot?.hosts ?? [])
+      .find((candidate) => candidate.id === chosen.hostId);
+    if (host === undefined || host.state !== "connected") return [];
+    if (host.roster.state !== "current") return [];
+    const native = host.nativeCli;
+    if (native === undefined || native.supported !== true) return [];
+    return native.targets;
+  }
+
+  /** The exact owner run the CURRENT Host choice names, or null. */
+  private newFormHostRunId(): string | null {
+    const option = this.currentNewFormHostOption();
+    return option !== undefined && option.kind === "remote" ? option.hostRunId : null;
+  }
+
+  /**
+   * True only while the current provider choice still belongs to the CURRENT host
+   * scope: it is Pi (always valid), or it was chosen while THIS exact destination
+   * and owner run were selected AND that destination still advertises it. A Local
+   * `external:` id never satisfies a remote owner's same-named configuration, and
+   * a reconnect or run replacement never leaves a stale owner choice selectable.
+   */
+  private newFormProviderChoiceCurrent(): boolean {
+    if (this.newFormProvider.backend === "pi") return true;
+    if (this.newFormProviderScope === undefined) return false;
+    // Latched, not re-compared: the scope this choice was made under has to be the
+    // scope that has been continuously in effect ever since. Equal present values
+    // are not proof of continuity — see newFormProviderScopeEpoch.
+    if (this.newFormProviderScope.epoch !== this.newFormProviderScopeEpoch) return false;
+    if (this.newFormProviderScope.hostKey !== this.newFormHostKey()) return false;
+    if (this.newFormProviderScope.hostRunId !== this.newFormHostRunId()) return false;
+    const key = this.newFormProviderKey();
+    return this.newFormProviderOptions().some((option) => newFormProviderOptionKey(option) === key);
+  }
+
+  /**
+   * True only while this form actually DRAWS a Provider line, so the focus ring
+   * can only ever stop on a control the operator can see. The drawn state is the
+   * last render's, and a render that lost the row also released any focus the
+   * line held, so the two can never disagree.
+   */
+  private newFormProviderDrawn(): boolean {
+    return this.newFormProviderAvailable() && !this.formProviderRowSuppressed;
   }
 
   /**
    * The provider choices this form can name: Pi first (the default), then every
-   * native target this host offers, in the order Main supplied them. Nothing is
-   * filtered by a first-match or capability guess: an offered target is offered.
+   * native target the CURRENT Host choice honestly offers, in the order it was
+   * supplied. Nothing is filtered by a first-match or capability guess: an offered
+   * target is offered — and a target belonging to the other destination never is.
    */
   private newFormProviderOptions(): NewFormProviderOption[] {
     const options: NewFormProviderOption[] = [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }];
-    for (const target of this.nativeCliTargets) {
+    for (const target of this.newFormNativeTargets()) {
       options.push({ backend: target.backend, targetId: target.id, label: target.label });
     }
     return options;
@@ -9150,6 +9719,15 @@ export class SidebarController {
     this.newFormProvider = option.targetId === undefined
       ? { backend: option.backend }
       : { backend: option.backend, targetId: option.targetId };
+    // A native choice is bound to the destination it was made under. Pi is the
+    // always-valid default and carries no scope.
+    this.newFormProviderScope = option.targetId === undefined
+      ? undefined
+      : {
+        hostKey: this.newFormHostKey(),
+        hostRunId: this.newFormHostRunId(),
+        epoch: this.newFormProviderScopeEpoch,
+      };
     this.formError = undefined;
   }
 
@@ -9182,7 +9760,10 @@ export class SidebarController {
     }
     if (matchesKey(data, "tab") || matchesShiftTab(data)) {
       if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        // Forward Tab leaves the Provider line downward into the workspace editor;
+        // backward Shift+Tab steps up to the Host line drawn above it.
         this.formProviderFocused = false;
+        this.formHostFocused = matchesShiftTab(data);
         this.onInvalidate?.();
       }
       return true;
@@ -9201,11 +9782,20 @@ export class SidebarController {
   /**
    * Route one form key to whichever host-owned selection control currently owns
    * the form's focus. The Provider line is checked first so its keys can never
-   * be mistaken for the Host line's (and vice versa).
+   * be mistaken for the Host line's (and vice versa). With neither control
+   * focused, only a fresh Shift+Tab acts, and it enters the control drawn
+   * directly ABOVE the workspace field — the Provider line when this form draws
+   * one, otherwise the Host line, exactly as before the Provider line existed.
    */
   private handleNewFormSelectionKey(data: string): boolean {
     if (this.formProviderFocused) return this.handleNewFormProviderKey(data);
-    return this.handleNewFormHostKey(data);
+    if (this.formHostFocused) return this.handleNewFormHostKey(data);
+    if (this.formKind !== "new" || !matchesShiftTab(data)) return false;
+    if (isKeyRelease(data) || isKeyRepeat(data)) return true;
+    if (this.newFormProviderDrawn()) this.formProviderFocused = true;
+    else this.formHostFocused = true;
+    this.onInvalidate?.();
+    return true;
   }
 
   /**
@@ -9224,6 +9814,7 @@ export class SidebarController {
       hostId: candidate.hostId,
       hostRunId: candidate.hostRunId,
       workspace: candidate.workspace,
+      providerKey: candidate.providerKey,
       cols: candidate.cols,
       rows: candidate.rows,
     });
@@ -9266,13 +9857,28 @@ export class SidebarController {
    * already earned; any change of generation, host identity, owner run, drawn
    * workspace, or pane geometry mints a new token that starts unwritten.
    */
-  private captureCreateFormCandidate(workspace: string, cols: number, rows: number): void {
+  /**
+   * `providerDrawn` says whether THIS render actually put a Provider line on the
+   * screen. The receipt then names exactly what the operator could see: the chosen
+   * provider when the line was drawn, and nothing when it was not — so a line this
+   * pane suppressed can never authorize a native create, while a destination that
+   * offers no provider at all keeps its ordinary Pi-only receipt.
+   */
+  private captureCreateFormCandidate(
+    workspace: string,
+    cols: number,
+    rows: number,
+    providerDrawn: boolean,
+  ): void {
     const hostKind = this.newFormHost.kind;
     const hostId = this.newFormHost.kind === "remote" ? this.newFormHost.hostId : "";
     const option = this.currentNewFormHostOption();
     const hostRunId = option !== undefined && option.kind === "remote" ? option.hostRunId : null;
+    // The drawn Provider choice is part of what the writer committed, so changing
+    // it mints a new token that needs its own written receipt.
+    const providerKey = providerDrawn ? this.newFormProviderKey() : undefined;
     const identity = JSON.stringify([
-      this.formGeneration, hostKind, hostId, hostRunId, workspace, cols, rows,
+      this.formGeneration, hostKind, hostId, hostRunId, workspace, providerKey, cols, rows,
     ]);
     const previous = this.createFormCandidate;
     if (previous !== undefined && previous.identity === identity) return;
@@ -9284,6 +9890,7 @@ export class SidebarController {
       hostId,
       hostRunId,
       workspace,
+      providerKey,
       cols,
       rows,
       written: false,
@@ -9330,17 +9937,19 @@ export class SidebarController {
     const candidate = this.editFormCandidate;
     if (candidate === undefined) return undefined;
     return Object.freeze({
+      kind: candidate.kind,
       formGeneration: candidate.formGeneration,
       renderToken: candidate.token,
       hostId: candidate.hostId,
       hostRunId: candidate.hostRunId,
       rowId: candidate.rowId,
-      nativeSessionId: candidate.nativeSessionId,
-      nativeSessionEpoch: candidate.nativeSessionEpoch,
+      ...(candidate.kind === "pi"
+        ? { nativeSessionId: candidate.nativeSessionId, nativeSessionEpoch: candidate.nativeSessionEpoch }
+        : { backend: candidate.backend }),
       name: candidate.name,
       cols: candidate.cols,
       rows: candidate.rows,
-    });
+    }) as SidebarEditFormPresentation;
   }
 
   /** True while this token is still the renderer's current complete Edit form. */
@@ -9370,26 +9979,46 @@ export class SidebarController {
    */
   private captureEditFormCandidate(name: string, cols: number, rows: number): void {
     const target = this.editTarget;
-    if (target === undefined || target.kind !== "remote") return;
+    if (target === undefined || (target.kind !== "remote" && target.kind !== "remote-native")) return;
+    const candidateKind = target.kind === "remote" ? "pi" as const : "native" as const;
     const previous = this.editFormCandidate;
-    if (previous !== undefined && previous.formGeneration === this.formGeneration
+    if (previous !== undefined && previous.kind === candidateKind
+      && previous.formGeneration === this.formGeneration
       && previous.hostId === target.hostId && previous.hostRunId === target.hostRunId
-      && previous.rowId === target.rowId && previous.nativeSessionId === target.nativeSession.sessionId
-      && previous.nativeSessionEpoch === target.nativeSession.epoch && previous.name === name
+      && previous.rowId === target.rowId && previous.name === name
+      && (target.kind === "remote"
+        ? previous.kind === "pi" && previous.nativeSessionId === target.nativeSession.sessionId
+          && previous.nativeSessionEpoch === target.nativeSession.epoch
+        : previous.kind === "native" && previous.backend === target.backend)
       && previous.cols === cols && previous.rows === rows) return;
-    this.editFormCandidate = {
-      token: this.editFormTokenSequence++,
-      formGeneration: this.formGeneration,
-      hostId: target.hostId,
-      hostRunId: target.hostRunId,
-      rowId: target.rowId,
-      nativeSessionId: target.nativeSession.sessionId,
-      nativeSessionEpoch: target.nativeSession.epoch,
-      name,
-      cols,
-      rows,
-      written: false,
-    };
+    this.editFormCandidate = target.kind === "remote"
+      ? {
+        token: this.editFormTokenSequence++,
+        kind: "pi",
+        formGeneration: this.formGeneration,
+        hostId: target.hostId,
+        hostRunId: target.hostRunId,
+        rowId: target.rowId,
+        nativeSessionId: target.nativeSession.sessionId,
+        nativeSessionEpoch: target.nativeSession.epoch,
+        name,
+        cols,
+        rows,
+        written: false,
+      }
+      : {
+        token: this.editFormTokenSequence++,
+        kind: "native",
+        formGeneration: this.formGeneration,
+        hostId: target.hostId,
+        hostRunId: target.hostRunId,
+        rowId: target.rowId,
+        backend: target.backend,
+        name,
+        cols,
+        rows,
+        written: false,
+      };
   }
 
   /**
@@ -9427,6 +10056,40 @@ export class SidebarController {
     const selected = this.currentEntry()?.remote;
     return selected?.hostId === target.hostId && selected.hostRunId === target.hostRunId
       && selected.row.id === target.rowId && this.remoteEditRowStillProjected(target);
+  }
+
+  /**
+   * The caller's last-instant proof for one frozen native HOST ROW NAME: the
+   * immutable action Main is holding still matches THIS open Edit form — same
+   * request id still owning it, same form generation, same frozen owner target and
+   * observed backend, same drawn name draft — and the owner is still connected,
+   * native-name-supporting, and still reporting that exact run, row, and backend.
+   * Nothing is re-derived from a later roster index, caption, or selection, and a
+   * Pi conversation tuple is never consulted or invented for a native row.
+   */
+  renameNativeOnPeerStillCurrent(submission: {
+    readonly requestId: number;
+    readonly formGeneration: number;
+    readonly hostId: string;
+    readonly hostRunId: string;
+    readonly rowId: string;
+    readonly backend: NativeCliBackend;
+    readonly name: string;
+  }): boolean {
+    if (!this._visible || this._focus !== "form") return false;
+    if (this.formKind !== "edit") return false;
+    if (this.pendingRename?.requestId !== submission.requestId) return false;
+    if (this.formGeneration !== submission.formGeneration) return false;
+    const target = this.editTarget;
+    if (target === undefined || target.kind !== "remote-native") return false;
+    if (target.hostId !== submission.hostId || target.hostRunId !== submission.hostRunId) return false;
+    if (target.rowId !== submission.rowId || target.backend !== submission.backend) return false;
+    if (this.editDraft !== submission.name) return false;
+    const field = this.formField;
+    if (field === undefined || field.getValue() !== submission.name) return false;
+    const selected = this.currentEntry()?.remote;
+    return selected?.hostId === target.hostId && selected.hostRunId === target.hostRunId
+      && selected.row.id === target.rowId && this.remoteNativeNameRowStillProjected(target);
   }
 
   // --- Settings: ONE grouped entry whose submenus reuse the existing panes. ---
@@ -10139,17 +10802,29 @@ export class SidebarController {
     if (this.pendingCreate || this.formKind !== "new") return;
     const providerBackend = this.newFormProvider.backend;
     const providerTargetId = this.newFormProvider.targetId;
-    if (providerBackend !== "pi" && this.newFormHostIsRemote()) {
-      // Native provider sessions are a LOCAL capability only. The operator's
-      // explicit provider choice is never silently converted into a Pi request
-      // for a remote destination (nor a remote request into a local one): the
-      // form states the conflict and emits nothing.
+    if (providerBackend !== "pi" && !this.newFormProviderChoiceCurrent()) {
+      // An explicit native choice belongs to the destination and owner run it was
+      // made under. A reconnect, an owner-run replacement, or a Host change that
+      // happened without an actual selection never lets it ride along: the form
+      // states the conflict and emits nothing, rather than quietly relaunching it
+      // somewhere else or quietly turning it into Pi.
+      this.formError = NATIVE_PROVIDER_SCOPE_CHANGED_NOTICE;
+      this.onInvalidate?.();
+      return;
+    }
+    if (providerBackend !== "pi" && this.newFormHostIsRemote()
+      && this.newFormNativeTargets().length === 0) {
+      // Native provider sessions are only a capability of a host that really offers
+      // them. The operator's explicit provider choice is never silently converted
+      // into a Pi request for a remote destination (nor a remote request into a
+      // local one): the form states the conflict and emits nothing.
       this.formError = `${sessionBackendDisplayLabel(providerBackend)} is local only; choose Local or Pi`;
       this.onInvalidate?.();
       return;
     }
     if (this.newFormHostIsRemote()) {
-      this.submitCreateOnPeer(submission);
+      if (providerBackend === "pi") this.submitCreateOnPeer(submission);
+      else this.submitNativeCreateOnPeer(submission, providerBackend, providerTargetId ?? "");
       return;
     }
     const workspace = submission.value;
@@ -10271,6 +10946,110 @@ export class SidebarController {
   }
 
   /**
+   * One deliberate REMOTE New submission of a NATIVE session on the explicitly
+   * selected owner. It reuses every fence the Pi remote New applies — the exact
+   * written frame, the still-connected destination, the exact drawn owner run, and
+   * the verbatim workspace — and adds the provider's own proof: the backend and
+   * owner-advertised target id must be the exact choice THIS drawn frame showed, so
+   * a provider change cannot borrow an older frame's receipt and a requester-side
+   * configured id can never be addressed as the owner's same-named one. The
+   * workspace is forwarded exactly as typed: the owner resolves `~`, relative, and
+   * absolute text against its OWN home and working directory.
+   */
+  private submitNativeCreateOnPeer(
+    submission: SessionHostFieldSubmission,
+    backend: NativeCliBackend,
+    targetId: string,
+  ): void {
+    const workspace = submission.value;
+    if (workspace.length === 0) {
+      this.formError = "Workspace is required";
+      this.workspaceDraft = "";
+      this.createFormField("");
+      return;
+    }
+    if (sanitizeCellText(workspace) !== workspace || countCodePoints(workspace) > PATH_FIELD_MAX_CODEPOINTS) {
+      this.formError = `Path exceeds ${PATH_FIELD_MAX_CODEPOINTS} characters or contains unsafe text`;
+      this.workspaceDraft = this.formField?.getValue() ?? "";
+      this.createFormField(this.workspaceDraft);
+      return;
+    }
+    this.workspaceDraft = workspace;
+    const target = this.currentNewFormHostOption();
+    const chosen = this.newFormHost;
+    if (chosen.kind !== "remote" || target === undefined || target.kind !== "remote"
+      || !target.connected) {
+      this.formError = CREATE_ON_PEER_TARGET_CHANGED_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    if (target.hostRunId === null || target.hostRunId.length === 0) {
+      this.formError = CREATE_ON_PEER_NO_RUN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    if (!isNativeCliTargetId(targetId)
+      || findRemoteNativeCliTarget(this.newFormNativeTargets(), backend, targetId) === null) {
+      // The choice must still be one this owner advertises RIGHT NOW. Nothing falls
+      // back to a default target, to the other backend, or to a Pi create.
+      this.formError = NATIVE_PROVIDER_SCOPE_CHANGED_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    const providerKey = newFormProviderOptionKey({ backend, targetId });
+    const drawn = this.createFormCandidate;
+    if (drawn !== undefined && drawn.providerKey === undefined) {
+      // This frame drew no Provider line at all — the pane suppressed it, or this
+      // owner offers no native target. Either way the operator never saw the
+      // provider they are about to launch, so nothing is sent, and nothing falls
+      // back to a Pi create on the same destination.
+      this.formError = NATIVE_PROVIDER_NOT_DRAWN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    if (drawn === undefined || !drawn.written
+      || drawn.formGeneration !== this.formGeneration
+      || drawn.hostKind !== "remote"
+      || drawn.hostId !== target.hostId
+      || drawn.hostRunId !== target.hostRunId
+      || drawn.workspace !== workspace
+      || drawn.providerKey !== providerKey) {
+      this.formError = CREATE_ON_PEER_UNWRITTEN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingCreate = {
+      requestId,
+      peer: {
+        formGeneration: drawn.formGeneration,
+        renderToken: drawn.token,
+        hostId: target.hostId,
+        hostRunId: target.hostRunId,
+        workspace,
+        backend,
+        targetId,
+      },
+    };
+    this.formError = undefined;
+    const submitKey = this.formInputSubmitKey;
+    this.formSubmitClaim = submitKey === undefined
+      ? undefined
+      : (data: string) => matchesKey(data, submitKey);
+    this.emit({
+      type: "create-native-on-peer",
+      requestId,
+      formGeneration: drawn.formGeneration,
+      renderToken: drawn.token,
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      workspace,
+      backend,
+      targetId,
+    });
+  }
+
+  /**
    * Resolves one remote New submission that the OWNER reported started. Nothing
    * local is created or accepted: no row is added to this roster and no local
    * manager is touched. The returned owner run must be the exact run that was
@@ -10318,6 +11097,29 @@ export class SidebarController {
       this.createFormField(name);
       return;
     }
+    if (this.editTarget.kind === "native" || this.editTarget.kind === "remote-native") {
+      // The shared native display-name rule decides here, so an oversized or
+      // otherwise unusable caption emits nothing at all: no row changes, and
+      // nothing is ever written toward the provider or its input. Both the local
+      // row and the OWNER's native row are host-side captions under the ONE rule,
+      // and neither is ever routed to the Pi conversation rename below.
+      if (!isNativeDisplayName(name)) {
+        this.formError = `Name must be one line of at most ${MAX_NATIVE_DISPLAY_NAME_CHARS} characters`;
+        this.editDraft = name;
+        this.createFormField(name);
+        return;
+      }
+      if (this.editTarget.kind === "remote-native") {
+        this.submitNativeRenameOnPeer(name);
+        return;
+      }
+      const requestId = this.nextRequestId++;
+      this.pendingRename = { requestId };
+      this.editDraft = name;
+      this.formError = undefined;
+      this.emit({ type: "rename-native", requestId, id: this.editTarget.id, name });
+      return;
+    }
     if (this.editTarget.kind === "remote") {
       this.submitRenameOnPeer(name);
       return;
@@ -10353,7 +11155,8 @@ export class SidebarController {
       return;
     }
     const drawn = this.editFormCandidate;
-    if (drawn === undefined || !drawn.written
+    if (drawn === undefined || drawn.kind !== "pi"
+      || !drawn.written
       || drawn.formGeneration !== this.formGeneration
       || drawn.hostId !== target.hostId
       || drawn.hostRunId !== target.hostRunId
@@ -10380,6 +11183,58 @@ export class SidebarController {
       rowId: target.rowId,
       nativeSessionId: target.nativeSession.sessionId,
       nativeSessionEpoch: target.nativeSession.epoch,
+      name,
+    });
+  }
+
+  /**
+   * One deliberate HOST ROW NAME of one OWNER native row, through the SAME shared
+   * Edit form. Nothing is sent unless the live projection still names this exact
+   * row on this exact owner run with this same native backend and a
+   * native-name-supporting connected owner, and unless the form this renderer drew
+   * completely is the one the writer reported written with this same draft. A
+   * too-small, covered, queued, held, stale, or since-changed frame sends nothing,
+   * and a refusal never substitutes a Pi conversation rename, a local caption, or a
+   * reconnect.
+   */
+  private submitNativeRenameOnPeer(name: string): void {
+    const target = this.editTarget;
+    if (target === undefined || target.kind !== "remote-native") return;
+    const selected = this.currentEntry()?.remote;
+    if (selected?.hostId !== target.hostId || selected.hostRunId !== target.hostRunId
+      || selected.row.id !== target.rowId || !this.remoteNativeNameRowStillProjected(target)) {
+      this.formError = REMOTE_EDIT_CHANGED_NOTICE;
+      this.createFormField(name);
+      return;
+    }
+    const drawn = this.editFormCandidate;
+    if (drawn === undefined || drawn.kind !== "native"
+      || !drawn.written
+      || drawn.formGeneration !== this.formGeneration
+      || drawn.hostId !== target.hostId
+      || drawn.hostRunId !== target.hostRunId
+      || drawn.rowId !== target.rowId
+      || drawn.backend !== target.backend
+      || drawn.name !== name) {
+      // The exact displayed form is the only thing that may submit, and only a
+      // NATIVE Edit frame: a Pi rename frame can never authorize a caption.
+      this.formError = REMOTE_EDIT_UNWRITTEN_NOTICE;
+      this.createFormField(name);
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingRename = { requestId };
+    this.editDraft = name;
+    this.formError = undefined;
+    this.emit({
+      type: "rename-native-remote",
+      requestId,
+      formGeneration: drawn.formGeneration,
+      renderToken: drawn.token,
+      hostId: target.hostId,
+      hostRunId: target.hostRunId,
+      rowId: target.rowId,
+      backend: target.backend,
       name,
     });
   }
@@ -12443,18 +13298,33 @@ export class SidebarController {
   /**
    * Whether the `e edit name` hint applies to the current highlight. Local rows
    * and every non-remote highlight keep their existing behavior; a REMOTE
-   * highlight shows the hint only when a rename could actually be requested for
-   * that drawn card (current observation, exact owner run, connected owner that
-   * reports rename support, and an observed native tuple). An ineligible card
-   * shows no affordance it cannot honor.
+   * highlight shows the hint when a name edit could actually be requested for that
+   * drawn card, on either of its two independent lanes: a Pi rename (current
+   * observation, exact owner run, connected owner that reports rename support, and
+   * an observed native tuple), or this side's native HOST ROW NAME (the owner's own
+   * reported native backend plus an owner that reports the separate native-name
+   * capability). Both lanes require the same current observation and exact owner
+   * run. An ineligible card shows no affordance it cannot honor. A remembered native
+   * placeholder is the local case of the same rule: `E` there would only refuse, so
+   * the hint is not drawn for it (issue #277).
    */
   private editHintAppliesToHighlight(): boolean {
     const entry = this.currentEntry();
-    if (entry === undefined || entry.kind !== "remote") return true;
+    if (entry === undefined || entry.kind !== "remote") {
+      // A remembered native placeholder is not a live row this host can caption,
+      // so it advertises no naming affordance it would refuse (issue #277).
+      const item = entry?.kind === "item" ? entry.item : undefined;
+      return !(item !== undefined && isNativeCliBackend(item.backend) && item.unavailable === true);
+    }
     const remote = entry.remote;
     if (remote === undefined) return false;
     if (remote.rosterState !== "current") return false;
     if (typeof remote.hostRunId !== "string" || remote.hostRunId.length === 0) return false;
+    // The two lanes are independent: an owner that can rename Pi rows but not name
+    // native ones, and the reverse, each advertise the hint for exactly what they
+    // can honour. Neither is ever inferred from a caption or a missing status.
+    if (isNativeCliBackend(remote.row.backend)
+      && this.remoteNativeNameHost(remote.hostId, remote.hostRunId) !== undefined) return true;
     if (remote.row.nativeSession === null) return false;
     return this.remoteRenameHost(remote.hostId, remote.hostRunId) !== undefined;
   }
@@ -13034,7 +13904,12 @@ export class SidebarController {
     // (bounded to the pane), so no row is added anywhere and the local Edit
     // header stays byte-identical.
     const newForm = this.formKind === "new";
-    const remoteEditTarget = editing && this.editTarget !== undefined && this.editTarget.kind === "remote"
+    // Both remote branches share this ONE editor: a Pi conversation rename and a
+    // native HOST ROW NAME are told apart by their typed target, and the header
+    // names the owner either way so the operator can see whose row they are typing
+    // into. No second Edit form and no second field exist.
+    const remoteEditTarget = editing && this.editTarget !== undefined
+      && (this.editTarget.kind === "remote" || this.editTarget.kind === "remote-native")
       ? this.editTarget
       : undefined;
     const header = editing
@@ -13063,6 +13938,10 @@ export class SidebarController {
     // field is rendered with exactly the rows the New form gave it before native
     // provider hosting, at every geometry, so the pinned Editor's viewport,
     // scroll window, and completion room cannot shift when a host offers one.
+    // Drawing it costs the pane one row of its TOTAL budget, exactly as when the
+    // line sat below the editor: the row it occupies and the reserved spacer row
+    // below the field trade places, and neither the field's own budget, a
+    // pending/error status, nor the footer is displaced.
     const hostRows = newForm ? 1 : 0;
     const fixedRows = editing
       ? 1 + 2 + 1 + 1 + noticeLines.length + footerLines.length
@@ -13103,8 +13982,6 @@ export class SidebarController {
       const currentName = sanitizeBounded(this.editTarget?.currentName ?? "", 256);
       lines.push(wrapRow(truncateToWidth(currentName, cols, "...", true), cols));
     }
-    const fieldTopRow = lines.length;
-    lines.push(...labeledRows);
     const statusLine = this.pendingCreate !== undefined
       ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
       : this.pendingRename !== undefined
@@ -13133,7 +14010,9 @@ export class SidebarController {
     if (this.formProviderRowSuppressed) this.formProviderFocused = false;
     if (providerRows === 1) {
       // One fixed Provider line in the same ordinary marker/label style, drawn
-      // after the field so the Editor's own rules keep their drawn rows.
+      // between the Host line and the workspace field so the drawn order is
+      // Header, Host, Provider, Workspace and the keyboard ring's forward and
+      // backward order matches what the operator actually sees.
       const providerPrefix = this.formProviderFocused
         ? `> ${NEW_FORM_PROVIDER_PREFIX}`
         : `  ${NEW_FORM_PROVIDER_PREFIX}`;
@@ -13150,6 +14029,8 @@ export class SidebarController {
       providerValueEnd = providerPrefixWidth + Math.max(1, visibleWidth(providerValue));
       lines.push(wrapRow(`${providerPrefix}${providerValue}`, cols));
     }
+    const fieldTopRow = lines.length;
+    lines.push(...labeledRows);
     if (statusLine !== undefined) lines.push(statusLine);
     else if (providerRows === 0) lines.push("");
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
@@ -13187,7 +14068,7 @@ export class SidebarController {
     // Local submission keeps its exact previous path and needs no receipt, and
     // it therefore adds no extra writer boundary either.
     if (newForm && this.newFormHostIsRemote()) {
-      this.captureCreateFormCandidate(this.formField.getValue(), cols, rows);
+      this.captureCreateFormCandidate(this.formField.getValue(), cols, rows, providerRows === 1);
     } else {
       this.createFormCandidate = undefined;
     }

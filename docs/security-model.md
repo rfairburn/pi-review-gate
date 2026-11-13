@@ -288,6 +288,24 @@ copy is unsupported until a real conversation exists. A network `SessionSpawn`
 and human handoff remain unimplemented. Close remains owner-routed from the
 requesting sidebar's actually written highlighted row, as described below.
 
+The optional `native-input-cli-v1` capability, which also depends on
+`native-input-copy-v1`, extends the same content lane to rows the owner hosts as
+a native CLI child (`claude` or `codex`) instead of a Pi conversation. Such a row
+has no Pi registration, no bootstrap readiness, and no per-registration encoder,
+so its bytes are handed to that row's PTY raw, exactly as the owner's own Main
+types them. The source states phase `native-cli`, the recorded backend, and no
+native session field, under a third token domain whose commitment key is private
+to the current process incarnation: a replaced child invalidates every identical
+public fact instead of accepting a re-labelled handle. This is terminal-process
+control only. It is never an attestation of provider conversation state, it never
+authorizes a copy, and a native CLI source is refused by the copy route rather
+than producing a clipboard write. Every other fence is unchanged: current owner
+facts, live ownership of that exact PTY, a non-stopping row, current input modes,
+geometry and policy generations, bounded dispatch, and the viewer's own Remote
+input/copy setting. A peer that never negotiated the capability publishes no such
+source, and one that sends such input without negotiating it is refused as a
+protocol violation with zero bytes written.
+
 The optional owner Close capability runs over the existing roster channel, not a
 new listener or permission kind. The current TLS-proved key, pin, and owner's
 receiving grant authorize each request and each result write. Main's same owner

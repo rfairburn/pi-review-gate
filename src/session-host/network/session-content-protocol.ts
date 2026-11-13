@@ -114,6 +114,19 @@ export const SESSION_CONTENT_NATIVE_IO_CAPABILITY = "native-input-copy-v1";
  */
 export const SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY = "native-input-startup-v1";
 /**
+ * Optional capability naming INPUT to a hosted provider CLI row (issue 277): a
+ * publish whose `nativeSession` is null may state the explicit tuple-less
+ * `native-cli` source naming that row's provider backend, and an input frame may
+ * echo it. Like startup input it depends on
+ * {@link SESSION_CONTENT_NATIVE_IO_CAPABILITY}: it is offered and acknowledged only
+ * together with it, and an acknowledgement naming it without native IO is a protocol
+ * violation. It never extends copy — a hosted provider child has no copy producer and
+ * no conversation to attribute one to — and it never reaches a Pi row, whose framed
+ * startup and conversation input paths are unchanged. A peer that does not negotiate
+ * it keeps the exact tuple-less publish with no source.
+ */
+export const SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY = "native-input-cli-v1";
+/**
  * Optional capabilities this lane negotiates without an explicit opt-in. There
  * are none: unlike a purely additive capability, the native IO extension can
  * carry input and clipboard data, so offering or acknowledging it on the
@@ -131,6 +144,7 @@ export const SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Ob
 export const SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 ]);
 
 /**
@@ -463,12 +477,41 @@ export interface NativeIoStartupSource {
 	readonly sourceToken: string;
 }
 
-/** Input-path source union. Copy paths keep {@link NativeIoSource} only. */
-export type NativeIoInputSource = NativeIoSource | NativeIoStartupSource;
+/**
+ * Exact host-written NATIVE CLI input source (optional
+ * {@link SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY}): one hosted provider CLI row
+ * this owner runs as a plain PTY process. The same run, owner row, geometry, viewer
+ * revision, and opaque token facts as {@link NativeIoSource}, an explicit
+ * `phase: "native-cli"`, the row's recorded provider backend, and NO `nativeSession`,
+ * registration, PID, path, or command field — the owner binds the source to the child
+ * process through its own private per-incarnation key, never through the wire. Input
+ * only: no copy frame can carry it.
+ */
+export interface NativeIoNativeCliSource {
+	readonly hostRunId: string;
+	/** Owner row id of the session, never a native conversation id. */
+	readonly sessionId: string;
+	readonly phase: "native-cli";
+	/** The owner's recorded backend of this row; never inferred from output. */
+	readonly backend: "claude" | "codex";
+	readonly geometry: SessionContentGeometry;
+	readonly viewerRevision: number;
+	readonly sourceToken: string;
+}
+
+/**
+ * Input-path source union. Copy paths keep {@link NativeIoSource} only.
+ */
+export type NativeIoInputSource = NativeIoSource | NativeIoStartupSource | NativeIoNativeCliSource;
 
 /** True for the startup variant of an input-path source. */
 export function isNativeIoStartupSource(source: NativeIoInputSource): source is NativeIoStartupSource {
 	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/** True for the hosted native CLI variant of an input-path source. */
+export function isNativeIoNativeCliSource(source: NativeIoInputSource): source is NativeIoNativeCliSource {
+	return (source as { readonly phase?: unknown }).phase === "native-cli";
 }
 
 /** Native input payload kinds. Image and file payloads are not expressible. */
@@ -1055,32 +1098,76 @@ function readNativeIoStartupSource(value: unknown, bounds: SessionContentBounds)
 }
 
 /**
- * Validate one input-path source: a startup source when (and only when) the
- * object names a `phase`, otherwise the unchanged conversation source. Copy paths
- * never call this, so a startup source is never readable as a copy source.
+ * Validate one input-path source: a startup source when it names phase `startup`, a
+ * hosted native CLI source when it names phase `native-cli`, otherwise the unchanged
+ * conversation source. Copy paths never call this, so neither a startup source nor a
+ * native CLI source is ever readable as a copy source.
  */
 function readNativeIoInputSource(value: unknown, bounds: SessionContentBounds): NativeIoInputSource {
 	if (isPlainRecord(value) && Object.prototype.hasOwnProperty.call(value, "phase")) {
-		return readNativeIoStartupSource(value, bounds);
+		return ownField(value, "phase") === "native-cli"
+			? readNativeIoNativeCliSource(value, bounds)
+			: readNativeIoStartupSource(value, bounds);
 	}
 	return readNativeIoSource(value, bounds);
+}
+
+const NATIVE_IO_NATIVE_CLI_SOURCE_KEYS: ReadonlySet<string> = new Set([
+	"hostRunId",
+	"sessionId",
+	"phase",
+	"backend",
+	"geometry",
+	"viewerRevision",
+	"sourceToken",
+]);
+
+/**
+ * Validate one exact native CLI source: closed keys, the one legal phase value, one
+ * of the two closed backends, and no `nativeSession` key at all (a null or fabricated
+ * tuple is refused), because a hosted provider child has no Pi conversation.
+ */
+function readNativeIoNativeCliSource(value: unknown, bounds: SessionContentBounds): NativeIoNativeCliSource {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	readExactKeys(value, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, "bad_frame");
+	if (ownField(value, "phase") !== "native-cli") fail("bad_frame");
+	const backend = ownField(value, "backend");
+	if (backend !== "claude" && backend !== "codex") fail("bad_frame");
+	return Object.freeze({
+		hostRunId: readIdentifier(ownField(value, "hostRunId"), bounds.maxIdentifierBytes),
+		sessionId: readIdentifier(ownField(value, "sessionId"), bounds.maxIdentifierBytes),
+		phase: "native-cli" as const,
+		backend,
+		geometry: readGeometry(ownField(value, "geometry"), bounds),
+		viewerRevision: readInteger(ownField(value, "viewerRevision"), 1, Number.MAX_SAFE_INTEGER),
+		sourceToken: readNativeIoSourceToken(ownField(value, "sourceToken")),
+	});
+}
+
+/** The closed variant of one input-path source, for the variant-aware comparison. */
+function nativeIoSourceVariant(source: NativeIoInputSource): "startup" | "native-cli" | "conversation" {
+	if (isNativeIoStartupSource(source)) return "startup";
+	return isNativeIoNativeCliSource(source) ? "native-cli" : "conversation";
 }
 
 /**
  * Exact structural, variant-aware equality of two sources. Equal dimensions are
  * never enough: the epoch, the geometry revision, the viewer revision, and the host
  * token must all agree, so an A→B→A viewport change is never treated as the
- * original A, and a startup source never equals a conversation source. This is a
+ * original A, and a startup source never equals a conversation source or a native CLI
+ * source. Two native CLI sources also have to name the same backend. This is a
  * comparison only; it grants and implies no authority.
  */
 export function nativeIoSourceEquals(left: NativeIoInputSource, right: NativeIoInputSource): boolean {
-	const leftStartup = isNativeIoStartupSource(left);
-	const rightStartup = isNativeIoStartupSource(right);
-	if (leftStartup !== rightStartup) return false;
-	if (!leftStartup && !rightStartup) {
+	const variant = nativeIoSourceVariant(left);
+	if (variant !== nativeIoSourceVariant(right)) return false;
+	if (variant === "conversation") {
 		const leftTuple = (left as NativeIoSource).nativeSession;
 		const rightTuple = (right as NativeIoSource).nativeSession;
 		if (leftTuple.sessionId !== rightTuple.sessionId || leftTuple.epoch !== rightTuple.epoch) return false;
+	}
+	if (variant === "native-cli") {
+		if ((left as NativeIoNativeCliSource).backend !== (right as NativeIoNativeCliSource).backend) return false;
 	}
 	return left.hostRunId === right.hostRunId
 		&& left.sessionId === right.sessionId
@@ -1165,6 +1252,19 @@ function checkInputSourceCoherence(inputSource: NativeIoInputSource, frame: {
 	if (isNativeIoStartupSource(inputSource)) {
 		// A startup source describes ONLY a publish that names no native conversation;
 		// a frame with a tuple can never be paired with a startup source.
+		if (frame.nativeSession !== null) fail("bad_frame");
+		if (inputSource.hostRunId !== frame.hostRunId) fail("bad_frame");
+		if (inputSource.sessionId !== frame.sessionId) fail("bad_frame");
+		if (inputSource.geometry.cols !== frame.geometry.cols
+			|| inputSource.geometry.rows !== frame.geometry.rows
+			|| inputSource.geometry.revision !== frame.geometry.revision) {
+			fail("bad_frame");
+		}
+		return;
+	}
+	if (isNativeIoNativeCliSource(inputSource)) {
+		// A hosted provider child has no Pi conversation, so its source describes ONLY
+		// a publish that names none; a frame carrying a tuple is never one of them.
 		if (frame.nativeSession !== null) fail("bad_frame");
 		if (inputSource.hostRunId !== frame.hostRunId) fail("bad_frame");
 		if (inputSource.sessionId !== frame.sessionId) fail("bad_frame");
@@ -1701,9 +1801,11 @@ function enabledOptionalCapabilities(options: unknown): readonly string[] {
 		if (enabled.includes(entry)) fail("invalid_bounds");
 		enabled.push(entry);
 	}
-	// Startup input depends on the native IO capability: enabling it alone is a
-	// malformed opt-in, refused rather than silently narrowed.
-	if (enabled.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+	// Startup input and hosted native CLI input each depend on the native IO
+	// capability: enabling either alone is a malformed opt-in, refused rather than
+	// silently narrowed.
+	if ((enabled.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		|| enabled.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY))
 		&& !enabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
 		fail("invalid_bounds");
 	}
@@ -1732,11 +1834,13 @@ export function negotiateSessionContentHello(
 	}
 	const offeredAndEnabled = hello.capabilities.filter((capability) =>
 		capability !== SESSION_CONTENT_REQUIRED_CAPABILITY && enabled.includes(capability));
-	// Startup input is acknowledged ONLY together with native IO: a peer that offers
-	// startup without native IO simply does not get it (never a partial extension).
+	// Startup input and hosted native CLI input are acknowledged ONLY together with
+	// native IO: a peer that offers either without native IO simply does not get it
+	// (never a partial extension).
 	const negotiated = offeredAndEnabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)
 		? offeredAndEnabled
-		: offeredAndEnabled.filter((capability) => capability !== SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY);
+		: offeredAndEnabled.filter((capability) => capability !== SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY
+			&& capability !== SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY);
 	return Object.freeze({
 		ok: true,
 		major: SESSION_CONTENT_MAJOR,
@@ -1777,9 +1881,11 @@ export function reviewSessionContentHelloAck(
 		}
 		if (!offered.capabilities.includes(capability)) return { ok: false, code: "protocol_violation" };
 	}
-	// An acknowledgement of startup input without the native IO capability it
-	// depends on describes an extension that cannot exist: a protocol violation.
-	if (ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+	// An acknowledgement of startup input or hosted native CLI input without the
+	// native IO capability they depend on describes an extension that cannot exist: a
+	// protocol violation.
+	if ((ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		|| ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY))
 		&& !ack.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
 		return { ok: false, code: "protocol_violation" };
 	}

@@ -84,6 +84,7 @@ import { resolveRosterBridgeBounds, type RosterBridgeBounds } from "./roster-bri
 import {
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
@@ -94,6 +95,7 @@ import {
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoNativeCliSource,
 	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	nativeIoSourceEquals,
@@ -428,12 +430,16 @@ function isNativeIoSourceShape(value: unknown): value is NativeIoInputSource {
 	const source = value as Record<string, unknown>;
 	const nativeSession = source.nativeSession;
 	const geometry = source.geometry;
-	// A startup source names its phase and carries no tuple; a conversation source
-	// carries a tuple. Exact equality against the published source decides the rest.
+	// A startup source names phase `startup` and carries no tuple; a hosted native CLI
+	// source names phase `native-cli`, names its backend, and carries no tuple; a
+	// conversation source carries a tuple. Exact equality against the published source
+	// decides the rest.
 	const tupleShape = Object.prototype.hasOwnProperty.call(source, "phase")
-		? source.phase === "startup" && !Object.prototype.hasOwnProperty.call(source, "nativeSession")
+		? (source.phase === "startup" || source.phase === "native-cli")
+			&& !Object.prototype.hasOwnProperty.call(source, "nativeSession")
 		: nativeSession !== null && typeof nativeSession === "object";
 	return tupleShape
+		&& (source.phase !== "native-cli" || source.backend === "claude" || source.backend === "codex")
 		&& geometry !== null && typeof geometry === "object"
 		&& typeof source.hostRunId === "string"
 		&& typeof source.sessionId === "string"
@@ -533,6 +539,8 @@ class ContentViewerBinding implements SessionContentViewer {
 	#nativeIoNegotiated = false;
 	/** True only after the owner ALSO acknowledged startup input beside native IO. */
 	#startupInputNegotiated = false;
+	/** True only after the owner ALSO acknowledged hosted native CLI input. */
+	#nativeCliInputNegotiated = false;
 
 	readonly #assembler: SessionContentTransferAssembler;
 	readonly #copyAssembler: NativeCopyAssembler;
@@ -616,6 +624,7 @@ class ContentViewerBinding implements SessionContentViewer {
 				SESSION_CONTENT_REQUIRED_CAPABILITY,
 				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+				SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 			]);
 		this.#requested = { cols: options.cols, rows: options.rows };
 		this.#activeSubscriptionId = subscriptionId;
@@ -995,6 +1004,10 @@ class ContentViewerBinding implements SessionContentViewer {
 			if (verdict.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)) {
 				this.#startupInputNegotiated = true;
 			}
+			// The ack review already refuses hosted native CLI input without native IO.
+			if (verdict.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
+				this.#nativeCliInputNegotiated = true;
+			}
 		}
 		// The sink is caller code: it can stop the viewer synchronously, and the rest
 		// of the handshake must not run (no subscribe, no timer) after that.
@@ -1069,6 +1082,12 @@ class ContentViewerBinding implements SessionContentViewer {
 		if (frame.inputSource !== undefined && frame.inputSource !== null
 			&& isNativeIoStartupSource(frame.inputSource) && !this.#startupInputNegotiated) {
 			// Startup data this side never negotiated is not silently dropped either.
+			this.#protocolFailure();
+			return;
+		}
+		if (frame.inputSource !== undefined && frame.inputSource !== null
+			&& isNativeIoNativeCliSource(frame.inputSource) && !this.#nativeCliInputNegotiated) {
+			// Hosted native CLI data this side never negotiated fails the same way.
 			this.#protocolFailure();
 			return;
 		}

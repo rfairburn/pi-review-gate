@@ -24,7 +24,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
-import { isSessionBackend, type SessionBackend } from "./session-backend";
+import { isSessionBackend, isNativeDisplayName, type SessionBackend } from "./session-backend";
 
 /**
  * Global session-host roster store and single-host ownership (#331).
@@ -167,6 +167,18 @@ export interface RosterEntry {
   readonly workspace?: string;
   /** Last observed native conversation name (display only). */
   readonly name?: string;
+  /**
+   * The operator's own host-side DISPLAY NAME of a native CLI row, keyed to this
+   * stable slot.
+   *
+   * This is a caption this host chose for its own row, NOT a conversation name:
+   * a native slot has no observable provider conversation, so a remembered native
+   * slot restores this text onto its unavailable placeholder and nothing else. It
+   * is never a provider identity, never sent to a provider, and never restored as
+   * a session, a resume target, or an auto-start. A Pi slot never carries it (a
+   * Pi row's name is the observed `name` above).
+   */
+  readonly displayName?: string;
   /** Last observed native persistence evidence for this binding. */
   readonly persistence?: RosterPersistence;
   /**
@@ -358,6 +370,10 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
     if (entry.sessionId !== undefined && !isValidNativeSessionId(entry.sessionId)) return undefined;
     if (entry.workspace !== undefined && !isValidRosterWorkspace(entry.workspace)) return undefined;
     if (entry.name !== undefined && !isValidRosterName(entry.name)) return undefined;
+    // A remembered host-side row caption follows the shared native display-name
+    // rule, not the provider conversation-name rule: an unbounded or
+    // control-bearing caption is a malformed document, never a truncated guess.
+    if (entry.displayName !== undefined && !isNativeDisplayName(entry.displayName)) return undefined;
     if (entry.persistence !== undefined && !isPersistence(entry.persistence)) return undefined;
     // The closed backend set only: an unknown provider identity is a malformed
     // document, never a value normalized to Pi or to the first known backend.
@@ -369,6 +385,7 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
       ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
       ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
       ...(entry.name !== undefined ? { name: entry.name } : {}),
+      ...(entry.displayName !== undefined ? { displayName: entry.displayName } : {}),
       ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
       ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
     });

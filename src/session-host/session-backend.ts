@@ -59,6 +59,34 @@ export function isNativeCliBackend(value: unknown): value is NativeCliBackend {
 }
 
 /**
+ * The upper bound for one operator-set native row display name, in UTF-16 code
+ * units. It is the same bound the host's single-line row label already carries
+ * (`MAX_LABEL_CHARS` in the session manager), so a name the sidebar can accept
+ * is never a value the manager must refuse.
+ */
+export const MAX_NATIVE_DISPLAY_NAME_CHARS = 80;
+
+/**
+ * The one native ROW DISPLAY NAME rule the whole host shares: a non-empty,
+ * bounded, single-line value with no control characters.
+ *
+ * This is deliberately NOT a conversation name. A native row has no observable
+ * provider conversation name, so this is only a host-side caption the operator
+ * chose for one sidebar row: it is never sent to the provider, never typed into
+ * the child, never compared with, defaulted from, or stored as a Pi native
+ * session identity, and it never renames anything outside this host's own row
+ * presentation. Neither the sidebar nor the manager keeps its own copy of this
+ * bound or its character class.
+ */
+export function isNativeDisplayName(value: unknown): value is string {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && value.trim() === value
+    && value.length <= MAX_NATIVE_DISPLAY_NAME_CHARS
+    && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value);
+}
+
+/**
  * Resolve an optional backend option. Absence is `pi` (compatibility with every
  * older caller and row); anything outside the closed set is a caller error and
  * throws rather than being guessed.

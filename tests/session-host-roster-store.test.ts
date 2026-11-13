@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { piAgentDir } from "../src/config-path";
+import { MAX_NATIVE_DISPLAY_NAME_CHARS } from "../src/session-host/session-backend";
 import {
   HOST_COORDINATION_FILENAME,
   HOST_OWNERSHIP_FILENAME,
@@ -875,6 +876,101 @@ test("the remembered roster keeps the optional closed provider backend and refus
     assert.equal(damaged.status, "unavailable");
     assert.match(damaged.status === "unavailable" ? damaged.reason : "", /malformed/);
     assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries[0].backend, "who-knows",
+      "a damaged roster is never rewritten or silently repaired");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The remembered native row's host-side display name (issue #277 host-UI slice)
+//
+// One native slot may carry ONE operator caption so it can come back under the
+// same name after a restart, when the row itself is a remembered placeholder.
+// Absence publishes no field at all, so every document this host wrote before
+// native naming stays byte-identical, and an unusable caption is a malformed
+// document — never a value truncated, coerced to the provider label, or dropped
+// while the rest of the entry survives.
+// ---------------------------------------------------------------------------
+
+test("the remembered roster keeps one native display name and refuses anything unusable", () => {
+  // Absence publishes nothing: an existing document keeps its exact payload.
+  const plain = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude" }],
+  });
+  assert.equal("displayName" in (localSlot(plain) ?? {}), false,
+    "a row nobody named publishes no caption field at all");
+
+  const named = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "Fleet work" }],
+  });
+  assert.equal(localSlot(named)?.displayName, "Fleet work");
+  assert.equal(localSlot(named)?.backend, "claude", "a caption never replaces the provider identity");
+  assert.equal(localSlot(named)?.name, undefined, "a caption is not the remembered conversation name");
+
+  // A caption the Pi rename path would refuse, and one the sidebar would refuse,
+  // are both malformed: the two rules cannot drift apart silently.
+  for (const displayName of [
+    "",
+    "   ",
+    " Fleet ",
+    "one\nline",
+    "line\u2028break",
+    "bell\u0007",
+    "c1\u0085control",
+    "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS + 1),
+    null,
+    1,
+    true,
+  ]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName }],
+    }), undefined, `caption ${JSON.stringify(displayName)} is not a usable name`);
+  }
+  // One unusable caption poisons the whole document, even beside a valid slot.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", displayName: "fine" },
+      { slotId: "s2", workspace: "/ws", displayName: "no\u0000control" },
+    ],
+  }), undefined);
+  // The bound itself is admissible.
+  assert.equal(localSlot(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "codex", displayName: "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS) }],
+  }))?.displayName, "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS));
+
+  // Publication validates too, and a damaged caption on disk is reported, not repaired.
+  const root = makeRoot("display-name");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "bad\nname" as never }],
+    }));
+    assert.equal(readRosterStore(agentDir).status, "absent", "the refused publication wrote nothing");
+
+    writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "Fleet work" }],
+    });
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.equal(localSlot(loaded.status === "loaded" ? loaded.roster : undefined)?.displayName, "Fleet work");
+
+    writeFileSync(rosterStorePath(agentDir), JSON.stringify({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "line\nbreak" }],
+    }), "utf8");
+    const damaged = readRosterStore(agentDir);
+    assert.equal(damaged.status, "unavailable");
+    assert.match(damaged.status === "unavailable" ? damaged.reason : "", /malformed/);
+    assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries[0].displayName, "line\nbreak",
       "a damaged roster is never rewritten or silently repaired");
   } finally {
     rmSync(root, { recursive: true, force: true });

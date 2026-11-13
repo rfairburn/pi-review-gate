@@ -12,6 +12,7 @@ import {
 import {
   InstanceManager,
   createDefaultPtyFactory,
+  isNativeViewerNativeCliInputSource,
   type InstancePty,
   type InstanceSpawnDescriptor,
   type InstanceStatusHandlers,
@@ -688,11 +689,19 @@ test("with host input framing ON, a native row still receives raw bytes while th
     assert.throws(() => harness.manager.write(piId, "ls\r"), /refusing unframed input/);
     await frameStaysWithout(harness.manager, piId, /PIGOT/, "no unframed byte reaches a framing Pi child");
 
-    // The strict viewer seam has nothing to fence a native row against.
+    // The strict viewer seam fences a hosted row against its own process-incarnation
+    // scope: the row mints the raw `native-cli` variant, with no registration identity
+    // anywhere in it, so framing stays Pi-only while remote input still has a fence.
     const viewer = harness.manager.openViewer({ hostRunId: "run-1", nativeClipboardSink: () => undefined });
     assert.ok(viewer);
     assert.equal(harness.manager.updateViewer(viewer.viewerId, { sessionId: claudeId, cols: 80, rows: 24 }).applied, true);
-    assert.equal(harness.manager.readViewerInputSource(viewer.viewerId), undefined, "a native row mints no viewer input scope");
+    const scope = harness.manager.readViewerInputSource(viewer.viewerId);
+    assert.ok(scope !== undefined && isNativeViewerNativeCliInputSource(scope),
+      "a native row mints its own hosted input scope, never a Pi one");
+    assert.equal(scope.rowId, claudeId);
+    assert.equal(scope.backend, "claude");
+    assert.equal(Object.hasOwn(scope, "registrationIdentity"), false);
+    assert.equal(Object.hasOwn(scope, "nativeSession"), false);
   });
 });
 

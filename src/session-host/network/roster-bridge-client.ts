@@ -80,6 +80,22 @@
  * else fails closed. The owner's delete policy is only described here
  * (`saved.policy`), starts unknown, and returns to unknown whenever the
  * subscription or channel ends; it never grants anything.
+ *
+ * The optional owner NATIVE lane rides the same channel, and only when the owner
+ * acknowledged {@link ROSTER_BRIDGE_NATIVE_CAPABILITY}. The owner's advertised
+ * target catalog commits with each complete snapshot
+ * (`projection.nativeCliTargets`), so a catalog is never held beside another run's
+ * rows, and it returns to `null` the moment the subscription or channel ends: a
+ * reconnect, resync, run replacement, or loss must earn a fresh one rather than
+ * reusing the previous run's choices. Rows the owner types carry its closed
+ * `backend` identity; absence stays the legacy Pi row and a backend is never
+ * inferred from a label. {@link RosterBridgeViewer.createNativeSession} names one
+ * exact advertised backend and target id and answers with the same three-way result
+ * union as the Pi create, sharing its one in-flight slot and its one monotonic
+ * per-channel attempt number, so the two lanes cannot run beside each other or
+ * bypass each other's ordering. A target the owner never advertised is refused
+ * before submission, and no outcome ever creates, selects, focuses, or defaults a
+ * local row.
  */
 
 import { randomUUID } from "node:crypto";
@@ -88,8 +104,11 @@ import type { PeerKey } from "./identity";
 import type { OwnerCloseRequest, PeerCloseResult } from "./peer-close";
 import {
   isOwnerCreateWorkspace,
+  findRemoteNativeCliTarget,
   type OwnerCreateRequest,
+  type OwnerNativeCreateRequest,
   type PeerCreateResult,
+  type RemoteNativeCliTarget,
 } from "./peer-create";
 import {
   isOwnerSavedQuery,
@@ -107,12 +126,21 @@ import {
   type PeerSavedResult,
   type PeerSavedSendOptions,
 } from "./peer-saved";
-import type { OwnerRenameRequest, PeerRenameOptions, PeerRenameResult } from "./peer-rename";
-import { isOwnerRenameTupleStillCurrent } from "./peer-rename";
+import type {
+  OwnerNativeRenameRequest,
+  OwnerRenameRequest,
+  PeerNativeRenameResult,
+  PeerRenameOptions,
+  PeerRenameResult,
+} from "./peer-rename";
+import { isOwnerNativeRenameRowStillCurrent, isOwnerRenameTupleStillCurrent } from "./peer-rename";
 import type { RemoteSessionMetadata } from "./roster-metadata";
+import { isNativeCliBackend, isNativeCliTargetId } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
@@ -128,6 +156,9 @@ import {
   type RosterBridgeBounds,
   type RosterBridgeCloseResultFrame,
   type RosterBridgeCreateResultFrame,
+  type RosterBridgeNativeCreateResultFrame,
+  type RosterBridgeNativeRenameRequestFrame,
+  type RosterBridgeNativeRenameResultFrame,
   type RosterBridgeRenameRequestFrame,
   type RosterBridgeRenameResultFrame,
   type RosterBridgeErrorCode,
@@ -175,6 +206,20 @@ export interface RosterBridgeProjection {
   readonly revision: number | null;
   /** Subscription that produced the published snapshot. */
   readonly subscriptionId: string | null;
+  /**
+   * The owner's advertised native launch targets, exactly as the LAST COMPLETE
+   * snapshot committed them, or `null` when no complete snapshot ever carried a
+   * catalog (including a channel that never negotiated the native lane).
+   *
+   * These are descriptive only: they name what the owner offered, they grant
+   * nothing, and they belong to the same run and revision as the rows beside them.
+   * When the projection is not `current` they are last-observed facts and must not
+   * be offered as choices; a stale, empty, or replaced observation, a new owner run,
+   * or a lost channel returns them to `null`. A requester selects one of these
+   * exact descriptors or asks for nothing — its own configured native targets are
+   * never addressed here, and nothing is ever defaulted.
+   */
+  readonly nativeCliTargets: readonly RemoteNativeCliTarget[] | null;
   readonly reason: RosterBridgeStalenessReason | null;
 }
 
@@ -294,8 +339,31 @@ export interface RosterBridgeViewer {
   readonly supportsClose: boolean;
   /** True only when this owner acknowledged the optional create capability. */
   readonly supportsCreate: boolean;
+  /**
+   * True only when this owner acknowledged the optional NATIVE lane: it really
+   * holds a native create provider AND an explicit target catalog. Descriptive
+   * only — it grants nothing, and a specific target is only ever one this owner
+   * published in a complete snapshot this side still holds as current.
+   */
+  readonly supportsNative: boolean;
   readonly supportsRename: boolean;
   renameSession(request: OwnerRenameRequest, options?: PeerRenameOptions): Promise<PeerRenameResult>;
+  /**
+   * True only when this owner acknowledged the SEPARATE native HOST ROW NAME
+   * lane. Descriptive only: it grants nothing, and a specific row is only ever one
+   * this owner still lists in a complete current snapshot under the run it names.
+   */
+  readonly supportsNativeName: boolean;
+  /**
+   * Ask this owner to host-name one of its native rows. It is a caption on the
+   * OWNER's row presentation and never a Pi conversation rename: the request
+   * carries no native conversation tuple, and this client never substitutes the Pi
+   * rename, a local caption, or a reconnect for it.
+   */
+  renameNativeSession(
+    request: OwnerNativeRenameRequest,
+    options?: PeerRenameOptions,
+  ): Promise<PeerNativeRenameResult>;
   /** Resolves on `hello_ack`; rejects on refusal, protocol failure, or channel loss. */
   readonly hello: Promise<void>;
   /** Subscribes and resolves with that subscription's first complete snapshot. */
@@ -339,6 +407,23 @@ export interface RosterBridgeViewer {
     options?: { readonly stillCurrent?: () => boolean },
   ): Promise<PeerCreateResult>;
   /**
+   * Ask this owner to create one NATIVE child in exactly one of its runs, naming
+   * one exact target from the catalog this owner advertised.
+   *
+   * The same three-way fixed result union, the same honesty rules, and — by design
+   * — the SAME one-in-flight slot and the SAME monotonic per-channel attempt number
+   * as {@link RosterBridgeViewer.createSession}: a native create cannot be submitted
+   * beside a Pi create on this channel, and neither lane can reuse an attempt
+   * number or bypass the other's ordering. A target this owner never advertised in
+   * a current complete snapshot is refused before submission; nothing falls back to
+   * a default target, the other backend, or a Pi create, and no local row,
+   * selection, or focus is produced by any outcome.
+   */
+  createNativeSession(
+    request: OwnerNativeCreateRequest,
+    options?: { readonly stillCurrent?: () => boolean },
+  ): Promise<PeerCreateResult>;
+  /**
    * The optional Saved catalog surface. Optional on this interface so older or
    * test viewers without it remain representable; a real viewer always supplies
    * it, and `saved.supported` says whether this owner acknowledged it.
@@ -372,13 +457,16 @@ interface PendingClose {
 }
 
 /**
- * The ONE outstanding create on this channel. Its attempt number is retained so a
- * result that names another owner run can never be reported as this request's.
+ * The ONE outstanding create on this channel, whichever lane asked for it. Its
+ * attempt number is retained so a result that names another owner run can never be
+ * reported as this request's, and its lane is retained so a Pi result can never
+ * settle a native request or the reverse.
  */
 interface PendingCreate {
   readonly requestId: string;
   readonly hostRunId: string;
   readonly sequence: number;
+  readonly resultType: "create_result" | "create_native_result";
   readonly settle: (result: PeerCreateResult) => void;
   timer: NodeJS.Timeout | null;
 }
@@ -387,6 +475,13 @@ interface PendingRename {
   readonly frame: RosterBridgeRenameRequestFrame;
   readonly deadlineAt: number;
   readonly settle: (result: PeerRenameResult) => void;
+  timer: NodeJS.Timeout | null;
+}
+
+interface PendingNativeRename {
+  readonly frame: RosterBridgeNativeRenameRequestFrame;
+  readonly deadlineAt: number;
+  readonly settle: (result: PeerNativeRenameResult) => void;
   timer: NodeJS.Timeout | null;
 }
 
@@ -543,6 +638,21 @@ function isCreateRequest(value: unknown, bounds: RosterBridgeBounds): value is O
   return isOwnerCreateWorkspace(record.workspace);
 }
 
+/**
+ * One locally acceptable native create request: the same run and workspace rules
+ * as a Pi create, plus one exact native backend and target id. This is only a
+ * shape check — the owner's advertised catalog decides whether the target exists,
+ * and nothing here defaults, aliases, or falls back.
+ */
+function isNativeCreateRequest(value: unknown, bounds: RosterBridgeBounds): value is OwnerNativeCreateRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (!isRosterBridgeIdentifier(record.hostRunId, bounds)) return false;
+  if (!isOwnerCreateWorkspace(record.workspace)) return false;
+  if (!isNativeCliBackend(record.backend)) return false;
+  return isNativeCliTargetId(record.targetId);
+}
+
 class ViewerBinding implements RosterBridgeViewer {
   readonly peerKey: PeerKey;
 
@@ -598,6 +708,14 @@ class ViewerBinding implements RosterBridgeViewer {
   #createSequence = 0;
   #pendingRename: PendingRename | null = null;
   #renameSequence = 0;
+  /**
+   * The native HOST ROW NAME lane's own one outstanding request and its own
+   * monotonic anti-replay high-water. They are deliberately separate from the Pi
+   * rename's so a host caption never queues behind a conversation rename and
+   * neither lane can consume, replay, or invalidate the other's attempt number.
+   */
+  #pendingNativeRename: PendingNativeRename | null = null;
+  #nativeRenameSequence = 0;
   /** The ONE outstanding Saved operation on this channel, if any. */
   #pendingSaved: PendingSaved | null = null;
   /**
@@ -660,6 +778,7 @@ class ViewerBinding implements RosterBridgeViewer {
       hostRunId: null,
       revision: null,
       subscriptionId: null,
+      nativeCliTargets: null,
       reason: null,
     });
     if (typeof options.onProjection === "function") this.#listeners.add(options.onProjection);
@@ -714,8 +833,16 @@ class ViewerBinding implements RosterBridgeViewer {
     return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY);
   }
 
+  get supportsNative(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY);
+  }
+
   get supportsRename(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_RENAME_CAPABILITY);
+  }
+
+  get supportsNativeName(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY);
   }
 
   get hello(): Promise<void> {
@@ -940,6 +1067,7 @@ class ViewerBinding implements RosterBridgeViewer {
       requestId,
       hostRunId: request.hostRunId,
       sequence,
+      resultType: "create_result",
       settle: (result) => outcome.resolve(result),
       timer: null,
     };
@@ -991,14 +1119,133 @@ class ViewerBinding implements RosterBridgeViewer {
   }
 
   /**
-   * One owner answer, matched only by the request id THIS side generated. An
-   * unsolicited, duplicated, foreign, or already-timed-out reply resolves nothing
-   * and is dropped, and a `started` fact that names another owner run can never be
-   * reported as a result of this request.
+   * True only while this side holds a CURRENT complete observation of the exact
+   * owner run the request names, and that observation advertised this exact
+   * backend and target id. A stale or never-completed observation, another run, a
+   * withdrawn catalog, or a target the owner never offered is no authorization to
+   * ask, and nothing here substitutes a default or reinterprets a requester-side id.
    */
-  #onCreateResult(frame: RosterBridgeCreateResultFrame): void {
+  #nativeTargetAdvertised(request: OwnerNativeCreateRequest): boolean {
+    const projection = this.#projection;
+    if (projection.state !== "current") return false;
+    if (projection.hostRunId !== request.hostRunId) return false;
+    return findRemoteNativeCliTarget(
+      projection.nativeCliTargets,
+      request.backend,
+      request.targetId,
+    ) !== null;
+  }
+
+  /**
+   * Ask this owner to create one NATIVE child in exactly one of its runs.
+   *
+   * Identical honesty rules to the Pi create, and deliberately the SAME one
+   * outstanding create and the SAME monotonic per-channel attempt number: a native
+   * attempt consumes the next number whether or not it is submitted, and a second
+   * create of either kind is refused `busy` rather than queued. The selected target
+   * must be one this owner advertised in the current complete snapshot, proved at
+   * admission and again synchronously inside the write that calls `channel.send`.
+   */
+  createNativeSession(
+    request: OwnerNativeCreateRequest,
+    options: { readonly stillCurrent?: () => boolean } = {},
+  ): Promise<PeerCreateResult> {
+    const refusal = this.#createRefusal();
+    if (refusal !== null) return Promise.resolve(refusal);
+    // The owner acknowledged no native lane for this channel, so no native create
+    // frame exists to send at all — and a Pi create is never attempted in its place.
+    if (!this.supportsNative) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    if (!isNativeCreateRequest(request, this.#bounds)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    // The only target this side may ever name is one the owner itself advertised.
+    if (!this.#nativeTargetAdvertised(request)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    if (this.#pendingCreate !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#createSequence >= Number.MAX_SAFE_INTEGER) {
+      return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    }
+    const sequence = this.#createSequence + 1;
+    // Advanced now and never rewound, on the counter the Pi create shares: this
+    // attempt owns its number even if the write is refused or the request times out.
+    this.#createSequence = sequence;
+    const requestId = randomUUID();
+    const outcome = deferred<PeerCreateResult>();
+    const pending: PendingCreate = {
+      requestId,
+      hostRunId: request.hostRunId,
+      sequence,
+      resultType: "create_native_result",
+      settle: (result) => outcome.resolve(result),
+      timer: null,
+    };
+    this.#pendingCreate = pending;
+    pending.timer = this.#arm(null, this.#bounds.createResultTimeoutMs, () => {
+      pending.timer = null;
+      // A silent owner is unobservable, not "never happened": a child may already
+      // exist, and nothing is re-sent, cancelled, or replayed on its behalf.
+      this.#settleCreate(pending, { kind: "unknown" });
+    });
+    const stillCurrent = options.stillCurrent;
+    const gate: ViewerSendGate = () => {
+      if (this.#stopRequested || this.#state === "detached" || this.#state === "failed") {
+        return { allow: false, reason: "not-ready" };
+      }
+      if (this.#pendingCreate !== pending) return { allow: false, reason: "not-ready" };
+      if (stillCurrent !== undefined) {
+        try {
+          if (stillCurrent() !== true) return { allow: false, reason: "target-unavailable" };
+        } catch {
+          // An unavailable fence decision is no decision at all.
+          return { allow: false, reason: "target-unavailable" };
+        }
+      }
+      // Re-proved after the caller's arbitrary callback: the owner's advertised
+      // catalog may have been replaced while this request waited.
+      return this.#nativeTargetAdvertised(request)
+        ? { allow: true }
+        : { allow: false, reason: "target-unavailable" };
+    };
+    void this.#queueSend({
+      type: "create_native_request",
+      requestId,
+      hostRunId: request.hostRunId,
+      workspace: request.workspace,
+      backend: request.backend,
+      targetId: request.targetId,
+      sequence,
+    }, gate).then((written) => {
+      if (written.ok) return;
+      if (!written.sent) {
+        // Positive proof this request never reached the transport.
+        this.#settleCreate(pending, { kind: "not-sent", reason: written.reason });
+        return;
+      }
+      // The write was invoked and then rejected: the owner may still have accepted
+      // it, so no outcome is established either way.
+      this.#settleCreate(pending, { kind: "unknown" });
+    });
+    return outcome.promise;
+  }
+
+  /**
+   * One owner answer, matched only by the request id THIS side generated AND by
+   * the lane that asked. An unsolicited, duplicated, foreign, already-timed-out,
+   * or lane-crossing reply resolves nothing and is dropped, and a `started` fact
+   * that names another owner run can never be reported as a result of this request.
+   */
+  #onCreateResult(
+    frame: RosterBridgeCreateResultFrame | RosterBridgeNativeCreateResultFrame,
+  ): void {
     const pending = this.#pendingCreate;
     if (pending === null || pending.requestId !== frame.requestId) return;
+    if (pending.resultType !== frame.type) {
+      // A Pi create is never answered by a native result and the reverse: the
+      // requester correlated one specific operation, and an answer on the other
+      // lane establishes nothing about this one.
+      return;
+    }
     const facts = frame.outcome;
     if (facts.kind === "started" && facts.hostRunId !== pending.hostRunId) {
       // The request named one exact run; an answer about another run establishes
@@ -1091,6 +1338,115 @@ class ViewerBinding implements RosterBridgeViewer {
 
   #settleAllRenames(): void {
     if (this.#pendingRename !== null) this.#settleRename(this.#pendingRename, { kind: "unknown" });
+  }
+
+  // ------------------------------------------------- native host row name
+
+  /**
+   * This side's only fence for one host-name request: a live subscription whose
+   * CURRENT complete snapshot names this exact owner run and still lists this exact
+   * row with the SAME native backend the request was built for. A stale or absent
+   * observation, a removed or replaced row, a run replacement, and a row whose
+   * reported backend moved are all refusals — never a retarget, and a backend is
+   * never inferred from a caption, a label, or the absence of Pi telemetry.
+   */
+  #nativeRenameTargetCurrent(request: OwnerNativeRenameRequest): boolean {
+    if (this.#stopRequested || this.#state !== "subscribed" || this.#projection.state !== "current"
+      || this.#projection.hostRunId !== request.hostRunId) return false;
+    const row = this.#projection.rows.find((candidate) => candidate.id === request.rowId);
+    return isOwnerNativeRenameRowStillCurrent(row, request);
+  }
+
+  renameNativeSession(
+    request: OwnerNativeRenameRequest,
+    options: PeerRenameOptions = {},
+  ): Promise<PeerNativeRenameResult> {
+    if (this.#controlRefusalReason() !== null) return Promise.resolve({ kind: "not-sent", reason: "not-ready" });
+    // The owner acknowledged no native NAME lane for this channel, so no host-name
+    // frame exists to send at all — and the Pi conversation rename is never
+    // attempted in its place, because a native row has no conversation to rename.
+    if (!this.supportsNativeName) {
+      return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    }
+    if (this.#pendingNativeRename !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#nativeRenameSequence >= Number.MAX_SAFE_INTEGER) {
+      return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    }
+    let frame: RosterBridgeNativeRenameRequestFrame;
+    try {
+      frame = Object.freeze({
+        type: "rename_native_request" as const,
+        hostRunId: request.hostRunId,
+        rowId: request.rowId,
+        backend: request.backend,
+        name: request.name,
+        requestId: randomUUID(),
+        sequence: this.#nativeRenameSequence + 1,
+      });
+      // The wire owns all identifier/native/caption rules; no parallel schema.
+      encodeRosterBridgeFrame(frame, this.#bounds);
+      if (!this.#nativeRenameTargetCurrent(frame)) {
+        return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
+      }
+    } catch { return Promise.resolve({ kind: "not-sent", reason: "invalid-request" }); }
+    this.#nativeRenameSequence = frame.sequence;
+    const outcome = deferred<PeerNativeRenameResult>();
+    const pending: PendingNativeRename = {
+      frame, deadlineAt: Date.now() + this.#bounds.renameResultTimeoutMs,
+      settle: (result) => outcome.resolve(result), timer: null,
+    };
+    this.#pendingNativeRename = pending;
+    pending.timer = this.#arm(null, this.#bounds.renameResultTimeoutMs, () => {
+      // A silent owner is unobservable, not "nothing happened": the caption may
+      // already be applied, and nothing is re-sent, cancelled, or replayed.
+      this.#settleNativeRename(pending, { kind: "unknown" });
+    });
+    const gate: ViewerSendGate = () => {
+      if (this.#pendingNativeRename !== pending || Date.now() >= pending.deadlineAt) {
+        return { allow: false, reason: "not-ready" };
+      }
+      try {
+        if (options.stillCurrent !== undefined && options.stillCurrent() !== true) {
+          return { allow: false, reason: "target-unavailable" };
+        }
+      } catch { return { allow: false, reason: "target-unavailable" }; }
+      // Re-prove after the caller's arbitrary synchronous callback.
+      return this.#pendingNativeRename === pending && Date.now() < pending.deadlineAt
+        && this.#nativeRenameTargetCurrent(frame)
+        ? { allow: true } : { allow: false, reason: "target-unavailable" };
+    };
+    void this.#queueSend(frame, gate).then((written) => {
+      if (!written.ok) {
+        this.#settleNativeRename(pending, written.sent
+          ? { kind: "unknown" } : { kind: "not-sent", reason: written.reason });
+      }
+    });
+    return outcome.promise;
+  }
+
+  #onNativeRenameResult(frame: RosterBridgeNativeRenameResultFrame): void {
+    const pending = this.#pendingNativeRename;
+    if (pending === null || pending.frame.requestId !== frame.requestId) return;
+    // An answer from a destination this side no longer observes is not this one's:
+    // the outcome is unobservable, never retargeted onto a newer row or run.
+    const result: PeerNativeRenameResult = Date.now() < pending.deadlineAt
+      && this.#nativeRenameTargetCurrent(pending.frame)
+      ? { kind: "owner-result", facts: frame.outcome } : { kind: "unknown" };
+    this.#settleNativeRename(pending, result);
+  }
+
+  #settleNativeRename(pending: PendingNativeRename, result: PeerNativeRenameResult): void {
+    if (this.#pendingNativeRename !== pending) return;
+    this.#pendingNativeRename = null;
+    if (pending.timer !== null) clearTimeout(pending.timer);
+    pending.timer = null;
+    pending.settle(result);
+  }
+
+  #settleAllNativeRenames(): void {
+    if (this.#pendingNativeRename !== null) {
+      this.#settleNativeRename(this.#pendingNativeRename, { kind: "unknown" });
+    }
   }
 
   // ------------------------------------------------------------------ saved
@@ -1319,6 +1675,17 @@ class ViewerBinding implements RosterBridgeViewer {
     const pending = this.#pendingSaved;
     if (pending !== null && isSavedReadKind(pending.kind)) this.#settleSaved(pending, { kind: "unknown" });
     this.#setSavedPolicy(undefined);
+  }
+
+  /**
+   * The live subscription ended: its advertised native catalog is no longer a set
+   * of choices this side may offer. Rows may stay as last-observed display facts;
+   * a target list is not one of them, because selecting it would address a run
+   * this side no longer observes.
+   */
+  #endNativeObservation(): void {
+    if (this.#projection.nativeCliTargets === null) return;
+    this.#setProjection({ state: this.#projection.state, reason: this.#projection.reason, nativeCliTargets: null });
   }
 
   #setSavedPolicy(policy: OwnerSavedPolicy | undefined): void {
@@ -1583,6 +1950,7 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllCloses();
     this.#settleAllCreates();
     this.#settleAllRenames();
+    this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
     const wasAwaitingAck = this.#state === "awaiting_ack";
@@ -1682,6 +2050,10 @@ class ViewerBinding implements RosterBridgeViewer {
   ): Promise<void> {
     // Whatever path ends the subscription, its run is no longer observed here.
     this.#endSavedObservation();
+    // Nor is its advertised native catalog: a target list belongs to one live
+    // complete observation, and a reconnect, resync, or run replacement must earn
+    // a fresh one from the owner rather than reusing the previous run's choices.
+    this.#endNativeObservation();
     if (this.#retirement !== null) return this.#retirement;
     if (this.#state !== "subscribed" || this.#subscriptionId === null) {
       this.#transfer = null;
@@ -1799,9 +2171,25 @@ class ViewerBinding implements RosterBridgeViewer {
       case "create_result":
         this.#onCreateResult(frame);
         return;
+      case "create_native_result":
+        if (!this.supportsNative) {
+          // Never acknowledged for this channel: outside the negotiated protocol.
+          this.#protocolFailure();
+          return;
+        }
+        this.#onCreateResult(frame);
+        return;
       case "rename_result":
         if (!this.supportsRename) this.#protocolFailure();
         else this.#onRenameResult(frame);
+        return;
+      case "rename_native_result":
+        if (!this.supportsNativeName) {
+          // Never acknowledged for this channel: outside the negotiated protocol.
+          this.#protocolFailure();
+          return;
+        }
+        this.#onNativeRenameResult(frame);
         return;
       case "saved_window_result":
       case "saved_window_begin":
@@ -1889,6 +2277,19 @@ class ViewerBinding implements RosterBridgeViewer {
     const transfer = this.#transfer;
     if (this.#isRetiringNoise(frame.subscriptionId)) return;
     if (this.#state !== "subscribed" || frame.subscriptionId !== this.#subscriptionId) return;
+    if (!this.supportsNative) {
+      for (const row of frame.rows) {
+        if (row.backend !== undefined) {
+          // A typed backend identity on a channel that never negotiated the native
+          // lane is an extension this side did not agree to, not a fact to drop on
+          // the floor: the whole subscription fails closed before ANY of this page
+          // is staged, so an unnegotiated owner cannot widen the row schema. A
+          // legacy page without the key is unaffected.
+          this.#protocolFailure();
+          return;
+        }
+      }
+    }
     if (transfer === null
       || frame.transferId !== transfer.transferId
       || frame.pageIndex !== transfer.pageIndex
@@ -1926,6 +2327,14 @@ class ViewerBinding implements RosterBridgeViewer {
     const transfer = this.#transfer;
     if (this.#isRetiringNoise(frame.subscriptionId)) return;
     if (this.#state !== "subscribed" || frame.subscriptionId !== this.#subscriptionId) return;
+    if (!this.supportsNative && frame.nativeCliTargets !== undefined) {
+      // Same rule as a typed row above: a native catalog arriving without the
+      // negotiated lane is refused as a protocol violation rather than silently
+      // ignored, so an unnegotiated peer can never test whether this side adopted
+      // an extension it never offered.
+      this.#protocolFailure();
+      return;
+    }
     if (transfer === null || frame.transferId !== transfer.transferId) {
       this.#protocolFailure();
       return;
@@ -1945,12 +2354,21 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#transfer = null;
     this.#clearTransferTimers();
     this.#lastComplete = { hostRunId: transfer.hostRunId, revision: transfer.revision, subscriptionId };
+    // The owner's advertised native catalog commits here and nowhere else: it
+    // belongs to these exact rows, this run, and this revision. An unnegotiated
+    // channel already failed closed above, so a catalog reaching this point means
+    // the lane was negotiated; a snapshot that carried none honestly publishes
+    // `null` instead of keeping the previous subscription's choices alive.
+    const advertised = this.supportsNative && frame.nativeCliTargets !== undefined
+      ? Object.freeze([...frame.nativeCliTargets])
+      : null;
     this.#setProjection({
       state: "current",
       rows,
       hostRunId: transfer.hostRunId,
       revision: transfer.revision,
       subscriptionId,
+      nativeCliTargets: advertised,
       reason: null,
     });
     this.#diagnostic("snapshot_published", rows.length);
@@ -2038,8 +2456,11 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllCloses();
     this.#settleAllCreates();
     this.#settleAllRenames();
+    this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
+    // A lost channel ends the native catalog too: its run is no longer observable.
+    this.#endNativeObservation();
     this.#transfer = null;
     this.#subscriptionId = null;
     this.#subscriptionRun = null;
@@ -2073,6 +2494,7 @@ class ViewerBinding implements RosterBridgeViewer {
     readonly hostRunId?: string | null;
     readonly revision?: number | null;
     readonly subscriptionId?: string | null;
+    readonly nativeCliTargets?: readonly RemoteNativeCliTarget[] | null;
   }): void {
     const previous = this.#projection;
     const next = Object.freeze({
@@ -2081,6 +2503,11 @@ class ViewerBinding implements RosterBridgeViewer {
       hostRunId: update.hostRunId ?? previous.hostRunId,
       revision: update.revision ?? previous.revision,
       subscriptionId: update.subscriptionId === undefined ? previous.subscriptionId : update.subscriptionId,
+      // `null` is a real value here (no catalog is observed), so only an omitted
+      // field keeps the previous one.
+      nativeCliTargets: update.nativeCliTargets === undefined
+        ? previous.nativeCliTargets
+        : update.nativeCliTargets,
       reason: update.reason,
     });
     this.#projection = next;
@@ -2276,6 +2703,7 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllCloses();
     this.#settleAllCreates();
     this.#settleAllRenames();
+    this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
     this.#detachHandler();

@@ -30,12 +30,18 @@ boundaries; [Development](development.md) owns verification commands.
   added: a provider's print, `exec`, or app-server path drives *its own* thread,
   so running it beside a hosted TUI would be a second conversation rather than
   the same session.
-- Provider selection is the New-session form's **Provider** line, local only, and
-  it **defaults to Pi every time the form opens**; choosing a native provider is
+- Provider selection is the New-session form's **Provider** line, and it
+  **defaults to Pi every time the form opens**; choosing a native provider is
+  explicit. The offered choices belong to the destination on the **Host** line: this
+  host's own targets when it names **Local**, and only a connected owner's advertised
+  targets when it names that owner. Choosing a native provider is
   explicit. The **Workspace** field and its initial focus behave exactly as before:
-  the form still opens on **Workspace**, `Shift+Tab` once reaches **Host**, a second
-  `Shift+Tab` reaches **Provider**, `Up`/`Down` cycle the displayed choice on the
-  focused line, and `Tab` from **Provider** returns to **Workspace**. With the mouse,
+  the form still opens on **Workspace**. The lines above it are drawn in the order
+  **Host**, then **Provider**, then the field, and the keyboard ring follows that
+  drawn order: `Shift+Tab` once from **Workspace** reaches **Provider** (or **Host**
+  when no Provider line is drawn), `Shift+Tab` again reaches **Host**, `Tab` from
+  **Host** steps to **Provider** and then back to **Workspace**, `Up`/`Down` cycle
+  the displayed choice on the focused line, and `Enter` still submits. With the mouse,
   clicking the **Provider** label focuses that line and clicking its value cycles to
   the next displayed choice — and only from the presentation currently drawn, so a
   stale frame never acts. The line is drawn only while the host offers native
@@ -46,9 +52,36 @@ boundaries; [Development](development.md) owns verification commands.
   releases any focus it held, arrows cannot change an undrawn choice, and a click
   there is refused. It returns on a later render once a row is spare again, for
   example after a resize or once the field stops drawing a completion list.
-- Choosing a native provider while the **Host** line names a connected destination is
-  refused in the form: nothing is sent, and the form shows
-  `<provider> is local only; choose Local or Pi`.
+- Choosing a native provider for a connected destination needs that owner to advertise
+  native targets and to hold the native owner-create provider. If it does, the form offers
+  only its own catalog and one request starts the row there; if it does not, no Provider
+  line is drawn for that destination and the choice is never carried across destinations or
+  quietly turned into Pi. Starting a native row on a paired owner over a real network is
+  still unproven provider acceptance; the shipped scope is the transport and the form, and
+  no physical-terminal or Windows result is claimed for it. The product description is
+  [Remote native create and host row name](session-host-alpha.md#remote-native-create-and-host-row-name).
+- The native **Workspace** field accepts exactly the spellings the Pi workspace field
+  already accepts, because both go through the host's one existing resolver: a bare
+  `~` or a `~/…` path is the host's own home directory, a relative spelling resolves
+  against the process working directory the host was started in, and an absolute
+  spelling is used as given. Whatever the spelling, the row and the child are anchored
+  at the single canonical real directory, and a path that is missing or is not a
+  directory is refused before anything spawns. No shell is involved, so a `~otheruser`
+  form and a `$VAR` form are not expanded here for either backend — that expansion
+  stays the invoking shell's job.
+- An existing native row can be **named** with the same `E` the host already has. What
+  it edits is a host-side caption of this host's own row, stored with the row's
+  remembered slot so the row comes back under the same name; it is never sent to the
+  child or the provider, never becomes provider conversation identity, and never
+  touches the authenticated Pi rename path. A name must be one trimmed line of at most
+  80 characters with no control characters; anything else is refused with the row and
+  the draft left exactly as they were. A remembered placeholder is not a live row to
+  caption: its footer advertises no naming affordance, and `E` there refuses truthfully.
+  Naming is honest about durability. When this host's roster publication for that
+  operation did not take — the store is unreadable, the remembered sequence overflowed,
+  or an earlier write failed — the live row is still captioned, and the host says so:
+  the name applies to this session only and will not return after a restart. It never
+  reuses an earlier one-time roster warning as if it described this naming.
 - A native target is either the built-in default for that backend or an explicit
   shared [`externalAgents`](configuration.md#the-externalagents-catalog) entry —
   its `command`, base `args`, and base `env`. The `review` and `execution` role
@@ -115,14 +148,22 @@ boundaries; [Development](development.md) owns verification commands.
 - A native row **does not carry this project's review gate, tool protection, or
   subtask capture/review/landing guarantees**, and is never presented as a
   review-gate-managed worker.
-- Native rows are created **locally only**. `SessionSpawn`, remote owner-create,
-  the Saved picker, and the standalone launchers all keep creating Pi sessions and
-  behave exactly as before. A remote viewer cannot type into a native row: that
-  row has no status registration to fence an input scope against, so the viewer
-  input path refuses it. No remote input, copy, or provider-tool behavior is
-  claimed for a native row.
+- Native rows are created by this host, and — over the paired owner lanes — by a
+  connected owner that advertises native targets. `SessionSpawn`, the Saved picker,
+  and the standalone launchers all keep creating Pi sessions and behave exactly as
+  before. A native row has no Pi status registration, so Pi's input framing and its
+  per-registration encoder do not apply to it. Instead, when both sides negotiated
+  the optional `native-input-cli-v1` capability, an authorized and consented viewer's
+  keys, canonical mouse packets, and whole pastes are handed to that row's PTY raw,
+  exactly as the owner's own Main types them, under a source-token domain separate
+  from both Pi families and the same per-viewer Remote input/copy setting. That is
+  terminal-process control only: it is never a claim about provider conversation
+  state, a hosted source is refused by the copy route rather than producing a
+  clipboard write, and no provider-tool behavior is claimed for a native row.
 - A remembered native row keeps its own backend and workspace and **always** comes
-  back as a truthful **unavailable placeholder** titled `<Provider> (unavailable)`:
+  back as a truthful **unavailable placeholder** titled `<name> (unavailable)`, where
+  `<name>` is the caption the operator gave the row or, if it was never named, its
+  provider label:
   a remembered native row is never restarted automatically by a host restart, so
   there is no conditional auto-restart to wait for. The row states
   `<Provider> sessions are not restored; open New to start one`. It is never
@@ -135,7 +176,9 @@ boundaries; [Development](development.md) owns verification commands.
 Each claim below carries one of four labels:
 
 - **Documented** — the provider's own official documentation, reviewed as source
-  only on 2026-11-12 against the versions below.
+  only against the versions below: on 2026-11-12, with the pages behind the Claude
+  Code mods, hooks, tools-reference, and agent-view statements and the Codex hooks
+  and slash-command statements rechecked on 2026-11-13.
 - **Probed** — an installed-binary check on a macOS development machine that ran
   version and help output only.
 - **Implemented, exercised with synthetic children** — host code covered by real
@@ -224,6 +267,9 @@ What the host-side runtime evidence actually is:
 - **Unknown, always:** agent busy or idle, a pending question, a pending approval,
   task and subagent counts, and background shell counts. A native row gets no
   status registration, so those fields stay unknown rather than being estimated.
+  `Unknown` records that this host added no provider-side observer for the field —
+  not that the provider has nothing to report. The capability tables below say what
+  each provider documents, and where a genuine gap remains.
 - The host **never scrapes the terminal** to guess a provider's state, and never
   infers idle from a missing PID, a quiet period, or an output gap. A row's exit
   event is the only settlement witness.
@@ -246,10 +292,11 @@ What the host-side runtime evidence actually is:
 | Cancel | Documented | [`Esc` interrupts the running turn](https://code.claude.com/docs/en/interactive-mode) and keeps a queued draft; `Ctrl+C` interrupts a running operation or clears input |
 | Shutdown | Documented, non-interactive only | `/exit` closes an interactive session. The documented SIGTERM contract (Bash process tree terminated, exit 143) is described for non-interactive runs, so interactive stop and settlement semantics are unverified |
 | Resume | Documented | [`claude -c`, `claude -r` with a session id or name, `/resume`, `--fork-session`, `--session-id <UUID>`](https://code.claude.com/docs/en/sessions); not everything is restored — plan mode only under conditions, and a forked process starts without the earlier session's permission grants. A hosted row starts no resume argument of its own |
-| Native tasks and subagents | Documented in-client; **Unknown** as an external read | [`--agents` definitions and the `SubagentStart`, `SubagentStop`, `TaskCreated`, `TaskCompleted` hook events](https://code.claude.com/docs/en/hooks). [Agent view](https://code.claude.com/docs/en/agent-view) documents that spawned subagents and teammates are **not** listed as separate rows, and no external per-session task count is documented |
-| Background shells | Documented in-client; **Unknown** as an external read | [`Ctrl+B`](https://code.claude.com/docs/en/interactive-mode) moves a running Bash command to the background (tmux users press twice); `!` shell mode runs a command directly; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` turns backgrounding off. No external per-session shell count is documented |
-| External current-state read | Documented; **Unknown** under a hosted PTY | [`claude agents --json [--all]`](https://code.claude.com/docs/en/agent-view) is documented as the supported way to read session state from outside Claude Code: entries carry `cwd`, `kind`, and `startedAt`, and a live entry carries `pid`, `status` (`busy`, `waiting`, `idle`) and, while waiting, `waitingFor` naming the cause (permission prompt, question or MCP input request, sandbox request, open dialog). Two documented limits matter here: an interactive session open in another terminal is **not listed until it is backgrounded**, and the documented `state` values cover background sessions |
+| Native tasks and subagents | Documented in-client and in-process; **Unknown** as an external read | [`--agents` definitions and the `SubagentStart`, `SubagentStop`, `TaskCreated`, `TaskCompleted` hook events](https://code.claude.com/docs/en/hooks) report transitions. Inside a running session a [mod](https://code.claude.com/docs/en/plugins/mods/reference) can take a live census: `$.agent.list()` "returns this session's subagents and teammates, each with a status of `pending`, `running`, `waiting`, `idle`, `completed`, `failed`, or `killed`", where `waiting` and `idle` need Claude Code v2.1.289 or later. [Agent view](https://code.claude.com/docs/en/agent-view) documents that those subagents and teammates are **not** listed as separate rows there, and no read from outside the running provider process is documented |
+| Background shells | Documented in-client; **Unknown** as an external read | [`Ctrl+B`](https://code.claude.com/docs/en/interactive-mode) moves a running Bash command to the background (tmux users press twice); `!` shell mode runs a command directly; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` turns backgrounding off. A tool hook can see a `Bash` call with `run_in_background: true`, but the running set is listed only in-client with `/tasks`, no completion event is documented, no per-change notification is documented, and no external per-session shell count is documented ([Tools reference](https://code.claude.com/docs/en/tools-reference#background-commands), [PreToolUse input](https://code.claude.com/docs/en/hooks#pretooluse-input)) |
+| External current-state read | Documented; **unverified** for a row this host starts | [`claude agents --json [--all]`](https://code.claude.com/docs/en/agent-view) is documented as the way to read session state from outside Claude Code — "every live session, plus background sessions that are still working or blocked even when their process has exited" — where entries carry `cwd`, `kind`, and `startedAt`, and a live entry carries `pid`, `status` (`busy`, `waiting`, `idle`) and, while waiting, `waitingFor` naming the cause (permission prompt, question or MCP input request, sandbox request, open dialog). The same page's agent-view list also says an interactive session open in another terminal does not appear until it is backgrounded, and the documented `state` values cover background sessions, so whether a session this host started in its own PTY is listed at all is **unverified** — not documented as impossible |
 | Hooks | Documented | A large [lifecycle event set](https://code.claude.com/docs/en/hooks) (session, prompt, tool, permission, subagent, task, model switch, compaction, session end) with command, HTTP, MCP-tool, prompt, and subagent handlers, restrictable by managed settings — an available later route, not something this project installs |
+| Mods (in-process observers) | Documented; **not installed or integrated by this host** | [A mod runs inside Claude Code](https://code.claude.com/docs/en/plugins/mods/reference) and follows its own conversation through [events](https://code.claude.com/docs/en/plugins/mods/events) including `turn.start`, `turn.step`, and `turn.complete`, with API namespaces such as `$.agent.list()`, `$.session` (`id`, `cwd`, `model`, `version`, …), and `$.env.get` / `set`. Running in the provider's own process, it needs no second client, which makes it the closest documented native-UI-preserving bridge; `--plugin-dir` and `--settings` are documented as applying to one session only. This project installs none, and it claims nothing about what any operator's own mod reports |
 | Headless and SDK | Documented, refused for a hosted row | `claude -p` and the Agent SDK drive their own conversation, and a project folder that was never trusted is treated differently there ([permissions](https://code.claude.com/docs/en/permissions)); they are never a substitute for the hosted interactive session, and a configured target that names them is refused |
 
 ## Codex CLI capabilities
@@ -264,10 +311,10 @@ What the host-side runtime evidence actually is:
 | Cancel | Partially documented | `interrupt_turn` is a configurable [`tui.keymap` chat action](https://learn.chatgpt.com/docs/config-file/config-basic); its default binding was not confirmed in the reviewed pages |
 | Shutdown | Documented | `Ctrl+C` or `/exit` closes the session ([CLI reference](https://learn.chatgpt.com/docs/cli/reference)); an `Interrupt` hook event fires when a turn is interrupted ([hooks](https://learn.chatgpt.com/docs/hooks)) |
 | Resume | Documented | [`codex resume` (by id or name, `--last`, `--all`) and `codex fork`](https://learn.chatgpt.com/docs/cli/reference); `--worktree` cannot combine with resume. These are subcommands or startup switches, so a hosted row starts none of them and resumes only in-pane |
-| Native tasks and subagents | Documented in-client; **Unknown** as an external read | [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): `agents.enabled` defaults to `true`, built-ins are `default`, `worker`, and `explorer`, and custom agents are TOML files under `~/.codex/agents/` or project `.codex/agents/`; `SubagentStart` and `SubagentStop` [hook events](https://learn.chatgpt.com/docs/hooks) exist. No external current-state read is documented |
-| Background shells | **Unknown** in the TUI; Documented, experimental, for app-server | No TUI shell mode or shell count was confirmed in the reviewed pages. app-server `thread/backgroundTerminals/list`, `/terminate`, and `/clean` are experimental and require the `experimentalApi` capability; `thread/shellCommand` runs outside the sandbox with full access and is never used |
+| Native tasks and subagents | Documented in-client; **Unknown** as an external read | [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): `agents.enabled` defaults to `true`, built-ins are `default`, `worker`, and `explorer`, and custom agents are TOML files under `~/.codex/agents/` or project `.codex/agents/`; `SubagentStart` and `SubagentStop` [hook events](https://learn.chatgpt.com/docs/hooks) exist. No programmatic current-state census for an ordinary hosted TUI session was established by this source review |
+| Background shells | Documented in-client; **Unknown** as an external read | [`/ps` lists the session's background terminals with each one's command and up to three recent non-empty output lines, and `/stop` (alias `/clean`) stops them](https://learn.chatgpt.com/docs/cli/slash-commands); that list is populated when `unified_exec` is in use, otherwise it may be empty. A unified-exec `exec_command` matches as Bash and "a later `write_stdin` poll can deliver the original command's `PostToolUse` when that command finishes" ([hooks](https://learn.chatgpt.com/docs/hooks)), so settlement is observable only when something polls; no external per-session shell count is documented. Separately, app-server `thread/backgroundTerminals/list`, `/terminate`, and `/clean` are experimental and require the `experimentalApi` capability; `thread/shellCommand` runs outside the sandbox with full access and is never used |
 | External current-state read | Documented for an app-server client; **Unknown** for a TUI-owned session | [`thread/read` and `thread/list` report runtime status, and `thread/status/changed` notifies with e.g. `status.type: "active"` and `activeFlags: ["waitingOnApproval"]`](https://learn.chatgpt.com/docs/app-server). Whether a second app-server client can observe a thread owned by a hosted TUI is unverified |
-| Hooks | Documented | [Lifecycle events](https://learn.chatgpt.com/docs/hooks) covering session start and end, prompt submit, tool pre and post, permission request, subagent start and stop, compaction, model request, stop, and interrupt; non-managed hooks must be reviewed and trusted by hash before running (`/hooks`) — so installing one for the host would be an undisclosed change to the operator's environment, and this project does not do it |
+| Hooks | Documented | [Lifecycle events](https://learn.chatgpt.com/docs/hooks) covering session start and end, prompt submit, tool pre and post, permission request, subagent start and stop, compaction, model request, stop, and interrupt. Hooks belong to the CLI itself, so they apply to a `--no-daemon` interactive row with no app-server connection — real transition signals, and still no current-state census; non-managed hooks must be reviewed and trusted by hash before running (`/hooks`) — so installing one for the host would be an undisclosed change to the operator's environment, and this project does not do it |
 | app-server | Documented, experimental | JSON-RPC over stdio by default; the WebSocket transport is documented as experimental and unsupported, and status-reading methods can be gated behind the `experimentalApi` capability |
 
 ## What a sidebar row shows today
@@ -275,6 +322,10 @@ What the host-side runtime evidence actually is:
 The sidebar rules apply unchanged: an unobserved field stays `unknown`, never
 idle and never zero, and the child's exit is the only settlement witness
 ([Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity)).
+Every `Unknown` below means this host added no observer for that field on this row;
+it is not a claim that the provider documents nothing. The capability tables above
+say what each provider does document, and the "Current state versus events, and
+freshness" paragraph below names the gaps that would survive any observer.
 
 | Sidebar field | Claude Code row | Codex CLI row |
 | --- | --- | --- |
@@ -285,9 +336,19 @@ idle and never zero, and the child's exit is the only settlement witness
 | Background task count | Unknown | Unknown |
 | Background shell count | Unknown | Unknown |
 | Activity lines | None | None |
-| Roster title of a remembered row after a host restart (always unavailable) | `<Provider> (unavailable)` | `<Provider> (unavailable)` |
+| Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
+| Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
+| Roster title of a remembered row after a host restart (always unavailable) | `<caption or Provider> (unavailable)` | `<caption or Provider> (unavailable)` |
 | Idle-only stop | Confirmation required, always | Confirmation required, always |
-| Rename, saved-conversation open, exited-row resume | Unavailable: Pi APIs | Unavailable: Pi APIs |
+| Provider conversation rename, saved-conversation open, exited-row resume | Unavailable: Pi APIs | Unavailable: Pi APIs |
+
+**Card structure.** A native card is drawn with the same rows as a Pi card, by the same
+shared card formatter. A row whose counts this host cannot
+observe reads `background unknown`, the existing summary a Pi card uses while both of
+those fields are unobserved; once a count is observed the row names each category
+(`bg tasks … | shells …`) exactly as a Pi card does. Nothing is ever rendered as a zero.
+That is a statement about what this host observed on this pass, not a claim that a
+provider could never report such a count.
 
 **Current state versus events, and freshness.** The host's status model is
 event-driven with no periodic polling. The Claude Code external read is a poll, so
@@ -296,25 +357,39 @@ staleness-to-unknown transition rather than a global polling loop, and the host'
 event-driven resynchronization points are not provider events. Codex's
 `thread/status/changed` is a genuine event, but only for a client of that
 app-server connection, and whether it describes a thread owned by a hosted TUI is
-unverified. What the providers do document is a *transition* notification:
-`SubagentStart` and `SubagentStop` on both, plus `TaskCreated` and `TaskCompleted`
-on Claude Code. Neither documents any notification that a background shell count
-changed inside a live interactive session, and no documented event carries the
-complete current set of tasks or background shells. Hooks are therefore real
-signal about transitions — but a transition stream is not a census: neither
-provider documents a reliable way to enumerate the complete current state at host
-startup or at a resynchronization point, so a hook-backed row would still have to
-answer "what exists right now" honestly before displaying anything.
+unverified. What both providers document for these fields is a *transition*
+notification: `SubagentStart` and `SubagentStop` on both, plus `TaskCreated` and
+`TaskCompleted` on Claude Code. A transition stream is not a census, and the two
+providers are not alike here. Claude Code documents one live census **inside a
+running session**: a mod's `$.agent.list()` returns that session's subagents and
+teammates with their current statuses, and `turn.start` / `turn.complete` mark the
+busy edges ([Mods reference](https://code.claude.com/docs/en/plugins/mods/reference),
+[Mods events](https://code.claude.com/docs/en/plugins/mods/events)). It is a
+read of one session by code running in that session, not an external read of a
+hosted TUI, and this host installs no mod. Codex documents no equivalent census.
+The background-shell gap stands on **both** providers: neither documents any
+notification that a background shell count changed inside a live interactive
+session. Claude Code's `Stop` and `SubagentStop` payloads carry a
+[`background_tasks`](https://code.claude.com/docs/en/hooks#stop-input) array of the
+in-flight tasks known at that instant, which is a turn-end snapshot rather than a
+live count, and no completion event for one shell is documented; Codex's `/ps` list
+is in-client only, with a unified-exec settlement that arrives only if something
+polls it. So a hook- or mod-backed row would still have to answer "what exists
+right now" honestly at host startup and at a resynchronization point, and where it
+cannot, the field stays `unknown`.
 
 ## Launch and ownership rules
 
 - The child inherits the host environment as-is, which is what makes each CLI's own
   `PATH`, home, and configuration-directory resolution work with zero
-  provider-side change. Host-owned session-bootstrap, startup-request, title,
-  `NODE_OPTIONS`-restore, settlement markers, and any delegated-worker role
-  authorization are stripped from the clone (including from a configured
-  environment overlay), so a native child never inherits a capability it did not
-  already own.
+  provider-side change. Two treatments apply to the clone (and to any configured
+  environment overlay), and they differ on purpose. A delegated worker's runtime
+  role authorization and executor tool catalog are **refused fail-closed**: the
+  launch is rejected outright rather than sanitized, because quietly deleting them
+  would launder a worker context into a top-level session. Stale host-only markers
+  — session-host bootstrap, startup-request, title, `NODE_OPTIONS`-restore, and
+  settlement/quiescence — are stripped, so a native child never inherits a
+  capability it did not already own.
 - The provider command, base arguments, and shared environment come from the
   operator's explicit
   [`externalAgents` catalog](configuration.md#the-externalagents-catalog) entry
@@ -416,11 +491,11 @@ What to expect, and what this does and does not prove:
   that is the unchanged default, and it is the first thing worth confirming. A pane
   too short to spare a row draws no **Provider** line and skips it in the focus
   ring; make the terminal taller.
-- To create a native row: press `Shift+Tab` twice (**Workspace** → **Host** →
-  **Provider**), use `Up`/`Down` to reach the provider you want, press `Tab` back to
-  **Workspace**, enter an existing directory, and submit. Choosing a native provider
-  and then a connected **Host** line is refused in the form with nothing sent —
-  `<provider> is local only; choose Local or Pi` — which is itself worth confirming.
+- To create a native row: press `Shift+Tab` once (**Workspace** → **Provider**),
+  use `Up`/`Down` to reach the provider you want, press `Tab` back to
+  **Workspace**, enter an existing directory, and submit. With a connected **Host** line the
+  Provider line offers only that owner's advertised targets, or nothing at all if it
+  advertises none; confirm which of the two you get before submitting.
 - The provider CLI inherits your normal `HOME`, configuration, and authentication,
   exactly as it would from your own shell. **You do not have to log in, select a
   model, or send a prompt to complete the tryout.** Opening the row, watching the
@@ -472,10 +547,14 @@ requirements:
 
 ## Open questions
 
-- Whether the Claude Code external status read is available and correct for a
-  session started inside a PTY host, given the documented rule that an interactive
-  session is not listed until backgrounded, and what it reports where agent view is
+- Whether the Claude Code external status read lists a session started inside a PTY
+  host at all: `--json` is documented as covering "every live session", while the
+  agent-view list says an interactive session open in another terminal does not
+  appear until it is backgrounded — plus what it reports where agent view is
   unavailable or disabled by policy.
+- Whether an operator-loaded Claude Code mod could be tied to one specific row for
+  the life of one launch: `--plugin-dir` and `--settings` are documented as
+  per-session, and no provider-side row identity is documented.
 - Whether any second-client status observation of a Codex TUI-owned thread is
   possible at all before app-server matures.
 - Whether a Codex interactive session surfaces background terminals in any way a
@@ -490,8 +569,10 @@ about it.
 
 ## Sources
 
-Provider documentation reviewed on 2026-11-12; the pages above link inline to the
-specific claim they support.
+Provider documentation reviewed on 2026-11-12, with the Claude Code mods, hooks,
+tools-reference, and agent-view pages and the Codex hooks and slash-commands pages
+rechecked on 2026-11-13; the pages above link inline to the specific claim they
+support.
 
 - Claude Code: [CLI reference](https://code.claude.com/docs/en/cli-reference),
   [Settings](https://code.claude.com/docs/en/settings),
@@ -502,13 +583,16 @@ specific claim they support.
   [Interactive mode](https://code.claude.com/docs/en/interactive-mode),
   [Manage sessions](https://code.claude.com/docs/en/sessions),
   [Hooks reference](https://code.claude.com/docs/en/hooks),
-  [Agent view](https://code.claude.com/docs/en/agent-view).
+  [Agent view](https://code.claude.com/docs/en/agent-view),
+  [Mods reference](https://code.claude.com/docs/en/plugins/mods/reference),
+  [Mods events](https://code.claude.com/docs/en/plugins/mods/events).
 - Codex CLI: [CLI reference](https://learn.chatgpt.com/docs/cli/reference),
   [Config basics](https://learn.chatgpt.com/docs/config-file/config-basic),
   [Agent approvals and security](https://learn.chatgpt.com/docs/agent-approvals-security),
   [App server](https://learn.chatgpt.com/docs/app-server),
   [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents),
-  [Hooks](https://learn.chatgpt.com/docs/hooks).
+  [Hooks](https://learn.chatgpt.com/docs/hooks),
+  [Slash commands](https://learn.chatgpt.com/docs/cli/slash-commands).
 - Published package versions at review time:
   [`@anthropic-ai/claude-code`](https://registry.npmjs.org/@anthropic-ai/claude-code/latest)
   2.1.322 and [`@openai/codex`](https://registry.npmjs.org/@openai/codex/latest)

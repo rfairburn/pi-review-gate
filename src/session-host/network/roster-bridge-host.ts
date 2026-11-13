@@ -103,8 +103,23 @@ import {
   type OwnerCreateFacts,
   type OwnerCreateHandler,
   type OwnerCreateRequest,
+  copyRemoteNativeCliTargets,
+  findRemoteNativeCliTarget,
+  type OwnerNativeCliTargetProvider,
+  type OwnerNativeCreateHandler,
+  type OwnerNativeCreateRequest,
+  type RemoteNativeCliTarget,
 } from "./peer-create";
-import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameHandler, type OwnerRenameRequest } from "./peer-rename";
+import {
+  isOwnerNativeRenameFacts,
+  isOwnerRenameFacts,
+  type OwnerNativeRenameFacts,
+  type OwnerNativeRenameHandler,
+  type OwnerNativeRenameRequest,
+  type OwnerRenameFacts,
+  type OwnerRenameHandler,
+  type OwnerRenameRequest,
+} from "./peer-rename";
 import {
   isOwnerSavedCatalogView,
   isOwnerSavedDeleteFacts,
@@ -121,9 +136,12 @@ import {
   type OwnerSavedWindowOutcome,
 } from "./peer-saved";
 import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
+import type { NativeCliBackend } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
@@ -138,10 +156,13 @@ import {
   isRosterBridgeProtocolError,
   negotiateRosterBridgeHello,
   resolveRosterBridgeBounds,
+  rosterBridgeNativeCatalogMaxEntries,
   rosterBridgeWireCodeForFailure,
   type RosterBridgeBounds,
   type RosterBridgeCloseRequestFrame,
   type RosterBridgeCreateRequestFrame,
+  type RosterBridgeNativeCreateRequestFrame,
+  type RosterBridgeNativeRenameRequestFrame,
   type RosterBridgeRenameRequestFrame,
   type RosterBridgeErrorCode,
   type RosterBridgeFrame,
@@ -229,6 +250,46 @@ export interface RosterBridgeHostOptions {
   /** Optional verified native rename provider; absence never acknowledges support. */
   readonly renameOwnedSession?: OwnerRenameHandler;
   /**
+   * The owner's ONE native create provider, supplied by Main, which already owns
+   * the only manager, run identity, and launch path (it will apply its own
+   * existing `startSession({ workspace, backend, nativeCliTarget })` semantics).
+   *
+   * It is paired with {@link RosterBridgeHostOptions.nativeCliTargets}: supplying
+   * exactly one of the two is refused at construction, and supplying neither keeps
+   * this host byte-for-byte the metadata/close/create/rename/Saved host it was.
+   * Supplying them grants nothing by itself: the native lane is acknowledged only
+   * for a peer that offered it, and every request is reauthorized against the
+   * current proved peer key and directional receiving grant immediately before the
+   * handler is reached, with the handler handed the same minimal re-proof the Pi
+   * create uses for its own last-instant check.
+   */
+  readonly nativeCreateOwnedSession?: OwnerNativeCreateHandler;
+  /**
+   * The owner's live native target catalog reader: the explicit list of targets
+   * this host really advertises, read from its own existing configuration. It is
+   * never stored, mirrored, polled, or cached by this bridge, and it is never
+   * called to resolve or launch anything — only to state, and to re-prove, exactly
+   * which owner targets exist right now. A throw or a malformed entry is a refusal
+   * to advertise, never a partial catalog.
+   */
+  readonly nativeCliTargets?: OwnerNativeCliTargetProvider;
+  /**
+   * The owner's ONE host-side ROW NAME provider for its native rows, supplied by
+   * Main, which already owns the only manager label, stable-slot caption, and
+   * roster publication.
+   *
+   * It is negotiated SEPARATELY from the native create lane: the
+   * {@link ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY} acknowledgement requires BOTH the
+   * validated native provider pair (create plus catalog) AND this callable, so an
+   * owner that launches native targets but never accepts a remote caption stays
+   * exactly what it was. Supplying it grants nothing by itself: every request is
+   * reauthorized against the current proved peer key and directional receiving
+   * grant immediately before the handler is reached, and the handler is handed the
+   * same minimal re-proof the other lanes use. It is never a Pi conversation
+   * rename and never a local mutation of anything belonging to the requester.
+   */
+  readonly renameNativeOwnedSession?: OwnerNativeRenameHandler;
+  /**
    * The owner's Saved catalog view factory, supplied by Main together with
    * {@link RosterBridgeHostOptions.remoteHistoryDeleteExposed}. Supplying exactly
    * one of the two is refused at construction; supplying neither keeps this host
@@ -252,6 +313,16 @@ export interface RosterBridgeHostOptions {
 interface SavedProviders {
   readonly createView: OwnerSavedCatalogViewFactory;
   readonly deleteExposed: OwnerRemoteHistoryDeletePolicy;
+}
+
+/**
+ * The validated native provider pair, captured once at host construction.
+ * Both halves or neither: a create provider with no catalog (or a catalog with no
+ * provider) is a partial configuration and is refused rather than defaulted.
+ */
+interface NativeProviders {
+  readonly create: OwnerNativeCreateHandler;
+  readonly targets: OwnerNativeCliTargetProvider;
 }
 
 /** One attached channel. Stopping it ends metadata delivery and nothing else. */
@@ -326,6 +397,22 @@ interface InFlightTransfer {
   index: number;
 }
 
+/**
+ * The ONE create this channel owns, whichever lane asked for it.
+ *
+ * Both lanes report the same closed fact set, so the only per-lane facts are which
+ * result frame answers and — for a native create — the exact advertised descriptor
+ * to re-prove immediately before the provider is invoked. It is bookkeeping for
+ * one operation, never a queue, history, or replay cache.
+ */
+interface InFlightCreate {
+  readonly requestId: string;
+  readonly hostRunId: string;
+  readonly resultType: "create_result" | "create_native_result";
+  /** Native only: the exact owner-advertised backend and target id this names. */
+  readonly descriptor: { readonly backend: NativeCliBackend; readonly targetId: string } | null;
+}
+
 class OwnerBinding implements RosterBridgeChannelBinding {
   readonly peerKey: PeerKey;
   readonly label: string | null;
@@ -367,13 +454,26 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * this binding already accepted: a later request that advances or is refused on
    * that scalar neither cancels the earlier child nor drops its fixed result.
    */
-  #inflightCreate: { readonly requestId: string; readonly hostRunId: string } | null = null;
+  #inflightCreate: InFlightCreate | null = null;
   #createSequence = 0;
   /** One operation and one anti-replay admission high-water, never a queue. */
   #inflightRename: { readonly requestId: string } | null = null;
   #renameSequence = 0;
+  /**
+   * The native HOST ROW NAME lane's own one operation and one anti-replay
+   * admission high-water. They are deliberately SEPARATE from the Pi rename's: a
+   * host caption never queues behind a conversation rename, and neither lane can
+   * consume, replay, or invalidate the other's attempt number.
+   */
+  #inflightNativeRename: { readonly requestId: string } | null = null;
+  #nativeRenameSequence = 0;
   /** The validated Saved provider pair, or null when this host has none. */
   readonly #saved: SavedProviders | null;
+  /**
+   * The validated native provider pair, or null when this host has none. Like
+   * Saved, both halves arrive together; neither grants anything by itself.
+   */
+  readonly #native: NativeProviders | null;
   /**
    * The channel's shared Saved anti-replay high-water. An ADMISSION fence only:
    * advancing it never cancels or drops an operation already accepted.
@@ -430,10 +530,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     diagnostic: (code: RosterBridgeOwnerDiagnosticCode, extra?: { rows?: number; pages?: number }) => void,
     onFinished: () => void,
     saved: SavedProviders | null,
+    native: NativeProviders | null,
   ) {
     this.#channel = channel;
     this.#options = options;
     this.#saved = saved;
+    this.#native = native;
     this.#bounds = bounds;
     this.#diagnostic = diagnostic;
     this.peerKey = channel.peerKey;
@@ -514,8 +616,14 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "create_request":
         this.#onCreateRequest(frame);
         return;
+      case "create_native_request":
+        this.#onNativeCreateRequest(frame);
+        return;
       case "rename_request":
         this.#onRenameRequest(frame);
+        return;
+      case "rename_native_request":
+        this.#onNativeRenameRequest(frame);
         return;
       case "saved_list_request":
       case "saved_search_request":
@@ -564,8 +672,24 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       if (capability === ROSTER_BRIDGE_CREATE_CAPABILITY) {
         return typeof this.#options.createOwnedSession === "function";
       }
+      if (capability === ROSTER_BRIDGE_NATIVE_CAPABILITY) {
+        // Implementation support only, and the strictest of the trio: a real
+        // injected native create provider AND an explicit target catalog reader,
+        // both captured at construction. A host with no native launch capability
+        // never widens anything, and acknowledging the lane states no authority,
+        // no available target, and no permission for this peer.
+        return this.#native !== null;
+      }
       if (capability === ROSTER_BRIDGE_RENAME_CAPABILITY) {
         return typeof this.#options.renameOwnedSession === "function";
+      }
+      if (capability === ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY) {
+        // The strictest reading of the lane: this owner holds a native host-name
+        // provider AND the validated native provider pair that makes a native row
+        // exist at all. It states implementation support only — never authority,
+        // never a grant, and never that any particular row is nameable by this peer.
+        return this.#native !== null
+          && typeof this.#options.renameNativeOwnedSession === "function";
       }
       if (capability === ROSTER_BRIDGE_SAVED_CAPABILITY) {
         // Implementation support only: a real view factory AND a live policy
@@ -831,7 +955,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     if (frame.sequence <= this.#createSequence) {
       // A previous or duplicated attempt number. Refused before any provider call,
       // and the high-water is unchanged, so nothing can be replayed.
-      this.#writeCreateResult(frame.requestId, { kind: "refused" });
+      this.#writeCreateResult("create_result", frame.requestId, { kind: "refused" });
       return;
     }
     // The attempt number is consumed now, whichever answer follows: it is a scalar
@@ -840,14 +964,19 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     if (this.#inflightCreate !== null) {
       // One create per channel. A second is refused, never queued, evicted, or
       // retargeted, and nothing was started for it.
-      this.#writeCreateResult(frame.requestId, { kind: "refused" });
+      this.#writeCreateResult("create_result", frame.requestId, { kind: "refused" });
       return;
     }
     const request: OwnerCreateRequest = Object.freeze({
       hostRunId: frame.hostRunId,
       workspace: frame.workspace,
     });
-    const inflight = { requestId: frame.requestId, hostRunId: frame.hostRunId };
+    const inflight: InFlightCreate = {
+      requestId: frame.requestId,
+      hostRunId: frame.hostRunId,
+      resultType: "create_result",
+      descriptor: null,
+    };
     this.#inflightCreate = inflight;
     this.#diagnostic("create_accepted");
     // The minimal re-proof handed to the provider: the current proved key, the
@@ -918,9 +1047,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * never forwarded: this channel may not report another run's child.
    */
   #completeCreate(
-    inflight: { readonly requestId: string; readonly hostRunId: string },
+    inflight: InFlightCreate,
     facts: OwnerCreateFacts,
-    providerReturned: boolean,
+    ownerEstablished: boolean,
   ): void {
     // A request abandoned by teardown is no longer this binding's to answer.
     if (this.#inflightCreate !== inflight) return;
@@ -929,30 +1058,268 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#diagnostic("create_reply_dropped");
       return;
     }
-    if (!this.#createStillAuthorized()) {
-      // A binding that retired inside the authorizer's own callout can no longer
-      // write a result at all; one that is merely unauthorized reports the refusal.
+    // A binding that retired inside the authorizer's own callout can no longer
+    // write a result at all; one that is merely unauthorized reports the refusal.
+    const authorized = inflight.resultType === "create_native_result"
+      // The native lane also re-proves its own exact run: a reply about a run this
+      // channel no longer subscribes to is not this request's answer.
+      ? this.#nativeCreateStillAuthorized(inflight.hostRunId)
+      : this.#createStillAuthorized();
+    if (!authorized) {
       this.#diagnostic(!this.#createBindingIsLive() ? "create_reply_dropped" : "create_refused");
       return;
     }
     if (facts.kind === "started" && facts.hostRunId !== inflight.hostRunId) {
       // The answer belongs to another run, so this request's outcome is
       // unobservable rather than a claimed child of the run it named.
-      this.#writeCreateResult(inflight.requestId, { kind: "unknown" });
+      this.#writeCreateResult(inflight.resultType, inflight.requestId, { kind: "unknown" });
       return;
     }
-    if (!providerReturned && facts.kind !== "unknown") {
-      // A re-proof that failed before the provider was reached establishes nothing
-      // about this owner's state.
-      this.#writeCreateResult(inflight.requestId, { kind: "unknown" });
+    if (!ownerEstablished && facts.kind !== "unknown") {
+      // A re-proof that failed before the owner's provider was reached establishes
+      // nothing about this owner's state.
+      this.#writeCreateResult(inflight.resultType, inflight.requestId, { kind: "unknown" });
       return;
     }
-    this.#writeCreateResult(inflight.requestId, facts);
+    this.#writeCreateResult(inflight.resultType, inflight.requestId, facts);
   }
 
-  /** Write one fixed create result, or drop it without touching the channel. */
-  #writeCreateResult(requestId: string, facts: OwnerCreateFacts): void {
-    this.#writeResult({ type: "create_result", requestId, outcome: facts }, "create_reply_dropped");
+  /**
+   * Write one fixed create result on the frame its own request used, or drop it
+   * without touching the channel. A Pi create is never answered on the native
+   * frame and the reverse, because the requester correlates by request id only and
+   * a lane-crossing answer would be a claim this side cannot support.
+   */
+  #writeCreateResult(
+    resultType: "create_result" | "create_native_result",
+    requestId: string,
+    facts: OwnerCreateFacts,
+  ): void {
+    this.#writeResult({ type: resultType, requestId, outcome: facts }, "create_reply_dropped");
+  }
+
+  // ---------------------------------------------------------- native create
+
+  /** True only when this channel negotiated the native lane AND this host has it. */
+  #nativeNegotiated(): boolean {
+    return this.#native !== null && this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY);
+  }
+
+  /**
+   * Read and validate the owner's OWN current advertised native target catalog.
+   *
+   * `null` means this owner cannot represent its native targets right now: no
+   * provider, a throw from the owner's own reader, a non-array, an over-long
+   * catalog beyond the frame-derived loop guard, or one malformed entry. That is a
+   * coherent refusal, never a partial, empty, or best-effort catalog, and nothing
+   * is cached from a previous read.
+   *
+   * The guard is the existing complete-frame byte bound expressed as an entry
+   * count, never the per-page row bound: this catalog describes the owner's own
+   * configured targets, so how many rows fit one snapshot page says nothing about
+   * how many targets it may advertise. Whether the catalog can actually be carried
+   * is settled by the encoded `snapshot_end` frame.
+   */
+  #advertisedNativeTargets(): readonly RemoteNativeCliTarget[] | null {
+    const native = this.#native;
+    if (native === null) return null;
+    let value: unknown;
+    try {
+      value = native.targets();
+    } catch {
+      return null;
+    }
+    return copyRemoteNativeCliTargets(value, rosterBridgeNativeCatalogMaxEntries(this.#bounds));
+  }
+
+  /**
+   * The native lane's exact-run fence, on the same subscription facts the rename
+   * and Saved lanes already use: a live, unfenced subscription that names THIS
+   * run. `#subscriptionRun` is set only while a watch is installed and nulled when
+   * the subscription retires — which is exactly what a run replacement does — so a
+   * request naming another run, or naming this channel's own run after that
+   * subscription was retired, fails here instead of reaching a provider.
+   */
+  #nativeRunIsCurrent(hostRunId: string): boolean {
+    return this.#state === "subscribed" && !this.#fenced && this.#subscriptionRun === hostRunId;
+  }
+
+  /**
+   * The native create's full re-proof: live binding, live subscription naming the
+   * requested run, and the current directional grant — with the lifecycle and run
+   * re-proved AFTER the arbitrary authorizer callout as well, so a Revoke, a
+   * teardown, or a run replacement that happens inside that callout fails closed.
+   */
+  #nativeCreateStillAuthorized(hostRunId: string): boolean {
+    if (!this.#createBindingIsLive() || !this.#nativeRunIsCurrent(hostRunId)) return false;
+    if (!this.#authorized()) return false;
+    return this.#createBindingIsLive() && this.#nativeRunIsCurrent(hostRunId);
+  }
+
+  /**
+   * Answer one native create request with the owner's ONE native provider, or not
+   * at all.
+   *
+   * Admission is decided here and now, on the same rules and with the SAME scalars
+   * as the Pi create plus one native-specific fact: the native lane must have been
+   * negotiated for this channel (which already required a real provider and
+   * catalog), the channel must not be fenced or pre-hello, the EXACT proved peer key
+   * must still carry this owner's current directional receiving grant, and the
+   * request must name the run this channel's live subscription actually observes.
+   * The shared monotonic sequence is then compared and CONSUMED before any
+   * target-dependent refusal, so a request refused because its target was
+   * unavailable, or because another create was in flight, cannot come back and
+   * succeed later — and a lower attempt number on either lane stays inadmissible.
+   * The request's backend and target id must match one descriptor in the owner's
+   * OWN current advertised catalog as a pair; an unknown id, an id owned by the
+   * other backend, or a catalog this owner cannot read is refused before any
+   * provider work, with no fallback to a default target, the other backend, or Pi.
+   *
+   * One exception is deliberate: the exact frame of the operation this binding has
+   * already accepted is ignored rather than answered. Its original result is still
+   * owed, and a second, competing `refused` on the same correlation would claim
+   * nothing was created while the provider may still be creating it.
+   *
+   * Inside the detached continuation the authorization, the exact run, and the
+   * exact advertised descriptor are each proved again — and proved AGAIN after the
+   * owner's catalog callout, immediately before the provider is invoked — so a
+   * target withdrawn, a grant revoked, or a run replaced after admission never
+   * launches.
+   */
+  #onNativeCreateRequest(frame: RosterBridgeNativeCreateRequestFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#native?.create;
+    if (handler === undefined || !this.#nativeNegotiated()) {
+      // Nothing was acknowledged for this channel, so a native create frame is
+      // outside the negotiated protocol: refused exactly like any other unexpected
+      // frame, and it never reaches an authority or falls back to a Pi create.
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    if (!this.#createStillAuthorized()) {
+      // No callback and no write: an unauthorized request establishes nothing, and
+      // the requester learns `unknown` from its own finite deadline rather than a
+      // fabricated refusal or a created child.
+      this.#diagnostic("create_refused");
+      return;
+    }
+    if (!this.#nativeRunIsCurrent(frame.hostRunId)) {
+      // The request names a run this channel does not currently observe: a foreign
+      // run id, or this channel's own subscription retired — which is exactly what
+      // a run replacement does — between the request being queued and arriving here.
+      // No callback and no write, for the same reason as an unauthorized request:
+      // this binding cannot speak about another run, and nothing here may claim the
+      // request was never seen either.
+      this.#diagnostic("create_refused");
+      return;
+    }
+    if (frame.sequence <= this.#createSequence) {
+      if (this.#inflightCreate !== null
+        && this.#inflightCreate.resultType === "create_native_result"
+        && this.#inflightCreate.requestId === frame.requestId) {
+        // The very frame of the native operation this binding already accepted,
+        // delivered again. Its one true result is still owed by the original
+        // continuation, so answering here would be a competing claim about an
+        // operation that may already have produced a child. Ignored: no second
+        // answer, no second provider call, and the attempt number stays consumed.
+        this.#diagnostic("create_refused");
+        return;
+      }
+      // A previous or duplicated attempt number on EITHER lane. Refused before any
+      // provider call, and the high-water is unchanged, so nothing can be replayed.
+      this.#writeCreateResult("create_native_result", frame.requestId, { kind: "refused" });
+      return;
+    }
+    // Consumed now, whichever answer follows: one channel-wide scalar, shared with
+    // the Pi create, so a native attempt cannot reuse a Pi attempt's number. This
+    // happens BEFORE every target-dependent refusal, so a target that is unavailable
+    // now and available later cannot turn the same consumed attempt into a launch.
+    this.#createSequence = frame.sequence;
+    // The owner's own current catalog is the only thing that can authorize this
+    // target. A requester's configured id, a label match, or a backend-only match
+    // is never enough, and a catalog this owner cannot read is a refusal.
+    const advertised = this.#advertisedNativeTargets();
+    if (!this.#nativeCreateStillAuthorized(frame.hostRunId)) {
+      // The owner's catalog reader is arbitrary owner code: re-prove the binding,
+      // the grant, and the exact run after that callout, before any write.
+      this.#diagnostic("create_refused");
+      return;
+    }
+    if (advertised === null
+      || findRemoteNativeCliTarget(advertised, frame.backend, frame.targetId) === null) {
+      this.#diagnostic("create_refused");
+      this.#writeCreateResult("create_native_result", frame.requestId, { kind: "refused" });
+      return;
+    }
+    if (this.#inflightCreate !== null) {
+      // One create per channel, across both lanes. A second is refused, never
+      // queued, evicted, retargeted, or run beside the first.
+      this.#writeCreateResult("create_native_result", frame.requestId, { kind: "refused" });
+      return;
+    }
+    const request: OwnerNativeCreateRequest = Object.freeze({
+      hostRunId: frame.hostRunId,
+      workspace: frame.workspace,
+      backend: frame.backend,
+      targetId: frame.targetId,
+    });
+    const descriptor = Object.freeze({ backend: frame.backend, targetId: frame.targetId });
+    const inflight: InFlightCreate = {
+      requestId: frame.requestId,
+      hostRunId: frame.hostRunId,
+      resultType: "create_native_result",
+      descriptor,
+    };
+    this.#inflightCreate = inflight;
+    this.#diagnostic("create_accepted");
+    const stillAuthorized = (): boolean => this.#nativeCreateStillAuthorized(request.hostRunId);
+    void Promise.resolve()
+      .then(() => {
+        // Re-proved inside the detached continuation, immediately before the call:
+        // a Revoke, a replacement, a run change, or a teardown that landed while
+        // this was queued means the provider is never reached.
+        if (!stillAuthorized()) {
+          this.#completeCreate(inflight, { kind: "unknown" }, false);
+          return;
+        }
+        // The exact advertised descriptor, proved again against the owner's live
+        // catalog right here. A withdrawal after admission is a positive
+        // pre-invocation establishment, so `refused` is truthful and nothing ran.
+        const current = this.#advertisedNativeTargets();
+        if (current === null || findRemoteNativeCliTarget(current, descriptor.backend, descriptor.targetId) === null) {
+          this.#diagnostic("create_refused");
+          this.#completeCreate(inflight, { kind: "refused" }, true);
+          return;
+        }
+        // The final catalog read is itself an arbitrary owner callout: it may revoke
+        // this peer's grant, retire this binding, or replace the owner run while
+        // still returning a catalog that names the requested target. Every one of
+        // those facts is therefore re-proved AFTER it, as the last thing checked
+        // before the provider is invoked, so a provider never runs for a request the
+        // owner no longer authorizes, on a run it no longer observes.
+        if (!stillAuthorized()) {
+          this.#diagnostic("create_refused");
+          this.#completeCreate(inflight, { kind: "unknown" }, false);
+          return;
+        }
+        return handler(request, stillAuthorized).then(
+          (facts) => this.#completeCreate(inflight, isOwnerCreateFacts(facts) ? facts : { kind: "unknown" }, true),
+          () => this.#completeCreate(inflight, { kind: "unknown" }, true),
+        );
+      })
+      .catch(() => {
+        // Nothing above may leave an accepted request stranded: an unexpected fault
+        // still completes it honestly and releases the one-in-flight bookkeeping.
+        this.#completeCreate(inflight, { kind: "unknown" }, false);
+      });
   }
 
   /**
@@ -1039,6 +1406,102 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       reply(facts);
     }).catch(() => {
       if (this.#inflightRename === inflight) this.#inflightRename = null;
+    });
+  }
+
+  // -------------------------------------------------- native host row name
+
+  /** True only when this channel negotiated the native NAME lane AND this host has it. */
+  #nativeNameNegotiated(): boolean {
+    return this.#nativeNameAvailable()
+      && this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY);
+  }
+
+  /** The validated provider pair this lane needs, or null when this host has none. */
+  #nativeNameProvider(): OwnerNativeRenameHandler | null {
+    if (this.#native === null) return null;
+    const handler = this.#options.renameNativeOwnedSession;
+    return typeof handler === "function" ? handler : null;
+  }
+
+  /** The pair plus a callable provider: what the acknowledgement is allowed to claim. */
+  #nativeNameAvailable(): boolean {
+    return this.#nativeNameProvider() !== null;
+  }
+
+  #nativeRenameStillAuthorized(hostRunId: string): boolean {
+    const current = (): boolean => this.#state === "subscribed" && !this.#fenced
+      && this.#subscriptionRun === hostRunId;
+    if (!current() || !this.#authorized()) return false;
+    return current(); // Re-prove lifecycle/run after the authorizer callout.
+  }
+
+  /**
+   * One deliberate HOST ROW NAME of one of this owner's native rows.
+   *
+   * The exchange mirrors the Pi rename's admission shape — a strictly increasing
+   * channel-wide attempt number, one in-flight operation, and one fixed result —
+   * while sharing NONE of its state, and it never reaches the Pi conversation
+   * rename: this frame carries no native tuple and this binding holds no path from
+   * it to `rename`. A frame on a channel that never negotiated the lane is a
+   * protocol violation, so an old or capability-narrower peer keeps exactly the
+   * lane it negotiated.
+   */
+  #onNativeRenameRequest(frame: RosterBridgeNativeRenameRequestFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#nativeNameProvider();
+    if (handler === null || !this.#nativeNameNegotiated()) {
+      this.#violation();
+      return;
+    }
+    if (!this.#nativeRenameStillAuthorized(frame.hostRunId)) return;
+    const reply = (facts: OwnerNativeRenameFacts): void => {
+      if (this.#nativeRenameStillAuthorized(frame.hostRunId)) {
+        this.#writeResult(
+          { type: "rename_native_result", requestId: frame.requestId, outcome: facts },
+          "rename_reply_dropped",
+        );
+      } else {
+        this.#diagnostic("rename_reply_dropped");
+      }
+    };
+    // A replay of the pending correlation must not settle that accepted work with
+    // a fabricated refusal; its original result remains the only answer.
+    if (this.#inflightNativeRename?.requestId === frame.requestId) return;
+    if (frame.sequence <= this.#nativeRenameSequence) {
+      reply({ kind: "refused" });
+      return;
+    }
+    this.#nativeRenameSequence = frame.sequence;
+    if (this.#inflightNativeRename !== null) {
+      // One host-name operation per channel. A second is refused, never queued,
+      // evicted, retargeted, or run beside the first.
+      reply({ kind: "refused" });
+      return;
+    }
+    const inflight = { requestId: frame.requestId };
+    this.#inflightNativeRename = inflight;
+    const request: OwnerNativeRenameRequest = Object.freeze({
+      hostRunId: frame.hostRunId,
+      rowId: frame.rowId,
+      backend: frame.backend,
+      name: frame.name,
+    });
+    const stillAuthorized = (): boolean => this.#nativeRenameStillAuthorized(frame.hostRunId);
+    // Owner work survives a lost channel. Only delivery belongs to this binding.
+    void Promise.resolve().then(async () => {
+      let facts: OwnerNativeRenameFacts = { kind: "unknown" };
+      try {
+        if (stillAuthorized()) {
+          const result = await handler(request, stillAuthorized);
+          if (isOwnerNativeRenameFacts(result)) facts = result;
+        }
+      } catch { /* An invoked failure cannot prove a no-op. */ }
+      if (this.#inflightNativeRename !== inflight) return;
+      this.#inflightNativeRename = null;
+      reply(facts);
+    }).catch(() => {
+      if (this.#inflightNativeRename === inflight) this.#inflightNativeRename = null;
     });
   }
 
@@ -1771,12 +2234,43 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // The DTO allowlist is the only way onto the wire: no spread of the owner
       // view, so no agent directory, current file, or other private field.
       // The owner's durable roster slot rides only on a channel that negotiated
-      // it; every other peer receives the pre-#477 row shape unchanged.
+      // it; every other peer receives the pre-#477 row shape unchanged. The typed
+      // backend identity rides only on a channel that negotiated the native lane,
+      // and it copies what the owner row already reports — it is never derived
+      // from a label or an absence of Pi telemetry.
       const carryRosterSlots = this.#capabilities.includes(ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY);
-      rows = snapshot.rows.map((row) => toRemoteSessionMetadata(row, { rosterSlotId: carryRosterSlots }));
+      const carryBackend = this.#nativeNegotiated();
+      rows = snapshot.rows.map((row) => toRemoteSessionMetadata(
+        row,
+        { rosterSlotId: carryRosterSlots, backend: carryBackend },
+      ));
     } catch (error) {
       this.#terminateSubscription(isRemoteSessionMetadataError(error) ? "row_unrepresentable" : "bad_frame", "snapshot_failed");
       return;
+    }
+    // A negotiated native lane owes this viewer a truthful catalog beside its
+    // rows. An unreadable or unrepresentable one refuses THIS snapshot whole
+    // through the existing terminal path rather than publishing rows with no
+    // catalog, an empty catalog, or a clipped one; the viewer then honestly marks
+    // its observation not current. With the lane unnegotiated nothing is read.
+    let nativeCliTargets: readonly RemoteNativeCliTarget[] | null = null;
+    if (this.#nativeNegotiated()) {
+      const catalog = this.#advertisedNativeTargets();
+      if (catalog === null) {
+        this.#terminateSubscription("row_unrepresentable", "snapshot_failed");
+        return;
+      }
+      // The catalog rides the `snapshot_end` frame, so its transport ceiling is
+      // that frame's bound — not the page bound and not a row count. This early
+      // check only names the honest `snapshot_too_large` code for a catalog that
+      // cannot fit a frame on its own; the authoritative all-or-nothing check is
+      // the encoded end frame inside the transfer builder below, so a catalog
+      // whose frame overhead no longer fits still refuses the whole snapshot.
+      if (Buffer.byteLength(JSON.stringify(catalog), "utf8") > this.#bounds.maxFrameBytes) {
+        this.#terminateSubscription("snapshot_too_large", "snapshot_failed");
+        return;
+      }
+      nativeCliTargets = catalog;
     }
     try {
       const built = buildRosterBridgeTransfer({
@@ -1786,6 +2280,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         revision: snapshot.revision,
         rows,
         bounds: this.#bounds,
+        ...(nativeCliTargets === null ? {} : { nativeCliTargets }),
       });
       this.#transfer = {
         frames: built.frames,
@@ -2102,6 +2597,10 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
   if (options.renameOwnedSession !== undefined && typeof options.renameOwnedSession !== "function") {
     throw new TypeError("roster metadata host requires a callable rename provider");
   }
+  if (options.renameNativeOwnedSession !== undefined
+    && typeof options.renameNativeOwnedSession !== "function") {
+    throw new TypeError("roster metadata host requires a callable native host-name provider");
+  }
   // The Saved pair is all-or-nothing: a view without a live delete policy (or the
   // reverse) is a partial configuration and is refused rather than defaulted.
   const savedView = options.savedCatalogView;
@@ -2112,6 +2611,18 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       throw new TypeError("roster metadata host requires a Saved view factory and a live delete policy together");
     }
     saved = Object.freeze({ createView: savedView, deleteExposed: savedPolicy });
+  }
+  // The native pair is all-or-nothing, exactly like Saved: a create provider with
+  // no explicit catalog (or the reverse) is a partial configuration and is refused
+  // rather than defaulted, so a host can never acknowledge a lane it cannot honour.
+  const nativeCreate = options.nativeCreateOwnedSession;
+  const nativeTargets = options.nativeCliTargets;
+  let native: NativeProviders | null = null;
+  if (nativeCreate !== undefined || nativeTargets !== undefined) {
+    if (typeof nativeCreate !== "function" || typeof nativeTargets !== "function") {
+      throw new TypeError("roster metadata host requires a native create provider and an explicit target catalog together");
+    }
+    native = Object.freeze({ create: nativeCreate, targets: nativeTargets });
   }
   const bounds = resolveRosterBridgeBounds(options.bounds);
   const bindings = new Set<OwnerBinding>();
@@ -2137,7 +2648,7 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       }
       const binding = new OwnerBinding(channel, options, bounds, diagnostic, () => {
         bindings.delete(binding);
-      }, saved);
+      }, saved, native);
       bindings.add(binding);
       void binding.closed.then(() => {
         bindings.delete(binding);

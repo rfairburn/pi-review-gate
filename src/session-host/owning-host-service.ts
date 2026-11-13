@@ -108,6 +108,10 @@ export type OwningHostManager = Pick<InstanceManager,
   // The strict viewer input seam is an optional manager capability: a manager that
   // does not offer it is simply not an input path, never an inferred one.
   | "readViewerInputSource" | "writeViewerInput"
+  // Captioning one native row's display label is optional the same way: a host
+  // whose manager does not offer it names nothing, and the Edit form reports that
+  // truthfully instead of guessing a rename through another path.
+  | "setNativeDisplayName"
   // The guarded saved Resume/Delete primitives are optional the same way: a manager
   // without them is unavailable for guarded mutation, never served through the
   // older nonatomic admit/validate/start methods.
@@ -131,6 +135,7 @@ export type {
   NativeViewerInputResult,
   NativeViewerInputSource,
   NativeViewerInputTuple,
+  NativeViewerNativeCliInputSource,
   NativeViewerStartupInputSource,
   SessionGeometry,
   SessionViewerRefusal,
@@ -879,11 +884,15 @@ export interface OwningHostService {
    * path), or undefined when that surface cannot take viewer input right now: no
    * manager, host teardown, a manager without the seam, an unknown or retired
    * surface, a surface with no copy sink or no row, a row that is gone, finished,
-   * stopping, or unregistered, a row whose input framing was not requested or whose
-   * readiness was never verified, or an unknown native conversation outside the
+   * stopping, or unregistered, a Pi row whose input framing was not requested or
+   * whose readiness was never verified, or an unknown native conversation outside the
    * row's explicit, sticky startup phase. During that startup phase (before the
    * registration's first accepted status) the source is the tuple-less startup
-   * variant; it is input-only and never a copy scope.
+   * variant; it is input-only and never a copy scope. A hosted provider CLI row
+   * (backends `claude` and `codex`) instead yields the tuple-less `native-cli` source
+   * naming its recorded backend, only while this host still owns its live PTY and
+   * surface; it is bound to that process incarnation by an owner-private key, is
+   * input-only, and never a copy scope.
    *
    * Reading is a pure fact read: nothing is written, queued, resized, spawned, or
    * armed, and the returned token describes those facts instead of granting

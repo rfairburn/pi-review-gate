@@ -11,8 +11,10 @@
  *   explicit native choice travels on the create action;
  * - a native row's card states its provider and nothing invented, with every
  *   Pi-only control refused truthfully;
- * - a native choice plus a remote Host is a truthful refusal, never a silent
- *   Pi submission.
+ * - the Provider line offers only the CHOSEN destination's own targets, so a
+ *   native-less remote owner keeps Pi-only behavior, an explicit native choice is
+ *   never reinterpreted for another destination or owner run, and nothing is ever
+ *   silently converted into a Pi submission.
  */
 
 import assert from "node:assert/strict";
@@ -24,10 +26,16 @@ import {
   SIDEBAR_GENERATED_SGR_ALLOWLIST,
   type SidebarAction,
   type SidebarControllerOptions,
+  type SidebarFieldFactoryOptions,
+  type SidebarFieldFactoryResult,
   type SidebarItem,
   type SidebarNativeCliTarget,
   SidebarController,
 } from "../src/session-host/sidebar";
+import type {
+  SessionHostFieldRender,
+  SessionHostFieldSubmission,
+} from "../src/session-host/field-editor";
 import type { PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
@@ -150,6 +158,21 @@ function peerHost(id: string, label: string): PeerUiHost {
   };
 }
 
+/**
+ * A destination whose owner really negotiated the native lane and advertises this
+ * catalog, so its New form can offer those owner targets and only those.
+ */
+function peerHostNative(
+  id: string,
+  label: string,
+  targets: readonly SidebarNativeCliTarget[] = [
+    { id: "claude", backend: "claude", label: "Claude (owner)" },
+  ],
+  state: PeerUiHost["state"] = "connected",
+): PeerUiHost {
+  return { ...peerHost(id, label), state, nativeCli: { supported: true, targets } };
+}
+
 function peerSnapshot(hosts: readonly PeerUiHost[]): PeerUiSnapshot {
   return {
     revision: 1, status: "ready", settings: null, identityFingerprint: null,
@@ -185,19 +208,29 @@ test("the Provider line offers Pi first and an ordinary submission still carries
     "a default Pi submission keeps the exact existing action shape");
 });
 
-test("Shift+Tab walks Host then Provider, cycles the drawn choice, and Tab returns to the workspace", () => {
+test("Shift+Tab walks Provider then Host, cycles the drawn choice, and Tab follows the drawn order", () => {
   const { harness } = newForm({ nativeCliTargets: TARGETS });
   harness.send("/draft");
+  // The drawn order is Header, Host, Provider, Workspace, and the ring follows
+  // it: one Shift+Tab from the workspace field reaches the Provider line drawn
+  // directly above it, a second reaches the Host line above that.
   harness.send(SHIFT_TAB);
   let texts = paneTexts(harness);
-  assert.ok(texts.some((line) => line.startsWith("> Host: [ Local ]")), JSON.stringify(texts));
-  assert.ok(texts.some((line) => line.startsWith("  Provider: [ Pi ]")));
+  assert.ok(texts.some((line) => line.startsWith("  Host: [ Local ]")), JSON.stringify(texts));
+  assert.ok(texts.some((line) => line.startsWith("> Provider: [ Pi ]")),
+    `the first Shift+Tab owns the control drawn above the field: ${JSON.stringify(texts)}`);
 
   harness.send(SHIFT_TAB);
   texts = paneTexts(harness);
-  assert.ok(texts.some((line) => line.startsWith("  Host: [ Local ]")),
-    "continuing the focus ring leaves the Host line unfocused");
-  assert.ok(texts.some((line) => line.startsWith("> Provider: [ Pi ]")), JSON.stringify(texts));
+  assert.ok(texts.some((line) => line.startsWith("> Host: [ Local ]")),
+    "continuing the focus ring reaches the Host line");
+  assert.ok(texts.some((line) => line.startsWith("  Provider: [ Pi ]")), JSON.stringify(texts));
+
+  // Tab forward from Host steps down onto the Provider line, not past it.
+  harness.send(TAB);
+  texts = paneTexts(harness);
+  assert.ok(texts.some((line) => line.startsWith("> Provider: [ Pi ]")),
+    `Tab follows the drawn order into the Provider line: ${JSON.stringify(texts)}`);
 
   harness.send(DOWN);
   texts = paneTexts(harness);
@@ -232,7 +265,6 @@ test("Shift+Tab walks Host then Provider, cycles the drawn choice, and Tab retur
 test("an explicit configured target travels unchanged as backend plus target id", () => {
   const { harness } = newForm({ nativeCliTargets: TARGETS });
   harness.send("/srv/app");
-  harness.send(SHIFT_TAB); // Host
   harness.send(SHIFT_TAB); // Provider
   harness.send(DOWN); // claude
   harness.send(DOWN); // codex
@@ -251,7 +283,6 @@ test("an explicit configured target travels unchanged as backend plus target id"
 test("every New opening resets the provider to Pi", () => {
   const { harness } = newForm({ nativeCliTargets: TARGETS });
   harness.send("/keep");
-  harness.send(SHIFT_TAB);
   harness.send(SHIFT_TAB);
   harness.send(DOWN);
   assert.ok(paneTexts(harness).some((line) => line.startsWith("> Provider: [ Claude Code (default) ]")));
@@ -301,7 +332,9 @@ function focusedSelectors(lines: string[]): string[] {
 
 test("a label click owns exactly one selector, and the keys follow the drawn marker", () => {
   const { harness, texts } = newForm({ nativeCliTargets: TARGETS });
-  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHost("lab-a", "Lab Alpha")]));
+  // The destination advertises its OWN native lane, so the Provider line stays
+  // drawn across the Host cycle and this test keeps exercising focus ownership.
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
   const drawn = paneTexts(harness);
   const hostRow = drawn.findIndex((line) => line.startsWith("  Host: [ Local ]"));
   const providerRow = drawn.findIndex((line) => line.startsWith("  Provider: [ Pi ]"));
@@ -310,8 +343,7 @@ test("a label click owns exactly one selector, and the keys follow the drawn mar
   // Keyboard focus reaches the Provider line, then a mouse press on the HOST
   // label transfers the single focus: the drawn marker moves, and the very same
   // keys now act on Host instead of the previously focused Provider.
-  harness.send(SHIFT_TAB); // Host line
-  harness.send(SHIFT_TAB); // Provider line
+  harness.send(SHIFT_TAB); // Provider line (drawn directly above the field)
   assert.deepEqual(focusedSelectors(paneTexts(harness)), ["Provider"]);
   const shown = harness.controller.captureMousePresentation();
   assert.equal(shown.activateFormHostAt?.(0, hostRow, 48, 14), true,
@@ -323,11 +355,12 @@ test("a label click owns exactly one selector, and the keys follow the drawn mar
   assert.ok(afterHostCycle.some((line) => line.startsWith("> Host: [ Lab Alpha ]")),
     JSON.stringify(afterHostCycle));
   assert.ok(afterHostCycle.some((line) => line.startsWith("  Provider: [ Pi ]")),
-    "the provider selection is untouched by the Host cycle");
+    "a Host change never reinterprets the provider selection: it stays Pi");
 
-  // The reverse transition: keyboard focus lands back on the Provider line, and
-  // a mouse press on the Host label again leaves exactly one focused control.
-  harness.send(SHIFT_TAB); // Host -> Provider (keyboard)
+  // The reverse transition: a forward Tab from the Host line steps back down
+  // onto the Provider line it precedes, and a mouse press on the Host label
+  // again leaves exactly one focused control.
+  harness.send(TAB); // Host -> Provider (keyboard, following the drawn order)
   assert.deepEqual(focusedSelectors(paneTexts(harness)), ["Provider"]);
   const relabel = harness.controller.captureMousePresentation();
   assert.equal(relabel.activateFormHostAt?.(0, hostRow, 48, 14), true);
@@ -361,22 +394,323 @@ test("a label click owns exactly one selector, and the keys follow the drawn mar
     "focus transfers and cycles never submit or launch anything");
 });
 
-test("a native provider choice with a remote Host refuses truthfully and emits nothing", () => {
+/** Give the currently drawn New form the writer receipt Main would report. */
+function settleNewForm(harness: Harness): void {
+  void paneTexts(harness);
+  const drawn = harness.controller.captureCreateFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn New form must be capturable");
+  assert.equal(harness.controller.settleCreateFormRender(drawn!.renderToken), true);
+}
+
+/** Give the currently drawn REMOTE Edit form the writer receipt Main would report. */
+function settleEditForm(harness: Harness): void {
+  void paneTexts(harness);
+  const drawn = harness.controller.captureEditFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn remote Edit form must be capturable");
+  assert.equal(harness.controller.settleEditFormRender(drawn!.renderToken), true);
+}
+
+/** True when a drawn notice line contains this exact phrase (notices clip). */
+function showsNotice(texts: string[], phrase: string): boolean {
+  return texts.map((line) => line.trim()).some((line) => line.startsWith("! ") && line.includes(phrase));
+}
+
+test("a native-less remote owner offers no native choice and keeps Pi-only behavior", () => {
   const { harness } = newForm({ nativeCliTargets: TARGETS });
   harness.controller.setPeerUiSnapshot(peerSnapshot([peerHost("lab-a", "Lab Alpha")]));
   void paneTexts(harness);
+  harness.send(SHIFT_TAB); // Provider line (the control drawn above the field)
   harness.send(SHIFT_TAB); // Host line
   harness.send(DOWN); // -> Lab Alpha
-  harness.send(SHIFT_TAB); // Provider line
-  harness.send(DOWN); // -> Claude
-  harness.send(TAB); // back to the workspace field
+  harness.send(TAB); // the focus ring skips the undrawn Provider and reaches Workspace
   harness.baseline = harness.actions.length;
   harness.send("/srv/app");
+  settleNewForm(harness);
   harness.send(ENTER);
+  // This owner never advertised native targets, so the form drew no Provider line
+  // for it at all: no native choice exists to make, and the submission stays the
+  // ordinary Pi remote create this owner has always answered.
+  const drawn = paneTexts(harness);
+  assert.equal(drawn.some((line) => line.includes("Provider:")), false,
+    `a native-less owner draws no Provider line: ${JSON.stringify(drawn)}`);
+  const actions = harness.focusedActions();
+  assert.deepEqual(actions.map((action) => action.type), ["create-on-peer"],
+    `an unchanged remote submission keeps its exact Pi shape: ${JSON.stringify(actions)}`);
+});
+
+test("an explicit native choice is never reinterpreted for another destination", () => {
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHost("lab-a", "Lab Alpha")]));
+  void paneTexts(harness);
+  // Choose a LOCAL native target first.
+  harness.send(SHIFT_TAB); // Provider line
+  harness.send(DOWN); // -> Claude (this host's own target)
+  assert.ok(paneTexts(harness).some((line) => line.startsWith("> Provider: [ Claude Code (default) ]")));
+  harness.baseline = harness.actions.length;
+  // Now change the Host to an owner that never advertised native targets. The
+  // explicit choice is dropped AND stated: it is never quietly kept as if the
+  // owner had a same-named configuration, and never quietly relabelled as Pi.
+  harness.send(SHIFT_TAB); // Host line
+  harness.send(DOWN); // -> Lab Alpha
+  const drawn = paneTexts(harness);
+  assert.ok(showsNotice(drawn, "is not available on"),
+    JSON.stringify(drawn));
+  assert.equal(drawn.some((line) => line.startsWith("> Provider: [ Claude")), false,
+    `the stale native choice is not drawn as if it still applied: ${JSON.stringify(drawn)}`);
   assert.deepEqual(harness.focusedActions(), [],
-    "a native choice is never converted into a remote create or a local Pi create");
-  assert.ok(drawnNotice(paneTexts(harness), "Claude is local only; choose Local or Pi"),
+    "a Host change never submits or launches anything");
+});
+
+test("a target the owner withdrew is refused instead of silently becoming Pi", () => {
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
+  void paneTexts(harness);
+  // Select the OWNER destination first, then pick the target it advertises.
+  harness.send(SHIFT_TAB); // Provider line
+  harness.send(SHIFT_TAB); // Host line
+  harness.send(DOWN); // -> Lab Alpha
+  harness.send(TAB); // Host -> Provider, following the drawn order
+  harness.send(DOWN); // -> Claude (owner)
+  assert.ok(paneTexts(harness).some((line) => line.startsWith("> Provider: [ Claude (owner) ]")),
     JSON.stringify(paneTexts(harness)));
+  harness.send(TAB); // back to the workspace field
+  harness.send("/srv/app");
+  // The owner still advertises the native lane, but no longer this target.
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [])]));
+  harness.baseline = harness.actions.length;
+  settleNewForm(harness);
+  harness.send(ENTER);
+  const drawn = paneTexts(harness);
+  assert.deepEqual(harness.focusedActions(), [],
+    "a withdrawn owner target is never submitted, and never quietly answered by a Pi create");
+  assert.ok(showsNotice(drawn, "Provider choice no longer applies to this"),
+    JSON.stringify(drawn));
+});
+
+/**
+ * Select one owner destination and the native target it advertises, then fill the
+ * workspace. Leaves the form open with the native choice held.
+ */
+function chooseNativeOnOwner(harness: Harness, label = "Claude (owner)"): void {
+  void paneTexts(harness);
+  harness.send(SHIFT_TAB); // Provider line
+  harness.send(SHIFT_TAB); // Host line
+  harness.send(DOWN); // -> the owner destination
+  harness.send(TAB); // Host -> Provider, following the drawn order
+  harness.send(DOWN); // -> the owner's advertised target
+  assert.ok(paneTexts(harness).some((line) => line.startsWith(`> Provider: [ ${label} ]`)),
+    JSON.stringify(paneTexts(harness)));
+  harness.send(TAB); // back to the workspace field
+  harness.send("/srv/app");
+  void paneTexts(harness);
+}
+
+test("reconnecting the same owner run never revives a native provider choice", () => {
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
+  chooseNativeOnOwner(harness);
+  // The destination drops and comes straight back with the SAME owner run, state,
+  // fingerprint, and advertised catalog. Every value the choice is compared against
+  // is identical again, so a comparison of present values would call it current.
+  harness.controller.setPeerUiSnapshot(
+    peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [], "disconnected")]),
+  );
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
+  harness.baseline = harness.actions.length;
+  // Redraw and settle exactly as Main would, so the refusal below cannot be blamed
+  // on a missing writer receipt.
+  void paneTexts(harness);
+  const drawn = harness.controller.captureCreateFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn New form must be capturable");
+  assert.equal(harness.controller.settleCreateFormRender(drawn!.renderToken), true);
+  harness.send(ENTER);
+  const after = paneTexts(harness);
+  assert.deepEqual(harness.focusedActions(), [],
+    "a reconnect to the same run submits nothing, and never quietly becomes a Pi create");
+  assert.ok(showsNotice(after, "Provider choice no longer applies to this"),
+    JSON.stringify(after));
+});
+
+test("a target withdrawn and then restored never revives a native provider choice", () => {
+  const catalog = [{ id: "claude", backend: "claude" as const, label: "Claude (owner)" }];
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", catalog)]));
+  chooseNativeOnOwner(harness);
+  // Withdraw the target, then advertise it again byte-for-byte.
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [])]));
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", catalog)]));
+  harness.baseline = harness.actions.length;
+  // The scope move already retired the receipt the earlier frame had earned, so the
+  // form is redrawn and settled again here: the refusal below is the provider-scope
+  // latch, never a missing writer receipt.
+  void paneTexts(harness);
+  const drawn = harness.controller.captureCreateFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn New form must be capturable");
+  assert.equal(harness.controller.settleCreateFormRender(drawn!.renderToken), true);
+  harness.send(ENTER);
+  const after = paneTexts(harness);
+  assert.deepEqual(harness.focusedActions(), [],
+    "a restored target is not the same grant as the withdrawn one, and nothing is sent");
+  assert.ok(showsNotice(after, "Provider choice no longer applies to this"),
+    JSON.stringify(after));
+});
+
+/**
+ * A workspace field that can overflow its own row budget by one row. That is the
+ * layout condition under which the New form gives up the Provider line: the field,
+ * a pending/error status, and the hint footer are never displaced by a provider
+ * control, so the provider control is the one that disappears.
+ */
+class BudgetField {
+  /** When true this render fills its budget plus one row. */
+  overflow = false;
+  private text: string;
+  constructor(
+    initialText: string,
+    private readonly onSubmit: (submission: SessionHostFieldSubmission) => void,
+  ) {
+    this.text = initialText;
+  }
+  handleInput(data: string): void {
+    if (data === ENTER) {
+      this.onSubmit({ text: this.text, value: this.text, source: "typed" });
+      return;
+    }
+    if (!data.startsWith("\x1b")) this.text += data;
+  }
+  getValue(): string { return this.text; }
+  dispose(): void { /* owns nothing */ }
+  render(cols: number, rows: number): SessionHostFieldRender {
+    // The New form gives up its Provider line exactly when the field fills its own
+    // budget AND a pending/error status row is present: neither may be displaced.
+    const count = Math.max(3, this.overflow ? rows : 3);
+    const body = `${this.text.slice(0, Math.max(0, cols - 1))}${" ".repeat(cols)}`;
+    const lines = ["\u2500".repeat(cols)];
+    for (let index = 1; index < count - 1; index += 1) lines.push(index === 1 ? body : " ".repeat(cols));
+    lines.push("\u2500".repeat(cols));
+    return { lines, cursor: { column: 1, row: 1, visible: true }, contentRow: 1 };
+  }
+}
+
+/** Open the New form with a workspace field the test can make overflow its budget. */
+function budgetNewForm(): { harness: Harness; field: () => BudgetField | undefined } {
+  let field: BudgetField | undefined;
+  const harness = makeController({
+    nativeCliTargets: TARGETS,
+    createTextField: (options: SidebarFieldFactoryOptions): SidebarFieldFactoryResult => {
+      field = new BudgetField(options.initialText ?? "", options.onSubmit);
+      return { field: field as unknown as SidebarFieldFactoryResult["field"] };
+    },
+  });
+  void harness.controller.render(40, 20);
+  harness.send(ENTER); // the default "New session" row opens the form
+  assert.equal(harness.controller.focus, "form");
+  return { harness, field: () => field };
+}
+
+test("a provider scope that moves after submission retires the in-flight native create", () => {
+  const catalog = [{ id: "claude", backend: "claude" as const, label: "Claude (owner)" }];
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", catalog)]));
+  chooseNativeOnOwner(harness);
+  settleNewForm(harness);
+  harness.send(ENTER);
+  const actions = harness.focusedActions();
+  assert.deepEqual(actions.map((action) => action.type), ["create-native-on-peer"],
+    JSON.stringify(actions));
+  const submitted = actions[0] as Extract<SidebarAction, { type: "create-native-on-peer" }>;
+  const proof = (): boolean => harness.controller.createOnPeerStillCurrent({
+    requestId: submitted.requestId,
+    formGeneration: submitted.formGeneration,
+    hostId: submitted.hostId,
+    hostRunId: submitted.hostRunId,
+    workspace: submitted.workspace,
+  });
+  // Main evaluates exactly this proof inside the ordered write that reaches the
+  // transport, so it starts out true for the request that owns this form.
+  assert.equal(proof(), true, "the submitted request owns this form before anything moves");
+  // Withdraw the advertised target and advertise it again, byte for byte. The owner
+  // run, the connection state, and the destination fingerprint never change, so the
+  // run/connection retirement branch alone would never notice this transition.
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [])]));
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", catalog)]));
+  // The in-flight native create is retired through the existing uncertainty path, so
+  // a held or delayed write can no longer launch on a choice the operator never
+  // re-confirmed. Nothing is re-sent, retried, or retargeted by this side.
+  assert.equal(proof(), false,
+    "a provider scope that moved retires the pending native create's last-instant proof");
+});
+
+test("a Provider line this pane suppressed never authorizes a native create", () => {
+  const { harness, field } = budgetNewForm();
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
+  chooseNativeOnOwner(harness);
+  // An earlier failed create leaves a status row, and the field now fills its whole
+  // budget. Neither may be displaced, so the provider control is what disappears
+  // from a pane that still holds the native selection underneath.
+  settleNewForm(harness);
+  harness.send(ENTER);
+  const first = harness.focusedActions();
+  assert.deepEqual(first.map((action) => action.type), ["create-native-on-peer"],
+    JSON.stringify(first));
+  harness.controller.failCreateOnPeer(
+    (first[0] as { readonly requestId: number }).requestId,
+    "the owner refused that session",
+  );
+  const editor = field();
+  assert.ok(editor !== undefined, "the New form must own a workspace field");
+  editor!.overflow = true;
+  const narrow = paneTexts(harness);
+  assert.equal(narrow.some((line) => line.includes("Provider:")), false,
+    `an overflowing field must suppress the Provider line: ${JSON.stringify(narrow)}`);
+  harness.baseline = harness.actions.length;
+  const drawn = harness.controller.captureCreateFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn New form must be capturable");
+  // The receipt describes what was DRAWN: no Provider line means no provider.
+  assert.equal(drawn!.providerKey, undefined,
+    `a suppressed Provider line leaves no provider receipt: ${JSON.stringify(drawn)}`);
+  assert.equal(harness.controller.settleCreateFormRender(drawn!.renderToken), true);
+  harness.send(ENTER);
+  const after = paneTexts(harness);
+  assert.deepEqual(harness.focusedActions(), [],
+    "a frame that never displayed the provider launches nothing");
+  assert.ok(showsNotice(after, "No Provider line is drawn here"), JSON.stringify(after));
+});
+
+test("a suppressed Provider line still submits the ordinary Pi remote create", () => {
+  const { harness, field } = budgetNewForm();
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha")]));
+  // Select the owner WITHOUT touching the provider, so the choice stays Pi.
+  void paneTexts(harness);
+  harness.send(SHIFT_TAB); // Provider line
+  harness.send(SHIFT_TAB); // Host line
+  harness.send(DOWN); // -> the owner destination
+  harness.send(TAB); // -> Provider, still Pi
+  harness.send(TAB); // -> Workspace
+  harness.send("/srv/app");
+  settleNewForm(harness);
+  harness.send(ENTER);
+  const first = harness.focusedActions();
+  assert.deepEqual(first.map((action) => action.type), ["create-on-peer"], JSON.stringify(first));
+  harness.controller.failCreateOnPeer(
+    (first[0] as { readonly requestId: number }).requestId,
+    "the owner refused that session",
+  );
+  const editor = field();
+  assert.ok(editor !== undefined, "the New form must own a workspace field");
+  editor!.overflow = true;
+  const narrow = paneTexts(harness);
+  assert.equal(narrow.some((line) => line.includes("Provider:")), false,
+    `an overflowing field must suppress the Provider line: ${JSON.stringify(narrow)}`);
+  harness.baseline = harness.actions.length;
+  const drawn = harness.controller.captureCreateFormPresentation();
+  assert.ok(drawn !== undefined, "the drawn New form must be capturable");
+  assert.equal(harness.controller.settleCreateFormRender(drawn!.renderToken), true);
+  harness.send(ENTER);
+  // A Pi submission is what this frame always was: the suppressed line names no
+  // provider, and the ordinary remote create is unaffected.
+  assert.deepEqual(harness.focusedActions().map((action) => action.type), ["create-on-peer"],
+    JSON.stringify(harness.focusedActions()));
 });
 
 // --- Native row display and the Pi-only controls. ---
@@ -402,16 +736,17 @@ function rosterText(harness: Harness, cols = 32, rows = 24): string {
 
 test("a native row is titled by its provider and stays honestly unknown", () => {
   const harness = rosterWith([NATIVE_ITEM]);
-  const text = rosterText(harness);
+  const text = rosterText(harness, 40);
   assert.ok(text.includes("Claude"), `the provider names the card: ${JSON.stringify(text)}`);
   assert.ok(text.includes("agent unknown | input unknown"),
     "missing telemetry is never rendered as idle or none");
-  assert.ok(text.includes("background unknown"), "missing counts are never rendered as zero");
+  assert.ok(text.includes("background unknown"),
+    "missing counts use the one shared card summary and are never rendered as zero");
 
   // The same row with the Pi telemetry a native child can never produce.
   const pi = rosterWith([{ ...NATIVE_ITEM, backend: undefined, busy: false, pendingInput: false,
     backgroundTasks: 0, backgroundShells: 0, activeTasks: 0, activeShells: 0 }]);
-  const piText = rosterText(pi);
+  const piText = rosterText(pi, 40);
   assert.ok(piText.includes("agent idle | input none"), piText);
   assert.ok(piText.includes("bg tasks 0 | shells 0"), piText);
 });
@@ -447,14 +782,35 @@ test("rename, exited resume, and unavailable activation all refuse a native row 
   harness.send(UP); // -> native-1 (alive)
   assert.equal(harness.controller.selectedId, "native-1");
   harness.send("e");
-  assert.deepEqual(harness.focusedActions(), [], "a native row emits no rename/edit request");
-  assert.ok(drawnNotice(
-    harness.controller.render(40, 30).lines.map((line) => line.replace(SGR_PATTERN, "")),
-    "Claude rows have no renameable Pi session name",
-  ));
+  // E on a native row opens the host-side naming editor: no Pi rename/edit intent
+  // is emitted, and nothing is sent until the operator submits a name.
+  assert.deepEqual(harness.focusedActions(), [], "a native row emits no Pi rename/edit request");
+  assert.equal(harness.controller.focus, "form", "the existing Edit form owns the native row's name");
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.deepEqual(harness.focusedActions(), [], "cancelling the naming editor emits nothing");
+  void rosterText(harness); // the roster must be drawn whole again before a row key acts
   harness.send(ENTER);
   assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "native-1" },
     "selecting a live native row stays the ordinary select");
+});
+
+test("E on a remembered native placeholder refuses instead of captioning a stale slot", () => {
+  const harness = rosterWith([
+    { ...NATIVE_ITEM, id: "native-3", lifecycle: "error", hasLiveProcess: false, unavailable: true,
+      activity: ["Claude sessions are not restored; open New to start one"] },
+  ]);
+  void rosterText(harness);
+  harness.send(UP); // New -> Saved conversations
+  harness.send(UP); // -> the unavailable placeholder
+  assert.equal(harness.controller.selectedId, "native-3");
+  harness.send("e");
+  assert.deepEqual(harness.focusedActions(), [], "a placeholder owns no row to caption");
+  assert.equal(harness.controller.focus, "sidebar", "no editor opens on a stale slot");
+  assert.ok(drawnNotice(
+    harness.controller.render(40, 30).lines.map((line) => line.replace(SGR_PATTERN, "")),
+    "A remembered native row is not a live session to name",
+  ));
 });
 
 test("a live native row still requires the existing stop confirmation", () => {
@@ -495,7 +851,6 @@ test("a malformed provider identity is dropped rather than guessed", () => {
   const texts = paneTexts(harness);
   assert.ok(texts.some((line) => line.startsWith("  Provider: [ Pi ]")), JSON.stringify(texts));
   harness.send(SHIFT_TAB);
-  harness.send(SHIFT_TAB);
   harness.send(DOWN);
   assert.ok(paneTexts(harness).some((line) => line.startsWith("> Provider: [ first wins ]")),
     "only the first entry of a duplicated id survives, and malformed ids and backends are gone");
@@ -524,7 +879,6 @@ test("a target the manager would refuse is dropped at the exact shared bound", (
   harness.send(ENTER);
   const texts = paneTexts(harness);
   assert.ok(texts.some((line) => line.startsWith("  Provider: [ Pi ]")), JSON.stringify(texts));
-  harness.send(SHIFT_TAB);
   harness.send(SHIFT_TAB);
   harness.send(DOWN);
   assert.ok(paneTexts(harness).some((line) => line.startsWith("> Provider: [ at the bound ]")),

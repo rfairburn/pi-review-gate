@@ -1067,6 +1067,19 @@ export function assertNoForbiddenSessionArgs(args: readonly string[]): void {
 const NEW_FORM_PANE_HEADER = "New session";
 /** The fixed New-form Host line with the default Local destination, unfocused and focused. */
 const NEW_FORM_LOCAL_HOST_ROWS = new Set(["Host: [ Local ]", "> Host: [ Local ]"]);
+/**
+ * The New form's Provider line drawn completely as its default: the unfocused
+ * marker beside the default Pi choice. A focused control, another provider, a
+ * clipped or truncated value, or any other Provider-shaped caption is never
+ * this drawn default, so only this exact row may occupy the optional row.
+ */
+const NEW_FORM_DEFAULT_PI_PROVIDER_ROW = "Provider: [ Pi ]";
+/**
+ * A right-pane row drawn as the New form's own Provider control: the optional
+ * focus marker followed by the Provider label. The labelled Workspace row never
+ * matches, so a draft whose text merely mentions a provider stays untouched.
+ */
+const PROVIDER_CONTROL_ROW = /^(?:>\s*)?Provider:/u;
 const WORKSPACE_FIELD_LABEL = "> Workspace:";
 /** Below this a run of `─` is a transcript divider or decoration, not the field's own border. */
 const MIN_NATIVE_EDITOR_RULE_COLUMNS = 20;
@@ -1090,9 +1103,23 @@ function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): nu
  *
  *   New session
  *     Host: [ Local ]
+ *     Provider: [ Pi ]          optional: drawn only when this host offers a
+ *                               provider and the pane has the row to spare
  *                ────────────   Editor top rule (blank gutter above the label)
  *   > Workspace: <draft>        the Editor's own labelled content row
  *                ────────────   Editor bottom rule, same width
+ *
+ * The Provider line sits between the Host line and the workspace field, so the
+ * drawn order is Header, Host, Provider, Workspace; the legacy layout with no
+ * Provider line — a host that offers none, or a pane with no row to spare —
+ * keeps its Header, Host, Workspace geometry and stays accepted.
+ *
+ * The form draws at most one Provider control, so the whole form pane is
+ * surveyed, not just the one optional slot: zero Provider rows is the legacy
+ * layout, and one is usable only in its drawn slot with the complete unfocused
+ * default value. A second Provider row, one below the Editor's bottom border,
+ * or one in place of the drawn default — focused, another provider, clipped —
+ * rejects the frame instead of matching around a stale or duplicated control.
  *
  * Every actual New-open wait uses this so a partial incremental paint — header,
  * Host line, top rule and labelled row with the bottom rule not yet written —
@@ -1104,20 +1131,36 @@ function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): nu
  */
 export function isCompleteLocalNewFormFrame(text: string): boolean {
   const pane = rightPaneText(text).split("\n");
+  // Every Provider control row the form pane actually draws, in drawn order.
+  const providerRows = pane
+    .map((row, index) => ({ row: row.trim(), index }))
+    .filter((entry) => PROVIDER_CONTROL_ROW.test(entry.row));
+  if (providerRows.length > 1) return false;
+  const providerRow = providerRows[0];
   for (let header = 0; header < pane.length; header += 1) {
     const headerRow: string | undefined = pane[header];
     if (headerRow?.trim() !== NEW_FORM_PANE_HEADER) continue;
     const hostRow: string | undefined = pane[header + 1];
     if (hostRow === undefined || !NEW_FORM_LOCAL_HOST_ROWS.has(hostRow.trim())) continue;
-    const labelledRow: string | undefined = pane[header + 3];
+    // No Provider row is the legacy layout and the Editor block sits directly
+    // below the Host line. A drawn Provider row shifts that block down by its
+    // one row only when it is the pane's single Provider control, sits in its
+    // drawn slot directly below Host, and carries the complete unfocused
+    // default; anywhere else, or in any other spelling, this form never matches.
+    if (providerRow !== undefined) {
+      if (providerRow.index !== header + 2) continue;
+      if (providerRow.row !== NEW_FORM_DEFAULT_PI_PROVIDER_ROW) continue;
+    }
+    const fieldTopRow = providerRow === undefined ? header + 2 : header + 3;
+    const labelledRow: string | undefined = pane[fieldTopRow + 1];
     if (labelledRow === undefined) continue;
     const label = labelledRow.indexOf(WORKSPACE_FIELD_LABEL);
     // The labelled row is the editable body row: the label plus its one-space
     // gutter must be drawn so a real (possibly empty) content region follows.
     if (label < 0 || labelledRow[label + WORKSPACE_FIELD_LABEL.length] !== " ") continue;
     const valueColumn = label + WORKSPACE_FIELD_LABEL.length + 1;
-    const top = nativeEditorRuleWidth(pane[header + 2], valueColumn);
-    const bottom = nativeEditorRuleWidth(pane[header + 4], valueColumn);
+    const top = nativeEditorRuleWidth(pane[fieldTopRow], valueColumn);
+    const bottom = nativeEditorRuleWidth(pane[fieldTopRow + 2], valueColumn);
     if (top !== undefined && top === bottom) return true;
   }
   return false;

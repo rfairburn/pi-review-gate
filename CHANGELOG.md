@@ -23,10 +23,11 @@ dates.
   a real, full-screen interactive Claude Code or Codex CLI session as its own sidebar
   row beside the Pi sessions, through the same owned PTY and terminal surfaces. The
   New-session form gains a **Provider** line that still names **Pi** every time it
-  opens, and the **Workspace** field and its initial focus are unchanged. Choosing a
-  native provider while the Host line names a connected destination is refused in the
-  form with nothing sent (`<provider> is local only; choose Local or Pi`), a remembered
-  native row that cannot start returns titled `<Provider> (unavailable)`, and every new
+  opens, and the **Workspace** field and its initial focus are unchanged. A native provider
+  is offered for this host and, separately, for a connected owner that advertises its own
+  targets (see the two native network entries below), while an owner that advertises nothing
+  draws no Provider line and stays Pi-only. A remembered
+  native row that cannot start returns titled `<caption or Provider> (unavailable)`, and every new
   session selects its native target again because the target id, executable, arguments,
   and environment are not persisted. A native target is the built-in default or an
   explicit shared `externalAgents` entry — its command, base arguments, and base
@@ -44,11 +45,75 @@ dates.
   no review gate, tool protection, or subtask capture/review/landing guarantee: its card
   reports only host-owned facts (liveness, input, resize, exit) and leaves busy/idle,
   pending input, and task and shell counts unknown, with no terminal scraping and no
-  idle inference. Native rows are created locally only; `SessionSpawn`, remote
-  owner-create, the Saved picker, and the standalone launchers are unchanged. This is
-  initial hosting: real-provider interactive behavior remains unverified, Windows remains
-  an unsupported validation target, and the guide states what evidence exists — see
+  idle inference. This entry is the local hosting; a paired owner can also start a native
+  row when it advertises native targets, and the two native network entries below describe
+  that. `SessionSpawn`, the existing Pi remote owner-create, the Saved picker, and the
+  standalone launchers are unchanged. This is initial hosting: real-provider interactive
+  behavior remains unverified, Windows remains an unsupported validation target, and the
+  guide states what evidence exists — see
   [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md).
+- **Naming a native sidebar row (#277)**: `E` on a live native Claude or Codex row opens
+  the host's Edit form and stores one host-side caption for that row, so the operator can
+  tell several provider sessions apart and the row comes back under the same name with its
+  remembered slot. The caption belongs to the owning host and is shared with its authorized
+  viewers; it is not sent to the child or provider, never becomes provider conversation
+  identity, never resumes or auto-starts
+  anything, and does not touch the authenticated Pi rename path, which still requires a
+  row's observed native session tuple and behaves exactly as before. A name must be one
+  trimmed line of at most 80 characters with no control characters; an empty, padded,
+  multi-line, control-bearing, or oversized name is refused and changes nothing. A
+  remembered native placeholder is not a live row to caption, so `E` there states that
+  truthfully and opens nothing.
+  Naming also reports its own durability: if this host's roster publication for that
+  operation did not take — an unreadable store, an overflowed remembered sequence, or an
+  earlier failed write — the live row is still captioned and the host says the name
+  applies to this session only and will not return after a restart, instead of reusing an
+  earlier one-time roster warning as if it described this naming.
+- **Starting a native Claude Code or Codex row on a paired owner (#277)**: the New form's
+  **Provider** line is now scoped to the destination on the **Host** line. A Local choice
+  still offers this host's own configured targets; a connected remote owner offers only the
+  native targets that owner advertises, with its own labels and ids, and this host's ids are
+  never merged in or substituted. Choosing one sends one native owner-create request over
+  the existing paired roster channel under a new independent `roster-native-v1` capability,
+  and the owner starts the row with its own existing manager, run identity, and native launch
+  path — only the workspace comes from the request, and no target is selected, activated, or
+  focused. The provider identity is part of the written-form proof, so a frame that drew Pi,
+  another target, or another backend can never authorize this submission. A native choice
+  never carries into another destination: changing **Host**, reconnecting, a replacement owner
+  run, or a target the owner withdrew drops the choice and says so, and the submission is
+  refused rather than reinterpreted as a same-named Local id or silently retried as Pi. An
+  owner that advertises nothing draws no Provider line and keeps its ordinary Pi-only path,
+  and a destination whose channel never negotiated the lane reports one fixed unsupported
+  notice with nothing sent. Existing Pi remote create keeps its exact previous request shape.
+- **Renaming one of a paired owner's native rows (#277)**: `e` on a remote row the owner
+  itself reported as native opens the same shared Edit form and renames that row **on the
+  owner** under a second independent capability, `roster-native-name-v1`, which the create
+  lane never implies. The request carries only the exact owner run, the row id, the backend
+  the owner reported, and the bounded replacement caption — no Pi conversation id, session id,
+  or title — so it can never reach the Pi rename path, and the Pi remote rename keeps its
+  exact existing tuple-shaped request. Whether a row is native comes only from typed roster
+  metadata the owner sent: a caption, a label, a missing status, and this host's local
+  configuration never make a row look native. The owner answers with one of four distinct
+  truths — renamed and saved, renamed for this run only, refused, or unknown — and the
+  requester states each separately: it never claims a saved name for a temporary one, never
+  edits its own caption in advance, and never falls back to a Pi rename, a local mutation, or
+  a reconnect. An unknown result stays `UNCERTAIN: the host may have renamed that row; verify
+  its current name before retrying` and is never retried automatically.
+
+### Changed
+
+- **The native New form draws Provider above Workspace (#277)**: the session host's
+  New-session form now draws its lines in the order **Host**, **Provider**, **Workspace**,
+  and the keyboard ring follows that drawn order — one `Shift+Tab` from the workspace field
+  reaches **Provider** (or **Host** when no Provider line is drawn), another reaches
+  **Host**, and `Tab` steps back down through **Provider** to the field. The field still
+  opens focused and still submits on `Enter`, the Provider line still costs exactly one
+  spare row, and a pane with nothing to spare still draws no Provider line and gives focus
+  to nothing undrawn. The native workspace field now accepts the same spellings the Pi
+  workspace field accepts, because both share the host's existing resolver: `~`, `~/…`, a
+  path relative to the process working directory, and an absolute path all resolve to one
+  canonical existing directory before anything spawns, with no shell, no `~otheruser`
+  expansion, and no `$VAR` expansion for either backend.
 
 ## [0.1.0-dev.280]
 

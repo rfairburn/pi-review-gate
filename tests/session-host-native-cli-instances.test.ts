@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative } from "node:path";
 import test from "node:test";
 
 import {
   InstanceManager,
+  isNativeViewerNativeCliInputSource,
+  MAX_LABEL_CHARS,
   MAX_NATIVE_CLI_TARGET_CHARS as MANAGER_MAX_NATIVE_CLI_TARGET_CHARS,
   type CreateInstanceOptions,
   type InstancePty,
@@ -24,7 +27,12 @@ import {
   type NativeLaunchDescriptor,
 } from "../src/session-host/launch";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
-import { MAX_NATIVE_CLI_TARGET_CHARS, sessionBackendDisplayLabel, type NativeCliBackend } from "../src/session-host/session-backend";
+import {
+  MAX_NATIVE_CLI_TARGET_CHARS,
+  MAX_NATIVE_DISPLAY_NAME_CHARS,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+} from "../src/session-host/session-backend";
 import { savedDeletionOwnedSessions } from "../src/session-host/owning-host-service";
 import { admitSavedSession, listSavedSessions, type SavedSessionAdmission } from "../src/session-host/saved-sessions";
 
@@ -420,13 +428,17 @@ test("host-wide input framing stays Pi-only: a native row's local input is raw w
     assert.throws(() => harness.manager.write(piId, "ls\r"), /refusing unframed input/);
     assert.deepEqual(harness.spawned.at(-1)?.writes ?? [], [], "no unframed byte reaches a framing Pi child");
 
-    // The strict viewer seam has nothing to fence a native row against, so remote
-    // native input stays unavailable rather than becoming an unframed back door.
+    // The strict viewer seam fences a hosted row against its OWN process-incarnation
+    // scope. The variant exists and is raw, but a forged Pi-shaped source is still
+    // refused before any byte: this is never an unframed back door into a child.
     const viewer = harness.manager.openViewer({ hostRunId: "run-1", nativeClipboardSink: () => undefined });
     assert.ok(viewer);
     assert.equal(harness.manager.updateViewer(viewer.viewerId, { sessionId: nativeId, cols: 80, rows: 24 }).applied, true);
-    assert.equal(harness.manager.readViewerInputSource(viewer.viewerId), undefined,
-      "a native row mints no viewer input scope");
+    const nativeScope = harness.manager.readViewerInputSource(viewer.viewerId);
+    assert.ok(nativeScope !== undefined && isNativeViewerNativeCliInputSource(nativeScope),
+      "a native row mints its own hosted input scope, never a Pi one");
+    assert.equal(Object.hasOwn(nativeScope, "registrationIdentity"), false);
+    assert.equal(Object.hasOwn(nativeScope, "nativeSession"), false);
     const forgedSource = {
       hostRunId: "run-1", viewerId: viewer.viewerId, viewerRevision: viewer.revision + 1, rowId: nativeId,
       nativeSession: { sessionId: "synthetic-native-conversation", epoch: 1 },
@@ -440,7 +452,7 @@ test("host-wide input framing stays Pi-only: a native row's local input is raw w
     const result = harness.manager.writeViewerInput(viewer.viewerId, {
       expectedSource: forgedSource, expectedInputModes: inputModes, data: "ls\r",
     } as unknown as NativeViewerInputRequest);
-    assert.deepEqual(result, { status: "refused", reason: "row-unavailable" });
+    assert.deepEqual(result, { status: "refused", reason: "stale-source" });
     assert.deepEqual(nativePty.writes.slice(2), [], "the refused viewer dispatch wrote nothing");
 
     await harness.manager.dispose();
@@ -880,6 +892,174 @@ test("an unusable provider result, a foreign cwd, or a stop during a pending pro
     assert.equal(dirtyPty.spawnDescriptor.env.CLAUDE_CONFIG_DIR, "/synthetic/home/.claude", "provider configuration is never touched");
     assert.equal(viewOf(dirtyManager, dirtyId).lifecycle, "alive");
     await dirtyManager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The native workspace accepts exactly the host's shared Pi spellings.
+//
+// A native row and a Pi row are the same host's rows, so the SAME resolver
+// decides what a workspace spelling means: a leading bare `~`/`~/`, the process
+// working directory for a relative spelling, and the canonical real path on
+// success. Nothing here resolves through a shell, and nothing expands an
+// environment variable or a `~otheruser` form — those stay the invoking shell's
+// business for both backends.
+// ---------------------------------------------------------------------------
+
+test("a native row accepts absolute, relative, and symlink workspace spellings as one canonical directory", async () => {
+  const harness = makeNativeHarness("workspace-spellings");
+  try {
+    const canonical = realpathSync(harness.workspace);
+    const link = join(harness.root, "workspace-link");
+    symlinkSync(harness.workspace, link);
+    const relativeSpelling = relative(process.cwd(), harness.workspace);
+    assert.ok(!isAbsolute(relativeSpelling), "the fixture spelling really is relative to this process");
+
+    for (const [label, input] of [
+      ["absolute", harness.workspace],
+      ["relative to the process working directory", relativeSpelling],
+      ["symlink", link],
+    ] as const) {
+      const id = await withTimeout(
+        harness.manager.create({ workspace: input, backend: "claude" }),
+        5000,
+        `native ${label} create`,
+      );
+      const call = harness.providerCalls.at(-1);
+      assert.ok(call, `${label}: the provider was asked for this row`);
+      assert.equal(call.request.workspace, canonical,
+        `${label}: the provider receives the one canonical directory, never the raw spelling`);
+      assert.equal(viewOf(harness.manager, id).workspace, canonical,
+        `${label}: the row records the canonical directory`);
+      assert.equal(harness.spawned.at(-1)?.spawnDescriptor.cwd, canonical,
+        `${label}: the child is anchored at the canonical directory`);
+    }
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a tilde native workspace is expanded by the host's own resolver before the provider runs", async () => {
+  const seen: string[] = [];
+  const harness = makeNativeHarness("workspace-tilde", {
+    provider: (_backend, request) => {
+      seen.push(request.workspace);
+      throw new Error("synthetic provider refusal; nothing spawns");
+    },
+  });
+  try {
+    const home = realpathSync(homedir());
+    const bareId = await withTimeout(
+      harness.manager.create({ workspace: "~", backend: "claude" }),
+      5000,
+      "tilde native create",
+    );
+    assert.deepEqual(seen, [home],
+      "a bare ~ is the home directory this host itself resolves, and the provider sees that path");
+    assert.equal(harness.spawned.length, 0, "the refusing provider spawned no child");
+    assert.equal(viewOf(harness.manager, bareId).lifecycle, "error");
+
+    // A ~-prefixed path that does not exist is refused by the same resolver,
+    // before the provider is ever consulted: no shell did any of this work.
+    const missingId = await withTimeout(
+      harness.manager.create({ workspace: `~/.prg-native-missing-${randomUUID()}`, backend: "claude" }),
+      5000,
+      "missing tilde native create",
+    );
+    assert.equal(seen.length, 1, "an unresolvable workspace never reaches the provider");
+    assert.equal(harness.spawned.length, 0, "no child exists for an unresolvable workspace");
+    assert.equal(viewOf(harness.manager, missingId).lifecycle, "error");
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a native workspace that is a file or does not exist is refused before the provider runs", async () => {
+  const harness = makeNativeHarness("workspace-refusals");
+  try {
+    const filePath = join(harness.root, "not-a-directory");
+    writeFileSync(filePath, "fixture file; never a workspace\n", "utf8");
+    for (const [label, input] of [
+      ["a regular file", filePath],
+      ["a missing directory", join(harness.root, "no-such-directory")],
+    ] as const) {
+      const id = await withTimeout(
+        harness.manager.create({ workspace: input, backend: "claude" }),
+        5000,
+        `native ${label} create`,
+      );
+      assert.equal(harness.providerCalls.length, 0, `${label}: the provider is never asked`);
+      assert.equal(harness.spawned.length, 0, `${label}: no child is ever spawned`);
+      assert.equal(viewOf(harness.manager, id).lifecycle, "error",
+        `${label}: the row reports the bounded launch error and nothing else`);
+    }
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// One native row's host-side display name: the operator's caption of THIS
+// host's row. It replaces the row's single existing label field, is validated
+// before anything changes, and is never a provider conversation identity.
+// ---------------------------------------------------------------------------
+
+test("a native row's display name replaces its one label field and never invents a second identity", async () => {
+  const harness = makeNativeHarness("display-name");
+  try {
+    const nativeId = await withTimeout(
+      harness.manager.create({ workspace: harness.workspace, backend: "claude" }),
+      5000,
+      "native create",
+    );
+    const providerLabel = sessionBackendDisplayLabel("claude");
+    assert.equal(viewOf(harness.manager, nativeId).label, providerLabel,
+      "the stable provider label is in charge until the operator names the row");
+
+    assert.equal(harness.manager.setNativeDisplayName(nativeId, "Fleet work"), "set");
+    const named = viewOf(harness.manager, nativeId);
+    assert.equal(named.label, "Fleet work", "the name travels in the label field the host already transmits");
+    assert.equal(Object.hasOwn(named, "nativeDisplayName"), false,
+      "no second name field is invented beside the existing label");
+    assert.equal(named.backend, "claude", "the row's backend identity is untouched by a caption");
+    assert.equal(named.nativeSession, null, "a caption never becomes or reveals a conversation identity");
+    assert.equal(harness.manager.setNativeDisplayName(nativeId, "Fleet work"), "unchanged");
+    assert.equal(harness.manager.setNativeDisplayName(nativeId, "Fleet work 2"), "set");
+    assert.equal(viewOf(harness.manager, nativeId).label, "Fleet work 2", "a later name replaces the earlier one");
+
+    // Every rejected caption leaves the row exactly as it was: nothing is
+    // truncated, coerced, or partially applied.
+    const before = viewOf(harness.manager, nativeId).label;
+    for (const [label, bad] of [
+      ["empty", ""],
+      ["whitespace only", "   "],
+      ["surrounding whitespace", " Fleet "],
+      ["one line break", "fleet\nwork"],
+      ["a control character", "fleet\u0007work"],
+      ["a C1 control character", "fleet\u0085work"],
+      ["one character past the bound", "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS + 1)],
+    ] as const) {
+      assert.equal(harness.manager.setNativeDisplayName(nativeId, bad), "invalid-name", `${label} is refused`);
+      assert.equal(viewOf(harness.manager, nativeId).label, before, `${label}: the row's label is untouched`);
+    }
+    assert.equal(harness.manager.setNativeDisplayName(nativeId, "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS)), "set",
+      "the bound itself is admissible");
+    assert.equal(MAX_NATIVE_DISPLAY_NAME_CHARS, MAX_LABEL_CHARS,
+      "the caption bound is the row-label bound the manager already enforces, so no accepted name is refused downstream");
+
+    // Unknown rows own no caption, and a Pi row is never captioned here: its name
+    // belongs to the authenticated Pi rename path alone.
+    assert.equal(harness.manager.setNativeDisplayName(randomUUID(), "ghost"), "no-row");
+    const piId = await withTimeout(harness.manager.create({ workspace: harness.workspace2 }), 5000, "Pi create");
+    const piLabel = viewOf(harness.manager, piId).label;
+    assert.equal(harness.manager.setNativeDisplayName(piId, "not my caption"), "not-native");
+    assert.equal(viewOf(harness.manager, piId).label, piLabel, "the Pi row's label is untouched");
+    await harness.manager.dispose();
   } finally {
     rmSync(harness.root, { recursive: true, force: true });
   }

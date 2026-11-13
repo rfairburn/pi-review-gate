@@ -52,6 +52,7 @@ import {
 	DEFAULT_INSTANCE_COLS,
 	DEFAULT_INSTANCE_ROWS,
 	InstanceManager,
+	isNativeViewerNativeCliInputSource,
 	isNativeViewerStartupInputSource,
 	type InstanceManagerOptions,
 	type InstancePty,
@@ -103,10 +104,12 @@ import {
 	encodeSessionContentViewport,
 	NATIVE_COPY_MAX_ENCODED_CHARS,
 	NATIVE_TEXT_PASTE_MAX_BYTES,
+	isNativeIoNativeCliSource,
 	isNativeIoStartupSource,
 	nativeIoSourceEquals,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
@@ -2451,8 +2454,9 @@ async function connectNativeViewer(
 			for (;;) {
 				const snapshot = await inbox.next(label);
 				const source = snapshot.meta.inputSource;
-				// Only a conversation source qualifies; a startup source names no tuple.
-				if (source !== undefined && source !== null && !isNativeIoStartupSource(source)) return source;
+				// Only a conversation source qualifies; a tuple-less source names no tuple.
+				if (source !== undefined && source !== null
+					&& !isNativeIoStartupSource(source) && !isNativeIoNativeCliSource(source)) return source;
 			}
 		},
 		nextCopy(label) {
@@ -2589,7 +2593,9 @@ async function openRawNativeSubscription(
 
 function statedSource(source: NativeIoInputSource | null | undefined): NativeIoSource {
 	assert.ok(source !== undefined && source !== null, "this publish states the owner's own native input source");
-	if (isNativeIoStartupSource(source)) throw new Error("this publish was expected to state a conversation source");
+	if (isNativeIoStartupSource(source) || isNativeIoNativeCliSource(source)) {
+		throw new Error("this publish was expected to state a conversation source");
+	}
 	return source;
 }
 
@@ -2684,8 +2690,9 @@ test("a native viewer's input crosses TLS into the framed child under the owner'
 	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
 	const first = await viewer.nextSource("a published viewport that states a native input source");
 	const lower = owner.service.readViewerInputSource(viewerIdOf(viewer.binding));
-	assert.ok(lower !== undefined && !isNativeViewerStartupInputSource(lower),
-		"the manager resolves this binding's own conversation input scope");
+	if (lower === undefined || isNativeViewerStartupInputSource(lower) || isNativeViewerNativeCliInputSource(lower)) {
+		throw new Error("the manager resolves this binding's own conversation input scope");
+	}
 	// The exact settled schema: one `nativeSession` tuple, the canonical geometry
 	// with its revision, this viewer's revision, and the host-minted token.
 	assert.deepEqual(first, {
@@ -3707,6 +3714,7 @@ test("startup-phase input crosses TLS before the first status, carries only the 
 		SESSION_CONTENT_REQUIRED_CAPABILITY,
 		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+		SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	], "startup input is acknowledged beside native IO");
 
 	const startupView = await nextSnapshotMatching(viewer.inbox, "the null-tuple viewport with a startup source",

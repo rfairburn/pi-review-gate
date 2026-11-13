@@ -10,7 +10,8 @@
  *
  * - the native field is rendered with byte-for-byte the same `(cols, rows)`
  *   budget with a Provider line as without one, at every tested geometry;
- * - the Provider line occupies the reserved spacer row, so the pane keeps its
+ * - the Provider line is drawn between the Host line and the workspace field, and
+ *   costs the pane exactly one row of its spare filler, so the pane keeps its
  *   exact row count and the hint footer keeps the last rows;
  * - a pending "Starting"/error status always keeps its own row beside the
  *   Provider line, and a pane with no spare row draws no Provider row at all
@@ -195,19 +196,32 @@ test("the Provider line never changes the native field's render budget, at any g
     "the real Main New-form pane keeps its pre-native native-field budget");
 });
 
-test("the Provider line takes the reserved spacer row and keeps the pre-native row layout", () => {
+test("the Provider line is drawn between Host and Workspace and costs the pane one row", () => {
   const without = makeHarness({});
   const withProvider = makeHarness({ targets: TARGETS });
   const plain = trimmed(without.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS));
   const provider = trimmed(withProvider.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS));
 
-  assert.equal(plain[5].trim(), "", "the pre-native New form leaves the row below the editor empty");
-  assert.equal(provider[5].trim(), "Provider: [ Pi ]", JSON.stringify(provider));
-  // Every other drawn row — header, Host line, the Editor's own rules, its
-  // labelled body row, the filler, and the footer — stays at its exact index.
-  for (let index = 0; index < plain.length; index += 1) {
-    if (index === 5) continue;
-    assert.equal(provider[index], plain[index], `row ${index} moved: ${JSON.stringify({ plain: plain[index], provider: provider[index] })}`);
+  // The intended visual order of the New form: Header, Host, Provider, Workspace.
+  assert.equal(provider[0].trim(), "New session", JSON.stringify(provider[0]));
+  assert.equal(provider[1].trim(), "Host: [ Local ]", JSON.stringify(provider[1]));
+  assert.equal(provider[2].trim(), "Provider: [ Pi ]", JSON.stringify(provider.slice(0, 6)));
+  assert.ok(provider[4].startsWith("> Workspace:"), JSON.stringify(provider.slice(2, 6)));
+
+  // The one row the Provider line costs comes out of the pane's spare filler, not
+  // out of the field's budget: every row the pre-native form drew above the field
+  // stays put, the field block shifts by exactly one row, and everything below it
+  // — the reserved spacer row, the blank filler, and the hint footer — keeps its
+  // exact index and the pane keeps its exact height.
+  assert.equal(provider.length, plain.length);
+  assert.equal(provider.at(-1), plain.at(-1), "the hint footer stays on the last row");
+  for (const index of [2, 3, 4]) {
+    assert.equal(provider[index + 1], plain[index],
+      `field row ${index} moved: ${JSON.stringify({ plain: plain[index], provider: provider[index + 1] })}`);
+  }
+  for (let index = 6; index < plain.length; index += 1) {
+    assert.equal(provider[index], plain[index],
+      `row ${index} moved: ${JSON.stringify({ plain: plain[index], provider: provider[index] })}`);
   }
 });
 
@@ -307,11 +321,10 @@ test("losing the Provider row while it holds focus hands keyboard ownership back
   harness.controller.failCreate(1, "workspace could not be opened");
 
   // The wider pane has the one filler row to spare, so the control is drawn and
-  // the focus ring reaches it (Main renders between keystrokes).
+  // the focus ring reaches it (Main renders between keystrokes). One Shift+Tab is
+  // enough: the Provider line is the control drawn directly above the field.
   const wide = trimmed(harness.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS));
   assert.ok(wide.some((line) => line.trim() === "Provider: [ Pi ]"), JSON.stringify(wide));
-  harness.send(SHIFT_TAB);
-  void harness.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS);
   harness.send(SHIFT_TAB);
   const focused = trimmed(harness.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS));
   assert.ok(focused.some((line) => line.startsWith("> Provider: [ Pi ]")),
@@ -395,12 +408,9 @@ test("the real native field keeps default Workspace focus, typing, and single-En
 test("the drawn Provider line still selects an explicit native target", () => {
   const harness = makeHarness({ targets: TARGETS });
   harness.send("/workspace");
-  harness.send(SHIFT_TAB); // Host line
+  harness.send(SHIFT_TAB); // Provider line (drawn directly above the workspace field)
   // Main renders between keystrokes; the focus ring only ever reaches a control
   // the current render actually drew.
-  assert.ok(trimmed(harness.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS))
-    .some((line) => line.startsWith("> Host: [ Local ]")), "the first Shift+Tab owns the Host line");
-  harness.send(SHIFT_TAB); // Provider line
   const focused = trimmed(harness.pane(MAIN_PANE_COLS, MAIN_PANE_ROWS));
   assert.ok(focused.some((line) => line.startsWith("> Provider: [ Pi ]")), JSON.stringify(focused));
   harness.send(DOWN); // one deliberate cycle to the first offered target

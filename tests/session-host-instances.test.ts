@@ -16,6 +16,7 @@ import {
   DEFAULT_SHUTDOWN_KILL_MS,
   InstanceManager,
   createDefaultPtyFactory,
+  isNativeViewerNativeCliInputSource,
   isNativeViewerStartupInputSource,
   __test as instanceTestSeam,
   MAX_ACTIVITY_ENTRIES,
@@ -5013,7 +5014,9 @@ function reportConversation(row: FramingRow, sessionId: string, epoch: number): 
  */
 function conversationSourceOf(manager: InstanceManager, viewerId: string): NativeViewerInputSource | undefined {
   const source = manager.readViewerInputSource(viewerId);
-  return source === undefined || isNativeViewerStartupInputSource(source) ? undefined : source;
+  return source === undefined || isNativeViewerStartupInputSource(source) || isNativeViewerNativeCliInputSource(source)
+    ? undefined
+    : source;
 }
 
 /** A complete, well-formed request built from the caller's own observations. */

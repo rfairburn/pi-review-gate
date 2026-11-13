@@ -564,20 +564,26 @@ async function openNewForm(driver: MainPtyDriver): Promise<void> {
   "the real New form opens again in the content pane with the provider defaulting to Pi and no native target preselected", afterOpen);
 }
 
-/** Shift+Tab once to the Host line, again to the Provider line, still on Pi. */
+/**
+ * Shift+Tab once to the Provider line — the control drawn directly ABOVE the
+ * workspace field and BELOW the Host line — still on Pi, and witness that drawn
+ * order in the same frame.
+ */
 async function focusProviderLine(driver: MainPtyDriver): Promise<void> {
-  const afterHost = driver.frameRevision;
-  driver.pty.write(SHIFT_TAB);
-  await driver.waitFrame((text) => contentPaneLines(text)
-    .some((line) => line.trimStart().startsWith("> Host: ["))
-    && providerValue(providerRow(text)) === PI_PROVIDER_VALUE,
-  "Shift+Tab moves the New form's focus to its Host line", afterHost);
-
   const afterProvider = driver.frameRevision;
   driver.pty.write(SHIFT_TAB);
-  await driver.waitFrame((text) => providerRow(text)?.trimStart().startsWith("> Provider: ") === true
-    && providerValue(providerRow(text)) === PI_PROVIDER_VALUE,
-  "a second Shift+Tab moves the focus to the Provider line, still Pi", afterProvider);
+  await driver.waitFrame((text) => {
+    const focusedProvider = providerRow(text);
+    if (focusedProvider?.trimStart().startsWith("> Provider: ") !== true) return false;
+    if (providerValue(focusedProvider) !== PI_PROVIDER_VALUE) return false;
+    const lines = contentPaneLines(text);
+    const bare = (line: string): string => line.trimStart().replace(/^>\s+/u, "");
+    const hostIndex = lines.findIndex((line) => bare(line).startsWith("Host: ["));
+    const providerIndex = lines.findIndex((line) => line === focusedProvider);
+    const workspaceIndex = lines.findIndex((line) => bare(line).startsWith("Workspace: "));
+    return hostIndex >= 0 && providerIndex > hostIndex
+      && (workspaceIndex < 0 || workspaceIndex > providerIndex);
+  }, "one Shift+Tab focuses the Provider line drawn between Host and Workspace", afterProvider);
 }
 
 /**
@@ -865,7 +871,7 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   assert.equal(claudeCard.status, "agent unknown | input unknown",
     "a provider card reports unknown agent and input state, never an inferred idle");
   assert.equal(claudeCard.background, "background unknown",
-    "a provider card never invents zero background counts");
+    "a provider card uses the shared unknown-count summary and never invents a zero");
 
   // The codex-backed fixture also receives the daemon-isolating argument the
   // production launcher composes; its own argv witness proves it arrived.

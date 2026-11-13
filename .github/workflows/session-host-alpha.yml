@@ -18,6 +18,17 @@
 # prerequisite (pinned Pi runtime, ConPTY/node-pty, PowerShell, Python 3) is a
 # hard failure, never a skip, on every enforced trigger path. Every existing job,
 # step, and test deadline is unchanged by this reuse conversion.
+#
+# The two cold source-launcher legs are independent evidence, so the generic
+# launcher acceptance step also runs once when the direct Main acceptance step
+# ahead of it fails: a later step skipped by that failure yields no diagnosable
+# launcher outcome at all. Its gate is deliberately narrow: the run must not be
+# cancelled, and the pin-export step below must report success. That anchor step
+# is itself unconditional, so it can only report success once every provisioning
+# and compile step ahead of it succeeded. This collects an independent outcome
+# and masks nothing: any failed or cancelled step still fails this job and its
+# check, a missing prerequisite still fails the step that requires it, and the
+# launcher step then skips instead of starting an unusable case.
 
 name: Session host alpha (Windows)
 
@@ -151,6 +162,9 @@ jobs:
           npx tsc -p tsconfig.test.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Export pinned Pi runtime and staged candidate pins
+        # Stable id: the single launcher-acceptance gate below anchors on this
+        # step's outcome, because it is the last unconditional prerequisite step.
+        id: export_pins
         # The canonical readable JS CLI is the installed package's declared Node
         # entry (dist/bundle/cli.js); the harness admits only that exact public
         # entry. A missing prerequisite fails here, not later as a skip.
@@ -200,6 +214,17 @@ jobs:
         # contains both cold wrapper legs, each with a 9-minute enforced test
         # deadline; PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 makes every
         # missing Pi/Python/PowerShell prerequisite a hard failure.
+        # Independent outcome collection, not failure tolerance: this step runs
+        # once even when the direct Main acceptance step above failed, so the
+        # cmd and direct PowerShell legs report their own verdict instead of
+        # being skipped as a later step. The gate requires a non-cancelled run
+        # plus the export step's own success, which transitively means every
+        # provisioning, compile, and pin-export prerequisite succeeded; a
+        # missing prerequisite therefore skips this step rather than starting an
+        # unusable launcher case. A failed Main step above still fails this job
+        # and its check: nothing here tolerates a failed step, and the gate never
+        # widens to run on a cancelled or unfinished job.
+        if: ${{ !cancelled() && steps.export_pins.outcome == 'success' }}
         timeout-minutes: 20
         env:
           PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"

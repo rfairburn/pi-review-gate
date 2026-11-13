@@ -72,6 +72,23 @@ function stepOf(job: string, name: string): string {
   return nextStep === -1 ? after : after.slice(0, nextStep);
 }
 
+/** Full-line YAML comments removed, so prose never trips a negative assertion. */
+function withoutComments(source: string): string {
+  return source.split("\n").filter((line) => !line.trimStart().startsWith("#")).join("\n");
+}
+
+/**
+ * Every real `if:` condition line outside full-line comments, with its
+ * indentation. Job keys sit at indent 4 and step keys at indent 8, so this
+ * distinguishes a conditional job from a conditional step.
+ */
+function conditions(source: string): Array<{ indent: number; text: string }> {
+  return [...withoutComments(source).matchAll(/^([ ]*)if: (.+)$/gm)].map((match) => ({
+    indent: match[1].length,
+    text: match[2].trim(),
+  }));
+}
+
 test("alpha workflow is reusable-call plus manual dispatch only, with no independent automatic trigger", () => {
   const source = readAlpha();
   const on = onBlock(source);
@@ -202,8 +219,76 @@ test("alpha workflow publishes nothing and merges nothing", () => {
 
 test("alpha job runs on every enforced trigger path with no hidden skip", () => {
   const source = readAlpha();
-  assert.doesNotMatch(source, /^ *if:/m,
-    "no job or step condition may skip an enforced trigger path or a missing prerequisite");
+  // A conditional job could take the whole matrix out of the enforced
+  // dependency set, and any second conditional step could hide a missing
+  // prerequisite behind a skip. The single permitted step condition is the
+  // launcher acceptance gate pinned by its own contract test below, which can
+  // only run the launcher more often than before, never vacuously.
+  assert.doesNotMatch(withoutComments(source), /^ {2,6}if:/m,
+    "no job may carry a condition: a conditional matrix job could be skipped out of the enforced dependency set");
+  assert.equal(conditions(source).length, 1,
+    "no job or step condition may skip an enforced trigger path or a missing prerequisite, except the single launcher acceptance gate");
+  assert.equal(conditions(source)[0].indent, 8,
+    "the one permitted condition must be a step condition, never a job condition");
+});
+
+test("launcher acceptance collects its own outcome after a Main failure without masking it", () => {
+  const source = readAlpha();
+  const job = jobBlock(source);
+  const exportStep = stepOf(job, "Export pinned Pi runtime and staged candidate pins");
+  const exportId = exportStep.match(/^        id: ([a-z][a-z0-9_]*)\s*$/m)?.[1];
+  assert.ok(exportId,
+    "the final prerequisite export step must carry a stable id for the launcher gate to anchor on");
+
+  const launcherStep = stepOf(job, "Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)");
+  const gate = conditions(launcherStep)[0];
+  assert.ok(gate, "the launcher acceptance step must carry the one narrow prerequisite gate");
+  assert.equal(gate.indent, 8, "the gate must be a step condition, not a job condition");
+  assert.equal(gate.text, `\${{ !cancelled() && steps.${exportId}.outcome == 'success' }}`,
+    "the gate must stay exactly a non-cancelled run plus the anchor step's own success: no always(), failure(), !success(), or disjunction may start the launcher without its prerequisites");
+
+  // The anchor is the last unconditional provisioning/compile/pin-export step:
+  // it can only report success when every step ahead of it succeeded, so a
+  // missing prerequisite keeps the launcher from starting an unusable case and
+  // that prerequisite failure still fails the job.
+  const anchorIndex = job.indexOf("      - name: Export pinned Pi runtime and staged candidate pins");
+  const launcherIndex = job.indexOf("      - name: Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)");
+  assert.ok(anchorIndex !== -1 && launcherIndex > anchorIndex,
+    "the gated launcher step must stay after its anchor step");
+  for (const prerequisite of [
+    "Install dependencies",
+    "Create fresh exclusive runner-temp child roots",
+    "Install pinned Pi UI runtime (fresh runner-temp root)",
+    "Compile candidate extension into fresh scratch (never live dist)",
+    "Copy packaged scripts into fresh candidate (bounded copier)",
+    "Create fresh complete source fixture (bounded copier, no dist or node_modules)",
+    "Verify the Python 3 prerequisite for real DDGS provisioning",
+    "Compile test bundle (direct tsc, no clean)",
+  ]) {
+    const index = job.indexOf(`      - name: ${prerequisite}`);
+    assert.ok(index !== -1 && index < anchorIndex,
+      `${prerequisite} must stay ahead of the gate anchor, so its failure keeps the launcher from starting`);
+    assert.equal(conditions(stepOf(job, prerequisite)).length, 0,
+      `${prerequisite} must stay unconditional: a conditional prerequisite could report success while missing`);
+  }
+
+  // Independent outcome collection, never failure masking: the direct Main
+  // acceptance keeps running unconditionally and nothing tolerates its failure.
+  const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
+  assert.equal(conditions(mainStep).length, 0,
+    "the direct Main acceptance must stay unconditional so its failure still fails the step, the job, and the check");
+  assert.equal(conditions(exportStep).length, 0, "the gate anchor step must stay unconditional");
+  assert.doesNotMatch(withoutComments(source), /\bcontinue-on-error\b|always\(\)|!success\(\)|\bfailure\(\)/,
+    "no tolerated-failure or unconditional-run construct may turn a failed Main or launcher leg green");
+
+  // The gate changes only when the step runs: its command, cap, and fail-closed
+  // opt-in stay exactly as they were.
+  assert.match(launcherStep, /^        timeout-minutes: 20\s*$/m,
+    "the launcher step cap must stay unchanged by the gate");
+  assert.match(launcherStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
+    "the launcher step must keep its fail-closed opt-in under the gate");
+  assert.match(launcherStep, /^        run: node --test dist-test\/tests\/session-host-launcher-windows-acceptance\.test\.js\s*$/m,
+    "the launcher step command must stay unchanged by the gate");
 });
 
 test("alpha roots are fresh exclusive runner-temp children, never cleaned or replaced", () => {
@@ -474,7 +559,10 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "the synthetic restoration negatives must stay in the lane");
   assert.match(testSource, /leg deadline blocks further input and observer creation after cancellation/,
     "the synthetic cancellation case must stay in the lane");
-  assert.doesNotMatch(source, /^ *if:/m, "no job or step condition may skip an enforced trigger path");
+  // The single permitted condition is the launcher acceptance prerequisite gate
+  // pinned by its own contract test; nothing else may become conditional.
+  assert.equal(conditions(source).length, 1,
+    "the launcher acceptance gate must stay the only job or step condition in the matrix");
 
   const preload = readFileSync(join(projectRoot, "tests", "fixtures", "session-host-windows-launcher-preload.cjs"), "utf8");
   assert.match(preload, /launcherEntryIsActual/, "the preload must positively identify the actual launcher entry");

@@ -30,6 +30,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
@@ -790,8 +791,8 @@ export interface WindowsOwnedSession {
 /**
  * Direct-Main session with the observer-recorded canonical display caption that
  * the strict automatic-New ownership and draft witnesses require. It remains a
- * subtype of the shared `WindowsOwnedSession` so the untouched launcher harness
- * (which never observes a Main caption) keeps compiling unchanged.
+ * subtype of the shared `WindowsOwnedSession`, which the launcher harness uses
+ * for its own caption-bearing New witness.
  */
 export interface WindowsMainOwnedSession extends WindowsOwnedSession {
   /** Observer-recorded canonical display caption for the exact native session. */
@@ -1284,8 +1285,22 @@ export class WindowsMainPtyDriver {
     return this.providerRecords();
   }
 
+  /**
+   * The unchanged notification-driven outer-exit wait - same predicate, same
+   * absolute deadline, same fail-closed rejection - with the existing bounded
+   * startup diagnostic appended when it fails, so a stalled exit reports the
+   * runner's actual Main return/result presence and flags the driver already
+   * holds instead of only "deadline exceeded". Diagnosis only: the appended
+   * metadata never satisfies the wait, never widens or re-arms its deadline,
+   * and carries no frame text, argv, environment, path, or transcript.
+   */
   async waitForExit(timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<NativePtyExit> {
-    if (!this.exitEvent) await this.exitSignal.waitFor(() => this.exitEvent !== undefined, timeoutMs, "outer public Main PTY exit");
+    if (!this.exitEvent) {
+      await this.exitSignal.waitFor(() => this.exitEvent !== undefined, timeoutMs, "outer public Main PTY exit")
+        .catch((error: unknown) => {
+          throw new Error(`${error instanceof Error ? error.message : "outer public Main PTY exit: bounded exit wait failed"}; ${this.startupDiagnostic()}`);
+        });
+    }
     return this.exitEvent!;
   }
 
@@ -2146,6 +2161,204 @@ export interface ObserverStartOptions {
   readonly nativePid: number;
 }
 
+/** The only text one observer stderr stage marker line may carry. */
+export const WINDOWS_OBSERVER_STAGE_MARKER_PREFIX = "PRG-OBS-STAGE:";
+
+/**
+ * The complete closed stage vocabulary, in canonical script order: the fixture
+ * body began, its root passed validation, the exact-PID lookup and public handle
+ * acquisition were about to happen, the handle was bound, the READY publication
+ * completed, and the result publication completed.
+ */
+export const WINDOWS_OBSERVER_STAGES = [
+  "script-entered",
+  "root-validated",
+  "lookup-start",
+  "handle-bound",
+  "ready-published",
+  "result-published",
+] as const;
+
+export type WindowsObserverStage = (typeof WINDOWS_OBSERVER_STAGES)[number];
+
+/** The most stderr one observer will ever scan, then it stops looking entirely. */
+const MAX_STAGE_SCAN_BYTES = 8_192;
+/** Saturating ceiling on one stage's repeat count and on discarded-line counts. */
+const MAX_STAGE_OBSERVATIONS = 999;
+/** Hard ceiling on the observer's whole diagnostic line, so CI output stays bounded. */
+export const OBSERVER_DIAGNOSTIC_MAX_CHARS = 380;
+
+export function isWindowsObserverStage(value: unknown): value is WindowsObserverStage {
+  return typeof value === "string" && (WINDOWS_OBSERVER_STAGES as readonly string[]).includes(value);
+}
+
+/**
+ * One stderr line, or `undefined`. Only the exact prefix plus a closed-vocabulary
+ * stage name is a stage: other prefixes, unknown names, bare prefixes, PowerShell
+ * error text, paths, nonces, PIDs, private payloads, and fragments are not stages
+ * and are never retained.
+ */
+export function parseWindowsObserverStageMarker(line: string): WindowsObserverStage | undefined {
+  const text = line.endsWith("\r") ? line.slice(0, -1) : line;
+  if (!text.startsWith(WINDOWS_OBSERVER_STAGE_MARKER_PREFIX)) return undefined;
+  const name = text.slice(WINDOWS_OBSERVER_STAGE_MARKER_PREFIX.length);
+  if (!/^[a-z][a-z-]{2,31}$/.test(name)) return undefined;
+  return isWindowsObserverStage(name) ? name : undefined;
+}
+
+/**
+ * Can this partial line still grow into a valid marker line? Only such a
+ * fragment is ever held; everything else is dropped the moment it is seen, so
+ * the ledger never buffers arbitrary stderr, however short.
+ */
+export function couldBecomeStageMarkerLine(fragment: string): boolean {
+  if (fragment.length === 0) return true;
+  for (const stage of WINDOWS_OBSERVER_STAGES) {
+    const marker = `${WINDOWS_OBSERVER_STAGE_MARKER_PREFIX}${stage}`;
+    if (marker.startsWith(fragment) || `${marker}\r`.startsWith(fragment)) return true;
+  }
+  return false;
+}
+
+export type WindowsObserverStageScan = "open" | "closed" | "truncated";
+
+/** One observed stage: when it was first noticed, plus a saturating repeat count. */
+export interface WindowsObserverStageRecord {
+  readonly stage: WindowsObserverStage;
+  /** Whole milliseconds since this observer's own child spawn. */
+  readonly elapsedMs: number;
+  readonly count: number;
+}
+
+/**
+ * Bounded stderr-only stage observation of one exact-process observer script.
+ *
+ * Diagnosis only, for the open question of WHERE a real observer run went quiet:
+ * the existing diagnostic can already say a READY leaf was absent while the child
+ * was alive, but not whether the PowerShell script ever entered, validated its
+ * root, bound its handle, or completed a publication. The fixture writes fixed
+ * marker lines to STDERR; this ledger turns only exact allowlisted marker lines
+ * into `stage -> first-notice elapsed ms` records. It never looks at STDOUT, never
+ * retains stderr text, never prints stderr, error text, a path, a nonce, or a PID,
+ * and adds no timer, retry, or delay — every existing deadline stays as it is.
+ *
+ * A stage record is a parent-side notice time of one marker line, subject to
+ * stream delivery latency and to the marker writes themselves. It is never
+ * readiness or exit proof: only the unchanged strict witness reads and the exact
+ * owned process close remain proof, and a missing stage never proves the script
+ * did not start, because a script that never started and a script whose stderr
+ * never reached this parser look identical here.
+ */
+export class WindowsObserverStageLedger {
+  private readonly startedAtMs = performance.now();
+  private readonly observed = new Map<WindowsObserverStage, { elapsedMs: number; count: number }>();
+  private pending = "";
+  /** True while the rest of a line that can no longer be a marker is skipped. */
+  private skippingLine = false;
+  private scannedBytes = 0;
+  private noiseLines = 0;
+  private scanTruncated = false;
+  private streamClosed = false;
+
+  /** Feed one stderr chunk. Only whole lines are examined, and never kept. */
+  observe(chunk: string | Buffer): void {
+    if (this.scanTruncated) return;
+    this.scannedBytes += Buffer.byteLength(chunk);
+    if (this.scannedBytes > MAX_STAGE_SCAN_BYTES) {
+      // Past its bound this observer stops scanning entirely rather than keeping
+      // an unbounded tail: no retained stderr, and an honest truncated state.
+      this.scanTruncated = true;
+      this.pending = "";
+      this.skippingLine = false;
+      return;
+    }
+    let text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (this.skippingLine) {
+      const newline = text.indexOf("\n");
+      if (newline < 0) return; // still the same already-discarded line
+      text = text.slice(newline + 1);
+      this.skippingLine = false;
+      this.countNoise(); // the line that ended here is the one that was dropped
+    }
+    this.pending += text;
+    for (;;) {
+      const newline = this.pending.indexOf("\n");
+      if (newline < 0) {
+        // An incomplete line is held only while it can still become a marker.
+        // Anything else is dropped now, and the rest of its line is skipped
+        // until its newline arrives, so arbitrary stderr never accumulates here.
+        if (this.pending.length > 0 && !couldBecomeStageMarkerLine(this.pending)) {
+          this.pending = "";
+          this.skippingLine = true;
+        }
+        return;
+      }
+      const line = this.pending.slice(0, newline);
+      this.pending = this.pending.slice(newline + 1);
+      const stage = parseWindowsObserverStageMarker(line);
+      if (stage === undefined) {
+        if (line.trim().length > 0) this.countNoise();
+      }
+      else this.record(stage);
+    }
+  }
+
+  /** The stderr stream ended (or the child closed); nothing more will be scanned. */
+  close(): void {
+    this.streamClosed = true;
+    this.pending = "";
+    this.skippingLine = false;
+  }
+
+  get scanState(): WindowsObserverStageScan {
+    if (this.scanTruncated) return "truncated";
+    return this.streamClosed ? "closed" : "open";
+  }
+
+  /** Observed stages only, in canonical order, as bounded records. */
+  get records(): readonly WindowsObserverStageRecord[] {
+    return WINDOWS_OBSERVER_STAGES
+      .filter((stage) => this.observed.has(stage))
+      .map((stage) => {
+        const seen = this.observed.get(stage)!;
+        return { stage, elapsedMs: seen.elapsedMs, count: seen.count };
+      });
+  }
+
+  /**
+   * Fixed-shape stage tokens for the observer diagnostic: `stages=` carries only
+   * allowlisted stage names with integer elapsed milliseconds (`none` when no
+   * stage was observed), beside a bounded scan state and a bounded count of
+   * discarded non-marker stderr lines. The count of discarded lines is disclosed
+   * precisely so that "the script wrote something we threw away" is distinguishable
+   * from "nothing arrived", without ever disclosing what was thrown away.
+   */
+  diagnosticFields(): readonly string[] {
+    const pairs = this.records.map((record) =>
+      `${record.stage}.${boundedInteger(record.elapsedMs)}${record.count > 1 ? `x${boundedInteger(record.count)}` : ""}`);
+    return [
+      `stages=${pairs.length === 0 ? "none" : pairs.join(".")}`,
+      `stageScan=${this.scanState}`,
+      `stageNoise=${boundedInteger(Math.min(this.noiseLines, MAX_STAGE_OBSERVATIONS))}`,
+    ];
+  }
+
+  private record(stage: WindowsObserverStage): void {
+    const seen = this.observed.get(stage);
+    if (seen === undefined) this.observed.set(stage, { elapsedMs: this.elapsedMs(), count: 1 });
+    else if (seen.count < MAX_STAGE_OBSERVATIONS) seen.count += 1;
+  }
+
+  private countNoise(): void {
+    if (this.noiseLines < MAX_STAGE_OBSERVATIONS) this.noiseLines += 1;
+  }
+
+  private elapsedMs(): number {
+    const elapsed = Math.max(0, Math.round(performance.now() - this.startedAtMs));
+    return Number.isSafeInteger(elapsed) ? elapsed : 0;
+  }
+}
+
 export class WindowsOwnedExitObserver {
   readonly root: string;
   readonly rootIdentity: FileIdentity;
@@ -2158,11 +2371,11 @@ export class WindowsOwnedExitObserver {
   private readonly signal = new ChangeSignal();
   private closeEvent?: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
   private spawnError?: Error;
-  private stdoutTail = "";
-  private stderrTail = "";
   private readyWitness?: WindowsExitWitness;
   private resultWitness?: WindowsExitWitness;
   private readonly witnessFileIdentities = new Map<string, FileIdentity>();
+  /** STDERR-only stage observation; diagnosis only, never readiness or exit proof. */
+  private readonly stageLedger = new WindowsObserverStageLedger();
 
   constructor(options: ObserverStartOptions) {
     this.root = options.root;
@@ -2195,7 +2408,7 @@ export class WindowsOwnedExitObserver {
       ], {
         cwd: process.cwd(),
         env,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "ignore", "pipe"],
         shell: false,
         windowsHide: true,
       });
@@ -2205,11 +2418,24 @@ export class WindowsOwnedExitObserver {
     }
     this.child.on("error", (error) => {
       this.spawnError = error;
+      this.stageLedger.close();
       this.signal.notify();
     });
     this.child.on("close", (code, signal) => {
       this.closeEvent = { code, signal };
+      this.stageLedger.close();
       this.signal.notify();
+    });
+    // STDOUT stays ignored. STDERR is drained as it arrives and only exact
+    // allowlisted marker lines become bounded stage records, so the child can
+    // never block on a full stderr pipe while no stderr text is retained. A
+    // stream error only stops the observation: it never becomes `spawnError`,
+    // because diagnosis must not change what a wait does.
+    this.child.stderr?.on("data", (chunk: string | Buffer) => {
+      this.stageLedger.observe(chunk);
+    });
+    this.child.stderr?.on("error", () => {
+      this.stageLedger.close();
     });
     this.watcher.on("change", () => this.signal.notify());
     this.watcher.on("error", (error) => {
@@ -2218,8 +2444,10 @@ export class WindowsOwnedExitObserver {
     });
     this.readyPath = join(this.root, `${this.nonce}.ready.json`);
     this.resultPath = join(this.root, `${this.nonce}.result.json`);
-    this.child.stdout?.on("data", (chunk: Buffer | string) => { this.stdoutTail = (this.stdoutTail + chunk.toString()).slice(-512); });
-    this.child.stderr?.on("data", (chunk: Buffer | string) => { this.stderrTail = (this.stderrTail + chunk.toString()).slice(-512); });
+    // No stdout or stderr tail exists to collect: stdout is ignored and stderr is
+    // scanned for allowlisted stage markers only. A failed READY/result wait
+    // therefore reports the bounded state of the observer's own witness leaves,
+    // its child handle, and its fixed-vocabulary stage timings.
   }
 
   private readWitness(path: string, expectedState: "READY" | "exited"): WindowsExitWitness | undefined {
@@ -2256,19 +2484,42 @@ export class WindowsOwnedExitObserver {
     }
   }
 
+  /**
+   * READY is durable file evidence the owned PowerShell fixture publishes with one
+   * exclusive write into the watched root, so this waits on the shared
+   * durable-readiness core: the unchanged strict witness predicate and the
+   * unchanged absolute deadline, the `fs.watch` notification as fast path, plus a
+   * bounded periodic re-read and one final re-read at the deadline. A READY leaf
+   * that is already on disk therefore cannot stay unexamined merely because no
+   * watcher event was delivered or the events were coalesced; a leaf that never
+   * becomes a valid READY witness still fails with the original deadline error,
+   * now followed by the observer's bounded state diagnostic.
+   */
   async waitUntilReady(timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<WindowsExitWitness> {
-    await this.signal.waitFor(() => {
+    await this.signal.waitForRecheck(() => {
       if (this.spawnError) throw this.spawnError;
       if (this.closeEvent) throw new Error(`PowerShell observer exited before READY (${this.closeEvent.code}/${this.closeEvent.signal ?? "none"})`);
       this.readyWitness = this.readWitness(this.readyPath, "READY");
       return this.readyWitness !== undefined;
-    }, timeoutMs, `PowerShell exact-process READY for native PID ${this.nativePid}`);
+    }, timeoutMs, `PowerShell exact-process READY for native PID ${this.nativePid}`).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "bounded READY wait failed"}; ${this.observerDiagnostic()}`);
+    });
     assert.ok(this.child.pid && this.child.pid > 1, "public powershell.exe spawn returned an observer PID");
     return this.readyWitness!;
   }
 
+  /**
+   * The exited result is the same class of durable file evidence as READY - one
+   * exclusive publication by the retained PowerShell Process handle - so it uses
+   * the same durable-readiness core with its unchanged predicate, unchanged
+   * absolute deadline, and unchanged notification fast path. The retained-handle,
+   * nonce/PID/creation-tick, and exit-code-zero validation is untouched, and an
+   * observer that closes without publishing a valid result still fails closed —
+   * with the observer's bounded state diagnostic appended to the unchanged
+   * failure.
+   */
   async waitForExitedResult(timeoutMs = (WINDOWS_OBSERVER_TIMEOUT_SECONDS + 10) * 1000): Promise<WindowsExitWitness> {
-    await this.signal.waitFor(() => {
+    await this.signal.waitForRecheck(() => {
       if (this.spawnError) throw this.spawnError;
       this.resultWitness = this.readWitness(this.resultPath, "exited");
       if (this.resultWitness) return true;
@@ -2276,7 +2527,9 @@ export class WindowsOwnedExitObserver {
         throw new Error(`retained PowerShell observer exited without an exited result (${this.closeEvent.code}/${this.closeEvent.signal ?? "none"})`);
       }
       return false;
-    }, timeoutMs, `retained PowerShell Process handle exit result for native PID ${this.nativePid}`);
+    }, timeoutMs, `retained PowerShell Process handle exit result for native PID ${this.nativePid}`).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "bounded result wait failed"}; ${this.observerDiagnostic()}`);
+    });
     const witness = this.resultWitness!;
     assertCurrentDirectoryIdentity(this.root, this.rootIdentity);
     return witness;
@@ -2304,6 +2557,14 @@ export class WindowsOwnedExitObserver {
     // result and exits without reacquiring or controlling the native PID.
     await this.waitForObserverProcessClose((WINDOWS_OBSERVER_TIMEOUT_SECONDS + 10) * 1000).catch(() => undefined);
     try { this.watcher.close(); } catch { /* retained witness files remain */ }
+    // Diagnosis only, after the exact owned child closed or this unchanged
+    // retention bound elapsed: one final bounded snapshot, so a stage marker or a
+    // witness leaf that appeared only after the READY wait's own deadline is still
+    // visible in the CI log. It adds no wait, changes no deadline, retains no
+    // stderr, and can never turn a failed case into a pass.
+    try {
+      process.stderr.write(`windows-observer-retained ${this.observerDiagnostic()}\n`);
+    } catch { /* a failed diagnostic write never changes the outcome */ }
   }
 
   dispose(): void {
@@ -2314,9 +2575,132 @@ export class WindowsOwnedExitObserver {
     return this.closeEvent;
   }
 
-  get diagnosticTail(): string {
-    return `${this.stdoutTail}${this.stderrTail}`.slice(-512);
+  /**
+   * Bounded fixed-shape state diagnostic for a failed READY or retained-result
+   * wait: for each of this observer's own witness leaves, a fixed parse state
+   * mirroring the unchanged strict guards (bounded regular file with a positive
+   * BigInt identity, JSON parse, then the exact nonce/PID/state witness
+   * contract) plus its byte size, and the exact owned child's close/spawn state
+   * and the observer root's identity guard as a boolean. It re-reads the same
+   * leaves under the same byte bound but registers no witness identity, retains
+   * no witness, and emits no leaf content, error text, nonce, path, or
+   * transcript, so it can never become exit proof. Diagnosis only: it never
+   * satisfies a wait, never changes a deadline, and never replaces the strict
+   * validate/read/identity guards that decide readiness.
+   *
+   * The exact owned-root identity guard runs first, exactly as `readWitness`
+   * gates every leaf examination: when the directory now at the observer's root
+   * path is not the directory whose identity it bound at start, neither leaf is
+   * lstat'ed or read at all. Both leaves are then disclosed as the bounded
+   * `unavailable` token beside `rootIdentityOk=false`, so a replaced or invalid
+   * root can never turn a foreign leaf placed at the observer's own paths into
+   * disclosed leaf state, retained evidence, or exit proof.
+   *
+   * The same line carries the bounded STDERR stage timings: only allowlisted
+   * stage names with integer elapsed milliseconds, the scan state, and a bounded
+   * count of discarded non-marker lines. When this observer never created a
+   * stderr ledger — a diagnostic-only fake built from the prototype, or a child
+   * whose stderr was never attached — the single honest `stages=unavailable`
+   * token is emitted instead. Stage absence is never reported as progress and
+   * never as proof the script did not start. If the whole line would exceed its
+   * cap, stage tokens are withheld before anything else.
+   */
+  observerDiagnostic(): string {
+    let rootIdentityOk = true;
+    try {
+      assertCurrentDirectoryIdentity(this.root, this.rootIdentity);
+    } catch {
+      rootIdentityOk = false;
+    }
+    const leaf = (path: string, expectedState: "READY" | "exited"): { readonly state: string; readonly bytes: string } => {
+      try {
+        const stats = lstatSync(path, { bigint: true });
+        if (stats.isSymbolicLink()) return { state: "symlink", bytes: "-" };
+        if (!stats.isFile()) return { state: "not-regular", bytes: "-" };
+        const bytes = stats.size >= 0n && stats.size <= 2_147_483_647n ? String(stats.size) : "?";
+        if (stats.size === 0n) return { state: "empty", bytes };
+        if (stats.dev <= 0n || stats.ino <= 0n) return { state: "no-identity", bytes };
+        if (stats.size > BigInt(MAX_WITNESS_BYTES)) return { state: "oversized", bytes };
+        let text: string;
+        try {
+          text = readFileSync(path, "utf8");
+        } catch {
+          return { state: "unreadable", bytes };
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return { state: "invalid-json", bytes };
+        }
+        try {
+          validateWindowsExitWitness(parsed, {
+            requestNonce: this.nonce,
+            observerPid: this.child.pid ?? -1,
+            nativePid: this.nativePid,
+            state: expectedState,
+          });
+          return { state: "valid", bytes };
+        } catch {
+          return { state: "schema-mismatch", bytes };
+        }
+      } catch (error) {
+        return { state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable", bytes: "-" };
+      }
+    };
+    try {
+      // Gated reads: an unbound root discloses the bounded unavailable token
+      // instead of examining either leaf.
+      const unexamined: { readonly state: string; readonly bytes: string } = { state: "unavailable", bytes: "-" };
+      const ready = rootIdentityOk ? leaf(this.readyPath, "READY") : unexamined;
+      const result = rootIdentityOk ? leaf(this.resultPath, "exited") : unexamined;
+      const close = this.closeEvent;
+      const signal = close?.signal;
+      const fields = [
+        `readyState=${ready.state}`,
+        `readyBytes=${ready.bytes}`,
+        `resultState=${result.state}`,
+        `resultBytes=${result.bytes}`,
+        `childState=${close ? "closed" : "alive"}`,
+        `childCode=${close ? (close.code === null ? "null" : boundedInteger(close.code)) : "-"}`,
+        `childSignal=${signal === null || signal === undefined ? "-" : (/^[A-Z]{2,16}$/.test(signal) ? signal : "?")}`,
+        `spawnError=${this.spawnError !== undefined}`,
+        `observerPidKnown=${Number.isSafeInteger(this.child?.pid) && (this.child?.pid ?? 0) > 0}`,
+        `rootIdentityOk=${rootIdentityOk}`,
+      ];
+      const stageFields = this.stageDiagnosticFields();
+      // Progressive withholding keeps the whole diagnostic bounded, and the
+      // optional stage tokens are always what gets dropped first.
+      for (let keep = stageFields.length; keep >= 0; keep -= 1) {
+        const rendered = `observerDiag{${[...fields, ...stageFields.slice(0, keep)].join(" ")}}`;
+        if (rendered.length <= OBSERVER_DIAGNOSTIC_MAX_CHARS) return rendered;
+      }
+      return "observerDiag{unavailable}";
+    } catch {
+      return "observerDiag{unavailable}";
+    }
   }
+
+  /**
+   * The observer's bounded STDERR stage tokens, or the single honest
+   * `stages=unavailable` token when no stderr ledger exists on this object. A
+   * prototype-only diagnostic fake that never ran the constructor keeps working:
+   * it simply discloses unknown stage progress instead of failing or implying any.
+   */
+  private stageDiagnosticFields(): readonly string[] {
+    const ledger: WindowsObserverStageLedger | undefined = this.stageLedger;
+    if (ledger === undefined) return ["stages=unavailable"];
+    try {
+      return ledger.diagnosticFields();
+    } catch {
+      return ["stages=unknown"];
+    }
+  }
+}
+
+/** A bounded integer token for the diagnostic's own numeric fields. */
+function boundedInteger(value: number): string {
+  return Number.isSafeInteger(value) && Math.abs(value) <= 2 ** 31 ? String(value) : "?";
 }
 
 export function randomNonce(): string {

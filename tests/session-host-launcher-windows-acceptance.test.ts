@@ -1,18 +1,42 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { createRequire } from "node:module";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 
+import { SidebarController } from "../src/session-host/sidebar";
+import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
+
 import {
+  LAUNCHER_BUILT_STAGE_DIRNAME,
   LAUNCHER_CLEANUP_BUDGET_MS,
   LAUNCHER_BODY_DEADLINE_MS,
   LAUNCHER_EVENT_TIMEOUT_MS,
   LAUNCHER_EXPECT_PI_VERSION,
+  LAUNCHER_EXIT_OBSERVATION_BUDGET_MS,
+  LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS,
   LAUNCHER_LEG_DEADLINE_MS,
   LAUNCHER_LEGS,
+  LAUNCHER_OUTER_COLS,
+  LAUNCHER_OUTER_ROWS,
+  LAUNCHER_PTY_VERSION,
+  LAUNCHER_READER_SETTLEMENT_BUDGET_MS,
   LAUNCHER_REQUIRE_ENV,
+  LAUNCHER_STAGE_REQUIRED,
   LAUNCHER_STARTUP_TIMEOUT_MS,
+  LAUNCHER_TEST_TIMEOUT_MS,
+  LauncherCleanupBudget,
   LauncherPtyDriver,
   LegDeadline,
   WindowsOwnedExitObserver,
@@ -24,24 +48,36 @@ import {
   assertLegArithmetic,
   assertNativeRestoration,
   assertNoUnownedNativeSessions,
+  assertRetainedLauncherStage,
   assertSourceFixtureUnchanged,
   createLauncherLegLayout,
   frameWaitFailure,
   identityOfRealDirectory,
   isSessionShutdownFor,
+  launcherOwnerDraftFrame,
   probeWindowsPowerShell,
   randomDigits,
   resolveLauncherRuntime,
   sameFileIdentity,
+  settleOwnedConptyReader,
   type NativeJournalRecord,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-launcher";
-import { frameHeader } from "./helpers/session-host-native-roster-witness";
+import { frameHeader, frameHeaderMatches, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
+import { WINDOWS_NATIVE_COLS, isWindowsMainOwnerFrame } from "./helpers/session-host-native-windows-harness";
 
 const restorationFixtures = require("../../tests/fixtures/session-host-windows-launcher-restoration.cjs") as {
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
   launcherRestorationSnapshot(baseline: unknown, current: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): Record<string, unknown>;
   nativeRestorationSnapshot(env: Record<string, string | undefined>): Record<string, unknown>;
+};
+
+// The current shared preparation producer, loaded read-only so the retained-stage
+// proof below stays bound to the stage grammar it actually creates instead of to a
+// remembered name. Nothing here drives or imitates a launcher run.
+const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launcher-windows-acceptance.test.ts"));
+const applicationBuild = requireCjs("../scripts/application-build.cjs") as {
+  createOwnedStage(parent: string, prefix: string): { root: string };
 };
 
 const optIn = process.env[LAUNCHER_REQUIRE_ENV] === "1";
@@ -53,14 +89,15 @@ test("source-launcher acceptance bounds are finite and fit the whole-file budget
   assert.equal(LAUNCHER_EXPECT_PI_VERSION, "1.5.2");
   assert.equal(LAUNCHER_LEG_DEADLINE_MS, 9 * 60_000);
   assert.ok(LAUNCHER_LEGS.length === 2,
-    "both real wrapper legs (cmd and direct PowerShell) are retained; runtime coverage deferred under #345");
+    "both real wrapper legs (cmd and direct PowerShell) stay registered as real Windows host proof");
 });
 
 for (const leg of LAUNCHER_LEGS) {
-  // TODO(https://github.com/rfairburn/pi-review-gate/issues/345): Windows sidebar
-  // runtime acceptance deferred to #345 for this release. Restore by re-registering
-  // as `test(...)` with the retained opt-in skip condition once #345 lands.
-  test.skip(`real Windows source launcher (${leg}) stages, builds, runs a native Pi child, and restores`, {
+  // Real Windows host proof, registered normally with the retained opt-in skip
+  // condition: without the opt-in env the leg reports the skip as not being
+  // Windows host proof, and once opted in every missing platform, pinned-runtime,
+  // source-fixture, or Python prerequisite is a hard failure, never a skip.
+  test(`real Windows source launcher (${leg}) stages, builds, runs a native Pi child, and restores`, {
     timeout: LAUNCHER_LEG_DEADLINE_MS,
     skip: optIn ? false : `${LAUNCHER_REQUIRE_ENV}=1 is required; this is not Windows host proof`,
   }, async (t) => {
@@ -86,26 +123,48 @@ for (const leg of LAUNCHER_LEGS) {
     let completed = false;
 
     t.after(async () => {
+      // One elapsed cleanup window covers every failure step below: the graceful
+      // attempt, the exact force-to-onExit observation, and the owned ConPTY
+      // reader settlement. Each is capped by its reserved slice AND by what this
+      // window still allows, so the whole sequence stays inside the ORIGINAL
+      // cleanup budget, and no step — including the reader settlement — can wait
+      // indefinitely.
+      driver.beginFailureCleanup();
       try {
         if (!completed) {
-          // Bounded cleanup only: a short-lived cleanup deadline plus exact-handle
-          // force, never unbounded graceful waits or post-cancellation input.
-          await driver.tryGracefulQuitAfterFailure(LAUNCHER_CLEANUP_BUDGET_MS);
+          // Bounded cleanup only: one short-lived graceful attempt, then the
+          // exact-handle force, then one finite input-free observation of the exact
+          // owned outer PTY's real public onExit. Never an unbounded graceful wait,
+          // never input after the budget, and never a reader close over an
+          // unconfirmed transport.
+          await driver.tryGracefulQuitAfterFailure();
           if (!driver.exitEvent) driver.forceKillOuterAfterFailure();
+          const outerExitObserved = await driver.observeOuterExitAfterForce();
           for (const observer of observers) {
             observer.dispose();
             // Bound failure cleanup: release the exact owned test helper child
             // rather than waiting for its independent observer timeout.
             try { observer.child.kill(); } catch { /* already exited */ }
           }
+          if (!outerExitObserved) {
+            // The actual outer exit is never assumed: the owned ConPTY reader is
+            // left untouched and the retained witness tree reports the uncertainty.
+            process.stderr.write("unconfirmed Windows source-launcher outer exit: reader left open, evidence retained\n");
+          }
           process.stderr.write(`preserved failed Windows source-launcher witness tree: ${layout.root}\n`);
         } else {
           for (const observer of observers) observer.dispose();
         }
       } finally {
-        // Subscriptions always settle, even on a cancelled or failed leg.
-        await driver.settleSubscriptions();
+        // Subscriptions always settle, even on a cancelled or failed leg. The owned
+        // ConPTY reader closes only behind a positively observed outer exit, and
+        // only within what the same cleanup window still allows.
+        const readerSettlement = await driver.settleSubscriptions();
         deadline.dispose();
+        if (readerSettlement !== "closed") {
+          // Cleanup uncertainty is reported; it never rewrites the leg's own result.
+          process.stderr.write(`uncertain Windows source-launcher ConPTY reader settlement (${readerSettlement}): evidence retained, result unchanged\n`);
+        }
       }
     });
 
@@ -135,23 +194,29 @@ for (const leg of LAUNCHER_LEGS) {
     const draftB = `launcherDraftB${suffix}`;
 
     const sessionA = await driver.createNativeSession(layout.workspaceA, labelA);
-    assert.notEqual(frameHeader(driver.currentText()), labelA,
-      "New highlights A but does not activate it; the outer header stays the welcome title");
-    await driver.activate(labelA);
-    await driver.writeDraft(draftA);
-    const headerA = driver.currentText().split("\n")[0];
+    assert.equal(frameHeaderMatches(driver.currentText(), labelA), true,
+      "the completed New activated A as the Main input owner, and the active-owner rename moved the header to A's new caption");
+    // The first activation has no draft yet, so the shared witness requires the
+    // complete fresh owner frame with the width-correct bordered EMPTY editor.
+    await driver.activate(labelA, "");
+    await driver.writeDraft(labelA, draftA);
 
-    const sessionB = await driver.createNativeSession(layout.workspaceB, labelB, headerA);
-    assert.equal(driver.currentText().split("\n")[0], headerA,
-      "New highlights B while leaving A active until explicit selection");
-    await driver.activate(labelB);
-    await driver.writeDraft(draftB);
+    const sessionB = await driver.createNativeSession(layout.workspaceB, labelB);
+    assert.notEqual(frameHeader(driver.currentText()), labelA,
+      "the second completed New transfers Main input ownership from A to B instead of leaving A's stale active header");
+    assert.equal(frameHeaderMatches(driver.currentText(), labelB), true,
+      "B's own freshly observed canonical caption is the active outer header after the ownership transition");
+    await driver.activate(labelB, "");
+    await driver.writeDraft(labelB, draftB);
     assert.ok(driver.currentText().includes(draftB));
     assert.equal(driver.currentText().includes(draftA), false, "B does not inherit A's independent native input draft");
-    await driver.activate(labelA);
+    // Each switch back is admitted only by that child's own complete fresh owner
+    // frame carrying exactly its bordered draft, so a header that moved before the
+    // native pane repainted can never satisfy it.
+    await driver.activate(labelA, draftA);
     assert.ok(driver.currentText().includes(draftA), "A retains its own native input draft after switching back");
     assert.equal(driver.currentText().includes(draftB), false);
-    await driver.activate(labelB);
+    await driver.activate(labelB, draftB);
     assert.ok(driver.currentText().includes(draftB), "B's independent draft survives returning from A");
     assert.equal(driver.currentText().includes(draftA), false);
 
@@ -306,6 +371,265 @@ function isAbsoluteNativePath(path: string): boolean {
   return process.platform === "win32" ? /^[A-Za-z]:[\\/]|^\\\\/.test(path) : isAbsolute(path);
 }
 
+// Focused negative control for the corrected launcher observation. A completed
+// New transfers Main input ownership to the created child, so the lane admits
+// only that child's own complete owner frame: the empty welcome surface the
+// stale lane accepted, a sidebar-focused footer, a partial native border, and a
+// header that never followed the active-owner rename are all refused.
+test("launcher New ownership witness rejects the welcome header, a stale footer, and a partial native border", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const owner = "(no messages)";
+  assert.equal(LAUNCHER_OUTER_COLS - SIDEBAR_COLUMNS - 1, WINDOWS_NATIVE_COLS,
+    "the composed launcher frame keeps the same wide native pane width the shared owner witness reads");
+  controller.updateItems([{
+    id: "launcher-new-owner", label: owner, workspace: "/owned/windows-launcher-new", agentDir: "/owned/agent",
+    lifecycle: "alive", hasLiveProcess: true, busy: false, pendingInput: false, inputSurface: false,
+    backgroundTasks: 0, backgroundShells: 0, activity: [],
+  }]);
+  controller.select("launcher-new-owner");
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  // The completed New activates the created child without a second host-row Enter.
+  controller.handleInput("\r");
+  const mainFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  const rule = "\u2500".repeat(WINDOWS_NATIVE_COLS);
+  const nativeRows = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: LAUNCHER_OUTER_ROWS - 1 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (header: string, sidebar: readonly string[], main: readonly string[]): string =>
+    [header, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}\u2502${main[index] ?? ""}`)].join("\n");
+  const emptyEditor = nativeRows(rule, "> ", rule);
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, mainFocused, emptyEditor), owner), true,
+    "the observed owner header, single highlight, complete Main-focused roster, and width-correct bordered empty native editor are a genuine automatic-New ownership witness");
+  assert.equal(isWindowsMainOwnerFrame(compose("Welcome \u2014 select a session", mainFocused, emptyEditor), owner), false,
+    "the pre-New empty welcome surface never proves the created child owns Main");
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, sidebarFocused, emptyEditor), owner), false,
+    "a stale sidebar-focused footer never proves Main input ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, mainFocused, nativeRows(rule, "> ", "")), owner), false,
+    "a partial native border that never drew its closing rule never proves ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose("A-stale-owner", mainFocused, emptyEditor), owner), false,
+    "a header that never followed the active-owner rename never proves the renamed child owns Main");
+});
+
+// Focused negative controls for the corrected launcher activation and draft
+// waits. The outer header repaints before the native pane, so the lane admits
+// only the complete fresh owner frame with exactly that child's bordered editor:
+// a freshly moved header over the previous owner's draft, over an empty or
+// mid-repaint pane, or beside an appended, altered, partial, or wrong-width
+// editor is refused, and so is a stale sidebar-focused footer.
+test("launcher owner draft witness rejects a fresh header over a stale native pane and altered drafts", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const owner = "(no messages)";
+  const draft = "launcherDraftA";
+  const otherDraft = "launcherDraftB";
+  controller.updateItems([{
+    id: "launcher-owner-draft", label: owner, workspace: "/owned/windows-launcher-draft", agentDir: "/owned/agent",
+    lifecycle: "alive", hasLiveProcess: true, busy: false, pendingInput: false, inputSurface: false,
+    backgroundTasks: 0, backgroundShells: 0, activity: [],
+  }]);
+  controller.select("launcher-owner-draft");
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  controller.handleInput("\r");
+  const mainFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  const rule = "\u2500".repeat(WINDOWS_NATIVE_COLS);
+  const nativeRows = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: LAUNCHER_OUTER_ROWS - 1 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (header: string, sidebar: readonly string[], main: readonly string[]): string =>
+    [header, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}\u2502${main[index] ?? ""}`)].join("\n");
+  const exactDraftPane = nativeRows(rule, `> ${draft}`, rule);
+  const ownerFrame = compose(owner, mainFocused, exactDraftPane);
+  assert.equal(launcherOwnerDraftFrame(ownerFrame, owner, draft), true,
+    "the observed owner header, single highlight, complete Main-focused roster, and width-correct bordered editor holding exactly this draft are a genuine activation witness");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> ${otherDraft}`, rule)), owner, draft), false,
+    "a freshly moved header over the native pane's previous draft never proves the switched-to child owns Main with its own draft");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", rule)), owner, draft), false,
+    "a freshly moved header over a still-empty native editor never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", "")), owner, draft), false,
+    "a freshly moved header over a mid-repaint partial native border never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> ${draft}qQ`, rule)), owner, draft), false,
+    "an appended draft is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> x-${draft}`, rule)), owner, draft), false,
+    "an altered draft is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows("\u2500".repeat(52), `> ${draft}`, "\u2500".repeat(52))), owner, draft), false,
+    "a wrong-width native border never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, sidebarFocused, exactDraftPane), owner, draft), false,
+    "a stale sidebar-focused footer never proves Main input ownership for the draft witness");
+  assert.equal(launcherOwnerDraftFrame(`${owner}\n${exactDraftPane.join("\n")}`, owner, draft), false,
+    "a draft without the complete owner roster is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose("A-stale-owner", mainFocused, exactDraftPane), owner, draft), false,
+    "a header that never followed the switched-to child never proves that child owns Main");
+
+  // The first activation of a freshly created child has no draft yet, so the
+  // same shared witness requires the width-correct bordered EMPTY editor under
+  // the complete owner surface, and refuses a pane that already carries text.
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", rule)), owner, ""), true,
+    "the complete owner frame with a width-correct bordered empty native editor proves a first activation");
+  assert.equal(launcherOwnerDraftFrame(ownerFrame, owner, ""), false,
+    "an expected first activation is never satisfied by a pane that already holds a draft");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, sidebarFocused, nativeRows(rule, "> ", rule)), owner, ""), false,
+    "a stale sidebar-focused footer never proves a first activation");
+});
+
+// Bounded, transcript-free launcher frame-wait diagnostics: the outer exit the
+// exact owned handle reported, plus presence-only witnesses and the fixed fields
+// of a summary the preload already journaled. Terminal content, drafts, paths,
+// arguments, and environment values never reach the message.
+test("launcher frame-wait diagnostics carry bounded exit and journal evidence, never terminal content", () => {
+  const sensitive = "PRIVATE-LAUNCHER-session-host-secret";
+  const error = frameWaitFailure("welcome frame", {
+    frameRevision: 8,
+    after: -1,
+    exitObserved: true,
+    aborted: false,
+    outerExitCode: 1,
+    outerExitSignal: 0,
+    launcherEntry: false,
+    ptyModule: false,
+    launcherSummary: true,
+    summaryExitCode: 1,
+    summaryForceAttempted: false,
+    summaryJournalFailed: false,
+    summaryUnresolvedSpawns: 0,
+    summaryUnexitedSpawns: 1,
+  }, sensitive);
+  assert.match(error.message, /welcome frame/);
+  assert.match(error.message, /revision=8/);
+  assert.match(error.message, /exit=true/);
+  assert.match(error.message, /outerExitCode=1/);
+  assert.match(error.message, /outerExitSignal=0/);
+  assert.match(error.message, /entry=no/, "a missing launcher-entry record is explicit evidence, not a guess");
+  assert.match(error.message, /module=no/);
+  assert.match(error.message, /summary=yes/);
+  assert.match(error.message, /summaryForce=no/);
+  assert.match(error.message, /summaryUnexited=1/);
+  assert.doesNotMatch(error.message, new RegExp(sensitive), "terminal content must never reach the diagnostic");
+  assert.doesNotMatch(error.message, /SESSION_HOST_LAUNCHER|--require|preload|draft|C:\\|\//i);
+
+  // An unreadable journal leaves those witnesses out entirely instead of
+  // reporting them as absent, and no exit fields appear before an actual exit.
+  const minimal = frameWaitFailure("welcome frame", {
+    frameRevision: 3,
+    after: -1,
+    exitObserved: false,
+    aborted: true,
+  }, sensitive);
+  assert.match(minimal.message, /revision=3/);
+  assert.match(minimal.message, /exit=false/);
+  assert.doesNotMatch(minimal.message, /outerExitCode=|entry=|module=|summary=/);
+  assert.doesNotMatch(minimal.message, new RegExp(sensitive));
+});
+
+test("launcher failure cleanup reserves every step inside the original budget", () => {
+  assert.equal(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS + LAUNCHER_EXIT_OBSERVATION_BUDGET_MS + LAUNCHER_READER_SETTLEMENT_BUDGET_MS, LAUNCHER_CLEANUP_BUDGET_MS,
+    "the exit observation and the reader settlement are reserved from the SAME cleanup budget: no new grace beyond the leg and file caps");
+  assert.ok(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS > 0 && LAUNCHER_EXIT_OBSERVATION_BUDGET_MS > 0 && LAUNCHER_READER_SETTLEMENT_BUDGET_MS > 0,
+    "every failure-cleanup slice stays finite");
+  assert.ok(LAUNCHER_LEG_DEADLINE_MS + LAUNCHER_CLEANUP_BUDGET_MS <= LAUNCHER_TEST_TIMEOUT_MS,
+    "the original per-leg plus cleanup budget still fits the unchanged whole-file budget");
+});
+
+test("launcher failure cleanup charges every step against one elapsed deadline", async () => {
+  // The real window is larger than every reserved slice, so a fresh window grants
+  // each step its whole slice and never more than the whole budget.
+  const full = new LauncherCleanupBudget(LAUNCHER_CLEANUP_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS), LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_EXIT_OBSERVATION_BUDGET_MS), LAUNCHER_EXIT_OBSERVATION_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS), LAUNCHER_READER_SETTLEMENT_BUDGET_MS);
+  assert.ok(full.remaining(LAUNCHER_CLEANUP_BUDGET_MS * 10) <= LAUNCHER_CLEANUP_BUDGET_MS,
+    "no step is ever granted more than the whole cleanup budget");
+
+  // A short window proves that the SAME deadline charges elapsed time to every
+  // later step and then grants nothing further to any of them.
+  const short = new LauncherCleanupBudget(60);
+  assert.ok(short.remaining(10_000) <= 60 && short.remaining(10_000) > 0,
+    "a step is capped by the window as well as by its own slice");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const mid = short.remaining(10_000);
+  assert.ok(mid < 60 && mid > 0, `elapsed time is charged to the same window (${Math.round(mid)}ms left)`);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(short.expired, "the window expires on its absolute deadline");
+  assert.equal(short.remaining(10_000), 0,
+    "an expired window grants no further time to any step, including the reader settlement");
+  assert.equal(short.remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS), 0);
+});
+
+test("launcher ConPTY reader settlement is bounded and keeps the observed-outer-exit guard", async () => {
+  let closeInvocations = 0;
+  const recordClose = async (): Promise<void> => {
+    closeInvocations += 1;
+  };
+  assert.equal(await settleOwnedConptyReader(false, 1_000, recordClose), "skipped",
+    "an unconfirmed outer exit never touches the owned reader");
+  assert.equal(closeInvocations, 0, "the observed-outer-exit guard is never relaxed");
+
+  assert.equal(await settleOwnedConptyReader(true, 1_000, recordClose), "closed");
+  assert.equal(closeInvocations, 1, "a prompt settlement is reported as closed");
+
+  // The shared cleanup window reports fractional milliseconds, so a leftover below
+  // a step's cap is still real time and must be observed, never abandoned.
+  assert.equal(await settleOwnedConptyReader(true, 1_000.5, async () => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }), "closed", "fractional remaining milliseconds still allow reader settlement");
+
+  // A fractional budget is actually waited on instead of returning uncertain at
+  // once because the duration is not an integer.
+  let startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20.5, () => new Promise<void>(() => { /* never settles */ })), "uncertain",
+    "a fractional budget with a never-settling cleanup is reported uncertain only after waiting");
+  let waited = performance.now() - startedAt;
+  assert.ok(waited >= 15 && waited < 2_000, `a fractional budget is waited on (${Math.round(waited)}ms)`);
+
+  // A non-finite duration is no time available at all.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, Number.POSITIVE_INFINITY, () => new Promise<void>(() => { /* never settles */ })), "uncertain");
+  assert.ok(performance.now() - startedAt < 200, "a non-finite remaining budget never waits");
+
+  // Integration shape: the exact kind of value the shared window hands to a step
+  // is a finite (usually fractional) leftover duration, and that value must still
+  // be observed rather than abandoned.
+  const leftover = new LauncherCleanupBudget(1_000).remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS);
+  assert.ok(Number.isFinite(leftover) && leftover > 0 && leftover <= LAUNCHER_READER_SETTLEMENT_BUDGET_MS,
+    "the shared window hands a step a finite positive leftover duration");
+  assert.equal(await settleOwnedConptyReader(true, leftover, recordClose), "closed",
+    "a settlement given the shared window's leftover duration is still observed");
+
+  // A never-settling cleanup returns at its own budget instead of holding the
+  // failure hook open indefinitely.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20, () => new Promise<void>(() => { /* never settles */ })), "uncertain",
+    "a never-settling reader cleanup is reported uncertain at its budget");
+  waited = performance.now() - startedAt;
+  assert.ok(waited >= 15 && waited < 2_000, `the bounded settlement returned at its own budget (${Math.round(waited)}ms)`);
+
+  // A delayed-but-eventual settlement is bounded the same way, and its later
+  // resolution never rewrites the reported outcome or escapes as an error.
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20, () => pending), "uncertain",
+    "a delayed reader cleanup is reported uncertain at its budget");
+  waited = performance.now() - startedAt;
+  assert.ok(waited < 2_000, `a delayed settlement is not waited on past its budget (${Math.round(waited)}ms)`);
+  release();
+
+  // A throwing settlement is reported, never rethrown as a new failure.
+  assert.equal(await settleOwnedConptyReader(true, 1_000, () => Promise.reject(new Error("not the pinned ConPTY-DLL shape"))), "uncertain",
+    "a failing settlement is reported as uncertain instead of escaping as a new error");
+
+  // An exhausted cleanup window grants no wait at all.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 0, () => new Promise<void>(() => { /* never settles */ })), "uncertain");
+  assert.ok(performance.now() - startedAt < 200, "an exhausted cleanup window never waits");
+});
+
 // Pure synthetic contracts that run everywhere: restoration witnesses, the
 // enforced leg deadline, and transcript-free diagnostics.
 test("launcher restoration witnesses reject corrupted options, unrestored raw mode, and provider drift", () => {
@@ -392,4 +716,168 @@ test("launcher frame-wait diagnostics never include terminal content", () => {
   assert.match(error.message, /revision=3/);
   assert.doesNotMatch(error.message, new RegExp(sensitive), "terminal content must never reach the diagnostic");
   assert.doesNotMatch(error.message, /SESSION_HOST_LAUNCHER|--require|preload|draft/i);
+});
+
+// ---------------------------------------------------------------------------
+// Retained launcher-stage proof (synthetic controls, every host).
+//
+// The retained stage of an actual launcher run is proved only by the real Windows
+// legs above. What these controls prove is that the SAME shared probe the legs
+// call fails closed: the current producer's exact stage grammar is admitted, and
+// an obsolete/stale/wrong name, a duplicate stage, a missing build output, an
+// altered lockfile, or a different @lydell/node-pty version never is. The fixture
+// is a confined naming/observation fixture — it never claims runtime proof.
+// ---------------------------------------------------------------------------
+
+const CURRENT_STAGE_HEX = "0123456789abcdef0123456789abcdef";
+/** The retired producer grammar this proof used to match (#663 cold-launcher CI). */
+const RETIRED_STAGE_DIRNAME = `pi-review-sessions-${CURRENT_STAGE_HEX}`;
+const ONE_RETAINED_STAGE = "exactly one retained launcher-owned source build stage";
+
+interface SyntheticStageFixture {
+  readonly sourceRoot: string;
+  readonly buildRoot: string;
+  readonly stage: string;
+  readonly lock: Buffer;
+}
+
+/**
+ * One confined fixture: a locked source root, the shared build cache, and — only
+ * when `stageName` is supplied — a stage carrying every required build output, a
+ * byte-identical lockfile copy, and the exact pinned public @lydell/node-pty
+ * manifest. Every fixture is task-owned and removed on the test's own hook.
+ */
+function createStageFixture(t: { after(fn: () => void): void }, stageName?: string): SyntheticStageFixture {
+  // Canonicalized so every ancestor is a real directory: the shared producer
+  // fences its whole parent chain from the filesystem root, and macOS's /var
+  // symlink is not something a fixture may hand it.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "prg-windows-launcher-stage-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceRoot = join(root, "source");
+  const buildRoot = join(root, "build");
+  mkdirSync(sourceRoot);
+  mkdirSync(buildRoot);
+  const lock = Buffer.from(`${JSON.stringify({
+    name: "pi-review-gate",
+    lockfileVersion: 3,
+    packages: { "": { dependencies: { "@lydell/node-pty": LAUNCHER_PTY_VERSION } } },
+  })}\n`, "utf8");
+  writeFileSync(join(sourceRoot, "package-lock.json"), lock);
+  let stage = "";
+  if (stageName !== undefined) {
+    stage = join(buildRoot, stageName);
+    mkdirSync(stage);
+    writeFileSync(join(stage, "package-lock.json"), lock);
+    for (const required of LAUNCHER_STAGE_REQUIRED) {
+      mkdirSync(dirname(join(stage, required)), { recursive: true });
+      writeFileSync(join(stage, required), "// staged build output\n");
+    }
+    const ptyRoot = join(stage, "node_modules", "@lydell", "node-pty");
+    mkdirSync(ptyRoot, { recursive: true });
+    writeFileSync(join(ptyRoot, "package.json"), JSON.stringify({ name: "@lydell/node-pty", version: LAUNCHER_PTY_VERSION }));
+  }
+  return { sourceRoot, buildRoot, stage, lock };
+}
+
+function probeStageFixture(fixture: SyntheticStageFixture): void {
+  assertRetainedLauncherStage({
+    buildRoot: fixture.buildRoot,
+    sourceRoot: fixture.sourceRoot,
+    ptyVersion: LAUNCHER_PTY_VERSION,
+  });
+}
+
+/** Require the probe's own fail-closed diagnostic, without path regex escaping. */
+function probeFails(body: () => void, expected: string, message: string): void {
+  assert.throws(body, (error: unknown) => {
+    const observed = error instanceof Error ? error.message : String(error);
+    assert.ok(observed.includes(expected), `${message}\n  observed: ${observed}`);
+    return true;
+  }, message);
+}
+
+test("retained launcher-stage proof is bound to the current prepared-stage producer", (t) => {
+  // The grammar comes from the producer, not from memory: the shared build engine
+  // still stages each generation under this prefix with a 16-byte hex suffix.
+  const producer = readFileSync(join(process.cwd(), "scripts", "application-build.cjs"), "utf8");
+  assert.match(producer, /createOwnedStage\(\s*buildCacheRoot,\s*"pi-review-gate-app-",\s*crypto\.randomBytes\b/,
+    "the shared producer still stages the application under the pi-review-gate-app- prefix");
+  assert.match(producer, /randomBytes\(16\)\.toString\("hex"\)/,
+    "the exclusive stage suffix is still 16 random bytes as 32 lowercase hex digits");
+
+  // A stage the real producer exclusively creates is admitted by the proof, so a
+  // future producer rename can never silently zero the real legs' evidence again.
+  const producerCache = createStageFixture(t);
+  const produced = applicationBuild.createOwnedStage(producerCache.buildRoot, "pi-review-gate-app-");
+  assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(basename(produced.root)), true,
+    "the current producer's own exclusive stage name matches the retained-stage proof grammar");
+
+  // Names the current producer can never create are refused by the grammar.
+  assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(`pi-review-gate-app-${CURRENT_STAGE_HEX}`), true,
+    "the current grammar is the exact prefix plus 32 lowercase hex digits");
+  for (const name of [
+    RETIRED_STAGE_DIRNAME,
+    `pi-review-sessions-setup-${CURRENT_STAGE_HEX}`,
+    "pi-review-gate-app-",
+    `pi-review-gate-app-${CURRENT_STAGE_HEX.slice(0, 31)}`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}0`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX.toUpperCase()}`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}-stale`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}.tmp`,
+    `pi-review-gate-application-${CURRENT_STAGE_HEX}`,
+    `previous-pi-review-gate-app-${CURRENT_STAGE_HEX}`,
+    `pi-review-gate-app-${"g".repeat(32)}`,
+  ]) {
+    assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(name), false, `${name} is never a current producer stage name`);
+  }
+});
+
+test("retained launcher-stage proof admits only one complete current stage", (t) => {
+  const stageName = `pi-review-gate-app-${randomBytes(16).toString("hex")}`;
+  const accepted = createStageFixture(t, stageName);
+  const evidence = assertRetainedLauncherStage({
+    buildRoot: accepted.buildRoot,
+    sourceRoot: accepted.sourceRoot,
+    ptyVersion: LAUNCHER_PTY_VERSION,
+  });
+  assert.equal(evidence.stage, accepted.stage, "the proof returns the single admitted stage");
+  assert.equal(evidence.ptyModulePath, join(accepted.stage, "node_modules", "@lydell", "node-pty"),
+    "the proof's PTY anchor is the package installed inside that same stage");
+
+  // An empty build cache — exactly what the retired grammar observed — and a second
+  // admitted stage both fail the one-exclusive-stage proof.
+  probeFails(() => probeStageFixture(createStageFixture(t)), ONE_RETAINED_STAGE,
+    "an empty build cache never satisfies the stage proof");
+  probeFails(() => probeStageFixture(createStageFixture(t, RETIRED_STAGE_DIRNAME)), ONE_RETAINED_STAGE,
+    "the retired producer's stage name is never admitted as a substitute");
+  const duplicate = createStageFixture(t, stageName);
+  mkdirSync(join(duplicate.buildRoot, `pi-review-gate-app-${randomBytes(16).toString("hex")}`));
+  probeFails(() => probeStageFixture(duplicate), ONE_RETAINED_STAGE,
+    "two retained stages are never accepted as one launcher build");
+
+  // Every required build output has to be present as a real file.
+  for (const required of LAUNCHER_STAGE_REQUIRED) {
+    const incomplete = createStageFixture(t, stageName);
+    rmSync(join(incomplete.stage, required));
+    probeFails(() => probeStageFixture(incomplete), required, `a stage missing ${required} is refused`);
+  }
+
+  // The staged lockfile stays byte-identical to the locked source fixture.
+  const alteredLock = createStageFixture(t, stageName);
+  writeFileSync(join(alteredLock.stage, "package-lock.json"), Buffer.concat([alteredLock.lock, Buffer.from(" ")]));
+  probeFails(() => probeStageFixture(alteredLock), "byte-identical",
+    "an altered staged lockfile is refused");
+
+  // The installed PTY is the exact pinned public package, present and versioned.
+  for (const version of ["1.1.0", "1.2.0", "1.2.0-beta.16"]) {
+    const wrongVersion = createStageFixture(t, stageName);
+    writeFileSync(join(wrongVersion.stage, "node_modules", "@lydell", "node-pty", "package.json"),
+      JSON.stringify({ name: "@lydell/node-pty", version }));
+    probeFails(() => probeStageFixture(wrongVersion), "exact pinned public",
+      `@lydell/node-pty ${version} is refused`);
+  }
+  const missingPtyManifest = createStageFixture(t, stageName);
+  rmSync(join(missingPtyManifest.stage, "node_modules", "@lydell", "node-pty", "package.json"));
+  probeFails(() => probeStageFixture(missingPtyManifest), join("node_modules", "@lydell", "node-pty", "package.json"),
+    "a stage without the pinned PTY package manifest is refused");
 });

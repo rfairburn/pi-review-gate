@@ -17,16 +17,23 @@ dates.
 
 ## [0.1.0-dev.281]
 
+### Fixed
+
+- **Windows session-host reader settlement (#666)**: capture the owned bundled-ConPTY
+  reader at spawn, drain and release it exactly once after that terminal's genuine
+  exit, and confirm settlement before reporting clean disposal. Unidentified or
+  unconfirmed cleanup remains a failure. Reader cleanup does not kill native
+  processes or force host exit; native exit codes, forced-stop history, POSIX and
+  custom terminal behavior, spawn arguments, pins, and shutdown deadlines stay unchanged.
+
 ### Tests
 
-- **Repair generic Windows Pi runtime acceptance (#663)**: register the real
-  public Main, cold CMD, and direct PowerShell cases under the existing opt-in,
-  correct the launcher tests' stale New-session ownership observations, and
-  observe durable exact-process witness files independently of watcher events,
-  and collect source-wrapper outcomes even when Main acceptance fails.
-  Original-process/PTY exit and terminal-restoration assertions, deadlines,
-  ownership checks, runtime pins, and CI check names remain unchanged.
-  Test-only: production behavior is untouched.
+- **Repair generic Windows Pi runtime acceptance (#663)**: register the real Main,
+  cold CMD, and direct PowerShell cases under the existing opt-in; correct stale
+  ownership observations; examine durable process witnesses independently of watcher
+  events; and collect wrapper outcomes even when Main acceptance fails. Retain
+  original-process/PTY exit and terminal-restoration assertions, ownership checks,
+  runtime pins, deadlines, and CI check names.
 
 ## [0.1.0-dev.280]
 

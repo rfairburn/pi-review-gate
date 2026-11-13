@@ -53,6 +53,11 @@ import {
 	type SavedSessionRow,
 } from "./saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
+import {
+	captureOwnedConptyReader,
+	ownedConptyReaderRecord,
+	type OwnedConptyReaderSettlement,
+} from "./windows-conpty-reader";
 import type {
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
@@ -938,7 +943,7 @@ export function createDefaultPtyFactory(): PtyFactory {
 		}
 		// The pinned implementation satisfies the InstancePty subset
 		// structurally (data/exit events, write, resize, kill, pause/resume).
-		return nodePty.spawn(descriptor.file, descriptor.args, {
+		const pty = nodePty.spawn(descriptor.file, descriptor.args, {
 			name: "xterm-256color",
 			cols: descriptor.cols,
 			rows: descriptor.rows,
@@ -951,6 +956,18 @@ export function createDefaultPtyFactory(): PtyFactory {
 			// `useConpty` hint is never set.
 			...(process.platform === "win32" ? { useConptyDll: true } : {}),
 		});
+		// #666: on that bundled-ConPTY request the pinned addon leaves its owned
+		// conout reader Worker alive after a natural exit, which keeps this host
+		// process from settling. Capture the exact reader now, while this factory
+		// still holds the handle it just created; the release is triggered only by
+		// that same handle's own exit event, and its one confirmation deadline is
+		// anchored at that exit inside the existing confirmation window. POSIX
+		// spawns never reach this, and the public handle returned below is never
+		// wrapped or replaced.
+		if (process.platform === "win32") {
+			captureOwnedConptyReader(pty, { confirmationWindowMs: DEFAULT_SHUTDOWN_KILL_MS });
+		}
+		return pty;
 	};
 }
 
@@ -1415,6 +1432,12 @@ export class InstanceManager {
 	readonly #ptyFactory: PtyFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
+	/**
+	 * #666: every owned Windows ConPTY reader settlement this manager's default PTY
+	 * factory created. Tracked here rather than only through the rows, so closing a
+	 * row can never make an unconfirmed required release disappear.
+	 */
+	readonly #ownedConptyReaders = new Set<OwnedConptyReaderSettlement>();
 	/** Registered viewing surfaces (#474): the only store of viewer facts. */
 	readonly #viewers = new Map<string, ManagedViewer>();
 	#nextViewerId = 1;
@@ -2739,11 +2762,16 @@ export class InstanceManager {
 	 * unknown files are never touched by this module.
 	 */
 	async dispose(): Promise<void> {
-		if (this.#disposed) {
-			return;
-		}
+		// The tracked promise is always checked first: disposal may already be
+		// running past its owned-resource cleanup and into the #666 reader
+		// confirmation, and a concurrent or later caller must observe that same
+		// outcome — including its rejection — rather than an early "already
+		// disposed" success while the required cleanup is unconfirmed.
 		if (this.#disposePromise) {
 			await this.#disposePromise;
+			return;
+		}
+		if (this.#disposed) {
 			return;
 		}
 		this.#disposePromise = this.#runDispose();
@@ -2788,6 +2816,37 @@ export class InstanceManager {
 		// Exit and read-error listeners of never-settled children stay attached:
 		// they release registration, surface, and admission on a late exit and
 		// keep the pinned native stream's unexpected errors contained.
+		// #666: finally, every owned Windows ConPTY reader whose handle exited must
+		// have positively settled. An unconfirmed release rejects disposal, which the
+		// host reports as a cleanup failure.
+		await this.#confirmOwnedConptyReaders();
+	}
+
+	/**
+	 * Require positive settlement of every owned Windows ConPTY reader released by
+	 * the default PTY factory's adapter (#666) once that exact handle's own exit
+	 * event made the release due. Cleanup follows the exit only: a handle that
+	 * never exited owes nothing here, and a POSIX row or an injected custom/fake
+	 * PTY has no owned addon reader at all and is never registered. A capture that
+	 * never identified the owned reader, and a disposal whose Worker never settled,
+	 * both stay explicit failures rather than synthesized success.
+	 *
+	 * No wait is granted here. Each record carries the one absolute confirmation
+	 * deadline anchored at the exit that triggered its release, inside the existing
+	 * {@linkcode DEFAULT_SHUTDOWN_KILL_MS} window and never later than the stop
+	 * budget of the ladder that ended that child; an already-expired deadline fails
+	 * immediately instead of restarting the clock.
+	 */
+	async #confirmOwnedConptyReaders(): Promise<void> {
+		const due = [...this.#ownedConptyReaders].filter((settlement) => settlement.exitObserved && !settlement.settled);
+		if (due.length === 0) return;
+		const outcomes = await Promise.all(due.map((settlement) => settlement.confirmSettlement()));
+		const unsettled = outcomes.filter((settled) => !settled).length;
+		if (unsettled > 0) {
+			throw new Error(
+				`session-host: owned Windows ConPTY reader settlement was not confirmed for ${unsettled} exited row(s)`,
+			);
+		}
 	}
 
 	#assertUsable(operation: string): void {
@@ -2937,6 +2996,15 @@ export class InstanceManager {
 					rows: record.rows,
 				});
 				record.pty = pty;
+				// #666: record this row's owned-reader settlement for the disposal-time
+				// confirmation; the release itself is triggered by the handle's own exit.
+				// Settled readers are already history, so they are dropped here instead of
+				// retaining a finished handle graph for the manager's whole lifetime.
+				for (const settled of this.#ownedConptyReaders) {
+					if (settled.settled) this.#ownedConptyReaders.delete(settled);
+				}
+				const ownedReader = ownedConptyReaderRecord(pty);
+				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
 				if (record.ptyExited) {
 					this.#disposeExitListener(record);
@@ -3529,6 +3597,12 @@ export class InstanceManager {
 		if (record.stopPromise) {
 			return record.stopPromise;
 		}
+		// #666: this ladder's forced escalation is one of the paths that can end the
+		// child and so trigger the owned reader's release. That release must fit
+		// inside this same stop budget: the cap is shortening-only, so a natural exit
+		// well inside the window keeps its existing confirmation time, while a late
+		// exit after an exhausted ladder can never renew time this stop already spent.
+		ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(Date.now() + graceMs + killMs);
 		const stopPromise = this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
 		record.stopPromise = stopPromise;
 		return stopPromise;

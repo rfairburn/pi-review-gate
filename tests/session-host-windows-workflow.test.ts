@@ -494,6 +494,8 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
     "the opt-in real Main/ConPTY test must run as an explicit compiled file");
   assert.match(mainStep, /dist-test\/tests\/session-host-native-windows-network\.test\.js/,
     "the same-harness Network storage companion runs in the same opt-in Main step");
+  assert.match(mainStep, /dist-test\/tests\/session-host-native-windows-conpty-reader\.test\.js/,
+    "the generic owned-ConPTY reader-settlement regression runs in that same existing opt-in step, under the same unchanged check name");
   assert.match(mainStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
     "missing Pi/ConPTY/PowerShell prerequisites must hard-fail, never skip");
 

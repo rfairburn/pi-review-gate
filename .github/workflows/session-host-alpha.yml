@@ -200,11 +200,14 @@ jobs:
         # Pi/ConPTY/PowerShell prerequisite a hard failure instead of a skip.
         # Each test's own 6-minute bound sits inside this 10-minute step cap;
         # the same-harness Network storage companion (Refs #494) runs as a
-        # separate concurrent file under the same opt-in.
+        # separate concurrent file under the same opt-in, alongside the generic
+        # owned-ConPTY reader-settlement regression (#666), whose own 3-minute
+        # bound sits inside the same cap and which fails closed on a non-Windows
+        # host instead of skipping once opted in.
         timeout-minutes: 10
         env:
           PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
-        run: node --test dist-test/tests/session-host-native-windows-main.test.js dist-test/tests/session-host-native-windows-network.test.js
+        run: node --test dist-test/tests/session-host-native-windows-main.test.js dist-test/tests/session-host-native-windows-network.test.js dist-test/tests/session-host-native-windows-conpty-reader.test.js
       - name: Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)
         # Exercises BOTH real shipped source wrappers through the real staged,
         # lockfile-exact, script-free install and build, at least one real

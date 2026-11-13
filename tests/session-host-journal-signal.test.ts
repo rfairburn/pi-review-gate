@@ -16,7 +16,9 @@
  * and the Saved/Resume acceptance family through the real `SavedMainDriver`
  * observer, PTY-journal and runner-result waits and its exported JSONL wrapper,
  * and the Windows exact-process exit observer through the real
- * `WindowsOwnedExitObserver` READY and retained-result waits,
+ * `WindowsOwnedExitObserver` READY and retained-result waits, including the
+ * bounded state diagnostic those waits append when they fail and the private
+ * content that diagnostic must never carry,
  * by calling the real adapter entry points with a real task-created file. Every
  * control runs on `node:test` mock timers with explicit state changes only.
  * Virtual time makes the recheck cadence, the single absolute deadline, and the
@@ -29,7 +31,7 @@
  * deadline: re-evaluation never fabricates readiness.
  */
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
@@ -54,6 +56,9 @@ import {
   type SessionRecord,
 } from "./helpers/session-host-native-main-harness";
 import { SavedMainDriver, readOwnedJsonl, waitForJsonl } from "./helpers/session-host-native-saved-main-harness";
+
+/** The live `node:fs` module object, so one control can observe which paths are examined. */
+const nodeFs = require("node:fs") as typeof import("node:fs");
 
 const WORKSPACE = "/owned/temporary/workspace";
 /** The driver's own captured frame text, used only by its failure diagnostic. */
@@ -952,6 +957,7 @@ type WindowsObserverAdapter = {
   readyWitness?: WindowsExitWitness;
   resultWitness?: WindowsExitWitness;
   readWitness(path: string, expectedState: "READY" | "exited"): WindowsExitWitness | undefined;
+  observerDiagnostic(): string;
   waitUntilReady(timeoutMs?: number): Promise<WindowsExitWitness>;
   waitForExitedResult(timeoutMs?: number): Promise<WindowsExitWitness>;
   waitForObserverProcessClose(timeoutMs?: number): Promise<void>;
@@ -964,8 +970,7 @@ const WINDOWS_TICKS = "638564000000000000";
 /** The observer's own unchanged retained-handle result bound, un-hardcoded. */
 const WINDOWS_RESULT_BOUND_MS = (WINDOWS_OBSERVER_TIMEOUT_SECONDS + 10) * 1000;
 
-function windowsObserver(t: TestContext): WindowsObserverAdapter {
-  const root = createOwnedFixtureRoot();
+function windowsObserver(t: TestContext, root: string = createOwnedFixtureRoot()): WindowsObserverAdapter {
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const observer = Object.create(WindowsOwnedExitObserver.prototype) as WindowsObserverAdapter;
   Object.assign(observer, {
@@ -1227,4 +1232,230 @@ test("the observer's process-handle close wait stays notification-driven because
   observer.signal.notify(); // exactly what the retained public child handle reports
   await closeWait;
   assert.equal(observer.signal.pendingWaiterCount, 0);
+});
+
+/**
+ * Private content a witness leaf or a child error could carry. None of it is
+ * ever a legitimate diagnostic token, so every control below seeds it and then
+ * proves the appended diagnostic stays metadata-only.
+ */
+const PRIVATE_TRANSCRIPT = "SECRET-OBSERVER-TRANSCRIPT-LINE";
+const PRIVATE_PATH = "C:\\Users\\private-owner\\secret-workspace";
+const PRIVATE_CHILD_ERROR = "the public powershell.exe child failed with SECRET-CHILD-ERROR-TEXT";
+const WINDOWS_DIAGNOSTIC_SHAPE = /^observerDiag\{(?:[a-zA-Z]+=[A-Za-z0-9?_.-]+ ?)+\}$/u;
+
+/** The one diagnostic the failed wait appended, or an assertion failure. */
+function windowsDiagnostic(message: string): string {
+  const diagnostic = /observerDiag\{[^}]*\}/u.exec(message)?.[0];
+  assert.ok(diagnostic !== undefined, "the failed wait carries the observer's bounded state diagnostic");
+  assert.match(diagnostic!, WINDOWS_DIAGNOSTIC_SHAPE, "only bounded numeric/boolean/state tokens are emitted");
+  assert.ok(diagnostic!.length < 400, "the diagnostic stays bounded");
+  for (const privateText of [PRIVATE_TRANSCRIPT, "private-owner", "SECRET-CHILD-ERROR-TEXT"]) {
+    assert.ok(!message.includes(privateText), `the diagnostic never carries seeded private content (${privateText})`);
+  }
+  return diagnostic!;
+}
+
+test("a READY deadline failure discloses the partially published leaf's bounded state and child state without its content, a path, or the observer nonce", async (t) => {
+  enableMockClock(t);
+  const observer = windowsObserver(t);
+  // A leaf that never reached its final bytes: the unchanged strict read still
+  // treats it as not-yet-readable, so the wait reaches its unchanged deadline.
+  writeFileSync(observer.readyPath, `{"requestNonce":"${PRIVATE_TRANSCRIPT}","workspace":"${PRIVATE_PATH}"`,
+    { flag: "wx", mode: 0o600 });
+  const waiter = observer.waitUntilReady();
+  let settledEarly = false;
+  waiter.then(() => { settledEarly = true; }, () => { settledEarly = true; });
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS - 1);
+  await flushMicrotasks();
+  assert.equal(settledEarly, false, "the diagnostic read did not shorten the unchanged READY deadline");
+  t.mock.timers.tick(1);
+  const message = await rejectionMessage(waiter);
+  assert.match(message, new RegExp(`PowerShell exact-process READY for native PID ${WINDOWS_NATIVE_PID}: deadline exceeded`),
+    "the unchanged deadline failure is preserved verbatim ahead of the diagnostic");
+
+  const diagnostic = windowsDiagnostic(message);
+  assert.ok(diagnostic.includes("readyState=invalid-json"), "the present-but-unparseable READY leaf is disclosed");
+  assert.match(diagnostic, /readyBytes=[1-9][0-9]*/u, "the leaf's byte size is disclosed instead of its content");
+  assert.ok(diagnostic.includes("resultState=absent") && diagnostic.includes("resultBytes=-"),
+    "the never-published result leaf is disclosed as absent");
+  assert.ok(diagnostic.includes("childState=alive") && diagnostic.includes("childCode=-") && diagnostic.includes("childSignal=-"),
+    "a still-running retained child is disclosed as alive");
+  assert.ok(diagnostic.includes("spawnError=false") && diagnostic.includes("observerPidKnown=true")
+    && diagnostic.includes("rootIdentityOk=true"), "the child and root guards are disclosed as booleans");
+  assert.ok(!message.includes(observer.nonce), "the diagnostic never echoes the observer's own request nonce");
+  assert.ok(!message.includes(observer.root), "the diagnostic never carries the owned root path");
+  assert.equal(observer.readyWitness, undefined, "the diagnostic read fabricated no READY proof");
+  assert.equal(observer.signal.pendingWaiterCount, 0, "the failed wait cleared its listener and interval");
+});
+
+test("a refused READY witness and a failed observer child are disclosed as bounded state and stay non-proof", async (t) => {
+  enableMockClock(t);
+  // A complete leaf belonging to another request, carrying private fields.
+  const mismatched = windowsObserver(t);
+  writeFileSync(mismatched.readyPath, JSON.stringify({
+    schemaVersion: 1,
+    requestNonce: "stale_nonce_00000000000000000000",
+    observerPid: WINDOWS_OBSERVER_PID + 1,
+    nativePid: WINDOWS_NATIVE_PID + 1,
+    nativeCreationTimeUtcTicks: WINDOWS_TICKS,
+    state: "READY",
+    transcript: PRIVATE_TRANSCRIPT,
+    workspace: PRIVATE_PATH,
+  }), { flag: "wx", mode: 0o600 });
+  const mismatchedMessage = await rejectionMessage(mismatched.waitUntilReady());
+  assert.match(mismatchedMessage,
+    new RegExp(`PowerShell exact-process READY for native PID ${WINDOWS_NATIVE_PID}: bounded event predicate failed`),
+    "the unchanged strict witness fence still refuses the durable leaf");
+  const mismatchedDiagnostic = windowsDiagnostic(mismatchedMessage);
+  assert.ok(mismatchedDiagnostic.includes("readyState=schema-mismatch"),
+    "a durable leaf that fails the exact nonce/PID/state contract is disclosed as mismatched, not as readiness");
+  assert.match(mismatchedDiagnostic, /readyBytes=[1-9][0-9]*/u, "the refused leaf's size is disclosed instead of its fields");
+  assert.equal(mismatched.readyWitness, undefined, "the diagnostic read retained no READY witness");
+
+  // A failed child is disclosed as a boolean, never with its error text.
+  const failed = windowsObserver(t);
+  Object.assign(failed, { spawnError: new Error(PRIVATE_CHILD_ERROR) });
+  const failedMessage = await rejectionMessage(failed.waitUntilReady());
+  assert.match(failedMessage, /bounded event predicate failed/,
+    "a spawn failure keeps its unchanged typed bounded failure");
+  const failedDiagnostic = windowsDiagnostic(failedMessage);
+  assert.ok(failedDiagnostic.includes("spawnError=true"), "the failed child is disclosed");
+  assert.ok(failedDiagnostic.includes("childState=alive") && failedDiagnostic.includes("readyState=absent"),
+    "the absent leaf and still-unreported close are disclosed as they are");
+  assert.equal(failed.readyWitness, undefined, "a disclosed spawn failure fabricated no readiness");
+});
+
+test("a result deadline failure discloses the absent result beside a valid READY leaf, and a closed child discloses its exact close state", async (t) => {
+  enableMockClock(t);
+  const observer = windowsObserver(t);
+  writeWindowsWitness(observer, "ready"); // a genuine READY leaf is disclosed as valid
+  const waiter = observer.waitForExitedResult();
+  let settledEarly = false;
+  waiter.then(() => { settledEarly = true; }, () => { settledEarly = true; });
+  t.mock.timers.tick(WINDOWS_RESULT_BOUND_MS - 1);
+  await flushMicrotasks();
+  assert.equal(settledEarly, false, "the diagnostic read did not shorten the unchanged result deadline");
+  t.mock.timers.tick(1);
+  const message = await rejectionMessage(waiter);
+  assert.match(message,
+    new RegExp(`retained PowerShell Process handle exit result for native PID ${WINDOWS_NATIVE_PID}: deadline exceeded`),
+    "the unchanged result deadline failure is preserved verbatim ahead of the diagnostic");
+  const diagnostic = windowsDiagnostic(message);
+  assert.ok(diagnostic.includes("readyState=valid"), "the observer's own validated READY leaf is disclosed as valid");
+  assert.ok(diagnostic.includes("resultState=absent") && diagnostic.includes("resultBytes=-"),
+    "the unpublished result leaf is disclosed as absent");
+  assert.equal(observer.resultWitness, undefined,
+    "a disclosed valid READY leaf and its diagnostic never became exit proof");
+
+  // A retained child that closed without a result discloses its exact close state.
+  const closed = windowsObserver(t);
+  const closedWait = closed.waitForExitedResult();
+  closed.closeEvent = { code: 2, signal: null };
+  closed.signal.notify(); // exactly what the retained public child handle reports
+  const closedDiagnostic = windowsDiagnostic(await rejectionMessage(closedWait));
+  assert.ok(closedDiagnostic.includes("childState=closed") && closedDiagnostic.includes("childCode=2")
+    && closedDiagnostic.includes("childSignal=-"), "the exited child's code is disclosed, its absent signal stays explicit");
+  assert.ok(closedDiagnostic.includes("resultState=absent"), "a closed-without-result observer discloses the absent leaf");
+  assert.equal(closed.resultWitness, undefined, "a disclosed close without a result retained no exit proof");
+
+  // Signal termination is disclosed as its fixed name with a null exit code.
+  const signaled = windowsObserver(t);
+  const signaledWait = signaled.waitForExitedResult();
+  signaled.closeEvent = { code: null, signal: "SIGKILL" };
+  signaled.signal.notify();
+  const signaledDiagnostic = windowsDiagnostic(await rejectionMessage(signaledWait));
+  assert.ok(signaledDiagnostic.includes("childState=closed") && signaledDiagnostic.includes("childCode=null")
+    && signaledDiagnostic.includes("childSignal=SIGKILL"), "the signal class is disclosed without a fabricated code");
+});
+
+/**
+ * The failure-only diagnostic honors the same owned-root gate as `readWitness`.
+ * Both cases below seed a foreign witness at the observer's own nonce-named leaf
+ * paths - one that matches this observer's nonce, observer PID, native PID, and
+ * state exactly, so any examination would classify it as valid evidence: a
+ * replaced root (the observer's own created directory moved away and a fresh
+ * directory now occupies its path) and an invalid bound identity. The diagnostic
+ * must disclose bounded unavailable tokens beside `rootIdentityOk=false`, must
+ * never lstat or read either foreign leaf, and must retain no witness, while the
+ * wait itself keeps its unchanged strict refusal and clears its listeners.
+ */
+test("a replaced or invalid observer root gates the diagnostic's leaf reads so a foreign witness at the observer's own paths is never examined or retained", async (t) => {
+  enableMockClock(t);
+  const observer = windowsObserver(t);
+  const relocated = `${observer.root}-relocated-original`;
+  renameSync(observer.root, relocated); // the bound directory moves away
+  mkdirSync(observer.root, { mode: 0o700 }); // a different real directory takes its path
+  t.after(() => rmSync(relocated, { recursive: true, force: true }));
+
+  // Positive setup: the identity the observer captured still exists intact at the
+  // relocated path, and the directory now at its root path is a different one.
+  assert.deepEqual(identityOfRealDirectory(relocated), observer.rootIdentity,
+    "the observer's own directory still carries its captured identity, so only the path was replaced");
+  assert.notDeepEqual(identityOfRealDirectory(observer.root), observer.rootIdentity,
+    "a different real directory now occupies the observer's owned root path");
+
+  // Foreign leaves in the fixture's own exclusive-publication shape, matching this
+  // observer's exact nonce/observer-PID/native-PID/state contract.
+  writeWindowsWitness(observer, "ready");
+  writeWindowsWitness(observer, "result");
+
+  // The same leaves stay readable and valid for an observer correctly bound to the
+  // directory that actually owns them, so only the gate can explain the tokens below.
+  const rebound = windowsObserver(t, observer.root);
+  const reboundDiagnostic = rebound.observerDiagnostic();
+  assert.ok(reboundDiagnostic.includes("rootIdentityOk=true")
+    && reboundDiagnostic.includes("readyState=valid") && reboundDiagnostic.includes("resultState=valid"),
+    "a correctly bound observer still discloses the seeded leaves as valid leaf state");
+
+  // Record every path the failed wait and its appended diagnostic examine.
+  const lstatOriginal = nodeFs.lstatSync as unknown as (...args: unknown[]) => unknown;
+  const readOriginal = nodeFs.readFileSync as unknown as (...args: unknown[]) => unknown;
+  const lstatPaths: unknown[] = [];
+  const readPaths: unknown[] = [];
+  t.mock.method(nodeFs, "lstatSync", ((...args: unknown[]) => {
+    lstatPaths.push(args[0]);
+    return lstatOriginal(...args);
+  }) as unknown as typeof nodeFs.lstatSync);
+  t.mock.method(nodeFs, "readFileSync", ((...args: unknown[]) => {
+    readPaths.push(args[0]);
+    return readOriginal(...args);
+  }) as unknown as typeof nodeFs.readFileSync);
+  const touches = (paths: readonly unknown[], leaf: string): number => paths.filter((path) => path === leaf).length;
+
+  const message = await rejectionMessage(observer.waitUntilReady());
+  assert.match(message,
+    new RegExp(`PowerShell exact-process READY for native PID ${WINDOWS_NATIVE_PID}: bounded event predicate failed`),
+    "the unchanged readWitness root gate still refuses the foreign leaf instead of authorizing readiness");
+  const diagnostic = windowsDiagnostic(message);
+  assert.ok(diagnostic.includes("rootIdentityOk=false"), "a replaced owned root is disclosed as a failed identity guard");
+  assert.ok(diagnostic.includes("readyState=unavailable") && diagnostic.includes("readyBytes=-")
+    && diagnostic.includes("resultState=unavailable") && diagnostic.includes("resultBytes=-"),
+    "both leaves are disclosed as bounded unavailable tokens instead of any classified leaf state");
+  for (const leaf of [observer.readyPath, observer.resultPath]) {
+    assert.equal(touches(lstatPaths, leaf), 0, "the gated wait and diagnostic never lstat'ed a foreign leaf path");
+    assert.equal(touches(readPaths, leaf), 0, "the gated wait and diagnostic never read a foreign leaf's bytes");
+  }
+  assert.ok(lstatPaths.includes(observer.root), "only the owned root path was examined, by the identity guard itself");
+  assert.equal(observer.readyWitness, undefined, "a foreign leaf matching this observer's exact contract retained no READY proof");
+  assert.equal(observer.resultWitness, undefined, "the gated diagnostic fabricated no exit proof either");
+  assert.equal(observer.witnessFileIdentities.size, 0, "no foreign leaf identity was registered as a retained witness");
+  assert.equal(observer.signal.pendingWaiterCount, 0, "the failed wait cleared its listener and recheck interval");
+
+  // An invalid bound identity behaves identically: same gate, same bounded tokens,
+  // and the same refusal to examine readable leaves at the observer's own paths.
+  const invalid = windowsObserver(t);
+  writeWindowsWitness(invalid, "ready");
+  writeWindowsWitness(invalid, "result");
+  Object.assign(invalid, { rootIdentity: identityOfRealDirectory(relocated) });
+  const invalidDiagnostic = invalid.observerDiagnostic();
+  assert.match(invalidDiagnostic, WINDOWS_DIAGNOSTIC_SHAPE, "the gated diagnostic keeps its bounded fixed shape");
+  assert.ok(invalidDiagnostic.includes("rootIdentityOk=false")
+    && invalidDiagnostic.includes("readyState=unavailable") && invalidDiagnostic.includes("resultState=unavailable"),
+    "an invalid bound identity discloses the same bounded unavailable tokens with no leaf state");
+  for (const leaf of [invalid.readyPath, invalid.resultPath]) {
+    assert.equal(touches(lstatPaths, leaf), 0, "the invalid-identity diagnostic never lstat'ed a foreign leaf path");
+    assert.equal(touches(readPaths, leaf), 0, "the invalid-identity diagnostic never read a foreign leaf's bytes");
+  }
+  assert.equal(invalid.readyWitness, undefined, "the invalid-identity diagnostic retained no READY witness");
 });

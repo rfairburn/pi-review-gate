@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
 import { Worker } from "node:worker_threads";
 
 import {
@@ -15,7 +19,13 @@ import {
   validateWindowsExitWitness,
   type WindowsWitnessExpectation,
 } from "./helpers/session-host-native-windows-contracts";
-import { closeExitedOwnedConptyReader, type NativePtyHandle } from "./helpers/session-host-native-windows-harness";
+import {
+  ChangeSignal,
+  WINDOWS_EVENT_TIMEOUT_MS,
+  closeExitedOwnedConptyReader,
+  WindowsMainPtyDriver,
+  type NativePtyHandle,
+} from "./helpers/session-host-native-windows-harness";
 
 const READY_EXPECTATION: WindowsWitnessExpectation = {
   requestNonce: "nonce_0123456789abcdef01234567",
@@ -282,5 +292,149 @@ test("an exited outer ConPTY-DLL PTY is closed publicly, then only its owned rea
     await assert.rejects(closeExitedOwnedConptyReader({ kill: () => killed.push(1), _agent: agent } as unknown as NativePtyHandle),
       /not the pinned ConPTY-DLL shape/);
     assert.deepEqual(killed, [], "an unexpected backend or reader shape fails closed before kill()");
+  }
+});
+
+/**
+ * The structural surface the outer-exit wait and its startup diagnostic touch.
+ * A prototype-only fake (no constructor, no PTY, no Windows host) exercises the
+ * real notification-driven wait and the real bounded startup diagnostic over
+ * real task-created runner leaves. A passing run here is not Windows host proof.
+ */
+interface FakeOuterExitDriver {
+  exitSignal: InstanceType<typeof ChangeSignal>;
+  exitEvent?: { readonly exitCode: number; readonly signal?: number };
+  resultFile: string;
+  stageJournal: string;
+  ptyJournal: string;
+  observerFile: string;
+  replyLog: string[];
+  spawnedAt: number;
+  dataChunks: number;
+  dataChars: number;
+  firstDataMs: number;
+  lastDataMs: number;
+  sawAlternateEnter: boolean;
+  sawAlternateLeave: boolean;
+  waitForExit(timeoutMs?: number): Promise<{ readonly exitCode: number; readonly signal?: number }>;
+}
+
+/** Private content the runner's result leaf could carry; never a diagnostic token. */
+const PRIVATE_MAIN_RESULT_TEXT = "SECRET-MAIN-RESULT-TEXT";
+const PRIVATE_MAIN_PATH = "C:\\Users\\private-owner\\secret-workspace";
+/** The real runner trace fixture, so the staged last stage is genuine vocabulary. */
+const startupTraceFixture = createRequire(join(process.cwd(), "package.json"))(
+  join(process.cwd(), "tests", "fixtures", "session-host-windows-startup-trace.cjs"),
+) as { createStartupTrace(options: Record<string, unknown>): { stage(name: string, fields?: Record<string, unknown>): void } };
+
+function fakeOuterExitDriver(files: { resultFile: string; stageJournal: string; ptyJournal: string; observerFile: string }): FakeOuterExitDriver {
+  const fake = Object.create(WindowsMainPtyDriver.prototype) as unknown as FakeOuterExitDriver;
+  Object.assign(fake, {
+    exitSignal: new ChangeSignal(),
+    exitEvent: undefined,
+    replyLog: [],
+    spawnedAt: performance.now(),
+    dataChunks: 41,
+    dataChars: 18_432,
+    firstDataMs: 12,
+    lastDataMs: 26_493,
+    sawAlternateEnter: true,
+    sawAlternateLeave: false,
+  }, files);
+  return fake;
+}
+
+/** Runs one real outer-exit wait to its unchanged deadline and returns the message. */
+async function outerExitFailure(t: TestContext, driver: FakeOuterExitDriver): Promise<string> {
+  const waiter = driver.waitForExit();
+  let settledEarly = false;
+  waiter.then(() => { settledEarly = true; }, () => { settledEarly = true; });
+  await Promise.resolve();
+  assert.equal(settledEarly, false, "an outer PTY with no exit event stays unsettled before its deadline");
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS);
+  return await waiter.then(() => "", (error: unknown) => (error instanceof Error ? error.message : String(error)));
+}
+
+test("the outer Main PTY exit wait keeps its unchanged deadline and appends the bounded runner result state without any private result content", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const root = mkdtempSync(join(tmpdir(), "prg-windows-outer-exit-diag-"));
+  try {
+    const files = {
+      resultFile: join(root, "main-result.json"),
+      stageJournal: join(root, "runner-stages.jsonl"),
+      ptyJournal: join(root, "pty-events.jsonl"),
+      observerFile: join(root, "native-main.jsonl"),
+    };
+    for (const path of [files.stageJournal, files.ptyJournal, files.observerFile]) writeFileSync(path, "");
+
+    // 1. The runner recorded nothing: its absence is disclosed, not assumed.
+    const absent = fakeOuterExitDriver(files);
+    const absentMessage = await outerExitFailure(t, absent);
+    assert.match(absentMessage, /outer public Main PTY exit: deadline exceeded/,
+      "the unchanged deadline failure is preserved verbatim ahead of the diagnostic");
+    assert.ok(absentMessage.includes("result=absent"), "an absent runner result is disclosed as absent");
+    assert.ok(absentMessage.includes("outer=alive"), "a still-running outer PTY is disclosed as alive");
+    assert.equal(absent.exitEvent, undefined, "the diagnostic fabricated no outer exit");
+
+    // 2. The runner returned zero but its outer PTY exit never arrived: the
+    //    existing MainResult flags become observable without any new proof.
+    writeFileSync(files.resultFile, JSON.stringify({
+      status: 0,
+      threw: false,
+      forceAttempted: false,
+      journalFailed: false,
+      unresolvedSpawns: 0,
+      unexitedSpawns: 0,
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      sameInputStream: false,
+      sameOutputStream: false,
+      rawBefore: false,
+      rawAfter: false,
+      errorText: `${PRIVATE_MAIN_PATH} ${PRIVATE_MAIN_RESULT_TEXT}`,
+    }));
+    // The runner's own fixed-vocabulary trace records its last completed stage.
+    startupTraceFixture.createStartupTrace({ journal: files.stageJournal, fs: require("node:fs") })
+      .stage("main-returned", { status: 0 });
+    const returned = fakeOuterExitDriver(files);
+    const returnedMessage = await outerExitFailure(t, returned);
+    assert.match(returnedMessage, /outer public Main PTY exit: deadline exceeded/);
+    assert.ok(returnedMessage.includes("outer=alive"),
+      "the missing outer exit event is disclosed as still alive beside a returned Main");
+    assert.ok(returnedMessage.includes("result={status=0") && returnedMessage.includes("unexitedSpawns=0")
+      && returnedMessage.includes("threw=false") && returnedMessage.includes("forceAttempted=false"),
+    "the runner's actual return/kill/spawn flags are disclosed");
+    assert.ok(returnedMessage.includes("rawBefore=false") && returnedMessage.includes("rawAfter=false"),
+      "the runner's TTY restoration flags are disclosed");
+    assert.ok(returnedMessage.includes("main-returned(status=0)"),
+      "the runner's own last recorded stage is disclosed beside the still-alive outer PTY, which is the distinction between a returned Main and a missing exit event");
+    for (const privateText of [PRIVATE_MAIN_RESULT_TEXT, "private-owner"]) {
+      assert.ok(!returnedMessage.includes(privateText), "the result leaf's private content is never formatted");
+    }
+    assert.ok(!returnedMessage.includes(root) && !returnedMessage.includes(files.resultFile),
+      "the diagnostic never carries a path");
+    assert.equal(returned.exitEvent, undefined, "a disclosed zero-returning result is never outer exit proof");
+
+    // 3. A present but unparseable result leaf stays disclosed as unreadable.
+    writeFileSync(files.resultFile, `{"status":0,"errorText":"${PRIVATE_MAIN_RESULT_TEXT}`);
+    const unreadable = fakeOuterExitDriver(files);
+    const unreadableMessage = await outerExitFailure(t, unreadable);
+    assert.match(unreadableMessage, /outer public Main PTY exit: deadline exceeded/);
+    assert.ok(unreadableMessage.includes("result=unreadable"), "a truncated runner result is disclosed as unreadable");
+    assert.ok(!unreadableMessage.includes(PRIVATE_MAIN_RESULT_TEXT), "an unreadable leaf's content is never formatted");
+
+    // Every appended diagnostic stays within the existing startup bound.
+    for (const message of [absentMessage, returnedMessage, unreadableMessage]) {
+      assert.match(/startup\{[^\n]*\}/u.exec(message)?.[0] ?? "", /startup\{.*\}/u, "the existing startup diagnostic is appended");
+      assert.ok(message.length < 4_000, "the appended diagnostic stays bounded");
+    }
+
+    // The unchanged fast path is untouched: a real exit event never waits.
+    const exited = fakeOuterExitDriver(files);
+    Object.assign(exited, { exitEvent: { exitCode: 0 } });
+    assert.deepEqual(await exited.waitForExit(WINDOWS_EVENT_TIMEOUT_MS), { exitCode: 0 },
+      "an already-observed outer exit still resolves without a wait or a diagnostic");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

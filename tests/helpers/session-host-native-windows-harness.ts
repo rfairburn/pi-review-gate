@@ -1284,8 +1284,22 @@ export class WindowsMainPtyDriver {
     return this.providerRecords();
   }
 
+  /**
+   * The unchanged notification-driven outer-exit wait - same predicate, same
+   * absolute deadline, same fail-closed rejection - with the existing bounded
+   * startup diagnostic appended when it fails, so a stalled exit reports the
+   * runner's actual Main return/result presence and flags the driver already
+   * holds instead of only "deadline exceeded". Diagnosis only: the appended
+   * metadata never satisfies the wait, never widens or re-arms its deadline,
+   * and carries no frame text, argv, environment, path, or transcript.
+   */
   async waitForExit(timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<NativePtyExit> {
-    if (!this.exitEvent) await this.exitSignal.waitFor(() => this.exitEvent !== undefined, timeoutMs, "outer public Main PTY exit");
+    if (!this.exitEvent) {
+      await this.exitSignal.waitFor(() => this.exitEvent !== undefined, timeoutMs, "outer public Main PTY exit")
+        .catch((error: unknown) => {
+          throw new Error(`${error instanceof Error ? error.message : "outer public Main PTY exit: bounded exit wait failed"}; ${this.startupDiagnostic()}`);
+        });
+    }
     return this.exitEvent!;
   }
 
@@ -2158,8 +2172,6 @@ export class WindowsOwnedExitObserver {
   private readonly signal = new ChangeSignal();
   private closeEvent?: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
   private spawnError?: Error;
-  private stdoutTail = "";
-  private stderrTail = "";
   private readyWitness?: WindowsExitWitness;
   private resultWitness?: WindowsExitWitness;
   private readonly witnessFileIdentities = new Map<string, FileIdentity>();
@@ -2218,8 +2230,9 @@ export class WindowsOwnedExitObserver {
     });
     this.readyPath = join(this.root, `${this.nonce}.ready.json`);
     this.resultPath = join(this.root, `${this.nonce}.result.json`);
-    this.child.stdout?.on("data", (chunk: Buffer | string) => { this.stdoutTail = (this.stdoutTail + chunk.toString()).slice(-512); });
-    this.child.stderr?.on("data", (chunk: Buffer | string) => { this.stderrTail = (this.stderrTail + chunk.toString()).slice(-512); });
+    // The public child is spawned with stdio ignored, so no stdout/stderr tail
+    // exists to collect; a failed READY/result wait instead reports the bounded
+    // state of the observer's own witness leaves and child handle.
   }
 
   private readWitness(path: string, expectedState: "READY" | "exited"): WindowsExitWitness | undefined {
@@ -2264,7 +2277,8 @@ export class WindowsOwnedExitObserver {
    * bounded periodic re-read and one final re-read at the deadline. A READY leaf
    * that is already on disk therefore cannot stay unexamined merely because no
    * watcher event was delivered or the events were coalesced; a leaf that never
-   * becomes a valid READY witness still fails with the original deadline error.
+   * becomes a valid READY witness still fails with the original deadline error,
+   * now followed by the observer's bounded state diagnostic.
    */
   async waitUntilReady(timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<WindowsExitWitness> {
     await this.signal.waitForRecheck(() => {
@@ -2272,7 +2286,9 @@ export class WindowsOwnedExitObserver {
       if (this.closeEvent) throw new Error(`PowerShell observer exited before READY (${this.closeEvent.code}/${this.closeEvent.signal ?? "none"})`);
       this.readyWitness = this.readWitness(this.readyPath, "READY");
       return this.readyWitness !== undefined;
-    }, timeoutMs, `PowerShell exact-process READY for native PID ${this.nativePid}`);
+    }, timeoutMs, `PowerShell exact-process READY for native PID ${this.nativePid}`).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "bounded READY wait failed"}; ${this.observerDiagnostic()}`);
+    });
     assert.ok(this.child.pid && this.child.pid > 1, "public powershell.exe spawn returned an observer PID");
     return this.readyWitness!;
   }
@@ -2283,7 +2299,9 @@ export class WindowsOwnedExitObserver {
    * the same durable-readiness core with its unchanged predicate, unchanged
    * absolute deadline, and unchanged notification fast path. The retained-handle,
    * nonce/PID/creation-tick, and exit-code-zero validation is untouched, and an
-   * observer that closes without publishing a valid result still fails closed.
+   * observer that closes without publishing a valid result still fails closed —
+   * with the observer's bounded state diagnostic appended to the unchanged
+   * failure.
    */
   async waitForExitedResult(timeoutMs = (WINDOWS_OBSERVER_TIMEOUT_SECONDS + 10) * 1000): Promise<WindowsExitWitness> {
     await this.signal.waitForRecheck(() => {
@@ -2294,7 +2312,9 @@ export class WindowsOwnedExitObserver {
         throw new Error(`retained PowerShell observer exited without an exited result (${this.closeEvent.code}/${this.closeEvent.signal ?? "none"})`);
       }
       return false;
-    }, timeoutMs, `retained PowerShell Process handle exit result for native PID ${this.nativePid}`);
+    }, timeoutMs, `retained PowerShell Process handle exit result for native PID ${this.nativePid}`).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "bounded result wait failed"}; ${this.observerDiagnostic()}`);
+    });
     const witness = this.resultWitness!;
     assertCurrentDirectoryIdentity(this.root, this.rootIdentity);
     return witness;
@@ -2332,9 +2352,99 @@ export class WindowsOwnedExitObserver {
     return this.closeEvent;
   }
 
-  get diagnosticTail(): string {
-    return `${this.stdoutTail}${this.stderrTail}`.slice(-512);
+  /**
+   * Bounded fixed-shape state diagnostic for a failed READY or retained-result
+   * wait: for each of this observer's own witness leaves, a fixed parse state
+   * mirroring the unchanged strict guards (bounded regular file with a positive
+   * BigInt identity, JSON parse, then the exact nonce/PID/state witness
+   * contract) plus its byte size, and the exact owned child's close/spawn state
+   * and the observer root's identity guard as a boolean. It re-reads the same
+   * leaves under the same byte bound but registers no witness identity, retains
+   * no witness, and emits no leaf content, error text, nonce, path, or
+   * transcript, so it can never become exit proof. Diagnosis only: it never
+   * satisfies a wait, never changes a deadline, and never replaces the strict
+   * validate/read/identity guards that decide readiness.
+   *
+   * The exact owned-root identity guard runs first, exactly as `readWitness`
+   * gates every leaf examination: when the directory now at the observer's root
+   * path is not the directory whose identity it bound at start, neither leaf is
+   * lstat'ed or read at all. Both leaves are then disclosed as the bounded
+   * `unavailable` token beside `rootIdentityOk=false`, so a replaced or invalid
+   * root can never turn a foreign leaf placed at the observer's own paths into
+   * disclosed leaf state, retained evidence, or exit proof.
+   */
+  observerDiagnostic(): string {
+    let rootIdentityOk = true;
+    try {
+      assertCurrentDirectoryIdentity(this.root, this.rootIdentity);
+    } catch {
+      rootIdentityOk = false;
+    }
+    const leaf = (path: string, expectedState: "READY" | "exited"): { readonly state: string; readonly bytes: string } => {
+      try {
+        const stats = lstatSync(path, { bigint: true });
+        if (stats.isSymbolicLink()) return { state: "symlink", bytes: "-" };
+        if (!stats.isFile()) return { state: "not-regular", bytes: "-" };
+        const bytes = stats.size >= 0n && stats.size <= 2_147_483_647n ? String(stats.size) : "?";
+        if (stats.size === 0n) return { state: "empty", bytes };
+        if (stats.dev <= 0n || stats.ino <= 0n) return { state: "no-identity", bytes };
+        if (stats.size > BigInt(MAX_WITNESS_BYTES)) return { state: "oversized", bytes };
+        let text: string;
+        try {
+          text = readFileSync(path, "utf8");
+        } catch {
+          return { state: "unreadable", bytes };
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return { state: "invalid-json", bytes };
+        }
+        try {
+          validateWindowsExitWitness(parsed, {
+            requestNonce: this.nonce,
+            observerPid: this.child.pid ?? -1,
+            nativePid: this.nativePid,
+            state: expectedState,
+          });
+          return { state: "valid", bytes };
+        } catch {
+          return { state: "schema-mismatch", bytes };
+        }
+      } catch (error) {
+        return { state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable", bytes: "-" };
+      }
+    };
+    try {
+      // Gated reads: an unbound root discloses the bounded unavailable token
+      // instead of examining either leaf.
+      const unexamined: { readonly state: string; readonly bytes: string } = { state: "unavailable", bytes: "-" };
+      const ready = rootIdentityOk ? leaf(this.readyPath, "READY") : unexamined;
+      const result = rootIdentityOk ? leaf(this.resultPath, "exited") : unexamined;
+      const close = this.closeEvent;
+      const signal = close?.signal;
+      return [
+        `observerDiag{readyState=${ready.state}`,
+        `readyBytes=${ready.bytes}`,
+        `resultState=${result.state}`,
+        `resultBytes=${result.bytes}`,
+        `childState=${close ? "closed" : "alive"}`,
+        `childCode=${close ? (close.code === null ? "null" : boundedInteger(close.code)) : "-"}`,
+        `childSignal=${signal === null || signal === undefined ? "-" : (/^[A-Z]{2,16}$/.test(signal) ? signal : "?")}`,
+        `spawnError=${this.spawnError !== undefined}`,
+        `observerPidKnown=${Number.isSafeInteger(this.child?.pid) && (this.child?.pid ?? 0) > 0}`,
+        `rootIdentityOk=${rootIdentityOk}}`,
+      ].join(" ");
+    } catch {
+      return "observerDiag{unavailable}";
+    }
   }
+}
+
+/** A bounded integer token for the diagnostic's own numeric fields. */
+function boundedInteger(value: number): string {
+  return Number.isSafeInteger(value) && Math.abs(value) <= 2 ** 31 ? String(value) : "?";
 }
 
 export function randomNonce(): string {

@@ -105,15 +105,49 @@ boundaries; [Development](development.md) owns verification commands.
   `SystemRoot\System32\cmd.exe` resolved from the **parent** environment only.
   Availability is also not a start: the launch below can still refuse a located
   executable — on its shared-argument guard, a target belonging to the other
-  backend, an unsupported platform, or a `cmd.exe` it cannot resolve as trusted.
+  backend, a platform other than macOS, Linux, or Windows, or a `cmd.exe` it
+  cannot resolve as trusted.
   **No caller-provided shell command string is ever accepted:**
   the operator supplies an executable and argv, never a complete shell command
   line. Windows batch execution does necessarily go through `cmd.exe`, so one
-  command string exists on that path — the host generates it by quoting the
-  resolved executable plus the exact argv it would otherwise have spawned, and
-  that host-generated string is the only command text `cmd.exe` is ever handed.
-  Whether a real Windows `cmd.exe` reproduces it verbatim is unverified
-  ([Evidence basis](#evidence-basis)).
+  command string exists on that path — the host generates it from the resolved
+  executable plus the exact argv it would otherwise have spawned, and that
+  host-generated string is the only command text `cmd.exe` is ever handed. What a
+  real `cmd.exe` delivers from it is no longer an open design question: it is what
+  the dedicated Windows acceptance cases are wired to observe, and no such run has
+  been reported yet ([Evidence basis](#evidence-basis)).
+- **On Windows a `.cmd`/`.bat` shim is launched as one batch command line, and a
+  direct executable never goes through `cmd.exe`.** The batch child is the trusted
+  `SystemRoot\System32\cmd.exe` resolved from the **parent** environment, invoked
+  as `/d /s /v:off /c "<quoted command text>"`. The pinned PTY spawn has exactly
+  two public forms — an argv array it escapes itself per the MSDN command-line
+  rules, or one pre-escaped command-line string appended verbatim after the
+  program path — and the batch invocation travels **only** in the string form,
+  with argv left empty: cmd.exe does not treat a backslash as an escape, so the
+  same invocation passed as argv would reach it as `\"` and re-tokenize the line
+  against the operator's own arguments. `/v:off` names delayed expansion off
+  explicitly, because a machine can turn it on for every `cmd.exe` through its
+  Command Processor settings, and then a `!name!` in the operator's own argument
+  would expand while the shim forwards `%*`; naming the switch keeps literal
+  bangs literal here instead of depending on whose machine this is. A literal `%`
+  cannot be *typed* into a `cmd.exe /c` line at all: cmd expands `%NAME%` while it
+  **reads** the line, before quoting and tokenization, and neither quoting nor a
+  caret suppresses that. Each percent in the batch text is therefore delivered as
+  one expansion of an internal carrier variable whose value is exactly `%`, under
+  a name already checked free in the environment the child starts with so an
+  existing operator variable is never overwritten, and the same line clears that
+  carrier with a leading `set "NAME=" &` before the shim runs — and so before the
+  CLI process inherits the environment. Percent expansion is a single pass per
+  line, which is what makes the quoted text identical to what the shared quoting
+  produces for an argument whose percent cmd left alone; that single-pass behavior
+  on a real Windows host is exactly what the acceptance cases below are wired to
+  observe, and this page asserts nothing about it. No argument is refused,
+  expanded, or reclassified to make the batch path work, and the shipped
+  launcher's own Pi batch path keeps its previous `/d /s /c` invocation unchanged.
+  A resolved executable that is not a `.cmd` or `.bat` shim — a direct `.exe`,
+  including one configured with a `node wrapper.js` argument prefix — keeps its
+  argv array, carries no command line, and the owned PTY handle **is** the CLI
+  process, with no batch wrapper between them. POSIX launches are unchanged.
 - **A missing binary is a refusal, and so is a shared argument this cannot host**
   — a documented headless or service mode, a permission, tool, sandbox, or
   hook-trust **override** flag, an existing-session attach or startup
@@ -173,7 +207,7 @@ boundaries; [Development](development.md) owns verification commands.
 
 ## Evidence basis
 
-Each claim below carries one of four labels:
+Each claim below carries one of five labels:
 
 - **Documented** — the provider's own official documentation, reviewed as source
   only against the versions below: on 2026-11-12, with the pages behind the Claude
@@ -184,6 +218,10 @@ Each claim below carries one of four labels:
 - **Implemented, exercised with synthetic children** — host code covered by real
   PTY tests whose child processes are purpose-built Node programs, not provider
   CLIs.
+- **Wired into native CI, not yet run** — a test tier that drives the production
+  path on a real host platform and fails rather than skips when a prerequisite is
+  missing, but whose native run has not been observed. It pins the acceptance
+  contract; it reports no outcome.
 - **Unknown** — no evidence, or evidence too weak to state a fact.
 
 | Provider | Documentation reviewed | Installed-binary probe |
@@ -243,18 +281,67 @@ What the host-side runtime evidence actually is:
   cause zero side effects on the operator's OS keychain or startup network
   behavior could not be proven, and evidence gathering must not spend the
   operator's real credentials or keychain.
-- Still unverified: a real provider interactive TUI in a physical terminal —
-  rendering, model and auth round trips, mouse, images, in-pane resume, approval
-  prompts, and platform-specific behavior. Windows remains an **unsupported
-  validation target**: descriptor-level and mocked Windows cases are not real
-  ConPTY certification
-  ([Windows runtime acceptance](session-host-alpha.md#known-limitation-windows-runtime-acceptance)).
-  One concrete gap: the Windows `.cmd`/`.bat` path builds a quoted batch command
-  for `cmd.exe`, and those tests pin the generated descriptor string only. That
-  string has never been observed arriving through a real `node-pty` Windows spawn,
-  and the launcher and the host adapter emitting the *same* `cmdQuote` output is
-  internal consistency, not evidence that Windows delivers it verbatim. Nothing
-  here claims Windows support.
+- Still unverified on every platform: a real provider interactive TUI in a
+  physical terminal — rendering, model and auth round trips, mouse, images,
+  in-pane resume, approval prompts, and platform-specific behavior. That gap
+  belongs to the provider, not to a platform: it stands on macOS, Linux, and
+  Windows alike, and it is not a reason to treat any of the three as excluded.
+- **Windows is inside this feature's supported-platform scope, and its native
+  acceptance coverage is wired and enforced.** Seven real-ConPTY cases in
+  `tests/session-host-native-cli-windows-pty.test.ts` wire the same production pair
+  the POSIX tier uses — `createNativeCliLauncher` feeding the session manager's
+  `nativeCliLaunch` provider, spawned by the manager's **default** pinned
+  `@lydell/node-pty` factory — with no injected platform, fake spawn, or second
+  resolver, and they take the host as they find it: on a Windows host a missing
+  pinned addon, a missing `SystemRoot`, or a missing `System32\cmd.exe` is a
+  **failure**, never a skip. From each real child's own terminal self-report they
+  observe: the built-in Claude and Codex `PATH`/`PATHEXT` `.cmd` shims with exact
+  argv, cwd (spaces included), environment, TTY state, geometry, and the `cmd.exe`
+  wrapper pid kept distinct from the CLI process the shim started; a configured
+  `.cmd` and `.bat` target's shared arguments and shared environment through real
+  `cmd.exe` delivery; an operator argument that *spells* a `cmd.exe` variable
+  reference — a defined name and an undefined one, `%1 %~dp0 %* %ERRORLEVEL%`, the
+  `!name!` forms `/v:off` exists for, a `&` sharing a token with a percent,
+  embedded quotes, a spaced path ending in a backslash, and an empty option
+  operand — arriving as the operator's literal text, with no internal carrier
+  variable surviving into the child's environment and that `&` never becoming a
+  command; a direct `.exe` with a `node wrapper.js` prefix staying off `cmd.exe`
+  with the prefix in front; exactly one `--no-daemon` in real option position for
+  Codex and no injected flag for Claude, as the child reports them; addressed
+  input, a prompt answer, and an addressed resize reaching only the owning row's
+  child while a sibling row shares nothing; and a deliberate fixture exit plus a
+  confirmed owned Stop settling with Windows lifecycle semantics — no POSIX signal,
+  the full grace window, the pinned forced kill, and settlement proven for the CLI
+  process the shim started rather than only for the wrapper the manager owns. Three
+  cross-platform cases in `tests/session-host-native-cli-windows-delivery.test.ts`
+  pin the wiring that makes that delivery possible at all: the batch child's
+  pre-escaped command line is what the pinned public spawn receives in place of an
+  argv array, one row's command line travels from the launch provider to the PTY
+  factory verbatim, and an unusable command line is refused before any child
+  exists. Both existing native Windows CI jobs — **Windows launcher
+  (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — run those
+  two files as their own step, so publication is gated on them.
+- **Wired into native CI, not yet run — no run of those cases has been observed,
+  so nothing here reports a Windows result.** They are the enforcement, not the
+  evidence. Only a successful native run — those CI steps on a real Windows
+  runner, or a manual run on a real Windows
+  machine — establishes that `cmd.exe` delivers the composed command line verbatim
+  into the child's own argv, that a percent carrier expands once and is cleared
+  before the CLI process inherits the environment, and that the Windows stop ladder
+  settles the CLI process and not merely the wrapper it owns. Until such a run is
+  reported, the honest reading is *evidence pending*, not *Windows unsupported*:
+  an operator's ordinary Windows Pi use stays valid operational evidence of the
+  platform, while this new native-provider behavior needs its own actual CI or
+  manual evidence and has claimed none.
+- What those cases still do not touch on Windows: a real provider binary's own
+  startup, auth, model, question, approval, and resume behavior — every child
+  there is a synthetic Node program behind a synthetic batch shim, and no provider
+  configuration, credential, or conversation is read or written — physical-terminal
+  behavior, and the paired-owner network path, which those local rows do not
+  exercise. The generic session-host Windows limitations — physical wheel and
+  pane-confined selection, and complete graceful settlement — stay owned by
+  [Session host](session-host-alpha.md#known-limitation-windows-runtime-acceptance)
+  and are not resolved here.
 - Provider documentation also moves quickly — Codex's documentation host has
   already moved once — so treat version-specific detail as a dated snapshot, and
   read [Sources](#sources) as the boundary of what was reviewed. **Nothing marked
@@ -414,6 +501,15 @@ cannot, the field stays `unknown`.
   only settlement witness; a PID disappearing is not proof of settlement. Because
   a native row has no status registration, no Pi shutdown request is attempted for
   it: the host signals the handle it owns and waits for that handle's exit.
+- A native launch descriptor may carry one Windows batch command line beside its
+  file, argv, environment, and workspace. The manager validates it as one printable
+  non-empty string and refuses a descriptor carrying an unusable one — it is never
+  silently dropped and never spawned as a bare interpreter with no command — and
+  the manager's default PTY factory hands that string to the pinned public
+  `@lydell/node-pty` spawn in place of argv. On Windows that factory also selects
+  the ConPTY DLL bundled with the pinned package (`useConptyDll: true`) instead of
+  the system ConPTY, so the shipped source path uses the same transport
+  the acceptance cases do; POSIX options are unchanged.
 
 ## Trying one in an owned inactive stage
 

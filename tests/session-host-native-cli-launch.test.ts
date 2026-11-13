@@ -420,9 +420,89 @@ test("the Windows batch descriptor delegates interpreter trust to the shipped la
       assert.equal(received.length, 1, "the adapter asks the shipped resolver instead of resolving an interpreter itself");
       // Exactly the PARENT environment is handed over — never the child's.
       assert.deepEqual(received[0], { SystemRoot: "Z:\\Fixture Windows Root" });
-      // Quoting also stays the shipped helper's single implementation.
-      assert.deepEqual(descriptor.args, ["/d", "/s", "/c", `"${helperModule.cmdQuote(join(bin, "codex.cmd"))} ${helperModule.cmdQuote("--no-daemon")}"`]);
+      // Quoting also stays the shipped helper's single implementation, and the
+      // batch invocation goes out in the pinned spawn's public pre-escaped
+      // command-line form: cmd.exe needs those outer quotes verbatim, so the
+      // argv array stays empty instead of being re-escaped by the PTY.
+      assert.deepEqual(descriptor.args, [], "a batch child is never delivered as argv");
+      assert.equal(descriptor.commandLine,
+        `/d /s /v:off /c "${helperModule.cmdQuote(join(bin, "codex.cmd"))} ${helperModule.cmdQuote("--no-daemon")}"`);
       assert.equal(descriptor.cwd, workspace);
+    } finally {
+      helperModule.resolveTrustedWindowsCmd = shipped;
+    }
+  });
+});
+
+test("a percent-bearing Windows batch argument is delivered as one carrier expansion cmd.exe clears before the shim runs", async () => {
+  await fixture(async (root, bin) => {
+    const shim = join(bin, "codex.cmd");
+    await writeFile(shim, "@echo off\r\n");
+    await chmod(shim, 0o755);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const trusted = "Z:\\Fixture Windows Root\\System32\\cmd.exe";
+    const shipped = helperModule.resolveTrustedWindowsCmd;
+    helperModule.resolveTrustedWindowsCmd = () => trusted;
+    // Spaces, quotes, a redirection operator, a trailing backslash, and every
+    // percent shape that fires in a cmd or batch context (a defined-looking
+    // reference, a stray pair, and the parameter/dynamic forms) ride the same
+    // delivery, alongside the delayed-expansion forms `/v:off` keeps literal.
+    const configured = [
+      "--profile", "%PRG_SYNTH_INHERITED%",
+      "--label", '100%PI% & echo PWNED',
+      "--params", "%1 %~dp0 %* %ERRORLEVEL%",
+      "--dir", "C:\\operator\\",
+      "--quote", 'say "%HOME%" & hi',
+      "--bangs", "!PRG_SYNTH_INHERITED! a!b!c",
+    ];
+    try {
+      const launcher = createNativeCliLauncher(configWith({
+        worker: { adapter: "codex-cli", command: "codex", args: configured, review: {} },
+      }), { platform: "win32", parentEnvironment: { SystemRoot: "Z:\\Fixture Windows Root" } });
+      const descriptor = await launcher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" });
+
+      // cmd.exe expands %NAME% while it reads the /c command line and offers no
+      // escape, so a percent is never typed there: it is carried by one internal
+      // variable whose whole value is the percent sign it delivers.
+      const carrier = "PRG_NATIVE_BATCH_PCT_0";
+      const carriers = Object.keys(descriptor.env).filter((name) => /^PRG_NATIVE_BATCH_PCT_\d+$/u.test(name));
+      assert.deepEqual(carriers, [carrier], "one canonical carrier spelling, and no other transport metadata");
+      assert.equal(descriptor.env[carrier], "%", "the carrier's whole value is the percent sign it delivers");
+
+      const quoteWith = (name: string) => (token: string): string => helperModule.cmdQuote(token.replace(/%/gu, `%${name}%`));
+      assert.equal(descriptor.commandLine,
+        `/d /s /v:off /c "set "${carrier}=" & ${[shim, ...configured, "--no-daemon"].map(quoteWith(carrier)).join(" ")}"`,
+        "every percent becomes one carrier reference and the same line clears it before the shim runs");
+
+      // The carrier belongs to the product only while cmd.exe needs it, and it
+      // never costs a valid launch a refusal: with every low-numbered slot
+      // already owned by the environment, the carrier takes the next free name
+      // and leaves all 64 operator values exactly as they were.
+      const owned = Object.fromEntries(
+        Array.from({ length: 64 }, (_unused, index) => [`PRG_NATIVE_BATCH_PCT_${index}`, `operator-owned-${index}`]),
+      );
+      const occupied = await launcher("codex", { workspace, env: { PATH: bin, ...owned }, targetId: "external:worker" });
+      assert.deepEqual(Object.keys(occupied.env).filter((name) => /^PRG_NATIVE_BATCH_PCT_\d+$/u.test(name)),
+        [...Object.keys(owned), "PRG_NATIVE_BATCH_PCT_64"], "the carrier takes the first free name past every occupied slot");
+      for (const [name, value] of Object.entries(owned)) {
+        assert.equal(occupied.env[name], value, `${name} survives untouched`);
+      }
+      assert.equal(occupied.commandLine,
+        `/d /s /v:off /c "set "PRG_NATIVE_BATCH_PCT_64=" & ${[shim, ...configured, "--no-daemon"].map(quoteWith("PRG_NATIVE_BATCH_PCT_64")).join(" ")}"`,
+        "only the product's own carrier is referenced and cleared");
+
+      // Percent-free batch delivery stays exactly what it was: byte-identical
+      // text, no carrier variable, no clearance.
+      const plainLauncher = createNativeCliLauncher(configWith({}), {
+        platform: "win32",
+        parentEnvironment: { SystemRoot: "Z:\\Fixture Windows Root" },
+      });
+      const plain = await plainLauncher("codex", { workspace, env: { PATH: bin } });
+      assert.deepEqual(Object.keys(plain.env).filter((name) => /^PRG_NATIVE_BATCH_PCT_/u.test(name)), []);
+      assert.equal(plain.commandLine,
+        `/d /s /v:off /c "${helperModule.cmdQuote(shim)} ${helperModule.cmdQuote("--no-daemon")}"`,
+        "a percent-free batch child carries no transport metadata at all");
     } finally {
       helperModule.resolveTrustedWindowsCmd = shipped;
     }
@@ -639,10 +719,11 @@ test("a Windows .cmd shim runs as a batch command through the trusted parent Sys
     `;
     const result = spawnSync(process.execPath, ["-e", source], { encoding: "utf8", env: process.env });
     assert.equal(result.status, 0, `simulated Windows launcher failed: ${result.stderr}`);
-    const descriptor = JSON.parse(result.stdout) as { file: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string };
+    const descriptor = JSON.parse(result.stdout) as { file: string; args: string[]; commandLine?: string; env: NodeJS.ProcessEnv; cwd: string };
     assert.equal(descriptor.file, "C:\\Windows\\System32\\cmd.exe");
     const shim = join(shimDirectory, "codex.cmd");
-    assert.deepEqual(descriptor.args, ["/d", "/s", "/c", `"${helperModule.cmdQuote(shim)} ${helperModule.cmdQuote("--no-daemon")}"`]);
+    assert.deepEqual(descriptor.args, [], "the .cmd shim launch carries no argv the pinned spawn could re-escape");
+    assert.equal(descriptor.commandLine, `/d /s /v:off /c "${helperModule.cmdQuote(shim)} ${helperModule.cmdQuote("--no-daemon")}"`);
     assert.equal(descriptor.cwd, workspace);
     // One canonical Windows environment spelling, with the shared overlay applied.
     assert.equal(descriptor.env.PATH, `${shimDirectory};C:\\untrusted`);

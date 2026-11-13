@@ -267,6 +267,20 @@ jobs:
         # entrypoint setup evidence only, never real Windows ConPTY or sidebar
         # UI readiness.
         run: node --test dist-test/tests/session-host-skill-provisioning.test.js
+      - name: Native interactive CLI Windows ConPTY acceptance (Node 22.23.4)
+        # Issue #277: the production native interactive CLI launcher feeding the
+        # session-host InstanceManager through its default pinned node-pty
+        # factory, on a real Windows ConPTY. The .cmd/.bat shim cases observe
+        # what cmd.exe actually delivers to the child's own argv, environment,
+        # cwd, TTY, geometry, input, and exit, and the delivery case pins the
+        # pinned spawn's pre-escaped command-line wiring. Every child is a
+        # synthetic Node program behind a synthetic batch shim: no provider CLI,
+        # credential, or model call. Missing Windows prerequisites fail these
+        # cases instead of skipping them.
+        run: >-
+          node --test
+          dist-test/tests/session-host-native-cli-windows-pty.test.js
+          dist-test/tests/session-host-native-cli-windows-delivery.test.js
       - name: Package build toolchain on native Windows
         # Native toolchain evidence only: this is the package's own prepack build
         # script. Since issue 344 the launchers never run a package build; they
@@ -431,6 +445,17 @@ jobs:
           dist-test/tests/background-shell-jobs.test.js
           dist-test/tests/background-process-readiness.test.js
           dist-test/tests/native-powershell-support.test.js
+      - name: Native interactive CLI Windows ConPTY acceptance (Node 24)
+        # Issue #277 on this job's Node line: the same real ConPTY acceptance of
+        # the production native interactive CLI launch path (launcher ->
+        # InstanceManager -> pinned node-pty ConPTY), including .cmd/.bat
+        # argument delivery through cmd.exe and the Windows stop/settlement
+        # ladder. Synthetic fixture programs only; missing prerequisites fail
+        # rather than skip.
+        run: >-
+          node --test
+          dist-test/tests/session-host-native-cli-windows-pty.test.js
+          dist-test/tests/session-host-native-cli-windows-delivery.test.js
 
   windows-session-host:
     # Read-only caller of the native Windows session-host alpha matrix, so the

@@ -627,6 +627,13 @@ export interface InstancePty {
 export interface InstanceSpawnDescriptor {
 	file: string;
 	args: string[];
+	/**
+	 * Windows only, for a batch (`.cmd`/`.bat`) child: the invocation in the
+	 * pinned implementation's public pre-escaped `CommandLine` form, delivered
+	 * verbatim after `file` instead of as an argv array the pinned spawn would
+	 * re-escape. Absent for every direct executable child.
+	 */
+	commandLine?: string;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
 	cols: number;
@@ -1081,7 +1088,7 @@ interface ManagedInstance {
 
 /** The lazy loader for the pinned real native PTY implementation. */
 interface LoadedNodePty {
-	spawn(file: string, args: string[], options: {
+	spawn(file: string, args: string[] | string, options: {
 		name: string;
 		cols: number;
 		rows: number;
@@ -1126,7 +1133,11 @@ export function createDefaultPtyFactory(): PtyFactory {
 		}
 		// The pinned implementation satisfies the InstancePty subset
 		// structurally (data/exit events, write, resize, kill, pause/resume).
-		return nodePty.spawn(descriptor.file, descriptor.args, {
+		// A batch child carries the public pre-escaped `CommandLine` string, so
+		// the pinned Windows spawn appends it verbatim instead of MSDN-escaping
+		// the quotes cmd.exe needs out of an argv array. Every other child keeps
+		// the argv form, and POSIX never sees a command line.
+		return nodePty.spawn(descriptor.file, descriptor.commandLine ?? descriptor.args, {
 			name: "xterm-256color",
 			cols: descriptor.cols,
 			rows: descriptor.rows,
@@ -1694,6 +1705,15 @@ function validatedNativeCliDescriptor(value: unknown, workspace: string): Native
 		|| args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
 		throw new Error(`session-host: the native CLI launch descriptor requires at most ${MAX_NATIVE_CLI_ARGS} string arguments`);
 	}
+	// A batch child's Windows command line reaches the pinned public spawn
+	// verbatim, so it is validated as one printable non-empty string and never
+	// silently dropped: a descriptor that carries an unusable one is refused
+	// rather than spawned as a bare interpreter with no command.
+	const commandLine = value.commandLine;
+	if (commandLine !== undefined
+		&& (typeof commandLine !== "string" || commandLine.length === 0 || /[\u0000-\u001f\u007f]/.test(commandLine))) {
+		throw new Error("session-host: the native CLI launch descriptor's Windows command line must be one printable non-empty string");
+	}
 	const env = value.env;
 	if (!isPlainRecord(env)
 		|| Object.values(env).some((entry) => entry !== undefined && typeof entry !== "string")) {
@@ -1703,7 +1723,7 @@ function validatedNativeCliDescriptor(value: unknown, workspace: string): Native
 	if (typeof cwd !== "string" || !isAbsolute(cwd) || realpathSync(cwd) !== workspace) {
 		throw new Error("session-host: the native CLI launch descriptor does not target this row's selected workspace");
 	}
-	return { file, args: [...args], env: { ...env } as NodeJS.ProcessEnv, cwd };
+	return { file, args: [...args], ...(commandLine === undefined ? {} : { commandLine }), env: { ...env } as NodeJS.ProcessEnv, cwd };
 }
 
 /** A fresh child environment with this host's own capability tokens removed. */
@@ -3538,6 +3558,7 @@ export class InstanceManager {
 				pty = this.#ptyFactory({
 					file: descriptor.file,
 					args: descriptor.args,
+					...(descriptor.commandLine === undefined ? {} : { commandLine: descriptor.commandLine }),
 					env: nativeCliChildEnv(descriptor.env),
 					cwd: descriptor.cwd,
 					cols: record.cols,

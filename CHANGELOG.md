@@ -49,8 +49,10 @@ dates.
   row when it advertises native targets, and the two native network entries below describe
   that. `SessionSpawn`, the existing Pi remote owner-create, the Saved picker, and the
   standalone launchers are unchanged. This is initial hosting: real-provider interactive
-  behavior remains unverified, Windows remains an unsupported validation target, and the
-  guide states what evidence exists — see
+  behavior remains unverified on every platform, Windows sits inside the
+  supported-platform scope with its own real-ConPTY acceptance coverage wired into
+  both native Windows CI jobs (see the Windows entries below), and the guide states
+  exactly what evidence exists — see
   [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md).
 - **Naming a native sidebar row (#277)**: `E` on a live native Claude or Codex row opens
   the host's Edit form and stores one host-side caption for that row, so the operator can
@@ -99,6 +101,43 @@ dates.
   edits its own caption in advance, and never falls back to a Pi rename, a local mutation, or
   a reconnect. An unknown result stays `UNCERTAIN: the host may have renamed that row; verify
   its current name before retrying` and is never retried automatically.
+- **Native Windows batch and direct launches (#277)**: a native Claude or Codex
+  target that resolves to a `.cmd`/`.bat` shim now runs as one batch command line —
+  the trusted parent `SystemRoot\System32\cmd.exe` invoked as
+  `/d /s /v:off /c "<quoted command text>"` — delivered to the pinned PTY spawn as
+  its public pre-escaped command-line string rather than an argv array it would
+  re-escape, because cmd.exe does not treat a backslash as an escape. `/v:off`
+  names delayed expansion off, so a `!name!` in an operator's own argument stays
+  literal even on a machine that turns it on for every `cmd.exe`. cmd.exe expands
+  `%NAME%` while it reads the line and offers no escape, so each percent in the
+  batch text is delivered as one expansion of an internal carrier variable whose
+  value is exactly `%`, allocated under a name already checked free in the child's
+  environment and cleared by the same line before the shim runs — and so before the
+  CLI process inherits the environment. No argument is refused, expanded, or
+  reclassified to make the batch path work, and a native descriptor carrying an
+  unusable command line is refused rather than dropped or spawned as a bare
+  interpreter. A direct `.exe` — including one configured with a `node wrapper.js`
+  prefix — never touches `cmd.exe`: it keeps its argv, carries no command line, and
+  the owned PTY handle is the CLI process itself. Pi launches, POSIX launches, and
+  the shipped launcher's own Pi batch `/d /s /c` invocation are unchanged.
+- **Real ConPTY acceptance for the native launch path is wired into CI (#277)**:
+  seven native Windows cases in `tests/session-host-native-cli-windows-pty.test.ts`
+  run the production native launcher feeding the session manager through its
+  default pinned `@lydell/node-pty` factory on a real ConPTY, observing the child's
+  own argv, cwd, environment, TTY state and geometry, the `cmd.exe` wrapper pid kept
+  distinct from the CLI process the shim started, percent- and bang-literal delivery
+  through `cmd.exe` and a batch shim with no carrier left behind, the `--no-daemon`
+  option position, addressed input and resize isolation between sibling rows, and
+  Windows stop and exit semantics with no POSIX signal. Three cross-platform cases
+  in `tests/session-host-native-cli-windows-delivery.test.ts` pin the command-line
+  wiring they depend on. Both existing Windows jobs — Windows launcher
+  (Node 22.23.4) and Windows shell (Node 24, on its 24.22.1 pin) — run both files
+  as their own step, and
+  a missing Windows prerequisite fails those cases instead of skipping them. Every
+  child there is a synthetic Node program behind a synthetic batch shim: no provider
+  CLI, credential, or model call. This is the acceptance contract for the Windows
+  path — the native runs of these new cases have not been observed yet, so this
+  entry records the coverage and no Windows result.
 
 ### Changed
 

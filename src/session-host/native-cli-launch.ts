@@ -74,9 +74,11 @@ import { type NativeCliBackend } from "./session-backend";
  *   authentication inheritance stay untouched. No Pi configuration is
  *   initialized.
  *
- * Validation coverage is source-level plus in-process fixtures. Windows is a
- * supported descriptor target but was NOT exercised on a Windows host, and no
- * real provider CLI is launched by this slice.
+ * Validation coverage is source-level plus in-process fixtures. On Windows the
+ * batch delivery above is what the real pinned ConPTY acceptance in the native
+ * Windows CI jobs exercises with synthetic Node programs, and only that native
+ * run can report what cmd.exe actually delivers; no real provider CLI is
+ * launched by any of it.
  */
 
 /**
@@ -567,12 +569,72 @@ function loadLauncherHelpers(): LauncherHelpers {
   return helper as LauncherHelpers;
 }
 
-/** A `.cmd`/`.bat` shim runs as a batch command through the trusted cmd.exe. */
+/**
+ * The internal Windows batch percent carrier's canonical name prefix. It is
+ * product-internal transport metadata, never operator-facing, and the numeric
+ * suffix keeps the chosen slot clear of any variable the child already owns.
+ */
+const WINDOWS_PERCENT_CARRIER_PREFIX = "PRG_NATIVE_BATCH_PCT_";
+
+/** The carrier's whole value: the single percent sign it exists to deliver. */
+const WINDOWS_PERCENT_CARRIER_VALUE = "%";
+
+/**
+ * The first unused canonical carrier name in the environment the batch child
+ * starts with. Windows names arrive in one canonical spelling from the shared
+ * snapshot, so this one check covers every case spelling, and an existing
+ * operator variable is never overwritten or cleared. A finite environment holds
+ * finitely many names, so one probe past its size always finds a free slot:
+ * preserving the literal argument never costs a valid launch a refusal.
+ */
+function windowsPercentCarrierName(environment: Readonly<NodeJS.ProcessEnv>): string {
+  const slots = Object.keys(environment).length + 1;
+  for (let probe = 0; probe < slots; probe += 1) {
+    const name = `${WINDOWS_PERCENT_CARRIER_PREFIX}${probe}`;
+    if (!Object.hasOwn(environment, name)) return name;
+  }
+  // Unreachable: at most `slots - 1` of these `slots` names can already exist.
+  throw refuse("no internal Windows batch percent carrier name is free in the configured child environment");
+}
+
+/**
+ * A `.cmd`/`.bat` shim runs as a batch command through the trusted cmd.exe.
+ *
+ * The command text is composed with the launcher's single `cmdQuote` authority,
+ * so the shared argument rules apply unchanged and no layer invents its own
+ * quoting. cmd.exe performs percent expansion while it READS the `/c` command
+ * line — before quoting and tokenization — and offers no escape from it: `%%`
+ * is a batch-source escape only (on a `/c` line `%%NAME%%` yields `%value%` for
+ * a defined `NAME`, and cmd performs no `%%` to `%` reduction there), and a
+ * caret is consumed later than the expansion. So a percent cannot be TYPED
+ * faithfully into a batch command line.
+ *
+ * It can be DELIVERED faithfully. Expansion is a single left-to-right pass, so
+ * a `%NAME%` reference whose value is one `%` leaves a literal percent that cmd
+ * never reads again. Every percent in the batch text is therefore replaced with
+ * a reference to one internal carrier variable that carries exactly `%`, and the
+ * carrier is cleared by a leading `set "NAME=" &` in the same line: the whole
+ * line expands from the environment cmd.exe starts with, then the reference is
+ * gone before the shim — and so before the CLI process that inherits it — runs.
+ * What cmd.exe tokenizes afterwards is exactly the text this quoting produces
+ * for an argument whose percent cmd left alone, so every other character keeps
+ * the delivery the Windows acceptance suite already proves, and no argument is
+ * refused, expanded, or reclassified.
+ *
+ * The batch invocation also carries `/v:off`. Delayed expansion is off by
+ * default, but a machine can turn it on for every `cmd.exe` through its Command
+ * Processor settings, and then a `!NAME!` in the operator's own argument would
+ * expand while the shim forwards `%*` — printable-argv fidelity that depends on
+ * whose machine this is. Naming the switch makes literal bangs literal here
+ * instead. This is the native interactive CLI batch launch only: the shipped
+ * launcher's Pi batch path keeps its own `/d /s /c` invocation unchanged.
+ */
 function adaptWindowsBatchShim(
   shim: string,
   args: readonly string[],
   parentEnvironment: NodeJS.ProcessEnv,
-): { file: string; args: string[] } {
+  childEnvironment: NodeJS.ProcessEnv,
+): { file: string; args: string[]; commandLine: string; env: NodeJS.ProcessEnv } {
   const helpers = loadLauncherHelpers();
   // The parent environment only: the child environment, ComSpec, and PATH stay
   // irrelevant, so a `.cmd`/`.bat` CLI shim never selects its own interpreter.
@@ -580,8 +642,37 @@ function adaptWindowsBatchShim(
   if (!cmdExe) {
     throw refuse("a valid regular cmd.exe was not found under the parent process's absolute Windows SystemRoot\\System32, so the configured .cmd/.bat CLI shim cannot be launched");
   }
-  const commandLine = [shim, ...args].map(helpers.cmdQuote).join(" ");
-  return { file: cmdExe, args: ["/d", "/s", "/c", `"${commandLine}"`] };
+  // Percent-free batch text stays byte-identical to the delivery before it: no
+  // carrier, no clearing, no change to a single quoted token.
+  const percentCarrier = [shim, ...args].some((token) => token.includes("%"))
+    ? windowsPercentCarrierName(childEnvironment)
+    : undefined;
+  const quoteToken = (token: string): string => helpers.cmdQuote(percentCarrier === undefined
+    ? token
+    : token.replace(/%/gu, `%${percentCarrier}%`));
+  const env = percentCarrier === undefined
+    ? childEnvironment
+    : { ...childEnvironment, [percentCarrier]: WINDOWS_PERCENT_CARRIER_VALUE };
+  // cmd.exe expands the whole command line from the environment it starts with,
+  // so this clearance runs after every carrier above has expanded and before the
+  // shim — and therefore before the CLI process that inherits the environment.
+  const carrierClearance = percentCarrier === undefined ? "" : `set "${percentCarrier}=" & `;
+  const commandText = [shim, ...args].map(quoteToken).join(" ");
+  // The pinned PTY's public Windows spawn takes either an argv array — which it
+  // escapes itself per the MSDN command-line rules — or one pre-escaped
+  // command-line string appended verbatim after the program path. cmd.exe needs
+  // this whole `/d /s /v:off /c "…"` remainder verbatim, exactly as Node's
+  // `windowsVerbatimArguments` spawn hands it to the shell, because cmd.exe does
+  // not treat a backslash as an escape. Passed as argv, the outer quotes would
+  // reach cmd.exe as `\"` and the batch command line would be re-tokenized
+  // against the operator's own arguments, so the batch invocation is delivered
+  // only in the string form and its argv stays empty.
+  return {
+    file: cmdExe,
+    args: [],
+    commandLine: `/d /s /v:off /c "${carrierClearance}${commandText}"`,
+    env,
+  };
 }
 
 /**
@@ -662,8 +753,8 @@ export function createNativeCliLauncher(
 
     const argv = composeNativeArgs(backend, args, target.id);
     if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-      const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env);
-      return { file: batch.file, args: batch.args, env, cwd };
+      const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
+      return { file: batch.file, args: batch.args, commandLine: batch.commandLine, env: batch.env, cwd };
     }
     return { file, args: argv, env, cwd };
   };

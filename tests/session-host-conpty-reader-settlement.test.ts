@@ -416,6 +416,41 @@ test("a reader whose disposal never settles keeps manager disposal an explicit f
   }
 });
 
+test("an unavailable adapter exit subscription cannot hide a required cleanup failure", async () => {
+  const fixture = makeOwnedReaderFixture();
+  const harness = makeDefaultFactoryHarness("trigger-unavailable", () => dllAgentShape(fixture));
+  const originalOnExit = SyntheticConptyPty.prototype.onExit;
+  let refusedAdapterSubscription = false;
+  SyntheticConptyPty.prototype.onExit = function (this: SyntheticConptyPty, listener) {
+    if (!refusedAdapterSubscription) {
+      refusedAdapterSubscription = true;
+      throw new Error("synthetic adapter subscription failure");
+    }
+    return originalOnExit.call(this, listener);
+  };
+  try {
+    await withPlatform("win32", async () => {
+      const id = await createRow(harness);
+      const pty = harness.spawned[0];
+      const settlement = settlementOf(pty);
+      assert.equal(settlement.refusal, "trigger-unavailable");
+      pty.emitExit(0);
+      assert.equal(harness.manager.list().find((row) => row.id === id)?.exitCode, 0,
+        "the manager independently received the genuine public PTY exit");
+      assert.equal(settlement.exitObserved, false, "the failed adapter trigger is not fabricated");
+      await assert.rejects(harness.manager.dispose(), /owned Windows ConPTY reader settlement was not confirmed/,
+        "a missing adapter trigger cannot turn required cleanup into success");
+      assert.deepEqual(fixture.disposeCalls, [], "no unconfirmed disposal trigger was guessed");
+      assert.deepEqual(pty.killSignals, [], "no native kill was used after the actual exit");
+    });
+  } finally {
+    SyntheticConptyPty.prototype.onExit = originalOnExit;
+    instanceTestSeam.setNodePtyLoaderForTests(undefined);
+    await fixture.worker.terminate().catch(() => undefined);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
 test("closing an exited row cannot hide an unconfirmed owned reader release", async () => {
   const fixture = makeOwnedReaderFixture({ settle: false });
   const harness = makeDefaultFactoryHarness("closed-row", () => dllAgentShape(fixture));

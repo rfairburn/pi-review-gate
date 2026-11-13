@@ -157,8 +157,6 @@ test("a real Windows ConPTY child exit settles the owned reader so the owning he
   let observerRef: WindowsOwnedExitObserver | undefined;
   let helperClose: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let helperSpawnError: Error | undefined;
-  let stdoutTail = "";
-  let stderrTail = "";
   const helper: ChildProcess = spawn(process.execPath, [
     READER_HELPER_FIXTURE,
     "--module", instancesModule,
@@ -168,14 +166,12 @@ test("a real Windows ConPTY child exit settles the owned reader so the owning he
   ], {
     cwd: process.cwd(),
     env: helperEnv,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: "ignore",
     shell: false,
     windowsHide: true,
   });
   helper.on("close", (code, signal) => { helperClose = { code, signal }; });
   helper.on("error", (error) => { helperSpawnError = error; });
-  helper.stdout?.on("data", (chunk: Buffer | string) => { stdoutTail = (stdoutTail + chunk.toString()).slice(-512); });
-  helper.stderr?.on("data", (chunk: Buffer | string) => { stderrTail = (stderrTail + chunk.toString()).slice(-512); });
   const abortForHelper = (): Error | undefined => helperSpawnError
     ?? (helperClose !== undefined
       ? new Error(`the owning helper exited early (${helperClose.code}/${helperClose.signal ?? "none"}); journal: ${JSON.stringify(readJournal(journalFile))}`)
@@ -188,7 +184,7 @@ test("a real Windows ConPTY child exit settles the owned reader so the owning he
     }
     // Failure path only: settle the retained exact-process observer first so its
     // watcher cannot keep this process alive, keep ownership of a possibly live
-    // helper, preserve the witness tree, and disclose bounded tails.
+    // helper, preserve the witness tree, and disclose only owned journal metadata.
     await settleObserverAfterFailure(observerRef);
     if (helperClose === undefined) {
       harnessKilledHelper = true;
@@ -196,7 +192,6 @@ test("a real Windows ConPTY child exit settles the owned reader so the owning he
     }
     process.stderr.write(`preserved failed Windows reader-settlement witness tree: ${root}\n`);
     process.stderr.write(`helper journal: ${JSON.stringify(readJournal(journalFile))}\n`);
-    process.stderr.write(`helper stdout tail: ${stdoutTail}\nhelper stderr tail: ${stderrTail}\n`);
   });
 
   const started = await waitFor(() => readJournal(journalFile).find((record) => record.type === "helper_started"),

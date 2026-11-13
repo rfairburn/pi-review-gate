@@ -2825,9 +2825,10 @@ export class InstanceManager {
 	/**
 	 * Require positive settlement of every owned Windows ConPTY reader released by
 	 * the default PTY factory's adapter (#666) once that exact handle's own exit
-	 * event made the release due. Cleanup follows the exit only: a handle that
-	 * never exited owes nothing here, and a POSIX row or an injected custom/fake
-	 * PTY has no owned addon reader at all and is never registered. A capture that
+	 * event made the release due. Cleanup follows the exit only: a pending handle
+	 * that never exited owes no release here, but adapter failures remain failures.
+	 * A POSIX row or an injected custom/fake PTY has no owned addon reader and is
+	 * never registered. A capture that
 	 * never identified the owned reader, and a disposal whose Worker never settled,
 	 * both stay explicit failures rather than synthesized success.
 	 *
@@ -2838,13 +2839,16 @@ export class InstanceManager {
 	 * immediately instead of restarting the clock.
 	 */
 	async #confirmOwnedConptyReaders(): Promise<void> {
-		const due = [...this.#ownedConptyReaders].filter((settlement) => settlement.exitObserved && !settlement.settled);
+		// A failed exit subscription cannot erase a required cleanup failure merely
+		// because the adapter could not observe the manager's genuine exit event.
+		const due = [...this.#ownedConptyReaders].filter((settlement) => settlement.state === "failed"
+			|| (settlement.exitObserved && !settlement.settled));
 		if (due.length === 0) return;
 		const outcomes = await Promise.all(due.map((settlement) => settlement.confirmSettlement()));
 		const unsettled = outcomes.filter((settled) => !settled).length;
 		if (unsettled > 0) {
 			throw new Error(
-				`session-host: owned Windows ConPTY reader settlement was not confirmed for ${unsettled} exited row(s)`,
+				`session-host: owned Windows ConPTY reader settlement was not confirmed for ${unsettled} cleanup record(s)`,
 			);
 		}
 	}

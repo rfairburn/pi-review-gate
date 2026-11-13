@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.281]
+## [0.1.0-dev.282]
 
 ### Security
 
@@ -52,6 +52,26 @@ dates.
   window as the merge; neither this change nor any workflow edits it. Earlier CI
   runs on the superseded floors remain historical evidence, not patched-runtime
   runs.
+
+## [0.1.0-dev.281]
+
+### Fixed
+
+- **Windows session-host reader settlement (#666)**: capture the owned bundled-ConPTY
+  reader at spawn, drain and release it exactly once after that terminal's genuine
+  exit, and confirm settlement before reporting clean disposal. Unidentified or
+  unconfirmed cleanup remains a failure. Reader cleanup does not kill native
+  processes or force host exit; native exit codes, forced-stop history, POSIX and
+  custom terminal behavior, spawn arguments, pins, and shutdown deadlines stay unchanged.
+
+### Tests
+
+- **Repair generic Windows Pi runtime acceptance (#663)**: register the real Main,
+  cold CMD, and direct PowerShell cases under the existing opt-in; correct stale
+  ownership observations; examine durable process witnesses independently of watcher
+  events; and collect wrapper outcomes even when Main acceptance fails. Retain
+  original-process/PTY exit and terminal-restoration assertions, ownership checks,
+  runtime pins, deadlines, and CI check names.
 
 ## [0.1.0-dev.280]
 

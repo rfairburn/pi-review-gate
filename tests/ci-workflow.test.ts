@@ -1019,7 +1019,14 @@ test("matrix keeps its fail-closed prerequisites, pins, and deadlines while reus
   assert.match(alpha, /timeout-minutes: 10\n/, "the Main acceptance step cap must stay unchanged");
   assert.match(alpha, /timeout-minutes: 20\n/, "the launcher acceptance step cap must stay unchanged");
   assert.doesNotMatch(alpha, /continue-on-error/, "no step may tolerate a missing prerequisite");
-  assert.doesNotMatch(alpha, /^ *if:/m, "no condition may skip an enforced native leg");
+  // The matrix job itself stays unconditional, and the only step condition is
+  // the launcher acceptance prerequisite gate pinned by
+  // tests/session-host-windows-workflow.test.ts. It can only start the launcher
+  // more often than before, never vacuously and never on a cancelled run.
+  assert.doesNotMatch(withoutComments(alpha), /^ {2,6}if:/m,
+    "no matrix job may carry a condition: a conditional job could be skipped out of the enforced dependency set");
+  assert.equal((withoutComments(alpha).match(/^ {8}if: /gm) ?? []).length, 1,
+    "the launcher acceptance prerequisite gate must stay the only step condition: no other enforced native leg may become skippable");
   assert.match(alpha, /^permissions:\n  contents: read$/m, "the reused matrix stays read-only");
   assert.doesNotMatch(alpha, /contents:\s*write|secrets:|workflows:/,
     "reuse must not add a write grant or any secret surface");
@@ -1078,7 +1085,14 @@ test("failed, skipped, cancelled, missing, and stale matrix outcomes keep public
   // Skipped: nothing on the enforced path may skip the matrix, so a skipped
   // dependency can only come from a real problem, which the implicit guard blocks.
   assert.doesNotMatch(job, /^ {4}if:/m, "a conditional caller could be skipped out of the dependency set");
-  assert.doesNotMatch(readSessionHostWorkflow(), /^ *if:/m, "a conditional matrix job or step could be skipped out of the dependency set");
+  const alphaWorkflow = readSessionHostWorkflow();
+  assert.doesNotMatch(withoutComments(alphaWorkflow), /^ {2,6}if:/m,
+    "a conditional matrix job could be skipped out of the dependency set");
+  const alphaStepConditions = withoutComments(alphaWorkflow).match(/^ {8}if: (.+)$/gm) ?? [];
+  assert.equal(alphaStepConditions.length, 1,
+    "only the launcher acceptance step may carry a condition, so no enforced native leg can be skipped out of the dependency set");
+  assert.match(alphaStepConditions[0] ?? "", /\$\{\{ !cancelled\(\) && steps\.[a-z][a-z0-9_]*\.outcome == 'success' \}\}/,
+    "the one condition must keep requiring a non-cancelled run and a successful prerequisite export, so a skipped launcher can only mean a real failure that already failed the job");
   assert.doesNotMatch(withoutComments(source), /secrets:\s*inherit/, "reuse must not widen the secret blast radius");
   // Missing: the callee must exist and stay read-only, or the whole run fails to
   // parse rather than publishing unverified.

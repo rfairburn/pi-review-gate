@@ -256,99 +256,126 @@ function writeBatchShim(shimPath: string, bodyPath: string): void {
 }
 
 /**
- * A thin witness around the REAL handle the production default factory returned.
+ * Test-owned observation installed on the REAL handle the production default
+ * factory returned, and removed again in `withHarness` cleanup.
  *
- * This is not a transport substitute: every call goes straight to the pinned
- * `@lydell/node-pty` object, event registrations are made on that object, and
- * `pid` stays a live getter over the pinned handle's own identity. The wrapper
- * exists because "the manager requests no POSIX kill signal on Windows" is a
+ * This is not a transport substitute and never becomes one: the factory hands
+ * the manager the pinned `@lydell/node-pty` object itself, unchanged, so the
+ * exact handle the default factory captured its owned ConPTY reader against is
+ * the handle the manager registers, stops, and confirms (#666). Observation uses
+ * that object's public surface only: output is witnessed by registering this
+ * file's own `onData` listener, and `kill` is the single slot shadowed with an
+ * own, configurable property that forwards to the pinned method with the same
+ * receiver and the same arity. `restore()` releases the listener and puts the
+ * handle's own `kill` descriptor back exactly as it was.
+ *
+ * Why `onData` is never replaced: the pinned `Terminal.prototype` defines it as
+ * a getter-only accessor (`get: () => this._onData.event`), so assigning to it
+ * throws `TypeError: Cannot set property onData of #<Terminal> which has only a
+ * getter` in the strict mode every compiled module runs in. A helper that threw
+ * there would fail the spawn before the handle was ever recorded or handed to the
+ * manager, which is the opposite of owning a child. So nothing here assigns to a
+ * pinned accessor, and an observation that cannot be installed is reported on
+ * `installFault` instead of throwing — the handle always reaches the manager.
+ *
+ * It exists because "the manager requests no POSIX kill signal on Windows" is a
  * claim about what the real handle was ASKED to do, and the only honest witness
- * for that is the argument list it actually received. It also records whether
- * any output arrived after a kill, which is the pinned implementation's own
- * precondition for shutting its ConPTY output worker down on the
- * `useConptyDll` path (see the file-level resource witness at the end).
+ * for that is the argument list it actually received. It also records whether any
+ * output arrived after a kill, which is the pinned implementation's own
+ * precondition for shutting its ConPTY output worker down on the `useConptyDll`
+ * path (see the file-level resource witness at the end).
  */
-class RecordingPty implements InstancePty {
+interface HandleObservation {
   /** One entry per `kill()` call on the real handle, preserving its arity. */
-  readonly killCalls: unknown[][] = [];
+  readonly killCalls: unknown[][];
   /** True once the real handle reported output after its first kill. */
-  dataAfterKill = false;
-  #real: InstancePty;
-  #killed = false;
+  dataAfterKill: boolean;
+  /** Why this file could not observe the handle; nothing is then claimed about it. */
+  readonly installFault: string | undefined;
+  /** Release this file's listener and restore the pinned handle's own slots. */
+  restore(): void;
+}
 
-  constructor(real: InstancePty) {
-    this.#real = real;
-  }
-
-  get pid(): number {
-    return this.#real.pid;
-  }
-
-  get cols(): number {
-    return this.#real.cols;
-  }
-
-  get rows(): number {
-    return this.#real.rows;
-  }
-
-  onData(listener: (data: string) => void): { dispose(): void } {
-    return this.#real.onData((data) => {
-      if (this.#killed) this.dataAfterKill = true;
-      listener(data);
+function observeRealHandle(pty: InstancePty): HandleObservation {
+  const killCalls: unknown[][] = [];
+  let killed = false;
+  let installFault: string | undefined;
+  let dataDisposable: { dispose(): void } | undefined;
+  let restoreKill: () => void = () => undefined;
+  const observation: HandleObservation = {
+    killCalls,
+    dataAfterKill: false,
+    get installFault(): string | undefined {
+      return installFault;
+    },
+    restore(): void {
+      try {
+        dataDisposable?.dispose();
+      } catch {
+        // A settled handle has nothing left to release; the waits decided already.
+      }
+      dataDisposable = undefined;
+      restoreKill();
+    },
+  };
+  // Output is witnessed through the handle's own public event API, never by
+  // replacing the pinned getter-only `onData` accessor.
+  try {
+    dataDisposable = pty.onData(() => {
+      if (killed) observation.dataAfterKill = true;
     });
+  } catch (error) {
+    installFault = `the real handle's own onData event could not be observed: ${error instanceof Error ? error.message : String(error)}`;
   }
-
-  onExit(listener: (event: { exitCode: number; signal?: number }) => void): { dispose(): void } {
-    return this.#real.onExit(listener);
-  }
-
-  on(eventName: "error", listener: (error: Error) => void): unknown {
-    return this.#real.on?.(eventName, listener);
-  }
-
-  removeListener(eventName: "error", listener: (error: Error) => void): unknown {
-    return this.#real.removeListener?.(eventName, listener);
-  }
-
-  write(data: string | Buffer): void {
-    this.#real.write(data);
-  }
-
-  resize(columns: number, rows: number): void {
-    this.#real.resize(columns, rows);
-  }
-
-  pause(): void {
-    this.#real.pause();
-  }
-
-  resume(): void {
-    this.#real.resume();
-  }
-
-  kill(signal?: string): void {
-    // Arity is the witness: the manager's Windows escalation is the pinned
-    // no-argument kill, while a POSIX signal request would carry one.
-    const arity = (arguments as { length: number }).length;
-    this.killCalls.push(arity === 0 ? [] : [signal]);
-    this.#killed = true;
-    if (arity === 0) {
-      this.#real.kill();
-      return;
+  // `kill` is the one slot this file shadows, and it shadows it with an own
+  // configurable property so restoring means restoring the handle's own
+  // descriptor (or removing the shadow when the slot was inherited).
+  const target = pty as unknown as Record<string, unknown>;
+  const originalDescriptor = Object.getOwnPropertyDescriptor(target, "kill");
+  const originalKill = target.kill;
+  if (typeof originalKill !== "function") {
+    installFault ??= "the real handle exposed no kill() to observe";
+  } else {
+    try {
+      Object.defineProperty(target, "kill", {
+        configurable: true,
+        enumerable: originalDescriptor?.enumerable ?? false,
+        value: function recordedKill(this: unknown, ...args: (string | undefined)[]): void {
+          // Arity is the witness: the manager's Windows escalation is the pinned
+          // no-argument kill, while a POSIX signal request would carry one.
+          killCalls.push(args.length === 0 ? [] : [args[0]]);
+          killed = true;
+          (originalKill as (...callArgs: (string | undefined)[]) => void).apply(this, args);
+        },
+      });
+      restoreKill = (): void => {
+        if (originalDescriptor !== undefined) Object.defineProperty(target, "kill", originalDescriptor);
+        else Reflect.deleteProperty(target, "kill");
+      };
+    } catch (error) {
+      installFault ??= `the real handle's own kill() could not be observed: ${error instanceof Error ? error.message : String(error)}`;
     }
-    this.#real.kill(signal);
   }
+  return observation;
 }
 
 /** Every real ConPTY handle this file created, for the file-level resource witness. */
 const nativeHandleWitness: { label: string; handle: RealHandle }[] = [];
 
+/** One fixture's outcome for the manager's owned-reader confirmation during cleanup. */
+const readerSettlementWitness: { label: string; outcome: string }[] = [];
+
 /** One real owned handle plus the exit event this file witnessed for it. */
 interface RealHandle {
   readonly descriptor: InstanceSpawnDescriptor;
-  /** The opaque owned ConPTY handle, kept only to witness what it was asked to do. */
-  readonly pty: RecordingPty;
+  /**
+   * The opaque owned ConPTY handle exactly as the production default factory
+   * returned it — the same object the factory captured its owned ConPTY reader
+   * against, and the object the manager owns, stops, and confirms.
+   */
+  readonly pty: InstancePty;
+  /** This file's kill-arity and post-kill-output witness on that same handle. */
+  readonly observation: HandleObservation;
   /**
    * The owned handle's ORIGINAL process identity, bound from the pinned public
    * `pid` getter once it reports one (see {@link observeOwnedPid}). It is
@@ -533,10 +560,14 @@ async function makeHarness(label: string, options: HarnessOptions = {}): Promise
     args: [],
     nativeCliLaunch: (backend, request) => launcher(backend, request),
     ptyFactory: (descriptor) => {
-      // The production default factory: the pinned real @lydell/node-pty ConPTY,
-      // wrapped only to witness the calls and events on that real handle.
-      const pty = new RecordingPty(defaultFactory(descriptor));
-      const handle: RealHandle = { descriptor, pty };
+      // The production default factory: the pinned real @lydell/node-pty ConPTY.
+      // Its handle is handed to the manager unchanged, because that exact object
+      // is the key the factory's owned-reader capture (#666) is stored under; a
+      // wrapper here would hide that ownership from the manager. The handle's own
+      // public methods are observed instead, and restored during cleanup.
+      const pty = defaultFactory(descriptor);
+      const observation = observeRealHandle(pty);
+      const handle: RealHandle = { descriptor, pty, observation };
       handles.push(handle);
       nativeHandleWitness.push({ label, handle });
       exitRegistrations.push(pty.onExit((event) => {
@@ -756,6 +787,19 @@ function processAlive(pid: number): boolean {
  * signal argument on that platform. A failed case, an unsettled process, or a
  * cleanup fault keeps its fixture under the system temp directory and prints the
  * retained path. The case's own failure is always the one reported.
+ *
+ * The manager's own `dispose()` is part of that settlement and is never swallowed:
+ * it is the only place the #666 owned Windows ConPTY reader confirmation runs, so a
+ * disposal it rejects is a required cleanup this file must report, not a detail a
+ * fixture may ignore. It runs only AFTER every owned handle's own exit has been
+ * witnessed, because disposal owes nothing for a handle that never exited: a
+ * disposal run first would resolve clean, a fallback kill would then produce that
+ * exit, and the reader release that came due afterwards would go unconfirmed while
+ * this file reported success. Anything still unexited when the wait ends is itself
+ * a failure, and the settlement witness says NOT CONFIRMED rather than confirmed.
+ * The file's thin observation of each real handle is removed here too, so no
+ * test-owned listener or property outlives the case, and an observation this file
+ * could not install fails the case instead of quietly weakening its witnesses.
  */
 async function withHarness(label: string, options: HarnessOptions, body: (harness: Harness) => Promise<void>): Promise<void> {
   const harness = await makeHarness(label, options);
@@ -773,7 +817,8 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
   }
   try {
     await harness.manager.shutdown({ graceMs: 4000, killMs: 4000 }).catch(() => undefined);
-    await harness.manager.dispose().catch(() => undefined);
+    // Failure handling only: a handle this file created that still has no exit
+    // event is asked to stop through its own owned handle.
     for (const handle of harness.handles) {
       if (handle.exit) continue;
       try {
@@ -783,6 +828,13 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
         // Already gone; the wait below still decides whether exit was witnessed.
       }
     }
+    // Every owned exit is observed BEFORE the manager is asked to confirm anything.
+    // Disposal deliberately owes nothing for a handle whose exit never came, so a
+    // disposal that ran first could resolve clean and then watch a fallback kill
+    // produce that exit — a reader release that came due afterwards and was never
+    // confirmed, which no later disposal can retroactively settle either, because
+    // the tracked disposal promise is cached. Waiting first is what lets a clean
+    // disposal mean what this file needs it to mean.
     const deadline = Date.now() + 15_000;
     while (harness.handles.some((handle) => handle.exit === undefined) && Date.now() < deadline) await sleep(50);
     const unsettled = harness.handles.filter((handle) => handle.exit === undefined);
@@ -796,6 +848,44 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
     const survivingNow = surviving();
     if (survivingNow.length > 0) {
       failFirst(new Error(`session-host native CLI Windows fixture: SHUTDOWN INTEGRATION SEAM — the owned PTY wrapper handles settled, but the CLI processes they started are still running: ${survivingNow.map((handle) => `cli pid ${handle.childPid} under wrapper ${ownedIdentity(handle)}`).join("; ")}. A forced kill that reaches only the batch wrapper leaves the hosted CLI alive; this is reported as an unresolved shutdown seam for the generic stop ladder rather than being masked here.`));
+    }
+    // Only now is disposal the real confirmation: every owned handle this file
+    // created has had its own exit witnessed, so each captured reader release came
+    // due, and a disposal this file rejects is a required cleanup it must report.
+    let disposeFailure: Error | undefined;
+    try {
+      await harness.manager.dispose();
+    } catch (error) {
+      disposeFailure = error instanceof Error ? error : new Error(String(error));
+    }
+    readerSettlementWitness.push({
+      label,
+      outcome: unsettled.length > 0
+        // Truthful, never a pass: those handles' releases never came due, so
+        // nothing was confirmed for them however this disposal resolved.
+        ? `NOT CONFIRMED: ${unsettled.length} owned handle(s) never exited, so their readers' release never came due before disposal${disposeFailure === undefined ? "" : `; disposal also REJECTED: ${disposeFailure.message}`}`
+        : disposeFailure === undefined
+          ? "manager disposal confirmed every owned reader"
+          : `manager disposal REJECTED: ${disposeFailure.message}`,
+    });
+    if (disposeFailure !== undefined) {
+      failFirst(new Error(`session-host native CLI Windows fixture: the instance manager's disposal — the only confirmation of its owned Windows ConPTY reader settlement (#666) — rejected: ${disposeFailure.message}`));
+    }
+    // An observation this file could not install is not a free pass: the kill-arity
+    // and post-kill-output claims for that handle cannot be made, and the handle
+    // still reached the manager, so the case reports it rather than passing silently.
+    const observationFaults = harness.handles.filter((handle) => handle.observation.installFault !== undefined);
+    if (observationFaults.length > 0) {
+      failFirst(new Error(`session-host native CLI Windows fixture: this file could not observe the real handle(s) it was given, so its kill-arity and post-kill-output witnesses are unavailable: ${observationFaults.map((handle) => `${ownedIdentity(handle)}: ${handle.observation.installFault}`).join("; ")}`));
+    }
+    // Test-owned observation cleanup: each real handle gets its own pinned methods
+    // back, so nothing this file installed stays on a production handle.
+    for (const handle of harness.handles) {
+      try {
+        handle.observation.restore();
+      } catch {
+        // A handle whose own slot could not be restored says nothing about the case.
+      }
     }
     // Test-owned listener cleanup: every exit witness this file registered on a
     // real handle is recorded above, so its own registration is released here.
@@ -1298,7 +1388,7 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     assert.deepEqual(refused, { status: "confirmation-required", forced: false });
     assert.equal(viewOf(harness.manager, stopId).lifecycle, "alive");
     assert.equal(harness.manager.hasLiveProcesses(), true);
-    assert.equal(stopHandle.pty.killCalls.length, 0, "an unconfirmed Stop made no kill request of any kind on the real handle");
+    assert.equal(stopHandle.observation.killCalls.length, 0, "an unconfirmed Stop made no kill request of any kind on the real handle");
     await frameStaysWithout(harness.manager, stopId, /SIGNAL /, "nothing reached the Windows child while its Stop stayed unconfirmed");
 
     // 3. The operator's confirmation runs the owned stop ladder, with the
@@ -1309,7 +1399,7 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     // escalation truthfully.
     assert.equal(stopHandle.descriptor.env.PRG_SYNTH_WATCH_PPID, undefined,
       "the fixture's parent-death watcher is disabled for this assertion, so nothing can mask a surviving CLI process");
-    const killRequestsBeforeStop = stopHandle.pty.killCalls.length;
+    const killRequestsBeforeStop = stopHandle.observation.killCalls.length;
     const startedAt = Date.now();
     const stopped = await harness.manager.stop(stopId, { confirmed: true });
     const elapsed = Date.now() - startedAt;
@@ -1321,7 +1411,7 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
     // handle. On Windows the only escalation is the pinned no-argument kill, and
     // a SIGTERM or SIGKILL request would show up here as a kill call carrying an
     // argument.
-    const killRequests = stopHandle.pty.killCalls.slice(killRequestsBeforeStop);
+    const killRequests = stopHandle.observation.killCalls.slice(killRequestsBeforeStop);
     assert.deepEqual(killRequests.filter((request) => request.length > 0), [],
       "the manager requested no POSIX signal on Windows: every kill it made of the real handle was the pinned no-argument owned kill");
     assert.equal(killRequests.length, 1, "the confirmed Stop escalated exactly once, through the owned handle");
@@ -1355,6 +1445,142 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
 });
 
 /**
+ * The pinned implementation's real property shapes, with no ConPTY and no child
+ * process: `onData` is an inherited getter-only accessor and `kill` is an
+ * inherited writable prototype method. Only the two host-independent controls
+ * below use it.
+ */
+class SyntheticPinnedShapePty {
+  readonly pid = 424243;
+  cols = 80;
+  rows = 24;
+  /** What the pinned `kill` this file forwards to actually received. */
+  readonly forwardedKills: { readonly receiver: unknown; readonly args: readonly (string | undefined)[] }[] = [];
+  #dataListeners: ((data: string) => void)[] = [];
+
+  /** The pinned accessor resolves to this on each read, as `this._onData.event` does. */
+  registerDataListener(listener: (data: string) => void): { dispose(): void } {
+    this.#dataListeners.push(listener);
+    return {
+      dispose: () => {
+        const index = this.#dataListeners.indexOf(listener);
+        if (index >= 0) this.#dataListeners.splice(index, 1);
+      },
+    };
+  }
+
+  get dataListenerTotal(): number {
+    return this.#dataListeners.length;
+  }
+
+  emitData(data: string): void {
+    for (const listener of [...this.#dataListeners]) listener(data);
+  }
+
+  /** Inherited, writable, configurable — the shape the pinned terminal's kill has. */
+  kill(...args: (string | undefined)[]): void {
+    this.forwardedKills.push({ receiver: this, args });
+  }
+}
+
+// Exactly the pinned accessor: a getter with no setter, so assigning to `onData`
+// throws `TypeError: Cannot set property onData ... which has only a getter` in
+// the strict mode every compiled module runs in.
+Object.defineProperty(SyntheticPinnedShapePty.prototype, "onData", {
+  get(this: SyntheticPinnedShapePty) {
+    return (listener: (data: string) => void): { dispose(): void } => this.registerDataListener(listener);
+  },
+  configurable: true,
+  enumerable: false,
+});
+
+/**
+ * Host-independent on purpose: this exercises this file's own observation helper
+ * against the property shapes the pinned implementation really has. It spawns
+ * nothing, because the failure it prevents is a Windows spawn dying inside the
+ * fixture before the created handle is ever recorded or handed to the manager.
+ */
+test("this file's handle observation shadows only kill and never assigns to the pinned getter-only onData accessor", async () => {
+  const handle = new SyntheticPinnedShapePty();
+  const pty = handle as unknown as InstancePty;
+  const protoDescriptor = Object.getOwnPropertyDescriptor(SyntheticPinnedShapePty.prototype, "onData");
+  assert.ok(protoDescriptor?.get, "the shape under test really is an accessor");
+  assert.equal(protoDescriptor.set, undefined, "the shape under test really has no setter");
+  // The premise: replacing `onData` by assignment is not available to any code
+  // in this file, so an observer that tried would break every real spawn.
+  assert.throws(() => {
+    (handle as unknown as { onData: unknown }).onData = (): void => undefined;
+  }, TypeError, "assignment to the pinned getter-only onData must throw in strict mode");
+
+  let observation: HandleObservation | undefined;
+  assert.doesNotThrow(() => {
+    observation = observeRealHandle(pty);
+  }, "installing the observation must never throw while a created handle is on its way to the manager");
+  assert.ok(observation);
+  assert.equal(observation.installFault, undefined, "a normal handle is observable without qualification");
+  assert.equal(Object.prototype.hasOwnProperty.call(handle, "onData"), false,
+    "the pinned accessor is never shadowed on the handle itself");
+  assert.equal(handle.dataListenerTotal, 1, "output is witnessed by one added public listener, not a replaced accessor");
+
+  // The handle's own public onData still works for everyone else, including the
+  // manager's own data and error wiring.
+  const seen: string[] = [];
+  const other = pty.onData((data) => { seen.push(data); });
+  handle.emitData("before");
+  assert.deepEqual(seen, ["before"], "the pinned accessor still registers listeners normally");
+  assert.equal(observation.dataAfterKill, false, "no post-kill output is claimed before any kill");
+
+  pty.kill();
+  pty.kill("SIGTERM");
+  assert.deepEqual(observation.killCalls, [[], ["SIGTERM"]],
+    "the kill-arity witness survives: the manager's Windows escalation carries no argument");
+  assert.equal(handle.forwardedKills.length, 2, "every recorded kill is forwarded to the pinned method");
+  assert.equal(handle.forwardedKills[0]?.receiver, handle, "the pinned method is called with the handle itself as receiver");
+  assert.deepEqual(handle.forwardedKills[1]?.args, ["SIGTERM"], "the pinned method receives the caller's argument unchanged");
+  handle.emitData("after");
+  assert.equal(observation.dataAfterKill, true, "post-kill output is still witnessed");
+
+  observation.restore();
+  assert.equal(Object.prototype.hasOwnProperty.call(handle, "kill"), false,
+    "restore removes the shadow and leaves the inherited pinned method in place");
+  pty.kill("SIGHUP");
+  assert.deepEqual(handle.forwardedKills[2]?.args, ["SIGHUP"], "the handle's own kill still works after restore");
+  assert.equal(handle.dataListenerTotal, 1, "this file's own data listener was released, leaving only the other one");
+  const witnessed = observation.dataAfterKill;
+  handle.emitData("late");
+  assert.equal(observation.dataAfterKill, witnessed, "a released observation witnesses nothing further");
+  other.dispose();
+});
+
+/**
+ * The other half of the same guarantee: an observation this file cannot install
+ * is reported, never thrown. A handle whose own slot refuses to be shadowed must
+ * still reach the harness registry and the manager, because a fixture that dies
+ * mid-spawn is how a created child ends up unowned.
+ */
+test("an observation this file cannot install is reported as a fault instead of throwing before the handle is owned", async () => {
+  const handle = new SyntheticPinnedShapePty();
+  // A `kill` slot that cannot be shadowed at all: neither assignment nor
+  // defineProperty can install anything over it.
+  Object.defineProperty(handle, "kill", {
+    value: (): void => undefined,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+  let observation: HandleObservation | undefined;
+  assert.doesNotThrow(() => {
+    observation = observeRealHandle(handle as unknown as InstancePty);
+  }, "an unshadowable slot must never break the spawn path");
+  assert.ok(observation);
+  assert.notEqual(observation.installFault, undefined, "the missing witness is reported, not silently accepted");
+  assert.match(observation.installFault ?? "", /kill/u);
+  assert.equal(Object.prototype.hasOwnProperty.call(handle, "onData"), false, "the pinned accessor is still untouched");
+  assert.equal(handle.dataListenerTotal, 1, "output observation still works on its own public listener");
+  observation.restore();
+});
+
+/**
  * One active-resource witness for the whole file, printed after its last case.
  *
  * A real Windows run of this file printed every case result and then never
@@ -1370,6 +1596,11 @@ test("a deliberate fixture exit and a confirmed owned Stop settle truthfully wit
  * because an unsampled handle says nothing about the pinned implementation. Node's
  * own active handle and request counts complete the picture. Nothing here waits,
  * retries, forces an exit, or changes any lifecycle.
+ *
+ * The per-fixture reader-settlement line states what each fixture's manager
+ * `dispose()` concluded. That confirmation — not post-kill output reaching the
+ * pinned drain — is what releases the owned ConPTY reader now (#666), so it is the
+ * fact that shows whether a fixture's host process could settle.
  */
 after(() => {
   if (!isWindows) return;
@@ -1391,12 +1622,12 @@ after(() => {
   // Which fixtures were killed with no output afterwards, by label: that is the
   // pinned condition under which the ConPTY output worker is never disposed.
   const unflushed = [...new Set(nativeHandleWitness
-    .filter((entry) => entry.handle.pty.killCalls.length > 0 && !entry.handle.pty.dataAfterKill)
+    .filter((entry) => entry.handle.observation.killCalls.length > 0 && !entry.handle.observation.dataAfterKill)
     .map((entry) => entry.label))];
   console.error(`prg-native-cli-windows: resource witness for ${handles.length} owned ConPTY handle(s): `
     + `${count((handle) => handle.exit !== undefined)} with an observed exit, `
     + `${count((handle) => handle.exit === undefined)} without one, `
-    + `${count((handle) => handle.pty.killCalls.some((request) => request.length > 0))} killed with a signal argument (expected 0), `
+    + `${count((handle) => handle.observation.killCalls.some((request) => request.length > 0))} killed with a signal argument (expected 0), `
     + `${unflushed.length} fixture(s) killed with no output after the kill `
     + `[${unflushed.join(", ") || "none"}] (the pinned useConptyDll path disposes its ConPTY output worker only on post-kill output, so each listed fixture can leave that worker thread and its pipe server alive), `
     + `${count((handle) => handle.handlePid !== undefined)} had a bound owned identity, `
@@ -1406,4 +1637,8 @@ after(() => {
     + `${count((handle) => handle.consoleCloseNotice === true)} reported the console-close notification; `
     + `active libuv handles: ${summarize(diagnosticProcess._getActiveHandles?.())}; `
     + `active libuv requests: ${summarize(diagnosticProcess._getActiveRequests?.())}`);
+  console.error(`prg-native-cli-windows: owned-reader settlement witness: `
+    + (readerSettlementWitness.length === 0
+      ? "no fixture reached manager disposal"
+      : readerSettlementWitness.map((entry) => `${entry.label}=${entry.outcome}`).join("; ")));
 });

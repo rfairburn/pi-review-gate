@@ -3628,6 +3628,17 @@ export class InstanceManager {
 					rows: record.rows,
 				});
 				record.pty = pty;
+				// #666: the same owned-reader contract as a Pi row. A native CLI child
+				// spawned by the default factory on Windows leaks the same addon reader,
+				// so its settlement is recorded here for the disposal-time confirmation;
+				// the release itself is still triggered only by that handle's own exit.
+				// Settled readers are already history, so they are dropped here instead of
+				// retaining a finished handle graph for the manager's whole lifetime.
+				for (const settled of this.#ownedConptyReaders) {
+					if (settled.settled) this.#ownedConptyReaders.delete(settled);
+				}
+				const ownedReader = ownedConptyReaderRecord(pty);
+				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
 				if (record.ptyExited) {
 					this.#disposeExitListener(record);

@@ -46,10 +46,17 @@ explicitly skipped, so green CI does not certify Windows runtime support; the
 Windows sidebar/host remains an unsupported validation target. CI now calls the
 separate session-host acceptance matrix in
 `.github/workflows/session-host-alpha.yml` — emitting the stable check names
-**Windows session host alpha (Node 22.23.5)** and **Windows session host alpha
-(Node 24.22.3)** — read-only on every enforced trigger and requires its results
-before publishing a numbered prerelease. That reuse changes no deferral: the
-genuine native Main case and both cold hosted-source wrapper legs above are
+**Windows session host alpha (Node 22)** and **Windows session host alpha
+(Node 24)** — qualified by that caller as **Session host alpha matrix / Windows
+session host alpha (Node 22)** and **Session host alpha matrix / Windows session
+host alpha (Node 24)** — read-only on every enforced trigger and requires its
+results before publishing a numbered prerelease. Those names come from the
+matrix's stable per-major labels, each paired explicitly with that line's exact
+pinned runtime (22.23.5 and 24.22.3), so a later patch or minor floor bump
+keeps these check names and the required contexts unchanged; adding or dropping
+a supported major stays a separate support decision. That reuse changes no
+deferral: the genuine native Main case and both cold hosted-source wrapper legs
+above are
 registered with an unconditional skip, so they stay deferred under #345 even
 inside that matrix, and a green matrix job is not proof that those cases
 executed. What the matrix does run on native Windows runners is its non-deferred

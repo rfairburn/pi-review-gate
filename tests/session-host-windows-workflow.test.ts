@@ -77,6 +77,74 @@ function withoutComments(source: string): string {
   return source.split("\n").filter((line) => !line.trimStart().startsWith("#")).join("\n");
 }
 
+type MatrixRow = { label: string; version: string };
+
+/**
+ * Parse the acceptance job's explicit `strategy.matrix.include:` rows into
+ * label/pin pairs. The stable per-major check-identity contract requires each
+ * row to pair one bare Node major (`node-major`, the value the check name
+ * renders and therefore the qualified caller context too) with that line's exact
+ * `node-version` pin (the value setup-node installs and logs), so raising a
+ * line's patch or minor floor changes only the pin.
+ */
+function matrixRows(job: string): MatrixRow[] {
+  const lines = job.split("\n");
+  const matrixAt = lines.findIndex((line) => line === "      matrix:");
+  assert.ok(matrixAt !== -1, "the acceptance job must declare a strategy.matrix block");
+  const includeAt = lines.findIndex((line, index) => index > matrixAt && line === "        include:");
+  assert.ok(includeAt !== -1,
+    "the matrix must declare explicit include: rows pairing each stable check-name label with its exact pinned runtime");
+  const rows: MatrixRow[] = [];
+  for (const line of lines.slice(includeAt + 1)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    if (line.length - line.trimStart().length < 10) break;
+    const row = /^(\s*)- node-major: (\S+)$/.exec(line);
+    if (row) {
+      rows.push({ label: row[2], version: "" });
+      continue;
+    }
+    const pin = /^(\s*)node-version: (\S+)$/.exec(line);
+    assert.ok(pin && rows.length > 0, `unexpected line inside the matrix include rows: ${line}`);
+    assert.ok(rows[rows.length - 1].version === "", `a matrix row may pin node-version exactly once: ${line}`);
+    rows[rows.length - 1].version = pin[2];
+  }
+  assert.ok(rows.length > 0, "the matrix must declare at least one include row");
+  for (const row of rows) {
+    assert.ok(row.version !== "", "every matrix row must pair a node-major label with a node-version pin");
+  }
+  return rows;
+}
+
+/**
+ * Enforce the stable per-major check identity on parsed matrix rows: exactly the
+ * expected leg per supported major in order, each label a bare major, each pin
+ * an exact `major.minor.patch` of that same major, and no duplicated, collapsed,
+ * or missing leg. Applied to the real workflow and to deliberately mutated
+ * sources, so the contract cannot pass vacuously.
+ */
+function assertMatrixIdentity(rows: MatrixRow[], expected: MatrixRow[], what: string): void {
+  assert.deepEqual(rows, expected,
+    `${what} must pair each stable major label with its exact pinned runtime, with no collapsed, missing, duplicated, or reordered leg`);
+  assert.equal(new Set(rows.map((row) => row.label)).size, rows.length,
+    `${what} labels must stay distinct: two rows sharing a label collapse two required contexts into one`);
+  assert.equal(new Set(rows.map((row) => row.version)).size, rows.length,
+    `${what} runtime pins must stay distinct: one leg per supported line`);
+  for (const row of rows) {
+    assert.match(row.label, /^\d+$/,
+      `${what} labels must be a bare Node major, never a pinned patch version that renames the required context on every floor bump`);
+    assert.match(row.version, /^\d+\.\d+\.\d+$/,
+      `${what} runtime pins must stay exact major.minor.patch security floors, never a floating line`);
+    assert.equal(row.version.split(".")[0], row.label,
+      `${what} labels must name the major of the runtime they pin`);
+  }
+}
+
+/** The two native alpha legs at the exact patched Node 22 and Node 24 floors. */
+const ALPHA_ROWS: MatrixRow[] = [
+  { label: "22", version: "22.23.5" },
+  { label: "24", version: "24.22.3" },
+];
+
 /**
  * Every real `if:` condition line outside full-line comments, with its
  * indentation. Job keys sit at indent 4 and step keys at indent 8, so this
@@ -188,8 +256,32 @@ test("every alpha action is pinned to an immutable commit SHA matching ci.yml", 
 test("alpha matrix runs windows-latest on both supported Node lines", () => {
   const job = jobBlock(readAlpha());
   assert.match(job, /runs-on: windows-latest/, "the acceptance needs a genuinely native Windows runner");
-  assert.match(job, /node-version: \[22\.23\.5, 24\.22\.3\]/, "both supported Node lines stay in the matrix");
+  assertMatrixIdentity(matrixRows(job), ALPHA_ROWS, "the two native alpha legs");
+  assert.match(job, /^          node-version: \$\{\{ matrix\.node-version \}\}$/m,
+    "setup-node must install each row's exact pinned runtime, not the label's major");
   assert.match(job, /fail-fast: false/);
+});
+
+test("the alpha identity contract rejects mismatched, collapsed, or missing legs", () => {
+  const source = readAlpha();
+  const check = (text: string) => assertMatrixIdentity(matrixRows(jobBlock(text)), ALPHA_ROWS, "the two native alpha legs");
+  const reject = (mutated: string, why: string) => {
+    assert.notEqual(mutated, source, `the ${why} mutation must actually change the workflow text`);
+    assert.throws(() => check(mutated), `the alpha identity contract must reject ${why}`);
+  };
+
+  check(source);
+  reject(source.replace("          - node-major: 24\n            node-version: 24.22.3",
+    "          - node-major: 24\n            node-version: 22.23.5"),
+  "a stable label pinned to another major's runtime");
+  reject(source.replace("          - node-major: 24\n            node-version: 24.22.3\n", ""),
+    "a dropped major that removes one native leg and its required context");
+  reject(source.replace("          - node-major: 22\n            node-version: 22.23.5",
+    "          - node-major: 22\n            node-version: 22"),
+  "a floating Node 22 line in place of the exact pinned floor");
+  reject(source.replace("          - node-major: 22\n            node-version: 22.23.5",
+    "          - node-major: 22.23.5\n            node-version: 22.23.5"),
+  "a patch-level label that renames the required context on the next floor bump");
 });
 
 test("alpha runtime is bounded by independent job and step timeouts", () => {
@@ -437,8 +529,10 @@ test("alpha check name is stable without claiming configured branch settings", (
     "the workflow must not guess externally configured branch-protection state");
   assert.match(source, /workflow does not configure branch protection/,
     "the check-name comment describes this workflow's bounded authority, not external settings");
-  assert.match(source, /name: Windows session host alpha \(Node \$\{\{ matrix\.node-version \}\}\)/,
-    "both matrix instances retain the stable check-name contract");
+  assert.match(source, /name: Windows session host alpha \(Node \$\{\{ matrix\.node-major \}\}\)/,
+    "both matrix instances retain the stable check-name contract, named from the per-major label rather than the pinned version");
+  assert.doesNotMatch(source, /^ {4}name: [^\n]*\d+\.\d+\.\d+/m,
+    "no emitted check name may embed a pinned version: every floor bump would rename the qualified required context");
 });
 
 test("alpha exports the pinned agent, canonical JS CLI, and staged candidate entry", () => {

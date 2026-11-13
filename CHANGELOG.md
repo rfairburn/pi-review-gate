@@ -38,20 +38,32 @@ dates.
 
 ### Changed
 
-- CI now selects the new exact patched floors (#669). The existing `verify` matrix
-  runs Node 22.23.5, 24.22.3, and 26.13.1 through the same stages, with no extra
-  full-suite stage. Its checks are renamed to **Verify (Node 22.23.5)**,
-  **Verify (Node 24.22.3)**, and **Verify (Node 26.13.1)**, replacing
-  **Verify (Node 22.23.4)**, **Verify (Node 24.22.1)**, and
-  **Verify (Node 26.12.1)**. The Linux full suite, the Windows shell job, and the
-  release builder use Node 24.22.3 and keep their check names. The Windows launcher
-  job uses Node 22.23.5 and is renamed **Windows launcher (Node 22.23.5)**. The
-  Windows session-host alpha matrix uses Node 22.23.5 and 24.22.3, which renames
-  its checks to match. Because those required contexts are named from the matrix
-  values, the operator must update branch protection to the new names in the same
-  window as the merge; neither this change nor any workflow edits it. Earlier CI
-  runs on the superseded floors remain historical evidence, not patched-runtime
-  runs.
+- CI now selects the new exact patched floors and names its required checks
+  stably per major (#669). The existing `verify` matrix runs Node 22.23.5,
+  24.22.3, and 26.13.1 through the same stages, with no extra full-suite stage,
+  as **Verify (Node 22)**, **Verify (Node 24)**, and **Verify (Node 26)**. The
+  Linux full suite and the Windows shell job keep **Full suite (Node 24)** and
+  **Windows shell (Node 24)** on Node 24.22.3, the release builder keeps using
+  Node 24.22.3, and the Windows launcher job runs Node 22.23.5 as **Windows
+  launcher (Node 22)**. The Windows session-host alpha matrix runs Node 22.23.5
+  and 24.22.3 as **Windows session host alpha (Node 22)** and **Windows session
+  host alpha (Node 24)**, which CI's read-only caller contributes as the
+  qualified contexts **Session host alpha matrix / Windows session host alpha
+  (Node 22)** and **Session host alpha matrix / Windows session host alpha
+  (Node 24)**. Every matrix leg now declares an explicit label/version pair, so a
+  later patch or minor floor bump changes only the pinned runtime and needs no
+  ruleset edit, while `actions/setup-node` logs the exact version each leg
+  installed; adding or dropping a supported major stays a separate support and
+  ruleset decision. These checks were previously named from the pinned versions,
+  such as **Verify (Node 22.23.4)**, so this is a one-time rename: the operator
+  must update
+  branch protection to **Verify (Node 22)**, **Verify
+  (Node 24)**, **Verify (Node 26)**, **Full suite (Node 24)**, **Windows launcher
+  (Node 22)**, **Windows shell (Node 24)**, **Session host alpha matrix / Windows
+  session host alpha (Node 22)**, and **Session host alpha matrix / Windows
+  session host alpha (Node 24)** in the same window as the merge; neither this
+  change nor any workflow edits it. Earlier CI runs on the superseded floors
+  remain historical evidence, not patched-runtime runs.
 
 ## [0.1.0-dev.281]
 

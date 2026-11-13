@@ -59,6 +59,67 @@ function blockOf(source: string, key: string, indent: number): string {
   return body.join("\n");
 }
 
+type MatrixRow = { label: string; version: string };
+
+/**
+ * Parse a job's explicit `strategy.matrix.include:` rows into label/pin pairs.
+ * The stable per-major check-identity contract requires each row to pair one
+ * bare Node major (`node-major`, the value the check name renders) with that
+ * line's exact `node-version` pin (the value setup-node installs and logs), so
+ * raising a line's patch or minor floor changes only the pin.
+ */
+function matrixRows(jobBlock: string): MatrixRow[] {
+  const lines = jobBlock.split("\n");
+  const matrixAt = lines.findIndex((line) => line === "      matrix:");
+  assert.ok(matrixAt !== -1, "the job must declare a strategy.matrix block");
+  const includeAt = lines.findIndex((line, index) => index > matrixAt && line === "        include:");
+  assert.ok(includeAt !== -1,
+    "the matrix must declare explicit include: rows pairing each stable check-name label with its exact pinned runtime");
+  const rows: MatrixRow[] = [];
+  for (const line of lines.slice(includeAt + 1)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    if (line.length - line.trimStart().length < 10) break;
+    const row = /^(\s*)- node-major: (\S+)$/.exec(line);
+    if (row) {
+      rows.push({ label: row[2], version: "" });
+      continue;
+    }
+    const pin = /^(\s*)node-version: (\S+)$/.exec(line);
+    assert.ok(pin && rows.length > 0, `unexpected line inside the matrix include rows: ${line}`);
+    assert.ok(rows[rows.length - 1].version === "", `a matrix row may pin node-version exactly once: ${line}`);
+    rows[rows.length - 1].version = pin[2];
+  }
+  assert.ok(rows.length > 0, "the matrix must declare at least one include row");
+  for (const row of rows) {
+    assert.ok(row.version !== "", "every matrix row must pair a node-major label with a node-version pin");
+  }
+  return rows;
+}
+
+/**
+ * Enforce the stable per-major check identity on parsed matrix rows: exactly
+ * the expected leg per supported major in order, each label a bare major, each
+ * pin an exact `major.minor.patch` of that same major, and no duplicated,
+ * collapsed, or missing leg. Applied to the real workflows and to deliberately
+ * mutated sources, so the contract cannot pass vacuously.
+ */
+function assertMatrixIdentity(rows: MatrixRow[], expected: MatrixRow[], what: string): void {
+  assert.deepEqual(rows, expected,
+    `${what} must pair each stable major label with its exact pinned runtime, with no collapsed, missing, duplicated, or reordered leg`);
+  assert.equal(new Set(rows.map((row) => row.label)).size, rows.length,
+    `${what} labels must stay distinct: two rows sharing a label collapse two required contexts into one`);
+  assert.equal(new Set(rows.map((row) => row.version)).size, rows.length,
+    `${what} runtime pins must stay distinct: one leg per supported line`);
+  for (const row of rows) {
+    assert.match(row.label, /^\d+$/,
+      `${what} labels must be a bare Node major, never a pinned patch version that renames the required context on every floor bump`);
+    assert.match(row.version, /^\d+\.\d+\.\d+$/,
+      `${what} runtime pins must stay exact major.minor.patch security floors, never a floating line`);
+    assert.equal(row.version.split(".")[0], row.label,
+      `${what} labels must name the major of the runtime they pin`);
+  }
+}
+
 test("workflow triggers cover pull requests, main pushes, and manual dispatch", () => {
   const source = readWorkflow();
   const on = blockOf(source, "on", 0);
@@ -186,9 +247,9 @@ test("every action is pinned to an immutable commit SHA with a human version com
 
 test("verify job keeps its stable check name, Node matrix, and fast tiers", () => {
   const source = readWorkflow();
-  assert.match(source, /name: Verify \(Node \$\{\{ matrix\.node-version \}\}\)/);
+  assert.match(source, /name: Verify \(Node \$\{\{ matrix\.node-major \}\}\)/);
   const verify = blockOf(source, "verify", 2);
-  assert.match(verify, /^        node-version: \[22\.23\.5, 24\.22\.3, 26\.13\.1\]$/m,
+  assert.deepEqual(matrixRows(verify).map((row) => row.version), ["22.23.5", "24.22.3", "26.13.1"],
     "each supported Node line runs once, at its exact patched security floor");
   assert.equal((verify.match(/run: npm run test:package/g) ?? []).length, 1,
     "the Node 26 entry joins the same matrix: no duplicate broad stage is added");
@@ -205,6 +266,58 @@ test("verify job keeps its stable check name, Node matrix, and fast tiers", () =
     "the fast tier needs no browser, so Chromium provisioning stays skipped");
   assert.match(verify, /node --test dist-test\/tests\/ci-workflow\.test\.js/,
     "the verify jobs exercise these workflow contract tests");
+});
+
+// --- Stable per-major CI check identities (issue #669 follow-up) ----------
+// Required contexts are named from the matrix's explicit per-major labels, not
+// from the pinned runtime versions: raising a line's patch or minor security
+// floor keeps every required context satisfiable with no ruleset edit, while
+// setup-node still installs (and logs) the exact pinned runtime. Adding or
+// dropping a supported major stays a separate support decision that renames
+// checks. These are source-level contracts, not proof of live ruleset state.
+
+const VERIFY_ROWS: MatrixRow[] = [
+  { label: "22", version: "22.23.5" },
+  { label: "24", version: "24.22.3" },
+  { label: "26", version: "26.13.1" },
+];
+
+test("Verify legs pair each stable major label with its exact pinned floor", () => {
+  const source = readWorkflow();
+  const verify = blockOf(source, "verify", 2);
+  assert.match(source, /^    name: Verify \(Node \$\{\{ matrix\.node-major \}\}\)$/m,
+    "the check name must render the stable per-major label, never the pinned runtime version");
+  assertMatrixIdentity(matrixRows(verify), VERIFY_ROWS, "the three Verify legs");
+  assert.match(verify, /^          node-version: \$\{\{ matrix\.node-version \}\}$/m,
+    "setup-node must install each row's exact pinned runtime, not the label's major");
+  assert.doesNotMatch(source, /^ {4}name: [^\n]*\d+\.\d+\.\d+/m,
+    "no required-check name may embed a pinned version: every floor bump would rename the required contexts");
+});
+
+test("the Verify identity contract rejects mismatched, collapsed, or missing legs", () => {
+  const source = readWorkflow();
+  const check = () => assertMatrixIdentity(matrixRows(blockOf(source, "verify", 2)), VERIFY_ROWS, "the three Verify legs");
+  const reject = (mutated: string, why: string) => {
+    assert.notEqual(mutated, source, `the ${why} mutation must actually change the workflow text`);
+    const mutatedRows = () => assertMatrixIdentity(matrixRows(blockOf(mutated, "verify", 2)), VERIFY_ROWS, "the three Verify legs");
+    assert.throws(mutatedRows, `the Verify identity contract must reject ${why}`);
+  };
+
+  check();
+  reject(source.replace("          - node-major: 24\n            node-version: 24.22.3",
+    "          - node-major: 24\n            node-version: 26.13.1"),
+  "a stable label pinned to another major's runtime");
+  reject(source.replace("          - node-major: 26\n            node-version: 26.13.1",
+    "          - node-major: 24\n            node-version: 24.22.3"),
+  "a duplicated leg that collapses two required contexts into one");
+  reject(source.replace("          - node-major: 26\n            node-version: 26.13.1\n", ""),
+    "a dropped major that removes a required context");
+  reject(source.replace("          - node-major: 26\n            node-version: 26.13.1",
+    "          - node-major: 26\n            node-version: 26"),
+  "a floating Node 26 line in place of the exact pinned floor");
+  reject(source.replace("          - node-major: 22\n            node-version: 22.23.5",
+    "          - node-major: 22.23.5\n            node-version: 22.23.5"),
+  "a patch-level label that renames the required context on the next floor bump");
 });
 
 test("full-tests job runs for pull requests, default-branch pushes, and manual dispatch", () => {
@@ -979,15 +1092,13 @@ test("publication depends on all eight verification legs and the Windows matrix 
 
   // Eight real verification legs gate publication: three Verify floors, the full
   // suite, the two native Windows jobs, and the matrix's two Node lines.
-  const verifyMatrix = blockOf(source, "verify", 2).match(/node-version: \[([^\]]+)\]/);
-  assert.ok(verifyMatrix, "the verify matrix must stay declared");
-  const verifyLegs = verifyMatrix![1].split(",").map((entry) => entry.trim());
-  assert.deepEqual(verifyLegs, ["22.23.5", "24.22.3", "26.13.1"], "three Verify legs at the exact patched floors");
-  const alphaMatrix = alpha.match(/node-version: \[([^\]]+)\]/);
-  assert.ok(alphaMatrix, "the alpha matrix must stay declared");
-  const alphaLegs = alphaMatrix![1].split(",").map((entry) => entry.trim());
-  assert.deepEqual(alphaLegs, ["22.23.5", "24.22.3"], "the matrix contributes exactly two native legs");
-  assert.equal(verifyLegs.length + 1 + 2 + alphaLegs.length, 8,
+  const verifyRows = matrixRows(blockOf(source, "verify", 2));
+  assert.deepEqual(verifyRows.map((row) => row.version), ["22.23.5", "24.22.3", "26.13.1"],
+    "three Verify legs at the exact patched floors");
+  const alphaRows = matrixRows(blockOf(alpha, "windows-acceptance", 2));
+  assert.deepEqual(alphaRows.map((row) => row.version), ["22.23.5", "24.22.3"],
+    "the matrix contributes exactly two native legs");
+  assert.equal(verifyRows.length + 1 + 2 + alphaRows.length, 8,
     "verify legs + full suite + two native Windows jobs + two native session-host legs = eight verification legs");
   const release = releaseJobBlock();
   for (const needed of ["verify", "full-tests", "windows-launcher", "windows-shell", SESSION_HOST_CALLER_JOB]) {
@@ -1108,9 +1219,9 @@ test("failed, skipped, cancelled, missing, and stale matrix outcomes keep public
 test("the six original CI check names stay stable and the new caller name is distinct", () => {
   const source = readWorkflow();
   const stableNames = [
-    "name: Verify (Node ${{ matrix.node-version }})",
+    "name: Verify (Node ${{ matrix.node-major }})",
     "name: Full suite (Node 24)",
-    "name: Windows launcher (Node 22.23.5)",
+    "name: Windows launcher (Node 22)",
     "name: Windows shell (Node 24)",
     "name: Publish numbered prerelease",
   ];
@@ -1119,6 +1230,8 @@ test("the six original CI check names stay stable and the new caller name is dis
   }
   const callerName = sessionHostCallerBlock().match(/^    name: (.+)$/m);
   assert.ok(callerName, "the caller job must carry an explicit stable name");
+  assert.equal(callerName![1], "Session host alpha matrix",
+    "the caller's stable name is the qualified-context prefix of the two matrix legs: Session host alpha matrix / Windows session host alpha (Node 22) and (Node 24)");
   assert.doesNotMatch(callerName![1], /Verify|Full suite|Windows launcher|Windows shell|Publish/,
     "the new caller's check name must not shadow an existing required-check name");
   // What the live contexts actually are (including the names the called matrix
@@ -1131,8 +1244,8 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
   assert.match(source, /^  windows-launcher:$/m, "the job id must stay stable for downstream callers");
   assert.match(job, /runs-on: windows-latest/,
     "the .cmd launcher and helper need a genuinely native Windows runner");
-  assert.match(job, /name: Windows launcher \(Node 22\.23\.5\)/,
-    "the native job name must name the exact patched floor version it exercises");
+  assert.match(job, /name: Windows launcher \(Node 22\)/,
+    "the native job name keeps the stable per-major label, so a Node 22 patch or minor floor bump never renames this required context");
   assert.match(job, /^          node-version: 22\.23\.5$/m, "the patched Node 22 security floor must be exercised natively");
   assert.doesNotMatch(withoutComments(job), /22\.19\.0/, "the native job must not keep selecting or naming the superseded Node 22 floor");
   assert.match(job, /PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"/,
@@ -1445,7 +1558,8 @@ test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
   assert.equal(rootLock.packages?.[""]?.engines?.node, pkg.engines?.node,
     "the lock's root package must mirror the engine floor exactly");
   const source = readWorkflow();
-  assert.match(source, /node-version: \[22\.23\.5, 24\.22\.3, 26\.13\.1\]/,
+  assert.deepEqual(matrixRows(blockOf(source, "verify", 2)).map((row) => row.version),
+    ["22.23.5", "24.22.3", "26.13.1"],
     "CI's matrix must exercise each engine line's exact floor, never an older Node");
   assert.doesNotMatch(withoutComments(source), /node-version: 24\.x|22\.19\.0/,
     "no CI selection or check name may keep a floating Node 24 line or the superseded Node 22 floor");

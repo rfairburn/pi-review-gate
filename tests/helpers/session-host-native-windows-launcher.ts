@@ -67,12 +67,14 @@ import {
   assertNoSavedSessionOverrides,
   assertNoUnownedNativeSessions,
   boundedJsonl,
+  closeExitedOwnedConptyReader,
   createNativeAgentRoot,
   createOwnedDirectory,
   createWindowsHarnessRoot,
   identityOfRealDirectory,
   isSessionShutdownFor,
   isWindowsMainOwnerFrame,
+  isWindowsOwnerDraftFrame,
   probeWindowsPowerShell,
   randomDigits,
   resolveInstalledPiRuntime,
@@ -107,6 +109,18 @@ export const LAUNCHER_OBSERVER_TIMEOUT_SECONDS = 180;
 export const LAUNCHER_OUTER_COLS = 120;
 export const LAUNCHER_OUTER_ROWS = 50;
 export const LAUNCHER_CLEANUP_BUDGET_MS = 20_000;
+// The original cleanup budget is divided once into reserved slices for the three
+// failure-cleanup steps: one short-lived graceful attempt, one bounded input-free
+// observation of the exact owned outer PTY's real public onExit after the
+// caller's exact-handle force, and the bounded settlement of the owned ConPTY
+// reader. They grant no new grace beyond the original per-leg and whole-file
+// caps, and one elapsed deadline (see `LauncherCleanupBudget`) charges every step
+// against the SAME window, so the whole sequence stays inside it.
+export const LAUNCHER_EXIT_OBSERVATION_BUDGET_MS = 5_000;
+export const LAUNCHER_READER_SETTLEMENT_BUDGET_MS = 3_000;
+export const LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS = LAUNCHER_CLEANUP_BUDGET_MS
+  - LAUNCHER_EXIT_OBSERVATION_BUDGET_MS
+  - LAUNCHER_READER_SETTLEMENT_BUDGET_MS;
 // The cancelled body aborts this far before the node:test timeout so the bounded
 // failure cleanup still completes inside the enforced per-leg deadline.
 export const LAUNCHER_BODY_DEADLINE_MS = LAUNCHER_LEG_DEADLINE_MS - LAUNCHER_CLEANUP_BUDGET_MS;
@@ -357,12 +371,105 @@ export class LegDeadline {
   }
 }
 
-/** Fixed metadata for a bounded frame-wait failure; terminal content is never included. */
+/**
+ * One absolute elapsed failure-cleanup deadline. Every cleanup step receives its
+ * reserved slice AND whatever this same deadline still allows, so the graceful
+ * attempt, the exact force-to-onExit observation, and the owned ConPTY reader
+ * settlement together can never exceed the original cleanup budget, and no step
+ * (including the reader settlement) can wait past the deadline.
+ */
+export class LauncherCleanupBudget {
+  private readonly deadlineAt: number;
+
+  constructor(budgetMs: number) {
+    this.deadlineAt = performance.now() + (Number.isSafeInteger(budgetMs) && budgetMs > 0 ? budgetMs : 0);
+  }
+
+  /** Remaining time for one step, never above that step's reserved slice. */
+  remaining(capMs: number): number {
+    const left = this.deadlineAt - performance.now();
+    return Math.max(0, Math.min(capMs, left));
+  }
+
+  get expired(): boolean {
+    return this.deadlineAt - performance.now() <= 0;
+  }
+}
+
+/** Bounded settlement outcome for one owned failure-cleanup resource. */
+export type LauncherSettlement = "closed" | "skipped" | "uncertain";
+
+/**
+ * Await one owned-resource settlement without ever waiting past the remaining
+ * cleanup budget. The observed-outer-exit guard is never relaxed: while the outer
+ * exit is unconfirmed the transport may still be live and the closer is never
+ * invoked. Any finite positive duration is accepted — the shared cleanup window
+ * reports fractional milliseconds, so a leftover below a step's cap is still real
+ * time and is waited on. A delayed, never-settling, or throwing settlement is
+ * reported as `uncertain` at the budget instead of hanging the failure hook or
+ * escaping as a new error, so the failed result stands unchanged while the
+ * uncertainty stays visible.
+ */
+export async function settleOwnedConptyReader(
+  exitObserved: boolean,
+  remainingMs: number,
+  close: () => Promise<void>,
+): Promise<LauncherSettlement> {
+  if (!exitObserved) return "skipped";
+  const settling = close().then(
+    () => "closed" as const,
+    () => "uncertain" as const,
+  );
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "uncertain";
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      settling,
+      new Promise<LauncherSettlement>((resolve) => { timer = setTimeout(() => resolve("uncertain"), remainingMs); }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Fixed metadata for a bounded frame-wait failure; terminal content is never
+ * included. The optional fields carry only already-journaled fixed evidence: the
+ * exact owned outer PTY's reported exit code/signal once its public onExit
+ * fired, and presence-only witnesses (plus that summary's fixed fields) from the
+ * journals the launcher preload already writes. An absent optional field means
+ * the evidence was unavailable, and it is reported as such rather than guessed.
+ */
 export interface FrameWaitMetadata {
   readonly frameRevision: number;
   readonly after: number;
   readonly exitObserved: boolean;
   readonly aborted: boolean;
+  readonly outerExitCode?: number | null;
+  readonly outerExitSignal?: number | string | null;
+  readonly launcherEntry?: boolean;
+  readonly ptyModule?: boolean;
+  readonly launcherSummary?: boolean;
+  readonly summaryExitCode?: number | null;
+  readonly summaryForceAttempted?: boolean | null;
+  readonly summaryJournalFailed?: boolean | null;
+  readonly summaryUnresolvedSpawns?: number | null;
+  readonly summaryUnexitedSpawns?: number | null;
+}
+
+/** Mutable builder shape for one bounded frame-wait evidence record. */
+type MutableFrameWaitEvidence = { -readonly [K in keyof FrameWaitMetadata]: FrameWaitMetadata[K] };
+
+function diagnosticYesNo(value: boolean | undefined): string {
+  return value === undefined ? "uncertain" : value ? "yes" : "no";
+}
+
+function diagnosticNumber(value: number | string | null | undefined): string {
+  return typeof value === "number" ? String(value) : typeof value === "string" && value.length > 0 ? value : "unreported";
+}
+
+function diagnosticFlag(value: boolean | null | undefined): string {
+  return value === undefined ? "uncertain" : value === null ? "unreported" : value ? "yes" : "no";
 }
 
 /**
@@ -374,7 +481,46 @@ export function frameWaitFailure(stage: string, metadata: FrameWaitMetadata, ter
   // `terminalContent` is accepted only so a caller cannot accidentally route it
   // into the message; it is deliberately never read.
   void terminalContent;
-  return new Error(`${stage}: bounded frame wait failed (revision=${metadata.frameRevision}, after=${metadata.after}, exit=${metadata.exitObserved}, aborted=${metadata.aborted})`);
+  const parts = [
+    `revision=${metadata.frameRevision}`,
+    `after=${metadata.after}`,
+    `exit=${metadata.exitObserved}`,
+    `aborted=${metadata.aborted}`,
+  ];
+  if (metadata.exitObserved) {
+    parts.push(`outerExitCode=${diagnosticNumber(metadata.outerExitCode)}`);
+    parts.push(`outerExitSignal=${diagnosticNumber(metadata.outerExitSignal)}`);
+  }
+  if (metadata.launcherEntry !== undefined) parts.push(`entry=${diagnosticYesNo(metadata.launcherEntry)}`);
+  if (metadata.ptyModule !== undefined) parts.push(`module=${diagnosticYesNo(metadata.ptyModule)}`);
+  if (metadata.launcherSummary !== undefined) {
+    parts.push(`summary=${diagnosticYesNo(metadata.launcherSummary)}`);
+    if (metadata.launcherSummary) {
+      parts.push(`summaryExitCode=${diagnosticNumber(metadata.summaryExitCode)}`);
+      parts.push(`summaryForce=${diagnosticFlag(metadata.summaryForceAttempted)}`);
+      parts.push(`summaryJournalFailed=${diagnosticFlag(metadata.summaryJournalFailed)}`);
+      parts.push(`summaryUnresolved=${diagnosticNumber(metadata.summaryUnresolvedSpawns)}`);
+      parts.push(`summaryUnexited=${diagnosticNumber(metadata.summaryUnexitedSpawns)}`);
+    }
+  }
+  return new Error(`${stage}: bounded frame wait failed (${parts.join(", ")})`);
+}
+
+/**
+ * The launcher lane's shared strict owner-and-pane witness for an explicit
+ * activation or a typed draft: the exact owner header, that owner's single
+ * highlight, the complete Main-focused roster footer, and the width-correct
+ * bordered native editor whose content row is EXACTLY `expectedDraft` — or, for
+ * the first activation before any draft exists, the width-correct bordered
+ * EMPTY editor. The outer header repaints before the native pane, so a header
+ * alone is never accepted: a freshly moved header over the previous owner's
+ * draft, over an empty or mid-repaint pane, or beside an appended, altered,
+ * partial, or wrong-width editor never satisfies it.
+ */
+export function launcherOwnerDraftFrame(text: string, ownerLabel: string, expectedDraft: string): boolean {
+  return expectedDraft.length === 0
+    ? isWindowsMainOwnerFrame(text, ownerLabel)
+    : isWindowsOwnerDraftFrame(text, ownerLabel, expectedDraft);
 }
 
 function launcherNodeOptions(preloadPath: string, original: string | undefined): string {
@@ -522,6 +668,13 @@ export class LauncherPtyDriver {
   private readonly exitSubscription: { dispose(): void };
   private readonly initialModes: ReturnType<TerminalSurface["inputModes"]>;
   private forced = false;
+  /**
+   * The one elapsed failure-cleanup deadline. Every cleanup step (graceful
+   * attempt, exact outer-exit observation, owned ConPTY reader settlement) is
+   * charged against this SAME window and against its own reserved slice, so the
+   * whole sequence stays inside the original cleanup budget.
+   */
+  private cleanupBudget?: LauncherCleanupBudget;
 
   private constructor(options: {
     pty: NativePtyHandle;
@@ -747,13 +900,49 @@ export class LauncherPtyDriver {
       // Fixed stage identifier and status metadata only: terminal content,
       // drafts, and preserved-preload output never reach diagnostics.
       if (error instanceof Error && /leg deadline|cancelled before completion/.test(error.message)) throw error;
-      throw frameWaitFailure(stage, {
-        frameRevision: this.frameRevision,
-        after,
-        exitObserved: this.exitEvent !== undefined,
-        aborted: signal.aborted,
-      });
+      throw frameWaitFailure(stage, this.waitFailureEvidence(after, signal));
     });
+  }
+
+  /**
+   * Bounded, transcript-free evidence for one frame-wait failure: the fixed
+   * revision/after/abort status, the exact owned outer PTY's reported exit
+   * code/signal once its public onExit fired, and presence-only witnesses from
+   * the journals the launcher preload already writes (the actual launcher entry,
+   * the staged production module anchor, the launcher exit summary) with that
+   * summary's fixed fields. A journal that cannot be read leaves those witnesses
+   * unreported rather than claiming they are absent; no frame text, draft,
+   * argument, environment value, or path is ever included.
+   */
+  private waitFailureEvidence(after: number, signal: AbortSignal): FrameWaitMetadata {
+    const evidence: MutableFrameWaitEvidence = {
+      frameRevision: this.frameRevision,
+      after,
+      exitObserved: this.exitEvent !== undefined,
+      aborted: signal.aborted,
+    };
+    if (this.exitEvent) {
+      evidence.outerExitCode = this.exitEvent.exitCode;
+      evidence.outerExitSignal = this.exitEvent.signal ?? 0;
+    }
+    let records: PtyJournalRecord[];
+    try {
+      records = this.ptyRecords();
+    } catch {
+      return evidence;
+    }
+    evidence.launcherEntry = records.some((record) => record.type === "launcher_entry");
+    evidence.ptyModule = records.some((record) => record.type === "pty_module");
+    const summary = records.filter((record) => record.type === "launcher_summary").at(-1);
+    evidence.launcherSummary = summary !== undefined;
+    if (summary !== undefined) {
+      evidence.summaryExitCode = typeof summary.exitCode === "number" ? summary.exitCode : null;
+      evidence.summaryForceAttempted = typeof summary.forceAttempted === "boolean" ? summary.forceAttempted : null;
+      evidence.summaryJournalFailed = typeof summary.journalFailed === "boolean" ? summary.journalFailed : null;
+      evidence.summaryUnresolvedSpawns = typeof summary.unresolvedSpawns === "number" ? summary.unresolvedSpawns : null;
+      evidence.summaryUnexitedSpawns = typeof summary.unexitedSpawns === "number" ? summary.unexitedSpawns : null;
+    }
+    return evidence;
   }
 
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, stage: string, timeoutMs = LAUNCHER_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {
@@ -958,20 +1147,36 @@ export class LauncherPtyDriver {
     this.focus = "sidebar";
   }
 
-  async activate(label: string): Promise<void> {
+  /**
+   * Explicitly activate one native row and admit only the complete fresh witness
+   * that this exact child owns Main input together with its own native pane: the
+   * owner header, that owner's single highlight, the complete Main-focused roster
+   * footer, and the width-correct bordered native editor whose content row is
+   * exactly `expectedDraft` — or, for the first activation before any draft is
+   * typed, the width-correct bordered EMPTY editor. The header repaints before
+   * the native pane, so a header-only observation is never activation evidence.
+   */
+  async activate(label: string, expectedDraft: string): Promise<void> {
     await this.ensureSidebarFocus();
     await this.moveRosterTo(label);
     const before = this.frameRevision;
     this.write(WINDOWS_KEYS.enter, "activate native row");
     this.focus = "main";
-    await this.waitFrame((frame) => frameHeaderMatches(frame, label),
-      "public Enter explicitly activates the selected native row", before);
+    await this.waitFrame((frame) => launcherOwnerDraftFrame(frame, label, expectedDraft),
+      `public Enter explicitly activates native row ${label} with its own complete owner frame`, before);
   }
 
-  async writeDraft(value: string): Promise<void> {
+  /**
+   * Type into the active native child and admit only the complete fresh witness
+   * that THIS owner's bordered native editor now shows exactly this draft. An
+   * unrelated substring elsewhere in the composed frame is never draft evidence.
+   */
+  async writeDraft(ownerLabel: string, value: string): Promise<void> {
+    assert.ok(ownerLabel.length > 0 && value.length > 0, "the draft witness requires the exact owner caption and a non-empty draft");
     const before = this.frameRevision;
     this.write(value, "type native draft");
-    await this.waitFrame((frame) => frame.includes(value), "native session displays its own draft", before);
+    await this.waitFrame((frame) => launcherOwnerDraftFrame(frame, ownerLabel, value),
+      `native session ${ownerLabel} displays its own exact bordered draft in a complete owner frame`, before);
   }
 
   async assertBeforeQuitModes(): Promise<void> {
@@ -1026,18 +1231,36 @@ export class LauncherPtyDriver {
   }
 
   /**
+   * Start the single elapsed failure-cleanup deadline (idempotent). The caller
+   * invokes this once at the top of its bounded failure cleanup so that the
+   * graceful attempt, the exact force-to-onExit observation, and the owned ConPTY
+   * reader settlement all share one window instead of each getting a fresh budget.
+   */
+  beginFailureCleanup(): void {
+    this.cleanupBudget ??= new LauncherCleanupBudget(LAUNCHER_CLEANUP_BUDGET_MS);
+  }
+
+  /** Remaining cleanup time for one step, never above that step's reserved slice. */
+  private cleanupRemaining(capMs: number): number {
+    this.beginFailureCleanup();
+    return this.cleanupBudget!.remaining(capMs);
+  }
+
+  /**
    * Bounded failure cleanup only: a short-lived cleanup deadline replaces the
    * (possibly already exhausted) leg deadline for one best-effort graceful
-   * attempt, then the caller forces the exact owned outer handle. No wait here
-   * can exceed the cleanup budget, and no input is sent after the budget.
+   * attempt, then the caller forces the exact owned outer handle. That attempt is
+   * capped by its reserved slice AND by the one elapsed cleanup deadline, so no
+   * wait here can exceed the original cleanup budget, and no input is sent after
+   * the budget.
    */
-  async tryGracefulQuitAfterFailure(budgetMs = LAUNCHER_CLEANUP_BUDGET_MS): Promise<void> {
+  async tryGracefulQuitAfterFailure(): Promise<void> {
     if (this.exitEvent) return;
     // If the leg deadline already fired, send no further input at all: cleanup
     // goes straight to the caller's exact-handle force.
     if (this.deadline.signal.aborted) return;
     const previous = this.deadline;
-    const cleanup = new LegDeadline(budgetMs);
+    const cleanup = new LegDeadline(this.cleanupRemaining(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS));
     this.deadline = cleanup;
     try {
       if (this.currentText().trim().length === 0) return;
@@ -1064,13 +1287,47 @@ export class LauncherPtyDriver {
     this.pty.kill(); // Exact public outer PTY handle, no signal argument.
   }
 
-  async settleSubscriptions(): Promise<void> {
+  /**
+   * One bounded, input-free observation of the exact owned outer PTY's real
+   * public onExit after the caller's exact-handle force. It runs on a finite
+   * timer inside the reserved slice of the one elapsed cleanup deadline: the
+   * often already exhausted leg deadline never gates it, and it never sends
+   * further input. Returns false while the actual exit remains unobserved, so the
+   * caller retains and reports the witness tree instead of declaring cleanup
+   * success and the owned ConPTY reader is never closed over a possibly-live
+   * transport.
+   */
+  async observeOuterExitAfterForce(): Promise<boolean> {
+    if (this.exitEvent) return true;
+    const budgetMs = this.cleanupRemaining(LAUNCHER_EXIT_OBSERVATION_BUDGET_MS);
+    if (budgetMs <= 0) return false;
+    try {
+      await this.exitSignal.waitFor(() => this.exitEvent !== undefined, budgetMs, "forced outer public PTY exit");
+    } catch {
+      // An unobserved exit is reported by the caller; the failed case stays failed.
+    }
+    return this.exitEvent !== undefined;
+  }
+
+  /**
+   * Settle every owned parent resource. The owned ConPTY reader is closed only
+   * behind a positively observed outer exit (the guard is never relaxed) and only
+   * under the remaining cleanup budget, so a delayed or never-settling reader
+   * cleanup can never hold the failure hook past the deadline: it is reported as
+   * `uncertain` and the leg's own failed result stands unchanged.
+   */
+  async settleSubscriptions(): Promise<LauncherSettlement> {
     try { this.dataSubscription.dispose(); } catch { /* exact outer PTY data subscription */ }
     try { this.exitSubscription.dispose(); } catch { /* exact outer PTY exit subscription */ }
     try { this.surface.dispose(); } catch { /* owned terminal model */ }
     try { this.logWatcher.close(); } catch { /* task-owned root watch */ }
     try { this.nativeWatcher.close(); } catch { /* task-owned journal watch */ }
     try { this.providerWatcher.close(); } catch { /* task-owned provider fixture watch */ }
+    return settleOwnedConptyReader(
+      this.exitEvent !== undefined,
+      this.cleanupRemaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS),
+      () => closeExitedOwnedConptyReader(this.pty),
+    );
   }
 
   get forcedCleanup(): boolean {
@@ -1089,6 +1346,11 @@ export function assertLegArithmetic(): void {
     "the cancelled body aborts early enough for bounded cleanup inside the leg deadline");
   assert.ok(LAUNCHER_LEG_DEADLINE_MS * LAUNCHER_LEGS.length <= LAUNCHER_TEST_TIMEOUT_MS,
     "all legs together fit the whole-file 20-minute budget");
+  assert.ok(LAUNCHER_EXIT_OBSERVATION_BUDGET_MS > 0
+      && LAUNCHER_READER_SETTLEMENT_BUDGET_MS > 0
+      && LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS > 0
+      && LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS + LAUNCHER_EXIT_OBSERVATION_BUDGET_MS + LAUNCHER_READER_SETTLEMENT_BUDGET_MS === LAUNCHER_CLEANUP_BUDGET_MS,
+    "failure cleanup reserves its exact outer-exit observation and bounded reader settlement inside the original cleanup budget, never beyond it");
   assert.ok(LAUNCHER_EVENT_TIMEOUT_MS < LAUNCHER_OBSERVER_TIMEOUT_SECONDS * 1000,
     "event waits are bounded below the exact-process observer timeout");
   assert.equal(LAUNCHER_OUTER_COLS, 120);

@@ -12,12 +12,17 @@ import {
   LAUNCHER_BODY_DEADLINE_MS,
   LAUNCHER_EVENT_TIMEOUT_MS,
   LAUNCHER_EXPECT_PI_VERSION,
+  LAUNCHER_EXIT_OBSERVATION_BUDGET_MS,
+  LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS,
   LAUNCHER_LEG_DEADLINE_MS,
   LAUNCHER_LEGS,
   LAUNCHER_OUTER_COLS,
   LAUNCHER_OUTER_ROWS,
+  LAUNCHER_READER_SETTLEMENT_BUDGET_MS,
   LAUNCHER_REQUIRE_ENV,
   LAUNCHER_STARTUP_TIMEOUT_MS,
+  LAUNCHER_TEST_TIMEOUT_MS,
+  LauncherCleanupBudget,
   LauncherPtyDriver,
   LegDeadline,
   WindowsOwnedExitObserver,
@@ -34,10 +39,12 @@ import {
   frameWaitFailure,
   identityOfRealDirectory,
   isSessionShutdownFor,
+  launcherOwnerDraftFrame,
   probeWindowsPowerShell,
   randomDigits,
   resolveLauncherRuntime,
   sameFileIdentity,
+  settleOwnedConptyReader,
   type NativeJournalRecord,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-launcher";
@@ -93,26 +100,48 @@ for (const leg of LAUNCHER_LEGS) {
     let completed = false;
 
     t.after(async () => {
+      // One elapsed cleanup window covers every failure step below: the graceful
+      // attempt, the exact force-to-onExit observation, and the owned ConPTY
+      // reader settlement. Each is capped by its reserved slice AND by what this
+      // window still allows, so the whole sequence stays inside the ORIGINAL
+      // cleanup budget, and no step — including the reader settlement — can wait
+      // indefinitely.
+      driver.beginFailureCleanup();
       try {
         if (!completed) {
-          // Bounded cleanup only: a short-lived cleanup deadline plus exact-handle
-          // force, never unbounded graceful waits or post-cancellation input.
-          await driver.tryGracefulQuitAfterFailure(LAUNCHER_CLEANUP_BUDGET_MS);
+          // Bounded cleanup only: one short-lived graceful attempt, then the
+          // exact-handle force, then one finite input-free observation of the exact
+          // owned outer PTY's real public onExit. Never an unbounded graceful wait,
+          // never input after the budget, and never a reader close over an
+          // unconfirmed transport.
+          await driver.tryGracefulQuitAfterFailure();
           if (!driver.exitEvent) driver.forceKillOuterAfterFailure();
+          const outerExitObserved = await driver.observeOuterExitAfterForce();
           for (const observer of observers) {
             observer.dispose();
             // Bound failure cleanup: release the exact owned test helper child
             // rather than waiting for its independent observer timeout.
             try { observer.child.kill(); } catch { /* already exited */ }
           }
+          if (!outerExitObserved) {
+            // The actual outer exit is never assumed: the owned ConPTY reader is
+            // left untouched and the retained witness tree reports the uncertainty.
+            process.stderr.write("unconfirmed Windows source-launcher outer exit: reader left open, evidence retained\n");
+          }
           process.stderr.write(`preserved failed Windows source-launcher witness tree: ${layout.root}\n`);
         } else {
           for (const observer of observers) observer.dispose();
         }
       } finally {
-        // Subscriptions always settle, even on a cancelled or failed leg.
-        await driver.settleSubscriptions();
+        // Subscriptions always settle, even on a cancelled or failed leg. The owned
+        // ConPTY reader closes only behind a positively observed outer exit, and
+        // only within what the same cleanup window still allows.
+        const readerSettlement = await driver.settleSubscriptions();
         deadline.dispose();
+        if (readerSettlement !== "closed") {
+          // Cleanup uncertainty is reported; it never rewrites the leg's own result.
+          process.stderr.write(`uncertain Windows source-launcher ConPTY reader settlement (${readerSettlement}): evidence retained, result unchanged\n`);
+        }
       }
     });
 
@@ -144,22 +173,27 @@ for (const leg of LAUNCHER_LEGS) {
     const sessionA = await driver.createNativeSession(layout.workspaceA, labelA);
     assert.equal(frameHeaderMatches(driver.currentText(), labelA), true,
       "the completed New activated A as the Main input owner, and the active-owner rename moved the header to A's new caption");
-    await driver.activate(labelA);
-    await driver.writeDraft(draftA);
+    // The first activation has no draft yet, so the shared witness requires the
+    // complete fresh owner frame with the width-correct bordered EMPTY editor.
+    await driver.activate(labelA, "");
+    await driver.writeDraft(labelA, draftA);
 
     const sessionB = await driver.createNativeSession(layout.workspaceB, labelB);
     assert.notEqual(frameHeader(driver.currentText()), labelA,
       "the second completed New transfers Main input ownership from A to B instead of leaving A's stale active header");
     assert.equal(frameHeaderMatches(driver.currentText(), labelB), true,
       "B's own freshly observed canonical caption is the active outer header after the ownership transition");
-    await driver.activate(labelB);
-    await driver.writeDraft(draftB);
+    await driver.activate(labelB, "");
+    await driver.writeDraft(labelB, draftB);
     assert.ok(driver.currentText().includes(draftB));
     assert.equal(driver.currentText().includes(draftA), false, "B does not inherit A's independent native input draft");
-    await driver.activate(labelA);
+    // Each switch back is admitted only by that child's own complete fresh owner
+    // frame carrying exactly its bordered draft, so a header that moved before the
+    // native pane repainted can never satisfy it.
+    await driver.activate(labelA, draftA);
     assert.ok(driver.currentText().includes(draftA), "A retains its own native input draft after switching back");
     assert.equal(driver.currentText().includes(draftB), false);
-    await driver.activate(labelB);
+    await driver.activate(labelB, draftB);
     assert.ok(driver.currentText().includes(draftB), "B's independent draft survives returning from A");
     assert.equal(driver.currentText().includes(draftA), false);
 
@@ -355,6 +389,222 @@ test("launcher New ownership witness rejects the welcome header, a stale footer,
     "a partial native border that never drew its closing rule never proves ownership");
   assert.equal(isWindowsMainOwnerFrame(compose("A-stale-owner", mainFocused, emptyEditor), owner), false,
     "a header that never followed the active-owner rename never proves the renamed child owns Main");
+});
+
+// Focused negative controls for the corrected launcher activation and draft
+// waits. The outer header repaints before the native pane, so the lane admits
+// only the complete fresh owner frame with exactly that child's bordered editor:
+// a freshly moved header over the previous owner's draft, over an empty or
+// mid-repaint pane, or beside an appended, altered, partial, or wrong-width
+// editor is refused, and so is a stale sidebar-focused footer.
+test("launcher owner draft witness rejects a fresh header over a stale native pane and altered drafts", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const owner = "(no messages)";
+  const draft = "launcherDraftA";
+  const otherDraft = "launcherDraftB";
+  controller.updateItems([{
+    id: "launcher-owner-draft", label: owner, workspace: "/owned/windows-launcher-draft", agentDir: "/owned/agent",
+    lifecycle: "alive", hasLiveProcess: true, busy: false, pendingInput: false, inputSurface: false,
+    backgroundTasks: 0, backgroundShells: 0, activity: [],
+  }]);
+  controller.select("launcher-owner-draft");
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  controller.handleInput("\r");
+  const mainFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  const rule = "\u2500".repeat(WINDOWS_NATIVE_COLS);
+  const nativeRows = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: LAUNCHER_OUTER_ROWS - 1 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (header: string, sidebar: readonly string[], main: readonly string[]): string =>
+    [header, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}\u2502${main[index] ?? ""}`)].join("\n");
+  const exactDraftPane = nativeRows(rule, `> ${draft}`, rule);
+  const ownerFrame = compose(owner, mainFocused, exactDraftPane);
+  assert.equal(launcherOwnerDraftFrame(ownerFrame, owner, draft), true,
+    "the observed owner header, single highlight, complete Main-focused roster, and width-correct bordered editor holding exactly this draft are a genuine activation witness");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> ${otherDraft}`, rule)), owner, draft), false,
+    "a freshly moved header over the native pane's previous draft never proves the switched-to child owns Main with its own draft");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", rule)), owner, draft), false,
+    "a freshly moved header over a still-empty native editor never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", "")), owner, draft), false,
+    "a freshly moved header over a mid-repaint partial native border never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> ${draft}qQ`, rule)), owner, draft), false,
+    "an appended draft is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, `> x-${draft}`, rule)), owner, draft), false,
+    "an altered draft is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows("\u2500".repeat(52), `> ${draft}`, "\u2500".repeat(52))), owner, draft), false,
+    "a wrong-width native border never proves the draft repainted");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, sidebarFocused, exactDraftPane), owner, draft), false,
+    "a stale sidebar-focused footer never proves Main input ownership for the draft witness");
+  assert.equal(launcherOwnerDraftFrame(`${owner}\n${exactDraftPane.join("\n")}`, owner, draft), false,
+    "a draft without the complete owner roster is rejected");
+  assert.equal(launcherOwnerDraftFrame(compose("A-stale-owner", mainFocused, exactDraftPane), owner, draft), false,
+    "a header that never followed the switched-to child never proves that child owns Main");
+
+  // The first activation of a freshly created child has no draft yet, so the
+  // same shared witness requires the width-correct bordered EMPTY editor under
+  // the complete owner surface, and refuses a pane that already carries text.
+  assert.equal(launcherOwnerDraftFrame(compose(owner, mainFocused, nativeRows(rule, "> ", rule)), owner, ""), true,
+    "the complete owner frame with a width-correct bordered empty native editor proves a first activation");
+  assert.equal(launcherOwnerDraftFrame(ownerFrame, owner, ""), false,
+    "an expected first activation is never satisfied by a pane that already holds a draft");
+  assert.equal(launcherOwnerDraftFrame(compose(owner, sidebarFocused, nativeRows(rule, "> ", rule)), owner, ""), false,
+    "a stale sidebar-focused footer never proves a first activation");
+});
+
+// Bounded, transcript-free launcher frame-wait diagnostics: the outer exit the
+// exact owned handle reported, plus presence-only witnesses and the fixed fields
+// of a summary the preload already journaled. Terminal content, drafts, paths,
+// arguments, and environment values never reach the message.
+test("launcher frame-wait diagnostics carry bounded exit and journal evidence, never terminal content", () => {
+  const sensitive = "PRIVATE-LAUNCHER-session-host-secret";
+  const error = frameWaitFailure("welcome frame", {
+    frameRevision: 8,
+    after: -1,
+    exitObserved: true,
+    aborted: false,
+    outerExitCode: 1,
+    outerExitSignal: 0,
+    launcherEntry: false,
+    ptyModule: false,
+    launcherSummary: true,
+    summaryExitCode: 1,
+    summaryForceAttempted: false,
+    summaryJournalFailed: false,
+    summaryUnresolvedSpawns: 0,
+    summaryUnexitedSpawns: 1,
+  }, sensitive);
+  assert.match(error.message, /welcome frame/);
+  assert.match(error.message, /revision=8/);
+  assert.match(error.message, /exit=true/);
+  assert.match(error.message, /outerExitCode=1/);
+  assert.match(error.message, /outerExitSignal=0/);
+  assert.match(error.message, /entry=no/, "a missing launcher-entry record is explicit evidence, not a guess");
+  assert.match(error.message, /module=no/);
+  assert.match(error.message, /summary=yes/);
+  assert.match(error.message, /summaryForce=no/);
+  assert.match(error.message, /summaryUnexited=1/);
+  assert.doesNotMatch(error.message, new RegExp(sensitive), "terminal content must never reach the diagnostic");
+  assert.doesNotMatch(error.message, /SESSION_HOST_LAUNCHER|--require|preload|draft|C:\\|\//i);
+
+  // An unreadable journal leaves those witnesses out entirely instead of
+  // reporting them as absent, and no exit fields appear before an actual exit.
+  const minimal = frameWaitFailure("welcome frame", {
+    frameRevision: 3,
+    after: -1,
+    exitObserved: false,
+    aborted: true,
+  }, sensitive);
+  assert.match(minimal.message, /revision=3/);
+  assert.match(minimal.message, /exit=false/);
+  assert.doesNotMatch(minimal.message, /outerExitCode=|entry=|module=|summary=/);
+  assert.doesNotMatch(minimal.message, new RegExp(sensitive));
+});
+
+test("launcher failure cleanup reserves every step inside the original budget", () => {
+  assert.equal(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS + LAUNCHER_EXIT_OBSERVATION_BUDGET_MS + LAUNCHER_READER_SETTLEMENT_BUDGET_MS, LAUNCHER_CLEANUP_BUDGET_MS,
+    "the exit observation and the reader settlement are reserved from the SAME cleanup budget: no new grace beyond the leg and file caps");
+  assert.ok(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS > 0 && LAUNCHER_EXIT_OBSERVATION_BUDGET_MS > 0 && LAUNCHER_READER_SETTLEMENT_BUDGET_MS > 0,
+    "every failure-cleanup slice stays finite");
+  assert.ok(LAUNCHER_LEG_DEADLINE_MS + LAUNCHER_CLEANUP_BUDGET_MS <= LAUNCHER_TEST_TIMEOUT_MS,
+    "the original per-leg plus cleanup budget still fits the unchanged whole-file budget");
+});
+
+test("launcher failure cleanup charges every step against one elapsed deadline", async () => {
+  // The real window is larger than every reserved slice, so a fresh window grants
+  // each step its whole slice and never more than the whole budget.
+  const full = new LauncherCleanupBudget(LAUNCHER_CLEANUP_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS), LAUNCHER_GRACEFUL_CLEANUP_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_EXIT_OBSERVATION_BUDGET_MS), LAUNCHER_EXIT_OBSERVATION_BUDGET_MS);
+  assert.equal(full.remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS), LAUNCHER_READER_SETTLEMENT_BUDGET_MS);
+  assert.ok(full.remaining(LAUNCHER_CLEANUP_BUDGET_MS * 10) <= LAUNCHER_CLEANUP_BUDGET_MS,
+    "no step is ever granted more than the whole cleanup budget");
+
+  // A short window proves that the SAME deadline charges elapsed time to every
+  // later step and then grants nothing further to any of them.
+  const short = new LauncherCleanupBudget(60);
+  assert.ok(short.remaining(10_000) <= 60 && short.remaining(10_000) > 0,
+    "a step is capped by the window as well as by its own slice");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const mid = short.remaining(10_000);
+  assert.ok(mid < 60 && mid > 0, `elapsed time is charged to the same window (${Math.round(mid)}ms left)`);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(short.expired, "the window expires on its absolute deadline");
+  assert.equal(short.remaining(10_000), 0,
+    "an expired window grants no further time to any step, including the reader settlement");
+  assert.equal(short.remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS), 0);
+});
+
+test("launcher ConPTY reader settlement is bounded and keeps the observed-outer-exit guard", async () => {
+  let closeInvocations = 0;
+  const recordClose = async (): Promise<void> => {
+    closeInvocations += 1;
+  };
+  assert.equal(await settleOwnedConptyReader(false, 1_000, recordClose), "skipped",
+    "an unconfirmed outer exit never touches the owned reader");
+  assert.equal(closeInvocations, 0, "the observed-outer-exit guard is never relaxed");
+
+  assert.equal(await settleOwnedConptyReader(true, 1_000, recordClose), "closed");
+  assert.equal(closeInvocations, 1, "a prompt settlement is reported as closed");
+
+  // The shared cleanup window reports fractional milliseconds, so a leftover below
+  // a step's cap is still real time and must be observed, never abandoned.
+  assert.equal(await settleOwnedConptyReader(true, 1_000.5, async () => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }), "closed", "fractional remaining milliseconds still allow reader settlement");
+
+  // A fractional budget is actually waited on instead of returning uncertain at
+  // once because the duration is not an integer.
+  let startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20.5, () => new Promise<void>(() => { /* never settles */ })), "uncertain",
+    "a fractional budget with a never-settling cleanup is reported uncertain only after waiting");
+  let waited = performance.now() - startedAt;
+  assert.ok(waited >= 15 && waited < 2_000, `a fractional budget is waited on (${Math.round(waited)}ms)`);
+
+  // A non-finite duration is no time available at all.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, Number.POSITIVE_INFINITY, () => new Promise<void>(() => { /* never settles */ })), "uncertain");
+  assert.ok(performance.now() - startedAt < 200, "a non-finite remaining budget never waits");
+
+  // Integration shape: the exact kind of value the shared window hands to a step
+  // is a finite (usually fractional) leftover duration, and that value must still
+  // be observed rather than abandoned.
+  const leftover = new LauncherCleanupBudget(1_000).remaining(LAUNCHER_READER_SETTLEMENT_BUDGET_MS);
+  assert.ok(Number.isFinite(leftover) && leftover > 0 && leftover <= LAUNCHER_READER_SETTLEMENT_BUDGET_MS,
+    "the shared window hands a step a finite positive leftover duration");
+  assert.equal(await settleOwnedConptyReader(true, leftover, recordClose), "closed",
+    "a settlement given the shared window's leftover duration is still observed");
+
+  // A never-settling cleanup returns at its own budget instead of holding the
+  // failure hook open indefinitely.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20, () => new Promise<void>(() => { /* never settles */ })), "uncertain",
+    "a never-settling reader cleanup is reported uncertain at its budget");
+  waited = performance.now() - startedAt;
+  assert.ok(waited >= 15 && waited < 2_000, `the bounded settlement returned at its own budget (${Math.round(waited)}ms)`);
+
+  // A delayed-but-eventual settlement is bounded the same way, and its later
+  // resolution never rewrites the reported outcome or escapes as an error.
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 20, () => pending), "uncertain",
+    "a delayed reader cleanup is reported uncertain at its budget");
+  waited = performance.now() - startedAt;
+  assert.ok(waited < 2_000, `a delayed settlement is not waited on past its budget (${Math.round(waited)}ms)`);
+  release();
+
+  // A throwing settlement is reported, never rethrown as a new failure.
+  assert.equal(await settleOwnedConptyReader(true, 1_000, () => Promise.reject(new Error("not the pinned ConPTY-DLL shape"))), "uncertain",
+    "a failing settlement is reported as uncertain instead of escaping as a new error");
+
+  // An exhausted cleanup window grants no wait at all.
+  startedAt = performance.now();
+  assert.equal(await settleOwnedConptyReader(true, 0, () => new Promise<void>(() => { /* never settles */ })), "uncertain");
+  assert.ok(performance.now() - startedAt < 200, "an exhausted cleanup window never waits");
 });
 
 // Pure synthetic contracts that run everywhere: restoration witnesses, the

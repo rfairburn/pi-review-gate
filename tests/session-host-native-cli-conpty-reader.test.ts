@@ -17,7 +17,9 @@
  * `tests/session-host-conpty-reader-settlement.test.ts`, these cases run the
  * PRODUCTION default PTY factory and the PRODUCTION instance manager against a
  * SYNTHETIC handle shaped like the pinned ConPTY-DLL agent, with a real
- * `node:worker_threads` Worker as the owned reader, under a platform override.
+ * `node:worker_threads` Worker as the owned reader, under a platform override,
+ * and with that manager's native agent registry pinned to a synthetic Pi agent
+ * directory the fixture owns and removes — never an ambient `~/.pi/agent`.
  * They load no native addon, spawn no Windows process, and prove nothing about a
  * real ConPTY; the real Windows proof is
  * `tests/session-host-native-cli-windows-pty.test.ts`, which runs the same
@@ -235,6 +237,14 @@ function makeNativeHarness(
   const workspace = join(root, "workspace");
   mkdirSync(workspace, { recursive: true });
   const pkg = makePackageFixture(root);
+  // With no injected preparer the manager builds the production native agent
+  // registry, which resolves the canonical Pi agent directory AT CONSTRUCTION.
+  // Point it at a directory this fixture owns inside its own temp root, so a
+  // control neither reads nor creates an ambient `~/.pi/agent`: on a host with
+  // no Pi home at all the construction below would fail closed for the wrong
+  // reason, and here it always resolves inside `root` and is removed with it.
+  const agentDir = join(root, "native-agent");
+  mkdirSync(agentDir, { recursive: true });
   const spawned: SyntheticNativePty[] = [];
   const spawnCalls: NativeHarness["spawnCalls"] = [];
   instanceTestSeam.setNodePtyLoaderForTests(() => ({
@@ -280,7 +290,7 @@ function makeNativeHarness(
     statusRegistrar: registrar,
     nativeCliLaunch,
     args: [],
-    env: { PATH: "/usr/bin" },
+    env: { PATH: "/usr/bin", PI_CODING_AGENT_DIR: agentDir },
   });
   return { root, workspace: realpathSync(workspace), manager, registrar, spawned, spawnCalls };
 }
@@ -302,16 +312,35 @@ async function createNativeRow(harness: NativeHarness, backend: "claude" | "code
   return await harness.manager.create({ workspace: harness.workspace, backend });
 }
 
-function cleanup(fixture: OwnedReaderFixture, harness: NativeHarness): void {
+/**
+ * Release everything one control owns, in the order that can never strand the
+ * test host: the loader seam first (a harness that threw mid-construction may
+ * already have registered one), then the owned reader Worker — AWAITED, because
+ * a live Worker is exactly what keeps a finished test file's process alive —
+ * then the fixture tree. Both resources are optional because every control
+ * reaches this before either one exists; a teardown that fails or never returns
+ * is reported through the control, never swallowed into a false pass.
+ */
+async function cleanup(
+  fixture: OwnedReaderFixture | undefined,
+  harness: NativeHarness | undefined,
+): Promise<void> {
   instanceTestSeam.setNodePtyLoaderForTests(undefined);
-  void fixture.worker.terminate().catch(() => undefined);
-  rmSync(harness.root, { recursive: true, force: true });
+  if (fixture !== undefined) await fixture.worker.terminate();
+  if (harness !== undefined) rmSync(harness.root, { recursive: true, force: true });
 }
 
 test("a native CLI row's batch command line and public spawn arguments reach the pinned spawn unchanged, and its exact reader is captured", async () => {
-  const fixture = makeOwnedReaderFixture();
-  const harness = makeNativeHarness("capture", { fixture });
+  // The owned Worker and the harness are both created INSIDE the try, with the
+  // cleanup below already reachable: a harness whose construction throws must
+  // still terminate the Worker it never got to use.
+  let ownedFixture: OwnedReaderFixture | undefined;
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const fixture = makeOwnedReaderFixture();
+    ownedFixture = fixture;
+    const harness = makeNativeHarness("capture", { fixture });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       const id = await createNativeRow(harness, "claude");
       assert.equal(harness.spawned.length, 1, "the production default factory spawned the native row");
@@ -344,14 +373,18 @@ test("a native CLI row's batch command line and public spawn arguments reach the
       assert.deepEqual(harness.registrar.requests, [], "a native CLI row owns no status registration");
     });
   } finally {
-    cleanup(fixture, harness);
+    await cleanup(ownedFixture, ownedHarness);
   }
 });
 
 test("a native CLI row's direct executable keeps its argv array and still captures its exact owned reader", async () => {
-  const fixture = makeOwnedReaderFixture();
-  const harness = makeNativeHarness("direct-exe", { fixture });
+  let ownedFixture: OwnedReaderFixture | undefined;
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const fixture = makeOwnedReaderFixture();
+    ownedFixture = fixture;
+    const harness = makeNativeHarness("direct-exe", { fixture });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       await createNativeRow(harness, "claude");
       await createNativeRow(harness, "codex");
@@ -368,14 +401,18 @@ test("a native CLI row's direct executable keeps its argv array and still captur
       assert.notEqual(settlementOf(direct), settlementOf(harness.spawned[0]), "each native row tracks its own reader");
     });
   } finally {
-    cleanup(fixture, harness);
+    await cleanup(ownedFixture, ownedHarness);
   }
 });
 
 test("a native CLI row's owned reader is confirmed by manager disposal after the native row is closed", async () => {
-  const fixture = makeOwnedReaderFixture();
-  const harness = makeNativeHarness("confirmed", { fixture });
+  let ownedFixture: OwnedReaderFixture | undefined;
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const fixture = makeOwnedReaderFixture();
+    ownedFixture = fixture;
+    const harness = makeNativeHarness("confirmed", { fixture });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       const id = await createNativeRow(harness, "codex");
       const pty = harness.spawned[0];
@@ -407,14 +444,18 @@ test("a native CLI row's owned reader is confirmed by manager disposal after the
         "the existing confirmation window bounds the wait; no new deadline was introduced");
     });
   } finally {
-    cleanup(fixture, harness);
+    await cleanup(ownedFixture, ownedHarness);
   }
 });
 
 test("an unconfirmed native CLI reader keeps manager disposal an explicit failure, even after its row is closed", async () => {
-  const fixture = makeOwnedReaderFixture({ settle: false });
-  const harness = makeNativeHarness("unsettled", { fixture });
+  let ownedFixture: OwnedReaderFixture | undefined;
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const fixture = makeOwnedReaderFixture({ settle: false });
+    ownedFixture = fixture;
+    const harness = makeNativeHarness("unsettled", { fixture });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       const id = await createNativeRow(harness, "claude");
       const pty = harness.spawned[0];
@@ -429,7 +470,7 @@ test("an unconfirmed native CLI reader keeps manager disposal an explicit failur
       assert.equal(settlementOf(pty).settled, false, "the adapter never claims a settlement it did not observe");
     });
   } finally {
-    cleanup(fixture, harness);
+    await cleanup(ownedFixture, ownedHarness);
   }
 });
 
@@ -437,8 +478,10 @@ test("a native CLI reader whose ownership was never identified still reports an 
   // A handle the pinned addon did not build with the bundled-ConPTY agent: the
   // adapter records it as not captured, and the native path must still treat the
   // resulting required release as a failure rather than as nothing owned.
-  const harness = makeNativeHarness("unidentified", { agentShape: { _useConptyDll: false } });
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const harness = makeNativeHarness("unidentified", { agentShape: { _useConptyDll: false } });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       const id = await createNativeRow(harness, "codex");
       const pty = harness.spawned[0];
@@ -454,8 +497,7 @@ test("a native CLI reader whose ownership was never identified still reports an 
         "an unidentified native release is required cleanup, not an absent one");
     });
   } finally {
-    instanceTestSeam.setNodePtyLoaderForTests(undefined);
-    rmSync(harness.root, { recursive: true, force: true });
+    await cleanup(undefined, ownedHarness);
   }
 });
 
@@ -472,9 +514,13 @@ test("a native CLI reader whose ownership was never identified still reports an 
  * "every owned reader settled".
  */
 test("a native CLI reader whose handle exits after disposal was never confirmed by that disposal", async () => {
-  const fixture = makeOwnedReaderFixture();
-  const harness = makeNativeHarness("late-exit", { fixture });
+  let ownedFixture: OwnedReaderFixture | undefined;
+  let ownedHarness: NativeHarness | undefined;
   try {
+    const fixture = makeOwnedReaderFixture();
+    ownedFixture = fixture;
+    const harness = makeNativeHarness("late-exit", { fixture });
+    ownedHarness = harness;
     await withPlatform("win32", async () => {
       const id = await createNativeRow(harness, "claude");
       const pty = harness.spawned[0];
@@ -510,6 +556,6 @@ test("a native CLI reader whose handle exits after disposal was never confirmed 
         "the exhausted stop budget, not a missing exit, is what left this unconfirmed");
     });
   } finally {
-    cleanup(fixture, harness);
+    await cleanup(ownedFixture, ownedHarness);
   }
 });

@@ -10,8 +10,8 @@ paths. Behavioral detail lives in the linked pages.
 - **Node.js at or above its release line's security floor**, plus **npm** for
   installation and source-checkout builds (see
   [Node.js security floors](#nodejs-security-floors)): Node 22.x needs
-  **22.23.4** or newer, Node 24.x needs **24.22.1** or newer, and Node 26.x
-  needs **26.12.1** or newer. CI's `verify` matrix exercises exactly those three
+  **22.23.5** or newer, Node 24.x needs **24.22.3** or newer, and Node 26.x
+  needs **26.13.1** or newer. CI's `verify` matrix exercises exactly those three
   floors.
 - **Pi 1.0.0 or newer**, installed independently. `pi-review-gate` consumes Pi's
   public extension and CLI/RPC surfaces; it does not patch or bundle Pi, and Pi
@@ -107,28 +107,28 @@ The Node.js requirement is a minimum per release line, not a single version:
 
 | Release line | Minimum version |
 | --- | --- |
-| Node 22.x | 22.23.4 |
-| Node 24.x | 24.22.1 |
-| Node 26.x | 26.12.1 |
+| Node 22.x | 22.23.5 |
+| Node 24.x | 24.22.3 |
+| Node 26.x | 26.13.1 |
 
 These minimums are the
-[October 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases),
-which fix several vulnerabilities in the 22.x, 24.x, and 26.x lines, including
-the eMudhra intermediate-CA compromise. The
-[Node.js 26.12.1 release notes](https://nodejs.org/en/blog/release/v26.12.1/),
-for example, update the root certificates to NSS 3.131.1 and reject certificate
-chains that contain blocked public keys. The package declares the floors as
-`>=22.23.4 <24.0.0 || >=24.22.1 <26.0.0 || >=26.12.1`. A bare `>=22.23.4` would
+[November 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/november-2026-security-releases),
+which fix 16 vulnerabilities (7 high, 6 medium, 3 low) across the 22.x, 24.x,
+and 26.x lines, including an `https.Agent` certificate-validation bypass through
+TLS session reuse, client-certificate authentication bypass during TLS 1.2
+renegotiation, and proxy credentials disclosed in proxy configuration errors.
+The package declares the floors as
+`>=22.23.5 <24.0.0 || >=24.22.3 <26.0.0 || >=26.13.1`. A bare `>=22.23.5` would
 still admit unpatched 24.x and 26.x releases.
 
 - Later patch and minor releases in the same line are accepted. You do not need
   to move to Node 26; any supported line at or above its own floor works.
 - Other majors keep their existing eligibility. This baseline adds no floor for
-  them and drops none. The October 2026 security releases cover only the 22.x, 24.x,
+  them and drops none. The November 2026 security releases cover only the 22.x, 24.x,
   and 26.x lines.
 - The session-host entry points' managed fallback runtime stays on Node 22 and
-  is now the checksum-pinned official Node.js 22.23.4 archive. A fallback
-  runtime that an earlier release set up on Node.js 22.19.0 is not reused.
+  is now the checksum-pinned official Node.js 22.23.5 archive. A fallback
+  runtime that an earlier release set up on Node.js 22.23.4 is not reused.
 - Raising the documented minimum does not change any Node.js already installed
   or running on your machine, and nothing replaces a live runtime automatically.
   Update Node.js through your usual installer or version manager. Then restart

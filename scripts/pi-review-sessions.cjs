@@ -96,8 +96,8 @@ const {
 const USAGE = `Usage: pi-review-sessions [--pi-executable <path>] [--state-root <path>] [--sidebar-key <key>] [--help] [-- <Pi arguments...>]
 
 Alpha same-machine macOS/Linux session host with Windows source paths available
-for native validation only (not a Windows readiness claim). Requires Node >=22.23.4
-with the per-line security minimums Node 24 >=24.22.1 and Node 26 >=26.12.1, and
+for native validation only (not a Windows readiness claim). Requires Node >=22.23.5
+with the per-line security minimums Node 24 >=24.22.3 and Node 26 >=26.13.1, and
 Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
@@ -140,11 +140,11 @@ const ROLE_ENV_NAMES = [
 // (pi-review-sessions-node.ps1), stableNodeVersion (src/session-host/main.ts),
 // and the package engines range.
 const NODE_LINE_FLOORS = Object.freeze([
-  Object.freeze([22, 23, 4]),
-  Object.freeze([24, 22, 1]),
-  Object.freeze([26, 12, 1]),
+  Object.freeze([22, 23, 5]),
+  Object.freeze([24, 22, 3]),
+  Object.freeze([26, 13, 1]),
 ]);
-const NODE_FLOOR_REQUIREMENT = "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1)";
+const NODE_FLOOR_REQUIREMENT = "Node >=22.23.5 (Node 24 >=24.22.3, Node 26 >=26.13.1)";
 
 // Public Pi runtime identity (issue 323): the supported package and its
 // exact provisioned version. The floor matches the native launch contract in

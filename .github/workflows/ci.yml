@@ -32,7 +32,7 @@ concurrency:
 jobs:
   verify:
     # Required-check names derive from the matrix values (for example
-    # "Verify (Node 22.23.4)"): changing an entry renames its check, so update
+    # "Verify (Node 22.23.5)"): changing an entry renames its check, so update
     # branch settings alongside any matrix change.
     name: Verify (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -40,9 +40,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exact per-line Node security floors (October 2026 security releases):
+        # Exact per-line Node security floors (November 2026 security releases):
         # each supported line runs the same stages at its patched minimum.
-        node-version: [22.23.4, 24.22.1, 26.12.1]
+        node-version: [22.23.5, 24.22.3, 26.13.1]
     # Pure/unit tier plus packaging: no browser needed, so provisioning stays skipped.
     env:
       PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
@@ -100,9 +100,9 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          # Exact patched Node 24 security floor (October 2026 security
+          # Exact patched Node 24 security floor (November 2026 security
           # releases); the stable check name keeps naming the Node 24 line.
-          node-version: 24.22.1
+          node-version: 24.22.3
           cache: npm
       # Skip the best-effort postinstall provisioning during npm ci so the
       # browser is installed exactly once, with Linux OS dependencies, below.
@@ -222,7 +222,7 @@ jobs:
     # exact npm toolchain the launcher invokes for development rebuilds.
     # Exercises the exact patched Node 22 security floor. Earlier runs of this
     # job on Node 22.19.0 are historical evidence, not patched-floor runs.
-    name: Windows launcher (Node 22.23.4)
+    name: Windows launcher (Node 22.23.5)
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -231,7 +231,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22.23.4
+          node-version: 22.23.5
           cache: npm
       - name: Install dependencies
         run: npm ci
@@ -401,7 +401,7 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           # Exact patched Node 24 security floor; the check name keeps the line.
-          node-version: 24.22.1
+          node-version: 24.22.3
           cache: npm
       - name: Install dependencies
         run: npm ci

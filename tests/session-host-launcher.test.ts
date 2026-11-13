@@ -483,7 +483,7 @@ function baseOverrides(
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.23.4",
+    nodeVersion: "22.23.5",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot,
@@ -599,7 +599,7 @@ test("Windows role aliases and ambiguous ordinary aliases stop before setup", as
       getEnv: () => env,
       processEnv: {},
       platform: "win32",
-      nodeVersion: "22.23.4",
+      nodeVersion: "22.23.5",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: process.cwd(),
@@ -846,9 +846,9 @@ test("--help works in the real CLI without TTY, role setup, build, or provisioni
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Alpha same-machine macOS\/Linux/);
-  assert.match(result.stdout, /Node >=22\.23\.4/);
-  assert.match(result.stdout, /Node 24 >=24\.22\.1/);
-  assert.match(result.stdout, /Node 26 >=26\.12\.1/);
+  assert.match(result.stdout, /Node >=22\.23\.5/);
+  assert.match(result.stdout, /Node 24 >=24\.22\.3/);
+  assert.match(result.stdout, /Node 26 >=26\.13\.1/);
   assert.match(result.stdout, /Pi >=1\.0\.4/);
   assert.match(result.stdout, /no\s+manual Pi CLI path is needed/);
   assert.match(result.stdout, /Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty/);
@@ -1101,7 +1101,7 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
       getEnv: () => makeEnvironment({ HOME: fixture.root }),
       processEnv: {},
       platform: "linux",
-      nodeVersion: "22.23.4",
+      nodeVersion: "22.23.5",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: fixture.packageRoot,
@@ -1319,7 +1319,7 @@ test("a relative PI_CODING_AGENT_DIR anchors host paths against the startup cwd"
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.23.4",
+    nodeVersion: "22.23.5",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
@@ -1396,7 +1396,7 @@ test("the preparation seam receives the sanitized setup environment exactly once
     getEnv: () => env,
     processEnv: {},
     platform: "linux",
-    nodeVersion: "22.23.4",
+    nodeVersion: "22.23.5",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
@@ -1476,8 +1476,8 @@ test("role, platform, Node floor, and TTY failures stop before setup without lea
       secret: "private-catalog-secret",
     },
     { env: makeEnvironment(), overrides: { platform: "freebsd" }, expected: /macOS\/Linux and Windows source admission only/ },
-    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.3" }, expected: /Node 22\.23\.3 is below the 22\.23\.4 security minimum/ },
-    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.4-rc.1" }, expected: /below the 22\.23\.4 security minimum/ },
+    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.3" }, expected: /Node 22\.23\.3 is below the 22\.23\.5 security minimum/ },
+    { env: makeEnvironment(), overrides: { nodeVersion: "22.23.5-rc.1" }, expected: /below the 22\.23\.5 security minimum/ },
     { env: makeEnvironment(), overrides: { stdinIsTTY: false }, expected: /interactive stdin and stdout/ },
     { env: makeEnvironment(), overrides: { stdoutIsTTY: false }, expected: /interactive stdin and stdout/ },
   ];
@@ -1488,7 +1488,7 @@ test("role, platform, Node floor, and TTY failures stop before setup without lea
       getEnv: () => failure.env,
       processEnv: {},
       platform: "linux",
-      nodeVersion: "22.23.4",
+      nodeVersion: "22.23.5",
       stdinIsTTY: true,
       stdoutIsTTY: true,
       packageRoot: process.cwd(),
@@ -1512,9 +1512,10 @@ test("per-line Node security minimums gate the launcher before any setup (issue 
   cleanupFixture(t, fixture);
   // Literal applicable line floors for every refused parseable case.
   const refusedFloor: Record<string, string> = {
-    "21.99.99": "22.23.4", "22.19.0": "22.23.4", "22.23.3": "22.23.4", "22.23.4-rc.1": "22.23.4",
-    "24.0.0": "24.22.1", "24.22.0": "24.22.1", "24.22.1-rc.1": "24.22.1",
-    "26.0.0": "26.12.1", "26.5.0": "26.12.1", "26.12.0": "26.12.1", "26.12.1-rc.1": "26.12.1",
+    "21.99.99": "22.23.5", "22.19.0": "22.23.5", "22.23.3": "22.23.5", "22.23.4": "22.23.5", "22.23.5-rc.1": "22.23.5",
+    "24.0.0": "24.22.3", "24.22.0": "24.22.3", "24.22.1": "24.22.3", "24.22.2": "24.22.3", "24.22.3-rc.1": "24.22.3",
+    "26.0.0": "26.13.1", "26.5.0": "26.13.1", "26.12.0": "26.13.1", "26.12.1": "26.13.1", "26.12.2": "26.13.1",
+    "26.13.0": "26.13.1", "26.13.1-rc.1": "26.13.1",
   };
   for (const entry of NODE_SECURITY_FLOOR_CASES) {
     const events: string[] = [];
@@ -1535,10 +1536,10 @@ test("per-line Node security minimums gate the launcher before any setup (issue 
       assert.deepEqual(events, [], `${entry.version} is refused before build, Pi, DDGS, load, or run`);
       assert.equal(stderr,
         `pi-review-sessions: Node ${entry.version} is below the ${floor} security minimum for its release line; `
-        + "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1) is required.\n");
+        + "Node >=22.23.5 (Node 24 >=24.22.3, Node 26 >=26.13.1) is required.\n");
     }
   }
-  for (const malformed of ["v22.23.4", "22.23", "", "22.23.4.1"]) {
+  for (const malformed of ["v22.23.5", "22.23", "", "22.23.5.1"]) {
     let stderr = "";
     const events: string[] = [];
     const status = await launcher.__test.runSessionHostLauncher([], baseOverrides(fixture.packageRoot, makeEnvironment(), events, [], {
@@ -1547,7 +1548,7 @@ test("per-line Node security minimums gate the launcher before any setup (issue 
     }));
     assert.equal(status, 1, `malformed ${JSON.stringify(malformed)} is refused`);
     assert.deepEqual(events, []);
-    assert.equal(stderr, "pi-review-sessions: Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1) is required.\n");
+    assert.equal(stderr, "pi-review-sessions: Node >=22.23.5 (Node 24 >=24.22.3, Node 26 >=26.13.1) is required.\n");
   }
 });
 

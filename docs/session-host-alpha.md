@@ -46,8 +46,8 @@ explicitly skipped, so green CI does not certify Windows runtime support; the
 Windows sidebar/host remains an unsupported validation target. CI now calls the
 separate session-host acceptance matrix in
 `.github/workflows/session-host-alpha.yml` — emitting the stable check names
-**Windows session host alpha (Node 22.23.4)** and **Windows session host alpha
-(Node 24.22.1)** — read-only on every enforced trigger and requires its results
+**Windows session host alpha (Node 22.23.5)** and **Windows session host alpha
+(Node 24.22.3)** — read-only on every enforced trigger and requires its results
 before publishing a numbered prerelease. That reuse changes no deferral: the
 genuine native Main case and both cold hosted-source wrapper legs above are
 registered with an unconditional skip, so they stay deferred under #345 even
@@ -99,10 +99,10 @@ support.
   runtime acceptance stays deferred under
   https://github.com/rfairburn/pi-review-gate/issues/345. The ordinary
   standalone Windows launcher remains unchanged.
-- **Node.js:** at or above its release line's security floor: 22.23.4 or newer
-  on Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26 (see
+- **Node.js:** at or above its release line's security floor: 22.23.5 or newer
+  on Node 22, 24.22.3 or newer on Node 24, or 26.13.1 or newer on Node 26 (see
   [Node.js security floors](getting-started.md#nodejs-security-floors)). The
-  managed fallback runtime is the checksum-pinned official Node.js 22.23.4
+  managed fallback runtime is the checksum-pinned official Node.js 22.23.5
   archive. Updating this requirement does not update or restart a running host
   or its sessions. Update Node.js, then restart them.
 - **Pi:** stable Pi 1.0.4 or newer; the managed fallback the launcher provisions
@@ -121,7 +121,7 @@ Start the host with the shipped one-command entry points:
 `scripts\pi-review-sessions.cmd` (native Windows source checkout from cmd.exe or
 PowerShell), or the installed `pi-review-sessions` package command. The `.sh`
 and `.cmd` entry points retain a supported Node on `PATH` or bootstrap the
-source-pinned official Node.js 22.23.4 archive under an isolated per-agent
+source-pinned official Node.js 22.23.5 archive under an isolated per-agent
 cache; the installed `pi-review-sessions` command runs the shared launcher
 (`scripts/pi-review-sessions.cjs`) directly and requires a supported Node
 already on `PATH`. These entry points are additional rather than replacements:

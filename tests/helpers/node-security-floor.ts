@@ -6,9 +6,9 @@
  * precondition only: the production checks are exercised directly by their own
  * focused regressions, never judged against this helper.
  */
-export const NODE_SECURITY_FLOOR_TEXT = "Node >=22.23.4 (Node 24 >=24.22.1, Node 26 >=26.12.1)";
+export const NODE_SECURITY_FLOOR_TEXT = "Node >=22.23.5 (Node 24 >=24.22.3, Node 26 >=26.13.1)";
 
-const LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 4], [24, 22, 1], [26, 12, 1]];
+const LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 5], [24, 22, 3], [26, 13, 1]];
 
 /** True only for a stable `x.y.z` (optional leading `v`) at or above its line's floor. */
 export function stableNodeMeetsSecurityFloor(version: string): boolean {
@@ -39,29 +39,35 @@ export interface NodeSecurityFloorCase {
 
 export const NODE_SECURITY_FLOOR_CASES: readonly NodeSecurityFloorCase[] = [
   { version: "21.99.99", launcher: false, main: false, why: "majors below 22 stay refused" },
-  { version: "22.19.0", launcher: false, main: false, why: "the superseded 22 floor is now below the minimum" },
+  { version: "22.19.0", launcher: false, main: false, why: "the superseded pre-489 22 floor stays below the minimum" },
   { version: "22.23.3", launcher: false, main: false, why: "below the Node 22 floor in the same line" },
-  { version: "22.23.4", launcher: true, main: true, why: "exact Node 22 floor" },
-  { version: "22.23.5", launcher: true, main: true, why: "later Node 22 patch" },
+  { version: "22.23.4", launcher: false, main: false, why: "the superseded October 2026 Node 22 floor is now below the minimum" },
+  { version: "22.23.5", launcher: true, main: true, why: "exact Node 22 floor" },
+  { version: "22.23.6", launcher: true, main: true, why: "later Node 22 patch" },
   { version: "22.24.0", launcher: true, main: true, why: "later Node 22 minor" },
-  { version: "22.23.4-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 22 floor" },
-  { version: "22.23.5-rc.1", launcher: true, main: false, why: "prerelease above the floor; Main is stable-only" },
+  { version: "22.23.5-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 22 floor" },
+  { version: "22.23.6-rc.1", launcher: true, main: false, why: "prerelease above the floor; Main is stable-only" },
   { version: "23.0.0", launcher: true, main: true, why: "unlisted newer major keeps existing policy" },
   { version: "23.0.0-rc.1", launcher: true, main: false, why: "unlisted-major prerelease keeps existing policy" },
   { version: "24.0.0", launcher: false, main: false, why: "unpatched Node 24 line" },
   { version: "24.22.0", launcher: false, main: false, why: "below the Node 24 floor in the same line" },
-  { version: "24.22.1", launcher: true, main: true, why: "exact Node 24 floor" },
-  { version: "24.22.2", launcher: true, main: true, why: "later Node 24 patch" },
+  { version: "24.22.1", launcher: false, main: false, why: "the superseded October 2026 Node 24 floor is now below the minimum" },
+  { version: "24.22.2", launcher: false, main: false, why: "below the Node 24 floor in the same line" },
+  { version: "24.22.3", launcher: true, main: true, why: "exact Node 24 floor" },
+  { version: "24.22.4", launcher: true, main: true, why: "later Node 24 patch" },
   { version: "24.23.0", launcher: true, main: true, why: "later Node 24 minor" },
-  { version: "24.22.1-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 24 floor" },
+  { version: "24.22.3-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 24 floor" },
   { version: "25.0.0", launcher: true, main: true, why: "unlisted newer major keeps existing policy" },
   { version: "26.0.0", launcher: false, main: false, why: "unpatched Node 26 line" },
   { version: "26.5.0", launcher: false, main: false, why: "unpatched Node 26 release" },
   { version: "26.12.0", launcher: false, main: false, why: "below the Node 26 floor in the same line" },
-  { version: "26.12.1", launcher: true, main: true, why: "exact Node 26 floor" },
-  { version: "26.12.2", launcher: true, main: true, why: "later Node 26 patch" },
-  { version: "26.13.0", launcher: true, main: true, why: "later Node 26 minor" },
-  { version: "26.12.1-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 26 floor" },
+  { version: "26.12.1", launcher: false, main: false, why: "the superseded October 2026 Node 26 floor is now below the minimum" },
+  { version: "26.12.2", launcher: false, main: false, why: "below the Node 26 floor in the same line" },
+  { version: "26.13.0", launcher: false, main: false, why: "below the Node 26 floor in the same line" },
+  { version: "26.13.1", launcher: true, main: true, why: "exact Node 26 floor" },
+  { version: "26.13.2", launcher: true, main: true, why: "later Node 26 patch" },
+  { version: "26.14.0", launcher: true, main: true, why: "later Node 26 minor" },
+  { version: "26.13.1-rc.1", launcher: false, main: false, why: "prerelease at the exact Node 26 floor" },
   { version: "27.0.0", launcher: true, main: true, why: "unlisted newer major keeps existing policy" },
   { version: "30.1.2", launcher: true, main: true, why: "unlisted newer major keeps existing policy" },
 ];

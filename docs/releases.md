@@ -46,11 +46,17 @@ else fails closed before any write:
   once per CI run, while its targeted `workflow_dispatch` path stays available.
   Its concurrency group uses a fixed prefix with cancellation disabled, so it
   can never cancel the calling CI run or a `main` publication run. The `verify`
-  matrix runs the exact per-line Node security floors 22.23.4, 24.22.1, and 26.12.1
+  matrix runs the exact per-line Node security floors 22.23.5, 24.22.3, and 26.13.1
   (see [Node.js security floors](getting-started.md#nodejs-security-floors)).
-  The full suite and the Windows shell job run on Node 24.22.1, and the Windows
-  launcher job runs on Node 22.23.4. Both Windows jobs gate publication, as does
-  the full suite. GitHub's implicit `success()` guard on `needs` skips
+  The full suite and the Windows shell job run on Node 24.22.3, and the Windows
+  launcher job runs on Node 22.23.5. Both Windows jobs gate publication, as does
+  the full suite. Because the `Verify (Node …)` and `Windows launcher (Node …)`
+  check names come from those selections, raising a floor renames the required
+  contexts, and the operator must update the repository ruleset to require
+  **Verify (Node 22.23.5)**, **Verify (Node 24.22.3)**, **Verify (Node
+  26.13.1)**, and **Windows launcher (Node 22.23.5)** in the same window as the
+  merge; nothing in this repository changes that live configuration. GitHub's
+  implicit `success()` guard on `needs` skips
   publication when any dependency failed or was skipped. There is no
   `workflow_run` privilege chain, no custom PAT, and no GitHub App; the only
   write permission anywhere is `contents: write` on the single publish job.

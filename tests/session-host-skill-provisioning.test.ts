@@ -201,7 +201,7 @@ function flowOverrides(
     getEnv: () => environment,
     processEnv: {},
     platform: process.platform,
-    nodeVersion: "22.23.4",
+    nodeVersion: "22.23.5",
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,

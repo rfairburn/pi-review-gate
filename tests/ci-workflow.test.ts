@@ -188,7 +188,7 @@ test("verify job keeps its stable check name, Node matrix, and fast tiers", () =
   const source = readWorkflow();
   assert.match(source, /name: Verify \(Node \$\{\{ matrix\.node-version \}\}\)/);
   const verify = blockOf(source, "verify", 2);
-  assert.match(verify, /^        node-version: \[22\.23\.4, 24\.22\.1, 26\.12\.1\]$/m,
+  assert.match(verify, /^        node-version: \[22\.23\.5, 24\.22\.3, 26\.13\.1\]$/m,
     "each supported Node line runs once, at its exact patched security floor");
   assert.equal((verify.match(/run: npm run test:package/g) ?? []).length, 1,
     "the Node 26 entry joins the same matrix: no duplicate broad stage is added");
@@ -219,7 +219,7 @@ test("full-tests job runs for pull requests, default-branch pushes, and manual d
   assert.match(full, /name: Full suite \(Node 24\)/);
   assert.match(full, /^    timeout-minutes: 30\s*$/m,
     "the Linux full-suite job must keep an active, job-scoped 30-minute runtime cap (a commented-out value or a 30 on a prerequisite step must not pass)");
-  assert.match(full, /^          node-version: 24\.22\.1$/m,
+  assert.match(full, /^          node-version: 24\.22\.3$/m,
     "the full suite must select the exact patched Node 24 security floor, never a floating 24.x that a stale runner tool cache could satisfy");
   assert.doesNotMatch(full, /node-version: 24\.x/);
 });
@@ -982,11 +982,11 @@ test("publication depends on all eight verification legs and the Windows matrix 
   const verifyMatrix = blockOf(source, "verify", 2).match(/node-version: \[([^\]]+)\]/);
   assert.ok(verifyMatrix, "the verify matrix must stay declared");
   const verifyLegs = verifyMatrix![1].split(",").map((entry) => entry.trim());
-  assert.deepEqual(verifyLegs, ["22.23.4", "24.22.1", "26.12.1"], "three Verify legs at the exact patched floors");
+  assert.deepEqual(verifyLegs, ["22.23.5", "24.22.3", "26.13.1"], "three Verify legs at the exact patched floors");
   const alphaMatrix = alpha.match(/node-version: \[([^\]]+)\]/);
   assert.ok(alphaMatrix, "the alpha matrix must stay declared");
   const alphaLegs = alphaMatrix![1].split(",").map((entry) => entry.trim());
-  assert.deepEqual(alphaLegs, ["22.23.4", "24.22.1"], "the matrix contributes exactly two native legs");
+  assert.deepEqual(alphaLegs, ["22.23.5", "24.22.3"], "the matrix contributes exactly two native legs");
   assert.equal(verifyLegs.length + 1 + 2 + alphaLegs.length, 8,
     "verify legs + full suite + two native Windows jobs + two native session-host legs = eight verification legs");
   const release = releaseJobBlock();
@@ -1096,7 +1096,7 @@ test("the six original CI check names stay stable and the new caller name is dis
   const stableNames = [
     "name: Verify (Node ${{ matrix.node-version }})",
     "name: Full suite (Node 24)",
-    "name: Windows launcher (Node 22.23.4)",
+    "name: Windows launcher (Node 22.23.5)",
     "name: Windows shell (Node 24)",
     "name: Publish numbered prerelease",
   ];
@@ -1117,9 +1117,9 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
   assert.match(source, /^  windows-launcher:$/m, "the job id must stay stable for downstream callers");
   assert.match(job, /runs-on: windows-latest/,
     "the .cmd launcher and helper need a genuinely native Windows runner");
-  assert.match(job, /name: Windows launcher \(Node 22\.23\.4\)/,
+  assert.match(job, /name: Windows launcher \(Node 22\.23\.5\)/,
     "the native job name must name the exact patched floor version it exercises");
-  assert.match(job, /^          node-version: 22\.23\.4$/m, "the patched Node 22 security floor must be exercised natively");
+  assert.match(job, /^          node-version: 22\.23\.5$/m, "the patched Node 22 security floor must be exercised natively");
   assert.doesNotMatch(withoutComments(job), /22\.19\.0/, "the native job must not keep selecting or naming the superseded Node 22 floor");
   assert.match(job, /PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"/,
     "the launcher tier needs no browser, so Chromium provisioning stays skipped");
@@ -1414,12 +1414,12 @@ test("compaction lineage sampling runs five fixed fresh samples and fails on any
 });
 
 /**
- * Per-line Node security floors (October 2026 Node.js security releases).
- * A bare `>=22.23.4` would still admit unpatched 24.x and 26.x releases, so
+ * Per-line Node security floors (November 2026 Node.js security releases).
+ * A bare `>=22.23.5` would still admit unpatched 24.x and 26.x releases, so
  * the engine range distinguishes each supported line's floor while leaving
  * other majors' existing eligibility (23.x, 25.x, and later majors) unchanged.
  */
-const NODE_ENGINE_RANGE = ">=22.23.4 <24.0.0 || >=24.22.1 <26.0.0 || >=26.12.1";
+const NODE_ENGINE_RANGE = ">=22.23.5 <24.0.0 || >=24.22.3 <26.0.0 || >=26.13.1";
 
 test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
   // Keep the package engine floors aligned with CI's per-line minimums; the
@@ -1431,11 +1431,11 @@ test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
   assert.equal(rootLock.packages?.[""]?.engines?.node, pkg.engines?.node,
     "the lock's root package must mirror the engine floor exactly");
   const source = readWorkflow();
-  assert.match(source, /node-version: \[22\.23\.4, 24\.22\.1, 26\.12\.1\]/,
+  assert.match(source, /node-version: \[22\.23\.5, 24\.22\.3, 26\.13\.1\]/,
     "CI's matrix must exercise each engine line's exact floor, never an older Node");
   assert.doesNotMatch(withoutComments(source), /node-version: 24\.x|22\.19\.0/,
     "no CI selection or check name may keep a floating Node 24 line or the superseded Node 22 floor");
-  assert.match(source, /^          node-version: 22\.23\.4$/m,
+  assert.match(source, /^          node-version: 22\.23\.5$/m,
     "the native Windows floor job must exercise the same patched Node 22 engine floor");
   // The independently useful agent-core fixture tracks Pi 1.5.2; the full
   // UI fixture tracks the alpha's Pi 1.5.2 pin, above its stable 1.0.4 minimum.
@@ -1461,10 +1461,10 @@ test("Windows shell and the reusable release builder select the exact patched No
   // every remaining Node 24 selection names the exact patched floor.
   const shell = blockOf(readWorkflow(), "windows-shell", 2);
   assert.match(shell, /name: Windows shell \(Node 24\)/, "the Windows shell check name keeps naming its Node line");
-  assert.match(shell, /^          node-version: 24\.22\.1$/m);
+  assert.match(shell, /^          node-version: 24\.22\.3$/m);
   const release = withoutComments(readReleaseWorkflow());
   const selections = [...release.matchAll(/^\s*node-version: (\S+)$/gm)].map((match) => match[1]);
-  assert.deepEqual(selections, Array(5).fill("24.22.1"),
+  assert.deepEqual(selections, Array(5).fill("24.22.3"),
     "every builder, signer, planner, and publisher job must select the exact patched Node 24 floor");
 });
 

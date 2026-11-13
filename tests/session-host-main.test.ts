@@ -1204,7 +1204,7 @@ test("direct Main preflight enforces stable per-line Node security minimums (iss
       assert.deepEqual(harness.reports, ["Session host preflight failed."]);
     }
   }
-  for (const malformed of ["v22.23.4", "22.23", "22.23.4+build", ""]) {
+  for (const malformed of ["v22.23.5", "22.23", "22.23.5+build", ""]) {
     const harness = createHarness({}, { nodeVersion: malformed });
     assert.equal(await harness.result, 1, `malformed ${JSON.stringify(malformed)} is refused`);
     assert.deepEqual(harness.events, []);

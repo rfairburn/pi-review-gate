@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # One-command session host launcher. A supported Node on PATH is preferred;
-# otherwise this entry point downloads the fixed official Node 22.23.4 archive
+# otherwise this entry point downloads the fixed official Node 22.23.5 archive
 # for the native OS/architecture, verifies its source-pinned SHA-256 before
 # listing or extracting it, and launches the shared CJS from a fresh exclusive
 # extraction. Existing cache files are never probed, repaired, or executed.
@@ -36,7 +36,7 @@ CJS_ENTRY="$SCRIPT_DIR/pi-review-sessions.cjs"
 
 # Mirrors meetsNodeFloor in scripts/pi-review-sessions.cjs. Node's own
 # --version must be one exact stable-format version. Per-line security minimums
-# (Node 22 >=22.23.4, Node 24 >=24.22.1, Node 26 >=26.12.1); any other major
+# (Node 22 >=22.23.5, Node 24 >=24.22.3, Node 26 >=26.13.1); any other major
 # inherits the floor of the nearest listed lower line, so newer unlisted majors
 # keep the shared CJS semantics and releases below Node 22 are refused. At the
 # precise applicable floor a prerelease is below the requirement.
@@ -52,13 +52,13 @@ node_version_supported() {
   if (( 10#$major < 22 )); then return 1; fi
   if (( 10#$major >= 26 )); then
     if (( 10#$major > 26 )); then return 0; fi
-    floor_minor=12; floor_patch=1
+    floor_minor=13; floor_patch=1
   elif (( 10#$major >= 24 )); then
     if (( 10#$major > 24 )); then return 0; fi
-    floor_minor=22; floor_patch=1
+    floor_minor=22; floor_patch=3
   else
     if (( 10#$major > 22 )); then return 0; fi
-    floor_minor=23; floor_patch=4
+    floor_minor=23; floor_patch=5
   fi
   if (( 10#$minor > floor_minor )); then return 0; fi
   if (( 10#$minor < floor_minor )); then return 1; fi
@@ -91,35 +91,35 @@ if [[ -n "$NODE_BIN" ]] && probe_node_version "$NODE_BIN"; then
 fi
 NODE_BIN=""
 
-# Fixed source-pinned official Node distribution digests (Node.js v22.23.4,
-# nodejs.org/dist/v22.23.4/SHASUMS256.txt). Never read a manifest or digest
+# Fixed source-pinned official Node distribution digests (Node.js v22.23.5,
+# nodejs.org/dist/v22.23.5/SHASUMS256.txt). Never read a manifest or digest
 # URL from disk, environment, or caller input.
-NODE_VERSION_PIN="22.23.4"
+NODE_VERSION_PIN="22.23.5"
 HOST_OS="$(uname -s 2>/dev/null || true)"
 HOST_ARCH="$(uname -m 2>/dev/null || true)"
 case "$HOST_OS:$HOST_ARCH" in
   Darwin:x86_64|Darwin:amd64)
     NODE_PLATFORM="darwin-x64"
-    NODE_ARCHIVE="node-v22.23.4-darwin-x64.tar.gz"
-    NODE_SHA256="efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819"
+    NODE_ARCHIVE="node-v22.23.5-darwin-x64.tar.gz"
+    NODE_SHA256="c53383238206b9ae4db23c5d8a63645e2e753bec8ab51a49cc81939aa64e9422"
     ;;
   Darwin:arm64|Darwin:aarch64)
     NODE_PLATFORM="darwin-arm64"
-    NODE_ARCHIVE="node-v22.23.4-darwin-arm64.tar.gz"
-    NODE_SHA256="c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428"
+    NODE_ARCHIVE="node-v22.23.5-darwin-arm64.tar.gz"
+    NODE_SHA256="e7131995759b61a0170b646010d2ad35a5d37b4cb0d471f3e8317eac6f742f3d"
     ;;
   Linux:x86_64|Linux:amd64)
     NODE_PLATFORM="linux-x64"
-    NODE_ARCHIVE="node-v22.23.4-linux-x64.tar.gz"
-    NODE_SHA256="b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406"
+    NODE_ARCHIVE="node-v22.23.5-linux-x64.tar.gz"
+    NODE_SHA256="c54118104acc524633b5abe106bbf44a53126ec8b4e5fa105cb92b5d7de8a1a1"
     ;;
   Linux:arm64|Linux:aarch64)
     NODE_PLATFORM="linux-arm64"
-    NODE_ARCHIVE="node-v22.23.4-linux-arm64.tar.gz"
-    NODE_SHA256="f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9"
+    NODE_ARCHIVE="node-v22.23.5-linux-arm64.tar.gz"
+    NODE_SHA256="8bd3dc69eee8f3f226315a80d7d1d4faccf217a4c8fae500168ac2e38f3bdba3"
     ;;
   *)
-    echo "pi-review-sessions: no pinned Node.js 22.23.4 archive is available for this platform." >&2
+    echo "pi-review-sessions: no pinned Node.js 22.23.5 archive is available for this platform." >&2
     exit 1
     ;;
 esac
@@ -487,7 +487,7 @@ assert_node_ownership() {
 # No redirects: the only permitted request is this fixed HTTPS artifact URL.
 # curl's configuration file is disabled, the elapsed transfer deadline is
 # finite, and both curl and a post-download size check enforce the byte cap.
-NODE_URL="https://nodejs.org/dist/v22.23.4/$NODE_ARCHIVE"
+NODE_URL="https://nodejs.org/dist/v22.23.5/$NODE_ARCHIVE"
 assert_workspace_identity || bootstrap_failure "isolated Node workspace identity changed before download."
 if ! HTTP_STATUS="$("$CURL_BIN" --disable --fail --silent --show-error --connect-timeout 15 --max-time 180 --max-filesize 268435456 --output "$ARCHIVE_PATH" --write-out '%{http_code}' "$NODE_URL" 2>/dev/null)"; then
   bootstrap_failure "official Node archive download failed or exceeded its deadline/size limit."

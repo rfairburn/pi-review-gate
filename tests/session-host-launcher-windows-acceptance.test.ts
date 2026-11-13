@@ -1,13 +1,25 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { createRequire } from "node:module";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 
 import { SidebarController } from "../src/session-host/sidebar";
 import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
 
 import {
+  LAUNCHER_BUILT_STAGE_DIRNAME,
   LAUNCHER_CLEANUP_BUDGET_MS,
   LAUNCHER_BODY_DEADLINE_MS,
   LAUNCHER_EVENT_TIMEOUT_MS,
@@ -18,8 +30,10 @@ import {
   LAUNCHER_LEGS,
   LAUNCHER_OUTER_COLS,
   LAUNCHER_OUTER_ROWS,
+  LAUNCHER_PTY_VERSION,
   LAUNCHER_READER_SETTLEMENT_BUDGET_MS,
   LAUNCHER_REQUIRE_ENV,
+  LAUNCHER_STAGE_REQUIRED,
   LAUNCHER_STARTUP_TIMEOUT_MS,
   LAUNCHER_TEST_TIMEOUT_MS,
   LauncherCleanupBudget,
@@ -34,6 +48,7 @@ import {
   assertLegArithmetic,
   assertNativeRestoration,
   assertNoUnownedNativeSessions,
+  assertRetainedLauncherStage,
   assertSourceFixtureUnchanged,
   createLauncherLegLayout,
   frameWaitFailure,
@@ -55,6 +70,14 @@ const restorationFixtures = require("../../tests/fixtures/session-host-windows-l
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
   launcherRestorationSnapshot(baseline: unknown, current: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): Record<string, unknown>;
   nativeRestorationSnapshot(env: Record<string, string | undefined>): Record<string, unknown>;
+};
+
+// The current shared preparation producer, loaded read-only so the retained-stage
+// proof below stays bound to the stage grammar it actually creates instead of to a
+// remembered name. Nothing here drives or imitates a launcher run.
+const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launcher-windows-acceptance.test.ts"));
+const applicationBuild = requireCjs("../scripts/application-build.cjs") as {
+  createOwnedStage(parent: string, prefix: string): { root: string };
 };
 
 const optIn = process.env[LAUNCHER_REQUIRE_ENV] === "1";
@@ -693,4 +716,168 @@ test("launcher frame-wait diagnostics never include terminal content", () => {
   assert.match(error.message, /revision=3/);
   assert.doesNotMatch(error.message, new RegExp(sensitive), "terminal content must never reach the diagnostic");
   assert.doesNotMatch(error.message, /SESSION_HOST_LAUNCHER|--require|preload|draft/i);
+});
+
+// ---------------------------------------------------------------------------
+// Retained launcher-stage proof (synthetic controls, every host).
+//
+// The retained stage of an actual launcher run is proved only by the real Windows
+// legs above. What these controls prove is that the SAME shared probe the legs
+// call fails closed: the current producer's exact stage grammar is admitted, and
+// an obsolete/stale/wrong name, a duplicate stage, a missing build output, an
+// altered lockfile, or a different @lydell/node-pty version never is. The fixture
+// is a confined naming/observation fixture — it never claims runtime proof.
+// ---------------------------------------------------------------------------
+
+const CURRENT_STAGE_HEX = "0123456789abcdef0123456789abcdef";
+/** The retired producer grammar this proof used to match (#663 cold-launcher CI). */
+const RETIRED_STAGE_DIRNAME = `pi-review-sessions-${CURRENT_STAGE_HEX}`;
+const ONE_RETAINED_STAGE = "exactly one retained launcher-owned source build stage";
+
+interface SyntheticStageFixture {
+  readonly sourceRoot: string;
+  readonly buildRoot: string;
+  readonly stage: string;
+  readonly lock: Buffer;
+}
+
+/**
+ * One confined fixture: a locked source root, the shared build cache, and — only
+ * when `stageName` is supplied — a stage carrying every required build output, a
+ * byte-identical lockfile copy, and the exact pinned public @lydell/node-pty
+ * manifest. Every fixture is task-owned and removed on the test's own hook.
+ */
+function createStageFixture(t: { after(fn: () => void): void }, stageName?: string): SyntheticStageFixture {
+  // Canonicalized so every ancestor is a real directory: the shared producer
+  // fences its whole parent chain from the filesystem root, and macOS's /var
+  // symlink is not something a fixture may hand it.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "prg-windows-launcher-stage-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceRoot = join(root, "source");
+  const buildRoot = join(root, "build");
+  mkdirSync(sourceRoot);
+  mkdirSync(buildRoot);
+  const lock = Buffer.from(`${JSON.stringify({
+    name: "pi-review-gate",
+    lockfileVersion: 3,
+    packages: { "": { dependencies: { "@lydell/node-pty": LAUNCHER_PTY_VERSION } } },
+  })}\n`, "utf8");
+  writeFileSync(join(sourceRoot, "package-lock.json"), lock);
+  let stage = "";
+  if (stageName !== undefined) {
+    stage = join(buildRoot, stageName);
+    mkdirSync(stage);
+    writeFileSync(join(stage, "package-lock.json"), lock);
+    for (const required of LAUNCHER_STAGE_REQUIRED) {
+      mkdirSync(dirname(join(stage, required)), { recursive: true });
+      writeFileSync(join(stage, required), "// staged build output\n");
+    }
+    const ptyRoot = join(stage, "node_modules", "@lydell", "node-pty");
+    mkdirSync(ptyRoot, { recursive: true });
+    writeFileSync(join(ptyRoot, "package.json"), JSON.stringify({ name: "@lydell/node-pty", version: LAUNCHER_PTY_VERSION }));
+  }
+  return { sourceRoot, buildRoot, stage, lock };
+}
+
+function probeStageFixture(fixture: SyntheticStageFixture): void {
+  assertRetainedLauncherStage({
+    buildRoot: fixture.buildRoot,
+    sourceRoot: fixture.sourceRoot,
+    ptyVersion: LAUNCHER_PTY_VERSION,
+  });
+}
+
+/** Require the probe's own fail-closed diagnostic, without path regex escaping. */
+function probeFails(body: () => void, expected: string, message: string): void {
+  assert.throws(body, (error: unknown) => {
+    const observed = error instanceof Error ? error.message : String(error);
+    assert.ok(observed.includes(expected), `${message}\n  observed: ${observed}`);
+    return true;
+  }, message);
+}
+
+test("retained launcher-stage proof is bound to the current prepared-stage producer", (t) => {
+  // The grammar comes from the producer, not from memory: the shared build engine
+  // still stages each generation under this prefix with a 16-byte hex suffix.
+  const producer = readFileSync(join(process.cwd(), "scripts", "application-build.cjs"), "utf8");
+  assert.match(producer, /createOwnedStage\(\s*buildCacheRoot,\s*"pi-review-gate-app-",\s*crypto\.randomBytes\b/,
+    "the shared producer still stages the application under the pi-review-gate-app- prefix");
+  assert.match(producer, /randomBytes\(16\)\.toString\("hex"\)/,
+    "the exclusive stage suffix is still 16 random bytes as 32 lowercase hex digits");
+
+  // A stage the real producer exclusively creates is admitted by the proof, so a
+  // future producer rename can never silently zero the real legs' evidence again.
+  const producerCache = createStageFixture(t);
+  const produced = applicationBuild.createOwnedStage(producerCache.buildRoot, "pi-review-gate-app-");
+  assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(basename(produced.root)), true,
+    "the current producer's own exclusive stage name matches the retained-stage proof grammar");
+
+  // Names the current producer can never create are refused by the grammar.
+  assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(`pi-review-gate-app-${CURRENT_STAGE_HEX}`), true,
+    "the current grammar is the exact prefix plus 32 lowercase hex digits");
+  for (const name of [
+    RETIRED_STAGE_DIRNAME,
+    `pi-review-sessions-setup-${CURRENT_STAGE_HEX}`,
+    "pi-review-gate-app-",
+    `pi-review-gate-app-${CURRENT_STAGE_HEX.slice(0, 31)}`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}0`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX.toUpperCase()}`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}-stale`,
+    `pi-review-gate-app-${CURRENT_STAGE_HEX}.tmp`,
+    `pi-review-gate-application-${CURRENT_STAGE_HEX}`,
+    `previous-pi-review-gate-app-${CURRENT_STAGE_HEX}`,
+    `pi-review-gate-app-${"g".repeat(32)}`,
+  ]) {
+    assert.equal(LAUNCHER_BUILT_STAGE_DIRNAME.test(name), false, `${name} is never a current producer stage name`);
+  }
+});
+
+test("retained launcher-stage proof admits only one complete current stage", (t) => {
+  const stageName = `pi-review-gate-app-${randomBytes(16).toString("hex")}`;
+  const accepted = createStageFixture(t, stageName);
+  const evidence = assertRetainedLauncherStage({
+    buildRoot: accepted.buildRoot,
+    sourceRoot: accepted.sourceRoot,
+    ptyVersion: LAUNCHER_PTY_VERSION,
+  });
+  assert.equal(evidence.stage, accepted.stage, "the proof returns the single admitted stage");
+  assert.equal(evidence.ptyModulePath, join(accepted.stage, "node_modules", "@lydell", "node-pty"),
+    "the proof's PTY anchor is the package installed inside that same stage");
+
+  // An empty build cache — exactly what the retired grammar observed — and a second
+  // admitted stage both fail the one-exclusive-stage proof.
+  probeFails(() => probeStageFixture(createStageFixture(t)), ONE_RETAINED_STAGE,
+    "an empty build cache never satisfies the stage proof");
+  probeFails(() => probeStageFixture(createStageFixture(t, RETIRED_STAGE_DIRNAME)), ONE_RETAINED_STAGE,
+    "the retired producer's stage name is never admitted as a substitute");
+  const duplicate = createStageFixture(t, stageName);
+  mkdirSync(join(duplicate.buildRoot, `pi-review-gate-app-${randomBytes(16).toString("hex")}`));
+  probeFails(() => probeStageFixture(duplicate), ONE_RETAINED_STAGE,
+    "two retained stages are never accepted as one launcher build");
+
+  // Every required build output has to be present as a real file.
+  for (const required of LAUNCHER_STAGE_REQUIRED) {
+    const incomplete = createStageFixture(t, stageName);
+    rmSync(join(incomplete.stage, required));
+    probeFails(() => probeStageFixture(incomplete), required, `a stage missing ${required} is refused`);
+  }
+
+  // The staged lockfile stays byte-identical to the locked source fixture.
+  const alteredLock = createStageFixture(t, stageName);
+  writeFileSync(join(alteredLock.stage, "package-lock.json"), Buffer.concat([alteredLock.lock, Buffer.from(" ")]));
+  probeFails(() => probeStageFixture(alteredLock), "byte-identical",
+    "an altered staged lockfile is refused");
+
+  // The installed PTY is the exact pinned public package, present and versioned.
+  for (const version of ["1.1.0", "1.2.0", "1.2.0-beta.16"]) {
+    const wrongVersion = createStageFixture(t, stageName);
+    writeFileSync(join(wrongVersion.stage, "node_modules", "@lydell", "node-pty", "package.json"),
+      JSON.stringify({ name: "@lydell/node-pty", version }));
+    probeFails(() => probeStageFixture(wrongVersion), "exact pinned public",
+      `@lydell/node-pty ${version} is refused`);
+  }
+  const missingPtyManifest = createStageFixture(t, stageName);
+  rmSync(join(missingPtyManifest.stage, "node_modules", "@lydell", "node-pty", "package.json"));
+  probeFails(() => probeStageFixture(missingPtyManifest), join("node_modules", "@lydell", "node-pty", "package.json"),
+    "a stage without the pinned PTY package manifest is refused");
 });

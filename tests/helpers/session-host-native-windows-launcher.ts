@@ -140,14 +140,28 @@ const SOURCE_FIXTURE_REQUIRED = [
   join("scripts", "pi-review-sessions-node.ps1"),
 ] as const;
 const SOURCE_FIXTURE_FORBIDDEN = ["dist", "node_modules", ".git", "tests"] as const;
-const STAGE_REQUIRED = [
+/** Every build output the retained launcher stage must carry as a real file. */
+export const LAUNCHER_STAGE_REQUIRED = [
   join("dist", "src", "session-host", "main.js"),
   join("dist", "src", "index.js"),
   join("dist", "src", "session-host", "reporter.js"),
   join("dist", "src", "session-host", "bootstrap-preload.js"),
   join("scripts", "pi-review-sessions.cjs"),
 ] as const;
-const BUILT_STAGE_DIRNAME = /^pi-review-sessions-[0-9a-f]{32}$/;
+/**
+ * The exact directory grammar of a stage the CURRENT shared preparation
+ * producer leaves behind. `scripts/application-build.cjs` stages every
+ * application generation with
+ * `createOwnedStage(buildCacheRoot, "pi-review-gate-app-", crypto.randomBytes)`,
+ * whose exclusively created name is that prefix plus
+ * `randomBytes(16).toString("hex")`, and the whole bounded install lives inside
+ * that SAME counted generation (`.npm-cache`, `.npm-logs`, `.npm-tmp`,
+ * `.home`). There is therefore no sibling install-scratch name left to filter,
+ * and the retired `pi-review-sessions-<32 hex>` grammar is never admitted: a
+ * directory that does not carry the current producer's name is not evidence of
+ * this launcher's build.
+ */
+export const LAUNCHER_BUILT_STAGE_DIRNAME = /^pi-review-gate-app-[0-9a-f]{32}$/;
 
 export interface LauncherRuntimePin {
   readonly sourceRoot: string;
@@ -580,27 +594,49 @@ export interface LauncherStageEvidence {
   readonly ptyModulePath: string;
 }
 
-/** Assert the real launcher-owned retained build stage after graceful shutdown. */
-export function assertLauncherStageEvidence(runtime: LauncherRuntimePin, layout: LauncherLegLayout): LauncherStageEvidence {
-  const buildRoot = join(layout.nativeAgentDir, ".pi-review-gate", "build");
-  const entries = readdirSync(buildRoot);
-  // Install scratch has a distinct pi-review-sessions-setup-* receipt;
-  // only exact compiled-stage names contribute to this one-stage proof.
-  const stages = entries.filter((entry) => BUILT_STAGE_DIRNAME.test(entry));
+/** One retained-stage observation boundary: the shared build cache, the exact
+ * locked source fixture the stage must match, and the exact pinned public PTY. */
+export interface LauncherStageProbe {
+  readonly buildRoot: string;
+  readonly sourceRoot: string;
+  readonly ptyVersion: string;
+}
+
+/**
+ * Assert one — and only one — launcher-owned retained build stage under
+ * `buildRoot`, cross-bound to the exact locked `sourceRoot`: the current
+ * producer's stage grammar, a real non-symlink directory, every required build
+ * output as a real non-symlink file, a lockfile byte-identical to the source
+ * fixture, and the exact pinned public @lydell/node-pty installed from it. No
+ * observation is relaxed for a fixture: the real Windows legs and the synthetic
+ * negative controls share this one implementation.
+ */
+export function assertRetainedLauncherStage(probe: LauncherStageProbe): LauncherStageEvidence {
+  const entries = readdirSync(probe.buildRoot);
+  const stages = entries.filter((entry) => LAUNCHER_BUILT_STAGE_DIRNAME.test(entry));
   assert.equal(stages.length, 1, "exactly one retained launcher-owned source build stage exists for the fresh per-leg agent root");
-  const stage = join(buildRoot, stages[0]!);
+  const stage = join(probe.buildRoot, stages[0]!);
   const stageStats = lstatSync(stage);
   assert.ok(stageStats.isDirectory() && !stageStats.isSymbolicLink(), "the retained launcher stage is a real directory");
-  for (const required of STAGE_REQUIRED) {
+  for (const required of LAUNCHER_STAGE_REQUIRED) {
     const stats = lstatSync(join(stage, required));
     assert.ok(stats.isFile() && !stats.isSymbolicLink(), `retained launcher stage is missing a real build output: ${required}`);
   }
-  const sourceLock = readFileSync(join(runtime.sourceRoot, "package-lock.json"));
+  const sourceLock = readFileSync(join(probe.sourceRoot, "package-lock.json"));
   const stageLock = readFileSync(join(stage, "package-lock.json"));
   assert.ok(sourceLock.equals(stageLock), "the retained stage lockfile is byte-identical to the locked source fixture");
   const ptyPackage = JSON.parse(readFileSync(join(stage, "node_modules", "@lydell", "node-pty", "package.json"), "utf8")) as { version?: string };
-  assert.equal(ptyPackage.version, LAUNCHER_PTY_VERSION, "the retained stage installed the exact pinned public @lydell/node-pty");
+  assert.equal(ptyPackage.version, probe.ptyVersion, "the retained stage installed the exact pinned public @lydell/node-pty");
   return { stage, ptyModulePath: join(stage, "node_modules", "@lydell", "node-pty") };
+}
+
+/** Assert the real launcher-owned retained build stage after graceful shutdown. */
+export function assertLauncherStageEvidence(runtime: LauncherRuntimePin, layout: LauncherLegLayout): LauncherStageEvidence {
+  return assertRetainedLauncherStage({
+    buildRoot: join(layout.nativeAgentDir, ".pi-review-gate", "build"),
+    sourceRoot: runtime.sourceRoot,
+    ptyVersion: LAUNCHER_PTY_VERSION,
+  });
 }
 
 export function assertLauncherSummary(summary: Record<string, unknown>): void {
@@ -758,6 +794,9 @@ export class LauncherPtyDriver {
     const expectedNodeOptions = launcherNodeOptions(runtime.preloadFixture, process.env.NODE_OPTIONS);
     const env: NodeJS.ProcessEnv = {
       PATH: `${pythonDirectory}${delimiter}${safeWindowsPath(runtime.systemRoot)}`,
+      // PowerShell needs PATHEXT to invoke/capture node.exe as an executable.
+      // CMD seeds it itself; the direct-PowerShell root needs it explicitly.
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
       SystemRoot: runtime.systemRoot,
       WINDIR: runtime.systemRoot,
       USERPROFILE: layout.home,

@@ -21,7 +21,8 @@ dates.
 
 - **Repair generic Windows Pi runtime acceptance (#663)**: register the real
   public Main, cold CMD, and direct PowerShell cases under the existing opt-in,
-  and correct the launcher tests' stale New-session ownership observations.
+  correct the launcher tests' stale New-session ownership observations, and
+  observe durable exact-process witness files independently of watcher events.
   Original-process/PTY exit and terminal-restoration assertions, deadlines,
   ownership checks, runtime pins, and CI check names remain unchanged.
   Test-only: production behavior is untouched.

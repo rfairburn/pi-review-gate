@@ -2256,8 +2256,18 @@ export class WindowsOwnedExitObserver {
     }
   }
 
+  /**
+   * READY is durable file evidence the owned PowerShell fixture publishes with one
+   * exclusive write into the watched root, so this waits on the shared
+   * durable-readiness core: the unchanged strict witness predicate and the
+   * unchanged absolute deadline, the `fs.watch` notification as fast path, plus a
+   * bounded periodic re-read and one final re-read at the deadline. A READY leaf
+   * that is already on disk therefore cannot stay unexamined merely because no
+   * watcher event was delivered or the events were coalesced; a leaf that never
+   * becomes a valid READY witness still fails with the original deadline error.
+   */
   async waitUntilReady(timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<WindowsExitWitness> {
-    await this.signal.waitFor(() => {
+    await this.signal.waitForRecheck(() => {
       if (this.spawnError) throw this.spawnError;
       if (this.closeEvent) throw new Error(`PowerShell observer exited before READY (${this.closeEvent.code}/${this.closeEvent.signal ?? "none"})`);
       this.readyWitness = this.readWitness(this.readyPath, "READY");
@@ -2267,8 +2277,16 @@ export class WindowsOwnedExitObserver {
     return this.readyWitness!;
   }
 
+  /**
+   * The exited result is the same class of durable file evidence as READY - one
+   * exclusive publication by the retained PowerShell Process handle - so it uses
+   * the same durable-readiness core with its unchanged predicate, unchanged
+   * absolute deadline, and unchanged notification fast path. The retained-handle,
+   * nonce/PID/creation-tick, and exit-code-zero validation is untouched, and an
+   * observer that closes without publishing a valid result still fails closed.
+   */
   async waitForExitedResult(timeoutMs = (WINDOWS_OBSERVER_TIMEOUT_SECONDS + 10) * 1000): Promise<WindowsExitWitness> {
-    await this.signal.waitFor(() => {
+    await this.signal.waitForRecheck(() => {
       if (this.spawnError) throw this.spawnError;
       this.resultWitness = this.readWitness(this.resultPath, "exited");
       if (this.resultWitness) return true;

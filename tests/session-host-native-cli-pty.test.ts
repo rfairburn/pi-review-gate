@@ -628,13 +628,20 @@ test("Claude, Codex, and Pi rows in one real manager keep independent PTYs, outp
     await untilFrame(harness.manager, claudeId, /HELLO tag=claude pid=\d+ tty=1 geo=80x24/, "the claude child's identity line");
     await untilFrame(harness.manager, codexId, /HELLO tag=codex pid=\d+ tty=1 geo=80x24/, "the codex child's identity line");
 
+    // The ENV report line is written BEFORE the child's final QUESTION line, so an
+    // identity-only wait can return while that ENV report is still in flight. Each
+    // row's environment evidence is therefore read from the frame of its OWN
+    // complete startup report, never from a glance at the identity frame.
+    const claudeReport = await untilFlat(harness.manager, claudeId, "QUESTION claude: type YES to confirm", "the claude child's complete startup report");
+    const codexReport = await untilFlat(harness.manager, codexId, "QUESTION codex: type YES to confirm", "the codex child's complete startup report");
+
     // Only the Pi row is registered, and only the Pi child sees the bootstrap.
     // (Both provider rows are compared on the joined frame: their long ENV report
     // lines soft-wrap, and the wrap column moves with the child's pid digits.)
     assert.equal(harness.registrar.requests.length, 1, "a provider row is never registered with the status broker");
     assert.equal(harness.registrar.requests[0]?.instanceId, piId);
-    assert.ok(flatFrame(surfaceOf(harness.manager, claudeId)).includes("BOOT=absent"));
-    assert.ok(flatFrame(surfaceOf(harness.manager, codexId)).includes("BOOT=absent"));
+    assert.ok(claudeReport.includes("BOOT=absent"));
+    assert.ok(codexReport.includes("BOOT=absent"));
 
     assert.equal(harness.handles.length, 3);
     const [piHandle, claudeHandle, codexHandle] = harness.handles;

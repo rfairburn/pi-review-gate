@@ -142,9 +142,10 @@ boundaries; [Development](development.md) owns verification commands.
   line, which is what makes the quoted text identical to what the shared quoting
   produces for an argument whose percent cmd left alone; that single-pass behavior
   on a real Windows host is what the acceptance cases below observed on both
-  current Node pins, with the clean-run boundary stated there. No argument is
-  refused, expanded, or reclassified to make the batch path work, and the shipped
-  launcher's own Pi batch path keeps its previous `/d /s /c` invocation unchanged.
+  current Node pins, with the boundary of that observation stated there. No
+  argument is refused, expanded, or reclassified to make the batch path work, and
+  the shipped launcher's own Pi batch path keeps its previous `/d /s /c` invocation
+  unchanged.
   A resolved executable that is not a `.cmd` or `.bat` shim — a direct `.exe`,
   including one configured with a `node wrapper.js` argument prefix — keeps its
   argv array, carries no command line, and the owned PTY handle **is** the CLI
@@ -219,12 +220,12 @@ Each claim below carries one of five labels:
 - **Implemented, exercised with synthetic children** — host code covered by real
   PTY tests whose child processes are purpose-built Node programs, not provider
   CLIs.
-- **Wired into native CI, observed without an accepted clean run** — a test tier
-  that drives the production path on a real host platform and fails rather than
-  skips when a prerequisite is missing. Its scenario assertions have been observed
-  passing on real Windows runners, but no completed run — those assertions passing
-  *and* the test command terminating normally on its own — has been reported. It
-  pins the acceptance contract and reports those observations and nothing more.
+- **Wired into native CI, completed on a real Windows host** — a test tier that
+  drives the production path on a real host platform and fails rather than skips
+  when a prerequisite is missing. Its scenario assertions passed on real Windows
+  runners at both current Node pins *and* its test command terminated normally on
+  its own, so a completed run of that tier exists on that host. It pins the
+  acceptance contract and reports those observations and nothing more.
 - **Unknown** — no evidence, or evidence too weak to state a fact.
 
 | Provider | Documentation reviewed | Installed-binary probe |
@@ -313,40 +314,48 @@ What the host-side runtime evidence actually is:
   Codex and no injected flag for Claude, as the child reports them; addressed
   input, a prompt answer, and an addressed resize reaching only the owning row's
   child while a sibling row shares nothing; and a deliberate fixture exit plus a
-  confirmed owned Stop settling with Windows lifecycle semantics — no POSIX signal,
-  the full grace window, the pinned forced kill, and settlement proven for the CLI
-  process the shim started rather than only for the wrapper the manager owns. Three
-  cross-platform cases in `tests/session-host-native-cli-windows-delivery.test.ts`
-  pin the wiring that makes that delivery possible at all: the batch child's
+  confirmed owned Stop settling with Windows lifecycle semantics — no POSIX signal
+  requested by the host, which says nothing about the `SIGHUP` Node itself emits
+  when a Windows console closes — the full grace window, the pinned forced kill,
+  and settlement proven for the CLI process the shim started rather than only for
+  the wrapper the manager owns. Three cross-platform cases in
+  `tests/session-host-native-cli-windows-delivery.test.ts` pin the wiring that makes
+  that delivery possible at all: the batch child's
   pre-escaped command line is what the pinned public spawn receives in place of an
   argv array, one row's command line travels from the launch provider to the PTY
   factory verbatim, and an unusable command line is refused before any child
   exists. Both existing native Windows CI jobs — **Windows launcher
   (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — run those
   two files as their own step, so publication is gated on them.
-- **Those cases have run on real Windows runners and their scenario assertions
-  passed, and no completed accepted run of them exists yet.** In one real-Windows
-  CI run on both existing native Windows jobs — **Windows launcher
-  (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — all seven
-  real-ConPTY cases and all three delivery cases reported their assertions
-  passing: `cmd.exe` delivered the composed command line into the child's own
-  argv, a percent carrier expanded once and was gone before the CLI process
-  inherited the environment, the bang literals stayed literal, and the Windows
-  stop ladder settled the CLI process the shim started rather than only the
-  wrapper the manager owns. Every spawned handle exited and each stayed bound to
-  the row that owned it. What that run did not produce is the other half of a
-  clean result: the Node test commands did not terminate on their own afterwards,
-  and those jobs were cancelled. That records the observed scenario behavior; it
-  is not an accepted Windows pass, and the fake-handle and descriptor tests alone
-  are not proof. The shipped default PTY factory now captures the pinned addon's
-  owned ConPTY reader and requires its observed settlement after that
-  handle's own exit, so the native cases must confirm that release end to end, and
-  no Windows run of them after that integration has been reported. Only a run with
-  the assertions passing *and* the test command terminating normally on its own
-  closes this boundary. The honest reading stays *evidence pending*, not *Windows
-  unsupported*: an operator's ordinary Windows Pi use stays valid operational
-  evidence of the platform, and the generic session-host Windows runtime
-  acceptance is real evidence, not a reason to exclude Windows.
+- **Those cases have completed on real Windows runners at both current Node
+  pins.** In one real-Windows CI run, both existing native Windows jobs —
+  **Windows launcher (Node 22.23.4)** and **Windows shell (Node 24, on its
+  24.22.1 pin)** — ran those two files as their own step and each ended with 12
+  tests passed, 0 failed, 0 skipped, its test command terminating normally on its
+  own in about 69 seconds. Those 12 are the seven real-ConPTY cases, the two
+  observation controls beside them in the same file — which pin that the file's
+  own handle shadowing touches only `kill`, and that an observation it cannot
+  install is reported as a fault instead of throwing before a handle is owned —
+  and the three cross-platform delivery cases. The scenarios reported their
+  assertions passing: `cmd.exe` delivered the composed command line into the
+  child's own argv, a percent carrier expanded once and was gone before the CLI
+  process inherited the environment, the bang literals stayed literal, and the
+  Windows stop ladder settled the CLI process the shim started rather than only
+  the wrapper the manager owns. All thirteen raw owned handles exited and each
+  stayed bound to the row that owned it. The owned-ConPTY reader settlement the
+  shipped default PTY factory now requires — capture the pinned addon's own reader
+  for the handle it created, release it through the addon's own drain after that
+  handle's genuine exit, and confirm settlement — was observed there rather than
+  assumed: each fixture's manager disposal reported every owned reader confirmed,
+  and the final resource counts of those runs showed no live `MessagePort`. Normal
+  termination counts as part of the required result because an earlier run of
+  these cases on these same jobs had its assertions passing and then had to be
+  cancelled when its test commands did not end on their own. That closes the
+  completed-run boundary for this tier and nothing past it: the children are
+  synthetic Node programs behind synthetic batch shims, so what this establishes is
+  real-host process facts about them, and the next bullet states what it never
+  touches. It is the result of the two native Windows jobs, not a full-suite or
+  whole-CI result.
 - What those cases still do not touch on Windows: a real provider binary's own
   startup, auth, model, question, approval, and resume behavior — every child
   there is a synthetic Node program behind a synthetic batch shim, and no provider
@@ -532,8 +541,9 @@ cannot, the field stays `unknown`.
   settlement to be positively observed — a release it cannot confirm stays a
   cleanup failure at host disposal instead of becoming success. A native row is
   spawned by that same factory, so its reader release is required on the same
-  terms as a Pi row's; the native acceptance cases still have to confirm it end to
-  end ([Evidence basis](#evidence-basis)).
+  terms as a Pi row's, and the real-Windows native acceptance cases observed that
+  release end to end at both current Node pins
+  ([Evidence basis](#evidence-basis)).
 
 ## Trying one in an owned inactive stage
 

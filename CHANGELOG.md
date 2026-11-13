@@ -128,7 +128,12 @@ dates.
   distinct from the CLI process the shim started, percent- and bang-literal delivery
   through `cmd.exe` and a batch shim with no carrier left behind, the `--no-daemon`
   option position, addressed input and resize isolation between sibling rows, and
-  Windows stop and exit semantics with no POSIX signal. Three cross-platform cases
+  Windows stop and exit semantics with no POSIX signal requested by the host —
+  Node's own Windows console-close `SIGHUP` is a separate thing this makes no
+  claim about. Two observation controls beside those seven cases pin that the
+  file's own handle shadowing touches only `kill` and that an observation it
+  cannot install is reported as a fault rather than throwing before a handle is
+  owned. Three cross-platform cases
   in `tests/session-host-native-cli-windows-delivery.test.ts` pin the command-line
   wiring they depend on. Both existing Windows jobs — Windows launcher
   (Node 22.23.4) and Windows shell (Node 24, on its 24.22.1 pin) — run both files
@@ -136,17 +141,22 @@ dates.
   a missing Windows prerequisite fails those cases instead of skipping them. Every
   child there is a synthetic Node program behind a synthetic batch shim: no provider
   CLI, credential, or model call. This is the acceptance contract for the Windows
-  path, and those cases have since run on both Windows jobs: every scenario
-  assertion passed there, including real `cmd.exe` delivery of the composed command
-  line, the once-expanded and cleared percent carrier, and the stop ladder settling
-  the CLI process rather than only the wrapper the manager owns, with every spawned
-  handle exiting and staying bound to its owning row. That run is not an accepted
-  Windows pass: the Node test commands did not terminate on their own afterwards
-  and the jobs were cancelled, so the required boundary is a run whose assertions
-  pass *and* whose test command ends normally. These rows now spawn on top of the
-  previously released owned-ConPTY reader settlement, which the native cases still
-  have to confirm end to end, and no Windows run of them after that integration has
-  been reported.
+  path, and those cases have now completed on both Windows jobs at the current
+  pins: 12 tests passed, 0 failed, 0 skipped on each job, and each job's test
+  command terminated normally on its own in about 69 seconds rather than being
+  cancelled. Every scenario assertion passed there, including real `cmd.exe`
+  delivery of the composed command line, the once-expanded and cleared percent
+  carrier, and the stop ladder settling the CLI process rather than only the
+  wrapper the manager owns, and all thirteen raw owned handles exited with each
+  staying bound to its owning row. The owned-ConPTY reader settlement these rows
+  now spawn on top of was confirmed end to end in that run: each fixture's manager
+  disposal reported every owned reader confirmed, and the final resource counts
+  showed no live `MessagePort` remaining. That is a completed real-Windows run of
+  this acceptance tier and nothing beyond it: the children there are synthetic
+  programs, so no real provider startup, auth, model, TUI, approval, or resume
+  behavior, no physical-terminal behavior, and no paired-owner network path is
+  claimed, and what passed is the two native Windows jobs, not a full suite or a
+  whole CI run.
 
 ### Changed
 

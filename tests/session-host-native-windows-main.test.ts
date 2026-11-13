@@ -39,10 +39,11 @@ import { SIDEBAR_COLUMNS, frameHeader, frameHeaderMatches } from "./helpers/sess
 
 const optIn = process.env[WINDOWS_REQUIRE_ENV] === "1";
 
-// TODO(https://github.com/rfairburn/pi-review-gate/issues/345): Windows sidebar
-// runtime acceptance deferred to #345 for this release. Restore by re-registering
-// as `test(...)` with the retained opt-in skip condition once #345 lands.
-test.skip("real public Main exits two live Windows ConPTY native Pi sessions through confirmed Quit", {
+// Real Windows host proof, registered normally with the retained opt-in skip
+// condition: without the opt-in env the case reports the skip as not being
+// Windows host proof, and once opted in every missing platform or pinned-runtime
+// prerequisite is a hard failure inside the body, never a second skip.
+test("real public Main exits two live Windows ConPTY native Pi sessions through confirmed Quit", {
   timeout: WINDOWS_TEST_TIMEOUT_MS,
   skip: optIn ? false : `${WINDOWS_REQUIRE_ENV}=1 is required; this is not Windows host proof`,
 }, async (t) => {

@@ -38,6 +38,25 @@
   witnesses for assertions and cleanup only after graceful owner settlement and
   exact root identity checks.
 
+  Witness JSON is produced only by the built-in Microsoft.PowerShell.Utility
+  serializer of the running host process. Before anything is published, the
+  fixture pins that module by absolute path under $PSHOME, the running host's own
+  installation directory, and every serializer call site uses the qualified
+  Microsoft.PowerShell.Utility\ConvertTo-Json, so no unqualified command name can
+  start ambient PowerShell module autoload or module-path discovery inside the
+  publication path. A missing built-in module, a loaded same-named module with no
+  filesystem identity, or one whose path lies outside $PSHOME, fails the run
+  nonzero: no ambient or dynamic module is ever substituted, nothing is discovered
+  instead, and no witness is published.
+
+  For test-harness diagnosis only, the script writes fixed-vocabulary stage
+  markers to STDERR: script-entered, root-validated, lookup-start, handle-bound,
+  ready-published, and result-published. Each marker line is exactly
+  'PRG-OBS-STAGE:<stage>' and carries no path, nonce, PID, error text, or other
+  payload; STDOUT is never written. Markers are diagnosis only: they never
+  satisfy readiness or exit, never replace a witness, and a missing marker is
+  never evidence that the script did not start.
+
   Public API references (.NET Framework 4.8.1 reference pages, applicable to
   Windows PowerShell 5.1):
     Process.Handle: https://learn.microsoft.com/dotnet/api/system.diagnostics.process.handle?view=netframework-4.8.1
@@ -76,6 +95,70 @@ $ErrorActionPreference = 'Stop'
 # An omitted [string] parameter defaults to ''; only the bound-key test
 # distinguishes omission from an explicitly supplied empty/invalid value.
 $hasExpectedStartTime = $PSBoundParameters.ContainsKey('ExpectedStartTimeUtcTicks')
+
+function Initialize-BuiltInJsonSerializer {
+    # Witness JSON may only come from the built-in serializer of this exact host
+    # process. An unqualified cmdlet name can start ambient PowerShell module
+    # autoload and module-path discovery, so the built-in module is pinned here by
+    # absolute path under $PSHOME, the running host's own installation directory,
+    # and every serializer call site stays module-qualified. A missing built-in
+    # module, or a same-named module loaded from outside $PSHOME, fails the run
+    # before any witness exists; nothing is substituted and nothing is discovered.
+    if ([string]::IsNullOrWhiteSpace($PSHOME)) {
+        throw 'Built-in serialization module path is unavailable.'
+    }
+    $builtInManifest = [System.IO.Path]::Combine(
+        $PSHOME,
+        'Modules',
+        'Microsoft.PowerShell.Utility',
+        'Microsoft.PowerShell.Utility.psd1'
+    )
+    if (-not [System.IO.File]::Exists($builtInManifest)) {
+        throw 'Built-in serialization module is missing.'
+    }
+    # Get-Module only inspects already-loaded modules, so this lookup itself can
+    # never start module discovery.
+    $loadedSerializerModule = Get-Module -Name 'Microsoft.PowerShell.Utility'
+    if ($null -eq $loadedSerializerModule) {
+        # Import-Module comes from the always-loaded core snapin, and an absolute
+        # path inside $PSHOME loads this one module: neither searches a module path.
+        $null = Import-Module -Name $builtInManifest -ErrorAction Stop
+        $loadedSerializerModule = Get-Module -Name 'Microsoft.PowerShell.Utility'
+        if ($null -eq $loadedSerializerModule) {
+            throw 'Built-in serialization module could not be loaded.'
+        }
+    }
+    # A module with no filesystem identity proves nothing: a dynamically created
+    # same-named module (New-Module -Name Microsoft.PowerShell.Utility) has an empty
+    # Path and could otherwise serve the witness. Only a module whose own path lies
+    # inside this host's installation directory is the built-in serializer, so both
+    # an empty path and a path elsewhere end the run before any witness exists.
+    $loadedModulePath = [string] $loadedSerializerModule.Path
+    if ([string]::IsNullOrEmpty($loadedModulePath)) {
+        throw 'Loaded serialization module has no filesystem identity.'
+    }
+    if (-not $loadedModulePath.StartsWith($PSHOME + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Loaded serialization module is not the built-in one.'
+    }
+}
+
+function Write-ObserverStageMarker {
+    # Diagnosis only: one fixed-vocabulary line on STDERR, before and after the
+    # exact-PID observation steps, so a caller can tell which step it reached.
+    # It carries no path, nonce, PID, error text, or other payload, never writes
+    # STDOUT, and a failed marker write never changes the observation itself.
+    param([Parameter(Mandatory = $true)][string] $Stage)
+
+    if ($Stage -notmatch '\A(?:script-entered|root-validated|lookup-start|handle-bound|ready-published|result-published)\z') {
+        return
+    }
+    try {
+        [System.Console]::Error.WriteLine('PRG-OBS-STAGE:' + $Stage)
+    }
+    catch {
+        # A marker is never proof and never worth failing observation for.
+    }
+}
 
 function Get-ValidatedRootPath {
     param([Parameter(Mandatory = $true)][string] $Candidate)
@@ -182,7 +265,9 @@ function Write-WitnessExclusive {
         throw 'Witness collision.'
     }
 
-    $json = ConvertTo-Json -InputObject $Payload -Compress -Depth 4
+    # Module-qualified so the pinned built-in serializer is used and no unqualified
+    # command name can start ambient module discovery inside the publication path.
+    $json = Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $Payload -Compress -Depth 4
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
     if ($bytes.Length -gt 1024) {
         throw 'Witness exceeded its byte bound.'
@@ -219,10 +304,15 @@ $observedExitCode = $null
 $scriptExitCode = 2
 $canPublish = $false
 
+Write-ObserverStageMarker -Stage 'script-entered'
+
 try {
     if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         throw 'This fixture requires Windows.'
     }
+    # The built-in serializer is a publication prerequisite, so it is pinned before
+    # anything could be published: a host without it fails nonzero with no witness.
+    Initialize-BuiltInJsonSerializer
     if ($NativePid -lt 2 -or $NativePid -gt [int]::MaxValue) {
         throw 'NativePid must be an exact positive Int32 process ID.'
     }
@@ -245,6 +335,7 @@ try {
     }
 
     $rootPath = Get-ValidatedRootPath -Candidate $Root
+    Write-ObserverStageMarker -Stage 'root-validated'
     $observerProcess = [System.Diagnostics.Process]::GetCurrentProcess()
     try {
         $observerPid = $observerProcess.Id
@@ -266,10 +357,12 @@ try {
     # GetProcessById is the sole target lookup: the caller supplies one exact
     # PID that its own spawn/journal fence has already identified.
     $terminalState = 'unavailable'
+    Write-ObserverStageMarker -Stage 'lookup-start'
     $process = [System.Diagnostics.Process]::GetProcessById($NativePid)
     # Force public handle acquisition now and retain this Process object until
     # after WaitForExit and ExitCode; later PID reuse cannot redirect that handle.
     $heldProcessHandle = $process.Handle
+    Write-ObserverStageMarker -Stage 'handle-bound'
     if ($process.HasExited) {
         throw 'Target process already exited before handle binding.'
     }
@@ -288,6 +381,7 @@ try {
         -NativeProcessId $NativePid -CreationTicks $creationTicks -State 'READY' -ObservedExitCode $null
     Write-WitnessExclusive -OriginalRoot $Root -ExpectedRoot $rootPath -Leaf $readyLeaf -Payload $readyPayload
     $readyPublished = $true
+    Write-ObserverStageMarker -Stage 'ready-published'
     $terminalState = 'failure'
 
     $deadline = [System.Diagnostics.Stopwatch]::StartNew()
@@ -336,6 +430,7 @@ if ($canPublish -and -not $resultPublished) {
         Write-WitnessExclusive -OriginalRoot $Root -ExpectedRoot $rootPath `
             -Leaf ($RequestNonce + '.result.json') -Payload $resultPayload
         $resultPublished = $true
+        Write-ObserverStageMarker -Stage 'result-published'
     }
     catch {
         $scriptExitCode = 2

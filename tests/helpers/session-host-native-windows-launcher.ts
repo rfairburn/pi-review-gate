@@ -41,6 +41,7 @@ import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/termi
 import {
   frameHeaderMatches,
   isSidebarFocusedFrame,
+  renderedTitleMatches,
   selectedRosterEntry,
   sidebarRosterHidden,
   SIDEBAR_COLUMNS,
@@ -71,6 +72,7 @@ import {
   createWindowsHarnessRoot,
   identityOfRealDirectory,
   isSessionShutdownFor,
+  isWindowsMainOwnerFrame,
   probeWindowsPowerShell,
   randomDigits,
   resolveInstalledPiRuntime,
@@ -391,6 +393,19 @@ function samePath(left: string, right: string): boolean {
 
 function selectedRosterLabel(frame: string): string | undefined {
   return selectedRosterEntry(frame, 32)?.label;
+}
+
+/**
+ * The observer-recorded canonical display caption for one native session. A
+ * session's startup caption may begin unavailable and settle to the public
+ * stored name or Pi's no-messages fallback; a missing caption is never guessed.
+ */
+function requireLauncherDisplayName(record: NativeJournalRecord, description: string): string {
+  const displayName = record.displayName;
+  if (typeof displayName !== "string" || displayName.length === 0) {
+    throw new Error(`${description}: native observer recorded no canonical display caption`);
+  }
+  return displayName;
 }
 
 function workspaceFieldEmpty(frame: string): boolean {
@@ -816,7 +831,7 @@ export class LauncherPtyDriver {
     assert.equal(selectedRosterLabel(this.currentText()), label, "actual launcher Main sidebar selected the requested row");
   }
 
-  async createNativeSession(workspace: string, label: string, priorActiveHeader?: string): Promise<WindowsOwnedSession> {
+  async createNativeSession(workspace: string, label: string): Promise<WindowsOwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
     await this.ensureSidebarFocus();
     await this.moveRosterTo("New session");
@@ -884,21 +899,31 @@ export class LauncherPtyDriver {
     assert.equal(matchingSpawns.length, 1, `${label} journal PID/cwd cross-binds to exactly one actual PTY spawn`);
     assert.ok(this.ptyRecords().every((entry) => !(entry.type === "pty_exit" && entry.pid === record!.pid)),
       `${label} remains a live Main-owned PTY after session_start`);
-    await this.waitFrame((frame) => selectedRosterLabel(frame) === "(no messages)" || frame.includes(label),
-      "New completion selects its row without activation");
-    this.focus = "sidebar";
-    if (priorActiveHeader !== undefined) {
-      assert.equal(this.currentText().split("\n")[0], priorActiveHeader,
-        `${label} New completion does not auto-activate or replace the already active native session`);
-    } else {
-      assert.ok(this.currentText().includes("Welcome"), `${label} New completion leaves the empty Main surface active`);
-    }
-    await this.renameSelectedNativeSession(record, label);
+    // A successful explicit New submission activates the created child as the
+    // Main input owner without a second host-row Enter (the sidebar stays visible
+    // exactly as it was): the active outer header is that child's own observed
+    // canonical caption, its row is the single highlight, and the complete
+    // Main-focused footer with the width-correct bordered empty native editor
+    // proves the ownership transfer really happened.
+    const startupCaption = requireLauncherDisplayName(record, `${label} new Workspace-only New`);
+    await this.waitFrame((frame) => isWindowsMainOwnerFrame(frame, startupCaption),
+      `${label} New completion activates the exact created child ${startupCaption} as the Main input owner with a complete Main-focused frame`);
+    this.focus = "main";
+    await this.renameSelectedNativeSession(record, label, startupCaption);
     return { label, workspace: canonicalWorkspace, record };
   }
 
-  private async renameSelectedNativeSession(record: NativeJournalRecord, label: string): Promise<void> {
-    assert.equal(selectedRosterLabel(this.currentText()), "(no messages)", "the freshly created native row is highlighted for public Edit");
+  /**
+   * Rename the freshly created row through the real host Edit form. The row is
+   * the active Main owner (its New activated it and nothing else was selected
+   * since), so this is always an active-owner rename: the owner header must
+   * follow the new caption. A welcome or startup header that never moved is not
+   * rename evidence.
+   */
+  private async renameSelectedNativeSession(record: NativeJournalRecord, label: string, startupCaption: string): Promise<void> {
+    await this.ensureSidebarFocus();
+    assert.ok(renderedTitleMatches(selectedRosterLabel(this.currentText()), startupCaption),
+      "the observed target row is the single highlight for the public Edit key");
     const beforeEdit = this.frameRevision;
     this.write("e", "open Edit form");
     this.focus = "form";
@@ -916,11 +941,20 @@ export class LauncherPtyDriver {
     assertNativeEditorFieldEmpty(this.currentText(), "> New name:");
     await this.send(label, "public Edit replacement is entered", (frame) => frame.includes(label));
     this.write(WINDOWS_KEYS.enter, "submit replacement name");
-    await this.waitForNative((records) => records.some((entry) => entry.type === "native_session_name"
-      && entry.pid === record.pid && entry.sessionId === record.sessionId && entry.storedName === label),
+    const nameRecords = await this.waitForNative((records) => records.some((entry) => entry.type === "native_session_name"
+      && entry.pid === record.pid && entry.sessionId === record.sessionId && entry.storedName === label
+      && typeof entry.displayName === "string"),
     "public native observer sees the live SessionManager display-name value");
-    await this.waitFrame((frame) => selectedRosterLabel(frame)?.includes(label) === true,
-      "public Edit updates the selected sidebar row");
+    const nameRecord = nameRecords.filter((entry) => entry.type === "native_session_name"
+      && entry.pid === record.pid && entry.sessionId === record.sessionId && entry.storedName === label
+      && typeof entry.displayName === "string").at(-1);
+    assert.ok(nameRecord, "the actual stored-name event includes its canonical bounded display caption");
+    const displayName = requireLauncherDisplayName(nameRecord, `${label} public Edit replacement`);
+    await this.waitFrame((frame) => renderedTitleMatches(selectedRosterLabel(frame), displayName)
+        && frameHeaderMatches(frame, displayName),
+      "the renamed active owner reports its new caption as the owner header");
+    assert.ok(frameHeaderMatches(this.currentText(), displayName),
+      "renaming the active owner keeps that same child as the active Main owner under its new caption");
     this.focus = "sidebar";
   }
 

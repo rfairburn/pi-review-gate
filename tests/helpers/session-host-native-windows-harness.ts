@@ -790,8 +790,8 @@ export interface WindowsOwnedSession {
 /**
  * Direct-Main session with the observer-recorded canonical display caption that
  * the strict automatic-New ownership and draft witnesses require. It remains a
- * subtype of the shared `WindowsOwnedSession` so the untouched launcher harness
- * (which never observes a Main caption) keeps compiling unchanged.
+ * subtype of the shared `WindowsOwnedSession`, which the launcher harness uses
+ * for its own caption-bearing New witness.
  */
 export interface WindowsMainOwnedSession extends WindowsOwnedSession {
   /** Observer-recorded canonical display caption for the exact native session. */

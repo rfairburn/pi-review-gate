@@ -4,6 +4,9 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 
+import { SidebarController } from "../src/session-host/sidebar";
+import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
+
 import {
   LAUNCHER_CLEANUP_BUDGET_MS,
   LAUNCHER_BODY_DEADLINE_MS,
@@ -11,6 +14,8 @@ import {
   LAUNCHER_EXPECT_PI_VERSION,
   LAUNCHER_LEG_DEADLINE_MS,
   LAUNCHER_LEGS,
+  LAUNCHER_OUTER_COLS,
+  LAUNCHER_OUTER_ROWS,
   LAUNCHER_REQUIRE_ENV,
   LAUNCHER_STARTUP_TIMEOUT_MS,
   LauncherPtyDriver,
@@ -36,7 +41,8 @@ import {
   type NativeJournalRecord,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-launcher";
-import { frameHeader } from "./helpers/session-host-native-roster-witness";
+import { frameHeader, frameHeaderMatches, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
+import { WINDOWS_NATIVE_COLS, isWindowsMainOwnerFrame } from "./helpers/session-host-native-windows-harness";
 
 const restorationFixtures = require("../../tests/fixtures/session-host-windows-launcher-restoration.cjs") as {
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
@@ -53,14 +59,15 @@ test("source-launcher acceptance bounds are finite and fit the whole-file budget
   assert.equal(LAUNCHER_EXPECT_PI_VERSION, "1.5.2");
   assert.equal(LAUNCHER_LEG_DEADLINE_MS, 9 * 60_000);
   assert.ok(LAUNCHER_LEGS.length === 2,
-    "both real wrapper legs (cmd and direct PowerShell) are retained; runtime coverage deferred under #345");
+    "both real wrapper legs (cmd and direct PowerShell) stay registered as real Windows host proof");
 });
 
 for (const leg of LAUNCHER_LEGS) {
-  // TODO(https://github.com/rfairburn/pi-review-gate/issues/345): Windows sidebar
-  // runtime acceptance deferred to #345 for this release. Restore by re-registering
-  // as `test(...)` with the retained opt-in skip condition once #345 lands.
-  test.skip(`real Windows source launcher (${leg}) stages, builds, runs a native Pi child, and restores`, {
+  // Real Windows host proof, registered normally with the retained opt-in skip
+  // condition: without the opt-in env the leg reports the skip as not being
+  // Windows host proof, and once opted in every missing platform, pinned-runtime,
+  // source-fixture, or Python prerequisite is a hard failure, never a skip.
+  test(`real Windows source launcher (${leg}) stages, builds, runs a native Pi child, and restores`, {
     timeout: LAUNCHER_LEG_DEADLINE_MS,
     skip: optIn ? false : `${LAUNCHER_REQUIRE_ENV}=1 is required; this is not Windows host proof`,
   }, async (t) => {
@@ -135,15 +142,16 @@ for (const leg of LAUNCHER_LEGS) {
     const draftB = `launcherDraftB${suffix}`;
 
     const sessionA = await driver.createNativeSession(layout.workspaceA, labelA);
-    assert.notEqual(frameHeader(driver.currentText()), labelA,
-      "New highlights A but does not activate it; the outer header stays the welcome title");
+    assert.equal(frameHeaderMatches(driver.currentText(), labelA), true,
+      "the completed New activated A as the Main input owner, and the active-owner rename moved the header to A's new caption");
     await driver.activate(labelA);
     await driver.writeDraft(draftA);
-    const headerA = driver.currentText().split("\n")[0];
 
-    const sessionB = await driver.createNativeSession(layout.workspaceB, labelB, headerA);
-    assert.equal(driver.currentText().split("\n")[0], headerA,
-      "New highlights B while leaving A active until explicit selection");
+    const sessionB = await driver.createNativeSession(layout.workspaceB, labelB);
+    assert.notEqual(frameHeader(driver.currentText()), labelA,
+      "the second completed New transfers Main input ownership from A to B instead of leaving A's stale active header");
+    assert.equal(frameHeaderMatches(driver.currentText(), labelB), true,
+      "B's own freshly observed canonical caption is the active outer header after the ownership transition");
     await driver.activate(labelB);
     await driver.writeDraft(draftB);
     assert.ok(driver.currentText().includes(draftB));
@@ -305,6 +313,49 @@ function samePathForTest(left: string, right: string): boolean {
 function isAbsoluteNativePath(path: string): boolean {
   return process.platform === "win32" ? /^[A-Za-z]:[\\/]|^\\\\/.test(path) : isAbsolute(path);
 }
+
+// Focused negative control for the corrected launcher observation. A completed
+// New transfers Main input ownership to the created child, so the lane admits
+// only that child's own complete owner frame: the empty welcome surface the
+// stale lane accepted, a sidebar-focused footer, a partial native border, and a
+// header that never followed the active-owner rename are all refused.
+test("launcher New ownership witness rejects the welcome header, a stale footer, and a partial native border", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const owner = "(no messages)";
+  assert.equal(LAUNCHER_OUTER_COLS - SIDEBAR_COLUMNS - 1, WINDOWS_NATIVE_COLS,
+    "the composed launcher frame keeps the same wide native pane width the shared owner witness reads");
+  controller.updateItems([{
+    id: "launcher-new-owner", label: owner, workspace: "/owned/windows-launcher-new", agentDir: "/owned/agent",
+    lifecycle: "alive", hasLiveProcess: true, busy: false, pendingInput: false, inputSurface: false,
+    backgroundTasks: 0, backgroundShells: 0, activity: [],
+  }]);
+  controller.select("launcher-new-owner");
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  // The completed New activates the created child without a second host-row Enter.
+  controller.handleInput("\r");
+  const mainFocused = controller.renderRoster(SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  const rule = "\u2500".repeat(WINDOWS_NATIVE_COLS);
+  const nativeRows = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: LAUNCHER_OUTER_ROWS - 1 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (header: string, sidebar: readonly string[], main: readonly string[]): string =>
+    [header, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}\u2502${main[index] ?? ""}`)].join("\n");
+  const emptyEditor = nativeRows(rule, "> ", rule);
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, mainFocused, emptyEditor), owner), true,
+    "the observed owner header, single highlight, complete Main-focused roster, and width-correct bordered empty native editor are a genuine automatic-New ownership witness");
+  assert.equal(isWindowsMainOwnerFrame(compose("Welcome \u2014 select a session", mainFocused, emptyEditor), owner), false,
+    "the pre-New empty welcome surface never proves the created child owns Main");
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, sidebarFocused, emptyEditor), owner), false,
+    "a stale sidebar-focused footer never proves Main input ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose(owner, mainFocused, nativeRows(rule, "> ", "")), owner), false,
+    "a partial native border that never drew its closing rule never proves ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose("A-stale-owner", mainFocused, emptyEditor), owner), false,
+    "a header that never followed the active-owner rename never proves the renamed child owns Main");
+});
 
 // Pure synthetic contracts that run everywhere: restoration witnesses, the
 // enforced leg deadline, and transcript-free diagnostics.

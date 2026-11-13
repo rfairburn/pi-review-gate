@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.281]
+
+### Tests
+
+- **Repair generic Windows Pi runtime acceptance (#663)**: register the real
+  public Main, cold CMD, and direct PowerShell cases under the existing opt-in,
+  and correct the launcher tests' stale New-session ownership observations.
+  Original-process/PTY exit and terminal-restoration assertions, deadlines,
+  ownership checks, runtime pins, and CI check names remain unchanged.
+  Test-only: production behavior is untouched.
+
 ## [0.1.0-dev.280]
 
 ### Added

@@ -64,6 +64,12 @@ import { type NativeCliBackend } from "./session-backend";
  *   option's operand is data and is never read as a subcommand; and past a `--`
  *   terminator every remaining token is the provider's own prompt data,
  *   forwarded exactly and never read as an option or subcommand.
+ * - **One Codex clipboard compatibility marker.** A Codex child environment —
+ *   built-in or explicitly configured target — carries `HERDR_ENV=1` so the
+ *   provider additionally emits a terminal OSC 52 copy request on its own row
+ *   (see `applyCodexTerminalClipboardMode` for the exact upstream branch, its
+ *   child-only scope, and what it never changes). Claude and native Pi get no
+ *   marker, and no multiplexer or SSH marker is ever faked.
  * - **No inherited host capability.** The environment is a clone sanitized by
  *   the same provider-neutral sanitizer the native Pi launch uses: worker role
  *   authorization is rejected fail-closed, and stale session-host bootstrap,
@@ -478,6 +484,69 @@ function composeNativeArgs(
 }
 
 /**
+ * The one environment variable a hosted Codex child is given for terminal text
+ * copy: `HERDR_ENV` with the exact value `1`.
+ *
+ * Upstream Codex (`codex-rs/tui/src/clipboard_copy.rs`, inspected at the pinned
+ * `rust-v0.167.2` tag) always attempts its native OS clipboard write, and when
+ * this variable is exactly `1` it ADDITIONALLY writes one terminal OSC 52 copy
+ * request (`\x1b]52;c;<base64>`, direct — not tmux/screen-wrapped unless the
+ * child really is inside an inherited multiplexer) to its own controlling
+ * terminal, which under this host is the row's PTY. That emitted request is
+ * what lets text be copied OUT of a hosted Codex row, including into a network
+ * viewer; the provider's own native write keeps happening exactly as it does
+ * for a locally-run Codex. Nothing else in the inspected source reads this
+ * variable.
+ *
+ * This is a narrow compatibility use of an existing upstream branch, not an
+ * integration: `HERDR_ENV` is undocumented in Codex, its semantics belong to
+ * upstream and can widen in a future release, and no HERDR repository, code,
+ * dependency, or attribution is involved here. No provider version probe, no
+ * added CLI argument, and no other environment marker: `SSH_TTY`,
+ * `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, and `STY` stay exactly as inherited,
+ * because faking them would additionally switch off Codex's own clipboard-text
+ * read, its right-click paste, and its local image links — behavior the
+ * operator keeps.
+ */
+const CODEX_TERMINAL_CLIPBOARD_ENV = "HERDR_ENV";
+
+/** The only value the upstream branch recognizes. */
+const CODEX_TERMINAL_CLIPBOARD_VALUE = "1";
+
+/**
+ * Set the Codex clipboard compatibility marker on one composed CHILD
+ * environment, in place, after every environment source has merged.
+ *
+ * Scope is exactly this one variable on this one child:
+ *
+ * - It is called for a Codex target only, and only on the descriptor's own
+ *   cloned environment, so the caller's request object, the launcher options,
+ *   and the host process environment are never mutated.
+ * - Because it runs after the configured shared overlay merged, the host-owned
+ *   mode intentionally wins for this single key: a preexisting `HERDR_ENV` of
+ *   any value — inherited or configured — is replaced. Every other composed
+ *   entry (inheritance, the configured overlay, `PWD`, and the Windows batch
+ *   percent carrier) keeps the value the ordinary composition gave it.
+ * - Windows environment names are case-insensitive, so the child must resolve
+ *   one spelling. The shared snapshot already uppercases every name it
+ *   composes; dropping any other spelling of this key first keeps that
+ *   invariant, so the assignment replaces the single canonical entry instead of
+ *   adding an alias the child could pick either way. POSIX names stay
+ *   case-sensitive, so an unrelated differently-cased variable is the
+ *   operator's own and is never touched.
+ */
+function applyCodexTerminalClipboardMode(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): void {
+  if (platform === "win32") {
+    for (const name of Object.keys(env)) {
+      if (name !== CODEX_TERMINAL_CLIPBOARD_ENV && name.toUpperCase() === CODEX_TERMINAL_CLIPBOARD_ENV) {
+        delete env[name];
+      }
+    }
+  }
+  env[CODEX_TERMINAL_CLIPBOARD_ENV] = CODEX_TERMINAL_CLIPBOARD_VALUE;
+}
+
+/**
  * Compose the child environment: a clone of the caller's environment through
  * the shared provider-neutral sanitizer, then the selected target's SHARED
  * env overlay (the caller adds the canonical `PWD` once the workspace is
@@ -729,6 +798,12 @@ export function createNativeCliLauncher(
     // discovery actually searches (same rule the settings availability probe
     // applies) and the located file is the file the child would execute.
     const env = composeNativeEnvironment(request.env, sharedEnv, platform);
+    // The Codex clipboard compatibility marker is applied to the composed child
+    // environment only, once normal target and environment resolution is done,
+    // so it wins for this one variable over any configured or inherited value
+    // while leaving the rest of the composition untouched (Claude and Pi
+    // descriptors receive nothing).
+    if (backend === "codex") applyCodexTerminalClipboardMode(env, platform);
     const cwd = canonicalNativeWorkspace(request.workspace);
     env.PWD = cwd;
     // Discovery anchors to the workspace the child is actually spawned in, so a

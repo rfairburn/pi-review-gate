@@ -32,6 +32,8 @@ import {
   type InstanceStatusUpdate,
   type NativeInstanceView,
   type NativeViewerClipboardReceipt,
+  type NativeViewerNativeCliClipboardReceipt,
+  type NativeCliClipboardEvent,
   type NativeViewerAnyInputSource,
   type NativeViewerClipboardSink,
   type NativeViewerInputRefusal,
@@ -4968,8 +4970,11 @@ const VIEWER_HOST_RUN = "11111111-2222-4333-8444-555555555555";
 const VIEWER_SESSION = "conversation-viewer-input";
 
 /** One viewer's own copy sink plus the receipts it received, in arrival order. */
-function viewerSink(): { receipts: NativeViewerClipboardReceipt[]; sink: NativeViewerClipboardSink } {
-  const receipts: NativeViewerClipboardReceipt[] = [];
+function viewerSink(): {
+  receipts: Array<NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt>;
+  sink: NativeViewerClipboardSink;
+} {
+  const receipts: Array<NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt> = [];
   return { receipts, sink: (receipt) => { receipts.push(receipt); } };
 }
 
@@ -4987,7 +4992,7 @@ function openSurface(manager: InstanceManager, options?: ViewerOpenOptions): str
 /** One fully bound surface: its own copy sink, the receipts it took, its own id. */
 function boundSurface(manager: InstanceManager): {
   viewerId: string;
-  receipts: NativeViewerClipboardReceipt[];
+  receipts: Array<NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt>;
 } {
   const own = viewerSink();
   const viewerId = openSurface(manager, { hostRunId: VIEWER_HOST_RUN, nativeClipboardSink: own.sink });
@@ -5088,7 +5093,7 @@ function originCapsule(
 const copyEvent = (text: string, sessionId: string, sessionEpoch: number): NativeClipboardEvent => ({
   kind: "copy", encoded: Buffer.from(text, "utf8").toString("base64"), sessionId, sessionEpoch,
 });
-const copiedText = (event: NativeClipboardEvent): string => Buffer.from(
+const copiedText = (event: NativeClipboardEvent | NativeCliClipboardEvent): string => Buffer.from(
   event.kind === "copy" ? event.encoded : "", "base64",
 ).toString("utf8");
 

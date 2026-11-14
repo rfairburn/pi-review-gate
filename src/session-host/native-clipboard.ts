@@ -282,6 +282,70 @@ export function createNativeClipboardReceiver(
   };
 }
 
+/**
+ * One clipboard selection code of a standard OSC 52 request: `c` (clipboard),
+ * `s` (selection), `p` (primary), `q` (secondary), or a numbered cut buffer
+ * (`0`–`7`), optionally several in one request. Anything outside this closed set
+ * — a wildcard, a space-separated list, or arbitrary text — is malformed. The
+ * EMPTY selection field is deliberately not matched here: it is the standard
+ * spelling of the default selection and is accepted separately.
+ */
+const OSC52_SELECTION_CODES = /^[cpsq01234567]{1,8}$/;
+
+/**
+ * Validate one already-normalized native TEXT copy payload: canonical base64 of
+ * at most {@linkcode MAX_ENCODED} characters (the unchanged native producer bound)
+ * that decodes to non-empty strict UTF-8 text. Binary, empty, over-bound, or
+ * malformed payloads are refused whole; nothing is ever truncated to fit.
+ */
+export function isNativeCliCopyEncoded(value: unknown): value is string {
+  if (!canonicalBase64(value, MAX_ENCODED)) return false;
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length === 0) return false;
+  try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return false; }
+  return true;
+}
+
+/**
+ * Parse one standard OSC 52 payload emitted INSIDE an owned hosted provider
+ * child's PTY (issue 277 native text-copy slice) into canonical base64 UTF-8
+ * text, or `undefined` to refuse the whole request.
+ *
+ * This is the capture parser for a CLOSED opt-in sink only; it grants nothing and
+ * knows nothing about rows, viewers, or destinations. Every refusal is a whole
+ * refusal, never a truncation:
+ * - exactly one clipboard-selection field and exactly one payload field;
+ * - the selection field is either EMPTY (the standard default-selection spelling)
+ *   or drawn only from the standard clipboard codes;
+ * - a clipboard QUERY (`?`) is refused outright — this host never answers one and
+ *   never sends clipboard content back toward a child;
+ * - the payload is canonical base64 of at most {@linkcode MAX_ENCODED} characters
+ *   (the unchanged native producer bound), decodes to non-empty strict UTF-8 text,
+ *   and is returned re-canonicalized so a caller never forwards a non-canonical
+ *   spelling;
+ * - binary, invalid UTF-8, empty, over-bound, or malformed payloads are refused.
+ *
+ * Nothing here re-emits a control sequence: the result is opaque text. A raw OSC
+ * 52 sequence never leaves this function, and on any surface that did not opt in
+ * the sequence stays denied by its own parser hook.
+ */
+export function parseNativeCliOsc52Text(data: string): string | undefined {
+  if (typeof data !== "string" || data.length === 0) return undefined;
+  const separator = data.indexOf(";");
+  // A missing separator, an empty payload, or any extra field is malformed. An
+  // EMPTY field before the separator is not: that is how a standard request asks
+  // for the default selection, and refusing it would drop a legitimate copy.
+  if (separator < 0 || separator === data.length - 1) return undefined;
+  if (data.indexOf(";", separator + 1) !== -1) return undefined;
+  const selection = data.slice(0, separator);
+  if (selection.length > 0 && !OSC52_SELECTION_CODES.test(selection)) return undefined;
+  const payload = data.slice(separator + 1);
+  if (payload === "?") return undefined;
+  if (!isNativeCliCopyEncoded(payload)) return undefined;
+  return Buffer.from(payload, "base64").toString("base64");
+}
+
 export interface NativeClipboardRuntime {
   readonly root: string;
   readonly tuiRoot?: string;

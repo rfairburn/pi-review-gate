@@ -87,6 +87,7 @@ import {
 	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	buildNativeInputInline,
@@ -106,7 +107,7 @@ import {
 	type NativeIoCompletedCopy,
 	type NativeIoInputKind,
 	type NativeIoInputSource,
-	type NativeIoSource,
+	type NativeIoCopySource,
 	type SessionContentBeginFrame,
 	type SessionContentBounds,
 	type SessionContentChunkFrame,
@@ -541,6 +542,8 @@ class ContentViewerBinding implements SessionContentViewer {
 	#startupInputNegotiated = false;
 	/** True only after the owner ALSO acknowledged hosted native CLI input. */
 	#nativeCliInputNegotiated = false;
+	/** True only after the owner ALSO acknowledged hosted native CLI TEXT copy. */
+	#nativeCopyCliNegotiated = false;
 
 	readonly #assembler: SessionContentTransferAssembler;
 	readonly #copyAssembler: NativeCopyAssembler;
@@ -550,7 +553,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	#copyDiscardId: string | null = null;
 	/** The paged copy whose header was admitted, until its assembly completes. */
 	#copyHeaderId: string | null = null;
-	#copyHeaderSource: NativeIoSource | null = null; // copy headers are conversation-only
+	#copyHeaderSource: NativeIoCopySource | null = null;
 	/** Ordered logical input operations; one operation's frames never interleave. */
 	#inputTail: Promise<void> = Promise.resolve();
 	readonly #pendingInputs = new Set<PendingInput>();
@@ -617,7 +620,9 @@ class ContentViewerBinding implements SessionContentViewer {
 		this.#onCopy = nativeIo === null ? null : nativeIo.onCopy;
 		// The optional capabilities are offered only for explicit, validated callbacks;
 		// the default hello keeps its exact single-capability shape and bytes. Startup
-		// input is offered only beside the native IO capability it depends on.
+		// input is offered only beside the native IO capability it depends on, and so is
+		// hosted provider TEXT copy: without the offer the owner never routes a provider
+		// copy to this endpoint, so an opted-in native IO viewer must state it here.
 		this.#capabilities = Object.freeze(nativeIo === null
 			? [SESSION_CONTENT_REQUIRED_CAPABILITY]
 			: [
@@ -625,6 +630,7 @@ class ContentViewerBinding implements SessionContentViewer {
 				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 				SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+				SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 			]);
 		this.#requested = { cols: options.cols, rows: options.rows };
 		this.#activeSubscriptionId = subscriptionId;
@@ -1007,6 +1013,10 @@ class ContentViewerBinding implements SessionContentViewer {
 			// The ack review already refuses hosted native CLI input without native IO.
 			if (verdict.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
 				this.#nativeCliInputNegotiated = true;
+			}
+			// The ack review already refuses hosted native CLI copy without that input.
+			if (verdict.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY)) {
+				this.#nativeCopyCliNegotiated = true;
 			}
 		}
 		// The sink is caller code: it can stop the viewer synchronously, and the rest
@@ -1479,6 +1489,13 @@ class ContentViewerBinding implements SessionContentViewer {
 		}
 		if (frame.type === "copy" || frame.type === "copy_begin") {
 			const source = frame.source;
+			if (isNativeIoNativeCliSource(source) && !this.#nativeCopyCliNegotiated) {
+				// A hosted provider copy on a channel that never negotiated it is not stale
+				// data: it is an extension this side never agreed to, and it is refused
+				// without reaching any clipboard callback.
+				this.#protocolFailure();
+				return;
+			}
 			if (source.hostRunId !== this.#expectedRun || source.sessionId !== this.#expectedSession) {
 				// Another run or another owner row is never this viewer's copy.
 				this.#protocolFailure();
@@ -1504,7 +1521,7 @@ class ContentViewerBinding implements SessionContentViewer {
 	}
 
 	/** Whether a copy's exact source is this endpoint's own current published source. */
-	#copyRoutable(source: NativeIoSource): boolean {
+	#copyRoutable(source: NativeIoCopySource): boolean {
 		if (!this.#nativeIoNegotiated || this.#retired || this.#stopRequested) return false;
 		if (this.#state !== "streaming" || this.#activeSubscriptionId !== this.subscriptionId) return false;
 		const snapshot = this.#snapshot;

@@ -135,6 +135,7 @@ export type {
   NativeViewerInputResult,
   NativeViewerInputSource,
   NativeViewerInputTuple,
+  NativeViewerNativeCliClipboardReceipt,
   NativeViewerNativeCliInputSource,
   NativeViewerStartupInputSource,
   SessionGeometry,
@@ -143,6 +144,8 @@ export type {
   SessionViewerUpdate,
   SessionViewerUpdateResult,
 } from "./instances";
+
+export { isNativeViewerNativeCliClipboardReceipt } from "./instances";
 
 /**
  * Local-only options for registering one viewing surface on the host's one manager.

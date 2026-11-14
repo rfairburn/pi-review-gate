@@ -583,6 +583,148 @@ test("the descriptor environment is a sanitized clone: role authorization reject
   });
 });
 
+test("a hosted Codex child gets the HERDR_ENV=1 terminal clipboard compatibility marker, Claude gets none, and nothing above the descriptor mutates", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "claude"));
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const hostValueBefore = process.env.HERDR_ENV;
+    const parentEnvironment: NodeJS.ProcessEnv = { SystemRoot: "Z:\\Fixture Windows Root" };
+    const launcher = createNativeCliLauncher(configWith({
+      "host-codex": {
+        adapter: "codex-cli",
+        command: join(bin, "codex"),
+        args: ["--profile", "host"],
+        // A configured value for this one key loses to the host-owned mode on
+        // purpose; every other configured entry survives unchanged.
+        env: { HERDR_ENV: "0", CODEX_HOME: "/operator/worker-codex-home" },
+        review: {},
+      },
+      "host-claude": {
+        adapter: "claude-cli",
+        command: join(bin, "claude"),
+        // Claude gets no injected marker and no scrubbing either: an operator's
+        // own value passes through verbatim.
+        env: { HERDR_ENV: "operator-own-value" },
+        review: {},
+      },
+    }), { platform: "darwin", parentEnvironment });
+    const requestEnvironment: NodeJS.ProcessEnv = {
+      PATH: bin,
+      HOME: "/operator/home",
+      CODEX_HOME: "/operator/home/.codex",
+      CLAUDE_CONFIG_DIR: "/operator/home/.claude",
+      // A preexisting inherited value for the same key loses; the differently
+      // cased spelling is an unrelated POSIX variable of the operator's.
+      HERDR_ENV: "0",
+      herdr_env: "operator-own-posix-variable",
+      // No spoofing and no scrubbing: multiplexer and SSH inheritance stays
+      // exactly as the operator's environment has it.
+      SSH_TTY: "/dev/ttys004",
+      SSH_CONNECTION: "192.0.2.1 5000 198.51.100.2 22",
+      TMUX: "/private/tmp/tmux-501/default,1234,0",
+      STY: "777.pts-0.host",
+    };
+    const requestSnapshot = { ...requestEnvironment };
+
+    const codex = await launcher("codex", { workspace, env: requestEnvironment });
+    assert.equal(codex.env.HERDR_ENV, "1", "the built-in Codex child gets the host-owned clipboard mode");
+    // POSIX environment names stay case-sensitive: only the exact canonical key
+    // is the mode, and the operator's other spelling is untouched.
+    assert.equal(codex.env.herdr_env, "operator-own-posix-variable");
+    // Everything else about the launch is exactly what it was before.
+    assert.deepEqual(codex.args, ["--no-daemon"]);
+    assert.equal(codex.env.CODEX_HOME, "/operator/home/.codex");
+    assert.equal(codex.env.PWD, workspace);
+    assert.equal(codex.env.SSH_TTY, "/dev/ttys004");
+    assert.equal(codex.env.SSH_CONNECTION, "192.0.2.1 5000 198.51.100.2 22");
+    assert.equal(codex.env.TMUX, "/private/tmp/tmux-501/default,1234,0");
+    assert.equal(codex.env.STY, "777.pts-0.host");
+
+    // An explicitly configured Codex target gets the marker too, overriding only
+    // that target's own conflicting value for this one key.
+    const configured = await launcher("codex", { workspace, env: { PATH: bin }, targetId: "external:host-codex" });
+    assert.equal(configured.env.HERDR_ENV, "1", "a configured Codex target's conflicting value loses");
+    assert.equal(configured.env.CODEX_HOME, "/operator/worker-codex-home");
+    assert.deepEqual(configured.args, ["--profile", "host", "--no-daemon"]);
+
+    // Claude receives no marker on either the default or a configured target: the
+    // inherited value survives untouched, and a configured one survives verbatim.
+    const claude = await launcher("claude", { workspace, env: requestEnvironment });
+    assert.equal(claude.env.HERDR_ENV, "0", "no marker is injected into a Claude child");
+    assert.equal(claude.env.herdr_env, "operator-own-posix-variable");
+    assert.equal(claude.env.PWD, workspace);
+    const configuredClaude = await launcher("claude", { workspace, env: { PATH: bin }, targetId: "external:host-claude" });
+    assert.equal(configuredClaude.env.HERDR_ENV, "operator-own-value", "a configured Claude value is neither injected nor scrubbed");
+
+    // Parent isolation: the caller's request object, the launcher options, and the
+    // host process environment all come back unchanged.
+    assert.deepEqual(requestEnvironment, requestSnapshot);
+    assert.deepEqual(parentEnvironment, { SystemRoot: "Z:\\Fixture Windows Root" });
+    if (hostValueBefore === undefined) assert.equal(process.env.HERDR_ENV, undefined);
+    else assert.equal(process.env.HERDR_ENV, hostValueBefore);
+  });
+});
+
+test("the Windows Codex descriptor carries one canonical HERDR_ENV spelling while its batch delivery stays byte-identical", async () => {
+  await fixture(async (root, bin) => {
+    for (const shim of ["codex.cmd", "claude.cmd"]) {
+      await writeFile(join(bin, shim), "@echo off\r\n");
+      await chmod(join(bin, shim), 0o755);
+    }
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const trusted = "Z:\\Fixture Windows Root\\System32\\cmd.exe";
+    const shipped = helperModule.resolveTrustedWindowsCmd;
+    helperModule.resolveTrustedWindowsCmd = () => trusted;
+    try {
+      const parentEnvironment: NodeJS.ProcessEnv = { SystemRoot: "Z:\\Fixture Windows Root" };
+      const launcher = createNativeCliLauncher(configWith({
+        "win-codex": {
+          adapter: "codex-cli",
+          command: "codex",
+          args: ["--profile", "host profile"],
+          env: { HERDR_ENV: "0", CODEX_HOME: "C:\\operator\\worker-home" },
+          review: {},
+        },
+      }), { platform: "win32", parentEnvironment });
+
+      const requestEnvironment: NodeJS.ProcessEnv = { PATH: bin, herdr_env: "inherited-lowercase", TMUX: "/tmp/tmux-501/default,1,0" };
+      const requestSnapshot = { ...requestEnvironment };
+      const descriptor = await launcher("codex", { workspace, env: requestEnvironment, targetId: "external:win-codex" });
+
+      assert.equal(descriptor.env.HERDR_ENV, "1");
+      // Exactly one canonical Windows spelling for this key: the child can never
+      // resolve a second case variant either way.
+      assert.deepEqual(Object.keys(descriptor.env).filter((name) => name.toUpperCase() === "HERDR_ENV"), ["HERDR_ENV"]);
+      assert.equal(descriptor.env.herdr_env, undefined, "the inherited alias spelling is not carried alongside the canonical key");
+      // The rest of the Windows composition is unchanged.
+      assert.equal(descriptor.env.CODEX_HOME, "C:\\operator\\worker-home");
+      assert.equal(descriptor.env.PATH, bin);
+      assert.equal(descriptor.env.PWD, workspace);
+      assert.equal(descriptor.env.TMUX, "/tmp/tmux-501/default,1,0");
+      // Batch delivery stays exactly as before: the trusted parent cmd.exe, no
+      // argv, and one pre-escaped command line with the one deliberate option.
+      assert.equal(descriptor.file, trusted);
+      assert.deepEqual(descriptor.args, []);
+      assert.equal(descriptor.commandLine,
+        `/d /s /v:off /c "${helperModule.cmdQuote(join(bin, "codex.cmd"))} ${helperModule.cmdQuote("--profile")} ${helperModule.cmdQuote("host profile")} ${helperModule.cmdQuote("--no-daemon")}"`);
+      assert.equal(descriptor.cwd, workspace);
+      assert.deepEqual(requestEnvironment, requestSnapshot);
+      assert.deepEqual(parentEnvironment, { SystemRoot: "Z:\\Fixture Windows Root" });
+
+      // A built-in Windows Claude child gets no marker at all, and its delivery
+      // is unchanged.
+      const claude = await launcher("claude", { workspace, env: { PATH: bin } });
+      assert.deepEqual(Object.keys(claude.env).filter((name) => name.toUpperCase() === "HERDR_ENV"), []);
+      assert.equal(claude.commandLine, `/d /s /v:off /c "${helperModule.cmdQuote(join(bin, "claude.cmd"))}"`);
+    } finally {
+      helperModule.resolveTrustedWindowsCmd = shipped;
+    }
+  });
+});
+
 test("the workspace is absolute, existing, and canonical; a missing executable refuses with no substitution", async () => {
   await fixture(async (root, bin) => {
     await fakeExecutable(join(bin, "codex"));

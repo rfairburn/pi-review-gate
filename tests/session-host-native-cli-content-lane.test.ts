@@ -10,8 +10,10 @@ import type {
 } from "../src/session-host/instances";
 import { isNativeViewerNativeCliInputSource } from "../src/session-host/instances";
 import type {
+  NativeViewerClipboardSink,
   NativeViewerInputRequest,
   NativeViewerInputResult,
+  NativeViewerNativeCliClipboardReceipt,
   NativeViewerNativeCliInputSource,
   OwningHostInventorySnapshot,
   OwningHostSessionContentListener,
@@ -32,6 +34,7 @@ import {
   SESSION_CONTENT_MAJOR,
   SESSION_CONTENT_MINOR,
   SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+  SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
   SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
   SESSION_CONTENT_NATIVE_IO_CAPABILITY,
   SESSION_CONTENT_REQUIRED_CAPABILITY,
@@ -40,6 +43,7 @@ import {
   decodeSessionContentFrame,
   encodeSessionContentFrame,
   isNativeIoNativeCliSource,
+  isNativeIoNativeCliCopyEvent,
   type NativeIoNativeCliSource,
   type SessionContentBounds,
   type SessionContentFrame,
@@ -161,6 +165,8 @@ class ContentChannel implements PeerByteChannel {
 class FakeNativeSource implements SessionContentSource {
   readonly writes: Array<{ readonly viewerId: string; readonly request: NativeViewerInputRequest }> = [];
   readonly openViewerOptions: Array<OwningHostViewerOptions | undefined> = [];
+  /** Each surface's own copy sink, exactly as the endpoint registered it. */
+  readonly sinks: NativeViewerClipboardSink[] = [];
   geometry: SessionGeometry = { cols: 80, rows: 24, revision: 3 };
   viewers = new Map<string, { revision: number; sessionId: string | undefined }>();
   /** Set to undefined to model a row that is no longer an input target. */
@@ -217,6 +223,7 @@ class FakeNativeSource implements SessionContentSource {
 
   openViewer(options?: OwningHostViewerOptions): SessionViewerState | undefined {
     this.openViewerOptions.push(options);
+    if (options?.nativeClipboardSink !== undefined) this.sinks.push(options.nativeClipboardSink);
     const viewerId = `viewer-${this.nextViewer += 1}`;
     this.viewers.set(viewerId, { revision: 1, sessionId: undefined });
     return { viewerId, sessionId: undefined, cols: undefined, rows: undefined, revision: 1 };
@@ -494,4 +501,118 @@ test("a hosted row whose scope disappeared publishes no source and takes no inpu
   for (const frame of built.frames) harness.channel.deliverBytes(frame);
   await settle();
   assert.equal(harness.source.writes.length, 0, "the retired target receives nothing");
+});
+
+/* ------------------------------------------------------------------------- *
+ * Hosted provider TEXT copy OUT (optional native-copy-cli capability)
+ * ------------------------------------------------------------------------- */
+
+const ALL_IO_COPY = [...ALL_IO, SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY];
+
+/** The owner-private scope of the surface this endpoint registered, in one receipt. */
+function cliCopyReceipt(
+  harness: Harness,
+  text: string,
+  overrides: Partial<NativeViewerNativeCliClipboardReceipt> = {},
+): NativeViewerNativeCliClipboardReceipt {
+  const viewerId = [...harness.source.viewers.keys()].at(-1)!;
+  const scope = harness.source.readViewerInputSource(viewerId);
+  assert.ok(scope !== undefined, "the endpoint's own surface still has a current hosted scope");
+  return Object.freeze({
+    source: scope,
+    event: Object.freeze({ kind: "copy" as const, encoded: Buffer.from(text, "utf8").toString("base64"), backend: "claude" as const }),
+    dispatchId: 1,
+    ...overrides,
+  });
+}
+
+/** Deliver one receipt through the sink THIS channel registered. */
+function deliverCopy(harness: Harness, receipt: NativeViewerNativeCliClipboardReceipt): void {
+  assert.equal(harness.source.sinks.length, 1, "a negotiated content lane registers exactly one copy sink");
+  harness.source.sinks[0]!(receipt);
+}
+
+test("the owner acknowledges hosted provider copy only beside hosted input and only to a peer that offered it", async () => {
+  const peerWithoutCopy = createHarness(true);
+  peerWithoutCopy.channel.deliver(helloFrame(ALL_IO));
+  await settle();
+  const ack = helloAck(peerWithoutCopy.channel.framesOfType("hello_ack")[0]);
+  assert.equal(ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY), true);
+  assert.equal(ack.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY), false,
+    "an identifier the peer never offered is never acknowledged");
+
+  const peerWithCopy = createHarness(true);
+  peerWithCopy.channel.deliver(helloFrame(ALL_IO_COPY));
+  await settle();
+  const withCopy = helloAck(peerWithCopy.channel.framesOfType("hello_ack")[0]);
+  assert.equal(withCopy.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY), true,
+    "an explicit opt-in plus a real peer offer negotiates provider copy");
+
+  const displayOnly = createHarness(false);
+  displayOnly.channel.deliver(helloFrame(ALL_IO_COPY));
+  await settle();
+  assert.deepEqual(helloAck(displayOnly.channel.framesOfType("hello_ack")[0]).capabilities,
+    [SESSION_CONTENT_REQUIRED_CAPABILITY], "without the host opt-in nothing is acknowledged");
+});
+
+test("a hosted provider TEXT copy crosses as its own tuple-less family, to this lane only", async () => {
+  const harness = createHarness(true);
+  const published = await openNativeSubscription(harness, ALL_IO_COPY);
+  assert.ok(published !== null);
+
+  deliverCopy(harness, cliCopyReceipt(harness, "text the child copied out"));
+  await settle();
+
+  const copies = harness.channel.framesOfType("copy");
+  assert.equal(copies.length, 1, "one whole inline copy emission");
+  const frame = copies[0]!;
+  assert.equal(frame.type, "copy");
+  if (frame.type !== "copy") return;
+  assert.equal(frame.subscriptionId, "sub-1");
+  assert.equal(frame.dispatchId, 1);
+  assert.equal(isNativeIoNativeCliSource(frame.source), true, "the frame names the hosted provider source");
+  assert.equal(Object.hasOwn(frame.source, "nativeSession"), false, "no conversation tuple crosses for a provider copy");
+  assert.deepEqual(frame.source, published, "the header names the exact source this viewer committed");
+  assert.deepEqual(Object.keys(frame.event).sort(), ["backend", "encoded", "kind"]);
+  // The discriminated boundary is explicit: a provider copy event is the hosted
+  // family (backend, no tuple), never a Pi conversation event read through a cast.
+  assert.equal(isNativeIoNativeCliCopyEvent(frame.event), true,
+    "the frame carries the hosted provider copy event family");
+  if (!isNativeIoNativeCliCopyEvent(frame.event)) return;
+  assert.equal(frame.event.kind, "copy");
+  assert.equal(frame.event.backend, "claude");
+  assert.equal(Buffer.from(frame.event.encoded, "base64").toString("utf8"), "text the child copied out");
+  assert.equal(harness.diagnostics.includes("copy_dropped"), false, "the copy was routed, not dropped");
+});
+
+test("a lane that never negotiated provider copy emits no copy frame, and a stale scope drops quietly", async () => {
+  const withoutCapability = createHarness(true);
+  await openNativeSubscription(withoutCapability, ALL_IO);
+  deliverCopy(withoutCapability, cliCopyReceipt(withoutCapability, "not negotiated here"));
+  await settle();
+  assert.equal(withoutCapability.channel.framesOfType("copy").length, 0, "no frame is ever minted for an unnegotiated family");
+  assert.equal(withoutCapability.diagnostics.includes("copy_dropped"), true, "the drop is recorded, never claimed as delivery");
+
+  const harness = createHarness(true);
+  await openNativeSubscription(harness, ALL_IO_COPY);
+  // The surface moved: its current scope is a different commitment, so the receipt
+  // that named the old one delivers nothing.
+  const viewerId = [...harness.source.viewers.keys()].at(-1)!;
+  const stale = cliCopyReceipt(harness, "made for the old revision");
+  harness.source.updateViewer(viewerId, {});
+  deliverCopy(harness, stale);
+  await settle();
+  assert.equal(harness.channel.framesOfType("copy").length, 0, "a stale provider scope is never delivered");
+
+  // A backend the row never recorded is refused too.
+  deliverCopy(harness, cliCopyReceipt(harness, "wrong backend", {
+    event: Object.freeze({ kind: "copy", encoded: Buffer.from("wrong backend", "utf8").toString("base64"), backend: "codex" as const }),
+  }));
+  await settle();
+  assert.equal(harness.channel.framesOfType("copy").length, 0, "the event backend must match the row's own backend");
+
+  // The same surface's current facts still work: a drop never latches the lane.
+  deliverCopy(harness, cliCopyReceipt(harness, "still deliverable"));
+  await settle();
+  assert.equal(harness.channel.framesOfType("copy").length, 1, "a current provider scope still delivers");
 });

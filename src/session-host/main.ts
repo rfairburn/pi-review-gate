@@ -46,6 +46,8 @@ import type { NativeInputSendResult } from "./network/session-content-client";
 import {
   NATIVE_COPY_MAX_ENCODED_CHARS,
   NATIVE_TEXT_PASTE_MAX_BYTES,
+  isNativeIoNativeCliCopyEvent,
+  isNativeIoNativeCliSource,
   nativeIoSourceEquals,
   type NativeIoInputKind,
   type NativeIoInputSource,
@@ -211,6 +213,7 @@ import {
 } from "./sidebar";
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
+import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
 import {
   isNativeCliBackend,
@@ -4420,10 +4423,22 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       if (!nativeIoBridgeEnabled || terminal === undefined) return;
       const source = receipt.source;
       const event = receipt.event;
-      // Validate the producer's own native tuple against the source it rode with.
+      // Validate the producer's own facts against the source it rode with. Two
+      // families never mix: a Pi conversation copy names the same conversation twice,
+      // while a hosted provider TEXT copy names that row's recorded backend and carries
+      // no tuple at all (and none is invented here).
       if (source === null || typeof source !== "object" || event === null || typeof event !== "object") return;
-      if (event.sessionId !== source.nativeSession.sessionId
-        || event.sessionEpoch !== source.nativeSession.epoch) return;
+      if (isNativeIoNativeCliSource(source)) {
+        // A hosted provider TEXT copy names that row's recorded backend and carries no
+        // tuple at all; the two must agree, and none is invented here.
+        if (!isNativeIoNativeCliCopyEvent(event) || event.backend !== source.backend) return;
+      } else if (isNativeIoNativeCliCopyEvent(event)) {
+        // The two families never mix on one frame.
+        return;
+      } else if (event.sessionId !== source.nativeSession.sessionId
+        || event.sessionEpoch !== source.nativeSession.epoch) {
+        return;
+      }
       if (currentWrittenRemoteNativeInput({
         hostId: receipt.hostId,
         selectionGeneration: receipt.selectionGeneration,
@@ -4500,13 +4515,17 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     }
   }
 
-  function routeNativeClipboard(id: string, event: NativeClipboardEvent): void {
-    const view = views.find((row) => row.id === id);
-    if (!view?.hasLiveProcess || view.lifecycle !== "alive"
-      || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
+  /**
+   * The owner's own "this row is the actually-shown, uncovered, focused Main
+   * surface right now" proof, shared by the Pi copy route and the hosted provider
+   * copy route. Stale, sibling, hidden, unfocused, covered, form, changed-geometry,
+   * and shutting-down states all refuse; nothing here claims anything about the
+   * producer, only about what this terminal currently displays.
+   */
+  function nativeClipboardMainGuards(id: string): boolean {
     const shown = displayedMousePresentation;
     const latest = latestMousePresentation;
-    const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
+    return terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
       && sidebar?.focus === "main" && localActiveId() === id && layout !== undefined
       && layout.form === undefined
       && shown?.focus === "main" && latest?.focus === "main"
@@ -4521,6 +4540,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // undrawn uncovering/geometry transition cannot authorize a copy (#474).
       // Padding stays host-owned; valid fully drawn child content stays eligible.
       && nativeInputAuthority(id) !== undefined;
+  }
+
+  function routeNativeClipboard(id: string, event: NativeClipboardEvent): void {
+    const view = views.find((row) => row.id === id);
+    if (!view?.hasLiveProcess || view.lifecycle !== "alive"
+      || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
+    const ownsVisibleMain = nativeClipboardMainGuards(id);
     // Stale, sibling, hidden, unfocused, covered, form, changed-geometry, and
     // shutting-down requests are ordinary safety refusals: quiet, fail closed.
     if (!ownsVisibleMain) return;
@@ -4541,6 +4567,37 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // clipboard changed, so success adds no host status or diagnostic.
     try {
       terminal!.write(`\x1b]52;c;${event.encoded}\x07`);
+    } catch {
+      // Never the exception text, payload, or stack: a fixed code only.
+      clipboardDiagnostics.note(id, "clipboard-terminal-write-failed");
+    }
+  }
+
+  /**
+   * The owner-local route of one captured hosted provider TEXT copy. The manager
+   * already proved the row, the child incarnation, and that the last input it
+   * accepted on that exact child was owner-local; this function adds only the
+   * owner's own live-row and actual-display proof, the same guards the Pi copy route
+   * uses. A hosted provider child has no Pi conversation, so no tuple is compared
+   * and none is invented. There is no viewer fallback: if these guards refuse, the
+   * copy is dropped quietly and nothing else receives it.
+   */
+  function routeNativeCliClipboard(id: string, event: NativeCliClipboardEvent): void {
+    const view = views.find((row) => row.id === id);
+    if (!view?.hasLiveProcess || view.lifecycle !== "alive") return;
+    // The row Main can see must be the same hosted backend the manager recorded on
+    // the child this copy rode in from; a mismatch is a stale view, not a route.
+    if (view.backend !== event.backend) return;
+    if (!nativeClipboardMainGuards(id)) return;
+    const surface = terminal;
+    if (surface === undefined) return;
+    const encoded = event.encoded;
+    // The manager re-validated this payload as canonical base64 UTF-8 text under the
+    // unchanged producer bound; it is carried here in full, never shrunk.
+    if (typeof encoded !== "string" || encoded.length === 0
+      || encoded.length > NATIVE_COPY_MAX_ENCODED_CHARS) return;
+    try {
+      surface.write(`\x1b]52;c;${encoded}\x07`);
     } catch {
       // Never the exception text, payload, or stack: a fixed code only.
       clipboardDiagnostics.note(id, "clipboard-terminal-write-failed");
@@ -9180,6 +9237,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       onChange: (id) => noteManagerChanged(id),
       onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
       onNativeClipboard: routeNativeClipboard,
+      onNativeCliClipboard: routeNativeCliClipboard,
       // Authenticated background child requests are admitted by the owning-host
       // service. This path never completes a sidebar form and never activates
       // the created row; manager onChange only refreshes the roster.

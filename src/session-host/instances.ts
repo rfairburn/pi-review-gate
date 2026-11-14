@@ -26,7 +26,7 @@ import {
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
+import { createNativeClipboardReceiver, isNativeCliCopyEncoded, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
 import {
 	createNativeInputEncoder,
 	mintNativeViewerScopeToken,
@@ -586,8 +586,50 @@ export interface NativeViewerClipboardReceipt {
 	readonly dispatchId: number;
 }
 
-/** One viewer's own copy destination, supplied by the host that owns that surface. */
-export type NativeViewerClipboardSink = (receipt: NativeViewerClipboardReceipt) => void;
+/**
+ * One captured TEXT copy from one owned hosted provider child (issue 277 native
+ * text-copy slice).
+ *
+ * It states only what the owner actually observed: a normalized canonical-base64
+ * UTF-8 text payload captured inside this row's own PTY, and the row's own
+ * positively recorded provider backend. There is deliberately NO `sessionId`,
+ * `sessionEpoch`, registration, PID, path, or command field: a hosted provider
+ * child has no Pi conversation, and inventing a tuple here would be a fabricated
+ * attribution. The child process the copy rode in on is bound only through this
+ * row's owner-private per-incarnation key.
+ */
+export interface NativeCliClipboardEvent {
+	readonly kind: "copy";
+	readonly encoded: string;
+	readonly backend: NativeCliBackend;
+}
+
+/**
+ * One hosted provider copy routed to the ONE viewer surface this manager last
+ * accepted input from on that exact child incarnation. `dispatchId` is the owner's
+ * own ordinal of that accepted input: a routing convention frozen when the copy was
+ * accepted, never causal proof that the input produced the copy.
+ */
+export interface NativeViewerNativeCliClipboardReceipt {
+	readonly source: NativeViewerNativeCliInputSource;
+	readonly event: NativeCliClipboardEvent;
+	readonly dispatchId: number;
+}
+
+/** True only for the hosted provider variant of a viewer copy receipt. */
+export function isNativeViewerNativeCliClipboardReceipt(
+	receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt,
+): receipt is NativeViewerNativeCliClipboardReceipt {
+	return (receipt.source as { readonly phase?: unknown }).phase === NATIVE_CLI_INPUT_PHASE;
+}
+
+/**
+ * One viewer's own copy destination, supplied by the host that owns that surface.
+ * It receives either an unchanged Pi conversation copy or a hosted provider TEXT
+ * copy; the variant is the surface's own business and is never merged.
+ */
+export type NativeViewerClipboardSink =
+	(receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt) => void;
 
 /**
  * Local-only registration options for one viewing surface. Both are immutable for
@@ -900,6 +942,16 @@ export interface InstanceManagerOptions {
 	 * encoded payload are never logged, rendered, or retained by this module.
 	 */
 	onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	/**
+	 * The owner-local route of one captured hosted provider TEXT copy, reached only
+	 * when this manager's own last accepted input on that exact child incarnation was
+	 * owner-local input. It carries no Pi conversation tuple, so it is deliberately a
+	 * separate callback: the existing native Pi route stays exactly as it was and can
+	 * never be fed a provider copy, and this route can never be fed a Pi copy. The
+	 * host still owes its own live row, focus, display, and coverage proof before any
+	 * clipboard request leaves it.
+	 */
+	onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
@@ -1080,6 +1132,26 @@ interface ManagedInstance {
 	 * confirmed exit, which is also when the row stops being an input target.
 	 */
 	nativeCliIncarnation?: Buffer;
+	/**
+	 * Owner-private routing convention of THIS row's current provider-child incarnation
+	 * (issue 277 native text-copy slice): the most recent ACTUAL accepted nonempty
+	 * input forwarded to that PTY, either owner-local or one viewer's verified input.
+	 *
+	 * It is set only when bytes really left this manager for that child — never by a
+	 * selected form, a refused or rejected request, a received copy request, or a
+	 * terminal protocol query/reply — and it is dropped with the incarnation itself.
+	 * It states who this manager last typed for, which is a routing choice and NOT
+	 * proof of which action caused a later copy; nothing in a child's output can
+	 * confirm or change it. Absent means no origin is known, which is a refusal, never
+	 * a fallback to some other viewer or the owner.
+	 */
+	nativeCliController?: NativeCliCopyController;
+	/**
+	 * Monotonic owner ordinal of accepted nonempty input on this incarnation, starting
+	 * at 0. Each accepted input takes the next value, and a copy frozen at acceptance
+	 * carries the ordinal of the input that established its recipient.
+	 */
+	nativeCliInputOrdinal: number;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -1180,6 +1252,42 @@ function validateShutdownMs(value: number, label: string): void {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`session-host: shutdown ${label} must be a non-negative safe integer, got ${value}`);
 	}
+}
+
+/**
+ * Owner-private record of the most recent actual accepted input on one hosted
+ * provider child incarnation. `viewer` carries that viewer's id and the exact scope
+ * token its input was verified under, so a later copy re-proves the CURRENT viewer
+ * facts instead of trusting a cached destination.
+ */
+type NativeCliCopyController =
+	| { readonly kind: "local"; readonly ordinal: number }
+	| { readonly kind: "viewer"; readonly viewerId: string; readonly sourceToken: string; readonly ordinal: number };
+
+/**
+ * The owner-private capture/submit seam of ONE live hosted provider run (issue 277
+ * native text-copy slice), handed to host code that already owns the manager.
+ *
+ * It is bound to one exact row AND one exact child-process incarnation: the
+ * incarnation's private key is captured when the seam is created and re-checked on
+ * EVERY submit, so a replaced child, an exited row, a stop, a removed row, or a
+ * disposed manager submits nothing, and this object can never address another row.
+ * It is not a public clipboard endpoint: it accepts only an already-normalized
+ * canonical-base64 UTF-8 text payload, performs no clipboard write itself, chooses
+ * no destination beyond this row's own last accepted input, and is never reachable
+ * from a peer, a wire frame, or a child.
+ */
+export interface NativeCliCopyCapture {
+	/** Owner row id this seam is bound to; descriptive, never a lookup key. */
+	readonly rowId: string;
+	/** The row's own recorded backend at binding time. */
+	readonly backend: NativeCliBackend;
+	/**
+	 * Submit one captured TEXT copy through this row's own fences. True means the
+	 * copy was handed to exactly one eligible recipient route; false means nothing
+	 * was delivered and nothing is queued, retried, or fallen back.
+	 */
+	submit(encoded: string): boolean;
 }
 
 /** Internal viewer record: one surface's facts, its host run identity, and its own sink. */
@@ -1789,6 +1897,7 @@ export class InstanceManager {
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
 	readonly #onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	readonly #onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -1863,6 +1972,7 @@ export class InstanceManager {
 		this.#onChange = options.onChange;
 		this.#onTerminalDiagnostic = options.onTerminalDiagnostic;
 		this.#onNativeClipboard = options.onNativeClipboard;
+		this.#onNativeCliClipboard = options.onNativeCliClipboard;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
@@ -2213,6 +2323,7 @@ export class InstanceManager {
 			geometryRevision: 0,
 			inputFramingRequested: false,
 			inputFramingReady: false,
+			nativeCliInputOrdinal: 0,
 			startupInputOpen: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -2582,6 +2693,10 @@ export class InstanceManager {
 		// viewer cannot route input through this seam in this phase, and an opaque
 		// viewer token alone would be no grant.
 		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
+		// Only bytes that actually left for this child count. On a hosted provider row
+		// this makes the owner the current copy recipient; on a Pi row it changes
+		// nothing, because Pi copies carry their own per-dispatch origin.
+		this.#noteNativeCliLocalInput(record, data);
 	}
 
 	/**
@@ -3109,6 +3224,9 @@ export class InstanceManager {
 			// whether the child received the bytes is genuinely unknown.
 			return { status: "unknown" };
 		}
+		// The bytes were handed to THIS child, so this surface is now the recipient of
+		// any later copy capture on this incarnation. A refusal above never reaches here.
+		this.#noteNativeCliViewerInput(record, viewer.id, source.sourceToken);
 		return { status: "submitted" };
 	}
 
@@ -3127,6 +3245,220 @@ export class InstanceManager {
 			&& record.lifecycle === "alive"
 			&& isNativeCliBackend(record.backend)
 			&& record.nativeCliIncarnation !== undefined;
+	}
+
+	/**
+	 * Record that nonempty bytes actually left for one hosted provider child as
+	 * owner-local input, making the owner the recipient of any later copy capture on
+	 * THIS incarnation. Called only after the write seam was invoked; an empty write,
+	 * a refused write, a terminal protocol reply, or a Pi row never reaches it, and a
+	 * prior viewer recipient is replaced rather than kept as a fallback.
+	 */
+	#noteNativeCliLocalInput(record: ManagedInstance, data: string | Buffer): void {
+		if (data.length === 0 || !isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({ kind: "local" as const, ordinal: record.nativeCliInputOrdinal });
+	}
+
+	/**
+	 * Record that one viewer's verified nonempty input actually left for this hosted
+	 * provider child, making that surface the recipient of any later copy capture on
+	 * THIS incarnation. The viewer id and the exact scope token its input verified
+	 * under are kept so a later copy re-proves the CURRENT facts instead of trusting
+	 * this cached destination.
+	 */
+	#noteNativeCliViewerInput(record: ManagedInstance, viewerId: string, sourceToken: string): void {
+		if (!isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({
+			kind: "viewer" as const,
+			viewerId,
+			sourceToken,
+			ordinal: record.nativeCliInputOrdinal,
+		});
+	}
+
+	/**
+	 * This row's own CLOSED OSC 52 TEXT capture sink, attached to a hosted provider
+	 * surface only. The incarnation whose private key a captured copy is bound to is
+	 * captured here, once, beside the exact PTY handle this surface parses.
+	 */
+	#nativeCliOsc52Sink(record: ManagedInstance, pty: InstancePty): (encoded: string) => void {
+		const incarnation = record.nativeCliIncarnation;
+		return (encoded) => {
+			try {
+				this.#submitNativeCliCopy(record, pty, incarnation, encoded);
+			} catch {
+				// Containment: a capture or routing failure never escapes into xterm's
+				// parser, and nothing here ever becomes a clipboard action by accident.
+			}
+		};
+	}
+
+	/**
+	 * Mint the capture/submit seam of ONE live hosted provider run for the host code
+	 * that already owns this manager (the dependent provider copy-path adapter).
+	 *
+	 * The returned object is bound to this exact record, this exact PTY handle, and
+	 * this exact process-incarnation key: every submit re-proves all three plus the
+	 * row's live ownership, so a replaced child, an exited or stopping row, a removed
+	 * row, or a disposed manager submits nothing. It cannot address any other row, it
+	 * is never reachable from a peer or a wire frame, and it performs no clipboard
+	 * write and no destination choice beyond this row's own last accepted input.
+	 * `undefined` means no live run to bind to — never a late-binding handle.
+	 */
+	nativeCliCopyCapture(instanceId: string): NativeCliCopyCapture | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend)) {
+			return undefined;
+		}
+		const pty = record.pty;
+		const incarnation = record.nativeCliIncarnation;
+		if (pty === undefined || incarnation === undefined) {
+			return undefined;
+		}
+		const backend = record.backend;
+		return Object.freeze({
+			rowId: record.id,
+			backend,
+			submit: (encoded: string): boolean => this.#submitNativeCliCopy(record, pty, incarnation, encoded),
+		});
+	}
+
+	/**
+	 * The ONE route a captured hosted provider TEXT copy can take, shared by the
+	 * surface's OSC 52 sink and this run's capture seam.
+	 *
+	 * Everything is re-proved here, at delivery time: the payload is re-validated as
+	 * normalized text; the row is still the current record holding this exact live,
+	 * unexited, un-stopping PTY under this exact incarnation key; and a recipient
+	 * exists at all. The recipient is frozen from the row's last accepted input, so
+	 * input that arrives after this copy was accepted never retargets it — and a
+	 * recipient that is no longer eligible delivers nothing. There is never a
+	 * broadcast, never an owner-local fallback for a viewer-routed copy, never a
+	 * sibling viewer, and never a queue or retry.
+	 */
+	#submitNativeCliCopy(
+		record: ManagedInstance,
+		pty: InstancePty,
+		incarnation: Buffer | undefined,
+		encoded: string,
+	): boolean {
+		if (!isNativeCliCopyEncoded(encoded)) {
+			return false;
+		}
+		const backend = record.backend;
+		if (!isNativeCliBackend(backend)
+			|| incarnation === undefined
+			|| record.nativeCliIncarnation !== incarnation
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		// Frozen at acceptance: this snapshot is the whole recipient decision.
+		const controller = record.nativeCliController;
+		if (controller === undefined) {
+			// No known origin on this incarnation: nothing is forwarded, and nothing
+			// falls back to the owner or to another surface.
+			return false;
+		}
+		const event: NativeCliClipboardEvent = Object.freeze({ kind: "copy" as const, encoded, backend });
+		if (controller.kind === "local") {
+			return this.#forwardNativeCliLocalCopy(record, event);
+		}
+		return this.#forwardNativeCliViewerCopy(record, controller, event);
+	}
+
+	/**
+	 * Owner-local hosted provider copy route. The manager holds no terminal and makes
+	 * no display claim: it hands the copy to the host's separate owner-local route,
+	 * which owes its own live-row, focus, and actual-coverage proof. Absent that route
+	 * there is no delivery and no substitute.
+	 */
+	#forwardNativeCliLocalCopy(record: ManagedInstance, event: NativeCliClipboardEvent): boolean {
+		const forward = this.#onNativeCliClipboard;
+		if (forward === undefined) {
+			return false;
+		}
+		try {
+			forward(record.id, event);
+		} catch {
+			// The host's own route contains its failures; a refusal cannot break a row.
+		}
+		return true;
+	}
+
+	/**
+	 * Route one captured copy to the ONE viewer this manager last accepted input from
+	 * on this incarnation, and to nobody else.
+	 *
+	 * The stored token is only a lookup commitment: delivery happens only after the
+	 * viewer record is re-read and its CURRENT facts re-verify that exact token under
+	 * this incarnation's private key, the viewer still displays this exact row, and it
+	 * still carries its own copy sink. A retired viewer, a viewer now showing another
+	 * row, a viewer revision, a geometry or backend change, a replacement child, a
+	 * released row, or a missing sink delivers nothing — quietly, with no sibling,
+	 * owner-local, broadcast, or retry.
+	 */
+	#forwardNativeCliViewerCopy(
+		record: ManagedInstance,
+		controller: {
+			readonly kind: "viewer";
+			readonly viewerId: string;
+			readonly sourceToken: string;
+			readonly ordinal: number;
+		},
+		event: NativeCliClipboardEvent,
+	): boolean {
+		const viewer = this.#viewers.get(controller.viewerId);
+		if (viewer === undefined || viewer.sessionId !== record.id) {
+			return false;
+		}
+		const sink = viewer.nativeClipboardSink;
+		if (sink === undefined) {
+			return false;
+		}
+		const incarnation = record.nativeCliIncarnation;
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (incarnation === undefined || facts === undefined
+			|| !verifyNativeViewerNativeCliScopeToken(incarnation, controller.sourceToken, facts)) {
+			return false;
+		}
+		const receipt: NativeViewerNativeCliClipboardReceipt = Object.freeze({
+			source: Object.freeze({
+				hostRunId: facts.hostRunId,
+				viewerId: facts.viewerId,
+				viewerRevision: facts.viewerRevision,
+				rowId: facts.rowId,
+				phase: NATIVE_CLI_INPUT_PHASE,
+				backend: facts.backend,
+				geometry: Object.freeze({
+					cols: facts.cols,
+					rows: facts.rows,
+					revision: facts.geometryRevision,
+				}),
+				sourceToken: controller.sourceToken,
+			}),
+			event,
+			dispatchId: controller.ordinal,
+		});
+		try {
+			sink(receipt);
+		} catch {
+			// A viewer's own refusal cannot break a row or escape into the parser.
+		}
+		return true;
 	}
 
 	/**
@@ -3653,6 +3985,9 @@ export class InstanceManager {
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
 					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+					// The closed TEXT copy capture of THIS child: bound to this exact
+					// handle and incarnation, and installed on no other surface.
+					onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
 					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
 					graphicsBudget: this.#graphicsBudget,
 				});
@@ -4073,6 +4408,9 @@ export class InstanceManager {
 		// source minted for it can be re-proven even by a caller holding every public
 		// fact unchanged.
 		record.nativeCliIncarnation = undefined;
+		// The routing convention belonged to that process incarnation and goes with it:
+		// a replacement child starts with no known recipient at all.
+		record.nativeCliController = undefined;
 		// The process incarnation is over, so its startup phase is over for good.
 		this.#closeStartupInput(record, false);
 		// A finished child displays nothing: every surface's participation in this

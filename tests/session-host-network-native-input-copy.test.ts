@@ -67,6 +67,7 @@ import {
   nativeIoSourceEquals,
   type NativeIoCompletedCopy,
   type NativeIoInputSource,
+  type NativeIoCopyEvent,
   type NativeIoSource,
   type SessionContentCopyBeginFrame,
   type SessionContentCopyChunkFrame,
@@ -1247,6 +1248,8 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       await signal.waitFor(() => copies.some((copy) => copy.event.kind === "copy"), 20_000,
         "the resumed conversation's last-assistant copy routes back to the initiating viewer");
       const firstCopy = copies.find((copy) => copy.event.kind === "copy")!;
+      // Every case here is a Pi conversation copy; narrow before reading its tuple.
+      const firstCopyEvent = firstCopy.event as NativeIoCopyEvent;
       assert.equal(helperRecords().length, 1, "the unchanged native helper ran exactly once");
       assert.equal(helperRecords()[0], ASSISTANT_TEXT, "the bytes handed to the recording helper are the seeded assistant text exactly");
       assert.equal(nativeIoSourceEquals(firstCopy.source, source), true,
@@ -1257,8 +1260,8 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(Buffer.from(firstCopy.event.encoded, "base64").toString("utf8"), ASSISTANT_TEXT,
         "the payload is the resumed conversation's assistant text byte-exactly");
       assert.equal(Buffer.from(firstCopy.event.encoded, "base64").length, 75_000);
-      assert.equal(firstCopy.event.sessionId, admission.sessionId, "the copy names the resumed conversation id");
-      assert.equal(firstCopy.event.sessionEpoch, resumed.epoch, "the copy names the resumed conversation epoch");
+      assert.equal(firstCopyEvent.sessionId, admission.sessionId, "the copy names the resumed conversation id");
+      assert.equal(firstCopyEvent.sessionEpoch, resumed.epoch, "the copy names the resumed conversation epoch");
       assert.equal(ownerDelivered.filter((event) => event.kind === "copy").length, 0,
         "a viewer-origin copy never reaches the owner-local clipboard route");
 
@@ -1331,8 +1334,9 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(units.length, 2, "one whole copy emission per native copy, and nothing else claimed a copy id");
       for (const unit of units) {
         assert.equal(unit.begin.source.sessionId, rowId);
-        assert.equal(unit.begin.source.nativeSession.sessionId, admission.sessionId);
-        assert.equal(unit.begin.source.nativeSession.epoch, resumed.epoch);
+        const beginSource = unit.begin.source as NativeIoSource;
+        assert.equal(beginSource.nativeSession.sessionId, admission.sessionId);
+        assert.equal(beginSource.nativeSession.epoch, resumed.epoch);
         assert.equal(nativeIoSourceEquals(unit.begin.source, source), true,
           "the wire header names the exact source this viewer committed");
         assert.equal(unit.begin.byteLength, ASSISTANT_ENCODED.length,

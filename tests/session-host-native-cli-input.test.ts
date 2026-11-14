@@ -16,6 +16,7 @@ import {
   type NativeCliLaunch,
   type NativeViewerAnyInputSource,
   type NativeViewerClipboardReceipt,
+  type NativeViewerNativeCliClipboardReceipt,
   type NativeViewerInputRequest,
   type NativeViewerNativeCliInputSource,
   type StatusRegistrar,
@@ -128,7 +129,7 @@ interface Harness {
   manager: InstanceManager;
   registrar: RecordingRegistrar;
   spawned: SpyPty[];
-  copies: NativeViewerClipboardReceipt[];
+  copies: Array<NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt>;
 }
 
 /**
@@ -153,7 +154,7 @@ function makeHarness(label: string): Harness {
 
   const registrar = new RecordingRegistrar();
   const spawned: SpyPty[] = [];
-  const copies: NativeViewerClipboardReceipt[] = [];
+  const copies: Array<NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt> = [];
   const provider: NativeCliLaunch = (backend, request) => ({
     file: `/synthetic/bin/${backend}`,
     args: ["--interactive"],

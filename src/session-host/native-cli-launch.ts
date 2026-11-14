@@ -504,9 +504,9 @@ function composeNativeArgs(
  * dependency, or attribution is involved here. No provider version probe, no
  * added CLI argument, and no other environment marker: `SSH_TTY`,
  * `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, and `STY` stay exactly as inherited,
- * because faking them would additionally switch off Codex's own clipboard-text
- * read, its right-click paste, and its local image links — behavior the
- * operator keeps.
+ * In particular, pretending to be an SSH session would switch off Codex's own
+ * clipboard-text read, its right-click paste, and its local image links — behavior
+ * the operator keeps. Multiplexer markers have their own unrelated effects.
  */
 const CODEX_TERMINAL_CLIPBOARD_ENV = "HERDR_ENV";
 

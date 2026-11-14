@@ -157,6 +157,63 @@ dates.
   claimed, and what passed is the two native Windows jobs, not a full suite or a
   whole CI run.
 
+- **Copying text out of a hosted native row (#277)**: a hosted Claude Code or Codex
+  row can now copy **text** out. That row's terminal surface is the only surface in
+  the host that opts into a hosted-provider OSC 52 text sink, and it parses rather
+  than relays: exactly one standard clipboard-selection field (empty is the standard
+  default-selection spelling) and one payload, a clipboard query refused outright
+  because this host never answers one and never sends clipboard content back toward a
+  child, and a payload required to be canonical base64 decoding to non-empty strict
+  UTF-8 text inside the unchanged 100,000-encoded-character producer bound (at most
+  75,000 decoded bytes); binary, empty, malformed, or over-bound payloads are refused
+  whole and never truncated. The recipient is the origin of the most recent **actual
+  accepted** nonempty input forwarded to that exact child — the owner's local Main
+  input or one viewer's verified input — never a selected form, a refused or rejected
+  request, a received copy request, or a terminal protocol reply, and it is frozen when
+  the owner accepts the copy, so input arriving later never retargets a copy already in
+  flight: viewer A then viewer B typing means B receives the next copy, while a copy
+  accepted for A before B typed stays A or is dropped. An ineligible recipient delivers
+  nothing — no fallback to the other peer, no broadcast, no retry, no queue, and no
+  global clipboard monitor — and a row nobody has typed into copies nowhere. Existing
+  pairing, consent, the per-viewer Remote input/copy setting, and the actual
+  written/uncovered/current-Main/source/backend/PTY-incarnation/geometry/run guards are
+  all still required, and the owner's own outer-terminal write keeps the Pi route's
+  actual-display proof. The copy rides a tuple-less `native-cli` source naming the row's
+  recorded backend and never a Pi conversation, under a new optional
+  `native-copy-cli-v1` capability negotiated only beside native IO and hosted native CLI
+  input; an acknowledgement naming it without them is a protocol violation, a peer that
+  never negotiated it gains nothing and refuses such a source, and the two producer
+  families never mix on one frame. Pi's existing authenticated per-dispatch copy support,
+  capsule authentication, and producer provenance are unchanged, raw OSC 52 stays
+  default-denied on every surface that did not opt in, and no image, file, clipboard
+  read, paste, right-click, status, notice, or count changed. Capture means the owner
+  accepted the request and wrote the outer one, not that any desktop clipboard changed:
+  tmux/screen-wrapped requests are not captured, the reviewed Claude build's Linux VTE
+  helper-only path may emit nothing capturable, and the evidence is focused synthetic
+  capture and wire tests with synthetic PTY children — no real provider conversation,
+  real OS clipboard, physical terminal, or two-machine run. See
+  [Copying text out of a hosted row](docs/native-sidebar-agents.md#copying-text-out-of-a-hosted-row).
+- **One Codex child environment marker for terminal text copy (#277)**: a hosted Codex
+  child — built-in or an explicitly configured target — now carries `HERDR_ENV=1`, the
+  one value of an undocumented upstream branch (reviewed at the pinned `rust-v0.167.2`
+  tag) under which Codex writes one extra terminal OSC 52 copy request to its own
+  controlling terminal **in addition to** its own native OS clipboard write, which keeps
+  happening. It is applied to that composed child environment only, after every
+  environment source has merged, so the host-owned mode intentionally wins for that
+  single key over an inherited or configured value while every other entry keeps what the
+  ordinary composition gave it; the host process, the launcher options, a caller's
+  request object, a Claude child, and a native Pi child receive nothing. This is a
+  narrow compatibility use, not an integration: no HERDR code, repository, or dependency
+  is involved, upstream owns the semantics and they can change in a future release, and
+  no other provider argument, permission, authentication, or session setting is added.
+  `SSH_TTY`, `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, and `STY` stay exactly as inherited.
+  Pretending to be an SSH session would also switch off Codex's own clipboard-text
+  read, right-click paste, and local image links; multiplexer markers have other
+  unrelated effects. A hosted Codex row can still write
+  the owner's OS clipboard itself, and the host's forwarding is additional to the single
+  controller it routes to rather than a guarantee that the owner's clipboard was
+  untouched.
+
 ### Changed
 
 - **The native New form draws Provider above Workspace (#277)**: the session host's

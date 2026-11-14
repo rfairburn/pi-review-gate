@@ -169,11 +169,13 @@ boundaries; [Development](development.md) owns verification commands.
 - **The CLI's own configuration and authentication are preserved.** The child
   inherits `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and provider
   authentication as-is, and nothing is written to the operator's Claude or Codex
-  settings, hooks, plugins, or trust stores. This is deliberately *not* a blanket
-  ban on settings, plugin, or MCP arguments: choosing a settings file, an MCP
-  configuration, a plugin directory, or an agent definition is the operator
-  configuring the very target they selected, and those arguments are forwarded
-  untouched. Only the narrow categories listed above are refused, and they are
+  settings, hooks, plugins, or trust stores. The one deliberate addition to a child
+  environment is `HERDR_ENV=1` on a Codex child only, for terminal text copy
+  ([Launch and ownership rules](#launch-and-ownership-rules)). This is deliberately
+  *not* a blanket ban on settings, plugin, or MCP arguments: choosing a settings
+  file, an MCP configuration, a plugin directory, or an agent definition is the
+  operator configuring the very target they selected, and those arguments are
+  forwarded untouched. Only the narrow categories listed above are refused, and they are
   refused by option name — so a permission, tool, or sandbox override flag is
   refused even when its value would make the provider stricter. The inherited
   native configuration stays native: the host neither reads it nor rewrites it.
@@ -194,8 +196,10 @@ boundaries; [Development](development.md) owns verification commands.
   exactly as the owner's own Main types them, under a source-token domain separate
   from both Pi families and the same per-viewer Remote input/copy setting. That is
   terminal-process control only: it is never a claim about provider conversation
-  state, a hosted source is refused by the copy route rather than producing a
-  clipboard write, and no provider-tool behavior is claimed for a native row.
+  state and no provider-tool behavior is claimed for a native row. Copying text
+  **out** of such a row is a separate, closed mechanism of its own —
+  [Copying text out of a hosted row](#copying-text-out-of-a-hosted-row) — not part of
+  the input lane.
 - A remembered native row keeps its own backend and workspace and **always** comes
   back as a truthful **unavailable placeholder** titled `<name> (unavailable)`, where
   `<name>` is the caption the operator gave the row or, if it was never named, its
@@ -281,6 +285,21 @@ What the host-side runtime evidence actually is:
   provider children with a real host, on POSIX, and these two are macOS-only — no
   real provider binary, physical terminal, Windows, review-gate, tool-protection,
   or MCP parity.
+- Hosted **text copy out** is covered by focused synthetic tiers only:
+  `tests/session-host-native-cli-copy.test.ts` (the closed OSC 52 text parser, the
+  opt-in surface sink against a surface that never opted in, the
+  last-actual-accepted-input recipient, the acceptance-time freeze, and every
+  no-fallback refusal), `tests/session-host-native-cli-content-lane.test.ts` and
+  `tests/session-host-network-session-content-integration.test.ts` (the
+  `native-copy-cli-v1` negotiation, the tuple-less wire family inline and paged, and
+  a peer that negotiated hosted input but not provider copy receiving no copy frame
+  at all), and `tests/session-host-native-cli-launch.test.ts` (the one Codex child
+  marker and what it never mutates). Every child there is a synthetic PTY program
+  writing synthetic terminal bytes: no real provider binary, real OS clipboard read
+  or write, provider configuration, credential, conversation, physical terminal, or
+  two-machine copy takes part, so a passing case proves the owner-side contract and
+  never that some desktop clipboard changed
+  ([Copying text out of a hosted row](#copying-text-out-of-a-hosted-row)).
 - An optional real Codex startup case was deliberately skipped: that it would
   cause zero side effects on the operator's OS keychain or startup network
   behavior could not be proven, and evidence gathering must not spend the
@@ -491,6 +510,107 @@ polls it. So a hook- or mod-backed row would still have to answer "what exists
 right now" honestly at host startup and at a resynchronization point, and where it
 cannot, the field stays `unknown`.
 
+## Copying text out of a hosted row
+
+A hosted Claude or Codex row can copy **text** out. This is its own closed
+mechanism, deliberately separate from Pi's authenticated clipboard bridge: Pi's
+selection producers, per-dispatch origin, capsule authentication, and provenance
+fences are unchanged, raw OSC 52 stays default-denied on every surface that did not
+opt into this sink, and nothing here adds clipboard **read**, paste, image or file
+transfer, synchronization, a right-click change, or any new status, notice, or
+count.
+
+**What is captured.** Only that row's terminal surface opts in. What crosses is
+parsed, never relayed: exactly one standard clipboard-selection field (empty is the
+standard spelling of the default selection) and exactly one payload; a clipboard
+**query** (`?`) is refused outright, because this host never answers one and never
+sends clipboard content back toward a child; and the payload must be canonical
+base64 decoding to non-empty strict UTF-8 text inside the unchanged
+100,000-encoded-character producer bound (at most 75,000 decoded bytes). Binary,
+empty, malformed, or over-bound payloads are refused whole — nothing is ever
+truncated to fit, and no control sequence is re-emitted. Capture is bound to one row
+and one child-process incarnation, and the sink is installed on no other surface.
+
+**What the trust is, and what it is not.** Pi's route proves a native *producer* by
+runtime call-stack provenance, because Pi has an audited producer to pin. A provider
+CLI has no such audited producer, so the fence here is different and narrower: the
+request is accepted because it appeared inside a PTY this host owns and opened for
+that provider — which means a copy request written by the provider's own UI, by a
+tool it ran, or by a program it started is accepted alike. Only text crosses that
+fence: no query, no binary, no clipboard direction back toward the child.
+
+**Who receives it.** The recipient is the origin of the most recent **actual
+accepted** nonempty input this host forwarded to that exact child — the owner's own
+local Main input, or one viewer's verified input. Never a currently selected form, a
+refused or rejected request, a received copy request, or a terminal protocol
+query/reply. The recipient is frozen when the owner accepts the copy, so input that
+arrives afterwards never retargets a copy already in flight, and the routing is a
+convention, never proof that the input caused the copy:
+
+- viewer A types, then viewer B types, then the provider copies — **B** receives it;
+- a copy accepted for A before B's input arrives stays **A**, and is **dropped**,
+  not retargeted, if A is no longer eligible by the time it is delivered.
+
+An ineligible recipient delivers nothing: a retired viewer, a viewer now
+displaying another row, a viewer-revision, geometry, or backend change, a replacement
+child, a released row, a channel that never negotiated the copy capability, or an
+owner-local route whose own live-row, focus, actual-coverage, and geometry proof
+refuses. There is no fallback to the other peer, no broadcast, no automatic retry,
+no queue, and no global clipboard monitor — and a row nobody has ever typed into
+copies nowhere at all. On the owner's own machine the host writes its outer-terminal
+OSC 52 request only under the same display guards the Pi copy route already uses; a
+hosted provider child has no Pi conversation, so no conversation tuple is compared
+and none is invented: the copy names that row's recorded backend and nothing else.
+
+**What crosses the network.** A viewer-routed copy rides that viewer's existing
+authenticated, consented content lane under a new optional `native-copy-cli-v1`
+capability, negotiated only beside native IO and hosted native CLI input; an
+acknowledgement naming it without them is a protocol violation, and a peer that
+never negotiated it gains nothing and refuses such a source outright. The frame
+carries the tuple-less hosted source and an event naming the same recorded backend,
+so the two producer families never mix on one frame, and the unchanged inline-or-paged
+transfer preserves the whole payload. Delivery still requires this viewer's own
+current written, uncovered, Main-focused frame and its **Remote input/copy** setting
+to be on, and the copy is written to that viewer's own terminal — a terminal-write
+submission, not proof that an OS clipboard changed.
+
+“Optional” here refers to protocol negotiation, not a new clipboard-only setting.
+The existing **Remote input/copy** switch controls both remote input and writes to
+the viewer's clipboard; turning it off does not cancel the provider's own OS copy.
+
+**What was actually read in the providers, and what was not run.** These are
+source-level findings from reviewing the shipped clipboard paths, not observed
+provider behavior: the reviewed Claude Code build (the 2.1.325 line) emits its
+OSC 52 request alongside its own OS clipboard helper on the normal macOS, Windows,
+and non-VTE Linux paths, while its Linux VTE helper-only path may emit no capturable
+request at all; a Codex child carrying the marker below additionally emits one OSC
+52 request while its own native OS copy continues. No extra helper wrapper and no
+provider flag is needed for the common Claude path. **tmux/screen DCS-wrapped** OSC
+52 capture is **not** implemented, so a provider the operator puts inside their own
+multiplexer, or a provider path that talks to a clipboard helper directly, can
+bypass the owned PTY emission entirely. Nothing here falls back to polling a
+clipboard.
+
+**One Codex child environment marker.** A hosted Codex child — built-in or an
+explicitly configured target — is given `HERDR_ENV=1`, the one value of an
+undocumented upstream branch (reviewed at the pinned `rust-v0.167.2` tag) under which
+Codex writes that extra terminal copy request to its own controlling terminal, which
+under this host is the row's PTY. It is applied to that one composed **child**
+environment after every environment source has merged, so the host-owned mode
+intentionally wins for this single key over any inherited or configured value while
+every other entry keeps what the ordinary composition gave it; the host process, the
+launcher options, a caller's request object, a Claude child, and a native Pi child
+receive nothing. This is a narrow compatibility use, not an integration: no HERDR
+code, repository, or dependency is involved, upstream owns the semantics and they can
+change in a future release, and no other provider argument, permission,
+authentication, or session setting is added. `SSH_TTY`, `SSH_CONNECTION`, `TMUX`,
+`TMUX_PANE`, and `STY` stay exactly as inherited. Pretending to be an SSH session
+would also switch off Codex's own clipboard-text read, right-click paste, and local
+image links; multiplexer markers have other unrelated effects. A hosted Codex row's
+own write to the owner's OS clipboard is still its
+own: the host's forwarding is **additional** to the single controller it routes to,
+never a guarantee that the owner's clipboard was untouched.
+
 ## Launch and ownership rules
 
 - The child inherits the host environment as-is, which is what makes each CLI's own
@@ -502,7 +622,13 @@ cannot, the field stays `unknown`.
   would launder a worker context into a top-level session. Stale host-only markers
   — session-host bootstrap, startup-request, title, `NODE_OPTIONS`-restore, and
   settlement/quiescence — are stripped, so a native child never inherits a
-  capability it did not already own.
+  capability it did not already own. One addition applies to a **Codex** child only:
+  after the ordinary composition and overlay merge, the cloned child environment
+  carries `HERDR_ENV=1` so the provider additionally emits a terminal text-copy
+  request the host can capture
+  ([Copying text out of a hosted row](#copying-text-out-of-a-hosted-row)). It wins
+  for that one key over an inherited or configured value, and no other entry, no
+  Claude or Pi child, and no multiplexer or SSH marker is touched.
 - The provider command, base arguments, and shared environment come from the
   operator's explicit
   [`externalAgents` catalog](configuration.md#the-externalagents-catalog) entry
@@ -647,6 +773,15 @@ What to expect, and what this does and does not prove:
   `<Provider> (unavailable)`, and the next New session asks you to choose the target
   again: a native target's id, executable, arguments, and environment are not
   persisted.
+- If your terminal implements OSC 52 clipboard writes, select and copy text in the
+  provider the provider's own way and see whether your connecting terminal's
+  clipboard changed. For a hosted Codex row this is exactly what the `HERDR_ENV=1`
+  marker exists to make possible. On this host's own machine either path can produce
+  that change — the provider's own native OS clipboard write, or the host's guarded
+  outer-terminal OSC 52 forwarding when this host's own Main was the last input this
+  row accepted — so the clipboard change alone does not tell the two apart; a
+  terminal, multiplexer, or permission that declines clipboard writes simply
+  discards the request, and this page claims no completed run of the check.
 - This stage proves startup, row ownership, input routing, resize, and exit on your
   machine. It does not certify the provider's own rendering, mouse, image, resume,
   approval, or platform behavior, and it is not Windows runtime evidence.
@@ -729,3 +864,9 @@ support.
   [`@anthropic-ai/claude-code`](https://registry.npmjs.org/@anthropic-ai/claude-code/latest)
   2.1.322 and [`@openai/codex`](https://registry.npmjs.org/@openai/codex/latest)
   0.167.2.
+- The shipped clipboard paths behind
+  [Copying text out of a hosted row](#copying-text-out-of-a-hosted-row) were read in
+  a separate source review — a Claude Code 2.1.325 build and the Codex
+  `rust-v0.167.2` tag (its `tui` clipboard-copy module) — and those findings are a
+  code reading, not part of the dated documentation review above. Nothing in them was
+  observed running, and upstream code moves independently of this host.

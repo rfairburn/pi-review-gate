@@ -297,9 +297,12 @@ types them. The source states phase `native-cli`, the recorded backend, and no
 native session field, under a third token domain whose commitment key is private
 to the current process incarnation: a replaced child invalidates every identical
 public fact instead of accepting a re-labelled handle. This is terminal-process
-control only. It is never an attestation of provider conversation state, it never
-authorizes a copy, and a native CLI source is refused by the copy route rather
-than producing a clipboard write. Every other fence is unchanged: current owner
+control only, never an attestation of provider conversation state. A hosted provider
+row's own text copy is a separate closed family on this lane under the optional
+`native-copy-cli-v1` capability, never the Pi conversation copy route, and it is
+described under
+[Session-host clipboard transport](#session-host-clipboard-transport). Every other
+fence is unchanged: current owner
 facts, live ownership of that exact PTY, a non-stopping row, current input modes,
 geometry and policy generations, bounded dispatch, and the viewer's own Remote
 input/copy setting. A peer that never negotiated the capability publishes no such
@@ -381,7 +384,10 @@ unknown outcome stays so. See
 
 ### Session-host clipboard transport
 
-Raw child OSC 52 is still default-denied. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
+Raw child OSC 52 is still default-denied on every surface that did not explicitly
+opt into the one hosted provider text-copy sink described below; that sink is the
+only exception, it is scoped to a single owned hosted provider row, and it changes
+nothing about the Pi path below. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
 and 1.5.2 runtimes, the owned Node stdio adapter distinguishes native
 clipboard-producer/copy-surface provenance from arbitrary rendered or PTY
 output, without changing Pi's selection or copy callbacks. Input delivery
@@ -419,7 +425,7 @@ bootstrap modes or requested installation failures refuse without downgrade or
 raw fallback. Non-user input cannot authorize a copy. A viewer's Remote
 input/copy setting never toggles this owner-side framing.
 
-Native children created with that bridge receive a cloned environment with Pi's
+Pi children created with that bridge receive a cloned environment with Pi's
 static `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays
 inside that hosted process tree, and standalone launches and the system
 environment are unchanged. Native owner OS clipboard writes stay unchanged.
@@ -431,7 +437,50 @@ the unchanged 100,000-character producer bound retained whole, and that viewer
 writes it to its own terminal only while its Remote input/copy setting is on. A
 copy cannot originate from the pre-conversation startup phase. No native Pi
 change or live retrofit is involved. Authenticated local and SSH clipboard
-copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied.
+copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied on every
+surface that did not opt into the hosted provider sink.
+
+A hosted provider (Claude or Codex) row has no audited Pi producer to pin, so its text
+copy is a separate, closed family, and its trust is the owned PTY rather than producer
+provenance: a standard OSC 52 TEXT request that appeared inside the PTY this host owns
+and opened for that provider is accepted as a copy request whether the provider's own
+UI, a tool it ran, or a program it started wrote it. Only text crosses that fence:
+exactly one standard clipboard-selection field and one payload, a clipboard **query**
+refused outright because this host never answers one and never sends clipboard content
+back toward a child, and a canonical-base64 payload decoding to non-empty strict UTF-8
+text inside the unchanged 100,000-character producer bound. Binary, empty, malformed,
+or over-bound payloads are refused whole and never truncated, no control sequence is
+re-emitted, and capture is bound to one row and one child-process incarnation. The
+recipient is the origin of the most recent **actual accepted** nonempty input
+forwarded to that exact child — the owner's own local Main input or one viewer's
+verified input — never a currently selected form, a refused or rejected request, a
+received copy request, or a terminal protocol query/reply; it is frozen when the owner
+accepts the copy, so input arriving later never retargets a copy already in flight, and
+the ordinal that travels with it is that routing convention rather than causal proof.
+An ineligible recipient delivers nothing: no fallback to the other peer, no broadcast,
+no retry, no queue, and no global clipboard monitor, and a row nobody has typed into
+copies nowhere. The wire family is tuple-less and names only that row's recorded
+backend under the optional `native-copy-cli-v1` capability, which is negotiated only
+beside native IO and hosted native CLI input, so no Pi conversation identity is
+invented and the two producer families never mix on one frame. Existing pairing and
+consent, the per-viewer Remote input/copy setting, and the actual
+written/uncovered/current-Main/source/backend/PTY-incarnation/geometry/run guards are
+all still required, and the owner's own terminal write keeps the same actual-display
+proof the Pi route uses. A hosted Codex child is additionally given `HERDR_ENV=1` —
+the one value of an undocumented upstream branch, reviewed at the pinned
+`rust-v0.167.2` tag, under which Codex writes that extra terminal request *beside* its
+own native OS clipboard write — applied to that composed child environment only, after
+every environment source merged, so the host-owned mode intentionally wins for that
+single key and reaches no other child, no Claude or Pi child, and never the host
+process. No `SSH_TTY`, `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, or `STY` value is faked.
+Pretending to be an SSH session would also switch off Codex's own clipboard-text
+read, right-click paste, and local image links; multiplexer markers have other
+unrelated effects. Because the provider's own OS write continues, the
+host's forwarding is additional to the one controller it routes to, never a guarantee
+that the owner's clipboard was untouched. tmux/screen DCS-wrapped requests are not
+captured, the evidence is focused synthetic capture and wire testing with synthetic PTY
+children, and "captured" means only that the owner accepted the request and wrote the
+outer one — not that any desktop clipboard changed.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

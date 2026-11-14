@@ -866,8 +866,13 @@ A native row is deliberately a plain provider child rather than a Pi child:
   packets, and whole pastes to the row's PTY raw under the negotiated
   `native-input-cli-v1` capability, exactly as its own Main types them (see
   [Native input and copy](#native-input-and-copy)). That is terminal-process
-  control only — a hosted native source is refused by the copy route rather than
-  producing a clipboard write.
+  control only. Text can also be copied **out** of a hosted row, but that is its own
+  closed mechanism, not the Pi clipboard route: the owner captures one standard
+  OSC 52 text request inside that row's PTY and hands it to the one recipient its own
+  last accepted input established — its own displayed Main, or that one viewer under
+  the optional `native-copy-cli-v1` capability — or drops it (the
+  **Hosted provider text copy** part of
+  [Native input and copy](#native-input-and-copy)).
 - Each new session selects its native target again: the chosen target id, its
   executable, arguments, and environment are not persisted, so a later form cannot
   silently reuse them.
@@ -1485,9 +1490,13 @@ saved conversations (see
 `SessionSpawn` remains the native, owner-bound tool described above rather than
 a network request, and human handoff is not implemented. The owner-routed Close
 controls are described below. Authenticated local and SSH clipboard copying,
-ordinary standalone Pi, and local host input are unchanged: nothing is
-broadcast, a remote copy reaches only its initiating viewer, raw PTY OSC 52
-stays denied, and no last-input-origin inference is added. Native Pi
+ordinary standalone Pi, and local host input are unchanged: nothing is broadcast,
+a remote copy reaches only its initiating viewer, raw PTY OSC 52 stays denied on
+every surface that did not explicitly opt into the hosted provider copy sink, and
+no last-input-origin routing applies to a Pi conversation copy — that routing
+exists only for a captured hosted provider copy, and only inside the one row it
+came from (see the **Hosted provider text copy** part of
+[Native input and copy](#native-input-and-copy)). Native Pi
 clipboard-producer coverage keeps the limits the
 [clipboard section](#clipboard-copying-over-ssh) describes.
 
@@ -1659,14 +1668,17 @@ truthfully, and none of them reaches a Pi rename.
 provider acceptance. Remote typing into a native row already exists on its own
 authenticated, consented, host-mediated lane — `native-input-cli-v1` delivers an
 authorized viewer's keys, canonical mouse packets, and whole pastes to that row's
-PTY raw, exactly as the owner's own Main types them, and it is refused by the copy
-route rather than producing a clipboard write (see
+PTY raw, exactly as the owner's own Main types them, and a hosted provider TEXT
+copy crosses that same lane under its own optional `native-copy-cli-v1`
+capability, routed to the one viewer whose input the owner last actually accepted
+on that child (see
 [Native input and copy](#native-input-and-copy)). What remains unproven, and is
 stated as pending on
 [Native Claude Code and Codex rows](#native-claude-code-and-codex-rows), is
 real-provider acceptance: a real Claude Code or Codex CLI actually starting and
-behaving correctly on a paired owner over a real network, remote clipboard with a
-native row, and Windows. A native row still has no status registration and carries
+behaving correctly on a paired owner over a real network, a real provider actually
+emitting a capturable text copy and a real OS clipboard accepting it on either end,
+and Windows. A native row still has no status registration and carries
 no review-gate or tool-protection guarantee.
 
 ### Saved conversations on a connected owner
@@ -2538,7 +2550,10 @@ reconstructed screen text. Pi remains the only selection and clipboard producer:
 native Main, visible question/notice selections, copy-on-select, the configured
 application copy shortcut, and the original local clipboard helper remain
 native. Nothing patches Pi, changes its settings, or adds a second selection
-engine. Raw PTY OSC 52 remains denied. The owned child observes the native
+engine. Raw PTY OSC 52 remains denied on every surface that did not explicitly opt
+into the hosted provider text-copy sink; that separate, closed capture for hosted
+Claude and Codex rows is described under **Hosted provider text copy** in the next
+section, and it changes nothing here. The owned child observes the native
 producer's runtime/call-stack provenance through Node's stdio boundary, then
 authenticates a bounded request with its existing per-child capability. The host
 checks the current session epoch and live, actually displayed Main input owner
@@ -2779,15 +2794,17 @@ families. Its commitment key is private to the current process incarnation, so a
 replaced child invalidates every identical public fact rather than accepting a
 re-labelled handle; an exit, a stop, a removed row, or a retired viewer yields no
 source at all. This is terminal-process control only: it is never a claim about
-provider conversation state, it never authorizes a copy, and a hosted source is
-refused by the copy route instead of producing a clipboard write. All other fences
+provider conversation state. A hosted provider row's own text copy is the separate
+family described under **Hosted provider text copy** below, and it is never routed
+through the Pi conversation copy route. All other fences
 above still apply, including the per-viewer Remote input/copy setting. A channel
 that never negotiated the capability publishes no hosted source, and hosted input
 sent without negotiating it is a protocol violation that writes zero bytes. Older
 and unnegotiated peers keep their existing display-only behavior.
 
-**Text copy.** Only the exact initiating viewer receives a completed copy; there
-is no owner outer-terminal or local clipboard fallback, broadcast, raw OSC 52
+**Text copy (Pi conversations).** Only the exact initiating viewer receives a
+completed copy; there is no owner outer-terminal or local clipboard fallback,
+broadcast, raw OSC 52
 relay, or highest-input-dispatch filter. An asynchronous copy caused by earlier
 input A still arrives after input B when it is still valid, because copies are
 ordered by their own emission sequence, not by input dispatch id. The full
@@ -2797,13 +2814,77 @@ paging preserves the complete encoded string as ASCII bytes, and the pages are
 joined before the text is decoded, without reducing the producer bound to a
 single message. Copy delivery is a terminal-write submission on the viewer, not
 proof of a physical OS clipboard write. The native producer and OS clipboard
-writer are unchanged. Each hosted child tree created with the bridge receives
+writer are unchanged. Each Pi child tree created with the bridge receives
 the static `PI_CLIPBOARD_OSC52=1` capture setting, and it inherits only inside
 that tree; standalone launches and the system environment stay unchanged, and no
 clipboard image push, read, or synchronization is added. While this viewer's
 Remote input/copy is off, a completed remote copy is dropped without a clipboard
 write; nothing is cancelled on the owner, and an older copy is not fenced out by
 a newer input. The existing 64 MiB whole-viewport assembly bound is unchanged.
+
+**Hosted provider text copy.** A hosted provider row has no Pi producer, so its text
+copy is a separate family on the same lane, negotiated as the optional
+`native-copy-cli-v1` capability. The owner offers and acknowledges it only beside
+native IO and `native-input-cli-v1`; an acknowledgement naming it without them is a
+protocol violation, and a peer that never negotiated it gains nothing and refuses
+such a source outright. Capture is a closed, opt-in sink on that row's own surface
+and nowhere else: exactly one standard clipboard-selection field (empty is the
+standard spelling of the default selection) and exactly one payload; a clipboard
+query (`?`) is refused outright, because this host never answers one and never sends
+clipboard content back toward a child; and the payload must be canonical base64
+decoding to non-empty strict UTF-8 text inside the unchanged 100,000-character
+producer bound (at most 75,000 decoded bytes). Binary, empty, malformed, or
+over-bound payloads are refused whole and never truncated, and no control sequence is
+re-emitted. Every other surface — every Pi row included — keeps raw OSC 52 denied
+exactly as before, and Pi's per-dispatch origin, capsule authentication, and
+producer provenance are untouched. The trust here is the owned PTY, not a proven
+producer gesture: a copy request written by the provider's own UI, by a tool it ran,
+or by a program it started is accepted alike, and only text crosses that fence.
+
+The recipient is the origin of the most recent **actual accepted** nonempty input the
+owner forwarded to that exact child incarnation — its own local Main input, or one
+viewer's verified input — never a currently selected form, a refused or rejected
+request, a received copy request, or a terminal protocol query/reply. It is frozen
+when the owner accepts the copy, so input arriving afterwards never retargets a copy
+already in flight, and the ordinal that travels with the copy is that routing
+convention rather than causal proof. Viewer A types, then viewer B types, then the
+provider copies: **B** receives it. A copy accepted for A before B's input arrives
+stays **A**, and is dropped rather than retargeted if A is no longer eligible.
+Ineligibility delivers nothing at all — a retired viewer, a viewer now displaying
+another row, a viewer-revision, geometry, or backend change, a replacement child, a
+released row, an unnegotiated channel, or an owner-local route whose own live-row,
+Main-focus, uncovered, and current-geometry proof refuses — with no fallback to the
+other peer, no broadcast, no retry, no queue, and no global clipboard monitor; a row
+nobody has typed into copies nowhere. The frame carries the tuple-less `native-cli`
+source and an event naming that same recorded backend, so the two producer families
+never mix on one frame and no Pi conversation identity is invented, and the
+inline-or-paged transfer and its bound are the unchanged ones.
+
+This is text only: no image, file, clipboard read, paste, or right-click behavior
+changes, and no new sidebar status, notice, dialog, or count is added — the existing
+bounded private diagnostics are the only record. The providers' own emission is a
+source-level finding rather than observed behavior — the reviewed Claude Code build
+emits its OSC 52 request alongside its own
+OS clipboard helper on the normal macOS, Windows, and non-VTE Linux paths, while its
+Linux VTE helper-only path may emit nothing capturable, and a hosted Codex child
+carrying `HERDR_ENV=1` additionally emits one while its own native OS copy continues.
+That marker is the single addition to a hosted Codex child environment, applied after
+the ordinary composition and overlay merge so the host-owned mode wins for that one
+key; it goes to no Claude or Pi child, never to the host process, and no `SSH_TTY`,
+`SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, or `STY` value is ever faked. Pretending to be
+an SSH session would also switch off Codex's own clipboard-text read, right-click
+paste, and local image links; multiplexer markers have other unrelated effects.
+A provider's own write to the owner's OS clipboard still happens: the
+host's forwarding is additional to the one controller it routes to, never a guarantee
+that the owner's clipboard was untouched. tmux/screen DCS-wrapped requests are **not**
+captured, so a provider the operator puts inside their own multiplexer, or a provider
+path that talks to a clipboard helper directly, can bypass the owned PTY emission
+entirely, and nothing polls a clipboard in compensation. The evidence is focused
+synthetic capture and wire tests whose children are synthetic PTY programs: no real
+provider conversation, real OS clipboard read or write, physical terminal, or
+two-machine copy is certified, and "captured" means only that the owner accepted the
+request and wrote the outer one. See
+[Copying text out of a hosted row](native-sidebar-agents.md#copying-text-out-of-a-hosted-row).
 
 **Outcomes.** `not-sent` is possible only before any transport-write invocation;
 `submitted` means only that local transport writes returned, never that the

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.284]
+## [0.1.0-dev.285]
 
 ### Added
 
@@ -358,6 +358,17 @@ dates.
   path relative to the process working directory, and an absolute path all resolve to one
   canonical existing directory before anything spawns, with no shell, no `~otheruser`
   expansion, and no `$VAR` expansion for either backend.
+
+## [0.1.0-dev.284]
+
+### Fixed
+
+- Android session-card Open terminal actions retain their committed standing
+  across roster-revision-only updates (#667), avoiding a demonstrated first-tap
+  refusal while a replacement proof waits for a frame commit. Drawn-title,
+  owner-row, placement, focus, coverage, and connection fences are unchanged, with
+  no automatic retry. Controlled emulator coverage reproduces this mechanism;
+  attribution to the original intermittent report remains unconfirmed.
 
 ## [0.1.0-dev.283]
 

@@ -1857,6 +1857,13 @@ incomplete: real-host Saved full-catalog, search, resume, network, and lifecycle
 acceptance is not established, and no full parity with the desktop sidebar or
 daily-use certification is claimed. It includes the Saved delete refresh above.
 
+**Open terminal.** A roster revision alone does not retire the session card's
+committed Open terminal action. Its first tap can start the existing opening
+flow for the same host, owner run, row, and drawn title without waiting for a
+replacement commit solely because the roster was republished. Title, target,
+placement, focus, coverage, and connection fences remain in force; no tap is
+queued or automatically retried.
+
 **Terminal input.** A single-finger tap on the terminal delivers one clean host
 left-click and does not open the IME. A real drag still reaches the host as
 selection/drag input, a two-finger vertical swipe still produces the owner's own

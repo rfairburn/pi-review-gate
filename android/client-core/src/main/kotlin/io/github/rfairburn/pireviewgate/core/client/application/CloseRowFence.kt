@@ -35,9 +35,9 @@ sealed interface CloseRowAdmission {
  * The stable owner identity is ([SessionActionTarget.hostId],
  * [SessionActionTarget.hostRunId], [SessionActionTarget.rowId]). `rosterRevision` and
  * `drawnTitle` freeze what one frame showed, but an ordinary metadata or title
- * refresh must not make the same owner row unclosable. Every other target-sensitive
- * action keeps the existing exact [SessionUiState] match; this fence is used only by
- * Close and never relaxes the shared row lookup.
+ * refresh must not make the same owner row unclosable. This fence is used only by
+ * Close and never relaxes the shared row lookup. Session-card Open terminal has its
+ * own revision-independent key; the terminal chooser keeps the exact target match.
  */
 object CloseRowFence {
     fun current(host: HostUiState?, target: SessionActionTarget): CloseRowAdmission {

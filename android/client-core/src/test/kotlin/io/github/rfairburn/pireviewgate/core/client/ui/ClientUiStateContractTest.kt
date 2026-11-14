@@ -6,6 +6,7 @@ import kotlin.test.Test
 import kotlin.test.assertSame
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -61,6 +62,28 @@ class ClientUiStateContractTest {
         assertEquals("display-row-1", frozen.drawnTitle)
         assertEquals(9L, SessionActionTarget.of(superseded).rosterRevision)
         assertFalse(frozen == SessionActionTarget.of(superseded))
+    }
+
+    @Test
+    fun `session card open identity ignores only the roster revision`() {
+        val drawn = ClientUiFixtures.row("a", rowId = "row-1", revision = 7L)
+        val target = SessionActionTarget.of(drawn)
+        val revisionOnly = drawn.copy(
+            rosterRevision = 8L,
+            metadata = drawn.metadata.copy(activity = listOf("new activity")),
+        )
+        assertEquals(SessionCardOpenKey.of(target), SessionCardOpenKey.of(revisionOnly))
+        assertEquals(SessionCardOpenKey.of(target), SessionCardOpenKey.of(SessionActionTarget.of(revisionOnly)))
+
+        val retitled = revisionOnly.copy(metadata = revisionOnly.metadata.copy(label = "new title"))
+        assertNotEquals(SessionCardOpenKey.of(revisionOnly), SessionCardOpenKey.of(retitled))
+
+        val otherRow = revisionOnly.copy(metadata = revisionOnly.metadata.copy(id = "row-2"))
+        assertNotEquals(SessionCardOpenKey.of(revisionOnly), SessionCardOpenKey.of(otherRow))
+        val otherRun = revisionOnly.copy(hostRunId = ClientUiFixtures.RUN_B)
+        assertNotEquals(SessionCardOpenKey.of(revisionOnly), SessionCardOpenKey.of(otherRun))
+        val otherHost = revisionOnly.copy(hostId = HostId.parse("b"))
+        assertNotEquals(SessionCardOpenKey.of(revisionOnly), SessionCardOpenKey.of(otherHost))
     }
 
     @Test

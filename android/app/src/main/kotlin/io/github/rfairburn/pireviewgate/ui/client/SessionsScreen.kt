@@ -83,6 +83,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.RosterFreshness
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionActionTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionCardBackground
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionCardDrag
+import io.github.rfairburn.pireviewgate.core.client.ui.SessionCardOpenKey
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionDragHover
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionDragItemSpan
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionIdentityIndex
@@ -623,13 +624,14 @@ private fun SessionCard(
     val renameTarget = RenameTarget.of(row)
     val rowKey = SessionRowKey.of(row)
     // Opening the terminal selects a row for the controller to write, so it is
-    // attributed to that row's own commit proof. The semantic key is the frozen target
-    // as drawn: a row whose title or revision changed retires its previous standing
-    // synchronously, while an unrelated host reporting changes nothing here.
+    // attributed to that row's own commit proof. The semantic key keeps the drawn
+    // owner row and title but not its roster revision: a revision-only republish still
+    // presents the same action and must not retire its committed standing. A title or
+    // owner change retires the previous standing synchronously.
     val selectTarget = SessionActionTarget.of(row)
     val selectGuard = rememberUiActionGuard(
         proof = row.selectProof,
-        semanticKey = selectTarget,
+        semanticKey = SessionCardOpenKey.of(selectTarget),
         covered = covered,
     )
 

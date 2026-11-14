@@ -15,6 +15,39 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.283]
+
+### Fixed
+
+- Session-host sidebar and typing responsiveness no longer collapses while
+  sessions stream output, most visibly on Windows (#670). Every parsed chunk of
+  child output used to rebuild the whole virtual-terminal frame three or four
+  times (for change detection, for each synchronized-output frame start, and
+  again for the redraw), serialize it to JSON, and then recompose and
+  reserialize the complete host frame, even though the writer draws at most one
+  frame per 16 ms interval. The bundled ConPTY also delivers each native Pi
+  render as two chunks (the synchronized frame, then a separate cursor restore),
+  so Windows paid that cost twice per render. The host now builds a session's
+  frame once per parse and reuses it until the next write; a write that only
+  moves the cursor or shows/hides it, and a synchronized frame opened after
+  such a lead, keep the already-built rows; change detection compares rows
+  instead of serializing the frame; composed and serialized rows that did not
+  change are reused; and child-output, roster, and remote-viewport changes are
+  composed once, just before the writer takes its next frame, instead of once
+  per chunk. Host input, focus, layout, and resize still redraw immediately.
+  Measured with a pi-tui-based streaming child through the real host and node-pty
+  (four sessions streaming about 60 tokens/s each, 160x45 outer terminal), the
+  Windows host's main thread went from saturated (about 100% busy, typing p50/p90
+  about 61/87 ms, about 28 frames/s) to about 21% busy with typing p50/p90 about
+  8/17 ms at the full 60 frames/s; macOS went from about 86% to about 17% busy.
+  With six sessions at about 120 tokens/s, Windows went from typing p50/p90 about
+  103/154 ms at about 14 frames/s to about 9/18 ms at about 58 frames/s. A same-host owner-to-viewer content channel over loopback TLS used
+  about 40% less CPU on both platforms. These are synthetic-workload
+  measurements, not a physical-terminal or two-machine certification, and they
+  do not change Windows' unsupported validation-target status. Drawn frames,
+  receipts, synchronized-output holds, input routing, and output bounds are
+  unchanged.
+
 ## [0.1.0-dev.282]
 
 ### Security

@@ -1177,3 +1177,138 @@ test("rendered output preserves explicit attribute resets at row boundaries", as
 	assert.ok(row1?.runs.every((run) => !run.text.includes("red")), "reset boundaries keep runs per row");
 	surface.dispose();
 });
+/** The surface's text frame built directly from xterm's buffer, bypassing every cache. */
+function uncachedTextFrame(surface: TerminalSurface): Omit<TerminalFrame, "graphics"> {
+	return (surface as unknown as { buildLiveTextFrame(): Omit<TerminalFrame, "graphics"> }).buildLiveTextFrame();
+}
+
+function textPart(frame: TerminalFrame): Omit<TerminalFrame, "graphics"> {
+	const { graphics, ...text } = frame;
+	void graphics;
+	return text;
+}
+
+test("reused frames always equal a fresh build across cell, cursor-only, and synchronized writes", async () => {
+	const surface = makeSurface(6, 24);
+	let notifications = 0;
+	const observed = makeSurface(6, 24, { onChange: () => { notifications += 1; } });
+	// Each entry is one write; the mix covers cell changes, cursor-only moves and
+	// visibility (which keep the cached rows), SGR-only pen changes, scrolling,
+	// erases, and synchronized frames opened after cursor-only leads.
+	const writes = [
+		"hello world\r\n",
+		`${ESC}[2A${ESC}[5G`,
+		`${ESC}[?25l`,
+		`${ESC}[31m`,
+		"red text",
+		`${ESC}[0m${ESC}[3;1H`,
+		`${ESC}[?25h${ESC}[1B\r`,
+		`${ESC}[?2026h${ESC}[2K changed row${ESC}[?2026l`,
+		`${ESC}[1A${ESC}[1G${ESC}[?25h${ESC}[?2026h${ESC}[2Kframe two${ESC}[?2026l${ESC}[2B`,
+		"\r\n\r\n\r\n\r\n\r\n\r\nscrolled\r\n",
+		`${ESC}[H`,
+		`${ESC}[2J`,
+		`${ESC}[4;4Hlate`,
+		`${ESC}[1;1H`,
+	];
+	for (const write of writes) {
+		surface.write(write);
+		observed.write(write);
+		await surface.flush();
+		await observed.flush();
+		assert.deepEqual(textPart(surface.frame()), uncachedTextFrame(surface), `after ${JSON.stringify(write)}`);
+		// A second read with nothing written reuses the cache and still matches.
+		assert.deepEqual(textPart(surface.frame()), uncachedTextFrame(surface), `reused after ${JSON.stringify(write)}`);
+	}
+	assert.ok(notifications >= 10, "cursor-only writes still notify when the cursor moved");
+	surface.dispose();
+	observed.dispose();
+});
+
+test("a frame held after a cursor-only lead commits the exact rows and the cursor at its marker", async () => {
+	const surface = makeSurface(5, 20);
+	await writeAll(surface, ["one\r\ntwo\r\nthree"]);
+	const before = surface.frame();
+	// The child moves the cursor, then opens a frame and draws part of it in the
+	// same write; the frame stays open until a later write.
+	surface.write(`${ESC}[2A${ESC}[3G${ESC}[?25l${ESC}[?2026h${ESC}[2Kpartial`);
+	await surface.flush();
+	const held = surface.frame();
+	assert.equal(surface.redrawState(), "held");
+	assert.deepEqual(held.lines, before.lines, "the committed rows are the rows before the frame opened");
+	assert.deepEqual(held.cursor, { column: 2, row: 0, visible: false },
+		"the committed cursor is where the lead left it, read at the marker");
+	// Reference: the same lead alone, built without any cache.
+	const reference = makeSurface(5, 20);
+	await writeAll(reference, ["one\r\ntwo\r\nthree", `${ESC}[2A${ESC}[3G${ESC}[?25l`]);
+	assert.deepEqual(textPart(held), uncachedTextFrame(reference), "held frame equals an uncached build at the marker");
+	surface.write(`${ESC}[?2026l`);
+	await surface.flush();
+	assert.equal(surface.redrawState(), "clear");
+	assert.equal(plainText(surface.frame().lines[0]).trim(), "partial");
+	assert.deepEqual(textPart(surface.frame()), uncachedTextFrame(surface));
+	surface.dispose();
+	reference.dispose();
+});
+
+test("a lead that changes a cell before the marker never reuses the cached rows", async () => {
+	const surface = makeSurface(3, 12);
+	await writeAll(surface, ["abc"]);
+	surface.frame(); // build the cache
+	// Printable text before the marker changes a cell: the commit must include it.
+	surface.write(`X${ESC}[?2026h${ESC}[2Kdropped`);
+	await surface.flush();
+	assert.equal(surface.redrawState(), "held");
+	assert.equal(plainText(surface.frame().lines[0]).trimEnd(), "abcX", "the committed rows include the lead's own text");
+	surface.write(`${ESC}[?2026l`);
+	await surface.flush();
+	surface.dispose();
+});
+
+test("line feeds are never treated as cursor-only writes, alone or before a synchronized frame", async () => {
+	for (const feed of ["\n", "\r\n", "\n\n"]) {
+		const surface = makeSurface(3, 10);
+		await writeAll(surface, ["one\r\ntwo\r\nthree"]);
+		surface.frame();
+		surface.write(feed);
+		await surface.flush();
+		assert.deepEqual(textPart(surface.frame()), uncachedTextFrame(surface), `scrolled by ${JSON.stringify(feed)}`);
+		assert.ok(!plainText(surface.frame().lines[0]).startsWith("one"), `${JSON.stringify(feed)} scrolled the top row away`);
+		surface.dispose();
+	}
+	const held = makeSurface(3, 10);
+	await writeAll(held, ["one\r\ntwo\r\nthree"]);
+	held.frame();
+	held.write(`\n${ESC}[?2026h${ESC}[2Kinside`);
+	await held.flush();
+	assert.equal(held.redrawState(), "held");
+	const reference = makeSurface(3, 10);
+	await writeAll(reference, ["one\r\ntwo\r\nthree", "\n"]);
+	assert.deepEqual(textPart(held.frame()), uncachedTextFrame(reference),
+		"the committed frame includes the scroll the lead's line feed caused");
+	held.write(`${ESC}[?2026l`);
+	await held.flush();
+	held.dispose();
+	reference.dispose();
+});
+
+test("a resize between queuing and parsing a synchronized frame never commits the pre-resize rows", async () => {
+	const surface = makeSurface(4, 20);
+	await writeAll(surface, ["one\r\ntwo"]);
+	surface.frame(); // build the cache the queued write could otherwise reuse
+	surface.write(`${ESC}[?2026h${ESC}[2Kinside`);
+	// Let the surface hand the write to xterm (a microtask) but not parse it yet.
+	await Promise.resolve();
+	await Promise.resolve();
+	surface.resize(12, 3);
+	await surface.flush();
+	assert.equal(surface.redrawState(), "held");
+	const frame = surface.frame();
+	assert.equal(frame.cols, 12);
+	assert.equal(frame.rows, 3);
+	assert.equal(frame.lines.length, 3);
+	surface.write(`${ESC}[?2026l`);
+	await surface.flush();
+	assert.deepEqual(textPart(surface.frame()), uncachedTextFrame(surface));
+	surface.dispose();
+});

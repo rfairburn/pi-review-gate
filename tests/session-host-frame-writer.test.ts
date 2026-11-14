@@ -5,7 +5,7 @@ import test from "node:test";
 import { Writable } from "node:stream";
 import { deflateSync } from "node:zlib";
 import { imageFallback } from "pi-session-host-tui";
-import { createSessionHostFrameWriter, type SessionHostFrameWriter } from "../src/session-host/frame-writer";
+import { __frameWriterTest, createSessionHostFrameWriter, type SessionHostFrameWriter } from "../src/session-host/frame-writer";
 import type { ComposedHostFrame, HostPaneRect } from "../src/session-host/compositor";
 import type { HostGraphicsLayer } from "../src/session-host/graphics-output";
 import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
@@ -1272,4 +1272,134 @@ test("close cancels redraws, is idempotent, preserves caller listeners, and boun
 	assert.throws(() => driver.submit(frame(["closed"]), 1, 1), /closed/);
 	assert.equal(output.endCalls, 0);
 	assert.equal(output.destroyCalls, 0);
+});
+
+test("hasPendingFrame reports only a retained, not yet drawn submission", async () => {
+	const output = new SyntheticWritable();
+	output.deferCallbacks = true;
+	const frames = writer(output, { redrawIntervalMs: 50 });
+	frames.start();
+	assert.equal(frames.hasPendingFrame(), false, "nothing submitted");
+	output.completeCallback(0); // alternate-screen entry
+	frames.submit(frame(["one"]), 10, 1);
+	// The first frame after start is drawn at once; its write is in flight.
+	assert.equal(output.writes.length, 2);
+	assert.equal(frames.hasPendingFrame(), false, "an in-flight write is not a retained frame");
+	frames.submit(frame(["two"]), 10, 1);
+	assert.equal(frames.hasPendingFrame(), true, "a frame behind the in-flight write is retained");
+	output.completeCallback(1);
+	await wait(70);
+	assert.equal(output.writes.length, 3, "the retained frame is drawn at the next allowed redraw");
+	assert.equal(frames.hasPendingFrame(), false, "a taken frame is no longer retained");
+	output.completeCallback(2);
+	await frames.close();
+	assert.equal(frames.hasPendingFrame(), false, "a closed writer retains nothing");
+});
+
+test("a frame refresh runs right before the retained frame is drawn and its newer frame wins that slot", async () => {
+	const output = new SyntheticWritable();
+	const frames = writer(output, { redrawIntervalMs: 30 });
+	frames.start();
+	frames.submit(frame(["first"]), 10, 1);
+	assert.equal(output.writes.length, 2, "the first frame is drawn at once");
+	const settled: string[] = [];
+	frames.submit(frame(["stale"]), 10, 1, (disposition) => settled.push(`stale:${disposition}`));
+	assert.equal(frames.hasPendingFrame(), true);
+	let refreshes = 0;
+	frames.requestFrameRefresh(() => {
+		refreshes += 1;
+		assert.equal(output.writes.length, 2, "the refresh runs before the retained frame is written");
+		// A submission queued as a microtask from the refresh is still drawn in this slot.
+		queueMicrotask(() => frames.submit(frame(["fresh"]), 10, 1, (disposition) => settled.push(`fresh:${disposition}`)));
+	});
+	assert.equal(refreshes, 0, "a request alone never runs the refresh");
+	await wait(60);
+	assert.equal(refreshes, 1, "the refresh runs exactly once");
+	assert.equal(output.writes.length, 3, "one frame is drawn in that slot");
+	assert.match(outputText(output, 2), /fresh/);
+	assert.doesNotMatch(outputText(output, 2), /stale/);
+	assert.deepEqual(settled, ["fresh:written"], "the replaced frame never settles; the newer one is written");
+	await wait(60);
+	assert.equal(refreshes, 1, "a consumed request is never repeated");
+	assert.equal(output.writes.length, 3);
+	await frames.close();
+});
+
+test("a throwing or closed-over frame refresh never blocks drawing and is dropped on close", async () => {
+	const output = new SyntheticWritable();
+	const frames = writer(output, { redrawIntervalMs: 20 });
+	frames.start();
+	frames.submit(frame(["first"]), 10, 1);
+	frames.submit(frame(["second"]), 10, 1);
+	frames.requestFrameRefresh(() => { throw new Error("synthetic refresh failure"); });
+	await wait(50);
+	assert.equal(output.writes.length, 3, "the retained frame is drawn as it is");
+	assert.match(outputText(output, 2), /second/);
+	frames.submit(frame(["third"]), 10, 1);
+	let called = false;
+	frames.requestFrameRefresh(() => { called = true; });
+	await frames.close();
+	await wait(40);
+	assert.equal(called, false, "a request pending at close is never called");
+});
+
+test("repeated rows reuse their serialization and the frame byte bound still applies to every row", () => {
+	const output = new SyntheticWritable();
+	const frames = writer(output, { redrawIntervalMs: 0, maxFrameBytes: 400 });
+	frames.start();
+	const row = `${ESC}[31m${"x".repeat(40)}${ESC}[0m`;
+	frames.submit(frame([row, "b"]), 60, 2);
+	frames.submit(frame([row, "c"]), 60, 2);
+	const last = outputText(output, output.writes.length - 1);
+	assert.ok(last.includes("c"), "the changed row is drawn");
+	assert.ok(!last.includes("x".repeat(40)), "the identical row is not redrawn");
+	// A frame whose rows were all serialized before still has to fit the bound.
+	assert.throws(
+		() => frames.submit(frame([row, row, row, row, row, row, row, row, row, row]), 60, 10),
+		/exceeds its UTF-8 byte limit/,
+	);
+	void frames.close();
+});
+
+test("the row memo never retains an oversized source, drops refused submissions, and releases on clear", () => {
+	const { RowSerializationMemo, ROW_MEMO_MAX_CODE_UNITS } = __frameWriterTest;
+	const memo = new RowSerializationMemo();
+	const clipped = { text: "abc", width: 3, bytes: 3 };
+	// A huge source that clips to a few cells is never kept.
+	const huge = "x".repeat(ROW_MEMO_MAX_CODE_UNITS + 1);
+	memo.begin();
+	memo.remember(huge, 10, clipped);
+	memo.commit();
+	assert.equal(memo.lookup(huge, 10), undefined);
+	assert.equal(memo.retainedCodeUnits(), 0);
+	// The per-generation budget caps the sum of many large rows.
+	memo.begin();
+	const half = "y".repeat(Math.floor(ROW_MEMO_MAX_CODE_UNITS / 2));
+	for (let index = 0; index < 8; index += 1) memo.remember(`${index}${half}`, 10, clipped);
+	memo.commit();
+	assert.ok(memo.retainedCodeUnits() <= ROW_MEMO_MAX_CODE_UNITS, "one generation stays inside its budget");
+	// A refused submission (begin without commit, then begin again) keeps nothing of it.
+	memo.begin();
+	memo.remember("partial", 10, clipped);
+	memo.begin();
+	assert.equal(memo.lookup("partial", 10), undefined);
+	// Two generations at most, and clear releases everything.
+	assert.ok(memo.retainedCodeUnits() <= 2 * ROW_MEMO_MAX_CODE_UNITS);
+	memo.clear();
+	assert.equal(memo.retainedCodeUnits(), 0);
+});
+
+test("an oversized clipped row and a refused submission leave later output exact", () => {
+	const output = new SyntheticWritable();
+	const frames = writer(output, { redrawIntervalMs: 0, maxFrameBytes: 400 });
+	frames.start();
+	const huge = "z".repeat(2 * 1024 * 1024);
+	frames.submit(frame([huge, "a"]), 10, 2);
+	assert.match(outputText(output, 1), /z{10}/);
+	assert.throws(() => frames.submit(frame(["q".repeat(60), "q".repeat(60), "q".repeat(60), "q".repeat(60),
+		"q".repeat(60), "q".repeat(60), "q".repeat(60)]), 60, 7), /exceeds its UTF-8 byte limit/);
+	frames.submit(frame([huge, "b"]), 10, 2);
+	const last = outputText(output, output.writes.length - 1);
+	assert.ok(last.includes("b") && !last.includes("z"), "only the changed row is redrawn against the written baseline");
+	void frames.close();
 });

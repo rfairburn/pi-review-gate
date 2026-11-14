@@ -6,7 +6,8 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "pi-session-host-tui";
+import { truncateToWidth, visibleWidth } from "pi-session-host-tui";
+import { NATIVE_STATUS_NOT_APPLICABLE_TEXT } from "../src/session-host/native-status";
 import { SidebarController, type SidebarItem } from "../src/session-host/sidebar";
 import type { PeerUiConsent, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
@@ -952,4 +953,298 @@ test("navigation direction chooses the shortest known cyclic step and refuses am
   const duplicatedLabel = [...targets, { position: 7, label: "owned-b" }];
   assert.equal(rosterNavigationDirection(duplicatedLabel, positionOf("owned-a"), "owned-b"), undefined,
     "one label drawn at two positions is ambiguous");
+});
+
+/* -------------------------------------------------------------------------- *
+ * Not-applicable card values (native status applicability, issue #277).      *
+ *                                                                            *
+ * A category the row's own observer positively declared unreportable renders *
+ * the shared not-applicable word in the agent cell, the input cell, or       *
+ * either count cell. Those are REAL rendered values, so the ONE shared       *
+ * witness must read them: every native acceptance harness acknowledges its   *
+ * focus, selection, and navigation frames through this parser, and a roster  *
+ * holding such a card is either a complete parse for all of them or no parse *
+ * at all.                                                                    *
+ *                                                                            *
+ * What follows pins the accepted forms against the actual production         *
+ * renderer and the exact clipped forms, and proves the closed set stays      *
+ * closed: a lookalike (`n/a`, `NA`, an annotated cell), a half-painted cell, *
+ * and a partial card remain no parse. Nothing here widens anything to free   *
+ * text.                                                                      *
+ * -------------------------------------------------------------------------- */
+
+/** The production not-applicable word, imported rather than retyped. */
+const NA = NATIVE_STATUS_NOT_APPLICABLE_TEXT;
+
+/** One display DTO shaped like a hosted provider row's own card facts. */
+function statusItem(overrides: Partial<SidebarItem> & { id: string }): SidebarItem {
+  return {
+    label: overrides.id,
+    workspace: `/workspace/${overrides.id}`,
+    agentDir: "/agents",
+    lifecycle: "alive",
+    busy: null,
+    pendingInput: null,
+    inputSurface: false,
+    activity: [],
+    nativeSession: null,
+    ...overrides,
+  };
+}
+
+/** The serializer-generated SGR pattern, stripped exactly as the witness strips it. */
+const DRAWN_SGR = /\x1b\[[0-9;]*m/g;
+
+/** One background row exactly as the renderer draws it in a `width`-cell pane. */
+const drawnBackground = (text: string, width = SIDEBAR_COLUMNS): string =>
+  truncateToWidth(`  ${text}`, width, "...", true).replace(DRAWN_SGR, "");
+
+/**
+ * A hand-made clipped count row's TEXT (no selection marker, so every caller adds
+ * its own) whose `...` sits exactly at the pane edge. Without that exact width a
+ * fixture would be rejected by the pane-boundary rule instead of by the count
+ * grammar, which is the whole point of the negative cases.
+ */
+function fakeClippedCounts(core: string): string {
+  assert.equal(visibleWidth(`  ${core}...`), SIDEBAR_COLUMNS,
+    `test fixture: ${JSON.stringify(core)} is not an exact pane-edge clip, so it would prove nothing`);
+  return `${core}...`;
+}
+
+/**
+ * One drawn card row from a status or count VALUE, with the two-cell unselected
+ * marker. A fixture that already carried its own marker would land at the
+ * four-cell activity indent and would then "prove" a rejection for never being a
+ * marker row at all, so this refuses that mistake outright.
+ */
+function drawnRow(value: string): string {
+  const row = `  ${value}`;
+  assert.ok(row.slice(2).length > 0 && !row.slice(2, 3).startsWith(" "),
+    `test fixture ${JSON.stringify(value)} would draw an activity row, not a marker row`);
+  return row;
+}
+
+/** A pane-only frame whose every row is exactly `width` cells, clipped like the renderer. */
+function paneFrame(width: number, rows: readonly string[]): string {
+  return rows.map((row) => truncateToWidth(row, width, "...", true).replace(DRAWN_SGR, "")).join("\n");
+}
+
+test("the shared witness reads the production renderer's not-applicable card values", () => {
+  const controller = rosterController({
+    settingsAvailable: true,
+    legacyToggleOverride: false,
+    items: [
+      // A Pi row and a claude-backed row carry no unreportable declaration.
+      statusItem({ id: "Pi conversation" }),
+      statusItem({ id: "Claude", backend: "claude" }),
+      // The armed codex-backed row: input and both counts positively unreportable.
+      statusItem({
+        id: "Codex",
+        backend: "codex",
+        statusSupport: { input: "unsupported", tasks: "unsupported", shells: "unsupported" },
+      }),
+      // One unreportable agent/input pair, and one count paired with an observed number.
+      statusItem({
+        id: "Mixed",
+        backend: "codex",
+        activeShells: 2,
+        statusSupport: { agent: "unsupported", input: "unsupported", tasks: "unsupported" },
+      }),
+    ],
+  });
+  const frame = renderRoster(controller);
+  assert.ok(frame.includes(`input ${NA}`), "the renderer really drew the not-applicable input cell");
+  assert.ok(frame.includes(`bg tasks ${NA} | shells ${NA}`),
+    "the renderer really drew both not-applicable count cells");
+
+  const parsed = parseRosterFrame(frame);
+  assert.equal(parsed.complete, true, "an armed native row is not a partial roster");
+  assert.equal(parsed.count, 4);
+  assert.deepEqual(parsed.cards.map((card) => [card.title, card.status, card.background]), [
+    ["Pi conversation", "agent unknown | input unknown", "background unknown"],
+    ["Claude", "agent unknown | input unknown", "background unknown"],
+    ["Codex", `agent unknown | input ${NA}`, `bg tasks ${NA} | shells ${NA}`],
+    ["Mixed", `agent ${NA} | input ${NA}`, `bg tasks ${NA} | shells 2`],
+  ], "each card keeps its own drawn status and count cells, with an unknown never rewritten");
+
+  // The exact witness `MainPtyDriver.ensureSidebarFocus()` asserts on this frame.
+  assert.equal(isSidebarFocusedFrame(frame), true,
+    "a complete roster holding a not-applicable card still proves real sidebar focus");
+  const targets = rosterNavigationTargets(parsed, [
+    { rowProbe: "pi", displayName: "Pi conversation" },
+    { rowProbe: "claude", displayName: "Claude" },
+    { rowProbe: "codex", displayName: "Codex" },
+    { rowProbe: "mixed", displayName: "Mixed" },
+  ]);
+  assert.ok(targets);
+  assert.equal(nextRosterNavigationTarget(targets, 0)?.label, "claude",
+    "navigation steps across a roster that contains not-applicable cards");
+});
+
+test("the shared status and count grammars admit the exact not-applicable forms", () => {
+  for (const status of [
+    `starting | input ${NA}`,
+    `agent ${NA} | input ${NA}`,
+    `agent unknown | input ${NA}`,
+    `agent idle | input ${NA}`,
+    `agent ${NA} | input none`,
+    "agent running | input pending",
+  ]) {
+    const frame = compose([HEADER(1), "Card", `  ${status}`, BACKGROUND, ...ACTIONS]);
+    const parsed = parseRosterFrame(frame);
+    assert.equal(parsed.complete, true, `accepts the drawn status ${JSON.stringify(status)}`);
+    assert.equal(parsed.cards[0]?.status, status);
+  }
+
+  for (const background of [
+    "background unknown",
+    "bg tasks 0 | shells 0",
+    `bg tasks ${NA} | shells ${NA}`,
+    `bg tasks ${NA} | shells 0`,
+    "bg tasks 3 | shells unknown",
+    `bg tasks unknown | shells ${NA}`,
+    `bg tasks ${NA} | shells unknown`,
+  ]) {
+    const frame = compose([HEADER(1), "Card", IDLE_STATUS, `  ${background}`, "", "", ...ACTIONS]);
+    const parsed = parseRosterFrame(frame);
+    assert.equal(parsed.complete, true, `accepts the drawn counts ${JSON.stringify(background)}`);
+    assert.equal(parsed.cards[0]?.background, background);
+  }
+
+  // One roster with legacy, zero, unknown, and not-applicable cards at once.
+  const mixed = compose([
+    HEADER(4),
+    "Pi row", IDLE_STATUS, "  background unknown",
+    "Observed zeros", "  agent idle | input none", "  bg tasks 0 | shells 0",
+    "Not applicable", `  agent ${NA} | input ${NA}`, `  bg tasks ${NA} | shells ${NA}`,
+    "Half known", IDLE_STATUS, `  bg tasks unknown | shells ${NA}`,
+    ...ACTIONS,
+  ]);
+  const parsedMixed = parseRosterFrame(mixed);
+  assert.equal(parsedMixed.complete, true);
+  assert.deepEqual(parsedMixed.cards.map((card) => card.background), [
+    "background unknown",
+    "bg tasks 0 | shells 0",
+    `bg tasks ${NA} | shells ${NA}`,
+    `bg tasks unknown | shells ${NA}`,
+  ], "one roster can carry every honest count shape at once");
+  assert.deepEqual(parsedMixed.cards.map((card) => card.status), [
+    "agent idle | input none",
+    "agent idle | input none",
+    `agent ${NA} | input ${NA}`,
+    "agent idle | input none",
+  ]);
+  assert.equal(selectedRosterCard(mixed), undefined, "no card is highlighted in this frame");
+});
+
+test("not-applicable count cells survive the renderer's clipped forms", () => {
+  // Clipped inside the observed shells count, with a complete not-applicable cell first.
+  const clippedCounts = drawnBackground("bg tasks N/A | shells 1234567890123456789");
+  assert.ok(clippedCounts.endsWith("..."), clippedCounts);
+  const countsFrame = compose([HEADER(1), "Codex", IDLE_STATUS, clippedCounts, "", "", ...ACTIONS]);
+  const counts = parseRosterFrame(countsFrame);
+  assert.equal(counts.complete, true);
+  assert.equal(counts.cards[0]?.background, clippedCounts.slice(2),
+    "the parsed background is the drawn row minus its two-cell marker");
+
+  // Clipped mid-word in the second cell, at the narrow overlay pane width, where the
+  // renderer's only drawing of that row is `bg tasks N/A | sh...`.
+  const narrow = 20;
+  const clippedCells = drawnBackground(`bg tasks ${NA} | shells ${NA}`, narrow);
+  assert.equal(visibleWidth(clippedCells), narrow, "the renderer drew the row at the pane edge");
+  assert.ok(clippedCells.endsWith("..."), clippedCells);
+  const narrowFrame = paneFrame(narrow, [
+    HEADER(1), "Codex", "  exited (code 0)", clippedCells,
+    "  Saved conversations", "  New session", "  Quit host",
+  ]);
+  const parsedNarrow = parseRosterFrame(narrowFrame, narrow);
+  assert.equal(parsedNarrow.complete, true, "the clipped not-applicable cells are a complete card");
+  assert.equal(parsedNarrow.cards[0]?.background, clippedCells.slice(2));
+  assert.equal(parsedNarrow.cards[0]?.status, "exited (code 0)");
+
+  // A clipped cell that stops inside the not-applicable word is still that word.
+  const clippedToken = `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345`)}`;
+  assert.equal(parseRosterFrame(compose([
+    HEADER(1), "Codex", IDLE_STATUS, clippedToken, "", "", ...ACTIONS,
+  ])).complete, true);
+});
+
+test("not-applicable lookalikes, half-painted cells, and partial cards stay no parse", () => {
+  // The closed word set: only the production spelling, never an annotation or case variant.
+  for (const status of [
+    "agent unknown | input n/a",
+    "agent unknown | input NA",
+    "agent unknown | input N/A (unreportable)",
+    "agent unknown | input N/A/",
+    "agent unknown|input N/A",
+    `agent unknown | input ${NA} | extra`,
+    `agent N/ | input ${NA}`,
+    `agent ${NA}`,
+    `input ${NA}`,
+  ]) {
+    const frame = compose([HEADER(1), "Card", drawnRow(status), BACKGROUND, "", "", ...ACTIONS]);
+    assert.equal(parseRosterFrame(frame).complete, false, `rejects the status ${JSON.stringify(status)}`);
+    assert.deepEqual(rosterCards(frame), [], `no card leaks out of ${JSON.stringify(status)}`);
+    assert.equal(selectedRosterCard(frame), undefined);
+  }
+
+  for (const background of [
+    `bg tasks ${NA}`,
+    "bg tasks n/a | shells n/a",
+    "bg tasks NA | shells 1",
+    "bg tasks N/ | shells 1",
+    "bg tasks N/A/ | shells 1",
+    "bg tasks N/A | shell 1",
+    "bg tasks N/A | shells 1 2",
+    `bg tasks ${NA} | shells ${NA} extra`,
+    fakeClippedCounts("bg tasks N/ | shells 123456"),
+    fakeClippedCounts("bg tasks NA | shells 123456"),
+    fakeClippedCounts("bg tasks n/a | shells 12345"),
+    fakeClippedCounts("bg tasks N/A | shell 123456"),
+  ]) {
+    const frame = compose([HEADER(1), "Card", IDLE_STATUS, drawnRow(background), "", "", ...ACTIONS]);
+    assert.equal(parseRosterFrame(frame).complete, false, `rejects the counts ${JSON.stringify(background)}`);
+    assert.deepEqual(rosterCards(frame), [], `no card leaks out of ${JSON.stringify(background)}`);
+  }
+
+  // A half-painted not-applicable cell is not a clipped one: the renderer's ellipsis
+  // is the only accepted evidence of clipping, and a status row is never clipped.
+  for (const partial of [
+    "agent unknown | input N/",
+    "agent unknown | input N",
+    `agent ${NA} | input N/`,
+    `bg tasks ${NA} | shells N/`,
+    `bg tasks ${NA} | shells`,
+  ]) {
+    const frame = compose([HEADER(1), "Card", drawnRow(partial), BACKGROUND, "", "", ...ACTIONS]);
+    assert.equal(parseRosterFrame(frame).complete, false, `rejects the half-painted ${JSON.stringify(partial)}`);
+  }
+  const statusTooWideForItsPane = paneFrame(20, [
+    HEADER(1), "Codex", `  agent unknown | input ${NA}`, "  background unknown",
+    "  Saved conversations", "  New session", "  Quit host",
+  ]);
+  assert.equal(parseRosterFrame(statusTooWideForItsPane, 20).complete, false,
+    "a status row the renderer had to clip is never accepted");
+
+  // A not-applicable card missing its count row, or missing its second activity row.
+  assert.equal(parseRosterFrame(compose([
+    HEADER(1), "Codex", `  agent unknown | input ${NA}`, ...ACTIONS,
+  ])).complete, false, "a card without its third row is not complete");
+  assert.equal(parseRosterFrame(compose([
+    HEADER(1), "Codex", `  agent unknown | input ${NA}`, `  bg tasks ${NA} | shells ${NA}`, "    one activity",
+    ...ACTIONS,
+  ])).complete, false, "a half-drawn expanded card is not complete");
+});
+
+test("a stale not-applicable row is never witnessed as a hidden sidebar", () => {
+  for (const remnant of [
+    `> agent unknown | input ${NA}`,
+    `  bg tasks ${NA} | shells ${NA}`,
+    `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345`)}`,
+    `> agent ${NA} | input ${NA}`,
+  ]) {
+    assert.equal(sidebarRosterHidden(remnant), false, `${JSON.stringify(remnant)} is still drawn`);
+  }
+  assert.equal(sidebarRosterHidden("Codex\nnative content row"), true,
+    "a divider-free frame with no such row is still hidden");
 });

@@ -52,12 +52,13 @@
  *    a hook fired, and nothing here proves a real provider accepts the flags.
  * - macOS only (the shared harness's explicit scope). Windows ConPTY, a
  *    physical terminal, and any real provider remain unverified.
- * - The sidebar roster is read by this file's own reader (`completeRoster`),
- *    because an armed Codex row draws the shared not-applicable word in cells
- *    the shared roster witness's grammar does not admit. It keeps the shared
- *    witness's completeness rules and its rejection of a partial frame; only
- *    the closed set of accepted status and count words grew. Every other
- *    harness keeps using the shared witness unchanged.
+ * - The sidebar roster is read by the ONE shared strict roster witness in
+ *    `helpers/session-host-native-roster-witness.ts`, whose closed value grammar
+ *    includes the not-applicable word an armed Codex row draws in its input and
+ *    count cells. This file keeps no roster grammar of its own: what remains is
+ *    only how a parsed entry is NAMED inside its own step and failure messages,
+ *    so every completeness rule, card extent, action tail, and partial-frame
+ *    rejection is the same one every other harness uses.
  *
  * FORM SUBMISSION is never assumed, and nothing here re-choreographs it.
  * `submitWorkspace` presses exactly the keys `MainPtyDriver.createNativeSession`
@@ -102,7 +103,6 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 import test from "node:test";
-import { truncateToWidth, visibleWidth } from "pi-session-host-tui";
 
 import { normalizeConfig } from "../src/config";
 import { SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
@@ -150,12 +150,17 @@ import {
 } from "./helpers/session-host-native-new-form-witness";
 import {
   NATIVE_PANE_START,
-  ROSTER_ACTIONS,
-  SETTINGS_ACTION,
   SIDEBAR_COLUMNS,
+  type ParsedRoster,
+  type RosterCardEntry,
+  type RosterEntry,
+  type RosterNavigationTarget,
   frameHeader,
+  nextRosterNavigationTarget,
+  parseRosterFrame,
   renderedTitleMatches,
-  sidebarPaneLines,
+  rosterCards,
+  selectedRosterEntry,
 } from "./helpers/session-host-native-roster-witness";
 
 const SHIFT_TAB = "\x1b[Z";
@@ -394,241 +399,35 @@ function providerValue(row: string | undefined): string {
 }
 
 /* -------------------------------------------------------------------------- *
- * This scenario's own N/A-aware roster reader                                 *
- *                                                                             *
- * The shared roster witness models the sidebar's card grammar and stays        *
- * unchanged for every other acceptance harness. Since the native status slice  *
- * the sidebar can also draw the shared not-applicable word in a card's agent,  *
- * input, and count cells, and that grammar does not admit it, a roster holding *
- * an armed Codex row cannot be read with it. So this file reads its own        *
- * roster here, on the shared pane extraction and the shared action labels.     *
- *                                                                             *
- * Nothing about it is looser than the shared witness: the same pinned          *
- * terminal-cell pane scope, the same header-declared session count, the same   *
- * fixed 3-or-5-row card extents, the same ordered required action tail with    *
- * the one optional Settings row in its only legal position, the same "any      *
- * extra entry-shaped row means this roster is not complete" rule, and the same *
- * treatment of a half-painted row as no parse at all. Only the set of          *
- * accepted VALUE words grew, and it is written out literally below from the    *
- * production constants rather than widened into anything-goes text.            *
+ * The drawn roster, read with the ONE shared strict witness                  *
+ *                                                                            *
+ * Every card rule lives in `helpers/session-host-native-roster-witness.ts`   *
+ * and nowhere else in this file: the pinned terminal-cell pane scope, the    *
+ * header-declared session count, the fixed 3-or-5-row card extents, the      *
+ * ordered required action tail with the one optional Settings row in its     *
+ * only legal position, the "any extra entry-shaped row means this roster is  *
+ * not complete" rule, and the closed set of accepted status/input/count      *
+ * VALUE words — including the shared not-applicable word an armed native row *
+ * draws. What stays here is only how this scenario NAMES a parsed entry      *
+ * inside its own step and failure messages. A partial repaint, an unknown    *
+ * status word, a duplicated entry, or a roster whose cards do not fill the   *
+ * declared count is still no parse at all, so nothing here is ever stepped   *
+ * on.                                                                        *
  * -------------------------------------------------------------------------- */
 
-/** The renderer's two-cell selection marker and its four-cell activity indent. */
-const MARKER_SELECTED = "> ";
-const MARKER_PLAIN = "  ";
-const ACTIVITY_PREFIX = "    ";
-const MARKER_CELLS = 2;
-const ROSTER_HEADER_PATTERN = /^\s*Sessions \((\d+)\)\s*$/u;
-
-/** The not-applicable word as a closed regex alternative, taken from production. */
-const NOT_APPLICABLE_CELL = NATIVE_STATUS_NOT_APPLICABLE_TEXT.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-/** The whole status row, exactly as the shared sidebar composes it. */
-const STATUS_PATTERN = new RegExp(
-  "^(?:starting \\| input (?:pending|none|unknown|" + NOT_APPLICABLE_CELL + ")"
-  + "|agent (?:running|waiting|idle|unknown|" + NOT_APPLICABLE_CELL + ") \\| input (?:pending|none|unknown|" + NOT_APPLICABLE_CELL + ")"
-  + "|exited(?: \\(code -?\\d+\\))?|error(?: \\(code -?\\d+\\))?)$", "u");
-/** The whole background row: the reportable-unknown aggregate, or two counts. */
-const BACKGROUND_CANONICAL = new RegExp(
-  "^(?:background unknown|bg tasks (?:unknown|\\d+|" + NOT_APPLICABLE_CELL + ") \\| shells (?:unknown|\\d+|" + NOT_APPLICABLE_CELL + "))$", "u");
-/** A background count token that is completely rendered. */
-const COUNT_TOKEN_COMPLETE = new RegExp("^(?:unknown|\\d+|" + NOT_APPLICABLE_CELL + ")$", "u");
-const BACKGROUND_ROOT = "bg tasks ";
-const BACKGROUND_SHELLS = " | shells";
-
-const isBlank = (line: string): boolean => line.trim().length === 0;
-const isActivityRow = (line: string): boolean => line.startsWith(ACTIVITY_PREFIX);
-
-/** A two-cell selection marker; a four-space activity row is never one. */
-function rowMarker(line: string): "selected" | "unselected" | undefined {
-  if (line.startsWith(MARKER_SELECTED)) return "selected";
-  if (line.startsWith(MARKER_PLAIN) && !line.startsWith(ACTIVITY_PREFIX)) return "unselected";
-  return undefined;
-}
-
-/** A complete or partial prefix of a nullable count token: "unknown", digits, or N/A. */
-function isCountTokenPrefix(text: string): boolean {
-  if (text.length === 0) return false;
-  if (/^\d+$/u.test(text)) return true;
-  return "unknown".startsWith(text) || NATIVE_STATUS_NOT_APPLICABLE_TEXT.startsWith(text);
-}
-
-/** True when `tail` is a prefix of the canonical " | shells" suffix (optionally a count). */
-function isShellsSuffixPrefix(tail: string): boolean {
-  if (BACKGROUND_SHELLS.startsWith(tail)) return true;
-  if (!tail.startsWith(BACKGROUND_SHELLS)) return false;
-  const after = tail.slice(BACKGROUND_SHELLS.length);
-  if (after.length === 0) return true;
-  if (!after.startsWith(" ")) return false;
-  const token = after.slice(1);
-  return token.length === 0 || isCountTokenPrefix(token);
-}
-
-/** True when `core` is a prefix of some canonical `bg tasks … | shells …` row. */
-function isBackgroundPrefix(core: string): boolean {
-  if (core.length < BACKGROUND_ROOT.length) return BACKGROUND_ROOT.startsWith(core);
-  if (!core.startsWith(BACKGROUND_ROOT)) return false;
-  const rest = core.slice(BACKGROUND_ROOT.length);
-  for (let end = 1; end <= rest.length; end += 1) {
-    const token = rest.slice(0, end);
-    if (!isCountTokenPrefix(token)) continue;
-    // A separator proves the preceding token was completely rendered; an
-    // incomplete token prefix (e.g. "unk") before it cannot be clipping.
-    if (end < rest.length && !COUNT_TOKEN_COMPLETE.test(token)) continue;
-    if (isShellsSuffixPrefix(rest.slice(end))) return true;
-  }
-  return false;
-}
-
-/** The complete background row, or exactly `width - 2` cells of a clipped one. */
-function isBackgroundRow(text: string, width: number): boolean {
-  if (BACKGROUND_CANONICAL.test(text)) return visibleWidth(text) + MARKER_CELLS <= width;
-  if (!text.endsWith("...")) return false;
-  if (visibleWidth(text) !== width - MARKER_CELLS) return false;
-  return isBackgroundPrefix(text.slice(0, -3));
-}
-
-/** One drawn native card, with the real status and background rows it displays. */
-interface DrawnCard {
-  readonly kind: "native";
-  readonly position: number;
-  readonly title: string;
-  readonly status: string;
-  readonly background: string;
-  readonly selected: boolean;
-}
-
-/** One drawn fixed roster action. */
-interface DrawnAction {
-  readonly kind: "action";
-  readonly position: number;
-  readonly label: string;
-  readonly selected: boolean;
-}
-
-type DrawnEntry = DrawnCard | DrawnAction;
-
-/** A COMPLETE drawn roster: every declared card, then the ordered action tail. */
-interface DrawnRoster {
-  readonly count: number;
-  readonly entries: readonly DrawnEntry[];
-  readonly cards: readonly DrawnCard[];
-}
-
-/** One complete native card, or nothing for anything that is not one. */
-function readDrawnCard(
-  body: readonly string[],
-  start: number,
-  position: number,
-  width: number,
-): { readonly card: DrawnCard; readonly next: number } | undefined {
-  const titleLine = body[start];
-  if (titleLine === undefined || isBlank(titleLine)) return undefined;
-  const statusLine = body[start + 1];
-  const marker = statusLine === undefined ? undefined : rowMarker(statusLine);
-  if (statusLine === undefined || marker === undefined) return undefined;
-  const status = statusLine.slice(MARKER_CELLS).trimEnd();
-  if (!STATUS_PATTERN.test(status)) return undefined;
-  const backgroundLine = body[start + 2];
-  if (backgroundLine === undefined || rowMarker(backgroundLine) !== "unselected") return undefined;
-  const background = backgroundLine.slice(MARKER_CELLS).trimEnd();
-  if (!isBackgroundRow(background, width)) return undefined;
-  // Expanded cards claim two more rows; a blank padded activity row is a valid
-  // placeholder, and anything else means this card is collapsed at three rows.
-  const fourth = body[start + 3];
-  const fourthIsActivity = fourth !== undefined && (isBlank(fourth) || isActivityRow(fourth));
-  const fifth = body[start + 4];
-  const expanded = fourthIsActivity && fifth !== undefined && (isBlank(fifth) || isActivityRow(fifth));
-  if (fourthIsActivity && !expanded) return undefined;
-  return {
-    card: { kind: "native", position, title: titleLine.trimEnd(), status, background, selected: marker === "selected" },
-    next: start + (expanded ? 5 : 3),
-  };
-}
-
-/** The exact row the renderer draws for one action label at this pane width. */
-function renderedActionRow(text: string, width: number): string {
-  return truncateToWidth(text, width, "...", true).trimEnd();
-}
-
-/** The label only for a complete action row the production renderer can draw here. */
-function drawnActionLabel(line: string, width: number): string | undefined {
-  const marker = rowMarker(line);
-  if (marker === undefined) return undefined;
-  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
-  const rendered = line.trimEnd();
-  for (const label of ROSTER_ACTIONS) {
-    if (rendered === renderedActionRow(`${prefix}${label}`, width)) return label;
-  }
-  return rendered === renderedActionRow(`${prefix}${SETTINGS_ACTION}`, width) ? SETTINGS_ACTION : undefined;
-}
-
-/**
- * The drawn roster, but only when it is complete: the header-declared number of
- * full native cards, then the ordered required actions with the optional
- * Settings row in its only legal position, and no extra entry-shaped row after.
- * A partial repaint, an unknown status word, a duplicated entry, or a roster
- * whose cards do not fill the declared count is no parse at all, so nothing
- * here is ever stepped on.
- */
-function completeRoster(text: string): DrawnRoster | undefined {
-  const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
-  const lines = pane.slice(ROSTER_HEADER_PATTERN.test(pane[0] ?? "") ? 0 : 1);
-  const header = ROSTER_HEADER_PATTERN.exec(lines[0] ?? "");
-  if (header === null) return undefined;
-  const count = Number(header[1]);
-  const body = lines.slice(1);
-  const cards: DrawnCard[] = [];
-  const entries: DrawnEntry[] = [];
-  let index = 0;
-  for (let position = 0; position < count; position += 1) {
-    const read = readDrawnCard(body, index, position, SIDEBAR_COLUMNS);
-    if (read === undefined) return undefined;
-    cards.push(read.card);
-    entries.push(read.card);
-    index = read.next;
-  }
-  const consumeAction = (expected: string): boolean => {
-    const line = body[index];
-    const marker = line === undefined ? undefined : rowMarker(line);
-    if (line === undefined || marker === undefined
-      || drawnActionLabel(line, SIDEBAR_COLUMNS) !== expected) return false;
-    entries.push({ kind: "action", position: entries.length, label: expected, selected: marker === "selected" });
-    index += 1;
-    return true;
-  };
-  const [saved, newSession, quitHost] = ROSTER_ACTIONS;
-  if (!consumeAction(saved)) return undefined;
-  if (!consumeAction(newSession)) return undefined;
-  const optionalLine = body[index];
-  if (optionalLine !== undefined && drawnActionLabel(optionalLine, SIDEBAR_COLUMNS) === SETTINGS_ACTION) {
-    entries.push({
-      kind: "action",
-      position: entries.length,
-      label: SETTINGS_ACTION,
-      selected: rowMarker(optionalLine) === "selected",
-    });
-    index += 1;
-  }
-  if (!consumeAction(quitHost)) return undefined;
-  // Anything extra that looks like an entry means the roster is stale or
-  // duplicated, not complete. Footer hints, notices, and blank padding are not.
-  for (let cursor = index; cursor < body.length; cursor += 1) {
-    const line = body[cursor]!;
-    if (isBlank(line)) continue;
-    if (rowMarker(line) !== undefined) return undefined;
-    if (readDrawnCard(body, cursor, entries.length, SIDEBAR_COLUMNS) !== undefined) return undefined;
-  }
-  return { count, entries, cards };
+/** The drawn roster, but only when the shared witness calls it complete. */
+function completeRoster(text: string): ParsedRoster | undefined {
+  const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
+  return parsed.complete ? parsed : undefined;
 }
 
 /**
  * The one drawn card whose complete title line belongs to `caption`, if any.
  * Its `status` and `background` are the real drawn rows, read verbatim.
  */
-function cardFor(text: string, caption: string): DrawnCard | undefined {
-  const parsed = completeRoster(text);
-  if (parsed === undefined) return undefined;
-  const matches = parsed.cards.filter((card) => renderedTitleMatches(card.title, caption));
+function cardFor(text: string, caption: string): RosterCardEntry | undefined {
+  const matches = rosterCards(text, SIDEBAR_COLUMNS)
+    .filter((card) => renderedTitleMatches(card.title, caption));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -641,31 +440,28 @@ function headerNamesOwner(text: string, title: string): boolean {
 
 /** True only for a complete roster whose single highlight is the requested row or action. */
 function rosterSelectionIs(text: string, expected: string): boolean {
-  const selected = uniqueHighlight(completeRoster(text));
+  const selected = selectedRosterEntry(text, SIDEBAR_COLUMNS);
   if (selected === undefined) return false;
   return selected.kind === "action"
     ? selected.label === expected
     : renderedTitleMatches(selected.title, expected);
 }
 
-/** The one uniquely highlighted entry of a complete roster, or nothing when no unique highlight is drawn. */
-function uniqueHighlight(parsed: DrawnRoster | undefined): DrawnEntry | undefined {
-  if (parsed === undefined) return undefined;
-  const selected = parsed.entries.filter((entry) => entry.selected);
-  return selected.length === 1 ? selected[0] : undefined;
-}
-
-/** The entry one cyclic Down from `position`, or nothing when that step is ambiguous. */
-function entryAfterOneDown(parsed: DrawnRoster, position: number): DrawnEntry | undefined {
-  if (parsed.entries.length === 0) return undefined;
-  const index = parsed.entries.findIndex((entry) => entry.position === position);
-  if (index < 0 || parsed.entries.some((entry, at) => at !== index && entry.position === position)) return undefined;
-  return parsed.entries[(index + 1) % parsed.entries.length];
-}
-
 /** How the drawn roster names one entry, for a step message that cannot lie about where it pressed. */
-function entryCaption(entry: DrawnEntry): string {
+function entryCaption(entry: RosterEntry): string {
   return entry.kind === "action" ? entry.label : entry.title;
+}
+
+/**
+ * The shared witness's navigation targets for one COMPLETE drawn roster, in the
+ * order it actually rendered them. `rosterNavigationTargets()` cannot take this
+ * role here: it correlates every drawn native card with an observer-confirmed Pi
+ * row, and a provider child never loads that observer. Positions, selection, and
+ * the duplicate-position refusal still come from the shared parse and the shared
+ * step logic, so no local rule decides where a Down press may land.
+ */
+function drawnRosterTargets(parsed: ParsedRoster): readonly RosterNavigationTarget[] {
+  return parsed.entries.map((entry) => ({ position: entry.position, label: entryCaption(entry) }));
 }
 
 /**
@@ -674,8 +470,9 @@ function entryCaption(entry: DrawnEntry): string {
  * The harness's `moveRosterTo` correlates every drawn native card with an
  * observer-confirmed Pi row, and a provider child never loads that observer, so
  * a roster that contains provider cards has no correlation to navigate on. This
- * reads the COMPLETE rendered roster, derives the single entry one cyclic Down
- * below the drawn highlight, presses one real Down, and witnesses the highlight
+ * reads the COMPLETE rendered roster through the shared witness, derives the
+ * single entry one cyclic Down below the drawn highlight with the shared step
+ * logic, presses one real Down, and witnesses the highlight
  * landing on exactly that intermediate entry before any further key is sent — so
  * a destination several rows away is reached step by step instead of timing out
  * on the first intermediate highlight. Wrapping is the roster's own order, never
@@ -689,25 +486,22 @@ async function stepRosterTo(driver: MainPtyDriver, expected: string, maximumStep
     const parsed = completeRoster(text);
     assert.ok(parsed, `the drawn sidebar is not a complete roster while navigating to ${expected}:\n${text}`);
     const after = driver.frameRevision;
-    const highlight = uniqueHighlight(parsed);
+    const highlight = selectedRosterEntry(text, SIDEBAR_COLUMNS);
     if (highlight === undefined) {
       // Removing a row can leave the roster with no highlight at all. One real
       // Down must then establish a unique highlight before any further step.
       driver.pty.write(KEYS.down);
-      await driver.waitFrame((drawn) => {
-        const redrawn = completeRoster(drawn);
-        return redrawn !== undefined && uniqueHighlight(redrawn) !== undefined;
-      }, `one real Down re-establishes a unique sidebar highlight on the way to ${expected}`, after);
+      await driver.waitFrame((drawn) => selectedRosterEntry(drawn, SIDEBAR_COLUMNS) !== undefined,
+      `one real Down re-establishes a unique sidebar highlight on the way to ${expected}`, after);
       continue;
     }
-    const next = entryAfterOneDown(parsed, highlight.position);
+    const next = nextRosterNavigationTarget(drawnRosterTargets(parsed), highlight.position);
     assert.ok(next, `the drawn roster names no unambiguous entry one Down from position ${highlight.position}:\n${text}`);
     driver.pty.write(KEYS.down); // Explicit UI navigation only, never activation.
     await driver.waitFrame((drawn) => {
-      const redrawn = completeRoster(drawn);
-      const landed = redrawn === undefined ? undefined : uniqueHighlight(redrawn);
+      const landed = selectedRosterEntry(drawn, SIDEBAR_COLUMNS);
       return landed !== undefined && landed.position === next.position;
-    }, `the real sidebar highlight steps one entry, ${entryCaption(highlight)} to ${entryCaption(next)}, on the way to ${expected}`, after);
+    }, `the real sidebar highlight steps one entry, ${entryCaption(highlight)} to ${next.label}, on the way to ${expected}`, after);
   }
   throw new Error(`the real sidebar highlight never reached ${expected} within ${maximumSteps} witnessed single-entry steps\nActual owned Main frame:\n${driver.currentText()}`);
 }
@@ -732,8 +526,8 @@ async function activateHighlighted(driver: MainPtyDriver, caption: string, expec
  * so a header-plus-nonempty-pane match can still be a mid-repaint slice missing
  * another row's card, and the census would start from an undercount. This applies
  * the same settled-activation discipline the harness's own witnessed activation
- * uses, with the witnesses this file already parses: the COMPLETE roster whose
- * single highlight is the activated row, then the real frame writer going quiet,
+ * uses, with the shared witness: the COMPLETE roster whose single highlight is
+ * the activated row, then the real frame writer going quiet,
  * then that same complete witness re-asserted on the settled frame. No extra key,
  * retry, or sleep is added, and no census assertion is relaxed.
  *
@@ -747,8 +541,7 @@ async function activateHighlightedOnSettledFrame(driver: MainPtyDriver, caption:
   const settledFrame = (text: string): boolean => {
     if (!headerNamesOwner(text, caption)) return false;
     if (nativePaneText(text).length === 0) return false;
-    const parsed = completeRoster(text);
-    const highlight = parsed === undefined ? undefined : uniqueHighlight(parsed);
+    const highlight = selectedRosterEntry(text, SIDEBAR_COLUMNS);
     return highlight !== undefined && highlight.kind === "native"
       && renderedTitleMatches(highlight.title, caption);
   };

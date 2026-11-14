@@ -12,6 +12,11 @@ import {
   snapshotNativeEnvironment,
   type NativeLaunchDescriptor,
 } from "./launch";
+import { type NativeHookBootstrap } from "./native-hook-protocol";
+import {
+  prepareNativeHookLaunch,
+  type NativeHookLaunchOutcome,
+} from "./native-hook-launch-prep";
 import { type NativeCliBackend } from "./session-backend";
 
 /**
@@ -20,9 +25,16 @@ import { type NativeCliBackend } from "./session-backend";
  * This module prepares the exact `{file, args, env, cwd}` descriptor for one
  * real, full-screen interactive Claude Code or Codex PTY session. It prepares
  * only: it never spawns, never bootstraps the session-host protocol, never
- * installs provider configuration, hooks, or telemetry, and never reads live
- * provider credentials. The host manager that owns the PTY consumes the
- * descriptor.
+ * installs provider configuration or telemetry, and never reads live provider
+ * credentials. The host manager that owns the PTY consumes the descriptor.
+ *
+ * The one opt-in exception is a status-hook preparation the OWNER explicitly
+ * arms for a single launch (`NativeCliLaunchRequest.nativeHook`): the adapter
+ * then adds that provider's own documented per-launch hook flags and one fresh
+ * child-environment marker, and nothing else. With no such option — every
+ * existing call site — the descriptor is exactly what this module composed
+ * before hook support existed. See ./native-hook-launch-prep for what arming
+ * does, what it refuses, and what it can never guarantee.
  *
  * Contract:
  *
@@ -128,13 +140,52 @@ export interface NativeCliLaunchRequest {
   env: NodeJS.ProcessEnv;
   /** Exact target id; absence selects that backend's default target. */
   targetId?: string;
+  /**
+   * OPTIONAL owner-supplied native status hook arming for this one launch.
+   * Absence — the existing behavior — composes exactly the descriptor this
+   * adapter composed before hook support existed: no added argument, no added
+   * environment entry, no artifact. Presence carries only the fresh bootstrap
+   * the broker's native-only registration issued for this row; the adapter
+   * derives everything else and never mutates the caller's option object.
+   */
+  nativeHook?: NativeCliNativeHookOption;
+}
+
+/** The whole owner-supplied hook option: the registration bootstrap, nothing else. */
+export interface NativeCliNativeHookOption {
+  /**
+   * `createStatusBroker().registerNativeHookSource(instanceId, backend, …)`
+   * bootstrap for THIS launch, registered before the provider child exists.
+   * Its backend must be the requested backend, and the marker name it is
+   * carried in is stripped from every inherited environment, so only this
+   * launch's child can ever authenticate a relay.
+   */
+  bootstrap: NativeHookBootstrap;
+}
+
+/**
+ * The descriptor this adapter returns: the ordinary launch descriptor the
+ * session host already consumes, plus the outcome of an explicitly armed hook
+ * preparation. The extra field never changes the shape of `file`, `args`,
+ * `commandLine`, `env`, or `cwd`, and it is absent whenever no hook option was
+ * supplied.
+ */
+export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
+  /**
+   * Present only when the request armed native status hooks. `prepared` means
+   * the flags and the fresh marker are in this descriptor and the caller now
+   * owns `lease` (release it only after the provider source and its PTY have
+   * settled); `unavailable` means nothing was added and the row stays reported
+   * unknown.
+   */
+  readonly nativeHook?: NativeHookLaunchOutcome;
 }
 
 /** Prepared descriptor producer for one normalized configuration. */
 export type NativeCliLauncher = (
   backend: NativeCliBackend,
   request: NativeCliLaunchRequest,
-) => Promise<NativeLaunchDescriptor>;
+) => Promise<NativeCliLaunchDescriptor>;
 
 export interface NativeCliLauncherOptions {
   /**
@@ -393,17 +444,50 @@ function parseOption(arg: string): ParsedOption | undefined {
   return equals === -1 ? { name: arg } : { name: arg.slice(0, equals), attached: arg.slice(equals + 1) };
 }
 
-/** Validate the shared args, then compose the exact interactive argv. */
-function composeNativeArgs(
+/** One option spelled in real option position, plus whatever value it carries. */
+export interface NativeArgOptionOccurrence {
+  readonly tokenIndex: number;
+  readonly name: string;
+  /** The value spelled inside the same token (`--flag=value`, `-cvalue`, `-c=value`). */
+  readonly attached?: string;
+  /** The following token this option consumed as its operand, when it is value-taking. */
+  readonly operand?: string;
+}
+
+/**
+ * What the ONE argv walk of this module knows about a configured argument list.
+ * Exported so the per-launch hook preparation reads the same real-option
+ * position facts the argv composition uses, instead of inventing a second
+ * parser that could drift from the terminator and operand rules above.
+ */
+export interface NativeArgPositionScan {
+  /** Index of the first `--` terminator, or -1 when the list carries none. */
+  readonly terminatorIndex: number;
+  /**
+   * The index a generated source flag belongs at: before the terminator,
+   * before a value-taking option still missing its operand, otherwise last.
+   */
+  readonly insertionIndex: number;
+  /** Every option in real option position, in argv order. */
+  readonly options: readonly NativeArgOptionOccurrence[];
+}
+
+/** Validate the shared args once, and report the positions the provider gives them. */
+export function scanNativeArgPositions(
   backend: NativeCliBackend,
   args: readonly string[],
   targetId: string,
-): string[] {
+): NativeArgPositionScan {
   const policy = backend === "claude" ? CLAUDE_ARGUMENT_POLICY : CODEX_ARGUMENT_POLICY;
   const rejected = (category: RejectionCategory, option: string): never => {
     throw refuse(`target "${targetId}" cannot start a native interactive session because its shared args include the ${category} option ${option}`);
   };
-  const argv: string[] = [];
+  const occurrences: {
+    tokenIndex: number;
+    name: string;
+    attached?: string;
+    operand?: string;
+  }[] = [];
   // The provider's own option boundary. Everything after a `--` is prompt data
   // for the provider, so it is forwarded exactly and never read as an option,
   // a subcommand, or a reason to refuse; our own option has to precede it.
@@ -413,11 +497,9 @@ function composeNativeArgs(
   // The index of that pending option, or -1. The isolation flag must never land
   // where the provider would read it as another option's operand.
   let pendingOperandIndex = -1;
-  // Set once the insertion point is known: the terminator position, or the
-  // pending option a bare `--` would have served as the operand of.
-  let insertionIndex: number | undefined;
-  // Only an option spelled in real option position isolates the daemon.
-  let daemonIsolationActive = false;
+  // Set once the terminator is seen: the terminator position, or the pending
+  // option a bare `--` would have served as the operand of.
+  let terminatorInsertionIndex = -1;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (typeof arg !== "string" || containsControlCharacter(arg)) {
@@ -431,7 +513,6 @@ function composeNativeArgs(
     if (arg.length === 0 && terminatorIndex === -1 && !pendingOperand) {
       throw refuse(`target "${targetId}" has a shared argument that is not a printable non-empty string`);
     }
-    argv.push(arg);
     // Past the terminator the provider never parses options, so a token that
     // merely spells an option or a subcommand is literal prompt text: refusing
     // it would drop the operator's own prompt, and re-reading it as an option
@@ -441,12 +522,14 @@ function composeNativeArgs(
       terminatorIndex = index;
       // A `--` that is still expected as an option's operand is data, so the
       // flag goes before the option that would otherwise swallow it.
-      insertionIndex = pendingOperandIndex >= 0 ? pendingOperandIndex : index;
+      terminatorInsertionIndex = pendingOperandIndex >= 0 ? pendingOperandIndex : index;
       pendingOperand = false;
       continue;
     }
     if (pendingOperand) {
       // A documented option's operand is data: never a subcommand.
+      const pending = occurrences[occurrences.length - 1];
+      if (pending !== undefined && pending.tokenIndex === pendingOperandIndex) pending.operand = arg;
       pendingOperand = false;
       pendingOperandIndex = -1;
       continue;
@@ -468,18 +551,50 @@ function composeNativeArgs(
         rejected("approval or sandbox bypass", option.name);
       }
     }
-    if (option.attached === undefined && option.name === CODEX_NO_DAEMON_ARG) daemonIsolationActive = true;
     if (option.attached === undefined && policy.valueOptions.includes(option.name)) {
       pendingOperand = true;
       pendingOperandIndex = index;
     }
+    occurrences.push({
+      tokenIndex: index,
+      name: option.name,
+      ...(option.attached === undefined ? {} : { attached: option.attached }),
+    });
   }
-  if (backend === "codex" && !daemonIsolationActive) {
-    // Real option position: before the terminator, before a pending option that
-    // would otherwise take the flag as its value, otherwise last.
-    const insertion = insertionIndex ?? (pendingOperandIndex >= 0 ? pendingOperandIndex : argv.length);
-    argv.splice(insertion, 0, CODEX_NO_DAEMON_ARG);
-  }
+  return {
+    terminatorIndex,
+    insertionIndex: terminatorIndex !== -1
+      ? terminatorInsertionIndex
+      : (pendingOperandIndex >= 0 ? pendingOperandIndex : args.length),
+    options: occurrences.map((occurrence) => ({ ...occurrence })),
+  };
+}
+
+/**
+ * Compose the exact interactive argv from that one scan. `sourceFlags` are the
+ * generated provider flags of an explicitly armed hook preparation; they land
+ * in the same real option position as the daemon isolation flag, before any
+ * terminator or pending operand, and never move or drop an operator token. An
+ * empty list — every launch with no hook option — composes exactly what this
+ * function composed before hook support existed.
+ */
+function composeNativeArgs(
+  backend: NativeCliBackend,
+  args: readonly string[],
+  targetId: string,
+  sourceFlags: readonly string[] = [],
+): string[] {
+  const scan = scanNativeArgPositions(backend, args, targetId);
+  const argv = [...args];
+  // Only an option spelled in real option position isolates the daemon.
+  const daemonIsolationActive = scan.options.some(
+    (option) => option.attached === undefined && option.name === CODEX_NO_DAEMON_ARG,
+  );
+  const generated: string[] = [];
+  if (backend === "codex" && !daemonIsolationActive) generated.push(CODEX_NO_DAEMON_ARG);
+  generated.push(...sourceFlags);
+  if (generated.length === 0) return argv;
+  argv.splice(scan.insertionIndex, 0, ...generated);
   return argv;
 }
 
@@ -544,6 +659,42 @@ function applyCodexTerminalClipboardMode(env: NodeJS.ProcessEnv, platform: NodeJ
     }
   }
   env[CODEX_TERMINAL_CLIPBOARD_ENV] = CODEX_TERMINAL_CLIPBOARD_VALUE;
+}
+
+/**
+ * Apply one fresh native hook bootstrap marker to a composed CHILD
+ * environment, in place, after the shared sanitizer and after the configured
+ * target overlay merged.
+ *
+ * Ordering is the whole point. The sanitizer strips the marker from the
+ * inherited environment and from the overlay, so the only spelling that can
+ * exist here is one this host owns; writing the fresh value last means a stale
+ * marker from an older launch, or a configured alias, can never authenticate a
+ * relay. Windows environment names are case-insensitive, so any other spelling
+ * is dropped first and the child resolves exactly one canonical entry — the
+ * same single-spelling invariant the clipboard marker above keeps.
+ *
+ * Scope is exactly the names the preparation handed back (today: the one
+ * marker). Nothing else in the composed environment is read or changed, and
+ * the caller's request object, the launcher options, and the host process
+ * environment are never touched.
+ */
+function applyNativeHookBootstrapEnvironment(
+  env: NodeJS.ProcessEnv,
+  entries: Readonly<Record<string, string>>,
+  platform: NodeJS.Platform,
+): void {
+  for (const [name, value] of Object.entries(entries)) {
+    if (typeof value !== "string" || containsControlCharacter(name) || containsControlCharacter(value)) {
+      throw refuse("a native hook environment entry is not a printable string");
+    }
+    if (platform === "win32") {
+      for (const existing of Object.keys(env)) {
+        if (existing !== name && existing.toUpperCase() === name.toUpperCase()) delete env[existing];
+      }
+    }
+    env[name] = value;
+  }
 }
 
 /**
@@ -826,11 +977,66 @@ export function createNativeCliLauncher(
       throw refuse(`the located executable for target "${target.id}" could not be canonicalized`);
     }
 
-    const argv = composeNativeArgs(backend, args, target.id);
-    if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-      const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
-      return { file: batch.file, args: batch.args, commandLine: batch.commandLine, env: batch.env, cwd };
+    // Owner-supplied native status hooks. This runs only when the request
+    // explicitly armed them, and only after the shared sanitizer already
+    // rejected a worker role, so no artifact is ever staged for a delegated
+    // worker. The generated flags are composed into argv HERE — before the
+    // Windows batch escaping below — so they are quoted by the one cmdQuote
+    // authority like every other token, and the batch percent carrier still
+    // covers them. The fresh marker is written after the sanitizer and after
+    // the target overlay for the same reason.
+    let nativeHook: NativeHookLaunchOutcome | undefined;
+    if (request.nativeHook !== undefined) {
+      const bootstrap = (request.nativeHook as { bootstrap?: unknown }).bootstrap;
+      if (bootstrap === null || typeof bootstrap !== "object") {
+        throw refuse("the native hook launch option must carry the broker's native hook bootstrap object");
+      }
+      const scan = scanNativeArgPositions(backend, args, target.id);
+      nativeHook = await prepareNativeHookLaunch({
+        backend,
+        bootstrap: bootstrap as NativeHookBootstrap,
+        platform,
+        args,
+        scan,
+        env,
+        ...(platform === "win32"
+          ? { windowsCommandQuoter: (token: string): string => loadLauncherHelpers().cmdQuote(token) }
+          : {}),
+      });
+      if (nativeHook.observation === "prepared") {
+        applyNativeHookBootstrapEnvironment(env, nativeHook.environment, platform);
+      }
     }
-    return { file, args: argv, env, cwd };
+
+    // Everything after a successful preparation can still fail — a Windows
+    // batch child needs a trusted cmd.exe, and descriptor construction has no
+    // further authority of its own. The caller receives either the descriptor
+    // (and with it ownership of the lease) or nothing, so a failure here must
+    // roll the staged artifacts back instead of orphaning them.
+    try {
+      const argv = composeNativeArgs(
+        backend,
+        args,
+        target.id,
+        nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
+      );
+      if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
+        const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
+        return {
+          file: batch.file,
+          args: batch.args,
+          commandLine: batch.commandLine,
+          env: batch.env,
+          cwd,
+          ...(nativeHook === undefined ? {} : { nativeHook }),
+        };
+      }
+      return { file, args: argv, env, cwd, ...(nativeHook === undefined ? {} : { nativeHook }) };
+    } catch (error) {
+      if (nativeHook !== undefined && nativeHook.observation === "prepared") {
+        await nativeHook.lease.cleanup().catch(() => undefined);
+      }
+      throw error;
+    }
   };
 }

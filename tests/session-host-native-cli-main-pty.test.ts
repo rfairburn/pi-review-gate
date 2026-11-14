@@ -16,7 +16,8 @@
  *    and `createNativeCliLauncher` into a real PTY child; and
  * 3. the whole lifecycle: addressed input and one synthetic prompt answer,
  *    switching rows with the retained frame, one deliberate outer resize with
- *    the fixture's own SIGWINCH geometry, the truthful unknown sidebar status,
+ *    the fixture's own SIGWINCH geometry, the truthful unknown and
+ *    not-applicable sidebar status,
  *    one natural fixture exit, one public stop confirmation, the real Pi row's
  *    graceful exit, and the host's normal Quit with full outer restoration.
  *
@@ -38,8 +39,25 @@
  *    journal, and the original-process settlement is the harness
  *    `OwnedPidExitWatcher` on the fixture-REPORTED PID plus the Main runner's
  *    real `@lydell/node-pty` `onExit` journal for the manager-owned PTY.
+ * - OBSERVATION ARMING IS REAL, HOOK DELIVERY IS NOT. The host arms every
+ *    provider row it can, so the launcher appends that backend's own documented
+ *    per-launch hook flags (Claude one hook-only `--settings` file; Codex
+ *    `--no-daemon` plus one `-c hooks.SessionStart=…`), the child receives the
+ *    fresh per-launch native-hook opt-in marker (a different marker family from
+ *    the Pi session-host bootstrap, which stays absent), and the host publishes
+ *    the observer's static applicability declaration. A SYNTHETIC fixture never
+ *    runs a hook, so no event ever arrives: the claude-backed row keeps every
+ *    category unknown, and the codex-backed row renders its declared
+ *    not-applicable categories as N/A with the rest unknown. Nothing here proves
+ *    a hook fired, and nothing here proves a real provider accepts the flags.
  * - macOS only (the shared harness's explicit scope). Windows ConPTY, a
  *    physical terminal, and any real provider remain unverified.
+ * - The sidebar roster is read by this file's own reader (`completeRoster`),
+ *    because an armed Codex row draws the shared not-applicable word in cells
+ *    the shared roster witness's grammar does not admit. It keeps the shared
+ *    witness's completeness rules and its rejection of a partial frame; only
+ *    the closed set of accepted status and count words grew. Every other
+ *    harness keeps using the shared witness unchanged.
  *
  * FORM SUBMISSION is never assumed, and nothing here re-choreographs it.
  * `submitWorkspace` presses exactly the keys `MainPtyDriver.createNativeSession`
@@ -81,12 +99,21 @@
  * top-level run reports an actual result.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, sep } from "node:path";
 import test from "node:test";
+import { truncateToWidth, visibleWidth } from "pi-session-host-tui";
 
 import { normalizeConfig } from "../src/config";
+import { SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
 import { listNativeCliTargets } from "../src/session-host/native-cli-launch";
+import {
+  CLAUDE_NATIVE_HOOK_EVENTS,
+  CODEX_NATIVE_HOOK_EVENTS,
+  NATIVE_HOOK_TIMEOUT_SECONDS,
+} from "../src/session-host/native-hook-launch-prep";
+import { NATIVE_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-hook-protocol";
+import { NATIVE_STATUS_NOT_APPLICABLE_TEXT } from "../src/session-host/native-status";
 
 import {
   EVENT_TIMEOUT_MS,
@@ -97,6 +124,7 @@ import {
   OUTER_ROWS,
   OwnedPidExitWatcher,
   TEST_TIMEOUT_MS,
+  type CandidatePackage,
   type CleanupOutcome,
   type OwnedSession,
   compileAndStageCandidate,
@@ -122,16 +150,12 @@ import {
 } from "./helpers/session-host-native-new-form-witness";
 import {
   NATIVE_PANE_START,
+  ROSTER_ACTIONS,
+  SETTINGS_ACTION,
   SIDEBAR_COLUMNS,
   frameHeader,
-  parseRosterFrame,
   renderedTitleMatches,
-  rosterCards,
-  selectedRosterEntry,
   sidebarPaneLines,
-  type ParsedRoster,
-  type RosterCardEntry,
-  type RosterEntry,
 } from "./helpers/session-host-native-roster-witness";
 
 const SHIFT_TAB = "\x1b[Z";
@@ -201,7 +225,8 @@ const self = {
   path: process.env.PATH === undefined ? "absent" : process.env.PATH,
   home: process.env.HOME === undefined ? "absent" : process.env.HOME,
   target: process.env.PRG_SYNTH_TARGET === undefined ? "absent" : process.env.PRG_SYNTH_TARGET,
-  boot: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ? "present" : "absent",
+  boot: process.env[${JSON.stringify(SESSION_HOST_BOOTSTRAP_ENV)}] ? "present" : "absent",
+  hook: process.env[${JSON.stringify(NATIVE_HOOK_BOOTSTRAP_ENV)}] ? "present" : "absent",
   role: process.env.PI_REVIEW_GATE_RUNTIME_ROLE === undefined ? "absent" : "present",
   nodeOptions: process.env.NODE_OPTIONS === undefined ? "absent" : "present",
 };
@@ -251,6 +276,8 @@ interface FixtureRecord {
   home?: string;
   target?: string;
   boot?: string;
+  /** Presence only: a fresh native-hook bootstrap is never copied into a witness. */
+  hook?: string;
   role?: string;
   nodeOptions?: string;
   line?: string;
@@ -366,9 +393,242 @@ function providerValue(row: string | undefined): string {
   return row.slice(index + "Provider:".length).trim();
 }
 
-/** The one drawn card whose complete title line belongs to `caption`, if any. */
-function cardFor(text: string, caption: string): RosterCardEntry | undefined {
-  const matches = rosterCards(text, SIDEBAR_COLUMNS).filter((card) => renderedTitleMatches(card.title, caption));
+/* -------------------------------------------------------------------------- *
+ * This scenario's own N/A-aware roster reader                                 *
+ *                                                                             *
+ * The shared roster witness models the sidebar's card grammar and stays        *
+ * unchanged for every other acceptance harness. Since the native status slice  *
+ * the sidebar can also draw the shared not-applicable word in a card's agent,  *
+ * input, and count cells, and that grammar does not admit it, a roster holding *
+ * an armed Codex row cannot be read with it. So this file reads its own        *
+ * roster here, on the shared pane extraction and the shared action labels.     *
+ *                                                                             *
+ * Nothing about it is looser than the shared witness: the same pinned          *
+ * terminal-cell pane scope, the same header-declared session count, the same   *
+ * fixed 3-or-5-row card extents, the same ordered required action tail with    *
+ * the one optional Settings row in its only legal position, the same "any      *
+ * extra entry-shaped row means this roster is not complete" rule, and the same *
+ * treatment of a half-painted row as no parse at all. Only the set of          *
+ * accepted VALUE words grew, and it is written out literally below from the    *
+ * production constants rather than widened into anything-goes text.            *
+ * -------------------------------------------------------------------------- */
+
+/** The renderer's two-cell selection marker and its four-cell activity indent. */
+const MARKER_SELECTED = "> ";
+const MARKER_PLAIN = "  ";
+const ACTIVITY_PREFIX = "    ";
+const MARKER_CELLS = 2;
+const ROSTER_HEADER_PATTERN = /^\s*Sessions \((\d+)\)\s*$/u;
+
+/** The not-applicable word as a closed regex alternative, taken from production. */
+const NOT_APPLICABLE_CELL = NATIVE_STATUS_NOT_APPLICABLE_TEXT.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+/** The whole status row, exactly as the shared sidebar composes it. */
+const STATUS_PATTERN = new RegExp(
+  "^(?:starting \\| input (?:pending|none|unknown|" + NOT_APPLICABLE_CELL + ")"
+  + "|agent (?:running|waiting|idle|unknown|" + NOT_APPLICABLE_CELL + ") \\| input (?:pending|none|unknown|" + NOT_APPLICABLE_CELL + ")"
+  + "|exited(?: \\(code -?\\d+\\))?|error(?: \\(code -?\\d+\\))?)$", "u");
+/** The whole background row: the reportable-unknown aggregate, or two counts. */
+const BACKGROUND_CANONICAL = new RegExp(
+  "^(?:background unknown|bg tasks (?:unknown|\\d+|" + NOT_APPLICABLE_CELL + ") \\| shells (?:unknown|\\d+|" + NOT_APPLICABLE_CELL + "))$", "u");
+/** A background count token that is completely rendered. */
+const COUNT_TOKEN_COMPLETE = new RegExp("^(?:unknown|\\d+|" + NOT_APPLICABLE_CELL + ")$", "u");
+const BACKGROUND_ROOT = "bg tasks ";
+const BACKGROUND_SHELLS = " | shells";
+
+const isBlank = (line: string): boolean => line.trim().length === 0;
+const isActivityRow = (line: string): boolean => line.startsWith(ACTIVITY_PREFIX);
+
+/** A two-cell selection marker; a four-space activity row is never one. */
+function rowMarker(line: string): "selected" | "unselected" | undefined {
+  if (line.startsWith(MARKER_SELECTED)) return "selected";
+  if (line.startsWith(MARKER_PLAIN) && !line.startsWith(ACTIVITY_PREFIX)) return "unselected";
+  return undefined;
+}
+
+/** A complete or partial prefix of a nullable count token: "unknown", digits, or N/A. */
+function isCountTokenPrefix(text: string): boolean {
+  if (text.length === 0) return false;
+  if (/^\d+$/u.test(text)) return true;
+  return "unknown".startsWith(text) || NATIVE_STATUS_NOT_APPLICABLE_TEXT.startsWith(text);
+}
+
+/** True when `tail` is a prefix of the canonical " | shells" suffix (optionally a count). */
+function isShellsSuffixPrefix(tail: string): boolean {
+  if (BACKGROUND_SHELLS.startsWith(tail)) return true;
+  if (!tail.startsWith(BACKGROUND_SHELLS)) return false;
+  const after = tail.slice(BACKGROUND_SHELLS.length);
+  if (after.length === 0) return true;
+  if (!after.startsWith(" ")) return false;
+  const token = after.slice(1);
+  return token.length === 0 || isCountTokenPrefix(token);
+}
+
+/** True when `core` is a prefix of some canonical `bg tasks … | shells …` row. */
+function isBackgroundPrefix(core: string): boolean {
+  if (core.length < BACKGROUND_ROOT.length) return BACKGROUND_ROOT.startsWith(core);
+  if (!core.startsWith(BACKGROUND_ROOT)) return false;
+  const rest = core.slice(BACKGROUND_ROOT.length);
+  for (let end = 1; end <= rest.length; end += 1) {
+    const token = rest.slice(0, end);
+    if (!isCountTokenPrefix(token)) continue;
+    // A separator proves the preceding token was completely rendered; an
+    // incomplete token prefix (e.g. "unk") before it cannot be clipping.
+    if (end < rest.length && !COUNT_TOKEN_COMPLETE.test(token)) continue;
+    if (isShellsSuffixPrefix(rest.slice(end))) return true;
+  }
+  return false;
+}
+
+/** The complete background row, or exactly `width - 2` cells of a clipped one. */
+function isBackgroundRow(text: string, width: number): boolean {
+  if (BACKGROUND_CANONICAL.test(text)) return visibleWidth(text) + MARKER_CELLS <= width;
+  if (!text.endsWith("...")) return false;
+  if (visibleWidth(text) !== width - MARKER_CELLS) return false;
+  return isBackgroundPrefix(text.slice(0, -3));
+}
+
+/** One drawn native card, with the real status and background rows it displays. */
+interface DrawnCard {
+  readonly kind: "native";
+  readonly position: number;
+  readonly title: string;
+  readonly status: string;
+  readonly background: string;
+  readonly selected: boolean;
+}
+
+/** One drawn fixed roster action. */
+interface DrawnAction {
+  readonly kind: "action";
+  readonly position: number;
+  readonly label: string;
+  readonly selected: boolean;
+}
+
+type DrawnEntry = DrawnCard | DrawnAction;
+
+/** A COMPLETE drawn roster: every declared card, then the ordered action tail. */
+interface DrawnRoster {
+  readonly count: number;
+  readonly entries: readonly DrawnEntry[];
+  readonly cards: readonly DrawnCard[];
+}
+
+/** One complete native card, or nothing for anything that is not one. */
+function readDrawnCard(
+  body: readonly string[],
+  start: number,
+  position: number,
+  width: number,
+): { readonly card: DrawnCard; readonly next: number } | undefined {
+  const titleLine = body[start];
+  if (titleLine === undefined || isBlank(titleLine)) return undefined;
+  const statusLine = body[start + 1];
+  const marker = statusLine === undefined ? undefined : rowMarker(statusLine);
+  if (statusLine === undefined || marker === undefined) return undefined;
+  const status = statusLine.slice(MARKER_CELLS).trimEnd();
+  if (!STATUS_PATTERN.test(status)) return undefined;
+  const backgroundLine = body[start + 2];
+  if (backgroundLine === undefined || rowMarker(backgroundLine) !== "unselected") return undefined;
+  const background = backgroundLine.slice(MARKER_CELLS).trimEnd();
+  if (!isBackgroundRow(background, width)) return undefined;
+  // Expanded cards claim two more rows; a blank padded activity row is a valid
+  // placeholder, and anything else means this card is collapsed at three rows.
+  const fourth = body[start + 3];
+  const fourthIsActivity = fourth !== undefined && (isBlank(fourth) || isActivityRow(fourth));
+  const fifth = body[start + 4];
+  const expanded = fourthIsActivity && fifth !== undefined && (isBlank(fifth) || isActivityRow(fifth));
+  if (fourthIsActivity && !expanded) return undefined;
+  return {
+    card: { kind: "native", position, title: titleLine.trimEnd(), status, background, selected: marker === "selected" },
+    next: start + (expanded ? 5 : 3),
+  };
+}
+
+/** The exact row the renderer draws for one action label at this pane width. */
+function renderedActionRow(text: string, width: number): string {
+  return truncateToWidth(text, width, "...", true).trimEnd();
+}
+
+/** The label only for a complete action row the production renderer can draw here. */
+function drawnActionLabel(line: string, width: number): string | undefined {
+  const marker = rowMarker(line);
+  if (marker === undefined) return undefined;
+  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
+  const rendered = line.trimEnd();
+  for (const label of ROSTER_ACTIONS) {
+    if (rendered === renderedActionRow(`${prefix}${label}`, width)) return label;
+  }
+  return rendered === renderedActionRow(`${prefix}${SETTINGS_ACTION}`, width) ? SETTINGS_ACTION : undefined;
+}
+
+/**
+ * The drawn roster, but only when it is complete: the header-declared number of
+ * full native cards, then the ordered required actions with the optional
+ * Settings row in its only legal position, and no extra entry-shaped row after.
+ * A partial repaint, an unknown status word, a duplicated entry, or a roster
+ * whose cards do not fill the declared count is no parse at all, so nothing
+ * here is ever stepped on.
+ */
+function completeRoster(text: string): DrawnRoster | undefined {
+  const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
+  const lines = pane.slice(ROSTER_HEADER_PATTERN.test(pane[0] ?? "") ? 0 : 1);
+  const header = ROSTER_HEADER_PATTERN.exec(lines[0] ?? "");
+  if (header === null) return undefined;
+  const count = Number(header[1]);
+  const body = lines.slice(1);
+  const cards: DrawnCard[] = [];
+  const entries: DrawnEntry[] = [];
+  let index = 0;
+  for (let position = 0; position < count; position += 1) {
+    const read = readDrawnCard(body, index, position, SIDEBAR_COLUMNS);
+    if (read === undefined) return undefined;
+    cards.push(read.card);
+    entries.push(read.card);
+    index = read.next;
+  }
+  const consumeAction = (expected: string): boolean => {
+    const line = body[index];
+    const marker = line === undefined ? undefined : rowMarker(line);
+    if (line === undefined || marker === undefined
+      || drawnActionLabel(line, SIDEBAR_COLUMNS) !== expected) return false;
+    entries.push({ kind: "action", position: entries.length, label: expected, selected: marker === "selected" });
+    index += 1;
+    return true;
+  };
+  const [saved, newSession, quitHost] = ROSTER_ACTIONS;
+  if (!consumeAction(saved)) return undefined;
+  if (!consumeAction(newSession)) return undefined;
+  const optionalLine = body[index];
+  if (optionalLine !== undefined && drawnActionLabel(optionalLine, SIDEBAR_COLUMNS) === SETTINGS_ACTION) {
+    entries.push({
+      kind: "action",
+      position: entries.length,
+      label: SETTINGS_ACTION,
+      selected: rowMarker(optionalLine) === "selected",
+    });
+    index += 1;
+  }
+  if (!consumeAction(quitHost)) return undefined;
+  // Anything extra that looks like an entry means the roster is stale or
+  // duplicated, not complete. Footer hints, notices, and blank padding are not.
+  for (let cursor = index; cursor < body.length; cursor += 1) {
+    const line = body[cursor]!;
+    if (isBlank(line)) continue;
+    if (rowMarker(line) !== undefined) return undefined;
+    if (readDrawnCard(body, cursor, entries.length, SIDEBAR_COLUMNS) !== undefined) return undefined;
+  }
+  return { count, entries, cards };
+}
+
+/**
+ * The one drawn card whose complete title line belongs to `caption`, if any.
+ * Its `status` and `background` are the real drawn rows, read verbatim.
+ */
+function cardFor(text: string, caption: string): DrawnCard | undefined {
+  const parsed = completeRoster(text);
+  if (parsed === undefined) return undefined;
+  const matches = parsed.cards.filter((card) => renderedTitleMatches(card.title, caption));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -381,27 +641,22 @@ function headerNamesOwner(text: string, title: string): boolean {
 
 /** True only for a complete roster whose single highlight is the requested row or action. */
 function rosterSelectionIs(text: string, expected: string): boolean {
-  const selected = selectedRosterEntry(text, SIDEBAR_COLUMNS);
+  const selected = uniqueHighlight(completeRoster(text));
   if (selected === undefined) return false;
   return selected.kind === "action"
     ? selected.label === expected
     : renderedTitleMatches(selected.title, expected);
 }
 
-/** The drawn roster only when it is complete; a partial roster is never stepped on. */
-function completeRoster(text: string): ParsedRoster | undefined {
-  const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
-  return parsed.complete ? parsed : undefined;
-}
-
 /** The one uniquely highlighted entry of a complete roster, or nothing when no unique highlight is drawn. */
-function uniqueHighlight(parsed: ParsedRoster): RosterEntry | undefined {
+function uniqueHighlight(parsed: DrawnRoster | undefined): DrawnEntry | undefined {
+  if (parsed === undefined) return undefined;
   const selected = parsed.entries.filter((entry) => entry.selected);
   return selected.length === 1 ? selected[0] : undefined;
 }
 
 /** The entry one cyclic Down from `position`, or nothing when that step is ambiguous. */
-function entryAfterOneDown(parsed: ParsedRoster, position: number): RosterEntry | undefined {
+function entryAfterOneDown(parsed: DrawnRoster, position: number): DrawnEntry | undefined {
   if (parsed.entries.length === 0) return undefined;
   const index = parsed.entries.findIndex((entry) => entry.position === position);
   if (index < 0 || parsed.entries.some((entry, at) => at !== index && entry.position === position)) return undefined;
@@ -409,7 +664,7 @@ function entryAfterOneDown(parsed: ParsedRoster, position: number): RosterEntry 
 }
 
 /** How the drawn roster names one entry, for a step message that cannot lie about where it pressed. */
-function entryCaption(entry: RosterEntry): string {
+function entryCaption(entry: DrawnEntry): string {
   return entry.kind === "action" ? entry.label : entry.title;
 }
 
@@ -547,6 +802,126 @@ function writeNativeAgentConfig(
   writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify(config, undefined, 2), { mode: 0o600 });
 }
 
+/**
+ * The two absolute files an armed observer's generated hook command names, as
+ * the REAL Main process resolves them: its own Node interpreter (the same
+ * interpreter this test spawned it with) and the compiled relay entry inside the
+ * staged candidate package, which is the only place the launch preparation
+ * looks for it. Both are non-secret paths.
+ */
+interface HookEntrypoints {
+  readonly nodeExecutable: string;
+  readonly relayEntry: string;
+}
+
+function expectedHookEntrypoints(candidate: CandidatePackage): HookEntrypoints {
+  const relayEntry = join(candidate.root, "dist", "src", "session-host", "native-hook-relay.js");
+  assert.ok(statSync(relayEntry).isFile(),
+    `the staged candidate package must carry the compiled native hook relay the armed launch names: ${relayEntry}`);
+  // The expected command strings below quote each path literally. If a fixture
+  // path ever needed shell or TOML escaping, this fails instead of quietly
+  // comparing a form the launcher would never deliver.
+  for (const path of [process.execPath, relayEntry]) {
+    assert.ok(!/[\\"\u0000-\u001f]/u.test(path),
+      `the hook command path ${JSON.stringify(path)} needs escaping this witness does not model`);
+  }
+  return { nodeExecutable: process.execPath, relayEntry };
+}
+
+/** The single-quote form the Codex hook command hands `$SHELL -lc` for one token. */
+function posixQuotedToken(token: string): string {
+  return `'${token.replace(/'/gu, `'\\''`)}'`;
+}
+
+/**
+ * The exact `-c` value an armed Codex launch injects: the one SessionStart
+ * matcher group whose single command handler is the compiled relay. The command
+ * carries no token, instance id, socket path, or generation, which is what
+ * keeps it one stable trustable command across every row of one host.
+ */
+function expectedCodexSessionStartConfig(entrypoints: HookEntrypoints): string {
+  const command = `${posixQuotedToken(entrypoints.nodeExecutable)} ${posixQuotedToken(entrypoints.relayEntry)}`;
+  const handler = `type="command",command="${command}",timeout=${NATIVE_HOOK_TIMEOUT_SECONDS}`;
+  return `hooks.${CODEX_NATIVE_HOOK_EVENTS[0]}=[{hooks=[{${handler}}]}]`;
+}
+
+/**
+ * Validate the one Claude hook-settings file this armed launch staged, from the
+ * path the child itself reported. This runs while the row is live: the manager
+ * releases the artifact lease once the provider source and the PTY settle, so
+ * the file is only guaranteed present now.
+ *
+ * Only the non-secret shape is checked: a flag-settings layer carrying nothing
+ * but `hooks`, exactly the events this host observes, and one command handler
+ * naming the Node interpreter and the compiled relay. No token, instance id,
+ * socket path, or generation can satisfy it, and none is ever printed.
+ */
+function assertClaudeHookSettingsFile(options: {
+  readonly settingsPath: string;
+  readonly ownedTmpRoot: string;
+  readonly entrypoints: HookEntrypoints;
+}): void {
+  const { settingsPath, ownedTmpRoot, entrypoints } = options;
+  assert.equal(basename(settingsPath), "claude-hook-settings.json",
+    "the generated flag-settings file keeps its own fixed owned name");
+  const namespace = dirname(settingsPath);
+  assert.ok(basename(namespace).startsWith("prg-native-hook-"),
+    "the settings file lives in the launcher's own freshly created artifact namespace");
+  const canonicalTmp = realpath(ownedTmpRoot);
+  const canonicalNamespace = realpath(namespace);
+  assert.ok(canonicalNamespace !== canonicalTmp && canonicalNamespace.startsWith(`${canonicalTmp}${sep}`),
+    "that namespace is this run's own, under the temporary root this host was started with");
+  assert.equal(statSync(settingsPath).mode & 0o777, 0o600,
+    "the staged settings file stays private to this process");
+  const parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(parsed), ["hooks"],
+    "the flag-settings layer carries ONLY the hooks key, so every other settings layer and key keeps its own value");
+  const hooks = parsed.hooks as Record<string, unknown>;
+  assert.deepEqual(Object.keys(hooks), [...CLAUDE_NATIVE_HOOK_EVENTS],
+    "the generated map names exactly the events this host observes, in order");
+  for (const event of CLAUDE_NATIVE_HOOK_EVENTS) {
+    const groups = hooks[event];
+    assert.ok(Array.isArray(groups) && groups.length === 1, `${event} carries exactly one matcher group`);
+    const group = (groups as unknown[])[0] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(group), ["hooks"], `${event} names no key besides its handler list`);
+    const handlers = group.hooks;
+    assert.ok(Array.isArray(handlers) && handlers.length === 1, `${event} carries exactly one handler`);
+    assert.deepEqual((handlers as unknown[])[0], {
+      type: "command",
+      command: entrypoints.nodeExecutable,
+      args: [entrypoints.relayEntry],
+      timeout: NATIVE_HOOK_TIMEOUT_SECONDS,
+      onFailure: "continue",
+    }, `the generated ${event} hook is the compiled relay's exec form, with no matcher, no condition, and no secret`);
+  }
+}
+
+/**
+ * The exact observer flags an armed claude launch appended after the configured
+ * base argv, proved by reading the file they point at and returned so the
+ * caller's single ordered-argv assertion pins both tokens in place.
+ */
+function claudeObserverFlags(
+  argv: readonly string[],
+  context: { readonly ownedTmpRoot: string; readonly entrypoints: HookEntrypoints },
+): readonly string[] {
+  const generated = argv.slice(2);
+  assert.equal(generated.length, 2,
+    `the claude-backed child receives exactly the configured base argv plus the two generated --settings tokens and nothing else; its own argv was ${JSON.stringify(argv)}`);
+  assert.equal(generated[0], "--settings",
+    "the claude route is the single hook-only --settings layer, because the configured argv carries no --settings of its own");
+  const settingsPath = generated[1] ?? "";
+  assertClaudeHookSettingsFile({ settingsPath, ...context });
+  return ["--settings", settingsPath];
+}
+
+/** The exact observer flags an armed codex launch appended after the configured base argv. */
+function codexObserverFlags(argv: readonly string[], expectedConfig: string): readonly string[] {
+  assert.deepEqual(argv.slice(2), ["--no-daemon", "-c", expectedConfig],
+    "the codex-backed child receives exactly the daemon-isolating flag and the one non-conflicting SessionStart hook configuration, in that order");
+  return ["--no-daemon", "-c", expectedConfig];
+}
+
 /** Open the real New form and require the provider choice to start at Pi. */
 async function openNewForm(driver: MainPtyDriver): Promise<void> {
   await driver.ensureSidebarFocus();
@@ -672,8 +1047,13 @@ async function createNativeFixtureSession(options: {
   readonly ownedBin: string;
   readonly scratchHome: string;
   readonly cycles: number;
-  /** The one backend argument the production launcher appends, in launch order. */
-  readonly extraArgs: readonly string[];
+  /**
+   * The exact observer flags this backend's armed launcher appends after the
+   * configured base argv. Each backend's function proves its own flags (and,
+   * for Claude, the file they point at) and returns them, so the single ordered
+   * argv assertion below stays exact rather than tolerating extra arguments.
+   */
+  readonly observerFlags: (argv: readonly string[]) => readonly string[];
 }): Promise<NativeFixture> {
   const { driver, workspace, tag, journalFile } = options;
   await openNewForm(driver);
@@ -697,8 +1077,9 @@ async function createNativeFixtureSession(options: {
   assert.deepEqual([hello.cols, hello.rows], [PANE_COLS, PANE_ROWS],
     "the child's own terminal is the pane the real host displays");
   assert.equal(hello.cwd, workspace, "the child runs in the workspace this row selected");
-  assert.deepEqual(hello.argv, [options.fixtureScript, tag, ...options.extraArgs],
-    "the child sees exactly the argv the production launcher composed for its backend, in order");
+  const generatedObserverFlags = options.observerFlags(hello.argv ?? []);
+  assert.deepEqual(hello.argv, [options.fixtureScript, tag, ...generatedObserverFlags],
+    "the child sees exactly the argv the production launcher composed for its backend, in order: the configured base tokens unchanged, then exactly this launch's generated observer flags");
   assert.equal(hello.path, options.ownedBin,
     "the configured shared environment makes one owned empty directory the only PATH the child can search");
   assert.equal(hello.execPath !== undefined && realpath(hello.execPath) === realpath(process.execPath), true,
@@ -706,6 +1087,10 @@ async function createNativeFixtureSession(options: {
   assert.equal(hello.home, options.scratchHome, "the child's HOME stays the fixture's owned home");
   assert.equal(hello.boot, "absent", "no session-host bootstrap token reaches a provider child");
   assert.equal(hello.role, "absent", "no delegated runtime-role authorization reaches a provider child");
+  assert.notEqual(NATIVE_HOOK_BOOTSTRAP_ENV, SESSION_HOST_BOOTSTRAP_ENV,
+    "the native-hook opt-in marker is a different marker family from the Pi session-host bootstrap that stays absent");
+  assert.equal(hello.hook, "present",
+    "this launch's own fresh native-hook opt-in marker reaches its provider child, which is what lets the armed observer authenticate a later hook");
 
   const watcher = new OwnedPidExitWatcher(pid);
   driver.nativeExitWatchers.set(pid, watcher);
@@ -773,7 +1158,7 @@ function registerCaseCleanup(t: { after(fn: () => Promise<void>): void }, state:
   });
 }
 
-test("real public Main hosts a real Pi row and two synthetic native CLI fixtures through the New provider UI, with owned input, resize, switching, unknown status, and exact exits", {
+test("real public Main hosts a real Pi row and two synthetic native CLI fixtures through the New provider UI, with owned input, resize, switching, unknown and not-applicable status, and exact exits", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
   const runtime = resolveRuntimePin(t);
@@ -825,6 +1210,17 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   assert.equal(args.some((arg) => FORBIDDEN_SESSION_ARGS.has(arg)), false,
     "the real Pi session receives no forced, resumed, or no-session override");
 
+  // An armed launch stages its private hook artifacts under the temporary root
+  // this host was started with, and the generated command names the compiled
+  // relay inside the staged candidate. Both are known here, so every observer
+  // flag below is checked against the real paths rather than allowed to be
+  // anything.
+  const ownedTmpRoot = startEnv.TMPDIR ?? "";
+  assert.ok(ownedTmpRoot.startsWith(`${scratch}${sep}`),
+    "the host's own temporary root stays inside this case's owned scratch");
+  const hookEntrypoints = expectedHookEntrypoints(candidate);
+  const codexSessionStartConfig = expectedCodexSessionStartConfig(hookEntrypoints);
+
   const driver = await MainPtyDriver.start({
     ptyModule: runtime.pty,
     scratchRoot: scratch,
@@ -850,7 +1246,10 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   assert.equal(processIsAlive(piSession.record.pid), true, "the real Pi child is live");
 
   // --- Two native provider rows through the actual New form Provider control. ---
-  // The claude-backed fixture is cycled past Pi and both built-in defaults.
+  // The claude-backed fixture is cycled past Pi and both built-in defaults. Its
+  // armed launch adds exactly one hook-only `--settings` layer, because the
+  // configured argv carries none of its own; the file it points at is read and
+  // validated here, while the row is still live.
   const claudeFixture = await createNativeFixtureSession({
     driver,
     workspace: workspaceClaude,
@@ -860,7 +1259,7 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
     ownedBin,
     scratchHome,
     cycles: 3,
-    extraArgs: [],
+    observerFlags: (argv) => claudeObserverFlags(argv, { ownedTmpRoot, entrypoints: hookEntrypoints }),
   });
   await driver.waitFrame((text) => headerNamesOwner(text, "Claude")
     && nativePaneText(text).includes(`FX ${CLAUDE_TARGET} HELLO pid=${claudeFixture.pid}`)
@@ -869,12 +1268,15 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   const claudeCard = cardFor(driver.currentText(), "Claude");
   assert.ok(claudeCard, "the native row draws its own roster card");
   assert.equal(claudeCard.status, "agent unknown | input unknown",
-    "a provider card reports unknown agent and input state, never an inferred idle");
+    "a claude-backed card reports unknown agent and input state, never an inferred idle: this route declares every category reportable and no hook has delivered anything");
   assert.equal(claudeCard.background, "background unknown",
-    "a provider card uses the shared unknown-count summary and never invents a zero");
+    "a claude-backed card uses the shared unknown-count summary and never invents a zero");
+  assert.ok(!`${claudeCard.status} ${claudeCard.background}`.includes(NATIVE_STATUS_NOT_APPLICABLE_TEXT),
+    "a route that can report every category never gains a not-applicable claim");
 
-  // The codex-backed fixture also receives the daemon-isolating argument the
-  // production launcher composes; its own argv witness proves it arrived.
+  // The codex-backed fixture receives the daemon-isolating argument and the one
+  // non-conflicting SessionStart hook configuration the production launcher
+  // composes for an armed codex launch; its own argv witness proves both arrived.
   const codexFixture = await createNativeFixtureSession({
     driver,
     workspace: workspaceCodex,
@@ -884,19 +1286,24 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
     ownedBin,
     scratchHome,
     cycles: 4,
-    // The Codex backend's one daemon-isolating argument, asserted as part of the
-    // exact ordered argv above and again below as a backend-specific witness.
-    extraArgs: ["--no-daemon"],
+    // The Codex backend's daemon isolation plus its single hook injection,
+    // asserted as part of the exact ordered argv above and again below as a
+    // backend-specific witness against the literal configuration string.
+    observerFlags: (argv) => codexObserverFlags(argv, codexSessionStartConfig),
   });
-  assert.deepEqual(codexFixture.hello.argv, [fixtureScript, CODEX_TARGET, "--no-daemon"],
-    "the one deliberate Codex argument reaches the real child in argv order");
+  assert.deepEqual(codexFixture.hello.argv, [fixtureScript, CODEX_TARGET, "--no-daemon", "-c", codexSessionStartConfig],
+    "the deliberate Codex daemon isolation and the one SessionStart hook configuration reach the real child in argv order");
   await driver.waitFrame((text) => headerNamesOwner(text, "Codex")
     && nativePaneText(text).includes(`FX ${CODEX_TARGET} HELLO pid=${codexFixture.pid}`),
   "the second native row becomes the displayed owner under its own header");
   const codexCard = cardFor(driver.currentText(), "Codex");
   assert.ok(codexCard);
-  assert.equal(codexCard.status, "agent unknown | input unknown",
-    "the second provider card is equally truthful about knowing nothing");
+  assert.equal(codexCard.status, `agent unknown | input ${NATIVE_STATUS_NOT_APPLICABLE_TEXT}`,
+    "the codex-backed card states its source's declared unreportable input category as not-applicable, never as an unknown a later hook could recover or a none it never observed");
+  assert.equal(codexCard.background, `bg tasks ${NATIVE_STATUS_NOT_APPLICABLE_TEXT} | shells ${NATIVE_STATUS_NOT_APPLICABLE_TEXT}`,
+    "both declared-unreportable background categories render not-applicable, never a zero and never the reportable-unknown aggregate");
+  assert.ok(codexCard.status.startsWith("agent unknown"),
+    "the codex-backed agent category stays reportable-and-unknown while nothing has been observed");
 
   // Independent ownership: three distinct OS processes in three distinct
   // workspaces, each journalling to its own file.
@@ -1010,12 +1417,12 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   // else may move: the roster must still be complete, with the real Pi row and
   // the naturally exited fixture's retained card both preserved.
   await driver.waitFrame((text) => {
-    if (completeRoster(text) === undefined) return false;
-    const cards = rosterCards(text, SIDEBAR_COLUMNS);
-    return !cards.some((card) => renderedTitleMatches(card.title, "Codex"))
-      && cards.some((card) => renderedTitleMatches(card.title, "Claude")
+    const parsed = completeRoster(text);
+    if (parsed === undefined) return false;
+    return !parsed.cards.some((card) => renderedTitleMatches(card.title, "Codex"))
+      && parsed.cards.some((card) => renderedTitleMatches(card.title, "Claude")
         && card.status === "exited (code 0)")
-      && cards.some((card) => renderedTitleMatches(card.title, piSession.displayName));
+      && parsed.cards.some((card) => renderedTitleMatches(card.title, piSession.displayName));
   }, "the confirmed stop removes only its own row: no Codex card remains, while the exited Claude card and the real Pi row are preserved",
   afterStopConfirm);
 

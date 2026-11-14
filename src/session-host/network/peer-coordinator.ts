@@ -289,6 +289,7 @@ import {
 	ROSTER_BRIDGE_CREATE_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
+	ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
 	ROSTER_BRIDGE_RENAME_CAPABILITY,
 	ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
 	ROSTER_BRIDGE_SAVED_CAPABILITY,
@@ -3201,6 +3202,12 @@ class OwnedPeerCoordinator implements
 					// host-name provider, so a legacy or provider-less owner keeps its exact
 					// previous capability set and is asked nothing it cannot answer.
 					ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
+					// The native STATUS APPLICABILITY lane is offered on its own for the same
+					// reason: this implementation decodes the optional row field and renders it
+					// through the same shared card classification. It is a statement about THIS side
+					// only — an owner acknowledges it solely when it can answer honestly, and an
+					// owner that never declares anything keeps sending the exact rows it sent before.
+					ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
 					...(this.#savedViewer
 						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
 						: [ROSTER_BRIDGE_CREATE_CAPABILITY]),

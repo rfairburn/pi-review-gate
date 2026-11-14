@@ -29,6 +29,7 @@ import {
   validateSavedSessionLocation,
 } from "./saved-sessions";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
+import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
 
 /**
  * Native standalone Pi launch preparation (alpha, backend descriptor stage).
@@ -450,7 +451,8 @@ function assertSupportedPlatform(platform: NodeJS.Platform): void {
 /** Windows has case-insensitive environment names; these stale capabilities are dropped in every casing. */
 function isStaleHostCapabilityName(name: string): boolean {
   if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV
-    || name === SESSION_HOST_STARTUP_REQUEST_ENV || name === SESSION_HOST_TITLE_COLUMNS_ENV) return true;
+    || name === SESSION_HOST_STARTUP_REQUEST_ENV || name === SESSION_HOST_TITLE_COLUMNS_ENV
+    || name === NATIVE_HOOK_BOOTSTRAP_ENV) return true;
   return SETTLEMENT_ENV_SUFFIXES.some((suffix) =>
     name === `PI_REVIEW_GATE_SETTLEMENT_${suffix}` || name === `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
   );
@@ -497,7 +499,10 @@ export function snapshotNativeEnvironment(
  * Reject real worker authorization, then remove stale host-only capabilities
  * before any probe/child. The sanitizer is provider-neutral (it names only
  * pi-review-gate capabilities), so the native interactive CLI launch
- * descriptors reuse this one implementation instead of a second copy.
+ * descriptors reuse this one implementation instead of a second copy. The
+ * narrow native hook bootstrap marker is stripped here too; fresh per-launch
+ * injection belongs to the later source-specific wiring. Genuine worker-role
+ * markers are rejected, never silently cleared or reinterpreted.
  */
 export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
   if (env[RUNTIME_ROLE_ENV]) {
@@ -515,6 +520,7 @@ export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv):
   delete env[SESSION_HOST_BOOTSTRAP_ENV];
   delete env[SESSION_HOST_STARTUP_REQUEST_ENV];
   delete env[SESSION_HOST_TITLE_COLUMNS_ENV];
+  delete env[NATIVE_HOOK_BOOTSTRAP_ENV];
   delete env[NODE_OPTIONS_RESTORE_ENV];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];

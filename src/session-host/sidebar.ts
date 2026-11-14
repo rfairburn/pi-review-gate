@@ -190,6 +190,12 @@ import {
 } from "./field-editor";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
 import {
+  isNativeCategoryUnsupported,
+  readNativeStatusSupport,
+  NATIVE_STATUS_NOT_APPLICABLE_TEXT,
+  type NativeStatusSupportMap,
+} from "./native-status";
+import {
   isNativeCliBackend,
   isNativeCliTargetId,
   isNativeDisplayName,
@@ -307,6 +313,16 @@ export interface SidebarItem {
   readonly activeTasks?: number | null;
   /** Observed activity-intent count of starting/running background shells. */
   readonly activeShells?: number | null;
+  /**
+   * The row's own declared per-category applicability (native status slice). Absence
+   * means no declaration, which is the unchanged legacy path: every unreported
+   * category renders `unknown`, exactly as before this field existed, and only a
+   * Pi row's observer could ever be silent in this way today. A POSITIVE
+   * `unsupported` category renders not-applicable instead, and is never read as 0,
+   * `false`, or idle anywhere — least of all by the stop/idle gate, which keeps
+   * reading the conservative ownership pair above.
+   */
+  readonly statusSupport?: NativeStatusSupportMap;
 }
 
 /**
@@ -2871,6 +2887,12 @@ interface SessionStatusFacts {
   readonly inputSurface: boolean;
   readonly activeTasks?: number | null;
   readonly activeShells?: number | null;
+  /**
+   * The same declared applicability the row carries, for the SAME classification.
+   * Absence is the legacy path: every category is treated as reportable, so Pi and
+   * every pre-native row renders byte-for-byte as before.
+   */
+  readonly statusSupport?: NativeStatusSupportMap;
   readonly exitCode?: number;
 }
 
@@ -2888,29 +2910,55 @@ interface CardStatusSegment {
 }
 
 /**
+ * The aggregate the agent line reads as rest. A category this row's own observer
+ * positively cannot report never blocks it — that is what lets a positively
+ * observed native turn end display as rest WITHOUT inventing background zeros to
+ * satisfy the formatter — while a supported-but-unobserved category still blocks
+ * it, exactly as before this helper existed.
+ *
+ * This is DISPLAY ONLY. The stop/remove confirmation gate is `isCompleteIdle`, a
+ * separate classification that keeps requiring every conservative ownership count
+ * to be a positively observed zero: a not-applicable category is never treated as
+ * zero, idle, or safe-to-stop there.
+ */
+function agentAtRest(item: SessionStatusFacts): boolean {
+  if (item.busy !== false) return false;
+  if (!isNativeCategoryUnsupported(item.statusSupport, "input") && item.pendingInput !== false) return false;
+  if (!isNativeCategoryUnsupported(item.statusSupport, "tasks") && sanitizeCount(item.activeTasks) !== 0) return false;
+  if (!isNativeCategoryUnsupported(item.statusSupport, "shells") && sanitizeCount(item.activeShells) !== 0) return false;
+  return true;
+}
+
+/**
  * The status row's exact text and semantic roles. Classification stays here and
  * nowhere else: the agent/lifecycle part and the input part are produced
  * independently, so `agent running | input pending` can color both facts
  * without either one overriding the other. The words are unchanged, and the
  * label words never take a status colour: only the observed VALUE is painted.
+ *
+ * A category the row's observer declared unreportable renders the shared
+ * not-applicable word on the neutral canvas instead of a status word: it is a
+ * different fact from `unknown`, and it is never painted as if it were rest.
  */
 function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
   const parts: CardStatusSegment[] = [];
+  const inputUnreportable = isNativeCategoryUnsupported(item.statusSupport, "input");
   switch (item.lifecycle) {
     case "starting":
       parts.push({ label: "", value: "starting", role: "statusStarting" });
       break;
     case "alive":
       parts.push(
-        item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
-          || (sanitizeCount(item.activeShells) ?? 0) > 0
-          ? { label: "agent ", value: "running", role: "statusRunning" }
-          : item.pendingInput === true || item.inputSurface === true
-            ? { label: "agent ", value: "waiting", role: "statusWaiting" }
-            : item.busy === false && item.pendingInput === false
-              && sanitizeCount(item.activeTasks) === 0 && sanitizeCount(item.activeShells) === 0
-              ? { label: "agent ", value: "idle", role: "statusIdle" }
-              : { label: "agent ", value: "unknown", role: "statusUnknown" },
+        isNativeCategoryUnsupported(item.statusSupport, "agent")
+          ? { label: "agent ", value: NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
+          : item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
+            || (sanitizeCount(item.activeShells) ?? 0) > 0
+            ? { label: "agent ", value: "running", role: "statusRunning" }
+            : item.pendingInput === true || item.inputSurface === true
+              ? { label: "agent ", value: "waiting", role: "statusWaiting" }
+              : agentAtRest(item)
+                ? { label: "agent ", value: "idle", role: "statusIdle" }
+                : { label: "agent ", value: "unknown", role: "statusUnknown" },
       );
       break;
     case "exited":
@@ -2930,13 +2978,15 @@ function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
   }
   if (item.lifecycle === "starting" || item.lifecycle === "alive") {
     parts.push(
-      item.pendingInput === true || item.inputSurface === true
-        ? { label: "input ", value: "pending", role: "inputPending" }
-        : item.pendingInput === false
-          // `none` is a VALUE like `idle`: the label stays neutral and the word
-          // takes the same muted, unbolded role as a positively idle agent.
-          ? { label: "input ", value: "none", role: "statusIdle" }
-          : { label: "input ", value: "unknown", role: "statusUnknown" },
+      inputUnreportable
+        ? { label: "input ", value: NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
+        : item.pendingInput === true || item.inputSurface === true
+          ? { label: "input ", value: "pending", role: "inputPending" }
+          : item.pendingInput === false
+            // `none` is a VALUE like `idle`: the label stays neutral and the word
+            // takes the same muted, unbolded role as a positively idle agent.
+            ? { label: "input ", value: "none", role: "statusIdle" }
+            : { label: "input ", value: "unknown", role: "statusUnknown" },
     );
   }
   return parts;
@@ -2982,21 +3032,26 @@ function countEmphasisRole(count: number): SidebarThemeRole {
 /**
  * The count row's exact text and semantic roles, classified once for every
  * renderer. A missing/invalid count stays `unknown` in its existing exact
- * plaintext and stays ordinary pane text: only an OBSERVED NUMBER is painted,
- * and each of the two counts is banded independently.
+ * plaintext and stays ordinary pane text: only an OBSERVED NUMBER is painted, and
+ * each of the two counts is banded independently. A category the row's observer
+ * declared unreportable renders the shared not-applicable word instead, also
+ * ordinary pane text and never a zero; the one-word aggregate stays reserved for
+ * the case it has always meant, two reportable categories with nothing observed.
  */
 function cardBackgroundSegments(item: SessionStatusFacts): CardBackgroundSegment[] {
-  const tasks = sanitizeCount(item.activeTasks);
-  const shells = sanitizeCount(item.activeShells);
-  if (tasks === null && shells === null) {
+  const tasksReportable = !isNativeCategoryUnsupported(item.statusSupport, "tasks");
+  const shellsReportable = !isNativeCategoryUnsupported(item.statusSupport, "shells");
+  const tasks = tasksReportable ? sanitizeCount(item.activeTasks) : null;
+  const shells = shellsReportable ? sanitizeCount(item.activeShells) : null;
+  if (tasks === null && shells === null && tasksReportable && shellsReportable) {
     return [{ label: "", value: "background unknown", role: null }];
   }
   return [
     tasks === null
-      ? { label: "bg tasks ", value: "unknown", role: null }
+      ? { label: "bg tasks ", value: tasksReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
       : { label: "bg tasks ", value: String(tasks), role: countEmphasisRole(tasks) },
     shells === null
-      ? { label: "shells ", value: "unknown", role: null }
+      ? { label: "shells ", value: shellsReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
       : { label: "shells ", value: String(shells), role: countEmphasisRole(shells) },
   ];
 }
@@ -3018,6 +3073,17 @@ function sanitizeCount(value: unknown): number | null {
 }
 
 /**
+ * The declared per-category applicability one DTO carries, as a frozen map, or
+ * honest absence. A malformed declaration is dropped rather than guessed, which
+ * can only ever return the row to its legacy `unknown` rendering: a copy path can
+ * never invent a not-applicable claim the owner did not state.
+ */
+function copyStatusSupportFields(value: unknown): { statusSupport?: NativeStatusSupportMap } {
+  const read = readNativeStatusSupport(value);
+  return read.status === "declared" ? { statusSupport: read.support } : {};
+}
+
+/**
  * The existing card status facts one remote roster DTO exposes. This adapter is
  * the only seam between a remote row and the local card renderer: the same
  * lifecycle/input/activity/unknown facts, no fabricated `SidebarItem` fields
@@ -3031,6 +3097,8 @@ function remoteSessionStatusFacts(row: SidebarRemoteRosterRow): SessionStatusFac
     inputSurface: row.inputSurface,
     activeTasks: row.activeTasks,
     activeShells: row.activeShells,
+    // The owner's own declaration, carried unchanged when the owner sent one.
+    ...(row.statusSupport === undefined ? {} : { statusSupport: row.statusSupport }),
     ...(row.exitCode === undefined ? {} : { exitCode: row.exitCode }),
   };
 }
@@ -3148,6 +3216,7 @@ function copyItem(item: SidebarItem): SidebarItem {
     backgroundShells: sanitizeCount(item.backgroundShells),
     activeTasks: sanitizeCount(item.activeTasks),
     activeShells: sanitizeCount(item.activeShells),
+    ...copyStatusSupportFields(item.statusSupport),
   };
 }
 
@@ -3268,6 +3337,11 @@ function copyPeerRosterRow(value: unknown): PeerRosterRow | null {
     // absent: a backend is never inferred from a caption, a native conversation, a
     // missing status, or this host's own configuration.
     ...(isNativeCliBackend(source.backend) ? { backend: source.backend } : {}),
+    // The owner's own applicability declaration, kept only when the owner stated
+    // one. Absence stays absence, so a legacy owner's rows keep the unchanged
+    // unknown rendering, and nothing here ever declares a category unreportable on
+    // an owner's behalf.
+    ...copyStatusSupportFields(source.statusSupport),
     ...(displayNumber(source.exitCode) === undefined ? {} : { exitCode: displayNumber(source.exitCode) }),
     ...(displayText(source.error) === undefined ? {} : { error: displayText(source.error) }),
   };
@@ -12250,6 +12324,7 @@ export class SidebarController {
           inputSurface: row.row.inputSurface,
           activeTasks: row.row.activeTasks,
           activeShells: row.row.activeShells,
+          ...(row.row.statusSupport === undefined ? {} : { statusSupport: row.row.statusSupport }),
           ...(row.row.exitCode === undefined ? {} : { exitCode: row.row.exitCode }),
         };
         const stale = row.rosterState === "stale" ? " [stale]" : "";

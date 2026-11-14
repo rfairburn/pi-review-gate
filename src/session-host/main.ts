@@ -6,7 +6,7 @@ import { isAbsolute, join } from "node:path";
 import type { Writable } from "node:stream";
 import { ProcessTerminal, matchesKey } from "pi-session-host-tui";
 
-import { createStatusBroker, type StatusBroker } from "./broker";
+import { createStatusBroker, type NativeHookStatusBroker, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type HostPaneRect, type RenderedSidebar } from "./compositor";
 import { chooseExitedRestart } from "./exited-restart";
 import {
@@ -215,6 +215,7 @@ import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest }
 import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
+import { createNativeStatusObserver } from "./native-observer-factory";
 import {
   isNativeCliBackend,
   isNativeDisplayName,
@@ -886,6 +887,10 @@ interface MainDependencies {
   readonly stdout: MainStdout;
   readonly signals: MainSignals;
   readonly resolvePi: (options: { executable?: string; env: NodeJS.ProcessEnv }) => { file: string; version: string };
+  /** The host's ONE status broker. Production's `createStatusBroker` always
+   * returns the facade that also carries the separate native hook family, which
+   * is what {@link nativeHookRegistrarOf} reads; a Pi-only facade stays valid and
+   * simply observes no provider status. */
   readonly createBroker: (options?: { socketRoot?: string }) => Promise<StatusBroker>;
   readonly createSessionSetup: (options: { env: NodeJS.ProcessEnv }) => {
     nativeSetup: boolean;
@@ -1349,6 +1354,25 @@ function savedDeletionFailureMessage(result: SavedSessionDeletionResult): string
     : `The saved conversation was not deleted: ${result.error}`;
 }
 
+/**
+ * The one capability read that decides whether this host arms native status
+ * observation (issue #277 native status activation).
+ *
+ * The production broker from {@link createStatusBroker} always implements the
+ * separate native hook family, so a production host that offers native provider
+ * sessions always arms the observation path with that SAME broker object. The
+ * narrower Pi-only {@link StatusBroker} facade stays a supported injected shape
+ * for existing internal consumers, and a broker that does not carry the native
+ * family simply observes nothing: no half-registrar, no substitute observer, and
+ * no provider field ever claimed on a row's behalf.
+ */
+function nativeHookRegistrarOf(broker: StatusBroker): NativeHookStatusBroker | undefined {
+  const capable: Partial<NativeHookStatusBroker> = broker;
+  return typeof capable.registerNativeHookSource === "function"
+    ? broker as NativeHookStatusBroker
+    : undefined;
+}
+
 function statusRegistrar(broker: StatusBroker): StatusRegistrar {
   return {
     register(instanceId, handlers, options) {
@@ -1409,6 +1433,9 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     backgroundShells: view.backgroundShells ?? null,
     activeTasks: view.activeTasks ?? null,
     activeShells: view.activeShells ?? null,
+    // The row's own declared applicability, carried only when the row declared
+    // something. This host never declares a category unreportable on a row's behalf.
+    ...(view.statusSupport === undefined ? {} : { statusSupport: view.statusSupport }),
     activity: view.activity,
     nativeSession,
   };
@@ -9223,6 +9250,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
+    // The native hook registrar is this host's ONE existing broker, never a
+    // second listener, socket, or registry: the same local broker the Pi
+    // reporters already use issues each launch's fresh native bootstrap. A
+    // Pi-only broker facade carries no native hook family, and such a host keeps
+    // launching native rows with the honest unknown provider fields it had before
+    // this slice - it never gets a half-armed observation path.
+    const nativeHookRegistrar = nativeHookRegistrarOf(broker);
+
     manager = hostService.openManager({
       packageRoot,
       piExecutable: pi.file,
@@ -9249,6 +9284,16 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // bootstrap, or framing path. Absent hosting leaves the manager exactly as
       // before: a native creation is refused before any row exists.
       ...(nativeCliLaunch === undefined ? {} : { nativeCliLaunch }),
+      // Native hooks share the existing broker's listener, never Pi reporter
+      // authority: the exact broker object this host already registered its Pi
+      // rows on issues each launch's fresh bootstrap, and the concrete factory
+      // supplies that run's only observer. The pair is issued together, only for
+      // a host that offers native provider sessions, and only when that broker
+      // actually carries the native hook family.
+      ...(nativeCliLaunch === undefined || nativeHookRegistrar === undefined ? {} : {
+        nativeHookRegistrar,
+        nativeStatusObserverFactory: createNativeStatusObserver,
+      }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

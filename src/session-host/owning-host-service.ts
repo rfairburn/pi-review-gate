@@ -148,6 +148,27 @@ export type {
 export { isNativeViewerNativeCliClipboardReceipt } from "./instances";
 
 /**
+ * The NATIVE STATUS contract (native status slice), re-exported at the owning-host
+ * boundary so a dependent host-side provider observer has ONE documented import
+ * point for the vocabulary it submits and the seam it is handed: the applicability
+ * declaration, the observation shape, the run-bound capture minted by
+ * `InstanceManager.nativeStatusCapture`, and its result codes.
+ *
+ * This service adds no second seam, no queue, no cache, and no status mirror of its
+ * own. The manager stays the only owner of every row fact, and these are exactly the
+ * types it publishes; nothing here can address a row the manager would refuse.
+ */
+export type {
+  NativeStatusCategory,
+  NativeStatusObservation,
+  NativeStatusRejectCode,
+  NativeStatusSubmitResult,
+  NativeStatusSupport,
+  NativeStatusSupportMap,
+} from "./native-status";
+export type { NativeStatusCapture } from "./instances";
+
+/**
  * Local-only options for registering one viewing surface on the host's one manager.
  * The caller can supply only its own surface's copy sink: the host run identity is
  * always this service's own run, never a caller's choice, so a consumer cannot

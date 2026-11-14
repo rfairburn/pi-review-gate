@@ -831,10 +831,17 @@ form opens**. Choosing a native provider changes nothing else about the form —
 
 A native row is deliberately a plain provider child rather than a Pi child:
 
-- It gets no status registration, no Pi bootstrap/preload/startup-payload/title
-  environment, no input framing, and no native clipboard receiver, so every provider
-  field in its card stays truthfully unknown and only the owned PTY's own exit
-  settles the row. Local keyboard input is forwarded raw to the owning row.
+- It gets no Pi status registration, no Pi bootstrap/preload/startup-payload/title
+  environment, no input framing, and no Pi clipboard receiver, so no Pi
+  reporter is involved anywhere on the row and only the owned PTY's own exit
+  settles it. Local keyboard input is forwarded raw to the owning row. What the
+  row **can** report about its own provider — agent running or at rest, the current
+  or last tool type, an observed pending question request, and on a Claude Code row
+  that provider harness's own background task and shell counts — arrives through a
+  separate native observation family, and only for the categories that route can
+  actually state; everything else stays `unknown`, and a category the route
+  positively cannot report reads `N/A` rather than idle or zero
+  ([Native Claude Code and Codex sessions](native-sidebar-agents.md#native-status-observation)).
 - Its command, base arguments, and base environment come from the built-in default
   for that backend or from an explicit shared
   [`externalAgents`](configuration.md#the-externalagents-catalog) entry — never from
@@ -843,11 +850,22 @@ A native row is deliberately a plain provider child rather than a Pi child:
   a missing binary or a configured argument that names a headless or service mode, an
   approval, sandbox, or hook-trust bypass, an existing-session attach, or a
   workspace-scope change is a refusal: never silently stripped, retried another way,
-  or replaced with another target. Codex adds only `--no-daemon`.
+  or replaced with another target. Codex adds only `--no-daemon` of its own; the
+  status observer's per-session hook flags, described below, are the only addition on
+  top.
 - Its configuration, authentication, and conversation state stay in the provider's
-  own directories. The host writes nothing to the operator's provider settings, hooks,
-  plugins, or trust stores, and the host's Pi agent directory keeps holding only Pi
-  data plus this host's roster and ownership record.
+  own directories. The host writes nothing into the operator's stored provider
+  settings, hooks, plugins, or trust stores, and the host's Pi agent directory keeps
+  holding only Pi data plus this host's roster and ownership record. When status
+  observation is armed for a launch, the host adds that provider's own
+  **per-session** hook flags — a freshly created private temporary file it owns and
+  cleans up, or one added per-session configuration entry — never a global or
+  project settings edit, never an installed
+  plugin, never a trust-record write, and never a permission or hook-trust bypass —
+  and the provider's normal trust, sideload, marketplace, and hook-disabling policy
+  can still withhold the observer entirely, in which case the row simply stays
+  unknown
+  ([Native status observation](native-sidebar-agents.md#native-status-observation)).
 - It carries no review gate, no tool protection, and none of the subtask
   capture/review/landing guarantees, and it is never presented as a review-gate-managed
   worker.
@@ -1054,6 +1072,19 @@ client holds only a projection of it. A lost projection — a disconnect, a
 stopped subscription, or an unavailable owner — means *not current*, never idle
 and never zero. No second controlling host, separate ACL, exclusive-controller
 lease, or new revocation lifecycle policy is added.
+
+For a row the owner hosts as a native provider session, one extra OPTIONAL row
+field is available: the owner's own per-category status applicability declaration,
+carried only to a peer that negotiated the independent `roster-native-status-v1`
+capability. It states, per sidebar category, whether the owner's observer for that
+row can report it or positively cannot, and it carries no observed value of its
+own — the observed busy, pending-input, activity, and provider-harness count facts
+keep travelling in the fields above. A peer that never negotiated it decodes the
+pre-existing row shape and renders every unobserved category as `unknown`, exactly
+as before, and a viewer can never declare a category unreportable on its owner's
+behalf. Absence of a declaration always stays absence: it is never read as
+not-applicable, zero, or idle
+([Native status observation](native-sidebar-agents.md#native-status-observation)).
 
 The roster projection itself stays metadata-only: connecting a destination adds
 no terminal content, input, or session operation by itself. The base `roster-v1`
@@ -1622,7 +1653,10 @@ renames one of the owner's native rows. Each is acknowledged only when the owner
 really holds the matching provider, and one never implies the other: an owner can
 start native rows and still refuse to name them. An unnegotiated peer sees the
 pre-native wire schema exactly as before, and neither lane adds a listener, queue,
-replay cache, registry, permission kind, or stored state.
+replay cache, registry, permission kind, or stored state. A third independent
+capability on the same channel, `roster-native-status-v1`, carries only the owner's
+per-category status applicability declaration for its native rows; it is described
+with the roster projection above and grants nothing here.
 
 **Starting a native row on an owner.** The New form's **Provider** line is scoped to
 the destination selected on the **Host** line. A Local choice offers this host's own
@@ -1678,8 +1712,10 @@ stated as pending on
 real-provider acceptance: a real Claude Code or Codex CLI actually starting and
 behaving correctly on a paired owner over a real network, a real provider actually
 emitting a capturable text copy and a real OS clipboard accepting it on either end,
-and Windows. A native row still has no status registration and carries
-no review-gate or tool-protection guarantee.
+and Windows. A native row still has no Pi status registration and carries no
+review-gate or tool-protection guarantee; that row's own provider-side status
+observer, where one is armed, is a separate native family described in
+[Native status observation](native-sidebar-agents.md#native-status-observation).
 
 ### Saved conversations on a connected owner
 
@@ -2227,14 +2263,26 @@ deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership
 count.
 
-A native **Claude Code** or **Codex CLI** row keeps every one of those rules, with
-nothing provider-side to observe: the host owns its process, so lifecycle and exit
-are real, while agent busy/idle, a pending question or approval, and every task and
-shell count stay `unknown` for that row's whole life. The host never scrapes the
-terminal to guess a provider's state and never infers idle from a missing PID, a
-quiet period, or an output gap, so a native row never shows a fabricated idle, zero,
-or pending state
-([Native Claude Code and Codex sessions](native-sidebar-agents.md#what-the-host-owns-and-what-it-never-infers)).
+A native **Claude Code** or **Codex CLI** row keeps every one of those rules. The
+host owns its process, so lifecycle and exit are real, and where that row's own
+provider-side observer is armed some further fields become observed too: the
+agent's running/rest state, the current or last tool type, an observed pending
+**question request**, and — on a Claude Code row — that provider harness's own
+task and shell counts taken from a real root `Stop` snapshot. Three answers are
+possible and they are never conflated: an observed value (a `0` only when the
+provider positively reported an empty set), `unknown` for a supported category that
+was never observed, failed, or was withdrawn after a gap, and `N/A` only for a
+category that route positively declares it cannot report — which is never a zero
+and never rest. A row with no applicability declaration keeps legacy `unknown` behavior. If an
+observer is armed but never receives data, its supported fields stay `unknown`;
+categories already declared unreportable keep showing `N/A`. The
+host never scrapes the terminal to guess a provider's state and never infers idle
+from a missing PID, a quiet period, or an output gap, so a native row never shows a
+fabricated idle, zero, or pending state. None of it touches the conservative
+**ownership** pair: a provider's own harness numbers never enter it, and an `N/A`
+or a displayed rest never authorizes an idle-only stop or removal
+([Native status observation](native-sidebar-agents.md#native-status-observation),
+[What the host owns, and what it never infers](native-sidebar-agents.md#what-the-host-owns-and-what-it-never-infers)).
 
 Loaded sessions establish activity from fresh, complete observations of their
 exact owning sources at startup/restore and safe event-driven resynchronization
@@ -2320,9 +2368,14 @@ Pi's muted grey for a positively idle one and for an empty `none` input value, P
 warning colour and bold for waiting and pending input, Pi's dim colour for unknown or
 exited), and the `agent`/`input` label words and the separator stay in the pane's normal
 text colour. The words and the observed/unknown classification remain unchanged; color
-never substitutes for status text. The two background activity numbers are coloured
+never substitutes for status text. On a native row whose observer declared a category
+unreportable, that category shows the shared `N/A` word on the neutral canvas instead
+of a status word — a different fact from `unknown`, never painted as rest, and never
+replacing the status word of a category that is merely unobserved. The two background
+activity numbers are coloured
 independently by how much work each reports (0 muted, 1-2 success, 3-6 warning, 7 or
-more error red, uncapped), while their labels, the separator, and any `unknown` value stay
+more error red, uncapped), while their labels, the separator, and any `unknown` or `N/A`
+value stay
 ordinary text; the error-family red is activity intensity only and never means the session
 failed.
 

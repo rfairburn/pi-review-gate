@@ -117,6 +117,69 @@ require separate native-platform validation. This IPC support does not establish
 Windows host parity, delivery readiness, security equivalence with the POSIX
 filesystem boundary, or a private Windows ACL guarantee.
 
+**Native provider status observation rides a separate one-shot family on that same
+broker.** A hosted Claude Code or Codex row can be armed per launch to report a
+bounded set of its own state through the provider's own command hooks. Each hook
+invocation is one short-lived relay: it authenticates with a token issued for that
+single owned launch, sends exactly one bounded event — or one closed failure
+reason — reads one fixed-size acknowledgement, and closes. The native family keeps
+its own registration map, token, and delivery limits; it never becomes a Pi
+reporter, never shares Pi status sequencing, reconnect handling, or command
+authority, and a duplicate active id in either family is refused. A native
+observation is bound to one exact row and one exact child-process incarnation, and
+a retired capture generation can write nothing further. Recoverable source gaps
+withdraw observations to unknown under the source's own stale-read fences;
+a malformed or foreign-field observation is refused whole rather than partially
+applied. This lane is observation only: it never authorizes, denies, or blocks a
+provider operation, and it carries no Pi conversation identity, bootstrap, or
+attestation.
+
+**What the observer may and may not carry.** Only a closed allowlist of provider
+event metadata — event name plus bounded, control-free identifier, label, and
+transcript-path strings — and one validated numeric projection of that provider's
+own background-task snapshot cross the wire. Question text, answers, prompt text,
+tool arguments, tool results, transcript lines, terminal output, and arbitrary
+provider fields are selected out before any frame is built and are never stored,
+logged, or broadcast. The per-launch token travels in one child-environment marker
+and never in provider hook command text, which is what lets one host's generated
+hook command stay byte-identical from row to row; that marker is stripped from any
+inherited environment before the fresh one is set. The observer's staged files live
+in a freshly created private temporary root this host owns (`0700` directories,
+`0600` files, exclusive creation, never inside a workspace), and cleanup removes
+only the exact entries that one preparation created, deepest first, and only where
+each is still the object it created — same device and inode, of the expected kind,
+checked without following any link, and reached through the recorded root and
+directories that still carry the identities they were created with (an unrecorded or
+changed ancestor fails closed, and a symlink standing where a recorded directory was
+is a different object, so nothing below it is removed through it). A directory that
+now holds an entry this preparation never created is not removed and survives with
+that entry. Artifact cleanup does not read or digest contents, so an in-place edit of a
+created file keeps its identity and is removed with the rest. The lease is released
+only after that row's provider source and PTY have settled.
+
+**What this is not.** It is not a claim that the provider ran anything: there is no
+heartbeat, queue, retry, or replay, so a hook that never fires or a relay that never
+connects reports nothing: supported fields stay unknown, while categories already
+declared unreportable keep showing N/A. Without a declaration, legacy unknown
+behavior remains. The owner *does* read bounded bytes from the
+exact provider-named JSONL file—Claude's native transcript or Codex's root-thread
+rollout—to derive status metadata. Record text is not kept as a history, logged or
+broadcast; this is not a transcript-free or attestation-grade channel. There is no `HOME` or
+history scan, no session-directory search, no global clipboard watch, no raw
+recording, no extra listener or port, and no second conversation. Arming the
+observer changes no provider authentication, permission, model, or configuration
+default: it adds only that provider's documented per-session hook flags — pointing
+at the host's own private per-session artifacts, or adding one per-session
+configuration entry — writes nothing to global or project settings,
+plugins, or any trust record, and bypasses no workspace-trust, sideload,
+marketplace, hook-disabling, or hook-review gate — those operator decisions can
+withhold the observation entirely. A provider's own task and shell numbers are
+activity facts about that provider's harness: they never enter this host's
+conservative background-ownership channel, so no provider reading — including a
+not-applicable category or a displayed rest — ever authorizes an idle-only stop or
+removal. See
+[Native status observation](native-sidebar-agents.md#native-status-observation).
+
 ### Session-host peer network (optional)
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for
@@ -222,7 +285,14 @@ below, each re-authorized and performed by the owner. Roster rows carry bounded
 display facts, including the exact owner-side workspace path, and never the
 native current-file guard, agent/account directories, configuration, providers,
 credentials, prompts, transcripts, question text, terminal/output bytes, or
-image data. A lost projection is stale or unavailable, never idle or zero.
+image data. A lost projection is stale or unavailable, never idle or zero. For a
+row the owner hosts as a native provider session, the independent optional
+`roster-native-status-v1` capability adds one field: the owner's own per-category
+status applicability declaration. It carries no observed value and no provider
+content, it states only what the owner's observer for that row can or positively
+cannot report, and it grants nothing — a viewer that never negotiated it decodes
+the pre-existing row shape and renders every unobserved category as unknown, and no
+viewer can declare a category unreportable on its owner's behalf.
 
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app`

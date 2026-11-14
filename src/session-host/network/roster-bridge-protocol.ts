@@ -232,6 +232,23 @@ export const ROSTER_BRIDGE_NATIVE_CAPABILITY = "roster-native-v1";
  */
 export const ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY = "roster-native-name-v1";
 /**
+ * Optional capability for one extra OPTIONAL row field: the owner row's own
+ * per-category NATIVE STATUS APPLICABILITY declaration (#277 native status slice).
+ * It says only that rows in this channel's snapshots may carry the bounded
+ * `statusSupport` map, and that a row whose observer declared nothing honestly
+ * omits it. It is an observation about the OWNER's row and its observer and nothing
+ * else: it grants nothing, carries no observed value, changes no row identity, and
+ * never lets a viewer declare a category unreportable on an owner's behalf.
+ *
+ * It is negotiated separately from {@link ROSTER_BRIDGE_NATIVE_CAPABILITY} on
+ * purpose: a peer that negotiated the native lane but not this one keeps the exact
+ * row shape it already decodes, so an older viewer's strict decoder never meets an
+ * unknown field, and an owner that never sends a declaration acknowledges nothing.
+ * Absence on the wire stays absence — a viewer renders every unobserved category as
+ * `unknown`, exactly as it did before this lane existed.
+ */
+export const ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY = "roster-native-status-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -244,6 +261,7 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */

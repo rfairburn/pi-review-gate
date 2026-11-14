@@ -142,6 +142,7 @@ import {
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
@@ -701,6 +702,14 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         // slot its own roster authority already holds for a row, and by
         // honestly omitting the field for a row with no slot. It is never
         // authority, never a second identity, and never a routing target.
+        return true;
+      }
+      if (capability === ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY) {
+        // Observation metadata only, and this owner can always honour it honestly:
+        // a row carries a declaration exactly when its own observer made one, and a
+        // row without one omits the field. Acknowledging it states no capability of
+        // the viewer, no provider coverage, and no permission — and it never widens
+        // a row that has nothing to say.
         return true;
       }
       return false;
@@ -2240,9 +2249,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // from a label or an absence of Pi telemetry.
       const carryRosterSlots = this.#capabilities.includes(ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY);
       const carryBackend = this.#nativeNegotiated();
+      // The owner row's own applicability declaration rides its own negotiated lane,
+      // and it is copied exactly: a row whose observer declared nothing omits the
+      // field, so a viewer keeps its unchanged unknown rendering for that row.
+      const carryStatusSupport = this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY);
       rows = snapshot.rows.map((row) => toRemoteSessionMetadata(
         row,
-        { rosterSlotId: carryRosterSlots, backend: carryBackend },
+        { rosterSlotId: carryRosterSlots, backend: carryBackend, statusSupport: carryStatusSupport },
       ));
     } catch (error) {
       this.#terminateSubscription(isRemoteSessionMetadataError(error) ? "row_unrepresentable" : "bad_frame", "snapshot_failed");

@@ -159,9 +159,9 @@ private fun positiveCount(value: Long?): Long? = value?.takeIf { it >= 0L }
  *
  * The triple ([hostId], [hostRunId], [rowId]) is the only row authority, and
  * [rosterRevision] records the snapshot the control was drawn from. A later
- * metadata change never retargets a target that is already on screen: the UI keeps
- * drawing the frozen values and the future controller refuses a target that no
- * longer matches its own facts.
+ * metadata change never retargets a target that is already on screen. Admission
+ * decides which drawn context must still match: session-card Open terminal uses
+ * [SessionCardOpenKey], while the terminal chooser keeps the exact target match.
  */
 public data class SessionActionTarget(
     public val hostId: HostId,
@@ -177,6 +177,38 @@ public data class SessionActionTarget(
             hostRunId = row.hostRunId,
             rowId = row.rowId,
             rosterRevision = row.rosterRevision,
+            drawnTitle = row.displayTitle,
+        )
+    }
+}
+
+/**
+ * The semantic identity of one session card's Open terminal control.
+ *
+ * The stable owner triple identifies the row and [drawnTitle] records the title the
+ * card drew. [SessionActionTarget.rosterRevision] is deliberately absent: a roster
+ * republish that only advances the revision presents the same card action, so it must
+ * not retire that action's committed standing. A changed title or owner row still
+ * changes this key and therefore still requires a fresh proof.
+ */
+public data class SessionCardOpenKey(
+    public val hostId: HostId,
+    public val hostRunId: String,
+    public val rowId: String,
+    public val drawnTitle: String,
+) {
+    public companion object {
+        public fun of(target: SessionActionTarget): SessionCardOpenKey = SessionCardOpenKey(
+            hostId = target.hostId,
+            hostRunId = target.hostRunId,
+            rowId = target.rowId,
+            drawnTitle = target.drawnTitle,
+        )
+
+        public fun of(row: SessionUiState): SessionCardOpenKey = SessionCardOpenKey(
+            hostId = row.hostId,
+            hostRunId = row.hostRunId,
+            rowId = row.rowId,
             drawnTitle = row.displayTitle,
         )
     }

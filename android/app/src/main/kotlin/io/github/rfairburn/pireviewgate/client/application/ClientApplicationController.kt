@@ -297,7 +297,7 @@ class ClientApplicationController private constructor(
             if (roster == null) host else host.copy(roster = roster.copy(rows = roster.rows.map { row ->
                 val generation = registryState.hosts.first { it.hostId == row.hostId }.generation
                 row.copy(selectProof = if (row.stale || route !is ClientRoute.Sessions || dialogs.hasModal || coverage != UiCoverage.NONE) null else proof(
-                    listOf("row", generation, SessionActionTarget.of(row)), UiProofScreen.SESSION_CLOSE,
+                    listOf("row", generation, SessionCardOpenKey.of(row)), UiProofScreen.SESSION_CLOSE,
                     row.hostId, row.hostRunId, row.rowId,
                 ))
             }))
@@ -623,8 +623,16 @@ class ClientApplicationController private constructor(
     private fun currentRow(target: SessionActionTarget): SessionUiState? = state.value.sessions.firstOrNull {
         !it.stale && SessionActionTarget.of(it) == target
     }
+    // Session-card terminal entry only: a roster republish can advance what activity
+    // was drawn without changing which owner row or title the operator selected. The
+    // stable owner triple and drawn title stay exact; the terminal chooser and any
+    // other exact-target lookup keep the currentRow match above.
+    private fun currentSessionCardRow(target: SessionActionTarget): SessionUiState? = state.value.sessions.firstOrNull {
+        !it.stale && SessionCardOpenKey.of(it) == SessionCardOpenKey.of(target)
+    }
     // Close-only: stable owner identity and current/non-stale/capability facts, not a
-    // display-context freeze. Other actions keep the exact currentRow match above.
+    // display-context freeze. The terminal chooser and any other exact-target lookup
+    // keep the currentRow match above.
     // The runtime check makes CURRENT/non-stale/generation source facts authoritative,
     // even if the last published UI frame is one refresh behind.
     private fun closeRow(target: SessionActionTarget): SessionUiState? {
@@ -1111,7 +1119,7 @@ class ClientApplicationController private constructor(
 
     private fun enter(target: SessionActionTarget, proof: UiActionProof, fromChooser: Boolean) {
         if (dialogs.hasModal || (!fromChooser && route !is ClientRoute.Sessions)) return
-        val row = currentRow(target) ?: return
+        val row = (if (fromChooser) currentRow(target) else currentSessionCardRow(target)) ?: return
         val expected = if (fromChooser) (route as? ClientRoute.Terminal)?.terminal?.chooserProofs?.get(SessionRowKey.of(row)) else row.selectProof
         if (expected !== proof) return
         val frozen = FrozenAction.capture(proof) ?: return

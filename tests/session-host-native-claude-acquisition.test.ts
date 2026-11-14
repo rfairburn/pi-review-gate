@@ -9,17 +9,30 @@
  *
  * What the assertions pin: Ready only from a positively read ROOT terminal row
  * (never from this observer's own `Stop` hook, never from a child/labelled row,
- * never from a row that predates the read barrier); a published `Ready` and count
- * snapshot withdrawn to unknown when the monitored transcript shows a NEW ROOT
- * model row — even when no hook ever arrives for that work — while sidechain,
- * agent-scoped, foreign-session, and non-work rows never claim root work; and that
- * a whole batch containing both an old summary and newer root work fails closed;
- * the observed-0 versus absent-unknown distinction on real ROOT `Stop` snapshots
- * and the refusal to use
- * a `SubagentStop` subset; withdrawal to unknown (never zero, never a stale Ready)
- * on truncation, replacement, malformed or oversized records, and a window too
- * small to cover the barrier; one-file-only access; and that no raw transcript
- * content ever leaves the controller.
+ * never from a row that predates the read barrier); POSITION and closed row kind
+ * inside one append-ordered window — the closing turn's own trailing rows (its
+ * final `assistant` row, its `user` tool-result row carrying BOTH `message` and
+ * `toolUseResult`) may land after the size barrier and before the summary, and a
+ * sufficient summary after them still confirms Ready even when an intervening
+ * read saw them first, while a root row that starts after that summary or a
+ * persisted root PROMPT row still spends the pass and leaves no Ready; a
+ * published `Ready` withdrawn to unknown when the monitored transcript shows a
+ * NEW ROOT model row — even when no hook ever arrives for that work — while
+ * sidechain, agent-scoped, foreign-session, and non-work rows never claim root
+ * work; the observed-0 versus absent-unknown distinction on real ROOT `Stop`
+ * snapshots, those numbers kept as last-reported state across unrelated hooks,
+ * ordinary new foreground work, and a transcript this controller cannot read, and
+ * the refusal to use a `SubagentStop` subset; withdrawal to unknown (never zero,
+ * never a stale Ready) of the transcript-derived claims on truncation,
+ * replacement, malformed or oversized records, and a window too small to cover
+ * the barrier, while a genuine hook-lane loss or scope change still withdraws the
+ * counts too; the refusal to reconstruct a count from activity or to read an
+ * unreadable snapshot as zero; a summary this run cannot use (child, sidechain,
+ * agent-scoped, or
+ * labelled for another event) never sets the positional completion boundary; and
+ * count-only monitoring reads the file for membership transitions without ever
+ * erasing a healthy hook-derived foreground or question census; one-file-only
+ * access; and that no raw transcript content ever leaves the controller.
  */
 
 import assert from "node:assert/strict";
@@ -197,6 +210,34 @@ function rootAssistantTextRow(): string {
     isSidechain: false,
     message: { role: "assistant", content: [{ type: "text", text: `root answer ${"a".repeat(64)}` }] },
     uuid: "root-assistant-text-row-1",
+  });
+}
+
+/**
+ * The persisted tool-result row of the CLOSING turn, in the shape the provider
+ * writes it: a `user` row carrying BOTH a `message` (the tool_result content) and
+ * its own `toolUseResult`. It flushes after this observer's Stop barrier and
+ * before the summary, so it is a finishing-turn row and not proof of a new turn.
+ */
+function rootUserToolResultRow(): string {
+  return jsonRow({
+    type: "user",
+    sessionId: SESSION,
+    isSidechain: false,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu-root-close", content: `root tool output ${"o".repeat(64)}` }],
+    },
+    toolUseResult: {
+      stdout: `root tool output ${"o".repeat(64)}`,
+      stderr: "",
+      interrupted: false,
+      isImage: false,
+      returnCodeInterpretation: "Success",
+    },
+    toolUseID: "toolu-root-close",
+    uuid: "root-user-tool-result-row-1",
+    timestamp: "2026-01-01T00:01:30.000Z",
   });
 }
 
@@ -381,9 +422,10 @@ test("a new prompt is not closed by the previous turn's summary", async () => {
   h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
   assert.equal(h.latest().busy, true);
   assert.deepEqual(h.latest().activity, ["Working"]);
-  // New work makes the last native snapshot unknown rather than stale.
-  assert.equal(h.latest().activeTasks, null);
-  assert.equal(h.latest().activeShells, null);
+  // Ordinary new foreground work proves nothing about background membership, so
+  // the last ROOT `Stop` snapshot stays published as last-reported.
+  assert.equal(h.latest().activeTasks, 1);
+  assert.equal(h.latest().activeShells, 0);
 
   h.hook("Stop", { prompt_id: "prompt-2" });
   await settle();
@@ -472,7 +514,10 @@ test("a malformed row after a sufficient summary withdraws instead of publishing
   await waitFor(() => h.gaps.includes("malformed"), "a malformed row anywhere in the window must be reported");
   assert.deepEqual(h.readySnapshots(), [], "Ready must never be published from a window that is not fully valid");
   assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  // The unreadable file is the transcript lane. The snapshot came from the ROOT
+  // `Stop` hook payload, so it survives as last-reported instead of being nulled.
+  assert.equal(h.latest().activeTasks, 1);
+  assert.equal(h.latest().activeShells, 1);
   h.controller.dispose();
 });
 
@@ -573,9 +618,12 @@ test("a watcher that cannot be created withdraws published state instead of leav
 
   assert.ok(h.gaps.includes("watch-unavailable"), `expected a watch-unavailable gap: ${h.gaps.join(",")}`);
   const after = h.latest();
-  assert.equal(after.activeTasks, null, "a positive count with no monitoring is not defensible");
-  assert.equal(after.activeShells, null);
+  // What the failed lane supported is withdrawn: no witness can be read, so no
+  // Ready may be claimed. The ROOT `Stop` snapshot came from the hook lane, so it
+  // stays published as the last thing the provider stated.
   assert.equal(after.busy, null);
+  assert.equal(after.activeTasks, 2, "a transcript lane that cannot watch never nulls a hook-payload count");
+  assert.equal(after.activeShells, 2);
 
   await h.append(summaryRow());
   await settle();
@@ -632,7 +680,10 @@ test("invalid UTF-8 bytes in the window withdraw rather than publishing Ready", 
   await waitFor(() => h.gaps.includes("unreadable"), "corrupt bytes must be reported as unreadable");
   assert.deepEqual(h.readySnapshots(), [], "a window with corrupt bytes must not publish Ready");
   assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  // A transcript this controller cannot decode says nothing about background
+  // membership: the hook-payload snapshot stays as last-reported.
+  assert.equal(h.latest().activeTasks, 1);
+  assert.equal(h.latest().activeShells, 1);
   h.controller.dispose();
 });
 
@@ -646,29 +697,173 @@ test("native counts keep the observed-zero and unknown distinction, and never ta
   assert.equal(h.latest().activeTasks, 0);
   assert.equal(h.latest().activeShells, 0);
 
-  // A SubagentStop snapshot is that subagent's array, never root scope.
+  // A SubagentStop snapshot is that subagent's array, never root scope: it neither
+  // replaces the root snapshot nor erases it.
   h.hook("SubagentStop", { background_counts: { tasks: 0, shells: 0 }, agent_id: "agent-9" });
-  assert.equal(h.latest().activeTasks, null);
-  assert.equal(h.latest().activeShells, null);
+  assert.equal(h.latest().activeTasks, 0);
+  assert.equal(h.latest().activeShells, 0);
 
-  // Absent is unverifiable, not zero.
+  // A valid root Stop that carried no snapshot is unknown, never a retained
+  // number and never a fabricated zero.
   h.hook("Stop");
   assert.equal(h.latest().activeTasks, null);
   assert.equal(h.latest().activeShells, null);
   h.controller.dispose();
 });
 
-test("a launch edge and tool work invalidate the last native snapshot", async () => {
+test("ordinary foreground work keeps the last snapshot; a newer snapshot replaces it", async () => {
   const h = await createHarness();
   await beginTurn(h);
   h.hook("Stop", { background_counts: { tasks: 2, shells: 2 } });
   assert.equal(h.latest().activeShells, 2);
 
+  // A new prompt and tool work are foreground facts. They prove nothing about
+  // whether a background task or shell is still running, so the last reported
+  // numbers stay published until a real transition, snapshot, or scope change.
   h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
   h.hook("PreToolUse", { tool_name: "Bash", tool_use_id: "tool-a", prompt_id: "prompt-2" });
+  h.hook("PostToolUse", { tool_name: "Bash", tool_use_id: "tool-a", prompt_id: "prompt-2" });
+  assert.equal(h.latest().busy, true);
+  assert.equal(h.latest().activeTasks, 2);
+  assert.equal(h.latest().activeShells, 2);
+
+  // The next root Stop's own snapshot replaces them, including with a real 0/1.
+  h.hook("Stop", { prompt_id: "prompt-2", background_counts: { tasks: 0, shells: 1 } });
+  assert.equal(h.latest().activeTasks, 0);
+  assert.equal(h.latest().activeShells, 1);
+  h.controller.dispose();
+});
+
+test("count-only monitoring reads the file without erasing a healthy running foreground", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 1 } });
+  assert.equal(h.latest().activeTasks, 2);
+
+  // Ordinary new foreground work while counts stay published: running state and
+  // an open question request now come from the hook lane.
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-2" });
+  assert.equal(h.latest().busy, true);
+  assert.equal(h.latest().pendingInput, true);
+  assert.equal(h.latest().activeTasks, 2);
+
+  // The monitor really is live on this file. Reading plain root rows of the
+  // running turn must not regress the hook-derived foreground or the census.
+  await h.append(rootAssistantToolUseRow());
+  readNow(received);
+  await settle();
+  let kept = h.latest();
+  assert.equal(kept.busy, true, "a plain root row is not evidence that a running turn stopped");
+  assert.deepEqual(kept.activity, ["Working"], "a plain root row claims no activity change");
+  assert.equal(kept.pendingInput, true, "an observed question request survives an unrelated read");
+  assert.equal(kept.activeTasks, 2);
+  assert.equal(kept.activeShells, 1);
+
+  await h.append(rootUserToolResultRow());
+  readNow(received);
+  await settle();
+  kept = h.latest();
+  assert.equal(kept.busy, true);
+  assert.equal(kept.pendingInput, true);
+  assert.equal(kept.activeTasks, 2);
+
+  // Proven membership change still corrects the counts, and only the counts.
+  await h.append(jsonRow({
+    type: "attachment",
+    attachment: { type: "task_status", taskId: "b1", taskType: "local_bash", status: "completed" },
+  }));
+  readNow(received);
+  await waitFor(() => h.latest().activeTasks === null, "the transition must still correct the counts");
+  assert.equal(h.latest().busy, true, "a membership transition does not erase the foreground");
+  assert.equal(h.latest().pendingInput, true);
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+});
+
+test("unrelated hook activity keeps the last-reported counts, including a published Ready", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
+  await h.append(summaryRow());
+  await waitFor(() => h.readySnapshots().length > 0, "Ready should land");
+
+  // A late tool close, subagent metadata, and a child snapshot with different
+  // numbers are all unrelated to root background membership.
+  const before = h.snapshots.length;
+  h.hook("PostToolUse", { tool_name: "Read", tool_use_id: "tool-late" });
+  h.hook("SubagentStart", { agent_id: "agent-9" });
+  h.hook("SubagentStop", { agent_id: "agent-9", background_counts: { tasks: 0, shells: 0 } });
+  await settle();
+  assert.equal(h.snapshots.length, before, "unrelated hooks publish nothing about membership");
+  const kept = h.latest();
+  assert.equal(kept.busy, false);
+  assert.deepEqual(kept.activity, ["Ready"]);
+  assert.equal(kept.activeTasks, 2);
+  assert.equal(kept.activeShells, 1);
+  h.controller.dispose();
+});
+
+test("a transcript this controller cannot read never nulls a hook-payload count", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  // The bound transcript is gone before this boundary: the terminal claim cannot
+  // be read, and that is reported as a gap on the transcript lane.
+  await fs.rm(h.transcript);
+  h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
+  assert.ok(h.gaps.includes("unavailable"), `expected an unavailable gap: ${h.gaps.join(",")}`);
+  const after = h.latest();
+  assert.equal(after.busy, null);
+  assert.equal(after.activeTasks, 2, "a transcript gap must not silently null a hook-reported count");
+  assert.equal(after.activeShells, 1);
+  await settle();
+  assert.deepEqual(h.readySnapshots(), []);
+  h.controller.dispose();
+});
+
+test("a withdrawn count is never reconstructed from later activity", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
+  assert.equal(h.latest().activeTasks, 2);
+
+  // Proven membership change makes the snapshot unknown...
+  await h.append(jsonRow({
+    type: "attachment",
+    attachment: { type: "task_status", taskId: "b1", taskType: "local_bash", status: "running" },
+  }));
+  await waitFor(() => h.latest().activeTasks === null, "the transition should invalidate the snapshot");
+
+  // ...and nothing about later foreground work may put a number back: no
+  // reconstruction from tool use, model output, quietness, or a child snapshot.
+  h.hook("PreToolUse", { tool_name: "Bash", tool_use_id: "tool-x", prompt_id: "prompt-1" });
+  h.hook("PostToolUse", { tool_name: "Bash", tool_use_id: "tool-x", prompt_id: "prompt-1" });
+  h.hook("SubagentStop", { agent_id: "agent-9", background_counts: { tasks: 1, shells: 1 } });
+  await h.append(rootAssistantTextRow());
+  await settle();
+  assert.equal(h.latest().activeTasks, null, "activity is never a count");
+  assert.equal(h.latest().activeShells, null, "activity is never a count");
+  h.controller.dispose();
+});
+
+test("an unreadable ROOT Stop snapshot is unknown, never a zero or a hold-over", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
+  assert.equal(h.latest().activeTasks, 2);
+
+  // A root Stop whose own snapshot cannot be read is unknown: not 0/0, not the
+  // previous number carried forward, and not a partial of the unreadable shape.
+  h.controller.acceptHook({
+    backend: "claude",
+    hook_event_name: "Stop",
+    session_id: SESSION,
+    transcript_path: h.transcript,
+    background_counts: { tasks: "two", shells: null },
+  } as unknown as NativeHookEvent);
   assert.equal(h.latest().activeTasks, null);
   assert.equal(h.latest().activeShells, null);
-  assert.equal(h.latest().busy, true);
   h.controller.dispose();
 });
 
@@ -682,7 +877,9 @@ test("truncation of the bound transcript withdraws instead of producing Ready", 
   await waitFor(() => h.gaps.includes("truncated"), "a shrink should be reported as a gap");
   assert.deepEqual(h.readySnapshots(), []);
   assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  // The hook-payload snapshot is not a claim about this file: it survives.
+  assert.equal(h.latest().activeTasks, 1);
+  assert.equal(h.latest().activeShells, 1);
   h.controller.dispose();
 });
 
@@ -699,7 +896,8 @@ test("replacing the bound transcript file is a gap, not a witness", async () => 
 
   await waitFor(() => h.gaps.includes("replaced"), "a replacement should be reported as a gap");
   assert.deepEqual(h.readySnapshots(), []);
-  assert.equal(h.latest().activeTasks, null);
+  assert.equal(h.latest().activeTasks, 1, "a lost file never nulls a hook-reported count");
+  assert.equal(h.latest().activeShells, 0);
   h.controller.dispose();
 });
 
@@ -713,7 +911,7 @@ test("a malformed record in the scanned window withdraws the supported state", a
   await waitFor(() => h.gaps.includes("malformed"), "an unreadable record should be reported");
   assert.deepEqual(h.readySnapshots(), []);
   assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeShells, null);
+  assert.equal(h.latest().activeShells, 1, "the transcript lane failed, not the hook lane");
   h.controller.dispose();
 });
 
@@ -865,7 +1063,7 @@ test("a task transition observed before the terminal row leaves the counts unkno
   h.controller.dispose();
 });
 
-test("new root transcript work after Ready withdraws Ready and counts to unknown with no hook ever arriving", async () => {
+test("new root transcript work after Ready withdraws Ready, keeping the last-reported counts", async () => {
   for (const counts of [{ tasks: 0, shells: 0 }, { tasks: 2, shells: 3 }]) {
     const h = await createHarness();
     await beginTurn(h);
@@ -881,23 +1079,26 @@ test("new root transcript work after Ready withdraws Ready and counts to unknown
     await h.append(rootUserRow());
     await waitFor(() => h.latest().busy === null, "a new root user row must withdraw the published Ready");
     assert.deepEqual(h.latest().activity, [], "a withdrawn row claims no activity label");
-    assert.equal(h.latest().activeTasks, null, "unknown, never a reconstruction");
-    assert.equal(h.latest().activeShells, null);
+    // New foreground work contradicts the foreground, not background membership:
+    // the last reported numbers survive as last-reported, still monitored.
+    assert.equal(h.latest().activeTasks, counts.tasks, "last-reported, not erased by foreground work");
+    assert.equal(h.latest().activeShells, counts.shells);
     assert.deepEqual(h.gaps, [], "observed new work is knowledge, not a source gap");
     assert.deepEqual(h.latest().support, NATIVE_CLAUDE_ACQUISITION_SUPPORT, "no category becomes unsupported");
 
-    // The rest of that silent turn keeps the row unknown: nothing may restore it.
+    // The rest of that silent turn keeps the foreground unknown: nothing may
+    // restore Ready, and no count is invented or reconstructed.
     await h.append(rootAssistantToolUseRow());
     await h.append(rootAssistantTextRow());
     await settle();
     assert.equal(h.readySnapshots().length, 1, "no later row may restore Ready");
     assert.equal(h.latest().busy, null);
-    assert.equal(h.latest().activeTasks, null);
-    assert.equal(h.latest().activeShells, null);
+    assert.equal(h.latest().activeTasks, counts.tasks);
+    assert.equal(h.latest().activeShells, counts.shells);
     for (const snapshot of h.snapshots.slice(publishedBefore)) {
       assert.notStrictEqual(snapshot.busy, true, "a withdrawal never claims busy instead");
-      assert.equal(snapshot.activeTasks, null, "a withdrawal never publishes a count");
-      assert.equal(snapshot.activeShells, null);
+      assert.equal(snapshot.activeTasks, counts.tasks, "a withdrawal never invents or erases a count");
+      assert.equal(snapshot.activeShells, counts.shells);
     }
 
     const leaked = JSON.stringify({ snapshots: h.snapshots, gaps: h.gaps });
@@ -918,8 +1119,9 @@ test("a root user row, an assistant tool_use row, and a plain assistant row each
 
     await h.append(row);
     await waitFor(() => h.latest().busy === null, `the root row must withdraw: ${row.slice(0, 24)}`);
-    assert.equal(h.latest().activeTasks, null);
-    assert.equal(h.latest().activeShells, null);
+    // The foreground went unknown; the last ROOT `Stop` snapshot is untouched.
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 1);
     h.controller.dispose();
   }
 });
@@ -990,36 +1192,164 @@ test("a turn's own rows before the barrier never withdraw, and its summary still
   h.controller.dispose();
 });
 
-test("an old summary and newer root work in one window fail closed instead of recreating Ready", async () => {
+test("root work that starts after the summary spends the batch, in either kind", async () => {
+  for (const row of [rootUserRow(), rootAssistantToolUseRow(), rootAssistantTextRow()]) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h);
+    h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
+    // One read covers the whole batch: a sufficient summary, then a newer root
+    // turn's rows. Newer work outranks a witness that came before it.
+    await h.append(summaryRow() + row);
+    readNow(received);
+    await settle();
+    assert.deepEqual(h.readySnapshots(), [], `a root row after the summary must not leave Ready: ${row.slice(0, 24)}`);
+    assert.equal(h.latest().busy, null);
+    assert.deepEqual(h.latest().activity, []);
+    // The batch is spent on withdrawing: a later summary for that same pass can
+    // no longer republish it.
+    await h.append(summaryRow({ uuid: "summary-row-later" }));
+    readNow(received);
+    await settle();
+    assert.deepEqual(h.readySnapshots(), [], "the spent pass must not close anything");
+    // What the withdrawal contradicts is the foreground, not the last-reported
+    // ROOT Stop snapshot.
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 1);
+    assert.deepEqual(h.gaps, [], "observed work is knowledge, not a source gap");
+    h.controller.dispose();
+  }
+});
+
+test("the closing turn's own trailing rows before its summary still confirm Ready", async () => {
+  // The real turn-end append order: the final assistant row and the tool-result
+  // row are written first, and the provider appends `stop_hook_summary` only once
+  // the whole Stop pass has answered. Each shape is read both in one batch and in
+  // two batches, because the watcher fires on the earlier append too.
+  const trailingRows: Array<readonly [string, string]> = [
+    ["final assistant row", rootAssistantTextRow()],
+    ["tool-result row with message AND toolUseResult", rootUserToolResultRow()],
+    ["tool_use row then its tool-result row", rootAssistantToolUseRow() + rootUserToolResultRow()],
+  ];
+  for (const [label, rows] of trailingRows) {
+    for (const separateBatches of [false, true]) {
+      const received: NativeClaudeWatchHandlers[] = [];
+      const h = await createHarness({ watchFile: manualWatch(received) });
+      await beginTurn(h);
+      h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 1 } });
+      if (separateBatches) {
+        await h.append(rows);
+        readNow(received);
+        await settle();
+        assert.deepEqual(h.readySnapshots(), [], "no witness has been read yet");
+        // The arm stays open, and the last-reported snapshot stays useful, while
+        // the summary is still on its way.
+        assert.equal(h.latest().activeTasks, 2);
+        assert.equal(h.latest().activeShells, 1);
+        assert.deepEqual(h.gaps, []);
+        await h.append(summaryRow());
+        readNow(received);
+      } else {
+        await h.append(rows + summaryRow());
+        readNow(received);
+      }
+      await waitFor(() => h.readySnapshots().length > 0, `Ready should land for ${label}`);
+      const ready = h.latest();
+      assert.equal(ready.busy, false);
+      assert.deepEqual(ready.activity, ["Ready"]);
+      assert.equal(ready.activeTasks, 2);
+      assert.equal(ready.activeShells, 1);
+      assert.deepEqual(h.gaps, []);
+      h.controller.dispose();
+    }
+  }
+});
+
+test("a rejected summary shape before the trailing rows cannot displace the completion boundary", async () => {
+  const rejected: Array<Record<string, unknown>> = [
+    { hookLabel: "SubagentStop" },
+    { agentId: "agent-9" },
+    { isSidechain: true },
+    { hookLabel: "PreToolUse" },
+  ];
+  for (const extra of rejected) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-1");
+    h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 1 } });
+    // One window: a summary this run cannot use, then the closing turn's own
+    // trailing rows, then its real root summary. The unusable row must not set
+    // the positional boundary and spend the pass on ordering alone.
+    await h.append(
+      summaryRow({ ...extra, uuid: "rejected-summary" })
+      + rootAssistantTextRow()
+      + rootUserToolResultRow()
+      + summaryRow({ uuid: "root-summary" }),
+    );
+    readNow(received);
+    await waitFor(
+      () => h.readySnapshots().length > 0,
+      `the valid root summary must still close: ${JSON.stringify(extra)}`,
+    );
+    const ready = h.latest();
+    assert.deepEqual(ready.activity, ["Ready"]);
+    assert.equal(ready.activeTasks, 2);
+    assert.equal(ready.activeShells, 1);
+    assert.deepEqual(h.gaps, []);
+    h.controller.dispose();
+  }
+});
+
+test("a retained snapshot stays monitored after a root-work withdrawal", async () => {
   const received: NativeClaudeWatchHandlers[] = [];
   const h = await createHarness({ watchFile: manualWatch(received) });
   await beginTurn(h);
-  h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
-  // One read covers the whole batch: a sufficient summary, then a newer root
-  // turn's rows. The newer work outranks the witness for the entire batch.
-  await h.append(summaryRow() + rootUserRow() + rootAssistantToolUseRow());
+  h.hook("Stop", { background_counts: { tasks: 3, shells: 1 } });
+  await h.append(summaryRow());
   readNow(received);
+  await waitFor(() => h.readySnapshots().length > 0, "Ready should land");
 
-  await waitFor(() => h.latest().activeTasks === null, "the batch must withdraw the published snapshot");
-  assert.deepEqual(h.readySnapshots(), [], "no witness in a batch with newer root work may publish Ready");
+  // A silent new root turn withdraws the published foreground. The count snapshot
+  // survives it, so the monitoring it depends on must survive too: the controller
+  // re-attaches on the same file and a later transition row still invalidates.
+  const watchersBefore = received.length;
+  await h.append(rootUserRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "new root work must withdraw the published Ready");
+  assert.equal(h.latest().activeTasks, 3);
+  assert.ok(received.length > watchersBefore, "a retained published count stays monitored");
+
+  await h.append(jsonRow({
+    type: "attachment",
+    attachment: { type: "task_status", taskId: "b1", taskType: "local_bash", status: "completed" },
+  }));
+  readNow(received);
+  await waitFor(() => h.latest().activeTasks === null, "the retained snapshot must still be correctable");
   assert.equal(h.latest().busy, null);
-  assert.deepEqual(h.latest().activity, []);
-  assert.equal(h.latest().activeShells, null);
   h.controller.dispose();
 });
 
-test("a root-work withdrawal retires the armed pass, so that turn's later summary cannot restore Ready", async () => {
-  const h = await createHarness();
+test("a new root prompt row retires the armed pass, so that turn's later summary cannot restore Ready", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
   await beginTurn(h, "prompt-1");
   h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
-  // New root work lands while the terminal read is still armed for the old turn.
+  // A NEW root prompt lands while the terminal read is still armed for the old
+  // turn: that is proof of newer work wherever it sits, so the pass is spent.
   await h.append(rootUserRow());
-  await waitFor(() => h.latest().activeTasks === null, "new root work must withdraw the published snapshot");
+  readNow(received);
+  await settle();
+  assert.deepEqual(h.readySnapshots(), [], "the withdrawal itself must not publish Ready");
+
   await h.append(summaryRow());
+  readNow(received);
   await settle();
   assert.deepEqual(h.readySnapshots(), [], "the retired pass must not close anything");
   assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  // The foreground claim went unknown; the last-reported ROOT Stop snapshot stays,
+  // because a new prompt says nothing about background membership.
+  assert.equal(h.latest().activeTasks, 1);
+  assert.equal(h.latest().activeShells, 1);
   h.controller.dispose();
 });
 
@@ -1059,8 +1389,9 @@ test("replacement of the bound file after Ready withdraws published state", asyn
   h.hook("PostToolUse", { tool_name: "Read", tool_use_id: "tool-after-replace" });
 
   await waitFor(() => h.gaps.includes("replaced"), "a replacement after Ready should be reported");
-  assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  assert.equal(h.latest().busy, null, "a transcript-derived Ready cannot survive its file");
+  assert.deepEqual(h.latest().activity, []);
+  assert.equal(h.latest().activeTasks, 1, "the hook-payload count is not a transcript claim");
   h.controller.dispose();
 });
 
@@ -1075,8 +1406,9 @@ test("truncation of the bound file after Ready withdraws published state", async
   h.hook("PostToolUse", { tool_name: "Read", tool_use_id: "tool-after-truncate" });
 
   await waitFor(() => h.gaps.includes("truncated"), "a shrink after Ready should be reported");
-  assert.equal(h.latest().busy, null);
-  assert.equal(h.latest().activeTasks, null);
+  assert.equal(h.latest().busy, null, "a transcript-derived Ready cannot survive its file");
+  assert.deepEqual(h.latest().activity, []);
+  assert.equal(h.latest().activeTasks, 1, "the hook-payload count is not a transcript claim");
   h.controller.dispose();
 });
 
@@ -1098,12 +1430,13 @@ test("without a positively bound transcript path there is no terminal claim", as
   h.hook("Stop", { background_counts: { tasks: 1, shells: 1 } });
 
   assert.ok(h.gaps.includes("unbound-transcript"));
-  // Arming against an unbound file is a source failure, not a bare report: the
-  // counts this Stop carried must not stay published with nothing to monitor them.
+  // Arming against an unbound file withdraws the terminal claim this Stop would
+  // have made. The counts this Stop carried came from the hook payload, not from
+  // that missing file, so they stay published as the last thing that was stated.
   const after = h.latest();
-  assert.equal(after.activeTasks, null);
-  assert.equal(after.activeShells, null);
   assert.equal(after.busy, null);
+  assert.equal(after.activeTasks, 1);
+  assert.equal(after.activeShells, 1);
   await settle();
   assert.deepEqual(h.readySnapshots(), []);
   h.controller.dispose();

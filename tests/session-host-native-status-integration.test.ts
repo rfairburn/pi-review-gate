@@ -458,7 +458,7 @@ test("a real Claude turn: hook lane publishes running, the tool TYPE, and the qu
     assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "UserPromptSubmit", { prompt_id: "p-1" }))).status, "accepted");
     const running = await harness.waitView(id, (view) => view.busy === true, "the accepted root turn");
     assert.deepEqual(running.activity, ["Working"]);
-    assert.equal(running.pendingInput, null, "no question has been observed either way");
+    assert.equal(running.pendingInput, false, "the observed fresh scope establishes no pending question before any request");
 
     assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "PreToolUse", { prompt_id: "p-1", tool_name: "Bash", tool_use_id: "t-1" }))).status, "accepted");
     const tool = await harness.waitView(id, (view) => view.activity[0] === "bash", "the observed tool TYPE");

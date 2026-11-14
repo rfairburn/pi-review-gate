@@ -38,10 +38,12 @@
  *   rootness, sufficiency, and binding rules the acquisition layer must satisfy;
  *   this module never tails a transcript, reconstructs a census, or ranks source
  *   records against each other.
- * - A definitive question closure yields `pendingInput: false` only for a scope
- *   a genuine root `SessionStart` established as fully observed, and only while
- *   this reducer can vouch that no other observed request remains open. A scope
- *   adopted mid-stream or released by invalidation keeps that claim unknown.
+ * - A definitive question census yields `pendingInput: false` only for a scope a
+ *   genuine root `SessionStart` with a readable identity established as fully
+ *   observed: that same boundary vouches the census EMPTY (no request can have
+ *   opened before this scope began), and it stays false while this reducer can
+ *   vouch that no observed request remains open. A scope adopted mid-stream or
+ *   released by invalidation keeps that claim unknown.
  * - Only the tool TYPE is retained. Tool arguments, commands, results, question
  *   text, answers, annotations, and transcripts are never read into state, and
  *   the fixed labels reuse the existing `Working`/`Ready` convention.
@@ -305,7 +307,12 @@ export class NativeClaudeStatusReducer {
    * never claims a definitive false for this scope.
    */
   #censusIncomplete = false;
-  /** True only after a definitive close left every observed request closed. */
+  /**
+   * True only while every question request this scope could have opened is
+   * positively known not to be open: either a genuine root `SessionStart`
+   * established the census empty at its beginning, or a definitive close left
+   * every observed request closed.
+   */
   #closureVouched = false;
   /**
    * Caller-attested identity of the last accepted terminal read, so re-reading
@@ -458,12 +465,19 @@ export class NativeClaudeStatusReducer {
   /**
    * A genuine root SessionStart is the only rebind: the new scope inherits no
    * Ready, pending, tool, question, or session claim, and only this boundary can
-   * mark the scope fully observed. A subagent SessionStart never rebinds.
+   * mark the scope fully observed and vouch its question census empty. A
+   * subagent SessionStart never rebinds.
    */
   #reduceSessionStart(sessionId: string | null, scope: ObservedScope): NativeClaudeReduceResult {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
     this.#resetScope(sessionId);
     this.#scopeFullyObserved = sessionId !== null;
+    // A root SessionStart with a readable identity shows the question census
+    // from its beginning, so nothing can have opened unobserved before it: the
+    // census is positively EMPTY here, which is the only pre-question source of
+    // a `pendingInput: false` claim. An adopted, invalidated, or unidentified
+    // scope never gets this baseline, so it stays unknown as before.
+    this.#closureVouched = sessionId !== null;
     // Without an identity the scope is genuinely new but uncorrelatable; the
     // next eligible event adopts it rather than a fabricated pairing.
     return sessionId === null
@@ -644,6 +658,12 @@ export class NativeClaudeStatusReducer {
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
   }
 
+  /**
+   * `true` for any positively observed open request; `false` only for a fully
+   * observed scope whose census is vouched empty — either by its own root
+   * `SessionStart` or by a definitive close of every observed request — and
+   * which has suffered no observation hole since; otherwise unknown.
+   */
   #pendingInput(): boolean | null {
     if (this.#openQuestions.size > 0) return true;
     if (!this.#scopeFullyObserved || this.#censusIncomplete || !this.#closureVouched) return null;

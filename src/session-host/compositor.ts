@@ -203,11 +203,13 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 	// Geometry produced by computeHostLayout covers every output column and
 	// row. Keep even malformed externally supplied layouts bounded at output.
 	for (let row = 0; row < lines.length; row += 1) {
-		if (visibleWidth(lines[row]) > layout.cols) {
+		let width = composedWidth(lines[row]);
+		if (width > layout.cols) {
 			lines[row] = `${sliceByColumn(lines[row], 0, layout.cols, true)}${SGR_RESET}`;
+			width = composedWidth(lines[row]);
 		}
-		if (visibleWidth(lines[row]) < layout.cols) {
-			lines[row] += " ".repeat(layout.cols - visibleWidth(lines[row]));
+		if (width < layout.cols) {
+			lines[row] += " ".repeat(layout.cols - width);
 		}
 	}
 
@@ -306,9 +308,74 @@ function headerRow(header: string, notice: string | undefined, cols: number): st
 }
 
 function panelRow(source: string | undefined, width: number): string {
-	const safe = sanitizeControls(typeof source === "string" ? source : "", true);
-	return `${SGR_RESET}${fitText(safe, width)}${SGR_RESET}`;
+	const text = typeof source === "string" ? source : "";
+	const remembered = panelRowMemo.get(width, text);
+	if (remembered !== undefined) return remembered;
+	const safe = sanitizeControls(text, true);
+	const row = `${SGR_RESET}${fitText(safe, width)}${SGR_RESET}`;
+	panelRowMemo.set(width, text, row);
+	return row;
 }
+
+/** Display width of one composed row; a pure function of the row text. */
+function composedWidth(line: string): number {
+	const remembered = composedWidthMemo.get(0, line);
+	if (remembered !== undefined) return remembered;
+	const width = visibleWidth(line);
+	composedWidthMemo.set(0, line, width);
+	return width;
+}
+
+/**
+ * Bounded two-generation memo for pure per-row functions. Consecutive frames
+ * repeat most rows (the roster, unchanged conversation lines), so a row's
+ * result is reused instead of recomputed; entries not used for two
+ * generations are dropped, and each generation is capped by both entry count
+ * and retained source text.
+ */
+class RowMemo<V> {
+	private current = new Map<number, Map<string, V>>();
+	private previous = new Map<number, Map<string, V>>();
+	private entries = 0;
+	private codeUnits = 0;
+
+	constructor(private readonly maxEntries: number, private readonly maxCodeUnits: number) {}
+
+	get(width: number, source: string): V | undefined {
+		const hit = this.current.get(width)?.get(source);
+		if (hit !== undefined) return hit;
+		const old = this.previous.get(width)?.get(source);
+		if (old !== undefined) this.set(width, source, old);
+		return old;
+	}
+
+	set(width: number, source: string, value: V): void {
+		// Retained text is the key plus a string result; numbers cost nothing extra.
+		const cost = source.length + (typeof value === "string" ? value.length : 0);
+		if (cost > this.maxCodeUnits) return;
+		if (this.entries >= this.maxEntries || this.codeUnits + cost > this.maxCodeUnits) {
+			this.previous = this.current;
+			this.current = new Map();
+			this.entries = 0;
+			this.codeUnits = 0;
+		}
+		let byWidth = this.current.get(width);
+		if (byWidth === undefined) {
+			byWidth = new Map();
+			this.current.set(width, byWidth);
+		}
+		if (!byWidth.has(source)) {
+			this.entries += 1;
+			this.codeUnits += cost;
+		}
+		byWidth.set(source, value);
+	}
+}
+
+const ROW_MEMO_MAX_ENTRIES = 4096;
+const ROW_MEMO_MAX_CODE_UNITS = 1024 * 1024;
+const panelRowMemo = new RowMemo<string>(ROW_MEMO_MAX_ENTRIES, ROW_MEMO_MAX_CODE_UNITS);
+const composedWidthMemo = new RowMemo<number>(ROW_MEMO_MAX_ENTRIES, ROW_MEMO_MAX_CODE_UNITS);
 
 /** Clip on grapheme/cell boundaries with the same pinned TUI width model. */
 function fitText(source: string, width: number): string {

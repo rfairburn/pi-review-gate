@@ -2902,8 +2902,15 @@ one that returns to the previous dimensions) redraw fully, cursor-only changes
 emit only the cursor sequence, and an unchanged frame emits nothing. Rapid
 invalidations coalesce so that only the newest composed frame is drawn at the
 next allowed redraw, and when the terminal refuses a write (backpressure) only
-the newest bounded frame is retained until drain. Main-focus input that leaves
-the child screen unchanged no longer reconciles host layout or prepares/submits
+the newest bounded frame is retained until drain. Changes that only update
+displayed content (parsed child output, roster and status changes, and an arriving
+remote viewport) are not composed while the writer still retains an undrawn frame:
+they are composed once, immediately before the writer takes its next frame, so
+continuous output costs about one composition per drawn frame rather than one per
+output chunk, without delaying that frame. Each session's virtual-terminal
+snapshot is likewise built once per parse and reused until the next write, and
+rows that did not change are not recomposed or reserialized. Main-focus input
+that leaves the child screen unchanged no longer reconciles host layout or prepares/submits
 a speculative frame for that unchanged screen. The child's existing output
 `onChange` path still updates the display; host UI, focus, layout, and resize
 actions remain immediate. This changes only redundant redraw work: it does not

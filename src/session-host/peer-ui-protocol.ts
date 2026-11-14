@@ -1,5 +1,6 @@
 /** Pure display/action contracts for the network sidebar (issue #482). No IO. */
 import type { RemoteSessionMetadata } from "./network/roster-metadata";
+import type { RemoteNativeCliTarget } from "./network/peer-create";
 
 export interface PeerUiConsent {
 	/** Opaque coordinator-owned request handle, not a display label or fingerprint. */
@@ -25,6 +26,28 @@ export interface PeerUiConsent {
 export interface PeerUiHostSaved {
 	readonly supported: boolean;
 	readonly deleteExposed: boolean | null;
+}
+
+/**
+ * Descriptive NATIVE-lane facts the coordinator observed for ONE destination.
+ * `supported` is true only while that owner is connected over a live metadata
+ * viewer that acknowledged the optional native lane — which the owner states only
+ * when it really holds a native create provider and an explicit target catalog.
+ * `targets` are the descriptors that owner advertised in its LAST COMPLETE roster
+ * observation, in the owner's own order: they are the only native targets this
+ * destination can ever be asked to launch, and they are display facts only. They
+ * grant nothing, the owner re-proves the exact descriptor against its own live
+ * catalog on every request, and an absent entry is never a default, a Pi fallback,
+ * or a locally configured target.
+ *
+ * Absence of the whole description means NOT supported and nothing to offer: an
+ * older coordinator, a fake, a disconnected or stale destination, a reconnect, a
+ * run replacement, or an owner with no native capability. A present
+ * `supported: false` is an honest unsupported choice that is asked nothing.
+ */
+export interface PeerUiHostNativeCli {
+	readonly supported: boolean;
+	readonly targets: readonly RemoteNativeCliTarget[];
 }
 
 export interface PeerUiHost {
@@ -60,6 +83,24 @@ export interface PeerUiHost {
 	readonly saved?: PeerUiHostSaved;
 	/** Current negotiated owner rename support; descriptive only, never authority. */
 	readonly renameSupported?: boolean;
+	/**
+	 * Optional native-lane capability and the owner's advertised launch targets.
+	 * Absent (an older coordinator, a fake, or a destination with no current
+	 * native observation) means NOT supported and no choices: the New form offers
+	 * nothing native for this destination and requests nothing from it. Like every
+	 * other fact here this is descriptive only — it never authorizes a create, and
+	 * the owner's own provider and final re-proof remain authoritative.
+	 */
+	readonly nativeCli?: PeerUiHostNativeCli;
+	/**
+	 * Optional descriptive support for the SEPARATE native HOST ROW NAME lane: the
+	 * owner's own verified ability to caption one of its native rows on request.
+	 * Absent (an older coordinator or fake) means NOT supported and nothing is ever
+	 * asked of it; `false` is an honest unsupported choice that is asked nothing.
+	 * Like every other fact here this is descriptive only — it never authorizes a
+	 * name, and the owner's own provider and final re-proof remain authoritative.
+	 */
+	readonly nativeNameSupported?: boolean;
 }
 
 export interface PeerUiTrustedPeer {

@@ -33,8 +33,12 @@
  *   native capsule OSC (`NATIVE_CLIPBOARD_OSC`, #466): its opaque payload is
  *   handed verbatim to `onNativeClipboardCapsule` and is never rendered,
  *   logged, forwarded, or turned into a clipboard action by this class — the
- *   owner's authenticated receiver decides. Unrelated OSC numbers keep the
- *   parser's default deny. A narrow native Kitty PNG subset is split
+ *   owner's authenticated receiver decides. A surface may additionally opt into
+ *   the CLOSED hosted-provider TEXT copy sink (`onNativeCliOsc52Copy`), which
+ *   receives only a parsed, canonical-base64 UTF-8 text payload and nothing
+ *   else; without that explicit option raw OSC 52 stays denied exactly as before.
+ *   Unrelated OSC numbers keep the parser's default deny. A narrow native Kitty
+ *   PNG subset is split
  *   before VT parsing, validated, and exposed only as typed image/placement
  *   and native-style fallback metadata; there is no renderer or host notice,
  *   and unsupported graphics commands are swallowed rather than forwarded.
@@ -114,7 +118,7 @@ import {
 	createTerminalGraphicsBudget,
 } from "./kitty-graphics";
 import { XtermDiagnosticCollector, type TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { NATIVE_CLIPBOARD_OSC } from "./native-clipboard";
+import { NATIVE_CLIPBOARD_OSC, parseNativeCliOsc52Text } from "./native-clipboard";
 
 /** A cell color as recorded by headless: default, 256-palette index, or RGB. */
 export interface TerminalColorSpec {
@@ -253,6 +257,21 @@ export interface TerminalSurfaceOptions {
 	 * callback; the payload stays out of frame text either way.
 	 */
 	readonly onNativeClipboardCapsule?: (capsule: string) => void;
+	/**
+	 * CLOSED opt-in capture of one standard OSC 52 TEXT copy request emitted by an
+	 * owned hosted provider child (issue 277 native text-copy slice). When present,
+	 * the payload is parsed and normalized by `parseNativeCliOsc52Text` and only a
+	 * validated canonical-base64 UTF-8 text payload reaches this callback; a query,
+	 * binary, malformed, empty, or over-bound payload is refused whole and nothing
+	 * is called.
+	 *
+	 * Absent (the default, and every Pi surface) keeps raw OSC 52 denied exactly as
+	 * before: the sequence is swallowed, never rendered, never replied to, and never
+	 * turned into a clipboard action here. This class still interprets no destination
+	 * and performs no clipboard write — the owner decides who, if anyone, receives
+	 * the captured text.
+	 */
+	readonly onNativeCliOsc52Copy?: (encoded: string) => void;
 	/** Optional budget shared by the host's surfaces; omitted means private. */
 	readonly graphicsBudget?: TerminalGraphicsBudget;
 	/** Bounded named scrollback lines (default 1000). */
@@ -965,7 +984,22 @@ export class TerminalSurface {
 		// untrusted controls. Only the authenticated native-producer capsule
 		// below can now reach the owner's separate clipboard route; reconstructed
 		// screen text and arbitrary PTY bytes grant no clipboard authority.
-		this.attach(this.terminal.parser.registerOscHandler(52, () => true));
+		// The one exception is a surface that explicitly opted into the closed
+		// hosted-provider TEXT copy sink: even then only a fully parsed, normalized
+		// text payload reaches that callback, a query/binary/malformed/over-bound
+		// payload is refused whole, the handler still claims the sequence so it can
+		// never fall through to default OSC handling or frame text, and no reply,
+		// clipboard write, or destination decision happens in this class.
+		this.attach(this.terminal.parser.registerOscHandler(52, (data) => {
+			const sink = this.options.onNativeCliOsc52Copy;
+			if (sink !== undefined && !this.disposed) {
+				const encoded = parseNativeCliOsc52Text(data);
+				if (encoded !== undefined) {
+					this.safePeerInvoke(() => sink(encoded));
+				}
+			}
+			return true;
+		}));
 		// The host's private capsule OSC (#466) is always claimed, so a capsule —
 		// verified or not — can never fall through to the parser's default OSC
 		// handling (icon/title side effects, diagnostics) or reach frame text.

@@ -97,6 +97,17 @@ function localNewFormRows(draft = ""): string[] {
   ];
 }
 
+/**
+ * The completed Local New form with the optional Provider line the native host
+ * draws between the Host line and the workspace field when it offers providers
+ * and the pane has the row: Header, Host, Provider, then the Editor's own
+ * top rule, labelled body row, and bottom rule.
+ */
+function localNewFormWithProviderRows(draft = ""): string[] {
+  const rows = localNewFormRows(draft);
+  return [rows[0]!, rows[1]!, "  Provider: [ Pi ]", ...rows.slice(2)];
+}
+
 test("shared New-open witness accepts the completed Local form with an empty or retained Workspace draft", () => {
   const empty = formHostFrame(localNewFormRows());
   assert.equal(isCompleteLocalNewFormFrame(empty), true, "the completed default-Local empty form is observed");
@@ -113,6 +124,108 @@ test("shared New-open witness accepts the completed Local form with an empty or 
   const hostFocused = formHostFrame(localNewFormRows().map((line, index) => index === 1 ? "> Host: [ Local ]" : line));
   assert.equal(workspaceOnlyNewFrame(hostFocused), true,
     "the same completed Local form is witnessed while its Host line owns focus");
+});
+
+test("shared New-open witness accepts the default Pi Provider line drawn above Workspace", () => {
+  const empty = formHostFrame(localNewFormWithProviderRows());
+  assert.equal(isCompleteLocalNewFormFrame(empty), true,
+    "the completed default-Local empty form with its complete default Provider line is observed");
+  assert.equal(workspaceOnlyNewFrame(empty), true,
+    "the drawn Provider line is part of the genuine New form, never a synthetic field");
+  assert.equal(isEmptyWorkspaceField(empty), true,
+    "the bordered empty body is still witnessed as empty beside the Provider line");
+
+  const retainedDraft = "/private/tmp/shm-abc123/saved-main-workspace-de4be0/";
+  assert.equal(workspaceOnlyNewFrame(formHostFrame(localNewFormWithProviderRows(retainedDraft))), true,
+    "the Provider layout with its retained Local workspace draft is the genuine New form");
+
+  const hostFocused = formHostFrame(localNewFormWithProviderRows()
+    .map((line, index) => index === 1 ? "> Host: [ Local ]" : line));
+  assert.equal(workspaceOnlyNewFrame(hostFocused), true,
+    "the Provider layout is witnessed while its Host line owns focus");
+
+  // The legacy layout stays accepted: a host that offers no provider, and a
+  // pane with no spare row, draw the form without the Provider line.
+  assert.equal(isCompleteLocalNewFormFrame(formHostFrame(localNewFormRows())), true,
+    "the completed no-Provider Local form remains the genuine New form");
+});
+
+test("shared New-open witness rejects incomplete, altered, duplicated, and misordered Provider rows", () => {
+  const rows = localNewFormWithProviderRows();
+  const gutter = " ".repeat(WORKSPACE_LABEL.length);
+  const rejects = (right: readonly string[], reason: string): void => {
+    const frame = formHostFrame(right);
+    assert.equal(isCompleteLocalNewFormFrame(frame), false, reason);
+    assert.equal(workspaceOnlyNewFrame(frame), false, `${reason}: the shared New-open witness keeps waiting`);
+  };
+
+  rejects([rows[0]!, rows[1]!, "> Provider: [ Pi ]", ...rows.slice(3)],
+    "a Provider line that owns the form's focus is not the drawn default");
+  rejects([rows[0]!, rows[1]!, "  Provider: [ Claude Code ]", ...rows.slice(3)],
+    "an explicitly chosen non-Pi provider is not the default New form");
+  rejects([rows[0]!, rows[1]!, "  Provider: [ Pi", ...rows.slice(3)],
+    "a Provider value painted only partway is not a complete drawn line");
+  rejects([rows[0]!, rows[1]!, "  Provider: [...]", ...rows.slice(3)],
+    "a truncated Provider value is not the complete default choice");
+  rejects([rows[0]!, rows[1]!, "  Provider:", ...rows.slice(3)],
+    "a bare Provider caption with no drawn value is never evidence");
+  rejects([rows[0]!, rows[1]!, rows[2]!, rows[2]!, ...rows.slice(3)],
+    "two Provider rows are not one drawn control");
+  rejects([rows[0]!, rows[1]!, "", rows[2]!, ...rows.slice(3)],
+    "a Provider line one row below the Host line is not its drawn slot");
+  rejects([rows[0]!, rows[2]!, rows[1]!, ...rows.slice(3)],
+    "the drawn order is Host then Provider, never Provider above Host");
+
+  // A Provider control drawn anywhere else in the form pane is a second or
+  // misplaced control, never the drawn default: the whole pane is surveyed, so
+  // a matching Editor box above or below it cannot carry the frame.
+  const legacy = localNewFormRows();
+  rejects([...legacy.slice(0, 5), "  Provider: [ Pi ]", ...legacy.slice(5)],
+    "a Provider control below the legacy form's bottom border is not its drawn slot");
+  rejects([...legacy.slice(0, 5), "  Provider: [ Claude Code ]", ...legacy.slice(5)],
+    "a trailing non-Pi Provider selection is never the default New form");
+  rejects([...legacy.slice(0, 4), "  Provider: [ Pi ]", legacy[4]!],
+    "a Provider control between the labelled row and the bottom border is not evidence");
+  rejects([...rows.slice(0, 6), "  Provider: [ Pi ]", ...rows.slice(6)],
+    "a second Provider control below the Provider layout's bottom border is not one drawn control");
+  rejects([...rows.slice(0, 6), "  Provider: [ Claude Code ]", ...rows.slice(6)],
+    "a trailing non-Pi Provider selection never accompanies the drawn default");
+  rejects([...rows.slice(0, 4), "  Provider: [ Pi ]", ...rows.slice(4)],
+    "a second Provider control inside the Editor box is never the drawn slot");
+
+  rejects([rows[0]!, rows[1]!, rows[2]!, "", rows[3]!, rows[4]!, rows[5]!],
+    "the workspace field must sit directly below the drawn Provider line, not one row later");
+  rejects([rows[0]!, rows[1]!, rows[2]!, "", ...rows.slice(4)],
+    "a missing top rule beside a drawn Provider line is never a bordered Editor");
+  rejects([...rows.slice(0, 5), `${gutter}${"─".repeat(40)}`, ...rows.slice(6)],
+    "a bottom rule of a different width than the top rule is stale geometry beside a Provider line");
+  rejects([rows[0]!, "  Host: [ build-box ]", rows[2]!, ...rows.slice(3)],
+    "a non-Local Host destination never becomes the default Local form by drawing a Provider line");
+
+  // Only a Provider control row is surveyed: a workspace draft whose own text
+  // mentions a provider is body content, and the completed form stays accepted.
+  assert.equal(workspaceOnlyNewFrame(formHostFrame(localNewFormRows("Provider: [ Pi ]"))), true,
+    "a workspace draft whose text mentions a provider is body content, not a second control row");
+
+  // The reproduced partial paint of the Provider layout: the complete header,
+  // Host line, Provider line, top rule and labelled body row, with the bottom
+  // rule's row not yet repainted. Every caption the substring witnesses read is
+  // present, so only the complete bordered Editor can admit the frame.
+  const partial = formHostFrame(rows, 5);
+  assert.equal(partial.includes("New session"), true);
+  assert.equal(partial.includes("Provider: [ Pi ]"), true);
+  assert.equal(partial.includes("> Workspace:"), true);
+  assert.equal(isCompleteLocalNewFormFrame(partial), false,
+    "a Provider layout whose bottom Editor rule is not yet drawn is not an open New form");
+  assert.equal(workspaceOnlyNewFrame(partial), false,
+    "the shared New-open witness keeps waiting for the completed bordered Editor");
+
+  // The same Provider geometry drawn in the left roster pane instead of the
+  // form pane is never right-pane evidence.
+  const wrongPane = hostFrameRows(rows, ["", "", ""], Number.POSITIVE_INFINITY).join("\n");
+  assert.equal(wrongPane.includes("Provider: [ Pi ]"), true);
+  assert.equal(isCompleteLocalNewFormFrame(wrongPane), false,
+    "the Provider layout drawn in the left roster pane is never right-pane evidence");
 });
 
 test("shared New-open witness rejects the reproduced partial paint whose bottom Editor rule is not yet drawn", () => {

@@ -18,6 +18,16 @@ owner's [saved conversations](#saved-conversations-on-a-connected-owner). It
 does this without adopting, migrating, or synchronizing them: the owning host
 keeps every process.
 
+The host's own sessions are Pi sessions, and it can also host a real full native
+interactive **Claude Code** or **Codex CLI** session as its own sidebar row beside
+them. Pi stays the default: every New-session form opens on Pi, and a native row is
+always an explicit local choice. That hosting is initial — the launch and process
+handling is covered by real PTY tests whose children are synthetic programs and the
+form and roster behavior by UI-level tests, while a real provider's own TUI behavior
+remains unverified. How a native row
+starts, what its row may honestly display, and a safe owned staging tryout are owned
+by [Native Claude Code and Codex sessions](native-sidebar-agents.md).
+
 This page documents the host as it ships, not a blanket compatibility guarantee. The host
 design uses Pi's public `ProcessTerminal` input and terminal-negotiation path with custom
 generated frame composition; it is not a `TuiAltScreen` renderer. Native wrapper,
@@ -28,23 +38,27 @@ Component, mock, or socket tests alone do not prove compatibility with a real
 native Pi wrapper, and same-host network tests do not establish two-machine,
 operator, or platform readiness for the cross-machine features. macOS and Linux
 are the intended POSIX host platforms; intended platform scope is not evidence
-that end-to-end runtime compatibility has been proven. Windows startup, public
-named-pipe, and pinned node-pty ConPTY source paths are validation paths only;
-they are not Windows runtime support or readiness evidence. Manual Windows
-validation has observed mouse clicks working, but that observation does not
-certify sidebar single-click activation, native Main click-to-focus, other
-physical input, or complete host-process shutdown (see below). Device-attributes
-negotiation also requires complete runtime acceptance; its narrow witness
-investigation is tracked in
+that end-to-end runtime compatibility has been proven. Windows is not an
+unsupported validation target: the host's generic Windows Pi runtime path has
+passed real runtime acceptance on native Windows runners at the Node floors
+then in force — 22.23.4 and 24.22.1 — on the pinned Pi 1.5.2. The genuine
+native Main case (startup, two live Pi sessions, the public Quit confirmation,
+original-process and outer-PTY settlement, and full terminal restoration) and
+both cold hosted-source wrapper legs (cmd and direct PowerShell) ran to
+completion with no skip, as did the owned bundled-ConPTY reader settlement
+case, and the mouse-tracking/SGR and device-attributes protocol witnesses that
+live inside those cases passed with them. Every missing prerequisite there is a
+hard failure rather than a skip. The narrow device-attributes witness
+investigation stays tracked in
 https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
-Windows-host follow-up. All remaining Windows sidebar/host runtime acceptance
-stays deferred to https://github.com/rfairburn/pi-review-gate/issues/345: the
-real native Main case (startup, public Quit confirmation,
-original-process/kernel settlement/restoration) and both cold hosted-source
-wrapper legs (cmd and direct PowerShell) are retained in the suite but
-explicitly skipped, so green CI does not certify Windows runtime support; the
-Windows sidebar/host remains an unsupported validation target. CI now calls the
-separate session-host acceptance matrix in
+Windows-host follow-up. That acceptance is measured scope, not a blanket
+certification: it covers the host's own Pi sessions on the tested Node and Pi
+pins, and it says nothing about other Windows builds or terminal emulators,
+physical input beyond what the limitation below lists, true two-machine
+operation, or a real Claude Code or Codex TUI. Remaining Windows sidebar/host
+runtime acceptance stays tracked at
+https://github.com/rfairburn/pi-review-gate/issues/345. CI runs the separate
+session-host acceptance matrix in
 `.github/workflows/session-host-alpha.yml` — emitting the stable check names
 **Windows session host alpha (Node 22)** and **Windows session host alpha
 (Node 24)** — qualified by that caller as **Session host alpha matrix / Windows
@@ -54,58 +68,75 @@ results before publishing a numbered prerelease. Those names come from the
 matrix's stable per-major labels, each paired explicitly with that line's exact
 pinned runtime (22.23.5 and 24.22.3), so a later patch or minor floor bump
 keeps these check names and the required contexts unchanged; adding or dropping
-a supported major stays a separate support decision. That reuse changes no
-deferral: the genuine native Main case and both cold hosted-source wrapper legs
-above are
-registered with an unconditional skip, so they stay deferred under #345 even
-inside that matrix, and a green matrix job is not proof that those cases
-executed. What the matrix does run on native Windows runners is its non-deferred
-tiers — the named-pipe broker/reporter/protocol components, the pure Windows
-helper contracts, the real pinned-provider workspace completion case, the
-Network storage real-Main cases, and the launcher witness/deadline regressions —
-with every missing prerequisite a hard failure for those tiers. The unresolved
-shutdown and physical-input limitations below are unchanged.
+a supported major stays a separate support decision. Inside that matrix the
+real-Main, Network storage, reader-settlement, and cold wrapper-leg steps run
+under the acceptance opt-in CI sets, so a completed green matrix job means those
+cases executed and passed there rather than being skipped. What the matrix also
+runs on native Windows runners is its other enforced tiers — the named-pipe
+broker/reporter/protocol components, the pure Windows helper contracts, the
+real pinned-provider workspace completion case, and the launcher
+witness/deadline regressions — with every missing prerequisite a hard failure
+for those tiers. That completed Windows evidence is from the floors then in
+force (22.23.4 and 24.22.1): the matrix now pins the raised 22.23.5 and 24.22.3,
+so its green run at those floors is still pending. The unresolved physical-input
+limitations below are unchanged.
 
 ## Known limitation: Windows runtime acceptance
 
-Bundled-ConPTY diagnostics have observed genuine native mouse-tracking/SGR
-requests and device-attributes negotiation. Their assertions are retained in the
-explicitly skipped runtime cases; those protocol observations do not certify
-physical wheel or selection behavior. Manual Windows validation has observed
-mouse clicks working, and that observation is limited to clicks:
+The host's generic Windows Pi runtime path is accepted by evidence rather than
+deferral. On native Windows runners at Node 22.23.4 and Node 24.22.1, with the
+pinned Pi 1.5.2, the real public Main case with two live Pi sessions and the
+public Quit confirmation, both cold hosted-source wrapper legs (cmd and direct
+PowerShell), and the owned bundled-ConPTY reader settlement case each passed
+with zero skips, keeping their original-process and outer-PTY exit and full
+terminal-restoration assertions. Complete graceful shutdown is therefore
+established for that tested path rather than assumed: the host captures the
+pinned addon's own ConPTY output reader at spawn, calls that addon's own drain
+and dispose path only after that exact terminal reports its genuine exit,
+revalidates the captured ownership chain before invoking anything, and treats a
+reader whose settlement it never observed as a cleanup failure instead of
+success. No forced exit, process kill, or synthesized result stands in for that
+positive evidence. That proof covers the tested Node and Pi pins on the runners'
+Windows terminals; it says nothing about other Windows builds or terminal
+emulators, or about a real Claude Code or Codex TUI.
+
+Physical input remains the open limitation here, and it stays bounded.
+Bundled-ConPTY diagnostics observed genuine native mouse-tracking/SGR requests
+and device-attributes negotiation inside the runtime cases that now run; those
+protocol observations do not certify physical wheel or selection behavior.
+Manual Windows validation has observed mouse clicks working, and that
+observation is limited to clicks:
 wheel/conversation scrolling and pane-confined selection still require
 interactive validation, rather than editor-history navigation or selection
 crossing host panes. Sidebar single-click activation and native Main
-click-to-focus are described below, but neither certifies Windows runtime
-behavior (#323, #345). Conversation wheel/trackpad scrolling remains outside
+click-to-focus are described below, but neither certifies Windows physical-input
+behavior (#323). Conversation wheel/trackpad scrolling remains outside
 this change and separate under #332; scroll-smoothness tuning remains separate
 work. A cosmetic child-pane flicker on pointer movement and clicks has been
 observed; it is not breakage and not a release blocker (#343). Native
 Pi/review-gate startup latency on Windows has been present since before this
-release and is unrelated to it (#344).
-
-Complete graceful shutdown is also unresolved: native child exits and a returned
-Main status do not establish original Main and outer/wrapper process settlement.
-Current diagnostics have not established that complete settlement; the pinned
-ConPTY lifecycle is an investigation lead, not proof of the exact retained
-resource or its cause. The genuine Main and cold CMD/direct-PowerShell runtime
-cases remain deferred under
-https://github.com/rfairburn/pi-review-gate/issues/345. Result files, passing
-subtests, or forced exits cannot replace positive original-process exit and full
-terminal-restoration evidence. Green CI does not certify Windows runtime
-support.
+release and is unrelated to it (#344). Windows sidebar/host runtime acceptance
+beyond the evidence above stays tracked at
+https://github.com/rfairburn/pi-review-gate/issues/345.
 
 ## Requirements and launch
 
 - **Host platform:** same-machine POSIX macOS or Linux remains the documented
-  runtime scope. Windows source paths now admit the same-machine host and public
-  ConPTY flow for validation, but Windows is not supported/readiness-certified
-  until real Windows runtime evidence on the patched Node 22 and 24 lines
-  passes. Earlier Windows evidence on Node 22.19.0 and 24.x is historical: it
-  predates the current security floors and is not a patched-runtime run. That
-  runtime acceptance stays deferred under
-  https://github.com/rfairburn/pi-review-gate/issues/345. The ordinary
-  standalone Windows launcher remains unchanged.
+  POSIX runtime scope. Windows now has real runtime evidence on the patched
+  Node 22 and 24 lines: on native Windows runners with the pinned Pi 1.5.2, the
+  real public Main case with two live Pi sessions and the public Quit
+  confirmation, both cold hosted-source wrapper legs (cmd and direct
+  PowerShell), and the owned bundled-ConPTY reader settlement case all passed
+  with no skip at Node 22.23.4 and Node 24.22.1, the floors then in force, with
+  every missing prerequisite a hard failure; the matrix's run at the raised
+  22.23.5 and 24.22.3 floors is still pending. That is the measured scope: it
+  does not certify other Windows builds or terminal emulators, the physical-input
+  gaps listed under the known limitation above, true two-machine operation, or a
+  real Claude Code or Codex TUI, and the remaining acceptance stays tracked at
+  https://github.com/rfairburn/pi-review-gate/issues/345. Earlier Windows
+  evidence on Node 22.19.0 and 24.x is historical: it predates the current
+  security floors and is not a patched-runtime run. The ordinary standalone
+  Windows launcher remains unchanged.
 - **Node.js:** at or above its release line's security floor: 22.23.5 or newer
   on Node 22, 24.22.3 or newer on Node 24, or 26.13.1 or newer on Node 26 (see
   [Node.js security floors](getting-started.md#nodejs-security-floors)). The
@@ -138,9 +169,10 @@ run the standalone launchers with unchanged behavior.
 The Windows session-host source path selects the Microsoft ConPTY implementation
 bundled with the pinned `@lydell/node-pty` package through its public
 `useConptyDll` option, rather than Windows' inbox ConPTY. The real Windows
-acceptance fixtures request the same public option. This selection alone is not
-runtime support evidence; the acceptance deferrals and limitations above still
-apply. POSIX PTYs and the ordinary standalone launchers are unchanged.
+acceptance fixtures request the same public option, and the runtime acceptance
+above ran on it. This selection alone is not runtime support evidence; the
+measured scope and the remaining limitations above still apply. POSIX PTYs and
+the ordinary standalone launchers are unchanged.
 
 The Windows validation path uses plain Node named pipes with the existing
 per-instance token authorization and the platform's default pipe ACL behavior.
@@ -157,8 +189,9 @@ generations are reclaimed best effort with confined, unchanged filesystem
 identities; a cleanup problem warns and the launch continues, because cache
 capacity never stops startup. No custom Win32 pipe application, TLS/PSK layer,
 taskkill tree scan, or private process helper is part of the design. These
-source paths do not make the host Windows-supported; that claim remains gated on
-the native evidence above.
+source paths establish no guarantee of their own beyond the native runtime
+evidence above, which covers the host's Pi sessions on the tested Node and Pi
+pins.
 
 The host must launch Pi through its actual supported Node CLI entry, not through an
 arbitrary shell command. By default, `pi-review-sessions` looks for `pi` on `PATH`,
@@ -533,11 +566,29 @@ position as a bounded error entry. Restoration runs before any deliberate user
 action is admitted, and the remembered active entry becomes the active Main
 input owner only when no deliberate user action happened while restoration was
 still running, so a slow restoration can never take over a user's own focus or
-action. Each **New session** has one explicit **Workspace** field and one
-**Host** line; there is no separate host display-label field. The Host line
-names **Local** every time the form opens: a Local submission asks only for an
-explicit existing workspace directory, keeps the native path editor and its
-completion, and immediately makes the created child the active Main input owner
+action. Each **New session** has one explicit **Workspace** field, one **Provider**
+line, and one **Host** line, drawn in that order from top to bottom as **Host**,
+**Provider**, then the field; there is no separate host display-label field. The
+Provider line names **Pi** every time the form opens, so a native
+**Claude Code**/**Codex CLI** row is always a deliberate choice (see
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). Its
+offered choices belong to the destination currently selected on the **Host** line:
+a Local choice offers this host's own targets, a remote choice offers only that
+owner's advertised targets, and an explicit native choice is never reinterpreted
+for another destination or a replaced owner run — it is dropped and stated, never
+quietly turned into Pi. `Shift+Tab`
+moves **Workspace** → **Provider** → **Host** — or **Workspace** → **Host** directly
+when no Provider line is drawn — and `Tab` steps back down through **Provider** to
+**Workspace**; `Up`/`Down` cycle the displayed choice on the focused line; a click
+on the **Provider** label focuses it, and a click on its value cycles from the
+presentation currently drawn. The **Provider** line appears only while that host
+offers native targets and the pane has one row to spare that displaces neither the
+Workspace field's budget, a pending or error status, nor the hint footer; when it is
+not drawn, keyboard focus and pointer activation skip it entirely. The Host line names
+**Local** every time the form opens: a Local submission asks only for an explicit
+existing workspace directory, keeps the
+native path editor and its completion, and immediately makes the created child the
+active Main input owner
 without a second row Enter, with the sidebar still visible. A previous remote
 choice is never carried forward, an actual Host change clears the Workspace
 value, and choosing the same Host again is a no-op, so no per-host history is
@@ -768,6 +819,72 @@ The host itself does not require Git merely to start a session. It adds no
 question-only, no-worktree, or capture-bypass mode: the normal review,
 evidence-capture, and delegated-execution policies still apply to native
 activity.
+
+### Native Claude Code and Codex rows
+
+Alongside its Pi rows, the host can start a real full native interactive **Claude
+Code** or **Codex CLI** session as its own sidebar row: the operator's own CLI as an
+ordinary PTY child with one workspace, one frame, and one owned handle, selected on
+the New-session form's **Provider** line, which **defaults to Pi every time the
+form opens**. Choosing a native provider changes nothing else about the form — the
+**Workspace** field and its initial focus behave exactly as before.
+
+A native row is deliberately a plain provider child rather than a Pi child:
+
+- It gets no status registration, no Pi bootstrap/preload/startup-payload/title
+  environment, no input framing, and no native clipboard receiver, so every provider
+  field in its card stays truthfully unknown and only the owned PTY's own exit
+  settles the row. Local keyboard input is forwarded raw to the owning row.
+- Its command, base arguments, and base environment come from the built-in default
+  for that backend or from an explicit shared
+  [`externalAgents`](configuration.md#the-externalagents-catalog) entry — never from
+  the `review`/`execution` role overlays, their models, or their reasoning. The
+  command is located by the same discovery the settings availability probe uses, and
+  a missing binary or a configured argument that names a headless or service mode, an
+  approval, sandbox, or hook-trust bypass, an existing-session attach, or a
+  workspace-scope change is a refusal: never silently stripped, retried another way,
+  or replaced with another target. Codex adds only `--no-daemon`.
+- Its configuration, authentication, and conversation state stay in the provider's
+  own directories. The host writes nothing to the operator's provider settings, hooks,
+  plugins, or trust stores, and the host's Pi agent directory keeps holding only Pi
+  data plus this host's roster and ownership record.
+- It carries no review gate, no tool protection, and none of the subtask
+  capture/review/landing guarantees, and it is never presented as a review-gate-managed
+  worker.
+- Native rows are created by **this host** and by **one connected owner that
+  advertises its own native targets**. Locally, the Provider line offers this
+  host's configured targets. When the **Host** line names a connected destination,
+  the same line offers only that owner's advertised catalog — never this host's own
+  configured ids, and never a blend — and submitting sends one native owner-create
+  request instead of a Pi one (see
+  [Remote native create and host row name](#remote-native-create-and-host-row-name)).
+  An owner that advertises nothing draws no Provider line at all and keeps its
+  ordinary Pi-only behavior. `SessionSpawn`, the Saved picker, and the standalone
+  launchers keep creating Pi sessions unchanged, and a native row contributes
+  nothing to the saved-conversation censuses. An authorized remote viewer **can**
+  type into a native row: the owner hands that viewer's keys, canonical mouse
+  packets, and whole pastes to the row's PTY raw under the negotiated
+  `native-input-cli-v1` capability, exactly as its own Main types them (see
+  [Native input and copy](#native-input-and-copy)). That is terminal-process
+  control only. Text can also be copied **out** of a hosted row, but that is its own
+  closed mechanism, not the Pi clipboard route: the owner captures one standard
+  OSC 52 text request inside that row's PTY and hands it to the one recipient its own
+  last accepted input established — its own displayed Main, or that one viewer under
+  the optional `native-copy-cli-v1` capability — or drops it (the
+  **Hosted provider text copy** part of
+  [Native input and copy](#native-input-and-copy)).
+- Each new session selects its native target again: the chosen target id, its
+  executable, arguments, and environment are not persisted, so a later form cannot
+  silently reuse them.
+- A remembered native row keeps its own backend and workspace and returns as a
+  truthful **unavailable placeholder** titled `<Provider> (unavailable)` when it cannot
+  be started — never as a Pi row and never bound to an arbitrary recent provider
+  conversation. Rename, saved-conversation open, and exited-row resume are unavailable
+  for a native row, because they are Pi APIs; resume happens in-pane through the
+  provider's own control.
+
+Provider-by-provider capability evidence and a safe owned staging tryout are on
+[Native Claude Code and Codex sessions](native-sidebar-agents.md).
 
 ### One owning host, one session manager
 
@@ -1373,9 +1490,13 @@ saved conversations (see
 `SessionSpawn` remains the native, owner-bound tool described above rather than
 a network request, and human handoff is not implemented. The owner-routed Close
 controls are described below. Authenticated local and SSH clipboard copying,
-ordinary standalone Pi, and local host input are unchanged: nothing is
-broadcast, a remote copy reaches only its initiating viewer, raw PTY OSC 52
-stays denied, and no last-input-origin inference is added. Native Pi
+ordinary standalone Pi, and local host input are unchanged: nothing is broadcast,
+a remote copy reaches only its initiating viewer, raw PTY OSC 52 stays denied on
+every surface that did not explicitly opt into the hosted provider copy sink, and
+no last-input-origin routing applies to a Pi conversation copy — that routing
+exists only for a captured hosted provider copy, and only inside the one row it
+came from (see the **Hosted provider text copy** part of
+[Native input and copy](#native-input-and-copy)). Native Pi
 clipboard-producer coverage keeps the limits the
 [clipboard section](#clipboard-copying-over-ssh) describes.
 
@@ -1492,6 +1613,73 @@ settings, Auto, the editable listen default, and protected identity/pin
 persistence are unchanged. `SessionSpawn` is not replaced: it stays the native,
 owner-bound tool described above. Remote New does not add or require a network
 `SessionSpawn` RPC.
+
+### Remote native create and host row name
+
+Two **independent** optional capabilities extend that same paired roster channel:
+`roster-native-v1` starts a native row on the owner, and `roster-native-name-v1`
+renames one of the owner's native rows. Each is acknowledged only when the owner
+really holds the matching provider, and one never implies the other: an owner can
+start native rows and still refuse to name them. An unnegotiated peer sees the
+pre-native wire schema exactly as before, and neither lane adds a listener, queue,
+replay cache, registry, permission kind, or stored state.
+
+**Starting a native row on an owner.** The New form's **Provider** line is scoped to
+the destination selected on the **Host** line. A Local choice offers this host's own
+configured targets; a remote choice offers only the catalog that owner advertises,
+with its own labels and ids, and this host's configured ids are never merged in or
+substituted. The choice is part of the written form the writer actually committed:
+submission requires that exact frame — its host identity, owner run, canonical
+workspace, pane geometry, and the drawn provider identity — and one request receipt
+consumed before dispatch. The request then names the exact owner run, that one
+backend, that one advertised target id, and the workspace, and the owner reuses the
+same manager, run identity, and native launch path as its own local New with only
+the workspace. No target is ever selected, activated, or focused, and a native
+remote create never becomes a Pi create.
+
+A native choice never survives into a destination it was not made for. Changing the
+**Host** line, reconnecting, a replacement owner run, or a target the owner withdrew
+makes the old choice inapplicable: it is dropped and stated, and the submission is
+refused rather than quietly reinterpreted as a Local id of the same name or as Pi.
+An owner that advertises no target draws no Provider line and keeps its ordinary
+Pi-only path, and a remote destination whose channel never negotiated the native
+lane reports one fixed unsupported notice and sends nothing.
+
+**Naming one of the owner's native rows.** A native row's host-side name is a
+different operation from renaming a Pi conversation, and the two never share a
+request. The sidebar offers it only for a row the owner itself reported as native:
+the backend travels as typed roster metadata from the owner, and nothing is ever
+inferred from a caption, a label, a missing status, or this host's local
+configuration. `e` on such a row opens the same shared Edit form, and the request
+carries only the exact owner run, the row id, the observed backend, and the bounded
+replacement caption — no Pi conversation id, session id, or title. The owner applies
+its own existing rename rule to its own row and answers with one of four distinct
+truths: renamed and saved, renamed for this run only, refused, or unknown. The
+requester states each of those separately and never claims a saved name for a
+temporary one, never edits its own caption in advance, and never falls back to the
+Pi rename, a local mutation, or a reconnect. An unknown answer stays
+`UNCERTAIN: the host may have renamed that row; verify its current name before
+retrying` and is never retried automatically. A row the owner never reported as
+native, an owner that did not acknowledge this lane, a row, backend, or run that
+moved while the form was open, and a lost reply are each refused or reported
+truthfully, and none of them reaches a Pi rename.
+
+**What this scope does not claim.** These two lanes are transport and UI, not
+provider acceptance. Remote typing into a native row already exists on its own
+authenticated, consented, host-mediated lane — `native-input-cli-v1` delivers an
+authorized viewer's keys, canonical mouse packets, and whole pastes to that row's
+PTY raw, exactly as the owner's own Main types them, and a hosted provider TEXT
+copy crosses that same lane under its own optional `native-copy-cli-v1`
+capability, routed to the one viewer whose input the owner last actually accepted
+on that child (see
+[Native input and copy](#native-input-and-copy)). What remains unproven, and is
+stated as pending on
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows), is
+real-provider acceptance: a real Claude Code or Codex CLI actually starting and
+behaving correctly on a paired owner over a real network, a real provider actually
+emitting a capturable text copy and a real OS clipboard accepting it on either end,
+and Windows. A native row still has no status registration and carries
+no review-gate or tool-protection guarantee.
 
 ### Saved conversations on a connected owner
 
@@ -1935,7 +2123,8 @@ and its current Pi editing bindings. A New form whose Host line names a
 destination keeps the same native editing bindings but no requester filesystem
 completion, and its Workspace text is forwarded verbatim. The form's single Host
 line is one host-owned selection control: Shift+Tab moves the form focus to it,
-Tab or one fresh Escape returns to the Workspace editor, and Up/Left and
+when no Provider line is drawn (with a drawn Provider line it takes a second
+Shift+Tab), Tab or one fresh Escape returns to the Workspace editor, and Up/Left and
 Down/Right step through Local and the connected saved destinations while it
 holds that focus. Every other press there is consumed instead of editing the
 hidden Workspace text, and a bracketed paste is consumed too. A single left
@@ -1999,7 +2188,7 @@ rather than silently guessing. Workspace/project `.pi/settings.json` overrides
 are deliberately not loaded, so this adds no project-code or trust grant. The
 command is parsed as literal arguments and run as a directly owned, shell-free
 child; Windows `.cmd`/batch and command-shell shims are unsupported. This
-editor-command support does not make the host Windows-supported: Windows
+editor-command path adds no Windows privacy guarantee: Windows
 temporary-file privacy follows Node and the operating system's default ACLs,
 without a custom-ACL or same-user sandbox guarantee. The editor uses a bounded
 temporary file; unsafe, oversized, or failed results are not applied. Use the
@@ -2037,6 +2226,15 @@ conservative **ownership** state still gates an idle-only stop or removal; it is
 deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership
 count.
+
+A native **Claude Code** or **Codex CLI** row keeps every one of those rules, with
+nothing provider-side to observe: the host owns its process, so lifecycle and exit
+are real, while agent busy/idle, a pending question or approval, and every task and
+shell count stay `unknown` for that row's whole life. The host never scrapes the
+terminal to guess a provider's state and never infers idle from a missing PID, a
+quiet period, or an output gap, so a native row never shows a fabricated idle, zero,
+or pending state
+([Native Claude Code and Codex sessions](native-sidebar-agents.md#what-the-host-owns-and-what-it-never-infers)).
 
 Loaded sessions establish activity from fresh, complete observations of their
 exact owning sources at startup/restore and safe event-driven resynchronization
@@ -2352,7 +2550,10 @@ reconstructed screen text. Pi remains the only selection and clipboard producer:
 native Main, visible question/notice selections, copy-on-select, the configured
 application copy shortcut, and the original local clipboard helper remain
 native. Nothing patches Pi, changes its settings, or adds a second selection
-engine. Raw PTY OSC 52 remains denied. The owned child observes the native
+engine. Raw PTY OSC 52 remains denied on every surface that did not explicitly opt
+into the hosted provider text-copy sink; that separate, closed capture for hosted
+Claude and Codex rows is described under **Hosted provider text copy** in the next
+section, and it changes nothing here. The owned child observes the native
 producer's runtime/call-stack provenance through Node's stdio boundary, then
 authenticates a bounded request with its existing per-child capability. The host
 checks the current session epoch and live, actually displayed Main input owner
@@ -2445,7 +2646,10 @@ off.
 Negotiation is explicit: `native-input-copy-v1` is offered only when Main
 supplied the callbacks, and knowing or acknowledging the identifier grants no
 authority. The separate optional `native-input-startup-v1` capability depends on
-it and is never negotiated without it (see **Startup input** below). The owner
+it and is never negotiated without it (see **Startup input** below). The separate
+optional `native-input-cli-v1` capability depends on it the same way and covers
+rows the owner hosts as a native CLI child (see **Hosted provider input**
+below). The owner
 side binds one viewer to one existing content subscription and states a
 host-written source; the viewer side only describes and submits against that
 exact source. On the child side, the bridge requests bootstrap mode `1` and
@@ -2579,8 +2783,28 @@ automatic trust, no Pi patch, and no new API. Copy is unsupported during
 startup. An asynchronous copy begun during startup can neither become a local
 copy nor complete as a remote one after the phase ends.
 
-**Text copy.** Only the exact initiating viewer receives a completed copy; there
-is no owner outer-terminal or local clipboard fallback, broadcast, raw OSC 52
+**Hosted provider input.** A row the owner hosts as a native CLI child (`claude`
+or `codex`) has no Pi registration, no bootstrap readiness, and no per-
+registration encoder, so when both sides negotiated `native-input-cli-v1` an
+authorized viewer's keys, canonical mouse packets, and whole pastes are handed to
+that row's PTY raw, exactly as the owner's own Main types them. The source states
+phase `native-cli` and the recorded backend, and carries no native session field
+and no registration field, under a source token domain separate from both Pi
+families. Its commitment key is private to the current process incarnation, so a
+replaced child invalidates every identical public fact rather than accepting a
+re-labelled handle; an exit, a stop, a removed row, or a retired viewer yields no
+source at all. This is terminal-process control only: it is never a claim about
+provider conversation state. A hosted provider row's own text copy is the separate
+family described under **Hosted provider text copy** below, and it is never routed
+through the Pi conversation copy route. All other fences
+above still apply, including the per-viewer Remote input/copy setting. A channel
+that never negotiated the capability publishes no hosted source, and hosted input
+sent without negotiating it is a protocol violation that writes zero bytes. Older
+and unnegotiated peers keep their existing display-only behavior.
+
+**Text copy (Pi conversations).** Only the exact initiating viewer receives a
+completed copy; there is no owner outer-terminal or local clipboard fallback,
+broadcast, raw OSC 52
 relay, or highest-input-dispatch filter. An asynchronous copy caused by earlier
 input A still arrives after input B when it is still valid, because copies are
 ordered by their own emission sequence, not by input dispatch id. The full
@@ -2590,13 +2814,77 @@ paging preserves the complete encoded string as ASCII bytes, and the pages are
 joined before the text is decoded, without reducing the producer bound to a
 single message. Copy delivery is a terminal-write submission on the viewer, not
 proof of a physical OS clipboard write. The native producer and OS clipboard
-writer are unchanged. Each hosted child tree created with the bridge receives
+writer are unchanged. Each Pi child tree created with the bridge receives
 the static `PI_CLIPBOARD_OSC52=1` capture setting, and it inherits only inside
 that tree; standalone launches and the system environment stay unchanged, and no
 clipboard image push, read, or synchronization is added. While this viewer's
 Remote input/copy is off, a completed remote copy is dropped without a clipboard
 write; nothing is cancelled on the owner, and an older copy is not fenced out by
 a newer input. The existing 64 MiB whole-viewport assembly bound is unchanged.
+
+**Hosted provider text copy.** A hosted provider row has no Pi producer, so its text
+copy is a separate family on the same lane, negotiated as the optional
+`native-copy-cli-v1` capability. The owner offers and acknowledges it only beside
+native IO and `native-input-cli-v1`; an acknowledgement naming it without them is a
+protocol violation, and a peer that never negotiated it gains nothing and refuses
+such a source outright. Capture is a closed, opt-in sink on that row's own surface
+and nowhere else: exactly one standard clipboard-selection field (empty is the
+standard spelling of the default selection) and exactly one payload; a clipboard
+query (`?`) is refused outright, because this host never answers one and never sends
+clipboard content back toward a child; and the payload must be canonical base64
+decoding to non-empty strict UTF-8 text inside the unchanged 100,000-character
+producer bound (at most 75,000 decoded bytes). Binary, empty, malformed, or
+over-bound payloads are refused whole and never truncated, and no control sequence is
+re-emitted. Every other surface — every Pi row included — keeps raw OSC 52 denied
+exactly as before, and Pi's per-dispatch origin, capsule authentication, and
+producer provenance are untouched. The trust here is the owned PTY, not a proven
+producer gesture: a copy request written by the provider's own UI, by a tool it ran,
+or by a program it started is accepted alike, and only text crosses that fence.
+
+The recipient is the origin of the most recent **actual accepted** nonempty input the
+owner forwarded to that exact child incarnation — its own local Main input, or one
+viewer's verified input — never a currently selected form, a refused or rejected
+request, a received copy request, or a terminal protocol query/reply. It is frozen
+when the owner accepts the copy, so input arriving afterwards never retargets a copy
+already in flight, and the ordinal that travels with the copy is that routing
+convention rather than causal proof. Viewer A types, then viewer B types, then the
+provider copies: **B** receives it. A copy accepted for A before B's input arrives
+stays **A**, and is dropped rather than retargeted if A is no longer eligible.
+Ineligibility delivers nothing at all — a retired viewer, a viewer now displaying
+another row, a viewer-revision, geometry, or backend change, a replacement child, a
+released row, an unnegotiated channel, or an owner-local route whose own live-row,
+Main-focus, uncovered, and current-geometry proof refuses — with no fallback to the
+other peer, no broadcast, no retry, no queue, and no global clipboard monitor; a row
+nobody has typed into copies nowhere. The frame carries the tuple-less `native-cli`
+source and an event naming that same recorded backend, so the two producer families
+never mix on one frame and no Pi conversation identity is invented, and the
+inline-or-paged transfer and its bound are the unchanged ones.
+
+This is text only: no image, file, clipboard read, paste, or right-click behavior
+changes, and no new sidebar status, notice, dialog, or count is added — the existing
+bounded private diagnostics are the only record. The providers' own emission is a
+source-level finding rather than observed behavior — the reviewed Claude Code build
+emits its OSC 52 request alongside its own
+OS clipboard helper on the normal macOS, Windows, and non-VTE Linux paths, while its
+Linux VTE helper-only path may emit nothing capturable, and a hosted Codex child
+carrying `HERDR_ENV=1` additionally emits one while its own native OS copy continues.
+That marker is the single addition to a hosted Codex child environment, applied after
+the ordinary composition and overlay merge so the host-owned mode wins for that one
+key; it goes to no Claude or Pi child, never to the host process, and no `SSH_TTY`,
+`SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, or `STY` value is ever faked. Pretending to be
+an SSH session would also switch off Codex's own clipboard-text read, right-click
+paste, and local image links; multiplexer markers have other unrelated effects.
+A provider's own write to the owner's OS clipboard still happens: the
+host's forwarding is additional to the one controller it routes to, never a guarantee
+that the owner's clipboard was untouched. tmux/screen DCS-wrapped requests are **not**
+captured, so a provider the operator puts inside their own multiplexer, or a provider
+path that talks to a clipboard helper directly, can bypass the owned PTY emission
+entirely, and nothing polls a clipboard in compensation. The evidence is focused
+synthetic capture and wire tests whose children are synthetic PTY programs: no real
+provider conversation, real OS clipboard read or write, physical terminal, or
+two-machine copy is certified, and "captured" means only that the owner accepted the
+request and wrote the outer one. See
+[Copying text out of a hosted row](native-sidebar-agents.md#copying-text-out-of-a-hosted-row).
 
 **Outcomes.** `not-sent` is possible only before any transport-write invocation;
 `submitted` means only that local transport writes returned, never that the
@@ -3090,6 +3378,8 @@ child-process handle, including a row marked error; the row's lifecycle badge
 alone does not determine whether a handle is live. It then asks each active
 authenticated status registration to request native shutdown, when that public
 control is available, and waits only within the existing bounded grace window. A
+native Claude Code or Codex row has no such registration, so no request is attempted
+there: the host signals the handle it owns and waits for that handle's actual exit. A
 `requested` acknowledgement means the request was accepted; it is not proof of
 PTY exit or successful graceful termination. The host therefore treats only the
 owned PTY's actual exit event as confirmation. On POSIX, unavailable or failed

@@ -493,8 +493,13 @@ export function snapshotNativeEnvironment(
   return snapshot;
 }
 
-/** Reject real worker authorization, then remove stale host-only capabilities before any probe/child. */
-function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
+/**
+ * Reject real worker authorization, then remove stale host-only capabilities
+ * before any probe/child. The sanitizer is provider-neutral (it names only
+ * pi-review-gate capabilities), so the native interactive CLI launch
+ * descriptors reuse this one implementation instead of a second copy.
+ */
+export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
   if (env[RUNTIME_ROLE_ENV]) {
     throw new Error(
       `pi-review-gate: refusing to prepare a native launch while ${RUNTIME_ROLE_ENV} is set; runtime role authorization comes only from the delegated execution adapter.`,
@@ -725,6 +730,16 @@ export interface NativeLaunchDescriptor {
   file: string;
   /** Full native argv: Windows starts with the canonical Pi CLI script, then extensions and forwarded args. */
   args: string[];
+  /**
+   * Windows only, and only for a child that is a `.cmd`/`.bat` batch command:
+   * the invocation in the pinned PTY implementation's public pre-escaped
+   * `CommandLine` form — the one argument string appended verbatim after
+   * `file`. The pinned Windows spawn escapes an `args` array itself per the
+   * MSDN command-line rules, which re-quotes the outer quotes cmd.exe needs,
+   * so a batch command is delivered as this string and never as argv. Absent
+   * for every direct executable launch, whose argv stays intact.
+   */
+  commandLine?: string;
   /** Cloned, sanitized environment; the caller's env is never mutated. */
   env: NodeJS.ProcessEnv;
   /** Canonical working directory: the per-instance workspace. */

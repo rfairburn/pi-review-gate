@@ -23,6 +23,7 @@ import {
   type InstanceManagerOptions,
   type InstanceStatusRegistration,
   type InstanceStatusUpdate,
+  type NativeCliLaunch,
   type NativeInstanceView,
   type ShutdownResult,
   type StatusRegistrar,
@@ -45,6 +46,8 @@ import type { NativeInputSendResult } from "./network/session-content-client";
 import {
   NATIVE_COPY_MAX_ENCODED_CHARS,
   NATIVE_TEXT_PASTE_MAX_BYTES,
+  isNativeIoNativeCliCopyEvent,
+  isNativeIoNativeCliSource,
   nativeIoSourceEquals,
   type NativeIoInputKind,
   type NativeIoInputSource,
@@ -58,14 +61,27 @@ import {
   type PeerCoordinatorWithClose,
 } from "./network/peer-close";
 import {
+  findRemoteNativeCliTarget,
   isOwnerCreateFacts,
   type OwnerCreateFacts,
   type OwnerCreateRequest,
+  type OwnerNativeCreateRequest,
   type PeerCoordinatorWithCreate,
   type PeerCreateController,
   type PeerCreateResult,
+  type RemoteNativeCliTarget,
 } from "./network/peer-create";
-import { isOwnerRenameFacts, type OwnerRenameFacts, type OwnerRenameRequest, type PeerCoordinatorWithRename, type PeerRenameResult } from "./network/peer-rename";
+import {
+  isOwnerNativeRenameFacts,
+  isOwnerRenameFacts,
+  type OwnerNativeRenameFacts,
+  type OwnerNativeRenameRequest,
+  type OwnerRenameFacts,
+  type OwnerRenameRequest,
+  type PeerCoordinatorWithRename,
+  type PeerNativeRenameResult,
+  type PeerRenameResult,
+} from "./network/peer-rename";
 import { createNativeSavedCatalogView, type NativeSavedCatalogReadOptions } from "./network/native-saved-provider";
 import {
   isOwnerSavedDeleteFacts,
@@ -174,6 +190,8 @@ import {
   REMOTE_EDIT_TARGET_CHANGED_NOTICE,
   REMOTE_EDIT_UNSUPPORTED_NOTICE,
   REMOTE_EDIT_UNWRITTEN_NOTICE,
+  REMOTE_NATIVE_NAME_NOT_DRAWN_NOTICE,
+  REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE,
   REMOTE_SAVED_DELETE_OFF_NOTICE,
   REMOTE_SAVED_OTHER_RUN_NOTICE,
   REMOTE_SAVED_UNCERTAIN_NOTICE,
@@ -186,13 +204,25 @@ import {
   type SidebarItem,
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
+  type SidebarNativeCliTarget,
   type SidebarRemoteCloseRow,
   type SidebarRemoteEditRow,
+  type SidebarRemoteNativeEditRow,
   type SidebarSavedPickerPresentation,
   type SidebarScrollDirection,
 } from "./sidebar";
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
+import type { NativeCliClipboardEvent } from "./instances";
+import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
+import {
+  isNativeCliBackend,
+  isNativeDisplayName,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+  type SessionBackend,
+} from "./session-backend";
+import { loadConfig } from "../config";
 import {
   HostClipboardDiagnosticCollector,
   TerminalDiagnosticsWarning,
@@ -220,6 +250,13 @@ const ROSTER_UNAVAILABLE_MESSAGE = "That remembered conversation is unavailable;
 const LOCAL_VIEW_DETACHED_MESSAGE = "No session is displayed. Every session keeps running; press enter on a row to display it.";
 const NO_LOCAL_VIEW_MESSAGE = "No session is displayed already; press enter on a row to display it";
 const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
+/**
+ * One native row's caption was applied to the live row but the durable roster
+ * publication for it did not succeed, so it will not come back after a restart.
+ * Reported per naming operation, never inferred from an earlier one-time roster
+ * warning: the name is real for this session and honestly temporary.
+ */
+const NATIVE_NAME_NOT_DURABLE_MESSAGE = "Named for this session only; the roster was not saved, so this name will not return after a restart";
 const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
 /**
  * Fixed notice for one reorder this host could not revalidate. A refused move
@@ -619,13 +656,28 @@ interface RemoteCloseConfirmationFrame {
   settled: boolean;
 }
 
-/** One remote Edit frame and the outer geometry of its actual writer receipt. */
-interface EditFormFrame extends SidebarEditFormPresentation {
-  readonly terminalCols: number;
-  readonly terminalRows: number;
-  readonly epoch: number;
-  settled: boolean;
-}
+/**
+ * One remote Edit frame and the outer geometry of its actual writer receipt.
+ *
+ * It is TYPED exactly like the sidebar's drawn candidate: a Pi conversation
+ * rename frame carries the observed native tuple, and a native HOST ROW NAME
+ * frame carries the observed backend instead. Main therefore can never accept a
+ * native caption action against a Pi frame (or invent a tuple for a native row),
+ * because the two shapes are not interchangeable.
+ */
+type EditFormFrame =
+  | (Extract<SidebarEditFormPresentation, { readonly kind: "pi" }> & {
+      readonly terminalCols: number;
+      readonly terminalRows: number;
+      readonly epoch: number;
+      settled: boolean;
+    })
+  | (Extract<SidebarEditFormPresentation, { readonly kind: "native" }> & {
+      readonly terminalCols: number;
+      readonly terminalRows: number;
+      readonly epoch: number;
+      settled: boolean;
+    });
 
 /**
  * One frozen New-form frame: exactly what the sidebar drew (host identity, the
@@ -668,6 +720,10 @@ interface CreateOnPeerAttempt {
   readonly paneCols: number;
   readonly paneRows: number;
   readonly epoch: number;
+  /** Present only for an explicit native remote create; never defaulted or inferred. */
+  readonly backend?: NativeCliBackend;
+  /** The exact owner-advertised target id this attempt was built for. */
+  readonly targetId?: string;
 }
 
 /** One bounded remote Close attempt, frozen for its notices and its marker. */
@@ -732,6 +788,26 @@ function sameRemoteEditRow(a: SidebarRemoteEditRow | undefined, b: SidebarRemote
   if (a === undefined || b === undefined) return a === b;
   return a.hostId === b.hostId && a.hostRunId === b.hostRunId && a.rowId === b.rowId
     && a.nativeSessionId === b.nativeSessionId && a.nativeSessionEpoch === b.nativeSessionEpoch
+    && a.row === b.row && a.height === b.height && a.cols === b.cols && a.rows === b.rows
+    && a.focus === b.focus
+    && a.title === b.title && a.hostLabel === b.hostLabel;
+}
+
+/**
+ * Value equality for one written native HOST ROW NAME highlight. It mirrors
+ * {@link sameRemoteEditRow} with the row's observed native BACKEND in place of the
+ * native conversation tuple, because a native row has no tuple and this side must
+ * never compare or invent one. Only the minimal owner target, the drawn row and
+ * height, the pane geometry, and the focus domain matter: never object identity and
+ * never the sidebar's mouse-authorization key.
+ */
+function sameRemoteNativeEditRow(
+  a: SidebarRemoteNativeEditRow | undefined,
+  b: SidebarRemoteNativeEditRow | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.hostId === b.hostId && a.hostRunId === b.hostRunId && a.rowId === b.rowId
+    && a.backend === b.backend
     && a.row === b.row && a.height === b.height && a.cols === b.cols && a.rows === b.rows
     && a.focus === b.focus
     && a.title === b.title && a.hostLabel === b.hostLabel;
@@ -817,6 +893,20 @@ interface MainDependencies {
     nativeAgentDir?: string;
   };
   readonly createManager: (options: InstanceManagerOptions) => OwningHostManager;
+  /**
+   * Native interactive CLI hosting (issue #277): the provider targets the New
+   * form offers and the launcher this host's manager calls for a native row.
+   * Production derives BOTH from the ONE already-normalized review-gate
+   * configuration through the existing config load/resolution path — no second
+   * parser, no new setting, and no config, command, argument, or environment
+   * value is ever logged. A host with no usable hosting offers no target and
+   * injects no launcher: the New form then draws no Provider line, every
+   * creation stays the ordinary Pi launch, and a native request cannot exist.
+   */
+  readonly nativeCliHosting: (env: NodeJS.ProcessEnv) => {
+    readonly targets: readonly SidebarNativeCliTarget[];
+    readonly launch?: NativeCliLaunch;
+  };
   /**
    * The presentation-independent owning-session operation boundary (#473): it
    * opens the host's one authoritative manager and owns the UI-independent row
@@ -938,7 +1028,21 @@ interface RosterRecord {
   sessionId?: string;
   workspace?: string;
   name?: string;
+  /**
+   * The operator's host-side DISPLAY NAME of a native CLI row, remembered on this
+   * stable slot. A caption only: it is never a provider conversation identity,
+   * never a resume target, and never restores or starts anything. A Pi slot never
+   * carries it (a Pi row's remembered name is `name` above).
+   */
+  displayName?: string;
   persistence?: "saved" | "unsaved" | "unknown";
+  /**
+   * The provider backend this slot's row was created with, present only for an
+   * explicit native row. Absence is Pi. Identity only: a native slot carries no
+   * provider conversation id, no executable, and no environment, and it can
+   * only ever be restored as a bounded unavailable placeholder.
+   */
+  backend?: SessionBackend;
   /** Bounded truthful reason this remembered conversation is not restorable. */
   unavailableReason?: string;
 }
@@ -1295,6 +1399,9 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     agentDir: view.agentDir,
     lifecycle: view.lifecycle,
     hasLiveProcess: view.hasLiveProcess,
+    // The row's own recorded backend, when it has one: the sidebar never
+    // infers a provider from state, output, or missing telemetry.
+    ...(view.backend === undefined ? {} : { backend: view.backend }),
     busy: view.busy,
     pendingInput: view.pendingInput,
     inputSurface: view.inputSurface,
@@ -1325,6 +1432,18 @@ function productionDependencies(): MainDependencies {
       return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
     },
     createManager: (options) => new InstanceManager(options),
+    // One normalized configuration, one resolution path: the selectable native
+    // targets and the launcher both come from the same `ReviewGateConfig` the
+    // rest of the product uses, so this host process never offers a target list
+    // the launcher was not built from. That is configuration parity inside one
+    // process, not executable-availability parity: each launch still resolves
+    // the command against its own workspace and composed child environment, and
+    // can still refuse on its argument, backend, platform, or trusted-cmd.exe
+    // policy.
+    nativeCliHosting: (env) => {
+      const config = loadConfig(env).config;
+      return { targets: listNativeCliTargets(config), launch: createNativeCliLauncher(config) };
+    },
     createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
     createPeerCoordinator,
@@ -1412,6 +1531,24 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let configuredAppearance: SidebarAppearance = DEFAULT_SIDEBAR_APPEARANCE;
   let appearanceNotice: string | undefined;
   const legacyToggleOverride = snapshot.toggleKey !== undefined;
+  /**
+   * This host's native provider hosting, resolved once from the operator's
+   * already-normalized review-gate configuration: the targets the New form may
+   * offer and the launcher the manager calls for a native row. A failure here
+   * is not fatal and never reaches the child or the transcript — it simply means
+   * this host offers no native session at all, so the New form keeps its exact
+   * pre-native layout and every creation stays the ordinary Pi launch.
+   */
+  let nativeCliTargets: readonly SidebarNativeCliTarget[] = [];
+  let nativeCliLaunch: NativeCliLaunch | undefined;
+  try {
+    const hosting = dependencies.nativeCliHosting(snapshot.env);
+    nativeCliTargets = hosting.targets;
+    nativeCliLaunch = hosting.launch;
+  } catch {
+    nativeCliTargets = [];
+    nativeCliLaunch = undefined;
+  }
   // The ONE content source this host displays (issue #389 display phase): a
   // local manager row, or one exact remote owner run/row. Every deliberate
   // selection — local or remote — advances `contentSelectionGeneration`, so a
@@ -2305,8 +2442,29 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // path: the owner's own provider decides, and only a peer that negotiated
         // the optional capability can ever reach it.
         createOwnedSession,
+        // The owner-side NATIVE create provider and this host's live advertised
+        // target catalog are handed over together, and ONLY when this host really
+        // has native launch support. With no real launcher neither option is
+        // supplied, so this host never acknowledges the native lane and never
+        // advertises a target it could not launch — every existing lane, fake, and
+        // frame behaves exactly as before. The pair reuses the very seam the local
+        // native New action uses (`hostService.startSession` with the operator's
+        // chosen backend and target id), so no second manager, config, discovery
+        // system, selected row, viewer, or launch path is added.
+        ...(nativeCliLaunch === undefined ? {} : {
+          nativeCreateOwnedSession: createNativeOwnedSession,
+          nativeCliTargets: advertisedNativeCliTargets,
+        }),
         // Rename uses this same host's existing verified native-name operation.
         renameOwnedSession,
+        // The owner-side native HOST ROW NAME provider, on its OWN separately
+        // negotiated capability and only with real native launch support: an owner
+        // that hosts no native rows never acknowledges the lane. It goes through
+        // the ONE naming core above, never the Pi rename, and it never touches
+        // anything belonging to the requester.
+        ...(nativeCliLaunch === undefined ? {} : {
+          renameNativeOwnedSession: renameNativeOwnedSession,
+        }),
         // OWNER Saved serving: the real native Saved catalog view over the SAME
         // owning-host service (its guarded Resume/Delete primitives and its
         // non-mutating delete preparation) and the exact native listing inputs the
@@ -2790,6 +2948,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
               displayedMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
             )
             || !sameRemoteEditRow(displayedMousePresentation.sidebar.remoteEdit, mousePresentation.sidebar.remoteEdit)
+             || !sameRemoteNativeEditRow(
+               displayedMousePresentation.sidebar.remoteNativeEdit, mousePresentation.sidebar.remoteNativeEdit,
+             )
             || displayedMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
             // A mode- or source-only change can render identical bytes. It is still
             // a new native IO boundary, so the next frame must be actually written
@@ -2802,6 +2963,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
                 latestMousePresentation.sidebar.remoteClose, mousePresentation.sidebar.remoteClose,
               )
               || !sameRemoteEditRow(latestMousePresentation.sidebar.remoteEdit, mousePresentation.sidebar.remoteEdit)
+               || !sameRemoteNativeEditRow(
+                 latestMousePresentation.sidebar.remoteNativeEdit, mousePresentation.sidebar.remoteNativeEdit,
+               )
               || latestMousePresentation.remoteCloseEpoch !== mousePresentation.remoteCloseEpoch
               || !sameNativeIoReceipt(latestMousePresentation.nativeInput, mousePresentation.nativeInput)))) {
           writer.invalidate?.();
@@ -3159,14 +3323,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function toRosterErrorItem(record: RosterRecord): SidebarItem {
     const name = record.name;
+    const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
     return {
       id: rosterErrorItemId(record.slotId),
-      label: name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)",
+      // A remembered native row keeps the caption the operator gave it, or its
+      // stable provider label when nobody captioned it: there is no provider
+      // conversation name to invent, and this row is never a Pi conversation this
+      // host could restart. The sidebar adds the drawn unavailable marker to this
+      // bare caption, so the label stays one caption and nothing else.
+      label: nativeBackend === undefined
+        ? (name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)")
+        : (record.displayName !== undefined && record.displayName.trim().length > 0
+          ? record.displayName
+          : sessionBackendDisplayLabel(nativeBackend)),
       workspace: record.workspace ?? "",
       agentDir: "",
       lifecycle: "error",
       hasLiveProcess: false,
       unavailable: true,
+      ...(record.backend === undefined ? {} : { backend: record.backend }),
       busy: null,
       pendingInput: null,
       inputSurface: false,
@@ -3223,6 +3398,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       record.rowId = view.id;
       record.unavailableReason = undefined;
       if (view.workspace.length > 0) record.workspace = view.workspace;
+      // The row's own recorded backend, never a guess: an unrecorded row keeps
+      // no backend field, so the persisted roster stays byte-identical for Pi.
+      if (view.backend !== undefined) record.backend = view.backend;
       const observed = view.nativeSession ?? view.lastNativeSession;
       if (observed !== undefined && observed !== null && isValidNativeSessionId(observed.sessionId)) {
         record.sessionId = observed.sessionId;
@@ -3503,7 +3681,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? { sessionId: record.sessionId } : {}),
         ...(record.workspace !== undefined && isValidRosterWorkspace(record.workspace) ? { workspace: record.workspace } : {}),
         ...(record.name !== undefined && isValidRosterName(record.name) ? { name: record.name } : {}),
+        ...(record.displayName !== undefined && isNativeDisplayName(record.displayName)
+          ? { displayName: record.displayName } : {}),
         ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
+        ...(record.backend === undefined ? {} : { backend: record.backend }),
       });
     }
     const localId = localActiveId();
@@ -3514,21 +3695,39 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return { version: ROSTER_STORE_VERSION, entries, ...active };
   }
 
+/**
+ * What one roster publication attempt achieved. Only `"persisted"` and
+ * `"unchanged"` mean the current state is on disk; every other member means the
+ * in-memory roster moved ahead of what a restart can restore.
+ *
+ * `"deferred"` is the re-entrant case: a sync is already in progress, so this
+ * call queued one and no publication was attempted here.
+ */
+type RosterPersistOutcome = "persisted" | "unchanged" | "disabled" | "overflow" | "failed" | "deferred";
+
+/** True only when the durable store is known to hold the current state. */
+function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
+  return outcome === "persisted" || outcome === "unchanged";
+}
+
   /**
    * Publish the roster only when it actually changed. A malformed or unwritable
    * store is never overwritten: persistence stays disabled and the bounded
-   * problem is surfaced once instead.
+   * problem is surfaced once instead. The returned outcome says what THIS call
+   * achieved, so an operation that must not imply durability (naming one native
+   * row) can state its own truth instead of reading the one-time warning flags —
+   * which a previous notice, or the Edit form opening, may already have consumed.
    */
-  function persistRoster(): void {
+  function persistRoster(): RosterPersistOutcome {
     const handle = hostState;
-    if (handle === undefined) return;
+    if (handle === undefined) return "disabled";
     if (handle.problem !== undefined) {
       if (!rosterProblemNoted && sidebar) {
         rosterProblemNoted = true;
         sidebar.showError(handle.problem);
         scheduleRedraw();
       }
-      return;
+      return "disabled";
     }
     const projection = buildRosterProjection();
     if (projection === undefined) {
@@ -3537,19 +3736,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         sidebar.showError(ROSTER_OVERFLOW_MESSAGE);
         scheduleRedraw();
       }
-      return;
+      return "overflow";
     }
     const serialized = JSON.stringify(projection);
-    if (serialized === lastPersistedRoster) return;
+    // The durable document already holds exactly this state.
+    if (serialized === lastPersistedRoster) return "unchanged";
     if (!handle.persist(projection)) {
       if (!rosterSaveFailureNoted && sidebar) {
         rosterSaveFailureNoted = true;
         sidebar.showError(ROSTER_SAVE_FAILURE_MESSAGE);
         scheduleRedraw();
       }
-      return;
+      return "failed";
     }
     lastPersistedRoster = serialized;
+    return "persisted";
   }
 
   /**
@@ -3570,7 +3771,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
           ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
           ...(entry.name !== undefined ? { name: entry.name } : {}),
+          ...(entry.displayName !== undefined ? { displayName: entry.displayName } : {}),
           ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
+          ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
         });
       }
     }
@@ -3630,7 +3833,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const controller = new AbortController();
     restoreAbort = controller;
     let catalog: SavedSessionCatalog | undefined;
-    if (typeof agentDir === "string" && agentDir !== "" && activePi !== undefined && activePi.file && activePi.version) {
+    // A remembered native slot has no Pi conversation to look for (#277), so a
+    // roster made ONLY of native slots never starts the Pi saved-conversation
+    // scan at all: its unavailable placeholders appear without reading unrelated
+    // Pi history. As soon as one remembered slot could be a Pi conversation, the
+    // existing single catalog snapshot is taken exactly as before.
+    const needsPiCatalog = remembered.some((entry) => !isNativeCliBackend(entry.backend));
+    if (needsPiCatalog
+      && typeof agentDir === "string" && agentDir !== "" && activePi !== undefined && activePi.file && activePi.version) {
       try {
         catalog = await dependencies.listSavedCatalog({
           agentDir,
@@ -3651,6 +3861,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       let createOptions: CreateInstanceOptions | undefined;
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
+      // A remembered native row is never started again automatically (#277):
+      // this host has no provider conversation identity to resume, no saved
+      // provider file to search, and no authority to adopt the newest provider
+      // session. It comes back as a bounded unavailable placeholder, and it is
+      // never quietly served as a new Pi session or a fresh native conversation.
+      if (isNativeCliBackend(entry.backend)) {
+        reason = `${sessionBackendDisplayLabel(entry.backend)} sessions are not restored; open New to start one`;
+        return { entry, createOptions, reason };
+      }
       // The remembered workspace is part of the contract: a conversation whose
       // current header resolves elsewhere is never silently launched there.
       const rememberedWorkspace = canonicalExistingDirectory(entry.workspace);
@@ -3726,8 +3945,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     syncRosterAndSchedule();
   }
 
-  function syncRosterAndSchedule(content = false): void {
-    if (!manager || !sidebar || shutdownRequested) return;
+  function syncRosterAndSchedule(content = false): RosterPersistOutcome {
+    if (!manager || !sidebar || shutdownRequested) return "disabled";
     if (rosterSyncInProgress) {
       if (!rosterSyncQueued) {
         rosterSyncQueued = true;
@@ -3736,9 +3955,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           syncRosterAndSchedule();
         });
       }
-      return;
+      return "deferred";
     }
     rosterSyncInProgress = true;
+    let outcome: RosterPersistOutcome = "failed";
     try {
       views = manager.list().filter((view) => !removedExitedIds.has(view.id));
       adoptRosterViews(views);
@@ -3758,7 +3978,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // falsely highlighted. It never changes activation or ownership.
       sidebar.setActiveMainOwnerKey(contentTarget);
       sidebar.updateItems(currentRosterItems());
-      persistRoster();
+      outcome = persistRoster();
       syncOuterMouseModes();
       if (content) scheduleContentRedraw();
       else scheduleRedraw();
@@ -3767,6 +3987,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } finally {
       rosterSyncInProgress = false;
     }
+    return outcome;
   }
 
   /**
@@ -4202,10 +4423,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (!nativeIoBridgeEnabled || terminal === undefined) return;
       const source = receipt.source;
       const event = receipt.event;
-      // Validate the producer's own native tuple against the source it rode with.
+      // Validate the producer's own facts against the source it rode with. Two
+      // families never mix: a Pi conversation copy names the same conversation twice,
+      // while a hosted provider TEXT copy names that row's recorded backend and carries
+      // no tuple at all (and none is invented here).
       if (source === null || typeof source !== "object" || event === null || typeof event !== "object") return;
-      if (event.sessionId !== source.nativeSession.sessionId
-        || event.sessionEpoch !== source.nativeSession.epoch) return;
+      if (isNativeIoNativeCliSource(source)) {
+        // A hosted provider TEXT copy names that row's recorded backend and carries no
+        // tuple at all; the two must agree, and none is invented here.
+        if (!isNativeIoNativeCliCopyEvent(event) || event.backend !== source.backend) return;
+      } else if (isNativeIoNativeCliCopyEvent(event)) {
+        // The two families never mix on one frame.
+        return;
+      } else if (event.sessionId !== source.nativeSession.sessionId
+        || event.sessionEpoch !== source.nativeSession.epoch) {
+        return;
+      }
       if (currentWrittenRemoteNativeInput({
         hostId: receipt.hostId,
         selectionGeneration: receipt.selectionGeneration,
@@ -4282,13 +4515,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
-  function routeNativeClipboard(id: string, event: NativeClipboardEvent): void {
-    const view = views.find((row) => row.id === id);
-    if (!view?.hasLiveProcess || view.lifecycle !== "alive"
-      || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
+  /**
+   * The owner's own "this row is the actually-shown, uncovered, focused Main
+   * surface right now" proof, shared by the Pi copy route and the hosted provider
+   * copy route. Stale, sibling, hidden, unfocused, covered, form, changed-geometry,
+   * and shutting-down states all refuse; nothing here claims anything about the
+   * producer, only about what this terminal currently displays.
+   */
+  function nativeClipboardMainGuards(id: string): boolean {
     const shown = displayedMousePresentation;
     const latest = latestMousePresentation;
-    const ownsVisibleMain = terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
+    return terminal !== undefined && terminalStarted && !shutdownRequested && !externalEditorActive
       && sidebar?.focus === "main" && localActiveId() === id && layout !== undefined
       && layout.form === undefined
       && shown?.focus === "main" && latest?.focus === "main"
@@ -4303,6 +4540,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // undrawn uncovering/geometry transition cannot authorize a copy (#474).
       // Padding stays host-owned; valid fully drawn child content stays eligible.
       && nativeInputAuthority(id) !== undefined;
+  }
+
+  function routeNativeClipboard(id: string, event: NativeClipboardEvent): void {
+    const view = views.find((row) => row.id === id);
+    if (!view?.hasLiveProcess || view.lifecycle !== "alive"
+      || view.nativeSession?.sessionId !== event.sessionId || view.nativeSession.epoch !== event.sessionEpoch) return;
+    const ownsVisibleMain = nativeClipboardMainGuards(id);
     // Stale, sibling, hidden, unfocused, covered, form, changed-geometry, and
     // shutting-down requests are ordinary safety refusals: quiet, fail closed.
     if (!ownsVisibleMain) return;
@@ -4323,6 +4567,37 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // clipboard changed, so success adds no host status or diagnostic.
     try {
       terminal!.write(`\x1b]52;c;${event.encoded}\x07`);
+    } catch {
+      // Never the exception text, payload, or stack: a fixed code only.
+      clipboardDiagnostics.note(id, "clipboard-terminal-write-failed");
+    }
+  }
+
+  /**
+   * The owner-local route of one captured hosted provider TEXT copy. The manager
+   * already proved the row, the child incarnation, and that the last input it
+   * accepted on that exact child was owner-local; this function adds only the
+   * owner's own live-row and actual-display proof, the same guards the Pi copy route
+   * uses. A hosted provider child has no Pi conversation, so no tuple is compared
+   * and none is invented. There is no viewer fallback: if these guards refuse, the
+   * copy is dropped quietly and nothing else receives it.
+   */
+  function routeNativeCliClipboard(id: string, event: NativeCliClipboardEvent): void {
+    const view = views.find((row) => row.id === id);
+    if (!view?.hasLiveProcess || view.lifecycle !== "alive") return;
+    // The row Main can see must be the same hosted backend the manager recorded on
+    // the child this copy rode in from; a mismatch is a stale view, not a route.
+    if (view.backend !== event.backend) return;
+    if (!nativeClipboardMainGuards(id)) return;
+    const surface = terminal;
+    if (surface === undefined) return;
+    const encoded = event.encoded;
+    // The manager re-validated this payload as canonical base64 UTF-8 text under the
+    // unchanged producer bound; it is carried here in full, never shrunk.
+    if (typeof encoded !== "string" || encoded.length === 0
+      || encoded.length > NATIVE_COPY_MAX_ENCODED_CHARS) return;
+    try {
+      surface.write(`\x1b]52;c;${encoded}\x07`);
     } catch {
       // Never the exception text, payload, or stack: a fixed code only.
       clipboardDiagnostics.note(id, "clipboard-terminal-write-failed");
@@ -5087,7 +5362,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function launchCreate(action: Extract<SidebarAction, { type: "create" }>): void {
     if (!manager || shutdownRequested || !negotiationReady) return;
-    const createOptions: CreateInstanceOptions = { workspace: action.workspace };
+    // The New form's explicit provider choice travels unchanged: the manager
+    // validates the backend and target, and the host's injected native launcher
+    // owns discovery, argv, and environment. An absent backend is the ordinary
+    // Pi create, exactly as before.
+    const createOptions: CreateInstanceOptions = {
+      workspace: action.workspace,
+      ...(action.backend === undefined ? {} : { backend: action.backend }),
+      ...(action.nativeCliTarget === undefined ? {} : { nativeCliTarget: action.nativeCliTarget }),
+    };
     let task!: Promise<void>;
     task = (async () => {
       try {
@@ -5402,6 +5685,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       sidebar.failRowResume(requestId, message);
       scheduleRedraw();
     };
+    // A native CLI row has no Pi saved conversation to restart (#277): the
+    // request is refused truthfully BEFORE any saved-conversation listing or
+    // Pi restart admission runs, and the exited placeholder is left untouched.
+    const resumedBackend = hostService.readRow(oldId)?.backend;
+    if (isNativeCliBackend(resumedBackend)) {
+      fail(`${sessionBackendDisplayLabel(resumedBackend)} rows cannot be resumed; open New to start one`);
+      return;
+    }
     const controller = record.controller;
     // Capture the exact current exited binding before the read-only listing.
     const before = hostService.readExitedResumeTarget(oldId);
@@ -5941,6 +6232,238 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
   }
 
+  /**
+   * This host's live native target catalog for the roster bridge.
+   *
+   * It reads the ONE already-resolved list this host's own New form offers, so the
+   * bridge can state and re-prove exactly which targets exist right now without a
+   * second configuration or discovery system. A host with no real native launch
+   * support has no provider at all (the option is never supplied), and a host whose
+   * manager is gone or whose teardown began reports an empty catalog, which the
+   * bridge treats as "nothing may be launched" rather than as a default.
+   */
+  function advertisedNativeCliTargets(): readonly RemoteNativeCliTarget[] {
+    if (nativeCliLaunch === undefined || shutdownRequested || manager === undefined) return [];
+    return nativeCliTargets;
+  }
+
+  /**
+   * The ONE owner-side rowless NATIVE create provider.
+   *
+   * It is the native sibling of {@link createOwnedSession} and reuses the same
+   * seams and the same fixed facts: the very {@link OwningHostService.startSession}
+   * call the local New action uses, now with the operator-chosen backend and
+   * target id, plus the same pre-create run fence and the same authoritative
+   * post-create live-row observation. Nothing else about the local New route
+   * happens here: no duplicate fence, no path resolution or cwd substitution, no
+   * trimming, no form bookkeeping, no row selection, and no activation or focus
+   * change — the owner's launch path is focus-free by construction.
+   *
+   * The requested backend and target id are resolved ONLY against this owner's own
+   * current advertised catalog, immediately and again immediately before the
+   * launch: a requester's configured id, a label match, a backend-only match, or a
+   * withdrawn target is a refusal, never a default, never the other backend, and
+   * never a Pi create. No arbitrary command, argument, environment, executable
+   * path, or credential is expressible in the request, so none can reach the
+   * launcher; this host's own configured launcher owns discovery, argv, and
+   * environment exactly as it does for a local native New.
+   */
+  async function createNativeOwnedSession(
+    request: OwnerNativeCreateRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerCreateFacts> {
+    // Fence teardown, the one manager run, and real native launch support.
+    if (manager === undefined || shutdownRequested || nativeCliLaunch === undefined) {
+      return { kind: "refused" };
+    }
+    let before: OwningHostInventorySnapshot | undefined;
+    try {
+      before = hostService.readInventorySnapshot();
+    } catch {
+      before = undefined;
+    }
+    if (before === undefined) return { kind: "unknown" };
+    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
+    // This owner's OWN current catalog is the only thing that can authorize the
+    // target. A miss is a positive pre-invocation establishment, so `refused`.
+    if (findRemoteNativeCliTarget(advertisedNativeCliTargets(), request.backend, request.targetId) === null) {
+      return { kind: "refused" };
+    }
+    let authorized = false;
+    try {
+      authorized = stillAuthorized() === true;
+    } catch {
+      authorized = false;
+    }
+    if (!authorized || shutdownRequested) return { kind: "refused" };
+    // The canonical form text is forwarded verbatim: the owner's own launcher
+    // applies its existing home/cwd resolution for ITS machine.
+    let outcome: StartedSessionOutcome;
+    try {
+      outcome = await hostService.startSession({
+        workspace: request.workspace,
+        backend: request.backend,
+        nativeCliTarget: request.targetId,
+      });
+    } catch {
+      return { kind: "unknown" };
+    }
+    if (outcome.status === "not-ready" || outcome.status === "failed") {
+      return { kind: "unconfirmed" };
+    }
+    if (outcome.status !== "started") return { kind: "unknown" };
+    // The same authoritative post-create observation as the Pi create: `started`
+    // requires THIS run's own inventory to report the row alive with a live
+    // process. An unreadable or foreign-run inventory cannot establish that nothing
+    // came up, so it stays `unknown`; an observable absent, starting, errored, or
+    // exited row is `unconfirmed`.
+    let after: OwningHostInventorySnapshot | undefined;
+    try {
+      after = hostService.readInventorySnapshot();
+    } catch {
+      after = undefined;
+    }
+    if (after === undefined) return { kind: "unknown" };
+    if (after.hostRunId !== request.hostRunId) return { kind: "unknown" };
+    const row = after.rows.find((candidate) => candidate.id === outcome.id);
+    if (row === undefined || row.lifecycle !== "alive" || row.hasLiveProcess !== true) {
+      return { kind: "unconfirmed" };
+    }
+    return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
+  }
+
+  // --- The ONE native naming core, shared by the local Edit form and a remote owner request. ---
+
+  /**
+   * The closed per-operation outcome of one native HOST ROW NAME on THIS host.
+   *
+   * The two success kinds are the whole point of the core: a caption is applied to
+   * the live row, and it is only REMEMBERED when this host owns a durable slot for
+   * that row AND the roster publication for THIS operation actually took. Reporting
+   * `in-memory` as `durable` would tell an operator a name survives a restart when
+   * nothing established that, and reporting `durable` as `in-memory` would
+   * understate a name that really was stored.
+   */
+  type NativeNameOutcome =
+    | { readonly kind: "durable" }
+    /** Applied to the live row now; NOT established to survive a restart. */
+    | { readonly kind: "in-memory" }
+    | { readonly kind: "refused-row" }
+    | { readonly kind: "refused-not-native" }
+    | { readonly kind: "refused-name" }
+    /** This host's manager exposes no caption seam at all. */
+    | { readonly kind: "refused-unsupported" };
+
+  const NATIVE_NAME_REFUSED_ROW = "That row is no longer here; nothing was renamed";
+  const NATIVE_NAME_REFUSED_NOT_NATIVE
+    = "Only a native session row can be named here; use E on a Pi row to rename its conversation";
+  const NATIVE_NAME_REFUSED_NAME = "The name was not valid; nothing was renamed";
+  const NATIVE_NAME_REFUSED_UNSUPPORTED = "This host cannot name a native row; nothing was renamed";
+
+  /**
+   * Apply one native HOST ROW NAME on THIS host and report the truth about what
+   * happened — the single place both the local `rename-native` route and a remote
+   * owner request go through, so neither keeps its own copy of the caption,
+   * stable-slot, or durability logic.
+   *
+   * The manager replaces that row's ONE display label, and the remembered slot keeps
+   * the same caption so a later unavailable placeholder restores it. Nothing else
+   * acts: no provider is told anything, no Pi conversation rename is attempted, and
+   * no row is started, resumed, adopted, or retargeted. A row that vanished, changed
+   * kind, or carries an invalid caption updates nothing at all, and every refusal is
+   * positively established BEFORE anything mutates.
+   *
+   * A roster publication this host cannot classify (a throw) is reported honestly as
+   * NOT durable rather than as a refusal: the live caption really did change.
+   */
+  function applyNativeDisplayName(rowId: string, name: string): NativeNameOutcome {
+    const owner = manager;
+    if (owner === undefined || shutdownRequested) return { kind: "refused-row" };
+    const row = views.find((candidate) => candidate.id === rowId);
+    if (row === undefined) return { kind: "refused-row" };
+    if (!isNativeCliBackend(row.backend)) return { kind: "refused-not-native" };
+    if (!isNativeDisplayName(name)) return { kind: "refused-name" };
+    if (typeof owner.setNativeDisplayName !== "function") return { kind: "refused-unsupported" };
+    const applied = owner.setNativeDisplayName(rowId, name);
+    if (applied === "no-row") return { kind: "refused-row" };
+    if (applied === "not-native") return { kind: "refused-not-native" };
+    if (applied === "invalid-name") return { kind: "refused-name" };
+    // Remember the caption on the row's own durable slot, so a host restart
+    // restores it onto the unavailable placeholder. A row with no remembered slot
+    // yet keeps its live caption; nothing is guessed into a new slot.
+    const namedSlot = roster.getLocal(durableSlotForRow(rowId));
+    if (namedSlot !== undefined) namedSlot.displayName = name;
+    let persisted: RosterPersistOutcome = "failed";
+    try {
+      persisted = syncRosterAndSchedule();
+    } catch {
+      persisted = "failed";
+    }
+    if (namedSlot === undefined || !rosterStateIsDurable(persisted)) return { kind: "in-memory" };
+    return { kind: "durable" };
+  }
+
+  /**
+   * The ONE owner-side native HOST ROW NAME provider.
+   *
+   * It names THIS host's exact run, one exact row of that run, the native backend
+   * the requester last observed on that row, and the bounded replacement caption.
+   * Nothing here is a Pi conversation rename: no native tuple is accepted, no
+   * provider is contacted, and nothing belonging to the requester is touched. The
+   * request is resolved ONLY against this owner's authoritative inventory, read
+   * before the write for the exact run and row, and the minimal re-proof is checked
+   * immediately before the caption is applied — after every callout above — so a
+   * Revoke, a replaced grant, or a retired channel that landed after admission never
+   * renames anything.
+   *
+   * The reported facts carry this host's own per-operation persistence truth: a
+   * caption the owner applied but could not establish as durable is honestly
+   * `renamed-in-memory`, and a result this host cannot classify after the write was
+   * addressed is `unknown`, never a confident refusal.
+   */
+  function renameNativeOwnedSession(
+    request: OwnerNativeRenameRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerNativeRenameFacts> {
+    const fail = (facts: OwnerNativeRenameFacts): Promise<OwnerNativeRenameFacts> =>
+      Promise.resolve(facts);
+    const owner = manager;
+    if (owner === undefined || shutdownRequested) return fail({ kind: "refused" });
+    let before: OwningHostInventorySnapshot | undefined;
+    try { before = hostService.readInventorySnapshot(); } catch { return fail({ kind: "unknown" }); }
+    if (before === undefined) return fail({ kind: "unknown" });
+    if (before.hostRunId !== request.hostRunId) return fail({ kind: "refused" });
+    const row = before.rows.find((candidate) => candidate.id === request.rowId);
+    if (row === undefined) return fail({ kind: "refused" });
+    // The requester's observed backend is a fence: a row that now records another
+    // backend (or none) is never captioned by a stale request, and no backend is
+    // ever inferred here from a label or a missing status.
+    if (row.backend !== request.backend) return fail({ kind: "refused" });
+    if (!isNativeCliBackend(request.backend) || !isNativeDisplayName(request.name)) {
+      return fail({ kind: "refused" });
+    }
+    let authorized = false;
+    try { authorized = stillAuthorized() === true; } catch { /* No admission authority. */ }
+    if (!authorized || shutdownRequested || manager !== owner) return fail({ kind: "refused" });
+    const outcome = applyNativeDisplayName(request.rowId, request.name);
+    if (shutdownRequested || manager !== owner) {
+      // The caption may already be applied on a row this host still owns while this
+      // host can no longer classify the result: that is unobservable, not a positive
+      // establishment that nothing changed.
+      return outcome.kind === "durable" || outcome.kind === "in-memory"
+        ? fail({ kind: "unknown" })
+        : fail({ kind: "refused" });
+    }
+    switch (outcome.kind) {
+      case "durable": return fail({ kind: "renamed-durable" });
+      case "in-memory": return fail({ kind: "renamed-in-memory" });
+      case "refused-row":
+      case "refused-not-native":
+      case "refused-name":
+      case "refused-unsupported": return fail({ kind: "refused" });
+    }
+  }
+
   /** Rename only this run's exact native conversation through the local seam. */
   async function renameOwnedSession(
     request: OwnerRenameRequest,
@@ -6450,6 +6973,155 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     scheduleRedraw();
   }
 
+  /**
+   * One deliberate `E` on a remote card whose OWNER row is a native CLI row.
+   *
+   * It mirrors {@link openRemoteNameEdit} with the row's observed BACKEND in place
+   * of the native conversation tuple: Main independently proves the exact written
+   * highlight, then the sidebar opens the SAME shared Edit form on a typed native
+   * target. A Pi rename is never substituted, no tuple is invented, and a row that
+   * the current observation no longer describes as that backend opens nothing.
+   */
+  function openRemoteNativeNameEdit(
+    action: Extract<SidebarAction, { type: "edit-remote-native" }>,
+  ): void {
+    if (sidebar === undefined) return;
+    const shown = displayedMousePresentation?.sidebar.remoteNativeEdit;
+    const latest = latestMousePresentation?.sidebar.remoteNativeEdit;
+    if (shown === undefined || !sameRemoteNativeEditRow(shown, latest)
+      || shown.hostId !== action.hostId || shown.hostRunId !== action.hostRunId
+      || shown.rowId !== action.rowId || shown.backend !== action.backend) {
+      sidebar.showError(REMOTE_NATIVE_NAME_NOT_DRAWN_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    const host = peerUiSnapshot?.hosts?.find((candidate) => candidate.id === action.hostId);
+    const row = host?.roster.rows?.find((candidate) => candidate.id === action.rowId);
+    if (host?.state !== "connected" || host.nativeNameSupported !== true
+      || host.roster.state !== "current" || host.roster.hostRunId !== action.hostRunId
+      || row?.backend !== action.backend
+      || !sidebar.openRemoteNativeEdit({
+        hostId: action.hostId,
+        hostRunId: action.hostRunId,
+        rowId: action.rowId,
+        backend: action.backend,
+        currentName: row.label,
+      })) {
+      sidebar.showError(REMOTE_EDIT_TARGET_CHANGED_NOTICE);
+    }
+    reconcileLayout(true);
+    scheduleRedraw();
+  }
+
+  /** The fixed, truthful notice for one settled owner HOST ROW NAME result. */
+  function remoteNativeRenameNotice(result: PeerNativeRenameResult): string {
+    if (result.kind === "not-sent") {
+      if (result.reason === "capability-unsupported") return REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE;
+      if (result.reason === "busy" || result.reason === "limit") {
+        return "A remote row name is already pending or unavailable; nothing was sent";
+      }
+      return "Remote row naming was refused before sending; reopen Edit from the current row";
+    }
+    if (result.kind === "owner-result" && isOwnerNativeRenameFacts(result.facts)) {
+      switch (result.facts.kind) {
+        case "renamed-durable":
+          // Handled by the caller; a durable fact never reaches this notice.
+          return "The host named that session row";
+        case "renamed-in-memory":
+          // Truthful and never upgraded: the owner applied the caption but did NOT
+          // establish that it survives a restart, and this side says exactly that.
+          return "Named on the host, but the host could not confirm it was saved";
+        case "refused":
+          return "The owner refused this row name; nothing was renamed";
+        case "unknown":
+          return "UNCERTAIN: the host may have renamed that row; verify its current name before retrying";
+      }
+    }
+    return "UNCERTAIN: the host may have renamed that row; verify its current name before retrying";
+  }
+
+  /**
+   * Submit ONE frozen native HOST ROW NAME to the coordinator's existing rename
+   * controller. It reuses the Pi remote rename's written-frame, single-consume,
+   * last-instant-proof, and no-replay fences, and it is TYPED: only a native Edit
+   * frame can authorize it, so a Pi rename frame never becomes a caption and this
+   * side never invents a conversation tuple for a native row. Nothing is retried,
+   * replayed, cancelled, or retargeted, and no local caption is edited optimistically
+   * — the owner's next complete roster observation is the only thing that can carry
+   * a renamed row.
+   */
+  function launchRemoteNativeRename(
+    action: Extract<SidebarAction, { type: "rename-native-remote" }>,
+  ): void {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return;
+    if (action.renderToken <= consumedRemoteRenameToken) return; // No duplicate send or draft mutation.
+    const frame = editFormFrame;
+    if (frame === undefined || frame.kind !== "native" || !frame.settled
+      || frame.renderToken !== action.renderToken
+      || frame.formGeneration !== action.formGeneration || frame.hostId !== action.hostId
+      || frame.hostRunId !== action.hostRunId || frame.rowId !== action.rowId
+      || frame.backend !== action.backend || frame.name !== action.name
+      || !isCurrentEditFormFrame(frame)
+      || !activeSidebar.renameNativeOnPeerStillCurrent(action)) {
+      activeSidebar.failRename(action.requestId, REMOTE_EDIT_UNWRITTEN_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    consumedRemoteRenameToken = action.renderToken;
+    editFormFrame = undefined;
+    let controller: Partial<PeerCoordinatorWithRename>["ownerRename"];
+    try { controller = (peerCoordinator as Partial<PeerCoordinatorWithRename> | undefined)?.ownerRename; }
+    catch { controller = undefined; }
+    if (controller === undefined) {
+      activeSidebar.failRename(action.requestId, REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    const renameNative = typeof controller.renameNativeSession === "function"
+      ? controller.renameNativeSession.bind(controller)
+      : undefined;
+    if (renameNative === undefined) {
+      // This side's coordinator never learned the native name lane. The request is
+      // refused here and NEVER answered by the Pi conversation rename.
+      activeSidebar.failRename(action.requestId, REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE);
+      scheduleRedraw();
+      return;
+    }
+    const stillCurrent = (): boolean => isCurrentEditFormFrame(frame) && activeSidebar === sidebar
+      && activeSidebar.renameNativeOnPeerStillCurrent(action);
+    void (async () => {
+      let result: PeerNativeRenameResult;
+      try {
+        result = await renameNative({
+          hostId: action.hostId,
+          hostRunId: action.hostRunId,
+          rowId: action.rowId,
+          backend: action.backend,
+          name: action.name,
+        }, { stillCurrent });
+      } catch { result = { kind: "unknown" }; }
+      if (shutdownRequested || sidebar !== activeSidebar) return;
+      // This side never claims a saved caption from its own cache: a durable owner
+      // fact closes the form, an in-memory fact closes it with the honest "not
+      // confirmed saved" notice, and anything else leaves the draft for the
+      // operator. In every case the caption itself arrives only with the owner's
+      // next complete roster observation.
+      const durable = result.kind === "owner-result" && isOwnerNativeRenameFacts(result.facts)
+        ? result.facts.kind : "";
+      if ((durable === "renamed-durable" || durable === "renamed-in-memory")
+        && activeSidebar.renameNativeOnPeerStillCurrent(action)) {
+        activeSidebar.completeRename(action.requestId, "renamed");
+        if (durable === "renamed-in-memory") activeSidebar.showError(remoteNativeRenameNotice(result));
+      } else {
+        // requestId alone owns error delivery; a later form ignores this entirely.
+        activeSidebar.failRename(action.requestId, remoteNativeRenameNotice(result));
+      }
+      reconcileLayout(true);
+      scheduleRedraw();
+    })();
+  }
+
   function isCurrentEditFormFrame(frame: EditFormFrame): boolean {
     if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted
       || sidebar === undefined || !sidebar.visible || sidebar.focus !== "form") return false;
@@ -6479,7 +7151,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (activeSidebar === undefined || shutdownRequested) return;
     if (action.renderToken <= consumedRemoteRenameToken) return; // No duplicate send or draft mutation.
     const frame = editFormFrame;
-    if (frame === undefined || !frame.settled || frame.renderToken !== action.renderToken
+    if (frame === undefined || frame.kind !== "pi" || !frame.settled
+      || frame.renderToken !== action.renderToken
       || frame.formGeneration !== action.formGeneration || frame.hostId !== action.hostId
       || frame.hostRunId !== action.hostRunId || frame.rowId !== action.rowId
       || frame.nativeSessionId !== action.nativeSessionId || frame.nativeSessionEpoch !== action.nativeSessionEpoch
@@ -6687,11 +7360,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     void (async () => {
       let result: PeerCreateResult;
       try {
-        result = await controller.createSession({
-          hostId: attempt.hostId,
-          hostRunId: attempt.hostRunId,
-          workspace: attempt.workspace,
-        }, { stillCurrent });
+        result = attempt.backend === undefined || attempt.targetId === undefined
+          ? await controller.createSession({
+            hostId: attempt.hostId,
+            hostRunId: attempt.hostRunId,
+            workspace: attempt.workspace,
+          }, { stillCurrent })
+          // An explicit native choice goes to the owner's NATIVE lane and nowhere
+          // else: the optional method is feature-detected at the call, and its
+          // absence is an honest unsupported answer rather than a Pi create.
+          : await controller.createNativeSession?.({
+            hostId: attempt.hostId,
+            hostRunId: attempt.hostRunId,
+            workspace: attempt.workspace,
+            backend: attempt.backend,
+            targetId: attempt.targetId,
+          }, { stillCurrent }) ?? { kind: "not-sent", reason: "capability-unsupported" };
         if (typeof result !== "object" || result === null
           || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
           result = { kind: "unknown" };
@@ -6715,9 +7399,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * from a later list, index, label, or selection, and a local `create` takes the
    * completely unchanged path above.
    */
-  function launchCreateOnPeer(action: Extract<SidebarAction, { type: "create-on-peer" }>): void {
+  function launchCreateOnPeer(action: Extract<SidebarAction, { type: "create-on-peer" | "create-native-on-peer" }>): void {
     const activeSidebar = sidebar;
     if (activeSidebar === undefined || shutdownRequested || terminal === undefined) return;
+    const native = action.type === "create-native-on-peer";
     const frame = createFormFrame;
     if (frame === undefined || !frame.settled
       || frame.renderToken !== action.renderToken
@@ -6726,6 +7411,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       || frame.hostId !== action.hostId
       || frame.hostRunId !== action.hostRunId
       || frame.workspace !== action.workspace
+      // The drawn Provider line is part of the written form: a native submission
+      // must name exactly the backend and owner-advertised target that frame showed.
+      // The key form is the sidebar's own (`native:<targetId>`), so a written frame
+      // that drew Pi, another target, or another backend can never authorize this.
+      // A Pi submission is authorized by a frame that drew Pi, or by one that drew
+      // no Provider line at all — that frame is the ordinary native-less New form.
+      || (native
+        ? frame.providerKey !== `native:${action.targetId}`
+        : frame.providerKey !== undefined && frame.providerKey !== "pi")
       || !isCurrentCreateFormFrame(frame)) {
       // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
       // never send anything: the exact written form is the only authority.
@@ -6751,6 +7445,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       scheduleRedraw();
       return;
     }
+    if (native && typeof controller.createNativeSession !== "function") {
+      // This side's coordinator never learned the native lane. The request is
+      // refused here and NEVER answered by a Pi create on the same destination.
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
     startCreateOnPeer({
       requestId: action.requestId,
       hostId: action.hostId,
@@ -6763,6 +7465,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       paneCols: frame.cols,
       paneRows: frame.rows,
       epoch: frame.epoch,
+      ...(native
+        ? { backend: action.backend, targetId: action.targetId }
+        : {}),
     }, controller);
   }
 
@@ -7634,11 +8339,26 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         scheduleRedraw();
         return;
+      case "create-native-on-peer":
+        // A deliberate REMOTE New submission of a NATIVE session on the explicitly
+        // selected owner. It shares every written-form, run, and single-in-flight
+        // fence of the Pi remote New and adds the drawn-provider proof; it is never
+        // answered by a local create or a Pi create.
+        launchCreateOnPeer(action);
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
       case "edit-remote":
         openRemoteNameEdit(action);
         return;
+      case "edit-remote-native":
+        openRemoteNativeNameEdit(action);
+        return;
       case "rename-remote":
         launchRemoteRename(action);
+        return;
+      case "rename-native-remote":
+        launchRemoteNativeRename(action);
         return;
       case "edit": {
         if (!sidebar) return;
@@ -7680,6 +8400,51 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             scheduleRedraw();
           },
         );
+        return;
+      }
+      case "rename-native": {
+        // A host-side CAPTION of one native row, through the ONE naming core this
+        // host also uses for a remote owner request. Nothing else acts: no provider
+        // is told anything, no Pi conversation rename is attempted, and no row is
+        // started, resumed, adopted, or retargeted. A row that vanished, changed
+        // kind, or carries an invalid caption updates nothing at all.
+        if (!manager || !sidebar) return;
+        const outcome = applyNativeDisplayName(action.id, action.name);
+        if (outcome.kind === "refused-row") {
+          sidebar.failRename(action.requestId, NATIVE_NAME_REFUSED_ROW);
+          scheduleRedraw();
+          return;
+        }
+        if (outcome.kind === "refused-not-native") {
+          sidebar.failRename(action.requestId, NATIVE_NAME_REFUSED_NOT_NATIVE);
+          scheduleRedraw();
+          return;
+        }
+        if (outcome.kind === "refused-name") {
+          sidebar.failRename(action.requestId, NATIVE_NAME_REFUSED_NAME);
+          scheduleRedraw();
+          return;
+        }
+        if (outcome.kind === "refused-unsupported") {
+          // No caption seam on this host's manager: nothing is renamed, and no
+          // other path (a Pi conversation rename above all) is substituted.
+          sidebar.failRename(action.requestId, NATIVE_NAME_REFUSED_UNSUPPORTED);
+          scheduleRedraw();
+          return;
+        }
+        sidebar.completeRename(action.requestId, "renamed");
+        reconcileLayout(true);
+        // The caption is applied to the live row either way. It is only
+        // REMEMBERED when this host owns a durable slot for the row AND the
+        // roster publication for this operation actually took, and that is what
+        // the operator is told. The roster's own one-time warning flags are not
+        // consulted here: opening the Edit form clears a standing notice,
+        // `completeRename` clears it again, and a flag set by an earlier failure
+        // stays set, so none of them says whether THIS name survived.
+        if (outcome.kind !== "durable") {
+          sidebar.showError(NATIVE_NAME_NOT_DURABLE_MESSAGE);
+          scheduleRedraw();
+        }
         return;
       }
       case "remove": {
@@ -8438,6 +9203,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         return createNativeSavedQueryInput(activeSessionSetup.nativeAgentDir);
       },
       initialVisible: true,
+      // The native provider targets this host can actually offer in the New
+      // form's Provider line (empty means: draw no Provider line at all).
+      nativeCliTargets,
       onAction: handleSidebarAction,
       // The sidebar's read-only view of this host's ONE canonical mixed order
       // (#477): the current runtime identities of the cards it is drawing, in
@@ -8469,11 +9237,18 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       onChange: (id) => noteManagerChanged(id),
       onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
       onNativeClipboard: routeNativeClipboard,
+      onNativeCliClipboard: routeNativeCliClipboard,
       // Authenticated background child requests are admitted by the owning-host
       // service. This path never completes a sidebar form and never activates
       // the created row; manager onChange only refreshes the roster.
       onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
+      // The host-injected native interactive launcher (issue #277). A row whose
+      // backend is Claude or Codex launches through it with the provider's own
+      // native approvals, and never through the Pi descriptor, registration,
+      // bootstrap, or framing path. Absent hosting leaves the manager exactly as
+      // before: a native creation is refused before any row exists.
+      ...(nativeCliLaunch === undefined ? {} : { nativeCliLaunch }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

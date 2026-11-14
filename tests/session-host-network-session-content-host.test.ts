@@ -39,7 +39,7 @@ import type {
 	SessionViewerUpdate,
 	SessionViewerUpdateResult,
 } from "../src/session-host/instances";
-import { isNativeViewerStartupInputSource } from "../src/session-host/instances";
+import { isNativeViewerNativeCliInputSource, isNativeViewerStartupInputSource } from "../src/session-host/instances";
 import { translateInput } from "../src/session-host/input";
 import type { NativeClipboardEvent } from "../src/session-host/native-clipboard";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
@@ -85,6 +85,7 @@ import {
 	createSessionContentTransferAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoNativeCliSource,
 	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	nativeIoSourceEquals,
@@ -712,9 +713,11 @@ class FakeContentSource implements SessionContentSource {
 		if (this.inputWriteOutcome !== undefined) return this.inputWriteOutcome;
 		const current = this.readViewerInputSource(viewerId);
 		if (current === undefined) return { status: "refused", reason: "no-input-source" };
-		// This fake models only conversation scopes, so a startup expectation is stale.
+		// This fake models only conversation scopes, so any tuple-less expectation is stale.
 		const expected = request.expectedSource;
-		if (isNativeViewerStartupInputSource(expected)) return { status: "refused", reason: "stale-source" };
+		if (isNativeViewerStartupInputSource(expected) || isNativeViewerNativeCliInputSource(expected)) {
+			return { status: "refused", reason: "stale-source" };
+		}
 		if (!sameScopeFacts(current, expected)) return { status: "refused", reason: "stale-source" };
 		if (!sameModesFacts(this.inputModes, request.expectedInputModes)) {
 			return { status: "refused", reason: "stale-input-modes" };
@@ -1146,9 +1149,10 @@ function publishedSource(channel: ContentChannel): NativeIoSource | null | undef
 	const begin = framesOfType(channel.frames(), "content_begin").at(-1);
 	assert.ok(begin !== undefined, "a viewport must have been published");
 	const stated = begin.inputSource;
-	// This fake publishes tuple-carrying viewports only; a startup source here is a defect.
-	if (stated !== undefined && stated !== null && isNativeIoStartupSource(stated)) {
-		throw new Error("a tuple-carrying publish never states a startup source");
+	// This fake publishes tuple-carrying viewports only; a tuple-less source here is a defect.
+	if (stated !== undefined && stated !== null
+		&& (isNativeIoStartupSource(stated) || isNativeIoNativeCliSource(stated))) {
+		throw new Error("a tuple-carrying publish never states a tuple-less source");
 	}
 	return stated;
 }

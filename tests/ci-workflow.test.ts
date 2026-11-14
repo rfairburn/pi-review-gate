@@ -1638,3 +1638,42 @@ test("the native Windows storage step also runs the Network storage protection p
   }
   assert.match(run, /--test-concurrency=1 --test-timeout=120000/, "the native storage files stay serialized and bounded");
 });
+
+// Issue #277: the native interactive CLI hosting path is only proven on a real
+// Windows host. These assertions pin the two additive native steps — one per
+// existing Windows job — as unconditional executions of the two new compiled
+// suites, and pin that the suites still exist as sources. Nothing here changes
+// an existing check name, pin, or step.
+const NATIVE_CLI_WINDOWS_SUITES = [
+  "session-host-native-cli-windows-pty",
+  "session-host-native-cli-windows-delivery",
+];
+
+for (const [jobId, stepName] of [
+  // The step label names the job's stable per-major Node line, not a pinned
+  // patch release, so raising that line's security floor never renames it.
+  ["windows-launcher", "Native interactive CLI Windows ConPTY acceptance (Node 22)"],
+  ["windows-shell", "Native interactive CLI Windows ConPTY acceptance (Node 24)"],
+] as const) {
+  test(`${jobId} natively runs the native interactive CLI ConPTY acceptance suites`, () => {
+    const job = blockOf(readWorkflow(), jobId, 2);
+    const step = stepOf(job, stepName);
+    for (const suite of NATIVE_CLI_WINDOWS_SUITES) {
+      assert.ok(step.includes(`dist-test/tests/${suite}.test.js`),
+        `${suite} must run natively in the ${jobId} job`);
+      assert.ok(existsSync(join(projectRoot, "tests", `${suite}.test.ts`)),
+        `${suite} must exist as a test source for the ${jobId} step to compile`);
+    }
+    // The real ConPTY tier is required evidence on a Windows host: never a
+    // conditional, a tolerated failure, or a step with its own new deadline.
+    const command = withoutComments(step);
+    assert.doesNotMatch(command, /^        (?:if|continue-on-error|timeout-minutes):/m,
+      `the ${jobId} native CLI step stays unconditional with no new exemption or timeout`);
+    assert.doesNotMatch(command, /--test-name-pattern|--test-only|skip/,
+      `the ${jobId} native CLI step selects whole suites, never a narrowed subset`);
+    assert.doesNotMatch(command, /--model|API_KEY|OPENAI|ANTHROPIC|provider/i,
+      "the native CLI acceptance adds no provider or model call");
+    // Both suites must be inside the job that already builds the test bundle.
+    assert.match(job, /run: npm run build:test/, `${jobId} must compile the suites it runs`);
+  });
+}

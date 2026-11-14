@@ -66,7 +66,11 @@ told.
   background activity counts read hotter as a session's intended work grows
   (activity only, never an error state), a remote card's owner hostname uses
   Pi's cyan, and the active conversation remains marked while browsing the
-  sidebar ([Session host](docs/session-host-alpha.md)).
+  sidebar ([Session host](docs/session-host-alpha.md)). Beside those rows the host
+  can also start an explicit, local-only **Claude Code** or **Codex CLI** row: a real
+  interactive provider session over the same owned PTY surfaces, with its own
+  sidebar card that reports only what the host owns and leaves provider activity
+  honestly unknown ([Native Claude Code and Codex sessions](docs/native-sidebar-agents.md)).
 - **Android application** — a native Pi Review Gate app for Android 13 (API 33)
   and newer that connects directly to a session host with hosting turned on,
   showing that host's roster, session cards, Saved picker, and terminal; nothing
@@ -199,10 +203,15 @@ automatically only when relevant inputs have changed.
 
 For day-to-day use, start Pi through the `pi-review-sessions` session host: one
 terminal, one left sidebar roster of your sessions, and the review gate plus the
-same shared configuration in every session the host starts. Each sidebar row is
+same shared configuration in every Pi session the host starts. Each Pi sidebar row is
 an ordinary native Pi session with its own workspace, conversation, and
-lifecycle. This is the documented recommendation for how to launch the gate,
-not a different review setup, and it changes nothing native in Pi. The host is a
+lifecycle. The host can also start a real interactive Claude Code or Codex CLI row
+beside them, chosen explicitly on the New-session form, which still defaults to Pi; a
+native row keeps the provider's own configuration and carries no review gate, tool
+protection, or subtask capture/review/landing guarantee
+([Native Claude Code and Codex sessions](docs/native-sidebar-agents.md)). This is the
+documented recommendation for how to launch the gate, not a different review setup,
+and it changes nothing native in Pi. The host is a
 separate entry point: it does not replace either launcher or the ordinary Pi
 CLI, and it does not attach to already-running standalone processes. Start it
 from a source checkout:
@@ -372,7 +381,7 @@ paths. Start with the guide for your task:
 | Task | Guides |
 | --- | --- |
 | Install and configure | [Getting started](docs/getting-started.md), [Configuration](docs/configuration.md), [Settings](docs/settings.md) |
-| Launch and host sessions | [Session host](docs/session-host-alpha.md), [Native Pi tools](docs/native-pi-tools.md) |
+| Launch and host sessions | [Session host](docs/session-host-alpha.md), [Native Pi tools](docs/native-pi-tools.md), [Native Claude Code and Codex rows](docs/native-sidebar-agents.md) |
 | Review and delegate | [Review workflow](docs/review-workflow.md), [Delegated execution](docs/delegated-execution.md), [Scheduled tasks](docs/scheduled-tasks.md) |
 | Research and browse | [Web tools](docs/web-tools.md), [Browser guide](docs/browser.md), [Browser permissions](docs/browser-permissions.md) |
 | Inspect and recover | [Subtask evidence](docs/subtask-evidence.md), [Recovery](docs/recovery.md), [Troubleshooting](docs/troubleshooting.md) |

@@ -70,6 +70,14 @@ import {
   sidebarRosterHidden,
   type RosterNavigationTarget,
 } from "./session-host-native-roster-witness";
+import {
+  captureStartIdentities,
+  newFormWorkspaceValue,
+  observeFreshStart,
+  observeWorkspaceSubmitWitness,
+  requiresSecondWorkspaceEnter,
+  type WorkspaceSubmitWitness,
+} from "./session-host-native-new-form-witness";
 import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export const TEST_TIMEOUT_MS = 8 * 60_000;
@@ -2514,24 +2522,40 @@ export class MainPtyDriver {
     await this.clearWorkspaceField("the native `ctrl+c clear` action removes any retained Workspace draft");
     await this.writeAndWait(canonicalWorkspace, (text) => text.includes(canonicalWorkspace.slice(-18)),
       "the explicit workspace is entered in the real native field");
-    const visibleWorkspace = (text: string): string | undefined => {
-      const fieldRows = text.split("\n");
-      const fieldIndex = fieldRows.findIndex((line) => line.includes("> Workspace:"));
-      if (fieldIndex < 0) return undefined;
-      const fieldColumn = fieldRows[fieldIndex]!.indexOf("> Workspace:") + "> Workspace: ".length;
-      // The label sits beside the editable content row, so the value is read
-      // from the labelled row itself, never from the Editor's rule above it.
-      return fieldRows[fieldIndex]!.slice(fieldColumn).trim();
-    };
+    // The one intended Enter is pressed, and the branch that may follow is
+    // chosen ONLY by a positive witness captured on the frame that matched it:
+    // the host's pending-create row, a fresh observer `session_start` for this
+    // exact workspace fenced against every identity already recorded, or the
+    // exact completed owned folder inside a complete New form. A repaint that
+    // merely lost the `> Workspace:` row is never evidence of a submission, and
+    // no later transient frame is re-read to decide the branch.
     const beforeFirstEnter = this.frameRevision;
+    const preexistingStarts = captureStartIdentities(this.records());
     this.pty.write(KEYS.enter);
-    await this.waitFrame((text) => !text.includes("> Workspace:") || text.includes("Starting (request")
-      || visibleWorkspace(text) === `${canonicalWorkspace}/`,
-    "native Enter accepts the exact folder completion or actually submits New", beforeFirstEnter);
-    const afterFirstEnter = this.currentText();
-    if (afterFirstEnter.includes("> Workspace:") && !afterFirstEnter.includes("Starting (request")) {
-      assert.equal(visibleWorkspace(afterFirstEnter), `${canonicalWorkspace}/`,
+    let firstEnter: WorkspaceSubmitWitness<SessionRecord> | undefined;
+    await this.waitFrame((text) => {
+      const witness = observeWorkspaceSubmitWitness(text, {
+        completedPath: `${canonicalWorkspace}/`,
+        freshStart: () => observeFreshStart(this.records(), {
+          workspace: canonicalWorkspace,
+          startType: "session_start",
+          fence: preexistingStarts,
+        }),
+      });
+      if (witness === undefined) return false;
+      firstEnter = witness; // the matched frame and record ARE the branch's evidence
+      return true;
+    },
+    "native Enter positively shows the completed owned folder in a complete New form, "
+      + "the host's pending-create row, or this workspace's fresh session_start",
+    beforeFirstEnter);
+    assert.ok(firstEnter !== undefined,
+      "the bounded frame wait resolves only once a positive New-form witness was captured");
+    if (requiresSecondWorkspaceEnter(firstEnter)) {
+      assert.equal(newFormWorkspaceValue(firstEnter.frame), `${canonicalWorkspace}/`,
         "first native Enter accepted the exact owned folder completion, not another path or an error");
+      // Exactly one further Enter, and only while the complete form still owns
+      // the field: a pending create or a fresh start never receives one.
       await this.writeKeys(KEYS.enter, "a separate native Enter submits the accepted Workspace path");
     }
     this.pendingWorkspace = canonicalWorkspace;

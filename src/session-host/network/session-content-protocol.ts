@@ -114,6 +114,32 @@ export const SESSION_CONTENT_NATIVE_IO_CAPABILITY = "native-input-copy-v1";
  */
 export const SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY = "native-input-startup-v1";
 /**
+ * Optional capability naming INPUT to a hosted provider CLI row (issue 277): a
+ * publish whose `nativeSession` is null may state the explicit tuple-less
+ * `native-cli` source naming that row's provider backend, and an input frame may
+ * echo it. Like startup input it depends on
+ * {@link SESSION_CONTENT_NATIVE_IO_CAPABILITY}: it is offered and acknowledged only
+ * together with it, and an acknowledgement naming it without native IO is a protocol
+ * violation. It never extends copy — a hosted provider child has no copy producer and
+ * no conversation to attribute one to — and it never reaches a Pi row, whose framed
+ * startup and conversation input paths are unchanged. A peer that does not negotiate
+ * it keeps the exact tuple-less publish with no source.
+ */
+export const SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY = "native-input-cli-v1";
+/**
+ * Optional capability naming TEXT copy OUT of a hosted provider CLI row (issue 277
+ * native text-copy slice): a `copy`/`copy_begin` frame may carry the tuple-less
+ * `native-cli` source together with a native CLI copy event that names that row's
+ * recorded backend and NO conversation tuple. It depends on BOTH
+ * {@link SESSION_CONTENT_NATIVE_IO_CAPABILITY} and
+ * {@link SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY}: it is offered and acknowledged
+ * only beside them, and an acknowledgement naming it without either is a protocol
+ * violation. It never widens Pi copy: a conversation copy keeps its unchanged
+ * tuple-sourced shape, and a peer that does not negotiate it keeps refusing a
+ * native CLI copy source outright rather than gaining implicit support.
+ */
+export const SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY = "native-copy-cli-v1";
+/**
  * Optional capabilities this lane negotiates without an explicit opt-in. There
  * are none: unlike a purely additive capability, the native IO extension can
  * carry input and clipboard data, so offering or acknowledging it on the
@@ -131,6 +157,8 @@ export const SESSION_CONTENT_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Ob
 export const SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 ]);
 
 /**
@@ -463,12 +491,41 @@ export interface NativeIoStartupSource {
 	readonly sourceToken: string;
 }
 
-/** Input-path source union. Copy paths keep {@link NativeIoSource} only. */
-export type NativeIoInputSource = NativeIoSource | NativeIoStartupSource;
+/**
+ * Exact host-written NATIVE CLI input source (optional
+ * {@link SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY}): one hosted provider CLI row
+ * this owner runs as a plain PTY process. The same run, owner row, geometry, viewer
+ * revision, and opaque token facts as {@link NativeIoSource}, an explicit
+ * `phase: "native-cli"`, the row's recorded provider backend, and NO `nativeSession`,
+ * registration, PID, path, or command field — the owner binds the source to the child
+ * process through its own private per-incarnation key, never through the wire. Input
+ * only: no copy frame can carry it.
+ */
+export interface NativeIoNativeCliSource {
+	readonly hostRunId: string;
+	/** Owner row id of the session, never a native conversation id. */
+	readonly sessionId: string;
+	readonly phase: "native-cli";
+	/** The owner's recorded backend of this row; never inferred from output. */
+	readonly backend: "claude" | "codex";
+	readonly geometry: SessionContentGeometry;
+	readonly viewerRevision: number;
+	readonly sourceToken: string;
+}
+
+/**
+ * Input-path source union. Copy paths keep {@link NativeIoSource} only.
+ */
+export type NativeIoInputSource = NativeIoSource | NativeIoStartupSource | NativeIoNativeCliSource;
 
 /** True for the startup variant of an input-path source. */
 export function isNativeIoStartupSource(source: NativeIoInputSource): source is NativeIoStartupSource {
 	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/** True for the hosted native CLI variant of an input-path source. */
+export function isNativeIoNativeCliSource(source: NativeIoInputSource): source is NativeIoNativeCliSource {
+	return (source as { readonly phase?: unknown }).phase === "native-cli";
 }
 
 /** Native input payload kinds. Image and file payloads are not expressible. */
@@ -547,6 +604,37 @@ export type NativeIoCopyEvent =
 		readonly sessionEpoch: number;
 	};
 
+/**
+ * The closed source shape a copy frame may carry: the unchanged Pi conversation
+ * source, or the tuple-less hosted provider CLI source of a channel that negotiated
+ * {@link SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY}. A startup source is never a
+ * copy source on either side.
+ */
+export type NativeIoCopySource = NativeIoSource | NativeIoNativeCliSource;
+
+/**
+ * Copy payload of one hosted provider TEXT copy: canonical base64 UTF-8 text plus
+ * the row's own recorded backend, and NO `sessionId`/`sessionEpoch` key at all. A
+ * hosted provider child has no Pi conversation, so stating a tuple here would be a
+ * fabricated attribution; the child process it rode in on is bound only through the
+ * owner's private per-incarnation key behind `source.sourceToken`.
+ */
+export type NativeIoNativeCliCopyEvent = {
+	readonly kind: "copy";
+	readonly encoded: string;
+	readonly backend: "claude" | "codex";
+};
+
+/** The copy event union: an unchanged Pi conversation event or a hosted CLI event. */
+export type NativeIoCopyFrameEvent = NativeIoCopyEvent | NativeIoNativeCliCopyEvent;
+
+/** True only for the hosted provider variant of a copy event. */
+export function isNativeIoNativeCliCopyEvent(
+	event: NativeIoCopyFrameEvent,
+): event is NativeIoNativeCliCopyEvent {
+	return (event as { readonly backend?: unknown }).backend !== undefined;
+}
+
 /** One inline native text copy that fits a single message. */
 export interface SessionContentCopyFrame {
 	readonly type: "copy";
@@ -554,19 +642,22 @@ export interface SessionContentCopyFrame {
 	readonly copyId: string;
 	/** Positive emission order per binding; independent of `dispatchId`. */
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	/**
 	 * Native input dispatch that caused this copy. Informational only: it may
 	 * arrive out of order (an asynchronous copy from input A can follow B), so it
-	 * never orders, fences, or drops a copy.
+	 * never orders, fences, or drops a copy. For a hosted provider copy it is the
+	 * owner's own ordinal of the accepted input this copy is ROUTED to — a routing
+	 * convention frozen at acceptance, never causal proof.
 	 */
 	readonly dispatchId: number;
 	/**
-	 * Producer event for this copy. Its `sessionId`/`sessionEpoch` must equal
-	 * `source.nativeSession`; a frame that names two different conversations is
+	 * Producer event for this copy. A conversation event's `sessionId`/`sessionEpoch`
+	 * must equal `source.nativeSession`; a hosted CLI event's `backend` must equal
+	 * `source.backend`. A frame whose source and event describe different producers is
 	 * refused rather than merged.
 	 */
-	readonly event: NativeIoCopyEvent;
+	readonly event: NativeIoCopyFrameEvent;
 }
 
 /** Begin of one atomic paged native text copy; never carries the payload. */
@@ -575,7 +666,7 @@ export interface SessionContentCopyBeginFrame {
 	readonly subscriptionId: string;
 	readonly copyId: string;
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly dispatchId: number;
 	readonly byteLength: number;
 	readonly chunkCount: number;
@@ -1055,32 +1146,76 @@ function readNativeIoStartupSource(value: unknown, bounds: SessionContentBounds)
 }
 
 /**
- * Validate one input-path source: a startup source when (and only when) the
- * object names a `phase`, otherwise the unchanged conversation source. Copy paths
- * never call this, so a startup source is never readable as a copy source.
+ * Validate one input-path source: a startup source when it names phase `startup`, a
+ * hosted native CLI source when it names phase `native-cli`, otherwise the unchanged
+ * conversation source. Copy paths never call this, so neither a startup source nor a
+ * native CLI source is ever readable as a copy source.
  */
 function readNativeIoInputSource(value: unknown, bounds: SessionContentBounds): NativeIoInputSource {
 	if (isPlainRecord(value) && Object.prototype.hasOwnProperty.call(value, "phase")) {
-		return readNativeIoStartupSource(value, bounds);
+		return ownField(value, "phase") === "native-cli"
+			? readNativeIoNativeCliSource(value, bounds)
+			: readNativeIoStartupSource(value, bounds);
 	}
 	return readNativeIoSource(value, bounds);
+}
+
+const NATIVE_IO_NATIVE_CLI_SOURCE_KEYS: ReadonlySet<string> = new Set([
+	"hostRunId",
+	"sessionId",
+	"phase",
+	"backend",
+	"geometry",
+	"viewerRevision",
+	"sourceToken",
+]);
+
+/**
+ * Validate one exact native CLI source: closed keys, the one legal phase value, one
+ * of the two closed backends, and no `nativeSession` key at all (a null or fabricated
+ * tuple is refused), because a hosted provider child has no Pi conversation.
+ */
+function readNativeIoNativeCliSource(value: unknown, bounds: SessionContentBounds): NativeIoNativeCliSource {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	readExactKeys(value, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, "bad_frame");
+	if (ownField(value, "phase") !== "native-cli") fail("bad_frame");
+	const backend = ownField(value, "backend");
+	if (backend !== "claude" && backend !== "codex") fail("bad_frame");
+	return Object.freeze({
+		hostRunId: readIdentifier(ownField(value, "hostRunId"), bounds.maxIdentifierBytes),
+		sessionId: readIdentifier(ownField(value, "sessionId"), bounds.maxIdentifierBytes),
+		phase: "native-cli" as const,
+		backend,
+		geometry: readGeometry(ownField(value, "geometry"), bounds),
+		viewerRevision: readInteger(ownField(value, "viewerRevision"), 1, Number.MAX_SAFE_INTEGER),
+		sourceToken: readNativeIoSourceToken(ownField(value, "sourceToken")),
+	});
+}
+
+/** The closed variant of one input-path source, for the variant-aware comparison. */
+function nativeIoSourceVariant(source: NativeIoInputSource): "startup" | "native-cli" | "conversation" {
+	if (isNativeIoStartupSource(source)) return "startup";
+	return isNativeIoNativeCliSource(source) ? "native-cli" : "conversation";
 }
 
 /**
  * Exact structural, variant-aware equality of two sources. Equal dimensions are
  * never enough: the epoch, the geometry revision, the viewer revision, and the host
  * token must all agree, so an A→B→A viewport change is never treated as the
- * original A, and a startup source never equals a conversation source. This is a
+ * original A, and a startup source never equals a conversation source or a native CLI
+ * source. Two native CLI sources also have to name the same backend. This is a
  * comparison only; it grants and implies no authority.
  */
 export function nativeIoSourceEquals(left: NativeIoInputSource, right: NativeIoInputSource): boolean {
-	const leftStartup = isNativeIoStartupSource(left);
-	const rightStartup = isNativeIoStartupSource(right);
-	if (leftStartup !== rightStartup) return false;
-	if (!leftStartup && !rightStartup) {
+	const variant = nativeIoSourceVariant(left);
+	if (variant !== nativeIoSourceVariant(right)) return false;
+	if (variant === "conversation") {
 		const leftTuple = (left as NativeIoSource).nativeSession;
 		const rightTuple = (right as NativeIoSource).nativeSession;
 		if (leftTuple.sessionId !== rightTuple.sessionId || leftTuple.epoch !== rightTuple.epoch) return false;
+	}
+	if (variant === "native-cli") {
+		if ((left as NativeIoNativeCliSource).backend !== (right as NativeIoNativeCliSource).backend) return false;
 	}
 	return left.hostRunId === right.hostRunId
 		&& left.sessionId === right.sessionId
@@ -1103,6 +1238,58 @@ function readNativeInputData(value: unknown, kind: NativeIoInputKind, bounds: Se
 /** Declared decoded byte length of one paged native text paste. */
 function readNativePasteByteLength(value: unknown, bounds: SessionContentBounds): number {
 	return readInteger(value, 1, Math.min(NATIVE_TEXT_PASTE_MAX_BYTES, bounds.maxTransferBytes));
+}
+
+const NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS: ReadonlySet<string> = new Set(["kind", "encoded", "backend"]);
+
+/**
+ * Validate one hosted provider TEXT copy event: closed keys, the `copy` kind only,
+ * the row's recorded backend, and a normalized text payload. There is no
+ * `sessionId`/`sessionEpoch` key and no `unavailable` variant: a hosted provider
+ * child has no conversation to attribute anything else to.
+ */
+function readNativeCliCopyEvent(value: unknown): NativeIoNativeCliCopyEvent {
+	if (!isPlainRecord(value)) fail("bad_frame");
+	readExactKeys(value, NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS, NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS, "bad_frame");
+	if (ownField(value, "kind") !== "copy") fail("bad_frame");
+	const backend = ownField(value, "backend");
+	if (backend !== "claude" && backend !== "codex") fail("bad_frame");
+	return Object.freeze({
+		kind: "copy" as const,
+		encoded: readNativeCopyEncoded(ownField(value, "encoded")),
+		backend,
+	});
+}
+
+/**
+ * Validate the copy event of one wire frame. A native CLI event is recognized by its
+ * `backend` key alone and a conversation event by its tuple keys; both readers are
+ * exact-key, so a frame that mixes the two families is refused rather than merged,
+ * and neither family can be read as the other.
+ */
+function readNativeCopyFrameEvent(value: unknown, bounds: SessionContentBounds): NativeIoCopyFrameEvent {
+	if (isPlainRecord(value) && Object.prototype.hasOwnProperty.call(value, "backend")) {
+		return readNativeCliCopyEvent(value);
+	}
+	return readNativeCopyEvent(value, bounds);
+}
+
+/**
+ * Validate the source of one copy frame: the unchanged conversation source, or the
+ * tuple-less hosted native CLI source. A startup source is never a copy source.
+ */
+function readNativeCopySource(value: unknown, bounds: SessionContentBounds): NativeIoCopySource {
+	if (isPlainRecord(value) && Object.prototype.hasOwnProperty.call(value, "phase")) {
+		return ownField(value, "phase") === "native-cli"
+			? readNativeIoNativeCliSource(value, bounds)
+			: fail("bad_frame");
+	}
+	return readNativeIoSource(value, bounds);
+}
+
+/** True for the hosted provider variant of a copy source or event. */
+function isNativeCliCopySource(source: NativeIoCopySource): source is NativeIoNativeCliSource {
+	return (source as { readonly phase?: unknown }).phase === "native-cli";
 }
 
 /**
@@ -1175,6 +1362,19 @@ function checkInputSourceCoherence(inputSource: NativeIoInputSource, frame: {
 		}
 		return;
 	}
+	if (isNativeIoNativeCliSource(inputSource)) {
+		// A hosted provider child has no Pi conversation, so its source describes ONLY
+		// a publish that names none; a frame carrying a tuple is never one of them.
+		if (frame.nativeSession !== null) fail("bad_frame");
+		if (inputSource.hostRunId !== frame.hostRunId) fail("bad_frame");
+		if (inputSource.sessionId !== frame.sessionId) fail("bad_frame");
+		if (inputSource.geometry.cols !== frame.geometry.cols
+			|| inputSource.geometry.rows !== frame.geometry.rows
+			|| inputSource.geometry.revision !== frame.geometry.revision) {
+			fail("bad_frame");
+		}
+		return;
+	}
 	const nativeSession = frame.nativeSession;
 	// No native session in the frame means there is no tuple a source may claim.
 	if (nativeSession === null) fail("bad_frame");
@@ -1191,16 +1391,25 @@ function checkInputSourceCoherence(inputSource: NativeIoInputSource, frame: {
 }
 
 /**
- * A copy names one authenticated native conversation twice: in the frame source
- * and in the producer's event. The two must agree, so an inline payload can
- * never be attributed to a different tuple, and an assembled copy keeps the
- * header source and the event tuple consistent.
+ * A copy names its producer twice: in the frame source and in the producer's event.
+ * A conversation copy names the same authenticated native conversation in both, so
+ * an inline payload can never be attributed to a different tuple. A hosted provider
+ * copy names the same recorded backend in both and carries NO tuple anywhere.
  *
  * Coherence only; no permission, gate, or lease is created here.
  */
-function checkCopyTupleCoherence(source: NativeIoSource, event: NativeIoCopyEvent): void {
-	if (event.sessionId !== source.nativeSession.sessionId) fail("bad_frame");
-	if (event.sessionEpoch !== source.nativeSession.epoch) fail("bad_frame");
+function checkCopyTupleCoherence(source: NativeIoCopySource, event: NativeIoCopyFrameEvent): void {
+	if (isNativeCliCopySource(source)) {
+		// The two families never mix: a tuple-carrying event on a tuple-less source (or
+		// the reverse) describes two different producers and is refused.
+		if (!Object.prototype.hasOwnProperty.call(event, "backend")) fail("bad_frame");
+		if ((event as { readonly backend?: unknown }).backend !== source.backend) fail("bad_frame");
+		return;
+	}
+	if (Object.prototype.hasOwnProperty.call(event, "backend")) fail("bad_frame");
+	const tuple = event as NativeIoCopyEvent;
+	if (tuple.sessionId !== source.nativeSession.sessionId) fail("bad_frame");
+	if (tuple.sessionEpoch !== source.nativeSession.epoch) fail("bad_frame");
 }
 
 function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds): SessionContentFrame {
@@ -1328,17 +1537,17 @@ function validateFrame(frame: SessionContentFrame, bounds: SessionContentBounds)
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
 			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
-			const source = readNativeIoSource(frame.source, bounds);
+			const source = readNativeCopySource(frame.source, bounds);
 			readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
-			// The producer's event tuple must be the source's native tuple.
-			checkCopyTupleCoherence(source, readNativeCopyEvent(frame.event, bounds));
+			// The producer's own facts must name the source's producer.
+			checkCopyTupleCoherence(source, readNativeCopyFrameEvent(frame.event, bounds));
 			return frame;
 		}
 		case "copy_begin": {
 			readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 			readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
 			readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
-			readNativeIoSource(frame.source, bounds);
+			readNativeCopySource(frame.source, bounds);
 			readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
 			const byteLength = readInteger(frame.byteLength, 1, NATIVE_COPY_MAX_ENCODED_CHARS);
 			const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
@@ -1575,9 +1784,9 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 			});
 		}
 		case "copy": {
-			const source = readNativeIoSource(ownField(record, "source"), bounds);
-			const event = readNativeCopyEvent(ownField(record, "event"), bounds);
-			// The event tuple and the source tuple name the same conversation.
+			const source = readNativeCopySource(ownField(record, "source"), bounds);
+			const event = readNativeCopyFrameEvent(ownField(record, "event"), bounds);
+			// The event's own producer facts and the source name the same producer.
 			checkCopyTupleCoherence(source, event);
 			return Object.freeze({
 				type,
@@ -1598,7 +1807,7 @@ function buildFrame(record: Record<string, unknown>, bounds: SessionContentBound
 				subscriptionId: readIdentifier(ownField(record, "subscriptionId"), bounds.maxIdentifierBytes),
 				copyId: readIdentifier(ownField(record, "copyId"), bounds.maxIdentifierBytes),
 				sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
-				source: readNativeIoSource(ownField(record, "source"), bounds),
+				source: readNativeCopySource(ownField(record, "source"), bounds),
 				dispatchId: readInteger(ownField(record, "dispatchId"), 1, Number.MAX_SAFE_INTEGER),
 				byteLength,
 				chunkCount,
@@ -1701,10 +1910,17 @@ function enabledOptionalCapabilities(options: unknown): readonly string[] {
 		if (enabled.includes(entry)) fail("invalid_bounds");
 		enabled.push(entry);
 	}
-	// Startup input depends on the native IO capability: enabling it alone is a
-	// malformed opt-in, refused rather than silently narrowed.
-	if (enabled.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+	// Startup input and hosted native CLI input each depend on the native IO
+	// capability: enabling either alone is a malformed opt-in, refused rather than
+	// silently narrowed. Hosted native CLI COPY additionally depends on hosted native
+	// CLI input, whose source shape it rides on.
+	if ((enabled.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		|| enabled.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY))
 		&& !enabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
+		fail("invalid_bounds");
+	}
+	if (enabled.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY)
+		&& !enabled.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
 		fail("invalid_bounds");
 	}
 	return Object.freeze(enabled);
@@ -1732,11 +1948,19 @@ export function negotiateSessionContentHello(
 	}
 	const offeredAndEnabled = hello.capabilities.filter((capability) =>
 		capability !== SESSION_CONTENT_REQUIRED_CAPABILITY && enabled.includes(capability));
-	// Startup input is acknowledged ONLY together with native IO: a peer that offers
-	// startup without native IO simply does not get it (never a partial extension).
-	const negotiated = offeredAndEnabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)
+	// Startup input and hosted native CLI input are acknowledged ONLY together with
+	// native IO: a peer that offers either without native IO simply does not get it
+	// (never a partial extension).
+	let negotiated = offeredAndEnabled.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)
 		? offeredAndEnabled
-		: offeredAndEnabled.filter((capability) => capability !== SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY);
+		: offeredAndEnabled.filter((capability) => capability !== SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY
+			&& capability !== SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY
+			&& capability !== SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY);
+	// Hosted native CLI copy also needs hosted native CLI input, whose source shape it
+	// rides on: without it this side simply does not get copy, never a partial pair.
+	if (!negotiated.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
+		negotiated = negotiated.filter((capability) => capability !== SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY);
+	}
 	return Object.freeze({
 		ok: true,
 		major: SESSION_CONTENT_MAJOR,
@@ -1777,10 +2001,17 @@ export function reviewSessionContentHelloAck(
 		}
 		if (!offered.capabilities.includes(capability)) return { ok: false, code: "protocol_violation" };
 	}
-	// An acknowledgement of startup input without the native IO capability it
-	// depends on describes an extension that cannot exist: a protocol violation.
-	if (ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+	// An acknowledgement of startup input or hosted native CLI input without the
+	// native IO capability they depend on describes an extension that cannot exist: a
+	// protocol violation. So does an acknowledgement of hosted native CLI copy without
+	// hosted native CLI input.
+	if ((ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)
+		|| ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY))
 		&& !ack.capabilities.includes(SESSION_CONTENT_NATIVE_IO_CAPABILITY)) {
+		return { ok: false, code: "protocol_violation" };
+	}
+	if (ack.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY)
+		&& !ack.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
 		return { ok: false, code: "protocol_violation" };
 	}
 	return Object.freeze({ ok: true, minor: ack.minor, capabilities: Object.freeze([...ack.capabilities]) });
@@ -2669,9 +2900,9 @@ export interface NativeIoCompletedCopy {
 	readonly subscriptionId: string;
 	readonly copyId: string;
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly dispatchId: number;
-	readonly event: NativeIoCopyEvent;
+	readonly event: NativeIoCopyFrameEvent;
 }
 
 /** Encoded frames of one packed native IO unit, in wire order. */
@@ -2877,14 +3108,14 @@ export function buildNativeCopyInline(options: {
 	readonly subscriptionId: string;
 	readonly copyId: string;
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly dispatchId: number;
-	readonly event: NativeIoCopyEvent;
+	readonly event: NativeIoCopyFrameEvent;
 	readonly bounds?: SessionContentBounds;
 }): NativeIoBuiltTransfer {
 	return builderFailure(() => {
 		const bounds = options.bounds ?? DEFAULT_SESSION_CONTENT_BOUNDS;
-		const event = readNativeCopyEvent(options.event, bounds);
+		const event = readNativeCopyFrameEvent(options.event, bounds);
 		const frame: SessionContentCopyFrame = Object.freeze({
 			type: "copy",
 			subscriptionId: options.subscriptionId,
@@ -2912,7 +3143,7 @@ export function buildNativeCopyPaged(options: {
 	readonly subscriptionId: string;
 	readonly copyId: string;
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly dispatchId: number;
 	readonly encoded: string;
 	readonly bounds?: SessionContentBounds;
@@ -3178,7 +3409,7 @@ interface PartialNativeCopy {
 	readonly subscriptionId: string;
 	readonly copyId: string;
 	readonly sequence: number;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly dispatchId: number;
 	readonly byteLength: number;
 	readonly chunkCount: number;
@@ -3214,13 +3445,13 @@ export function createNativeCopyAssembler(
 		subscriptionId: string,
 		copyId: string,
 		sequence: number,
-		source: NativeIoSource,
+		source: NativeIoCopySource,
 		dispatchId: number,
-		event: NativeIoCopyEvent,
+		event: NativeIoCopyFrameEvent,
 	): NativeIoCompletedCopy => {
 		// Emission order is the copy sequence; `dispatchId` never orders or fences.
 		if (sequence <= completedSequence) refuse();
-		// The completed event always names the header source's own native tuple.
+		// The completed event always names the header source's own producer.
 		checkCopyTupleCoherence(source, event);
 		completedSequence = sequence;
 		return Object.freeze({ subscriptionId, copyId, sequence, source, dispatchId, event });
@@ -3232,11 +3463,11 @@ export function createNativeCopyAssembler(
 				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 				const copyId = readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
 				const sequence = readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
-				const source = readNativeIoSource(frame.source, bounds);
+				const source = readNativeCopySource(frame.source, bounds);
 				const dispatchId = readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
-				let event: NativeIoCopyEvent;
+				let event: NativeIoCopyFrameEvent;
 				try {
-					event = readNativeCopyEvent(frame.event, bounds);
+					event = readNativeCopyFrameEvent(frame.event, bounds);
 				} catch (error) {
 					discard();
 					throw error;
@@ -3248,7 +3479,7 @@ export function createNativeCopyAssembler(
 				const subscriptionId = readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
 				const copyId = readIdentifier(frame.copyId, bounds.maxIdentifierBytes);
 				const sequence = readInteger(frame.sequence, 1, Number.MAX_SAFE_INTEGER);
-				const source = readNativeIoSource(frame.source, bounds);
+				const source = readNativeCopySource(frame.source, bounds);
 				const dispatchId = readInteger(frame.dispatchId, 1, Number.MAX_SAFE_INTEGER);
 				const byteLength = readInteger(frame.byteLength, 1, NATIVE_COPY_MAX_ENCODED_CHARS);
 				const chunkCount = readInteger(frame.chunkCount, 1, byteLength);
@@ -3313,21 +3544,24 @@ export function createNativeCopyAssembler(
 				// The assembled payload must be the producer's canonical, UTF-8 text
 				// encoding before it can become a completed copy.
 				const encoded = readNativeCopyEncoded(decodeNativeIoText(buffer));
-				// The assembled payload inherits the header source's authenticated tuple,
-				// so the completed event and the header source stay consistent by
-				// construction and are re-checked by `complete`.
+				// The assembled payload inherits the header source's authenticated producer
+				// facts — a conversation tuple or a hosted backend, never both — so the
+				// completed event and the header source stay consistent by construction and
+				// are re-checked by `complete`.
 				return complete(
 					transfer.subscriptionId,
 					transfer.copyId,
 					transfer.sequence,
 					transfer.source,
 					transfer.dispatchId,
-					Object.freeze({
-						kind: "copy",
-						encoded,
-						sessionId: transfer.source.nativeSession.sessionId,
-						sessionEpoch: transfer.source.nativeSession.epoch,
-					}),
+					isNativeCliCopySource(transfer.source)
+						? Object.freeze({ kind: "copy" as const, encoded, backend: transfer.source.backend })
+						: Object.freeze({
+							kind: "copy" as const,
+							encoded,
+							sessionId: transfer.source.nativeSession.sessionId,
+							sessionEpoch: transfer.source.nativeSession.epoch,
+						}),
 				);
 			}
 			// Control and viewport transfer frames belong to the endpoint state machine.

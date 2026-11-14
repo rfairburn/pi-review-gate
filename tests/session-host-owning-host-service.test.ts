@@ -71,6 +71,8 @@ class SyntheticManager {
   createPublishesRow = true;
   ownedThrows = false;
   hasLiveThrows = false;
+  /** When set, `ownedLiveSessions()` returns this census instead of the default. */
+  ownedLiveSessionsOverride: { id?: string }[] | undefined;
 
   openManager(options: InstanceManagerOptions): void {
     this.receivedOptions.push(options);
@@ -97,7 +99,7 @@ class SyntheticManager {
 
   ownedLiveSessions(): { id?: string }[] {
     if (this.ownedThrows) throw new Error("synthetic ownership failure");
-    return [{ id: "owned-conversation" }];
+    return this.ownedLiveSessionsOverride ?? [{ id: "owned-conversation" }];
   }
 
   hasLiveProcesses(): boolean {
@@ -414,6 +416,35 @@ test("the saved-conversation ownership fence keeps its unknown-binding evidence"
   const settled = new SyntheticManager();
   settled.views = [rowView({ id: "row-1", lifecycle: "exited", hasLiveProcess: false, nativeSession: null })];
   assert.deepEqual(savedDeletionOwnedSessions(settled.asManager()), [{ id: "owned-conversation" }]);
+});
+
+test("a known native CLI row adds no unknown-binding evidence while an unknown Pi row still does", () => {
+  // A provider child owns no Pi conversation at all: its absent Pi binding is not
+  // uncertainty about one, so it never blocks deleting an unrelated saved
+  // conversation. The manager's own census already omits the row too.
+  const native = new SyntheticManager();
+  native.ownedLiveSessionsOverride = [];
+  native.views = [rowView({ id: "claude-1", backend: "claude", nativeSession: null })];
+  assert.deepEqual(savedDeletionOwnedSessions(native.asManager()), [],
+    "a live Claude row contributes neither a binding nor an unknown-binding placeholder");
+
+  // The same manager with an unknown Pi row still refuses.
+  const mixed = new SyntheticManager();
+  mixed.ownedLiveSessionsOverride = [];
+  mixed.views = [
+    rowView({ id: "claude-1", backend: "codex", nativeSession: null }),
+    rowView({ id: "pi-1", nativeSession: null }),
+  ];
+  const snapshot = savedDeletionOwnedSessions(mixed.asManager());
+  assert.equal(snapshot.length, 1, "only the unknown Pi child contributes evidence");
+  assert.deepEqual(snapshot[0], {});
+
+  // An unrecorded backend is Pi: the compatibility default never weakens the fence.
+  const unrecorded = new SyntheticManager();
+  unrecorded.ownedLiveSessionsOverride = [];
+  unrecorded.views = [rowView({ id: "row-1", nativeSession: null })];
+  assert.deepEqual(savedDeletionOwnedSessions(unrecorded.asManager()), [{}],
+    "a live row with no recorded backend is still an unknown Pi child");
 });
 
 test("deletion and admission preflight refuse instead of guessing when ownership is unreadable", () => {

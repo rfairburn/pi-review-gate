@@ -1,33 +1,47 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { realpathSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
+import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
-import { NativeAgentRegistry, PreparedProfile, ProfilePreparer } from "./profiles";
+import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveExistingDirectory } from "./profiles";
 import {
+  NODE_OPTIONS_RESTORE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
   NativeLaunchDescriptor,
   composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
 } from "./launch";
+import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  isNativeDisplayName,
+  resolveSessionBackend,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+  type SessionBackend,
+} from "./session-backend";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
+import { createNativeClipboardReceiver, isNativeCliCopyEncoded, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
 import {
 	createNativeInputEncoder,
 	mintNativeViewerScopeToken,
 	mintNativeViewerStartupScopeToken,
+	mintNativeViewerNativeCliScopeToken,
 	parseNativeViewerScopeToken,
 	verifyNativeViewerScopeToken,
+	verifyNativeViewerNativeCliScopeToken,
 	NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
 	type NativeInputEncoder,
 	type NativeInputExpectedFence,
 	type NativeInputOrigin,
 	type NativeViewerScopeFacts,
 	type NativeViewerStartupScopeFacts,
+	type NativeViewerNativeCliScopeFacts,
 } from "./native-input-origin";
 import {
 	hasCompleteSessionIdle,
@@ -165,6 +179,21 @@ import {
  *   can neither resurrect a detached surface nor overwrite a later selection.
  *   Nothing here grants or withholds input: input remains addressed-only and every
  *   existing displayed-owner fence stays where it is.
+ *
+ * - Per-row backend identity (issue 277 core slice): every row belongs to one
+ *   closed backend (src/session-host/session-backend.ts), and an absent backend
+ *   means Pi. A native CLI row (Claude or Codex) is an ordinary provider PTY
+ *   child: its launch descriptor comes only from the host-injected
+ *   {@linkcode InstanceManagerOptions.nativeCliLaunch} provider, it gets NO
+ *   status registration, no Pi bootstrap/preload/startup-payload/title
+ *   environment, no input framing, and no native clipboard receiver, so every
+ *   provider field stays truthfully unknown and only the owned PTY's own exit
+ *   settles the row. Its workspace is validated and canonicalized here without
+ *   any Pi agent-directory setup. Local input is forwarded raw, exactly as for
+ *   a legacy unframed row; the viewer input seam refuses it because that row has
+ *   no registration to fence a scope against. A known native CLI row owns no Pi
+ *   conversation, so it contributes nothing to the saved-conversation censuses,
+ *   while an unknown Pi row keeps refusing exactly as before.
  *
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
@@ -430,14 +459,63 @@ export interface NativeViewerStartupInputSource {
 	readonly sourceToken: string;
 }
 
-/** The input-path union: an unchanged conversation source or a startup source. */
-export type NativeViewerAnyInputSource = NativeViewerInputSource | NativeViewerStartupInputSource;
+/**
+ * The host's own immutable description of one viewer's input scope on a NATIVE
+ * CLI row (issue 277 native remote-input slice): a hosted provider child this
+ * manager owns only as a PTY process, with no Pi status registration, no bootstrap
+ * token, no input framing, and no Pi native conversation.
+ *
+ * It carries the host run, viewer identity and revision, row, the row's positively
+ * recorded provider backend, and the canonical geometry and its revision — and NO
+ * `nativeSession`, `registrationIdentity`, or `registrationGeneration` key at all,
+ * because inventing any of them would claim a fact the row does not have. The
+ * process this scope is bound to is deliberately NOT a public fact: it is carried by
+ * an owner-private per-incarnation secret the manager minted when it took ownership
+ * of this child's PTY, which appears nowhere here and never crosses a wire.
+ *
+ * Its token lives in the separate `nvcli1` commitment domain, so it can never be
+ * read or verified as a Pi conversation-copy scope or a Pi startup scope. Input
+ * only: no copy receipt ever carries it, and a native CLI row has no copy producer.
+ * The scope describes terminal-process control and nothing more — it is never a
+ * claim about what the provider conversation is doing, and none of its facts are
+ * derived from child output or process liveness beyond the manager's own ownership.
+ */
+export interface NativeViewerNativeCliInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly phase: "native-cli";
+	readonly backend: NativeCliBackend;
+	readonly geometry: NativeViewerInputGeometry;
+	/** Descriptive, echoable host-minted `nvcli1` token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/** The closed phase marker of a native CLI input source. */
+const NATIVE_CLI_INPUT_PHASE = "native-cli" as const;
+
+/**
+ * The input-path union: an unchanged Pi conversation source, a Pi startup source,
+ * or a hosted native CLI process source.
+ */
+export type NativeViewerAnyInputSource =
+	| NativeViewerInputSource
+	| NativeViewerStartupInputSource
+	| NativeViewerNativeCliInputSource;
 
 /** True for the startup variant of an input-path source. */
 export function isNativeViewerStartupInputSource(
 	source: NativeViewerAnyInputSource,
 ): source is NativeViewerStartupInputSource {
 	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/** True for the hosted native CLI variant of an input-path source. */
+export function isNativeViewerNativeCliInputSource(
+	source: NativeViewerAnyInputSource,
+): source is NativeViewerNativeCliInputSource {
+	return (source as { readonly phase?: unknown }).phase === NATIVE_CLI_INPUT_PHASE;
 }
 
 /**
@@ -481,7 +559,10 @@ export type NativeViewerInputResult =
 
 /** One strict viewer input request: current facts, current modes, and the bytes. */
 export interface NativeViewerInputRequest {
-	/** The exact current source: a conversation source or, before the first status, a startup source. */
+	/**
+	 * The exact current source: a Pi conversation source, a Pi startup source, or a
+	 * hosted provider CLI process source.
+	 */
 	readonly expectedSource: NativeViewerAnyInputSource;
 	readonly expectedInputModes: TerminalInputModes;
 	/**
@@ -505,8 +586,50 @@ export interface NativeViewerClipboardReceipt {
 	readonly dispatchId: number;
 }
 
-/** One viewer's own copy destination, supplied by the host that owns that surface. */
-export type NativeViewerClipboardSink = (receipt: NativeViewerClipboardReceipt) => void;
+/**
+ * One captured TEXT copy from one owned hosted provider child (issue 277 native
+ * text-copy slice).
+ *
+ * It states only what the owner actually observed: a normalized canonical-base64
+ * UTF-8 text payload captured inside this row's own PTY, and the row's own
+ * positively recorded provider backend. There is deliberately NO `sessionId`,
+ * `sessionEpoch`, registration, PID, path, or command field: a hosted provider
+ * child has no Pi conversation, and inventing a tuple here would be a fabricated
+ * attribution. The child process the copy rode in on is bound only through this
+ * row's owner-private per-incarnation key.
+ */
+export interface NativeCliClipboardEvent {
+	readonly kind: "copy";
+	readonly encoded: string;
+	readonly backend: NativeCliBackend;
+}
+
+/**
+ * One hosted provider copy routed to the ONE viewer surface this manager last
+ * accepted input from on that exact child incarnation. `dispatchId` is the owner's
+ * own ordinal of that accepted input: a routing convention frozen when the copy was
+ * accepted, never causal proof that the input produced the copy.
+ */
+export interface NativeViewerNativeCliClipboardReceipt {
+	readonly source: NativeViewerNativeCliInputSource;
+	readonly event: NativeCliClipboardEvent;
+	readonly dispatchId: number;
+}
+
+/** True only for the hosted provider variant of a viewer copy receipt. */
+export function isNativeViewerNativeCliClipboardReceipt(
+	receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt,
+): receipt is NativeViewerNativeCliClipboardReceipt {
+	return (receipt.source as { readonly phase?: unknown }).phase === NATIVE_CLI_INPUT_PHASE;
+}
+
+/**
+ * One viewer's own copy destination, supplied by the host that owns that surface.
+ * It receives either an unchanged Pi conversation copy or a hosted provider TEXT
+ * copy; the variant is the surface's own business and is never merged.
+ */
+export type NativeViewerClipboardSink =
+	(receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt) => void;
 
 /**
  * Local-only registration options for one viewing surface. Both are immutable for
@@ -551,6 +674,13 @@ export interface InstancePty {
 export interface InstanceSpawnDescriptor {
 	file: string;
 	args: string[];
+	/**
+	 * Windows only, for a batch (`.cmd`/`.bat`) child: the invocation in the
+	 * pinned implementation's public pre-escaped `CommandLine` form, delivered
+	 * verbatim after `file` instead of as an argv array the pinned spawn would
+	 * re-escape. Absent for every direct executable child.
+	 */
+	commandLine?: string;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
 	cols: number;
@@ -655,9 +785,23 @@ export interface InstanceStatusRegistrationOptions {
 /** Immutable, copied view row for one instance (later SidebarItem shape). */
 export interface NativeInstanceView {
 	readonly id: string;
+	/**
+	 * The row's display label, in the shape every presentation of this host (and
+	 * the roster projection built from it) already transmits. For a native CLI row
+	 * this is the stable provider label until the operator captions the row; for a
+	 * Pi row it is the observed native conversation name. It is never a provider
+	 * conversation identity, never observed child output, and never something the
+	 * provider was told.
+	 */
 	readonly label: string;
 	readonly workspace: string;
 	readonly agentDir: string;
+	/**
+	 * The backend this row was created with, present only when the creation was
+	 * explicit. Absence means Pi, exactly as for every row written before native
+	 * CLI hosting. A native CLI row never reports a Pi native conversation.
+	 */
+	readonly backend?: SessionBackend;
 	readonly lifecycle: InstanceLifecycle;
 	readonly busy: boolean | null;
 	readonly pendingInput: boolean | null;
@@ -682,6 +826,17 @@ export interface NativeInstanceView {
 	readonly error?: string;
 }
 
+/** Closed outcome of one {@linkcode InstanceManager.setNativeDisplayName} call. */
+export type NativeDisplayNameResult =
+	| "set"
+	| "unchanged"
+	/** No such row (or the manager is shutting down): nothing changed. */
+	| "no-row"
+	/** The row is not a native CLI row: its name belongs to the Pi rename path. */
+	| "not-native"
+	/** The value failed the shared native display-name bound: nothing changed. */
+	| "invalid-name";
+
 export interface CreateInstanceOptions {
 	/** Legacy/test-only initial display label; production creation omits it and waits for native metadata. */
 	label?: string;
@@ -701,7 +856,54 @@ export interface CreateInstanceOptions {
 	savedSession?: SavedSessionAdmission;
 	/** Fresh model-request child only: the exact title and prompt to deliver at native session start. */
 	initialRequest?: { readonly title: string; readonly prompt: string };
+	/**
+	 * Which backend this row belongs to. Absence means `pi` (every existing caller
+	 * and every older row). A native CLI backend (`claude`, `codex`) launches the
+	 * provider's own interactive CLI through the host-injected
+	 * {@linkcode InstanceManagerOptions.nativeCliLaunch} provider instead of the
+	 * Pi launch composition, and therefore never receives a status registration,
+	 * Pi bootstrap, preload, startup payload, title token, or input framing.
+	 */
+	backend?: SessionBackend;
+	/**
+	 * Native CLI rows only: the operator's explicit configured launch-target
+	 * selection, forwarded unchanged to the launch provider as
+	 * {@linkcode NativeCliLaunchRequest.targetId}. This manager never persists,
+	 * resolves, or interprets it, and never selects a target itself. Combining it
+	 * with a Pi backend is refused before anything is posted.
+	 */
+	nativeCliTarget?: string;
 }
+
+/**
+ * One native CLI launch request from this manager to the host's launch provider.
+ * `workspace` is the row's already-validated canonical workspace (the child cwd
+ * the manager will spawn with), and `env` is a fresh copy of the manager's
+ * environment snapshot that neither the provider nor the manager mutates.
+ * `targetId` is the unchanged operator selection when one was given.
+ */
+export interface NativeCliLaunchRequest {
+	readonly workspace: string;
+	readonly env: NodeJS.ProcessEnv;
+	readonly targetId?: string;
+}
+
+/**
+ * The host-injected provider that turns one native CLI backend selection into a
+ * complete interactive launch descriptor. Provider discovery, argv composition,
+ * configured-target resolution, and provider-side environment sanitization all
+ * belong to the provider; the manager only validates the returned descriptor,
+ * requires its cwd to be this row's selected canonical workspace, and spawns it
+ * verbatim. It may be asynchronous. It runs BEFORE the synchronous spawn stretch,
+ * and the manager races it against its own shutdown/disposal notification: a
+ * provider that never answers can never hold the host away from stopping its
+ * existing children, and an answer that arrives later is discarded rather than
+ * spawned. A provider must therefore tolerate being abandoned.
+ */
+export type NativeCliLaunch = (
+	backend: NativeCliBackend,
+	request: NativeCliLaunchRequest,
+) => NativeLaunchDescriptor | Promise<NativeLaunchDescriptor>;
 
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
@@ -740,6 +942,16 @@ export interface InstanceManagerOptions {
 	 * encoded payload are never logged, rendered, or retained by this module.
 	 */
 	onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	/**
+	 * The owner-local route of one captured hosted provider TEXT copy, reached only
+	 * when this manager's own last accepted input on that exact child incarnation was
+	 * owner-local input. It carries no Pi conversation tuple, so it is deliberately a
+	 * separate callback: the existing native Pi route stays exactly as it was and can
+	 * never be fed a provider copy, and this route can never be fed a Pi copy. The
+	 * host still owes its own live row, focus, display, and coverage proof before any
+	 * clipboard request leaves it.
+	 */
+	onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
@@ -761,6 +973,16 @@ export interface InstanceManagerOptions {
 	 * accident.
 	 */
 	nativeInputOriginFraming?: boolean;
+	/**
+	 * Host-injected launch provider for the native CLI backends (issue 277). It is
+	 * required only when a row is created with a native backend; a manager without
+	 * it keeps every existing Pi behavior and refuses a native creation before it
+	 * posts a row. The manager never composes, repairs, or extends what the
+	 * provider returns beyond validating it, and it never injects its own
+	 * bootstrap, preload, startup-payload, or title environment into a native
+	 * child.
+	 */
+	nativeCliLaunch?: NativeCliLaunch;
 }
 
 export interface ShutdownOptions {
@@ -787,12 +1009,26 @@ interface ManagedInstance {
 	 * the global create set.
 	 */
 	launchSettled: boolean;
+	/**
+	 * The row's display label. A Pi row's label is the last authenticated native
+	 * conversation name (or a placeholder until one is observed). A native CLI
+	 * row's label is the stable provider label until the operator captions the row
+	 * through {@linkcode InstanceManager.setNativeDisplayName}, which replaces this
+	 * one field: there is no second name field, so every surface that already
+	 * transmits `label` carries the caption without any new identity.
+	 */
 	label: string;
 	nativeSession: SessionHostNativeSession | null;
 	lastNativeSession?: SessionHostNativeSession;
 	workspace: string;
 	agentDir: string;
 	lifecycle: InstanceLifecycle;
+	/**
+	 * The creation's explicit backend, or undefined for an unrecorded (Pi) row.
+	 * Only ever `claude`/`codex` here: a Pi row keeps the unchanged launch path and
+	 * needs no second marker.
+	 */
+	backend?: SessionBackend;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
@@ -885,6 +1121,37 @@ interface ManagedInstance {
 	 * extension reload; a new child/registration gets a new encoder.
 	 */
 	inputEncoder?: NativeInputEncoder;
+	/**
+	 * Owner-private secret of THIS row's current provider-child process incarnation
+	 * (issue 277 native remote-input slice). Minted once, right before the owned PTY
+	 * is spawned, and never exposed: it appears in no view, no wire frame, no token,
+	 * and no log. It is the key material of the `nvcli1` viewer input scope
+	 * commitment, so a replacement child — even one with the same row id, workspace,
+	 * backend, geometry, and PID after reuse — yields a different token and every
+	 * source minted for the old incarnation becomes stale. Cleared at the child's
+	 * confirmed exit, which is also when the row stops being an input target.
+	 */
+	nativeCliIncarnation?: Buffer;
+	/**
+	 * Owner-private routing convention of THIS row's current provider-child incarnation
+	 * (issue 277 native text-copy slice): the most recent ACTUAL accepted nonempty
+	 * input forwarded to that PTY, either owner-local or one viewer's verified input.
+	 *
+	 * It is set only when bytes really left this manager for that child — never by a
+	 * selected form, a refused or rejected request, a received copy request, or a
+	 * terminal protocol query/reply — and it is dropped with the incarnation itself.
+	 * It states who this manager last typed for, which is a routing choice and NOT
+	 * proof of which action caused a later copy; nothing in a child's output can
+	 * confirm or change it. Absent means no origin is known, which is a refusal, never
+	 * a fallback to some other viewer or the owner.
+	 */
+	nativeCliController?: NativeCliCopyController;
+	/**
+	 * Monotonic owner ordinal of accepted nonempty input on this incarnation, starting
+	 * at 0. Each accepted input takes the next value, and a copy frozen at acceptance
+	 * carries the ordinal of the input that established its recipient.
+	 */
+	nativeCliInputOrdinal: number;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -898,7 +1165,7 @@ interface ManagedInstance {
 
 /** The lazy loader for the pinned real native PTY implementation. */
 interface LoadedNodePty {
-	spawn(file: string, args: string[], options: {
+	spawn(file: string, args: string[] | string, options: {
 		name: string;
 		cols: number;
 		rows: number;
@@ -943,7 +1210,11 @@ export function createDefaultPtyFactory(): PtyFactory {
 		}
 		// The pinned implementation satisfies the InstancePty subset
 		// structurally (data/exit events, write, resize, kill, pause/resume).
-		const pty = nodePty.spawn(descriptor.file, descriptor.args, {
+		// A batch child carries the public pre-escaped `CommandLine` string, so
+		// the pinned Windows spawn appends it verbatim instead of MSDN-escaping
+		// the quotes cmd.exe needs out of an argv array. Every other child keeps
+		// the argv form, and POSIX never sees a command line.
+		const pty = nodePty.spawn(descriptor.file, descriptor.commandLine ?? descriptor.args, {
 			name: "xterm-256color",
 			cols: descriptor.cols,
 			rows: descriptor.rows,
@@ -981,6 +1252,42 @@ function validateShutdownMs(value: number, label: string): void {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`session-host: shutdown ${label} must be a non-negative safe integer, got ${value}`);
 	}
+}
+
+/**
+ * Owner-private record of the most recent actual accepted input on one hosted
+ * provider child incarnation. `viewer` carries that viewer's id and the exact scope
+ * token its input was verified under, so a later copy re-proves the CURRENT viewer
+ * facts instead of trusting a cached destination.
+ */
+type NativeCliCopyController =
+	| { readonly kind: "local"; readonly ordinal: number }
+	| { readonly kind: "viewer"; readonly viewerId: string; readonly sourceToken: string; readonly ordinal: number };
+
+/**
+ * The owner-private capture/submit seam of ONE live hosted provider run (issue 277
+ * native text-copy slice), handed to host code that already owns the manager.
+ *
+ * It is bound to one exact row AND one exact child-process incarnation: the
+ * incarnation's private key is captured when the seam is created and re-checked on
+ * EVERY submit, so a replaced child, an exited row, a stop, a removed row, or a
+ * disposed manager submits nothing, and this object can never address another row.
+ * It is not a public clipboard endpoint: it accepts only an already-normalized
+ * canonical-base64 UTF-8 text payload, performs no clipboard write itself, chooses
+ * no destination beyond this row's own last accepted input, and is never reachable
+ * from a peer, a wire frame, or a child.
+ */
+export interface NativeCliCopyCapture {
+	/** Owner row id this seam is bound to; descriptive, never a lookup key. */
+	readonly rowId: string;
+	/** The row's own recorded backend at binding time. */
+	readonly backend: NativeCliBackend;
+	/**
+	 * Submit one captured TEXT copy through this row's own fences. True means the
+	 * copy was handed to exactly one eligible recipient route; false means nothing
+	 * was delivered and nothing is queued, retried, or fallen back.
+	 */
+	submit(encoded: string): boolean;
 }
 
 /** Internal viewer record: one surface's facts, its host run identity, and its own sink. */
@@ -1048,6 +1355,13 @@ const PUBLIC_INSTANCE_ERRORS = {
 } as const;
 
 type InstanceErrorCode = keyof typeof PUBLIC_INSTANCE_ERRORS;
+
+/**
+ * Size of the owner-private per-incarnation secret of one hosted provider child.
+ * It matches the native CLI scope family's minimum key material and is never
+ * exported, published, or derived from anything observable about the child.
+ */
+const NATIVE_CLI_INCARNATION_BYTES = 32;
 
 /**
  * The host's own local-user input origin. It is a closed classification of
@@ -1166,29 +1480,80 @@ function isViewerStartupInputSource(value: unknown): value is NativeViewerStartu
 
 /** Variant-aware shape check for an expected input source handed back by a caller. */
 function isAnyViewerInputSource(value: unknown): value is NativeViewerAnyInputSource {
-	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) return isViewerStartupInputSource(value);
+	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) {
+		return value.phase === NATIVE_CLI_INPUT_PHASE
+			? isViewerNativeCliInputSource(value)
+			: isViewerStartupInputSource(value);
+	}
 	return isViewerInputSource(value);
 }
 
 /**
+ * Closed shape check for a hosted native CLI source: exactly its own keys, an
+ * explicit `phase: "native-cli"`, one of the two closed backends, and no
+ * `nativeSession`, `registrationIdentity`, or `registrationGeneration` key at all
+ * (a null or fabricated one fails).
+ */
+function isViewerNativeCliInputSource(value: unknown): value is NativeViewerNativeCliInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "phase", "backend", "geometry", "sourceToken",
+		])) {
+		return false;
+	}
+	return value.phase === NATIVE_CLI_INPUT_PHASE
+		&& isNativeCliBackend(value.backend)
+		&& isBoundedFactField(value.hostRunId)
+		&& isBoundedFactField(value.sourceToken)
+		&& isBoundedFactField(value.rowId)
+		&& isOrdinal(value.viewerRevision)
+		&& isViewerInputGeometry(value.geometry);
+}
+
+/** The closed variant of one input-path source, for the variant-aware comparisons. */
+type InputSourceVariant = "startup" | "native-cli" | "conversation";
+
+function sourceVariant(source: NativeViewerAnyInputSource): InputSourceVariant {
+	if (isNativeViewerStartupInputSource(source)) return "startup";
+	return isNativeViewerNativeCliInputSource(source) ? "native-cli" : "conversation";
+}
+
+/**
  * Variant-aware exact equality of two input-path sources. A startup source never
- * equals a conversation source, whatever their other facts say.
+ * equals a conversation source or a hosted native CLI source, and a native CLI
+ * source never equals either of the others whatever its other facts say.
  */
 function sameAnyViewerInputSource(left: NativeViewerAnyInputSource, right: NativeViewerAnyInputSource): boolean {
-	const leftStartup = isNativeViewerStartupInputSource(left);
-	const rightStartup = isNativeViewerStartupInputSource(right);
-	if (leftStartup !== rightStartup) return false;
-	if (leftStartup && rightStartup) {
-		return left.hostRunId === right.hostRunId
-			&& left.viewerId === right.viewerId
-			&& left.viewerRevision === right.viewerRevision
-			&& left.rowId === right.rowId
-			&& left.geometry.cols === right.geometry.cols
-			&& left.geometry.rows === right.geometry.rows
-			&& left.geometry.revision === right.geometry.revision
-			&& left.registrationIdentity === right.registrationIdentity
-			&& left.registrationGeneration === right.registrationGeneration
-			&& left.sourceToken === right.sourceToken;
+	const variant = sourceVariant(left);
+	if (variant !== sourceVariant(right)) return false;
+	if (variant === "native-cli") {
+		const a = left as NativeViewerNativeCliInputSource;
+		const b = right as NativeViewerNativeCliInputSource;
+		return a.hostRunId === b.hostRunId
+			&& a.viewerId === b.viewerId
+			&& a.viewerRevision === b.viewerRevision
+			&& a.rowId === b.rowId
+			&& a.backend === b.backend
+			&& a.geometry.cols === b.geometry.cols
+			&& a.geometry.rows === b.geometry.rows
+			&& a.geometry.revision === b.geometry.revision
+			// The token commits to the current process incarnation as well as every
+			// fact above, so a source rebuilt from older facts is caught here too.
+			&& a.sourceToken === b.sourceToken;
+	}
+	if (variant === "startup") {
+		const a = left as NativeViewerStartupInputSource;
+		const b = right as NativeViewerStartupInputSource;
+		return a.hostRunId === b.hostRunId
+			&& a.viewerId === b.viewerId
+			&& a.viewerRevision === b.viewerRevision
+			&& a.rowId === b.rowId
+			&& a.geometry.cols === b.geometry.cols
+			&& a.geometry.rows === b.geometry.rows
+			&& a.geometry.revision === b.geometry.revision
+			&& a.registrationIdentity === b.registrationIdentity
+			&& a.registrationGeneration === b.registrationGeneration
+			&& a.sourceToken === b.sourceToken;
 	}
 	return sameViewerInputSource(left as NativeViewerInputSource, right as NativeViewerInputSource);
 }
@@ -1393,6 +1758,111 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	return { title: request.title, prompt: request.prompt };
 }
 
+/**
+ * Bounds for one operator's opaque native CLI launch-target selection. The
+ * target-id bound itself is owned by `session-backend.ts`, where the sidebar's
+ * ingestion reads the same value; this re-export only keeps the manager's own
+ * historical import path working.
+ */
+export { MAX_NATIVE_CLI_TARGET_CHARS } from "./session-backend";
+/** Upper bound for one native CLI launch descriptor's argument array. */
+export const MAX_NATIVE_CLI_ARGS = 256;
+
+/**
+ * The host's own capability environment keys. They are never injected into a
+ * native CLI child and never forwarded to one: provider-side sanitization stays
+ * with the launch provider, while these host-owned tokens never leak past this
+ * module's own spawn seam.
+ */
+const HOST_CAPABILITY_ENV_KEYS: readonly string[] = Object.freeze([
+	SESSION_HOST_BOOTSTRAP_ENV,
+	SESSION_HOST_STARTUP_REQUEST_ENV,
+	SESSION_HOST_TITLE_COLUMNS_ENV,
+	NODE_OPTIONS_RESTORE_ENV,
+]);
+
+function validateNativeCliTarget(value: unknown): string {
+	if (!isNativeCliTargetId(value)) {
+		throw new Error(`session-host: the native CLI launch target must be bounded single-line text`);
+	}
+	return value;
+}
+
+/**
+ * Validate and canonicalize the workspace one native CLI row was explicitly
+ * given. This is the whole setup an ordinary provider child needs: an existing
+ * directory, canonically resolved so the descriptor cwd is
+ * cwd-independent. No Pi agent directory, config, profile, or skill work happens
+ * here or anywhere else on this path.
+ *
+ * The resolution IS the host's shared Pi workspace resolution
+ * ({@linkcode resolveExistingDirectory}): a leading bare `~`/`~/` expands
+ * against the home directory, a relative spelling resolves against this
+ * process's working directory, and the result is the canonical real path. A
+ * native row therefore accepts exactly the spellings a Pi row accepts, because
+ * both rows go through the one resolver — this adds no second rule, and it
+ * never asks a shell to expand anything. No environment-variable or
+ * `~otheruser` form is expanded here any more than it is for Pi.
+ */
+function canonicalNativeWorkspace(workspace: string): string {
+	return resolveExistingDirectory(workspace, "the native CLI workspace");
+}
+
+/**
+ * Validate one native CLI launch descriptor the provider composed, against this
+ * row's own selected canonical workspace, and return a private copy. The
+ * descriptor is the full interactive launch: one executable plus its argv and
+ * environment, applied verbatim at spawn. Requiring the cwd to be exactly the
+ * selected workspace is what keeps one row = one workspace true for a child the
+ * manager did not compose; anything else about the provider's argv or environment
+ * is the provider's own decision.
+ */
+function validatedNativeCliDescriptor(value: unknown, workspace: string): NativeLaunchDescriptor {
+	if (!isPlainRecord(value)) {
+		throw new Error("session-host: the native CLI launch provider returned no launch descriptor");
+	}
+	const file = value.file;
+	if (typeof file !== "string" || file.length === 0 || /[\u0000-\u001f\u007f-\u009f]/.test(file)) {
+		throw new Error("session-host: the native CLI launch descriptor must name exactly one executable file");
+	}
+	const args = value.args;
+	if (!Array.isArray(args) || args.length > MAX_NATIVE_CLI_ARGS
+		|| args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+		throw new Error(`session-host: the native CLI launch descriptor requires at most ${MAX_NATIVE_CLI_ARGS} string arguments`);
+	}
+	// A batch child's Windows command line reaches the pinned public spawn
+	// verbatim, so it is validated as one printable non-empty string and never
+	// silently dropped: a descriptor that carries an unusable one is refused
+	// rather than spawned as a bare interpreter with no command.
+	const commandLine = value.commandLine;
+	if (commandLine !== undefined
+		&& (typeof commandLine !== "string" || commandLine.length === 0 || /[\u0000-\u001f\u007f]/.test(commandLine))) {
+		throw new Error("session-host: the native CLI launch descriptor's Windows command line must be one printable non-empty string");
+	}
+	const env = value.env;
+	if (!isPlainRecord(env)
+		|| Object.values(env).some((entry) => entry !== undefined && typeof entry !== "string")) {
+		throw new Error("session-host: the native CLI launch descriptor requires an environment of string values");
+	}
+	const cwd = value.cwd;
+	if (typeof cwd !== "string" || !isAbsolute(cwd) || realpathSync(cwd) !== workspace) {
+		throw new Error("session-host: the native CLI launch descriptor does not target this row's selected workspace");
+	}
+	return { file, args: [...args], ...(commandLine === undefined ? {} : { commandLine }), env: { ...env } as NodeJS.ProcessEnv, cwd };
+}
+
+/** A fresh child environment with this host's own capability tokens removed. */
+function nativeCliChildEnv(descriptorEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env = { ...descriptorEnv };
+	for (const key of HOST_CAPABILITY_ENV_KEYS) delete env[key];
+	return env;
+}
+
+/** True only for a row whose recorded backend is a native CLI backend. */
+function isNativeCliRow(record: ManagedInstance): boolean {
+	return isNativeCliBackend(record.backend);
+}
+
 /** The caller's final guard: only an exact `true` authorizes; a throw refuses. */
 function callerAuthorized(authorize: SavedMutationAuthorization): boolean {
 	try {
@@ -1427,9 +1897,11 @@ export class InstanceManager {
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
 	readonly #onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	readonly #onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
+	readonly #nativeCliLaunch?: NativeCliLaunch;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/**
@@ -1445,6 +1917,15 @@ export class InstanceManager {
 	#stopping = false;
 	#disposed = false;
 	#disposePromise?: Promise<void>;
+	/**
+	 * One-shot notification that this manager began shutting down or being disposed.
+	 * It exists so an unbounded pre-spawn wait — the native CLI launch provider —
+	 * can settle without holding `shutdown()`/`dispose()` away from the owned stop
+	 * ladder. It releases no resource, signals no process, and is never a claim that
+	 * anything settled: it only lets an unspawned creation stop waiting.
+	 */
+	#shutdownNotice?: Promise<void>;
+	#shutdownNoticeResolve?: () => void;
 
 	constructor(options: InstanceManagerOptions) {
 		if (!options || typeof options !== "object") {
@@ -1491,9 +1972,14 @@ export class InstanceManager {
 		this.#onChange = options.onChange;
 		this.#onTerminalDiagnostic = options.onTerminalDiagnostic;
 		this.#onNativeClipboard = options.onNativeClipboard;
+		this.#onNativeCliClipboard = options.onNativeCliClipboard;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
+		if (options.nativeCliLaunch !== undefined && typeof options.nativeCliLaunch !== "function") {
+			throw new Error("session-host: nativeCliLaunch must be a function or absent");
+		}
+		this.#nativeCliLaunch = options.nativeCliLaunch;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
 
@@ -1504,6 +1990,7 @@ export class InstanceManager {
 			const view: NativeInstanceView & { exitCode?: number; error?: string } = {
 				id: record.id,
 				label: record.label,
+				...(record.backend === undefined ? {} : { backend: record.backend }),
 				nativeSession: record.nativeSession ? Object.freeze(nativeSessionForPresentation(record.nativeSession)) : null,
 				...(record.lastNativeSession ? { lastNativeSession: Object.freeze(nativeSessionForPresentation(record.lastNativeSession)) } : {}),
 				workspace: record.workspace,
@@ -1528,6 +2015,33 @@ export class InstanceManager {
 			views.push(Object.freeze(view));
 		}
 		return views;
+	}
+
+	/**
+	 * Caption exactly one native CLI row by replacing the ONE display label field
+	 * this host already transmits for it.
+	 *
+	 * The name is a caption on THIS host's row presentation and nothing else. It
+	 * is never written to the child, never typed into its input, never sent to a
+	 * provider, and never a Pi conversation rename: {@linkcode rename} through the
+	 * authenticated registration stays the only conversation-name path, and a row
+	 * that is not a native CLI row is refused here so no call can be mistaken for
+	 * one. The value is validated against the shared native display-name rule
+	 * before anything changes, so an empty, oversized, or control-bearing value
+	 * updates nothing. A settled row is captioned too — the caption belongs to the
+	 * row, not to the live process — and the row's stable provider label stays in
+	 * charge until a name is actually set.
+	 */
+	setNativeDisplayName(id: string, name: string): NativeDisplayNameResult {
+		if (this.#disposed || this.#stopping) return "no-row";
+		const record = this.#records.get(id);
+		if (record === undefined) return "no-row";
+		if (!isNativeCliBackend(record.backend)) return "not-native";
+		if (!isNativeDisplayName(name)) return "invalid-name";
+		if (record.label === name) return "unchanged";
+		record.label = name;
+		this.#safeChanged(record.id);
+		return "set";
 	}
 
 	/**
@@ -1727,7 +2241,15 @@ export class InstanceManager {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
-		const label = options?.label === undefined ? "(session starting)" : validateLabel(options.label);
+		const backend = resolveSessionBackend(options?.backend);
+		const nativeCliTarget = options?.nativeCliTarget === undefined
+			? undefined
+			: validateNativeCliTarget(options.nativeCliTarget);
+		// A native CLI row has no observable native conversation name, so it carries a
+		// stable provider label instead of a name that never arrives.
+		const label = options?.label === undefined
+			? (isNativeCliBackend(backend) ? sessionBackendDisplayLabel(backend) : "(session starting)")
+			: validateLabel(options.label);
 		if (typeof options?.workspace !== "string" || options.workspace === "") {
 			throw new Error("session-host: create requires an explicit workspace directory");
 		}
@@ -1748,6 +2270,27 @@ export class InstanceManager {
 		if (initialRequest !== undefined && savedSession !== undefined) {
 			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
+		// A native CLI row is an ordinary provider child, so every Pi-specific launch
+		// input is refused here — before any row, reservation, or callback exists —
+		// and a native request is never quietly served as a Pi launch. A Pi row never
+		// gets a configured native launch target either: an explicit operator choice
+		// that cannot apply is refused rather than silently ignored.
+		if (isNativeCliBackend(backend)) {
+			if (this.#nativeCliLaunch === undefined) {
+				throw new Error("session-host: this host has no native CLI launch provider, so the requested backend cannot start");
+			}
+			if (profile !== undefined) {
+				throw new Error("session-host: a native CLI row never uses a Pi profile directory");
+			}
+			if (savedSession !== undefined) {
+				throw new Error("session-host: a native CLI row never opens a Pi saved conversation");
+			}
+			if (initialRequest !== undefined) {
+				throw new Error("session-host: a native CLI row never receives a Pi startup request");
+			}
+		} else if (nativeCliTarget !== undefined) {
+			throw new Error("session-host: a native CLI launch target is only valid for a native CLI backend");
+		}
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
 		// cannot both spawn, including pending creations of siblings.
@@ -1763,6 +2306,7 @@ export class InstanceManager {
 			workspace: options.workspace,
 			agentDir: "",
 			lifecycle: "starting",
+			...(options.backend === undefined ? {} : { backend }),
 			busy: null,
 			pendingInput: null,
 			inputSurface: false,
@@ -1779,6 +2323,7 @@ export class InstanceManager {
 			geometryRevision: 0,
 			inputFramingRequested: false,
 			inputFramingReady: false,
+			nativeCliInputOrdinal: 0,
 			startupInputOpen: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -1796,7 +2341,13 @@ export class InstanceManager {
 		};
 		this.#records.set(id, record);
 		this.#safeChanged(id);
-		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession, initialRequest });
+		const launch = this.#launchInstance(record, {
+			workspace: options.workspace,
+			profile,
+			savedSession,
+			initialRequest,
+			...(nativeCliTarget === undefined ? {} : { nativeCliTarget }),
+		});
 		this.#inflightCreates.add(launch);
 		try {
 			await launch;
@@ -1836,7 +2387,9 @@ export class InstanceManager {
 	 * fencing: separately tagged current ID/file observations, exact admitted
 	 * reservations (including pending creations), and historical ID-only
 	 * launch fences. Data only — no process discovery, scan, daemon, or lock.
-	 * Exited and removed rows contribute nothing.
+	 * Exited and removed rows contribute nothing, and so does every row this
+	 * manager knows to be a native CLI child: a Claude or Codex row never loads,
+	 * reserves, or rebinds a Pi conversation, so it is not evidence about one.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
 		return this.#ownedSessionCensus();
@@ -1851,6 +2404,11 @@ export class InstanceManager {
 	#ownedSessionCensus(): OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
+			// A known native CLI row owns no Pi conversation at all: it contributes
+			// neither a current binding nor an unknown-binding placeholder, so a
+			// provider child never blocks a Pi saved conversation. An unknown Pi row
+			// still contributes exactly what it did before.
+			if (isNativeCliRow(record)) continue;
 			const live = Boolean(record.pty && !record.ptyExited);
 			if (!live && record.savedReservation === undefined) continue;
 			if (record.savedReservation !== undefined) {
@@ -1892,6 +2450,7 @@ export class InstanceManager {
 	#savedDeletionCensus(): OwnedLiveSession[] {
 		const sessions = this.#ownedSessionCensus();
 		for (const record of this.#records.values()) {
+			if (isNativeCliRow(record)) continue;
 			if (record.pty && !record.ptyExited && !record.nativeSession) {
 				sessions.push({});
 				break;
@@ -2134,6 +2693,10 @@ export class InstanceManager {
 		// viewer cannot route input through this seam in this phase, and an opaque
 		// viewer token alone would be no grant.
 		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
+		// Only bytes that actually left for this child count. On a hosted provider row
+		// this makes the owner the current copy recipient; on a Pi row it changes
+		// nothing, because Pi copies carry their own per-dispatch origin.
+		this.#noteNativeCliLocalInput(record, data);
 	}
 
 	/**
@@ -2333,11 +2896,14 @@ export class InstanceManager {
 	/**
 	 * The CURRENT immutable input scope of one registered surface, or undefined when
 	 * this surface cannot take viewer input right now: it is unknown or retired, was
-	 * registered without this host's run identity or without its own copy sink, shows
-	 * no row or a row that is gone/finished/stopping, is not a framed row whose own
-	 * readiness was verified, or has no current native conversation. Resolving never
-	 * writes, resizes, queues, spawns, or changes any state, and the returned token
-	 * describes the facts rather than granting anything.
+	 * registered without this host's run identity (or, for a Pi row, without its own
+	 * copy sink), shows no row or a row that is gone/finished/stopping, is a Pi row
+	 * whose framing was not requested or whose readiness was never verified, or has no
+	 * current native conversation outside its explicit startup phase. A hosted
+	 * provider CLI row yields its process-incarnation source only while this manager
+	 * still owns its live PTY and surface. Resolving never writes, resizes, queues,
+	 * spawns, or changes any state, and the returned token describes the facts rather
+	 * than granting anything.
 	 *
 	 * There is no terminal-text field on purpose: the input owner is the surface and
 	 * its conversation, not the newest line on screen.
@@ -2355,21 +2921,26 @@ export class InstanceManager {
 	 * 1. the request shape (a malformed request, empty bytes, or a dispatch larger
 	 *    than the child's technical whole-dispatch assembly bound is refused);
 	 * 2. the CURRENT scope — same manager, live row, exact unreleased registration,
-	 *    framed and ready, known native tuple, and a mintable scope token;
+	 *    framed and ready, known native tuple, and a mintable scope token; or, for a
+	 *    hosted provider CLI row, this manager's live ownership of its PTY and surface
+	 *    and that process incarnation's current private scope key;
 	 * 3. EVERY expected source fact against the current one, including the canonical
-	 *    geometry revision, this viewer's revision, the native tuple, the
-	 *    registration identity/generation, and the host run — an ABA change (resized
-	 *    away and back, reselected, new run, new registration, new epoch, row exit,
-	 *    stop, release) is a refusal, and nothing is ever inferred from the bytes;
+	 *    geometry revision, this viewer's revision, the native tuple (or the native
+	 *    CLI backend), the registration identity/generation, and the host run — an ABA
+	 *    change (resized away and back, reselected, new run, new registration, new
+	 *    epoch, a replaced child process, row exit, stop, release) is a refusal, and
+	 *    nothing is ever inferred from the bytes;
 	 * 4. the CURRENT input modes against the modes the bytes were made for, because
 	 *    the same bytes mean something else in another mode (modes, descriptors, and
 	 *    tokens are freshness evidence, never authority);
 	 * 5. one more core-scope recheck after the modes read, in case a reentrant
 	 *    observer changed the facts in between.
 	 *
-	 * The row's input is then framed with this registration's own encoder under the
+	 * A Pi row's input is then framed with this registration's own encoder under the
 	 * viewer origin, carrying the current native tuple as the child-side fence. A
-	 * refusal never touches the child. Once the write seam was invoked, a throw is
+	 * hosted provider CLI row's input is written RAW to its own PTY, because no Pi
+	 * registration, encoder, or child-side decoder exists for it.
+	 * A refusal never touches the child. Once the write seam was invoked, a throw is
 	 * reported as `unknown` — never retried, queued, replayed, or re-routed.
 	 */
 	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
@@ -2401,6 +2972,13 @@ export class InstanceManager {
 		const pty = current.record.pty;
 		if (pty === undefined) {
 			return { status: "refused", reason: "row-unavailable" };
+		}
+		if (isNativeViewerNativeCliInputSource(current.source)) {
+			// A hosted provider child takes its bytes RAW: there is no Pi registration,
+			// no per-registration encoder, no framed origin, and no child-side fence for
+			// it. The remaining fences are the owner's own: the current incarnation key,
+			// live ownership of this exact handle, and a non-stopping row.
+			return this.#writeNativeCliViewerInput(current.viewer, current.record, pty, current.source, request.data);
 		}
 		let fence: NativeInputExpectedFence;
 		if (isNativeViewerStartupInputSource(current.source)) {
@@ -2463,18 +3041,30 @@ export class InstanceManager {
 		if (viewer === undefined) {
 			return { ok: false, reason: "unknown-viewer" };
 		}
-		if (viewer.hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
-			// No host run identity and no copy destination means no verifiable scope:
-			// this path has no intentional permanent copy drop.
+		// The row is read first only to learn whether this is a hosted provider row:
+		// a hosted child has no copy producer, so requiring a copy destination of it
+		// would be a rule about a thing that cannot exist. For every Pi row the
+		// verifiable-scope requirement below is exactly what it always was.
+		const rowId = viewer.sessionId;
+		const record = rowId === undefined ? undefined : this.#records.get(rowId);
+		const hostedCli = record !== undefined && isNativeCliBackend(record.backend);
+		if (viewer.hostRunId === undefined || (!hostedCli && viewer.nativeClipboardSink === undefined)) {
+			// Without this host's own run identity (and, for a Pi row, its own copy
+			// destination) there is no verifiable scope at all.
 			return { ok: false, reason: "no-input-source" };
 		}
-		const rowId = viewer.sessionId;
 		if (rowId === undefined) {
 			return { ok: false, reason: "row-unavailable" };
 		}
-		const record = this.#records.get(rowId);
 		if (record === undefined) {
 			return { ok: false, reason: "row-unavailable" };
+		}
+		if (hostedCli) {
+			// A hosted provider child has no Pi registration, no bootstrap, no input
+			// framing, and no copy producer, so every registration-based check below is
+			// meaningless for it. Its scope is proven against this manager's own
+			// ownership of the live PTY and the private key of that process incarnation.
+			return this.#nativeCliViewerScope(viewer, record);
 		}
 		const registration = record.registration;
 		if (registration === undefined || record.registrationReleased) {
@@ -2509,6 +3099,366 @@ export class InstanceManager {
 			return { ok: false, reason: "no-input-source" };
 		}
 		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * Resolve one viewer's current input scope on a hosted provider CLI row and mint
+	 * its `nvcli1` scope token (issue 277 native remote-input slice).
+	 *
+	 * A source exists only while every one of these is true of THIS record: the row's
+	 * own recorded backend is a native CLI backend (never inferred from output or
+	 * from a missing Pi tuple), the manager still holds its live, unexited PTY, the
+	 * row has a surface whose modes can be read, the row is running and not inside a
+	 * stop, the viewer has this host's run identity, and this incarnation's private
+	 * scope key exists. A replacement child, an exit, a stop, a removed row, or a
+	 * retired viewer yields no source. Nothing here writes, resizes, queues, spawns,
+	 * or changes any state, and the returned token describes these facts instead of
+	 * granting anything.
+	 */
+	#nativeCliViewerScope(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+	):
+		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerNativeCliInputSource }
+		| { readonly ok: false; readonly reason: NativeViewerInputRefusal } {
+		if (this.#disposed || this.#stopping) {
+			return { ok: false, reason: "disposed" };
+		}
+		if (record.pty === undefined || record.ptyExited || record.lifecycle !== "alive"
+			|| record.stopAdmissionClosed || record.surface === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const incarnation = record.nativeCliIncarnation;
+		if (incarnation === undefined) {
+			// No private key for the current process incarnation means no describable
+			// scope: this is a refusal, never a source with a placeholder identity.
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (facts === undefined) {
+			return { ok: false, reason: "no-input-source" };
+		}
+		const sourceToken = mintNativeViewerNativeCliScopeToken(incarnation, facts);
+		if (sourceToken === undefined) {
+			return { ok: false, reason: "no-input-source" };
+		}
+		const source: NativeViewerNativeCliInputSource = Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			phase: NATIVE_CLI_INPUT_PHASE,
+			backend: facts.backend,
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			sourceToken,
+		});
+		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * The immutable facts one viewer's native CLI scope commits to, read from the
+	 * CURRENT record: run, viewer and revision, row, the row's own recorded backend,
+	 * and canonical geometry and revision. Undefined when the row is not positively a
+	 * native CLI row or the viewer carries no run identity. There is deliberately no
+	 * conversation, registration, or PID field: a hosted provider child has none of
+	 * those as public facts, and the process itself is bound only through the
+	 * owner-private incarnation key these facts are committed under.
+	 */
+	#viewerNativeCliScopeFacts(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+	): NativeViewerNativeCliScopeFacts | undefined {
+		const hostRunId = viewer.hostRunId;
+		const backend = record.backend;
+		if (hostRunId === undefined || !isNativeCliBackend(backend)) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			backend,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+	}
+
+	/**
+	 * The one raw handoff of viewer input to a hosted provider child, reached only
+	 * after the shared scope, source-equality, and mode fences have passed.
+	 *
+	 * The token is re-proved under the CURRENT incarnation key immediately before the
+	 * write, so a source minted for an earlier child — or carrying a backend the row
+	 * never recorded — verifies to false even when every public fact still matches.
+	 * Ownership is then re-proved against the live record and this exact handle.
+	 * Bytes go to the PTY exactly as the caller's translator produced them: no Pi
+	 * framing, no encoder, and no child-side fence exists for this child. A throw
+	 * after the write was invoked is `unknown`, never a retry.
+	 */
+	#writeNativeCliViewerInput(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		pty: InstancePty,
+		source: NativeViewerNativeCliInputSource,
+		data: string | Buffer,
+	): NativeViewerInputResult {
+		const incarnation = record.nativeCliIncarnation;
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (incarnation === undefined || facts === undefined
+			|| !verifyNativeViewerNativeCliScopeToken(incarnation, source.sourceToken, facts)) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		if (!this.#nativeCliInputAdmissible(record, pty)) {
+			return { status: "refused", reason: "row-unavailable" };
+		}
+		try {
+			pty.write(data);
+		} catch {
+			// The seam was open when it was last checked and the write was invoked, so
+			// whether the child received the bytes is genuinely unknown.
+			return { status: "unknown" };
+		}
+		// The bytes were handed to THIS child, so this surface is now the recipient of
+		// any later copy capture on this incarnation. A refusal above never reaches here.
+		this.#noteNativeCliViewerInput(record, viewer.id, source.sourceToken);
+		return { status: "submitted" };
+	}
+
+	/**
+	 * Ownership admission evaluated immediately before one raw native CLI write:
+	 * still the current record for its id, still holding this exact live PTY, not
+	 * exited, not inside a stop, still a positively recorded native CLI row, and with
+	 * this incarnation's private key still in hand. `false` means no byte leaves now;
+	 * nothing is queued, retried, or retargeted.
+	 */
+	#nativeCliInputAdmissible(record: ManagedInstance, pty: InstancePty): boolean {
+		return !this.#disposed && !this.#stopping
+			&& this.#records.get(record.id) === record
+			&& record.pty === pty && !record.ptyExited
+			&& !record.stopAdmissionClosed
+			&& record.lifecycle === "alive"
+			&& isNativeCliBackend(record.backend)
+			&& record.nativeCliIncarnation !== undefined;
+	}
+
+	/**
+	 * Record that nonempty bytes actually left for one hosted provider child as
+	 * owner-local input, making the owner the recipient of any later copy capture on
+	 * THIS incarnation. Called only after the write seam was invoked; an empty write,
+	 * a refused write, a terminal protocol reply, or a Pi row never reaches it, and a
+	 * prior viewer recipient is replaced rather than kept as a fallback.
+	 */
+	#noteNativeCliLocalInput(record: ManagedInstance, data: string | Buffer): void {
+		if (data.length === 0 || !isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({ kind: "local" as const, ordinal: record.nativeCliInputOrdinal });
+	}
+
+	/**
+	 * Record that one viewer's verified nonempty input actually left for this hosted
+	 * provider child, making that surface the recipient of any later copy capture on
+	 * THIS incarnation. The viewer id and the exact scope token its input verified
+	 * under are kept so a later copy re-proves the CURRENT facts instead of trusting
+	 * this cached destination.
+	 */
+	#noteNativeCliViewerInput(record: ManagedInstance, viewerId: string, sourceToken: string): void {
+		if (!isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({
+			kind: "viewer" as const,
+			viewerId,
+			sourceToken,
+			ordinal: record.nativeCliInputOrdinal,
+		});
+	}
+
+	/**
+	 * This row's own CLOSED OSC 52 TEXT capture sink, attached to a hosted provider
+	 * surface only. The incarnation whose private key a captured copy is bound to is
+	 * captured here, once, beside the exact PTY handle this surface parses.
+	 */
+	#nativeCliOsc52Sink(record: ManagedInstance, pty: InstancePty): (encoded: string) => void {
+		const incarnation = record.nativeCliIncarnation;
+		return (encoded) => {
+			try {
+				this.#submitNativeCliCopy(record, pty, incarnation, encoded);
+			} catch {
+				// Containment: a capture or routing failure never escapes into xterm's
+				// parser, and nothing here ever becomes a clipboard action by accident.
+			}
+		};
+	}
+
+	/**
+	 * Mint the capture/submit seam of ONE live hosted provider run for the host code
+	 * that already owns this manager (the dependent provider copy-path adapter).
+	 *
+	 * The returned object is bound to this exact record, this exact PTY handle, and
+	 * this exact process-incarnation key: every submit re-proves all three plus the
+	 * row's live ownership, so a replaced child, an exited or stopping row, a removed
+	 * row, or a disposed manager submits nothing. It cannot address any other row, it
+	 * is never reachable from a peer or a wire frame, and it performs no clipboard
+	 * write and no destination choice beyond this row's own last accepted input.
+	 * `undefined` means no live run to bind to — never a late-binding handle.
+	 */
+	nativeCliCopyCapture(instanceId: string): NativeCliCopyCapture | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend)) {
+			return undefined;
+		}
+		const pty = record.pty;
+		const incarnation = record.nativeCliIncarnation;
+		if (pty === undefined || incarnation === undefined) {
+			return undefined;
+		}
+		const backend = record.backend;
+		return Object.freeze({
+			rowId: record.id,
+			backend,
+			submit: (encoded: string): boolean => this.#submitNativeCliCopy(record, pty, incarnation, encoded),
+		});
+	}
+
+	/**
+	 * The ONE route a captured hosted provider TEXT copy can take, shared by the
+	 * surface's OSC 52 sink and this run's capture seam.
+	 *
+	 * Everything is re-proved here, at delivery time: the payload is re-validated as
+	 * normalized text; the row is still the current record holding this exact live,
+	 * unexited, un-stopping PTY under this exact incarnation key; and a recipient
+	 * exists at all. The recipient is frozen from the row's last accepted input, so
+	 * input that arrives after this copy was accepted never retargets it — and a
+	 * recipient that is no longer eligible delivers nothing. There is never a
+	 * broadcast, never an owner-local fallback for a viewer-routed copy, never a
+	 * sibling viewer, and never a queue or retry.
+	 */
+	#submitNativeCliCopy(
+		record: ManagedInstance,
+		pty: InstancePty,
+		incarnation: Buffer | undefined,
+		encoded: string,
+	): boolean {
+		if (!isNativeCliCopyEncoded(encoded)) {
+			return false;
+		}
+		const backend = record.backend;
+		if (!isNativeCliBackend(backend)
+			|| incarnation === undefined
+			|| record.nativeCliIncarnation !== incarnation
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		// Frozen at acceptance: this snapshot is the whole recipient decision.
+		const controller = record.nativeCliController;
+		if (controller === undefined) {
+			// No known origin on this incarnation: nothing is forwarded, and nothing
+			// falls back to the owner or to another surface.
+			return false;
+		}
+		const event: NativeCliClipboardEvent = Object.freeze({ kind: "copy" as const, encoded, backend });
+		if (controller.kind === "local") {
+			return this.#forwardNativeCliLocalCopy(record, event);
+		}
+		return this.#forwardNativeCliViewerCopy(record, controller, event);
+	}
+
+	/**
+	 * Owner-local hosted provider copy route. The manager holds no terminal and makes
+	 * no display claim: it hands the copy to the host's separate owner-local route,
+	 * which owes its own live-row, focus, and actual-coverage proof. Absent that route
+	 * there is no delivery and no substitute.
+	 */
+	#forwardNativeCliLocalCopy(record: ManagedInstance, event: NativeCliClipboardEvent): boolean {
+		const forward = this.#onNativeCliClipboard;
+		if (forward === undefined) {
+			return false;
+		}
+		try {
+			forward(record.id, event);
+		} catch {
+			// The host's own route contains its failures; a refusal cannot break a row.
+		}
+		return true;
+	}
+
+	/**
+	 * Route one captured copy to the ONE viewer this manager last accepted input from
+	 * on this incarnation, and to nobody else.
+	 *
+	 * The stored token is only a lookup commitment: delivery happens only after the
+	 * viewer record is re-read and its CURRENT facts re-verify that exact token under
+	 * this incarnation's private key, the viewer still displays this exact row, and it
+	 * still carries its own copy sink. A retired viewer, a viewer now showing another
+	 * row, a viewer revision, a geometry or backend change, a replacement child, a
+	 * released row, or a missing sink delivers nothing — quietly, with no sibling,
+	 * owner-local, broadcast, or retry.
+	 */
+	#forwardNativeCliViewerCopy(
+		record: ManagedInstance,
+		controller: {
+			readonly kind: "viewer";
+			readonly viewerId: string;
+			readonly sourceToken: string;
+			readonly ordinal: number;
+		},
+		event: NativeCliClipboardEvent,
+	): boolean {
+		const viewer = this.#viewers.get(controller.viewerId);
+		if (viewer === undefined || viewer.sessionId !== record.id) {
+			return false;
+		}
+		const sink = viewer.nativeClipboardSink;
+		if (sink === undefined) {
+			return false;
+		}
+		const incarnation = record.nativeCliIncarnation;
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (incarnation === undefined || facts === undefined
+			|| !verifyNativeViewerNativeCliScopeToken(incarnation, controller.sourceToken, facts)) {
+			return false;
+		}
+		const receipt: NativeViewerNativeCliClipboardReceipt = Object.freeze({
+			source: Object.freeze({
+				hostRunId: facts.hostRunId,
+				viewerId: facts.viewerId,
+				viewerRevision: facts.viewerRevision,
+				rowId: facts.rowId,
+				phase: NATIVE_CLI_INPUT_PHASE,
+				backend: facts.backend,
+				geometry: Object.freeze({
+					cols: facts.cols,
+					rows: facts.rows,
+					revision: facts.geometryRevision,
+				}),
+				sourceToken: controller.sourceToken,
+			}),
+			event,
+			dispatchId: controller.ordinal,
+		});
+		try {
+			sink(receipt);
+		} catch {
+			// A viewer's own refusal cannot break a row or escape into the parser.
+		}
+		return true;
 	}
 
 	/**
@@ -2746,6 +3696,9 @@ export class InstanceManager {
 		validateShutdownMs(graceMs, "graceMs");
 		validateShutdownMs(killMs, "killMs");
 		this.#stopping = true;
+		// An in-flight pre-spawn wait (a native CLI launch provider) stops waiting
+		// here, so a provider that never answers cannot postpone this stop ladder.
+		this.#publishShutdownNotice();
 		// A stopping manager admits no startup input again, in any row.
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		// Late async creates settle or abort here; none can spawn after stop.
@@ -2780,6 +3733,8 @@ export class InstanceManager {
 
 	async #runDispose(): Promise<void> {
 		this.#stopping = true;
+		// Same abort as shutdown(): disposal never waits on an unresolved provider.
+		this.#publishShutdownNotice();
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
@@ -2859,6 +3814,26 @@ export class InstanceManager {
 		}
 	}
 
+	/**
+	 * The current shutdown/disposal notification, resolved as soon as this manager
+	 * has begun either. A creation that starts after that point is already aborted.
+	 */
+	#awaitShutdownNotice(): Promise<void> {
+		if (this.#shutdownNotice === undefined) {
+			let resolve: () => void = () => undefined;
+			this.#shutdownNotice = new Promise<void>((fulfill) => { resolve = fulfill; });
+			this.#shutdownNoticeResolve = resolve;
+		}
+		if (this.#stopping) this.#shutdownNoticeResolve?.();
+		return this.#shutdownNotice;
+	}
+
+	/** Publish the notification once, immediately after the stopping latch is set. */
+	#publishShutdownNotice(): void {
+		this.#awaitShutdownNotice();
+		this.#shutdownNoticeResolve?.();
+	}
+
 	#sidebarTitleColumnsSnapshot(): number | undefined {
 		try {
 			const columns = this.#getSidebarTitleColumns?.();
@@ -2867,6 +3842,225 @@ export class InstanceManager {
 				: undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * The manager's own shared native Pi root, read only for native-row ownership
+	 * bookkeeping. It comes from the injected setup preparer's canonical root when
+	 * that preparer publishes one (production's native registry). Nothing is
+	 * admitted, prepared, initialized, or released here, and the recorded value
+	 * never says where the provider keeps its own configuration: a native row's
+	 * provider state stays entirely the provider's own.
+	 */
+	#hostAgentDir(): string {
+		const preparer = this.#profilePreparer as { readonly agentDir?: unknown };
+		const agentDir = preparer?.agentDir;
+		return typeof agentDir === "string" ? agentDir : "";
+	}
+
+	/**
+	 * Launch one native CLI row (issue 277 core slice): an ordinary interactive
+	 * provider child running in this row's explicitly selected workspace.
+	 *
+	 * What this path deliberately never does is the point of it: no setup admission
+	 * and no Pi agent-directory initialization, no Pi launch composition, no status
+	 * registration (so no bootstrap token exists for this child anywhere), no
+	 * startup payload, no preload/NODE_OPTIONS or title-columns environment, no
+	 * input framing, and no native clipboard receiver. The injected provider owns
+	 * the executable, argv, and provider-side environment sanitization; the manager
+	 * contributes nothing to the child's environment except the removal of its own
+	 * host capability tokens.
+	 *
+	 * Everything else is the same ownership machinery as a Pi row: the row is
+	 * already posted, the provider is resolved BEFORE the synchronous spawn stretch
+	 * and this manager's shutdown latch is rechecked after that await so a
+	 * concurrent stop never spawns, ownership of the exact PTY handle is recorded
+	 * before any child callback can fire, and that handle's own exit event remains
+	 * the only settlement witness.
+	 */
+	async #launchNativeCliInstance(
+			record: ManagedInstance,
+			options: { workspace: string; backend: NativeCliBackend; targetId?: string },
+		): Promise<void> {
+		try {
+			// 1. The selected workspace is the only setup fact this row needs: an
+			// existing absolute directory, canonicalized. No provider configuration,
+			// agent directory, profile, or skill work happens on this path.
+			const workspace = canonicalNativeWorkspace(options.workspace);
+			record.workspace = workspace;
+			record.agentDir = this.#hostAgentDir();
+			this.#safeChanged(record.id);
+
+			await yieldCheckpoint();
+			if (this.#stopping) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+
+			// 2. Resolve the provider's full interactive descriptor before the spawn
+			// stretch. The provider receives a fresh copy of this manager's environment
+			// snapshot (never mutated) plus the unchanged operator target selection.
+			//
+			// The provider lives outside this module and may take arbitrarily long, so
+			// its resolution is raced against this manager's shutdown notification:
+			// `shutdown()`/`dispose()` must reach the owned stop ladder for the
+			// manager's other children even when a provider never answers. Both outcome
+			// handlers are attached to the provider promise itself, so a late
+			// fulfillment is simply discarded and a late rejection can never surface as
+			// an unhandled rejection. Nothing below the race can spawn before #stopping
+			// is rechecked, and the spawn stretch itself never yields.
+			const launch = this.#nativeCliLaunch;
+			if (launch === undefined) {
+				// create() refused this combination already; a manager reconfigured after
+				// posting the row still never falls back to a Pi launch.
+				throw new Error("session-host: this host has no native CLI launch provider");
+			}
+			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
+				workspace,
+				env: { ...this.#env },
+				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
+			}));
+			const outcome = await Promise.race([
+				pendingProvider.then(
+					(descriptor) => ({ kind: "provided" as const, descriptor }),
+					() => ({ kind: "failed" as const }),
+				),
+				this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+			]);
+			// The provider ran across an await: a stop that began meanwhile takes this
+			// launch, so no child is ever created after the host began shutting down,
+			// and a provider that answers later can never resurrect this creation.
+			if (this.#stopping || this.#disposed) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+			if (outcome.kind !== "provided") {
+				throw new Error(outcome.kind === "aborted"
+					? "shutting down; native CLI launch aborted before any child existed"
+					: "session-host: the native CLI launch provider did not produce a descriptor");
+			}
+			const descriptor = validatedNativeCliDescriptor(outcome.descriptor, workspace);
+
+			// 3. Synchronous spawn stretch: nothing yields until the handlers and the
+			// terminal surface are attached, so ownership is recorded before any child
+			// callback can fire. The descriptor is applied verbatim.
+			let pty: InstancePty | undefined;
+			try {
+				// The private fact of the process about to exist, minted in the same
+				// synchronous stretch as the spawn: a row never owns a live provider child
+				// whose input scope key does not exist yet, and a replacement child never
+				// inherits its predecessor's. Nothing derived from it is ever published.
+				record.nativeCliIncarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
+				pty = this.#ptyFactory({
+					file: descriptor.file,
+					args: descriptor.args,
+					...(descriptor.commandLine === undefined ? {} : { commandLine: descriptor.commandLine }),
+					env: nativeCliChildEnv(descriptor.env),
+					cwd: descriptor.cwd,
+					cols: record.cols,
+					rows: record.rows,
+				});
+				record.pty = pty;
+				// #666: the same owned-reader contract as a Pi row. A native CLI child
+				// spawned by the default factory on Windows leaks the same addon reader,
+				// so its settlement is recorded here for the disposal-time confirmation;
+				// the release itself is still triggered only by that handle's own exit.
+				// Settled readers are already history, so they are dropped here instead of
+				// retaining a finished handle graph for the manager's whole lifetime.
+				for (const settled of this.#ownedConptyReaders) {
+					if (settled.settled) this.#ownedConptyReaders.delete(settled);
+				}
+				const ownedReader = ownedConptyReaderRecord(pty);
+				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
+				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+				if (record.ptyExited) {
+					this.#disposeExitListener(record);
+					if (this.#records.get(record.id) !== record) {
+						// An exit observer may synchronously close the row while onExit()
+						// registers its listener: allocate nothing else for a detached record.
+						return;
+					}
+				}
+				record.surface = new TerminalSurface(record.cols, record.rows, {
+					onReply: (data) => this.#onQueryReply(record, undefined, data),
+					onChange: () => this.#safeChanged(record.id),
+					onBackpressure: (paused) => this.#onBackpressure(record, paused),
+					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+					// The closed TEXT copy capture of THIS child: bound to this exact
+					// handle and incarnation, and installed on no other surface.
+					onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
+					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+					graphicsBudget: this.#graphicsBudget,
+				});
+				if (!record.ptyExited) {
+					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+				}
+				if (!record.ptyExited) {
+					record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
+					if (record.ptyExited) {
+						// An injected/fake event source may emit synchronously while listener
+						// registration is returning; never revive its row.
+						this.#disposeDataListener(record);
+					} else if (record.lifecycle === "starting") {
+						record.lifecycle = "alive";
+					}
+				}
+			} catch {
+				if (pty) {
+					// The child exists but could not be wired: keep ownership and initiate a
+					// bounded graceful owned stop rather than leaving an untracked process.
+					record.error = publicInstanceError("ptySetup");
+					record.lifecycle = "error";
+					if (!record.exitDisposable && !record.ptyExited) {
+						try {
+							record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+						} catch {
+							// Without an exit event, ownership remains held fail-closed.
+						}
+					}
+					if (record.ptyExited) {
+						this.#disposeExitListener(record);
+					}
+					try {
+						record.dataDisposable?.dispose();
+					} catch {
+						// Continue toward an owned stop even if listener cleanup fails.
+					}
+					record.dataDisposable = undefined;
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+					this.#safeChanged(record.id);
+					if (record.ptyExited) {
+						this.#releaseRegistration(record);
+						this.#releaseProfile(record);
+					} else {
+						void this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS).catch(() => {});
+					}
+					return;
+				}
+				// Failed spawn before any child exists: nothing was ever acquired.
+				record.error = publicInstanceError("ptySetup");
+				record.lifecycle = "error";
+				this.#releaseRegistration(record);
+				this.#releaseProfile(record);
+				this.#safeChanged(record.id);
+				return;
+			}
+			if (this.#records.get(record.id) === record) {
+				this.#safeChanged(record.id);
+			}
+		} catch {
+			// Pre-spawn failure or a stop-aborted launch: no child ever existed, and a
+			// native row owns no registration, profile admission, startup payload, or
+			// saved-session reservation, so the row simply reports the bounded error.
+			record.error = publicInstanceError("launchPreparation");
+			record.lifecycle = "error";
+			this.#releaseRegistration(record);
+			this.#releaseProfile(record);
+			this.#safeChanged(record.id);
 		}
 	}
 
@@ -2880,8 +4074,20 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string } },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string },
 		): Promise<void> {
+		const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
+		if (nativeBackend !== undefined) {
+			// One dispatch point, chosen from the row's own recorded backend: a native
+			// CLI row never reaches the Pi setup, descriptor, registration, or framing
+			// path below, and a Pi row's launch is unchanged.
+			await this.#launchNativeCliInstance(record, {
+				workspace: options.workspace,
+				backend: nativeBackend,
+				...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
+			});
+			return;
+		}
 		let stagedStartup: ReturnType<typeof stageSessionHostStartupRequest> | undefined;
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
@@ -3139,7 +4345,7 @@ export class InstanceManager {
 		this.#failRunningInstance(record, "ptyRead");
 	}
 
-	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration, data: string): void {
+	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration | undefined, data: string): void {
 		if (this.#records.get(record.id) !== record || this.#disposed) {
 			return;
 		}
@@ -3198,6 +4404,13 @@ export class InstanceManager {
 			return; // stale or already-final exit
 		}
 		record.ptyExited = true;
+		// This process incarnation is over. Its private scope key goes with it, so no
+		// source minted for it can be re-proven even by a caller holding every public
+		// fact unchanged.
+		record.nativeCliIncarnation = undefined;
+		// The routing convention belonged to that process incarnation and goes with it:
+		// a replacement child starts with no known recipient at all.
+		record.nativeCliController = undefined;
 		// The process incarnation is over, so its startup phase is over for good.
 		this.#closeStartupInput(record, false);
 		// A finished child displays nothing: every surface's participation in this
@@ -3845,6 +5058,10 @@ export class InstanceManager {
 	/**
 	 * Route one authenticated viewer-origin copy to the ONE viewer that caused it.
 	 *
+	 * A hosted provider CLI row is refused here first: it has no copy producer, no
+	 * Pi conversation to attribute a copy to, and its `nvcli1` input scope is
+	 * input-only, so a native CLI row can never reach a clipboard sink.
+	 *
 	 * The token is only a lookup aid: its handle names the viewer record to consult,
 	 * and the copy is delivered only after that record is re-read and its CURRENT
 	 * facts re-commit to exactly the received token under THIS registration's key.
@@ -3861,6 +5078,11 @@ export class InstanceManager {
 		receipt: NativeClipboardOriginEvent,
 	): void {
 		if (!this.#clipboardEventLive(record, registration, receipt.event)) {
+			return;
+		}
+		if (isNativeCliBackend(record.backend)) {
+			// Input-only by construction: a native CLI input source can never carry a
+			// copy receipt, and nothing on this row is a copy producer.
 			return;
 		}
 		const origin = receipt.origin;
@@ -3898,8 +5120,11 @@ export class InstanceManager {
 	 * PTY passes, for exactly the three admitted sources: local user input
 	 * ({@linkcode write}), TerminalSurface protocol replies
 	 * ({@linkcode #onQueryReply}), and strict viewer-origin input
-	 * ({@linkcode writeViewerInput}). There is no raw unframed bypass and no fourth
-	 * caller.
+	 * ({@linkcode writeViewerInput}) on a Pi row. There is no raw unframed bypass of
+	 * a Pi row's framing and no fourth caller here. A hosted provider CLI row never
+	 * enters this seam: it has no registration and no encoder, and its viewer input is
+	 * handed to its own PTY by {@linkcode #writeNativeCliViewerInput}, which carries
+	 * its own ownership and process-incarnation fences.
 	 *
 	 * - Legacy rows (mode absent) forward the bytes exactly as before.
 	 * - Framing rows encode EVERY write with this registration's single encoder:

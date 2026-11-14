@@ -43,6 +43,8 @@ import {
   ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
+  ROSTER_BRIDGE_NATIVE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
@@ -119,15 +121,17 @@ test("roster-rename-v1 is an optional known capability that never replaces the b
   assert.equal(ROSTER_BRIDGE_RENAME_CAPABILITY, "roster-rename-v1");
   assert.notEqual(ROSTER_BRIDGE_RENAME_CAPABILITY, ROSTER_BRIDGE_REQUIRED_CAPABILITY);
   assert.ok(ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES.includes(ROSTER_BRIDGE_RENAME_CAPABILITY));
-  // Still exactly the five optional lanes, each declared once, and the baseline
-  // is never part of the optional set. The roster-slot lane (#477) is one more
-  // optional lane of the SAME channel: it neither replaces rename nor gives it
-  // a second catalogue.
+  // Still exactly the known optional lanes, each declared once, and the baseline
+  // is never part of the optional set. The native lane is one more optional lane
+  // of the SAME channel: it neither replaces rename nor gives it a second
+  // catalogue, and an unnegotiated peer still sees the pre-native schema.
   assert.deepEqual(
     [...ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES].sort(),
     [
       ROSTER_BRIDGE_CLOSE_CAPABILITY,
       ROSTER_BRIDGE_CREATE_CAPABILITY,
+      ROSTER_BRIDGE_NATIVE_CAPABILITY,
+      ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
       ROSTER_BRIDGE_RENAME_CAPABILITY,
       ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
       ROSTER_BRIDGE_SAVED_CAPABILITY,

@@ -10,7 +10,7 @@ import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
  * One-command session-host entry points (issue 323): scripts/
  * pi-review-sessions.sh (POSIX) and scripts/pi-review-sessions.cmd (native
  * Windows). They retain a supported PATH Node, or bootstrap only the fixed
- * source-pinned official Node 22.23.4 platform archive after verifying its
+ * source-pinned official Node 22.23.5 platform archive after verifying its
  * digest. Tests use synthetic downloader, hasher, and archive-tool fixtures;
  * they never fetch, extract, or execute the real official Node distribution.
  * Windows host-runtime tests are intentionally owned by the parent phase.
@@ -22,13 +22,13 @@ const psPath = resolve("scripts/pi-review-sessions-node.ps1");
 const cjsPath = resolve("scripts/pi-review-sessions.cjs");
 const isWindows = process.platform === "win32";
 
-// Official nodejs.org/dist/v22.23.4/SHASUMS256.txt digests (issue 489).
-const NODE_PIN = "22.23.4";
+// Official nodejs.org/dist/v22.23.5/SHASUMS256.txt digests (issue 489).
+const NODE_PIN = "22.23.5";
 const POSIX_PINS: Record<string, string> = {
-  "darwin-arm64": "c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428",
-  "darwin-x64": "efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819",
-  "linux-arm64": "f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9",
-  "linux-x64": "b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406",
+  "darwin-arm64": "e7131995759b61a0170b646010d2ad35a5d37b4cb0d471f3e8317eac6f742f3d",
+  "darwin-x64": "c53383238206b9ae4db23c5d8a63645e2e753bec8ab51a49cc81939aa64e9422",
+  "linux-arm64": "8bd3dc69eee8f3f226315a80d7d1d4faccf217a4c8fae500168ac2e38f3bdba3",
+  "linux-x64": "c54118104acc524633b5abe106bbf44a53126ec8b4e5fa105cb92b5d7de8a1a1",
 };
 // The superseded pre-489 linux-x64 pin: a record naming it must never be reused.
 const LEGACY_LINUX_X64_PIN = { version: "22.19.0", sha256: "d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d" };
@@ -163,7 +163,7 @@ function writeBootstrapNode(fixture: EntrypointFixture, exitCode = 0): string {
   writeExecutable(file, [
     "#!/bin/bash",
     ". \"$FAKE_BOOTSTRAP_COMMON\"",
-    "if [[ \"${1:-}\" == \"--version\" ]]; then record_phase fallback-node-version; printf '%s\\n' 'v22.23.4'; exit 0; fi",
+    "if [[ \"${1:-}\" == \"--version\" ]]; then record_phase fallback-node-version; printf '%s\\n' 'v22.23.5'; exit 0; fi",
     "record_phase dispatch",
     "for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$FAKE_NODE_LOG\"; done",
     "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$PATH\" \"$PWD\" \"${NODE_OPTIONS:-}\" \"${PI_CODING_AGENT_DIR:-}\" \"$(umask)\" >> \"$FAKE_FALLBACK_ENV_LOG\"",
@@ -435,7 +435,7 @@ test(".sh rejects executor role contexts before any probe, download, or extracto
 test(".sh retains supported PATH Node, exact argv, trusted NODE_OPTIONS, and CJS exit status", { skip: isWindows ? "POSIX entry point" : false }, async (t) => {
   const fixture = makeEntrypointFixture(".session-host-entry-sh-dispatch-");
   cleanupFixture(t, fixture);
-  writeFakeNode(fixture.bin, "v22.23.4", fixture.nodeLog, { exitCode: 42 });
+  writeFakeNode(fixture.bin, "v22.23.5", fixture.nodeLog, { exitCode: 42 });
 
   const args = ["--state-root", "./state dir π", "--sidebar-key", "f8", "--", "--scheduler", "雪"];
   const result = runSh(fixture, args, {
@@ -532,7 +532,7 @@ test(".sh treats a prerelease at the exact minimum as unsupported and uses the s
   const fixture = makeEntrypointFixture(".session-host-entry-sh-prerelease-");
   cleanupFixture(t, fixture);
   writeBootstrapTools(fixture);
-  writeFakeNode(fixture.bin, "v22.23.4-rc.1", fixture.nodeLog);
+  writeFakeNode(fixture.bin, "v22.23.5-rc.1", fixture.nodeLog);
 
   const result = runSh(fixture, ["--help"]);
   assert.equal(result.status, 0, result.stderr);
@@ -547,11 +547,11 @@ test(".sh falls back from an old PATH Node without executing or modifying an unk
   writeBootstrapTools(fixture);
   writeFakeNode(fixture.bin, "v22.23.3", fixture.nodeLog);
 
-  const nodeCacheDir = join(fixture.agentDir, ".pi-review-gate", "node", "v22.23.4");
+  const nodeCacheDir = join(fixture.agentDir, ".pi-review-gate", "node", "v22.23.5");
   const cachedNodeDir = join(nodeCacheDir, "bin");
   mkdirSync(cachedNodeDir, { recursive: true });
   const cacheLog = join(fixture.root, "cached-node-invocations.txt");
-  writeFakeNode(cachedNodeDir, "v22.23.4", cacheLog);
+  writeFakeNode(cachedNodeDir, "v22.23.5", cacheLog);
   writeFileSync(join(nodeCacheDir, ".provenance"), "self-asserted, untrusted cache metadata\n", "utf8");
   const sentinel = join(nodeCacheDir, "sentinel.txt");
   writeFileSync(sentinel, "preserve me\n", "utf8");
@@ -664,7 +664,7 @@ test(".sh reports unsupported fallback architectures without a network request",
 
   const result = runSh(fixture, ["--help"]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /no pinned Node\.js 22\.23\.4 archive is available for this platform/);
+  assert.match(result.stderr, /no pinned Node\.js 22\.23\.5 archive is available for this platform/);
   assert.deepEqual(recordedPhases(fixture), ["uname", "uname"]);
   fixture.markAssertionsPassed();
 });
@@ -3154,7 +3154,7 @@ test(".cmd delegates arguments to the PowerShell Node bootstrap after fail-close
   assert.match(helper, /if \(-not \[string\]::IsNullOrEmpty\(\$env:PI_REVIEW_GATE_RUNTIME_ROLE\)\)/);
   assert.match(helper, /\$env:PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP = \$null/);
   assert.match(helper, /Get-Command -Name 'node\.exe'/);
-  assert.match(helper, /https:\/\/nodejs\.org\/dist\/v22\.23\.4\/' \+ \$NodeArchive/);
+  assert.match(helper, /https:\/\/nodejs\.org\/dist\/v22\.23\.5\/' \+ \$NodeArchive/);
   assert.match(helper, /AllowAutoRedirect = \$false/);
   assert.match(helper, /CreateNew/);
   assert.match(helper, /Get-Sha256 \$archivePath[\s\S]*?if \(\$actualSha256 -cne \$NodeSha256\)[\s\S]*?Expand-VerifiedZip/);
@@ -3200,7 +3200,7 @@ test("native Windows Test-NodeFloor from the real helper source enforces per-lin
     "$ErrorActionPreference = 'Stop'",
     floors,
     testNodeFloor,
-    `foreach ($candidate in @(${versions}, 'v22.23.4.1', '22.23.4')) { [Console]::Out.WriteLine($candidate + '=' + [string](Test-NodeFloor $candidate)) }`,
+    `foreach ($candidate in @(${versions}, 'v22.23.5.1', '22.23.5')) { [Console]::Out.WriteLine($candidate + '=' + [string](Test-NodeFloor $candidate)) }`,
   ].join("\n");
   const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
@@ -3215,8 +3215,8 @@ test("native Windows Test-NodeFloor from the real helper source enforces per-lin
   for (const entry of NODE_SECURITY_FLOOR_CASES) {
     assert.equal(verdicts.get(`v${entry.version}`), entry.launcher ? "True" : "False", `${entry.version}: ${entry.why}`);
   }
-  assert.equal(verdicts.get("v22.23.4.1"), "False", "a malformed version is refused");
-  assert.equal(verdicts.get("22.23.4"), "False", "Node's own v-prefixed --version shape is required");
+  assert.equal(verdicts.get("v22.23.5.1"), "False", "a malformed version is refused");
+  assert.equal(verdicts.get("22.23.5"), "False", "Node's own v-prefixed --version shape is required");
 });
 
 test("bootstrap source pins every official platform artifact and bounds download/extraction", async () => {
@@ -3226,9 +3226,9 @@ test("bootstrap source pins every official platform artifact and bounds download
     assert.ok(posix.includes(digest), `POSIX source includes fixed pin ${digest}`);
   }
   const windowsArtifacts = [
-    ["node-v22.23.4-win-arm64.zip", "a8b8cd79cbbb3062435f449591d98dd63730bbbf30ce2d7cc3a6376c236cb111"],
-    ["node-v22.23.4-win-x64.zip", "cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20"],
-    ["node-v22.23.4-win-x86.zip", "7d6c4dce2ecccca46e3c4b3e43c8bebbd1969bd616fdb4fda1e8269171d9ccea"],
+    ["node-v22.23.5-win-arm64.zip", "c1856817f611738c77534efbff8a5a17990593eab24046bc8d2c23a77a160d13"],
+    ["node-v22.23.5-win-x64.zip", "4a191082e9706866830379d577d2cc8a50c776fcd9436a8d061b063ed0d9a0e3"],
+    ["node-v22.23.5-win-x86.zip", "9c01245683c87e3f81eedfbad82c1665611749627cd1b0b5a42921db9361b4a6"],
   ];
   for (const [artifact, digest] of windowsArtifacts) {
     assert.ok(windows.includes(artifact), `Windows source selects ${artifact}`);
@@ -3257,7 +3257,7 @@ if (isWindows) {
     assert.match(protection, /\$coordination = Enter-NodeCoordination \$AgentDirectory/u);
     assert.doesNotMatch(protection, /Enter-NodeAdmissionLock/u,
       "consumer publication requires the coordination entry, not admission-lock best effort");
-    assert.match(protection, /Join-Path \(Join-Path \(Join-Path \$GenerationRoot 'extracted'\) \('node-v22\.23\.4-' \+ \$NodePlatform\)\) 'node\.exe'/u,
+    assert.match(protection, /Join-Path \(Join-Path \(Join-Path \$GenerationRoot 'extracted'\) \('node-v22\.23\.5-' \+ \$NodePlatform\)\) 'node\.exe'/u,
       "the executable is checked at its nested location inside the generation");
     assert.match(source, /Protect-CachedFallbackRuntime \$cacheRoot \(Join-Path \$cacheRoot \$currentRuntime\.Generation\) \$agentDirectory/u,
       "the direct-child generation, not the extracted distribution, receives the record");
@@ -3323,7 +3323,7 @@ test(".sh replaces a stale completed-runtime marker after one installation", { s
     assert.equal(first.status, 0, first.stderr);
     assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
       "the stale record forces exactly one installation");
-    assert.match(readFileSync(marker, "utf8"), /^version=22\.23\.4$/mu, "the completed record is published");
+    assert.match(readFileSync(marker, "utf8"), /^version=22\.23\.5$/mu, "the completed record is published");
     const second = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
     assert.equal(second.status, 0, second.stderr);
     assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractionsBefore + 1,
@@ -3403,8 +3403,8 @@ test(".sh replaces a wrong-pin marker that still references an existing runtime"
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, 3,
     "a legacy-pin record forces exactly one patched installation");
   const published = readFileSync(marker, "utf8");
-  assert.match(published, /^version=22\.23\.4$/mu);
-  assert.match(published, /^archive=node-v22\.23\.4-linux-x64\.tar\.gz$/mu);
+  assert.match(published, /^version=22\.23\.5$/mu);
+  assert.match(published, /^archive=node-v22\.23\.5-linux-x64\.tar\.gz$/mu);
   assert.match(published, new RegExp(`^sha256=${POSIX_PINS["linux-x64"]}$`, "mu"));
   assert.equal(readFileSync(f.curlLog, "utf8").trim(), expectedArchiveFor("linux-x64"),
     "the replacement installation requests the patched official archive");

@@ -339,6 +339,9 @@ interface ReadableCell {
 	isOverline(): number;
 }
 
+/** The text part of a frame: everything except its graphics layer. */
+type CachedTextFrame = Omit<TerminalFrame, "graphics">;
+
 interface WritableRun {
 	startColumn: number;
 	text: string;
@@ -376,6 +379,8 @@ const SYNCHRONIZED_OUTPUT_MODE = 2026;
 const BUFFER_SWITCH_MODES = [47, 1047, 1049] as const;
 
 const SGR_RESET = "\x1b[0m";
+/** The exact native synchronized-output open marker (`CSI ? 2026 h`). */
+const SYNC_OPEN_MARKER = "\x1b[?2026h";
 const SAFE_EMPTY_APC = "\x1b_G\x1b\\";
 const GENERATED_SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 
@@ -436,6 +441,112 @@ function colorSpec(
 		return { mode: "rgb", value: color & 0xffffff };
 	}
 	return { mode: "default", value: 0 };
+}
+
+/** Sanitized text of one cell, with a fast path for a single printable ASCII character. */
+function cellText(chars: string): string {
+	if (chars.length === 1) {
+		const code = chars.charCodeAt(0);
+		if (code >= 0x20 && code < 0x7f) {
+			return chars;
+		}
+	}
+	return sanitizeText(chars) || " ";
+}
+
+/** Normalized color-spec encoding matching `colorSpec`: kind and value. */
+function colorKey(isDefault: boolean, isPalette: boolean, isRgb: boolean, color: number): string {
+	if (isDefault) {
+		return "d";
+	}
+	if (isPalette) {
+		return `p${Math.min(Math.max(color, 0), 255)}`;
+	}
+	if (isRgb) {
+		return `r${color & 0xffffff}`;
+	}
+	return "x";
+}
+
+/**
+ * A compact key that is equal for two cells exactly when `cellAttributes`
+ * returns equal attribute objects for them: the same normalized foreground and
+ * background specs and the same set of boolean attributes.
+ */
+function cellAttributesKey(cell: ReadableCell): string {
+	const flags = (cell.isBold() ? 1 : 0)
+		| (cell.isDim() ? 2 : 0)
+		| (cell.isItalic() ? 4 : 0)
+		| (cell.isUnderline() ? 8 : 0)
+		| (cell.isBlink() ? 16 : 0)
+		| (cell.isInverse() ? 32 : 0)
+		| (cell.isInvisible() ? 64 : 0)
+		| (cell.isStrikethrough() ? 128 : 0)
+		| (cell.isOverline() ? 256 : 0);
+	return `${colorKey(cell.isFgDefault(), cell.isFgPalette(), cell.isFgRGB(), cell.getFgColor())}`
+		+ `|${colorKey(cell.isBgDefault(), cell.isBgPalette(), cell.isBgRGB(), cell.getBgColor())}|${flags}`;
+}
+
+/**
+ * Controls that never change a cell, scroll, or switch buffers: CR, cursor
+ * up/down/forward/back, cursor horizontal absolute, cursor position, cursor
+ * show/hide, and SGR (which changes only the pen for later output).
+ */
+// The final `(?![\s\S])` is the true end of input: `$` would also accept a
+// trailing newline, and a line feed can scroll cells.
+const CELL_PRESERVING_LEAD = /^(?:\r|\x1b\[(?:\d{0,4}[ABCDG]|\d{0,4}(?:;\d{0,4})?H|\?25[hl]|[\d;]{0,64}m))*(?![\s\S])/;
+const MAX_SYNC_LEAD_CODE_UNITS = 256;
+
+/**
+ * True when `data` contains the exact synchronized-output open marker and
+ * everything before its first occurrence is a sequence of complete
+ * cell-preserving controls. Then the parser is at ground state when it reaches
+ * that marker, the marker is the first synchronized-output open of the write,
+ * and no cell, scroll position, or buffer has changed since the write began.
+ */
+function hasCellPreservingSyncLead(data: string): boolean {
+	const markerAt = data.indexOf(SYNC_OPEN_MARKER);
+	if (markerAt < 0 || markerAt > MAX_SYNC_LEAD_CODE_UNITS) {
+		return false;
+	}
+	return markerAt === 0 || CELL_PRESERVING_LEAD.test(data.slice(0, markerAt));
+}
+
+/**
+ * True when the whole write is a bounded run of complete cell-preserving
+ * controls (`CELL_PRESERVING_LEAD`): parsing it can move the cursor or change
+ * its visibility, but no cell, scroll position, or buffer changes.
+ */
+function isCellPreservingWrite(data: string): boolean {
+	return data.length <= MAX_SYNC_LEAD_CODE_UNITS && CELL_PRESERVING_LEAD.test(data);
+}
+
+/** The key of a cell with no attributes at all (the row's default state). */
+const DEFAULT_ATTRIBUTES_KEY = "d|d|0";
+
+function withGraphics(text: CachedTextFrame, graphics: TerminalGraphicsFrame | undefined): TerminalFrame {
+	return graphics ? { ...text, graphics } : { ...text };
+}
+
+/** Exact equality of two text frames: geometry, every serialized row, cursor, and style runs. */
+function sameTextFrame(a: CachedTextFrame, b: CachedTextFrame): boolean {
+	if (a === b) {
+		return true;
+	}
+	if (a.cols !== b.cols || a.rows !== b.rows || a.lines.length !== b.lines.length) {
+		return false;
+	}
+	if (a.cursor.column !== b.cursor.column || a.cursor.row !== b.cursor.row || a.cursor.visible !== b.cursor.visible) {
+		return false;
+	}
+	for (let index = 0; index < a.lines.length; index += 1) {
+		if (a.lines[index] !== b.lines[index]) {
+			return false;
+		}
+	}
+	// Rows already carry their generated styling; the structured runs are
+	// compared only when every row matched, so this stays off the common path.
+	return a.styles === b.styles || JSON.stringify(a.styles) === JSON.stringify(b.styles);
 }
 
 function cellAttributes(cell: ReadableCell): CellAttributes {
@@ -561,6 +672,12 @@ export class TerminalSurface {
 	private readonly graphicsSplitter: KittyGraphicsSplitter;
 	private readonly graphics: KittyGraphicsState;
 	private readonly diagnostics: XtermDiagnosticCollector;
+	/**
+	 * xterm's buffer namespace. The pinned Terminal creates it once and returns
+	 * that same object from every `buffer` access (after a proposed-API options
+	 * check), so it is read once here instead of on every parser hook and frame.
+	 */
+	private readonly bufferApi: Terminal["buffer"];
 	private graphicsPreflightState: GraphicsPreflightState = "ground";
 	private options: TerminalSurfaceOptions;
 	private readonly maxPendingBytes: number;
@@ -578,7 +695,39 @@ export class TerminalSurface {
 	private processingWrite = false;
 	private activeTerminalWriteResolve?: () => void;
 	private parseFailed = false;
-	private lastInvalidateKey = "";
+	/**
+	 * What the last change notification observed, compared field by field so a
+	 * parse that changed visible text is detected without serializing the whole
+	 * frame. `undefined` until the first observation (and after disposal).
+	 */
+	private lastInvalidated?: {
+		readonly text: CachedTextFrame;
+		readonly graphicsKey: string;
+		readonly modesKey: string;
+	};
+	/**
+	 * The text part of the live frame, valid only while no terminal write has
+	 * started since it was built (and no resize happened). It is never stored
+	 * while a write is in flight, so a mid-parse observation is never reused.
+	 */
+	private liveTextCache?: CachedTextFrame;
+	/**
+	 * The cached rows are still exact but the cursor may have moved: the last
+	 * write carried only cell-preserving controls (`isCellPreservingWrite`).
+	 */
+	private liveTextCursorStale = false;
+	/** True from handing bytes to xterm until that write's parse callback. */
+	private terminalWriteInFlight = false;
+	/**
+	 * The live text frame as it stood immediately before the write in flight,
+	 * kept only when everything that write carries before its first exact
+	 * synchronized-output open marker is complete cursor-movement, cursor
+	 * visibility, SGR, or carriage-return controls (`hasCellPreservingSyncLead`):
+	 * none of them changes a cell, scrolls, or switches buffers, so the rows at
+	 * that marker are exactly this frame. Consumed by that marker's commit and
+	 * dropped when the write ends.
+	 */
+	private syncLeadText?: CachedTextFrame;
 	private syncFrame?: SyncFrame;
 	/** Observers of the end of a held synchronized frame (#500). */
 	private readonly redrawObservers = new Set<() => void>();
@@ -618,7 +767,7 @@ export class TerminalSurface {
 			context: () => ({
 				cols: this.terminal.cols,
 				rows: this.terminal.rows,
-				buffer: this.terminal.buffer.active.type === "alternate" ? "alternate" : "normal",
+				buffer: this.bufferApi.active.type === "alternate" ? "alternate" : "normal",
 				synchronizedFrameHeld: this.syncFrame !== undefined,
 			}),
 		});
@@ -629,12 +778,13 @@ export class TerminalSurface {
 			allowProposedApi: true,
 			logger: this.diagnostics.logger,
 		});
+		this.bufferApi = this.terminal.buffer;
 		const unicode11 = new Unicode11Addon();
 		this.terminal.loadAddon(unicode11);
 		this.terminal.unicode.activeVersion = "11";
 
 		const noteAlternateGraphicsInvalidation = () => {
-			if (this.terminal.buffer.active.type === "alternate") {
+			if (this.bufferApi.active.type === "alternate") {
 				this.pendingAlternateGraphicsInvalidation = true;
 			}
 		};
@@ -696,7 +846,7 @@ export class TerminalSurface {
 		}));
 		// Backstop: any buffer switch the mode hooks did not already settle
 		// (for example RIS) ends a held frame without guessing anchors.
-		this.attach(this.terminal.buffer.onBufferChange(() => {
+		this.attach(this.bufferApi.onBufferChange(() => {
 			if (this.syncFrame) {
 				this.endSyncFrame("discard");
 			}
@@ -895,6 +1045,10 @@ export class TerminalSurface {
 		// never reports stale cols/rows, then invalidate geometry-bound state.
 		this.cancelSyncFrame();
 		this.graphics.invalidatePlacements();
+		this.liveTextCache = undefined;
+		this.liveTextCursorStale = false;
+		// A queued write's pre-write rows describe the old geometry: never commit them.
+		this.syncLeadText = undefined;
 		this.terminal.resize(cols, rows);
 		// Resize invalidates geometry deterministically: the underlying resize
 		// is synchronous and buffers are reflowed immediately.
@@ -913,11 +1067,67 @@ export class TerminalSurface {
 		if (held) {
 			return { ...held, lines: [...held.lines] };
 		}
-		return this.liveFrame();
+		const live = this.liveFrame();
+		// The text part may be the shared cache: callers get their own rows array.
+		return { ...live, lines: [...live.lines] };
 	}
 
 	private liveFrame(): TerminalFrame {
-		const buffer = this.terminal.buffer.active;
+		const text = this.liveTextFrame();
+		const buffer = this.bufferApi.active;
+		const graphics = this.graphics.frame(buffer.type, buffer.viewportY, text.cols, text.rows);
+		return withGraphics(text, graphics);
+	}
+
+	/**
+	 * The text part of the live frame (rows, styles, cursor). Reused from the
+	 * cache while nothing has been written or resized since it was built; a
+	 * frame read while xterm is still parsing a write is built fresh and never
+	 * cached, so it can never be served after that write completes.
+	 */
+	private liveTextFrame(): CachedTextFrame {
+		const cached = this.liveTextCache;
+		if (cached !== undefined && !this.terminalWriteInFlight) {
+			if (!this.liveTextCursorStale) {
+				return cached;
+			}
+			// Only the cursor can differ from the cached rows (see liveTextCursorStale).
+			const refreshed = { ...cached, cursor: this.liveCursor() };
+			this.liveTextCache = refreshed;
+			this.liveTextCursorStale = false;
+			return refreshed;
+		}
+		const built = this.buildLiveTextFrame();
+		if (!this.terminalWriteInFlight) {
+			this.liveTextCache = built;
+		}
+		return built;
+	}
+
+	private liveCursor(): TerminalFrame["cursor"] {
+		const buffer = this.bufferApi.active;
+		const cols = this.terminal.cols;
+		const rows = this.terminal.rows;
+		// The cursor lives at viewport-relative buffer.cursorY; map it into
+		// the frame's viewport window (scrollback-aware, alternates use the
+		// alternate buffer's own baseY/viewportY of 0). cursorX === cols is
+		// the wrap-pending position the pinned API permits after a row is
+		// filled; the cursor stays visible at the clamped last column.
+		const bufferCursorLine = buffer.baseY + buffer.cursorY;
+		const rawCursorRow = bufferCursorLine - buffer.viewportY;
+		const cursorRow = Math.min(Math.max(rawCursorRow, 0), rows - 1);
+		const visible = this.cursorVisible
+			&& rawCursorRow >= 0
+			&& rawCursorRow < rows;
+		return {
+			column: Math.min(buffer.cursorX, cols - 1),
+			row: cursorRow,
+			visible,
+		};
+	}
+
+	private buildLiveTextFrame(): CachedTextFrame {
+		const buffer = this.bufferApi.active;
 		const cols = this.terminal.cols;
 		const rows = this.terminal.rows;
 		const lines: string[] = [];
@@ -935,9 +1145,12 @@ export class TerminalSurface {
 					// duplicated text while run columns stay in frame space.
 					continue;
 				}
-				const content = sanitizeText(cell.getChars()) || " ";
-				const attrs = cellAttributes(cell);
-				const attrsKey = JSON.stringify(attrs);
+				const content = cellText(cell.getChars());
+				// The run key is a compact, injective encoding of exactly the
+				// normalized attributes `cellAttributes` reports, so two cells share
+				// a run if and only if their attribute objects are equal. The
+				// attribute object itself is built once per run, not per cell.
+				const attrsKey = cellAttributesKey(cell);
 				if (currentRun && currentRun.attrsKey === attrsKey) {
 					currentRun.text += content;
 				} else {
@@ -945,7 +1158,7 @@ export class TerminalSurface {
 						startColumn: x,
 						text: content,
 						attrsKey,
-						attrs,
+						attrs: cellAttributes(cell),
 					};
 					runs.push(next);
 					currentRun = next;
@@ -960,11 +1173,10 @@ export class TerminalSurface {
 			// preserved within a row because every run is reconstructed from
 			// its cells.
 			let serialized = SGR_RESET;
-			const defaultKey = JSON.stringify({});
-			let currentKey = defaultKey;
+			let currentKey = DEFAULT_ATTRIBUTES_KEY;
 			for (const run of runs) {
 				if (run.attrsKey !== currentKey) {
-					if (currentKey !== defaultKey) {
+					if (currentKey !== DEFAULT_ATTRIBUTES_KEY) {
 						serialized += SGR_RESET;
 					}
 					serialized += generateSgr(run.attrs);
@@ -977,35 +1189,12 @@ export class TerminalSurface {
 			if (runs.length > 0) {
 				styles.push({
 					line: row,
-					runs: runs.map((run) => {
-						const { attrsKey, ...rest } = run;
-						void attrsKey;
-						return { startColumn: rest.startColumn, text: rest.text, ...rest.attrs };
-					}),
+					runs: runs.map((run) => ({ startColumn: run.startColumn, text: run.text, ...run.attrs })),
 				});
 			}
 		}
-		// The cursor lives at viewport-relative buffer.cursorY; map it into
-		// the frame's viewport window (scrollback-aware, alternates use the
-		// alternate buffer's own baseY/viewportY of 0). cursorX === cols is
-		// the wrap-pending position the pinned API permits after a row is
-		// filled; the cursor stays visible at the clamped last column.
-		const bufferCursorLine = buffer.baseY + buffer.cursorY;
-		const rawCursorRow = bufferCursorLine - buffer.viewportY;
-		const cursorRow = Math.min(Math.max(rawCursorRow, 0), rows - 1);
-		const visible = this.cursorVisible
-			&& rawCursorRow >= 0
-			&& rawCursorRow < rows;
-		const cursor = {
-			column: Math.min(buffer.cursorX, cols - 1),
-			row: cursorRow,
-			visible,
-		};
-		const graphics = this.graphics.frame(buffer.type, buffer.viewportY, cols, rows);
-		if (styles.length > 0) {
-			return { cols, rows, lines, cursor, styles, ...(graphics ? { graphics } : {}) };
-		}
-		return { cols, rows, lines, cursor, ...(graphics ? { graphics } : {}) };
+		const cursor = this.liveCursor();
+		return styles.length > 0 ? { cols, rows, lines, cursor, styles } : { cols, rows, lines, cursor };
 	}
 
 	/**
@@ -1160,7 +1349,10 @@ export class TerminalSurface {
 		this.modifyOtherKeys = 0;
 		this.mouseEncoding = "default";
 		this.cursorVisible = true;
-		this.lastInvalidateKey = "";
+		this.lastInvalidated = undefined;
+		this.liveTextCache = undefined;
+		this.liveTextCursorStale = false;
+		this.syncLeadText = undefined;
 		this.paused = false;
 		// Drop owner callback/support closures as part of teardown as well as
 		// disposing every xterm event/parser subscription below.
@@ -1581,11 +1773,24 @@ export class TerminalSurface {
 		// boundary would, so the committed snapshot is a coherent state.
 		this.applyPendingAlternateGraphicsInvalidation();
 		this.graphics.validateAlternateScreen(this.alternateScreenState().textAt, false);
-		const committed = this.liveFrame();
+		// A write whose bytes before this marker can only move or show/hide the
+		// cursor (see `syncLeadText`) left every cell exactly as it was before
+		// that write: the committed rows are that cached state, with the cursor
+		// read live at this exact stream position.
+		const lead = this.syncLeadText;
+		this.syncLeadText = undefined;
+		const committed = lead === undefined
+			? this.liveFrame()
+			: withGraphics({ ...lead, cursor: this.liveCursor() }, this.graphics.frame(
+				this.bufferApi.active.type,
+				this.bufferApi.active.viewportY,
+				lead.cols,
+				lead.rows,
+			));
 		// Captured before `syncFrame` is set, so its mouse fields are the
 		// child's actual request (see requestedMouseReporting()).
 		const committedModes = this.inputModesState();
-		this.graphics.retainPublished(committed.graphics, this.terminal.buffer.active.type);
+		this.graphics.retainPublished(committed.graphics, this.bufferApi.active.type);
 		this.graphics.beginDeferredAlternateAnchors();
 		const timer = setTimeout(() => this.expireSyncFrame(), MAX_SYNC_FRAME_MS);
 		timer.unref?.();
@@ -1684,7 +1889,7 @@ export class TerminalSurface {
 
 	/** Alternate anchors require per-chunk validation, including across buffer switches. */
 	private hasAlternateGraphicsPlacements(): boolean {
-		const buffer = this.terminal.buffer.alternate;
+		const buffer = this.bufferApi.alternate;
 		const graphics = this.graphics.frame("alternate", buffer.viewportY, this.terminal.cols, this.terminal.rows);
 		return (graphics?.placements.length ?? 0) > 0 || (graphics?.fallbacks.length ?? 0) > 0;
 	}
@@ -1700,6 +1905,7 @@ export class TerminalSurface {
 					return;
 				}
 				settled = true;
+				this.endTerminalWrite(false);
 				if (this.activeTerminalWriteResolve === settle) {
 					this.activeTerminalWriteResolve = undefined;
 				}
@@ -1710,18 +1916,46 @@ export class TerminalSurface {
 					return;
 				}
 				settled = true;
+				this.endTerminalWrite(true);
 				if (this.activeTerminalWriteResolve === settle) {
 					this.activeTerminalWriteResolve = undefined;
 				}
 				reject(new Error("TerminalSurface terminal parser failed"));
 			};
 			this.activeTerminalWriteResolve = settle;
+			// Any parse may change what the frame shows: the cached live text is
+			// retired before xterm sees a byte. Only a write that opens with the
+			// exact synchronized-output marker may hand that pre-write state to the
+			// marker's own commit (see `syncLeadText`).
+			// The lead's rows are exact even when only its cursor is stale: the
+			// commit reads the cursor live at the marker.
+			const cached = this.liveTextCache;
+			this.syncLeadText = cached !== undefined && hasCellPreservingSyncLead(data) ? cached : undefined;
+			if (this.liveTextCache !== undefined && isCellPreservingWrite(data)) {
+				// Cursor moves and visibility only: every row stays exact, and the
+				// cursor is read live once this write has parsed.
+				this.liveTextCursorStale = true;
+			} else {
+				this.liveTextCache = undefined;
+				this.liveTextCursorStale = false;
+			}
+			this.terminalWriteInFlight = true;
 			try {
 				this.terminal.write(data, settle);
 			} catch {
 				fail();
 			}
 		});
+	}
+
+	private endTerminalWrite(failed: boolean): void {
+		this.terminalWriteInFlight = false;
+		this.syncLeadText = undefined;
+		if (failed) {
+			// Nothing observed before a failed parse describes its result.
+			this.liveTextCache = undefined;
+			this.liveTextCursorStale = false;
+		}
 	}
 
 	private applyPendingAlternateGraphicsInvalidation(): void {
@@ -1733,7 +1967,7 @@ export class TerminalSurface {
 	}
 
 	private graphicsPosition(command: string): TerminalGraphicsPosition {
-		const buffer = this.terminal.buffer.active;
+		const buffer = this.bufferApi.active;
 		const alternateScreen = buffer.type === "alternate" ? this.alternateScreenState() : undefined;
 		const marker = KittyGraphicsState.needsPosition(command) && buffer.type === "normal"
 			? this.terminal.registerMarker(0)
@@ -1754,7 +1988,7 @@ export class TerminalSurface {
 	private alternateScreenState(): {
 		readonly textAt: (row: number, column: number, width: number) => string;
 	} {
-		const buffer = this.terminal.buffer.alternate;
+		const buffer = this.bufferApi.alternate;
 		return {
 			textAt: (row, column, width) => buffer.getLine(buffer.viewportY + row)
 				?.translateToString(false, column, column + width) ?? "",
@@ -1777,7 +2011,7 @@ export class TerminalSurface {
 	 * is selected from the real `buffer.active.type` at sequence-parse time.
 	 */
 	private kittyBranch(): KittyState {
-		return this.terminal.buffer.active.type === "alternate" ? this.kittyAlternate : this.kittyNormal;
+		return this.bufferApi.active.type === "alternate" ? this.kittyAlternate : this.kittyNormal;
 	}
 
 	/**
@@ -1873,27 +2107,30 @@ export class TerminalSurface {
 		if (this.disposed) {
 			return;
 		}
-		// The invalidation key covers the frame and the input-mode state, so
+		// The observation covers the frame and the input-mode state, so
 		// mode-only changes (bracketed paste, cursor keys, mouse tracking,
 		// kitty flags) still notify the host — after the parse completes.
 		const frame = this.frame();
 		const revision = this.syncFrame?.committedRevision ?? this.graphics.revision;
 		const { graphics, ...textFrame } = frame;
-		const graphicsKey = graphics
+		const graphicsKey = JSON.stringify(graphics
 			? {
 				revision,
 				images: graphics.images.map(({ id, mimeType, widthPx, heightPx }) => ({ id, mimeType, widthPx, heightPx })),
 				placements: graphics.placements,
 				fallbacks: graphics.fallbacks,
 			}
-			: { revision };
+			: { revision });
 		// While a frame is held the key is the committed state only, so mode
 		// changes inside an incomplete frame do not notify until it commits.
-		const modes = this.syncFrame?.committedModes ?? this.inputModesState();
-		const key = JSON.stringify(textFrame) + "|" + JSON.stringify(graphicsKey)
-			+ "|" + JSON.stringify(modes);
-		if (key !== this.lastInvalidateKey) {
-			this.lastInvalidateKey = key;
+		const modesKey = JSON.stringify(this.syncFrame?.committedModes ?? this.inputModesState());
+		const previous = this.lastInvalidated;
+		const changed = previous === undefined
+			|| previous.graphicsKey !== graphicsKey
+			|| previous.modesKey !== modesKey
+			|| !sameTextFrame(previous.text, textFrame);
+		this.lastInvalidated = { text: textFrame, graphicsKey, modesKey };
+		if (changed) {
 			this.safePeerInvoke(() => this.options.onChange?.());
 		}
 	}

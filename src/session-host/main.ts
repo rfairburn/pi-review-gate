@@ -411,7 +411,7 @@ type MainTerminal = Pick<ProcessTerminal,
 >;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">
-  & Partial<Pick<SessionHostFrameWriter, "invalidate">>;
+  & Partial<Pick<SessionHostFrameWriter, "invalidate" | "hasPendingFrame" | "requestFrameRefresh">>;
 
 interface MouseFramePresentation {
   readonly layout: HostLayout;
@@ -1281,7 +1281,7 @@ function canonicalExistingDirectory(path: string | undefined): string | undefine
  * nearest listed lower line, so newer unlisted majors keep the existing policy
  * and releases below Node 22 are refused. Main admits stable versions only.
  */
-const NODE_LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 4], [24, 22, 1], [26, 12, 1]];
+const NODE_LINE_FLOORS: readonly (readonly [number, number, number])[] = [[22, 23, 5], [24, 22, 3], [26, 13, 1]];
 
 function stableNodeVersion(version: string): boolean {
   const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
@@ -1710,6 +1710,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let rosterSyncInProgress = false;
   let rosterSyncQueued = false;
   let redrawQueued = false;
+  /**
+   * The writer an outstanding content refresh was requested from (see
+   * scheduleContentRedraw). Every composition clears it: a composition reads
+   * every current fact, so a later refresh call for it does nothing.
+   */
+  let contentRefreshWriter: MainWriter | undefined;
   let hostGraphicsEnabled = false;
   let negotiationReady = false;
   let observedFlags = 0;
@@ -2267,7 +2273,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     if (nativeIoBridgeEnabled) syncOuterMouseModes();
     // A published viewport is the only reason this frame appears: an arriving
     // frame repaints on its own, with no keyboard, roster, or resize event.
-    scheduleRedraw();
+    scheduleContentRedraw();
     return true;
   }
 
@@ -2700,12 +2706,42 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  /**
+   * Redraw for a change that only updates displayed content or the roster (a
+   * child's parsed output, a manager change, an arriving remote viewport).
+   * While the writer still retains a frame it has not taken for drawing yet
+   * (it waits for the redraw interval, an in-flight write, or a blocked sink),
+   * a newer composition would only replace that frame. Such changes are
+   * therefore composed once, right before the writer takes its next frame, so
+   * continuous output composes about once per frame the writer can actually
+   * draw instead of once per output chunk, without delaying that frame. Host
+   * UI, focus, layout, and input keep the immediate scheduleRedraw.
+   */
+  function scheduleContentRedraw(): void {
+    const current = writer;
+    if (current !== undefined && current.hasPendingFrame?.() === true && current.requestFrameRefresh !== undefined) {
+      // One outstanding request to this writer already covers this change.
+      if (contentRefreshWriter === current) return;
+      contentRefreshWriter = current;
+      current.requestFrameRefresh(() => {
+        // A composition since the request already drew these changes.
+        if (contentRefreshWriter !== current) return;
+        contentRefreshWriter = undefined;
+        scheduleRedraw();
+      });
+      return;
+    }
+    scheduleRedraw();
+  }
+
   function scheduleRedraw(): void {
     if (redrawQueued || shutdownRequested || externalEditorActive || !writer || !sidebar || !terminal) return;
     redrawQueued = true;
     queueMicrotask(() => {
       redrawQueued = false;
       if (shutdownRequested || externalEditorActive || !writer || !sidebar || !terminal) return;
+      // This composition reads every current fact, including deferred content.
+      contentRefreshWriter = undefined;
       try {
         const cols = clampDimension(terminal.columns, 80);
         const rows = clampDimension(terminal.rows, 24);
@@ -3906,7 +3942,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     syncRosterAndSchedule();
   }
 
-  function syncRosterAndSchedule(): RosterPersistOutcome {
+  function syncRosterAndSchedule(content = false): RosterPersistOutcome {
     if (!manager || !sidebar || shutdownRequested) return "disabled";
     if (rosterSyncInProgress) {
       if (!rosterSyncQueued) {
@@ -3941,7 +3977,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       sidebar.updateItems(currentRosterItems());
       outcome = persistRoster();
       syncOuterMouseModes();
-      scheduleRedraw();
+      if (content) scheduleContentRedraw();
+      else scheduleRedraw();
     } catch {
       requestShutdown(true);
     } finally {
@@ -5468,7 +5505,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         }
       }
     }
-    syncRosterAndSchedule();
+    // A manager change (parsed child output, status, lifecycle) is drawn by the
+    // next composition the writer can actually take.
+    syncRosterAndSchedule(true);
   }
 
   /** Forced settlement of every outstanding readiness wait (shutdown only). */

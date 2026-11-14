@@ -1,6 +1,6 @@
 /**
  * Issue 489: the package engines range expresses the per-release-line Node
- * security minimums (Node 22 >=22.23.4, Node 24 >=24.22.1, Node 26 >=26.12.1)
+ * security minimums (Node 22 >=22.23.5, Node 24 >=24.22.3, Node 26 >=26.13.1)
  * without dropping other majors above 22. The range is evaluated with npm's own
  * bundled semver (the implementation npm uses for `engines`), not by string
  * comparison, and judged against the literal shared expectation table that the
@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
 
-const ENGINES_RANGE = ">=22.23.4 <24.0.0 || >=24.22.1 <26.0.0 || >=26.12.1";
+const ENGINES_RANGE = ">=22.23.5 <24.0.0 || >=24.22.3 <26.0.0 || >=26.13.1";
 
 interface Semver {
   validRange(range: string): string | null;
@@ -64,7 +64,7 @@ test("npm semver evaluates the engines range per release line and keeps other ma
   }
   // A single global floor would still admit unpatched 24.x/26.x; the actual
   // range must not.
-  assert.equal(semver.satisfies("24.0.0", ">=22.23.4"), true, "control: a single floor admits unpatched Node 24");
+  assert.equal(semver.satisfies("24.0.0", ">=22.23.5"), true, "control: a single floor admits unpatched Node 24");
   assert.equal(semver.satisfies("24.0.0", ENGINES_RANGE), false);
   assert.equal(semver.satisfies("26.11.9", ENGINES_RANGE), false);
 });

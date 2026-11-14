@@ -455,7 +455,7 @@ function createHarness(
   let harness!: Harness;
   const result = __test.runWithDependencies(options(optionOverrides), {
     platform: "linux",
-    nodeVersion: "22.23.4",
+    nodeVersion: "22.23.5",
     stdin,
     stdout: stdout as unknown as Writable & EventEmitter & { isTTY?: boolean; columns?: number; rows?: number },
     signals,

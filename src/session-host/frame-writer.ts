@@ -108,6 +108,23 @@ export interface SessionHostFrameWriter {
 	 * submitted content and geometry are unchanged.
 	 */
 	invalidate(): void;
+	/**
+	 * True while a submitted frame is retained but not yet taken for drawing:
+	 * it waits for the redraw interval, an in-flight write, or a blocked sink to
+	 * drain. A newer submission would only replace it, so a caller can use
+	 * `requestFrameRefresh` instead of composing frames that are never drawn.
+	 */
+	hasPendingFrame(): boolean;
+	/**
+	 * Ask for one call of `refresh` when the writer is next about to take its
+	 * pending frame for drawing. The writer then waits one microtask turn, so a
+	 * newer frame the caller submits from `refresh` or from a microtask it
+	 * queued there is drawn in that same slot instead of the older one. Only
+	 * the most recent request is kept; it is dropped without a call when the
+	 * writer closes or fails. A throw from `refresh` is contained and the
+	 * pending frame is drawn as it is.
+	 */
+	requestFrameRefresh(refresh: () => void): void;
 	close(): Promise<boolean>;
 }
 
@@ -202,6 +219,10 @@ export function createSessionHostFrameWriter(
 		throw new RangeError("Session host frame writer maxFrameBytes must be a safe integer");
 	}
 
+	// Row serialization is a pure function of (row source, cols); most rows are
+	// identical from one composed frame to the next, so their sanitized result
+	// is reused. Bounded to the rows of the previous and current submission.
+	const rowMemo = new RowSerializationMemo();
 	let started = false;
 	let closing = false;
 	let closed = false;
@@ -210,6 +231,9 @@ export function createSessionHostFrameWriter(
 	let blocked = false;
 	let frameInFlight = false;
 	let pending: PendingFrame | undefined;
+	let frameRefresh: (() => void) | undefined;
+	/** A pump deferred by one microtask after a frame refresh; nothing else may pump first. */
+	let refreshPumpQueued = false;
 	let blockedSettlement: (() => void) | undefined;
 	let baseline: FrameCandidate | undefined;
 	// KittyGraphicsState returns the same frozen, own-data image object across
@@ -289,6 +313,8 @@ export function createSessionHostFrameWriter(
 	function recordOutputFailure(): void {
 		failed = true;
 		frameInFlight = false;
+		frameRefresh = undefined;
+		rowMemo.clear();
 		pending = undefined;
 		blockedSettlement = undefined;
 		clearRedrawTimer();
@@ -391,6 +417,24 @@ export function createSessionHostFrameWriter(
 
 	function pump(): void {
 		if (!started || closing || closed || failed || blocked || frameInFlight || pending === undefined) return;
+		const refresh = frameRefresh;
+		if (refresh !== undefined) {
+			frameRefresh = undefined;
+			try {
+				refresh();
+			} catch {
+				// A failed refresh leaves the pending frame to be drawn as it is.
+			}
+			// Work the refresh queued as a microtask (a composition and its
+			// submit) runs before this deferred pump, which then takes the newest
+			// pending frame in this same slot. The pump is held for that one turn.
+			refreshPumpQueued = true;
+			queueMicrotask(() => {
+				refreshPumpQueued = false;
+				pump();
+			});
+			return;
+		}
 		const submission = pending;
 		pending = undefined;
 		const candidate = submission.candidate;
@@ -535,6 +579,7 @@ export function createSessionHostFrameWriter(
 	}
 
 	function schedulePump(): void {
+		if (refreshPumpQueued) return; // the deferred pump takes the newest pending frame itself
 		if (!started || closing || closed || failed || blocked || frameInFlight
 			|| pending === undefined || redrawTimer !== undefined) return;
 		if (redrawIntervalMs === 0 || lastFrameAt === undefined) {
@@ -664,52 +709,60 @@ export function createSessionHostFrameWriter(
 				throw new TypeError("Composed host frame must contain a lines array");
 			}
 			const cursor = validCursor(frame.cursor, cols, rows);
-			let graphics = graphicsEnabled && frame.graphics
-				? prepareGraphicsPlan(frame.graphics, cols, rows, immutableGraphicsImageCache)
-				: undefined;
-			let effectiveFrame = frame;
-			if (frame.graphics) {
-				effectiveFrame = graphics
-					? fallbackHostGraphics(frame, cols, rows, {
-						excludePlacementIds: new Set(graphics.placements.map((placement) => placement.sourceId)),
-						preserveGraphics: true,
-					})
-					: fallbackHostGraphics(frame, cols, rows);
-			}
-			let candidate: FrameCandidate;
+			rowMemo.begin();
 			try {
-				candidate = serializeCandidate(effectiveFrame, cols, rows, cursor, graphics, maxFrameBytes);
+				let graphics = graphicsEnabled && frame.graphics
+					? prepareGraphicsPlan(frame.graphics, cols, rows, immutableGraphicsImageCache)
+					: undefined;
+				let effectiveFrame = frame;
+				if (frame.graphics) {
+					effectiveFrame = graphics
+						? fallbackHostGraphics(frame, cols, rows, {
+							excludePlacementIds: new Set(graphics.placements.map((placement) => placement.sourceId)),
+							preserveGraphics: true,
+						})
+						: fallbackHostGraphics(frame, cols, rows);
+				}
+				let candidate: FrameCandidate;
+				try {
+					candidate = serializeCandidate(effectiveFrame, cols, rows, cursor, graphics, maxFrameBytes, rowMemo);
+				} catch (error) {
+					if (!frame.graphics) throw error;
+					graphics = undefined;
+					try {
+						candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes, rowMemo);
+					} catch {
+						// Fallback text must not make an otherwise valid text frame fail.
+						const { graphics: _graphics, ...plainFrame } = frame;
+						void _graphics;
+						candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes, rowMemo);
+					}
+				}
+				if (graphics && graphicsWouldExceedBudget(
+					candidate,
+					graphics,
+					graphicsDeletionPending ? undefined : activeGraphics,
+					nextGraphicsImageId,
+					nextGraphicsPlacementId,
+					maxFrameBytes,
+				)) {
+					graphics = undefined;
+					try {
+						candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes, rowMemo);
+					} catch {
+						// Fallback text must not make an otherwise valid text frame fail.
+						const { graphics: _graphics, ...plainFrame } = frame;
+						void _graphics;
+						candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes, rowMemo);
+					}
+				}
+				rowMemo.commit();
+				pending = { candidate, onSettled };
 			} catch (error) {
-				if (!frame.graphics) throw error;
-				graphics = undefined;
-				try {
-					candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes);
-				} catch {
-					// Fallback text must not make an otherwise valid text frame fail.
-					const { graphics: _graphics, ...plainFrame } = frame;
-					void _graphics;
-					candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes);
-				}
+				// A refused submission keeps nothing it partially serialized.
+				rowMemo.begin();
+				throw error;
 			}
-			if (graphics && graphicsWouldExceedBudget(
-				candidate,
-				graphics,
-				graphicsDeletionPending ? undefined : activeGraphics,
-				nextGraphicsImageId,
-				nextGraphicsPlacementId,
-				maxFrameBytes,
-			)) {
-				graphics = undefined;
-				try {
-					candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes);
-				} catch {
-					// Fallback text must not make an otherwise valid text frame fail.
-					const { graphics: _graphics, ...plainFrame } = frame;
-					void _graphics;
-					candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes);
-				}
-			}
-			pending = { candidate, onSettled };
 			schedulePump();
 		},
 
@@ -723,11 +776,23 @@ export function createSessionHostFrameWriter(
 			schedulePump();
 		},
 
+		hasPendingFrame(): boolean {
+			if (closing || closed || failed) return false;
+			return pending !== undefined;
+		},
+
+		requestFrameRefresh(refresh: () => void): void {
+			if (closing || closed || failed || typeof refresh !== "function") return;
+			frameRefresh = refresh;
+		},
+
 		close(): Promise<boolean> {
 			if (closePromise) return closePromise;
 			closing = true;
 			clearRedrawTimer();
 			pending = undefined;
+			frameRefresh = undefined;
+			rowMemo.clear();
 			blockedSettlement = undefined;
 			closePromise = new Promise<boolean>((resolve) => {
 				finishClose = resolve;
@@ -805,10 +870,11 @@ function serializeRowContent(
 	cols: number,
 	segmenter: Intl.Segmenter,
 	byteLimit: number,
-): { readonly text: string; readonly width: number } {
+): SerializedRow {
 	const builder = new BoundedFrameBuilder(byteLimit);
 	const width = appendSafeClippedLine(builder, source, cols, segmenter);
-	return { text: builder.finish().toString("utf8"), width };
+	const finished = builder.finish();
+	return { text: finished.toString("utf8"), width, bytes: finished.length };
 }
 
 function rowEnvelopePrefix(row: number): string {
@@ -895,8 +961,8 @@ function serializeCandidate(
 	cursor: FrameCandidate["cursor"],
 	graphics: ValidatedGraphicsPlan | undefined,
 	maxFrameBytes: number,
+	memo?: RowSerializationMemo,
 ): FrameCandidate {
-	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 	// Reserve the fixed envelope (hide prefix, per-row CUP/erase/reset,
 	// cursor suffix) before retaining row content.
 	let contentBudget = maxFrameBytes
@@ -910,12 +976,106 @@ function serializeCandidate(
 	const rowWidths: number[] = [];
 	for (let row = 0; row < rows; row += 1) {
 		const source = typeof frame.lines[row] === "string" ? frame.lines[row] : "";
-		const serialized = serializeRowContent(source, cols, segmenter, contentBudget);
+		const serialized = memo?.lookup(source, cols) ?? serializeRowContent(source, cols, rowSegmenter(), contentBudget);
+		// A remembered row is checked against this frame's remaining budget exactly
+		// as its first serialization was: the row fits iff its bytes fit.
+		if (serialized.bytes > contentBudget) throw new RangeError("Serialized host frame exceeds its UTF-8 byte limit");
+		memo?.remember(source, cols, serialized);
 		rowTexts.push(serialized.text);
 		rowWidths.push(serialized.width);
-		contentBudget -= Buffer.byteLength(serialized.text, "utf8");
+		contentBudget -= serialized.bytes;
 	}
 	return { cols, rows, rowTexts, rowWidths, cursor, ...(graphics ? { graphics } : {}) };
+}
+
+interface SerializedRow {
+	readonly text: string;
+	readonly width: number;
+	/** UTF-8 byte length of `text`. */
+	readonly bytes: number;
+}
+
+/**
+ * Two-generation memo of row serializations for one writer: results from the
+ * previous submission are reused for identical sources at the same width, and
+ * only rows seen in the current or previous submission are retained. Each
+ * generation retains at most `ROW_MEMO_MAX_CODE_UNITS` of source plus result
+ * text; a row that would exceed that budget is simply not remembered, so an
+ * oversized source that clips to a few cells is never kept after submit().
+ */
+class RowSerializationMemo {
+	private previous = new Map<string, SerializedRow>();
+	private current = new Map<string, SerializedRow>();
+	private previousCols = 0;
+	private currentCols = 0;
+	private currentCodeUnits = 0;
+
+	lookup(source: string, cols: number): SerializedRow | undefined {
+		if (cols === this.currentCols) {
+			const hit = this.current.get(source);
+			if (hit !== undefined) return hit;
+		}
+		return cols === this.previousCols ? this.previous.get(source) : undefined;
+	}
+
+	remember(source: string, cols: number, row: SerializedRow): void {
+		if (cols !== this.currentCols) {
+			this.current = new Map();
+			this.currentCols = cols;
+			this.currentCodeUnits = 0;
+		}
+		if (this.current.has(source)) return;
+		const cost = source.length + row.text.length;
+		if (this.currentCodeUnits + cost > ROW_MEMO_MAX_CODE_UNITS) return;
+		this.currentCodeUnits += cost;
+		this.current.set(source, row);
+	}
+
+	/** Start one submission; rows of an earlier submission that never completed are dropped. */
+	begin(): void {
+		this.current = new Map();
+		this.currentCodeUnits = 0;
+	}
+
+	/** End one submission: its rows become the reusable generation. */
+	commit(): void {
+		this.previous = this.current;
+		this.previousCols = this.currentCols;
+		this.current = new Map();
+		this.currentCodeUnits = 0;
+	}
+
+	/** Release everything (close or output failure). */
+	clear(): void {
+		this.previous = new Map();
+		this.current = new Map();
+		this.previousCols = 0;
+		this.currentCols = 0;
+		this.currentCodeUnits = 0;
+	}
+
+	/** Retained source plus result code units across both generations (diagnostics/tests). */
+	retainedCodeUnits(): number {
+		let total = 0;
+		for (const generation of [this.previous, this.current]) {
+			for (const [source, row] of generation) total += source.length + row.text.length;
+		}
+		return total;
+	}
+}
+
+/** Per-generation retention budget of the row memo, in UTF-16 code units. */
+const ROW_MEMO_MAX_CODE_UNITS = 1024 * 1024;
+
+/** Focused-test seam for the writer's bounded row memo; not part of the writer API. */
+export const __frameWriterTest = Object.freeze({ RowSerializationMemo, ROW_MEMO_MAX_CODE_UNITS });
+
+let sharedRowSegmenter: Intl.Segmenter | undefined;
+
+/** Grapheme segmentation is stateless per call, so one segmenter is shared. */
+function rowSegmenter(): Intl.Segmenter {
+	sharedRowSegmenter ??= new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	return sharedRowSegmenter;
 }
 
 function graphicsWouldExceedBudget(

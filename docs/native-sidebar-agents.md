@@ -324,17 +324,18 @@ What the host-side runtime evidence actually is:
   pre-escaped command line is what the pinned public spawn receives in place of an
   argv array, one row's command line travels from the launch provider to the PTY
   factory verbatim, and an unusable command line is refused before any child
-  exists. Both existing native Windows CI jobs — **Windows launcher
-  (Node 22.23.4)** and **Windows shell (Node 24, on its 24.22.1 pin)** — run those
-  two files as their own step, so publication is gated on them.
-- **Those cases have completed on real Windows runners at both current Node
-  pins.** In one real-Windows CI run, both existing native Windows jobs —
-  **Windows launcher (Node 22.23.4)** and **Windows shell (Node 24, on its
-  24.22.1 pin)** — ran those two files as their own step and each ended with 12
-  tests passed, 0 failed, 0 skipped, its test command terminating normally on its
-  own in about 69 seconds. Those 12 are the seven real-ConPTY cases, the two
-  observation controls beside them in the same file — which pin that the file's
-  own handle shadowing touches only `kill`, and that an observation it cannot
+  exists. Both existing native Windows CI jobs — **Windows launcher (Node 22)**
+  and **Windows shell (Node 24)** — run those two files as their own step, so
+  publication is gated on them.
+- **Those cases have completed on real Windows runners at the Node pins then in
+  force.** In one real-Windows CI run, both existing native Windows jobs —
+  **Windows launcher (Node 22)** and **Windows shell (Node 24)**, on that run's
+  22.23.4 and 24.22.1 pins — ran those two files as their own step and each
+  ended with 12 tests passed, 0 failed, 0 skipped, its test command terminating
+  normally on its own in about 69 seconds. Those 12 are the seven real-ConPTY
+  cases, the two observation controls beside them in the same file — which pin
+  that the file's own handle shadowing touches only `kill`, and that an
+  observation it cannot
   install is reported as a fault instead of throwing before a handle is owned —
   and the three cross-platform delivery cases. The scenarios reported their
   assertions passing: `cmd.exe` delivered the composed command line into the
@@ -355,7 +356,8 @@ What the host-side runtime evidence actually is:
   synthetic Node programs behind synthetic batch shims, so what this establishes is
   real-host process facts about them, and the next bullet states what it never
   touches. It is the result of the two native Windows jobs, not a full-suite or
-  whole-CI result.
+  whole-CI result. The per-line Node security floors have since risen to 22.23.5
+  and 24.22.3, so this tier's run on the raised pins is still pending.
 - What those cases still do not touch on Windows: a real provider binary's own
   startup, auth, model, question, approval, and resume behavior — every child
   there is a synthetic Node program behind a synthetic batch shim, and no provider

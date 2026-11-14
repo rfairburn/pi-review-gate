@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.282]
+## [0.1.0-dev.284]
 
 ### Added
 
@@ -135,16 +135,15 @@ dates.
   cannot install is reported as a fault rather than throwing before a handle is
   owned. Three cross-platform cases
   in `tests/session-host-native-cli-windows-delivery.test.ts` pin the command-line
-  wiring they depend on. Both existing Windows jobs — Windows launcher
-  (Node 22.23.4) and Windows shell (Node 24, on its 24.22.1 pin) — run both files
-  as their own step, and
-  a missing Windows prerequisite fails those cases instead of skipping them. Every
+  wiring they depend on. Both existing Windows jobs — Windows launcher (Node 22)
+  and Windows shell (Node 24) — run both files as their own step, and a missing
+  Windows prerequisite fails those cases instead of skipping them. Every
   child there is a synthetic Node program behind a synthetic batch shim: no provider
   CLI, credential, or model call. This is the acceptance contract for the Windows
-  path, and those cases have now completed on both Windows jobs at the current
-  pins: 12 tests passed, 0 failed, 0 skipped on each job, and each job's test
-  command terminated normally on its own in about 69 seconds rather than being
-  cancelled. Every scenario assertion passed there, including real `cmd.exe`
+  path, and those cases have now completed on both Windows jobs at the pins then
+  current (Node 22.23.4 and 24.22.1): 12 tests passed, 0 failed, 0 skipped on each
+  job, and each job's test command terminated normally on its own in about 69
+  seconds rather than being cancelled. Every scenario assertion passed there, including real `cmd.exe`
   delivery of the composed command line, the once-expanded and cleared percent
   carrier, and the stop ladder settling the CLI process rather than only the
   wrapper the manager owns, and all thirteen raw owned handles exited with each
@@ -172,6 +171,90 @@ dates.
   path relative to the process working directory, and an absolute path all resolve to one
   canonical existing directory before anything spawns, with no shell, no `~otheruser`
   expansion, and no `$VAR` expansion for either backend.
+
+## [0.1.0-dev.283]
+
+### Fixed
+
+- Session-host sidebar and typing responsiveness no longer collapses while
+  sessions stream output, most visibly on Windows (#670). Every parsed chunk of
+  child output used to rebuild the whole virtual-terminal frame three or four
+  times (for change detection, for each synchronized-output frame start, and
+  again for the redraw), serialize it to JSON, and then recompose and
+  reserialize the complete host frame, even though the writer draws at most one
+  frame per 16 ms interval. The bundled ConPTY also delivers each native Pi
+  render as two chunks (the synchronized frame, then a separate cursor restore),
+  so Windows paid that cost twice per render. The host now builds a session's
+  frame once per parse and reuses it until the next write; a write that only
+  moves the cursor or shows/hides it, and a synchronized frame opened after
+  such a lead, keep the already-built rows; change detection compares rows
+  instead of serializing the frame; composed and serialized rows that did not
+  change are reused; and child-output, roster, and remote-viewport changes are
+  composed once, just before the writer takes its next frame, instead of once
+  per chunk. Host input, focus, layout, and resize still redraw immediately.
+  Measured with a pi-tui-based streaming child through the real host and node-pty
+  (four sessions streaming about 60 tokens/s each, 160x45 outer terminal), the
+  Windows host's main thread went from saturated (about 100% busy, typing p50/p90
+  about 61/87 ms, about 28 frames/s) to about 21% busy with typing p50/p90 about
+  8/17 ms at the full 60 frames/s; macOS went from about 86% to about 17% busy.
+  With six sessions at about 120 tokens/s, Windows went from typing p50/p90 about
+  103/154 ms at about 14 frames/s to about 9/18 ms at about 58 frames/s. A same-host owner-to-viewer content channel over loopback TLS used
+  about 40% less CPU on both platforms. These are synthetic-workload
+  measurements, not a physical-terminal or two-machine certification, and they
+  do not change Windows' unsupported validation-target status. Drawn frames,
+  receipts, synchronized-output holds, input routing, and output bounds are
+  unchanged.
+
+## [0.1.0-dev.282]
+
+### Security
+
+- The per-line Node.js security floors rise to the November 2026 security release:
+  22.23.5 or newer on Node 22, 24.22.3 or newer on Node 24, and 26.13.1 or newer
+  on Node 26 (#669). These replace the October 2026 minimums from #489 and match
+  the [November 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/november-2026-security-releases),
+  which fix 16 vulnerabilities (7 high, 6 medium, 3 low) across the 22.x, 24.x,
+  and 26.x lines, including an `https.Agent` certificate-validation bypass through
+  cross-policy TLS session reuse, client-certificate authentication bypass during
+  TLS 1.2 renegotiation, proxy credentials disclosed in `ERR_PROXY_INVALID_CONFIG`
+  messages, and Permission Model bypass or over-grant. The package engine range is
+  `>=22.23.5 <24.0.0 || >=24.22.3 <26.0.0 || >=26.13.1`. Later patches in a line
+  stay accepted, Node 26 is still not required, and no line is added or dropped.
+  The session-host managed fallback stays on Node 22 and now bootstraps the
+  checksum-pinned official Node.js 22.23.5 archive; a fallback runtime an earlier
+  release set up on 22.23.4 is not reused. This release does not update or restart
+  Node.js installations or running processes. Update Node.js yourself, then restart
+  running Pi, review-gate, session-host, and web-tool processes.
+
+### Changed
+
+- CI now selects the new exact patched floors and names its required checks
+  stably per major (#669). The existing `verify` matrix runs Node 22.23.5,
+  24.22.3, and 26.13.1 through the same stages, with no extra full-suite stage,
+  as **Verify (Node 22)**, **Verify (Node 24)**, and **Verify (Node 26)**. The
+  Linux full suite and the Windows shell job keep **Full suite (Node 24)** and
+  **Windows shell (Node 24)** on Node 24.22.3, the release builder keeps using
+  Node 24.22.3, and the Windows launcher job runs Node 22.23.5 as **Windows
+  launcher (Node 22)**. The Windows session-host alpha matrix runs Node 22.23.5
+  and 24.22.3 as **Windows session host alpha (Node 22)** and **Windows session
+  host alpha (Node 24)**, which CI's read-only caller contributes as the
+  qualified contexts **Session host alpha matrix / Windows session host alpha
+  (Node 22)** and **Session host alpha matrix / Windows session host alpha
+  (Node 24)**. Every matrix leg now declares an explicit label/version pair, so a
+  later patch or minor floor bump changes only the pinned runtime and needs no
+  ruleset edit, while `actions/setup-node` logs the exact version each leg
+  installed; adding or dropping a supported major stays a separate support and
+  ruleset decision. These checks were previously named from the pinned versions,
+  such as **Verify (Node 22.23.4)**, so this is a one-time rename: the operator
+  must update
+  branch protection to **Verify (Node 22)**, **Verify
+  (Node 24)**, **Verify (Node 26)**, **Full suite (Node 24)**, **Windows launcher
+  (Node 22)**, **Windows shell (Node 24)**, **Session host alpha matrix / Windows
+  session host alpha (Node 22)**, and **Session host alpha matrix / Windows
+  session host alpha (Node 24)** in the same window as the merge; neither this
+  change nor any workflow edits it. Earlier CI runs on the superseded floors
+  remain historical evidence, not patched-runtime runs.
+
 ## [0.1.0-dev.281]
 
 ### Fixed

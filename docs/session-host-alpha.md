@@ -40,9 +40,9 @@ operator, or platform readiness for the cross-machine features. macOS and Linux
 are the intended POSIX host platforms; intended platform scope is not evidence
 that end-to-end runtime compatibility has been proven. Windows is not an
 unsupported validation target: the host's generic Windows Pi runtime path has
-passed real runtime acceptance on native Windows runners at both current Node
-pins — 22.23.4 and 24.22.1 — on the pinned Pi 1.5.2. The genuine native Main
-case (startup, two live Pi sessions, the public Quit confirmation,
+passed real runtime acceptance on native Windows runners at the Node floors
+then in force — 22.23.4 and 24.22.1 — on the pinned Pi 1.5.2. The genuine
+native Main case (startup, two live Pi sessions, the public Quit confirmation,
 original-process and outer-PTY settlement, and full terminal restoration) and
 both cold hosted-source wrapper legs (cmd and direct PowerShell) ran to
 completion with no skip, as did the owned bundled-ConPTY reader settlement
@@ -60,17 +60,26 @@ runtime acceptance stays tracked at
 https://github.com/rfairburn/pi-review-gate/issues/345. CI runs the separate
 session-host acceptance matrix in
 `.github/workflows/session-host-alpha.yml` — emitting the stable check names
-**Windows session host alpha (Node 22.23.4)** and **Windows session host alpha
-(Node 24.22.1)** — read-only on every enforced trigger and requires its results
-before publishing a numbered prerelease. Inside that matrix the real-Main,
-Network storage, reader-settlement, and cold wrapper-leg steps run under the
-acceptance opt-in CI sets, so a completed green matrix job means those cases
-executed and passed there rather than being skipped. What the matrix also runs
-on native Windows runners is its other enforced tiers — the named-pipe
+**Windows session host alpha (Node 22)** and **Windows session host alpha
+(Node 24)** — qualified by that caller as **Session host alpha matrix / Windows
+session host alpha (Node 22)** and **Session host alpha matrix / Windows session
+host alpha (Node 24)** — read-only on every enforced trigger and requires its
+results before publishing a numbered prerelease. Those names come from the
+matrix's stable per-major labels, each paired explicitly with that line's exact
+pinned runtime (22.23.5 and 24.22.3), so a later patch or minor floor bump
+keeps these check names and the required contexts unchanged; adding or dropping
+a supported major stays a separate support decision. Inside that matrix the
+real-Main, Network storage, reader-settlement, and cold wrapper-leg steps run
+under the acceptance opt-in CI sets, so a completed green matrix job means those
+cases executed and passed there rather than being skipped. What the matrix also
+runs on native Windows runners is its other enforced tiers — the named-pipe
 broker/reporter/protocol components, the pure Windows helper contracts, the
 real pinned-provider workspace completion case, and the launcher
 witness/deadline regressions — with every missing prerequisite a hard failure
-for those tiers. The unresolved physical-input limitations below are unchanged.
+for those tiers. That completed Windows evidence is from the floors then in
+force (22.23.4 and 24.22.1): the matrix now pins the raised 22.23.5 and 24.22.3,
+so its green run at those floors is still pending. The unresolved physical-input
+limitations below are unchanged.
 
 ## Known limitation: Windows runtime acceptance
 
@@ -118,19 +127,20 @@ https://github.com/rfairburn/pi-review-gate/issues/345.
   real public Main case with two live Pi sessions and the public Quit
   confirmation, both cold hosted-source wrapper legs (cmd and direct
   PowerShell), and the owned bundled-ConPTY reader settlement case all passed
-  with no skip at Node 22.23.4 and Node 24.22.1, with every missing
-  prerequisite a hard failure. That is the measured scope: it does not certify
-  other Windows builds or terminal emulators, the physical-input gaps listed
-  under the known limitation above, true two-machine operation, or a real
-  Claude Code or Codex TUI, and the remaining acceptance stays tracked at
+  with no skip at Node 22.23.4 and Node 24.22.1, the floors then in force, with
+  every missing prerequisite a hard failure; the matrix's run at the raised
+  22.23.5 and 24.22.3 floors is still pending. That is the measured scope: it
+  does not certify other Windows builds or terminal emulators, the physical-input
+  gaps listed under the known limitation above, true two-machine operation, or a
+  real Claude Code or Codex TUI, and the remaining acceptance stays tracked at
   https://github.com/rfairburn/pi-review-gate/issues/345. Earlier Windows
   evidence on Node 22.19.0 and 24.x is historical: it predates the current
   security floors and is not a patched-runtime run. The ordinary standalone
   Windows launcher remains unchanged.
-- **Node.js:** at or above its release line's security floor: 22.23.4 or newer
-  on Node 22, 24.22.1 or newer on Node 24, or 26.12.1 or newer on Node 26 (see
+- **Node.js:** at or above its release line's security floor: 22.23.5 or newer
+  on Node 22, 24.22.3 or newer on Node 24, or 26.13.1 or newer on Node 26 (see
   [Node.js security floors](getting-started.md#nodejs-security-floors)). The
-  managed fallback runtime is the checksum-pinned official Node.js 22.23.4
+  managed fallback runtime is the checksum-pinned official Node.js 22.23.5
   archive. Updating this requirement does not update or restart a running host
   or its sessions. Update Node.js, then restart them.
 - **Pi:** stable Pi 1.0.4 or newer; the managed fallback the launcher provisions
@@ -149,7 +159,7 @@ Start the host with the shipped one-command entry points:
 `scripts\pi-review-sessions.cmd` (native Windows source checkout from cmd.exe or
 PowerShell), or the installed `pi-review-sessions` package command. The `.sh`
 and `.cmd` entry points retain a supported Node on `PATH` or bootstrap the
-source-pinned official Node.js 22.23.4 archive under an isolated per-agent
+source-pinned official Node.js 22.23.5 archive under an isolated per-agent
 cache; the installed `pi-review-sessions` command runs the shared launcher
 (`scripts/pi-review-sessions.cjs`) directly and requires a supported Node
 already on `PATH`. These entry points are additional rather than replacements:
@@ -3099,8 +3109,15 @@ one that returns to the previous dimensions) redraw fully, cursor-only changes
 emit only the cursor sequence, and an unchanged frame emits nothing. Rapid
 invalidations coalesce so that only the newest composed frame is drawn at the
 next allowed redraw, and when the terminal refuses a write (backpressure) only
-the newest bounded frame is retained until drain. Main-focus input that leaves
-the child screen unchanged no longer reconciles host layout or prepares/submits
+the newest bounded frame is retained until drain. Changes that only update
+displayed content (parsed child output, roster and status changes, and an arriving
+remote viewport) are not composed while the writer still retains an undrawn frame:
+they are composed once, immediately before the writer takes its next frame, so
+continuous output costs about one composition per drawn frame rather than one per
+output chunk, without delaying that frame. Each session's virtual-terminal
+snapshot is likewise built once per parse and reused until the next write, and
+rows that did not change are not recomposed or reserialized. Main-focus input
+that leaves the child screen unchanged no longer reconciles host layout or prepares/submits
 a speculative frame for that unchanged screen. The child's existing output
 `onChange` path still updates the display; host UI, focus, layout, and resize
 actions remain immediate. This changes only redundant redraw work: it does not

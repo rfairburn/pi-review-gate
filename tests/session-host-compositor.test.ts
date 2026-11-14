@@ -763,3 +763,32 @@ test("dimensions use the TerminalSurface integer bounds", () => {
 		assert.throws(() => computeHostLayout(2, rows, { sidebarVisible: false, focus: "main" }), /rows/);
 	}
 });
+
+test("repeated composition reuses rows without changing clipping, width, or sanitization", () => {
+	const wide = computeHostLayout(60, 4, { sidebarVisible: true, focus: "main" });
+	const narrow = computeHostLayout(45, 4, { sidebarVisible: false, focus: "main" });
+	const unsafe = `${ESC}]0;title\x07safe ${ESC}[31mred${ESC}[0m 世界文字 tail-that-is-long-enough-to-clip-at-narrow-widths`;
+	const sidebar: RenderedSidebar = { lines: ["roster", unsafe] };
+	const options = (lines: string[]) => ({
+		main: mainFrame(27, 3, lines),
+		sidebar,
+		header: "Host",
+		focus: "main" as const,
+	});
+	const first = composeHostFrame(wide, options([unsafe, "two", "three"]));
+	const again = composeHostFrame(wide, options([unsafe, "two", "three"]));
+	assert.deepEqual(again, first, "an identical composition is byte-identical");
+	assertBounded(first.lines, 60, 4);
+	noUnsafeControls(first.lines);
+	// The same rows at another width are clipped for that width, not reused.
+	const narrowed = composeHostFrame(narrow, options([unsafe, "two", "three"]));
+	assertBounded(narrowed.lines, 45, 4);
+	noUnsafeControls(narrowed.lines);
+	assert.ok(plain(narrowed.lines[1] ?? "").startsWith("safe red 世界文字"));
+	// A changed row is recomposed while the others stay identical.
+	const changed = composeHostFrame(wide, options([unsafe, "TWO", "three"]));
+	assert.equal(changed.lines[1], first.lines[1]);
+	assert.notEqual(changed.lines[2], first.lines[2]);
+	assert.ok(plain(changed.lines[2] ?? "").includes("TWO"));
+	assert.equal(changed.lines[3], first.lines[3]);
+});

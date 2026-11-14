@@ -1204,7 +1204,7 @@ test("direct Main preflight enforces stable per-line Node security minimums (iss
       assert.deepEqual(harness.reports, ["Session host preflight failed."]);
     }
   }
-  for (const malformed of ["v22.23.4", "22.23", "22.23.4+build", ""]) {
+  for (const malformed of ["v22.23.5", "22.23", "22.23.5+build", ""]) {
     const harness = createHarness({}, { nodeVersion: malformed });
     assert.equal(await harness.result, 1, `malformed ${JSON.stringify(malformed)} is refused`);
     assert.deepEqual(harness.events, []);
@@ -10069,4 +10069,60 @@ test("a resize or a superseded assessment revokes a written storage repair frame
     assert.deepEqual(peer.repairs, [], "a superseded assessment is never retargeted");
     assert.equal(harness.sidebar!.capturePeerRepairPresentation(), undefined);
   } finally { assert.equal(await closeWithSignal(harness), 0); }
+});
+
+test("content changes behind a retained frame compose once, right before the writer takes its next frame", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  await nextTurn();
+  let retained = false;
+  const requests: Array<() => void> = [];
+  Object.assign(harness.writer, {
+    hasPendingFrame: () => retained,
+    requestFrameRefresh: (callback: () => void) => { requests.push(callback); },
+  });
+  // Nothing retained: a content change composes at once, as before.
+  const initial = harness.writer.frames.length;
+  manager.notify("content-with-nothing-retained");
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, initial + 1);
+  assert.equal(requests.length, 0, "no refresh is requested while nothing is retained");
+
+  // A retained frame: a burst of content changes asks for exactly one refresh.
+  retained = true;
+  const beforeBurst = harness.writer.frames.length;
+  manager.notify("chunk-1");
+  manager.notify("chunk-2");
+  manager.notify("chunk-3");
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeBurst, "nothing is composed for a frame that cannot be drawn yet");
+  assert.equal(requests.length, 1, "one refresh is requested");
+  const requested = requests[0]!;
+  manager.notify("chunk-4");
+  await nextTurn();
+  assert.equal(requests.length, 1, "a pending request covers later content too");
+
+  // The writer is about to take its frame: one composition of the newest state.
+  retained = false;
+  requested();
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeBurst + 1, "the burst is composed exactly once");
+  requested();
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeBurst + 1, "a consumed request composes nothing again");
+
+  // Host input is never deferred, and a composition it causes covers deferred content.
+  retained = true;
+  manager.notify("chunk-5");
+  await nextTurn();
+  assert.equal(requests.length, 2, "a new burst asks for a new refresh");
+  const deferred = requests[1]!;
+  const beforeInput = harness.writer.frames.length;
+  harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeInput + 1, "host input composes immediately");
+  deferred();
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeInput + 1, "content already drawn by that composition is not composed again");
+  assert.equal(await closeWithSignal(harness), 0);
 });

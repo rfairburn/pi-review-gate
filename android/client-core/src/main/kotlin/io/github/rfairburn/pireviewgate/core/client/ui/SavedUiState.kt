@@ -1,6 +1,8 @@
 package io.github.rfairburn.pireviewgate.core.client.ui
 
+import io.github.rfairburn.pireviewgate.core.client.roster.NativeCatalogScope
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedEntry
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedDeleteRefusalReason
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedWindowRefusalReason
@@ -24,7 +26,40 @@ public data class OwnerChoice(
     public val endpointDisplayText: String,
     public val connection: HostConnectionState,
     public val createEligible: Boolean = false,
-)
+    /** Exact owner run the current catalog belongs to, or `null` when not current. */
+    public val hostRunId: String? = null,
+    /**
+     * The native targets committed with that owner's CURRENT snapshot. Empty means
+     * this owner offers no native target now; it is never filled from another host.
+     */
+    public val nativeTargets: List<NativeCliTarget> = emptyList(),
+    /** The exact catalog observation lifetime [nativeTargets] belongs to. */
+    public val nativeCatalogScope: NativeCatalogScope? = null,
+    /** True only when this owner can take a native create now. */
+    public val nativeCreateEligible: Boolean = false,
+) {
+    public companion object {
+        /**
+         * Project one drawn owner row. Native choices are offered only from the
+         * CURRENT advertised catalog of that exact host and run; a stale or absent
+         * catalog produces no native choice rather than a remembered one.
+         */
+        public fun of(host: HostUiState): OwnerChoice {
+            val currentRun = host.roster?.takeIf { it.freshness == RosterFreshness.CURRENT }?.hostRunId
+            return OwnerChoice(
+                hostId = host.host.id,
+                label = host.host.label.value,
+                endpointDisplayText = host.host.endpoint.displayText(),
+                connection = host.connection,
+                createEligible = host.canCreateSession,
+                hostRunId = currentRun,
+                nativeTargets = if (host.canCreateNativeSession) host.nativeCliTargets.orEmpty() else emptyList(),
+                nativeCatalogScope = if (host.canCreateNativeSession) host.nativeCatalogScope else null,
+                nativeCreateEligible = host.canCreateNativeSession,
+            )
+        }
+    }
+}
 
 /**
  * One frozen Saved owner address for a request that has no result yet.

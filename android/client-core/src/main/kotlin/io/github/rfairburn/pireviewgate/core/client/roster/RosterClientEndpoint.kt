@@ -1,5 +1,9 @@
 package io.github.rfairburn.pireviewgate.core.client.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeCliTargetId
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeDisplayName
 import io.github.rfairburn.pireviewgate.core.protocol.roster.MAX_SAFE_INTEGER
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerCloseFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerCreateFacts
@@ -49,11 +53,12 @@ import java.util.IdentityHashMap
  *    (last-observed rows only). A lost channel, a refused request, a run change,
  *    or a stop keeps the rows and marks them not current; it never manufactures an
  *    empty, idle, or zero-count roster.
- *  - Every remote operation the lane carries — Close, Create, Rename, and the full
- *    Saved list/search/window/resume/delete exchange — with one pending slot per
- *    kind, per-channel monotonic attempt numbers that are never rewound or reused,
- *    and results that are only ever the owner's own facts, a positively not-sent
- *    refusal, or `unknown`.
+ *  - Every remote operation the lane carries — Close, Pi Create, native Create,
+ *    Pi Rename, the separate native host-caption Rename, and the full Saved
+ *    list/search/window/resume/delete exchange — with one pending slot per
+ *    operation family, per-channel monotonic attempt numbers that are never
+ *    rewound or reused, and results that are only ever the owner's own facts, a
+ *    positively not-sent refusal, or `unknown`.
  *
  * What it deliberately never does: reconnect, retry, replay, back off, heartbeat,
  * queue a mutation, optimistically rename or remove a row, create a local row,
@@ -114,6 +119,11 @@ public class RosterClientEndpoint(
     private var createSequence = 0L
     private var pendingRename: PendingRename? = null
     private var renameSequence = 0L
+    private var pendingNativeRename: PendingNativeRename? = null
+    private var nativeRenameSequence = 0L
+    /** Effective catalog last published; only a real change advances the scope. */
+    private var nativeCatalogState: List<NativeCliTarget>? = null
+    private var nativeCatalogEpoch = 0L
     private var pendingSaved: PendingSaved? = null
     private var savedSequence = 0L
     private var savedPolicy: RosterSavedPolicy? = null
@@ -201,6 +211,7 @@ public class RosterClientEndpoint(
         settleAllCloses()
         settleAllCreates()
         settleAllRenames()
+        settleAllNativeRenames()
         settleAllSaved()
         setSavedPolicy(null)
         savedOwnership = null
@@ -265,6 +276,13 @@ public class RosterClientEndpoint(
                 val pending = pendingRename
                 if (pending != null && pending.requestId == token.id) {
                     settleRename(pending, RosterRequestResult.Unknown)
+                }
+            }
+
+            RosterDeadlineKind.NATIVE_RENAME_RESULT -> {
+                val pending = pendingNativeRename
+                if (pending != null && pending.requestId == token.id) {
+                    settleNativeRename(pending, RosterRequestResult.Unknown)
                 }
             }
 
@@ -338,6 +356,11 @@ public class RosterClientEndpoint(
                 if (pending != null && pending.requestId == sent.correlationId) settleRename(pending, result)
             }
 
+            SendPurpose.NATIVE_RENAME -> {
+                val pending = pendingNativeRename
+                if (pending != null && pending.requestId == sent.correlationId) settleNativeRename(pending, result)
+            }
+
             SendPurpose.SAVED -> {
                 val pending = pendingSaved
                 if (pending != null && pending.requestId == sent.correlationId) settleSaved(pending, result)
@@ -378,6 +401,8 @@ public class RosterClientEndpoint(
             is RosterSendProof.Control -> emptyList()
             is RosterSendProof.RowAction -> listOfNotNull(proof.ui, proof.confirmation)
             is RosterSendProof.Form -> listOf(proof.ui)
+            is RosterSendProof.NativeForm -> listOf(proof.ui)
+            is RosterSendProof.NativeRowAction -> listOf(proof.ui)
             is RosterSendProof.PickerRead -> listOf(proof.ui)
             is RosterSendProof.PickerEntry -> listOfNotNull(proof.ui, proof.confirmation)
         }
@@ -443,6 +468,17 @@ public class RosterClientEndpoint(
                 val pending = pendingCreate ?: return RosterSendRefusal.NOT_READY
                 if (pending.requestId != id) return RosterSendRefusal.NOT_READY
                 if (clock() > pending.deadlineAt) return RosterSendRefusal.NOT_READY
+                val native = pending.native
+                if (native != null &&
+                    !nativeCreateTargetCurrent(
+                        pending.hostRunId,
+                        native.backend,
+                        native.targetId,
+                        native.catalogScope,
+                    )
+                ) {
+                    return RosterSendRefusal.PROOF_UNAVAILABLE
+                }
                 null
             }
 
@@ -457,6 +493,16 @@ public class RosterClientEndpoint(
                         pending.expectedSessionEpoch,
                     )
                 ) {
+                    return RosterSendRefusal.PROOF_UNAVAILABLE
+                }
+                null
+            }
+
+            SendPurpose.NATIVE_RENAME -> {
+                val pending = pendingNativeRename ?: return RosterSendRefusal.NOT_READY
+                if (pending.requestId != id) return RosterSendRefusal.NOT_READY
+                if (clock() >= pending.deadlineAt) return RosterSendRefusal.NOT_READY
+                if (!nativeRenameTargetCurrent(pending.hostRunId, pending.rowId, pending.backend)) {
                     return RosterSendRefusal.PROOF_UNAVAILABLE
                 }
                 null
@@ -564,6 +610,7 @@ public class RosterClientEndpoint(
         settleAllCloses()
         settleAllCreates()
         settleAllRenames()
+        settleAllNativeRenames()
         settleAllSaved()
         setSavedPolicy(null)
         beginRetirement(RetirementKind.GRACEFUL, RosterStalenessReason.STOPPED, announceEmpty = true)
@@ -695,6 +742,91 @@ public class RosterClientEndpoint(
         return step()
     }
 
+    /**
+     * Ask this owner to create one NATIVE CLI child in one run.
+     *
+     * It shares the Pi create's ONE in-flight slot and monotonic attempt scalar, so
+     * a native create can never run beside a Pi create or reuse its number. The
+     * backend/target pair must be present in the catalog this side committed with
+     * the CURRENT snapshot for the exact named run; an absent, stale, or other-owner
+     * target is refused as never submitted. No default target, other backend, or Pi
+     * fallback exists here.
+     */
+    @Synchronized
+    public fun createNativeSession(command: RosterNativeCreateCommand): RosterClientStep {
+        controlRefusal()?.let { return refuse(RosterOperationKind.CREATE, it) }
+        if (!snapshot().supportsNative) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
+        }
+        if (!isIdentifier(command.hostRunId) || !RosterText.isCreateWorkspace(command.workspace) ||
+            !isNativeCliTargetId(command.targetId)
+        ) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
+        }
+        val proof = command.proof
+        if (proof == null ||
+            proof.channelGeneration != generation ||
+            proof.hostRunId != command.hostRunId ||
+            proof.workspace != command.workspace ||
+            proof.backend != command.backend ||
+            proof.targetId != command.targetId ||
+            proof.catalogScope.hostRunId != command.hostRunId
+        ) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
+        }
+        if (!proofHolds(proof.ui)) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.TARGET_UNAVAILABLE)
+        }
+        // The wire owns the exact representable shape; no parallel rule is kept.
+        val probe = RosterFrame.NativeCreateRequest(
+            requestId = "probe",
+            hostRunId = command.hostRunId,
+            workspace = command.workspace,
+            backend = command.backend,
+            targetId = command.targetId,
+            sequence = 1L,
+        )
+        try {
+            RosterProtocol.encode(probe, bounds)
+        } catch (ignored: Exception) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
+        }
+        if (!nativeCreateTargetCurrent(command.hostRunId, command.backend, command.targetId, proof.catalogScope)) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.TARGET_UNAVAILABLE)
+        }
+        if (pendingCreate != null) return refuse(RosterOperationKind.CREATE, RosterNotSentReason.BUSY)
+        if (createSequence >= MAX_SAFE_INTEGER) return refuse(RosterOperationKind.CREATE, RosterNotSentReason.LIMIT)
+        val sequence = createSequence + 1L
+        createSequence = sequence
+        val requestId = idFactory()
+        pendingCreate = PendingCreate(
+            requestId = requestId,
+            hostRunId = command.hostRunId,
+            sequence = sequence,
+            deadlineAt = clock() + bounds.createResultTimeoutMs,
+            native = PendingNativeCreate(command.backend, command.targetId, proof.catalogScope),
+        )
+        armDeadline(RosterDeadlineKind.CREATE_RESULT, requestId, bounds.createResultTimeoutMs)
+        events += RosterClientEvent.OperationAccepted(RosterOperationKind.CREATE, requestId, command.hostRunId)
+        val sent = send(
+            RosterFrame.NativeCreateRequest(
+                requestId = requestId,
+                hostRunId = command.hostRunId,
+                workspace = command.workspace,
+                backend = command.backend,
+                targetId = command.targetId,
+                sequence = sequence,
+            ),
+            SendPurpose.CREATE,
+            requestId,
+            proof,
+        )
+        if (!sent) {
+            settleCreate(requireNotNull(pendingCreate), RosterRequestResult.NotSent(RosterNotSentReason.NOT_READY))
+        }
+        return step()
+    }
+
     // ------------------------------------------------------------- rename
 
     /**
@@ -763,6 +895,82 @@ public class RosterClientEndpoint(
         val sent = send(frame, SendPurpose.RENAME, requestId, proof)
         if (!sent) {
             settleRename(requireNotNull(pendingRename), RosterRequestResult.NotSent(RosterNotSentReason.NOT_READY))
+        }
+        return step()
+    }
+
+    /**
+     * Ask this owner to caption exactly one of its native rows.
+     *
+     * It owns its OWN in-flight slot and monotonic attempt number, separate from the
+     * Pi conversation rename, so a host caption never queues behind or reuses a Pi
+     * rename attempt. The fence is the exact current run/row and the native backend
+     * this side observed on it; no Pi tuple is consulted or invented.
+     */
+    @Synchronized
+    public fun renameNativeSession(command: RosterNativeRenameCommand): RosterClientStep {
+        controlRefusal()?.let { return refuse(RosterOperationKind.NATIVE_RENAME, it) }
+        if (!snapshot().supportsNativeName) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
+        }
+        if (pendingNativeRename != null) return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.BUSY)
+        if (nativeRenameSequence >= MAX_SAFE_INTEGER) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.LIMIT)
+        }
+        val proof = command.proof
+        if (proof == null ||
+            proof.channelGeneration != generation ||
+            proof.hostRunId != command.hostRunId ||
+            proof.rowId != command.rowId ||
+            proof.backend != command.backend
+        ) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.INVALID_REQUEST)
+        }
+        if (!isNativeDisplayName(command.name)) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.INVALID_REQUEST)
+        }
+        val sequence = nativeRenameSequence + 1L
+        val requestId = idFactory()
+        val frame = RosterFrame.NativeRenameRequest(
+            requestId = requestId,
+            hostRunId = command.hostRunId,
+            rowId = command.rowId,
+            backend = command.backend,
+            name = command.name,
+            sequence = sequence,
+        )
+        try {
+            RosterProtocol.encode(frame, bounds)
+        } catch (ignored: Exception) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.INVALID_REQUEST)
+        }
+        if (!nativeRenameTargetCurrent(command.hostRunId, command.rowId, command.backend)) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.TARGET_UNAVAILABLE)
+        }
+        if (!proofHolds(proof.ui)) {
+            return refuse(RosterOperationKind.NATIVE_RENAME, RosterNotSentReason.TARGET_UNAVAILABLE)
+        }
+        nativeRenameSequence = sequence
+        pendingNativeRename = PendingNativeRename(
+            requestId = requestId,
+            hostRunId = command.hostRunId,
+            rowId = command.rowId,
+            backend = command.backend,
+            nativeSequence = sequence,
+            deadlineAt = clock() + bounds.renameResultTimeoutMs,
+        )
+        armDeadline(RosterDeadlineKind.NATIVE_RENAME_RESULT, requestId, bounds.renameResultTimeoutMs)
+        events += RosterClientEvent.OperationAccepted(
+            RosterOperationKind.NATIVE_RENAME,
+            requestId,
+            command.hostRunId,
+        )
+        val sent = send(frame, SendPurpose.NATIVE_RENAME, requestId, proof)
+        if (!sent) {
+            settleNativeRename(
+                requireNotNull(pendingNativeRename),
+                RosterRequestResult.NotSent(RosterNotSentReason.NOT_READY),
+            )
         }
         return step()
     }
@@ -912,8 +1120,12 @@ public class RosterClientEndpoint(
             is RosterFrame.Failure -> onOwnerError(frame.code, frame.subscriptionId)
             is RosterFrame.CloseResult -> onCloseResult(frame)
             is RosterFrame.CreateResult -> onCreateResult(frame)
+            is RosterFrame.NativeCreateResult ->
+                if (!snapshot().supportsNative) protocolFailure() else onNativeCreateResult(frame)
             is RosterFrame.RenameResult ->
                 if (!snapshot().supportsRename) protocolFailure() else onRenameResult(frame)
+            is RosterFrame.NativeRenameResult ->
+                if (!snapshot().supportsNativeName) protocolFailure() else onNativeRenameResult(frame)
 
             is RosterFrame.SavedWindowResult,
             is RosterFrame.SavedWindowBegin,
@@ -1002,6 +1214,14 @@ public class RosterClientEndpoint(
     private fun onSnapshotPage(frame: RosterFrame.SnapshotPage) {
         if (isRetiringNoise(frame.subscriptionId)) return
         if (phase != RosterClientPhase.SUBSCRIBED || frame.subscriptionId != subscriptionId) return
+        if (!capabilities.contains(RosterWire.NATIVE_CAPABILITY) && frame.rows.any { it.backend != null }) {
+            // A typed backend on a channel that never negotiated the native lane is
+            // an extension this side did not agree to, not a fact to silently drop:
+            // the whole page fails closed before ANY row is staged, so an
+            // unnegotiated owner cannot widen the legacy row shape.
+            protocolFailure()
+            return
+        }
         val staged = transfer
         if (staged == null ||
             frame.transferId != staged.transferId ||
@@ -1037,6 +1257,12 @@ public class RosterClientEndpoint(
     private fun onSnapshotEnd(frame: RosterFrame.SnapshotEnd) {
         if (isRetiringNoise(frame.subscriptionId)) return
         if (phase != RosterClientPhase.SUBSCRIBED || frame.subscriptionId != subscriptionId) return
+        if (frame.nativeCliTargets != null && !capabilities.contains(RosterWire.NATIVE_CAPABILITY)) {
+            // A catalog on a channel that never acknowledged the native lane is outside
+            // the negotiated protocol; it is never published beside these rows.
+            protocolFailure()
+            return
+        }
         val staged = transfer
         if (staged == null || frame.transferId != staged.transferId) {
             protocolFailure()
@@ -1068,6 +1294,7 @@ public class RosterClientEndpoint(
             hostRunId = staged.hostRunId,
             revision = staged.revision,
             subscriptionId = published,
+            nativeCliTargets = frame.nativeCliTargets,
         )
         diagnostic(RosterClientDiagnosticCode.SNAPSHOT_PUBLISHED, rows.size.toLong())
     }
@@ -1160,6 +1387,9 @@ public class RosterClientEndpoint(
     private fun onCreateResult(frame: RosterFrame.CreateResult) {
         val pending = pendingCreate ?: return
         if (pending.requestId != frame.requestId) return
+        // A Pi result never settles a native create: the lanes are separate even
+        // though they share the one in-flight slot.
+        if (pending.native != null) return
         val facts = frame.outcome
         if (facts is OwnerCreateFacts.Started && facts.hostRunId != pending.hostRunId) {
             // The request named one exact run; an answer about another run establishes
@@ -1238,6 +1468,86 @@ public class RosterClientEndpoint(
 
     private fun settleAllRenames() {
         pendingRename?.let { settleRename(it, RosterRequestResult.Unknown) }
+    }
+
+    private fun onNativeCreateResult(frame: RosterFrame.NativeCreateResult) {
+        val pending = pendingCreate ?: return
+        if (pending.requestId != frame.requestId || pending.native == null) return
+        val facts = frame.outcome
+        if (facts is OwnerCreateFacts.Started && facts.hostRunId != pending.hostRunId) {
+            settleCreate(pending, RosterRequestResult.Unknown)
+            return
+        }
+        settleCreate(pending, RosterRequestResult.OwnerResult(RosterOwnerOutcome.Create(facts)))
+    }
+
+    /**
+     * True only while this side's CURRENT snapshot for the exact named run still
+     * advertises that backend/target pair. A missing, stale, empty, foreign-run, or
+     * replaced catalog is never a match: the request is refused rather than
+     * defaulted, retargeted, or retried as Pi.
+     */
+    private fun nativeCreateTargetCurrent(
+        hostRunId: String,
+        backend: NativeCliBackend,
+        targetId: String,
+        catalogScope: NativeCatalogScope,
+    ): Boolean {
+        if (stopRequested || phase != RosterClientPhase.SUBSCRIBED) return false
+        if (projection.state != RosterProjectionState.CURRENT) return false
+        if (projection.hostRunId != hostRunId) return false
+        // The exact observation the written form froze: an unchanged catalog on a
+        // later roster revision keeps this scope, while any add/remove/relabel/
+        // reorder/withdrawal/re-advertisement advances it and refuses the old request.
+        if (projection.nativeCatalogScope != catalogScope) return false
+        val targets = projection.nativeCliTargets ?: return false
+        return targets.any { it.backend == backend && it.id == targetId }
+    }
+
+    private fun onNativeRenameResult(frame: RosterFrame.NativeRenameResult) {
+        val pending = pendingNativeRename ?: return
+        if (pending.requestId != frame.requestId) return
+        val stillCurrent = clock() < pending.deadlineAt &&
+            nativeRenameTargetCurrent(pending.hostRunId, pending.rowId, pending.backend)
+        val result = if (stillCurrent) {
+            RosterRequestResult.OwnerResult(RosterOwnerOutcome.NativeRename(frame.outcome))
+        } else {
+            RosterRequestResult.Unknown
+        }
+        settleNativeRename(pending, result)
+    }
+
+    private fun settleNativeRename(pending: PendingNativeRename, result: RosterRequestResult) {
+        if (pendingNativeRename !== pending) return
+        pendingNativeRename = null
+        clearDeadline(RosterDeadlineKind.NATIVE_RENAME_RESULT, pending.requestId)
+        events += RosterClientEvent.OperationSettled(
+            RosterOperationKind.NATIVE_RENAME,
+            pending.requestId,
+            pending.hostRunId,
+            result,
+        )
+    }
+
+    private fun settleAllNativeRenames() {
+        pendingNativeRename?.let { settleNativeRename(it, RosterRequestResult.Unknown) }
+    }
+
+    /**
+     * True only while the CURRENT snapshot for the exact run still carries that row
+     * with the SAME owner-reported native backend. No Pi native conversation is
+     * consulted, and a backend move, row replacement, or stale view is a refusal.
+     */
+    private fun nativeRenameTargetCurrent(
+        hostRunId: String,
+        rowId: String,
+        backend: NativeCliBackend,
+    ): Boolean {
+        if (stopRequested || phase != RosterClientPhase.SUBSCRIBED) return false
+        if (projection.state != RosterProjectionState.CURRENT) return false
+        if (projection.hostRunId != hostRunId) return false
+        val row = projection.rows.firstOrNull { it.id == rowId } ?: return false
+        return row.backend?.nativeCliOrNull() == backend
     }
 
     // ----------------------------------------------------- saved submission
@@ -2003,6 +2313,7 @@ public class RosterClientEndpoint(
         settleAllCloses()
         settleAllCreates()
         settleAllRenames()
+        settleAllNativeRenames()
         settleAllSaved()
         setSavedPolicy(null)
         savedOwnership = null
@@ -2071,15 +2382,35 @@ public class RosterClientEndpoint(
         hostRunId: String? = null,
         revision: Long? = null,
         subscriptionId: String? = null,
+        nativeCliTargets: List<NativeCliTarget>? = null,
     ) {
         val previous = projection
+        val nextRun = hostRunId ?: previous.hostRunId
+        // Only a CURRENT publication can offer a catalog. Every stale/empty
+        // transition clears it, so a reconnect or lost channel never leaves a
+        // previous owner run's provider choice selectable.
+        val nextCatalog = if (state == RosterProjectionState.CURRENT) nativeCliTargets else null
+        if (nextCatalog != nativeCatalogState) {
+            // One lifetime per effective catalog observation. Withdrawal and
+            // re-advertisement are two changes, so an older queued create cannot
+            // revive when the same pair reappears.
+            nativeCatalogState = nextCatalog
+            nativeCatalogEpoch += 1L
+        }
+        val nextScope = if (nextCatalog == null || nextRun == null) {
+            null
+        } else {
+            NativeCatalogScope(nextRun, generation, nativeCatalogEpoch)
+        }
         val next = RosterProjection(
             state = state,
             rows = rows ?: previous.rows,
-            hostRunId = hostRunId ?: previous.hostRunId,
+            hostRunId = nextRun,
             revision = revision ?: previous.revision,
             subscriptionId = subscriptionId ?: previous.subscriptionId,
             reason = reason,
+            nativeCliTargets = nextCatalog,
+            nativeCatalogScope = nextScope,
         )
         if (next == previous) return
         projection = next
@@ -2223,6 +2554,16 @@ public class RosterClientEndpoint(
                 deadlineAtMs = it.deadlineAt,
             )
         }
+        pendingNativeRename?.let {
+            pending += RosterPendingOperation(
+                kind = RosterOperationKind.NATIVE_RENAME,
+                requestId = it.requestId,
+                hostRunId = it.hostRunId,
+                rowId = it.rowId,
+                sequence = it.nativeSequence,
+                deadlineAtMs = it.deadlineAt,
+            )
+        }
         pendingSaved?.let {
             pending += RosterPendingOperation(
                 kind = it.kind,
@@ -2267,13 +2608,16 @@ public class RosterClientEndpoint(
             createSequence = createSequence,
             renameSequence = renameSequence,
             savedSequence = savedSequence,
+            nativeRenameSequence = nativeRenameSequence,
             armedCloseConfirmationRows = armedRows.toList(),
         )
     }
 
     // ------------------------------------------------------------- internals
 
-    private enum class SendPurpose { HELLO, SUBSCRIBE, UNSUBSCRIBE, ERROR_NOTICE, CLOSE, CREATE, RENAME, SAVED }
+    private enum class SendPurpose {
+        HELLO, SUBSCRIBE, UNSUBSCRIBE, ERROR_NOTICE, CLOSE, CREATE, RENAME, NATIVE_RENAME, SAVED,
+    }
 
     private class OutstandingSend(
         val purpose: SendPurpose,
@@ -2290,6 +2634,14 @@ public class RosterClientEndpoint(
         val hostRunId: String,
         val sequence: Long,
         val deadlineAt: Long,
+        /** Non-null only for a native create; the exact advertised pair it named. */
+        val native: PendingNativeCreate? = null,
+    )
+
+    private class PendingNativeCreate(
+        val backend: NativeCliBackend,
+        val targetId: String,
+        val catalogScope: NativeCatalogScope,
     )
 
     private class PendingRename(
@@ -2298,6 +2650,15 @@ public class RosterClientEndpoint(
         val rowId: String,
         val expectedSessionId: String,
         val expectedSessionEpoch: Long,
+        val deadlineAt: Long,
+    )
+
+    private class PendingNativeRename(
+        val requestId: String,
+        val hostRunId: String,
+        val rowId: String,
+        val backend: NativeCliBackend,
+        val nativeSequence: Long,
         val deadlineAt: Long,
     )
 

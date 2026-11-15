@@ -78,6 +78,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.HostCapabilities
 import io.github.rfairburn.pireviewgate.core.client.ui.HostConnectionState
 import io.github.rfairburn.pireviewgate.core.client.ui.HostUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.InputObservation
+import io.github.rfairburn.pireviewgate.core.client.ui.NativeRenameTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.RenameTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.RosterFreshness
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionActionTarget
@@ -622,6 +623,7 @@ private fun SessionCard(
     val capabilities: HostCapabilities = host?.capabilities ?: HostCapabilities.UNKNOWN
     val live = isLiveHost(host)
     val renameTarget = RenameTarget.of(row)
+    val nativeRenameTarget = NativeRenameTarget.of(row)
     val rowKey = SessionRowKey.of(row)
     // Opening the terminal selects a row for the controller to write, so it is
     // attributed to that row's own commit proof. The semantic key keeps the drawn
@@ -757,12 +759,28 @@ private fun SessionCard(
                     },
                 ) {
                     DropdownMenuItem(
-                        text = { Text(stringResource(R.string.action_rename)) },
-                        enabled = live &&
-                            capabilities.supports(RosterWire.RENAME_CAPABILITY) &&
-                            renameTarget != null,
+                        text = {
+                            Text(stringResource(
+                                if (nativeRenameTarget != null) {
+                                    R.string.action_rename_native
+                                } else {
+                                    R.string.action_rename
+                                },
+                            ))
+                        },
+                        enabled = live && if (nativeRenameTarget != null) {
+                            capabilities.supports(RosterWire.NATIVE_NAME_CAPABILITY)
+                        } else {
+                            capabilities.supports(RosterWire.RENAME_CAPABILITY) && renameTarget != null
+                        },
                         onClick = {
-                            act { renameTarget?.let { onIntent(ClientIntent.RequestSessionRename(it)) } }
+                            act {
+                                if (nativeRenameTarget != null) {
+                                    onIntent(ClientIntent.RequestNativeSessionRename(nativeRenameTarget))
+                                } else {
+                                    renameTarget?.let { onIntent(ClientIntent.RequestSessionRename(it)) }
+                                }
+                            }
                         },
                     )
                     DropdownMenuItem(
@@ -1000,6 +1018,8 @@ private fun SessionDetails(row: SessionUiState) {
         metadata.exitCode?.let { it.toInt().toString() } ?: stringResource(R.string.value_unknown),
     )
     FactRow(stringResource(R.string.fact_error), metadata.error ?: stringResource(R.string.value_none))
+
+    row.providerLabel?.let { FactRow(stringResource(R.string.fact_provider), it) }
 
     val native = metadata.nativeSession
     if (native == null) {

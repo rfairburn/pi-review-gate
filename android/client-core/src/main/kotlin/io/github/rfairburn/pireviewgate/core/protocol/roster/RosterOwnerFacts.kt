@@ -73,6 +73,27 @@ enum class OwnerRenameFacts(val wireName: String) {
     }
 }
 
+/**
+ * The fixed facts one owner native HOST ROW NAME established. None carries a name,
+ * a row id, or a backend, and the two success kinds are never collapsed: the owner's
+ * own per-operation persistence truth decides between them.
+ */
+enum class OwnerNativeRenameFacts(val wireName: String) {
+    /** The caption was applied and this owner's roster publication reported it durable. */
+    RENAMED_DURABLE("renamed-durable"),
+    /** The caption was applied but durability was not reported for THIS operation. */
+    RENAMED_IN_MEMORY("renamed-in-memory"),
+    /** Nothing was renamed, positively established before any caption was applied. */
+    REFUSED("refused"),
+    /** Unobservable: the caption may or may not have changed. Nothing is re-sent. */
+    UNKNOWN("unknown"),
+    ;
+
+    companion object {
+        fun fromWireName(value: String): OwnerNativeRenameFacts? = entries.firstOrNull { it.wireName == value }
+    }
+}
+
 /** Fixed reasons a Saved window request was refused before any data was produced. */
 enum class SavedWindowRefusalReason(val wireName: String) {
     ADMISSION("admission"),

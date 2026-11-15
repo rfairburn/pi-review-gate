@@ -72,6 +72,7 @@
     <string name="session_activity_lines">Activity</string>
     <string name="action_open_terminal">Open terminal</string>
     <string name="action_rename">Rename</string>
+    <string name="action_rename_native">Rename native row</string>
     <string name="action_close">Close</string>
     <string name="action_saved">Saved conversations</string>
     <string name="action_move_up">Move up</string>
@@ -86,6 +87,7 @@
 
     <!-- Owner facts -->
     <string name="fact_row_label">Owner label</string>
+    <string name="fact_provider">Provider</string>
     <string name="fact_workspace">Workspace</string>
     <string name="fact_live_process">Live process</string>
     <string name="fact_busy">Busy</string>
@@ -144,6 +146,11 @@
     <string name="create_owner_none">No host chosen</string>
     <string name="create_choose_owner">Choose</string>
     <string name="create_owner_not_connected">That host is not connected. It stays chosen; connect to it first.</string>
+    <string name="create_provider_field">Provider: %1$s</string>
+    <string name="create_provider_choose">Choose provider</string>
+    <string name="create_provider_none">No provider chosen</string>
+    <string name="create_provider_pi">Pi</string>
+    <string name="create_provider_stale">The selected provider is no longer advertised by this host. Choose a provider again; nothing was changed and nothing will be created until you do.</string>
     <string name="create_workspace_field">Workspace path</string>
     <string name="create_workspace_note">The path is sent to that host exactly as you type it. This device does not browse or complete its filesystem.</string>
     <string name="create_submit">Create session</string>
@@ -155,6 +162,14 @@
     <string name="rename_note">The rename applies only to this conversation. If the host\'s conversation has changed, the rename is refused rather than applied elsewhere.</string>
     <string name="rename_name_field">New name</string>
     <string name="rename_submit">Rename</string>
+
+    <!-- Native host caption -->
+    <string name="native_rename_title">Rename native row</string>
+    <string name="native_rename_caption_field">Current caption</string>
+    <string name="native_rename_backend_field">Provider</string>
+    <string name="native_rename_note">This caption is a host-side row label only. It is never sent to the provider or typed into its session. If the row or its provider has changed, the rename is refused rather than applied elsewhere.</string>
+    <string name="native_rename_name_field">New caption</string>
+    <string name="native_rename_submit">Rename</string>
 
     <!-- Close session -->
     <string name="close_title">Close this session?</string>

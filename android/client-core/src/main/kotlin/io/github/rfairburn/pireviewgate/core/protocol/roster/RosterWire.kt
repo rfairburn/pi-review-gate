@@ -44,6 +44,23 @@ object RosterWire {
     const val ROSTER_SLOT_CAPABILITY: String = "roster-slot-v1"
 
     /**
+     * Optional capability for the owner's native lane: the advertised native
+     * launch-target catalog on `snapshot_end`, the typed backend identity on rows
+     * the owner reports, and the rowless native create exchange. It states only
+     * that the owner really holds both a native create provider and an explicit
+     * catalog; protocol support only, never authority or an available target.
+     */
+    const val NATIVE_CAPABILITY: String = "roster-native-v1"
+
+    /**
+     * Optional capability for the owner's SEPARATE native host-caption lane. An
+     * owner may advertise native targets while never accepting a remote caption,
+     * so this is negotiated independently and never inferred from
+     * [NATIVE_CAPABILITY] or from the Pi rename capability.
+     */
+    const val NATIVE_NAME_CAPABILITY: String = "roster-native-name-v1"
+
+    /**
      * Optional capabilities this implementation knows. An identifier offered by a
      * peer is recorded only when it appears here and is otherwise ignored; an
      * acknowledgement additionally narrows to what the owner can really honour.
@@ -54,6 +71,8 @@ object RosterWire {
         SAVED_CAPABILITY,
         RENAME_CAPABILITY,
         ROSTER_SLOT_CAPABILITY,
+        NATIVE_CAPABILITY,
+        NATIVE_NAME_CAPABILITY,
     )
 
     /** One metadata subscription per channel; not configurable. */

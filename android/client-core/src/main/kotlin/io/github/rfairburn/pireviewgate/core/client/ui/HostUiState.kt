@@ -1,7 +1,9 @@
 package io.github.rfairburn.pireviewgate.core.client.ui
 
 import io.github.rfairburn.pireviewgate.core.hosts.ConfiguredHost
+import io.github.rfairburn.pireviewgate.core.client.roster.NativeCatalogScope
 import io.github.rfairburn.pireviewgate.core.permissions.LocalNetworkRequestToken
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterWire
 
 /**
@@ -67,6 +69,8 @@ public data class HostCapabilities(
     public val saved: CapabilityStatus = CapabilityStatus.UNKNOWN,
     public val rename: CapabilityStatus = CapabilityStatus.UNKNOWN,
     public val rosterSlot: CapabilityStatus = CapabilityStatus.UNKNOWN,
+    public val native: CapabilityStatus = CapabilityStatus.UNKNOWN,
+    public val nativeName: CapabilityStatus = CapabilityStatus.UNKNOWN,
 ) {
     /** Support for one identifier, or [CapabilityStatus.UNKNOWN] before negotiation. */
     public fun statusOf(capability: String): CapabilityStatus = when (capability) {
@@ -75,6 +79,8 @@ public data class HostCapabilities(
         RosterWire.SAVED_CAPABILITY -> saved
         RosterWire.RENAME_CAPABILITY -> rename
         RosterWire.ROSTER_SLOT_CAPABILITY -> rosterSlot
+        RosterWire.NATIVE_CAPABILITY -> native
+        RosterWire.NATIVE_NAME_CAPABILITY -> nativeName
         else -> CapabilityStatus.UNKNOWN
     }
 
@@ -101,6 +107,8 @@ public data class HostCapabilities(
                 saved = status(capabilities, RosterWire.SAVED_CAPABILITY),
                 rename = status(capabilities, RosterWire.RENAME_CAPABILITY),
                 rosterSlot = status(capabilities, RosterWire.ROSTER_SLOT_CAPABILITY),
+                native = status(capabilities, RosterWire.NATIVE_CAPABILITY),
+                nativeName = status(capabilities, RosterWire.NATIVE_NAME_CAPABILITY),
             )
 
         private fun status(capabilities: List<String>, capability: String): CapabilityStatus =
@@ -151,6 +159,18 @@ public data class HostUiState(
     public val roster: RosterSnapshot? = null,
     public val capabilities: HostCapabilities = HostCapabilities.UNKNOWN,
     public val savedPolicy: SavedPolicyStatus = SavedPolicyStatus.UNKNOWN,
+    /**
+     * Native targets committed with the CURRENT snapshot for [roster], or `null`
+     * when no current catalog is offered. A stale catalog is never published here,
+     * so a previous owner run's provider can never be selected.
+     */
+    public val nativeCliTargets: List<NativeCliTarget>? = null,
+    /**
+     * The exact catalog observation lifetime of [nativeCliTargets], or `null` when
+     * none is current. It changes on every catalog add/remove/relabel/reorder/
+     * withdrawal/re-advertisement and stays unchanged across roster-only revisions.
+     */
+    public val nativeCatalogScope: NativeCatalogScope? = null,
     public val serverFingerprint: String? = null,
     public val noticeText: String? = null,
     public val pendingConnectToken: LocalNetworkRequestToken? = null,
@@ -180,6 +200,19 @@ public data class HostUiState(
     public val canBrowseSaved: Boolean
         get() = connection == HostConnectionState.CONNECTED &&
             capabilities.supports(RosterWire.SAVED_CAPABILITY)
+
+    /**
+     * True only when this owner can take a native create now: live connection, the
+     * native lane positively acknowledged, and a non-empty CURRENT advertised
+     * catalog. An empty or absent catalog keeps the form Pi-only; a stale one is
+     * never eligible.
+     */
+    public val canCreateNativeSession: Boolean
+        get() = connection == HostConnectionState.CONNECTED &&
+            capabilities.supports(RosterWire.NATIVE_CAPABILITY) &&
+            roster?.freshness == RosterFreshness.CURRENT &&
+            nativeCatalogScope != null &&
+            !nativeCliTargets.isNullOrEmpty()
 }
 
 /**

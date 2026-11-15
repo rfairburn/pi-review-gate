@@ -1,5 +1,8 @@
 package io.github.rfairburn.pireviewgate.core.protocol.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+
 /**
  * Every frame the roster metadata lane can carry, as one closed set.
  *
@@ -13,10 +16,12 @@ package io.github.rfairburn.pireviewgate.core.protocol.roster
  * [SnapshotPage] frames carry the rows, and [SnapshotEnd] completes it. A revision
  * may jump; only a regression against the same run is invalid.
  *
- * The optional owner exchanges (Close, Create, Rename, Saved) ride the same lane,
- * direction, and authentication, and only when both sides acknowledged their
- * capability. Each is a closed frame set: no payload, error, signal, path, native
- * current file, or owner text can ride along beside them.
+ * The optional owner exchanges (Close, Create, Rename, Saved, and the two native
+ * lanes) ride the same lane, direction, and authentication, and only when both
+ * sides acknowledged their capability. Each is a closed frame set: no payload,
+ * error, signal, path, native current file, or owner text can ride along beside
+ * them. The native create lane also carries the owner's advertised catalog on
+ * [SnapshotEnd], and the separate native-name lane never borrows the Pi rename.
  */
 sealed interface RosterFrame {
 
@@ -76,6 +81,14 @@ sealed interface RosterFrame {
         val transferId: String,
         val revision: Long,
         val totalRows: Long,
+        /**
+         * The owner's advertised native targets, present only on a channel that
+         * negotiated [RosterWire.NATIVE_CAPABILITY] and only when the owner really
+         * holds a catalog. It commits on THIS frame with the snapshot's rows, so a
+         * catalog and rows from different owner runs are never published together.
+         * Absence is honest absence, never an empty or default catalog.
+         */
+        val nativeCliTargets: List<NativeCliTarget>? = null,
     ) : RosterFrame {
         override val type: String get() = "snapshot_end"
     }
@@ -154,6 +167,56 @@ sealed interface RosterFrame {
      */
     data class RenameResult(val requestId: String, val outcome: OwnerRenameFacts) : RosterFrame {
         override val type: String get() = "rename_result"
+    }
+
+    /**
+     * One rowless native create: this owner's exact run, one canonical workspace,
+     * one exact owner-advertised backend/target id pair, and this channel's shared
+     * strictly increasing attempt number. No command, argument, executable,
+     * environment, credential, role, approval, row, or private path is expressible.
+     */
+    data class NativeCreateRequest(
+        val requestId: String,
+        val hostRunId: String,
+        val workspace: String,
+        val backend: NativeCliBackend,
+        val targetId: String,
+        val sequence: Long,
+    ) : RosterFrame {
+        override val type: String get() = "create_native_request"
+    }
+
+    /** One fixed owner answer for exactly one native create request id. */
+    data class NativeCreateResult(
+        val requestId: String,
+        val outcome: OwnerCreateFacts,
+    ) : RosterFrame {
+        override val type: String get() = "create_native_result"
+    }
+
+    /**
+     * One owner-routed HOST ROW NAME of exactly one row: this owner's run, one row,
+     * the native backend this side observed on it, the replacement caption, and the
+     * separate native-name attempt number. It carries NO Pi native conversation id
+     * or epoch, because a native row has no conversation tuple to fence.
+     */
+    data class NativeRenameRequest(
+        val requestId: String,
+        val hostRunId: String,
+        val rowId: String,
+        val backend: NativeCliBackend,
+        val name: String,
+        val sequence: Long,
+    ) : RosterFrame {
+        override val type: String get() = "rename_native_request"
+    }
+
+    /** One fixed owner answer for exactly one native host-name request id. */
+    data class NativeRenameResult(
+        val requestId: String,
+        val outcome: OwnerNativeRenameFacts,
+    ) : RosterFrame {
+        override val type: String get() = "rename_native_result"
     }
 
     /** Fresh Saved catalog listing request. */

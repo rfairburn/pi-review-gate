@@ -181,6 +181,8 @@ data class ClientRuntimeConfig(
             RosterWire.SAVED_CAPABILITY,
             RosterWire.RENAME_CAPABILITY,
             RosterWire.ROSTER_SLOT_CAPABILITY,
+            RosterWire.NATIVE_CAPABILITY,
+            RosterWire.NATIVE_NAME_CAPABILITY,
         )
 
         /** Every optional content capability this build implements. */

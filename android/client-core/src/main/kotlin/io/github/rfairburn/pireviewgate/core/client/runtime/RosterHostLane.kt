@@ -11,6 +11,8 @@ import io.github.rfairburn.pireviewgate.core.client.roster.RosterCloseCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterCreateCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterDeadlineToken
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterDispatchDecision
+import io.github.rfairburn.pireviewgate.core.client.roster.RosterNativeCreateCommand
+import io.github.rfairburn.pireviewgate.core.client.roster.RosterNativeRenameCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterNotSentReason
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterOperationKind
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterRenameCommand
@@ -145,8 +147,14 @@ internal class RosterHostLane(
     suspend fun createSession(command: RosterCreateCommand): RosterOperationAdmission =
         submit(RosterOperationKind.CREATE) { it.createSession(command) }
 
+    suspend fun createNativeSession(command: RosterNativeCreateCommand): RosterOperationAdmission =
+        submit(RosterOperationKind.CREATE) { it.createNativeSession(command) }
+
     suspend fun renameSession(command: RosterRenameCommand): RosterOperationAdmission =
         submit(RosterOperationKind.RENAME) { it.renameSession(command) }
+
+    suspend fun renameNativeSession(command: RosterNativeRenameCommand): RosterOperationAdmission =
+        submit(RosterOperationKind.NATIVE_RENAME) { it.renameNativeSession(command) }
 
     suspend fun savedList(command: RosterSavedListCommand): RosterOperationAdmission =
         submit(RosterOperationKind.SAVED_LIST) { it.savedList(command) }

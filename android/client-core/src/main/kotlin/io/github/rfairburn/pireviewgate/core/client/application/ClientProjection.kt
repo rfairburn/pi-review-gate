@@ -55,7 +55,13 @@ class ClientProjection {
                     saved = capability(roster, roster?.supportsSaved),
                     rename = capability(roster, roster?.supportsRename),
                     rosterSlot = capability(roster, roster?.supportsRosterSlot),
+                    native = capability(roster, roster?.supportsNative),
+                    nativeName = capability(roster, roster?.supportsNativeName),
                 ),
+                // A catalog is offered only with the CURRENT snapshot it committed
+                // with. Retained/STALE rows never carry a selectable provider.
+                nativeCliTargets = complete?.nativeCliTargets?.takeIf { current },
+                nativeCatalogScope = complete?.nativeCatalogScope?.takeIf { current },
                 savedPolicy = when (roster?.savedPolicy?.deleteExposed) {
                     true -> SavedPolicyStatus.EXPOSED
                     false -> SavedPolicyStatus.OFF

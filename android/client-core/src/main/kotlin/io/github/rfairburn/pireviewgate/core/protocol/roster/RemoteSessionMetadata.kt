@@ -1,5 +1,7 @@
 package io.github.rfairburn.pireviewgate.core.protocol.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.SessionBackend
+
 /**
  * Inert remote roster row: the display-oriented projection of one owner session
  * that a remote sidebar can render like a local row.
@@ -74,6 +76,8 @@ data class RemoteNativeSession(
  * @property activeShells Observed ACTIVITY-INTENT count, independent of the ownership pair.
  * @property exitCode Present only when the owner observed a finite exit code.
  * @property error Bounded, terminal-safe, redacted diagnostic text; absent when none.
+ * @property backend The owner's typed backend identity, or `null` when the row
+ *   reports none (the legacy Pi row). It is never inferred and never a guess.
  */
 data class RemoteSessionMetadata(
     val id: String,
@@ -93,4 +97,11 @@ data class RemoteSessionMetadata(
     val activeShells: Long? = null,
     val exitCode: Double? = null,
     val error: String? = null,
+    /**
+     * The owner's typed backend identity, present only when the owner row reports
+     * one. Absence is the legacy Pi row and is never inferred from a label, a
+     * native conversation, a status, or missing Pi telemetry. A present value is
+     * the closed host backend set (`pi`, `claude`, `codex`), never a foreign string.
+     */
+    val backend: SessionBackend? = null,
 )

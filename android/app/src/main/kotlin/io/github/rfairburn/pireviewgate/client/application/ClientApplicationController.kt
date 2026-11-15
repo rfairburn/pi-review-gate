@@ -274,6 +274,7 @@ class ClientApplicationController private constructor(
             ClientDialogKind.FIRST_CONTACT_CONSENT to dialogs.firstContactConsent?.proof,
             ClientDialogKind.CREATE_SESSION to dialogs.createSession?.proof,
             ClientDialogKind.RENAME_SESSION to dialogs.renameSession?.proof,
+            ClientDialogKind.NATIVE_RENAME_SESSION to dialogs.nativeRenameSession?.proof,
             ClientDialogKind.CLOSE_SESSION to dialogs.closeSession?.proof,
             ClientDialogKind.SAVED_DELETE to dialogs.savedDelete?.proof,
         )
@@ -307,15 +308,22 @@ class ClientApplicationController private constructor(
         // while retaining the exact committed pending form through writer dispatch.
         dialogs.createSession?.let { form ->
             if (form.proof !in busyForms) {
-                val owners = hosts.map { OwnerChoice(it.host.id, it.host.label.value, it.host.endpoint.displayText(), it.connection, it.canCreateSession) }
+                val owners = hosts.map { OwnerChoice.of(it) }
+                val previousOwner = form.selectedOwner
                 val selected = owners.firstOrNull { it.hostId == form.selectedHostId }
+                // A native provider survives only the same owner run and the exact same
+                // committed catalog. Any catalog change, replacement run, or lost
+                // catalog invalidates the choice to "choose again"; it never becomes Pi.
+                val provider = CreateProviderSelection.reconcile(previousOwner, selected, form.provider)
                 val nextProof = selected?.let {
-                    proof(listOf("create-binding", it.hostId, generation(it.hostId), currentRun(it.hostId),
-                        it.label, it.endpointDisplayText, form.workspaceDraft), UiProofScreen.SESSION_CREATE,
-                        it.hostId, currentRun(it.hostId))
+                    proof(listOf("create-binding", it.hostId, it.hostRunId, generation(it.hostId), currentRun(it.hostId),
+                        it.label, it.endpointDisplayText, form.workspaceDraft, CreateProviderSelection.key(provider)),
+                        UiProofScreen.SESSION_CREATE, it.hostId, currentRun(it.hostId))
                 } ?: form.proof
                 if (nextProof !== form.proof) (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
-                if (form.owners != owners || nextProof !== form.proof) dialogs = dialogs.copy(createSession = form.copy(owners = owners, proof = nextProof))
+                if (form.owners != owners || nextProof !== form.proof || form.provider != provider) {
+                    dialogs = dialogs.copy(createSession = form.copy(owners = owners, provider = provider, proof = nextProof))
+                }
             }
         }
         val consent = registryState.pendingConsents.firstOrNull()
@@ -460,7 +468,8 @@ class ClientApplicationController private constructor(
         (next.route as? ClientRoute.Terminal)?.terminal?.chooserProofs?.values?.let { used.addAll(it) }
         used.addAll(listOfNotNull(next.dialogs.addHost?.proof, next.dialogs.editHostAddress?.proof, next.dialogs.removeHost?.proof,
             next.dialogs.firstContactConsent?.proof, next.dialogs.createSession?.proof,
-            next.dialogs.renameSession?.proof, next.dialogs.closeSession?.proof, next.dialogs.savedDelete?.proof))
+            next.dialogs.renameSession?.proof, next.dialogs.nativeRenameSession?.proof,
+            next.dialogs.closeSession?.proof, next.dialogs.savedDelete?.proof))
         if (next.route is ClientRoute.Saved && !next.dialogs.hasModal && next.coverage == UiCoverage.NONE) {
             used.addAll(listOfNotNull(next.saved.listProof, next.saved.windowProof))
             next.saved.entryProofs.values.forEach { used.addAll(listOfNotNull(it.resume, it.deletePrepare)) }
@@ -487,6 +496,9 @@ class ClientApplicationController private constructor(
             removeHost = dialogs.removeHost?.let { it.copy(proof = renew(it.proof, ClientDialogKind.REMOVE_HOST)) },
             createSession = dialogs.createSession?.let { it.copy(proof = renew(it.proof, ClientDialogKind.CREATE_SESSION)) },
             renameSession = dialogs.renameSession?.let { it.copy(proof = renew(it.proof, ClientDialogKind.RENAME_SESSION)) },
+            nativeRenameSession = dialogs.nativeRenameSession?.let {
+                it.copy(proof = renew(it.proof, ClientDialogKind.NATIVE_RENAME_SESSION))
+            },
             closeSession = dialogs.closeSession?.let { it.copy(proof = renew(it.proof, ClientDialogKind.CLOSE_SESSION)) },
             savedDelete = dialogs.savedDelete?.let { it.copy(proof = renew(it.proof, ClientDialogKind.SAVED_DELETE)) },
         )
@@ -711,7 +723,13 @@ class ClientApplicationController private constructor(
         if (!registryState.foreground || dialogs.hasModal || createdActivationCovered() ||
             route != activation.originRoute || connectionGeneration != activation.connectionGeneration ||
             host == null || host.connection != HostConnectionState.CONNECTED ||
-            !host.capabilities.supports(RosterWire.CREATE_CAPABILITY) ||
+            !host.capabilities.supports(
+                if (activation.provider is CreateProviderChoice.Native) {
+                    RosterWire.NATIVE_CAPABILITY
+                } else {
+                    RosterWire.CREATE_CAPABILITY
+                },
+            ) ||
             (projectedRun != null && projectedRun != activation.hostRunId)) {
             cancelCreatedActivation()
             return
@@ -894,18 +912,47 @@ class ClientApplicationController private constructor(
             }
             is ClientIntent.UpdateDraft -> draft(intent.draft)
             ClientIntent.RequestSessionCreate -> dialogs = dialogs.copy(createSession = CreateSessionDialog(
-                state.value.hostStates.map { OwnerChoice(it.host.id, it.host.label.value, it.host.endpoint.displayText(), it.connection, it.canCreateSession) },
+                state.value.hostStates.map { OwnerChoice.of(it) },
+                provider = CreateProviderChoice.Pi,
                 proof = proof(listOf("create", ++proofGeneration), UiProofScreen.SESSION_CREATE, localFormHost)))
             is ClientIntent.SelectCreateOwner -> dialogs.createSession?.let { form ->
                 if (form.proof in busyForms) return
                 (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
-                dialogs = dialogs.copy(createSession = form.copy(selectedHostId = intent.hostId,
-                    proof = proof(listOf("create", intent.hostId, form.workspaceDraft, ++proofGeneration), UiProofScreen.SESSION_CREATE,
-                        intent.hostId, currentRun(intent.hostId))))
+                // Reselecting the same owner preserves its exact provider. A real
+                // destination change after a native choice invalidates to "choose
+                // again" and never restores Pi. Pi remains the fresh-form default.
+                val provider = if (form.selectedHostId == intent.hostId) {
+                    form.provider
+                } else {
+                    CreateProviderSelection.afterOwnerChange(form.provider)
+                }
+                dialogs = dialogs.copy(createSession = form.copy(selectedHostId = intent.hostId, provider = provider,
+                    proof = proof(listOf("create", intent.hostId, form.workspaceDraft, CreateProviderSelection.key(provider),
+                        ++proofGeneration), UiProofScreen.SESSION_CREATE, intent.hostId, currentRun(intent.hostId))))
+            }
+            is ClientIntent.SelectCreateProvider -> dialogs.createSession?.let { form ->
+                if (form.proof in busyForms) return
+                val owner = form.selectedOwner ?: return
+                if (!CreateProviderSelection.admits(owner, intent.provider)) return
+                (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
+                dialogs = dialogs.copy(createSession = form.copy(provider = intent.provider,
+                    proof = proof(listOf("create-provider", owner.hostId, owner.hostRunId, form.workspaceDraft,
+                        CreateProviderSelection.key(intent.provider), ++proofGeneration), UiProofScreen.SESSION_CREATE,
+                        owner.hostId, owner.hostRunId)))
             }
             is ClientIntent.SubmitSessionCreate -> {
                 val form = dialogs.createSession ?: return
-                if (form.proof !== intent.proof || form.selectedHostId != intent.hostId || form.workspaceDraft != intent.workspace) return
+                if (form.proof !== intent.proof || form.selectedHostId != intent.hostId ||
+                    form.workspaceDraft != intent.workspace || form.provider != intent.provider) return
+                val provider = form.provider ?: run {
+                    report("Create not submitted: provider is no longer available")
+                    return
+                }
+                val host = state.value.hostState(intent.hostId) ?: return
+                if (!CreateProviderSelection.admits(OwnerChoice.of(host), provider)) {
+                    report("Create not submitted: provider is no longer available")
+                    return
+                }
                 val run = currentRun(intent.hostId) ?: run { report("Create not submitted: owner roster is not current"); return }
                 val gen = generation(intent.hostId) ?: return
                 if (intent.proof.target.hostRunId != run) return
@@ -927,8 +974,15 @@ class ClientApplicationController private constructor(
                     form, frozen, route) ?: return
                 submittedCreate = activation
                 operation(OperationContext(intent.hostId, gen, intent.proof, created = activation)) {
-                    runtime.createSession(intent.hostId, RosterCreateCommand(run, intent.workspace,
-                        RosterSendProof.Form(gen, run, intent.workspace, frozen)))
+                    when (provider) {
+                        CreateProviderChoice.Pi -> runtime.createSession(intent.hostId,
+                            RosterCreateCommand(run, intent.workspace,
+                                RosterSendProof.Form(gen, run, intent.workspace, frozen)))
+                        is CreateProviderChoice.Native -> runtime.createNativeSession(intent.hostId,
+                            RosterNativeCreateCommand(run, intent.workspace, provider.backend, provider.targetId,
+                                RosterSendProof.NativeForm(gen, run, intent.workspace, provider.backend,
+                                    provider.targetId, provider.catalogScope, frozen)))
+                    }
                 }
             }
             is ClientIntent.RequestSessionClose -> {
@@ -988,6 +1042,26 @@ class ClientApplicationController private constructor(
                 val submission = RenameSubmission.begin(state.value.hostState(hostId), gen, form, intent.proof) ?: return
                 operation(OperationContext(hostId, gen, intent.proof, rename = submission)) {
                     runtime.renameSession(hostId, submission.command)
+                }
+            }
+            is ClientIntent.RequestNativeSessionRename -> {
+                val host = state.value.hostState(intent.target.base.hostId)
+                if (NativeRenameRowFence.row(host, intent.target) == null) return
+                dialogs = dialogs.copy(nativeRenameSession = NativeRenameSessionDialog(intent.target,
+                    intent.target.currentCaption,
+                    proof(listOf("native-rename", intent.target, ++proofGeneration), UiProofScreen.SESSION_RENAME,
+                        intent.target.base.hostId, intent.target.base.hostRunId, intent.target.base.rowId)))
+            }
+            is ClientIntent.SubmitNativeSessionRename -> {
+                val form = dialogs.nativeRenameSession ?: return
+                if (form.target != intent.target || form.nameDraft != intent.name || form.proof !== intent.proof) return
+                val hostId = intent.target.base.hostId
+                val gen = generation(hostId) ?: return
+                val submission = NativeRenameSubmission.begin(
+                    state.value.hostState(hostId), gen, form, intent.proof,
+                ) ?: return
+                operation(OperationContext(hostId, gen, intent.proof, nativeRename = submission)) {
+                    runtime.renameNativeSession(hostId, submission.command)
                 }
             }
             is ClientIntent.MoveSessionRow -> move(intent)
@@ -1187,13 +1261,20 @@ class ClientApplicationController private constructor(
             is ClientDraft.Workspace -> dialogs.createSession?.let { form ->
                 if (form.proof in busyForms) return
                 dialogs = dialogs.copy(createSession = form.copy(workspaceDraft = draft.value,
-                    proof = proof(listOf("create-draft", form.selectedHostId, draft, ++proofGeneration), UiProofScreen.SESSION_CREATE,
+                    proof = proof(listOf("create-draft", form.selectedHostId, draft,
+                        CreateProviderSelection.key(form.provider), ++proofGeneration), UiProofScreen.SESSION_CREATE,
                         form.selectedHostId ?: localFormHost, form.selectedHostId?.let { currentRun(it) })))
             }
             is ClientDraft.Rename -> dialogs.renameSession?.let { form ->
                 if (form.target != draft.target || form.proof in busyForms) return
                 dialogs = dialogs.copy(renameSession = form.copy(nameDraft = draft.value,
                     proof = proof(listOf("rename-draft", draft, ++proofGeneration), UiProofScreen.SESSION_RENAME,
+                        draft.target.base.hostId, draft.target.base.hostRunId, draft.target.base.rowId)))
+            }
+            is ClientDraft.NativeRename -> dialogs.nativeRenameSession?.let { form ->
+                if (form.target != draft.target || form.proof in busyForms) return
+                dialogs = dialogs.copy(nativeRenameSession = form.copy(nameDraft = draft.value,
+                    proof = proof(listOf("native-rename-draft", draft, ++proofGeneration), UiProofScreen.SESSION_RENAME,
                         draft.target.base.hostId, draft.target.base.hostRunId, draft.target.base.rowId)))
             }
             is ClientDraft.SavedSearch -> {
@@ -1316,7 +1397,7 @@ class ClientApplicationController private constructor(
         val pickerEpoch: Long? = null, val savedResult: SavedResultTarget? = null,
         val deletion: AcceptedSavedDeletion? = null, val savedReadLifetime: AcceptedSavedDeletion? = null,
         val savedIntake: SavedReadFeedback.View? = null, val created: AcceptedCreateActivation? = null,
-        val rename: RenameSubmission? = null)
+        val rename: RenameSubmission? = null, val nativeRename: NativeRenameSubmission? = null)
 
     private fun operation(context: OperationContext, command: suspend () -> RosterOperationAdmission) {
         if (context.proof in busyForms || busyForms.size >= 64) {
@@ -1393,6 +1474,7 @@ class ClientApplicationController private constructor(
         // the owner's positive `renamed` closes that form. The displayed name still comes
         // only from the owner's next complete authoritative snapshot.
         context.rename?.let { dialogs = it.closeIfConfirmed(dialogs, event.hostRunId, event.result) }
+        context.nativeRename?.let { dialogs = it.closeIfConfirmed(dialogs, event.hostRunId, event.result) }
         if (context.created != null) {
             finishCreated(context, event)
             return
@@ -1570,6 +1652,7 @@ class ClientApplicationController private constructor(
             is RosterRequestResult.OwnerResult -> when (val outcome = result.outcome) {
                 is RosterOwnerOutcome.Close -> outcome.facts.wireName
                 is RosterOwnerOutcome.Rename -> outcome.facts.wireName
+                is RosterOwnerOutcome.NativeRename -> outcome.facts.wireName
                 is RosterOwnerOutcome.Create -> when (outcome.facts) {
                     is OwnerCreateFacts.Started -> "owner reports started"
                     OwnerCreateFacts.Unconfirmed -> "unconfirmed"

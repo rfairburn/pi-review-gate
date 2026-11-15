@@ -27,6 +27,8 @@ internal class RosterClientHarness(
         RosterWire.SAVED_CAPABILITY,
         RosterWire.RENAME_CAPABILITY,
         RosterWire.ROSTER_SLOT_CAPABILITY,
+        RosterWire.NATIVE_CAPABILITY,
+        RosterWire.NATIVE_NAME_CAPABILITY,
     ),
     hostId: String = "host-1",
 ) {
@@ -127,6 +129,7 @@ internal class RosterClientHarness(
         revision: Long = 1L,
         rows: List<RemoteSessionMetadata> = listOf(row("row-1"), row("row-2")),
         subscription: String = subscriptionId(),
+        nativeCliTargets: List<io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget>? = null,
     ) {
         val pages = rows.chunked(2).ifEmpty { listOf(emptyList()) }
         deliver(
@@ -155,6 +158,7 @@ internal class RosterClientHarness(
                 transferId = "transfer-$revision",
                 revision = revision,
                 totalRows = rows.size.toLong(),
+                nativeCliTargets = nativeCliTargets,
             ),
         )
     }
@@ -222,6 +226,8 @@ internal class RosterClientHarness(
             RosterWire.SAVED_CAPABILITY,
             RosterWire.RENAME_CAPABILITY,
             RosterWire.ROSTER_SLOT_CAPABILITY,
+            RosterWire.NATIVE_CAPABILITY,
+            RosterWire.NATIVE_NAME_CAPABILITY,
         )
 
         val TRUE_PROOF: RosterUiProof = RosterUiProof { true }

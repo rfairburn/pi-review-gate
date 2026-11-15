@@ -599,6 +599,7 @@ not Pi-scoped model names or live provider discovery:
 | --- | --- | --- |
 | Claude Code | Opus 5.5 | `claude-opus-5-5` |
 | Claude Code | Fable 5.1 | `claude-fable-5-1` |
+| Claude Code | Fable 5.2 | `claude-fable-5-2` |
 | Claude Code | Sonnet 5.5 | `claude-sonnet-5-5` |
 | Claude Code | Haiku 4.5 | `claude-haiku-4-5` |
 | Codex CLI | GPT-6.1-Sol | `gpt-6.1-sol` |
@@ -619,9 +620,15 @@ The lists are verified against the official
 and [Codex models](https://developers.openai.com/codex/models) documentation and
 maintained with review-gate releases. Catalog data and verification provenance
 live in `src/settings/external-agent-models.ts`; the Codex catalog was verified
-against Codex CLI 0.160.0 on 2026-10-05. Release maintenance must recheck those
-upstream sources and update catalog values and verification provenance when
-supported choices change. A catalog entry is a known CLI selection, not proof of
+against Codex CLI 0.160.0 on 2026-10-05. The other Claude entries retain their
+2026-10-05 verification. Fable 5.2 was verified on 2026-11-15,
+including its `low`, `medium`, `high`, `xhigh`, and `max` effort levels; its
+Claude Code default is Medium (`medium`), not the raw Anthropic API default of
+High (`high`). Claude Code 2.1.321 is version evidence for when the model was
+introduced, not an account-access or installed-runtime certification. Release
+maintenance must recheck those upstream sources and update catalog values and
+verification provenance when supported choices change. A catalog entry is a
+known CLI selection, not proof of
 account access: availability and alias resolution depend on CLI version,
 authentication, provider, plan, and organization policy. Settings do not probe a
 provider, start one, or authenticate on your behalf, and a release catalog does

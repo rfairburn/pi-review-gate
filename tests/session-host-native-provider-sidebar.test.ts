@@ -751,6 +751,41 @@ test("a native row is titled by its provider and stays honestly unknown", () => 
   assert.ok(piText.includes("bg tasks 0 | shells 0"), piText);
 });
 
+/** The real Claude acquisition declaration: every category is reportable. */
+const CLAUDE_SUPPORT = {
+  agent: "supported",
+  input: "supported",
+  tasks: "supported",
+  shells: "supported",
+  activity: "supported",
+} as const;
+
+/** The real Codex acquisition declaration: its census categories are N/A. */
+const CODEX_SUPPORT = {
+  agent: "supported",
+  input: "unsupported",
+  tasks: "unsupported",
+  shells: "unsupported",
+  activity: "supported",
+} as const;
+
+test("known idle Claude and Codex rows keep Ready beside truthful background counts", () => {
+  const harness = rosterWith([
+    { ...NATIVE_ITEM, busy: false, pendingInput: false, activeTasks: 1, activeShells: 1,
+      activity: ["Ready"], statusSupport: CLAUDE_SUPPORT },
+    { ...NATIVE_ITEM, id: "native-2", label: "Codex", backend: "codex", busy: false, pendingInput: null,
+      activeTasks: null, activeShells: null, activity: ["Ready"], statusSupport: CODEX_SUPPORT },
+  ]);
+  const lines = rosterText(harness, 48, 40).split("\n").map((line) => line.trimEnd());
+  assert.ok(lines.includes("  agent idle | input none"), JSON.stringify(lines));
+  assert.ok(lines.includes("  bg tasks 1 | shells 1"),
+    "the observed counts stay truthful and are never zeroed");
+  assert.ok(lines.includes("  agent idle | input N/A"), JSON.stringify(lines));
+  assert.ok(lines.includes("  bg tasks N/A | shells N/A"), JSON.stringify(lines));
+  assert.equal(lines.filter((line) => line === "    Ready").length, 2,
+    "both known-idle native rows keep the existing Ready activity line");
+});
+
 test("rename, exited resume, and unavailable activation all refuse a native row without a Pi path", () => {
   const harness = rosterWith([
     NATIVE_ITEM,

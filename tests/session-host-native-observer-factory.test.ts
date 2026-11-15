@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { NativeStatusObserver } from "../src/session-host/instances";
 import { createNativeStatusObserver } from "../src/session-host/native-observer-factory";
 import type { NativeStatusObservation } from "../src/session-host/native-status";
 
@@ -72,5 +73,32 @@ test("factory disposal is idempotent and later calls cannot emit", () => {
     observer.acceptHook({ backend, hook_event_name: "SessionEnd", session_id: "old-session" });
     observer.acceptFailure({ backend, reason: "input-invalid" });
     assert.equal(observations.length, 0);
+  }
+});
+
+test("only the Claude source can state a launch baseline; Codex keeps its unknown-until-record path", () => {
+  const observations: NativeStatusObservation[] = [];
+  const claude: NativeStatusObserver = createNativeStatusObserver({
+    rowId: "claude-row", backend: "claude", emit: (value) => observations.push(value),
+  });
+  const codex: NativeStatusObserver = createNativeStatusObserver({
+    rowId: "codex-row", backend: "codex", emit: (value) => observations.push(value),
+  });
+  try {
+    assert.equal(typeof claude.observeOwnedStartup, "function");
+    assert.equal(codex.observeOwnedStartup, undefined, "the Codex route states no launch baseline today");
+
+    claude.observeOwnedStartup!();
+    assert.equal(observations.length, 1, "the baseline is published, not held back for a hook");
+    const baseline = observations[0]!;
+    assert.equal(baseline.busy, false);
+    assert.equal(baseline.pendingInput, false);
+    assert.equal(baseline.activeTasks, 0);
+    assert.equal(baseline.activeShells, 0);
+    assert.deepEqual(baseline.activity, ["Ready"]);
+    assert.deepEqual(baseline.support, claude.support);
+  } finally {
+    claude.dispose();
+    codex.dispose();
   }
 });

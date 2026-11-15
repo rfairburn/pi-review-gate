@@ -221,6 +221,233 @@ test("a positively observed foreground turn end displays without inventing backg
   assert.ok(working.includes("bash · npm test"), working);
 });
 
+/* ------------------------------------------------------------------------- *
+ * Native foreground Ready is composed from foreground facts only
+ * ------------------------------------------------------------------------- */
+
+/** The real Claude acquisition declaration: every category is reportable. */
+const CLAUDE_SUPPORT = {
+  agent: "supported",
+  input: "supported",
+  tasks: "supported",
+  shells: "supported",
+  activity: "supported",
+} as const;
+
+/** The real Codex acquisition declaration: its census categories are N/A. */
+const CODEX_SUPPORT = {
+  agent: "supported",
+  input: "unsupported",
+  tasks: "unsupported",
+  shells: "unsupported",
+  activity: "supported",
+} as const;
+
+test("a known idle native foreground keeps Ready beside genuine background counts or a lost count source", () => {
+  const harness = rosterWith([
+    nativeItem({
+      id: "claude-bg",
+      label: "Claude bg",
+      backend: "claude",
+      busy: false,
+      pendingInput: false,
+      activeTasks: 1,
+      activeShells: 1,
+      activity: ["Ready"],
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "claude-lost",
+      label: "Claude lost",
+      backend: "claude",
+      busy: false,
+      pendingInput: false,
+      activeTasks: null,
+      activeShells: null,
+      activity: ["Ready"],
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "codex-idle",
+      label: "Codex idle",
+      backend: "codex",
+      busy: false,
+      pendingInput: null,
+      activeTasks: null,
+      activeShells: null,
+      activity: ["Ready"],
+      statusSupport: CODEX_SUPPORT,
+    }),
+  ]);
+  const texts = rosterLines(harness, 48, 40);
+  const known = cardLines(texts, "Claude bg").join("\n");
+  assert.ok(known.includes("agent idle | input none"), known);
+  assert.ok(known.includes("bg tasks 1 | shells 1"), `the observed counts stay truthful:\n${known}`);
+  assert.ok(known.includes("Ready"), `the existing activity line is the Ready statement:\n${known}`);
+  const lost = cardLines(texts, "Claude lost").join("\n");
+  assert.ok(lost.includes("agent idle | input none"), lost);
+  assert.ok(lost.includes("background unknown"),
+    `a lost count source keeps the existing unknown summary and is never zeroed:\n${lost}`);
+  assert.ok(lost.includes("Ready"), lost);
+  const codex = cardLines(texts, "Codex idle").join("\n");
+  assert.ok(codex.includes("agent idle | input N/A"), codex);
+  assert.ok(codex.includes("bg tasks N/A | shells N/A"), codex);
+  assert.ok(codex.includes("Ready"), codex);
+});
+
+test("genuine busy, pending input, and unknown foreground facts are never promoted to Ready", () => {
+  const harness = rosterWith([
+    nativeItem({
+      id: "busy",
+      label: "Native busy",
+      backend: "claude",
+      busy: true,
+      pendingInput: false,
+      activeTasks: 0,
+      activeShells: 0,
+      activity: ["Working"],
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "pending",
+      label: "Native pending",
+      backend: "claude",
+      busy: false,
+      pendingInput: true,
+      activeTasks: 0,
+      activeShells: 0,
+      activity: ["Working"],
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "unknown-busy",
+      label: "Unknown busy",
+      backend: "claude",
+      busy: null,
+      pendingInput: false,
+      activeTasks: 1,
+      activeShells: 1,
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "unknown-busy-zero",
+      label: "Unknown busy zero",
+      backend: "claude",
+      busy: null,
+      pendingInput: false,
+      activeTasks: 0,
+      activeShells: 0,
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "unknown-input",
+      label: "Unknown input",
+      backend: "claude",
+      busy: false,
+      pendingInput: null,
+      activeTasks: 1,
+      activeShells: 1,
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "unknown-input-zero",
+      label: "Unknown input zero",
+      backend: "claude",
+      busy: false,
+      pendingInput: null,
+      activeTasks: 0,
+      activeShells: 0,
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+    nativeItem({
+      id: "codex-unknown",
+      label: "Codex unknown",
+      backend: "codex",
+      busy: null,
+      pendingInput: null,
+      activeTasks: null,
+      activeShells: null,
+      statusSupport: CODEX_SUPPORT,
+    }),
+  ]);
+  const texts = rosterLines(harness, 48, 52);
+  const busy = cardLines(texts, "Native busy").join("\n");
+  assert.ok(busy.includes("agent running | input none"), busy);
+  assert.ok(!busy.includes("agent idle"), busy);
+  const pending = cardLines(texts, "Native pending").join("\n");
+  assert.ok(pending.includes("agent waiting | input pending"), pending);
+  assert.ok(!pending.includes("agent idle"), pending);
+  // Unknown foreground facts are never promoted to Ready, and their existing
+  // count-based reading is untouched.
+  const unknownBusy = cardLines(texts, "Unknown busy").join("\n");
+  assert.ok(unknownBusy.includes("agent running | input none"), unknownBusy);
+  assert.ok(!unknownBusy.includes("agent idle"), unknownBusy);
+  assert.ok(unknownBusy.includes("bg tasks 1 | shells 1"),
+    "a background count keeps its existing display reading here");
+  const unknownBusyZero = cardLines(texts, "Unknown busy zero").join("\n");
+  assert.ok(unknownBusyZero.includes("agent unknown | input none"), unknownBusyZero);
+  assert.ok(!unknownBusyZero.includes("agent idle"), unknownBusyZero);
+  const unknownInput = cardLines(texts, "Unknown input").join("\n");
+  assert.ok(unknownInput.includes("agent running | input unknown"), unknownInput);
+  assert.ok(!unknownInput.includes("agent idle"), unknownInput);
+  const unknownInputZero = cardLines(texts, "Unknown input zero").join("\n");
+  assert.ok(unknownInputZero.includes("agent unknown | input unknown"), unknownInputZero);
+  assert.ok(!unknownInputZero.includes("agent idle"), unknownInputZero);
+  const codexUnknown = cardLines(texts, "Codex unknown").join("\n");
+  assert.ok(codexUnknown.includes("agent unknown | input N/A"), codexUnknown);
+  assert.ok(!codexUnknown.includes("agent idle"), codexUnknown);
+});
+
+test("Pi's nonzero and unknown count readings are unchanged and a native rest line grants no Stop authority", () => {
+  const piHarness = rosterWith([
+    piItem({
+      id: "pi-bg",
+      label: "Pi bg",
+      busy: false,
+      pendingInput: false,
+      activeTasks: 1,
+      activeShells: 1,
+      activity: ["Ready"],
+    }),
+    piItem({ id: "pi-lost", label: "Pi lost", busy: false, pendingInput: false }),
+  ]);
+  const texts = rosterLines(piHarness, 44, 30);
+  const bg = cardLines(texts, "Pi bg").join("\n");
+  assert.ok(bg.includes("agent running | input none"),
+    `a Pi row keeps its unchanged nonzero-count reading:\n${bg}`);
+  assert.ok(bg.includes("bg tasks 1 | shells 1"), bg);
+  const lost = cardLines(texts, "Pi lost").join("\n");
+  assert.ok(lost.includes("agent unknown | input none"),
+    `a Pi row's lost count source still blocks rest:\n${lost}`);
+  assert.ok(lost.includes("background unknown"), lost);
+
+  // The native Ready card is DISPLAY only: stop/remove still needs the existing
+  // confirmation because this row carries no positively observed ownership zeros.
+  const nativeHarness = rosterWith([
+    nativeItem({
+      id: "native-idle",
+      label: "Native idle",
+      backend: "claude",
+      busy: false,
+      pendingInput: false,
+      activeTasks: 1,
+      activeShells: 1,
+      activity: ["Ready"],
+      statusSupport: CLAUDE_SUPPORT,
+    }),
+  ]);
+  void rosterLines(nativeHarness);
+  nativeHarness.send("\x1b[A"); // New -> Saved conversations
+  nativeHarness.send("\x1b[A"); // -> the native card
+  assert.equal(nativeHarness.controller.selectedId, "native-idle");
+  nativeHarness.baseline = nativeHarness.actions.length;
+  nativeHarness.send("d");
+  assert.equal(nativeHarness.controller.focus, "confirm",
+    "a displayed native rest line never authorizes an unconfirmed stop");
+  assert.deepEqual(nativeHarness.actions.slice(nativeHarness.baseline), [],
+    "nothing is stopped before the operator confirms");
+});
+
 test("a Pi row and a row with no declaration render exactly as before", () => {
   const harness = rosterWith([
     piItem({
@@ -395,8 +622,8 @@ test("the Network pane's plain activity summary uses the same applicability word
     harness.send("\x1b[B");
   }
   const summary = lines.filter((line) => line.includes("plain summary")).join("\n");
-  // One observed shell is the only running fact; the unreportable categories say so
-  // in the same plain line the palette-free renderer uses.
-  assert.ok(summary.includes("agent running | input N/A"), summary);
+  // The observed shell is a background DISPLAY fact: the foreground is at rest,
+  // and the unreportable categories say so in the same plain line.
+  assert.ok(summary.includes("agent idle | input N/A"), summary);
   assert.ok(summary.includes("bg tasks N/A | shells 1"), summary);
 });

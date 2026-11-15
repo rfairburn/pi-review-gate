@@ -197,8 +197,15 @@ class SpyNativeRegistrar implements NativeHookSourceRegistrar {
 class SpyObserver implements NativeStatusObserver {
   readonly hooks: NativeHookEvent[] = [];
   readonly failures: NativeHookFailure[] = [];
+  /** One entry per launch-baseline call the owner made, in the order it made them. */
+  readonly startupCalls: number[] = [];
   disposeCount = 0;
   readonly support: NativeStatusSupportMap;
+  /**
+   * What this source states for a run the host launched itself. `null` keeps the
+   * observer exactly as it was: the manager's optional call changes nothing.
+   */
+  startupBaseline: NativeStatusObservation | null = null;
 
   constructor(
     readonly context: NativeStatusObserverContext,
@@ -211,6 +218,11 @@ class SpyObserver implements NativeStatusObserver {
   acceptFailure(failure: NativeHookFailure): void { this.failures.push(failure); }
   dispose(): void { this.disposeCount += 1; }
   emit(observation: NativeStatusObservation): NativeStatusSubmitResult { return this.context.emit(observation); }
+
+  observeOwnedStartup(): void {
+    this.startupCalls.push(this.hooks.length);
+    if (this.startupBaseline !== null) void this.emit(this.startupBaseline);
+  }
 }
 
 /** A staged-artifact handle that only counts how often it was asked to clean up. */
@@ -1384,6 +1396,78 @@ test("an observer that throws in acceptFailure before activation cannot publish 
     harness.nativeRegistrar.emitEvent(id, { backend: "claude", hook_event_name: "Stop" });
     assert.equal(observer.emit({ busy: true }).accepted, false);
     assertCollapsedToUnknown(harness.manager, id);
+  } finally {
+    await harness.manager.dispose();
+  }
+});
+
+test("the owner states the launch baseline once the capture is live and no hook has arrived", async () => {
+  const declared: NativeStatusSupportMap = {
+    agent: "supported", input: "supported", tasks: "supported", shells: "supported", activity: "supported",
+  };
+  const harness = makeOwnerHarness("startup-baseline", { support: declared });
+  try {
+    harness.setObserverFactory((context) => {
+      const observer = new SpyObserver(context, declared);
+      observer.startupBaseline = {
+        busy: false, pendingInput: false, activeTasks: 0, activeShells: 0, activity: ["Ready"],
+      };
+      harness.observers.push(observer);
+      return observer;
+    });
+
+    const id = await createNative(harness, "claude");
+    const observer = lastObserver(harness);
+
+    // Exactly one statement, and it landed: a call before the run's capture
+    // existed would have been refused by the capture, so the row carrying it is
+    // the proof that activation had already bound this exact live handle.
+    assert.equal(observer.startupCalls.length, 1);
+    assert.equal(observer.startupCalls[0], 0, "no provider hook had been delivered when the baseline was stated");
+
+    const view = viewOf(harness.manager, id);
+    assert.equal(view.busy, false);
+    assert.equal(view.pendingInput, false);
+    assert.equal(view.activeTasks, 0);
+    assert.equal(view.activeShells, 0);
+    assert.deepEqual(view.activity, ["Ready"]);
+    assert.deepEqual(view.statusSupport, declared);
+
+    // Real provider observations then take over normally.
+    harness.nativeRegistrar.emitEvent(id, { backend: "claude", hook_event_name: "UserPromptSubmit", session_id: "synthetic-session" });
+    const result = observer.emit({ busy: true, pendingInput: null, activeTasks: null, activeShells: null, activity: ["Working"] });
+    assert.equal(result.accepted, true);
+    assert.equal(viewOf(harness.manager, id).busy, true);
+
+    // Retirement still collapses the row to unknown; the baseline is not a hold-over.
+    await harness.manager.stop(id, { confirmed: true });
+    const stopped = viewOf(harness.manager, id);
+    assert.equal(stopped.busy, null, "a retired run never keeps a launch baseline");
+    assert.equal(stopped.activeTasks, null);
+  } finally {
+    await harness.manager.dispose();
+  }
+});
+
+test("an observer that states no launch baseline keeps the row entirely unknown", async () => {
+  const harness = makeOwnerHarness("no-startup-hook", { support: { agent: "supported" } });
+  try {
+    harness.setObserverFactory((context) => {
+      const silent: NativeStatusObserver = {
+        support: { agent: "supported" },
+        acceptHook: () => undefined,
+        acceptFailure: () => undefined,
+        dispose: () => undefined,
+      };
+      return silent;
+    });
+    const id = await createNative(harness, "claude");
+    const view = viewOf(harness.manager, id);
+    assert.equal(view.busy, null, "no baseline hook means no baseline claim");
+    assert.equal(view.pendingInput, null);
+    assert.equal(view.activeTasks, null);
+    assert.equal(view.activeShells, null);
+    assert.deepEqual(view.activity, []);
   } finally {
     await harness.manager.dispose();
   }

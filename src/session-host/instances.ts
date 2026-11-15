@@ -1018,6 +1018,17 @@ export interface NativeStatusObserver {
 	 * run's status capture — so an observer without this hook behaves identically.
 	 */
 	invalidate?(): void;
+	/**
+	 * Optional: state the baseline this source can state for a native run the HOST
+	 * itself launched. It is called once, synchronously, when this run's status
+	 * capture is already bound to the exact live PTY handle and incarnation and no
+	 * input has been sent to the child — the source therefore does not have to wait
+	 * for a provider hook to know the run started idle with nothing pending. A
+	 * source that cannot state a launch-time baseline omits this hook and keeps
+	 * today's all-unknown-until-first-observation behaviour, and a source that can
+	 * still refuses the claim if it has already observed work.
+	 */
+	observeOwnedStartup?(): void;
 	/** Retire this observer. Idempotent; it never signals or waits on the child. */
 	dispose(): void;
 }
@@ -4100,6 +4111,17 @@ export class InstanceManager {
 		run.capture = capture;
 		run.activated = true;
 		this.#publishNativeStatusSupport(run);
+		// The child exists, this run's capture is bound to this exact handle and
+		// incarnation, and nothing has been typed into the row: that is the only
+		// moment a source may state its launch-time baseline, and the only fact the
+		// manager contributes to it — that it owns this spawn. A source without the
+		// hook, and a source that refuses because it already observed work, change
+		// nothing, and a throw here can never disturb the live run.
+		try {
+			run.observer?.observeOwnedStartup?.();
+		} catch {
+			// An observer's own baseline claim is contained: the run stays live.
+		}
 	}
 
 	/**

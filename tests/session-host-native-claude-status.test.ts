@@ -353,8 +353,10 @@ test("a delayed event from an older root prompt cannot move the foreground or co
   expectOutcome(reducer.confirmTurnEnd({ promptId: "p1" }), "ignored", "stale-prompt");
   const confirmed = reducer.confirmTurnEnd({ promptId: "p2" });
   expectOutcome(confirmed, "applied", "turn-ended-confirmed");
-  // The unresolved request is withdrawn as unverifiable, never as answered.
-  assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: null, activity: ["Ready"] });
+  // The source stated the root turn ENDED, so the still-open root request ended
+  // with it: nothing awaits input any more. It is never reported as answered —
+  // only as no longer pending — and the census is not stranded as unknown.
+  assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
 test("subagent edges never mark the root foreground Ready or replace its tool activity", () => {
@@ -583,7 +585,7 @@ test("an unbound terminal claim cannot overwrite live work, and a repeated read 
   );
 });
 
-test("an unresolved question survives a Stop candidate and is withdrawn only by a confirmed end", () => {
+test("a confirmed root turn end ENDS its unresolved root request, never a child's", () => {
   const reducer = boundReducer();
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
   reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
@@ -599,14 +601,32 @@ test("an unresolved question survives a Stop candidate and is withdrawn only by 
   expectOutcome(closed, "applied", "question-request-closed");
   assert.equal(snapshotOf(closed).pendingInput, false);
 
-  // A request still unresolved at a confirmed terminal record is withdrawn as
-  // unverifiable, never reported as answered.
+  // A request still open at a CONFIRMED terminal record ended with that turn: the
+  // provider stated the turn over, so nothing awaits input. It is retired as no
+  // longer pending — never as answered — and the census keeps its definitive
+  // answer instead of being stranded as unknown for the rest of the scope.
   reducer.reduce(questionOpen("toolu_q2"));
   const confirmed = reducer.confirmTurnEnd({ promptId: "p1" });
   expectOutcome(confirmed, "applied", "turn-ended-confirmed");
-  assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: null, activity: ["Ready"] });
+  assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: false, activity: ["Ready"] });
   expectOutcome(reducer.reduce(questionClose("toolu_q2")), "ignored", "duplicate-question-close");
-  assert.equal(reducer.snapshot().pendingInput, null);
+  assert.equal(reducer.snapshot().pendingInput, false);
+
+  // A subagent's still-open request survives a root completion: it lives in
+  // another conversation, and its own definitive close edge owns it.
+  const child = boundReducer();
+  child.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  child.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_child" }));
+  assert.equal(child.snapshot().pendingInput, true);
+  const childEnded = child.confirmTurnEnd({ promptId: "p1" });
+  expectOutcome(childEnded, "applied", "turn-ended-confirmed");
+  assert.deepEqual(snapshotOf(childEnded), { busy: false, pendingInput: true, activity: ["Ready"] });
+  expectOutcome(
+    child.reduce(subagentHook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_child" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.equal(child.snapshot().pendingInput, false);
 });
 
 test("activity keeps the current/last tool TYPE only, with no payload text", () => {
@@ -734,19 +754,37 @@ test("a genuine SessionStart rebinds scope, clears stale claims, and vouches the
   reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
   reducer.reduce(hook("Stop", { stop_hook_active: false }));
   reducer.confirmTurnEnd({ promptId: "p1" });
-  // The still-unresolved request is withdrawn as unverifiable, so no definitive
-  // none-remain claim survives into the Ready state.
-  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: null, activity: ["Ready"] });
+  // The still-unresolved request ended with that confirmed turn, so the Ready the
+  // scope now carries is a definitive none-pending, not an unknown.
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 
-  for (const source of ["startup", "resume", "clear", "compact", "fork"]) {
+  // A source that describes a new or resumed conversation rebinds this scope:
+  // no inherited Ready, no inherited pending request, and no fake Ready from the
+  // boundary itself; the fully observed fresh scope vouches its census empty.
+  for (const source of ["resume", "clear", "compact", "fork"]) {
     const rebound = reducer.reduce(hook("SessionStart", { source, model: "private-model-name" }));
     expectOutcome(rebound, "applied", "scope-rebound");
-    // No inherited Ready, no inherited pending request, and no fake Ready from
-    // startup; the fully observed fresh scope vouches its census empty.
     assert.deepEqual(snapshotOf(rebound), { busy: null, pendingInput: false, activity: [] });
     reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
     reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
   }
+  // A `startup` notice naming this same already-bound conversation is not a new
+  // boundary at all: it is refused, and the live turn and its request survive.
+  expectOutcome(
+    reducer.reduce(hook("SessionStart", { source: "startup", model: "private-model-name" })),
+    "ignored",
+    "duplicate-session-start",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+  // The same conversation id arriving as a genuinely new conversation still
+  // rebinds, and that new scope is armed for its own corroboration.
+  expectOutcome(
+    reducer.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "startup" })),
+    "applied",
+    "scope-rebound",
+  );
+  expectOutcome(reducer.confirmFreshStart({ sessionId: OTHER_SESSION }), "applied", "fresh-start-confirmed");
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
 test("events from another native session cannot close current questions or overwrite tool state", () => {
@@ -977,4 +1015,228 @@ test("the none baseline becomes pending only for an actual open question request
   // blanket none for an unbound row.
   expectUnknown(reducer.invalidate());
   assert.equal(reducer.snapshot().pendingInput, null);
+});
+
+test("the host's own launch states a fresh idle baseline before any prompt or hook", () => {
+  const reducer = new NativeClaudeStatusReducer();
+  expectUnknown(reducer.snapshot());
+
+  // The evidence is the spawn itself: this controller's owner started the process
+  // and has sent it nothing, so nothing has run in it and nothing awaits input.
+  const baseline = reducer.observeOwnedStartup();
+  expectOutcome(baseline, "applied", "startup-baseline");
+  assert.deepEqual(snapshotOf(baseline), { busy: false, pendingInput: false, activity: ["Ready"] });
+
+  // Repeating the statement is not news and changes nothing.
+  expectOutcome(reducer.observeOwnedStartup(), "applied", "startup-baseline");
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+
+  // Once real work has been observed the launch baseline is refused outright: a
+  // late call can never idle a live turn, and it leaves the running state intact.
+  const running = new NativeClaudeStatusReducer();
+  running.observeOwnedStartup();
+  running.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  expectOutcome(running.observeOwnedStartup(), "ignored", "startup-baseline-superseded");
+  // The census began with the process, so the accepted turn still knows nothing is
+  // pending — while the idle claim itself is not restorable over it.
+  assert.deepEqual(running.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // An open question request is observed work too, and an ended scope is closed.
+  const asked = new NativeClaudeStatusReducer();
+  asked.observeOwnedStartup();
+  asked.reduce(questionOpen("toolu_q1"));
+  expectOutcome(asked.observeOwnedStartup(), "ignored", "startup-baseline-superseded");
+  assert.equal(asked.snapshot().pendingInput, true);
+
+  const ended = new NativeClaudeStatusReducer();
+  ended.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  expectOutcome(ended.reduce(hook("SessionEnd", { reason: "prompt_input_exit" })), "applied", "scope-ended");
+  expectOutcome(ended.observeOwnedStartup(), "ignored", "scope-closed");
+  expectUnknown(ended.snapshot());
+
+  // The baseline states no native conversation, so it never invents a binding: a
+  // real event for the run's own session is still adopted normally.
+  const adopted = new NativeClaudeStatusReducer();
+  adopted.observeOwnedStartup();
+  expectOutcome(
+    adopted.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_b" })),
+    "applied",
+    "tool-type-observed",
+  );
+  assert.deepEqual(adopted.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+});
+
+test("a launch baseline survives its own SessionStart but never crosses observed work", () => {
+  for (const source of ["startup", "clear", "resume", "compact", "fork", undefined]) {
+    const reducer = new NativeClaudeStatusReducer();
+    reducer.observeOwnedStartup();
+    // The provider restating this process's boundary — or the user clearing or
+    // resuming into an idle row — says nothing that contradicts "nothing has run
+    // yet", so the row does not blink through unknown.
+    const rebound = reducer.reduce(hook("SessionStart", { source }));
+    expectOutcome(rebound, "applied", "scope-rebound");
+    assert.deepEqual(snapshotOf(rebound), { busy: false, pendingInput: false, activity: ["Ready"] });
+  }
+
+  // After real work, a SessionStart for a conversation it does not already name
+  // rebinds to unknown exactly as before: the idle claim is never carried across
+  // a turn. A `startup` naming the SAME conversation is refused instead (below).
+  const worked = new NativeClaudeStatusReducer();
+  worked.observeOwnedStartup();
+  worked.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  const rebound = worked.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "startup" }));
+  expectOutcome(rebound, "applied", "scope-rebound");
+  assert.deepEqual(snapshotOf(rebound), { busy: null, pendingInput: false, activity: [] });
+
+  expectOutcome(
+    worked.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "startup" })),
+    "ignored",
+    "duplicate-session-start",
+  );
+  assert.deepEqual(worked.snapshot(), { busy: null, pendingInput: false, activity: [] });
+});
+
+test("a fresh root SessionStart idles only once the caller's read found no prerecorded work", () => {
+  const fresh = new NativeClaudeStatusReducer();
+  // The boundary alone still claims no foreground: the provider's `source` says
+  // this is a new conversation, but only the caller can read its own source.
+  expectOutcome(fresh.reduce(hook("SessionStart", { source: "startup" })), "applied", "scope-rebound");
+  assert.deepEqual(fresh.snapshot(), { busy: null, pendingInput: false, activity: [] });
+
+  const confirmed = fresh.confirmFreshStart({ sessionId: SESSION, sourceToken: "read-1" });
+  expectOutcome(confirmed, "applied", "fresh-start-confirmed");
+  assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: false, activity: ["Ready"] });
+
+  // The corroboration is one-shot, and a foreign conversation cannot supply it.
+  expectOutcome(fresh.confirmFreshStart({ sessionId: SESSION, sourceToken: "read-2" }), "ignored", "fresh-start-superseded");
+  expectOutcome(fresh.confirmFreshStart({ sessionId: OTHER_SESSION }), "ignored", "stale-session");
+
+  // `resume`, `compact`, `fork`, and an unreadable source all continue recorded
+  // work, so there is nothing to corroborate and no idle claim follows.
+  for (const source of ["resume", "compact", "fork", "", 7]) {
+    const resumed = new NativeClaudeStatusReducer();
+    expectOutcome(resumed.reduce(hook("SessionStart", { source })), "applied", "scope-rebound");
+    expectOutcome(resumed.confirmFreshStart({ sessionId: SESSION }), "ignored", "fresh-start-superseded");
+    assert.deepEqual(resumed.snapshot(), { busy: null, pendingInput: false, activity: [] });
+  }
+
+  // A start whose work arrived before the corroboration is never idled late.
+  const late = new NativeClaudeStatusReducer();
+  late.reduce(hook("SessionStart", { source: "startup" }));
+  late.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  expectOutcome(late.confirmFreshStart({ sessionId: SESSION }), "ignored", "fresh-start-superseded");
+  assert.deepEqual(late.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // A child's start never establishes a root fresh scope at all.
+  const child = new NativeClaudeStatusReducer();
+  expectOutcome(
+    child.reduce(subagentHook("SessionStart", { source: "startup" })),
+    "ignored",
+    "subagent-scope",
+  );
+  expectOutcome(child.confirmFreshStart({ sessionId: SESSION }), "ignored", "fresh-start-superseded");
+  expectUnknown(child.snapshot());
+});
+
+test("a persisted tool_result closes an open root question without any answer content", () => {
+  const ANSWER_BODY = "the-user-picked-this-option-secret";
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.equal(reducer.snapshot().pendingInput, true);
+
+  // The declined/cancelled shape: the provider persisted the tool_result for this
+  // exact request identity even though no Post hook ever reached this observer.
+  const closed = reducer.observeQuestionToolResult({ requestId: "toolu_q1", sessionId: SESSION });
+  expectOutcome(closed, "applied", "question-request-closed");
+  assert.deepEqual(snapshotOf(closed), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // The identities offered for matching are ROOT request identities only, and
+  // nothing about the question itself is among them.
+  const offered = new NativeClaudeStatusReducer();
+  offered.reduce(questionOpen("toolu_offer", { question: QUESTION_TEXT }));
+  offered.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_sub" }));
+  assert.deepEqual(offered.openQuestionRequestIds(), ["toolu_offer"]);
+  assert.equal(JSON.stringify(offered.openQuestionRequestIds()).includes(QUESTION_TEXT), false);
+
+  // A replay of the same evidence is a duplicate, never a fresh closure.
+  expectOutcome(reducer.observeQuestionToolResult({ requestId: "toolu_q1" }), "ignored", "duplicate-question-close");
+
+  // Some other tool's result is not this census's business: an identity this
+  // reducer never opened as a root question changes nothing, not even the census.
+  expectOutcome(reducer.observeQuestionToolResult({ requestId: "toolu_bash" }), "ignored", "question-tool-result-unobserved");
+  assert.equal(reducer.snapshot().pendingInput, false);
+
+  // A request observed in a subagent context is never closed from the root
+  // conversation, and a foreign session cannot close anything at all.
+  const scoped = boundReducer();
+  scoped.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_shared" }));
+  scoped.reduce(questionOpen("toolu_shared"));
+  expectOutcome(scoped.observeQuestionToolResult({ requestId: "toolu_shared" }), "applied", "question-request-closed");
+  assert.equal(scoped.snapshot().pendingInput, true, "only the root request closed");
+  expectOutcome(
+    scoped.observeQuestionToolResult({ requestId: "toolu_shared", sessionId: OTHER_SESSION }),
+    "ignored",
+    "stale-session",
+  );
+
+  // No identity, no closure — and nothing about the result was ever needed.
+  expectOutcome(reducer.observeQuestionToolResult({ requestId: "  " }), "ignored", "question-close-unidentified");
+  expectOutcome(
+    reducer.observeQuestionToolResult({} as { requestId: string }),
+    "ignored",
+    "question-close-unidentified",
+  );
+  assert.equal(JSON.stringify(reducer.snapshot()).includes(ANSWER_BODY), false);
+
+  // With the root request closed, nothing is offered for the root conversation:
+  // a subagent's still-open request is never matched against a root row.
+  assert.deepEqual(scoped.openQuestionRequestIds(), []);
+});
+
+test("duplicate same-session startup notices change nothing and never arm an idle corroboration", () => {
+  const reducer = new NativeClaudeStatusReducer();
+  reducer.reduce(hook("SessionStart", { source: "startup" }));
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  const running = reducer.snapshot();
+  assert.deepEqual(running, { busy: true, pendingInput: true, activity: ["Working"] });
+
+  // Two late or repeated `startup` notices for the very conversation already at
+  // work, whose source has not persisted this turn yet. Neither is a new
+  // boundary: the foreground, the activity line, and above all the live question
+  // request stay exactly as they were.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    expectOutcome(
+      reducer.reduce(hook("SessionStart", { source: "startup" })),
+      "ignored",
+      "duplicate-session-start",
+    );
+    assert.deepEqual(reducer.snapshot(), running, "a duplicate start changes nothing at all");
+  }
+
+  // With the scope untouched, the corroboration a later empty-source read would
+  // supply is still refused: the live turn is never idled or zeroed.
+  expectOutcome(reducer.confirmFreshStart({ sessionId: SESSION }), "ignored", "fresh-start-superseded");
+  assert.deepEqual(reducer.snapshot(), running);
+
+  // The request the duplicate would have deleted is still tracked, and closes on
+  // its own matching edge afterwards.
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // A start naming a conversation this reducer has NOT bound is a genuine new
+  // boundary even though the conversation it replaces ran work: it rebinds, and
+  // its own empty source may corroborate its own baseline.
+  expectOutcome(
+    reducer.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" })),
+    "applied",
+    "scope-rebound",
+  );
+  expectOutcome(reducer.confirmFreshStart({ sessionId: OTHER_SESSION }), "applied", "fresh-start-confirmed");
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });

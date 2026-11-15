@@ -72,6 +72,7 @@ import type { NativeCliBackend } from "../src/session-host/session-backend";
 const SECRET_PROMPT = "SECRET-PROMPT-TEXT";
 const SECRET_TOOL_INPUT = "SECRET-TOOL-INPUT-JSON";
 const SECRET_AGENT_MESSAGE = "SECRET-LAST-AGENT-MESSAGE";
+const SECRET_DECLINE_TEXT = "SECRET-DECLINED-QUESTION-RESULT-TEXT";
 
 const ownedDirectories: string[] = [];
 /** Any broker still listening when a test ends would hold the runner open. */
@@ -398,6 +399,95 @@ const claudeSummaryRow = (fields: Record<string, unknown> = {}) => `${JSON.strin
   ...fields,
 })}\n`;
 
+/**
+ * The persisted ROOT tool-result row of a question the user DECLINED: no
+ * `toolUseResult` envelope at all, only the structured `tool_result` block inside
+ * `message.content`, exactly as the provider writes it when no Post hook ran.
+ */
+const claudeDeclinedToolResultRow = (sessionId: string, requestId: string): string => `${JSON.stringify({
+  type: "user",
+  sessionId,
+  isSidechain: false,
+  message: {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: requestId, content: SECRET_DECLINE_TEXT, is_error: true }],
+  },
+  uuid: `declined-${requestId}`,
+  timestamp: "2026-01-02T03:04:06.000Z",
+})}\n`;
+
+test("a freshly spawned Claude row is known idle before any provider hook, and the provider's own boundary keeps it there", async () => {
+  const harness = await makeHarness();
+  try {
+    const id = await harness.create("claude");
+
+    // Nothing was relayed, no transcript was opened, and nothing was typed. The
+    // evidence is the spawn the manager itself performed.
+    const fresh = harness.view(id);
+    assert.equal(fresh.busy, false);
+    assert.equal(fresh.pendingInput, false);
+    assert.equal(fresh.activeTasks, 0);
+    assert.equal(fresh.activeShells, 0);
+    assert.deepEqual(fresh.activity, ["Ready"]);
+
+    const transcript = transcriptFile(harness, "claude-fresh.jsonl");
+    const bootstrap = bootstrapOf(harness);
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "SessionStart", { source: "startup" }));
+    const boundary = harness.view(id);
+    assert.equal(boundary.busy, false, "the provider's own start does not blank the known baseline");
+    assert.deepEqual(boundary.activity, ["Ready"]);
+    assert.equal(boundary.activeTasks, 0);
+
+    // Real work still takes over normally, and the provider's own numbers replace
+    // the launch-time zeros.
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "UserPromptSubmit", { prompt_id: "p-1" }));
+    const running = await harness.waitView(id, (view) => view.busy === true, "the accepted root turn");
+    assert.deepEqual(running.activity, ["Working"]);
+    assert.equal(running.pendingInput, false);
+
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "Stop", {
+      prompt_id: "p-1",
+      background_tasks: [{ id: "shell-1", description: SECRET_AGENT_MESSAGE, type: "shell", status: "running", backgrounded: true }],
+    }));
+    const stopped = harness.view(id);
+    assert.equal(stopped.activeShells, 1, "the root Stop snapshot supersedes the launch baseline");
+    assert.equal(stopped.activeTasks, 0);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("a declined question clears pending input from its persisted tool_result, with no Post hook", async () => {
+  const harness = await makeHarness();
+  try {
+    const id = await harness.create("claude");
+    const transcript = transcriptFile(harness, "claude-declined.jsonl");
+    const bootstrap = bootstrapOf(harness);
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "SessionStart", { source: "startup" }));
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "UserPromptSubmit", { prompt_id: "p-1" }));
+    await harness.waitView(id, (view) => view.busy === true, "the running root turn");
+
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "PreToolUse", {
+      prompt_id: "p-1", tool_name: "AskUserQuestion", tool_use_id: "q-1",
+    }));
+    const asked = await harness.waitView(id, (view) => view.pendingInput === true, "the open question request");
+    assert.equal(asked.busy, true);
+
+    // The user declined. No Post hook ever ran for this request; the provider's
+    // own persisted tool_result for that exact identity is the terminal evidence.
+    appendFileSync(transcript, claudeDeclinedToolResultRow("sess-a", "q-1"), "utf8");
+    const cleared = await harness.waitView(id, (view) => view.pendingInput === false, "the persisted tool_result closed the request");
+    assert.equal(cleared.busy, true, "closing a declined question is not a turn end");
+    assert.deepEqual(cleared.activity, ["Working"]);
+
+    // Nothing about the result crosses the row's public surface.
+    assert.ok(!JSON.stringify(harness.manager.list()).includes(SECRET_DECLINE_TEXT));
+    assert.ok(!JSON.stringify(harness.manager.list()).includes(transcript));
+  } finally {
+    await harness.dispose();
+  }
+});
+
 /* ------------------------------------------------------------------ tests */
 
 test("activation: the real broker's fresh bootstrap is registered before the provider and the spawn, and the prepared lease is retained", async () => {
@@ -426,16 +516,18 @@ test("activation: the real broker's fresh bootstrap is registered before the pro
     assert.equal(harness.leases[0]!.cleanupCount, 0);
     assert.equal(harness.spawned.length, 1);
 
-    // No observation has arrived yet: every supported field is unknown, never
-    // Ready, never zero. The source's own declaration is published at activation.
+    // The row's own child is live and the host launched it, so its baseline is
+    // already known before any provider hook, any transcript read, or any prompt:
+    // idle, nothing pending, nothing backgrounded. The source's own declaration is
+    // published at activation alongside it.
     const view = harness.view(id);
     assert.equal(view.backend, "claude");
     assert.equal(view.lifecycle, "alive");
-    assert.equal(view.busy, null);
-    assert.equal(view.pendingInput, null);
-    assert.equal(view.activeTasks, null);
-    assert.equal(view.activeShells, null);
-    assert.deepEqual(view.activity, []);
+    assert.equal(view.busy, false, "a run the host just started is known idle, not unknown");
+    assert.equal(view.pendingInput, false);
+    assert.equal(view.activeTasks, 0, "a brand-new provider process has no background work to report");
+    assert.equal(view.activeShells, 0);
+    assert.deepEqual(view.activity, ["Ready"]);
     assert.deepEqual(view.statusSupport, {
       agent: "supported", input: "supported", tasks: "supported", shells: "supported", activity: "supported",
     });
@@ -452,8 +544,13 @@ test("a real Claude turn: hook lane publishes running, the tool TYPE, and the qu
     const transcript = transcriptFile(harness, "claude-session.jsonl");
     const bootstrap = bootstrapOf(harness);
 
-    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "SessionStart"))).status, "accepted");
-    assert.equal(harness.view(id).busy, null, "a session boundary alone claims no foreground state");
+    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "SessionStart", { source: "startup" }))).status, "accepted");
+    // The provider restating this process's own boundary neither invents nor
+    // loses the idle claim the host already stated from its spawn: the row does
+    // not blink through unknown while the provider catches up.
+    const boundary = harness.view(id);
+    assert.equal(boundary.busy, false);
+    assert.deepEqual(boundary.activity, ["Ready"]);
 
     assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "UserPromptSubmit", { prompt_id: "p-1" }))).status, "accepted");
     const running = await harness.waitView(id, (view) => view.busy === true, "the accepted root turn");
@@ -553,6 +650,9 @@ test("an inconclusive root summary is neither Ready nor idle, and the same live 
       background_tasks: [{ id: "task-1", description: SECRET_AGENT_MESSAGE, type: "agent", status: "running", backgrounded: true }],
     }));
     await harness.waitView(id, (view) => view.activeTasks === 1, "the root Stop snapshot");
+    // The only idle view this row ever carried so far is the host's launch
+    // baseline, published before the turn began.
+    const idleViewsBefore = harness.viewsOf(id).filter((view) => view.busy === false).length;
 
     // One batch: a summary whose `preventedContinuation: false` sits alongside a
     // nonempty `hookErrors` array (blocking and nonblocking outcomes mixed, so the
@@ -566,7 +666,7 @@ test("an inconclusive root summary is neither Ready nor idle, and the same live 
     })}\n`, "utf8");
     await harness.waitView(id, (view) => view.activeTasks === null, "the appended summary batch was read and decided");
 
-    assert.ok(!harness.viewsOf(id).some((view) => view.busy === false),
+    assert.equal(harness.viewsOf(id).filter((view) => view.busy === false).length, idleViewsBefore,
       "an undecidable summary never became Ready, and nothing published since the Stop claimed it either");
 
     // The same live observer recovers on the next accepted root turn.
@@ -660,9 +760,9 @@ test("observations reach only the exact owned row: a sibling row's hook changes 
     await harness.waitView(first, (view) => view.busy === true, "the first row's running turn");
 
     const other = harness.view(second);
-    assert.equal(other.busy, null, "another row's provider state is untouched");
-    assert.equal(other.activeTasks, null);
-    assert.deepEqual(other.activity, []);
+    assert.equal(other.busy, false, "another row stays on its own launch baseline");
+    assert.equal(other.activeTasks, 0);
+    assert.deepEqual(other.activity, ["Ready"]);
     assert.deepEqual(other.statusSupport, harness.view(first).statusSupport,
       "each row declares its own source's applicability independently");
 

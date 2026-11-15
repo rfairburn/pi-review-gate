@@ -16,8 +16,8 @@
  *    and `createNativeCliLauncher` into a real PTY child; and
  * 3. the whole lifecycle: addressed input and one synthetic prompt answer,
  *    switching rows with the retained frame, one deliberate outer resize with
- *    the fixture's own SIGWINCH geometry, the truthful unknown and
- *    not-applicable sidebar status,
+ *    the fixture's own SIGWINCH geometry, the truthful owned-startup, unknown,
+ *    and not-applicable sidebar status,
  *    one natural fixture exit, one public stop confirmation, the real Pi row's
  *    graceful exit, and the host's normal Quit with full outer restoration.
  *
@@ -46,10 +46,14 @@
  *    fresh per-launch native-hook opt-in marker (a different marker family from
  *    the Pi session-host bootstrap, which stays absent), and the host publishes
  *    the observer's static applicability declaration. A SYNTHETIC fixture never
- *    runs a hook, so no event ever arrives: the claude-backed row keeps every
- *    category unknown, and the codex-backed row renders its declared
+ *    runs a hook, so no hook event ever arrives. What the claude-backed row
+ *    therefore shows is ONLY what that run's own owner is entitled to state from
+ *    the spawn it holds — idle, nothing pending, 0 tasks, 0 shells, `Ready` —
+ *    and never a provider-reported lifecycle fact; the codex-backed row, whose
+ *    source states no such startup baseline today, renders its declared
  *    not-applicable categories as N/A with the rest unknown. Nothing here proves
- *    a hook fired, and nothing here proves a real provider accepts the flags.
+ *    a hook fired, and nothing here proves a real provider accepts the flags or
+ *    reports its own foreground, question, or background state.
  * - macOS only (the shared harness's explicit scope). Windows ConPTY, a
  *    physical terminal, and any real provider remain unverified.
  * - The sidebar roster is read by the ONE shared strict roster witness in
@@ -951,7 +955,7 @@ function registerCaseCleanup(t: { after(fn: () => Promise<void>): void }, state:
   });
 }
 
-test("real public Main hosts a real Pi row and two synthetic native CLI fixtures through the New provider UI, with owned input, resize, switching, unknown and not-applicable status, and exact exits", {
+test("real public Main hosts a real Pi row and two synthetic native CLI fixtures through the New provider UI, with owned input, resize, switching, the host-owned Claude startup baseline, unknown and not-applicable status, and exact exits", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
   const runtime = resolveRuntimePin(t);
@@ -1060,10 +1064,20 @@ test("real public Main hosts a real Pi row and two synthetic native CLI fixtures
   "the real host displays the created native row's own terminal output under its own header");
   const claudeCard = cardFor(driver.currentText(), "Claude");
   assert.ok(claudeCard, "the native row draws its own roster card");
-  assert.equal(claudeCard.status, "agent unknown | input unknown",
-    "a claude-backed card reports unknown agent and input state, never an inferred idle: this route declares every category reportable and no hook has delivered anything");
-  assert.equal(claudeCard.background, "background unknown",
-    "a claude-backed card uses the shared unknown-count summary and never invents a zero");
+  // The drawn Claude cells are the launch baseline the run's OWN owner stated
+  // when it bound this row to its live PTY handle and incarnation, before any
+  // byte could reach the child. Their evidence is the spawn, which only the host
+  // holds: no hook ran in this synthetic child, so no provider ever reported a
+  // foreground, a question, or a background count here. In particular the
+  // fixture's own `QUESTION` line above is terminal text this file wrote — it is
+  // pane content, never native pending-input metadata, and it leaves the input
+  // cell `none` because no provider question was ever observed.
+  assert.equal(claudeCard.status, "agent idle | input none",
+    "the claude-backed card draws the host-owned fresh-start baseline — idle with nothing pending — rather than an unknown that only a provider hook could retire");
+  assert.equal(claudeCard.background, "bg tasks 0 | shells 0",
+    "the same baseline states this freshly launched run's empty background set as observed zeros, never the unknown-count aggregate and never a provider's own job count");
+  assert.deepEqual(claudeCard.activity, ["Ready", ""],
+    "the card's two fixed activity slots contain the owner-stated Ready baseline and a blank second slot; a synthetic child that runs no hook adds no activity of its own");
   assert.ok(!`${claudeCard.status} ${claudeCard.background}`.includes(NATIVE_STATUS_NOT_APPLICABLE_TEXT),
     "a route that can report every category never gains a not-applicable claim");
 

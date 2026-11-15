@@ -1635,10 +1635,426 @@ test("a root SessionStart rebinds the scope so prior Ready and counts do not sur
   await h.append(summaryRow());
   await waitFor(() => h.readySnapshots().length > 0, "Ready should land");
 
-  h.hook("SessionStart");
+  // A genuine new conversation: the boundary names a conversation this run never
+  // observed, so everything the old one published is released with it.
+  h.hook("SessionStart", { session_id: OTHER_SESSION });
   const rebound = h.latest();
   assert.equal(rebound.busy, null);
   assert.deepEqual(rebound.activity, []);
   assert.equal(rebound.activeTasks, null);
+  h.controller.dispose();
+});
+
+test("work in one conversation never blocks a genuinely new session's empty baseline", async () => {
+  const h = await createHarness();
+  // Conversation A runs a real turn and ends it, reporting background work.
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 2 } });
+  await h.append(summaryRow({ preventedContinuation: true }));
+  await waitFor(() => h.latest().busy === false, "conversation A's turn ends on its witness");
+  assert.equal(h.latest().activeTasks, 1);
+
+  // The user clears into a brand-new conversation whose OWN transcript is empty.
+  const nextPath = path.join(h.dir, "next-transcript.jsonl");
+  await fs.writeFile(nextPath, "", "utf8");
+  h.hook("SessionStart", { session_id: OTHER_SESSION, source: "clear", transcript_path: nextPath });
+
+  await waitFor(() => {
+    const snapshot = h.latest();
+    return snapshot.busy === false
+      && snapshot.pendingInput === false
+      && snapshot.activeTasks === 0
+      && snapshot.activeShells === 0;
+  }, "the new session's empty transcript corroborates its own baseline");
+  const fresh = h.latest();
+  assert.deepEqual(fresh.activity, ["Ready"]);
+  assert.equal(fresh.activeTasks, 0, "A's background numbers are not carried into B");
+  assert.equal(fresh.activeShells, 0);
+  assert.deepEqual(h.gaps, []);
+
+  // B then behaves normally: a prompt moves it, and its own Stop replaces the
+  // corroborated zeros.
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2", session_id: OTHER_SESSION });
+  assert.equal(h.latest().busy, true);
+  h.hook("Stop", {
+    prompt_id: "prompt-2",
+    session_id: OTHER_SESSION,
+    background_counts: { tasks: 3, shells: 0 },
+  });
+  assert.equal(h.latest().activeTasks, 3);
+  h.controller.dispose();
+});
+
+test("a delayed same-session SessionStart cannot idle a live turn with an empty source", async () => {
+  // An empty source stands in for a provider that has not persisted this turn
+  // yet: a whole-file read would still say "nothing recorded".
+  const h = await createHarness({ seed: "" });
+  h.hook("SessionStart", { source: "startup" });
+  await waitFor(() => h.latest().busy === false, "the fresh start corroborates from the empty source");
+  assert.deepEqual(h.latest().activity, ["Ready"]);
+  assert.equal(h.latest().activeTasks, 0);
+
+  // Real work now runs on the hook lane while the transcript stays empty.
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  const running = h.latest();
+  assert.equal(running.busy, true);
+  assert.equal(running.pendingInput, true);
+  assert.deepEqual(running.activity, ["Working"]);
+
+  // Two late or repeated `startup` notices for this same conversation then
+  // arrive. Neither is a new boundary: acquisition returns before rebinding the
+  // transcript, retiring the generation, or arming a corroboration read, so the
+  // live turn, its open request, and its counts all stay. The corroboration read
+  // is asynchronous, so the whole window is drained before asserting.
+  const mark = h.snapshots.length;
+  for (let attempt = 0; attempt < 2; attempt += 1) h.hook("SessionStart", { source: "startup" });
+  await settle();
+  const after = h.latest();
+  assert.equal(
+    h.snapshots.slice(mark).some((snapshot) => snapshot.busy === false),
+    false,
+    "a duplicate start never becomes Ready, not even from its own empty-source read",
+  );
+  assert.equal(after.busy, true, "a duplicate start does not clear a live turn");
+  assert.equal(after.pendingInput, true, "the open question survives both duplicates");
+  assert.deepEqual(after.activity, ["Working"]);
+  assert.equal(after.activeTasks, 0, "the scope's own counts are untouched");
+  assert.equal(after.activeShells, 0);
+
+  // The request the duplicates would have deleted still closes on its own edge,
+  // and a later turn still ends on its own witness.
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, false, "the still-tracked request still closes");
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  h.hook("Stop", { prompt_id: "prompt-2" });
+  await h.append(summaryRow({ preventedContinuation: true }));
+  await waitFor(() => h.latest().busy === false, "a later turn still ends on its own witness");
+  h.controller.dispose();
+});
+
+/* ------------------------------------------------- fresh owned-start baseline */
+
+test("the host's own launch states the fresh baseline before any provider hook arrives", async () => {
+  const h = await createHarness();
+  assert.deepEqual(h.snapshots, [], "nothing is published before the host or the provider says anything");
+
+  // The host owns this spawn: the process exists, nothing has run in it, and no
+  // input has reached it. That is the whole evidence for the baseline.
+  h.controller.observeOwnedStartup();
+  const baseline = h.latest();
+  assert.equal(baseline.busy, false);
+  assert.equal(baseline.pendingInput, false);
+  assert.deepEqual(baseline.activity, ["Ready"]);
+  assert.equal(baseline.activeTasks, 0);
+  assert.equal(baseline.activeShells, 0);
+  assert.deepEqual(h.gaps, [], "an owned start is knowledge, not a source gap");
+
+  // A real turn then moves every axis normally, and the provider's own snapshot
+  // replaces the launch-time zeros.
+  await beginTurn(h, "prompt-1");
+  assert.equal(h.latest().busy, true);
+  assert.deepEqual(h.latest().activity, ["Working"]);
+  h.hook("PreToolUse", { tool_name: "Bash", tool_use_id: "tool-a", prompt_id: "prompt-1" });
+  assert.deepEqual(h.latest().activity, ["bash"]);
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 1 } });
+  assert.equal(h.latest().activeTasks, 2);
+  assert.equal(h.latest().activeShells, 1);
+  h.controller.dispose();
+});
+
+test("a late launch baseline never idles observed work or invents counts", async () => {
+  const h = await createHarness();
+  await beginTurn(h, "prompt-1");
+  const snapshotsBefore = h.snapshots.length;
+
+  h.controller.observeOwnedStartup();
+  await settle();
+  assert.equal(h.snapshots.length, snapshotsBefore, "a refused baseline publishes nothing");
+  assert.equal(h.latest().busy, true, "a live turn is never reset to idle");
+  assert.equal(h.latest().activeTasks, null, "the launch zeros are not claimed retroactively");
+
+  // Invalidation withdraws the run; a later baseline call cannot restate it.
+  h.controller.invalidate();
+  h.controller.observeOwnedStartup();
+  await settle();
+  assert.deepEqual(h.readySnapshots(), []);
+  h.controller.dispose();
+});
+
+test("a fresh root SessionStart idles the row only when its own transcript holds no conversation", async () => {
+  // The provider's own new transcript, read from byte 0 and holding no turn row:
+  // the scope is positively empty, so the row is idle with an observed 0/0.
+  const fresh = await createHarness({ seed: "" });
+  fresh.hook("SessionStart", { source: "startup" });
+  await waitFor(() => fresh.readySnapshots().length > 0, "a corroborated fresh start should idle the row");
+  const idle = fresh.latest();
+  assert.deepEqual(idle.activity, ["Ready"]);
+  assert.equal(idle.pendingInput, false);
+  assert.equal(idle.activeTasks, 0);
+  assert.equal(idle.activeShells, 0);
+  assert.deepEqual(fresh.gaps, []);
+  fresh.controller.dispose();
+
+  // The same boundary over recorded conversation is not fresh: the read says so,
+  // and the foreground stays unknown instead of being zeroed by the label.
+  const recorded = await createHarness();
+  recorded.hook("SessionStart", { source: "startup" });
+  await settle();
+  assert.deepEqual(recorded.readySnapshots(), [], "prerecorded work cannot be an empty baseline");
+  assert.equal(recorded.latest().busy, null);
+  assert.equal(recorded.latest().activeTasks, null);
+  assert.deepEqual(recorded.gaps, [], "an unremarkable read is not a source gap");
+  recorded.controller.dispose();
+
+  // `resume`, `compact`, `fork`, and a missing source all continue history: the
+  // file's contents never enter into it.
+  for (const source of ["resume", "compact", "fork", undefined]) {
+    const continuing = await createHarness({ seed: "" });
+    continuing.hook("SessionStart", source === undefined ? {} : { source });
+    await settle();
+    assert.deepEqual(continuing.readySnapshots(), [], `source ${String(source)} is never a fresh baseline`);
+    assert.equal(continuing.latest().activeTasks, null);
+    continuing.controller.dispose();
+  }
+});
+
+/* -------------------------------------------------- declined question closure */
+
+/**
+ * The persisted root tool-result row of a question the user DECLINED: the shape
+ * that carries no top-level `toolUseResult` envelope at all, only the structured
+ * `tool_result` block inside `message.content`.
+ */
+function rootDeclinedToolResultRow(requestId: string, secret: string): string {
+  return jsonRow({
+    type: "user",
+    sessionId: SESSION,
+    isSidechain: false,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: requestId, content: secret, is_error: true }],
+    },
+    uuid: "declined-tool-result-row",
+    timestamp: "2026-01-01T00:02:00.000Z",
+  });
+}
+
+/** A provider task-notification injection: a `user` row the human never typed. */
+function rootTaskNotificationRow(secret: string): string {
+  return jsonRow({
+    type: "user",
+    sessionId: SESSION,
+    isSidechain: false,
+    isMeta: true,
+    commandMode: "task-notification",
+    origin: { kind: "task-notification", producer: "session-task", runId: "r-1" },
+    message: { role: "user", content: secret },
+    uuid: "task-notification-row",
+  });
+}
+
+test("a declined question closes on its persisted tool_result, with no Post hook and no answer text", async () => {
+  const DECLINE_TEXT = "declined-question-secret-result-text";
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, true, "the request is open on the hook lane");
+
+  await h.append(rootDeclinedToolResultRow("q-1", DECLINE_TEXT));
+  readNow(received);
+  await waitFor(() => h.latest().pendingInput === false, "the persisted tool_result must close the request");
+  const closed = h.latest();
+  assert.equal(closed.pendingInput, false);
+  assert.equal(closed.busy, true, "closing a question is not a turn end");
+  assert.deepEqual(h.gaps, []);
+  assert.ok(!JSON.stringify(h.snapshots).includes(DECLINE_TEXT), "no result text crosses the observation");
+
+  // A row for a different identity re-reads as nothing: the census stays as it is.
+  const before = h.snapshots.length;
+  await h.append(rootDeclinedToolResultRow("q-some-other-tool", DECLINE_TEXT));
+  readNow(received);
+  await settle();
+  assert.equal(h.snapshots.length, before, "an unrelated tool's result is not news");
+  assert.equal(h.latest().pendingInput, false);
+
+  // A request in another conversation is never closed from this file: a row
+  // naming a foreign session, or an agent-scoped row, is refused outright.
+  const foreign = await createHarness({ watchFile: manualWatch([]) });
+  await beginTurn(foreign, "prompt-1");
+  foreign.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-9", prompt_id: "prompt-1" });
+  await foreign.append(jsonRow({
+    type: "user",
+    sessionId: OTHER_SESSION,
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "q-9", content: "x" }] },
+  }));
+  await foreign.append(jsonRow({
+    type: "user",
+    sessionId: SESSION,
+    agentId: "agent-9",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "q-9", content: "x" }] },
+  }));
+  await waitFor(() => foreign.snapshots.length > 0, "the harness read ran");
+  await settle();
+  assert.equal(foreign.latest().pendingInput, true, "a foreign or agent-scoped row closes nothing");
+  h.controller.dispose();
+  foreign.controller.dispose();
+});
+
+test("a tool-result row without its envelope and a task-notification row are not a new prompt", async () => {
+  const rows: Array<[string, string]> = [
+    ["tool_result with no toolUseResult envelope", rootDeclinedToolResultRow("toolu-root-close", "output")],
+    ["provider task-notification user row", rootTaskNotificationRow("background work settled")],
+  ];
+  for (const [label, row] of rows) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-1");
+    h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+    // The row lands before the summary, as it really does: a terminal pass armed
+    // for the closing turn must stay open through it, not be spent on it.
+    await h.append(row);
+    readNow(received);
+    await settle();
+    assert.deepEqual(h.readySnapshots(), [], `no witness has been read for ${label}`);
+    assert.equal(h.latest().busy, null);
+    assert.deepEqual(h.gaps, []);
+
+    await h.append(summaryRow());
+    readNow(received);
+    await waitFor(() => h.readySnapshots().length > 0, `the pass must stay armed for ${label}`);
+    assert.deepEqual(h.latest().activity, ["Ready"]);
+    h.controller.dispose();
+  }
+});
+
+/* ------------------------------------------- per-lane withdrawal of one claim */
+
+test("a transcript gap withdraws only the claim it supported, keeping the hook census", async () => {
+  const h = await createHarness();
+  await beginTurn(h, "prompt-1");
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, false, "the hook lane vouched the census");
+
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+  await h.append(summaryRow());
+  await waitFor(() => h.readySnapshots().length > 0, "Ready should land");
+  assert.equal(h.latest().pendingInput, false);
+
+  // The bound file is replaced: the Ready was READ from it, so it goes; the
+  // question census and the run's foreground lane came from elsewhere and stay.
+  const replacement = path.join(h.dir, "replacement.jsonl");
+  await fs.writeFile(replacement, priorHistory(), "utf8");
+  await fs.rename(replacement, h.transcript);
+  h.hook("PostToolUse", { tool_name: "Read", tool_use_id: "tool-after-replace" });
+
+  await waitFor(() => h.gaps.includes("replaced"), "a replacement should be reported");
+  const after = h.latest();
+  assert.equal(after.busy, null, "a transcript-derived Ready cannot survive its file");
+  assert.deepEqual(after.activity, []);
+  assert.equal(after.pendingInput, false, "an unreadable transcript never voids the hook census");
+  assert.equal(after.activeTasks, 1, "a hook-payload count is not a transcript claim");
+
+  // And the same live observer recovers on fresh evidence of its own.
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  assert.equal(h.latest().busy, true);
+  assert.equal(h.latest().pendingInput, false);
+  h.controller.dispose();
+});
+
+/* ------------------------- idle claims contradicted by the monitored file */
+
+test("a corroborated fresh-start Ready is withdrawn by a root prompt row no hook ever reported", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ seed: "", watchFile: manualWatch(received) });
+  h.hook("SessionStart", { source: "startup" });
+  await waitFor(() => h.latest().busy === false, "the fresh start corroborates from the empty source");
+  const fresh = h.latest();
+  assert.deepEqual(fresh.activity, ["Ready"]);
+  assert.equal(fresh.activeTasks, 0);
+
+  // The human typed their first prompt. The provider persisted the row and no
+  // hook ever reached this observer for it: the monitored file is the only thing
+  // left that can say this idle claim stopped being true.
+  await h.append(rootUserRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "the appended root prompt withdraws the fresh Ready");
+  const withdrawn = h.latest();
+  assert.equal(withdrawn.busy, null, "withdrawn to unknown, never a fabricated busy");
+  assert.deepEqual(withdrawn.activity, []);
+
+  // The same holds for the host's launch baseline once the provider's own start
+  // bound this run's transcript: the baseline is not a permanent idle claim.
+  const owned = await createHarness({ seed: "", watchFile: manualWatch(received) });
+  owned.controller.observeOwnedStartup();
+  assert.equal(owned.latest().busy, false);
+  owned.hook("SessionStart", { source: "startup" });
+  assert.equal(owned.latest().busy, false, "the provider's own start keeps the known baseline idle");
+  await owned.append(rootUserRow());
+  readNow(received);
+  await waitFor(() => owned.latest().busy === null, "the appended root prompt withdraws the launch baseline");
+  assert.deepEqual(owned.latest().activity, []);
+
+  for (const one of [h, owned]) one.controller.dispose();
+});
+
+test("a background notification or a persisted result after Ready costs the foreground nothing", async () => {
+  const NOTIFICATION_TEXT = "background-task-notification-secret-text";
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 0 } });
+  await h.append(summaryRow({ preventedContinuation: true }));
+  readNow(received);
+  await waitFor(() => h.latest().busy === false, "the summary confirms Ready");
+  const ready = h.latest();
+  assert.equal(ready.activeTasks, 1);
+
+  // A background task told the conversation something, and a call's result landed.
+  // Neither started a turn: the idle foreground, its census, and the last-reported
+  // numbers all stay.
+  const before = h.snapshots.length;
+  await h.append(rootTaskNotificationRow(NOTIFICATION_TEXT) + rootUserToolResultRow());
+  readNow(received);
+  await settle();
+  assert.equal(h.snapshots.length, before, "a signal row contradicts no published idle claim");
+  const kept = h.latest();
+  assert.equal(kept.busy, false);
+  assert.deepEqual(kept.activity, ["Ready"]);
+  assert.equal(kept.activeTasks, 1);
+
+  // A real model row still contradicts, immediately after the same window.
+  await h.append(rootAssistantTextRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "a root model row still withdraws a published Ready");
+  assert.ok(!JSON.stringify(h.snapshots).includes(NOTIFICATION_TEXT));
+  h.controller.dispose();
+});
+
+test("a notification landing after its own turn's summary still confirms Ready and keeps a child question pending", async () => {
+  const NOTIFICATION_TEXT = "late-notification-secret-text";
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  // A subagent's own question is open on the hook lane while this root turn ends.
+  h.hook("PreToolUse", {
+    tool_name: "AskUserQuestion", tool_use_id: "q-child", prompt_id: "prompt-1", agent_id: "agent-1",
+  });
+  assert.equal(h.latest().pendingInput, true);
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 0 } });
+
+  // One window: the closing turn's summary, then a provider notification for
+  // background work. The summary confirms this turn; the notification is a
+  // signal, not newer foreground, and it must not spend the pass.
+  await h.append(summaryRow({ preventedContinuation: true }) + rootTaskNotificationRow(NOTIFICATION_TEXT));
+  readNow(received);
+  await waitFor(() => h.latest().busy === false, "the summary in the same window confirms Ready");
+  const ready = h.latest();
+  assert.deepEqual(ready.activity, ["Ready"]);
+  assert.equal(ready.activeTasks, 2, "the root snapshot stays published");
+  assert.equal(ready.pendingInput, true, "the child's own open request survives its parent's turn end");
+  assert.ok(!JSON.stringify(h.snapshots).includes(NOTIFICATION_TEXT));
   h.controller.dispose();
 });

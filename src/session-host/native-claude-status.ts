@@ -29,11 +29,17 @@
  *   be read withdraws exactly the observations that payload would have
  *   supported (foreground, or the pending-request census) instead of leaving a
  *   stale Ready, running, or "none remain" claim in place.
- * - Nothing here fabricates a Ready/idle claim from process startup, missing
- *   data, quiet output, or the arrival of this observer's own `Stop` hook. A
- *   `Stop` or `StopFailure` boundary makes the foreground unverifiable; only
- *   {@link NativeClaudeStatusReducer.confirmTurnEnd}, driven by a terminal
- *   record the source actually read, can establish `busy: false` and `Ready`.
+ * - Nothing here fabricates a Ready/idle claim from a process that merely looks
+ *   quiet, from missing data, from quiet output, or from the arrival of this
+ *   observer's own `Stop` hook. A `Stop` or `StopFailure` boundary makes the
+ *   foreground unverifiable; {@link NativeClaudeStatusReducer.confirmTurnEnd},
+ *   driven by a terminal record the source actually read, establishes
+ *   `busy: false` and `Ready` for a turn that ran. The only idle claim made
+ *   BEFORE any prompt is the one the run's own owner is entitled to make about a
+ *   process it launched itself
+ *   ({@link NativeClaudeStatusReducer.observeOwnedStartup}) or restates from a
+ *   `startup`/`clear` boundary once it has read that source and found nothing
+ *   recorded in it ({@link NativeClaudeStatusReducer.confirmFreshStart}).
  *   {@link NativeClaudeTurnEndConfirmation} states the source-grounded
  *   rootness, sufficiency, and binding rules the acquisition layer must satisfy;
  *   this module never tails a transcript, reconstructs a census, or ranks source
@@ -43,7 +49,26 @@
  *   observed: that same boundary vouches the census EMPTY (no request can have
  *   opened before this scope began), and it stays false while this reducer can
  *   vouch that no observed request remains open. A scope adopted mid-stream or
- *   released by invalidation keeps that claim unknown.
+ *   released by invalidation keeps that claim unknown. A root request that was
+ *   still open when a CONFIRMED root turn end was read ended with that turn: the
+ *   provider stated the turn over, so nothing is awaiting input any more, and the
+ *   census stays definitive instead of being stranded as unknown forever.
+ * - A brand-new scope can also be shown IDLE before its first prompt, but only on
+ *   two facts the caller actually has: the provider's own `SessionStart` said
+ *   `source` is `startup` or `clear` (the closed values for a new owned startup
+ *   and `/clear`, never `resume`, `compact`, `fork`, or an unreadable value), and
+ *   the caller then positively read the bound source and found NO prerecorded
+ *   work. {@link NativeClaudeStatusReducer.confirmFreshStart} is that second
+ *   half; without it the fresh scope keeps an unknown foreground exactly as before.
+ *   A host that launched the process itself needs no such read: it states the
+ *   empty baseline from its own spawn, and that vouch is what lets the provider's
+ *   later `SessionStart` rebind the scope without blinking the row through
+ *   unknown. Either way the claim dies the moment real work is observed.
+ * - A question request also terminates when the source shows its OWN persisted
+ *   `tool_result` for that exact `tool_use_id` — the shape a declined or
+ *   cancelled question leaves behind when no `Post*` hook ever arrived. That
+ *   closure reads the request identity only: no answer, annotation, error text,
+ *   or result content is ever read, retained, or compared.
  * - Only the tool TYPE is retained. Tool arguments, commands, results, question
  *   text, answers, annotations, and transcripts are never read into state, and
  *   the fixed labels reuse the existing `Working`/`Ready` convention.
@@ -118,7 +143,13 @@ export type NativeClaudeReduceReason =
   | "question-close-unidentified"
   | "question-close-unobserved"
   | "question-close-prompt-mismatch"
-  | "question-census-capacity";
+  | "question-census-capacity"
+  | "question-tool-result-unobserved"
+  | "fresh-start-confirmed"
+  | "fresh-start-superseded"
+  | "startup-baseline"
+  | "startup-baseline-superseded"
+  | "duplicate-session-start";
 
 /**
  * Explicit reduce outcome, so a caller never republishes a stale ignored event
@@ -166,6 +197,33 @@ export interface NativeClaudeTerminalRecord {
   readonly hookErrors?: readonly unknown[] | null;
   /** `hookAdditionalContext`: nonempty can continue the same turn. */
   readonly hookAdditionalContext?: readonly unknown[] | null;
+}
+
+/**
+ * The caller's corroboration that the fresh root `SessionStart` this scope came
+ * from really began a brand-new conversation. This reducer cannot look at a
+ * transcript, so the adapter that owns the source read states the fact here;
+ * nothing in this type carries record text, paths, or provider content.
+ */
+export interface NativeClaudeFreshStartConfirmation {
+  /** Native session identity the corroborated start belongs to, when read. */
+  readonly sessionId?: string | null;
+  /** Caller-attested identity of the read that corroborated this start. */
+  readonly sourceToken?: string | null;
+}
+
+/**
+ * A persisted `tool_result` the caller positively read for one exact native tool
+ * request identity, in this run's own ROOT conversation. Only the identity
+ * travels: an answer, an error message, a result body, and any other record
+ * field stay in the source, and a decline is never distinguished from an answer
+ * because this reducer makes no outcome claim from either.
+ */
+export interface NativeClaudeQuestionToolResult {
+  /** The `tool_use_id` of the persisted tool_result row. */
+  readonly requestId: string;
+  /** Native session identity the row was read from, when the row carried one. */
+  readonly sessionId?: string | null;
 }
 
 /**
@@ -228,6 +286,24 @@ const READY_ACTIVITY = "Ready";
 /** Lowercased native question-tool type; matches the shipped AskUserQuestion tool name. */
 const QUESTION_TOOL_TYPE = "askuserquestion";
 
+/**
+ * The closed `SessionStart.source` values that positively state a brand-new
+ * scope. `resume`, `compact`, and `fork` all continue a conversation that
+ * already has history, and an absent or unreadable source states nothing, so
+ * none of them may idle a row or zero its counts.
+ */
+const FRESH_START_SOURCES: ReadonlySet<string> = new Set(["startup", "clear"]);
+
+/**
+ * Whether one `SessionStart.source` value positively names a new owned startup
+ * or a `/clear`. Exported so the adapter that corroborates the claim in the
+ * bound source and this reducer judge the same closed value once.
+ */
+export function isNativeClaudeFreshStartSource(value: unknown): boolean {
+  const token = readToken(value);
+  return token !== null && FRESH_START_SOURCES.has(token);
+}
+
 /** A tool TYPE is a short identifier; anything longer is not claimed as one. */
 const MAX_TOOL_TYPE_CHARS = 64;
 /**
@@ -263,6 +339,8 @@ type ObservedScope = "root" | "subagent";
 
 interface ObservedQuestionRequest {
   readonly scope: ObservedScope;
+  /** The request identity this reducer holds open, as the provider named it. */
+  readonly requestId: string;
   /** Prompt id positively carried by the open edge, when any. */
   readonly promptId: string | null;
 }
@@ -286,6 +364,30 @@ export class NativeClaudeStatusReducer {
   #scopeFullyObserved = false;
   /** True after an observed root SessionEnd: only a new SessionStart rebinds. */
   #scopeClosed = false;
+  /**
+   * Which lane last established the current foreground claim. `observed` means
+   * this run's own lifecycle lane or the host's own launch of it (including a
+   * corroborated fresh start); `transcript` means a terminal record read out of
+   * the bound transcript file. A lane that fails may only withdraw a claim its
+   * own lane supported, which is what keeps an unrelated transcript loss from
+   * destroying hook-derived state.
+   */
+  #foregroundOrigin: "observed" | "transcript" | null = null;
+  /**
+   * True while a genuine fresh root `SessionStart` (a `startup` or `clear` with a
+   * readable identity) awaits the caller's corroboration that the bound source
+   * shows no prerecorded work. Any observed root work clears it, so a start that
+   * arrives late can never idle a live turn.
+   */
+  #freshStartPending = false;
+  /**
+   * True while the host's own launch of this run vouches that nothing has run in
+   * it yet. It is what lets a later `SessionStart` — the provider's own start
+   * notice, or a `/clear` or `/resume` typed into an idle row — rebind its scope
+   * without blinking the row through unknown, and any observed work ends the
+   * vouch immediately.
+   */
+  #startupVouched = false;
   /** Prompt correlation of the root turn this reducer last positively observed. */
   #rootPromptId: string | null = null;
   /** Root foreground busy; null means unknown, never a silent idle claim. */
@@ -345,6 +447,134 @@ export class NativeClaudeStatusReducer {
   }
 
   /**
+   * The host's own baseline for a native run it launched itself and has given no
+   * input: this process exists, nothing has run in it, so its foreground is idle
+   * and its question census begins here empty. This is the ONE idle claim not
+   * built from a provider payload or a record — its evidence is that the caller
+   * owns the spawn, and it is therefore refused the moment anything has been
+   * observed (an accepted prompt, a tool request, an open question, a prompt
+   * correlation, or an ended scope), so a baseline that arrives late over real
+   * work changes nothing. It never invents a session identity, and a later
+   * `SessionStart`, prompt, or count source replaces it with provider evidence.
+   */
+  observeOwnedStartup(): NativeClaudeReduceResult {
+    if (this.#scopeClosed) return { outcome: "ignored", reason: "scope-closed" };
+    if (this.#workObserved()) return { outcome: "ignored", reason: "startup-baseline-superseded" };
+    this.#startupVouched = true;
+    // The census genuinely begins with this process: no request can have opened
+    // before it. An observation hole this reducer already reported survives.
+    this.#scopeFullyObserved = true;
+    this.#closureVouched = !this.#censusIncomplete;
+    this.#freshStartPending = false;
+    this.#busy = false;
+    this.#activity = [READY_ACTIVITY];
+    this.#foregroundOrigin = "observed";
+    return { outcome: "applied", reason: "startup-baseline", snapshot: this.snapshot() };
+  }
+
+  /**
+   * Whether this reducer has positively observed anything run in this scope: the
+   * only state a startup baseline may still overwrite is a scope that has shown
+   * nothing at all.
+   */
+  #workObserved(): boolean {
+    return this.#busy === true
+      || this.#rootPromptId !== null
+      || this.#openQuestions.size > 0
+      || this.#toolRequests.size > 0;
+  }
+
+  /**
+   * Withdraw ONLY the foreground claim a source-confirmed turn end established,
+   * for a loss of the lane that supported it (a bound transcript this adapter can
+   * no longer read). A hook-payload claim — running, a tool TYPE, a corroborated
+   * fresh-start idle — is not contradicted by a file this observer cannot read,
+   * so it stays; the scope binding, prompt correlation, tool ledger, and question
+   * census are hook-lane observations and are never released here. That is what
+   * keeps a transcript gap from costing the pending-input census until the next
+   * `SessionStart`.
+   */
+  withdrawTranscriptForeground(): NativeClaudeForegroundObservation {
+    if (this.#foregroundOrigin === "transcript") {
+      this.#busy = null;
+      this.#activity = [];
+      this.#foregroundOrigin = null;
+    }
+    return this.snapshot();
+  }
+
+  /**
+   * Corroborate a fresh root `SessionStart` this scope is still holding: the
+   * caller read its own bound source and found no prerecorded work, so the
+   * brand-new conversation is positively idle before its first prompt. This is
+   * the only input that can establish `busy: false` with no observed turn: a
+   * start whose source is not `startup`/`clear`, a scope adopted mid-stream, a
+   * closed scope, another native conversation, or a scope where root work was
+   * already observed are all refused, and a refusal changes nothing.
+   */
+  confirmFreshStart(confirmation: NativeClaudeFreshStartConfirmation = {}): NativeClaudeReduceResult {
+    const sessionId = readToken(confirmation.sessionId);
+    if (this.#scopeClosed) return { outcome: "ignored", reason: "scope-closed" };
+    if (sessionId !== null && this.#scope !== null && sessionId !== this.#scope) {
+      return { outcome: "ignored", reason: "stale-session" };
+    }
+    if (!this.#freshStartPending || this.#busy === true) {
+      return { outcome: "ignored", reason: "fresh-start-superseded" };
+    }
+    this.#freshStartPending = false;
+    this.#busy = false;
+    this.#activity = [READY_ACTIVITY];
+    // The idle claim is the provider's own `SessionStart` statement, corroborated
+    // by one read of its source: a later transcript gap does not contradict it.
+    this.#foregroundOrigin = "observed";
+    return { outcome: "applied", reason: "fresh-start-confirmed", snapshot: this.snapshot() };
+  }
+
+  /**
+   * The ROOT-scoped question request identities this reducer currently holds
+   * open, so a source adapter can tell whether a persisted `tool_result` row it
+   * just read can terminate one of them. Identities only: no question text,
+   * answer, prompt correlation, or scope detail crosses.
+   */
+  openQuestionRequestIds(): readonly string[] {
+    const ids: string[] = [];
+    for (const request of this.#openQuestions.values()) {
+      if (request.scope === "root") ids.push(request.requestId);
+    }
+    return ids;
+  }
+
+  /**
+   * Close an open ROOT question request on the source's own persisted
+   * `tool_result` for that exact request identity — the terminal evidence a
+   * declined, cancelled, or answered question leaves when no `PostToolUse` or
+   * `PostToolUseFailure` edge ever reached this observer. The closure is the
+   * identity match alone: nothing about the result is read, so no answered
+   * outcome is fabricated and no English phrase is matched. A `tool_result` for
+   * an identity this reducer never opened as a root question is some other tool's
+   * result and is refused without degrading the census; a subagent-scoped request
+   * is never closed from the root conversation.
+   */
+  observeQuestionToolResult(observation: NativeClaudeQuestionToolResult): NativeClaudeReduceResult {
+    const requestId = readToken(observation?.requestId);
+    if (requestId === null) return { outcome: "ignored", reason: "question-close-unidentified" };
+    if (this.#scopeClosed) return { outcome: "ignored", reason: "scope-closed" };
+    const sessionId = readToken(observation.sessionId);
+    if (sessionId !== null && this.#scope !== null && sessionId !== this.#scope) {
+      return { outcome: "ignored", reason: "stale-session" };
+    }
+    const key = requestKey("root", requestId);
+    if (!this.#openQuestions.has(key)) {
+      if (this.#closedRequests.includes(key)) return { outcome: "ignored", reason: "duplicate-question-close" };
+      return { outcome: "ignored", reason: "question-tool-result-unobserved" };
+    }
+    this.#openQuestions.delete(key);
+    this.#rememberClosed(key);
+    this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
+    return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
+  }
+
+  /**
    * Apply a source-confirmed terminal record for the root turn. This is the only
    * input that establishes `busy: false` and `Ready`: an operator `Stop` hook
    * can block and continue the same turn, so this observer's own `Stop` hook
@@ -386,10 +616,13 @@ export class NativeClaudeStatusReducer {
     if (this.#scope === null && sessionId !== null) this.#scope = sessionId;
     if (this.#rootPromptId === null) this.#rootPromptId = promptId;
     if (sourceToken !== null) this.#terminalToken = sourceToken;
-    this.#withdrawUnresolvedRootRequests();
+    this.#retireRootRequestsWithTurnEnd();
     this.#clearTurnToolState();
     this.#busy = false;
     this.#activity = [READY_ACTIVITY];
+    this.#foregroundOrigin = "transcript";
+    this.#freshStartPending = false;
+    this.#startupVouched = false;
     return { outcome: "applied", reason: "turn-ended-confirmed", snapshot: this.snapshot() };
   }
 
@@ -403,7 +636,9 @@ export class NativeClaudeStatusReducer {
     const scope = readScope(event.agent_id);
     if (scope === "unusable") return this.#invalid("malformed-scope", true);
 
-    if (hookEventName === "SessionStart") return this.#reduceSessionStart(sessionId, scope);
+    if (hookEventName === "SessionStart") {
+      return this.#reduceSessionStart(sessionId, scope, event.source);
+    }
 
     // Every other event is only interpretable against the scope it belongs to.
     if (sessionId === null) return this.#invalid("malformed-envelope", true);
@@ -466,18 +701,70 @@ export class NativeClaudeStatusReducer {
    * A genuine root SessionStart is the only rebind: the new scope inherits no
    * Ready, pending, tool, question, or session claim, and only this boundary can
    * mark the scope fully observed and vouch its question census empty. A
-   * subagent SessionStart never rebinds.
+   * subagent SessionStart never rebinds. A `startup` or `clear` additionally
+   * states a brand-new conversation, but the IDLE claim it would support is held
+   * until the caller corroborates that the bound source shows no prerecorded
+   * work, so a start that arrives over live work or over an unreadable source
+   * still publishes nothing but the boundary itself: a start that arrives after
+   * THIS conversation observed work is never armed for corroboration, so no later
+   * read of an empty or not-yet-created source can idle it — and a `startup`
+   * notice for a conversation already bound is refused outright, so it cannot
+   * even clear the work. Work belonging to an earlier conversation never
+   * disqualifies a genuinely new session from its own corroborated baseline.
    */
-  #reduceSessionStart(sessionId: string | null, scope: ObservedScope): NativeClaudeReduceResult {
+  #reduceSessionStart(
+    sessionId: string | null,
+    scope: ObservedScope,
+    source: unknown,
+  ): NativeClaudeReduceResult {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
+    const sameScope = sessionId !== null && sessionId === this.#scope;
+    // A `startup` notice cannot restart a conversation this reducer already
+    // bound. A late or repeated delivery of it is not a new boundary: resetting
+    // on it would delete a live question with no closure evidence and hand the
+    // next empty-source read a cleared scope to idle. Only another conversation,
+    // or a source that positively describes one (`clear`, `compact`, `fork`), or
+    // a resumed history (`resume`), rebinds a bound scope.
+    if (sameScope && readToken(source) === "startup") {
+      return { outcome: "ignored", reason: "duplicate-session-start" };
+    }
+    // Work observed in THIS session, read BEFORE any reset releases it. A start
+    // that arrives after real work in the conversation it names is a boundary in
+    // the middle of a stream, not the beginning of an empty conversation, so it
+    // may rebind as always but may never be corroborated into an idle row with an
+    // empty census and zero counts. Work in some PREVIOUS conversation is none of
+    // a genuinely new session's business: it never blocks that session's own
+    // corroborated empty baseline.
+    const hadWork = sameScope && this.#workObserved();
+    // The host launched this run and nothing has run in it, so its boundary is
+    // the same fact the provider's own `SessionStart` restates: this process is
+    // idle and nothing is pending. The idle claim therefore survives this
+    // rebind — for any source, including `resume`, which describes the
+    // conversation's history and not this process's foreground — instead of
+    // blinking the row through unknown between the host's baseline and the
+    // provider's notice. Once ANY work has been observed the vouch is gone, so
+    // this never preserves a live or ended turn across a boundary.
+    const preserve = this.#startupVouched && !this.#workObserved();
+    const preservedBusy = preserve ? this.#busy : null;
+    const preservedActivity = preserve ? this.#activity : [];
     this.#resetScope(sessionId);
-    this.#scopeFullyObserved = sessionId !== null;
+    this.#scopeFullyObserved = sessionId !== null || preserve;
     // A root SessionStart with a readable identity shows the question census
     // from its beginning, so nothing can have opened unobserved before it: the
     // census is positively EMPTY here, which is the only pre-question source of
     // a `pendingInput: false` claim. An adopted, invalidated, or unidentified
     // scope never gets this baseline, so it stays unknown as before.
-    this.#closureVouched = sessionId !== null;
+    this.#closureVouched = (sessionId !== null || preserve) && !this.#censusIncomplete;
+    this.#startupVouched = preserve;
+    this.#freshStartPending = sessionId !== null
+      && !preserve
+      && !hadWork
+      && isNativeClaudeFreshStartSource(source);
+    if (preserve) {
+      this.#busy = preservedBusy;
+      this.#activity = preservedActivity;
+      this.#foregroundOrigin = "observed";
+    }
     // Without an identity the scope is genuinely new but uncorrelatable; the
     // next eligible event adopts it rather than a fabricated pairing.
     return sessionId === null
@@ -499,6 +786,9 @@ export class NativeClaudeStatusReducer {
     this.#rootPromptId = promptId;
     this.#busy = true;
     this.#activity = [WORKING_ACTIVITY];
+    this.#foregroundOrigin = "observed";
+    this.#freshStartPending = false;
+    this.#startupVouched = false;
     this.#clearTurnToolState();
     return { outcome: "applied", reason: "turn-submitted", snapshot: this.snapshot() };
   }
@@ -518,6 +808,7 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#busy = null;
     this.#activity = [];
+    this.#foregroundOrigin = null;
     return { outcome: "applied", reason: "turn-end-candidate", snapshot: this.snapshot() };
   }
 
@@ -527,6 +818,7 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#busy = null;
     this.#activity = [];
+    this.#foregroundOrigin = null;
     return { outcome: "applied", reason: "turn-failed", snapshot: this.snapshot() };
   }
 
@@ -550,6 +842,9 @@ export class NativeClaudeStatusReducer {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
     this.#busy = true;
     this.#activity = [toolType];
+    this.#foregroundOrigin = "observed";
+    this.#freshStartPending = false;
+    this.#startupVouched = false;
     if (requestId === null) {
       this.#lastToolId = null;
     } else {
@@ -617,7 +912,7 @@ export class NativeClaudeStatusReducer {
     if (this.#openQuestions.size >= MAX_TRACKED_QUESTION_REQUESTS) {
       return this.#invalid("question-census-capacity", scope === "root");
     }
-    this.#openQuestions.set(key, { scope, promptId: readToken(event.prompt_id) });
+    this.#openQuestions.set(key, { scope, requestId, promptId: readToken(event.prompt_id) });
     if (scope === "root") {
       // An accepted root question request is positively observed root tool work:
       // the foreground is running even when this is the first observed tool or a
@@ -625,6 +920,9 @@ export class NativeClaudeStatusReducer {
       // last-tool label is preserved; only a missing or stale Ready claim is
       // replaced by the generic running label.
       this.#busy = true;
+      this.#foregroundOrigin = "observed";
+      this.#freshStartPending = false;
+      this.#startupVouched = false;
       if (this.#activity.every((line) => line === READY_ACTIVITY)) {
         this.#activity = [WORKING_ACTIVITY];
       }
@@ -678,6 +976,7 @@ export class NativeClaudeStatusReducer {
   #withdrawForeground(): void {
     this.#busy = null;
     this.#activity = [];
+    this.#foregroundOrigin = null;
     this.#clearTurnToolState();
   }
 
@@ -695,20 +994,22 @@ export class NativeClaudeStatusReducer {
   }
 
   /**
-   * Drop unresolved root-scope requests as unverifiable. Subagent-scoped
-   * requests are untouched: their own definitive close edges own them.
+   * A confirmed root turn end ENDS the root requests still open in it: the
+   * source positively stated the turn is over, so nothing can still be awaiting
+   * input, and holding those requests as a permanent unknown would strand the
+   * row's pending census for the rest of the scope. They are recorded as closed
+   * (never as answered: no outcome is claimed), so a replayed close edge still
+   * reads as a duplicate. Subagent-scoped requests are untouched: their own
+   * definitive close edges, or their own subagent transcript, own them, and an
+   * unrelated root completion says nothing about them.
    */
-  #withdrawUnresolvedRootRequests(): void {
-    let withdrew = false;
-    for (const [key, request] of this.#openQuestions) {
+  #retireRootRequestsWithTurnEnd(): void {
+    for (const [key, request] of [...this.#openQuestions]) {
       if (request.scope !== "root") continue;
       this.#openQuestions.delete(key);
       this.#rememberClosed(key);
-      withdrew = true;
     }
-    // A request that ended without a definitive close was never observed
-    // closing, so no definitive "none remain" claim survives it.
-    if (withdrew) this.#markCensusIncomplete();
+    this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
   }
 
   #rememberClosed(key: string): void {
@@ -726,6 +1027,9 @@ export class NativeClaudeStatusReducer {
     this.#rootPromptId = null;
     this.#busy = null;
     this.#activity = [];
+    this.#foregroundOrigin = null;
+    this.#freshStartPending = false;
+    this.#startupVouched = false;
     this.#clearTurnToolState();
     this.#openQuestions.clear();
     this.#closedRequests = [];

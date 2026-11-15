@@ -2910,11 +2910,14 @@ interface CardStatusSegment {
 }
 
 /**
- * The aggregate the agent line reads as rest. A category this row's own observer
- * positively cannot report never blocks it — that is what lets a positively
- * observed native turn end display as rest WITHOUT inventing background zeros to
- * satisfy the formatter — while a supported-but-unobserved category still blocks
- * it, exactly as before this helper existed.
+ * The aggregate a row with NO applicability declaration reads as rest: Pi and
+ * every pre-native row. It is deliberately unchanged, so a supported but
+ * unobserved category still blocks rest exactly as it did before this native
+ * foreground composition existed.
+ *
+ * A hosted provider row that declared its own applicability is classified by
+ * `nativeForegroundAtRest` instead, where that provider's background counts are
+ * display facts rather than foreground facts. This helper itself is unchanged.
  *
  * This is DISPLAY ONLY. The stop/remove confirmation gate is `isCompleteIdle`, a
  * separate classification that keeps requiring every conservative ownership count
@@ -2927,6 +2930,57 @@ function agentAtRest(item: SessionStatusFacts): boolean {
   if (!isNativeCategoryUnsupported(item.statusSupport, "tasks") && sanitizeCount(item.activeTasks) !== 0) return false;
   if (!isNativeCategoryUnsupported(item.statusSupport, "shells") && sanitizeCount(item.activeShells) !== 0) return false;
   return true;
+}
+
+/**
+ * True only for a row carrying its own observer's applicability declaration. Only
+ * a hosted provider row's observer declares one — the Pi status path never does,
+ * and an absent declaration is documented as the unchanged legacy path — so this
+ * existing source fact selects the native foreground composition below. A row
+ * without a declaration keeps the legacy classification byte for byte.
+ */
+function hasNativeStatusDeclaration(item: SessionStatusFacts): boolean {
+  return item.statusSupport !== undefined;
+}
+
+/**
+ * The agent line's running claim. A positively observed busy foreground always
+ * reads running. A hosted provider row's two numeric background counts describe
+ * THAT provider harness's jobs: they are display facts, never foreground
+ * activity and never ownership, so they can never keep a positively at-rest
+ * foreground from reading Ready; for every other foreground state they keep
+ * their existing reading, and every non-native row keeps the unchanged
+ * count-based reading.
+ */
+function foregroundRunning(item: SessionStatusFacts): boolean {
+  if (item.busy === true) return true;
+  const counts = (sanitizeCount(item.activeTasks) ?? 0) > 0
+    || (sanitizeCount(item.activeShells) ?? 0) > 0;
+  if (!counts) return false;
+  return !(hasNativeStatusDeclaration(item) && nativeForegroundAtRest(item));
+}
+
+/**
+ * The agent line's rest claim for a hosted provider row: its FOREGROUND facts
+ * alone decide. A positively observed idle foreground with no open input surface
+ * and a positively observed input-none (or an input category this source cannot
+ * report) is at rest whether its background counts are 1, 0, or lost. The counts
+ * row keeps stating the actual numbers or `unknown`; nothing here invents a zero
+ * to satisfy it, and a supported-but-unobserved input is unknown rather than rest.
+ *
+ * This is DISPLAY ONLY, exactly like `agentAtRest`: `isCompleteIdle` remains the
+ * stop/remove gate and keeps requiring the conservative ownership counts to be
+ * positively observed zeros, so this composition grants no Stop authority.
+ */
+function nativeForegroundAtRest(item: SessionStatusFacts): boolean {
+  if (item.busy !== false) return false;
+  if (item.inputSurface !== false) return false;
+  return isNativeCategoryUnsupported(item.statusSupport, "input") || item.pendingInput === false;
+}
+
+/** The agent line's rest claim, selected by the row's own source facts. */
+function foregroundAtRest(item: SessionStatusFacts): boolean {
+  return hasNativeStatusDeclaration(item) ? nativeForegroundAtRest(item) : agentAtRest(item);
 }
 
 /**
@@ -2951,12 +3005,11 @@ function cardStatusSegments(item: SessionStatusFacts): CardStatusSegment[] {
       parts.push(
         isNativeCategoryUnsupported(item.statusSupport, "agent")
           ? { label: "agent ", value: NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
-          : item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
-            || (sanitizeCount(item.activeShells) ?? 0) > 0
+          : foregroundRunning(item)
             ? { label: "agent ", value: "running", role: "statusRunning" }
             : item.pendingInput === true || item.inputSurface === true
               ? { label: "agent ", value: "waiting", role: "statusWaiting" }
-              : agentAtRest(item)
+              : foregroundAtRest(item)
                 ? { label: "agent ", value: "idle", role: "statusIdle" }
                 : { label: "agent ", value: "unknown", role: "statusUnknown" },
       );

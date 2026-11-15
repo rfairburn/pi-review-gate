@@ -7,10 +7,14 @@
  * landed native hook lane delivers for that run, reduces them through the landed
  * pure {@link NativeClaudeStatusReducer}, and — separately — reads the ONE
  * transcript file the provider itself named in that run's own hook payloads to
- * confirm a REAL root turn end from the persisted `stop_hook_summary` row, and to
- * keep the native count snapshot honest while it is published. Nothing here is
- * wired to the manager, launch, broker registration, PTY, or sidebar yet; the
- * caller owns that.
+ * confirm a REAL root turn end from the persisted `stop_hook_summary` row, to
+ * settle a question request the provider never closed on the hook lane, and to
+ * keep the native count snapshot honest while it is published. The owner may also
+ * hand this controller the one fact only the owner has — that it launched this
+ * exact process and has given it no input — through
+ * {@link NativeClaudeAcquisitionController.observeOwnedStartup}. Nothing here is
+ * wired to the manager, launch, broker registration, PTY, or sidebar by itself;
+ * the caller owns that.
  *
  * What "acquisition" means concretely, and its honest limits:
  *
@@ -27,6 +31,33 @@
  *    row carries no prompt or turn correlation). A turn whose only terminal
  *    evidence is one of those two stays unknown, which is reported as a concrete
  *    gap rather than closed with a guess.
+ * 1b. The idle baseline of a run the host itself launched. `observeOwnedStartup()`
+ *    is called by the owner in the same synchronous stretch that binds this run to
+ *    its live PTY incarnation, BEFORE any input can reach the child, so the row is
+ *    known idle, none-pending, and 0/0 from the moment it exists rather than after
+ *    whichever hook happens to arrive first. The evidence is the spawn, which only
+ *    the owner holds; a controller that already observed work refuses the claim, a
+ *    second call changes nothing, and any accepted prompt, tool edge, provider
+ *    count snapshot, session end, hook-lane loss, or newer observed root row ends
+ *    the vouch. Independently, a root `SessionStart` whose own payload names
+ *    `source` `startup` or `clear` can establish the same baseline, but only after
+ *    ONE bounded read of the run's own transcript proves the file holds no
+ *    conversation row — `resume`, `compact`, `fork`, an unreadable source, an
+ *    unreadable or covered-only-partly transcript, and a start sitting on recorded
+ *    work all publish nothing. A brand-new provider process states its own empty
+ *    background set: those zeros are observed, never reconstructed, and every
+ *    later membership fact replaces or withdraws them on its own evidence.
+ * 1c. A question request the hook lane never closed. `PreToolUse` for
+ *    `AskUserQuestion` opens a request, `Post*` closes it, but a DECLINED or
+ *    cancelled question can bypass the Post hook entirely and strand the row as
+ *    pending. The same file answers that: a persisted ROOT `user` row whose
+ *    `message.content` carries a `tool_result` block naming an open request's
+ *    `tool_use_id` is that request's own terminal evidence, and the closure
+ *    compares identities only — no answer, error text, `is_error` outcome, or
+ *    English phrase is read or matched, because this source makes no claim about
+ *    whether a question was answered. A root turn whose terminal record was read
+ *    also ends the root requests still open in it, while a subagent's still-open
+ *    request in another conversation is never touched by either path.
  * 2. A read barrier, not a fake identity. Native JSONL rows carry no `promptId`,
  *    so this controller invents none. The barrier is a byte offset: the broker
  *    invokes a source callback BEFORE it writes the fixed ACK, the relay exits
@@ -146,6 +177,7 @@ import { lstatSync, watch, type Stats } from "node:fs";
 
 import { isRecord } from "../record-guard";
 import {
+  isNativeClaudeFreshStartSource,
   NativeClaudeStatusReducer,
   type NativeClaudeReduceReason,
   type NativeClaudeTerminalRecord,
@@ -274,12 +306,13 @@ interface WindowScan {
   /** True when the window carried a structured native task/launch transition. */
   readonly transition: boolean;
   /**
-   * True when the window carried a positively observed ROOT model row: the
-   * conversation shows work of this run's own root turn, which outranks whatever
-   * this controller last published UNLESS a terminal witness for it is still
-   * being sought and the row is only that closing turn's own trailing flush.
+   * True when the window carried a positively observed ROOT FOREGROUND row: a
+   * persisted human PROMPT row or a root `assistant` model row. This is the only
+   * kind of row that can outrank whatever this controller last published about the
+   * foreground, and then only UNLESS a terminal witness for it is still being
+   * sought and the row is only that closing turn's own trailing flush.
    */
-  readonly rootWork: boolean;
+  readonly foregroundWork: boolean;
   /**
    * True when the window carried a persisted ROOT `user` PROMPT row (a `message`
    * with no `toolUseResult`): a new root turn started, which retires an armed
@@ -297,13 +330,35 @@ interface WindowScan {
    */
   readonly firstCandidateIndex: number;
   /** True when a positively observed root model row starts AFTER that candidate. */
-  readonly rootWorkAfterCandidate: boolean;
+  readonly foregroundWorkAfterCandidate: boolean;
+  /**
+   * Identities of ROOT `tool_result` rows in this window that match a question
+   * request the reducer held open when the read started. Identities only: no
+   * result body, answer, error text, or role prose crosses.
+   */
+  readonly questionClosures: readonly string[];
 }
 
 /** One live watcher plus the generation that attached it. */
 interface ActiveWatch {
   readonly generation: number;
   readonly handle: NativeClaudeFileWatch;
+}
+
+/**
+ * One pending corroboration of a fresh root `SessionStart`: the ONE read of the
+ * run's own bound transcript that can show the new scope really began with no
+ * prerecorded conversation. It carries no record text and no path beyond the
+ * single bound file this controller already holds.
+ */
+interface FreshStartProbe {
+  readonly generation: number;
+  readonly path: string;
+  readonly sessionId: string | null;
+  /** Identity of the file to read, or null when the bound path did not exist. */
+  readonly identity: NativeJsonlFileIdentity | null;
+  /** True when the bound path was absent: nothing could have been recorded in it. */
+  readonly absent: boolean;
 }
 
 /** Hook kinds that may establish this run's own root scope, mirroring the reducer. */
@@ -322,6 +377,9 @@ const NEW_ROOT_WORK_EVENTS: ReadonlySet<string> = new Set(["UserPromptSubmit", "
 /** Bounded terminal candidates per window: more than this is a source we cannot rank. */
 const MAX_TERMINAL_CANDIDATES = 8;
 
+/** Bounded `tool_result` identities extracted from one window. */
+const MAX_QUESTION_CLOSURES_PER_WINDOW = 32;
+
 /**
  * Reduction outcomes that mean the landed reducer refused this edge as belonging
  * to a session, prompt, or scope it positively observed is no longer current.
@@ -332,6 +390,7 @@ const STALE_REDUCTION_REASONS: ReadonlySet<NativeClaudeReduceReason> = new Set([
   "stale-session",
   "stale-prompt",
   "scope-closed",
+  "duplicate-session-start",
 ]);
 
 /**
@@ -380,8 +439,24 @@ export class NativeClaudeAcquisitionController {
   #armed: ArmedRead | null = null;
   /** True once THIS pass' terminal witness was applied, so no second witness is sought. */
   #terminalAccepted = false;
-  /** True while a source-confirmed Ready is published and worth re-checking. */
+  /** True while a Ready READ FROM THIS FILE is published and still defensible. */
   #readyPublished = false;
+  /** One pending fresh-start corroboration read, or null. */
+  #freshProbe: FreshStartProbe | null = null;
+  /**
+   * True while the host's own launch of THIS run vouches an empty baseline: the
+   * process was started by this owner, nothing has run in it, and it has received
+   * no input. Real work, a provider count snapshot, a session end, a hook-lane
+   * loss, an explicit invalidation, or newer observed transcript work all end it.
+   */
+  #startupVouched = false;
+  /**
+   * True once this controller has had to withdraw: after an invalidation, a
+   * hook-lane loss, or a withdrawal for observed newer work, the launch-time
+   * baseline is no longer something it can restate for this run, and a later
+   * call claiming it is refused.
+   */
+  #baselineRetired = false;
   /** Last positive ROOT Stop count snapshot; null is unknown, never zero. */
   #counts: NativeHookBackgroundCounts | null = null;
 
@@ -470,13 +545,28 @@ export class NativeClaudeAcquisitionController {
     // Accepted new root work ends the armed pass outright, independently of any
     // prompt correlation: an arm whose turn has been superseded, and any read
     // still in flight for it, can no longer publish.
-    if (admitted && sameScope && isRoot && NEW_ROOT_WORK_EVENTS.has(hookEventName)) this.#retire();
+    if (admitted && sameScope && isRoot && NEW_ROOT_WORK_EVENTS.has(hookEventName)) {
+      this.#startupVouched = false;
+      this.#retire();
+    }
 
     if (admitted && sameScope && isRoot && hookEventName === "Stop") {
       this.#armTerminalRead(readToken((event as { prompt_id?: unknown }).prompt_id));
     } else if (admitted && sameScope && isRoot && (hookEventName === "StopFailure" || hookEventName === "SessionEnd")) {
       // Neither path can produce a terminal witness for this pass.
       this.#armed = null;
+    }
+
+    // A root `SessionStart` whose own payload names a new owned startup or a
+    // `/clear` is the only boundary that can show a row idle before its first
+    // prompt, and only once this controller has actually read the run's own
+    // source and found nothing recorded in it. `resume`, `compact`, `fork`, an
+    // unreadable source, a child start, and a start with no bound path all get
+    // no corroboration and therefore no idle claim.
+    if (admitted && sameScope && isRoot && hookEventName === "SessionStart"
+      && !this.#startupVouched
+      && isNativeClaudeFreshStartSource((event as { source?: unknown }).source)) {
+      this.#armFreshStartProbe();
     }
 
     this.#syncWatcher();
@@ -497,6 +587,31 @@ export class NativeClaudeAcquisitionController {
   }
 
   /**
+   * State the baseline the run's OWN owner can state for a native process it
+   * launched itself and has given no input: idle, nothing pending, no background
+   * work. The evidence is the spawn itself, so this is called once by the host in
+   * the same synchronous stretch that binds this run to its live PTY
+   * incarnation — before any input can reach the child, and with no provider hook
+   * having arrived yet. It is not a general "the process looks quiet" shortcut:
+   * if this controller already observed work, or the run's scope ended, the
+   * reducer refuses it and nothing changes, and every later provider observation
+   * replaces or withdraws the baseline exactly like any other source.
+   */
+  observeOwnedStartup(): void {
+    if (this.#disposed || this.#startupVouched || this.#baselineRetired) return;
+    const baseline = this.#reducer.observeOwnedStartup();
+    if (baseline.outcome !== "applied") return;
+    this.#startupVouched = true;
+    // A process this host started a moment ago has registered no background work
+    // of its own: that is a positively observed zero for this run, not a
+    // reconstruction, and any later ROOT `Stop` snapshot, task transition, scope
+    // change, or lane loss replaces or withdraws it on its own evidence.
+    this.#counts = { tasks: 0, shells: 0 };
+    this.#syncWatcher();
+    this.#emit();
+  }
+
+  /**
    * Stop vouching for everything this controller last reported. Values become
    * unknown (never zero, never a stale Ready), the transcript read is retired, and
    * the watcher is closed. The caller keeps ownership of its own capture seam and
@@ -505,6 +620,8 @@ export class NativeClaudeAcquisitionController {
    */
   invalidate(): void {
     if (this.#disposed) return;
+    this.#startupVouched = false;
+    this.#baselineRetired = true;
     this.#retire();
     // An explicit withdrawal is the caller taking back every claim, including the
     // hook-payload snapshot it last saw published.
@@ -521,6 +638,8 @@ export class NativeClaudeAcquisitionController {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#startupVouched = false;
+    this.#baselineRetired = true;
     this.#retire();
     this.#counts = null;
     this.#sessionId = null;
@@ -551,11 +670,17 @@ export class NativeClaudeAcquisitionController {
     // conversation it replaces. Every other event is checked against the scope.
     if (hookEventName === "SessionStart") {
       this.#resetScope(sessionId, transcriptPath);
+      // The host's own launch vouches this process's empty baseline across its own
+      // start notice, so the run does not blink through unknown while the provider
+      // reports the boundary the host already knows. A scope this controller has
+      // been observing work in never held the vouch and stays unknown.
+      if (this.#startupVouched) this.#counts = { tasks: 0, shells: 0 };
       return;
     }
     if (this.#sessionId !== null && sessionId !== null && sessionId !== this.#sessionId) return;
 
     if (hookEventName === "SessionEnd") {
+      this.#startupVouched = false;
       this.#resetScope(null, null);
       return;
     }
@@ -596,6 +721,7 @@ export class NativeClaudeAcquisitionController {
   #retire(): void {
     this.#generation += 1;
     this.#armed = null;
+    this.#freshProbe = null;
     this.#closeWatcher();
     this.#cursor = null;
     this.#identity = null;
@@ -621,6 +747,9 @@ export class NativeClaudeAcquisitionController {
    */
   #noteCounts(event: NativeHookEvent, isRoot: boolean, hookEventName: string): void {
     if (!isRoot || hookEventName !== "Stop") return;
+    // The provider's own snapshot is now the authority on this run's membership:
+    // the launch-time baseline vouch is spent, and the numbers come from here on.
+    this.#startupVouched = false;
     this.#counts = readBackgroundCounts(event);
   }
 
@@ -628,12 +757,27 @@ export class NativeClaudeAcquisitionController {
 
   /**
    * True while there is anything worth reading the file for: an armed terminal
-   * read, or published state (a count snapshot or a source-confirmed Ready) whose
-   * validity, task transitions, and any newer ROOT model row still have to be
-   * watched.
+   * read, or published state (a count snapshot, or ANY idle foreground claim the
+   * reducer is currently making — a witness-confirmed `Ready` or a corroborated
+   * fresh-start idle) whose validity, task transitions, and any newer ROOT model
+   * row still have to be watched, or a question request the hook lane opened and
+   * has never seen close — its closure can live only in this file, so a declined
+   * question must not wait for some other event to be resolved.
    */
   #shouldRead(): boolean {
-    return this.#armed !== null || this.#counts !== null || this.#readyPublished;
+    return this.#armed !== null
+      || this.#counts !== null
+      || this.#idlePublished()
+      || this.#reducer.openQuestionRequestIds().length > 0;
+  }
+
+  /**
+   * True while the reducer publishes an idle foreground. A fresh-start idle is
+   * not a claim READ from this file, but this file is still the only thing that
+   * can contradict it once the hook lane goes silent, so it stays monitored.
+   */
+  #idlePublished(): boolean {
+    return this.#reducer.snapshot().busy === false;
   }
 
   /**
@@ -664,6 +808,111 @@ export class NativeClaudeAcquisitionController {
     if (this.#identity === null) this.#identity = identity;
   }
 
+  /**
+   * Arm the one corroboration read for a fresh root `SessionStart`. The claim is
+   * only ever made after the run's own bound transcript is positively read, so a
+   * start that names a new conversation but sits on top of recorded work — or on
+   * a file this controller cannot read at all — publishes nothing.
+   */
+  #armFreshStartProbe(): void {
+    this.#freshProbe = null;
+    const path = this.#transcriptPath;
+    if (path === null) return;
+    const stat = this.#statBound();
+    if ("gap" in stat) {
+      // A transcript that does not exist yet positively states that nothing has
+      // been recorded in it. Every other gap — unreadable, a symlink, a
+      // directory, an unbound path — leaves the answer unknown, so no idle claim.
+      if (stat.gap !== "unavailable") return;
+      this.#freshProbe = {
+        generation: this.#generation,
+        path,
+        sessionId: this.#sessionId,
+        identity: null,
+        absent: true,
+      };
+    } else {
+      this.#freshProbe = {
+        generation: this.#generation,
+        path,
+        sessionId: this.#sessionId,
+        identity: { dev: stat.stats.dev, ino: stat.stats.ino },
+        absent: false,
+      };
+    }
+    void this.#readFreshStart();
+  }
+
+  /**
+   * Read the bound file from its very beginning and apply the fresh-start claim
+   * only when the window covered the WHOLE file, every record in it was readable,
+   * and none of them is a persisted conversation row. Anything else — history this
+   * window could not cover, an unreadable or half-appended row, or a real
+   * `user`/`assistant` row — leaves the scope exactly as the boundary alone left
+   * it. The result is applied only while the generation and the probe that started
+   * it are still current, so a newer scope, a retired start, or an intervening
+   * invalidation cannot be idled by this read.
+   */
+  async #readFreshStart(): Promise<void> {
+    const probe = this.#freshProbe;
+    if (probe === null || this.#disposed) return;
+
+    let corroborated = probe.absent;
+    let scannedTo: number | null = null;
+    let readIdentity: NativeJsonlFileIdentity | null = null;
+    if (!probe.absent) {
+      try {
+        const result = await readNativeJsonlTail({
+          path: probe.path,
+          from: 0,
+          maxBytes: this.#maxTailBytes,
+          maxLineBytes: this.#maxLineBytes,
+          expectIdentity: probe.identity ?? undefined,
+        });
+        // Coverage is the whole point: a window that started past byte 0, skipped
+        // the floor, cut a record, or could not decode a row says nothing about
+        // what came before this scope.
+        if (result.ok
+          && result.windowStart === 0
+          && !result.skippedBefore
+          && !result.droppedLeadingPartial
+          && !result.trailingPartial
+          && result.oversizedLines === 0) {
+          const seen = scanForPrerecordedWork(result.records);
+          corroborated = seen.malformed === 0 && seen.conversationRows === 0;
+          scannedTo = result.scannedTo;
+          readIdentity = result.identity;
+        }
+      } catch {
+        corroborated = false;
+      }
+    }
+
+    if (this.#disposed || this.#freshProbe !== probe || this.#generation !== probe.generation) return;
+    this.#freshProbe = null;
+    if (!corroborated) return;
+
+    const confirmation = this.#reducer.confirmFreshStart({
+      sessionId: probe.sessionId,
+      sourceToken: `nca-fresh:${probe.generation}`,
+    });
+    if (confirmation.outcome !== "applied") return;
+    // A brand-new provider process whose own transcript holds no conversation row
+    // positively states that it has no background work yet: this is an observed
+    // zero for this scope, not a reconstruction, and every later count source
+    // (a newer ROOT `Stop` snapshot, a transition row, a scope change, a hook-lane
+    // loss) replaces or withdraws it exactly like any other snapshot.
+    this.#counts = { tasks: 0, shells: 0 };
+    // This read consumed the entire file, so the monitor's floor starts here and
+    // the first row of any later turn is still seen.
+    if (scannedTo !== null && readIdentity !== null) {
+      this.#cursor = scannedTo;
+      this.#identity = readIdentity;
+    }
+    this.#syncWatcher();
+    this.#emit();
+  }
+
   /** One lstat of the positively bound path, with the closed failure codes. */
   #statBound(): { readonly stats: Stats } | { readonly gap: NativeClaudeAcquisitionGapReason } {
     const path = this.#transcriptPath;
@@ -690,10 +939,11 @@ export class NativeClaudeAcquisitionController {
     if (this.#cursor !== null) return true;
     const stat = this.#statBound();
     if ("gap" in stat) {
-      // Only a source-confirmed Ready is a claim read from this file, so only it
-      // is withdrawn by a floor this controller cannot establish. A retained
-      // last-reported count is not a transcript claim, and an armed read reports
-      // its own stat gap where that matters, so nothing else is escalated here.
+      // Only a Ready READ FROM THIS FILE is a claim this floor was supposed to
+      // defend. A corroborated fresh-start idle is a statement about a brand-new
+      // provider process, not about this file's contents, and a retained
+      // last-reported count is not a transcript claim either, so neither is
+      // escalated here; an armed read reports its own stat gap where that matters.
       if (this.#readyPublished) this.#transcriptFailure(stat.gap);
       return false;
     }
@@ -776,6 +1026,11 @@ export class NativeClaudeAcquisitionController {
     const generation = this.#generation;
     const armedFor = this.#armed;
     const sessionId = this.#sessionId;
+    // The identities this reducer holds open NOW, captured before the await so a
+    // window can only ever close a request that was open when it started reading.
+    // An empty set means there is nothing to match, and no row is inspected for
+    // an identity at all.
+    const openQuestions = new Set(this.#reducer.openQuestionRequestIds());
     const from = Math.max(armedFor?.byteOffset ?? 0, this.#cursor ?? 0);
     const expectIdentity = armedFor?.identity ?? this.#identity ?? undefined;
     this.#reading = true;
@@ -799,7 +1054,7 @@ export class NativeClaudeAcquisitionController {
       } else if (result.oversizedLines > 0) {
         gap = "oversized";
       } else {
-        scan = this.#scanRecords(result.records, armedFor !== null, sessionId);
+        scan = this.#scanRecords(result.records, armedFor !== null, sessionId, openQuestions);
         if (scan.malformed > 0) gap = "malformed";
         else {
           scannedTo = result.scannedTo;
@@ -817,6 +1072,15 @@ export class NativeClaudeAcquisitionController {
       if (gap !== null) {
         this.#transcriptFailure(gap);
       } else if (scan !== null && scannedTo !== null && readIdentity !== null) {
+        // A persisted `tool_result` for a request this reducer holds open is that
+        // request's own terminal evidence — the shape a declined, cancelled, or
+        // answered question leaves when no `Post*` hook ever arrived. It is
+        // applied first, because it is an independent fact about one request and
+        // neither a membership transition nor newer work makes it less true. Only
+        // the identity crossed here; no answer, error text, or result content.
+        for (const requestId of scan.questionClosures) {
+          this.#reducer.observeQuestionToolResult({ requestId, sessionId });
+        }
         // A structured native task/launch transition is proven membership change:
         // it makes the last snapshot unknown whichever way the window resolves.
         // It never replaces the snapshot with a reconstruction or a zero.
@@ -831,18 +1095,23 @@ export class NativeClaudeAcquisitionController {
         // read must not spend the armed pass on them. A persisted root PROMPT
         // row, and any root model row once no witness pass is armed, still
         // withdraws, exactly as before.
-        // What a root model row can contradict depends on what is actually
-        // published. An armed completion pass is contradicted by a new root prompt
-        // row, or by any root row that starts after this window's root-summary
-        // candidate. A source-confirmed Ready is contradicted by any root model
-        // row. With only a last-reported count published there is no foreground
-        // claim to contradict: the file is still read, so a membership transition
-        // can still withdraw the numbers, but a plain root row must not erase a
-        // healthy hook-derived foreground or question census.
-        const contradicts = scan.rootWork && (armedFor !== null
+        // What a root row can contradict depends on what is actually published.
+        // An armed completion pass is contradicted by a new root prompt row, or by
+        // a root prompt or model row that starts after this window's root-summary
+        // candidate. ANY published idle foreground — a witness-confirmed `Ready`, a
+        // corroborated fresh `SessionStart`, or the host's own launch baseline — is
+        // contradicted by a newer root prompt or model row, because the file is the
+        // only thing left that can say this idle claim stopped being true. With
+        // only a last-reported count published there is no foreground claim to
+        // contradict: the file is still read, so a membership transition can still
+        // withdraw the numbers, but a plain root row must not erase a healthy
+        // hook-derived foreground or question census. A signal row — a persisted
+        // result or a provider notification — contradicts no foreground claim at
+        // all, whichever of these is published.
+        const contradicts = scan.foregroundWork && (armedFor !== null
           ? (scan.newRootPromptWork
-            || (scan.firstCandidateIndex >= 0 && scan.rootWorkAfterCandidate))
-          : this.#readyPublished);
+            || (scan.firstCandidateIndex >= 0 && scan.foregroundWorkAfterCandidate))
+          : this.#idlePublished());
         if (contradicts) {
           this.#withdrawForRootWork();
         } else {
@@ -868,22 +1137,26 @@ export class NativeClaudeAcquisitionController {
    * Classify every complete record in the window. Only closed discriminators are
    * read — row `type`/`subtype`, `attachment.type`, `origin.kind`/`origin.producer`,
    * `toolUseResult.status`, the root-model markers (`isSidechain`, agent id,
-   * session, and the presence of a `message` object), and the summary row's
-   * rootness/terminality fields.
+   * session, and the presence of a `message` object), the block `type` of a
+   * persisted `tool_result`, the provider-injection markers (`isMeta`,
+   * `commandMode`, `origin.kind`), and the summary row's rootness/terminality
+   * fields.
    * No content, command, description, path, question, answer, or error text.
    */
   #scanRecords(
     records: readonly string[],
     seekWitness: boolean,
     sessionId: string | null,
+    openQuestionIds: ReadonlySet<string>,
   ): WindowScan {
     let malformed = 0;
     let transition = false;
-    let rootWork = false;
+    let foregroundWork = false;
     let newRootPromptWork = false;
     let firstCandidateIndex = -1;
-    let rootWorkAfterCandidate = false;
+    let foregroundWorkAfterCandidate = false;
     const candidates: NativeClaudeTerminalRecord[] = [];
+    const questionClosures: string[] = [];
     for (const [index, record] of records.entries()) {
       let parsed: unknown;
       try {
@@ -912,23 +1185,48 @@ export class NativeClaudeAcquisitionController {
       }
       if (isTaskTransitionRow(parsed)) transition = true;
       const rootRow = classifyRootTurnRow(parsed, sessionId);
+      // Only a persisted human PROMPT row or a root `assistant` model row is
+      // newer FOREGROUND work. A result-only row or a provider-injected
+      // notification carries the conversation without starting a turn of its own,
+      // so it outranks nothing: it must never cost a published Ready its
+      // foreground, its question census, or a still-open child request.
+      const foreground = rootRow === "prompt" || rootRow === "model";
       if (rootRow !== "none") {
-        rootWork = true;
+        if (foreground) foregroundWork = true;
         if (rootRow === "prompt") newRootPromptWork = true;
         // Append order is the only ordering fact a JSONL window carries: a row
         // that starts after the closing turn's own summary is newer work, a row
         // that starts before it belongs to the turn that summary closed.
-        if (firstCandidateIndex >= 0 && index > firstCandidateIndex) rootWorkAfterCandidate = true;
+        if (foreground && firstCandidateIndex >= 0 && index > firstCandidateIndex) {
+          foregroundWorkAfterCandidate = true;
+        }
+        // A persisted `tool_result` naming a request the reducer still holds open
+        // is that request's own terminal evidence — the shape a declined or
+        // cancelled question leaves when no `Post*` hook ever reached this
+        // observer. Only identities are compared, and only against requests that
+        // were open when this read began.
+        if (openQuestionIds.size > 0
+          && questionClosures.length < MAX_QUESTION_CLOSURES_PER_WINDOW
+          && isRecord(parsed.message)) {
+          for (const requestId of readToolResultRequestIds(parsed.message)) {
+            if (openQuestionIds.has(requestId)
+              && !questionClosures.includes(requestId)
+              && questionClosures.length < MAX_QUESTION_CLOSURES_PER_WINDOW) {
+              questionClosures.push(requestId);
+            }
+          }
+        }
       }
     }
     return {
       malformed,
       transition,
-      rootWork,
+      foregroundWork,
       newRootPromptWork,
       candidates,
       firstCandidateIndex,
-      rootWorkAfterCandidate,
+      foregroundWorkAfterCandidate,
+      questionClosures,
     };
   }
 
@@ -984,7 +1282,15 @@ export class NativeClaudeAcquisitionController {
    * loss of it, and the next real boundary can publish again.
    */
   #withdrawForRootWork(): void {
+    this.#startupVouched = false;
+    this.#baselineRetired = true;
     this.#retire();
+    // The conversation moved past whatever this controller published, and it did
+    // so without this run's hook lane saying a word: the whole derived scope is
+    // no longer trustworthy, so it is released as a unit and a genuinely new
+    // boundary re-adopts it. A window that only carried a task transition, a
+    // settlement, or a tool-result row never reaches this path — those rows
+    // contradict nothing about the foreground.
     this.#reducer.invalidate();
     // A retained count is still a published value: keep watching the same file
     // from a fresh scan floor so membership change can still contradict it.
@@ -998,6 +1304,8 @@ export class NativeClaudeAcquisitionController {
    * never to zero.
    */
   #hookLaneFailure(reason: NativeClaudeAcquisitionGapReason): void {
+    this.#startupVouched = false;
+    this.#baselineRetired = true;
     this.#retire();
     this.#counts = null;
     this.#reportGap(reason);
@@ -1017,7 +1325,11 @@ export class NativeClaudeAcquisitionController {
   #transcriptFailure(reason: NativeClaudeAcquisitionGapReason): void {
     this.#retire();
     this.#reportGap(reason);
-    this.#reducer.invalidate();
+    // Only the claim this lane supported goes unknown. The authenticated hook
+    // lane still vouches the run's foreground, its question census, and its
+    // scope, so a transcript this controller cannot read must not cost the row
+    // its pending-input answer until the next `SessionStart`.
+    this.#reducer.withdrawTranscriptForeground();
     this.#emit();
   }
 
@@ -1129,10 +1441,22 @@ function isRootSummaryCandidate(record: NativeClaudeTerminalRecord): boolean {
  * quiet" timing decides anything, and no arbitrary JSON line counts as work.
  *
  * `"prompt"` is the persisted shape of a NEW root turn: a `user` row with a
- * `message` and no `toolUseResult`. `"trailing"` is work belonging to a turn
- * already in flight — model output, or the result of a tool call already made —
- * which is exactly what legitimately flushes after a read barrier and before the
- * summary the provider appends once the whole Stop pass has answered.
+ * `message` and neither its own `toolUseResult` object nor a persisted
+ * `tool_result` block in its `message.content`. `"model"` is a root `assistant`
+ * row: the model produced something new. A `"prompt"` and a `"model"` row are the
+ * two kinds of newer FOREGROUND work. `"signal"` is a row the conversation
+ * carries forward without starting a turn of its own — the result of a tool call
+ * already made, or a provider task notification or meta injection.
+ * A real tool-result row does not always carry the top-level `toolUseResult`
+ * object, so the structured block inside `message.content` is what settles it:
+ * without that check a completed tool call would be misread as a human typing a
+ * new prompt, and a provider task notification or meta injection is likewise not
+ * a human turn. Only closed markers decide this; no text is inspected.
+ *
+ * The distinction is not cosmetic. A signal can terminate one request's own
+ * identity and can positively signal membership change, but it says nothing about
+ * whether the foreground moved, so it must never be the reason a published idle
+ * claim, a question census, or an unrelated still-open request is released.
  *
  * The markers that would make the row somebody else's turn are refused first, so
  * a child, a sidechain, or an unrelated native conversation can neither withdraw
@@ -1149,7 +1473,7 @@ function isRootSummaryCandidate(record: NativeClaudeTerminalRecord): boolean {
 function classifyRootTurnRow(
   parsed: Record<string, unknown>,
   sessionId: string | null,
-): "none" | "prompt" | "trailing" {
+): "none" | "prompt" | "model" | "signal" {
   const rowType = typeof parsed.type === "string" ? parsed.type : "";
   if (rowType !== "user" && rowType !== "assistant") return "none";
   if (parsed.isSidechain === true || parsed.is_sidechain === true) return "none";
@@ -1157,8 +1481,89 @@ function classifyRootTurnRow(
   const rowSession = readToken(parsed.sessionId) ?? readToken(parsed.session_id);
   if (rowSession !== null && sessionId !== null && rowSession !== sessionId) return "none";
   if (!isRecord(parsed.message)) return "none";
-  if (rowType === "assistant") return "trailing";
-  return isRecord(parsed.toolUseResult) ? "trailing" : "prompt";
+  if (rowType === "assistant") return "model";
+  if (isRecord(parsed.toolUseResult)) return "signal";
+  // The result of a call this conversation already made, in the shape that omits
+  // the top-level `toolUseResult` object but keeps the structured `tool_result`
+  // block: never a new human prompt.
+  if (hasToolResultBlock(parsed.message)) return "signal";
+  // A provider-injected user row — a background task notification, a meta notice —
+  // carries the conversation forward without a human turn behind it.
+  if (isProviderInjectedUserRow(parsed)) return "signal";
+  return "prompt";
+}
+
+/**
+ * Whether a persisted `message` carries structured `tool_result` content. Only
+ * the block `type` discriminator is read; the result body stays in the row.
+ */
+function hasToolResultBlock(message: Record<string, unknown>): boolean {
+  const content = message.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => isRecord(block) && block.type === "tool_result");
+}
+
+/**
+ * The `tool_use_id` identities of the structured `tool_result` blocks in one
+ * persisted `message`, bounded. Identities only: an answer, an error body, and
+ * every other field of the block stay unread.
+ */
+function readToolResultRequestIds(message: Record<string, unknown>): readonly string[] {
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "tool_result") continue;
+    const requestId = readToken(block.tool_use_id);
+    if (requestId !== null && !ids.includes(requestId)) {
+      ids.push(requestId);
+      if (ids.length >= MAX_QUESTION_CLOSURES_PER_WINDOW) break;
+    }
+  }
+  return ids;
+}
+
+/**
+ * Whether a persisted ROOT `user` row is the provider speaking rather than a
+ * human, from the closed markers the provider itself persists: `isMeta`, a
+ * `commandMode` no human types, or an `origin.kind` the provider stamps on its own
+ * injections (a settled background task, for instance). Anything else stays a
+ * human prompt, which errs toward withdrawing a published claim rather than
+ * keeping one.
+ */
+function isProviderInjectedUserRow(parsed: Record<string, unknown>): boolean {
+  if (parsed.isMeta === true) return true;
+  if (parsed.commandMode === "task-notification") return true;
+  return isRecord(parsed.origin) && parsed.origin.kind === "task-notification";
+}
+
+/**
+ * Whether one whole-file window still shows a brand-new conversation. Only the
+ * row `type` discriminator is read: any persisted `user` or `assistant` row — in
+ * any scope, from any session — means this file already recorded a conversation,
+ * and an unreadable row leaves the answer unknown rather than empty.
+ */
+function scanForPrerecordedWork(records: readonly string[]): {
+  readonly conversationRows: number;
+  readonly malformed: number;
+} {
+  let conversationRows = 0;
+  let malformed = 0;
+  for (const record of records) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(record);
+    } catch {
+      malformed += 1;
+      continue;
+    }
+    if (!isRecord(parsed)) {
+      malformed += 1;
+      continue;
+    }
+    if (parsed.type === "user" || parsed.type === "assistant") conversationRows += 1;
+  }
+  return { conversationRows, malformed };
 }
 
 /** A length-only array: `Array.isArray` and `.length` are all the reducer may read. */

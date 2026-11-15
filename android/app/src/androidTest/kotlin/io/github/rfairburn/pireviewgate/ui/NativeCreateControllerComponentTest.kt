@@ -126,7 +126,7 @@ class NativeCreateControllerComponentTest {
             RemotePresentationOrderCoordinator(),
             AtomicReference<ClientApplicationController.PromptStanding?>(null),
         ) as ClientApplicationController
-        setRuntimeState(built.runtime, ObservedState.runtime())
+        installRuntimeObservation(built.runtime, ObservedState.runtime())
         setRegistrySnapshot(registry, ObservedState.registry())
         compose.runOnIdle { refresh(built) }
         controller = built
@@ -147,11 +147,35 @@ class NativeCreateControllerComponentTest {
         method.invoke(controller)
     }
 
-    private fun setRuntimeState(runtime: ClientRuntime, state: ClientRuntimeState) {
+    /**
+     * Publish the synthetic lane observation on the flow the controller reads, and keep it
+     * there for the whole scenario.
+     *
+     * `ClientRuntime.publishState()` rebuilds the published state from the host lanes that
+     * are actually attached, and both [ClientApplicationController.intent] and
+     * `refresh()` report terminal coverage through
+     * [ClientRuntime.setTerminalInputCoverage], which republishes on every call. So one
+     * write to the runtime's own flow is rebuilt away during the very first refresh, and
+     * the next projection honestly sees three hosts with no roster, no acknowledged
+     * capability, and no advertised catalog — the create form then offers only Pi and the
+     * native choice can never be admitted or preserved.
+     *
+     * This scenario installs no lane by contract (no transport and no owner operation),
+     * so the runtime's internal publication target is pointed at a separate flow nothing
+     * reads, and the observation above stays the only thing the controller projects. Only
+     * where the observation comes from changes: the controller still projects, mints and
+     * invalidates proofs, admits, and reconciles the provider choice through production
+     * code, and no owner, catalog, capability, proof, or timing rule is relaxed.
+     */
+    private fun installRuntimeObservation(runtime: ClientRuntime, state: ClientRuntimeState) {
         val field = ClientRuntime::class.java.getDeclaredField("stateFlow")
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
-        (field.get(runtime) as MutableStateFlow<ClientRuntimeState>).value = state
+        val published = field.get(runtime) as MutableStateFlow<ClientRuntimeState>
+        // `ClientRuntime.state` is this same object, and it is what the controller reads.
+        published.value = state
+        // Production republishes land here instead, and nothing reads this one.
+        field.set(runtime, MutableStateFlow(state))
     }
 
     private object ObservedState {

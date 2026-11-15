@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.287]
+
+### Changed
+
+- Orchestration and execution guidance now keeps the foreground responsive by
+  preferring background shells/tasks, completion signals, callbacks, and a
+  one-shot `SubtasksWatch` over a foreground `sleep 300` or long polling loop.
+  There is no need to poll when those notifications provide the signal;
+  purposeful status checks and background monitoring remain allowed, and
+  harmless monitoring alone is not a reason to steer or correct a worker.
+  Runtime watch/background-shell behavior, tool permissions, bounded deadlines,
+  review gates, and CI obligations are unchanged (#668).
+
 ## [0.1.0-dev.286]
 
 ### Fixed

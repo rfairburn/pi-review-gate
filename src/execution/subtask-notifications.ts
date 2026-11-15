@@ -172,7 +172,7 @@ export function lifecycleWakeGuidanceLine(): string {
     "The start/add result reports queued tasks.",
     `Quiet mode (the default) triggers orchestrator turns for each ${quietTurnWakeStateList()}, or other recovery-required task; Noisy mode additionally triggers ${interactive}.`,
     `${passiveStateList()} remain visible in SubtasksInspect and /subtasks-view but do not trigger turns.`,
-    "DO NOT POLL for task-state changes and do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate.",
+    "Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield. Keep waiting or repeated monitoring in the background, use a purposeful status check when it informs a decision, and do not treat a harmless check alone as a violation to correct.",
     "Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.",
   ].join(" ");
 }
@@ -194,7 +194,7 @@ export function terminalWakeGuidanceLine(): string {
     "Each task completion, failure, and critical conflict triggers a model notification.",
     synchronousLandingNotificationCarveOut(),
     `Ordinary ${NOISY_INTERACTIVE_WAKE_STATES.map((state) => state.label.toLowerCase()).join("/") } transitions do so only in noisy mode.`,
-    "Use SubtasksInspect whenever you need current status or diagnostics; avoid tight repetitive polling.",
+    "Use SubtasksInspect when you need current status or diagnostics; a purposeful check is fine — prefer event notifications when sufficient, and move repeated monitoring to the background to keep the foreground responsive.",
   ].join(" ");
 }
 

@@ -367,7 +367,7 @@ test("primary off: active background work neither defers review nor wakes the or
     await trigger(rt.hooks, "tool_result", {
       cwd: dir,
       toolName: "ShellStart",
-      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; do not poll.` }] },
+      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; there is no need to poll.` }] },
       isError: false,
     });
     await triggerAgentEnd(rt.hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
@@ -425,7 +425,7 @@ test("toggling primary off mid-deferral keeps the completion wake and resumes wi
     await trigger(rt.hooks, "tool_result", {
       cwd: dir,
       toolName: "ShellStart",
-      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; do not poll.` }] },
+      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; there is no need to poll.` }] },
       isError: false,
     });
     await triggerAgentEnd(rt.hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });

@@ -592,7 +592,7 @@ function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof text
  *  The real extension API's pi.sendMessage returns void (the loader forwards
  *  the call without returning a result), so there is no delivery promise to
  *  observe. For exit wakes — the acknowledged completion contract behind
- *  "You will be notified automatically; do not poll" — the send is therefore
+ *  "You will be notified automatically; there is no need to poll" — the send is therefore
  *  retained on the job as a queued receipt until its custom message enters
  *  the transcript (message_start with matching customType and details.id),
  *  and as an injected receipt until a later normal assistant response proves
@@ -1091,7 +1091,9 @@ export function registerBackgroundShell(
       "otherwise Windows PowerShell; there is no shell selection) — so write it in that shell's " +
       "syntax. Use this instead of the foreground shell tool for anything that takes minutes " +
       "(training, builds, installs, servers, watchers). Declare what is worth interrupting you for " +
-      "in wake_on; you will be told automatically when it happens, so do NOT poll the job in a loop.",
+      "in wake_on; you will be told automatically when it happens, so there is no need to poll " +
+      "the job in a loop. Check its status when you need the output or a decision, and keep the " +
+      "foreground available for other work.",
     parameters: objectSchema({
       command: stringSchema("Shell command to run in the background"),
       label: stringSchema("Short name for this job, e.g. 'finetune'"),
@@ -1191,7 +1193,7 @@ export function registerBackgroundShell(
       return textResult(
         `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}); currently running.\n` +
           `Future wake triggers (not current events): ${watchingSummary || "nothing"}.\n` +
-          `You will be notified automatically; do not poll.`,
+          `You will be notified automatically; there is no need to poll. A purposeful status read is fine.`,
         false,
         shellResultDetails("ShellStart", {
           event: "started",

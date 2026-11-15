@@ -414,7 +414,7 @@ test("tool-specific duplicate feedback uses only observed results and approved n
     ["bash", { command: "SECRET-bash" }, "Review any existing command result and the current workspace state."],
     ["powershell", { command: "SECRET-powershell" }, "Review any existing command result and the current workspace state."],
     ["ApplyPatch", { patch: "SECRET-patch" }, "Revalidate the intended patch against the current file contents and any prior patch outcome before making further edits."],
-    ["SubtasksInspect", { executionId: "SECRET-execution" }, "No inspection snapshot was taken by this member. Repeated polling is discouraged; rely on event-driven completion notifications, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues."],
+    ["SubtasksInspect", { executionId: "SECRET-execution" }, "No inspection snapshot was taken by this member. There is no need to poll when event-driven completion notifications provide the signal; a purposeful status check is fine, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues."],
     ["ShellList", {}, "Use the evidence already available."],
     ["ShellStart", { command: "SECRET-start" }, ""],
     ["SubtasksStart", { tasks: [] }, ""],

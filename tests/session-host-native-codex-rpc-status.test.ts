@@ -93,6 +93,18 @@ function settle(ms = 5): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Wait for a running census to land. Mid-census publications are suppressed by
+ * design, so a test that asserts the effect of a caller-side update has to let
+ * the in-flight walk republish first rather than race it.
+ */
+async function awaitQuiet(observer: NativeCodexRpcStatusObserver): Promise<void> {
+  for (let waited = 0; observer.censusInFlight && waited < 4_000; waited += 10) {
+    await settle(10);
+  }
+  assert.equal(observer.censusInFlight, false, "the census should have landed");
+}
+
 interface Harness {
   readonly server: FakeCodexAppServer;
   readonly scheduler: FakeScheduler;
@@ -101,6 +113,7 @@ interface Harness {
   readonly observer: NativeCodexRpcStatusObserver;
   latest(): NativeStatusObservation;
   requests(method: string): number;
+  quiet(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -156,6 +169,9 @@ async function startHarness(
     observer,
     latest: () => observations[observations.length - 1] as NativeStatusObservation,
     requests: (method) => server.requests.filter((request) => request.method === method).length,
+    quiet: async () => {
+      await awaitQuiet(observer);
+    },
     close: async () => {
       observer.dispose();
       await server.stop();
@@ -322,7 +338,7 @@ test("a descendant status edge recomputes the count while the root stays idle", 
     h.server.broadcast("thread/status/changed", { threadId: CHILD_ACTIVE, status: { type: "idle" } });
     await settle(25);
     await h.scheduler.advance(300);
-    await settle(25);
+    await h.quiet();
 
     assert.equal(h.latest().activeTasks, 0, "completed-but-loaded children are excluded");
     assert.ok(h.requests("thread/list") > censusBefore, "the descendant edge must trigger a re-pull");
@@ -356,7 +372,7 @@ test("background shells reach a live zero while the root status never changes", 
     // The provider-scoped refresh is armed because work is known to be live.
     h.server.setBackgroundTerminals(ROOT, []);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, 0, "the live finish reaches zero without a poller");
     assert.equal(h.latest().busy, false);
     assert.equal(h.scheduler.pendingTimerCount, 1,
@@ -367,7 +383,7 @@ test("background shells reach a live zero while the root status never changes", 
     h.server.setStatus(CHILD_ACTIVE, idleStatus);
     h.server.setStatus(NESTED, idleStatus);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 0);
     assert.equal(h.scheduler.pendingTimerCount, 0, "an idle row arms no further refresh");
     const quiet = h.server.rawInboundFrames.length;
@@ -442,7 +458,7 @@ test("a failed census withdraws its own axis instead of publishing a partial cou
     assert.equal(h.latest().activeTasks, 2);
     h.server.failMethod("thread/list", 1);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, null, "unknown, never a partial number and never zero");
     assert.equal(h.latest().activeShells, null,
       "a failed descendant listing leaves the set of threads that could own a terminal unknown, so the shell axis cannot claim a total either");
@@ -451,7 +467,7 @@ test("a failed census withdraws its own axis instead of publishing a partial cou
 
     // Recovery: a later complete walk publishes a number again.
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 2);
   } finally {
     await h.close();
@@ -501,7 +517,7 @@ test("a membership failure withdraws the shell axis instead of finalizing it", a
 
     // Recovery proves the real count...
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 2);
     assert.equal(h.latest().activeShells, 1);
 
@@ -509,7 +525,7 @@ test("a membership failure withdraws the shell axis instead of finalizing it", a
     // over whatever descendant set happened to survive.
     h.server.failMethod("thread/list", 1);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, null);
     assert.equal(h.latest().activeShells, null,
       "keeping the previous scope is not completeness once a membership read failed");
@@ -539,7 +555,7 @@ test("an unreadable or misidentified loaded child is never cached as unrelated",
     // metadata decodes, an ordinary healthy census counts the child.
     h.server.unreadable.delete(CHILD_ACTIVE);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 1, "the child is still eligible after a previously unreadable read");
     assert.equal(h.latest().activeShells, 0, "and the shell axis completes again");
 
@@ -547,13 +563,13 @@ test("an unreadable or misidentified loaded child is never cached as unrelated",
     // equally not evidence of anything about this id.
     h.server.mismatched.add(CHILD_ACTIVE);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, null, "an identity mismatch is not a negative ownership answer");
     assert.equal(h.latest().activeShells, null);
 
     h.server.mismatched.delete(CHILD_ACTIVE);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 1, "and the census recovers once the identity matches again");
   } finally {
     await h.close();
@@ -580,7 +596,7 @@ test("an unreadable parent during ancestry resolution degrades instead of dismis
 
     h.server.unreadable.delete(CHILD_ACTIVE);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 1,
       "the grandchild counts once its ancestry can actually be proved");
     assert.equal(h.latest().activeShells, 0);
@@ -605,14 +621,14 @@ test("positive tasks keep the recovery chain alive while the shell axis is unkno
     // Two consecutive terminal-read failures bracket the child finishing.
     h.server.failMethod("thread/backgroundTerminals/list", 2);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, null);
     assert.equal(h.latest().activeTasks, 1, "the task axis is unaffected by the shell failure");
 
     // The owned child finishes, with no broadcast at all.
     h.server.setStatus(CHILD_ACTIVE, idleStatus);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 0);
     assert.equal(h.latest().activeShells, null, "the second failure still withdraws");
     assert.equal(h.scheduler.pendingTimerCount, 1,
@@ -623,7 +639,7 @@ test("positive tasks keep the recovery chain alive while the shell axis is unkno
     // discover for itself.
     h.server.setBackgroundTerminals(ROOT, []);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, 0);
     // ...and only a census that positively saw everything idle retires the chain.
     assert.equal(h.scheduler.pendingTimerCount, 0);
@@ -735,21 +751,21 @@ test("one transient shell-read failure cannot strand the shell axis unknown", as
     // One failed terminal read withdraws the axis...
     h.server.failMethod("thread/backgroundTerminals/list", 1);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, null);
     assert.ok(h.diagnostics.includes("shells-incomplete"));
 
     // ...and the provider-scoped refresh recovers it with no root notification
     // and no manual refresh: a withdrawn value is not evidence of no work.
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, 1, "the transient failure resolves on its own");
 
     // When the terminal really finishes, a COMPLETE read retires the witness and
     // the row goes quiet instead of polling forever.
     h.server.setBackgroundTerminals(ROOT, []);
     await h.scheduler.advance(2_000);
-    await settle(25);
+    await h.quiet();
     assert.equal(h.latest().activeShells, 0);
     assert.equal(h.scheduler.pendingTimerCount, 0, "the recovery chain ends once the work is positively resolved");
   } finally {
@@ -837,13 +853,331 @@ test("pages are followed and rows deduped before any number is published", async
   }
 });
 
-test("a census that hits its page bound publishes unknown, not a truncation", async () => {
+test("a census with a tiny slice budget still completes the whole walk", async () => {
+  // One row per page and two pages per slice: the census needs several slices,
+  // and every one of them is ordinary work, never a degraded value.
   const h = await startHarness({ pageSize: 1 }, { limits: { maxCensusPages: 2 } });
   try {
-    assert.equal(h.latest().activeTasks, null, "an unfinished walk cannot publish a count");
-    assert.ok(h.diagnostics.includes("tasks-budget"));
-    assert.equal(h.latest().activeShells, null,
-      "the shell census is scoped by that same unfinished membership, so it is withdrawn too");
+    const card = h.latest();
+    assert.equal(card.activeTasks, 2, "a slice budget is not a census ceiling");
+    assert.equal(card.activeShells, 0, "and the shell scope is still walked in full");
+    assert.equal(card.busy, false);
+    assert.deepEqual(h.diagnostics, [], "suspension is not a diagnostic and never a degraded value");
+    assert.ok(h.requests("thread/list") >= 4, "every page was followed, across slices");
+  } finally {
+    await h.close();
+  }
+});
+
+/* -------------------------------------------------- census size and slices */
+
+const IDLE_CHILD_COUNT = 17;
+const IDLE_CHILDREN: readonly string[] = Array.from(
+  { length: IDLE_CHILD_COUNT },
+  (_unused, index) => `idle-child-${index}`,
+);
+const HISTORY_COUNT = 420;
+
+function idleChildren(parentId: string, ids: readonly string[]): FakeThread[] {
+  return ids.map((id) => ({
+    id,
+    parentThreadId: parentId,
+    status: idleStatus,
+    sourceKind: "subAgentThreadSpawn" as const,
+  }));
+}
+
+test("more loaded owned threads than one slice affords still report a complete card", async () => {
+  // Seventeen finished-but-loaded children plus the root is eighteen live
+  // threads: more than the old shell-census bound, and a perfectly healthy row.
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      ...idleChildren(ROOT, IDLE_CHILDREN),
+    ],
+    loadedIds: [ROOT, ...IDLE_CHILDREN],
+    backgroundTerminals: { [ROOT]: [] },
+  });
+  try {
+    const card = h.latest();
+    assert.equal(card.activeTasks, 0, "completed-but-loaded children never count");
+    assert.equal(card.activeShells, 0, "every live thread was still asked");
+    assert.equal(card.busy, false, "Ready stays known, not unknown");
+    assert.deepEqual(card.activity, [NATIVE_CODEX_RPC_ACTIVITY_READY]);
+    assert.deepEqual(h.diagnostics, [], "population size is not a failure");
+
+    const queried = new Set(h.server.requests
+      .filter((request) => request.method === "thread/backgroundTerminals/list")
+      .map((request) => String((request.params as { threadId?: string }).threadId)));
+    assert.equal(queried.size, IDLE_CHILD_COUNT + 1, "root plus every loaded owned thread");
+    assert.equal(queried.has(IDLE_CHILDREN[IDLE_CHILD_COUNT - 1] as string), true,
+      "the walk continues past the slice bound instead of stopping at it");
+
+    // An idle child owns a real background terminal. Nothing is counted as a
+    // task and the root is Ready, so only a complete scope can report the one.
+    h.server.setBackgroundTerminals(IDLE_CHILDREN[5] as string, [{ processId: "p-idle" }]);
+    h.observer.refresh();
+    await settle(30);
+    const withShell = h.latest();
+    assert.equal(withShell.activeTasks, 0);
+    assert.equal(withShell.activeShells, 1, "an idle child's running shell is never dropped");
+    assert.equal(withShell.busy, false, "a background shell never makes the root run");
+    assert.deepEqual(withShell.activity, [NATIVE_CODEX_RPC_ACTIVITY_READY]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("hundreds of historical persisted children still yield a complete census", async () => {
+  // Ordinary persisted history: every one of these is unloaded, so none of them
+  // counts as a task and none can own a terminal, but the provider's listing
+  // still has to be walked to know that.
+  const history = idleChildren(ROOT, Array.from({ length: HISTORY_COUNT }, (_unused, index) => `hist-${index}`));
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      ...history,
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    pageSize: 50,
+    backgroundTerminals: { [ROOT]: [], [CHILD_ACTIVE]: [{ processId: "p-child" }] },
+  });
+  try {
+    const card = h.latest();
+    assert.equal(card.activeTasks, 1, "only the live owned child counts");
+    assert.equal(card.activeShells, 1, "the shell census is complete over the live scope");
+    assert.equal(card.busy, false, "owned work never holds the root's foreground running");
+    assert.equal(card.pendingInput, false);
+    assert.deepEqual(h.diagnostics, [], "history size is not a budget failure");
+    assert.equal(h.requests("thread/list"), Math.ceil((HISTORY_COUNT + 1) / 50),
+      "every page exactly once: past the old eight-page ceiling, with no re-walk");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a deeper owned lineage is proved, not budgeted away", async () => {
+  const chain = ["nested-1", "nested-2", "nested-3", "nested-4", "nested-5", "nested-6"];
+  const threads: FakeThread[] = [{ id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" }];
+  let parent = ROOT;
+  for (const id of chain) {
+    // Each level legitimately runs in its own worktree, so no cwd may filter it.
+    threads.push({ id, parentThreadId: parent, status: idleStatus, sourceKind: "subAgentThreadSpawn", cwd: `/owned/${id}` });
+    parent = id;
+  }
+  const h = await startHarness({
+    threads,
+    loadedIds: [ROOT, ...chain],
+    // Only the deepest thread is listed, so every ancestor has to be read.
+    persistedListing: [chain[chain.length - 1] as string],
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 0);
+    assert.ok(h.requests("thread/read") >= chain.length, "the ancestry bridges were read, not assumed");
+
+    h.server.setStatus(chain[chain.length - 1] as string, activeStatus());
+    h.server.broadcast("thread/status/changed", {
+      threadId: chain[chain.length - 1] as string,
+      status: { type: "active", activeFlags: [] },
+    });
+    await settle(30);
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1,
+      "an owned descendant six hops down is still this row's subagent");
+    assert.deepEqual(h.diagnostics, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a suspended slice never skips the loaded thread it stopped on", async () => {
+  // Both children are ephemeral, so each one costs a metadata read, and the
+  // slice budget affords exactly one read. The second child is the boundary.
+  const h = await startHarness(
+    {
+      threads: [
+        { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+        { id: "ephemeral-a", parentThreadId: ROOT, status: idleStatus, sourceKind: "subAgentThreadSpawn" },
+        { id: "ephemeral-b", parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      ],
+      loadedIds: [ROOT, "ephemeral-a", "ephemeral-b"],
+      persistedListing: [],
+      backgroundTerminals: { ["ephemeral-b"]: [{ processId: "p-boundary" }] },
+    },
+    { limits: { maxDescendantReads: 1 } },
+  );
+  try {
+    const card = h.latest();
+    assert.equal(card.activeTasks, 1, "the child the walk suspended on is still counted");
+    assert.equal(card.activeShells, 1, "and its running shell is inside the complete scope");
+    assert.deepEqual(h.diagnostics, [], "a slice boundary is not a failure");
+    assert.equal(h.requests("thread/read"), 3, "root plus both children, each exactly once");
+  } finally {
+    await h.close();
+  }
+});
+
+test("memo eviction cannot silently drop a proven owned child", async () => {
+  // More proven descendants than the cross-census ancestry memo can hold. The
+  // memo is an optimization; the membership this census publishes is its own.
+  const owned = Array.from({ length: 12 }, (_unused, index) => `owned-${index}`);
+  const firstOwned = owned[0] as string;
+  const h = await startHarness(
+    {
+      threads: [
+        { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+        ...idleChildren(ROOT, owned).map((row) => ({ ...row, status: activeStatus() })),
+      ],
+      loadedIds: [ROOT, ...owned],
+      backgroundTerminals: { [firstOwned]: [{ processId: "p-first-owned" }] },
+    },
+    { limits: { maxUnrelatedIds: 4 } },
+  );
+  try {
+    const card = h.latest();
+    assert.equal(card.activeTasks, owned.length,
+      "every proven descendant is a member, whatever the bounded memo evicted");
+    assert.equal(card.activeShells, 1, "the evicted-then-reproved child is still in the terminal scope");
+    assert.deepEqual(h.diagnostics, [], "eviction is not a failure and must not be lossy");
+    const queried = new Set(h.server.requests
+      .filter((request) => request.method === "thread/backgroundTerminals/list")
+      .map((request) => String((request.params as { threadId?: string }).threadId)));
+    assert.equal(queried.has(firstOwned), true, "the first-owned child was asked, not forgotten");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a lineage deeper than the slice budget is proved across slices, not failed", async () => {
+  // Seventy legitimate levels, two units of lineage work per slice: the proof
+  // needs many slices and no depth ceiling may end it.
+  const chain = Array.from({ length: 70 }, (_unused, index) => `deep-${index}`);
+  const deepest = chain[chain.length - 1] as string;
+  const threads: FakeThread[] = [{ id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" }];
+  let parent = ROOT;
+  for (const id of chain) {
+    threads.push({
+      id,
+      parentThreadId: parent,
+      status: id === deepest ? activeStatus() : idleStatus,
+      sourceKind: "subAgentThreadSpawn",
+    });
+    parent = id;
+  }
+  const h = await startHarness(
+    {
+      threads,
+      loadedIds: [ROOT, ...chain],
+      // Only the deepest is listed, so the whole chain has to be walked up.
+      persistedListing: [deepest],
+    },
+    { limits: { maxDescendantReads: 2 } },
+  );
+  try {
+    const card = h.latest();
+    assert.equal(card.activeTasks, 1, "an owned descendant seventy hops down counts");
+    assert.equal(card.activeShells, 0, "the terminal census covers the full live scope");
+    assert.deepEqual(h.diagnostics, [], "no depth ceiling and no budget failure");
+    assert.equal(h.requests("thread/read"), chain.length, "root plus every ancestor, each exactly once");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a repeating page cursor is a source fault, not an endless walk or a count", async () => {
+  // A cursor the walk already asked for is a provider loop. It fails the axis
+  // like any other unreadable page, and it is detected instead of chased.
+  const h = await startHarness({
+    rawResults: {
+      "thread/list": {
+        data: [{ id: "loop-child", parentThreadId: ROOT, status: { type: "idle" } }],
+        nextCursor: "the-same-cursor",
+      },
+    },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, null, "a looping cursor never becomes a count, let alone a zero");
+    assert.equal(h.latest().activeShells, null, "and no shell total is claimed over an unfinished membership");
+    assert.ok(h.diagnostics.includes("tasks-incomplete"));
+    assert.ok(h.diagnostics.includes("shells-incomplete"));
+    assert.equal(h.requests("thread/list"), 2, "the loop is detected on the repeat, not chased forever");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a parent cycle fails the census closed instead of counting or looping", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: "cycle-a", parentThreadId: "cycle-b", status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      { id: "cycle-b", parentThreadId: "cycle-a", status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, "cycle-a", "cycle-b"],
+    // The provider's own ancestor filter cannot place a cycle, so these ids only
+    // surface through the loaded set.
+    persistedListing: [],
+  });
+  try {
+    assert.equal(h.latest().activeTasks, null, "a cycle proves nothing, so nothing is counted");
+    assert.equal(h.latest().activeShells, null);
+    assert.ok(h.diagnostics.includes("tasks-cycle"));
+  } finally {
+    await h.close();
+  }
+});
+
+test("a streaming census keeps the last complete card until it lands", async () => {
+  const h = await startHarness({ pageSize: 1, delayMs: { "thread/list": 20 } });
+  try {
+    const published = h.observations.length;
+    const card = h.latest();
+    assert.equal(card.activeTasks, 2);
+
+    h.observer.refresh();
+    await settle(60);
+    assert.equal(h.observer.censusInFlight, true, "the walk is still streaming");
+    assert.equal(h.observations.length, published,
+      "a multi-slice census publishes nothing half-built, and blanks nothing");
+    assert.deepEqual(h.latest(), card);
+
+    await settle(500);
+    assert.equal(h.observer.censusInFlight, false);
+    assert.equal(h.observations.length, published, "a healthy re-pull still publishes nothing new");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a membership edge mid-walk restarts the enumeration instead of publishing it", async () => {
+  const h = await startHarness({ pageSize: 1, delayMs: { "thread/list": 25 } });
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    h.observer.refresh();
+    await settle(40);
+    assert.equal(h.observer.censusInFlight, true, "the census is part-way through its pages");
+
+    // A new owned child starts while pages are in flight. It may sit behind a
+    // page this walk already passed, so the walk is not publishable.
+    h.server.setThread({
+      id: "late-child",
+      parentThreadId: ROOT,
+      status: activeStatus(),
+      sourceKind: "subAgentThreadSpawn",
+    });
+    h.server.setLoaded("late-child", true);
+    h.server.broadcast("thread/started", {
+      thread: { id: "late-child", parentThreadId: ROOT, status: { type: "active", activeFlags: [] } },
+    });
+    await settle(200);
+    await h.scheduler.advance(400);
+    await h.quiet();
+
+    assert.equal(h.observer.censusInFlight, false);
+    assert.equal(h.latest().activeTasks, 3,
+      "the trailing census re-enumerated from the first page and found the new child");
+    assert.equal(h.latest().activeShells, 0);
   } finally {
     await h.close();
   }
@@ -854,7 +1188,7 @@ test("privacy: no command, cwd, preview, name, or model ever reaches an observat
   try {
     h.server.setBackgroundTerminals(ROOT, [{ processId: "proc-1", command: `${FAKE_MARKER} secret command`, cwd: `${FAKE_MARKER}/secret` }]);
     h.observer.refresh();
-    await settle();
+    await h.quiet();
     h.server.setStatus(ROOT, activeStatus(["waitingOnUserInput"]));
     h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: ["waitingOnUserInput"] } });
     await settle();
@@ -902,7 +1236,9 @@ test("the tool-type merge seam is authoritative for the caller and never implies
     assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
 
     h.observer.observeToolActivity("Exec");
-    assert.deepEqual(h.latest().activity, ["Exec"]);
+    await awaitQuiet(h.observer);
+    assert.deepEqual(h.latest().activity, ["Exec"],
+      "the caller's tool type reaches the card once the in-flight census republishes");
 
     // The RPC lane keeps authority over Ready vs Working: once the root is idle
     // the caller's label is dropped, so no stale tool line can outlive the turn.
@@ -916,6 +1252,7 @@ test("the tool-type merge seam is authoritative for the caller and never implies
     h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
     await settle();
     h.observer.observeToolActivity(`rm -rf ${FAKE_MARKER} && echo done`.repeat(6));
+    await awaitQuiet(h.observer);
     const line = (h.latest().activity ?? [])[0] ?? "";
     assert.ok(line.length > 0 && line.length <= 120);
     assert.ok(!line.includes(FAKE_MARKER));
@@ -948,6 +1285,7 @@ test("reconnect withdraws, then re-pulls the true state, including a child that 
     await h.scheduler.advance(300);
     await settle(50);
     assert.equal(h.observer.connected, true);
+    await h.quiet();
     assert.equal(h.latest().activeTasks, 0, "the reconnect re-pull sees the finished children");
     assert.equal(h.latest().activeShells, 0);
     assert.equal(h.latest().busy, false);
@@ -992,7 +1330,7 @@ test("a stale in-flight census can never publish after a rebinding", async () =>
 });
 
 test("disposal is bounded: no late timer, callback, or request survives it", async () => {
-  const h = await startHarness({ delayMs: { "thread/list": 40 } });
+  const h = await startHarness({ pageSize: 1, delayMs: { "thread/list": 40 } });
   try {
     h.observer.refresh();
     await settle(10);

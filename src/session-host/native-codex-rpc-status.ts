@@ -57,14 +57,31 @@
  *   persisted-not-loaded child are all excluded. There is deliberately no cwd
  *   filter, because an owned child legitimately runs in its own worktree.
  * - **shells** — the complete `thread/backgroundTerminals/list` count for the
- *   bound root and its known descendants, deduplicated by process identity
- *   across pages and threads. An authoritative empty page is a real `0`.
+ *   bound root and every proven descendant the provider positively established
+ *   as live, deduplicated by process identity across pages and threads. An
+ *   authoritative empty page is a real `0`.
  * - **activity** — `Ready` from `idle` and `Working` from `active`. The
  *   tool-TYPE sub-detail comes from the parent's existing hook/rollout feed
  *   through {@link NativeCodexRpcStatusObserver.observeToolActivity}, which is
  *   the documented merge seam: this lane never pretends to see item events it
  *   cannot receive without subscribing. `Working` is a real activity value, not
  *   a placeholder for an unknown.
+ *
+ * ## Census size
+ *
+ * Every walk in a census is streamed in bounded WORK SLICES, and a slice that
+ * runs out of page or read budget hands its cursor, its buffered page, and any
+ * parent chain it is mid-way through to the next slice. The page, read, and
+ * per-slice thread bounds are therefore backpressure on how much provider
+ * traffic one scheduling step may issue — they are never a ceiling on how large
+ * a row may be. Seventeen loaded children, hundreds of historical persisted
+ * children, or a deeper legitimate lineage cost more slices, not a permanent
+ * `unknown`: a healthy row always reaches its complete, truthful count.
+ *
+ * What still fails an axis closed is a real provider fault — a refused or timed
+ * out read, an undecodable or repeating page cursor, a parent cycle, an identity
+ * mismatch, a disconnect, or a retired binding. Suspension never publishes,
+ * and no census ever publishes a number it did not finish collecting.
  *
  * ## Freshness
  *
@@ -75,10 +92,11 @@
  * stays unchanged still reaches a live `0` without a global poller and without a
  * new user-facing setting. One census runs at a time; requests that arrive
  * during one coalesce into at most one trailing refresh, so a broadcast burst
- * cannot become a poll storm. A refresh never blanks a known value: values are
- * only withdrawn by a real failure, and a failed census withdraws its own axis
- * to unknown rather than inventing a zero. Timers here bound scheduling; none of
- * them ever manufactures an idle claim.
+ * cannot become a poll storm, and a census that needs several slices still runs
+ * as that one census rather than as a poller. A refresh never blanks a known
+ * value: values are only withdrawn by a real failure, and a failed census
+ * withdraws its own axis to unknown rather than inventing a zero. Timers here
+ * bound scheduling; none of them ever manufactures an idle claim.
  */
 
 import {
@@ -88,7 +106,10 @@ import {
   type NativeCodexRpcFailureCode,
   type NativeCodexRpcNotification,
   type NativeCodexRpcTransportOptions,
+  type NativeCodexLoadedPage,
   type NativeCodexServerRequestSignal,
+  type NativeCodexTerminalPage,
+  type NativeCodexThreadPage,
   type NativeCodexThreadRow,
   type NativeCodexThreadStatus,
 } from "./native-codex-rpc";
@@ -117,21 +138,33 @@ export const NATIVE_CODEX_RPC_ACTIVITY_WORKING = "Working";
 /** A caller-supplied tool type is a short label, never a command or argument. */
 export const NATIVE_CODEX_RPC_MAX_TOOL_LABEL_CHARS = 48;
 
-/** Scheduling and walk bounds. All of them are ceilings, never idle heuristics. */
+/**
+ * Scheduling and walk bounds. None of them may degrade a healthy row's published
+ * value: they bound one slice's traffic and this observer's memory, never the
+ * size of the row being observed.
+ */
 export interface NativeCodexRpcStatusLimits {
   /** Requested page size for every census listing (capped by the transport). */
   readonly censusPageLimit: number;
-  /** Maximum pages followed per listing source per census. */
+  /**
+   * Page fetches allowed in one work slice. A census may run as many slices as
+   * its own lineage needs, so this bounds how much traffic one scheduling step
+   * can issue; it never caps how much of the row the census can enumerate.
+   */
   readonly maxCensusPages: number;
-  /** Maximum `thread/read` calls one census may make for bare or unresolved ids. */
+  /**
+   * Units of descendant-resolution work allowed in one work slice: a
+   * `thread/read` for a bare loaded id, or one hop up a parent chain. A census
+   * may run as many slices as its lineage needs, so this bounds one scheduling
+   * step; it never caps how deep or how large a row may be.
+   */
   readonly maxDescendantReads: number;
-  /** Maximum parent hops accepted when proving a row descends from the bound root. */
-  readonly maxDescendantDepth: number;
-  /** Maximum descendant ids tracked at once; beyond it the census degrades. */
-  readonly maxKnownDescendants: number;
   /** Maximum ids remembered as proven-not-descendant, so they stop costing reads. */
   readonly maxUnrelatedIds: number;
-  /** Maximum threads whose background terminals one census may list. */
+  /**
+   * Threads whose background terminals may be listed in one work slice. The
+   * full live scope is always walked, across as many slices as it needs.
+   */
   readonly maxShellCensusThreads: number;
   /** Minimum spacing between census starts, in timer units. */
   readonly refreshCooldownMs: number;
@@ -149,8 +182,6 @@ export const NATIVE_CODEX_RPC_STATUS_DEFAULT_LIMITS: NativeCodexRpcStatusLimits 
   censusPageLimit: 50,
   maxCensusPages: 8,
   maxDescendantReads: 48,
-  maxDescendantDepth: 4,
-  maxKnownDescendants: 64,
   maxUnrelatedIds: 256,
   maxShellCensusThreads: 16,
   refreshCooldownMs: 250,
@@ -177,14 +208,10 @@ export type NativeCodexRpcStatusDiagnosticCode =
   | "root-not-loaded"
   /** The sub-agent census could not be completed; tasks published unknown. */
   | "tasks-incomplete"
-  /** The sub-agent census hit a walk bound before completing. */
-  | "tasks-budget"
   /** The sub-agent census found a parent cycle. */
   | "tasks-cycle"
   /** The background-terminal census could not be completed; shells published unknown. */
   | "shells-incomplete"
-  /** The background-terminal census hit its thread bound before completing. */
-  | "shells-budget"
   /** A transport failure code, passed through unchanged. */
   | NativeCodexRpcFailureCode;
 
@@ -307,8 +334,37 @@ export interface NativeCodexRpcStatusObserverOptions {
 
 type Ancestry = "descendant" | "unrelated";
 
+/**
+ * What one slice of a census walk achieved. `"suspended"` is a scheduling fact,
+ * never a degraded value: the next slice continues the same walk.
+ */
+type CensusStage = "suspended" | "settled" | "stale";
+
+/** One parent chain being proved, held as walk state so it can resume mid-chain. */
+interface CensusChain {
+  /** Ids already on this chain, in visit order; also the cycle detector. */
+  readonly visited: Set<string>;
+  /** The row whose parent is being resolved right now. */
+  currentId: string;
+  /** Whether the provider's own ancestor filter named the starting row. */
+  readonly fromAncestorQuery: boolean;
+}
+
+/**
+ * One census's streamed walk.
+ *
+ * The census publishes once, but it enumerates in bounded slices, so every
+ * cursor, buffered page, chain, and accumulated id below exists to let the next
+ * slice pick up exactly where the previous one stopped. Nothing here outlives
+ * the census that built it; only proven ancestry is cached on the observer.
+ */
 interface CensusWalk {
-  /** Every collected row, keyed by thread id, from either enumeration source. */
+  /** The bound root this census is scoped to. */
+  readonly rootThreadId: string;
+  /**
+   * Collected rows that can still change a published value: live threads plus
+   * ancestry bridges. Historical `notLoaded` rows are streamed past and dropped.
+   */
   readonly rows: Map<string, NativeCodexThreadRow>;
   /**
    * Which collected rows came from the provider's own ancestor-filtered query.
@@ -317,9 +373,78 @@ interface CensusWalk {
    * that fails the chain is simply not this row's child.
    */
   readonly ancestorIds: Set<string>;
-  /** Set when a bound was hit or a read failed: the census may not publish a number. */
+  /**
+   * Ownership verdicts proved BY THIS CENSUS. Membership is read from here and
+   * only here, so it cannot be changed by the bounded cross-census memo evicting
+   * an entry mid-walk; that memo may only ever cost a later re-proof.
+   */
+  readonly verdicts: Map<string, Ancestry>;
+  /** Set when a real read failed or the source contradicted itself. */
   failure: NativeCodexRpcStatusDiagnosticCode | null;
-  reads: number;
+  /** True once a membership edge or a retirement superseded this walk. */
+  voided: boolean;
+  /** Page fetches issued in the current slice. */
+  slicePages: number;
+  /** Metadata steps (reads and lineage hops) taken in the current slice. */
+  sliceReads: number;
+  /** Threads whose terminal listing was started in the current slice. */
+  sliceThreads: number;
+
+  persistedCursor: string | null;
+  persistedDone: boolean;
+  readonly seenPersistedCursors: Set<string>;
+
+  loadedCursor: string | null;
+  loadedDone: boolean;
+  loadedPage: readonly string[];
+  loadedIndex: number;
+  readonly seenLoadedCursors: Set<string>;
+
+  ancestryIds: readonly string[];
+  ancestryIndex: number;
+  chain: CensusChain | null;
+
+  rootLive: boolean;
+  terminalScope: readonly string[];
+  terminalIndex: number;
+  /** True while the thread at `terminalIndex` already holds this slice's budget. */
+  terminalThreadStarted: boolean;
+  terminalCursor: string | null;
+  readonly seenTerminalCursors: Set<string>;
+  readonly processes: Set<string>;
+}
+
+/** Fresh walk state for one census. */
+function createCensusWalk(rootThreadId: string): CensusWalk {
+  return {
+    rootThreadId,
+    rows: new Map(),
+    ancestorIds: new Set(),
+    verdicts: new Map(),
+    failure: null,
+    voided: false,
+    slicePages: 0,
+    sliceReads: 0,
+    sliceThreads: 0,
+    persistedCursor: null,
+    persistedDone: false,
+    seenPersistedCursors: new Set(),
+    loadedCursor: null,
+    loadedDone: false,
+    loadedPage: [],
+    loadedIndex: 0,
+    seenLoadedCursors: new Set(),
+    ancestryIds: [],
+    ancestryIndex: 0,
+    chain: null,
+    rootLive: false,
+    terminalScope: [],
+    terminalIndex: 0,
+    terminalThreadStarted: false,
+    terminalCursor: null,
+    seenTerminalCursors: new Set(),
+    processes: new Set(),
+  };
 }
 
 /**
@@ -369,6 +494,8 @@ export class NativeCodexRpcStatusObserver {
 
   /** Known descendants of the bound root and their last known status. */
   readonly #descendants = new Map<string, NativeCodexThreadStatus>();
+  /** The census walk in progress, if any; superseded by any membership edge. */
+  #walk: CensusWalk | null = null;
   /** Bounded ancestry memory so unrelated loaded ids stop costing reads. */
   readonly #ancestry = new Map<string, Ancestry>();
 
@@ -573,6 +700,7 @@ export class NativeCodexRpcStatusObserver {
     this.#workWitness = false;
     this.#toolLabel = null;
     this.#descendants.clear();
+    this.#invalidateWalk();
     this.#ancestry.clear();
     transport?.close();
   }
@@ -686,9 +814,23 @@ export class NativeCodexRpcStatusObserver {
     this.#workWitness = false;
     this.#toolLabel = null;
     this.#descendants.clear();
+    this.#invalidateWalk();
     this.#publish();
     this.#diagnostic("connection-lost");
     this.#scheduleReconnect();
+  }
+
+  /**
+   * Supersede the census walk in progress, if any. A membership edge means the
+   * pages already walked no longer describe the row, so the walk is dropped and
+   * the coalesced trailing census re-enumerates from the first page. Length alone
+   * is never a reason to drop a walk: a walk that is merely long keeps running.
+   */
+  #invalidateWalk(): void {
+    const walk = this.#walk;
+    if (walk === null) return;
+    walk.voided = true;
+    this.#walk = null;
   }
 
   #scheduleReconnect(): void {
@@ -717,7 +859,17 @@ export class NativeCodexRpcStatusObserver {
         }
         if (!this.#descendants.has(notification.threadId)) {
           // A broadcast for a thread outside the bound lineage is not this row's
-          // evidence, and must not churn the census.
+          // evidence, and must not churn the census. A walk that happens to be
+          // holding the row still takes the newer status, so a long census cannot
+          // publish a status the provider already told us is stale.
+          const walk = this.#walk;
+          const held = walk === null ? undefined : walk.rows.get(notification.threadId);
+          if (held === undefined || this.#ancestry.get(notification.threadId) === "unrelated") return;
+          walk?.rows.set(notification.threadId, {
+            threadId: held.threadId,
+            parentThreadId: held.parentThreadId,
+            status: notification.status,
+          });
           return;
         }
         this.#descendants.set(notification.threadId, notification.status);
@@ -733,6 +885,11 @@ export class NativeCodexRpcStatusObserver {
         }
         if (row.parentThreadId === this.#rootThreadId || this.#descendants.has(row.threadId)
           || this.#ancestry.get(row.threadId) === "descendant") {
+          // A new thread in the bound lineage may sit behind a page this walk has
+          // already passed, so the walk is dropped and the trailing census
+          // re-enumerates from the first page instead of publishing a membership
+          // it can no longer be sure of.
+          this.#invalidateWalk();
           this.#requestRefresh();
         }
         return;
@@ -748,7 +905,8 @@ export class NativeCodexRpcStatusObserver {
           this.#requestRefresh();
           return;
         }
-        if (!this.#descendants.delete(id)) return;
+        if (!this.#descendants.delete(id) && this.#walk?.rows.has(id) !== true) return;
+        this.#invalidateWalk();
         this.#requestRefresh();
         return;
       }
@@ -827,6 +985,7 @@ export class NativeCodexRpcStatusObserver {
     this.#workWitness = false;
     this.#toolLabel = null;
     this.#descendants.clear();
+    this.#invalidateWalk();
     this.#ancestry.clear();
     this.#clearTimer("#cooldownHandle");
     this.#clearTimer("#activeHandle");
@@ -923,9 +1082,22 @@ export class NativeCodexRpcStatusObserver {
   }
 
   /**
-   * One complete census: root snapshot, owned descendant walk, background
-   * terminal census. Every await is fenced on the binding that started it, so a
-   * rebinding or disconnect can never publish out of a retired walk.
+   * One complete census: root snapshot, the owned descendant walk, and the
+   * background terminal census.
+   *
+   * The census is one atomic PUBLICATION, but it is not one atomic block of
+   * provider traffic. Every walk inside it advances in a bounded work slice, and
+   * a slice that runs out of page or read budget hands its position to the next
+   * slice instead of failing the axis. Ordinary lineage and ordinary persisted
+   * history therefore cost ordinary time: they can no longer park a healthy row
+   * on a permanent `unknown` because its population crossed an internal number.
+   * What still ends a census is a real provider failure, an unreadable or
+   * repeating page cursor, a corrupt parent chain, or a retired binding — and
+   * each of those withdraws its own axis rather than publishing a partial count
+   * or a zero it never saw.
+   *
+   * Every await is fenced on the binding that started it, so a rebinding or a
+   * disconnect can never publish out of a retired walk.
    */
   async #runCensus(): Promise<void> {
     if (this.#inFlight || this.#disposed || !this.#connected) return;
@@ -936,17 +1108,19 @@ export class NativeCodexRpcStatusObserver {
     const generation = this.#generation;
     const rootThreadId = this.#rootThreadId;
     const seq = this.#connectionSeq;
+    const walk = createCensusWalk(rootThreadId);
+    this.#walk = walk;
     const stale = (): boolean => this.#disposed
       || !this.#connected
       || seq !== this.#connectionSeq
       || this.#generation !== generation
       || this.#rootThreadId !== rootThreadId
-      || this.#transport !== transport;
+      || this.#transport !== transport
+      || walk.voided;
 
     try {
       // 1. Root snapshot. Status broadcasts are additive, not authoritative:
       //    every census re-reads the bound root.
-      let rootLiveForTerminals = false;
       try {
         const rootRow = await transport.readThread(rootThreadId);
         if (stale()) return;
@@ -958,7 +1132,7 @@ export class NativeCodexRpcStatusObserver {
           // A thread the provider just described is in its in-memory model unless
           // it explicitly reports `notLoaded`, and only such a thread can own a
           // running background terminal.
-          rootLiveForTerminals = rootRow.status.kind !== "notLoaded";
+          walk.rootLive = rootRow.status.kind !== "notLoaded";
         }
       } catch {
         if (stale()) return;
@@ -966,24 +1140,25 @@ export class NativeCodexRpcStatusObserver {
         this.#diagnostic("root-read-failed");
       }
 
-      // 2. Owned descendant census.
-      const walk: CensusWalk = { rows: new Map(), ancestorIds: new Set(), failure: null, reads: 0 };
-      await this.#collectPersistedDescendants(transport, rootThreadId, walk, stale);
-      if (stale()) return;
-      await this.#collectLoadedChildren(transport, rootThreadId, walk, stale);
-      if (stale()) return;
-      await this.#resolveAncestry(transport, rootThreadId, walk, stale);
-      if (stale()) return;
+      // 2. Owned descendant census: persisted listing, loaded listing, then the
+      //    ancestry proofs, streamed across as many bounded slices as the row's
+      //    own lineage needs. Suspension is not a failure and never publishes.
+      for (;;) {
+        this.#beginSlice(walk);
+        const outcome = await this.#advanceDescendantWalk(transport, walk, stale);
+        if (stale()) return;
+        if (outcome === "settled") break;
+      }
 
       const descendants = new Map<string, NativeCodexThreadRow>();
       if (walk.failure !== null) {
-        // A partial walk cannot publish a number, and certainly not a zero.
+        // A walk that failed cannot publish a number, and certainly not a zero.
         this.#tasks = null;
         this.#diagnostic(walk.failure);
       } else {
         for (const [id, row] of walk.rows) {
           if (id === rootThreadId) continue;
-          if (this.#ancestry.get(id) !== "descendant") continue;
+          if (walk.verdicts.get(id) !== "descendant") continue;
           descendants.set(id, row);
         }
         this.#descendants.clear();
@@ -996,10 +1171,11 @@ export class NativeCodexRpcStatusObserver {
       //    census whose membership never completed — or whose root liveness was
       //    never established — cannot claim a total. That axis is withdrawn
       //    rather than counted over a scope that may be missing an owned child.
-      await this.#censusBackgroundTerminals(
+      await this.#runTerminalCensus(
         transport,
-        rootThreadId,
-        { rootLive: rootLiveForTerminals, descendants, membershipComplete: walk.failure === null },
+        walk,
+        descendants,
+        walk.failure === null,
         stale,
       );
       if (stale()) return;
@@ -1020,83 +1196,205 @@ export class NativeCodexRpcStatusObserver {
       this.#suppressPublish = false;
       this.#publish();
     } finally {
+      if (this.#walk === walk) this.#walk = null;
       this.#suppressPublish = false;
       if (seq === this.#connectionSeq && !this.#disposed) this.#afterCensus();
       else this.#inFlight = false;
     }
   }
 
-  /** `thread/list` scoped to the bound ancestor, followed across every page. */
-  async #collectPersistedDescendants(
+  /* ------------------------------------------------------- streamed census */
+
+  /**
+   * Start one bounded work slice. The budgets restart; the walk does not. This is
+   * also the compaction point, so a walk across a long persisted history holds
+   * only what can still change a published value.
+   */
+  #beginSlice(walk: CensusWalk): void {
+    this.#compactWalk(walk);
+    walk.slicePages = 0;
+    walk.sliceReads = 0;
+    walk.sliceThreads = 0;
+  }
+
+  /**
+   * Budget for one provider page fetch. Running out suspends the walk — the next
+   * slice picks the same cursor back up — so a slice bound is backpressure on
+   * this census's own traffic, never a ceiling on what the row can report.
+   */
+  #takePage(walk: CensusWalk): boolean {
+    if (walk.slicePages >= this.#limits.maxCensusPages) return false;
+    walk.slicePages += 1;
+    return true;
+  }
+
+  /**
+   * Budget for one unit of descendant-resolution work: a `thread/read` for a bare
+   * loaded id, or one hop up a parent chain. Running out suspends the walk — the
+   * next slice picks the same pending id or the same chain back up — so this is
+   * backpressure on one scheduling step, never a ceiling on the row.
+   */
+  #takeStep(walk: CensusWalk): boolean {
+    if (walk.sliceReads >= this.#limits.maxDescendantReads) return false;
+    walk.sliceReads += 1;
+    return true;
+  }
+
+  /**
+   * Budget for starting one thread's terminal listing. A thread already under way
+   * keeps its allowance across slices, so this bounds how many new listings one
+   * scheduling step opens — it never decides how many threads the row has.
+   */
+  #takeThread(walk: CensusWalk): boolean {
+    if (walk.sliceThreads >= this.#limits.maxShellCensusThreads) return false;
+    walk.sliceThreads += 1;
+    return true;
+  }
+
+  /**
+   * Drop the collected rows that cannot matter to either published value: a
+   * thread the provider reports `notLoaded` is neither an active sub-agent nor a
+   * thread that can own a running terminal, and unless something still held names
+   * it as a parent it is not an ancestry bridge either. This is what keeps a
+   * streamed walk over thousands of historical children bounded in memory without
+   * bounding the truth it reports.
+   */
+  #compactWalk(walk: CensusWalk): void {
+    if (walk.rows.size === 0) return;
+    const keep = new Set<string>();
+    for (const row of walk.rows.values()) {
+      if (row.parentThreadId !== null) keep.add(row.parentThreadId);
+    }
+    // A chain in progress is resumable, so every id it is holding is still live
+    // work even if nothing else references it yet.
+    const chain = walk.chain;
+    if (chain !== null) {
+      for (const id of chain.visited) keep.add(id);
+    }
+    for (const [id, row] of [...walk.rows]) {
+      if (row.status.kind !== "notLoaded" || keep.has(id)) continue;
+      walk.rows.delete(id);
+      walk.ancestorIds.delete(id);
+    }
+  }
+
+  /**
+   * One slice of the descendant census. `"suspended"` means the budgets ran out
+   * and the next slice continues; `"settled"` means the walk is finished, either
+   * with `walk.failure` set or with a complete descendant set.
+   */
+  async #advanceDescendantWalk(
     transport: NativeCodexRpcTransport,
-    rootThreadId: string,
     walk: CensusWalk,
     stale: () => boolean,
-  ): Promise<void> {
-    if (walk.failure !== null) return;
-    let cursor: string | null = null;
-    for (let page = 0; page < this.#limits.maxCensusPages; page += 1) {
+  ): Promise<CensusStage> {
+    const persisted = await this.#advancePersistedStage(transport, walk, stale);
+    if (persisted !== "settled" || walk.failure !== null) return persisted;
+    const loaded = await this.#advanceLoadedStage(transport, walk, stale);
+    if (loaded !== "settled" || walk.failure !== null) return loaded;
+    return await this.#advanceAncestryStage(transport, walk, stale);
+  }
+
+  /**
+   * `thread/list` scoped to the bound ancestor, followed across every page. The
+   * cursor is walk state, so a slice that runs out of budget resumes the same
+   * listing where it stopped rather than truncating it or failing the axis.
+   */
+  async #advancePersistedStage(
+    transport: NativeCodexRpcTransport,
+    walk: CensusWalk,
+    stale: () => boolean,
+  ): Promise<CensusStage> {
+    while (!walk.persistedDone) {
+      if (!this.#takePage(walk)) return "suspended";
+      let result: NativeCodexThreadPage;
       try {
-        const result = await transport.listDescendantThreads(rootThreadId, cursor);
-        if (stale()) return;
-        for (const row of result.rows) {
-          if (row.threadId === rootThreadId) continue;
-          walk.rows.set(row.threadId, row);
-          walk.ancestorIds.add(row.threadId);
-          if (walk.rows.size > this.#limits.maxKnownDescendants) {
-            walk.failure = "tasks-budget";
-            return;
-          }
-        }
-        cursor = result.nextCursor;
-        if (cursor === null) return;
+        result = await transport.listDescendantThreads(walk.rootThreadId, walk.persistedCursor);
       } catch {
-        if (stale()) return;
+        if (stale()) return "stale";
         walk.failure = "tasks-incomplete";
-        return;
+        return "settled";
       }
+      if (stale()) return "stale";
+      for (const row of result.rows) {
+        if (row.threadId === walk.rootThreadId) continue;
+        walk.rows.set(row.threadId, row);
+        // The provider's own ancestor filter is server-side ownership evidence.
+        walk.ancestorIds.add(row.threadId);
+      }
+      const next = result.nextCursor;
+      if (next === null) {
+        walk.persistedDone = true;
+        return "settled";
+      }
+      // A cursor this walk already asked for is a provider loop, not a listing
+      // longer than one slice. It is a real source fault, so it fails the axis
+      // like any other unreadable page; it is never read as "the rest is empty".
+      if (walk.seenPersistedCursors.has(next)) {
+        walk.failure = "tasks-incomplete";
+        return "settled";
+      }
+      walk.seenPersistedCursors.add(next);
+      walk.persistedCursor = next;
     }
-    // Pages remained: the walk is incomplete and may not publish a count.
-    walk.failure = "tasks-budget";
+    return "settled";
   }
 
   /**
    * `thread/loaded/list` catches children that are live but absent from the
    * persisted listing (ephemeral sub-agents). The ids it returns are bare, so
-   * each unknown one costs one metadata read, inside a bounded budget.
+   * each unknown one costs one metadata read; the page cursor, the buffered page,
+   * and the position inside it are all walk state, so running out of budget
+   * suspends the enumeration instead of failing it.
    */
-  async #collectLoadedChildren(
+  async #advanceLoadedStage(
     transport: NativeCodexRpcTransport,
-    rootThreadId: string,
     walk: CensusWalk,
     stale: () => boolean,
-  ): Promise<void> {
-    if (walk.failure !== null) return;
-    let cursor: string | null = null;
-    for (let page = 0; page < this.#limits.maxCensusPages; page += 1) {
-      let threadIds: readonly string[];
-      try {
-        const result = await transport.listLoadedThreadIds(cursor);
-        if (stale()) return;
-        threadIds = result.threadIds;
-        cursor = result.nextCursor;
-      } catch {
-        if (stale()) return;
-        walk.failure = "tasks-incomplete";
-        return;
-      }
-      for (const id of threadIds) {
-        if (id === rootThreadId) continue;
-        if (walk.rows.has(id)) continue;
-        if (this.#ancestry.get(id) === "unrelated") continue;
-        if (walk.reads >= this.#limits.maxDescendantReads) {
-          walk.failure = "tasks-budget";
-          return;
+  ): Promise<CensusStage> {
+    for (;;) {
+      if (walk.loadedIndex >= walk.loadedPage.length) {
+        if (walk.loadedDone) return "settled";
+        if (!this.#takePage(walk)) return "suspended";
+        let page: NativeCodexLoadedPage;
+        try {
+          page = await transport.listLoadedThreadIds(walk.loadedCursor);
+        } catch {
+          if (stale()) return "stale";
+          walk.failure = "tasks-incomplete";
+          return "settled";
         }
-        walk.reads += 1;
+        if (stale()) return "stale";
+        walk.loadedPage = page.threadIds;
+        walk.loadedIndex = 0;
+        const next = page.nextCursor;
+        if (next === null) {
+          walk.loadedDone = true;
+        } else {
+          if (walk.seenLoadedCursors.has(next)) {
+            walk.failure = "tasks-incomplete";
+            return "settled";
+          }
+          walk.seenLoadedCursors.add(next);
+          walk.loadedCursor = next;
+        }
+        if (walk.loadedPage.length === 0) continue;
+      }
+      while (walk.loadedIndex < walk.loadedPage.length) {
+        const id = walk.loadedPage[walk.loadedIndex] as string;
+        if (id === walk.rootThreadId || walk.rows.has(id) || this.#verdictOf(walk, id) === "unrelated") {
+          // Free skips: they cost no provider request, so the buffered id is used up.
+          walk.loadedIndex += 1;
+          continue;
+        }
+        // The budget is taken BEFORE the id is consumed. A suspended slice must
+        // leave the pending id in the buffer for the next slice; consuming it here
+        // would drop that thread from an otherwise complete census.
+        if (!this.#takeStep(walk)) return "suspended";
+        walk.loadedIndex += 1;
         try {
           const row = await transport.readThread(id);
-          if (stale()) return;
+          if (stale()) return "stale";
           // An unreadable row, or one whose identity does not match the id asked
           // for, means ownership could NOT be established. It is never evidence
           // that the thread is unrelated: caching it that way would exclude
@@ -1104,118 +1402,142 @@ export class NativeCodexRpcStatusObserver {
           // afterwards. The census degrades instead, and a later read can succeed.
           if (row === null || row.threadId !== id) {
             walk.failure = "tasks-incomplete";
-            return;
+            return "settled";
           }
           walk.rows.set(row.threadId, row);
         } catch {
-          if (stale()) return;
+          if (stale()) return "stale";
           walk.failure = "tasks-incomplete";
-          return;
+          return "settled";
         }
       }
-      if (cursor === null) return;
     }
-    walk.failure = "tasks-budget";
   }
 
   /**
    * Proves each collected row descends from the bound root. A row counts only
-   * when its parent chain reaches the root within the depth bound; a row that
-   * reaches another root, a fork without a parent link, or a cycle does not.
+   * when its parent chain reaches the root; a row that reaches another root, a
+   * fork without a parent link, or a cycle does not.
+   *
+   * The chain being walked is walk state, so a slice budget that runs out
+   * mid-chain suspends the proof and the next slice continues the same chain from
+   * the same row. Nothing else limits how deep a legitimate lineage may be: the
+   * visited set is the cycle detector, and an acyclic chain is finite because the
+   * provider's thread universe is.
    */
-  async #resolveAncestry(
+  async #advanceAncestryStage(
     transport: NativeCodexRpcTransport,
-    rootThreadId: string,
     walk: CensusWalk,
     stale: () => boolean,
-  ): Promise<void> {
-    for (const [id] of [...walk.rows]) {
-      if (walk.failure !== null) return;
-      if (id === rootThreadId) continue;
-      const fromAncestorQuery = walk.ancestorIds.has(id);
-      const known = this.#ancestry.get(id);
-      if (known === "descendant") continue;
-      if (known === "unrelated") {
-        // The provider's own ancestor filter said this row IS a descendant and
-        // our chain memory says it is not: the view is contradictory, so the
-        // census degrades instead of quietly dropping a possibly-live child.
-        if (fromAncestorQuery) {
-          walk.failure = "tasks-incomplete";
-          return;
+  ): Promise<CensusStage> {
+    if (walk.ancestryIds.length === 0 && walk.ancestryIndex === 0) {
+      walk.ancestryIds = [...walk.rows.keys()];
+    }
+    for (;;) {
+      const chain = walk.chain;
+      if (chain === null) {
+        if (walk.ancestryIndex >= walk.ancestryIds.length) return "settled";
+        const id = walk.ancestryIds[walk.ancestryIndex] as string;
+        walk.ancestryIndex += 1;
+        if (id === walk.rootThreadId) continue;
+        // A row compacted after this snapshot was taken is neither an active
+        // sub-agent nor a live terminal owner, so nothing about it is owed.
+        if (!walk.rows.has(id)) continue;
+        const fromAncestorQuery = walk.ancestorIds.has(id);
+        const known = this.#verdictOf(walk, id);
+        if (known === "descendant") {
+          // A memo hit is still this census's answer, and membership reads only
+          // the census's own verdicts, so the hit is recorded here too.
+          walk.verdicts.set(id, "descendant");
+          continue;
         }
+        if (known === "unrelated") {
+          walk.verdicts.set(id, "unrelated");
+          // The provider's own ancestor filter said this row IS a descendant and
+          // our chain memory says it is not: the view is contradictory, so the
+          // census degrades instead of quietly dropping a possibly-live child.
+          if (fromAncestorQuery) {
+            walk.failure = "tasks-incomplete";
+            return "settled";
+          }
+          continue;
+        }
+        walk.chain = { visited: new Set([id]), currentId: id, fromAncestorQuery };
         continue;
       }
-      const visited = new Set<string>([id]);
-      let currentId = id;
-      let depth = 0;
       for (;;) {
-        const row = walk.rows.get(currentId);
+        const row = walk.rows.get(chain.currentId);
         if (row === undefined) {
+          // The chain left a row this census could not obtain, so ownership is
+          // unknown — which is never the same thing as "not ours".
           walk.failure = "tasks-incomplete";
-          return;
+          walk.chain = null;
+          return "settled";
         }
         const parent = row.parentThreadId;
         if (parent === null) {
           // A row with no parent is another root, or a fork with no parent link:
           // never this row's sub-agent. From the ancestor query that is a
           // contradiction, and the census degrades rather than under-counting.
-          if (fromAncestorQuery) {
+          if (chain.fromAncestorQuery) {
             walk.failure = "tasks-incomplete";
-            return;
+            walk.chain = null;
+            return "settled";
           }
-          this.#markChain(visited, "unrelated");
+          this.#markChain(walk, chain.visited, "unrelated");
+          walk.chain = null;
           break;
         }
-        if (parent === rootThreadId) {
-          this.#markChain(visited, "descendant");
+        if (parent === walk.rootThreadId) {
+          this.#markChain(walk, chain.visited, "descendant");
+          walk.chain = null;
           break;
         }
-        const parentKnown = this.#ancestry.get(parent);
+        const parentKnown = this.#verdictOf(walk, parent);
         if (parentKnown !== undefined) {
-          if (fromAncestorQuery && parentKnown === "unrelated") {
+          if (chain.fromAncestorQuery && parentKnown === "unrelated") {
             walk.failure = "tasks-incomplete";
-            return;
+            walk.chain = null;
+            return "settled";
           }
-          this.#markChain(visited, parentKnown);
+          this.#markChain(walk, chain.visited, parentKnown);
+          walk.chain = null;
           break;
         }
-        if (visited.has(parent)) {
+        if (chain.visited.has(parent)) {
           walk.failure = "tasks-cycle";
-          return;
+          walk.chain = null;
+          return "settled";
         }
-        depth += 1;
-        if (depth > this.#limits.maxDescendantDepth) {
-          walk.failure = "tasks-budget";
-          return;
+        // One unit of lineage work per traversed edge, charged before the edge is
+        // taken. Exhausting the slice budget suspends this same chain intact;
+        // depth itself is never a failure.
+        if (!this.#takeStep(walk)) {
+          return "suspended";
         }
         if (!walk.rows.has(parent)) {
-          if (walk.reads >= this.#limits.maxDescendantReads) {
-            walk.failure = "tasks-budget";
-            return;
-          }
-          walk.reads += 1;
           try {
             const parentRow = await transport.readThread(parent);
-            if (stale()) return;
+            if (stale()) return "stale";
             // Same rule one level up: a missing or identity-mismatched parent row
             // proves nothing about the chain, so the census degrades rather than
             // marking the chain unrelated on an unreadable read.
             if (parentRow === null || parentRow.threadId !== parent) {
               walk.failure = "tasks-incomplete";
-              return;
+              walk.chain = null;
+              return "settled";
             }
             walk.rows.set(parentRow.threadId, parentRow);
           } catch {
-            if (stale()) return;
+            if (stale()) return "stale";
             walk.failure = "tasks-incomplete";
-            return;
+            return "settled";
           }
         }
-        visited.add(parent);
-        currentId = parent;
+        chain.visited.add(parent);
+        chain.currentId = parent;
       }
     }
-    if (this.#descendants.size > this.#limits.maxKnownDescendants) walk.failure = "tasks-budget";
   }
 
   /**
@@ -1226,69 +1548,107 @@ export class NativeCodexRpcStatusObserver {
    * `notLoaded` threads are excluded because the provider's own handler resolves
    * the id against its in-memory threads and rejects an unloaded one: querying a
    * historical persisted child would fail the whole axis for a thread that cannot
-   * own a running terminal. Any other failure withdraws the aggregate rather than
-   * publishing a partial count, and never publishes a zero it did not see.
+   * own a running terminal. The scope is walked in bounded slices like every
+   * other part of the census, so a row whose live threads outnumber one slice
+   * still reaches a complete count instead of a permanent unknown. Any other
+   * failure withdraws the aggregate rather than publishing a partial count, and
+   * never publishes a zero it did not see.
    */
-  async #censusBackgroundTerminals(
+  async #runTerminalCensus(
     transport: NativeCodexRpcTransport,
-    rootThreadId: string,
-    scope: {
-      readonly rootLive: boolean;
-      readonly descendants: ReadonlyMap<string, NativeCodexThreadRow>;
-      readonly membershipComplete: boolean;
-    },
+    walk: CensusWalk,
+    descendants: ReadonlyMap<string, NativeCodexThreadRow>,
+    membershipComplete: boolean,
     stale: () => boolean,
   ): Promise<void> {
-    if (!scope.rootLive || !scope.membershipComplete) {
+    if (!walk.rootLive || !membershipComplete) {
       this.#shells = null;
       this.#diagnostic("shells-incomplete");
       return;
     }
-    const threadIds: string[] = [rootThreadId];
-    for (const [id, row] of scope.descendants) {
-      if (row.status.kind === "notLoaded") continue;
-      threadIds.push(id);
+    if (walk.terminalScope.length === 0) {
+      const threadIds: string[] = [walk.rootThreadId];
+      for (const [id, row] of descendants) {
+        if (row.status.kind === "notLoaded") continue;
+        threadIds.push(id);
+      }
+      walk.terminalScope = threadIds;
     }
-    if (threadIds.length > this.#limits.maxShellCensusThreads) {
-      // Refuse to publish a knowingly partial count.
+    for (;;) {
+      this.#beginSlice(walk);
+      const outcome = await this.#advanceTerminalStage(transport, walk, stale);
+      if (stale()) return;
+      if (outcome === "settled") break;
+    }
+    if (walk.failure !== null) {
       this.#shells = null;
-      this.#diagnostic("shells-budget");
+      this.#diagnostic(walk.failure);
       return;
     }
-    const processes = new Set<string>();
-    for (const threadId of threadIds) {
-      let cursor: string | null = null;
-      let pages = 0;
-      for (;;) {
-        pages += 1;
-        if (pages > this.#limits.maxCensusPages) {
-          // Pages remained: this is not a complete count.
-          this.#shells = null;
-          this.#diagnostic("shells-incomplete");
-          return;
-        }
-        try {
-          const result = await transport.listBackgroundTerminals(threadId, cursor);
-          if (stale()) return;
-          for (const processId of result.processIds) processes.add(processId);
-          cursor = result.nextCursor;
-        } catch {
-          if (stale()) return;
-          this.#shells = null;
-          this.#diagnostic("shells-incomplete");
-          return;
-        }
-        if (cursor === null) break;
+    this.#shells = walk.processes.size;
+  }
+
+  /** One slice of the terminal census; cursors are per thread and per walk. */
+  async #advanceTerminalStage(
+    transport: NativeCodexRpcTransport,
+    walk: CensusWalk,
+    stale: () => boolean,
+  ): Promise<CensusStage> {
+    while (walk.terminalIndex < walk.terminalScope.length) {
+      if (!walk.terminalThreadStarted) {
+        if (!this.#takeThread(walk)) return "suspended";
+        walk.terminalThreadStarted = true;
       }
+      const threadId = walk.terminalScope[walk.terminalIndex] as string;
+      for (;;) {
+        if (!this.#takePage(walk)) return "suspended";
+        let result: NativeCodexTerminalPage;
+        try {
+          result = await transport.listBackgroundTerminals(threadId, walk.terminalCursor);
+        } catch {
+          if (stale()) return "stale";
+          walk.failure = "shells-incomplete";
+          return "settled";
+        }
+        if (stale()) return "stale";
+        for (const processId of result.processIds) walk.processes.add(processId);
+        const next = result.nextCursor;
+        if (next === null) break;
+        if (walk.seenTerminalCursors.has(next)) {
+          walk.failure = "shells-incomplete";
+          return "settled";
+        }
+        walk.seenTerminalCursors.add(next);
+        walk.terminalCursor = next;
+      }
+      walk.terminalCursor = null;
+      walk.seenTerminalCursors.clear();
+      walk.terminalThreadStarted = false;
+      walk.terminalIndex += 1;
     }
-    this.#shells = processes.size;
+    return "settled";
   }
 
   /* -------------------------------------------------------------- helpers */
 
-  #markChain(ids: Iterable<string>, verdict: Ancestry): void {
+  /**
+   * The ownership verdict for one id: this census's own proof first, then the
+   * bounded cross-census memo. The memo may evict, so a miss can only ever cost
+   * extra work — it can never change what a completed census concluded.
+   */
+  #verdictOf(walk: CensusWalk, id: string): Ancestry | undefined {
+    return walk.verdicts.get(id) ?? this.#ancestry.get(id);
+  }
+
+  /**
+   * Record one proven chain. The census keeps its verdicts unconditionally: they
+   * are the membership it is about to publish. The cross-census memo stays bounded
+   * and may evict, which can only cost a later re-proof.
+   */
+  #markChain(walk: CensusWalk, ids: Iterable<string>, verdict: Ancestry): void {
     for (const id of ids) {
       if (id === this.#rootThreadId) continue;
+      walk.verdicts.set(id, verdict);
       this.#ancestry.set(id, verdict);
       while (this.#ancestry.size > this.#limits.maxUnrelatedIds) {
         const oldest = this.#ancestry.keys().next();
@@ -1378,8 +1738,6 @@ function normalizeLimits(limits: Partial<NativeCodexRpcStatusLimits> | undefined
     censusPageLimit: positive(limits?.censusPageLimit, base.censusPageLimit, NATIVE_CODEX_RPC_MAX_PAGE_LIMIT),
     maxCensusPages: positive(limits?.maxCensusPages, base.maxCensusPages, 64),
     maxDescendantReads: positive(limits?.maxDescendantReads, base.maxDescendantReads, 512),
-    maxDescendantDepth: positive(limits?.maxDescendantDepth, base.maxDescendantDepth, 16),
-    maxKnownDescendants: positive(limits?.maxKnownDescendants, base.maxKnownDescendants, 512),
     maxUnrelatedIds: positive(limits?.maxUnrelatedIds, base.maxUnrelatedIds, 4_096),
     maxShellCensusThreads: positive(limits?.maxShellCensusThreads, base.maxShellCensusThreads, 64),
     refreshCooldownMs: int(limits?.refreshCooldownMs, base.refreshCooldownMs, 60_000),

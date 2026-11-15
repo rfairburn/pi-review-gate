@@ -82,6 +82,16 @@ import { type NativeCliBackend } from "./session-backend";
  *   (see `applyCodexTerminalClipboardMode` for the exact upstream branch, its
  *   child-only scope, and what it never changes). Claude and native Pi get no
  *   marker, and no multiplexer or SSH marker is ever faked.
+ * - **Preparation only in owned Codex backend mode.** A launcher constructed
+ *   with `NativeCliLauncherOptions.ownedCodexBackend` attaches one extra
+ *   read-only plan to a Codex descriptor so the future owning host can start
+ *   one private app-server child and its TUI client from the same resolved
+ *   target. This module still spawns nothing, selects no endpoint, generates no
+ *   token, and owns no lease: the plan re-renders complete literal argv from the
+ *   facts of this one launch through the same trusted Windows authority, and
+ *   stages no new artifact on any render. With the option absent or false —
+ *   every existing call site, production included — no descriptor carries a
+ *   plan and nothing about a launch changes.
  * - **No inherited host capability.** The environment is a clone sanitized by
  *   the same provider-neutral sanitizer the native Pi launch uses: worker role
  *   authorization is rejected fail-closed, and stale session-host bootstrap,
@@ -179,6 +189,15 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
    * unknown.
    */
   readonly nativeHook?: NativeHookLaunchOutcome;
+  /**
+   * Present only for a Codex launch prepared by a launcher constructed with
+   * `NativeCliLauncherOptions.ownedCodexBackend`. It is a rendering plan, not a
+   * second child and not an ownership claim: the ordinary `file`, `args`,
+   * `commandLine`, `env`, `cwd`, and `nativeHook` fields above stay exactly
+   * what an unarmed launch composes, and the hook artifacts this launch staged
+   * remain owned through `nativeHook` alone.
+   */
+  readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
 }
 
 /** Prepared descriptor producer for one normalized configuration. */
@@ -200,6 +219,112 @@ export interface NativeCliLauncherOptions {
    * consulted — never the child environment, `ComSpec`, or PATH.
    */
   parentEnvironment?: NodeJS.ProcessEnv;
+  /**
+   * Attach the optional owned Codex backend plan to Codex launches (default
+   * false). This is a construction-time property of one launcher instance, set
+   * by the future owning host for itself: it is never a user setting, never a
+   * per-request field, and never something a peer, wire message, or provider
+   * can claim. Absent or false — every existing call site — no launch carries a
+   * plan and every descriptor is byte-identical to the one this module composed
+   * before the mode existed.
+   */
+  ownedCodexBackend?: boolean;
+}
+
+/** Fixed, public-safe code of the one owned-mode named-profile refusal. */
+export const NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE = "owned-codex-named-profile-unsupported";
+
+/**
+ * Why an owned Codex backend launch was refused for a target that chooses one
+ * of the operator's named provider profiles.
+ *
+ * A named profile re-scopes the provider's own configuration, and this host
+ * does not route profile-scoped configuration into a separate owned backend
+ * process; dropping the selection would run the operator's default profile
+ * while they asked for another one, which is exactly the silent loss this
+ * refusal exists to prevent. The ordinary non-owned Codex launch keeps accepting
+ * every profile spelling unchanged.
+ *
+ * The type is closed: its constructor takes no user content, so the message and
+ * code can never carry a profile name, path, argument, or environment value.
+ */
+export class NativeCodexOwnedProfileUnsupportedError extends Error {
+  readonly code = NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE;
+
+  constructor() {
+    super("pi-review-gate: refusing to prepare an owned Codex backend launch because the selected target's configured arguments choose a named provider profile");
+    this.name = "NativeCodexOwnedProfileUnsupportedError";
+  }
+}
+
+/**
+ * The lease's private TUI connection material, as returned by the owned backend
+ * readiness accessor: the native remote-connection arguments plus the fresh
+ * child-only environment that carries the bearer. Both are sensitive and are
+ * never logged, stored, or reported by this module.
+ */
+export interface NativeCodexOwnedTuiConnection {
+  readonly args: readonly string[];
+  readonly env: NodeJS.ProcessEnv;
+}
+
+/**
+ * The prepared rendering plan of one owned Codex backend launch.
+ *
+ * It renders the two children of one launch from the facts resolved once by
+ * this module — the canonical executable, the canonical workspace, the
+ * validated operator argv and its real-option-position scan, and the outcome of
+ * this launch's single hook preparation — and it does nothing else: no spawn,
+ * no endpoint choice, no token, no RPC, no lease, no artifact, and no provider
+ * configuration read or write. Rendering is pure and repeatable, so re-rendering
+ * restages nothing and never mutates any input.
+ */
+export interface NativeCodexOwnedLaunchPlan {
+  /**
+   * The backend child's base environment: the same sanitized operator
+   * environment the TUI child starts from — same `CODEX_HOME`, same native
+   * inheritance, same canonical `PWD` — without the host-imposed clipboard
+   * marker (which belongs to the interactive TUI only) and without the hook
+   * bootstrap marker (which only the backend's own hook channel needs, and which
+   * `renderBackend` applies). It carries no bearer and is never mutated.
+   */
+  readonly backendEnv: NodeJS.ProcessEnv;
+  /**
+   * Render the backend descriptor from the lease's CLOSED control argv: the
+   * `app-server` subcommand, its loopback `--listen` URL, its
+   * `capability-token` authentication mode, and the token's SHA-256 digest. Any
+   * other list is refused. The digest is the only secret material that reaches
+   * the backend, and it arrives in the owner-generated arguments only.
+   *
+   * The operator's own global configuration and feature options — `-c`/`--config`
+   * and `--enable`/`--disable`, each with its exact configured spelling and
+   * value, in configured order — are re-emitted in valid native global option
+   * position ahead of the subcommand, followed by this launch's prepared
+   * SessionStart hook override, so the core that executes hooks and MCP servers
+   * sees the configuration the operator chose. Runtime-only options (`-m` and
+   * friends) are not app-server arguments and stay on the TUI, whose native
+   * protocol projects them.
+   *
+   * The rendered command line always starts with the same program the TUI
+   * launches, and with that program's own configured argv ahead of the
+   * provider's options — the script of a `node wrapper.js <provider args>`
+   * target included — so the backend is the operator's own launch command put
+   * into app-server mode, never a bare interpreter invocation that lost its
+   * wrapper. A command that spells the provider's own executable has no such
+   * prefix, and its prompt data stays on the TUI alone.
+   */
+  renderBackend(controlArgs: readonly string[], environment: NodeJS.ProcessEnv): NativeLaunchDescriptor;
+  /**
+   * Render the interactive TUI descriptor from one fulfilled lease connection:
+   * every allowed operator argument, unchanged and in order, with the private
+   * connection arguments inserted in real option position. Only the
+   * host-added `--no-daemon` disappears on this branch, because this TUI now
+   * attaches to the one owned backend instead of a shared daemon; an operator
+   * who configured the flag themselves keeps it. The connection environment is
+   * preserved exactly, plus the existing clipboard marker the hosted TUI has
+   * always carried and, on Windows, the batch percent carrier.
+   */
+  renderTui(connection: NativeCodexOwnedTuiConnection): NativeLaunchDescriptor;
 }
 
 /** A target resolved to the exact shared configuration it launches from. */
@@ -649,8 +774,17 @@ const CODEX_TERMINAL_CLIPBOARD_VALUE = "1";
  *   adding an alias the child could pick either way. POSIX names stay
  *   case-sensitive, so an unrelated differently-cased variable is the
  *   operator's own and is never touched.
+ *
+ * The value is a parameter only so the owned backend plan can hand this same
+ * key back its operator's own value (`readCodexTerminalClipboardMode`), which
+ * is a preserved inherited setting rather than the host-imposed mode. Every
+ * existing caller passes no value and gets the host-owned `1`.
  */
-function applyCodexTerminalClipboardMode(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): void {
+function applyCodexTerminalClipboardMode(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  value: string = CODEX_TERMINAL_CLIPBOARD_VALUE,
+): void {
   if (platform === "win32") {
     for (const name of Object.keys(env)) {
       if (name !== CODEX_TERMINAL_CLIPBOARD_ENV && name.toUpperCase() === CODEX_TERMINAL_CLIPBOARD_ENV) {
@@ -658,7 +792,43 @@ function applyCodexTerminalClipboardMode(env: NodeJS.ProcessEnv, platform: NodeJ
       }
     }
   }
-  env[CODEX_TERMINAL_CLIPBOARD_ENV] = CODEX_TERMINAL_CLIPBOARD_VALUE;
+  env[CODEX_TERMINAL_CLIPBOARD_ENV] = value;
+}
+
+/**
+ * The value one environment already carries for the clipboard marker key, read
+ * with the same spelling rule `applyCodexTerminalClipboardMode` writes with, or
+ * `undefined` when it carries no spelling of the key at all. Only the
+ * `undefined` case means a later `1` is a host-imposed addition: an existing
+ * value is the operator's own setting, and a child that must not gain the host
+ * mode still keeps it verbatim.
+ */
+function readCodexTerminalClipboardMode(
+  environment: Readonly<NodeJS.ProcessEnv>,
+  platform: NodeJS.Platform,
+): string | undefined {
+  const canonical = environment[CODEX_TERMINAL_CLIPBOARD_ENV];
+  if (canonical !== undefined) return canonical;
+  if (platform !== "win32") return undefined;
+  for (const name of Object.keys(environment)) {
+    if (name.toUpperCase() === CODEX_TERMINAL_CLIPBOARD_ENV) return environment[name];
+  }
+  return undefined;
+}
+
+/**
+ * Drop every spelling of the clipboard marker key a composed environment now
+ * holds, leaving every other entry exactly as it was. Windows resolves one name
+ * case-insensitively, so every alias goes too; POSIX names are case-sensitive,
+ * so an operator's differently-cased variable of the same letters survives.
+ */
+function deleteCodexTerminalClipboardMode(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): void {
+  for (const name of Object.keys(env)) {
+    const matches = platform === "win32"
+      ? name.toUpperCase() === CODEX_TERMINAL_CLIPBOARD_ENV
+      : name === CODEX_TERMINAL_CLIPBOARD_ENV;
+    if (matches) delete env[name];
+  }
 }
 
 /**
@@ -896,6 +1066,290 @@ function adaptWindowsBatchShim(
 }
 
 /**
+ * The closed Codex global options whose configuration semantics the owned
+ * backend process must receive. These are the provider's own configuration and
+ * feature channels: `-c`/`--config` writes a configuration override and
+ * `--enable`/`--disable` selects a feature flag, and both are read by the core
+ * — which under an owned launch is the app-server child, not the TUI client.
+ * Every other allowed operator option is either runtime UI state the native
+ * protocol projects (a model choice, an attached image) or already refused by
+ * the shared argv policy, so nothing here is a new permission or a new drop.
+ */
+const CODEX_BACKEND_CONFIG_OPTIONS: readonly string[] = ["-c", "--config", "--enable", "--disable"];
+
+/**
+ * The closed Codex spellings that select one of the operator's named provider
+ * profiles. They are matched only as canonical option names from the ONE argv
+ * scan — never as a substring of a value — so `-c profile=x` stays an ordinary
+ * configuration override and a `--profile` past the `--` terminator stays
+ * literal prompt data.
+ */
+const CODEX_NAMED_PROFILE_OPTIONS: readonly string[] = ["-p", "--profile"];
+
+/**
+ * The fixed prefix of the owned backend's control argv. It mirrors the closed
+ * list the owned backend lease generates in `native-codex-backend.ts`: the
+ * `app-server` subcommand, its ephemeral loopback listen URL, and its
+ * capability-token authentication mode. This launcher renders that list rather
+ * than generating it, so it validates it against these literals instead of
+ * splicing whatever it is handed.
+ */
+const OWNED_BACKEND_CONTROL_PREFIX: readonly string[] = [
+  "app-server",
+  "--listen",
+  "ws://127.0.0.1:0",
+  "--ws-auth",
+  "capability-token",
+  "--ws-token-sha256",
+];
+
+/** The control argv's trailing operand: a lowercase SHA-256 digest, and nothing else. */
+const OWNED_BACKEND_TOKEN_DIGEST = /^[0-9a-f]{64}$/u;
+
+/**
+ * Whether a configured command spells the provider's OWN executable — a direct
+ * native invocation — rather than some other program that carries its own argv
+ * ahead of the provider's (the documented `node wrapper.js <provider args>`
+ * shape). The test is on the operator's own declared command: its final path
+ * component is the backend's command word, with or without a native executable
+ * extension.
+ *
+ * This is the whole distinction, and it is deliberately not an interpreter
+ * allowlist: `node`, `bun`, `python`, or any custom launcher is simply "not the
+ * provider's own executable", and gets its configured leading argv preserved on
+ * both children. What it settles is the one question the owned split cannot ask
+ * the argv itself — whether a bare positional is the provider's prompt (which
+ * belongs to the interactive TUI alone) or an argument of the program being
+ * launched (which both children need).
+ */
+const DIRECT_PROVIDER_COMMAND: Readonly<Record<NativeCliBackend, RegExp>> = {
+  claude: /(?:^|[/\\])claude(?:\.(?:exe|cmd|bat))?$/iu,
+  codex: /(?:^|[/\\])codex(?:\.(?:exe|cmd|bat))?$/iu,
+};
+
+/**
+ * Validate the CLOSED control argv the lease generated. Every message is fixed
+ * text: a rejected list is never echoed, because its final operand is the
+ * token digest.
+ */
+function assertOwnedBackendControlArgs(controlArgs: readonly string[]): string[] {
+  const malformed = (): never => {
+    throw refuse("the owned Codex backend control arguments are not the closed app-server capability-token argv");
+  };
+  if (!Array.isArray(controlArgs) || controlArgs.length !== OWNED_BACKEND_CONTROL_PREFIX.length + 1) malformed();
+  for (let index = 0; index < OWNED_BACKEND_CONTROL_PREFIX.length; index += 1) {
+    if (controlArgs[index] !== OWNED_BACKEND_CONTROL_PREFIX[index]) malformed();
+  }
+  const digest = controlArgs[OWNED_BACKEND_CONTROL_PREFIX.length];
+  if (typeof digest !== "string" || !OWNED_BACKEND_TOKEN_DIGEST.test(digest)) {
+    throw refuse("the owned Codex backend control arguments do not end in a lowercase SHA-256 token digest");
+  }
+  return [...controlArgs];
+}
+
+/**
+ * Validate the lease's private TUI connection material and copy it. The
+ * connection arguments are the provider's own remote-attachment options: they
+ * are inserted literally, they are never inspected for meaning, and neither
+ * they nor the environment is ever logged or reported. A connection with no
+ * argument would silently start a TUI attached to nothing, so it is refused.
+ */
+function assertOwnedTuiConnection(connection: NativeCodexOwnedTuiConnection): { args: string[]; env: NodeJS.ProcessEnv } {
+  if (connection === null || typeof connection !== "object" || Array.isArray(connection)) {
+    throw refuse("an owned Codex TUI connection object is required");
+  }
+  const args = (connection as { args?: unknown }).args;
+  if (!Array.isArray(args) || args.length === 0
+    || args.some((token) => typeof token !== "string" || containsControlCharacter(token))) {
+    throw refuse("the owned Codex TUI connection carries no printable connection arguments");
+  }
+  const env = (connection as { env?: unknown }).env;
+  if (env === null || typeof env !== "object" || Array.isArray(env)) {
+    throw refuse("the owned Codex TUI connection carries no environment");
+  }
+  return { args: [...args] as string[], env: { ...(env as NodeJS.ProcessEnv) } };
+}
+
+/** What one owned Codex launch resolved once, before any environment or artifact work. */
+interface OwnedCodexLaunchFacts {
+  /** The ONE argv scan the plan's TUI renderer inserts the connection into. */
+  readonly scan: NativeArgPositionScan;
+  /**
+   * The configured tokens that sit ahead of the provider's own option parsing:
+   * the launch command's own argv, such as the script of a documented
+   * `node wrapper.js <provider args>` target. The backend runs the SAME resolved
+   * program as the TUI, so it receives this prefix unchanged and in order;
+   * without it a wrapper target would exec the interpreter with bare provider
+   * arguments and never start the intended backend.
+   *
+   * Empty for a command that spells the provider's own executable: a direct
+   * native invocation has no argv of its own to carry, so every positional in
+   * its configured args is the provider's prompt and stays on the TUI alone.
+   */
+  readonly programPrefixArgs: readonly string[];
+  /** The operator's global configuration and feature tokens, in configured order. */
+  readonly backendConfigArgs: readonly string[];
+}
+
+/**
+ * Read the configured argv once for an owned Codex launch, refusing before the
+ * environment clone, the hook preparation, any artifact, and any process.
+ *
+ * A named profile is refused outright rather than forwarded or dropped: this
+ * host does not route profile-scoped provider configuration into a separate
+ * owned backend, so forwarding it would leave the TUI's core on one profile and
+ * the backend that actually executes hooks and MCP servers on another, and
+ * dropping it would run the operator's default profile while they asked for a
+ * named one. The refusal is the typed, code-carrying, content-free
+ * `NativeCodexOwnedProfileUnsupportedError`, so the owner maps it through its
+ * existing sanitizing error lanes; every other failure keeps its existing
+ * sanitization.
+ *
+ * The same scan yields the backend's global configuration block. A value-taking
+ * option that carries no value cannot be placed ahead of the backend
+ * subcommand — the subcommand word would become its operand — so that
+ * malformed spelling refuses clearly instead of rendering a shifted command.
+ *
+ * The same scan also fixes the launch command's own prefix: the configured
+ * tokens before the first real option, which is exactly where the documented
+ * wrapper shape puts its own argv (`node wrapper.js -c key=value`). Positionals
+ * at or after that first option, and everything past a `--` terminator, are the
+ * provider's own prompt data and stay on the TUI alone, so no prompt ever
+ * reaches the backend. A command that spells the provider's own executable
+ * (`codex`, `/usr/local/bin/codex`, `codex.cmd`) has no program prefix at all,
+ * so its leading positional — the provider's prompt, whether or not configuration
+ * options follow it — is TUI-only data and the backend stays the closed
+ * app-server invocation.
+ *
+ * What remains genuinely ambiguous is reported rather than guessed: a custom
+ * program whose final path component happens to spell the provider's word while
+ * actually being a wrapper, or an interpreter whose leading argv mixes its own
+ * arguments with forwarded prompt text. This launcher never refuses for either
+ * shape and never inspects the program beyond the operator's declared command.
+ */
+function prepareOwnedCodexLaunchFacts(
+  backend: NativeCliBackend,
+  args: readonly string[],
+  targetId: string,
+  command: string,
+): OwnedCodexLaunchFacts {
+  const scan = scanNativeArgPositions(backend, args, targetId);
+  if (scan.options.some((option) => CODEX_NAMED_PROFILE_OPTIONS.includes(option.name))) {
+    throw new NativeCodexOwnedProfileUnsupportedError();
+  }
+  // A direct provider executable owns no argv of its own, so nothing ahead of
+  // its first option is a program prefix: those tokens are its prompt. Any other
+  // program keeps the configured tokens ahead of the provider's option parsing,
+  // exactly as the TUI receives them.
+  const programArgvStart = DIRECT_PROVIDER_COMMAND[backend].test(command)
+    ? 0
+    : (scan.options.length > 0
+      ? scan.options[0].tokenIndex
+      : (scan.terminatorIndex !== -1 ? scan.terminatorIndex : args.length));
+  const backendConfigArgs: string[] = [];
+  for (const option of scan.options) {
+    if (!CODEX_BACKEND_CONFIG_OPTIONS.includes(option.name)) continue;
+    const token = args[option.tokenIndex];
+    if (typeof token !== "string") {
+      throw refuse("an owned Codex backend configuration option has no configured token");
+    }
+    backendConfigArgs.push(token);
+    if (option.attached !== undefined) continue;
+    if (option.operand === undefined || args[option.tokenIndex + 1] !== option.operand) {
+      throw refuse("an owned Codex backend configuration or feature option is configured without a value");
+    }
+    backendConfigArgs.push(option.operand);
+  }
+  return { scan, programPrefixArgs: args.slice(0, programArgvStart), backendConfigArgs };
+}
+
+/**
+ * The base environment of one owned backend child: the same sanitized operator
+ * environment the TUI child starts from, so `CODEX_HOME` and every other native
+ * setting resolve identically in both processes, minus the clipboard marker the
+ * host imposes on the interactive TUI alone. An operator's own value for that
+ * key is not a host imposition and is preserved exactly.
+ *
+ * The clone is taken before this launch's hook bootstrap marker is written to
+ * the TUI environment: the marker belongs where the hook command runs, and
+ * `renderBackend` applies it to the environment the lease hands back.
+ */
+function ownedCodexBackendEnvironment(
+  composed: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  operatorClipboardValue: string | undefined,
+): NodeJS.ProcessEnv {
+  const backendEnv = { ...composed };
+  if (operatorClipboardValue === undefined) deleteCodexTerminalClipboardMode(backendEnv, platform);
+  else applyCodexTerminalClipboardMode(backendEnv, platform, operatorClipboardValue);
+  return backendEnv;
+}
+
+/** Everything one owned Codex plan needs; the caller owns every field. */
+interface OwnedCodexLaunchPlanInput {
+  readonly file: string;
+  readonly cwd: string;
+  readonly args: readonly string[];
+  readonly facts: OwnedCodexLaunchFacts;
+  readonly platform: NodeJS.Platform;
+  readonly parentEnvironment: NodeJS.ProcessEnv;
+  readonly backendEnv: NodeJS.ProcessEnv;
+  /** The hook flags this launch's ONE preparation produced, empty when it armed nothing. */
+  readonly hookArgs: readonly string[];
+  /** The hook marker entries of that same preparation, empty when it armed nothing. */
+  readonly hookEnvironment: Readonly<Record<string, string>>;
+}
+
+/**
+ * Build the plan of one owned Codex launch. Every fact is already resolved and
+ * every artifact already staged by the ordinary preparation, so both renderers
+ * are pure re-compositions of literal tokens: they stage nothing, spawn nothing,
+ * mutate nothing they were given, and repeat identically.
+ *
+ * The Windows branch is the same trusted batch path the ordinary descriptor
+ * uses, fed complete literal argv each time. It never re-quotes or appends to a
+ * previously rendered `commandLine`, so `/d /s /v:off /c "…"`, the one percent
+ * carrier, and the trusted parent `cmd.exe` stay exactly the established
+ * convention for both children.
+ */
+function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCodexOwnedLaunchPlan {
+  const { file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment } = input;
+  const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor => {
+    if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
+      const batch = adaptWindowsBatchShim(file, argv, parentEnvironment, env);
+      return { file: batch.file, args: batch.args, commandLine: batch.commandLine, env: batch.env, cwd };
+    }
+    return { file, args: [...argv], env, cwd };
+  };
+  return {
+    backendEnv,
+    renderBackend: (controlArgs, environment) => {
+      const control = assertOwnedBackendControlArgs(controlArgs);
+      if (environment === null || typeof environment !== "object" || Array.isArray(environment)) {
+        throw refuse("the owned Codex backend environment is required");
+      }
+      const env = { ...environment };
+      // The hook channel and its marker belong to this child alone: the core
+      // that runs the provider's hooks and MCP servers is the backend.
+      applyNativeHookBootstrapEnvironment(env, hookEnvironment, platform);
+      // Same program, same configured argv prefix, then the provider's global
+      // configuration, then this launch's hook channel, then the app-server
+      // control argv. Prompt and runtime-only arguments never cross over.
+      return render([...facts.programPrefixArgs, ...facts.backendConfigArgs, ...hookArgs, ...control], env);
+    },
+    renderTui: (connection) => {
+      const { args: connectionArgs, env } = assertOwnedTuiConnection(connection);
+      // The hosted TUI keeps the clipboard marker it has always carried; the
+      // connection environment it arrives in is otherwise preserved exactly.
+      applyCodexTerminalClipboardMode(env, platform);
+      const insertion = facts.scan.insertionIndex;
+      const argv = [...args.slice(0, insertion), ...connectionArgs, ...args.slice(insertion)];
+      return render(argv, env);
+    },
+  };
+}
+
+/**
  * Create the native interactive CLI launcher for one already-normalized
  * configuration (no live config, auth, or provider reads happen here).
  *
@@ -908,11 +1362,20 @@ function adaptWindowsBatchShim(
  * - The result is the ordinary `NativeLaunchDescriptor` the session host
  *   already consumes: canonical file, exact interactive argv, cloned sanitized
  *   environment, canonical workspace.
+ * - Only a launcher constructed with `ownedCodexBackend: true` attaches a
+ *   `NativeCodexOwnedLaunchPlan` to a Codex result, and it attaches nothing to
+ *   any other backend. The mode changes no resolution, no guard, and no
+ *   descriptor: it adds one preparation-only plan, and one new refusal — a
+ *   configured named profile, which this host cannot route to an owned backend.
  */
 export function createNativeCliLauncher(
   config: ReviewGateConfig,
   options: NativeCliLauncherOptions = {},
 ): NativeCliLauncher {
+  if (options.ownedCodexBackend !== undefined && typeof options.ownedCodexBackend !== "boolean") {
+    throw refuse("the owned Codex backend launcher option must be a boolean or absent");
+  }
+  const ownedCodexBackend = options.ownedCodexBackend === true;
   return async (backend, request) => {
     const platform = options.platform ?? process.platform;
     assertSupportedPlatform(platform);
@@ -945,10 +1408,26 @@ export function createNativeCliLauncher(
       throw refuse(`target "${target.id}" names a shell command string rather than a single executable filename`);
     }
 
+    // Owned Codex backend mode reads the configured argv once, here, before the
+    // environment clone, the hook preparation, any artifact, and any process:
+    // the profile refusal must cost nothing, and the plan's renderers need the
+    // same real-option-position facts this module's ONE scanner produces. A
+    // Claude launch never enters this branch, so the mode attaches no plan and
+    // changes nothing about it.
+    const ownedFacts = ownedCodexBackend && backend === "codex"
+      ? prepareOwnedCodexLaunchFacts(backend, args, target.id, command)
+      : undefined;
+
     // The child environment first, so a configured PATH override is the PATH
     // discovery actually searches (same rule the settings availability probe
     // applies) and the located file is the file the child would execute.
     const env = composeNativeEnvironment(request.env, sharedEnv, platform);
+    // Whether this environment already carries the clipboard marker is observed
+    // before the host mode wins the key: only an absent key means a later `1`
+    // is host-imposed. Every other launch behavior is untouched.
+    const operatorClipboardValue = backend === "codex"
+      ? readCodexTerminalClipboardMode(env, platform)
+      : undefined;
     // The Codex clipboard compatibility marker is applied to the composed child
     // environment only, once normal target and environment resolution is done,
     // so it wins for this one variable over any configured or inherited value
@@ -957,6 +1436,12 @@ export function createNativeCliLauncher(
     if (backend === "codex") applyCodexTerminalClipboardMode(env, platform);
     const cwd = canonicalNativeWorkspace(request.workspace);
     env.PWD = cwd;
+    // Cloned now, so the backend base environment carries the operator's
+    // composition and never this launch's hook marker, which is written to the
+    // TUI environment below and to the backend only at render time.
+    const ownedBackendEnv = ownedFacts === undefined
+      ? undefined
+      : ownedCodexBackendEnvironment(env, platform, operatorClipboardValue);
     // Discovery anchors to the workspace the child is actually spawned in, so a
     // relative command or a relative PATH entry resolves exactly as the spawn
     // would resolve it — never against the host process cwd.
@@ -1020,6 +1505,21 @@ export function createNativeCliLauncher(
         target.id,
         nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
       );
+      const ownedCodex = ownedFacts === undefined || ownedBackendEnv === undefined
+        ? undefined
+        : createOwnedCodexLaunchPlan({
+          file,
+          cwd,
+          args,
+          facts: ownedFacts,
+          platform,
+          parentEnvironment: options.parentEnvironment ?? process.env,
+          backendEnv: ownedBackendEnv,
+          hookArgs: nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
+          hookEnvironment: nativeHook !== undefined && nativeHook.observation === "prepared"
+            ? nativeHook.environment
+            : {},
+        });
       if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
         const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
         return {
@@ -1029,9 +1529,17 @@ export function createNativeCliLauncher(
           env: batch.env,
           cwd,
           ...(nativeHook === undefined ? {} : { nativeHook }),
+          ...(ownedCodex === undefined ? {} : { ownedCodex }),
         };
       }
-      return { file, args: argv, env, cwd, ...(nativeHook === undefined ? {} : { nativeHook }) };
+      return {
+        file,
+        args: argv,
+        env,
+        cwd,
+        ...(nativeHook === undefined ? {} : { nativeHook }),
+        ...(ownedCodex === undefined ? {} : { ownedCodex }),
+      };
     } catch (error) {
       if (nativeHook !== undefined && nativeHook.observation === "prepared") {
         await nativeHook.lease.cleanup().catch(() => undefined);

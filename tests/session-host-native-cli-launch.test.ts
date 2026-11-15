@@ -8,9 +8,19 @@ import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
   NATIVE_CLI_DEFAULT_TARGET_IDS,
+  NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
+  NativeCodexOwnedProfileUnsupportedError,
   createNativeCliLauncher,
   listNativeCliTargets,
+  type NativeCliLaunchDescriptor,
+  type NativeCodexOwnedLaunchPlan,
+  type NativeCodexOwnedTuiConnection,
 } from "../src/session-host/native-cli-launch";
+import {
+  NATIVE_HOOK_BOOTSTRAP_ENV,
+  type NativeHookBootstrap,
+} from "../src/session-host/native-hook-protocol";
+import { type NativeHookLaunchOutcome } from "../src/session-host/native-hook-launch-prep";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   NODE_OPTIONS_RESTORE_ENV,
@@ -872,5 +882,576 @@ test("a Windows .cmd shim runs as a batch command through the trusted parent Sys
     assert.equal(descriptor.env.NPM_CONFIG_PROFILECACHE, "C:\\profiles");
     assert.equal(descriptor.env.COMSPEC, join(bin, "cmd.exe"));
     assert.equal(descriptor.env.PWD, workspace);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Owned Codex backend plan (preparation only)
+//
+// The owned backend itself is another slice's process owner: nothing here
+// spawns a provider, generates real capability material, or claims that a host
+// activated the mode. These tests only pin what this launcher may and must not
+// do while preparing: attach a plan to nothing it was not asked to, re-render
+// both children from literal tokens, and refuse one named profile.
+// ---------------------------------------------------------------------------
+
+const OWNED_CODEX_DIGEST = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OWNED_CODEX_ENDPOINT = "ws://127.0.0.1:54321";
+/** A synthetic reserved-name bearer: the shape the lease uses, never real material. */
+const OWNED_TUI_AUTH_ENV = "PI_REVIEW_GATE_OWNED_CODEX_RPC_0";
+const OWNED_TUI_BEARER = "synthetic-bearer-never-a-real-token";
+
+/** The CLOSED control argv the owned backend lease generates. */
+const ownedControlArgs = (digest = OWNED_CODEX_DIGEST): string[] => [
+  "app-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token", "--ws-token-sha256", digest,
+];
+
+/** The private TUI connection arguments the lease's readiness accessor returns. */
+const ownedConnectionArgs = (endpoint = OWNED_CODEX_ENDPOINT): string[] => [
+  "--remote", endpoint, "--remote-auth-token-env", OWNED_TUI_AUTH_ENV,
+];
+
+const HOOK_INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
+const HOOK_GENERATION = "22222222-2222-4222-8222-222222222222";
+const HOOK_TOKEN = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+function bootstrapFor(backend: "claude" | "codex"): NativeHookBootstrap {
+  return {
+    version: 1,
+    socketPath: "/tmp/prg-synthetic-status-broker.sock",
+    generation: HOOK_GENERATION,
+    instanceId: HOOK_INSTANCE_ID,
+    backend,
+    token: HOOK_TOKEN,
+  };
+}
+
+function preparedHook(outcome: NativeHookLaunchOutcome | undefined) {
+  assert.equal(outcome?.observation, "prepared", `expected a prepared outcome, got ${String(outcome?.observation)}`);
+  if (outcome?.observation !== "prepared") throw new Error("unreachable");
+  return outcome;
+}
+
+function unavailableHook(outcome: NativeHookLaunchOutcome | undefined) {
+  assert.equal(outcome?.observation, "unavailable", `expected an unavailable outcome, got ${String(outcome?.observation)}`);
+  if (outcome?.observation !== "unavailable") throw new Error("unreachable");
+  return outcome;
+}
+
+/** The Error one closed renderer threw, so its message can be inspected too. */
+function throwFrom(operation: () => unknown): Error {
+  try { operation(); } catch (caught) {
+    assert.ok(caught instanceof Error);
+    return caught;
+  }
+  throw new Error("expected the closed renderer to refuse");
+}
+
+function ownedPlanOf(descriptor: NativeCliLaunchDescriptor): NativeCodexOwnedLaunchPlan {
+  assert.ok(descriptor.ownedCodex !== undefined, "an owned Codex launch carries a plan");
+  return descriptor.ownedCodex!;
+}
+
+function ownedConnection(env: Readonly<NodeJS.ProcessEnv>) {
+  return { args: ownedConnectionArgs(), env: { ...env, [OWNED_TUI_AUTH_ENV]: OWNED_TUI_BEARER } as NodeJS.ProcessEnv };
+}
+
+test("the owned Codex plan is construction-time only: nothing without the option, nothing for Claude, and the ordinary descriptor is untouched", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "claude"));
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const config = configWith({});
+    const plain = createNativeCliLauncher(config, { platform: "darwin" });
+    const owned = createNativeCliLauncher(config, { platform: "darwin", ownedCodexBackend: true });
+    const off = createNativeCliLauncher(config, { platform: "darwin", ownedCodexBackend: false });
+
+    // Without the mode — every existing call site — the descriptor is exactly
+    // what it was, plan absent.
+    const plainCodex = await plain("codex", { workspace, env: { PATH: bin } });
+    assert.equal(plainCodex.ownedCodex, undefined);
+    assert.equal((await off("codex", { workspace, env: { PATH: bin } })).ownedCodex, undefined);
+
+    const ownedCodex = await owned("codex", { workspace, env: { PATH: bin } });
+    assert.ok(ownedCodex.ownedCodex !== undefined);
+    // The plan is additive: the ordinary descriptor the manager consumes is
+    // byte-identical, so a manager that ignores it launches exactly what it
+    // launched before the mode existed.
+    assert.equal(ownedCodex.file, plainCodex.file);
+    assert.equal(ownedCodex.cwd, plainCodex.cwd);
+    assert.deepEqual(ownedCodex.args, plainCodex.args);
+    assert.deepEqual(ownedCodex.env, plainCodex.env);
+    assert.equal(ownedCodex.nativeHook, undefined);
+
+    // Claude is never part of owned Codex mode: no plan, and nothing else about
+    // the launch changes either.
+    const plainClaude = await plain("claude", { workspace, env: { PATH: bin } });
+    const ownedClaude = await owned("claude", { workspace, env: { PATH: bin } });
+    assert.equal(ownedClaude.ownedCodex, undefined, "owned Codex mode attaches no plan to a Claude launch");
+    assert.deepEqual(ownedClaude.args, plainClaude.args);
+    assert.deepEqual(ownedClaude.env, plainClaude.env);
+
+    // The mode is a construction-time boolean, never a per-request field: a
+    // request carries no way to ask for it, and a non-boolean option is a
+    // programming error refused when the launcher is built.
+    assert.throws(
+      () => createNativeCliLauncher(config, { platform: "darwin", ownedCodexBackend: "yes" as unknown as boolean }),
+      /owned Codex backend launcher option must be a boolean or absent/u,
+    );
+    const perRequest = { workspace, env: { PATH: bin }, ownedCodexBackend: true };
+    assert.equal((await plain("codex", perRequest)).ownedCodex, undefined, "a per-request ownedCodexBackend claim is inert data");
+
+    // The plan's backend environment is its own object, never the descriptor's,
+    // and it carries no capability material of any kind.
+    const plan = ownedPlanOf(ownedCodex);
+    assert.notEqual(plan.backendEnv, ownedCodex.env);
+    assert.deepEqual(Object.keys(plan.backendEnv).filter((name) => /^PI_REVIEW_GATE_OWNED_CODEX_RPC/u.test(name)), []);
+    assert.equal(plan.backendEnv[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+  });
+});
+
+test("owned Codex mode refuses every named-profile spelling with one closed typed code, before any environment, hook, artifact, or process work", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const spellings: string[][] = [
+      ["--profile", "host"], ["--profile=host"], ["-p", "host"], ["-phost"], ["-p=host"],
+    ];
+    for (const args of spellings) {
+      const config = configWith({ worker: { adapter: "codex-cli", command: join(bin, "codex"), args, review: {} } });
+      // Outside the mode the operator's profile selection stays exactly as it was.
+      const accepted = await createNativeCliLauncher(config, { platform: "darwin" })("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" });
+      assert.deepEqual(accepted.args, [...args, "--no-daemon"], `${JSON.stringify(args)} stays accepted outside owned mode`);
+
+      const error = await createNativeCliLauncher(config, { platform: "darwin", ownedCodexBackend: true })(
+        "codex", { workspace, env: { PATH: bin }, targetId: "external:worker" },
+      ).then(() => undefined, (caught: unknown) => caught);
+      assert.ok(error instanceof NativeCodexOwnedProfileUnsupportedError, `${JSON.stringify(args)} refused by type`);
+      assert.equal((error as NativeCodexOwnedProfileUnsupportedError).code, NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE);
+      // The fixed message carries no profile name, value, path, or argument.
+      for (const leak of ["host", bin, workspace, "--profile"]) {
+        assert.ok(!error!.message.includes(leak), `the refusal leaked ${JSON.stringify(leak)}: ${error!.message}`);
+      }
+    }
+
+    // Ordering is the whole resource claim: a missing executable and a
+    // malformed hook bootstrap both fail later, so surfacing the profile code
+    // instead proves the refusal happened before the environment clone, the
+    // hook preparation, any artifact, and any process.
+    const ordering = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: ["--profile", "host"], review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const early = await ordering("codex", {
+      workspace,
+      env: { PATH: join(root, "nowhere") },
+      targetId: "external:worker",
+      nativeHook: { bootstrap: { version: 1 } as unknown as NativeHookBootstrap },
+    }).then(() => undefined, (caught: unknown) => caught);
+    assert.ok(early instanceof NativeCodexOwnedProfileUnsupportedError, "the profile refusal wins over every later failure");
+
+    // Narrowness: `-c profile=x` is an ordinary configuration override and a
+    // `--profile` past the `--` terminator is prompt data. Neither names the
+    // profile option, so neither is newly banned, and the configuration override
+    // is routed to the backend like any other `-c`.
+    const ownedNear = (args: string[]) => createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args, review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true })("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" });
+    const configValue = await ownedNear(["-c", "profile=x"]);
+    assert.deepEqual(configValue.args, ["-c", "profile=x", "--no-daemon"]);
+    assert.deepEqual(
+      ownedPlanOf(configValue).renderBackend(ownedControlArgs(), { ...ownedPlanOf(configValue).backendEnv }).args.slice(0, 2),
+      ["-c", "profile=x"],
+    );
+    const promptData = await ownedNear(["--", "--profile"]);
+    assert.deepEqual(promptData.args, ["--no-daemon", "--", "--profile"]);
+    assert.ok(!ownedPlanOf(promptData).renderBackend(ownedControlArgs(), { ...ownedPlanOf(promptData).backendEnv }).args.includes("--profile"));
+    // A configuration VALUE that merely spells the flag is data, not an option.
+    const spelledValue = await ownedNear(["-c", 'label="--profile host"']);
+    assert.deepEqual(
+      ownedPlanOf(spelledValue).renderBackend(ownedControlArgs(), { ...ownedPlanOf(spelledValue).backendEnv }).args.slice(0, 2),
+      ["-c", 'label="--profile host"'],
+    );
+  });
+});
+
+test("the owned TUI render keeps every operator argument, inserts the lease connection in real option position, and drops only the host-added --no-daemon", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const configured = [
+      "-c", 'model_reasoning_effort="high"', "--enable", "feature_x",
+      "--model", "gpt-5.1-codex", "--", "fix the bug",
+    ];
+    const launcher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: configured, review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const descriptor = await launcher("codex", { workspace, env: { PATH: bin, CODEX_HOME: "/operator/.codex" }, targetId: "external:worker" });
+    const plan = ownedPlanOf(descriptor);
+    const backendSnapshot = { ...plan.backendEnv };
+    const connection = ownedConnection(plan.backendEnv);
+    const connectionSnapshot = { ...connection.env };
+
+    const tui = plan.renderTui(connection);
+    assert.deepEqual(tui.args, [
+      "-c", 'model_reasoning_effort="high"', "--enable", "feature_x", "--model", "gpt-5.1-codex",
+      ...ownedConnectionArgs(),
+      "--", "fix the bug",
+    ], "operator tokens keep their order, the connection lands in option position before the terminator");
+    assert.ok(!tui.args.includes("--no-daemon"), "only the host-added daemon isolation flag disappears");
+    assert.ok(!tui.args.some((token) => token.startsWith("hooks.")), "no generated SessionStart override on the TUI");
+    assert.equal(tui.file, descriptor.file);
+    assert.equal(tui.cwd, workspace);
+    assert.equal(tui.commandLine, undefined);
+    // The hosted TUI keeps the clipboard marker and the bearer variable, and
+    // never the backend's hook marker.
+    assert.equal(tui.env.HERDR_ENV, "1");
+    assert.equal(tui.env[OWNED_TUI_AUTH_ENV], OWNED_TUI_BEARER);
+    assert.equal(tui.env.CODEX_HOME, "/operator/.codex");
+    assert.equal(tui.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+    // No input mutated, and a second render repeats identically on fresh objects.
+    assert.deepEqual(plan.backendEnv, backendSnapshot);
+    assert.deepEqual(connection.env, connectionSnapshot);
+    const again = plan.renderTui(connection);
+    assert.deepEqual(again.args, tui.args);
+    assert.deepEqual(again.env, tui.env);
+    assert.notEqual(again.env, tui.env);
+
+    // A value-taking option still missing its operand keeps the connection ahead
+    // of it, exactly as the isolation flag always was.
+    const danglingLauncher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: ["--model"], review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const dangling = ownedPlanOf(await danglingLauncher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" }));
+    assert.deepEqual(dangling.renderTui(ownedConnection(dangling.backendEnv)).args, [...ownedConnectionArgs(), "--model"]);
+
+    // An operator who configured the isolation flag themselves keeps it: only the
+    // host-added one is removed.
+    const operatorLauncher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: ["--no-daemon"], review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const operatorPlan = ownedPlanOf(await operatorLauncher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" }));
+    assert.deepEqual(operatorPlan.renderTui(ownedConnection(operatorPlan.backendEnv)).args, ["--no-daemon", ...ownedConnectionArgs()]);
+
+    // A connection this launcher did not prepare is refused, never guessed at.
+    assert.throws(() => plan.renderTui({ args: [], env: { ...plan.backendEnv } }), /carries no printable connection arguments/u);
+    assert.throws(
+      () => plan.renderTui({ args: ownedConnectionArgs(), env: undefined } as unknown as NativeCodexOwnedTuiConnection),
+      /carries no environment/u,
+    );
+    assert.throws(
+      () => plan.renderTui({ args: ["--remote", "ws://127.0.0.1:1\nrm"], env: { ...plan.backendEnv } }),
+      /carries no printable connection arguments/u,
+    );
+  });
+});
+
+test("the owned backend render routes the operator's global config and features, arms the prepared SessionStart hook only there, and keeps the closed control argv", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const configured = [
+      "-c", 'model_reasoning_effort="high"', "--config", 'model_provider="corp"',
+      "--enable", "feature_x", "--disable", "feature_y",
+      "--model", "gpt-5.1-codex", "--", "app-server", "-c", 'approval_policy="never"',
+    ];
+    const launcher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: configured, review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const descriptor = await launcher("codex", {
+      workspace,
+      env: { PATH: bin, CODEX_HOME: "/operator/.codex" },
+      targetId: "external:worker",
+      nativeHook: { bootstrap: bootstrapFor("codex") },
+    });
+    const hook = preparedHook(descriptor.nativeHook);
+    assert.equal(hook.route, "codex-session-start");
+    // This route stages no file at all, so a render has nothing to re-stage.
+    assert.equal(hook.lease.root, null);
+    const plan = ownedPlanOf(descriptor);
+    const backendSnapshot = { ...plan.backendEnv };
+
+    const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+    assert.deepEqual(backend.args, [
+      // The operator's global configuration and feature tokens, in configured
+      // order and exact spelling, then this launch's ONE prepared hook channel,
+      // then the closed control argv.
+      "-c", 'model_reasoning_effort="high"', "--config", 'model_provider="corp"',
+      "--enable", "feature_x", "--disable", "feature_y",
+      ...hook.args,
+      ...ownedControlArgs(),
+    ]);
+    assert.equal(backend.file, descriptor.file);
+    assert.equal(backend.cwd, workspace);
+    // Runtime UI options are not app-server arguments: they stay on the TUI,
+    // whose native protocol projects them. Post-terminator prompt data is never
+    // read as an option either.
+    for (const absent of ["--model", "gpt-5.1-codex", "--no-daemon", "--", 'approval_policy="never"']) {
+      assert.ok(!backend.args.includes(absent), `${absent} never reaches the backend argv`);
+    }
+    // Only the digest crosses to the backend, exactly once, and no bearer or
+    // endpoint ever does.
+    assert.equal(backend.args.filter((token) => token === OWNED_CODEX_DIGEST).length, 1);
+    assert.ok(!backend.args.some((token) => token.includes(OWNED_CODEX_ENDPOINT) || token.includes(OWNED_TUI_BEARER)));
+    // The backend keeps the operator's environment and the hook marker, and gains
+    // neither the host-imposed clipboard marker nor the TUI's bearer variable.
+    assert.equal(backend.env.CODEX_HOME, "/operator/.codex");
+    assert.equal(backend.env.PWD, workspace);
+    assert.deepEqual(Object.keys(backend.env).filter((name) => name.toUpperCase() === "HERDR_ENV"), []);
+    assert.equal(backend.env[OWNED_TUI_AUTH_ENV], undefined);
+    const marker = JSON.parse(backend.env[NATIVE_HOOK_BOOTSTRAP_ENV]!) as NativeHookBootstrap;
+    assert.equal(marker.token, HOOK_TOKEN);
+    assert.equal(marker.backend, "codex");
+    // Rendering is pure and repeatable: the same argv from an unchanged base,
+    // with no second preparation and no marker duplication.
+    const second = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+    assert.deepEqual(second.args, backend.args);
+    assert.deepEqual(second.env, backend.env);
+    assert.deepEqual(plan.backendEnv, backendSnapshot);
+    assert.deepEqual(Object.keys(plan.backendEnv).filter((name) => name === NATIVE_HOOK_BOOTSTRAP_ENV), []);
+    assert.deepEqual(await hook.lease.cleanup(), { removed: [], preserved: [] });
+
+    // An attached spelling is routed as the single literal token it is, and the
+    // TUI keeps it exactly as configured too.
+    const attachedLauncher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: ['-c=model_reasoning_effort="high"', "--enable=feature_z"], review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const attached = ownedPlanOf(await attachedLauncher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" }));
+    assert.deepEqual(
+      attached.renderBackend(ownedControlArgs(), { ...attached.backendEnv }).args.slice(0, 2),
+      ['-c=model_reasoning_effort="high"', "--enable=feature_z"],
+    );
+    assert.deepEqual(
+      attached.renderTui(ownedConnection(attached.backendEnv)).args.slice(0, 2),
+      ['-c=model_reasoning_effort="high"', "--enable=feature_z"],
+    );
+
+    // The operator's own clipboard value is theirs, not host-imposed: it survives
+    // on the backend while the hosted TUI keeps the host mode.
+    const operatorClipboard = ownedPlanOf(await launcher("codex", {
+      workspace, env: { PATH: bin, HERDR_ENV: "operator-value" }, targetId: "external:worker",
+    }));
+    assert.equal(operatorClipboard.backendEnv.HERDR_ENV, "operator-value");
+    assert.equal(operatorClipboard.renderBackend(ownedControlArgs(), { ...operatorClipboard.backendEnv }).env.HERDR_ENV, "operator-value");
+    assert.equal(operatorClipboard.renderTui(ownedConnection(operatorClipboard.backendEnv)).env.HERDR_ENV, "1");
+
+    // An operator who writes their own SessionStart override keeps it and gets no
+    // second one: their own `-c` token is still routed to the core.
+    const operatorHooks = ["-c", 'hooks.SessionStart=[{type="command",command="operator.sh"}]'];
+    const preserved = await createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: operatorHooks, review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true })("codex", {
+      workspace, env: { PATH: bin }, targetId: "external:worker", nativeHook: { bootstrap: bootstrapFor("codex") },
+    });
+    assert.equal(unavailableHook(preserved.nativeHook).reason, "operator-hook-override");
+    const preservedPlan = ownedPlanOf(preserved);
+    const preservedBackend = preservedPlan.renderBackend(ownedControlArgs(), { ...preservedPlan.backendEnv });
+    assert.deepEqual(preservedBackend.args.slice(0, 2), operatorHooks);
+    assert.equal(preservedBackend.args.filter((token) => token.startsWith("hooks.")).length, 1, "exactly the operator's own hook override");
+    assert.equal(preservedBackend.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined, "a declined acquisition arms no marker anywhere");
+  });
+});
+
+test("an owned Codex launch keeps a wrapper target's command prefix on both children and never forwards the prompt", async () => {
+  await fixture(async (root, bin) => {
+    // The documented wrapper shape: the configured command is an interpreter and
+    // the first configured argument is the script it runs. The backend executes
+    // the SAME resolved program, so it must keep that prefix.
+    await fakeExecutable(join(bin, "node"));
+    const wrapper = join(root, "codex wrapper.js");
+    await writeFile(wrapper, "// never invoked\n");
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const configured = [wrapper, "-c", 'model_provider="corp"', "--model", "gpt-5.1-codex", "--", "fix the bug"];
+    const launcher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "node"), args: configured, review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true });
+    const descriptor = await launcher("codex", {
+      workspace, env: { PATH: bin }, targetId: "external:worker", nativeHook: { bootstrap: bootstrapFor("codex") },
+    });
+    const hook = preparedHook(descriptor.nativeHook);
+    assert.equal(descriptor.file, join(bin, "node"));
+    // The ordinary (non-plan) composition is unchanged: the host flags land in
+    // real option position, before the terminator.
+    assert.deepEqual(descriptor.args, [
+      wrapper, "-c", 'model_provider="corp"', "--model", "gpt-5.1-codex",
+      "--no-daemon", ...hook.args,
+      "--", "fix the bug",
+    ]);
+
+    const plan = ownedPlanOf(descriptor);
+    const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+    assert.deepEqual(backend.args, [
+      wrapper, "-c", 'model_provider="corp"', ...hook.args, ...ownedControlArgs(),
+    ], "the backend runs the configured wrapper with its prefix, plus only backend-routed configuration");
+    assert.equal(backend.file, descriptor.file);
+    assert.equal(backend.cwd, workspace);
+    // Runtime-only options, the terminator, and the prompt stay on the TUI.
+    for (const absent of ["--model", "gpt-5.1-codex", "--", "fix the bug", "--no-daemon"]) {
+      assert.ok(!backend.args.includes(absent), `${absent} never reaches the backend argv`);
+    }
+
+    const tui = plan.renderTui(ownedConnection(plan.backendEnv));
+    assert.deepEqual(tui.args, [
+      wrapper, "-c", 'model_provider="corp"', "--model", "gpt-5.1-codex",
+      ...ownedConnectionArgs(), "--", "fix the bug",
+    ]);
+    assert.equal(tui.file, descriptor.file);
+
+    // A wrapper whose configured argv is only its script keeps it too: there is
+    // nothing after it that could be provider option data.
+    const bareWrapper = join(root, "bare wrapper.js");
+    await writeFile(bareWrapper, "// never invoked\n");
+    const barePlan = ownedPlanOf(await createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "node"), args: [bareWrapper], review: {} },
+    }), { platform: "darwin", ownedCodexBackend: true })("codex", {
+      workspace, env: { PATH: bin }, targetId: "external:worker",
+    }));
+    assert.deepEqual(
+      barePlan.renderBackend(ownedControlArgs(), { ...barePlan.backendEnv }).args,
+      [bareWrapper, ...ownedControlArgs()],
+    );
+  });
+});
+
+test("a direct Codex command owns no program prefix, so its prompt stays TUI-only and the backend stays the closed app-server argv", async () => {
+  await fixture(async (root, bin) => {
+    // A command that spells the provider's own executable has no argv of its own
+    // ahead of the provider's options, so a leading positional is the provider's
+    // prompt: interactive data that belongs to the TUI alone, whether or not
+    // configuration options follow it. The wrapper regression above covers the
+    // opposite shape, where the configured program does own a prefix.
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const cases: Array<{ readonly command: string; readonly args: readonly string[] }> = [
+      { command: join(bin, "codex"), args: ["fix the bug"] },
+      { command: join(bin, "codex"), args: ["fix the bug", "-c", 'model_provider="corp"'] },
+      { command: join(bin, "codex"), args: ["fix the bug", "--", "and keep this literal"] },
+      { command: "codex", args: ["fix the bug", "-c", 'model_provider="corp"'] },
+    ];
+    for (const item of cases) {
+      const launcher = createNativeCliLauncher(configWith({
+        worker: { adapter: "codex-cli", command: item.command, args: [...item.args], review: {} },
+      }), { platform: "darwin", ownedCodexBackend: true });
+      const descriptor = await launcher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" });
+      // The ordinary launch still receives the prompt exactly as before, with the
+      // host flag in real option position — before a terminator, otherwise last.
+      const terminator = item.args.indexOf("--");
+      const insertAt = terminator === -1 ? item.args.length : terminator;
+      assert.deepEqual(descriptor.args, [...item.args.slice(0, insertAt), "--no-daemon", ...item.args.slice(insertAt)]);
+      const plan = ownedPlanOf(descriptor);
+      // The backend never gains prompt data: only the operator's routed
+      // configuration, then the closed control argv.
+      const routed = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv }).args;
+      assert.ok(!routed.includes("fix the bug"), `prompt reached the backend: ${JSON.stringify(routed)}`);
+      assert.ok(!routed.includes("and keep this literal"));
+      assert.deepEqual(routed.slice(routed.length - ownedControlArgs().length), ownedControlArgs());
+      assert.deepEqual(routed.slice(0, routed.length - ownedControlArgs().length), item.args.filter((token) => token !== "fix the bug" && token !== "and keep this literal" && token !== "--"));
+      // The TUI keeps everything, in order, with the connection in option position.
+      assert.deepEqual(
+        plan.renderTui(ownedConnection(plan.backendEnv)).args,
+        [...item.args.slice(0, insertAt), ...ownedConnectionArgs(), ...item.args.slice(insertAt)],
+      );
+    }
+  });
+});
+
+test("the owned renderers refuse a control argv they did not generate without echoing its digest", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const plan = ownedPlanOf(await createNativeCliLauncher(configWith({}), { platform: "darwin", ownedCodexBackend: true })("codex", {
+      workspace, env: { PATH: bin },
+    }));
+    const malformed: unknown[] = [
+      ["exec", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token", "--ws-token-sha256", OWNED_CODEX_DIGEST],
+      ["app-server", "--listen", "ws://127.0.0.1:9", "--ws-auth", "capability-token", "--ws-token-sha256", OWNED_CODEX_DIGEST],
+      ["app-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "bearer", "--ws-token-sha256", OWNED_CODEX_DIGEST],
+      ["app-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token", OWNED_CODEX_DIGEST],
+      [...ownedControlArgs(), "--extra"],
+      [...ownedControlArgs(OWNED_CODEX_DIGEST.toUpperCase())],
+      [...ownedControlArgs(`${OWNED_CODEX_DIGEST}zz`)],
+      "not-an-array",
+    ];
+    for (const controlArgs of malformed) {
+      const error = throwFrom(() => plan.renderBackend(controlArgs as unknown as readonly string[], { ...plan.backendEnv }));
+      assert.match(error.message, /closed app-server capability-token argv|lowercase SHA-256 token digest/u);
+      assert.ok(!error.message.includes(OWNED_CODEX_DIGEST), `the refusal leaked the digest: ${error.message}`);
+      assert.ok(!error.message.includes("127.0.0.1"), `the refusal leaked the endpoint: ${error.message}`);
+    }
+    assert.throws(() => plan.renderBackend(ownedControlArgs(), null as unknown as NodeJS.ProcessEnv), /backend environment is required/u);
+  });
+});
+
+test("the owned Windows renders re-compose both children from literal tokens through the one trusted batch path", async () => {
+  await fixture(async (root, bin) => {
+    const shim = join(bin, "codex.cmd");
+    await writeFile(shim, "@echo off\r\n");
+    await chmod(shim, 0o755);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const trusted = "Z:\\Fixture Windows Root\\System32\\cmd.exe";
+    const shipped = helperModule.resolveTrustedWindowsCmd;
+    helperModule.resolveTrustedWindowsCmd = () => trusted;
+    const configured = [
+      "-c", 'model_provider="corp"', "--enable", "feature_x",
+      "--label", "100%PI% & echo PWNED", "--bangs", "!PRG_SYNTH_INHERITED! a!b!c",
+    ];
+    try {
+      const launcher = createNativeCliLauncher(configWith({
+        worker: { adapter: "codex-cli", command: join(bin, "codex"), args: configured, review: {} },
+      }), { platform: "win32", parentEnvironment: { SystemRoot: "Z:\\Fixture Windows Root" }, ownedCodexBackend: true });
+      const descriptor = await launcher("codex", { workspace, env: { PATH: bin }, targetId: "external:worker" });
+      const plan = ownedPlanOf(descriptor);
+      const carrier = "PRG_NATIVE_BATCH_PCT_0";
+      // The one established batch convention, applied to whichever tokens this
+      // child actually receives: percent-free argv keeps the plain delivery, and
+      // a percent anywhere brings the single carrier and its clearance.
+      const batch = (tokens: readonly string[]): string => {
+        const percent = tokens.some((token) => token.includes("%"));
+        const quote = (token: string): string => helperModule.cmdQuote(percent ? token.replace(/%/gu, `%${carrier}%`) : token);
+        return `/d /s /v:off /c "${percent ? `set "${carrier}=" & ` : ""}${tokens.map(quote).join(" ")}"`;
+      };
+
+      const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+      assert.equal(backend.file, trusted);
+      assert.deepEqual(backend.args, [], "a batch child is never delivered as argv");
+      assert.equal(backend.commandLine, batch([
+        shim, "-c", 'model_provider="corp"', "--enable", "feature_x", ...ownedControlArgs(),
+      ]));
+      assert.ok(!backend.commandLine!.includes("--no-daemon"), "the batch text is re-composed, not spliced onto the ordinary descriptor");
+      // The operator's percent-bearing `--label` is not backend configuration, so
+      // the backend line stays percent-free and carries no transport metadata.
+      assert.deepEqual(Object.keys(backend.env).filter((name) => /^PRG_NATIVE_BATCH_PCT_/u.test(name)), []);
+      assert.ok(!backend.commandLine!.includes("PWNED"));
+
+      const tui = plan.renderTui(ownedConnection(plan.backendEnv));
+      assert.equal(tui.file, trusted);
+      assert.deepEqual(tui.args, []);
+      assert.equal(tui.commandLine, batch([
+        shim, ...configured, ...ownedConnectionArgs(),
+      ]));
+      assert.ok(!tui.commandLine!.includes("--no-daemon"));
+      assert.equal(tui.env[carrier], "%");
+      assert.equal(tui.env.HERDR_ENV, "1");
+      assert.equal(tui.env[OWNED_TUI_AUTH_ENV], OWNED_TUI_BEARER);
+      assert.deepEqual(Object.keys(tui.env).filter((name) => /^PRG_NATIVE_BATCH_PCT_/u.test(name)), [carrier]);
+
+      // Re-rendering delivers the identical batch text and never restages or
+      // re-quotes anything: the plan's base environment stays carrier-free.
+      assert.equal(plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv }).commandLine, backend.commandLine);
+      assert.equal(plan.renderTui(ownedConnection(plan.backendEnv)).commandLine, tui.commandLine);
+      assert.deepEqual(Object.keys(plan.backendEnv).filter((name) => /^PRG_NATIVE_BATCH_PCT_/u.test(name)), []);
+      // The ordinary descriptor of the same launch still delivers what it always
+      // did, including the host-added isolation flag and its own carrier.
+      assert.equal(descriptor.commandLine, batch([shim, ...configured, "--no-daemon"]));
+    } finally {
+      helperModule.resolveTrustedWindowsCmd = shipped;
+    }
   });
 });

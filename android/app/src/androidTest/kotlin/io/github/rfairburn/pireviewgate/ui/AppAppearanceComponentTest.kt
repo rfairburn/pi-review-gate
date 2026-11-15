@@ -22,6 +22,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -54,6 +55,7 @@ import io.github.rfairburn.pireviewgate.core.hosts.HostLabel
 import io.github.rfairburn.pireviewgate.core.hosts.NetworkSettings
 import io.github.rfairburn.pireviewgate.core.input.CellColorResolution
 import io.github.rfairburn.pireviewgate.core.input.SgrStyle
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalColorMode
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalColorSpec
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetadata
@@ -64,6 +66,7 @@ import io.github.rfairburn.pireviewgate.ui.client.NonTerminalStatusSlot
 import io.github.rfairburn.pireviewgate.ui.client.RootUIScreen
 import io.github.rfairburn.pireviewgate.ui.terminal.TerminalSurfaceView
 import kotlin.math.abs
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertSame
@@ -347,6 +350,105 @@ class AppAppearanceComponentTest {
             "$variant notice must not inherit the other appearance's content color: $strongest",
             distance(strongest, scheme.onSurface) < distance(strongest, other.onSurface) / 3f,
         )
+    }
+
+    @Test
+    fun theKeysPopupSessionTitlePaintsWithTheSavedAppearanceAndKeepsItsTextActionsAndRouting() {
+        val fixture = NativeUiFixture(NativeUiFixtures.sessions().copy(
+            route = ClientRoute.Terminal(NativeUiFixtures.terminal()),
+        )).apply { binding = NativeUiFixtures.binding(sourced = true) }
+        compose.setContent { fixture.Content() }
+        awaitTerminalInput(fixture)
+
+        // The real Keys control opens the real docked panel. Its title is the same
+        // session title the terminal route carries, and its actions stay present.
+        compose.onNodeWithText("Keys").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Conversation A").assertIsDisplayed()
+        compose.onNodeWithText("Paste").assertExists()
+        compose.onNodeWithText("Esc").assertExists()
+        assertKeysTitlePaintsWith("light", lightColorScheme(), darkColorScheme())
+
+        compose.runOnIdle {
+            fixture.state = fixture.state.copy(
+                settings = fixture.state.settings.withAppearance(AppAppearance.DARK),
+            )
+        }
+        compose.waitForIdle()
+        compose.onNodeWithText("Conversation A").assertIsDisplayed()
+        compose.onNodeWithText("Paste").assertExists()
+        compose.onNodeWithText("Esc").assertExists()
+        assertKeysTitlePaintsWith("dark", darkColorScheme(), lightColorScheme())
+
+        // The panel's key action still submits through the selected terminal target and
+        // its committed input proof; only the title's painted color changed.
+        compose.onNodeWithText("Esc").performScrollTo().performClick()
+        compose.runOnIdle {
+            val packet = fixture.packets.single()
+            assertEquals(NativeIoInputKind.KEYBOARD, packet.kind)
+            assertArrayEquals(byteArrayOf(27), packet.bytes)
+            assertEquals(NativeUiFixtures.hostA.value, packet.receipt.hostId)
+            assertEquals("duplicate-row", packet.receipt.rowId)
+            assertEquals(1L, packet.receipt.selectionGeneration)
+            assertTrue(packet.verifiedAtCapture)
+        }
+    }
+
+    /**
+     * The Keys panel title must paint with the selected scheme's own content color on
+     * the panel's translucent surface. The captured title is real pixels: its strongest
+     * glyph pixel must land on the selected scheme's onSurface and stay far from the
+     * other appearance's content color.
+     */
+    private fun assertKeysTitlePaintsWith(
+        variant: String,
+        scheme: ColorScheme,
+        other: ColorScheme,
+    ) {
+        val image = compose.onNodeWithText("Conversation A").captureToImage()
+        val pixels = image.toPixelMap()
+        assertTrue("expected a captured Keys title: ${image.width}x${image.height}",
+            image.width > 8 && image.height > 8)
+
+        // The line's own box includes leading above the glyphs, so its top-left pixel is
+        // the panel's painted backing rather than title ink.
+        val backing = pixels[0, 0]
+        var strongest = backing
+        var strongestDistance = -1f
+        for (y in 0 until image.height) {
+            for (x in 0 until image.width) {
+                val actual = pixels[x, y]
+                val distance = distance(actual, backing)
+                if (distance > strongestDistance) {
+                    strongestDistance = distance
+                    strongest = actual
+                }
+            }
+        }
+        assertTrue(
+            "$variant Keys title must be visible against its own surface, not an " +
+                "invisible default: $strongest on $backing",
+            strongestDistance > 1f,
+        )
+        assertTrue(
+            "$variant Keys title must use the selected scheme's own content color: " +
+                "$strongest is ${distance(strongest, scheme.onSurface)} from ${scheme.onSurface} " +
+                "and ${distance(strongest, other.onSurface)} from the other appearance's " +
+                "${other.onSurface}",
+            distance(strongest, scheme.onSurface) < 0.45f,
+        )
+        assertTrue(
+            "$variant Keys title must not inherit the other appearance's content color: $strongest",
+            distance(strongest, scheme.onSurface) < distance(strongest, other.onSurface) / 3f,
+        )
+    }
+
+    private fun awaitTerminalInput(fixture: NativeUiFixture) {
+        compose.waitUntil(10_000) {
+            compose.runOnIdle {
+                val surface = fixture.surface
+                surface?.currentInputProof()?.also { assertTrue(surface.verifyReceipt(it)) } != null
+            }
+        }
     }
 
     /** Summed RGB channel distance, in 0f..1f components. */

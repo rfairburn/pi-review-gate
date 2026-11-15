@@ -1238,6 +1238,9 @@ private fun TerminalKeysPanel(
                 Text(
                     text = terminal.sessionTitle,
                     style = MaterialTheme.typography.titleSmall,
+                    // The panel's surface is the scheme surface at overlay alpha, so
+                    // Surface cannot derive a matching content color for it.
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.286]
+
+### Fixed
+
+- The session title inside the Android Keys popup now follows the saved Light or Dark
+  appearance instead of staying dark on the popup's dark translucent surface (#680).
+  The title text, host context, controls, sizing, and selected-session input routing are
+  unchanged.
+
 ## [0.1.0-dev.285]
 
 ### Added

@@ -26,6 +26,14 @@ const CLAUDE_PROVENANCE = {
   verifiedOn: "2026-10-05",
 } as const satisfies ExternalAgentModelProvenance;
 
+/** The version records when the model was introduced, not account access or a tested runtime. */
+const FABLE_5_2_PROVENANCE = {
+  source: "https://code.claude.com/docs/en/model-config",
+  effortSource: "https://code.claude.com/docs/en/model-config#adjust-effort-level",
+  verifiedOn: "2026-11-15",
+  version: "2.1.321",
+} as const satisfies ExternalAgentModelProvenance;
+
 const CODEX_PROVENANCE = {
   source: "https://developers.openai.com/codex/models",
   effortSource: "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/models-manager/models.json",
@@ -49,6 +57,8 @@ export const EXTERNAL_AGENT_MODEL_CATALOG = {
     models: [
       { value: "claude-opus-5-5", label: "Opus 5.5 (claude-opus-5-5)", effortLevels: LOW_TO_MAX, defaultEffort: "medium", provenance: CLAUDE_PROVENANCE },
       { value: "claude-fable-5-1", label: "Fable 5.1 (claude-fable-5-1)", effortLevels: LOW_TO_MAX, defaultEffort: "high", provenance: CLAUDE_PROVENANCE },
+      // Claude Code's CLI default is medium; the raw API default (high) is deliberately not used.
+      { value: "claude-fable-5-2", label: "Fable 5.2 (claude-fable-5-2)", effortLevels: LOW_TO_MAX, defaultEffort: "medium", provenance: FABLE_5_2_PROVENANCE },
       { value: "claude-sonnet-5-5", label: "Sonnet 5.5 (claude-sonnet-5-5)", effortLevels: LOW_TO_MAX, defaultEffort: "medium", provenance: CLAUDE_PROVENANCE },
       { value: "claude-haiku-4-5", label: "Haiku 4.5 (claude-haiku-4-5)", effortLevels: [], defaultEffort: undefined, provenance: CLAUDE_PROVENANCE },
     ],

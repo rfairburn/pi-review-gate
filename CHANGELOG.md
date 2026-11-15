@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.285]
+
+### Added
+
+- Claude Code definitions in `/review-settings` can select Fable 5.2
+  (`claude-fable-5-2`) with its five native effort levels — `low`, `medium`,
+  `high`, `xhigh`, and `max`. The catalog records Claude Code's documented
+  `medium` default for Fable 5.2 as model metadata; it is not an applied or
+  overriding effort. Choosing CLI default sends no app-owned effort flag, so
+  Claude Code and any native settings choose the effective effort. Max remains
+  distinct from Extra High (`xhigh`).
+  The entry records verification on 2026-11-15 against the official model
+  configuration, including effort availability; Claude Code 2.1.321 is version
+  evidence for when the model was introduced, not an account-access or
+  installed-runtime certification. Fable 5.1, every other catalog entry,
+  custom model strings, existing saved settings, and role behavior are
+  unchanged (#678).
+
 ## [0.1.0-dev.284]
 
 ### Fixed

@@ -1,25 +1,33 @@
 # Native Claude Code and Codex sessions
 
-Guide and reference for the session host's **initial native hosting**: real,
-top-level interactive **Claude Code** and **Codex CLI** sessions started as
-sidebar rows beside the Pi sessions, in the same owning sidebar, over the same
-owned PTY and terminal surfaces. It is the published deliverable of
+Guide and reference for the session host's native hosting: real, top-level
+interactive **Claude Code** and **Codex CLI** sessions started as sidebar rows
+beside the Pi sessions, in the same owning sidebar, over the same owned PTY and
+terminal surfaces. It is the published deliverable of
 [#277](https://github.com/rfairburn/pi-review-gate/issues/277): how a native row
 starts, what the host can honestly display about it, and what stays unknown.
 
 Pi stays the default everywhere. Every New-session form still opens on Pi, every
 existing Pi path is unchanged, and a native row is always an explicit local
-choice. This is initial hosting, not a compatibility promise: the launch path, the
-process handling (tested with synthetic children), and the New-session form and roster
-behavior (tested at the UI level) are implemented, while **no real provider session
-has been driven through the host yet**
-([Evidence basis](#evidence-basis)).
+choice. A hosted row is the operator's own CLI as an ordinary child: the host
+owns its process, its input, its size, and its exit, and everything else is what
+the provider's own surfaces state. The provider's own startup, authentication,
+model behavior, in-pane approvals and resume, and physical-terminal rendering
+belong to the provider and are not certified here.
 
 What a hosted row can honestly say about its own provider — busy or at rest, the
 current tool type, an observed question request, that provider harness's own
-background counts — is observed through the provider's own documented surfaces
-where those surfaces support it, and is stated as `unknown` or `N/A` where they do
-not ([Native status observation](#native-status-observation)).
+background counts — is observed through the provider's own documented surfaces,
+and each field shows an observed value or `unknown`
+([Native status observation](#native-status-observation)).
+
+The [Claude Code capabilities](#claude-code-capabilities) and
+[Codex CLI capabilities](#codex-cli-capabilities) tables use **Documented** for
+what the provider's own official documentation states — a source review at the
+pinned versions listed in [Sources](#sources), never observed running —
+**Partially documented** where those pages cover only part of it, and **Unknown**
+where this host has no documented surface to rely on and infers nothing. Provider
+documentation moves quickly, so version-specific detail is a dated snapshot.
 
 Cross-ownership: [Session host](session-host-alpha.md) owns the host contract,
 roster, sidebar status rules, and stop ladder;
@@ -40,8 +48,8 @@ boundaries; [Development](development.md) owns verification commands.
   **defaults to Pi every time the form opens**; choosing a native provider is
   explicit. The offered choices belong to the destination on the **Host** line: this
   host's own targets when it names **Local**, and only a connected owner's advertised
-  targets when it names that owner. Choosing a native provider is
-  explicit. The **Workspace** field and its initial focus behave exactly as before:
+  targets when it names that owner. The **Workspace** field and its initial focus
+  behave exactly as before:
   the form still opens on **Workspace**. The lines above it are drawn in the order
   **Host**, then **Provider**, then the field, and the keyboard ring follows that
   drawn order: `Shift+Tab` once from **Workspace** reaches **Provider** (or **Host**
@@ -62,9 +70,7 @@ boundaries; [Development](development.md) owns verification commands.
   native targets and to hold the native owner-create provider. If it does, the form offers
   only its own catalog and one request starts the row there; if it does not, no Provider
   line is drawn for that destination and the choice is never carried across destinations or
-  quietly turned into Pi. Starting a native row on a paired owner over a real network is
-  still unproven provider acceptance; the shipped scope is the transport and the form, and
-  no physical-terminal or Windows result is claimed for it. The product description is
+  quietly turned into Pi. The product description is
   [Remote native create and host row name](session-host-alpha.md#remote-native-create-and-host-row-name).
 - The native **Workspace** field accepts exactly the spellings the Pi workspace field
   already accepts, because both go through the host's one existing resolver: a bare
@@ -118,11 +124,7 @@ boundaries; [Development](development.md) owns verification commands.
   line. Windows batch execution does necessarily go through `cmd.exe`, so one
   command string exists on that path — the host generates it from the resolved
   executable plus the exact argv it would otherwise have spawned, and that
-  host-generated string is the only command text `cmd.exe` is ever handed. What a
-  real `cmd.exe` delivers from it is no longer an open design question: the
-  dedicated Windows acceptance cases observed it on real Windows runners at both
-  current Node pins, and the boundary of that observation is stated in
-  [Evidence basis](#evidence-basis).
+  host-generated string is the only command text `cmd.exe` is ever handed.
 - **On Windows a `.cmd`/`.bat` shim is launched as one batch command line, and a
   direct executable never goes through `cmd.exe`.** The batch child is the trusted
   `SystemRoot\System32\cmd.exe` resolved from the **parent** environment, invoked
@@ -146,10 +148,8 @@ boundaries; [Development](development.md) owns verification commands.
   carrier with a leading `set "NAME=" &` before the shim runs — and so before the
   CLI process inherits the environment. Percent expansion is a single pass per
   line, which is what makes the quoted text identical to what the shared quoting
-  produces for an argument whose percent cmd left alone; that single-pass behavior
-  on a real Windows host is what the acceptance cases below observed on both
-  current Node pins, with the boundary of that observation stated there. No
-  argument is refused, expanded, or reclassified to make the batch path work, and
+  produces for an argument whose percent cmd left alone. No argument is refused,
+  expanded, or reclassified to make the batch path work, and
   the shipped launcher's own Pi batch path keeps its previous `/d /s /c` invocation
   unchanged.
   A resolved executable that is not a `.cmd` or `.bat` shim — a direct `.exe`,
@@ -202,15 +202,14 @@ boundaries; [Development](development.md) owns verification commands.
 - A native row **does not carry this project's review gate, tool protection, or
   subtask capture/review/landing guarantees**, and is never presented as a
   review-gate-managed worker.
-- **A hosted row can report its own foreground status, within stated limits.**
+- **A hosted row can report its own foreground status.**
   Where the provider's own documented hook surface states a fact this host can
   read, the row's card shows it: the agent working or at rest, the current or last
   **tool type**, an observed pending **question request**, and — on a Claude Code
   row — that provider harness's own background task and shell counts taken from a
-  root `Stop` snapshot. A category this route cannot report at all reads `N/A`; a
-  category that is reportable but was not positively observed reads `unknown`; a
-  `0` appears only when the provider positively reported an empty set. None of it
-  is scraped from the terminal, none of it is this host's own subtask or
+  root `Stop` snapshot. A field shows an observed value — a `0` only when the
+  provider positively reported an empty set — or `unknown`.
+  None of it is scraped from the terminal, none of it is this host's own subtask or
   background-shell registry, and none of it weakens a stop confirmation
   ([Native status observation](#native-status-observation)).
 - Native rows are created by this host, and — over the paired owner lanes — by a
@@ -238,225 +237,23 @@ boundaries; [Development](development.md) owns verification commands.
   bound to an arbitrary recent provider conversation; starting one again is always the
   operator's own New submission.
 
-## Evidence basis
-
-Each claim below carries one of five labels:
-
-- **Documented** — the provider's own official documentation, reviewed as source
-  only against the versions below: on 2026-11-12, with the pages behind the Claude
-  Code mods, hooks, tools-reference, and agent-view statements and the Codex hooks
-  and slash-command statements rechecked on 2026-11-13.
-- **Probed** — an installed-binary check on a macOS development machine that ran
-  version and help output only.
-- **Implemented, exercised with synthetic children** — host code covered by real
-  PTY tests whose child processes are purpose-built Node programs, not provider
-  CLIs.
-- **Wired into native CI, completed on a real Windows host** — a test tier that
-  drives the production path on a real host platform and fails rather than skips
-  when a prerequisite is missing. Its scenario assertions passed on real Windows
-  runners at both current Node pins *and* its test command terminated normally on
-  its own, so a completed run of that tier exists on that host. It pins the
-  acceptance contract and reports those observations and nothing more.
-- **Unknown** — no evidence, or evidence too weak to state a fact.
-
-| Provider | Documentation reviewed | Installed-binary probe |
-| --- | --- | --- |
-| Claude Code | `code.claude.com/docs`, the `@anthropic-ai/claude-code` 2.1.322 line | 2.1.319, a compiled native macOS binary |
-| Codex CLI | `learn.chatgpt.com/docs`, the `@openai/codex` 0.167.2 line | 0.167.0, a compiled native macOS binary |
-
-What the host-side runtime evidence actually is:
-
-- Eight real POSIX `node-pty` tests in `tests/session-host-native-cli-pty.test.ts`
-  drive the production launch adapter and the production session manager together:
-  every child is a real OS process that reports its own pid, tty state, geometry,
-  argv, and environment back through its own terminal, so spawn, addressed input,
-  resize, a prompt answer, signals, and confirmed exit are observed from the real
-  child. Claude, Codex, and Pi rows coexist in one manager without sharing a PTY,
-  a registration, or a byte of input, and a native row keeps receiving raw bytes
-  even when host input framing is on.
-- **Every one of those children is a synthetic Node program with a synthetic
-  question.** None of them is Claude Code or the Codex CLI, and the Pi rows in
-  that file run an inert Pi shim, so it is not real-Pi, reporter, or
-  broker-socket evidence either.
-- The New-session form, roster, and refusal behavior above is covered by named
-  suites rather than a run total:
-  `tests/session-host-native-provider-sidebar.test.ts` (the Pi default at every
-  opening, the explicit native choice, native card display, and the local-only
-  refusal), `tests/session-host-new-form-provider-layout.test.ts` (the field's row
-  budget and the suppressed-row keyboard and pointer rules against the real pinned
-  field), `tests/session-host-native-provider-main.test.ts` (one injected launcher,
-  that host's offered targets, and the carried provider choice),
-  `tests/session-host-native-cli-instances.test.ts` (manager-side target validation
-  and ownership), `tests/session-host-native-cli-launch.test.ts` (descriptor and
-  argument policy), and `tests/session-host-roster-main.test.ts` (remembered-row
-  restoration). That is form, roster, and refusal behavior only — no real provider
-  binary takes part.
-- The strongest host-side witness is one integrated acceptance case,
-  `tests/session-host-native-cli-main-pty.test.ts`: the real public
-  `runSessionHost` Main on a real outer `node-pty`, one ordinary Pi row on the
-  pinned real Pi 1.5.2 run offline with tools and context files disabled (no model
-  call, no prompt), and two native rows created through the actual Provider control
-  — the real keystroke path through the production sidebar action, host create
-  options, manager, and `createNativeCliLauncher`. It observes addressed input and
-  its continuation after a row switch, one deliberate outer resize, the truthful
-  unknown sidebar status, a natural fixture exit and a confirmed stop, the original
-  pid and kernel-PTY exits, the Pi row's graceful exit, and the host's normal Quit
-  with full outer restoration. A focused run of that case passed 1/1 in about 12
-  seconds. The adjacent real-Main framing regression,
-  `tests/session-host-native-main-framing.test.ts` (real production Main, one local
-  New reaching a live real-Pi PTY child that renders typed text under the
-  input-origin framing opt-in), passed 1/1 in about 11 seconds; it pins that Main
-  framing path, not provider behavior.
-- Those two focused runs are host-side only, and they are not a full-suite or CI
-  result. They carry the same boundary as the eight PTY tests above — synthetic
-  provider children with a real host, on POSIX, and these two are macOS-only — no
-  real provider binary, physical terminal, Windows, review-gate, tool-protection,
-  or MCP parity.
-- Hosted **text copy out** is covered by focused synthetic tiers only:
-  `tests/session-host-native-cli-copy.test.ts` (the closed OSC 52 text parser, the
-  opt-in surface sink against a surface that never opted in, the
-  last-actual-accepted-input recipient, the acceptance-time freeze, and every
-  no-fallback refusal), `tests/session-host-native-cli-content-lane.test.ts` and
-  `tests/session-host-network-session-content-integration.test.ts` (the
-  `native-copy-cli-v1` negotiation, the tuple-less wire family inline and paged, and
-  a peer that negotiated hosted input but not provider copy receiving no copy frame
-  at all), and `tests/session-host-native-cli-launch.test.ts` (the one Codex child
-  marker and what it never mutates). Every child there is a synthetic PTY program
-  writing synthetic terminal bytes: no real provider binary, real OS clipboard read
-  or write, provider configuration, credential, conversation, physical terminal, or
-  two-machine copy takes part, so a passing case proves the owner-side contract and
-  never that some desktop clipboard changed
-  ([Copying text out of a hosted row](#copying-text-out-of-a-hosted-row)).
-- An optional real Codex startup case was deliberately skipped: that it would
-  cause zero side effects on the operator's OS keychain or startup network
-  behavior could not be proven, and evidence gathering must not spend the
-  operator's real credentials or keychain.
-- **Native status observation is source-derived and exercised with synthetic
-  children only.** The hook relay, its closed wire family, the per-launch hook
-  preparation, the Claude foreground/count reducers, the owned-transcript tail
-  reader, the Codex foreground reducer, the shared applicability contract, the
-  card rendering of `N/A` / a real zero / `unknown`, and the paired-owner
-  declaration lane are each covered by named suites —
-  `tests/session-host-native-hook.test.ts`,
-  `tests/session-host-native-hook-launch-prep.test.ts`,
-  `tests/session-host-native-claude-status.test.ts`,
-  `tests/session-host-native-claude-acquisition.test.ts`,
-  `tests/session-host-native-jsonl-tail.test.ts`,
-  `tests/session-host-native-codex-status.test.ts`,
-  `tests/session-host-native-status.test.ts`,
-  `tests/session-host-native-status-sidebar.test.ts`, and
-  `tests/session-host-native-status-roster.test.ts`. Every child there is a
-  purpose-built fixture: the hook payloads, rollout records, and persisted
-  turn-end summaries are synthesized from the reviewed provider shapes, never
-  captured from a running provider. So a passing case proves the host's own
-  interpretation of those shapes and every refusal rule around them; it is not
-  runtime acceptance on a real provider, and **no real Claude Code or Codex
-  session has been observed through this status path on any platform**.
-- Still unverified on every platform: a real provider interactive TUI in a
-  physical terminal — rendering, model and auth round trips, mouse, images,
-  in-pane resume, approval prompts, and platform-specific behavior. That gap
-  belongs to the provider, not to a platform: it stands on macOS, Linux, and
-  Windows alike, and it is not a reason to treat any of the three as excluded.
-- **Windows is inside this feature's supported-platform scope, and its native
-  acceptance coverage is wired and enforced.** Seven real-ConPTY cases in
-  `tests/session-host-native-cli-windows-pty.test.ts` wire the same production pair
-  the POSIX tier uses — `createNativeCliLauncher` feeding the session manager's
-  `nativeCliLaunch` provider, spawned by the manager's **default** pinned
-  `@lydell/node-pty` factory — with no injected platform, fake spawn, or second
-  resolver, and they take the host as they find it: on a Windows host a missing
-  pinned addon, a missing `SystemRoot`, or a missing `System32\cmd.exe` is a
-  **failure**, never a skip. From each real child's own terminal self-report they
-  observe: the built-in Claude and Codex `PATH`/`PATHEXT` `.cmd` shims with exact
-  argv, cwd (spaces included), environment, TTY state, geometry, and the `cmd.exe`
-  wrapper pid kept distinct from the CLI process the shim started; a configured
-  `.cmd` and `.bat` target's shared arguments and shared environment through real
-  `cmd.exe` delivery; an operator argument that *spells* a `cmd.exe` variable
-  reference — a defined name and an undefined one, `%1 %~dp0 %* %ERRORLEVEL%`, the
-  `!name!` forms `/v:off` exists for, a `&` sharing a token with a percent,
-  embedded quotes, a spaced path ending in a backslash, and an empty option
-  operand — arriving as the operator's literal text, with no internal carrier
-  variable surviving into the child's environment and that `&` never becoming a
-  command; a direct `.exe` with a `node wrapper.js` prefix staying off `cmd.exe`
-  with the prefix in front; exactly one `--no-daemon` in real option position for
-  Codex and no injected flag for Claude in those cases, as the child reports them;
-  addressed input, a prompt answer, and an addressed resize reaching only the owning
-  row's child while a sibling row shares nothing; and a deliberate fixture exit plus a
-  confirmed owned Stop settling with Windows lifecycle semantics — no POSIX signal
-  requested by the host, which says nothing about the `SIGHUP` Node itself emits
-  when a Windows console closes — the full grace window, the pinned forced kill,
-  and settlement proven for the CLI process the shim started rather than only for
-  the wrapper the manager owns. Three cross-platform cases in
-  `tests/session-host-native-cli-windows-delivery.test.ts` pin the wiring that makes
-  that delivery possible at all: the batch child's
-  pre-escaped command line is what the pinned public spawn receives in place of an
-  argv array, one row's command line travels from the launch provider to the PTY
-  factory verbatim, and an unusable command line is refused before any child
-  exists. Both existing native Windows CI jobs — **Windows launcher (Node 22)**
-  and **Windows shell (Node 24)** — run those two files as their own step, so
-  publication is gated on them.
-- **Those cases have completed on real Windows runners at the Node pins then in
-  force.** In one real-Windows CI run, both existing native Windows jobs —
-  **Windows launcher (Node 22)** and **Windows shell (Node 24)**, on that run's
-  22.23.4 and 24.22.1 pins — ran those two files as their own step and each
-  ended with 12 tests passed, 0 failed, 0 skipped, its test command terminating
-  normally on its own in about 69 seconds. Those 12 are the seven real-ConPTY
-  cases, the two observation controls beside them in the same file — which pin
-  that the file's own handle shadowing touches only `kill`, and that an
-  observation it cannot
-  install is reported as a fault instead of throwing before a handle is owned —
-  and the three cross-platform delivery cases. The scenarios reported their
-  assertions passing: `cmd.exe` delivered the composed command line into the
-  child's own argv, a percent carrier expanded once and was gone before the CLI
-  process inherited the environment, the bang literals stayed literal, and the
-  Windows stop ladder settled the CLI process the shim started rather than only
-  the wrapper the manager owns. All thirteen raw owned handles exited and each
-  stayed bound to the row that owned it. The owned-ConPTY reader settlement the
-  shipped default PTY factory now requires — capture the pinned addon's own reader
-  for the handle it created, release it through the addon's own drain after that
-  handle's genuine exit, and confirm settlement — was observed there rather than
-  assumed: each fixture's manager disposal reported every owned reader confirmed,
-  and the final resource counts of those runs showed no live `MessagePort`. Normal
-  termination counts as part of the required result because an earlier run of
-  these cases on these same jobs had its assertions passing and then had to be
-  cancelled when its test commands did not end on their own. That closes the
-  completed-run boundary for this tier and nothing past it: the children are
-  synthetic Node programs behind synthetic batch shims, so what this establishes is
-  real-host process facts about them, and the next bullet states what it never
-  touches. It is the result of the two native Windows jobs, not a full-suite or
-  whole-CI result. The per-line Node security floors have since risen to 22.23.5
-  and 24.22.3, so this tier's run on the raised pins is still pending.
-- What those cases still do not touch on Windows: a real provider binary's own
-  startup, auth, model, question, approval, and resume behavior — every child
-  there is a synthetic Node program behind a synthetic batch shim, and no provider
-  configuration, credential, or conversation is read or written — physical-terminal
-  behavior, and the paired-owner network path, which those local rows do not
-  exercise. The generic session-host Windows limitations — physical wheel and
-  pane-confined selection, and the rest of the remaining scope listed there —
-  stay owned by
-  [Session host](session-host-alpha.md#known-limitation-windows-runtime-acceptance)
-  and are not resolved here.
-- Provider documentation also moves quickly — Codex's documentation host has
-  already moved once — so treat version-specific detail as a dated snapshot, and
-  read [Sources](#sources) as the boundary of what was reviewed. **Nothing marked
-  Documented below has been observed running.**
-
 ## What the host owns, and what it never infers
 
 - **Supported:** process spawn, addressed keyboard input, resize, the owned stop
   ladder, and the child's exit. These are host-owned process facts.
-- **Observed where this host armed a provider-side observer, and only for the
-  categories that observer declares it can report:** the agent's working/rest
-  state, the current or last tool **type**, and — on a Claude Code row — an
-  observed pending question request and that provider harness's own background
-  task and shell counts. Everything else on such a row stays unknown. See
+- **Observed where this host armed a provider-side observer and that observer
+  reached its source:** the agent's working/rest state, the current or last tool
+  **type**, an observed pending question request, and — on a Claude Code row — that
+  provider harness's own background task and shell counts. Everything the host has
+  not observed stays unknown. See
   [Native status observation](#native-status-observation) for what each provider
-  can actually state, and for the three answers a field can hold.
+  documents and for the two answers a field can hold.
 - **Unknown, always, whatever the observer reports:** a pending native
   **approval**, and this host's own conservative ownership pair
   (`backgroundTasks` / `backgroundShells`) that gates an idle-only stop or
   removal. A provider's own task and shell numbers are activity facts about that
   provider's harness; they never enter the ownership channel, so no provider
-  reading — including an `N/A` or a displayed rest — ever authorizes stopping a
+  reading — including a displayed rest — ever authorizes stopping a
   row that would otherwise require confirmation.
   `Unknown` records that this host observed nothing usable for the field — not
   that the provider has nothing to report. The capability tables below say what
@@ -516,36 +313,31 @@ What the host-side runtime evidence actually is:
 
 A hosted row can say more than "I own this process". This section states exactly
 what this host observes, how it reaches the host, and what each answer means.
-Everything here is a source-derived contract implemented in this repository and
-exercised with synthetic fixtures; **no real provider runtime has been driven
-through it** ([Evidence basis](#evidence-basis)).
+Everything here is source-derived: the host reads the provider's own documented
+hook and persisted-record surfaces, and states nothing it did not observe.
 
-**One shared surface, three honest answers.** The same shared sidebar components
+**One shared card.** The same shared sidebar components
 draw a native row locally and a native row the operator sees through a paired
-owner: the agent state, the current or last tool **type**, and — on a Claude Code
-row — the existing `Working` / `Ready` activity wording, plus a
-pending-**question-request** indication where the source actually observed one —
-never an invented counter of something else. Every
-observed category has exactly three possible answers:
+owner: the agent state, the current or last tool **type**, the existing
+`Working` / `Ready` activity wording, a
+pending-**question-request** indication where the host actually observed one —
+never an invented counter of something else — and that provider harness's own
+background task and shell numbers. Every
+field holds one of two answers:
 
 - a **real observation** — and a `0` only when the source positively reported an
   empty set for that category;
-- **`unknown`** — a category this route supports whose value failed, was
-  unverified, was never observed, or was withdrawn after a gap;
-- **`N/A`** — only a category this route positively declares it cannot report.
+- **`unknown`** — a value that failed, was
+  unverified, was never observed, or was withdrawn after a gap.
 
-`N/A` and `unknown` are different facts and are painted differently; neither is
-ever rendered as a zero or as rest. **Absence of any declaration stays legacy
-unknown**: a Pi row, and a native row whose observer never declared anything,
-render exactly as they did before this existed. A value submitted for a category
-the row declared unreportable is not a value — the declaration wins, and that one
-category stays unknown while the rest of the observation still lands.
+`unknown` is never rendered as a zero or as rest, and a value that simply went
+missing stays `unknown` rather than being relabelled.
 
 **Native harness jobs are not this host's jobs.** A provider's own subtasks and
 background shells are that provider's harness work. They are never this host's
 subtask registry or its background-shell registry, and a provider number never
 enters the conservative `backgroundTasks` / `backgroundShells` ownership channel
-that gates a stop. An `N/A` never becomes a zero, and a displayed `Ready` never
+that gates a stop. A displayed `Ready` never
 becomes idle-only stop authority: the stop and remove gate keeps requiring this
 host's own ownership counts to be positively observed zeros, which a hosted
 provider child never reports. A displayed foreground rest is a display fact about
@@ -580,12 +372,11 @@ conversation.
 
 **There is no liveness proof.** If the provider never runs the hook, or the relay
 never reaches the broker, nothing is reported to the row: no heartbeat, no queue,
-no retry, no replay. Supported fields stay unknown until observed and return to
-unknown when a gap is detected. A category already declared unreportable keeps
-showing N/A; without any declaration, the row keeps legacy unknown behavior.
+no retry, no replay. Fields stay unknown until observed and are withdrawn when their own
+source fails; a transcript-only failure does not erase a hook-reported count.
 No promise is made that every missed hook is detected.
 
-**Claude Code: what this route states.** The armed event set is `SessionStart`,
+**Claude Code: what the observer states.** The armed event set is `SessionStart`,
 `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PostToolUseFailure`, `Stop`, `StopFailure`, `SubagentStart`, and `SubagentStop`.
 
@@ -593,25 +384,27 @@ No promise is made that every missed hook is detected.
   opens a request and a matching `Post*` closes it. `Pre` means a question was
   *requested* — it is not proof that a human-visible dialog was painted or that
   anything was answered. `input pending` reflects open observed requests; a
-  definitive "none remain" is claimed only for a scope a genuine root
-  `SessionStart` observed from its beginning.
+  genuine root `SessionStart` establishes the empty request baseline, so input is
+  `none` before the first question and remains so through ordinary work. A matching
+  close restores `none` when no observed request remains and the scope has no gap.
 - Tool activity is **type-only**: the current or last tool TYPE label, or
   `Working` / `Ready`. Arguments, results, and question content never enter state.
 - A turn is **at rest** only from the positively bound, persisted **root**
   `stop_hook_summary` record, which the provider writes after every `Stop` hook
   has answered. This host's own `Stop` callback is never sufficient, because
   another operator's `Stop` hook can block and continue the same turn. An
-  ambiguous, non-root, or gapped source leaves the foreground unknown.
+  ambiguous, non-root, or gapped source leaves the foreground unknown. Trailing
+  assistant and tool-result rows before the post-decision summary belong to the
+  finishing turn; they do not discard its Ready witness. New root work after that
+  boundary still withdraws the old Ready claim.
 - Task and shell counts come **only** from real **root** `Stop` snapshots of the
   documented `background_tasks` array. Present — including an empty array, which
   is a real 0/0 — is a real observed snapshot; absent is unknown; a subagent's
-  snapshot is never used as root scope. Any new accepted work, task transition,
-  scope change, or source gap drops the last snapshot to unknown rather than
-  reconstructing membership. There is no continuous census, no process counting,
-  no quiet-period inference, and no reconstructed edges.
-- Every one of the five categories is declared **supported** on this route, so
-  nothing here renders `N/A`; a temporarily unverifiable value is `unknown`, which
-  is exactly why it is not declared unreportable.
+  snapshot is never used as root scope. Numbers remain **last-reported** across
+  unrelated hooks, ordinary foreground work, and transcript-only failures. A new
+  root snapshot replaces them; an observed membership transition, scope change,
+  or hook-lane loss withdraws them. This component is not a continuously live
+  count source and does not infer membership from process counts or quietness.
 - Arming is by that provider's own per-session channel, with the operator's own
   configuration always first: a hooks-only `--settings` file is added **only**
   when the configured arguments carry no `--settings` of their own (a second one
@@ -625,11 +418,11 @@ No promise is made that every missed hook is detected.
   sideload-flag and marketplace policy, `disableAllHooks` — can withhold these
   hooks entirely, and this host bypasses none of it: the row simply stays unknown.
 
-**Codex: what this route states, and what it declares it cannot.** Arming is one
+**Codex: what the observer states.** Arming is one
 `-c hooks.SessionStart=[…]` entry, and only when the operator writes no
 conflicting `hooks` or `hooks.SessionStart` override in real option position —
 same-layer paths are last-wins, so adding one there would replace theirs. An
-existing override is preserved untouched and that row's supported categories
+existing override is preserved untouched and that row's fields
 simply stay unknown. File-based hook layers from other sources stay additive; this
 host writes no hook file, no `hooks.state` trust record, no self-trust, and no
 bypass, so the provider's own review-and-trust step still runs in front of it.
@@ -649,28 +442,14 @@ operator's trust store.
 - A raw hook `Stop` (or a notification) is **never** a terminal: a blocking
   `Stop` hook continues the same turn, so the durable terminal in the rollout is
   the only rest witness, and it grants rest once, for the held turn only.
-- What this route cannot report it declares **unreportable**, which renders
-  `N/A` — never `0`, and never a claim about the provider: a complete, ongoing
-  pending-input census and a background work / shell census. Some question
-  surfaces are transient and some clears are local to the provider, so this route
-  cannot show their full lifecycle. A Codex row's `input`, `bg tasks`, and
-  `shells` read `N/A` because of **this route's** limit — not because Codex lacks
-  the feature, and not as a zero. Failures inside the categories this route does
-  support (agent state, activity) go to `unknown`, not `N/A`.
-- No new input-surface representation is added anywhere, and none of this is a
-  universal claim that a hosted Codex row can never report those categories.
-  Actual native questions and approvals stay in Codex's own UI; this route never
-  stands in for them.
+- Questions and approvals stay in Codex's own UI, and nothing on the card stands
+  in for them.
 
-**What a paired viewer sees.** The owner's per-category applicability declaration
-reaches an authorized viewer as derived status facts and support through the
-optional `roster-native-status-v1` roster capability, negotiated separately from
-native create and native rename. Observed values keep travelling in the row fields
-the roster already carried. A peer that never negotiated it decodes the row shape
-it always did and renders every unobserved category as `unknown`; a viewer can
-never declare a category unreportable on its owner's behalf. The capability grants
-nothing by itself — it is a protocol capability, not a new user-facing telemetry
-switch.
+**What a paired viewer sees.** A paired viewer sees the same card. The owner's
+observed status facts travel to an authorized viewer in the roster row fields the
+roster already carried, under the existing pairing, consent, and per-viewer
+settings, and nothing a viewer holds changes what the owner reports or how a
+field is drawn.
 
 **What is staged, and when it goes away.** The Claude routes stage their artifacts
 in a freshly created private temporary directory this host owns (directories
@@ -687,15 +466,14 @@ file keeps its identity and goes with the rest, and nothing is swept or deleted
 recursively. The lease is released only after the provider source and the row's
 actual PTY have settled.
 
-## What a sidebar row shows today
+## What a sidebar row shows
 
 The sidebar rules apply unchanged: an unobserved field stays `unknown`, never
 idle and never zero, and the child's exit is the only settlement witness
 ([Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity)).
-Where this host armed a provider-side observer for a row, some of those fields are
-now **observed**; where that observer states it cannot report a category, the
-field reads `N/A`; and an observer that armed but never reached the provider, or
-that lost its source, leaves the field `unknown` exactly as before. Every
+Where this host armed a provider-side observer for a row and that observer reached
+its source, some of those fields are **observed**; an observer that armed but never
+reached the provider, or that lost its source, leaves the field `unknown`. Every
 `unknown` below still means this host observed nothing usable — not that the
 provider documents nothing. The capability tables above say what each provider
 does document, and the "Current state versus events, and freshness" paragraph
@@ -706,9 +484,9 @@ below names the gaps that survive any observer.
 | Lifecycle and exit code | Real: the host owns the child process | Real: the host owns the child process |
 | Conversation name | Unknown: never scraped | Unknown: never scraped |
 | Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
-| Pending input | Observed as an open **question request** where the hook lane saw one; `unknown` when nothing was observed or the census has a hole — never a guessed count | `N/A`: this route cannot show that lifecycle completely. Not a zero, and not a claim that Codex has no questions |
-| Background task count | Observed only from a real root `Stop` snapshot — an empty snapshot is a real `0`; `unknown` when no snapshot is current or anything newer invalidated it | `N/A`: this route has no complete census. Not a zero, and not a claim about Codex |
-| Background shell count | Observed only from the same real root `Stop` snapshot; `unknown` otherwise | `N/A`: same limit as above |
+| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes a question request; never an inferred value, and never a claim about Codex |
+| Background task count | Last-reported real root `Stop` snapshot — an empty snapshot is a real `0`; retained across unrelated foreground work and transcript-only loss, withdrawn on a membership transition, scope change, or hook-lane loss | `unknown` until this host observes one — never an inferred zero, while a positively observed empty set displays `0`; never a claim about Codex |
+| Background shell count | Last-reported from the same real root `Stop` snapshot, with the same retention and invalidation rules | `unknown` until this host observes one — never an inferred zero, while a positively observed empty set displays `0`; never a claim about Codex |
 | Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn; empty when nothing was observed or after a withdrawal |
 | Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
 | Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
@@ -718,21 +496,12 @@ below names the gaps that survive any observer.
 
 **Card structure.** A native card is drawn with the same rows as a Pi card, by the same
 shared card formatter, and a paired owner's native row is drawn by that same
-formatter from the same three answers. The one-word aggregate `background unknown`
-stays reserved for what it has always meant: two reportable categories with
-nothing observed. Once a category is observed the row names it (`bg tasks 2 |
-shells 0`), and a category the row's observer declared unreportable reads `N/A`
-instead — ordinary pane text, never a zero and never painted as rest. A supported
-category whose value simply went missing still reads `unknown`; it is never
-relabelled `N/A`. Nothing here is ever rendered as a zero that was not observed.
-That is a statement about what this host observed on this pass, not a claim that a
-provider could never report such a count. The aggregate `agent` word follows the
-same rule: it reads rest only when every **reportable** category is positively at
-rest or zero — a supported-but-unobserved category keeps it `unknown`, while a
-declared-unreportable one does not block it — so a positively observed provider turn
-end can display as rest without anyone inventing background zeros to satisfy the
-formatter, while the same positive rest observation on a row whose other categories
-were never observed still reads `unknown`.
+formatter. The one-word aggregate `background unknown`
+stays reserved for what it has always meant: nothing observed for the two
+background categories. Once a category is observed the row names it (`bg tasks 2 |
+shells 0`) in ordinary pane text; a category whose value simply went missing reads
+`unknown`. An unobserved field is never rendered as a zero or as rest, and a
+displayed foreground rest never grants idle-only stop authority.
 
 **Current state versus events, and freshness.** The host's status model is
 event-driven with no periodic polling, and the shipped observer keeps that rule:
@@ -765,10 +534,9 @@ live count, and no completion event for one shell is documented; Codex's `/ps` l
 is in-client only, with a unified-exec settlement that arrives only if something
 polls it. The shipped route therefore does not pretend to answer "what exists
 right now" continuously: on a Claude row a count is published only as that root
-`Stop` snapshot, and any newer work, structured transition, scope change, or
-source gap retires it to `unknown`; on a Codex row the category is declared
-unreportable and reads `N/A`. Where an observer cannot answer honestly, the field
-stays `unknown` or `N/A`, never a reconstruction.
+`Stop` snapshot and retained across unrelated foreground work or transcript-only
+loss; an actual membership transition, scope change, or hook-lane loss withdraws
+it. Missing observations are never turned into fabricated zeros.
 
 ## Copying text out of a hosted row
 
@@ -900,8 +668,8 @@ never a guarantee that the owner's clipboard was untouched.
   holding a hooks-only plugin, or one `-c hooks.SessionStart=[…]` entry for Codex —
   and where they would conflict with the operator's own configuration they are
   skipped and the row stays unknown. Any refusal here is a **declined observer**,
-  never a failed launch: the child is then composed exactly as it was before status
-  observation existed. The Claude routes stage their files in a freshly created
+  never a failed launch: the child is then composed exactly as it would be with no
+  observer at all. The Claude routes stage their files in a freshly created
   private temporary root this host owns (`0700` directories, `0600` files,
   exclusive creation, never inside a workspace), and cleanup removes only the exact
   entries that one preparation created, deepest first, and only where each is still
@@ -952,8 +720,8 @@ never a guarantee that the owner's clipboard was untouched.
   the manager's default PTY factory hands that string to the pinned public
   `@lydell/node-pty` spawn in place of argv. On Windows that factory also selects
   the ConPTY DLL bundled with the pinned package (`useConptyDll: true`) instead of
-  the system ConPTY, so the shipped source path uses the same transport
-  the acceptance cases do; POSIX options are unchanged. On that same Windows
+  the system ConPTY, so the shipped source path uses the same ConPTY transport as
+  the Windows runtime path; POSIX options are unchanged. On that same Windows
   request the factory captures the addon's own output reader for the handle it
   just created, releases it through the addon's own drain and dispose path only
   after that handle reports its genuine exit, revalidates the captured ownership
@@ -961,9 +729,7 @@ never a guarantee that the owner's clipboard was untouched.
   settlement to be positively observed — a release it cannot confirm stays a
   cleanup failure at host disposal instead of becoming success. A native row is
   spawned by that same factory, so its reader release is required on the same
-  terms as a Pi row's, and the real-Windows native acceptance cases observed that
-  release end to end at both current Node pins
-  ([Evidence basis](#evidence-basis)).
+  terms as a Pi row's.
 
 ## Trying one in an owned inactive stage
 
@@ -1062,12 +828,10 @@ What to expect, and what this does and does not prove:
   watching: the agent line moves between running and rest as the provider's own
   turns start and end, the activity line names the current or last tool type, and a
   Claude row can show an observed pending question request and its root-snapshot
-  background counts. A Codex row's `input`, `bg tasks`, and `shells` read `N/A` by
-  design. Two honest outcomes are also correct behavior: a card whose supported fields
+  background counts. Two outcomes are also correct behavior: a card whose fields
   stay `unknown` because the provider's own policy declined the observer's hooks, and —
   on Codex — the provider's own hook review-and-trust prompt, which this host never
-  answers or bypasses for you. Nothing here proves any of that ran: this page
-  reports no completed run of the tryout.
+  answers or bypasses for you.
 - **No automated approvals.** Never try a provider's permission-bypass or
   approval-disabling flag to make a tryout easier; a configured target that names
   one is refused by design, and that refusal is the behavior under test.
@@ -1083,7 +847,7 @@ What to expect, and what this does and does not prove:
   outer-terminal OSC 52 forwarding when this host's own Main was the last input this
   row accepted — so the clipboard change alone does not tell the two apart; a
   terminal, multiplexer, or permission that declines clipboard writes simply
-  discards the request, and this page claims no completed run of the check.
+  discards the request.
 - This stage proves startup, row ownership, input routing, resize, and exit on your
   machine. It does not certify the provider's own rendering, mouse, image, resume,
   approval, or platform behavior, and it is not Windows runtime evidence.
@@ -1097,47 +861,6 @@ ownership record, and the ordinary zero-model review-gate default it creates whe
 exists — are written inside the stage and never in your live Pi agent directory. If you
 did interact with a real provider, its own state directory holds whatever you chose to
 create.
-
-## Later MCP and review integration responsibilities
-
-Native rows never carry this project's review gate, tool protection, or
-MCP-exposed integration tools today, and are never presented as review-gate-managed
-workers. Later work maps onto existing owning layers instead of inventing new
-requirements:
-
-| Responsibility | Owner |
-| --- | --- |
-| Process spawn, resize, signal, and settlement; PTY frames; focus; workspace ownership | The session host and its provider launch path |
-| Approvals, sandbox decisions, question UI | The provider, in-pane and native; the sidebar may only display an observed waiting state |
-| Agent status, pending input, task and shell counts | The provider's own API or hook surface — per provider, optional, and honestly `unknown` or `N/A` where absent. The shipped hook-backed route is described in [Native status observation](#native-status-observation); anything it cannot state stays unknown or declared-unreportable rather than being inferred |
-| This project's tools exposed *to* Claude Code or Codex (`SessionSpawn`, later defined tools) | The owning MCP integration layer, keeping tool authorization, session/workspace/process ownership, and originating-session routing; it grants no extra execution or review authority and is not required to host a session |
-| Provider-to-sidebar lifecycle and status | Partially today, through the provider's own documented hook and persisted-record surfaces only, and only for the categories a given route can state ([Native status observation](#native-status-observation)). Exposing a tool does not by itself establish anything about a provider session's lifecycle, activity, input, or control: the sidebar needs a reliable native observation, not merely an available call, and a native observation never becomes stop or idle authority |
-| Review gate and tool protection | Out of scope for hosted provider sessions |
-
-## Open questions
-
-- Whether the Claude Code external status read lists a session started inside a PTY
-  host at all: `--json` is documented as covering "every live session", while the
-  agent-view list says an interactive session open in another terminal does not
-  appear until it is backgrounded — plus what it reports where agent view is
-  unavailable or disabled by policy. The shipped status route does not use that
-  read, so this bounds a possible future route only.
-- Whether an operator-loaded Claude Code mod could be tied to one specific row for
-  the life of one launch: `--plugin-dir` and `--settings` are documented as
-  per-session, and no provider-side row identity is documented. The shipped route
-  uses the per-session hook channels for one row's own launch and installs no mod;
-  a mod-backed bridge remains a separate question.
-- Whether any second-client status observation of a Codex TUI-owned thread is
-  possible at all before app-server matures.
-- Whether a Codex interactive session surfaces background terminals in any way a
-  host could count, and what its default interrupt binding actually is.
-- Whether interactive shutdown and settlement match the documented non-interactive
-  contract for either provider.
-- Which of these deserve a sidebar control surface rather than staying in-pane
-  native, and what the operator is told when a row is permanently unknown.
-
-None of these blocks the hosting that shipped; each bounds what may be claimed
-about it.
 
 ## Sources
 

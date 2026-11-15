@@ -159,9 +159,10 @@ only after that row's provider source and PTY have settled.
 
 **What this is not.** It is not a claim that the provider ran anything: there is no
 heartbeat, queue, retry, or replay, so a hook that never fires or a relay that never
-connects reports nothing: supported fields stay unknown, while categories already
-declared unreportable keep showing N/A. Without a declaration, legacy unknown
-behavior remains. The owner *does* read bounded bytes from the
+connects reports nothing: fields stay unknown. Source loss is lane-specific: a
+transcript-only failure does not erase a count reported by an authenticated hook;
+that number remains the last reported snapshot, not a continuously live census. The
+owner *does* read bounded bytes from the
 exact provider-named JSONL file—Claude's native transcript or Codex's root-thread
 rollout—to derive status metadata. Record text is not kept as a history, logged or
 broadcast; this is not a transcript-free or attestation-grade channel. There is no `HOME` or
@@ -176,7 +177,7 @@ marketplace, hook-disabling, or hook-review gate — those operator decisions ca
 withhold the observation entirely. A provider's own task and shell numbers are
 activity facts about that provider's harness: they never enter this host's
 conservative background-ownership channel, so no provider reading — including a
-not-applicable category or a displayed rest — ever authorizes an idle-only stop or
+displayed rest — ever authorizes an idle-only stop or
 removal. See
 [Native status observation](native-sidebar-agents.md#native-status-observation).
 
@@ -285,14 +286,9 @@ below, each re-authorized and performed by the owner. Roster rows carry bounded
 display facts, including the exact owner-side workspace path, and never the
 native current-file guard, agent/account directories, configuration, providers,
 credentials, prompts, transcripts, question text, terminal/output bytes, or
-image data. A lost projection is stale or unavailable, never idle or zero. For a
-row the owner hosts as a native provider session, the independent optional
-`roster-native-status-v1` capability adds one field: the owner's own per-category
-status applicability declaration. It carries no observed value and no provider
-content, it states only what the owner's observer for that row can or positively
-cannot report, and it grants nothing — a viewer that never negotiated it decodes
-the pre-existing row shape and renders every unobserved category as unknown, and no
-viewer can declare a category unreportable on its owner's behalf.
+image data. A lost projection is stale or unavailable, never idle or zero. A row
+the owner hosts as a native provider session projects the same bounded display
+facts, and an unobserved field stays unknown.
 
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app`

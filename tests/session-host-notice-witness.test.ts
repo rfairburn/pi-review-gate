@@ -24,7 +24,8 @@ const ROSTER = [
   " Sessions (1) ",
   "Native native-1",
   "> exited",
-  "  background unknown",
+  // The exact both-unknown count row drawn at the sidebar width.
+  "  bg tasks unknown | shells u...",
   "    Waiting for input",
   "",
   "  Saved conversations",

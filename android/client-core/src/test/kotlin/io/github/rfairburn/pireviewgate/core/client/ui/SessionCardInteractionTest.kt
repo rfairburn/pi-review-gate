@@ -43,30 +43,34 @@ class SessionCardInteractionTest {
     // -- background line ------------------------------------------------------------
 
     @Test
-    fun `both activity counts missing is background unknown`() {
-        assertEquals(SessionCardBackground.Unknown, sessionCardBackground(row("a", "x").metadata))
+    fun `both counts missing stay two independent unknowns, never an aggregate`() {
+        assertEquals(
+            SessionCardBackground(null, null),
+            sessionCardBackground(row("a", "x").metadata),
+            "neither cell folds into one aggregate and neither is invented as zero",
+        )
     }
 
     @Test
     fun `one missing count stays unknown beside a known one`() {
         val tasksOnly = ClientUiFixtures.row("a", activeTasks = 2L, activeShells = null)
         val shellsOnly = ClientUiFixtures.row("a", activeTasks = null, activeShells = 0L)
-        assertEquals(SessionCardBackground.Counts(2L, null), sessionCardBackground(tasksOnly.metadata))
-        assertEquals(SessionCardBackground.Counts(null, 0L), sessionCardBackground(shellsOnly.metadata))
+        assertEquals(SessionCardBackground(2L, null), sessionCardBackground(tasksOnly.metadata))
+        assertEquals(SessionCardBackground(null, 0L), sessionCardBackground(shellsOnly.metadata))
     }
 
     @Test
     fun `zero is a real count and is not unknown`() {
         val zero = ClientUiFixtures.row("a", activeTasks = 0L, activeShells = 0L)
-        assertEquals(SessionCardBackground.Counts(0L, 0L), sessionCardBackground(zero.metadata))
+        assertEquals(SessionCardBackground(0L, 0L), sessionCardBackground(zero.metadata))
     }
 
     @Test
     fun `a negative count is unknown, never zero`() {
         val bad = ClientUiFixtures.row("a", activeTasks = -1L, activeShells = -3L)
-        assertEquals(SessionCardBackground.Unknown, sessionCardBackground(bad.metadata))
+        assertEquals(SessionCardBackground(null, null), sessionCardBackground(bad.metadata))
         val half = ClientUiFixtures.row("a", activeTasks = -1L, activeShells = 4L)
-        assertEquals(SessionCardBackground.Counts(null, 4L), sessionCardBackground(half.metadata))
+        assertEquals(SessionCardBackground(null, 4L), sessionCardBackground(half.metadata))
     }
 
     @Test
@@ -74,11 +78,11 @@ class SessionCardInteractionTest {
         val ownershipOnly = ClientUiFixtures.row(
             "a", backgroundTasks = 5L, backgroundShells = 3L, activeTasks = null, activeShells = null,
         )
-        assertEquals(SessionCardBackground.Unknown, sessionCardBackground(ownershipOnly.metadata))
+        assertEquals(SessionCardBackground(null, null), sessionCardBackground(ownershipOnly.metadata))
         val both = ClientUiFixtures.row(
             "a", backgroundTasks = 9L, backgroundShells = 9L, activeTasks = 1L, activeShells = 2L,
         )
-        assertEquals(SessionCardBackground.Counts(1L, 2L), sessionCardBackground(both.metadata))
+        assertEquals(SessionCardBackground(1L, 2L), sessionCardBackground(both.metadata))
     }
 
     // -- compact activity line -------------------------------------------------------

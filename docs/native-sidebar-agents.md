@@ -496,12 +496,12 @@ below names the gaps that survive any observer.
 
 **Card structure.** A native card is drawn with the same rows as a Pi card, by the same
 shared card formatter, and a paired owner's native row is drawn by that same
-formatter. The one-word aggregate `background unknown`
-stays reserved for what it has always meant: nothing observed for the two
-background categories. Once a category is observed the row names it (`bg tasks 2 |
-shells 0`) in ordinary pane text; a category whose value simply went missing reads
-`unknown`. An unobserved field is never rendered as a zero or as rest, and a
-displayed foreground rest never grants idle-only stop authority.
+formatter. The background row always names both categories independently
+(`bg tasks 2 | shells 0`), even when neither is observed
+(`bg tasks unknown | shells unknown`): there is no combined wording. A category
+whose value simply went missing reads `unknown`; a category the row's own observer
+declared unreportable reads `N/A`. An unobserved field is never rendered as a zero
+or as rest, and a displayed foreground rest never grants idle-only stop authority.
 
 **Current state versus events, and freshness.** The host's status model is
 event-driven with no periodic polling, and the shipped observer keeps that rule:

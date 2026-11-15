@@ -190,8 +190,9 @@ dates.
   a value that was never observed, failed, or was withdrawn after a gap. `unknown` is
   ordinary pane text, never a zero and never painted as rest, and a
   value that merely went missing stays `unknown` rather than
-  being relabelled. The one-word `background unknown` summary stays reserved for what
-  it always meant: nothing observed for the two background categories. A provider's
+  being relabelled. The background row always names both categories independently
+  (`bg tasks 2 | shells 0`), even when neither is observed
+  (`bg tasks unknown | shells unknown`); there is no combined fallback wording. A provider's
   own subtasks and
   shells are that provider's harness work, never this host's subtask or
   background-shell registries: a provider number never enters the conservative

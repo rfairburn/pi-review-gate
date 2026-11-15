@@ -142,7 +142,12 @@ function pane(sidebar: readonly string[]): string {
 
 const IDLE_STATUS = "  agent idle | input none";
 const SELECTED_IDLE_STATUS = "> agent idle | input none";
-const BACKGROUND = "  background unknown";
+/**
+ * The exact both-unknown count row the shared formatter draws at the witness
+ * width. Both labeled cells are always present; the second value is clipped by
+ * the renderer's existing pane-edge ellipsis, never replaced by a combined word.
+ */
+const BACKGROUND = "  bg tasks unknown | shells u...";
 
 function expandedCard(title: string, status = IDLE_STATUS, activity: readonly string[] = ["", ""]): string[] {
   return [title, status, BACKGROUND, ...activity];
@@ -166,7 +171,7 @@ test("the parser reads a complete expanded default card as title/status/backgrou
   assert.equal(card.rows, 5);
   assert.equal(card.selected, true);
   assert.equal(card.status, "agent running | input pending");
-  assert.equal(card.background, "background unknown");
+  assert.equal(card.background, BACKGROUND.slice(2));
   assert.deepEqual(card.activity, ["compiling", "waiting"]);
   assert.equal(card.position, 0);
   assert.deepEqual(parsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS]);
@@ -423,7 +428,7 @@ test("background rows validate the complete nullable grammar and the renderer's 
   assert.equal(parsed.complete, true);
   assert.equal(parsed.cards[0]!.background, "bg tasks 9007199254740991 |...");
 
-  for (const bad of ["background unknown garbage", "bg tasks  | shells", "bg tasks 2 | shells", "bg tasks 2 | shells 3 extra", "background", "bg tasks unk | shells 12345..."]) {
+  for (const bad of ["background unknown", "background unknown garbage", "bg tasks  | shells", "bg tasks 2 | shells", "bg tasks 2 | shells 3 extra", "background", "bg tasks unk | shells 12345..."]) {
     const frame = compose([HEADER(1), "Bad", IDLE_STATUS, `  ${bad}`, "", "", ...ACTIONS]);
     assert.equal(parseRosterFrame(frame).complete, false, `rejects ${JSON.stringify(bad)}`);
     assert.deepEqual(rosterCards(frame), []);
@@ -1061,8 +1066,8 @@ test("the shared witness reads the production renderer's not-applicable card val
   assert.equal(parsed.complete, true, "an armed native row is not a partial roster");
   assert.equal(parsed.count, 4);
   assert.deepEqual(parsed.cards.map((card) => [card.title, card.status, card.background]), [
-    ["Pi conversation", "agent unknown | input unknown", "background unknown"],
-    ["Claude", "agent unknown | input unknown", "background unknown"],
+    ["Pi conversation", "agent unknown | input unknown", BACKGROUND.slice(2)],
+    ["Claude", "agent unknown | input unknown", BACKGROUND.slice(2)],
     ["Codex", `agent unknown | input ${NA}`, `bg tasks ${NA} | shells ${NA}`],
     ["Mixed", `agent ${NA} | input ${NA}`, `bg tasks ${NA} | shells 2`],
   ], "each card keeps its own drawn status and count cells, with an unknown never rewritten");
@@ -1097,7 +1102,7 @@ test("the shared status and count grammars admit the exact not-applicable forms"
   }
 
   for (const background of [
-    "background unknown",
+    BACKGROUND.slice(2),
     "bg tasks 0 | shells 0",
     `bg tasks ${NA} | shells ${NA}`,
     `bg tasks ${NA} | shells 0`,
@@ -1111,10 +1116,20 @@ test("the shared status and count grammars admit the exact not-applicable forms"
     assert.equal(parsed.cards[0]?.background, background);
   }
 
-  // One roster with legacy, zero, unknown, and not-applicable cards at once.
+  // The canonical both-unknown row is two independently named cells, never a
+  // combined phrase: a wider pane draws it whole.
+  const wide = paneFrame(40, [
+    HEADER(1), "Card", IDLE_STATUS, "  bg tasks unknown | shells unknown", "", "", ...ACTIONS,
+  ]);
+  const parsedWide = parseRosterFrame(wide, 40);
+  assert.equal(parsedWide.complete, true);
+  assert.equal(parsedWide.cards[0]?.background, "bg tasks unknown | shells unknown",
+    "both unobserved counts keep their own labeled cells instead of one aggregate word");
+
+  // One roster with both-unknown, observed-zero, not-applicable, and half-known count cards at once.
   const mixed = compose([
     HEADER(4),
-    "Pi row", IDLE_STATUS, "  background unknown",
+    "Pi row", IDLE_STATUS, BACKGROUND,
     "Observed zeros", "  agent idle | input none", "  bg tasks 0 | shells 0",
     "Not applicable", `  agent ${NA} | input ${NA}`, `  bg tasks ${NA} | shells ${NA}`,
     "Half known", IDLE_STATUS, `  bg tasks unknown | shells ${NA}`,
@@ -1123,7 +1138,7 @@ test("the shared status and count grammars admit the exact not-applicable forms"
   const parsedMixed = parseRosterFrame(mixed);
   assert.equal(parsedMixed.complete, true);
   assert.deepEqual(parsedMixed.cards.map((card) => card.background), [
-    "background unknown",
+    BACKGROUND.slice(2),
     "bg tasks 0 | shells 0",
     `bg tasks ${NA} | shells ${NA}`,
     `bg tasks unknown | shells ${NA}`,
@@ -1220,7 +1235,7 @@ test("not-applicable lookalikes, half-painted cells, and partial cards stay no p
     assert.equal(parseRosterFrame(frame).complete, false, `rejects the half-painted ${JSON.stringify(partial)}`);
   }
   const statusTooWideForItsPane = paneFrame(20, [
-    HEADER(1), "Codex", `  agent unknown | input ${NA}`, "  background unknown",
+    HEADER(1), "Codex", `  agent unknown | input ${NA}`, drawnBackground("bg tasks 0 | shells 0", 20),
     "  Saved conversations", "  New session", "  Quit host",
   ]);
   assert.equal(parseRosterFrame(statusTooWideForItsPane, 20).complete, false,

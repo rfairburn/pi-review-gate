@@ -3056,8 +3056,8 @@ function cardStatusText(item: SessionStatusFacts): string {
  * wording the palette never paints (`bg tasks ` / `shells `), `value` is the
  * count a role MAY paint, and `role` chooses that foreground (`null` keeps the
  * value on the neutral canvas too). Joined with `" | "`, `label + value` is the
- * exact existing background plaintext, so this stays the single source of truth
- * for both the painted card row and the plain Network activity summary.
+ * exact background plaintext, so this stays the single source of truth for both
+ * the painted card row and the plain Network activity summary.
  */
 interface CardBackgroundSegment {
   readonly label: string;
@@ -3088,17 +3088,15 @@ function countEmphasisRole(count: number): SidebarThemeRole {
  * plaintext and stays ordinary pane text: only an OBSERVED NUMBER is painted, and
  * each of the two counts is banded independently. A category the row's observer
  * declared unreportable renders the shared not-applicable word instead, also
- * ordinary pane text and never a zero; the one-word aggregate stays reserved for
- * the case it has always meant, two reportable categories with nothing observed.
+ * ordinary pane text and never a zero. Both labeled cells are always drawn,
+ * including when neither category was observed; there is no combined fallback
+ * row.
  */
 function cardBackgroundSegments(item: SessionStatusFacts): CardBackgroundSegment[] {
   const tasksReportable = !isNativeCategoryUnsupported(item.statusSupport, "tasks");
   const shellsReportable = !isNativeCategoryUnsupported(item.statusSupport, "shells");
   const tasks = tasksReportable ? sanitizeCount(item.activeTasks) : null;
   const shells = shellsReportable ? sanitizeCount(item.activeShells) : null;
-  if (tasks === null && shells === null && tasksReportable && shellsReportable) {
-    return [{ label: "", value: "background unknown", role: null }];
-  }
   return [
     tasks === null
       ? { label: "bg tasks ", value: tasksReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }

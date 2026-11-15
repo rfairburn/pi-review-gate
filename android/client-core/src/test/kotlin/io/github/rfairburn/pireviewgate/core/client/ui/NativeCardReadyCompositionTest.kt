@@ -73,7 +73,7 @@ class NativeCardReadyCompositionTest {
                 assertEquals(SessionStatusRole.IDLE, roles.agent)
                 assertEquals(SessionStatusRole.IDLE, roles.input)
                 // The count band keeps the reported intent zeros and never borrows the pair.
-                assertEquals(SessionCardBackground.Counts(0L, 0L), sessionCardBackground(drawn.metadata))
+                assertEquals(SessionCardBackground(0L, 0L), sessionCardBackground(drawn.metadata))
             }
         }
     }
@@ -88,9 +88,9 @@ class NativeCardReadyCompositionTest {
         )
         assertEquals(SessionStatusRole.UNKNOWN, sessionCardStatusRoles(drawn).agent)
         assertEquals(
-            SessionCardBackground.Unknown,
+            SessionCardBackground(null, null),
             sessionCardBackground(drawn.metadata),
-            "the card draws no count the owner did not report",
+            "both labels stay unknown and the card draws no count the owner did not report",
         )
     }
 

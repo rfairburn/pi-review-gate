@@ -165,9 +165,13 @@ function actionRows(labels: readonly string[]): string[] {
   return labels.map((label) => `  ${label}`);
 }
 
-/** One complete five-row native card for the pure tail witness; no process or file. */
+/**
+ * One complete five-row native card for the pure tail witness; no process or file.
+ * The count row is the exact both-unknown row the formatter draws at this width:
+ * both labels are named and the second value keeps the renderer's ellipsis.
+ */
 function tailCard(title: string): string[] {
-  return [title, "  agent idle | input none", "  background unknown", "    idle activity", "    idle activity"];
+  return [title, "  agent idle | input none", "  bg tasks unknown | shells u...", "    idle activity", "    idle activity"];
 }
 
 /** A pane-only roster (header on line 0) of two cards followed by the drawn rows. */

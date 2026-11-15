@@ -292,7 +292,7 @@ test("the left roster projects remote cards alongside locals with honest facts a
   // Unknown stays unknown: no fabricated idle, zero, agent dir, or current file.
   assert.ok(joined.includes("agent unknown"));
   assert.ok(joined.includes("input unknown"));
-  assert.ok(joined.includes("background unknown"));
+  assert.ok(joined.includes("bg tasks unknown | shells unknown"));
   assert.ok(!joined.includes("agent idle"));
   assert.ok(!joined.includes("bg tasks 0"));
   assert.ok(!joined.includes("/agents/"), "no private owner fields are projected");

@@ -154,7 +154,8 @@ function drawnCardTitles(harness: Harness): string[] {
     const title = rows[row].trimEnd();
     if (!/^Session \d+$/u.test(title)) continue;
     assert.match(rows[row + 1]?.trimEnd() ?? "", /^(?:> |  )agent /u, `"${title}" is drawn with its status row`);
-    assert.match(rows[row + 2]?.trimEnd() ?? "", /^(?:> |  )background /u, `"${title}" is drawn with its background row`);
+    assert.match(rows[row + 2]?.trimEnd() ?? "", /^(?:> |  )bg tasks (?:unknown|\d+|N\/A) \| shells /u,
+      `"${title}" is drawn with both of its labeled background count cells`);
     for (const activityRow of [rows[row + 3] ?? "", rows[row + 4] ?? ""]) {
       assert.ok(activityRow.trimEnd() === "" || /^ {4}/u.test(activityRow.trimEnd()),
         `"${title}" keeps its full expanded extent instead of a clipped card`);
@@ -709,8 +710,8 @@ test("a keyboard move step re-follows its source after a wheel scroll moved it o
   assert.equal(markedCardTitle(harness), "Session 1", "the returned card is still marked as the one being moved");
   const markedRows = rosterRows(harness);
   const markedRow = markedRows.findIndex((line) => line.startsWith(">>"));
-  assert.ok(/^ {2}background /u.test(markedRows[markedRow + 1] ?? ""),
-    "the returned card is drawn COMPLETE, not clipped at the window edge");
+  assert.ok(/^ {2}bg tasks (?:unknown|\d+|N\/A) \| shells /u.test(markedRows[markedRow + 1] ?? ""),
+    "the returned card keeps both labeled count cells and is drawn COMPLETE, not clipped at the window edge");
   assert.ok(markedRows.some((line) => /^(?:\^ |v )agent /u.test(line)),
     "the destination card and its insertion marker came back with it");
   assert.equal(harness.sidebar?.selectedId, selected, "the wheel and the step moved no highlight");

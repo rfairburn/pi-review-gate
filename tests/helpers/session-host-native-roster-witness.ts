@@ -179,7 +179,12 @@ const HEADER_PATTERN = /^\s*Sessions \((\d+)\)\s*$/u;
  * literally: `n/a`, `NA`, `N/A (…)` or any other annotation stays no parse.
  */
 const STATUS_PATTERN = /^(?:starting \| input (?:pending|none|unknown|N\/A)|agent (?:running|waiting|idle|unknown|N\/A) \| input (?:pending|none|unknown|N\/A)|exited(?: \(code -?\d+\))?|error(?: \(code -?\d+\))?)$/u;
-const BACKGROUND_CANONICAL = /^(?:background unknown|bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A))$/u;
+/**
+ * The two independently labeled count cells the shared card formatter emits.
+ * There is no combined-unknown alternative: both `bg tasks` and `shells` are
+ * always named, even when neither was observed.
+ */
+const BACKGROUND_CANONICAL = /^bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A)$/u;
 const ROOT_HEAD = "bg tasks ";
 const SHELLS_MID = " | shells";
 /** One completely rendered nullable count cell: `unknown`, digits, or `N/A`. */

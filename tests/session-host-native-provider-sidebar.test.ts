@@ -740,8 +740,8 @@ test("a native row is titled by its provider and stays honestly unknown", () => 
   assert.ok(text.includes("Claude"), `the provider names the card: ${JSON.stringify(text)}`);
   assert.ok(text.includes("agent unknown | input unknown"),
     "missing telemetry is never rendered as idle or none");
-  assert.ok(text.includes("background unknown"),
-    "missing counts use the one shared card summary and are never rendered as zero");
+  assert.ok(text.includes("bg tasks unknown | shells unknown"),
+    "both missing counts keep their own labeled cells and are never rendered as zero");
 
   // The same row with the Pi telemetry a native child can never produce.
   const pi = rosterWith([{ ...NATIVE_ITEM, backend: undefined, busy: false, pendingInput: false,

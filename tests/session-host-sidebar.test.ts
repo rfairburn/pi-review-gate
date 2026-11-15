@@ -2947,9 +2947,9 @@ test("activity-intent counts are honest: observed integers shown, anything else 
   assert.equal(texts[settling + 1]?.trimEnd(), "  agent idle | input none");
   assert.equal(texts[settling + 2]?.trimEnd(), "  bg tasks 0 | shells 0");
   assert.equal(texts[cardIndex(texts, "Mixed") + 2]?.trimEnd(), "  bg tasks unknown | shells 3");
-  assert.equal(texts[cardIndex(texts, "Bogus") + 2]?.trimEnd(), "  background unknown");
-  assert.equal(texts[cardIndex(texts, "Hostile") + 2]?.trimEnd(), "  background unknown");
-  assert.equal(texts[cardIndex(texts, "Nonfinite") + 2]?.trimEnd(), "  background unknown");
+  assert.equal(texts[cardIndex(texts, "Bogus") + 2]?.trimEnd(), "  bg tasks unknown | shells unknown");
+  assert.equal(texts[cardIndex(texts, "Hostile") + 2]?.trimEnd(), "  bg tasks unknown | shells unknown");
+  assert.equal(texts[cardIndex(texts, "Nonfinite") + 2]?.trimEnd(), "  bg tasks unknown | shells unknown");
   // The stored DTO copy is sanitized the same way: unknown is null, never 0.
   const items = harness.controller.items;
   assert.deepEqual(items.map((item) => [item.activeTasks, item.activeShells]), [
@@ -3073,7 +3073,7 @@ test("expanded card activity is generic, sanitized, and bounded to two rows", ()
   const collapsed = rosterView(harness.controller, 40, 12).texts;
   assert.equal(collapsed[1]?.trimEnd(), "label-a");
   assert.ok(collapsed[2]?.startsWith("> agent"), JSON.stringify(collapsed));
-  assert.equal(collapsed[3]?.trimEnd(), "  background unknown");
+  assert.equal(collapsed[3]?.trimEnd(), "  bg tasks unknown | shells unknown");
   assert.equal(collapsed[4]?.trimEnd(), "  Saved conversations", "the collapsed card is exactly 3 rows, dropping both activity rows");
 });
 
@@ -3158,7 +3158,7 @@ test("a card that cannot fit is truthfully too small and selection keys never ac
   const fits = rosterView(harness.controller, 40, 8).texts;
   assert.equal(fits[1]?.trimEnd(), "Nine");
   assert.ok(fits[2]?.startsWith("> exited"));
-  assert.equal(fits[3]?.trimEnd(), "  background unknown");
+  assert.equal(fits[3]?.trimEnd(), "  bg tasks unknown | shells unknown");
   harness.send(ENTER);
   assert.deepEqual(harness.sinceActions(), [{ type: "resume-row", requestId: 1, id: "a" }],
     "a drawn exited card asks the backend to restart that exact row");

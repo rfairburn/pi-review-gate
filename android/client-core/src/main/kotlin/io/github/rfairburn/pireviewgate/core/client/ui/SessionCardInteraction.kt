@@ -13,30 +13,21 @@ import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetada
  * It mirrors the desktop card's background text and reads only the owner's
  * ACTIVITY-INTENT counts (`activeTasks`/`activeShells`). The ownership counts
  * (`backgroundTasks`/`backgroundShells`) are a different fact and stay in the card
- * details. A missing or invalid count is unknown and is never rendered as zero or
- * as idle, and nothing here is derived from terminal output.
+ * details. Both counts are always carried and drawn as their own labeled cells: a
+ * missing or invalid member is unknown on that cell alone, never zero and never
+ * idle, and there is no combined unknown state to fall back to. Nothing here is
+ * derived from terminal output.
  */
-public sealed interface SessionCardBackground {
-    /** Neither activity-intent count was reported: the whole line is unknown. */
-    public data object Unknown : SessionCardBackground
-
-    /** At least one count was reported; a `null` member is still unknown, never zero. */
-    public data class Counts(
-        public val activeTasks: Long?,
-        public val activeShells: Long?,
-    ) : SessionCardBackground
-}
+public data class SessionCardBackground(
+    public val activeTasks: Long?,
+    public val activeShells: Long?,
+)
 
 /** The background line for one row, from its activity-intent counts only. */
-public fun sessionCardBackground(metadata: RemoteSessionMetadata): SessionCardBackground {
-    val tasks = reportedCount(metadata.activeTasks)
-    val shells = reportedCount(metadata.activeShells)
-    return if (tasks == null && shells == null) {
-        SessionCardBackground.Unknown
-    } else {
-        SessionCardBackground.Counts(tasks, shells)
-    }
-}
+public fun sessionCardBackground(metadata: RemoteSessionMetadata): SessionCardBackground = SessionCardBackground(
+    activeTasks = reportedCount(metadata.activeTasks),
+    activeShells = reportedCount(metadata.activeShells),
+)
 
 /** Only a nonnegative count is an observation; everything else is unknown. */
 private fun reportedCount(value: Long?): Long? = value?.takeIf { it >= 0L }

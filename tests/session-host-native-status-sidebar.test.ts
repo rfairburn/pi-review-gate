@@ -286,8 +286,8 @@ test("a known idle native foreground keeps Ready beside genuine background count
   assert.ok(known.includes("Ready"), `the existing activity line is the Ready statement:\n${known}`);
   const lost = cardLines(texts, "Claude lost").join("\n");
   assert.ok(lost.includes("agent idle | input none"), lost);
-  assert.ok(lost.includes("background unknown"),
-    `a lost count source keeps the existing unknown summary and is never zeroed:\n${lost}`);
+  assert.ok(lost.includes("bg tasks unknown | shells unknown"),
+    `a lost count source keeps both unknown cells and is never zeroed:\n${lost}`);
   assert.ok(lost.includes("Ready"), lost);
   const codex = cardLines(texts, "Codex idle").join("\n");
   assert.ok(codex.includes("agent idle | input N/A"), codex);
@@ -419,7 +419,7 @@ test("Pi's nonzero and unknown count readings are unchanged and a native rest li
   const lost = cardLines(texts, "Pi lost").join("\n");
   assert.ok(lost.includes("agent unknown | input none"),
     `a Pi row's lost count source still blocks rest:\n${lost}`);
-  assert.ok(lost.includes("background unknown"), lost);
+  assert.ok(lost.includes("bg tasks unknown | shells unknown"), lost);
 
   // The native Ready card is DISPLAY only: stop/remove still needs the existing
   // confirmation because this row carries no positively observed ownership zeros.
@@ -471,10 +471,10 @@ test("a Pi row and a row with no declaration render exactly as before", () => {
   assert.ok(idle.includes("bg tasks 0 | shells 0"), idle);
   const unknown = cardLines(texts, "Pi unknown").join("\n");
   assert.ok(unknown.includes("agent unknown | input unknown"), unknown);
-  assert.ok(unknown.includes("background unknown"), unknown);
+  assert.ok(unknown.includes("bg tasks unknown | shells unknown"), unknown);
   const undeclared = cardLines(texts, "Undeclared native").join("\n");
   assert.ok(undeclared.includes("agent unknown | input unknown"), undeclared);
-  assert.ok(undeclared.includes("background unknown"), undeclared);
+  assert.ok(undeclared.includes("bg tasks unknown | shells unknown"), undeclared);
   assert.ok(!texts.join("\n").includes("N/A"), "no row gains a not-applicable claim on its own");
 });
 
@@ -598,7 +598,7 @@ test("a paired-owner row renders the same N/A, zero, and unknown facts as a loca
   assert.ok(zeros.includes("bg tasks 0 | shells 0"), zeros);
   const legacy = cardLines(texts, "owner legacy").join("\n");
   assert.ok(legacy.includes("agent unknown | input unknown"), legacy);
-  assert.ok(legacy.includes("background unknown"), legacy);
+  assert.ok(legacy.includes("bg tasks unknown | shells unknown"), legacy);
 });
 
 test("the Network pane's plain activity summary uses the same applicability words", () => {

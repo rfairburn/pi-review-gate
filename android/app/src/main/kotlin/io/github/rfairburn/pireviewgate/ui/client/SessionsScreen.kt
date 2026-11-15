@@ -952,35 +952,28 @@ private fun inputChipText(observation: InputObservation, style: SessionStatusSty
  *
  * Each count is painted on its own from the desktop band of its own observed number
  * in the current native [theme], so one count never colours the other and the red of
- * the highest band is activity intensity only, never an error state or a status. A
- * missing or invalid count has no observed number and stays a plain neutral
- * "unknown". The neutral chip surfaces, the neutral labels, the exact wording, and
- * the full-size numbers are unchanged, and neither chip is interactive.
+ * the highest band is activity intensity only, never an error state or a status. Both
+ * labeled chips are always drawn: a missing or invalid count has no observed number
+ * and stays a plain neutral "unknown" on its own chip, even when neither count is
+ * known. The neutral chip surfaces, the neutral labels, the exact wording, and the
+ * full-size numbers are unchanged, and neither chip is interactive.
  */
 @Composable
 private fun backgroundChipTexts(
     background: SessionCardBackground,
     theme: SessionStatusTheme,
 ): List<AnnotatedString> {
-    val taskCount = when (background) {
-        SessionCardBackground.Unknown -> null
-        is SessionCardBackground.Counts -> background.activeTasks
-    }
-    val shellCount = when (background) {
-        SessionCardBackground.Unknown -> null
-        is SessionCardBackground.Counts -> background.activeShells
-    }
     val unknown = stringResource(R.string.session_card_count_unknown)
     return listOf(
         sessionStatusChipText(
             stringResource(R.string.session_card_background_tasks_label),
-            taskCount?.toString() ?: unknown,
-            sessionCountStatusRole(taskCount)?.style(theme),
+            background.activeTasks?.toString() ?: unknown,
+            sessionCountStatusRole(background.activeTasks)?.style(theme),
         ),
         sessionStatusChipText(
             stringResource(R.string.session_card_background_shells_label),
-            shellCount?.toString() ?: unknown,
-            sessionCountStatusRole(shellCount)?.style(theme),
+            background.activeShells?.toString() ?: unknown,
+            sessionCountStatusRole(background.activeShells)?.style(theme),
         ),
     )
 }

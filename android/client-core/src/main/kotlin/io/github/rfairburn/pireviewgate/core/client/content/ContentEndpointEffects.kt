@@ -2,10 +2,10 @@ package io.github.rfairburn.pireviewgate.core.client.content
 
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentFrame
-import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopyEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopyFrameEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopySource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputSource
-import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.SessionGeometry
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalInputModes
 
@@ -181,11 +181,15 @@ data class ContentCopyReceipt(
 	val copyId: String,
 	/** Emission order per binding; copies are ordered by this, never by [dispatchId]. */
 	val sequence: Long,
-	val source: NativeIoSource,
+	/** The conversation source, or the tuple-less hosted provider CLI source. */
+	val source: NativeIoCopySource,
 	/** Native input dispatch that caused this copy. Informational only. */
 	val dispatchId: Long,
-	/** Canonical base64 text or a fixed unavailable reason; never a raw OSC 52 byte. */
-	val event: NativeIoCopyEvent,
+	/**
+	 * Canonical base64 text with the producer's own facts — a conversation tuple or a
+	 * hosted backend — or a fixed unavailable reason; never a raw OSC 52 byte.
+	 */
+	val event: NativeIoCopyFrameEvent,
 )
 
 /**

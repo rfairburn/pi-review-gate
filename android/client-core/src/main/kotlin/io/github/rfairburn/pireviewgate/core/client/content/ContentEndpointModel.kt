@@ -70,8 +70,9 @@ data class ContentViewportRequest(val cols: Int, val rows: Int) {
 data class ContentNativeIoOptions(
 	/**
 	 * Optional capabilities this viewer offers. Only identifiers the protocol can
-	 * implement are admissible, and startup input is admissible only beside the
-	 * native IO capability it depends on.
+	 * implement are admissible, and each extension is admissible only beside the
+	 * capability it depends on: startup input and hosted provider input beside native
+	 * IO, hosted provider copy beside hosted provider input.
 	 */
 	val offeredCapabilities: List<String>,
 ) {
@@ -85,6 +86,14 @@ data class ContentNativeIoOptions(
 			!offeredCapabilities.contains(ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY) ||
 				offeredCapabilities.contains(ContentProtocol.NATIVE_IO_CAPABILITY),
 		) { "content startup input requires the native IO capability" }
+		require(
+			!offeredCapabilities.contains(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY) ||
+				offeredCapabilities.contains(ContentProtocol.NATIVE_IO_CAPABILITY),
+		) { "content hosted provider input requires the native IO capability" }
+		require(
+			!offeredCapabilities.contains(ContentProtocol.NATIVE_COPY_CLI_CAPABILITY) ||
+				offeredCapabilities.contains(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY),
+		) { "content hosted provider copy requires hosted provider input" }
 	}
 }
 
@@ -257,8 +266,10 @@ data class ContentNativeInputTarget(
 	val subscriptionId: String,
 	/**
 	 * The exact host-written source of the currently published view: a conversation
-	 * source, or the tuple-less startup source of a publish that named no
-	 * conversation. It is descriptive only and never authority to write.
+	 * source, or one tuple-less source of a publish that named no conversation — the
+	 * startup source of a row in its explicit startup phase, or the hosted provider CLI
+	 * source naming that row's recorded backend. It is descriptive only and never
+	 * authority to write.
 	 */
 	val source: NativeIoInputSource,
 	/** The exact observed input modes of that same published view. */
@@ -285,6 +296,10 @@ data class ContentEndpointObservation(
 	val acknowledgedCapabilities: List<String>,
 	val nativeIoNegotiated: Boolean,
 	val startupInputNegotiated: Boolean,
+	/** Whether this channel's hosted provider CLI INPUT extension was acknowledged. */
+	val nativeCliInputNegotiated: Boolean,
+	/** Whether this channel's hosted provider CLI TEXT COPY extension was acknowledged. */
+	val nativeCliCopyNegotiated: Boolean,
 	/** Newest viewer-requested size; the owner reports its own geometry in frames. */
 	val requestedViewport: ContentViewportRequest,
 	/** Geometry of the currently published view, if any. */

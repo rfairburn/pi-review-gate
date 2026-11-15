@@ -305,7 +305,12 @@ class ContentFrameCodecTest {
 		)
 		assertTrue(ContentProtocol.KNOWN_OPTIONAL_CAPABILITIES.isEmpty())
 		assertEquals(
-			listOf(ContentProtocol.NATIVE_IO_CAPABILITY, ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY),
+			listOf(
+				ContentProtocol.NATIVE_IO_CAPABILITY,
+				ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY,
+				ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY,
+				ContentProtocol.NATIVE_COPY_CLI_CAPABILITY,
+			),
 			ContentProtocol.IMPLEMENTABLE_OPTIONAL_CAPABILITIES,
 		)
 		assertEquals(

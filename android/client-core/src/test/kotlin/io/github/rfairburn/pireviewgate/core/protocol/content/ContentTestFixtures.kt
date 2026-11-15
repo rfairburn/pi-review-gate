@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.protocol.content
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.zip.Deflater
@@ -301,6 +302,26 @@ internal fun startupSource(
 	sourceToken = sourceToken,
 )
 
+/**
+ * One hosted provider CLI source: the same run, row, geometry, viewer revision, and
+ * token facts as [nativeSource], that row's recorded backend, and no tuple at all.
+ */
+internal fun nativeCliSource(
+	hostRunId: String = "run-1",
+	sessionId: String = "instance-1",
+	backend: NativeCliBackend = NativeCliBackend.CLAUDE,
+	geometry: SessionGeometry = SessionGeometry(cols = 80, rows = 24, revision = 7),
+	viewerRevision: Long = 2,
+	sourceToken: String = "host-source-token-1",
+): NativeIoNativeCliSource = NativeIoNativeCliSource(
+	hostRunId = hostRunId,
+	sessionId = sessionId,
+	backend = backend,
+	geometry = geometry,
+	viewerRevision = viewerRevision,
+	sourceToken = sourceToken,
+)
+
 /** One begin whose metadata matches [sampleFrame] and [contentSource]. */
 internal fun sampleBegin(
 	nativeSession: NativeSessionRef? = NativeSessionRef("native-session-1", 3),
@@ -335,6 +356,12 @@ internal fun unavailableEvent(
 	sessionId = sessionId,
 	sessionEpoch = sessionEpoch,
 )
+
+/** One hosted provider TEXT copy event: canonical base64 plus the row's backend. */
+internal fun cliCopyEvent(
+	encoded: String,
+	backend: NativeCliBackend = NativeCliBackend.CLAUDE,
+): NativeIoNativeCliCopyEvent = NativeIoNativeCliCopyEvent(encoded = encoded, backend = backend)
 
 /* ------------------------------------------------------------------------- *
  * Assertion helpers

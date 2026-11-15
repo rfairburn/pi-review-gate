@@ -169,6 +169,14 @@ data class ClientRuntimeConfig(
             !contentCapabilities.contains(ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY) ||
                 contentCapabilities.contains(ContentProtocol.NATIVE_IO_CAPABILITY),
         ) { "content startup input requires the native IO capability" }
+        require(
+            !contentCapabilities.contains(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY) ||
+                contentCapabilities.contains(ContentProtocol.NATIVE_IO_CAPABILITY),
+        ) { "content hosted provider input requires the native IO capability" }
+        require(
+            !contentCapabilities.contains(ContentProtocol.NATIVE_COPY_CLI_CAPABILITY) ||
+                contentCapabilities.contains(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY),
+        ) { "content hosted provider copy requires hosted provider input" }
     }
 
     companion object {
@@ -185,10 +193,18 @@ data class ClientRuntimeConfig(
             RosterWire.NATIVE_NAME_CAPABILITY,
         )
 
-        /** Every optional content capability this build implements. */
+        /**
+         * Every optional content capability this build implements: the native input and
+         * text-copy extension, its startup-input variant, and its hosted provider CLI
+         * input and text-copy variants. Offering them grants nothing — the owner's
+         * acknowledgement is the only authority — and the native IO extension stays
+         * inert until a published view carries a source this client can act on.
+         */
         val DEFAULT_CONTENT_CAPABILITIES: List<String> = listOf(
             ContentProtocol.NATIVE_IO_CAPABILITY,
             ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY,
+            ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY,
+            ContentProtocol.NATIVE_COPY_CLI_CAPABILITY,
         )
     }
 }

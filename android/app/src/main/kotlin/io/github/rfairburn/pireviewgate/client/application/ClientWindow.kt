@@ -490,10 +490,20 @@ class ClientWindow(private val activity: ClientActivity, private val app: Client
         val proof = if (view != null && receipt != null) currentProof(view, receipt, epoch) else RosterUiProof { false }
         val claim = app.runtime.claimTerminalCopy(event.selectionGeneration, event.copy.copyId, proof)
         if (claim !is TerminalCopyClaim.Granted) return
-        val copy = claim.copy.event
-        if (copy is NativeIoCopyEvent.Unavailable) { app.report("Copy unavailable: ${copy.reason.name}"); return }
-        copy as NativeIoCopyEvent.Copy
-        val bytes = try { Base64.getDecoder().decode(copy.encoded) } catch (_: IllegalArgumentException) { return }
+        val event = claim.copy.event
+        // Text only, from either producer family: a Pi conversation copy carries its own
+        // tuple, a hosted provider CLI copy carries that row's recorded backend and no
+        // tuple. Neither is a raw OSC 52 byte, an image, or a file.
+        val encoded = when (event) {
+            is NativeIoCopyEvent.Unavailable -> {
+                app.report("Copy unavailable: ${event.reason.name}")
+                return
+            }
+
+            is NativeIoCopyEvent.Copy -> event.encoded
+            is NativeIoNativeCliCopyEvent -> event.encoded
+        }
+        val bytes = try { Base64.getDecoder().decode(encoded) } catch (_: IllegalArgumentException) { return }
         val text = decodeUtf8(bytes) ?: return
         // One-shot immediate claim/delivery on Main, independently fresh actual view.
         // Copy is NOT input and is intentionally unrelated to last-input/dispatch order.

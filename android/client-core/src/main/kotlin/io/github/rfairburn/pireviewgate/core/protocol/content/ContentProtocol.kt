@@ -91,6 +91,26 @@ object ContentProtocol {
 	const val NATIVE_INPUT_STARTUP_CAPABILITY: String = "native-input-startup-v1"
 
 	/**
+	 * Optional capability naming INPUT to a hosted provider CLI row: a publish whose
+	 * `nativeSession` is null may state the tuple-less `native-cli` source naming that
+	 * row's recorded backend, and an input or copy frame may echo it. Like startup input
+	 * it depends on [NATIVE_IO_CAPABILITY]: it is offered and acknowledged only together
+	 * with it. It never reaches a Pi row, whose framed startup and conversation input
+	 * paths are unchanged.
+	 */
+	const val NATIVE_INPUT_CLI_CAPABILITY: String = "native-input-cli-v1"
+
+	/**
+	 * Optional capability naming TEXT copy OUT of a hosted provider CLI row: a
+	 * `copy`/`copy_begin` frame may carry the tuple-less `native-cli` source together
+	 * with a copy event naming that row's recorded backend and NO conversation tuple.
+	 * It depends on BOTH [NATIVE_IO_CAPABILITY] and [NATIVE_INPUT_CLI_CAPABILITY],
+	 * whose source shape it rides on. It never widens Pi copy: a conversation copy keeps
+	 * its unchanged tuple-sourced shape.
+	 */
+	const val NATIVE_COPY_CLI_CAPABILITY: String = "native-copy-cli-v1"
+
+	/**
 	 * Optional capabilities negotiated without an explicit opt-in. There are none:
 	 * the native IO extension can carry input and clipboard data, so offering it on
 	 * the strength of a peer's hello alone would be an activation.
@@ -102,7 +122,12 @@ object ContentProtocol {
 	 * enables them. Being implementable is never an offer.
 	 */
 	val IMPLEMENTABLE_OPTIONAL_CAPABILITIES: List<String> =
-		listOf(NATIVE_IO_CAPABILITY, NATIVE_INPUT_STARTUP_CAPABILITY)
+		listOf(
+			NATIVE_IO_CAPABILITY,
+			NATIVE_INPUT_STARTUP_CAPABILITY,
+			NATIVE_INPUT_CLI_CAPABILITY,
+			NATIVE_COPY_CLI_CAPABILITY,
+		)
 
 	/**
 	 * Decoded UTF-8 bytes accepted by one atomic native text paste: exactly 1 MiB.
@@ -204,12 +229,22 @@ object ContentProtocol {
 		val offeredAndEnabled = hello.capabilities.filter { capability ->
 			capability != REQUIRED_CAPABILITY && enabled.contains(capability)
 		}
-		// Startup input is acknowledged ONLY together with native IO: a peer that
-		// offers startup without native IO simply does not get it.
-		val negotiated = if (offeredAndEnabled.contains(NATIVE_IO_CAPABILITY)) {
+		// Startup input and hosted provider CLI input are acknowledged ONLY together
+		// with native IO: a peer that offers either without native IO simply does not
+		// get it, never a partial extension.
+		var negotiated = if (offeredAndEnabled.contains(NATIVE_IO_CAPABILITY)) {
 			offeredAndEnabled
 		} else {
-			offeredAndEnabled.filter { capability -> capability != NATIVE_INPUT_STARTUP_CAPABILITY }
+			offeredAndEnabled.filter { capability ->
+				capability != NATIVE_INPUT_STARTUP_CAPABILITY &&
+					capability != NATIVE_INPUT_CLI_CAPABILITY &&
+					capability != NATIVE_COPY_CLI_CAPABILITY
+			}
+		}
+		// Hosted provider copy also needs hosted provider input, whose source shape it
+		// rides on: without it this side does not get copy, never a partial pair.
+		if (!negotiated.contains(NATIVE_INPUT_CLI_CAPABILITY)) {
+			negotiated = negotiated.filter { capability -> capability != NATIVE_COPY_CLI_CAPABILITY }
 		}
 		return ContentHelloDecision.Accepted(
 			major = MAJOR,
@@ -244,10 +279,17 @@ object ContentProtocol {
 				return ContentAckDecision.Refused(ContentErrorCode.PROTOCOL_VIOLATION)
 			}
 		}
-		// An acknowledgement of startup input without the native IO capability it
-		// depends on describes an extension that cannot exist.
-		if (ack.capabilities.contains(NATIVE_INPUT_STARTUP_CAPABILITY) &&
+		// An acknowledgement of startup input or hosted provider input without the
+		// native IO capability they depend on describes an extension that cannot exist.
+		// So does an acknowledgement of hosted provider copy without hosted provider input.
+		if ((ack.capabilities.contains(NATIVE_INPUT_STARTUP_CAPABILITY) ||
+				ack.capabilities.contains(NATIVE_INPUT_CLI_CAPABILITY)) &&
 			!ack.capabilities.contains(NATIVE_IO_CAPABILITY)
+		) {
+			return ContentAckDecision.Refused(ContentErrorCode.PROTOCOL_VIOLATION)
+		}
+		if (ack.capabilities.contains(NATIVE_COPY_CLI_CAPABILITY) &&
+			!ack.capabilities.contains(NATIVE_INPUT_CLI_CAPABILITY)
 		) {
 			return ContentAckDecision.Refused(ContentErrorCode.PROTOCOL_VIOLATION)
 		}
@@ -287,9 +329,16 @@ object ContentProtocol {
 			if (enabled.contains(entry)) fail(ContentFailureCode.INVALID_BOUNDS)
 			enabled.add(entry)
 		}
-		// Startup input depends on the native IO capability: enabling it alone is a
-		// malformed opt-in, refused rather than silently narrowed.
-		if (enabled.contains(NATIVE_INPUT_STARTUP_CAPABILITY) && !enabled.contains(NATIVE_IO_CAPABILITY)) {
+		// Startup input and hosted provider input each depend on the native IO
+		// capability: enabling either alone is a malformed opt-in, refused rather than
+		// silently narrowed. Hosted provider copy additionally depends on hosted
+		// provider input, whose source shape it rides on.
+		if ((enabled.contains(NATIVE_INPUT_STARTUP_CAPABILITY) || enabled.contains(NATIVE_INPUT_CLI_CAPABILITY)) &&
+			!enabled.contains(NATIVE_IO_CAPABILITY)
+		) {
+			fail(ContentFailureCode.INVALID_BOUNDS)
+		}
+		if (enabled.contains(NATIVE_COPY_CLI_CAPABILITY) && !enabled.contains(NATIVE_INPUT_CLI_CAPABILITY)) {
 			fail(ContentFailureCode.INVALID_BOUNDS)
 		}
 		return enabled

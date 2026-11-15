@@ -289,14 +289,18 @@ data class CopyFrame(
 	val copyId: String,
 	/** Positive emission order per binding; independent of `dispatchId`. */
 	val sequence: Long,
-	val source: NativeIoSource,
+	/** The conversation source, or the tuple-less hosted provider CLI source. */
+	val source: NativeIoCopySource,
 	/**
 	 * Native input dispatch that caused this copy. Informational only: it may
 	 * arrive out of order, so it never orders, fences, or drops a copy.
 	 */
 	val dispatchId: Long,
-	/** Producer event; its tuple must equal the source's native tuple. */
-	val event: NativeIoCopyEvent,
+	/**
+	 * Producer event. A conversation event's tuple must equal the source's native
+	 * tuple; a hosted provider event's backend must equal the source's backend.
+	 */
+	val event: NativeIoCopyFrameEvent,
 ) : ContentFrame.NativeIoFrame {
 	override val wireType: String get() = ContentFrameType.COPY.wireValue
 }
@@ -306,7 +310,7 @@ data class CopyBeginFrame(
 	val subscriptionId: String,
 	val copyId: String,
 	val sequence: Long,
-	val source: NativeIoSource,
+	val source: NativeIoCopySource,
 	val dispatchId: Long,
 	/** Encoded characters of the whole copy payload. */
 	val byteLength: Int,

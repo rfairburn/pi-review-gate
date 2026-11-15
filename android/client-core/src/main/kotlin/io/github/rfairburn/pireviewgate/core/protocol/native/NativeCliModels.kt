@@ -5,9 +5,9 @@ package io.github.rfairburn.pireviewgate.core.protocol.native
  *
  * This is the ONE shared native identity this client uses. The roster lane decodes
  * the owner's typed row backend and advertised target catalog with it, native
- * create and native host-caption requests address targets with it, and a future
- * native IO variant consumes the same [NativeCliBackend] and [NativeCliTarget]
- * instead of declaring a second backend vocabulary.
+ * create and native host-caption requests address targets with it, and the CONTENT
+ * hosted provider input and text copy carry the same [NativeCliBackend] rather than
+ * declaring a second backend vocabulary.
  *
  * Nothing here discovers a provider, resolves a target, launches a process, reads
  * an environment, or carries a command, argument, credential, path, or private
@@ -46,8 +46,8 @@ enum class SessionBackend(val wireName: String) {
 /**
  * The closed native CLI backend identity: Claude or Codex and nothing else.
  *
- * This type is the future native IO consumer contract as well as today's roster,
- * create, and host-caption identity. It is never inferred from a label, a row
+ * This type is the CONTENT hosted provider identity as well as the roster, create,
+ * and host-caption identity. It is never inferred from a label, a row
  * status, a native conversation, an executable name, or the absence of Pi telemetry.
  */
 enum class NativeCliBackend(val wireName: String) {

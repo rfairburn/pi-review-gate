@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.protocol.content
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -267,12 +268,63 @@ private fun readNativeIoStartupSource(value: JsonElement, bounds: ContentBounds)
 
 /**
  * Validate one input-path source: a startup source when (and only when) the
- * object names a `phase`, otherwise the unchanged conversation source. Copy
- * paths never call this, so a startup source is never readable as a copy source.
+ * object names a `phase` — the hosted provider CLI source when it names
+ * `native-cli`, otherwise the startup source — and otherwise the unchanged
+ * conversation source. Copy paths never call this, so a startup source is never
+ * readable as a copy source.
  */
 private fun readNativeIoInputSource(value: JsonElement, bounds: ContentBounds): NativeIoInputSource {
 	if (value is JsonObject && value.containsKey("phase")) {
-		return readNativeIoStartupSource(value, bounds)
+		return if (value.string("phase") == NATIVE_CLI_PHASE) {
+			readNativeIoNativeCliSource(value, bounds)
+		} else {
+			readNativeIoStartupSource(value, bounds)
+		}
+	}
+	return readNativeIoSource(value, bounds)
+}
+
+private const val NATIVE_CLI_PHASE = "native-cli"
+
+private val NATIVE_IO_NATIVE_CLI_SOURCE_KEYS = setOf(
+	"hostRunId",
+	"sessionId",
+	"phase",
+	"backend",
+	"geometry",
+	"viewerRevision",
+	"sourceToken",
+)
+
+/**
+ * Validate one exact hosted provider CLI source: closed keys, the one legal phase
+ * value, one of the two closed backends, and no native tuple key at all (a null or
+ * fabricated tuple is refused), because a hosted provider child has no Pi
+ * conversation.
+ */
+private fun readNativeIoNativeCliSource(value: JsonElement, bounds: ContentBounds): NativeIoNativeCliSource {
+	if (value !is JsonObject) fail(ContentFailureCode.BAD_FRAME)
+	readExactKeys(value, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, NATIVE_IO_NATIVE_CLI_SOURCE_KEYS, ContentFailureCode.BAD_FRAME)
+	if (value.string("phase") != NATIVE_CLI_PHASE) fail(ContentFailureCode.BAD_FRAME)
+	val backend = NativeCliBackend.fromWireName(value.string("backend")) ?: fail(ContentFailureCode.BAD_FRAME)
+	return NativeIoNativeCliSource(
+		hostRunId = readIdentifierValue(value.string("hostRunId"), bounds.maxIdentifierBytes),
+		sessionId = readIdentifierValue(value.string("sessionId"), bounds.maxIdentifierBytes),
+		backend = backend,
+		geometry = readGeometry(value.element("geometry"), bounds),
+		viewerRevision = value.integer("viewerRevision", 1L, MAX_SAFE_INTEGER),
+		sourceToken = readNativeIoSourceToken(value.string("sourceToken")),
+	)
+}
+
+/**
+ * Validate the source of one copy frame: the unchanged conversation source, or the
+ * tuple-less hosted provider CLI source. A startup source is never a copy source.
+ */
+private fun readNativeCopySource(value: JsonElement, bounds: ContentBounds): NativeIoCopySource {
+	if (value is JsonObject && value.containsKey("phase")) {
+		if (value.string("phase") != NATIVE_CLI_PHASE) fail(ContentFailureCode.BAD_FRAME)
+		return readNativeIoNativeCliSource(value, bounds)
 	}
 	return readNativeIoSource(value, bounds)
 }
@@ -319,6 +371,7 @@ private fun readNativeCopyEncoded(value: JsonElement): String {
 
 private val NATIVE_IO_COPY_EVENT_KEYS = setOf("kind", "encoded", "sessionId", "sessionEpoch")
 private val NATIVE_IO_COPY_UNAVAILABLE_KEYS = setOf("kind", "reason", "sessionId", "sessionEpoch")
+private val NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS = setOf("kind", "encoded", "backend")
 
 private fun readNativeCopyEvent(value: JsonElement, bounds: ContentBounds): NativeIoCopyEvent {
 	if (value !is JsonObject) fail(ContentFailureCode.BAD_FRAME)
@@ -342,6 +395,38 @@ private fun readNativeCopyEvent(value: JsonElement, bounds: ContentBounds): Nati
 }
 
 /**
+ * Validate one hosted provider TEXT copy event: closed keys, the `copy` kind only,
+ * the row's recorded backend, and a normalized text payload. There is no tuple key
+ * and no `unavailable` variant: a hosted provider child has no conversation to
+ * attribute anything else to.
+ */
+private fun readNativeCliCopyEvent(value: JsonObject): NativeIoNativeCliCopyEvent {
+	readExactKeys(
+		value,
+		NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS,
+		NATIVE_IO_NATIVE_CLI_COPY_EVENT_KEYS,
+		ContentFailureCode.BAD_FRAME,
+	)
+	if (value.string("kind") != "copy") fail(ContentFailureCode.BAD_FRAME)
+	val backend = NativeCliBackend.fromWireName(value.string("backend")) ?: fail(ContentFailureCode.BAD_FRAME)
+	return NativeIoNativeCliCopyEvent(
+		encoded = readNativeCopyEncoded(value.element("encoded")),
+		backend = backend,
+	)
+}
+
+/**
+ * Validate the copy event of one wire frame. A hosted provider event is recognized by
+ * its `backend` key alone and a conversation event by its tuple keys; both readers are
+ * exact-key, so a frame that mixes the two families is refused rather than merged, and
+ * neither family can be read as the other.
+ */
+private fun readNativeCopyFrameEvent(value: JsonElement, bounds: ContentBounds): NativeIoCopyFrameEvent {
+	if (value is JsonObject && value.containsKey("backend")) return readNativeCliCopyEvent(value)
+	return readNativeCopyEvent(value, bounds)
+}
+
+/**
  * A `content_begin` may describe a native IO source only for ITS OWN native
  * snapshot: the source must name the same owner run, the same owner row, the same
  * native tuple, and exactly the same geometry including its revision as the frame
@@ -359,8 +444,8 @@ private fun checkInputSourceCoherence(
 	nativeSession: NativeSessionRef?,
 	geometry: SessionGeometry,
 ) {
-	if (inputSource is NativeIoStartupSource) {
-		// A startup source describes ONLY a publish that names no native
+	if (inputSource is NativeIoStartupSource || inputSource is NativeIoNativeCliSource) {
+		// A tuple-less source describes ONLY a publish that names no native
 		// conversation; a frame with a tuple can never be paired with one.
 		if (nativeSession != null) fail(ContentFailureCode.BAD_FRAME)
 		if (inputSource.hostRunId != hostRunId) fail(ContentFailureCode.BAD_FRAME)
@@ -390,14 +475,26 @@ private fun checkInputSourceCoherence(
 }
 
 /**
- * A copy names one authenticated native conversation twice: in the frame source
- * and in the producer's event. The two must agree, so an inline payload can never
- * be attributed to a different tuple. Coherence only; no permission, gate, or
- * lease is created here.
+ * A copy names its producer twice: in the frame source and in the producer's event.
+ * A conversation copy names the same authenticated native conversation in both, so
+ * an inline payload can never be attributed to a different tuple. A hosted provider
+ * copy names the same recorded backend in both and carries NO tuple anywhere.
+ *
+ * Coherence only; no permission, gate, or lease is created here.
  */
-private fun checkCopyTupleCoherence(source: NativeIoSource, event: NativeIoCopyEvent) {
-	if (event.sessionId != source.nativeSession.sessionId) fail(ContentFailureCode.BAD_FRAME)
-	if (event.sessionEpoch != source.nativeSession.epoch) fail(ContentFailureCode.BAD_FRAME)
+private fun checkCopyCoherence(source: NativeIoCopySource, event: NativeIoCopyFrameEvent) {
+	if (source is NativeIoNativeCliSource) {
+		// The two families never mix: a tuple-carrying event on a tuple-less source (or
+		// the reverse) describes two different producers and is refused.
+		val cli = event as? NativeIoNativeCliCopyEvent ?: fail(ContentFailureCode.BAD_FRAME)
+		if (cli.backend != source.backend) fail(ContentFailureCode.BAD_FRAME)
+		return
+	}
+	if (event is NativeIoNativeCliCopyEvent) fail(ContentFailureCode.BAD_FRAME)
+	val conversation = event as NativeIoCopyEvent
+	val tupleSource = source as? NativeIoSource ?: fail(ContentFailureCode.BAD_FRAME)
+	if (conversation.sessionId != tupleSource.nativeSession.sessionId) fail(ContentFailureCode.BAD_FRAME)
+	if (conversation.sessionEpoch != tupleSource.nativeSession.epoch) fail(ContentFailureCode.BAD_FRAME)
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1201,10 +1298,10 @@ internal fun buildFrame(record: JsonObject, bounds: ContentBounds): ContentFrame
 		)
 
 		"copy" -> {
-			val source = readNativeIoSource(record.element("source"), bounds)
-			val event = readNativeCopyEvent(record.element("event"), bounds)
-			// The event tuple and the source tuple name the same conversation.
-			checkCopyTupleCoherence(source, event)
+			val source = readNativeCopySource(record.element("source"), bounds)
+			val event = readNativeCopyFrameEvent(record.element("event"), bounds)
+			// The event names the same producer as the source: tuple, or recorded backend.
+			checkCopyCoherence(source, event)
 			CopyFrame(
 				subscriptionId = readIdentifierValue(record.string("subscriptionId"), bounds.maxIdentifierBytes),
 				copyId = readIdentifierValue(record.string("copyId"), bounds.maxIdentifierBytes),
@@ -1224,7 +1321,7 @@ internal fun buildFrame(record: JsonObject, bounds: ContentBounds): ContentFrame
 				subscriptionId = readIdentifierValue(record.string("subscriptionId"), bounds.maxIdentifierBytes),
 				copyId = readIdentifierValue(record.string("copyId"), bounds.maxIdentifierBytes),
 				sequence = record.integer("sequence", 1L, MAX_SAFE_INTEGER),
-				source = readNativeIoSource(record.element("source"), bounds),
+				source = readNativeCopySource(record.element("source"), bounds),
 				dispatchId = record.integer("dispatchId", 1L, MAX_SAFE_INTEGER),
 				byteLength = byteLength,
 				chunkCount = chunkCount,

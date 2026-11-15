@@ -19,8 +19,10 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.ContentFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentProtocol
 import io.github.rfairburn.pireviewgate.core.protocol.content.INPUT_MODES
 import io.github.rfairburn.pireviewgate.core.protocol.content.contentSource
+import io.github.rfairburn.pireviewgate.core.protocol.content.nativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.sampleFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputSource
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.OptionalNativeIoSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.SessionGeometry
 import io.github.rfairburn.pireviewgate.core.protocol.content.SubscribeFrame
@@ -541,6 +543,13 @@ internal class RuntimeHarness(
         publish: Boolean = true,
         cols: Int = 80,
         rows: Int = 24,
+        /** What this side offers and the fake owner acknowledges on the CONTENT hello. */
+        contentCapabilities: List<String> = NATIVE_IO_ACK_CAPS,
+        /** The host-written source of the published viewport, or none. */
+        source: NativeIoInputSource? = nativeSource(rowId),
+        /** The Pi conversation the publish names; null for a tuple-less hosted publish. */
+        nativeSession: io.github.rfairburn.pireviewgate.core.protocol.content.NativeSessionRef? =
+            io.github.rfairburn.pireviewgate.core.protocol.content.NativeSessionRef("native-session-1", 3),
     ): FakePeerByteChannel {
         val existing = hostChannel(hostId)
         val roster = existing ?: attach(hostId).also {
@@ -553,8 +562,17 @@ internal class RuntimeHarness(
         check(selected is SelectionResult.Selected) { "selection was refused: $selected" }
         settle()
         val content = lastContentChannel()
-        contentUp(content, NATIVE_IO_ACK_CAPS, hostId, RUN_ID, rowId)
-        if (publish) publishContent(content, source = nativeSource(rowId), sequence = 1L, runId = RUN_ID, rowId = rowId)
+        contentUp(content, contentCapabilities, hostId, RUN_ID, rowId)
+        if (publish) {
+            publishContent(
+                content,
+                source = source,
+                sequence = 1L,
+                runId = RUN_ID,
+                rowId = rowId,
+                nativeSession = nativeSession,
+            )
+        }
         return content
     }
 
@@ -734,6 +752,21 @@ internal val CONTENT_GEOMETRY: SessionGeometry = SessionGeometry(cols = 12, rows
 /** The native IO capability pair a suite acks when it wants remote input. */
 internal val NATIVE_IO_ACK_CAPS: List<String> =
     listOf(ContentProtocol.REQUIRED_CAPABILITY, ContentProtocol.NATIVE_IO_CAPABILITY)
+
+/**
+ * The acknowledgement that also turns on the hosted provider CLI input and text copy.
+ * Offering them is this side's act; this list is what the fake owner says back.
+ */
+internal val HOSTED_IO_ACK_CAPS: List<String> = listOf(
+    ContentProtocol.REQUIRED_CAPABILITY,
+    ContentProtocol.NATIVE_IO_CAPABILITY,
+    ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY,
+    ContentProtocol.NATIVE_COPY_CLI_CAPABILITY,
+)
+
+/** The hosted provider CLI source of [CONTENT_GEOMETRY], bound to this suite's run and row. */
+internal fun hostedSource(rowId: String = ROW_1): NativeIoNativeCliSource =
+    nativeCliSource(sessionId = rowId, geometry = CONTENT_GEOMETRY)
 
 /** The host-written source of [CONTENT_GEOMETRY], bound to this suite's run and row. */
 internal fun nativeSource(rowId: String = ROW_1): io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoSource =

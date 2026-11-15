@@ -45,9 +45,9 @@ and does not by itself block an otherwise admissible new start. The accepted
 duplicate risk is disclosed, not hidden: because that legacy group's original
 submitted identity is unavailable, an identical new start can duplicate its
 still-active work; the new start is not proven distinct or safe. A blocked
-`SubtasksInspect` takes no new snapshot; repeated polling is discouraged in
-favor of event-driven completion notifications or a decision-relevant, one-shot
-`SubtasksWatch` callback.
+`SubtasksInspect` takes no new snapshot; there is no need to poll when event-driven
+completion notifications provide the signal, and a decision-relevant, one-shot
+`SubtasksWatch` callback remains available. A purposeful status check is fine.
 
 This is a native Pi extension-hook guard in the primary and Pi executor
 runtimes. It does not intercept calls made by an external API harness or wrapper
@@ -637,6 +637,16 @@ work. Prolonged work without a verifiable result is a reason to reassess — not
 an automatic cancellation or a rigid elapsed-time or task-size limit — and
 rescoping preserves completed work and accepted invariants.
 
+**Foreground responsiveness and monitoring.** Keep the foreground available for
+interaction and useful work. Prefer a background shell/task with its completion
+signal, a one-shot `SubtasksWatch` checkpoint, callbacks, or proactive
+completion/failure/conflict notifications over a foreground `sleep 300` or a
+long polling loop. There is no need to poll when those notifications provide the
+signal; a purposeful status check or background monitor is appropriate when it
+supplies information that waiting blindly would not, and harmless monitoring
+alone is not a reason to correct or steer a worker. Responsibility for
+completion, failures, validation, review, and CI remains unchanged.
+
 **Representative scenarios.** The deterministic checks in this repository
 validate that the policy is present on the shipped surfaces and that the
 applicable mechanics (independent capture and landing, top-off, one-shot watch)
@@ -660,9 +670,17 @@ evaluations of the intended behavior:
 7. *Positive:* justified controlled overlap with an integration order, resolved
    so both accepted intents survive and the combined result is validated.
 8. *Positive:* reassessment based on observed lack of progress or review churn,
-   without polling loops or automatic time-limit cancellation.
+   without a foreground polling loop occupying the interactive turn or automatic
+   time-limit cancellation.
 9. *Positive:* legitimate waiting when nothing useful is ready or user authority
    or answers are required.
+10. *Positive:* a background shell/task with its completion signal, callback, or
+    one-shot `SubtasksWatch` checkpoint instead of a foreground `sleep 300` or a
+    long polling loop.
+11. *Positive:* a purposeful status check or harmless watch/monitor that informs
+    a decision, with no correction solely for checking status.
+12. *Negative:* a foreground sleep or long polling loop that blocks interaction
+    when background work plus a completion signal would meet the need.
 
 ## Capture and ignore policy
 
@@ -1142,9 +1160,11 @@ assigned-starting versus capacity-waiting tasks and a point-in-time scheduler
 snapshot without claiming startup has completed. A partial landing event
 identifies the landed paths and every sibling that has not landed; only the
 final event invites aggregate verification. Completion, failure, meaningful
-state changes, and workspace conflicts are delivered proactively; polling loops
-are neither required nor recommended, but purposeful `SubtasksInspect` calls are
-always supported.
+state changes, and workspace conflicts are delivered proactively, so there is no
+need to poll when those notifications provide the signal. A purposeful
+`SubtasksInspect` or background monitor is supported and can be appropriate; keep
+waiting or repeated monitoring in the background instead of a foreground sleep or
+long polling loop.
 
 **Compact expandable presentation:** the extension's automatic notification
 messages render through one shared, presentation-only expansion core (the same

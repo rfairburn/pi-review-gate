@@ -27,7 +27,7 @@ Read the packet for:
 6. **Recovery manifests and safe actions.** Follow the packet's safe/blocked actions. A verified landing-recovery manifest may be reconciled during continuation; an unverified manifest blocks source mutation.
 7. **Artifacts and diagnostics.** Use the task artifact directory, activity, reviewer result, failed stage, and error-state exception to decide whether the worker should continue, be replaced, or have its checkpoint landed.
 
-Do not poll for ordinary progress. Inspect once for a decision, take the selected action, then rely on events again.
+There is no need to poll for ordinary progress: inspect once when a current snapshot informs a decision, take the selected action, then rely on events again. A purposeful status check or background monitor remains allowed; harmless monitoring alone is not a recovery problem.
 
 ## Choose recovery by state
 

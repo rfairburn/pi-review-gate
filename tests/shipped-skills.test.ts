@@ -98,14 +98,16 @@ test("execution skill covers background shells, the workspace contract, and hone
   const skill = await readSkillFlat("pi-review-gate-execution");
   for (const phrase of [
     // Background-shell semantics from src/background-shell: handles, event
-    // wakes, explicit stop — never polling.
+    // wakes, explicit stop — advisory monitoring, not a hard polling ban.
     "`ShellStart`",
     "`ShellList`",
     "`ShellLog`",
     "`ShellSend`",
     "`ShellStop`",
     "event notifications and wakes",
-    "never poll",
+    "there is no need to poll, sleep, or spin on handles",
+    "a purposeful `ShellLog` or status read is fine",
+    "preferable to a foreground `sleep 300` or a long polling loop",
     // Delegated execution workspace contract: detached HEAD, harness-owned.
     "detached-HEAD managed worktrees",
     "Never check out, create, switch, or delete Git branches",
@@ -125,6 +127,65 @@ test("execution skill covers background shells, the workspace contract, and hone
   ]) {
     assert.ok(skill.includes(phrase), `execution skill missing: ${phrase}`);
   }
+});
+
+test("shipped orchestration and execution guidance keeps the foreground responsive with advisory monitoring (#668)", async () => {
+  // Wording and wiring checks on shipped model-facing guidance. They pin the
+  // positive background/event-driven preference, the permission for useful
+  // monitoring, and the unchanged one-shot watch contract; they are not evidence
+  // of model behavior or token savings.
+  const skill = await readSkillFlat("pi-review-gate-orchestrator");
+  const execution = await readSkillFlat("pi-review-gate-execution");
+  const prompt = await readRepoFileFlat(path.join("scripts", "orchestrator-system-prompt.md"));
+  const executionPrompt = await readRepoFileFlat(path.join("scripts", "execution-system-prompt.md"));
+  const recovery = await readRepoFileFlat(path.join("skills", "pi-review-gate-orchestrator", "references", "recovery.md"));
+  const readme = await readRepoFileFlat("README.md");
+  const docs = await readRepoFileFlat(path.join("docs", "delegated-execution.md"));
+
+  for (const [name, text] of [
+    ["orchestrator skill", skill],
+    ["execution skill", execution],
+    ["orchestrator prompt", prompt],
+    ["execution prompt", executionPrompt],
+  ] as const) {
+    // Positive preference for background work and its completion signal, with
+    // the foreground kept available for interaction and meaningful work.
+    assert.match(text, /background (shell|shells)|background shell\/task|background shells\/tasks/, `${name} must recommend background work`);
+    assert.match(text, /completion signal|completion wake|event notifications|automatic notifications/, `${name} must recommend completion signals or events`);
+    assert.match(text, /no need to poll/, `${name} must state that polling is unnecessary when notifications suffice`);
+    assert.match(text, /foreground `sleep 300`|foreground sleep/, `${name} must illustrate the foreground sleep case`);
+    // Monitoring remains permitted; the orchestrator surfaces also state that
+    // harmless monitoring alone is not a correction-worthy violation.
+    assert.match(text, /purposeful status check|purposeful `ShellLog`|purposeful SubtasksInspect/, `${name} must allow purposeful monitoring`);
+  }
+  for (const [name, text] of [
+    ["orchestrator skill", skill],
+    ["orchestrator prompt", prompt],
+  ] as const) {
+    assert.match(text, /harmless monitoring alone is not|not itself a violation|not a reason to steer/, `${name} must not treat harmless monitoring as a violation`);
+  }
+  // The recovery runbook keeps the same advisory boundary without banning a
+  // useful check.
+  assert.match(recovery, /There is no need to poll for ordinary progress/);
+  assert.match(recovery, /purposeful status check or background monitor remains allowed/);
+  assert.doesNotMatch(recovery, /Do not poll for ordinary progress/);
+  // Public docs prefer a background completion signal/one-shot watch over a
+  // foreground sleep or long poll, while keeping useful checks allowed.
+  assert.match(readme, /Keep the foreground responsive/);
+  assert.match(readme, /one explicit checkpoint rather than a recurring heartbeat/);
+  assert.match(readme, /purposeful status checks and background monitoring remain allowed/);
+  assert.match(docs, /Foreground responsiveness and monitoring/);
+  assert.match(docs, /one-shot `SubtasksWatch` checkpoint/);
+  assert.match(docs, /harmless monitoring alone is not a reason to correct or steer a worker/);
+  assert.match(docs, /a foreground `sleep 300` or a long polling loop/);
+  assert.match(docs, /there is no need to poll when those notifications provide the signal/);
+
+  // The watch remains one-shot and explicitly rearmed; no runtime contract was
+  // relaxed into a recurring heartbeat.
+  assert.match(skill, /use `SubtasksWatch`\. It returns immediately, replaces the execution's prior watch, cancels on an earlier completion\/failure\/conflict\/recovery event, and fires at most once/);
+  assert.match(skill, /Never turn it into a recurring heartbeat/);
+  assert.match(prompt, /one-shot, is cancelled by an earlier actionable event, and must be explicitly rearmed/);
+  assert.match(execution, /Only genuinely quick commands — seconds, not minutes — belong in the foreground/);
 });
 
 test("research skill enforces read-only work and forbids execution even when called research", async () => {

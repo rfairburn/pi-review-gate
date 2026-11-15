@@ -979,7 +979,7 @@ function toolSpecificNextStep(name: string, earlierResultObserved: boolean): str
     case "SubtasksStart":
       return undefined;
     case "SubtasksInspect":
-      return "No inspection snapshot was taken by this member. Repeated polling is discouraged; rely on event-driven completion notifications, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues.";
+      return "No inspection snapshot was taken by this member. There is no need to poll when event-driven completion notifications provide the signal; a purposeful status check is fine, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues.";
     case "ApplyPatch":
       return "Revalidate the intended patch against the current file contents and any prior patch outcome before making further edits.";
     case "bash":

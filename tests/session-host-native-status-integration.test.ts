@@ -416,6 +416,41 @@ const claudeDeclinedToolResultRow = (sessionId: string, requestId: string): stri
   timestamp: "2026-01-02T03:04:06.000Z",
 })}\n`;
 
+/**
+ * Fixture text of one provider background completion notification. The member id
+ * is the provider's own task-registry key - the same namespace a successful
+ * launch result and a root membership snapshot report - and none of this text,
+ * the output path, or the summary may ever resurface on a row view.
+ */
+const TASK_ID = "synthetic-shell-id";
+const TASK_TOOL_USE_ID = "synthetic-bash-tool-id";
+const TASK_OUTPUT_FILE = "/synthetic/output";
+const TASK_SUMMARY = "[synthetic]";
+
+/**
+ * The provider's OWN persisted completion record for one background member: a
+ * `queue-operation` `enqueue` row in this run's own root session whose `content`
+ * carries the native `task-notification` envelope - the shape the installed
+ * provider writes when a background job finishes, persisted BEFORE that
+ * notification is handed to the model, so before any answer, decline, or next
+ * prompt. Only the `task-id` and `status` tags are ever readable from it.
+ */
+const claudeQueuedTaskCompletionRow = (sessionId: string, taskId: string): string => `${JSON.stringify({
+  type: "queue-operation",
+  operation: "enqueue",
+  sessionId,
+  timestamp: "2026-01-02T03:04:05.000Z",
+  content: [
+    "<task-notification>",
+    `<task-id>${taskId}</task-id>`,
+    `<tool-use-id>${TASK_TOOL_USE_ID}</tool-use-id>`,
+    `<output-file>${TASK_OUTPUT_FILE}</output-file>`,
+    "<status>completed</status>",
+    `<summary>${TASK_SUMMARY}</summary>`,
+    "</task-notification>",
+  ].join("\n"),
+})}\n`;
+
 test("a freshly spawned Claude row is known idle before any provider hook, and the provider's own boundary keeps it there", async () => {
   const harness = await makeHarness();
   try {
@@ -471,7 +506,11 @@ test("a declined question clears pending input from its persisted tool_result, w
       prompt_id: "p-1", tool_name: "AskUserQuestion", tool_use_id: "q-1",
     }));
     const asked = await harness.waitView(id, (view) => view.pendingInput === true, "the open question request");
-    assert.equal(asked.busy, true);
+    // Nothing else in this turn has an open request, so this question IS what the
+    // provider is stopped on: the published foreground is the stopped-on-input
+    // `false` the host uses for any session waiting on a human, while the observed
+    // turn underneath it is kept and returns when the request closes.
+    assert.equal(asked.busy, false, "a lone open root question publishes waiting, not running");
 
     // The user declined. No Post hook ever ran for this request; the provider's
     // own persisted tool_result for that exact identity is the terminal evidence.
@@ -578,6 +617,107 @@ test("a real Claude turn: hook lane publishes running, the tool TYPE, and the qu
     const serialized = JSON.stringify(harness.manager.list());
     for (const secret of [SECRET_PROMPT, SECRET_TOOL_INPUT, transcript]) {
       assert.ok(!serialized.includes(secret), "the row view carries no provider content or path");
+    }
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test("background membership: a real Bash launch counts one shell, its own persisted completion row settles it while a question stays pending, and host ownership never moves", async () => {
+  const harness = await makeHarness();
+  try {
+    const id = await harness.create("claude");
+    const transcript = transcriptFile(harness, "claude-background-membership.jsonl");
+    const bootstrap = bootstrapOf(harness);
+
+    // The host owns this spawn, so this run's census starts from a positively
+    // known EMPTY set - and the row's OWNERSHIP pair, which only a Pi child can
+    // state, starts unknown and stays unknown for every provider number below.
+    const fresh = harness.view(id);
+    assert.equal(fresh.activeTasks, 0);
+    assert.equal(fresh.activeShells, 0);
+    assert.equal(fresh.backgroundTasks, null, "a hosted provider child owns no Pi background work");
+    assert.equal(fresh.backgroundShells, null);
+
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "SessionStart", { source: "startup" }));
+    await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "UserPromptSubmit", { prompt_id: "p-1" }));
+    await harness.waitView(id, (view) => view.busy === true, "the running root turn");
+
+    // A backgrounding INTENT is not a launch: the opening call claims a tool TYPE
+    // and adds no member.
+    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "PreToolUse", {
+      prompt_id: "p-1", tool_name: "Bash", tool_use_id: TASK_TOOL_USE_ID,
+    }))).status, "accepted");
+    const intent = harness.view(id);
+    assert.equal(intent.activity[0], "bash");
+    assert.equal(intent.activeShells, 0, "a PreToolUse intent is never a member");
+
+    // The provider's own successful result names the task-registry id of the shell
+    // it actually started, and only that verified pairing counts as membership.
+    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "PostToolUse", {
+      prompt_id: "p-1", tool_name: "Bash", tool_use_id: TASK_TOOL_USE_ID,
+      tool_response: { backgroundTaskId: TASK_ID },
+    }))).status, "accepted");
+    const launched = await harness.waitView(id, (view) => view.activeShells === 1, "the confirmed shell launch joined the census");
+    assert.equal(launched.activeTasks, 0);
+    assert.equal(launched.busy, true);
+    assert.equal(launched.pendingInput, false);
+    assert.equal(launched.backgroundShells, null, "the provider's number never becomes this host's ownership");
+
+    // The Bash request closed with its own result, so the question that opens next
+    // is the provider's current block: waiting, beside a census that stays live.
+    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "PreToolUse", {
+      prompt_id: "p-1", tool_name: "AskUserQuestion", tool_use_id: "q-1",
+    }))).status, "accepted");
+    const asked = await harness.waitView(id, (view) => view.pendingInput === true, "the open question request");
+    assert.equal(asked.busy, false, "the standing question publishes waiting, not running");
+    assert.deepEqual(asked.activity, ["bash"]);
+    assert.equal(asked.activeShells, 1, "a paused foreground says nothing about the running shell");
+
+    // The shell finishes while the row still waits on that question: no Stop, no
+    // answer, no decline, and no next prompt happened. The one fact is the
+    // provider's own structured completion row in this run's bound root session,
+    // read by the real bounded tail of this run's own bound file.
+    appendFileSync(transcript, claudeQueuedTaskCompletionRow("sess-a", TASK_ID), "utf8");
+    const settled = await harness.waitView(id, (view) => view.activeShells === 0, "the persisted completion row settled this exact shell");
+    assert.equal(settled.activeTasks, 0);
+    assert.equal(settled.pendingInput, true, "the settlement says nothing about the standing question");
+    assert.equal(settled.busy, false, "the row is still waiting on the question it was waiting on");
+    assert.deepEqual(settled.activity, ["bash"], "a settlement invents no foreground claim");
+
+    // The user declines: the persisted tool_result for that exact identity closes
+    // the request, and the observed turn underneath the pause returns - a running
+    // row, never a fabricated Ready.
+    appendFileSync(transcript, claudeDeclinedToolResultRow("sess-a", "q-1"), "utf8");
+    const closed = await harness.waitView(id, (view) => view.pendingInput === false, "the persisted tool_result closed the question");
+    assert.equal(closed.busy, true, "closing the standing question restores the observed running foreground");
+    assert.deepEqual(closed.activity, ["bash"]);
+    assert.equal(closed.activeShells, 0, "a settled shell stays settled");
+
+    // The turn still ends only on its own evidence: this observer's Stop is a
+    // boundary, and Ready comes from the summary persisted after the relay's ACK.
+    assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "Stop", { prompt_id: "p-1" }))).status, "accepted");
+    assert.equal(harness.view(id).busy, null, "this observer's own Stop hook is never proof of Ready");
+    appendFileSync(transcript, claudeSummaryRow(), "utf8");
+    const ready = await harness.waitView(id, (view) => view.busy === false, "the source-confirmed root turn end");
+    assert.deepEqual(ready.activity, ["Ready"]);
+    assert.equal(ready.pendingInput, false);
+    assert.equal(ready.activeTasks, 0, "the exact empty census survives its own turn end");
+    assert.equal(ready.activeShells, 0);
+
+    // Across every view this row ever carried, the provider's display-only numbers
+    // never became the host's ownership pair, and nothing the provider or the
+    // notification named travels on this lane.
+    for (const view of harness.viewsOf(id)) {
+      assert.equal(view.backgroundTasks, null, "no provider count ever became Pi ownership");
+      assert.equal(view.backgroundShells, null, "no provider count ever became Pi ownership");
+    }
+    const serialized = JSON.stringify(harness.manager.list());
+    for (const secret of [
+      SECRET_PROMPT, SECRET_TOOL_INPUT, transcript,
+      TASK_ID, TASK_TOOL_USE_ID, TASK_OUTPUT_FILE, TASK_SUMMARY, "<task-notification>",
+    ]) {
+      assert.ok(!serialized.includes(secret), "the row view carries no provider content, path, or member id");
     }
   } finally {
     await harness.dispose();

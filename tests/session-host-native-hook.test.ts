@@ -30,6 +30,9 @@ import {
   MAX_NATIVE_HOOK_BACKGROUND_TASKS,
   MAX_NATIVE_HOOK_STDIN_BYTES,
   NATIVE_HOOK_BOOTSTRAP_ENV,
+  MAX_NATIVE_HOOK_MEMBER_ID_BYTES,
+  MAX_NATIVE_HOOK_MEMBERS_ID_BYTES,
+  deriveNativeHookBackgroundSnapshot,
   decodeNativeHookAck,
   decodeNativeHookFrame,
   encodeNativeHookBootstrapEnv,
@@ -38,6 +41,7 @@ import {
   parseNativeHookBootstrapEnv,
   sanitizeNativeHookProviderInput,
   type NativeHookAckFrame,
+  type NativeHookBackgroundMember,
   type NativeHookBootstrap,
   type NativeHookEvent,
   type NativeHookEventFrame,
@@ -46,6 +50,7 @@ import {
   type NativeHookFailureReason,
 } from "../src/session-host/native-hook-protocol";
 import { runNativeHookRelay } from "../src/session-host/native-hook-relay";
+import { NativeClaudeBackgroundLedger } from "../src/session-host/native-claude-background";
 import {
   NODE_OPTIONS_RESTORE_ENV,
   RUNTIME_ROLE_ENV,
@@ -537,7 +542,13 @@ test("Stop-family background snapshot projection is whole-array validated and co
   });
   assert.deepEqual(sanitizeNativeHookProviderInput({ hook_event_name: "Stop", background_tasks: [] }), {
     ok: true,
-    metadata: { hook_event_name: "Stop", background_counts: { tasks: 0, shells: 0 } },
+    metadata: {
+      hook_event_name: "Stop",
+      background_counts: { tasks: 0, shells: 0 },
+      // An empty provider array is a complete snapshot, so membership is known
+      // to be empty rather than merely unobserved.
+      background_members: [],
+    },
   });
   // The snapshot is established only for Stop/SubagentStop; another hook's
   // arbitrary background_tasks field is not reinterpreted as native counts.
@@ -676,7 +687,12 @@ test("relay projects validated Stop/SubagentStop background counts and keeps abs
       background_counts: { tasks: 2, shells: 1 },
     },
     { backend: "claude", hook_event_name: "Stop" },
-    { backend: "claude", hook_event_name: "Stop", background_counts: { tasks: 0, shells: 0 } },
+    {
+      backend: "claude",
+      hook_event_name: "Stop",
+      background_counts: { tasks: 0, shells: 0 },
+      background_members: [],
+    },
     {
       backend: "claude",
       hook_event_name: "SubagentStop",
@@ -1377,4 +1393,492 @@ test("the genuine compiled entrypoint stays silent, exits zero, and delivers one
   assert.equal(failed.stderr, "");
   await waitFor(() => recorded.failures.length === 1, "entrypoint failure");
   assert.deepEqual(recorded.failures[0], { backend: "claude", reason: "input-malformed" });
+});
+
+// --- background membership and launch metadata (live-count counter core) -----
+//
+// These fixtures use the field shapes verified in the installed Claude Code
+// 2.1.325 binary: a Stop `background_tasks` entry is
+// `{id, type, status, description, …type extras}` (producer `$Qn`, schema `aC`)
+// already pre-filtered by the provider to running/pending backgrounded work, and
+// a background launch is a `PostToolUse` `tool_response` carrying either
+// `backgroundTaskId` (Bash) or `status:"async_launched"` plus `agentId`
+// (Task/Agent). Ids are the provider's own task-registry keys, so a launch id
+// and a later snapshot member id are the same namespace.
+
+const REAL_STOP_SNAPSHOT = [
+  { id: "b8k3n1p4q", type: "shell", status: "running", description: "SECRET DESCRIPTION", command: "SECRET COMMAND" },
+  { id: "a1a2b3c4d", type: "subagent", status: "running", description: "SECRET DESCRIPTION", agent_type: "worker" },
+  { id: "m22222222", type: "monitor", status: "pending", description: "SECRET DESCRIPTION", server: "SECRET SERVER", tool: "SECRET TOOL" },
+];
+
+test("a real-shaped Stop snapshot projects closed membership alongside counts, without any provider text", () => {
+  const selected = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    session_id: "session-root",
+    stop_hook_active: false,
+    last_assistant_message: "SECRET FINAL MESSAGE",
+    background_tasks: REAL_STOP_SNAPSHOT,
+    session_crons: [{ id: "c1", schedule: "SECRET CRON", prompt: "SECRET PROMPT" }],
+  });
+  assert.equal(selected.ok, true);
+  if (!selected.ok) assert.fail("the real-shaped Stop snapshot must be admitted");
+  assert.deepEqual(selected.metadata, {
+    hook_event_name: "Stop",
+    session_id: "session-root",
+    background_counts: { tasks: 2, shells: 1 },
+    background_members: [
+      { id: "b8k3n1p4q", kind: "shell" },
+      { id: "a1a2b3c4d", kind: "task" },
+      { id: "m22222222", kind: "task" },
+    ],
+  });
+  const serialized = JSON.stringify(selected);
+  assert.ok(!serialized.includes("SECRET"), "no description, command, cron, prompt, or message is projected");
+  assert.ok(!serialized.includes("background_tasks"), "the raw provider array never crosses the wire");
+
+  // An empty provider array is a positively observed empty set, not an absence.
+  const empty = sanitizeNativeHookProviderInput({ hook_event_name: "Stop", background_tasks: [] });
+  assert.deepEqual(empty, {
+    ok: true,
+    metadata: {
+      hook_event_name: "Stop",
+      background_counts: { tasks: 0, shells: 0 },
+      background_members: [],
+    },
+  });
+
+  // The shared derivation pass is what keeps counts and membership consistent.
+  const derived = deriveNativeHookBackgroundSnapshot(REAL_STOP_SNAPSHOT);
+  assert.equal(derived.ok, true);
+  if (!derived.ok) assert.fail("the snapshot should derive");
+  assert.deepEqual(derived.counts, { tasks: 2, shells: 1 });
+  assert.deepEqual(derived.members, [
+    { id: "b8k3n1p4q", kind: "shell" },
+    { id: "a1a2b3c4d", kind: "task" },
+    { id: "m22222222", kind: "task" },
+  ]);
+});
+
+test("an unidentified active entry makes membership unknown instead of a shortened set", () => {
+  const selected = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    background_tasks: [
+      { id: "b8k3n1p4q", type: "shell", status: "running", description: "SECRET" },
+      { type: "subagent", status: "pending", description: "SECRET" },
+    ],
+  });
+  assert.equal(selected.ok, true);
+  if (!selected.ok) assert.fail("counts are still derivable");
+  assert.deepEqual(selected.metadata, {
+    hook_event_name: "Stop",
+    background_counts: { tasks: 1, shells: 1 },
+  });
+  assert.ok(!("background_members" in selected.metadata), "a partial membership view is never published");
+
+  // Foreground entries stay excluded exactly as before: an explicit
+  // `backgrounded: false` is the provider's own foreground marker.
+  const foreground = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    background_tasks: [
+      { id: "b8k3n1p4q", type: "shell", status: "running", backgrounded: false, description: "SECRET" },
+      { id: "a1a2b3c4d", type: "subagent", status: "running", backgrounded: true, description: "SECRET" },
+    ],
+  });
+  assert.deepEqual(foreground, {
+    ok: true,
+    metadata: {
+      hook_event_name: "Stop",
+      background_counts: { tasks: 1, shells: 0 },
+      background_members: [{ id: "a1a2b3c4d", kind: "task" }],
+    },
+  });
+});
+
+test("malformed membership ids and snapshots are closed failures, never partial counts or a fake empty", () => {
+  const malformed: unknown[] = [
+    // Duplicate ids: the set would silently lose a member.
+    [
+      { id: "b8k3n1p4q", type: "shell", status: "running", description: "SECRET" },
+      { id: "b8k3n1p4q", type: "subagent", status: "running", description: "SECRET" },
+    ],
+    // A non-text id, an empty id, and an oversized id are not opaque ids.
+    [{ id: 7, type: "shell", status: "running", description: "SECRET" }],
+    [{ id: "", type: "shell", status: "running", description: "SECRET" }],
+    [{ id: "x".repeat(MAX_NATIVE_HOOK_MEMBER_ID_BYTES + 1), type: "shell", status: "running", description: "SECRET" }],
+    // A control character is refused by the existing text guard.
+    [{ id: "bad\u0001id", type: "shell", status: "running", description: "SECRET" }],
+    // The existing whole-array guards are preserved unchanged.
+    [{ status: "running", backgrounded: "yes", type: "shell" }],
+    [{ id: "b8k3n1p4q", status: "", type: "shell", description: "SECRET" }],
+    Array.from({ length: MAX_NATIVE_HOOK_BACKGROUND_TASKS + 1 }, () => ({
+      id: "b8k3n1p4q",
+      status: "completed",
+      backgrounded: false,
+      type: "shell",
+    })),
+  ];
+  for (const snapshot of malformed) {
+    const result = sanitizeNativeHookProviderInput({ hook_event_name: "Stop", background_tasks: snapshot });
+    assert.equal(result.ok, false, "malformed membership fails closed instead of counting partially");
+    if (result.ok) assert.fail("expected an explicit snapshot failure");
+    assert.ok(result.reason === "input-invalid" || result.reason === "input-too-large");
+  }
+});
+
+test("only an actual successful launch result projects background_started", () => {
+  const bashBackground = sanitizeNativeHookProviderInput({
+    hook_event_name: "PostToolUse",
+    session_id: "session-root",
+    tool_name: "Bash",
+    tool_use_id: "toolu-1",
+    tool_input: { command: "SECRET COMMAND", run_in_background: true },
+    tool_response: {
+      stdout: "SECRET OUTPUT",
+      stderr: "",
+      interrupted: false,
+      backgroundTaskId: "b8k3n1p4q",
+      backgroundOutputPath: "/tmp/SECRET-OUTPUT-PATH",
+    },
+  });
+  assert.equal(bashBackground.ok, true);
+  if (!bashBackground.ok) assert.fail("the Bash background result should be admitted");
+  assert.deepEqual(bashBackground.metadata, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-root",
+    tool_name: "Bash",
+    tool_use_id: "toolu-1",
+    background_started: { id: "b8k3n1p4q", kind: "shell" },
+  });
+
+  const asyncAgent = sanitizeNativeHookProviderInput({
+    hook_event_name: "PostToolUse",
+    tool_name: "Task",
+    tool_use_id: "toolu-2",
+    tool_input: { prompt: "SECRET PROMPT", subagent_type: "worker" },
+    tool_response: {
+      status: "async_launched",
+      agentId: "a1a2b3c4d",
+      description: "SECRET DESCRIPTION",
+      prompt: "SECRET PROMPT",
+      outputFile: "/tmp/SECRET-OUTPUT-PATH",
+    },
+  });
+  assert.equal(asyncAgent.ok, true);
+  if (!asyncAgent.ok) assert.fail("the async agent result should be admitted");
+  assert.deepEqual(asyncAgent.metadata.background_started, { id: "a1a2b3c4d", kind: "task" });
+  assert.ok(!JSON.stringify(asyncAgent.metadata).includes("SECRET"), "no prompt, description, or path is projected");
+
+  // The provider's own name dispatch accepts both spellings of the subagent
+  // tool, so both are verified task-launch tools.
+  const agentAlias = sanitizeNativeHookProviderInput({
+    hook_event_name: "PostToolUse",
+    tool_name: "Agent",
+    tool_use_id: "toolu-2b",
+    tool_response: { status: "async_launched", agentId: "a9z9z9z9z" },
+  });
+  assert.equal(agentAlias.ok, true);
+  if (!agentAlias.ok) assert.fail("the Agent alias should be admitted");
+  assert.deepEqual(agentAlias.metadata.background_started, { id: "a9z9z9z9z", kind: "task" });
+
+  const notBackground: unknown[] = [
+    // A backgrounding INTENT is not a launch: the tool may still be denied.
+    { hook_event_name: "PreToolUse", tool_name: "Bash", tool_use_id: "toolu-3", tool_input: { command: "SECRET", run_in_background: true } },
+    // A foreground agent that ran to completion is not background work.
+    { hook_event_name: "PostToolUse", tool_name: "Task", tool_use_id: "toolu-4", tool_response: { status: "completed", report: "SECRET REPORT" } },
+    // A failed tool result never launches anything, even with the field present.
+    { hook_event_name: "PostToolUseFailure", tool_name: "Bash", tool_use_id: "toolu-5", tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+    // An unusable id is unknown, never a guessed member.
+    { hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu-6", tool_response: { backgroundTaskId: 7 } },
+    { hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu-7", tool_response: { backgroundTaskId: "" } },
+    { hook_event_name: "PostToolUse", tool_name: "Task", tool_use_id: "toolu-8", tool_response: { status: "async_launched" } },
+    // A prose or partial status match is not the provider's own result shape.
+    { hook_event_name: "PostToolUse", tool_name: "Task", tool_use_id: "toolu-9", tool_response: { status: "async_launched by the user", agentId: "a1a2b3c4d" } },
+    { hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu-10", tool_response: "SECRET STRING RESULT" },
+    // An unrelated tool carrying a lifecycle-looking field is not evidence.
+    { hook_event_name: "PostToolUse", tool_name: "Read", tool_use_id: "toolu-11", tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+    { hook_event_name: "PostToolUse", tool_name: "WebFetch", tool_use_id: "toolu-12", tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+    { hook_event_name: "PostToolUse", tool_name: "Edit", tool_use_id: "toolu-13", tool_response: { status: "async_launched", agentId: "a1a2b3c4d" } },
+    { hook_event_name: "PostToolUse", tool_name: "TaskStop", tool_use_id: "toolu-14", tool_response: { status: "async_launched", agentId: "a1a2b3c4d" } },
+    { hook_event_name: "PostToolUse", tool_use_id: "toolu-15", tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+    // Each id belongs to one verified tool, so a cross-kind pairing claims nothing.
+    { hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu-16", tool_response: { status: "async_launched", agentId: "a1a2b3c4d" } },
+    { hook_event_name: "PostToolUse", tool_name: "Task", tool_use_id: "toolu-17", tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+  ];
+  for (const input of notBackground) {
+    const result = sanitizeNativeHookProviderInput(input);
+    assert.equal(result.ok, true, `the event itself stays admissible: ${JSON.stringify(input).slice(0, 40)}`);
+    if (!result.ok) assert.fail("expected the event to be admitted");
+    assert.ok(!("background_started" in result.metadata), "no launch is claimed");
+  }
+});
+
+test("the wire family admits the closed membership and launch fields and refuses every forged combination", () => {
+  const bootstrap: NativeHookBootstrap = {
+    version: 1,
+    socketPath: "/tmp/broker.sock",
+    generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instanceId: INSTANCE_NATIVE,
+    backend: "claude",
+    token: "a".repeat(64),
+  };
+  const members: readonly NativeHookBackgroundMember[] = [
+    { id: "b8k3n1p4q", kind: "shell" },
+    { id: "a1a2b3c4d", kind: "task" },
+  ];
+
+  const stop = nativeEventFrame(bootstrap, {
+    hook_event_name: "Stop",
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: members,
+  });
+  const decodedStop = decodeNativeHookFrame(encodeNativeHookFrame(stop));
+  assert.equal(decodedStop?.kind, "event");
+  assert.deepEqual(decodedStop?.kind === "event" ? decodedStop.event : undefined, {
+    backend: "claude",
+    hook_event_name: "Stop",
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: members,
+  });
+
+  const refused: unknown[] = [
+    // Counts and membership are one snapshot: they must agree.
+    { ...stop, background_counts: { tasks: 2, shells: 0 } },
+    { ...stop, background_counts: { tasks: 0, shells: 0 } },
+    // Membership is a Stop-family snapshot only.
+    { ...stop, hook_event_name: "PostToolUse" },
+    // Closed member objects only.
+    { ...stop, background_members: [{ id: "b8k3n1p4q", kind: "shell", command: "SECRET" }, { id: "a1a2b3c4d", kind: "task" }] },
+    { ...stop, background_members: [{ id: "b8k3n1p4q", kind: "agent" }, { id: "a1a2b3c4d", kind: "task" }] },
+    { ...stop, background_members: [{ id: "b8k3n1p4q" }, { id: "a1a2b3c4d", kind: "task" }] },
+    { ...stop, background_members: [{ id: "b8k3n1p4q", kind: "shell" }, { id: "b8k3n1p4q", kind: "task" }] },
+    { ...stop, background_members: [{ id: "bad\u0001id", kind: "shell" }] },
+    { ...stop, background_members: { 0: { id: "b8k3n1p4q", kind: "shell" } } },
+    // The aggregate id budget keeps a maximum set inside the fixed frame bound.
+    {
+      ...stop,
+      background_counts: { tasks: 0, shells: 40 },
+      background_members: Array.from({ length: 40 }, (_unused, index) => ({
+        // 40 ids, each inside the per-id bound but past the aggregate budget.
+        id: `b${"y".repeat(MAX_NATIVE_HOOK_MEMBER_ID_BYTES - 3)}${index}`,
+        kind: "shell",
+      })),
+    },
+    // A launch edge exists only on the event with a real tool result, and only
+    // for the backend whose provider issues those ids.
+    { ...stop, background_started: { id: "b8k3n1p4q", kind: "shell" } },
+    { ...nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", background_started: { id: "b8k3n1p4q", kind: "shell" } }), backend: "codex" },
+    // Membership is Claude-only projection data as well.
+    { ...stop, backend: "codex" },
+    // A launch kind must be paired with the tool that can actually report it.
+    nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", background_started: { id: "b8k3n1p4q", kind: "shell" } }),
+    nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", tool_name: "Read", background_started: { id: "b8k3n1p4q", kind: "shell" } }),
+    nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", tool_name: "Task", background_started: { id: "b8k3n1p4q", kind: "shell" } }),
+    nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", tool_name: "Bash", background_started: { id: "a1a2b3c4d", kind: "task" } }),
+    // The raw provider payload fields are still refused outright.
+    { ...stop, background_tasks: REAL_STOP_SNAPSHOT },
+    { ...nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", tool_name: "Bash" }), tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+  ];
+  for (const frame of refused) {
+    assert.equal(decodeNativeHookFrame(encodeNativeHookFrame(frame as NativeHookEventFrame)), undefined,
+      `refused: ${JSON.stringify(frame).slice(0, 60)}`);
+  }
+
+  const launched = nativeEventFrame(bootstrap, {
+    hook_event_name: "PostToolUse",
+    tool_name: "Bash",
+    tool_use_id: "toolu-1",
+    background_started: { id: "b8k3n1p4q", kind: "shell" },
+  });
+  const decodedLaunch = decodeNativeHookFrame(encodeNativeHookFrame(launched));
+  assert.deepEqual(decodedLaunch?.kind === "event" ? decodedLaunch.event : undefined, {
+    backend: "claude",
+    hook_event_name: "PostToolUse",
+    tool_name: "Bash",
+    tool_use_id: "toolu-1",
+    background_started: { id: "b8k3n1p4q", kind: "shell" },
+  });
+});
+
+test("a genuine broker delivery carries membership and launch metadata to the registered native source", async () => {
+  const broker = await makeBroker();
+  const recorded = recordingNative();
+  const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, "claude", recorded.handlers);
+
+  // A real background shell launch, then a real async agent launch.
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-root",
+    tool_name: "Bash",
+    tool_use_id: "toolu-shell",
+    tool_input: { command: "SECRET COMMAND", run_in_background: true },
+    tool_response: { stdout: "SECRET OUTPUT", interrupted: false, backgroundTaskId: "b8k3n1p4q" },
+  })).status, "accepted");
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-root",
+    tool_name: "Task",
+    tool_use_id: "toolu-agent",
+    tool_input: { prompt: "SECRET PROMPT" },
+    tool_response: { status: "async_launched", agentId: "a1a2b3c4d", prompt: "SECRET PROMPT", outputFile: "/tmp/SECRET" },
+  })).status, "accepted");
+  // A backgrounding intent and a foreground agent carry no launch edge.
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "PreToolUse",
+    session_id: "session-root",
+    tool_name: "Bash",
+    tool_use_id: "toolu-intent",
+    tool_input: { command: "SECRET COMMAND", run_in_background: true },
+  })).status, "accepted");
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-root",
+    tool_name: "Task",
+    tool_use_id: "toolu-foreground",
+    tool_response: { status: "completed", report: "SECRET REPORT" },
+  })).status, "accepted");
+  // Then the root Stop snapshot of that same moment, plus the later empty one.
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "Stop",
+    session_id: "session-root",
+    last_assistant_message: "SECRET FINAL MESSAGE",
+    background_tasks: REAL_STOP_SNAPSHOT,
+  })).status, "accepted");
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "Stop",
+    session_id: "session-root",
+    background_tasks: [{ id: "b8k3n1p4q", type: "shell", status: "completed", description: "SECRET" }],
+  })).status, "accepted");
+
+  assert.deepEqual(recorded.failures, []);
+  assert.deepEqual(recorded.events, [
+    {
+      backend: "claude",
+      hook_event_name: "PostToolUse",
+      session_id: "session-root",
+      tool_name: "Bash",
+      tool_use_id: "toolu-shell",
+      background_started: { id: "b8k3n1p4q", kind: "shell" },
+    },
+    {
+      backend: "claude",
+      hook_event_name: "PostToolUse",
+      session_id: "session-root",
+      tool_name: "Task",
+      tool_use_id: "toolu-agent",
+      background_started: { id: "a1a2b3c4d", kind: "task" },
+    },
+    {
+      backend: "claude",
+      hook_event_name: "PreToolUse",
+      session_id: "session-root",
+      tool_name: "Bash",
+      tool_use_id: "toolu-intent",
+    },
+    {
+      backend: "claude",
+      hook_event_name: "PostToolUse",
+      session_id: "session-root",
+      tool_name: "Task",
+      tool_use_id: "toolu-foreground",
+    },
+    {
+      backend: "claude",
+      hook_event_name: "Stop",
+      session_id: "session-root",
+      background_counts: { tasks: 2, shells: 1 },
+      background_members: [
+        { id: "b8k3n1p4q", kind: "shell" },
+        { id: "a1a2b3c4d", kind: "task" },
+        { id: "m22222222", kind: "task" },
+      ],
+    },
+    {
+      backend: "claude",
+      hook_event_name: "Stop",
+      session_id: "session-root",
+      background_counts: { tasks: 0, shells: 0 },
+      background_members: [],
+    },
+  ]);
+
+  const serialized = JSON.stringify(recorded.events);
+  assert.ok(!serialized.includes("SECRET"), "no provider content reaches the registered source");
+  assert.ok(!serialized.includes("tool_response"), "the raw tool response never crosses the wire");
+  assert.ok(!serialized.includes("background_tasks"), "the raw snapshot array never crosses the wire");
+  assert.ok(!serialized.includes(registration.bootstrap.token), "the token never reaches the callback");
+
+  // The delivered metadata is exactly what the membership ledger consumes: the
+  // known fresh owned-run baseline plus these launch edges gives live 0 → 1 → 2,
+  // and the root snapshot resync and its later empty snapshot stay exact.
+  const ledger = new NativeClaudeBackgroundLedger();
+  const progression: Array<{ tasks: number; shells: number } | null> = [];
+  assert.deepEqual(ledger.initializeFreshOwnedRun("owned-run-1").counts, { tasks: 0, shells: 0 });
+  for (const event of recorded.events) {
+    const launch = event.background_started;
+    if (launch !== undefined) ledger.observeStarted("owned-run-1", launch);
+    const members = event.background_members;
+    if (members !== undefined) ledger.replaceFullRootMembers("owned-run-1", members);
+    progression.push(ledger.counts());
+  }
+  assert.deepEqual(progression, [
+    { tasks: 0, shells: 1 },
+    { tasks: 1, shells: 1 },
+    { tasks: 1, shells: 1 },
+    { tasks: 1, shells: 1 },
+    { tasks: 2, shells: 1 },
+    { tasks: 0, shells: 0 },
+  ]);
+  assert.equal(ledger.counts() === null, false);
+  assert.equal(ledger.snapshot().membershipKnown, true);
+});
+
+test("the membership and launch projections do not change the Codex projection", async () => {
+  const broker = await makeBroker();
+  const recorded = recordingNative();
+  const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, "codex", recorded.handlers);
+
+  const outcome = await runRelay(registration.bootstrap, {
+    hook_event_name: "PostToolUse",
+    session_id: "session-codex",
+    tool_name: "bash",
+    tool_use_id: "call-1",
+    // A Claude-shaped result field on a Codex run is not a Codex launch witness.
+    tool_response: { backgroundTaskId: "b8k3n1p4q" },
+  });
+  assert.equal(outcome.status, "accepted");
+  // A Codex Stop keeps its pre-existing shape: the counts projection it already
+  // had, and none of the new Claude-only membership field — not even `[]`.
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "Stop",
+    session_id: "session-codex",
+    background_tasks: [
+      { id: "b8k3n1p4q", type: "shell", status: "running", description: "SECRET" },
+    ],
+  })).status, "accepted");
+  assert.equal((await runRelay(registration.bootstrap, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-codex",
+    agent_id: "child-1",
+    background_tasks: [],
+  })).status, "accepted");
+  assert.deepEqual(recorded.events, [{
+    backend: "codex",
+    hook_event_name: "PostToolUse",
+    session_id: "session-codex",
+    tool_name: "bash",
+    tool_use_id: "call-1",
+  }, {
+    backend: "codex",
+    hook_event_name: "Stop",
+    session_id: "session-codex",
+    background_counts: { tasks: 0, shells: 1 },
+  }, {
+    backend: "codex",
+    hook_event_name: "SubagentStop",
+    session_id: "session-codex",
+    agent_id: "child-1",
+    background_counts: { tasks: 0, shells: 0 },
+  }]);
+  assert.deepEqual(recorded.failures, []);
 });

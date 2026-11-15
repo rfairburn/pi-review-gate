@@ -18,13 +18,17 @@
  * BEFORE any wire encoding, so question/answer/prompt text, tool arguments or
  * results, transcript lines, terminal output, and arbitrary hook fields never
  * enter a frame. For Stop/SubagentStop only, the whole `background_tasks`
- * array is validated and projected to `background_counts`; the raw array and
- * its descriptions/commands/IDs never cross the wire, and an invalid or
- * oversized snapshot becomes an explicit authenticated failure rather than a
- * partial/zero count.
+ * array is validated once and projected to `background_counts` plus, when every
+ * active entry was identifiable, `background_members`; for PostToolUse only, a
+ * result that actually launched background work projects one
+ * `background_started` id and kind. The raw array, its
+ * descriptions/commands/IDs, and any `tool_response` body never cross the wire,
+ * and an invalid or oversized snapshot becomes an explicit authenticated failure
+ * rather than a partial/zero count.
  */
 
 import { createConnection, type Socket } from "node:net";
+import type { NativeCliBackend } from "./session-backend";
 import {
   MAX_NATIVE_HOOK_ACK_BYTES,
   MAX_NATIVE_HOOK_STDIN_BYTES,
@@ -176,6 +180,22 @@ function failureFrame(bootstrap: NativeHookBootstrap, reason: NativeHookFailureR
     token: bootstrap.token,
     reason,
   };
+}
+
+/**
+ * Drops the Claude-only background projections for a backend whose provider
+ * issues no such ids. The Codex selection and wire shape stay exactly as they
+ * were before this lane existed, and the broker's strict decoder never has to
+ * refuse an otherwise valid Codex event because a Claude-shaped field rode
+ * along.
+ */
+function projectSelectedMetadata(
+  metadata: NativeHookEventMetadata,
+  backend: NativeCliBackend,
+): NativeHookEventMetadata {
+  if (backend === "claude") return metadata;
+  const { background_started: _claudeStarted, background_members: _claudeMembers, ...rest } = metadata;
+  return rest;
 }
 
 function exchange(
@@ -339,7 +359,7 @@ export async function runNativeHookRelay(options: NativeHookRelayOptions = {}): 
     // last so no selected value can overwrite them.
     return deliver(
       bootstrap,
-      eventFrame(bootstrap, selected.metadata),
+      eventFrame(bootstrap, projectSelectedMetadata(selected.metadata, bootstrap.backend)),
       "event",
       undefined,
       options,

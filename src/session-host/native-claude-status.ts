@@ -69,6 +69,20 @@
  *   cancelled question leaves behind when no `Post*` hook ever arrived. That
  *   closure reads the request identity only: no answer, annotation, error text,
  *   or result content is ever read, retained, or compared.
+ * - A root question request that is still open is the provider stopped on input:
+ *   the PUBLISHED foreground is `busy: false` beside `pendingInput: true`, the same
+ *   stopped-on-input foreground the host uses for any session waiting on a human,
+ *   while the observed turn underneath it is kept — so closing the request returns
+ *   the running foreground instead of a stale `Ready` or a turn end this source
+ *   never saw. The claim is qualified to that ONE request and the prompt it stands
+ *   in: it is never armed while another root tool request is still open (that is
+ *   work demonstrably in flight), it ends with its own request, and a request from
+ *   an earlier prompt that stays open cannot keep the row looking paused. Newer
+ *   root work or a turn-end boundary ends it at once, and a subagent's question
+ *   never blocks the root foreground. A stopped-on-input foreground is not an IDLE
+ *   claim: `idleForegroundPublished()` is the only answer to "can newer root work
+ *   contradict this?", and newer root work withdraws the foreground while keeping
+ *   every open request's identity for its own close edge.
  * - Only the tool TYPE is retained. Tool arguments, commands, results, question
  *   text, answers, annotations, and transcripts are never read into state, and
  *   the fixed labels reuse the existing `Working`/`Ready` convention.
@@ -124,6 +138,7 @@ export type NativeClaudeReduceReason =
   | "question-request-closed"
   | "tool-type-observed"
   | "tool-completed"
+  | "question-block-resumed"
   | "subagent-scope"
   | "stale-session"
   | "stale-prompt"
@@ -392,6 +407,27 @@ export class NativeClaudeStatusReducer {
   #rootPromptId: string | null = null;
   /** Root foreground busy; null means unknown, never a silent idle claim. */
   #busy: boolean | null = null;
+  /**
+   * The request this run is currently stopped on, if any: its identity and the
+   * prompt it was opened in. Qualified rather than global, because "waiting" is a
+   * claim about ONE request being the provider's current block — not about the
+   * conversation having asked something at some point. It is never armed while a
+   * non-question root tool request is still open (that is root work demonstrably
+   * in flight), and it is dropped the moment its own request closes, a newer root
+   * prompt or root tool arrives, or any turn-end or withdrawal boundary lands.
+   * An OLDER request that stays open after this one closed therefore cannot keep
+   * the row looking paused.
+   */
+  #blockingQuestion: { readonly key: string; readonly promptId: string | null } | null = null;
+  /**
+   * The most recently accepted ROOT question request, remembered while it stays
+   * open. A root request that opened over in-flight tool work cannot block the
+   * foreground then, but the close of that work can be the fact that leaves the
+   * provider waiting on it, so the request is kept here for that moment. It is
+   * dropped when the request itself closes and at every boundary that ends the
+   * stopped-on-input claim, so an older turn's request never arms a later pause.
+   */
+  #waitingQuestionKey: string | null = null;
   /** Bounded activity lines: a tool TYPE, `Working`, `Ready`, or empty. */
   #activity: readonly string[] = [];
   /** Request identity of the most recent root tool request in this turn. */
@@ -429,10 +465,71 @@ export class NativeClaudeStatusReducer {
    */
   snapshot(): NativeClaudeForegroundObservation {
     return {
-      busy: this.#busy,
+      busy: this.#publishedBusy(),
       pendingInput: this.#pendingInput(),
       activity: [...this.#activity],
     };
+  }
+
+  /**
+   * The foreground the host is told about: the observed turn, except that the one
+   * question request this run is stopped on is reported as stopped-on-input rather
+   * than running. Only the published value changes, so closing that request
+   * returns exactly the foreground observed underneath it — never a stale `Ready`,
+   * and never a turn end or an idle claim this source did not see.
+   */
+  #publishedBusy(): boolean | null {
+    return this.questionBlocksForeground() ? false : this.#busy;
+  }
+
+  /**
+   * True while the published foreground is the stopped-on-input projection: one
+   * accepted root request, in the prompt it stands in, is what the provider is
+   * waiting on. A caller that has to decide what newer ROOT work can contradict
+   * needs this distinct from `idleForegroundPublished()` — a paused turn and an
+   * idle conversation are different claims, and a new root row proves only that
+   * the pause is over.
+   */
+  questionBlocksForeground(): boolean {
+    const blocking = this.#blockingQuestion;
+    if (blocking === null || !this.#openQuestions.has(blocking.key)) return false;
+    return blocking.promptId === null || this.#rootPromptId === blocking.promptId;
+  }
+
+  /**
+   * True only while the published `busy: false` is a genuine IDLE claim: a
+   * source-read terminal record, a corroborated fresh start, or the host's own
+   * launch baseline. A `false` published because a question request stands is a
+   * turn paused on a human, not a conversation at rest, and a caller watching for
+   * what can contradict an idle claim must not treat it as one.
+   */
+  idleForegroundPublished(): boolean {
+    return this.#busy === false;
+  }
+
+  /**
+   * Newer ROOT work this run's own source positively shows, with nothing from the
+   * hook lane to describe it. Every foreground claim made for the previous state
+   * is withdrawn as unverifiable, along with any stopped-on-input projection —
+   * the provider is doing something else. The scope and its open question
+   * requests SURVIVE: a newer turn says nothing about whether an earlier request
+   * closed, so that request stays pending until its own close edge lands.
+   */
+  noteRootWorkBeyondClaims(): NativeClaudeForegroundObservation {
+    this.#busy = null;
+    this.#activity = [];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
+    this.#foregroundOrigin = null;
+    this.#freshStartPending = false;
+    this.#startupVouched = false;
+    // The prompt this reducer last observed is no longer the conversation's
+    // current one: the file shows work that started without this run's hook lane
+    // saying a word, and the prompt it started with was never seen. Holding the
+    // old correlation would refuse the new turn's own boundary as stale.
+    this.#rootPromptId = null;
+    this.#clearTurnToolState();
+    return this.snapshot();
   }
 
   /**
@@ -570,6 +667,8 @@ export class NativeClaudeStatusReducer {
     }
     this.#openQuestions.delete(key);
     this.#rememberClosed(key);
+    if (this.#blockingQuestion?.key === key) this.#blockingQuestion = null;
+    if (this.#waitingQuestionKey === key) this.#waitingQuestionKey = null;
     this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
   }
@@ -620,6 +719,8 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#busy = false;
     this.#activity = [READY_ACTIVITY];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = "transcript";
     this.#freshStartPending = false;
     this.#startupVouched = false;
@@ -786,6 +887,8 @@ export class NativeClaudeStatusReducer {
     this.#rootPromptId = promptId;
     this.#busy = true;
     this.#activity = [WORKING_ACTIVITY];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = "observed";
     this.#freshStartPending = false;
     this.#startupVouched = false;
@@ -808,6 +911,8 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#busy = null;
     this.#activity = [];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = null;
     return { outcome: "applied", reason: "turn-end-candidate", snapshot: this.snapshot() };
   }
@@ -818,6 +923,8 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#busy = null;
     this.#activity = [];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = null;
     return { outcome: "applied", reason: "turn-failed", snapshot: this.snapshot() };
   }
@@ -842,6 +949,10 @@ export class NativeClaudeStatusReducer {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
     this.#busy = true;
     this.#activity = [toolType];
+    // Real root tool work is running: it outranks a question request that is
+    // still open, so the row is never made to look paused while the provider is
+    // doing something else.
+    this.#blockingQuestion = null;
     this.#foregroundOrigin = "observed";
     this.#freshStartPending = false;
     this.#startupVouched = false;
@@ -882,15 +993,52 @@ export class NativeClaudeStatusReducer {
       return { outcome: "ignored", reason: "tool-close-unobserved" };
     }
     if (state === "closed") return { outcome: "ignored", reason: "duplicate-tool-close" };
+    // The close is recorded whichever request it names: the ledger has to say what
+    // is still running, and an older request that finished must not keep looking
+    // like work in flight. Only the CURRENT request's close may relabel activity —
+    // an older one says nothing about what the provider is doing now.
+    this.#toolRequests.set(requestId, "closed");
+    // The close of the last other root request can be exactly what leaves the
+    // provider with nothing to do but wait, so the standing question request is
+    // re-armed here rather than dismissed along with the tool that finished.
+    const rearmed = this.#rearmQuestionBlock();
     if (requestId !== this.#lastToolId) {
-      // A close for an older request must not overwrite newer tool state.
+      // A close for an older request must not overwrite newer tool state — but
+      // where it is the close that empties the field, the stopped-on-input
+      // projection is a real published fact about this row, and it is not
+      // withheld behind a label this older request cannot restate.
+      if (rearmed) return { outcome: "applied", reason: "question-block-resumed", snapshot: this.snapshot() };
       return { outcome: "ignored", reason: "stale-tool-close" };
     }
     // The tool TYPE stays as the last observed one; only a confirmed turn end
     // yields Ready.
-    this.#toolRequests.set(requestId, "closed");
     this.#activity = [toolType];
+    if (!rearmed) this.#blockingQuestion = null;
     return { outcome: "applied", reason: "tool-completed", snapshot: this.snapshot() };
+  }
+
+  /**
+   * Arm the stopped-on-input projection for the standing root question request
+   * once nothing else is demonstrably in flight. Qualified the same way the open
+   * edge arms it: one request identity, in the prompt it stands in, over a turn
+   * this source observed running, and only when EVERY tracked root request has a
+   * matching close.
+   */
+  #rearmQuestionBlock(): boolean {
+    if (this.#busy !== true) return false;
+    const key = this.#waitingQuestionKey;
+    if (key === null) return false;
+    const request = this.#openQuestions.get(key);
+    if (request === undefined) {
+      this.#waitingQuestionKey = null;
+      return false;
+    }
+    if (request.promptId !== null && this.#rootPromptId !== request.promptId) return false;
+    for (const state of this.#toolRequests.values()) {
+      if (state === "open") return false;
+    }
+    this.#blockingQuestion = { key, promptId: request.promptId };
+    return true;
   }
 
   #openQuestionRequest(
@@ -915,11 +1063,29 @@ export class NativeClaudeStatusReducer {
     this.#openQuestions.set(key, { scope, requestId, promptId: readToken(event.prompt_id) });
     if (scope === "root") {
       // An accepted root question request is positively observed root tool work:
-      // the foreground is running even when this is the first observed tool or a
-      // blocked Stop continued straight into it. An existing running or
-      // last-tool label is preserved; only a missing or stale Ready claim is
-      // replaced by the generic running label.
+      // the turn is live and its foreground claim is preserved, so an existing
+      // running or last-tool label survives and a first observed tool still
+      // proves a turn. What the request adds is the block: while it stands, the
+      // published foreground reports stopped-on-input. An existing missing or
+      // stale Ready claim is replaced by the generic running label.
       this.#busy = true;
+      // The block is armed for THIS request, and only when nothing else is
+      // demonstrably running: EVERY tracked root request that opened without a
+      // matching close is work in flight — the most recent one is not the only
+      // candidate — and a question must not make that row look paused.
+      let toolInFlight = false;
+      for (const state of this.#toolRequests.values()) {
+        if (state === "open") {
+          toolInFlight = true;
+          break;
+        }
+      }
+      this.#blockingQuestion = toolInFlight
+        ? null
+        : { key, promptId: readToken(event.prompt_id) };
+      // Remembered whichever way the block landed, so the close of the work this
+      // request opened over can arm the pause it could not arm itself.
+      this.#waitingQuestionKey = key;
       this.#foregroundOrigin = "observed";
       this.#freshStartPending = false;
       this.#startupVouched = false;
@@ -952,6 +1118,8 @@ export class NativeClaudeStatusReducer {
     }
     this.#openQuestions.delete(key);
     this.#rememberClosed(key);
+    if (this.#blockingQuestion?.key === key) this.#blockingQuestion = null;
+    if (this.#waitingQuestionKey === key) this.#waitingQuestionKey = null;
     this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
   }
@@ -976,6 +1144,11 @@ export class NativeClaudeStatusReducer {
   #withdrawForeground(): void {
     this.#busy = null;
     this.#activity = [];
+    // The unreadable payload could itself be the standing request's own close, so
+    // a stopped-on-input claim is withdrawn with the rest of the foreground rather
+    // than left standing on evidence this payload may already have contradicted.
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = null;
     this.#clearTurnToolState();
   }
@@ -1027,6 +1200,8 @@ export class NativeClaudeStatusReducer {
     this.#rootPromptId = null;
     this.#busy = null;
     this.#activity = [];
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
     this.#foregroundOrigin = null;
     this.#freshStartPending = false;
     this.#startupVouched = false;

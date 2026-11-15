@@ -124,7 +124,8 @@ test("a question request opens pending input and closes definitively on its matc
 
   const opened = reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
   expectOutcome(opened, "applied", "question-request-open");
-  assert.deepEqual(snapshotOf(opened), { busy: true, pendingInput: true, activity: ["Working"] });
+  // The provider stopped mid-turn for a human: the foreground reports waiting.
+  assert.deepEqual(snapshotOf(opened), { busy: false, pendingInput: true, activity: ["Working"] });
 
   const closed = reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" }));
   expectOutcome(closed, "applied", "question-request-closed");
@@ -157,25 +158,31 @@ test("closure is definitive with answers, without them, and on the failure edge"
   }
 });
 
-test("root question work establishes running initially and after a Stop candidate", () => {
+test("root question work establishes a live turn whose foreground reports stopped-on-input", () => {
   // Observation beginning with a question request still proves root tool work.
   const adopted = new NativeClaudeStatusReducer();
   adopted.reduce(questionOpen("first"));
-  assert.deepEqual(adopted.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+  assert.deepEqual(adopted.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
 
   // A blocked Stop continuation that runs straight into a question request.
   const reducer = boundReducer();
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
   reducer.reduce(hook("Stop", { prompt_id: "p1", stop_hook_active: true }));
   reducer.reduce(questionOpen("continued", { prompt_id: "p1" }));
-  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
 
   // An established last-tool label is preserved, not overwritten.
   const labeled = boundReducer();
   labeled.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
   labeled.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_read", prompt_id: "p1" }));
+  labeled.reduce(hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_read", prompt_id: "p1" }));
   labeled.reduce(questionOpen("ask", { prompt_id: "p1" }));
-  assert.deepEqual(labeled.snapshot(), { busy: true, pendingInput: true, activity: ["read"] });
+  assert.deepEqual(labeled.snapshot(), { busy: false, pendingInput: true, activity: ["read"] });
+
+  // ...and the turn underneath the request is restored, not a stale Ready, when
+  // the request closes: the model resumes the work it was interrupted for.
+  labeled.reduce(questionClose("ask", { prompt_id: "p1" }));
+  assert.deepEqual(labeled.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
 });
 
 test("untrackable root question work withdraws an established Ready", () => {
@@ -229,7 +236,7 @@ test("question closure uses request correlation across root prompt boundaries", 
   expectOutcome(reducer.reduce(questionClose("old", { prompt_id: "p2" })), "ignored", "stale-prompt");
   // Its own definitive closure still lands, without disturbing the newer turn.
   expectOutcome(reducer.reduce(questionClose("old", { prompt_id: "p1" })), "applied", "question-request-closed");
-  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
   expectOutcome(reducer.reduce(questionClose("new", { prompt_id: "p2" })), "applied", "question-request-closed");
   assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
 });
@@ -775,7 +782,7 @@ test("a genuine SessionStart rebinds scope, clears stale claims, and vouches the
     "ignored",
     "duplicate-session-start",
   );
-  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
   // The same conversation id arriving as a genuinely new conversation still
   // rebinds, and that new scope is armed for its own corroboration.
   expectOutcome(
@@ -801,6 +808,8 @@ test("events from another native session cannot close current questions or overw
   ]) {
     expectOutcome(reducer.reduce(event), "ignored", "stale-session");
   }
+  // The root's own Read is still open, so root work is demonstrably in flight:
+  // the standing question cannot make this row look paused.
   assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["read"] });
 });
 
@@ -882,8 +891,10 @@ test("malformed recognized payloads degrade instead of claiming zero, none, or R
     const result = reducer.reduce(event);
     expectOutcome(result, "invalid", reason);
     const snapshot = snapshotOf(result);
-    // Never a fabricated cleared/none/Ready outcome from a broken payload.
-    assert.notEqual(snapshot.busy, false);
+    // Never a fabricated cleared/none/Ready outcome from a broken payload. The
+    // open request may publish `busy: false`, but that is stopped-on-input beside
+    // a pending request, never the idle claim this assertion is about.
+    assert.equal(snapshot.busy === false && snapshot.pendingInput !== true, false);
     assert.equal(snapshot.activity.includes("Ready"), false);
   }
 });
@@ -1200,7 +1211,7 @@ test("duplicate same-session startup notices change nothing and never arm an idl
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
   reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
   const running = reducer.snapshot();
-  assert.deepEqual(running, { busy: true, pendingInput: true, activity: ["Working"] });
+  assert.deepEqual(running, { busy: false, pendingInput: true, activity: ["Working"] });
 
   // Two late or repeated `startup` notices for the very conversation already at
   // work, whose source has not persisted this turn yet. Neither is a new
@@ -1239,4 +1250,332 @@ test("duplicate same-session startup notices change nothing and never arm an idl
   );
   expectOutcome(reducer.confirmFreshStart({ sessionId: OTHER_SESSION }), "applied", "fresh-start-confirmed");
   assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+});
+
+/* --------------------------------------- stopped-on-input foreground mapping */
+
+/*
+ * A root question request is the provider stopping mid-turn to wait for a human,
+ * so the published foreground says exactly that — the shared stopped-on-input
+ * fact the host uses for any session awaiting input — while the observed turn
+ * underneath it is kept intact and returns when the request closes. These tests
+ * pin which facts can and cannot end that claim, and which cannot.
+ */
+
+test("a root question blocks the foreground while a child's question stays foreground-neutral", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+
+  // A child asking something inside its own conversation says nothing about the
+  // root foreground: the root keeps its observed running claim.
+  reducer.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_child" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] });
+
+  // The root's own request is the provider stopped on input.
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["bash"] });
+
+  // The child's own closure leaves the root block untouched...
+  reducer.reduce(subagentHook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_child" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["bash"] });
+
+  // ...and closing the root request restores the foreground observed underneath
+  // it: the same last-tool TYPE and a running turn, never a stale Ready.
+  reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+});
+
+test("a request from an older prompt cannot keep the row waiting once the current one closes", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_old", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+
+  // A newer accepted turn is newer root work: the row runs again, and the older
+  // request is still counted as pending input.
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+
+  // The newer turn's own request is what it is stopped on now.
+  reducer.reduce(questionOpen("toolu_new", { prompt_id: "p2" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+
+  // Closing the CURRENT request returns the running foreground even though the
+  // older-prompt request is still open: that older request cannot hold the row
+  // paused, and its own close edge still owns it.
+  reducer.reduce(questionClose("toolu_new", { prompt_id: "p2" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["Working"] });
+
+  // Its own correlated close still lands definitively.
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_old", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+});
+
+test("newer root work or a turn-end boundary ends the stopped-on-input claim", () => {
+  // A new accepted prompt is newer root work: the row runs again.
+  const prompt = boundReducer();
+  prompt.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  prompt.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.equal(prompt.snapshot().busy, false);
+  prompt.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.equal(prompt.snapshot().busy, true, "a new accepted turn is running, not waiting");
+
+  // Observed root tool work after a standing block is in flight, so the row is
+  // never made to look paused while the provider is doing something else — and a
+  // request that opens once nothing else is running blocks.
+  const tool = boundReducer();
+  tool.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  tool.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  tool.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_read", prompt_id: "p1" }));
+  assert.equal(tool.snapshot().busy, true, "root tool work is never a pause");
+  assert.equal(tool.snapshot().pendingInput, true, "the earlier request is still open");
+  // While that Read is still open, a further question cannot make the row look
+  // paused either: the block is only ever armed for the provider's current stop.
+  tool.reduce(questionOpen("toolu_q2", { prompt_id: "p1" }));
+  assert.equal(tool.snapshot().busy, true, "a request opening over in-flight tool work does not block");
+  tool.reduce(hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_read", prompt_id: "p1" }));
+  tool.reduce(questionOpen("toolu_q3", { prompt_id: "p1" }));
+  assert.equal(tool.snapshot().busy, false, "with nothing else running, the new request blocks");
+
+  // A `Stop` boundary proves neither a finished turn nor a still-standing answer:
+  // the foreground becomes unverifiable rather than waiting.
+  const stopped = boundReducer();
+  stopped.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  stopped.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  stopped.reduce(hook("Stop", { prompt_id: "p1", stop_hook_active: true }));
+  assert.deepEqual(stopped.snapshot(), { busy: null, pendingInput: true, activity: [] });
+
+  // A request whose identity cannot be read can never be matched to a close, so
+  // nothing is claimed as waiting either: the foreground withdraws to unknown.
+  const untracked = boundReducer();
+  untracked.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  expectOutcome(
+    untracked.reduce(hook("PreToolUse", { tool_name: "AskUserQuestion" })),
+    "invalid",
+    "question-request-unidentified",
+  );
+  assert.deepEqual(untracked.snapshot(), { busy: null, pendingInput: null, activity: [] });
+
+  // Only the source-read terminal record states an idle foreground, and it ends
+  // the block together with the turn it closed.
+  const ended = boundReducer();
+  ended.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  ended.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(ended.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+  expectOutcome(ended.confirmTurnEnd({ promptId: "p1" }), "applied", "turn-ended-confirmed");
+  assert.deepEqual(ended.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+});
+
+test("the row keeps waiting until the last root request closes, and a replayed open adds nothing", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_q2", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+  expectOutcome(
+    reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" })),
+    "ignored",
+    "duplicate-question-open",
+  );
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_q2", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+});
+
+test("an unreadable payload withdraws a standing stopped-on-input claim too", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+
+  // A root payload whose tool name cannot be read could itself be that request's
+  // own close, so the waiting claim goes with the rest of the foreground:
+  // unknown, never a stale waiting or Ready claim. The request is not consumed by
+  // an unreadable edge, so the row still reports input pending.
+  expectOutcome(
+    reducer.reduce(hook("PostToolUse", { tool_use_id: "toolu_q1" })),
+    "invalid",
+    "tool-name-unavailable",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: true, activity: [] });
+
+  // The request's own readable close still lands and is never counted as answered.
+  // What it cannot do is rebuild what the unreadable payload withdrew: the
+  // foreground stays unverifiable until newer work or a confirmed turn end states
+  // it, and a census with a hole never claims a definitive none again.
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: null, activity: [] });
+
+  // Newer root work is what re-establishes the foreground — and it is running,
+  // not an idle claim carried over from the withdrawn state.
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: null, activity: ["Working"] });
+});
+
+test("a paused foreground is never reported as an idle claim", () => {
+  const reducer = boundReducer();
+  // Nothing observed yet: no idle claim, and no pause.
+  assert.equal(reducer.idleForegroundPublished(), false);
+  assert.equal(reducer.questionBlocksForeground(), false);
+
+  // A running turn is neither.
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.equal(reducer.idleForegroundPublished(), false);
+  assert.equal(reducer.questionBlocksForeground(), false);
+
+  // A standing root request publishes `busy: false`, but it is a pause in a live
+  // turn: only the question accessor says so.
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.equal(reducer.snapshot().busy, false);
+  assert.equal(reducer.idleForegroundPublished(), false);
+  assert.equal(reducer.questionBlocksForeground(), true);
+
+  // A source-read terminal record is the real idle claim, and it ends the pause.
+  const ended = reducer.confirmTurnEnd({ promptId: "p1" });
+  expectOutcome(ended, "applied", "turn-ended-confirmed");
+  assert.equal(reducer.idleForegroundPublished(), true);
+  assert.equal(reducer.questionBlocksForeground(), false);
+
+  // Newer root work beyond the claims withdraws both: unknown, which is neither.
+  const paused = boundReducer();
+  paused.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  paused.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.equal(paused.questionBlocksForeground(), true);
+  paused.noteRootWorkBeyondClaims();
+  assert.equal(paused.snapshot().busy, null);
+  assert.equal(paused.idleForegroundPublished(), false);
+  assert.equal(paused.questionBlocksForeground(), false);
+  assert.equal(paused.snapshot().pendingInput, true, "the open request survives it");
+});
+
+test("every independently open root tool keeps the row running, and an older close only records", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_a", prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_b", prompt_id: "p1" }));
+
+  // The newest request closes: its label stands, and the older request is still
+  // demonstrably running.
+  const closedB = reducer.reduce(hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_b", prompt_id: "p1" }));
+  expectOutcome(closedB, "applied", "tool-completed");
+  assert.deepEqual(snapshotOf(closedB), { busy: true, pendingInput: false, activity: ["read"] });
+
+  // A question cannot look paused while A is still open.
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["read"] });
+
+  // A's own close is recorded — it is no longer work in flight — and it still does
+  // not relabel the current activity, which belongs to B. But it is the close that
+  // empties the field, and the standing request is what the provider is left
+  // waiting on, so that much IS published about this row.
+  expectOutcome(
+    reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_a", prompt_id: "p1" })),
+    "applied",
+    "question-block-resumed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["read"] });
+
+  // A replayed close of the older request is still just a duplicate, and the
+  // pause keeps standing on the one request identity it was armed for.
+  expectOutcome(
+    reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_a", prompt_id: "p1" })),
+    "ignored",
+    "duplicate-tool-close",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["read"] });
+});
+
+test("the late close of the tool a question opened over hands the pause to it", () => {
+  // The order native 2.1.325 actually delivers: the backgrounded Bash request is
+  // still open when the question opens, and that command's own PostToolUse lands
+  // afterwards, while the question is still unanswered.
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  reducer.reduce(questionOpen("toolu_ask", { prompt_id: "p1" }));
+
+  // A pending question never hides root work that is demonstrably still running.
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] });
+
+  // The close of the last other root request is the fact that leaves the provider
+  // with nothing to do but wait: the row is stopped on the standing request, and
+  // the tool TYPE observed underneath the pause is untouched.
+  expectOutcome(
+    reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" })),
+    "applied",
+    "tool-completed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: true, activity: ["bash"] });
+
+  // Closing that request restores the turn observed underneath it: running, not a
+  // fabricated Ready and not a turn end.
+  expectOutcome(
+    reducer.reduce(questionClose("toolu_ask", { prompt_id: "p1" })),
+    "applied",
+    "question-request-closed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+});
+
+test("only a current root request is handed the pause, and only by a real close", () => {
+  // A request from the previous prompt cannot be armed by this turn's tool close:
+  // the new prompt dropped the claim, and nothing re-arms an older identity.
+  const older = boundReducer();
+  older.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  older.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  older.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  older.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p2" }));
+  expectOutcome(
+    older.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p2" })),
+    "applied",
+    "tool-completed",
+  );
+  assert.deepEqual(older.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] },
+    "a stale turn's request does not make this turn look paused");
+
+  // A child's question is foreground-neutral and is never the root's pause, even
+  // after every root request has closed.
+  const child = boundReducer();
+  child.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  child.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  child.reduce(subagentHook("PreToolUse", {
+    tool_name: "AskUserQuestion",
+    tool_use_id: "toolu_child_ask",
+    prompt_id: "p1",
+  }));
+  expectOutcome(
+    child.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" })),
+    "applied",
+    "tool-completed",
+  );
+  assert.deepEqual(child.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] },
+    "a child's question is not the root's pause");
+
+  // With no close ever arriving for the tool the question opened over, nothing is
+  // claimed as waiting: the row keeps reporting the work this source observed.
+  const never = boundReducer();
+  never.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  never.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  never.reduce(questionOpen("toolu_ask", { prompt_id: "p1" }));
+  assert.deepEqual(never.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] });
 });

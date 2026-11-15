@@ -16,7 +16,11 @@
  *
  * - Only the original provider hook field names named below may cross the wire,
  *   plus one closed derived projection: `background_counts` for a validated
- *   Claude Stop/SubagentStop `background_tasks` snapshot. Question text,
+ *   Claude Stop/SubagentStop `background_tasks` snapshot, plus two further
+ *   closed projections of that same validated snapshot and of an actual
+ *   successful background launch: `background_members` (opaque member id +
+ *   `task`/`shell` kind) and `background_started` (one confirmed launch id +
+ *   kind, from a real `PostToolUse` result only). Question text,
  *   answers, prompt text, tool arguments, tool results/response bodies,
  *   transcript lines, terminal output, task descriptions/commands/IDs, and
  *   arbitrary provider fields are never selected, stored, logged, or relayed.
@@ -25,6 +29,12 @@
  *   field cannot reach a callback. The counts are native provider observations
  *   only; they are never Pi `backgroundTasks`/`backgroundShells`, ownership,
  *   Stop authority, or an inference from earlier events.
+ *   `background_members` is the whole-array membership form of the same
+ *   snapshot (never a partial view: an entry that cannot be identified makes
+ *   the projection absent rather than shrinking it), and `background_started`
+ *   carries only an id and a kind — never a description, command, prompt, tool
+ *   argument, or result body. A `PreToolUse` backgrounding intent is never a
+ *   launch, and a foreground agent never produces one.
  * - Identifiers and paths are bounded, strict text: no C0/DEL/C1 controls, no
  *   line/paragraph separators, and a fixed UTF-8 byte cap. A transcript path is
  *   the provider's own path string, never the transcript's contents.
@@ -78,6 +88,54 @@ export const MAX_NATIVE_HOOK_STDIN_BYTES = 1_048_576;
  * rather than counted partially (which would undercount) or zeroed.
  */
 export const MAX_NATIVE_HOOK_BACKGROUND_TASKS = 64;
+
+/**
+ * Maximum UTF-8 bytes of one opaque background member/launch id. The installed
+ * provider issues 9-character ids (`Fw`/`Y1` ~287020178); this bound is wider
+ * so a provider id-shape change cannot silently discard genuine membership,
+ * while still refusing anything that is not an opaque bounded id.
+ */
+export const MAX_NATIVE_HOOK_MEMBER_ID_BYTES = 64;
+
+/**
+ * Aggregate UTF-8 byte budget for the ids of one projected membership set. It
+ * keeps a maximum-size membership frame inside the fixed frame bound instead of
+ * letting it fail only at encode time.
+ */
+export const MAX_NATIVE_HOOK_MEMBERS_ID_BYTES = 1024;
+
+/** Closed member-kind set shared with the membership ledger. */
+export const NATIVE_HOOK_BACKGROUND_KINDS = Object.freeze(["task", "shell"] as const);
+
+/**
+ * The only tool whose verified result can report a backgrounded SHELL: the
+ * provider's Bash tool (name constant `Re = "Bash"` ~281330375; result schema
+ * `$No` ~294172813; result key set `PIt` ~294083573; and the provider's own
+ * result validator `vhi` ~294177345 accepts `backgroundTaskId` only when
+ * `Y1("local_bash", id)` holds). No other tool's result field is treated as
+ * shell-lifecycle evidence, even if it carries the same field name.
+ */
+export const NATIVE_HOOK_SHELL_LAUNCH_TOOL = "Bash";
+
+/**
+ * The only tools whose verified result can report a backgrounded TASK: the
+ * provider's subagent tool (name constant `ou = "Task"` ~282970790, and the
+ * provider's own name dispatch at ~282417100 accepts both `"Task"` and
+ * `"Agent"` for it), whose async result schema `vo` ~298108731 states
+ * `status: "async_launched"` together with `agentId`.
+ */
+export const NATIVE_HOOK_TASK_LAUNCH_TOOLS = Object.freeze(["Task", "Agent"] as const);
+
+/** True only for the verified shell-launch tool name. */
+export function isNativeHookShellLaunchTool(value: unknown): boolean {
+  return value === NATIVE_HOOK_SHELL_LAUNCH_TOOL;
+}
+
+/** True only for a verified task-launch tool name. */
+export function isNativeHookTaskLaunchTool(value: unknown): boolean {
+  return typeof value === "string"
+    && (NATIVE_HOOK_TASK_LAUNCH_TOOLS as readonly string[]).includes(value);
+}
 
 const MAX_SOCKET_PATH_LENGTH = 2048;
 const MAX_INSTANCE_ID_LENGTH = 128;
@@ -170,12 +228,38 @@ export interface NativeHookBackgroundCounts {
 }
 
 /**
+ * One identified member of a validated Stop/SubagentStop `background_tasks`
+ * snapshot: the provider's own opaque task id plus the closed count kind. It
+ * carries no description, command, prompt, tool argument, result, or timestamp.
+ */
+export interface NativeHookBackgroundMember {
+  readonly id: string;
+  readonly kind: NativeHookBackgroundKind;
+}
+
+/**
+ * One positively observed background launch: the id the provider itself
+ * returned from a successful tool result, plus its closed count kind. Absence
+ * is unknown, never zero; presence is never inferred from a `PreToolUse`
+ * backgrounding intent or from a foreground agent run.
+ */
+export interface NativeHookBackgroundStarted {
+  readonly id: string;
+  readonly kind: NativeHookBackgroundKind;
+}
+
+export type NativeHookBackgroundKind = (typeof NATIVE_HOOK_BACKGROUND_KINDS)[number];
+
+/**
  * Selected provider hook metadata using the provider's original field names.
  * Every field except `hook_event_name` is optional; absence is unknown and is
- * never filled in with a guessed value. `background_counts` is the only
- * derived field: the relay validates the whole native Stop/SubagentStop
- * `background_tasks` array and projects closed counts. It is absent when the
- * provider omitted the snapshot and is never reconstructed from event edges.
+ * never filled in with a guessed value. The `background_*` fields are the only
+ * derived ones: the relay validates the whole native Stop/SubagentStop
+ * `background_tasks` array once and projects closed counts plus, when every
+ * active entry was identifiable, its membership form; a `PostToolUse` whose own
+ * result actually launched background work projects one launch id and kind.
+ * They are absent when the provider omitted the snapshot or launched nothing,
+ * and are never reconstructed from other event edges.
  */
 export interface NativeHookEventMetadata {
   hook_event_name: NativeHookEventName;
@@ -191,6 +275,15 @@ export interface NativeHookEventMetadata {
   tool_use_id?: string;
   /** Present only for a validated Stop/SubagentStop snapshot; [] means real 0/0. */
   background_counts?: NativeHookBackgroundCounts;
+  /**
+   * Membership form of the same validated Stop/SubagentStop snapshot, present
+   * only when every active entry carried an identifiable opaque id. `[]` means
+   * the provider positively reported an empty in-flight set. A SubagentStop
+   * array is that hook's own whole array, never a claim of root scope.
+   */
+  background_members?: readonly NativeHookBackgroundMember[];
+  /** Present only for a `PostToolUse` whose actual result launched background work. */
+  background_started?: NativeHookBackgroundStarted;
 }
 
 /** Sanitized event delivered to a bound native source callback (no token/auth fields). */
@@ -263,8 +356,24 @@ export type NativeHookBackgroundCountsResult =
   | { readonly ok: true; readonly counts: NativeHookBackgroundCounts }
   | { readonly ok: false; readonly reason: "input-invalid" | "input-too-large" };
 
+/** Whole-array background snapshot projection: counts plus optional membership. */
+export type NativeHookBackgroundSnapshotResult =
+  | {
+    readonly ok: true;
+    readonly counts: NativeHookBackgroundCounts;
+    /** Null when an active entry carried no identifiable id. Never partial. */
+    readonly members: readonly NativeHookBackgroundMember[] | null;
+  }
+  | { readonly ok: false; readonly reason: "input-invalid" | "input-too-large" };
+
 const METADATA_TEXT_LIMITS: Readonly<
-  Record<Exclude<keyof NativeHookEventMetadata, "hook_event_name" | "background_counts">, number>
+  Record<
+    Exclude<
+      keyof NativeHookEventMetadata,
+      "hook_event_name" | "background_counts" | "background_members" | "background_started"
+    >,
+    number
+  >
 > = Object.freeze({
   session_id: MAX_NATIVE_HOOK_ID_BYTES,
   transcript_path: MAX_NATIVE_HOOK_PATH_BYTES,
@@ -281,8 +390,12 @@ const METADATA_TEXT_LIMITS: Readonly<
 const METADATA_KEYS: ReadonlySet<string> = new Set([
   ...Object.keys(METADATA_TEXT_LIMITS),
   "background_counts",
+  "background_members",
+  "background_started",
 ]);
 const BACKGROUND_COUNT_KEYS: ReadonlySet<string> = new Set(["tasks", "shells"]);
+const BACKGROUND_MEMBER_KEYS: ReadonlySet<string> = new Set(["id", "kind"]);
+const BACKGROUND_STARTED_KEYS: ReadonlySet<string> = new Set(["id", "kind"]);
 const EVENT_FRAME_KEYS: ReadonlySet<string> = new Set([
   "version",
   "type",
@@ -320,6 +433,11 @@ export function isNativeHookEventName(value: unknown): value is NativeHookEventN
 /** True only for a value from the closed failure-reason set. */
 export function isNativeHookFailureReason(value: unknown): value is NativeHookFailureReason {
   return typeof value === "string" && (NATIVE_HOOK_FAILURE_REASONS as readonly string[]).includes(value);
+}
+
+/** True only for a value from the closed background member-kind set. */
+export function isNativeHookBackgroundKind(value: unknown): value is NativeHookBackgroundKind {
+  return typeof value === "string" && (NATIVE_HOOK_BACKGROUND_KINDS as readonly string[]).includes(value);
 }
 
 /** Bounded host/instance identity shape shared with the broker registration API. */
@@ -421,16 +539,36 @@ export function encodeNativeHookBootstrapEnv(bootstrap: NativeHookBootstrap): st
  * a malformed/oversized/truncated snapshot becomes an explicit unknown failure
  * rather than a partial count, an undercount, or a fabricated zero.
  *
- * Filter: status is exactly `running` or `pending` AND `backgrounded === true`.
+ * Filter: status is exactly `running` or `pending`, AND `backgrounded` is not
+ * `false`. The installed Claude Code 2.1.325 provider pre-filters this array
+ * itself: `$Qn(taskRegistry.all())` (~292635600) emits
+ * `{id, type, status, description}` entries selected by `ES` (~283507589),
+ * which admits only `status ∈ {running, pending}` and never
+ * `isBackgrounded === false`, and the published entry schema `aC` (~280531508)
+ * has no `backgrounded` member at all. So an absent `backgrounded` is the
+ * provider's normal shape, not missing data; an explicit `false` still excludes
+ * the entry, which is what keeps foreground work out of the counts.
+ *
  * Classification for kept entries: `type === "shell"` is a shell; every other
- * nonempty native type label is a task. Extra provider fields (descriptions,
- * commands, IDs, output, crons) are intentionally ignored.
+ * nonempty native type label is a task. The provider's label map `JIo`
+ * (~283506226) yields `"shell"` only for `local_bash`, so agents, monitors,
+ * workflows, teammates, and cloud sessions land in `tasks`. Extra provider
+ * fields (descriptions, commands, output, crons) are intentionally ignored.
+ *
+ * Membership is the same validated pass: every kept entry that the provider
+ * identified becomes `{id, kind}`. If any kept entry carries no id the
+ * projection is `null` rather than a shortened set, and a present-but-malformed
+ * or duplicated id anywhere in the array fails the whole snapshot.
  */
-export function deriveNativeHookBackgroundCounts(value: unknown): NativeHookBackgroundCountsResult {
+export function deriveNativeHookBackgroundSnapshot(value: unknown): NativeHookBackgroundSnapshotResult {
   if (!Array.isArray(value)) return { ok: false, reason: "input-invalid" };
   if (value.length > MAX_NATIVE_HOOK_BACKGROUND_TASKS) return { ok: false, reason: "input-too-large" };
   let tasks = 0;
   let shells = 0;
+  const members: NativeHookBackgroundMember[] = [];
+  const seenIds = new Set<string>();
+  let memberIds = true;
+  let idBytes = 0;
   for (const entry of value) {
     if (!isRecord(entry)) return { ok: false, reason: "input-invalid" };
     const status = entry.status;
@@ -439,19 +577,86 @@ export function deriveNativeHookBackgroundCounts(value: unknown): NativeHookBack
         ? { ok: false, reason: "input-too-large" }
         : { ok: false, reason: "input-invalid" };
     }
-    if (typeof entry.backgrounded !== "boolean") return { ok: false, reason: "input-invalid" };
+    const backgrounded = entry.backgrounded;
+    if (backgrounded !== undefined && typeof backgrounded !== "boolean") {
+      return { ok: false, reason: "input-invalid" };
+    }
     const type = entry.type;
     if (!isBoundedText(type, MAX_NATIVE_HOOK_LABEL_BYTES)) {
       return typeof type === "string" && Buffer.byteLength(type, "utf8") > MAX_NATIVE_HOOK_LABEL_BYTES
         ? { ok: false, reason: "input-too-large" }
         : { ok: false, reason: "input-invalid" };
     }
-    if ((status === "running" || status === "pending") && entry.backgrounded) {
-      if (type === "shell") shells += 1;
+    const id = entry.id;
+    if (id !== undefined && !isBoundedText(id, MAX_NATIVE_HOOK_MEMBER_ID_BYTES)) {
+      return { ok: false, reason: "input-invalid" };
+    }
+    if (typeof id === "string") {
+      if (seenIds.has(id)) return { ok: false, reason: "input-invalid" };
+      seenIds.add(id);
+    }
+    if ((status === "running" || status === "pending") && backgrounded !== false) {
+      const kind: NativeHookBackgroundKind = type === "shell" ? "shell" : "task";
+      if (kind === "shell") shells += 1;
       else tasks += 1;
+      if (typeof id === "string") {
+        idBytes += Buffer.byteLength(id, "utf8");
+        if (idBytes > MAX_NATIVE_HOOK_MEMBERS_ID_BYTES) return { ok: false, reason: "input-too-large" };
+        members.push({ id, kind });
+      } else {
+        memberIds = false;
+      }
     }
   }
-  return { ok: true, counts: { tasks, shells } };
+  return { ok: true, counts: { tasks, shells }, members: memberIds ? members : null };
+}
+
+/**
+ * Counts-only form of {@link deriveNativeHookBackgroundSnapshot}; the closed
+ * counts semantics are identical because both come from the same single pass.
+ */
+export function deriveNativeHookBackgroundCounts(value: unknown): NativeHookBackgroundCountsResult {
+  const derived = deriveNativeHookBackgroundSnapshot(value);
+  return derived.ok ? { ok: true, counts: derived.counts } : derived;
+}
+
+/**
+ * Selects the closed positive-launch projection from one already-parsed
+ * provider value. Only the verified tool for that kind, on an actual
+ * successful result of its own, can produce one:
+ * - `tool_name === "Bash"` with a result carrying `backgroundTaskId` is a
+ *   `shell`;
+ * - `tool_name` in `{"Task","Agent"}` with a result whose own `status` is
+ *   exactly `"async_launched"` and which carries `agentId` is a `task`.
+ * An unrelated tool that happens to carry either field is not lifecycle
+ * evidence and selects nothing, and a tool whose result belongs to the other
+ * kind is not accepted either.
+ * Both ids are the provider's task-registry keys, the same namespace the root
+ * `Stop` snapshot reports as `background_tasks[].id`, so a launch id and a
+ * later member id are directly comparable. A `PreToolUse` `run_in_background`
+ * intent, a foreground agent, a failed tool, or an unusable id selects nothing:
+ * absence is unknown, never zero and never a guessed member.
+ */
+function selectNativeHookBackgroundStarted(value: Record<string, unknown>): NativeHookBackgroundStarted | undefined {
+  const toolName = value.tool_name;
+  if (typeof toolName !== "string") return undefined;
+  const response = value.tool_response;
+  if (!isRecord(response)) return undefined;
+  if (isNativeHookShellLaunchTool(toolName)) {
+    const taskId = response.backgroundTaskId;
+    return typeof taskId === "string" && isBoundedText(taskId, MAX_NATIVE_HOOK_MEMBER_ID_BYTES)
+      ? { id: taskId, kind: "shell" }
+      : undefined;
+  }
+  if (isNativeHookTaskLaunchTool(toolName)) {
+    const agentId = response.agentId;
+    if (response.status === "async_launched"
+      && typeof agentId === "string"
+      && isBoundedText(agentId, MAX_NATIVE_HOOK_MEMBER_ID_BYTES)) {
+      return { id: agentId, kind: "task" };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -460,7 +665,9 @@ export function deriveNativeHookBackgroundCounts(value: unknown): NativeHookBack
  * field that is malformed or oversized is an explicit closed failure. Selection
  * happens BEFORE any wire encoding, so sensitive provider text has no path into
  * the frame. The optional `background_counts` projection is derived only for
- * the established Stop/SubagentStop snapshot field.
+ * the established Stop/SubagentStop snapshot field, together with its
+ * `background_members` form, and `background_started` is derived only from a
+ * `PostToolUse` result that actually launched background work.
  */
 export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProviderInputResult {
   if (!isRecord(value)) return { ok: false, reason: "input-invalid" };
@@ -482,10 +689,15 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
   }
   if (name === "Stop" || name === "SubagentStop") {
     if (Object.prototype.hasOwnProperty.call(value, "background_tasks")) {
-      const derived = deriveNativeHookBackgroundCounts(value.background_tasks);
+      const derived = deriveNativeHookBackgroundSnapshot(value.background_tasks);
       if (!derived.ok) return { ok: false, reason: derived.reason };
       metadata.background_counts = derived.counts;
+      if (derived.members !== null) metadata.background_members = derived.members;
     }
+  }
+  if (name === "PostToolUse") {
+    const started = selectNativeHookBackgroundStarted(value);
+    if (started !== undefined) metadata.background_started = started;
   }
   return { ok: true, metadata };
 }
@@ -498,6 +710,53 @@ function parseNativeHookBackgroundCounts(value: unknown): NativeHookBackgroundCo
   if (!Number.isSafeInteger(shells) || (shells as number) < 0 || (shells as number) > MAX_NATIVE_HOOK_BACKGROUND_TASKS) return undefined;
   if ((tasks as number) + (shells as number) > MAX_NATIVE_HOOK_BACKGROUND_TASKS) return undefined;
   return { tasks: tasks as number, shells: shells as number };
+}
+
+/**
+ * Strictly rebuilds one projected membership set from wire bytes: closed
+ * `{id, kind}` objects only, bounded opaque ids, unique ids, and an aggregate
+ * id byte budget. Any extra member field, duplicate id, unknown kind, or
+ * oversize input refuses the whole frame.
+ */
+function parseNativeHookBackgroundMembers(value: unknown): readonly NativeHookBackgroundMember[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_NATIVE_HOOK_BACKGROUND_TASKS) return undefined;
+  const members: NativeHookBackgroundMember[] = [];
+  const seen = new Set<string>();
+  let idBytes = 0;
+  for (const entry of value) {
+    if (!isRecord(entry) || !hasOnlyKeys(entry, BACKGROUND_MEMBER_KEYS)) return undefined;
+    const id = entry.id;
+    const kind = entry.kind;
+    if (!isBoundedText(id, MAX_NATIVE_HOOK_MEMBER_ID_BYTES)) return undefined;
+    if (!isNativeHookBackgroundKind(kind)) return undefined;
+    if (seen.has(id)) return undefined;
+    seen.add(id);
+    idBytes += Buffer.byteLength(id, "utf8");
+    if (idBytes > MAX_NATIVE_HOOK_MEMBERS_ID_BYTES) return undefined;
+    members.push({ id, kind });
+  }
+  return members;
+}
+
+/**
+ * Strictly rebuilds one projected launch id/kind pair from wire bytes, and
+ * re-checks the pairing the selection is built on: a `shell` launch is only
+ * credible from the shell-launch tool and a `task` launch only from a
+ * task-launch tool. A frame that names no tool, or pairs a kind with the wrong
+ * tool, is refused rather than trusted.
+ */
+function parseNativeHookBackgroundStarted(
+  value: unknown,
+  toolName: unknown,
+): NativeHookBackgroundStarted | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, BACKGROUND_STARTED_KEYS)) return undefined;
+  const id = value.id;
+  const kind = value.kind;
+  if (!isBoundedText(id, MAX_NATIVE_HOOK_MEMBER_ID_BYTES)) return undefined;
+  if (!isNativeHookBackgroundKind(kind)) return undefined;
+  if (kind === "shell" && !isNativeHookShellLaunchTool(toolName)) return undefined;
+  if (kind === "task" && !isNativeHookTaskLaunchTool(toolName)) return undefined;
+  return { id, kind };
 }
 
 function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame | undefined {
@@ -517,6 +776,36 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
     backgroundCounts = parseNativeHookBackgroundCounts(value.background_counts);
     if (!backgroundCounts) return undefined;
   }
+  let backgroundMembers: readonly NativeHookBackgroundMember[] | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "background_members")) {
+    // Membership is the same Stop-family snapshot, so it is admitted nowhere
+    // else. A wire client cannot inject a membership set on an unrelated event.
+    if (value.hook_event_name !== "Stop" && value.hook_event_name !== "SubagentStop") return undefined;
+    // And it is Claude-only projection data: a Codex frame keeps its pre-existing
+    // shape, so a new Claude-only field can never ride into that projection.
+    if (backend !== "claude") return undefined;
+    backgroundMembers = parseNativeHookBackgroundMembers(value.background_members);
+    if (!backgroundMembers) return undefined;
+    if (backgroundCounts !== undefined) {
+      // Both forms of one snapshot must agree. A frame that claims 0/0 while
+      // carrying members (or vice versa) is refused, not reconciled.
+      let tasks = 0;
+      let shells = 0;
+      for (const member of backgroundMembers) {
+        if (member.kind === "shell") shells += 1;
+        else tasks += 1;
+      }
+      if (tasks !== backgroundCounts.tasks || shells !== backgroundCounts.shells) return undefined;
+    }
+  }
+  let backgroundStarted: NativeHookBackgroundStarted | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "background_started")) {
+    // A launch edge exists only on the event that carries a real tool result,
+    // and only for the backend whose result schema actually issues these ids.
+    if (value.hook_event_name !== "PostToolUse" || backend !== "claude") return undefined;
+    backgroundStarted = parseNativeHookBackgroundStarted(value.background_started, value.tool_name);
+    if (!backgroundStarted) return undefined;
+  }
   return {
     version: 1,
     type: "native_hook_event",
@@ -526,6 +815,8 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
     token: value.token,
     ...selected.metadata,
     ...(backgroundCounts === undefined ? {} : { background_counts: backgroundCounts }),
+    ...(backgroundMembers === undefined ? {} : { background_members: backgroundMembers }),
+    ...(backgroundStarted === undefined ? {} : { background_started: backgroundStarted }),
   };
 }
 
@@ -570,7 +861,22 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
   if (parsed.type === "native_hook_event") {
     const frame = parseEventFrame(parsed);
     if (!frame) return undefined;
-    const { hook_event_name, session_id, transcript_path, agent_id, agent_type, prompt_id, turn_id, source, reason, tool_name, tool_use_id, background_counts } = frame;
+    const {
+      hook_event_name,
+      session_id,
+      transcript_path,
+      agent_id,
+      agent_type,
+      prompt_id,
+      turn_id,
+      source,
+      reason,
+      tool_name,
+      tool_use_id,
+      background_counts,
+      background_members,
+      background_started,
+    } = frame;
     return {
       kind: "event",
       frame,
@@ -588,6 +894,8 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
         ...(tool_name === undefined ? {} : { tool_name }),
         ...(tool_use_id === undefined ? {} : { tool_use_id }),
         ...(background_counts === undefined ? {} : { background_counts }),
+        ...(background_members === undefined ? {} : { background_members }),
+        ...(background_started === undefined ? {} : { background_started }),
       },
     };
   }

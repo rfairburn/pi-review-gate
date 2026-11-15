@@ -89,33 +89,60 @@
  *    THIS controller's generation and read attempt, so a re-read is idempotent
  *    and a stale callback is fenceable. It is never presented as, and cannot
  *    become, proof of a native conversation identity.
- * 6. Counts are last-reported snapshots, not a census. The only native count
- *    this controller carries is the ROOT `Stop` hook's own `background_counts`
- *    projection: present (including 0/0) is a real observed snapshot, absent or
- *    unreadable is unknown (never a zero), and a `SubagentStop` snapshot is never
- *    used as root scope. A published snapshot is dropped only by what can
- *    actually contradict it — a newer ROOT `Stop` payload, a task transition the
- *    transcript positively shows, a scope change, or a loss of the authenticated
- *    hook lane — and never merely because some other event arrived. Ordinary new
- *    foreground work (a prompt, tool use, or a newer root model row in the
- *    transcript) says nothing about background membership, so the last reported
- *    numbers stay published as last-reported until one of those invalidators
- *    lands. Nothing reconstructs a count from activity, quietness, or a missing
- *    snapshot, and no published number is presented as a continuously live
- *    census: it is what this run's own root `Stop` last stated, for display.
- *    The live `system/background_tasks_changed` level is unreachable on this
- *    hook/PTY route by design, so it is never probed and never reported as a
- *    failed probe.
- * 7. Published state stays monitored. Terminal-witness arming and fixed-file
- *    validity/count monitoring are separate: while a count snapshot or a
+ * 6. Counts are live native membership, or a real snapshot, never a guess. Two
+ *    sources feed one published pair, and they are never mixed:
+ *    - the per-run membership {@link NativeClaudeBackgroundLedger} carries this
+ *      run's exact active set. It is seeded only by evidence that can vouch for
+ *      it — the host's own launch of this process, or a complete ROOT membership
+ *      snapshot — and it then moves exactly on positively observed edges: a
+ *      confirmed `background_started` launch identity, a matching settle read out
+ *      of this run's own persisted root rows, and a complete ROOT `Stop`
+ *      `background_members` snapshot, which is the resync and outranks everything
+ *      the ledger itself remembered. A genuine hole — a settle for an id never
+ *      launched, a membership change whose member cannot be identified, a scope
+ *      boundary, a hook-lane loss, or a lost transcript (this file is one of the
+ *      two places a member's end is positively read, so a skipped window, a
+ *      replaced or truncated file, or a watcher failure is a census hole, not just
+ *      a read failure) — withdraws the ledger to unknown until the next complete
+ *      snapshot: it never holds a stale count and never fabricates a zero. Every
+ *      transcript membership source first passes one root fence — not sidechain,
+ *      not agent-scoped, and naming no conversation other than this run's bound
+ *      root session — so a child's or another conversation's completion can
+ *      neither settle this run's member nor open a hole here.
+ *    - when the ledger has no exact set to publish, a ROOT `Stop`'s own
+ *      identity-free `background_counts` totals stand as this run's last-reported
+ *      snapshot: present (including 0/0) is a real observation, absent or
+ *      unreadable is unknown, and any membership edge clears it, because totals
+ *      cannot account for a member the ledger never saw.
+ *    A published number is dropped only by what can actually contradict it — a
+ *    newer ROOT snapshot, a membership transition the transcript positively
+ *    shows, a scope change, or a loss of the authenticated hook lane — and never
+ *    merely because some other event arrived. Ordinary new foreground work (a
+ *    prompt, tool use, or a newer root model row in the transcript) says nothing
+ *    about background membership, so a live set or a last-reported snapshot
+ *    survives it. Nothing reconstructs a count from activity, quietness, or a
+ *    missing snapshot. Counts are DISPLAY ONLY: they are never this host's
+ *    `backgroundTasks`/`backgroundShells`, never ownership, and never Stop or
+ *    idle authority. A `SubagentStop` snapshot is that child's array and is never
+ *    root scope. The live `system/background_tasks_changed` level is unreachable
+ *    on this hook/PTY route by design, so it is never probed and never reported
+ *    as a failed probe.
+ * 7. Published state stays monitored — including while the provider has not
+ *    created its root JSONL yet, where that file's own creation is the watched
+ *    event that starts monitoring and a brand-new file is scanned from its first
+ *    record so nothing already written is skipped. Terminal-witness arming and
+ *    fixed-file validity/count monitoring are separate: while a count snapshot or a
  *    source-confirmed Ready is published, the watcher stays attached and reads
  *    continue, so a structured task transition in the transcript
- *    (`attachment/task_status`, a `queued_command` whose `origin.kind` is
+ *    (`attachment/task_status`, a provider `queue-operation` `enqueue` in this
+ *    run's own bound root session whose `task-notification` envelope names a
+ *    finished id and a terminal status, a `queued_command` whose `origin.kind` is
  *    `task-notification` or whose `origin.producer` is `session-task`, or a
- *    `toolUseResult.status` of `async_launched`) invalidates the published counts,
- *    a positively observed NEW ROOT model row in that file withdraws the published
- *    foreground and activity to unknown, and a later replacement or truncation of
- *    the bound file withdraws the transcript-derived state. Rootness comes
+ *    `toolUseResult.status` of `async_launched`) settles the member it names or,
+ *    when it cannot name a member this ledger tracks, withdraws the published
+ *    counts, a positively observed NEW ROOT model row in that file withdraws the
+ *    published foreground and activity to unknown, and a later replacement or
+ *    truncation of the bound file withdraws the transcript-derived state. Rootness comes
  *    from closed structural metadata only — the persisted turn-record `type` plus
  *    an actual `message` object, refused for `isSidechain`, an agent id, or a row
  *    naming another native session — never from prompt text, model prose, tool
@@ -174,8 +201,16 @@
  */
 
 import { lstatSync, watch, type Stats } from "node:fs";
+import { dirname } from "node:path";
 
 import { isRecord } from "../record-guard";
+import {
+  NativeClaudeBackgroundLedger,
+  isValidNativeClaudeBackgroundMemberId,
+  readNativeClaudeBackgroundLaunch,
+  readNativeClaudeBackgroundMembers,
+  type NativeClaudeBackgroundCounts,
+} from "./native-claude-background";
 import {
   isNativeClaudeFreshStartSource,
   NativeClaudeStatusReducer,
@@ -306,6 +341,17 @@ interface WindowScan {
   /** True when the window carried a structured native task/launch transition. */
   readonly transition: boolean;
   /**
+   * Member identities a settled native task row in this window names, in file
+   * order, bounded. Identities only: no command, description, output, or
+   * notification text crosses.
+   */
+  readonly settleIds: readonly string[];
+  /**
+   * True when a membership transition could not be resolved to one member this
+   * ledger tracks — the census changed, but not in a way that can be counted.
+   */
+  readonly unresolvedTransition: boolean;
+  /**
    * True when the window carried a positively observed ROOT FOREGROUND row: a
    * persisted human PROMPT row or a root `assistant` model row. This is the only
    * kind of row that can outrank whatever this controller last published about the
@@ -374,6 +420,50 @@ const ADOPTABLE_EVENTS: ReadonlySet<string> = new Set([
 /** Hook kinds that are positively observed new root work, ending an armed pass. */
 const NEW_ROOT_WORK_EVENTS: ReadonlySet<string> = new Set(["UserPromptSubmit", "PreToolUse"]);
 
+/**
+ * The closed native task statuses that positively state a member finished. Only
+ * these settle a tracked member; anything else the provider reports about a live
+ * task is not evidence that membership ended.
+ */
+const SETTLED_TASK_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * The provider's own queue operations. An `enqueue` of a task notification is the
+ * record the provider writes when a background job finishes — persisted before
+ * that notification is ever handed to the model, and therefore before any answer,
+ * decline, or next prompt. `dequeue` only says the queued text was handed over:
+ * it is neither new work nor a settlement, and no other operation claims anything
+ * here.
+ */
+const NATIVE_QUEUE_ENQUEUE = "enqueue";
+
+/** The provider's own completion envelope and the two tags this lane consumes. */
+const TASK_NOTIFICATION_OPEN = "<task-notification>";
+const TASK_NOTIFICATION_CLOSE = "</task-notification>";
+const TASK_NOTIFICATION_ID_TAG = "task-id";
+const TASK_NOTIFICATION_STATUS_TAG = "status";
+
+/**
+ * Bounded envelope text. The provider's completion block is a few hundred bytes;
+ * anything larger is not that block and is refused rather than scanned.
+ */
+const MAX_TASK_NOTIFICATION_BYTES = 8 * 1024;
+
+/** Bounded tag value: an id or a status token, never a body. */
+const MAX_TASK_NOTIFICATION_VALUE_BYTES = 64;
+
+/** Bounded settled-member identities extracted from one scanned window. */
+const MAX_SETTLEMENTS_PER_WINDOW = 64;
+
+/**
+ * Private per-run ledger scope tokens. One controller observes exactly one owned
+ * run, so a process-unique token is exactly that run's scope: it is never
+ * published, never a provider field, and never derived from a native session id,
+ * which lets the host's launch-time baseline stand before the provider ever
+ * names a conversation.
+ */
+let ledgerScopeSequence = 0;
+
 /** Bounded terminal candidates per window: more than this is a source we cannot rank. */
 const MAX_TERMINAL_CANDIDATES = 8;
 
@@ -419,6 +509,10 @@ export class NativeClaudeAcquisitionController {
   readonly #watchFile: NativeClaudeWatchFactory;
 
   readonly #reducer = new NativeClaudeStatusReducer();
+  /** This run's live background membership census. Never published as ownership. */
+  readonly #ledger = new NativeClaudeBackgroundLedger();
+  /** This run's private ledger scope token; never crosses an observation. */
+  readonly #ledgerScope: string;
 
   /**
    * Local generation fence. Bumped by a scope rebind, accepted new root work, an
@@ -434,8 +528,28 @@ export class NativeClaudeAcquisitionController {
   #transcriptPath: string | null = null;
   /** Absolute offset through the last complete record positively scanned. */
   #cursor: number | null = null;
+  /**
+   * The byte offset at which transcript rows begin being able to contradict the
+   * FOREGROUND this controller last derived from the hook lane. Every accepted
+   * root-work hook re-states it at the file's size at that moment: rows already
+   * written belong to the very turn that hook just described, so reading them a
+   * moment later — which the preserved scan cursor guarantees happens — is not
+   * newer work and must not withdraw what the hook positively observed. Membership
+   * rows and question-result rows are still consumed from below that floor: only
+   * the foreground contradiction is fenced by position.
+   */
+  #foregroundFloor = 0;
   /** Identity of the file the cursor belongs to; a change is a replacement. */
   #identity: NativeJsonlFileIdentity | null = null;
+  /**
+   * The path of the transcript this controller has actually read from — a scan
+   * floor established or a window consumed. Unlike the scan cursor it survives a
+   * retire, because it answers a different question: has this file ever existed
+   * for us at all. A provider creates its root JSONL when the conversation
+   * begins, so a bound path that has never been read and is not there yet holds
+   * no records, while a path once read and now missing is a hole.
+   */
+  #transcriptSeenPath: string | null = null;
   #armed: ArmedRead | null = null;
   /** True once THIS pass' terminal witness was applied, so no second witness is sought. */
   #terminalAccepted = false;
@@ -457,10 +571,25 @@ export class NativeClaudeAcquisitionController {
    * call claiming it is refused.
    */
   #baselineRetired = false;
-  /** Last positive ROOT Stop count snapshot; null is unknown, never zero. */
-  #counts: NativeHookBackgroundCounts | null = null;
+  /**
+   * Last reported ROOT `Stop` count totals, which carry no member identities.
+   * They publish only while the membership ledger has no exact set, and any
+   * membership edge clears them. Null is unknown, never zero.
+   */
+  #snapshotCounts: NativeHookBackgroundCounts | null = null;
 
   #watcher: ActiveWatch | null = null;
+  /**
+   * One bounded watch on the PARENT of the bound transcript, armed only while that
+   * path is absent and has never been read. The provider creates its root JSONL
+   * when the conversation begins, so the creation itself is the only event that
+   * can say monitoring can start; a file that does not exist yet cannot be watched
+   * directly. It is closed the moment the file appears (the file watch takes over)
+   * and never outlives the lane it belongs to.
+   */
+  #pendingFileWatch: ActiveWatch | null = null;
+  /** The path whose creation {@link #pendingFileWatch} waits for. */
+  #awaitedTranscriptPath: string | null = null;
   #reading = false;
   #readAgain = false;
   #readSeq = 0;
@@ -483,6 +612,7 @@ export class NativeClaudeAcquisitionController {
     this.#maxTailBytes = options.maxTailBytes;
     this.#maxLineBytes = options.maxLineBytes;
     this.#watchFile = typeof options.watchFile === "function" ? options.watchFile : defaultWatchFile;
+    this.#ledgerScope = `native-claude-run-${++ledgerScopeSequence}`;
   }
 
   /**
@@ -538,7 +668,7 @@ export class NativeClaudeAcquisitionController {
     // Only this run's own scope may contribute counts: an event naming a different
     // native conversation never replaces this run's own snapshot.
     const sameScope = this.#sessionId === null || eventSession === null || eventSession === this.#sessionId;
-    if (sameScope) this.#noteCounts(event, isRoot, hookEventName);
+    if (sameScope) this.#noteMembership(event, isRoot, hookEventName);
 
     const admitted = reduction.outcome === "applied";
 
@@ -547,7 +677,17 @@ export class NativeClaudeAcquisitionController {
     // still in flight for it, can no longer publish.
     if (admitted && sameScope && isRoot && NEW_ROOT_WORK_EVENTS.has(hookEventName)) {
       this.#startupVouched = false;
-      this.#retire();
+      // The previous turn's terminal-witness authority is over, but rows this
+      // controller has not scanned yet are still this run's facts: a completion
+      // record written a moment before this hook must not go permanently unread
+      // because an unrelated foreground edge arrived.
+      this.#retireTerminalWitness();
+      // What that hook positively stated describes everything written so far, so
+      // only rows appended after it can contradict it. A file this controller
+      // cannot size gets no floor at all: unreadable positions must not be used to
+      // discard a positively observed hook-lane foreground.
+      const boundary = this.#statBound();
+      this.#foregroundFloor = "gap" in boundary ? Number.POSITIVE_INFINITY : boundary.stats.size;
     }
 
     if (admitted && sameScope && isRoot && hookEventName === "Stop") {
@@ -606,7 +746,12 @@ export class NativeClaudeAcquisitionController {
     // of its own: that is a positively observed zero for this run, not a
     // reconstruction, and any later ROOT `Stop` snapshot, task transition, scope
     // change, or lane loss replaces or withdraws it on its own evidence.
-    this.#counts = { tasks: 0, shells: 0 };
+    // The membership ledger gets the same vouch from the same evidence: this is
+    // the ONE place a KNOWN-EMPTY census is minted, and it is minted on this run's
+    // own private scope token, so a later provider `SessionStart` that binds a
+    // session id can neither reset it nor have it re-minted over live work.
+    this.#ledger.initializeFreshOwnedRun(this.#ledgerScope);
+    this.#snapshotCounts = { tasks: 0, shells: 0 };
     this.#syncWatcher();
     this.#emit();
   }
@@ -625,7 +770,10 @@ export class NativeClaudeAcquisitionController {
     this.#retire();
     // An explicit withdrawal is the caller taking back every claim, including the
     // hook-payload snapshot it last saw published.
-    this.#counts = null;
+    this.#snapshotCounts = null;
+    // The census goes unknown on this run's own scope; the scope itself stays
+    // bound, because recovery is new evidence, never a freshly minted baseline.
+    this.#ledger.noteCoverageGap(this.#ledgerScope);
     this.#reducer.invalidate();
     this.#emit();
   }
@@ -641,7 +789,10 @@ export class NativeClaudeAcquisitionController {
     this.#startupVouched = false;
     this.#baselineRetired = true;
     this.#retire();
-    this.#counts = null;
+    this.#snapshotCounts = null;
+    // The run is over: retire the ledger scope outright. Nothing is carried into a
+    // later run, and this call never mints a fresh status-capture authority.
+    this.#ledger.retireScope(this.#ledgerScope);
     this.#sessionId = null;
     this.#transcriptPath = null;
   }
@@ -674,7 +825,7 @@ export class NativeClaudeAcquisitionController {
       // start notice, so the run does not blink through unknown while the provider
       // reports the boundary the host already knows. A scope this controller has
       // been observing work in never held the vouch and stays unknown.
-      if (this.#startupVouched) this.#counts = { tasks: 0, shells: 0 };
+      if (this.#startupVouched) this.#snapshotCounts = { tasks: 0, shells: 0 };
       return;
     }
     if (this.#sessionId !== null && sessionId !== null && sessionId !== this.#sessionId) return;
@@ -702,82 +853,183 @@ export class NativeClaudeAcquisitionController {
     }
   }
 
-  /** Drop every derived fact: a new scope inherits no Ready, count, or cursor. */
+  /**
+   * Drop every derived fact: a new scope inherits no Ready, count, or cursor.
+   * Membership is never re-based here — a boundary the provider reports is not
+   * the host's spawn, so this call cannot mint a fresh census. What it can do is
+   * report a hole, and only where one actually exists: a positively known EMPTY
+   * census states that nothing was outstanding when this boundary arrived, so the
+   * boundary contradicts nothing and the exact zeros stand (which is what lets a
+   * host-owned run keep live counts across its own `SessionStart`). A live set
+   * does not survive a boundary this observer cannot see through, so it withdraws
+   * to unknown until this run's next complete membership snapshot.
+   */
   #resetScope(sessionId: string | null, transcriptPath: string | null): void {
     this.#retire();
-    this.#counts = null;
+    this.#snapshotCounts = null;
+    if (this.#ledger.snapshot().members.length > 0) this.#ledger.noteCoverageGap(this.#ledgerScope);
     this.#sessionId = sessionId;
     this.#transcriptPath = transcriptPath;
   }
 
   /**
-   * Retire the in-flight read: closes the watcher and clears every fact derived
-   * from the transcript lane. The ROOT `Stop` count snapshot is deliberately NOT
-   * cleared here — retiring a read cursor, a generation, or a published `Ready`
-   * says nothing about background membership, and only the snapshot's own
-   * invalidators (a newer root snapshot, a transcript transition that positively
-   * shows membership change, a scope change, or a hook-lane loss) withdraw it.
+   * Retire the in-flight read AND re-establish a fresh scan floor. Used when the
+   * transcript lane itself loses standing: a new scope or file, a lost read, an
+   * explicit withdrawal, or the end of the run.
+   *
+   * Neither variant clears background membership: retiring a read cursor, a
+   * generation, or a published `Ready` says nothing about what is running, and
+   * only membership's own invalidators (a newer root snapshot, a transition row
+   * that positively shows membership change, a scope change, a lost settlement
+   * source, or a hook-lane loss) withdraw it.
    */
   #retire(): void {
+    this.#retireLane(false);
+  }
+
+  /**
+   * Retire the terminal-witness authority — the armed pass, the corroborated
+   * fresh start, the published `Ready`, the accepted terminal identity, and any
+   * read in flight — while KEEPING the byte offset this controller has already
+   * scanned up to. Newer root work ends what the previous turn's read could
+   * claim; it says nothing about rows the file already holds past the last
+   * completed scan, so a membership transition written before this edge is still
+   * read next. Dropping the cursor here would skip it until some unrelated
+   * snapshot, leaving a count wrong in the meantime — and a read discarded by the
+   * generation change is covered by the same preserved offset.
+   */
+  #retireTerminalWitness(): void {
+    this.#retireLane(true);
+  }
+
+  #retireLane(keepScanCursor: boolean): void {
     this.#generation += 1;
     this.#armed = null;
     this.#freshProbe = null;
     this.#closeWatcher();
-    this.#cursor = null;
-    this.#identity = null;
+    // A preserved cursor is only safe together with the file identity it belongs
+    // to: reading a replaced or truncated file from an old offset is worse than
+    // skipping it, so the two are retired or kept as one fact.
+    if (!keepScanCursor) {
+      this.#cursor = null;
+      this.#identity = null;
+      this.#foregroundFloor = 0;
+    }
     this.#terminalAccepted = false;
     this.#readyPublished = false;
     this.#readAgain = false;
   }
 
-  // --- native counts -------------------------------------------------------
+  // --- native background membership ----------------------------------------
 
   /**
-   * The only native count source this controller carries: the ROOT `Stop` hook's
-   * own validated snapshot. Present (including 0/0) is a real observation; absent
-   * or unreadable is unknown, never zero, and a newer root `Stop` replaces the
-   * last snapshot with its own. Every other event — including a `SubagentStop`
-   * snapshot, which is that subagent's array and never root scope, and including
-   * ordinary new foreground work — leaves the last snapshot alone: an unrelated
-   * edge is not evidence that background membership changed, so the numbers this
-   * run's own root `Stop` reported stay published as last-reported until a
-   * membership-changing transition row, a scope change, or a hook-lane loss
-   * withdraws them. Nothing here replaces a snapshot with a child subset or a
-   * reconstruction.
+   * Feed this run's ROOT background membership edges to the ledger, and keep the
+   * identity-free totals snapshot honest alongside it.
+   *
+   * Only root events are root membership: a `SubagentStop` snapshot is that
+   * child's whole array and can never replace or erase the root set. Within the
+   * root lane:
+   * - a `PostToolUse` that actually launched background work contributes one
+   *   confirmed member. A `PreToolUse` `run_in_background` intent, a failed
+   *   launch, and a foreground agent produce no such projection at all, so they
+   *   contribute nothing here either.
+   * - a ROOT `Stop` carrying `background_members` is a complete census and
+   *   resyncs the ledger exactly, including a real empty set.
+   * - a ROOT `Stop` carrying only totals replaces the last-reported snapshot;
+   *   absent or unreadable totals are unknown, never a retained number and never
+   *   a zero. Totals that disagree with a census this ledger can state prove at
+   *   least one membership edge went unobserved, so the census withdraws to
+   *   unknown rather than silently under- or over-counting.
+   * Ordinary foreground work is not a membership edge, so the published numbers
+   * survive it as last-reported until one of membership's own invalidators lands.
    */
-  #noteCounts(event: NativeHookEvent, isRoot: boolean, hookEventName: string): void {
-    if (!isRoot || hookEventName !== "Stop") return;
+  #noteMembership(event: NativeHookEvent, isRoot: boolean, hookEventName: string): void {
+    if (!isRoot) return;
+
+    if (hookEventName === "PostToolUse") {
+      const launch = readNativeClaudeBackgroundLaunch(event);
+      if (launch === null) return;
+      this.#ensureLedgerScope();
+      this.#ledger.observeStarted(this.#ledgerScope, launch);
+      // A confirmed launch is membership change the last totals snapshot cannot
+      // account for. The ledger carries the run from here; a totals-only claim
+      // would silently undercount it.
+      this.#snapshotCounts = null;
+      return;
+    }
+    if (hookEventName !== "Stop") return;
+
     // The provider's own snapshot is now the authority on this run's membership:
     // the launch-time baseline vouch is spent, and the numbers come from here on.
     this.#startupVouched = false;
-    this.#counts = readBackgroundCounts(event);
+    const members = readNativeClaudeBackgroundMembers(event);
+    if (members !== null) {
+      this.#ensureLedgerScope();
+      this.#ledger.replaceFullRootMembers(this.#ledgerScope, members);
+      this.#snapshotCounts = null;
+      return;
+    }
+    const totals = readBackgroundCounts(event);
+    this.#snapshotCounts = totals;
+    if (totals === null) return;
+    const live = this.#ledger.counts();
+    if (live !== null && (live.tasks !== totals.tasks || live.shells !== totals.shells)) {
+      this.#ledger.noteCoverageGap(this.#ledgerScope);
+    }
+  }
+
+  /**
+   * Bind the ledger to this run before its first membership edge. A run the host
+   * launched already holds a positively known empty baseline; any other run is
+   * ADOPTED, which tracks members but publishes nothing until a complete root
+   * snapshot proves the census whole — a mid-stream join never claims the empty
+   * set it did not observe from the beginning.
+   */
+  #ensureLedgerScope(): void {
+    if (this.#ledger.snapshot().scopeToken === null) this.#ledger.adoptRootSession(this.#ledgerScope);
+  }
+
+  /**
+   * The pair this controller may publish: the ledger's exact live census whenever
+   * membership is known, otherwise the last ROOT `Stop` totals snapshot,
+   * otherwise unknown. Every membership edge clears the totals, so the two
+   * sources never contradict each other and an unknown census never falls back to
+   * a number that edge already contradicted.
+   */
+  #publishedCounts(): NativeClaudeBackgroundCounts | null {
+    return this.#ledger.counts() ?? this.#snapshotCounts;
   }
 
   // --- reading: terminal witness and published-state monitoring -------------
 
   /**
    * True while there is anything worth reading the file for: an armed terminal
-   * read, or published state (a count snapshot, or ANY idle foreground claim the
-   * reducer is currently making — a witness-confirmed `Ready` or a corroborated
-   * fresh-start idle) whose validity, task transitions, and any newer ROOT model
-   * row still have to be watched, or a question request the hook lane opened and
+   * read, or published state (a live census or count snapshot, or ANY idle
+   * foreground claim the reducer is currently making — a witness-confirmed
+   * `Ready` or a corroborated fresh-start idle) whose validity, task transitions,
+   * and any newer ROOT model row still have to be watched, or a question request
+   * the hook lane opened and
    * has never seen close — its closure can live only in this file, so a declined
    * question must not wait for some other event to be resolved.
    */
   #shouldRead(): boolean {
     return this.#armed !== null
-      || this.#counts !== null
+      || this.#publishedCounts() !== null
       || this.#idlePublished()
       || this.#reducer.openQuestionRequestIds().length > 0;
   }
 
   /**
-   * True while the reducer publishes an idle foreground. A fresh-start idle is
-   * not a claim READ from this file, but this file is still the only thing that
-   * can contradict it once the hook lane goes silent, so it stays monitored.
+   * True while the reducer publishes a genuine IDLE foreground — a source-read
+   * terminal record, a corroborated fresh start, or the host's own launch
+   * baseline. A foreground published `false` because a question request stands is
+   * stopped-on-input in the middle of a live turn, not an idle claim, and must
+   * never be contradicted as if the turn had ended. A fresh-start idle is not a
+   * claim READ from this file, but this file is still the only thing that can
+   * contradict it once the hook lane goes silent, so it stays monitored.
    */
   #idlePublished(): boolean {
-    return this.#reducer.snapshot().busy === false;
+    return this.#reducer.idleForegroundPublished();
   }
 
   /**
@@ -901,13 +1153,17 @@ export class NativeClaudeAcquisitionController {
     // positively states that it has no background work yet: this is an observed
     // zero for this scope, not a reconstruction, and every later count source
     // (a newer ROOT `Stop` snapshot, a transition row, a scope change, a hook-lane
-    // loss) replaces or withdraws it exactly like any other snapshot.
-    this.#counts = { tasks: 0, shells: 0 };
+    // loss) replaces or withdraws it exactly like any other snapshot. It is a
+    // totals-level claim, not a minted census: only the host's own spawn may seed
+    // the ledger's known-empty set, so a run observed from outside keeps these
+    // corroborated zeros until its first complete membership snapshot.
+    this.#snapshotCounts = { tasks: 0, shells: 0 };
     // This read consumed the entire file, so the monitor's floor starts here and
     // the first row of any later turn is still seen.
     if (scannedTo !== null && readIdentity !== null) {
       this.#cursor = scannedTo;
       this.#identity = readIdentity;
+      this.#transcriptSeenPath = this.#transcriptPath;
     }
     this.#syncWatcher();
     this.#emit();
@@ -947,8 +1203,17 @@ export class NativeClaudeAcquisitionController {
       if (this.#readyPublished) this.#transcriptFailure(stat.gap);
       return false;
     }
-    this.#cursor = stat.stats.size;
+    // A file this controller was WAITING for was created by this very run, so
+    // nothing in it predates the conversation being observed: the scan starts at
+    // its first record, and a launch confirmation, a persisted question result, or
+    // a completion written before anyone could watch still lands. A file that was
+    // already there when monitoring started keeps the prior-history floor, so an
+    // older turn's row can never close a newer one.
+    const appeared = this.#awaitedTranscriptPath === this.#transcriptPath;
+    this.#awaitedTranscriptPath = null;
+    this.#cursor = appeared ? 0 : stat.stats.size;
     this.#identity = { dev: stat.stats.dev, ino: stat.stats.ino };
+    this.#transcriptSeenPath = this.#transcriptPath;
     return true;
   }
 
@@ -962,8 +1227,77 @@ export class NativeClaudeAcquisitionController {
       this.#closeWatcher();
       return;
     }
-    if (!this.#ensureScanFloor()) return;
+    if (!this.#ensureScanFloor()) {
+      // Nothing can be scanned yet. If the reason is simply that the provider has
+      // not created this file, that creation has to be an EVENT: no later hook is
+      // guaranteed to arrive, and a poll or timer is not available. Every other
+      // gap reports itself where it happened and gets no watch.
+      this.#armMaterializationWatch();
+      return;
+    }
+    this.#closeMaterializationWatch();
     if (this.#watcher === null) this.#attachWatcher();
+  }
+
+  /**
+   * Arm the one bounded creation watch for the bound transcript's parent
+   * directory. Its callback answers exactly one question — has the bound file
+   * appeared yet — and hands over to {@link #syncWatcher} either way, so no
+   * observation is derived from the directory itself and nothing is read from it.
+   */
+  #armMaterializationWatch(): void {
+    const path = this.#transcriptPath;
+    if (this.#disposed || path === null) return;
+    if (this.#pendingFileWatch !== null && this.#awaitedTranscriptPath === path) return;
+    const bound = this.#statBound();
+    if ("stats" in bound || bound.gap !== "unavailable") {
+      this.#closeMaterializationWatch();
+      this.#awaitedTranscriptPath = null;
+      return;
+    }
+    this.#closeMaterializationWatch();
+    // The fact that this path did not exist yet is what later justifies scanning
+    // the created file from its first record instead of skipping its history.
+    this.#awaitedTranscriptPath = path;
+    const generation = this.#generation;
+    try {
+      const handle = this.#watchFile(dirname(path), {
+        onChange: () => {
+          if (this.#disposed || generation !== this.#generation || this.#pendingFileWatch?.handle !== handle) return;
+          this.#syncWatcher();
+          // A file that just appeared may already hold this run's rows: read it
+          // now rather than waiting for an append that may never come. A file that
+          // still does not exist reports nothing at all.
+          void this.#readTail();
+        },
+        onError: () => {
+          if (this.#disposed || generation !== this.#generation || this.#pendingFileWatch?.handle !== handle) return;
+          this.#closeMaterializationWatch();
+          // Losing this watch is the coverage gap, not the file's absence: with a
+          // tracked member and no guaranteed further hook, nothing else is left
+          // that can ever consume this file's rows. The transcript lane's own
+          // failure path withdraws ledger exactness and reports the gap, while the
+          // hook lane's foreground, question census, and scope stay as observed.
+          this.#transcriptFailure("watch-unavailable");
+        },
+      });
+      this.#pendingFileWatch = { generation, handle };
+    } catch {
+      // Same fact, reached synchronously: the only mechanism that could learn this
+      // file was created cannot be built, so exact membership cannot be defended.
+      this.#transcriptFailure("watch-unavailable");
+    }
+  }
+
+  #closeMaterializationWatch(): void {
+    const pending = this.#pendingFileWatch;
+    this.#pendingFileWatch = null;
+    if (pending === null) return;
+    try {
+      pending.handle.close();
+    } catch {
+      // An already-closed watcher is the desired end state.
+    }
   }
 
   #attachWatcher(): void {
@@ -998,6 +1332,7 @@ export class NativeClaudeAcquisitionController {
   }
 
   #closeWatcher(): void {
+    this.#closeMaterializationWatch();
     const watcher = this.#watcher;
     this.#watcher = null;
     if (watcher === null) return;
@@ -1031,6 +1366,9 @@ export class NativeClaudeAcquisitionController {
     // An empty set means there is nothing to match, and no row is inspected for
     // an identity at all.
     const openQuestions = new Set(this.#reducer.openQuestionRequestIds());
+    // Likewise the member ids this run's census holds active NOW: a membership row
+    // that names one of them confirms the census instead of contradicting it.
+    const activeMembers = new Set(this.#ledger.snapshot().members.map((member) => member.id));
     const from = Math.max(armedFor?.byteOffset ?? 0, this.#cursor ?? 0);
     const expectIdentity = armedFor?.identity ?? this.#identity ?? undefined;
     this.#reading = true;
@@ -1039,6 +1377,16 @@ export class NativeClaudeAcquisitionController {
     let scan: WindowScan | null = null;
     let scannedTo: number | null = null;
     let readIdentity: NativeJsonlFileIdentity | null = null;
+    // The window's records and where they start, kept for the commit below: a
+    // membership or question edge accepted while this read is in flight is resolved
+    // against what this run holds at COMMIT time, not against the set captured
+    // before the await.
+    let windowRecords: readonly string[] = [];
+    let windowStart = 0;
+    // The size observed under the SAME handle that produced this window, trailing
+    // partial record included: what a committed window proves, it proves at this
+    // size.
+    let windowFileSize = 0;
     try {
       const result = await readNativeJsonlTail({
         path,
@@ -1054,7 +1402,23 @@ export class NativeClaudeAcquisitionController {
       } else if (result.oversizedLines > 0) {
         gap = "oversized";
       } else {
-        scan = this.#scanRecords(result.records, armedFor !== null, sessionId, openQuestions);
+        // Every record in the window, in order, starts exactly here: the tail
+        // reader consumed whole newline-terminated lines up to `scannedTo`, and an
+        // oversized line would have discarded this scan entirely.
+        windowRecords = result.records;
+        windowFileSize = result.fileSize;
+        windowStart = result.scannedTo - result.records.reduce(
+          (bytes, record) => bytes + Buffer.byteLength(record, "utf8") + 1,
+          0,
+        );
+        scan = this.#scanRecords(
+          result.records,
+          armedFor !== null,
+          sessionId,
+          openQuestions,
+          activeMembers,
+          windowStart,
+        );
         if (scan.malformed > 0) gap = "malformed";
         else {
           scannedTo = result.scannedTo;
@@ -1070,8 +1434,30 @@ export class NativeClaudeAcquisitionController {
     const stale = this.#disposed || generation !== this.#generation || this.#armed !== armedFor;
     if (!stale) {
       if (gap !== null) {
-        this.#transcriptFailure(gap);
+        this.#monitoringFailure(gap, armedFor !== null);
       } else if (scan !== null && scannedTo !== null && readIdentity !== null) {
+        // A hook accepted while this window was in flight can name a member this
+        // ledger holds NOW and did not hold when the read began — the ordinary
+        // shape of an async launch, whose persisted `async_launched` row and whose
+        // `background_started` confirmation land seconds apart. Judged against the
+        // captured set that row is an unresolvable membership change, so the
+        // census the hook just made exact would withdraw, and the cursor advanced
+        // here would hide the row ever after. The same records are therefore
+        // classified once more against what this run holds at commit time, and only
+        // that result is applied. Malformed and oversized counts cannot depend on
+        // identities, so the window's validity is already settled.
+        const membersNow = new Set(this.#ledger.snapshot().members.map((member) => member.id));
+        const questionsNow = new Set(this.#reducer.openQuestionRequestIds());
+        if (!sameIdentityNames(activeMembers, membersNow) || !sameIdentityNames(openQuestions, questionsNow)) {
+          scan = this.#scanRecords(
+            windowRecords,
+            armedFor !== null,
+            sessionId,
+            questionsNow,
+            membersNow,
+            windowStart,
+          );
+        }
         // A persisted `tool_result` for a request this reducer holds open is that
         // request's own terminal evidence — the shape a declined, cancelled, or
         // answered question leaves when no `Post*` hook ever arrived. It is
@@ -1081,10 +1467,22 @@ export class NativeClaudeAcquisitionController {
         for (const requestId of scan.questionClosures) {
           this.#reducer.observeQuestionToolResult({ requestId, sessionId });
         }
-        // A structured native task/launch transition is proven membership change:
-        // it makes the last snapshot unknown whichever way the window resolves.
-        // It never replaces the snapshot with a reconstruction or a zero.
-        if (scan.transition) this.#counts = null;
+        // A structured native task/launch transition is proven membership change,
+        // so the identity-free totals snapshot can no longer describe this run
+        // whichever way the window resolves. Where the row names the member that
+        // ended, that member settles and the census stays exact — which is what
+        // lets a background command finishing while the row sits `Ready`, or with a
+        // question pending, move the count on its own event instead of waiting for
+        // the next prompt's snapshot. Where it cannot name one this ledger tracks,
+        // the census has a hole and withdraws to unknown until the next complete
+        // root snapshot. Nothing here reconstructs a count or fabricates a zero.
+        if (scan.transition) {
+          this.#snapshotCounts = null;
+          for (const settledId of scan.settleIds) {
+            this.#ledger.observeSettled(this.#ledgerScope, settledId);
+          }
+          if (scan.unresolvedTransition) this.#ledger.noteCoverageGap(this.#ledgerScope);
+        }
         // Position and closed row kind, not the batch, decide a witness. Only a
         // root model row that STARTS AFTER the window's first root-summary
         // candidate can contradict that witness. While a terminal pass is armed
@@ -1117,7 +1515,26 @@ export class NativeClaudeAcquisitionController {
         } else {
           this.#cursor = scannedTo;
           this.#identity = readIdentity;
+          this.#transcriptSeenPath = path;
+          // A root-work hook accepted while the file did not exist could not state
+          // a position, so it suppressed the foreground floor rather than risk
+          // discarding a positive hook observation. That suppression is only ever
+          // meant to cover the window this read just consumed: from here the file
+          // has a real size, so the floor becomes finite and a newer root row this
+          // run's hook lane never saw can end a published waiting state again.
+          if (this.#foregroundFloor === Number.POSITIVE_INFINITY) {
+            this.#foregroundFloor = windowFileSize;
+          }
           if (armedFor !== null) this.#applyWitness(armedFor, sessionId, scan.candidates);
+          // A root prompt or model row while the row is published as
+          // stopped-on-input shows the provider moved on without this run's hook
+          // lane: the pause is over, so the foreground becomes unverifiable rather
+          // than staying a claim the file contradicts. It proves nothing about the
+          // request itself — the open request keeps its identity, still counts as
+          // pending input, and its own close edge still lands.
+          if (scan.foregroundWork && this.#reducer.questionBlocksForeground()) {
+            this.#reducer.noteRootWorkBeyondClaims();
+          }
         }
       }
     }
@@ -1135,22 +1552,37 @@ export class NativeClaudeAcquisitionController {
 
   /**
    * Classify every complete record in the window. Only closed discriminators are
-   * read — row `type`/`subtype`, `attachment.type`, `origin.kind`/`origin.producer`,
-   * `toolUseResult.status`, the root-model markers (`isSidechain`, agent id,
+   * read — row `type`/`subtype`, `attachment.type`/`attachment.taskId`/
+   * `attachment.status`, `origin.kind`/`origin.producer`, `toolUseResult.status`
+   * and `toolUseResult.agentId`, the root-model markers (`isSidechain`, agent id,
    * session, and the presence of a `message` object), the block `type` of a
    * persisted `tool_result`, the provider-injection markers (`isMeta`,
-   * `commandMode`, `origin.kind`), and the summary row's rootness/terminality
-   * fields.
-   * No content, command, description, path, question, answer, or error text.
+   * `commandMode`, `origin.kind`), the `queue-operation` row's `operation` and
+   * `sessionId` plus only the `task-id`/`status` tags inside its completion
+   * envelope, and the summary row's rootness/terminality fields.
+   * No content, command, description, output, summary, output path, notification
+   * body, question, answer, or error text: a membership id is consumed as an
+   * opaque key and never leaves the controller.
+   *
+   * `recordOffset` is where the first record of this window starts in the file, so
+   * each row's position is known: a foreground contradiction is only ever raised by
+   * a row that begins at or beyond the floor the latest accepted root-work hook
+   * established. Membership and question-result rows are consumed regardless of
+   * position, because they correct facts the hook lane never reported rather than
+   * claiming the conversation moved on.
    */
   #scanRecords(
     records: readonly string[],
     seekWitness: boolean,
     sessionId: string | null,
     openQuestionIds: ReadonlySet<string>,
+    activeMemberIds: ReadonlySet<string>,
+    recordOffset: number,
   ): WindowScan {
     let malformed = 0;
     let transition = false;
+    let unresolvedTransition = false;
+    const settleIds: string[] = [];
     let foregroundWork = false;
     let newRootPromptWork = false;
     let firstCandidateIndex = -1;
@@ -1158,6 +1590,9 @@ export class NativeClaudeAcquisitionController {
     const candidates: NativeClaudeTerminalRecord[] = [];
     const questionClosures: string[] = [];
     for (const [index, record] of records.entries()) {
+      // Whole lines, in order: this row starts here and the next starts after it.
+      const recordStart = recordOffset;
+      recordOffset += Buffer.byteLength(record, "utf8") + 1;
       let parsed: unknown;
       try {
         parsed = JSON.parse(record);
@@ -1183,17 +1618,32 @@ export class NativeClaudeAcquisitionController {
           candidates.push(candidate);
         }
       }
-      if (isTaskTransitionRow(parsed)) transition = true;
+      const membership = readMembershipTransition(parsed, activeMemberIds, sessionId);
+      if (membership !== null) {
+        transition = true;
+        if (membership.settle === null) {
+          unresolvedTransition = true;
+        } else if (settleIds.length >= MAX_SETTLEMENTS_PER_WINDOW) {
+          // A settlement this window could not carry is a hole, not a truncation.
+          unresolvedTransition = true;
+        } else if (!settleIds.includes(membership.settle)) {
+          settleIds.push(membership.settle);
+        }
+      }
       const rootRow = classifyRootTurnRow(parsed, sessionId);
-      // Only a persisted human PROMPT row or a root `assistant` model row is
-      // newer FOREGROUND work. A result-only row or a provider-injected
+      // Only a persisted human PROMPT row or a root `assistant` model row that
+      // STARTED AFTER the latest accepted root-work hook is newer FOREGROUND work.
+      // A row written earlier belongs to the turn that hook just described, and
+      // reaching it late is a consequence of the preserved scan cursor, not of the
+      // conversation moving on. A result-only row or a provider-injected
       // notification carries the conversation without starting a turn of its own,
       // so it outranks nothing: it must never cost a published Ready its
       // foreground, its question census, or a still-open child request.
-      const foreground = rootRow === "prompt" || rootRow === "model";
+      const foreground = (rootRow === "prompt" || rootRow === "model")
+        && recordStart >= this.#foregroundFloor;
       if (rootRow !== "none") {
         if (foreground) foregroundWork = true;
-        if (rootRow === "prompt") newRootPromptWork = true;
+        if (foreground && rootRow === "prompt") newRootPromptWork = true;
         // Append order is the only ordering fact a JSONL window carries: a row
         // that starts after the closing turn's own summary is newer work, a row
         // that starts before it belongs to the turn that summary closed.
@@ -1221,6 +1671,8 @@ export class NativeClaudeAcquisitionController {
     return {
       malformed,
       transition,
+      settleIds,
+      unresolvedTransition,
       foregroundWork,
       newRootPromptWork,
       candidates,
@@ -1284,16 +1736,21 @@ export class NativeClaudeAcquisitionController {
   #withdrawForRootWork(): void {
     this.#startupVouched = false;
     this.#baselineRetired = true;
-    this.#retire();
+    // The terminal-witness authority for the contradicted claim goes; the scan
+    // offset stays, so rows this read had not reached are still read next instead
+    // of being skipped past by a re-established floor at end-of-file.
+    this.#retireTerminalWitness();
     // The conversation moved past whatever this controller published, and it did
-    // so without this run's hook lane saying a word: the whole derived scope is
-    // no longer trustworthy, so it is released as a unit and a genuinely new
-    // boundary re-adopts it. A window that only carried a task transition, a
+    // so without this run's hook lane saying a word: the foreground claim it
+    // supported is no longer trustworthy and goes unknown. It is NOT proof that
+    // an open question request closed — that request's own close edge still owns
+    // it, and a declined or unanswered request must not be erased by newer work
+    // elsewhere in the file. A window that only carried a task transition, a
     // settlement, or a tool-result row never reaches this path — those rows
     // contradict nothing about the foreground.
-    this.#reducer.invalidate();
+    this.#reducer.noteRootWorkBeyondClaims();
     // A retained count is still a published value: keep watching the same file
-    // from a fresh scan floor so membership change can still contradict it.
+    // from where this read left off, so membership change can still contradict it.
     this.#syncWatcher();
     this.#emit();
   }
@@ -1307,7 +1764,10 @@ export class NativeClaudeAcquisitionController {
     this.#startupVouched = false;
     this.#baselineRetired = true;
     this.#retire();
-    this.#counts = null;
+    this.#snapshotCounts = null;
+    // The authenticated lane is where every membership edge comes from, so a loss
+    // of it is a real hole in the census, not just in the last snapshot.
+    this.#ledger.noteCoverageGap(this.#ledgerScope);
     this.#reportGap(reason);
     this.#reducer.invalidate();
     this.#emit();
@@ -1325,12 +1785,43 @@ export class NativeClaudeAcquisitionController {
   #transcriptFailure(reason: NativeClaudeAcquisitionGapReason): void {
     this.#retire();
     this.#reportGap(reason);
+    // This file is one of the two places a member's end is positively read, so a
+    // hole in its coverage is a hole in the census: an exact active set cannot
+    // keep claiming to be exact across records this controller can no longer
+    // read. The published pair falls back to the hook payload's own last-reported
+    // totals, and the hook lane's foreground, question census, and scope are
+    // untouched — a transcript this controller cannot read says nothing about
+    // them. The next complete root census restores exactness.
+    this.#ledger.noteCoverageGap(this.#ledgerScope);
     // Only the claim this lane supported goes unknown. The authenticated hook
     // lane still vouches the run's foreground, its question census, and its
     // scope, so a transcript this controller cannot read must not cost the row
     // its pending-input answer until the next `SessionStart`.
     this.#reducer.withdrawTranscriptForeground();
     this.#emit();
+  }
+
+  /** True once the currently bound path has been read from at all. */
+  #transcriptSeen(): boolean {
+    const path = this.#transcriptPath;
+    return path !== null && this.#transcriptSeenPath === path;
+  }
+
+  /**
+   * A gap reported by the ordinary monitoring lane, as opposed to one that stops
+   * a terminal witness this pass was seeking.
+   *
+   * A provider creates its root JSONL when the conversation begins, so a bound
+   * path that this controller has never read and that is not there yet is a
+   * source with NOTHING recorded in it — not a coverage hole. It can hold no
+   * membership transition, so the census this run's own spawn vouched for stays
+   * exact, and a healthy startup is not announced to the host as a gap on every
+   * hook. A path once read and now missing, any other reason, and any gap that
+   * would have fed a witness are real holes and withdraw as before.
+   */
+  #monitoringFailure(reason: NativeClaudeAcquisitionGapReason, soughtWitness: boolean): void {
+    if (!soughtWitness && reason === "unavailable" && !this.#transcriptSeen()) return;
+    this.#transcriptFailure(reason);
   }
 
   #reportGap(reason: NativeClaudeAcquisitionGapReason): void {
@@ -1347,12 +1838,13 @@ export class NativeClaudeAcquisitionController {
   #emit(): void {
     if (this.#disposed) return;
     const foreground = this.#reducer.snapshot();
+    const counts = this.#publishedCounts();
     const snapshot: NativeClaudeAcquisitionSnapshot = {
       busy: foreground.busy,
       pendingInput: foreground.pendingInput,
       activity: [...foreground.activity],
-      activeTasks: this.#counts === null ? null : this.#counts.tasks,
-      activeShells: this.#counts === null ? null : this.#counts.shells,
+      activeTasks: counts === null ? null : counts.tasks,
+      activeShells: counts === null ? null : counts.shells,
       support: NATIVE_CLAUDE_ACQUISITION_SUPPORT,
     };
     if (snapshotsEqual(this.#last, snapshot)) return;
@@ -1372,6 +1864,15 @@ function mapTailFailure(reason: NativeJsonlTailFailureReason): NativeClaudeAcqui
   if (reason === "not-a-regular-file") return "not-a-regular-file";
   if (reason === "symlink") return "symlink";
   return "unreadable";
+}
+
+/** True when two captured identity sets hold exactly the same opaque names. */
+function sameIdentityNames(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  if (left.size !== right.size) return false;
+  for (const name of left) {
+    if (!right.has(name)) return false;
+  }
+  return true;
 }
 
 /**
@@ -1396,24 +1897,144 @@ function readTerminalCandidate(parsed: Record<string, unknown>): NativeClaudeTer
 }
 
 /**
- * A structured native task or launch transition, recognized from closed
- * discriminators only: a `task_status` attachment injection, a `queued_command`
- * attachment whose origin is a settled background run, or a tool result that
- * reports an asynchronous launch. Presence is all that matters; it invalidates
- * the last count snapshot, and no field content is read or retained.
+ * The root fence every membership-transition source must pass before its row may
+ * touch this run's census: the row must not be sidechain work, must not carry an
+ * agent identity, and must not name a native conversation other than this run's
+ * bound root session. A child's completion, or another conversation's, is that
+ * conversation's fact: it can neither settle this run's member nor open a hole in
+ * this run's census. A row naming no conversation at all is attributed to the
+ * bound file this tail reads, and nothing else.
  */
-function isTaskTransitionRow(parsed: Record<string, unknown>): boolean {
+function isRootMembershipRow(parsed: Record<string, unknown>, boundSessionId: string | null): boolean {
+  if (parsed.isSidechain === true) return false;
+  if (readToken(parsed.agentId) !== null || readToken(parsed.agent_id) !== null) return false;
+  const rowSession = readToken(parsed.sessionId) ?? readToken(parsed.session_id);
+  if (rowSession === null) return true;
+  return boundSessionId !== null && rowSession === boundSessionId;
+}
+
+/**
+ * What one persisted row positively states about this run's ROOT background
+ * membership, recognized from closed discriminators only, or `null` when the row
+ * says nothing about membership:
+ * - a provider `queue-operation` `enqueue` in this run's own bound root session
+ *   whose `content` carries the native `task-notification` envelope: the envelope
+ *   names the finished member's own id and a closed terminal status, which
+ *   settles it exactly the moment it is persisted — while a question is still
+ *   open, before the notification is delivered, and before any answer or decline.
+ *   A `dequeue`, a foreign or unattributable session, and any payload without the
+ *   envelope claim nothing at all.
+ * - a `task_status` attachment names the provider's own task id and a closed
+ *   status. One of `completed`, `failed`, or `cancelled` names the member that
+ *   ended, which is what settles it exactly. A still-live status for a member
+ *   this census already holds confirms that census and changes nothing.
+ * - a `queued_command` attachment whose origin is a settled background run, and
+ *   an async-launch tool result whose member is not already tracked, both prove
+ *   membership changed without naming a member this ledger can consume, so they
+ *   resolve to a change with no identity.
+ * - an async-launch result for a member already tracked is the same launch the
+ *   hook lane reported, so it is not news.
+ *
+ * Only the id and status discriminators are read; no description, command,
+ * output, summary, output path, or notification body is read or retained, and an
+ * id never leaves the controller.
+ */
+function readMembershipTransition(
+  parsed: Record<string, unknown>,
+  activeMemberIds: ReadonlySet<string>,
+  boundSessionId: string | null,
+): { readonly settle: string | null } | null {
+  // No child, agent-scoped, or foreign-conversation row reaches the census at all,
+  // whichever membership source it would otherwise have been read from.
+  if (!isRootMembershipRow(parsed, boundSessionId)) return null;
+  if (parsed.type === "queue-operation") return readQueuedTaskCompletion(parsed, boundSessionId);
   if (isRecord(parsed.attachment)) {
     const attachment = parsed.attachment;
     const kind = typeof attachment.type === "string" ? attachment.type : "";
-    if (kind === "task_status") return true;
+    if (kind === "task_status") {
+      const status = readToken(attachment.status);
+      if (status !== null
+        && SETTLED_TASK_STATUSES.has(status)
+        && isValidNativeClaudeBackgroundMemberId(attachment.taskId)) {
+        return { settle: attachment.taskId };
+      }
+      if (isValidNativeClaudeBackgroundMemberId(attachment.taskId)
+        && activeMemberIds.has(attachment.taskId)) return null;
+      return { settle: null };
+    }
     if (kind === "queued_command" && isRecord(attachment.origin)) {
       const origin = attachment.origin;
-      return origin.kind === "task-notification" || origin.producer === "session-task";
+      return origin.kind === "task-notification" || origin.producer === "session-task"
+        ? { settle: null }
+        : null;
     }
-    return false;
+    return null;
   }
-  return isRecord(parsed.toolUseResult) && parsed.toolUseResult.status === "async_launched";
+  if (isRecord(parsed.toolUseResult) && parsed.toolUseResult.status === "async_launched") {
+    const agentId = readToken(parsed.toolUseResult.agentId);
+    return agentId !== null && activeMemberIds.has(agentId) ? null : { settle: null };
+  }
+  return null;
+}
+
+/**
+ * Read the provider's own structured completion record out of one `enqueue`d
+ * queue payload. The envelope is the provider's tag block, so this reads tags and
+ * two values and nothing else: the finished member's id and its terminal status.
+ * The summary, the output-file path, and the whole surrounding body are never
+ * read into a value, and the payload's prose is never interpreted.
+ *
+ * `null` means the row says nothing about membership — not an `enqueue`, a foreign
+ * or unattributable session, or a payload with no completion envelope (the queue
+ * carries other things too). A payload that DOES carry the envelope but cannot be
+ * read cleanly is a change with no usable identity, which is reported as such so
+ * the census withdraws instead of holding a count that may already be wrong.
+ */
+function readQueuedTaskCompletion(
+  parsed: Record<string, unknown>,
+  boundSessionId: string | null,
+): { readonly settle: string | null } | null {
+  if (parsed.operation !== NATIVE_QUEUE_ENQUEUE) return null;
+  // Only this run's own bound root session: the queue row names the conversation
+  // it belongs to, and a foreign or unreadable one is not this run's fact.
+  if (boundSessionId === null || readToken(parsed.sessionId) !== boundSessionId) return null;
+  const content = parsed.content;
+  if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > MAX_TASK_NOTIFICATION_BYTES) {
+    return null;
+  }
+  const start = content.indexOf(TASK_NOTIFICATION_OPEN);
+  if (start < 0) return null;
+  const end = content.indexOf(TASK_NOTIFICATION_CLOSE, start);
+  if (end < 0) return { settle: null };
+  const envelope = content.slice(start, end + TASK_NOTIFICATION_CLOSE.length);
+  const status = readEnvelopeTag(envelope, TASK_NOTIFICATION_STATUS_TAG);
+  if (status === null) return { settle: null };
+  // A status this lane does not recognize as ended is a membership change it
+  // cannot classify, so it withdraws the census rather than leaving a count that
+  // may already be wrong or inventing an end the provider never stated.
+  if (!SETTLED_TASK_STATUSES.has(status)) return { settle: null };
+  const taskId = readEnvelopeTag(envelope, TASK_NOTIFICATION_ID_TAG);
+  if (taskId === null || !isValidNativeClaudeBackgroundMemberId(taskId)) return { settle: null };
+  return { settle: taskId };
+}
+
+/**
+ * One `<tag>value</tag>` value, read only when the tag appears exactly once and
+ * its value is a single opaque token. An ambiguous or nested tag is refused: this
+ * never guesses which of two values a payload meant.
+ */
+function readEnvelopeTag(envelope: string, tag: string): string | null {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const start = envelope.indexOf(open);
+  if (start < 0) return null;
+  if (envelope.indexOf(open, start + open.length) !== -1) return null;
+  const valueStart = start + open.length;
+  const valueEnd = envelope.indexOf(close, valueStart);
+  if (valueEnd < 0) return null;
+  const value = envelope.slice(valueStart, valueEnd);
+  if (value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_TASK_NOTIFICATION_VALUE_BYTES) return null;
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
 }
 
 /**

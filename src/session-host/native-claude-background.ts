@@ -25,11 +25,18 @@
  *   counts exact. A scope merely adopted mid-stream (`adoptRootSession`) tracks
  *   members but publishes nothing, because work may have started before this
  *   observer saw the scope.
- * - Any genuine coverage hole withdraws the counts to `unknown` and demands a
- *   full membership resync: a settle for an id this ledger never observed (its
- *   launch edge was lost), an over-capacity member set, a malformed snapshot, a
- *   caller-reported hook gap, or scope retirement. Withdrawal is never a
- *   fabricated zero and never a stale hold-over.
+ * - Any genuine coverage hole withdraws the counts it actually reaches and
+ *   demands a full membership resync: a settle for an id this ledger never
+ *   observed (its launch edge was lost), an over-capacity member set, a
+ *   malformed snapshot, a caller-reported hook gap, or scope retirement.
+ *   Withdrawal is never a fabricated zero and never a stale hold-over.
+ * - A hole is withdrawn at the width of its own evidence. When the failed
+ *   evidence positively names one count category — a snapshot that could not key
+ *   a member of a known kind, a launch of a known kind this ledger cannot track
+ *   — only that category becomes unknown and the other keeps its exact number.
+ *   When it names none, both withdraw. An unrelated event (a foreground edge, a
+ *   question request, a read failure on some other lane) is not a hole in either
+ *   category and withdraws nothing on its own.
  * - Normal start/stop edges never make a known scope unknown. Losing the
  *   `known` flag requires evidence that the census has a hole.
  * - Every observation, resync, gap report, and retirement names the scope token
@@ -100,6 +107,19 @@ export interface NativeClaudeBackgroundCounts {
 }
 
 /**
+ * The published reading, kind by kind. A count category whose own coverage has
+ * a hole is the explicit `null`; a category this ledger can still state exactly
+ * keeps its number. This is what keeps a hole in one category from erasing a
+ * fact the failed evidence never contradicted — and it is never a stale
+ * hold-over: a kind only appears here as a number while its own coverage is
+ * unbroken.
+ */
+export interface NativeClaudeBackgroundCoverage {
+  readonly tasks: number | null;
+  readonly shells: number | null;
+}
+
+/**
  * Member bound. Matches the native hook lane's whole-snapshot admission bound,
  * so a snapshot the protocol can carry is one this ledger can hold. Exceeding
  * it is a closed failure that withdraws the counts, never a silent truncation.
@@ -154,14 +174,18 @@ export type NativeClaudeBackgroundReason =
  * observation:
  * - `applied`: membership changed while the set was exactly known, and `counts`
  *   is the new exact value.
- * - `tracked`: membership changed but nothing is publishable yet (a scope
- *   adopted mid-stream, or an edge on such a scope). `counts` is `null`.
+ * - `tracked`: membership changed but the WHOLE pair is not publishable — a
+ *   scope adopted mid-stream, an edge on such a scope, or a scope whose other
+ *   category already has a hole. `counts` is `null`; {@link
+ *   NativeClaudeBackgroundLedger.coverage} still states any category whose own
+ *   coverage is unbroken.
  * - `ignored`: nothing was claimed from the input (duplicate edge, foreign or
  *   unbound scope, malformed input). State is unchanged and `counts` is simply
  *   the current reading.
- * - `invalid`: the input showed the census has a hole, so the counts are
- *   withdrawn to `null` (unknown) and a full membership resync is required.
- *   `counts` is always `null`.
+ * - `invalid`: the input showed the census has a hole, so the categories that
+ *   hole reaches are withdrawn to `null` (unknown) and a full membership resync
+ *   is required. `counts` is always `null`, and `coverage()` still states any
+ *   category the hole did not reach.
  */
 export type NativeClaudeBackgroundOutcome =
   | {
@@ -285,6 +309,24 @@ export function countNativeClaudeBackgroundMembers(
 }
 
 /**
+ * Resolve a caller's claimed hole into the count categories it may withdraw.
+ * Absent, empty, or unreadable input withdraws EVERY category: a hole nobody can
+ * attribute is a hole in the whole census, and guessing which category survived
+ * is exactly the fabricated certainty this ledger exists to refuse.
+ */
+function withdrawableKinds(
+  kinds: readonly NativeClaudeBackgroundKind[] | undefined,
+): { readonly tasks: boolean; readonly shells: boolean } {
+  if (!Array.isArray(kinds) || kinds.length === 0) return { tasks: true, shells: true };
+  const claimed = new Set<NativeClaudeBackgroundKind>();
+  for (const kind of kinds) {
+    if (!isNativeClaudeBackgroundKind(kind)) return { tasks: true, shells: true };
+    claimed.add(kind);
+  }
+  return { tasks: claimed.has("task"), shells: claimed.has("shell") };
+}
+
+/**
  * Per-owned-run membership ledger. One instance observes exactly one owned
  * native run; the caller owns scope binding, root-fencing, and publication,
  * and this class owns only the honest arithmetic of what it is handed.
@@ -292,8 +334,14 @@ export function countNativeClaudeBackgroundMembers(
 export class NativeClaudeBackgroundLedger {
   /** Bound scope token, or null while no owned run is bound. */
   #scopeToken: string | null = null;
-  /** True only while the active set is exactly known (see `membershipKnown`). */
-  #known = false;
+  /**
+   * Per-category coverage. A category is exactly known only while its OWN
+   * coverage is unbroken: a hole that can be attributed to one count kind
+   * withdraws that kind and leaves the other exactly known, while a hole that
+   * cannot be attributed withdraws both. `membershipKnown` is the conjunction.
+   */
+  #knownTasks = false;
+  #knownShells = false;
   /** True while recovery requires a complete root membership snapshot. */
   #needsResync = false;
   /** Active members, keyed by opaque id, in insertion order. */
@@ -306,17 +354,30 @@ export class NativeClaudeBackgroundLedger {
     const members = [...this.#members.values()];
     return {
       scopeToken: this.#scopeToken,
-      membershipKnown: this.#known,
+      membershipKnown: this.#allKindsKnown(),
       needsResync: this.#needsResync,
-      counts: this.#known ? countNativeClaudeBackgroundMembers(members) : null,
+      counts: this.#allKindsKnown() ? countNativeClaudeBackgroundMembers(members) : null,
       members,
     };
   }
 
   /** Exact counts for a known scope, or null. Never a fabricated zero. */
   counts(): NativeClaudeBackgroundCounts | null {
-    if (!this.#known) return null;
+    if (!this.#allKindsKnown()) return null;
     return countNativeClaudeBackgroundMembers(this.#members.values());
+  }
+
+  /**
+   * The per-category reading. Every category whose own coverage is unbroken is
+   * stated exactly (including a real `0`); every category with a hole is the
+   * explicit `null`. A complete root membership snapshot is what repairs both.
+   */
+  coverage(): NativeClaudeBackgroundCoverage {
+    const counts = countNativeClaudeBackgroundMembers(this.#members.values());
+    return {
+      tasks: this.#knownTasks ? counts.tasks : null,
+      shells: this.#knownShells ? counts.shells : null,
+    };
   }
 
   /**
@@ -340,7 +401,8 @@ export class NativeClaudeBackgroundLedger {
     this.#scopeToken = scopeToken;
     this.#members.clear();
     this.#settled = [];
-    this.#known = true;
+    this.#knownTasks = true;
+    this.#knownShells = true;
     this.#needsResync = false;
     return { outcome: "applied", reason: "fresh-owned-run", counts: { tasks: 0, shells: 0 } };
   }
@@ -361,7 +423,8 @@ export class NativeClaudeBackgroundLedger {
     this.#scopeToken = scopeToken;
     this.#members.clear();
     this.#settled = [];
-    this.#known = false;
+    this.#knownTasks = false;
+    this.#knownShells = false;
     this.#needsResync = true;
     return { outcome: "tracked", reason: "root-session-adopted", counts: null };
   }
@@ -386,10 +449,13 @@ export class NativeClaudeBackgroundLedger {
     if (this.#members.has(id)) return this.#ignored("duplicate-start");
     if (this.#settled.includes(id)) return this.#ignored("late-start-after-settle");
     if (this.#members.size >= MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS) {
-      return this.#withdraw("capacity");
+      // This member's kind was validated above, so the category this overflow
+      // actually reaches is that member's own: a launch this ledger cannot track
+      // is a hole in the tasks, never in the shells it can still state exactly.
+      return this.#withdraw("capacity", [member.kind]);
     }
     this.#members.set(id, { id, kind: member.kind });
-    if (!this.#known) return { outcome: "tracked", reason: "launch-observed", counts: null };
+    if (!this.#allKindsKnown()) return { outcome: "tracked", reason: "launch-observed", counts: null };
     return { outcome: "applied", reason: "launch-observed", counts: this.counts() as NativeClaudeBackgroundCounts };
   }
 
@@ -425,12 +491,35 @@ export class NativeClaudeBackgroundLedger {
     // costs one id's late-edge protection, not the census, so the outcome names it
     // and the counts stay published.
     const evicted = this.#rememberSettled(id);
-    if (!this.#known) return { outcome: "tracked", reason: "settle-observed", counts: null };
+    if (!this.#allKindsKnown()) return { outcome: "tracked", reason: "settle-observed", counts: null };
     return {
       outcome: "applied",
       reason: evicted ? "tombstone-capacity" : "settle-observed",
       counts: this.counts() as NativeClaudeBackgroundCounts,
     };
+  }
+
+  /**
+   * Read-only, scope-fenced question about ONE id: does this ledger positively
+   * remember that member as settled, and is it not currently an active member?
+   *
+   * This is a judgement about the ledger's OWN settled memory, never new
+   * evidence: it mutates nothing, opens no window, settles nothing, and exposes
+   * no history, no id list, and no count — the caller learns one bit about the
+   * one id it already holds. An id this ledger forgot because the bounded memory
+   * evicted it answers `false`, exactly as the memory contract already states:
+   * forgetting is not knowledge, so a caller may not claim a forgotten id is a
+   * known-settled one. A foreign, malformed, unbound, or retired scope answers
+   * `false` too, and an id the ledger currently holds ACTIVE answers `false`
+   * even if an older settle for it is still remembered, because a resync that
+   * re-listed the member cleared that memory — a member this ledger believes is
+   * running is never "already settled".
+   */
+  hasSettled(scopeToken: unknown, id: unknown): boolean {
+    if (this.#fence(scopeToken) !== null) return false;
+    if (!isValidNativeClaudeBackgroundMemberId(id)) return false;
+    if (this.#members.has(id)) return false;
+    return this.#settled.includes(id);
   }
 
   /**
@@ -470,7 +559,8 @@ export class NativeClaudeBackgroundLedger {
       : kept;
     this.#members.clear();
     for (const member of parsed) this.#members.set(member.id, member);
-    this.#known = true;
+    this.#knownTasks = true;
+    this.#knownShells = true;
     this.#needsResync = false;
     const counts = countNativeClaudeBackgroundMembers(this.#members.values());
     return {
@@ -485,11 +575,22 @@ export class NativeClaudeBackgroundLedger {
    * gap, a lost relay, a retired child, or caller-side invalidation. Members are
    * retained only as internal context; nothing is relabeled zero, and a full
    * root membership snapshot is required before counts publish again.
+   *
+   * Pass the closed count kinds the hole is actually attributed to and only
+   * those categories withdraw; the other category keeps its exact number,
+   * because the failed evidence said nothing about it. With no usable kind list —
+   * a whole-lane loss, a lost settlement source, or a hole whose member kind
+   * cannot be proven — every category withdraws, exactly as before. Naming a
+   * kind here is a claim about the EVIDENCE hole, never a claim that the other
+   * category's members were observed.
    */
-  noteCoverageGap(scopeToken: unknown): NativeClaudeBackgroundOutcome {
+  noteCoverageGap(
+    scopeToken: unknown,
+    kinds?: readonly NativeClaudeBackgroundKind[],
+  ): NativeClaudeBackgroundOutcome {
     const refused = this.#fence(scopeToken);
     if (refused !== null) return refused;
-    return this.#withdraw("coverage-gap");
+    return this.#withdraw("coverage-gap", kinds);
   }
 
   /**
@@ -504,12 +605,18 @@ export class NativeClaudeBackgroundLedger {
     this.#scopeToken = null;
     this.#members.clear();
     this.#settled = [];
-    this.#known = false;
+    this.#knownTasks = false;
+    this.#knownShells = false;
     this.#needsResync = false;
     return this.snapshot();
   }
 
   // --- internals -----------------------------------------------------------
+
+  /** True only while BOTH count categories have unbroken coverage. */
+  #allKindsKnown(): boolean {
+    return this.#knownTasks && this.#knownShells;
+  }
 
   /**
    * Reject anything that does not name the currently bound scope. Returns the
@@ -522,8 +629,13 @@ export class NativeClaudeBackgroundLedger {
     return null;
   }
 
-  #withdraw(reason: NativeClaudeBackgroundReason): NativeClaudeBackgroundOutcome {
-    this.#known = false;
+  #withdraw(
+    reason: NativeClaudeBackgroundReason,
+    kinds?: readonly NativeClaudeBackgroundKind[],
+  ): NativeClaudeBackgroundOutcome {
+    const affected = withdrawableKinds(kinds);
+    if (affected.tasks) this.#knownTasks = false;
+    if (affected.shells) this.#knownShells = false;
     this.#needsResync = true;
     return { outcome: "invalid", reason, counts: null };
   }

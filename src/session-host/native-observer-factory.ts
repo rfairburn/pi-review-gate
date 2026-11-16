@@ -8,6 +8,8 @@ import {
   NATIVE_CODEX_ACQUISITION_SUPPORT,
 } from "./native-codex-acquisition";
 import type { NativeHookEvent, NativeHookFailure } from "./native-hook-protocol";
+import { createOwnedNativeCodexStatusObserver } from "./native-codex-owned-status";
+import type { NativeStatusObserverFactory } from "./instances";
 import type { NativeStatusObservation } from "./native-status";
 
 /** Owner-only construction context; no provider conversation is created here. */
@@ -46,4 +48,44 @@ export function createNativeStatusObserver(context: NativeObserverFactoryContext
     });
   }
   throw new RangeError("native status observation requires a native CLI backend");
+}
+
+/**
+ * The owning host's internal opt-in for the owned Codex observation route.
+ *
+ * It is a construction-time property of one host, set by the host that also
+ * injects an owned Codex backend factory: never a user setting, never a
+ * per-request field, and never something a peer, a wire frame, or a provider can
+ * claim. Absent or false — every existing call site — the factory this module has
+ * always supplied is returned unchanged, so a Pi, Claude, or ordinary standalone
+ * Codex row keeps its exact legacy hook lane and its exact applicability
+ * declaration.
+ */
+export interface NativeObserverFactoryHostOptions {
+  /** Route a genuinely owned Codex run to its read-only RPC lane (default false). */
+  readonly ownedCodexBackend?: boolean;
+}
+
+/**
+ * Build one host's observer factory. With the opt-in set, a Codex run is wrapped
+ * by the owned-aware consumer: it starts as the exact legacy source above and
+ * switches to the read-only RPC lane only when the manager hands that run its own
+ * owned-backend capability, so a host that opted in but whose provider composed an
+ * ordinary descriptor receives no capability and keeps the legacy lane entirely.
+ * Claude and Pi routes are never wrapped, whatever the host opted into.
+ */
+export function createNativeStatusObserverFactory(
+  host: NativeObserverFactoryHostOptions = {},
+): NativeStatusObserverFactory {
+  if (host.ownedCodexBackend !== undefined && typeof host.ownedCodexBackend !== "boolean") {
+    throw new TypeError("native observer factory ownedCodexBackend must be a boolean or absent");
+  }
+  const ownedCodexBackend = host.ownedCodexBackend === true;
+  return (context) => {
+    // The legacy source is always built first: until a capability proves this run
+    // is owned, it is the only source, with the only declaration it ever had.
+    const legacy = createNativeStatusObserver(context);
+    if (!ownedCodexBackend || context.backend !== "codex") return legacy;
+    return createOwnedNativeCodexStatusObserver({ legacy, emit: context.emit });
+  };
 }

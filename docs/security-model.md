@@ -118,8 +118,9 @@ Windows host parity, delivery readiness, security equivalence with the POSIX
 filesystem boundary, or a private Windows ACL guarantee.
 
 **Native provider status observation rides a separate one-shot family on that same
-broker.** A hosted Claude Code or Codex row can be armed per launch to report a
-bounded set of its own state through the provider's own command hooks. Each hook
+broker.** A hosted Claude Code row — and a Codex row this host does not front with its
+own backend — can be armed per launch to report a bounded set of its own state through
+the provider's own command hooks. Each hook
 invocation is one short-lived relay: it authenticates with a token issued for that
 single owned launch, sends exactly one bounded event — or one closed failure
 reason — reads one fixed-size acknowledgement, and closes. The native family keeps
@@ -161,17 +162,19 @@ only after that row's provider source and PTY have settled.
 heartbeat, queue, retry, or replay, so a hook that never fires or a relay that never
 connects reports nothing: fields stay unknown. Source loss is lane-specific: a
 transcript-only failure does not erase a count reported by an authenticated hook;
-that number remains the last reported snapshot, not a continuously live census. The
+that number remains the last reported reading, not a value reconstructed from activity
+or quietness. The
 owner *does* read bounded bytes from the
 exact provider-named JSONL file—Claude's native transcript or Codex's root-thread
 rollout—to derive status metadata. Record text is not kept as a history, logged or
 broadcast; this is not a transcript-free or attestation-grade channel. There is no `HOME` or
 history scan, no session-directory search, no global clipboard watch, no raw
-recording, no extra listener or port, and no second conversation. Arming the
+recording, no extra listener or port for the hook lane, and no second conversation. Arming the
 observer changes no provider authentication, permission, model, or configuration
 default: it adds only that provider's documented per-session hook flags — pointing
 at the host's own private per-session artifacts, or adding one per-session
-configuration entry — writes nothing to global or project settings,
+configuration entry — and for a hosted Codex row it adds no flag, marker, or artifact
+of its own at all; it writes nothing to global or project settings,
 plugins, or any trust record, and bypasses no workspace-trust, sideload,
 marketplace, hook-disabling, or hook-review gate — those operator decisions can
 withhold the observation entirely. A provider's own task and shell numbers are
@@ -180,6 +183,29 @@ conservative background-ownership channel, so no provider reading — including 
 displayed rest — ever authorizes an idle-only stop or
 removal. See
 [Native status observation](native-sidebar-agents.md#native-status-observation).
+
+**An owned Codex row observes through a private local relay instead.** For such a row
+this host starts one provider app-server child on numeric IPv4 loopback with an
+operating-system-chosen ephemeral port, authenticated by one fresh capability token of
+which only the SHA-256 digest ever reaches that child's generated arguments, and the
+row's interactive client is pointed at a private relay this host owns in front of that
+backend. The relay forwards the provider's own bytes unchanged — the only rewrite is
+the `Host` header, which has to name the backend it dials — originates no
+application-layer message of its own, never subscribes, starts, resumes, forks,
+retries, answers, or approves anything, and refuses a second concurrent client; its
+read-only tap emits only closed metadata projections (opaque ids, closed enums,
+booleans, counts) and never prompt, command, output, question, option, answer, path,
+model text, or error text. The row's status then comes from one read-only connection
+to that same backend, which never replies to a provider request, so a live approval or
+question prompt can never be resolved by this host. Those two loopback listeners belong
+to that row alone and are closed with it; no routable address is bound, no port is
+scanned, no shared or unauthenticated daemon is adopted, and no provider credential is
+read, written, or migrated. The backend child inherits the same native configuration
+and authentication the interactive client does, and this host arms no provider hook of
+its own for such a launch. Retiring the observer closes only its own connection,
+watcher, and timers: the relay keeps forwarding, and the owner's stop of the row's own
+resources — backend, relay, and PTY — is unchanged, and nothing about that row is
+reported settled until each of them proves its own actual end.
 
 ### Session-host peer network (optional)
 

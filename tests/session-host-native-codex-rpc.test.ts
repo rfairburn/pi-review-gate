@@ -62,6 +62,20 @@ function settle(ms = 25): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function within<T>(promise: Promise<T>, message: string, ms = 2_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function endpointCode(value: unknown): string {
   const read = readNativeCodexRpcEndpoint(value);
   return read.status === "invalid" ? read.code : "valid";
@@ -305,6 +319,7 @@ test("builds only the allowlisted read-only census requests", async () => {
       "listLoadedThreadIds",
       "pendingRequestCount",
       "readThread",
+      "socketClosed",
       "state",
     ]);
     transport.close();
@@ -623,6 +638,123 @@ test("an unexpected disconnect reports one closed code", async () => {
       assert.equal(transport.state, "closed");
       transport.close();
     });
+});
+
+/* ------------------------------------------------------------ socket close */
+
+test("socketClosed resolves on the real WebSocket close after connect and is idempotent", async () => {
+  await withLoopbackTransport(
+    { threads: [{ id: ROOT, parentThreadId: null, status: { type: "idle" } }] },
+    async (_server, port) => {
+      const transport = new NativeCodexRpcTransport({
+        endpoint: {
+          kind: "loopback-ws",
+          host: "127.0.0.1",
+          port,
+          authorization: { scheme: "bearer", token: () => "socket-close-token" },
+        },
+      });
+      try {
+        assert.equal(transport.socketClosed, transport.socketClosed);
+        await transport.connect();
+        transport.close();
+        await within(transport.socketClosed, "socket close was not observed");
+        assert.equal(transport.state, "closed");
+        // Repeated close is still one proof and never rejects.
+        transport.close();
+        await within(transport.socketClosed, "repeated close proof");
+      } finally {
+        transport.close();
+      }
+    },
+  );
+});
+
+test("socketClosed is already proven for a preconnect close and a refused later connect", async () => {
+  await withLoopbackTransport(
+    { threads: [{ id: ROOT, parentThreadId: null, status: { type: "idle" } }] },
+    async (_server, port) => {
+      const transport = new NativeCodexRpcTransport({
+        endpoint: {
+          kind: "loopback-ws",
+          host: "127.0.0.1",
+          port,
+          authorization: { scheme: "bearer", token: () => "socket-close-token" },
+        },
+      });
+      // No socket was ever opened, and disposal is irreversible.
+      transport.close();
+      await within(transport.socketClosed, "preconnect close proof");
+      await assert.rejects(
+        transport.connect(),
+        (error: unknown) => error instanceof NativeCodexRpcError && error.code === "closed",
+      );
+      await within(transport.socketClosed, "already-closed proof");
+      transport.close();
+    },
+  );
+});
+
+test("socketClosed resolves after a refused handshake", async () => {
+  await withLoopbackTransport(
+    {
+      threads: [{ id: ROOT, parentThreadId: null, status: { type: "idle" } }],
+      requireAuthorization: "expected-token",
+    },
+    async (_server, port) => {
+      const transport = new NativeCodexRpcTransport({
+        endpoint: {
+          kind: "loopback-ws",
+          host: "127.0.0.1",
+          port,
+          authorization: { scheme: "bearer", token: () => "wrong-token" },
+        },
+      });
+      try {
+        await assert.rejects(
+          transport.connect(),
+          (error: unknown) => error instanceof NativeCodexRpcError && error.code === "handshake",
+        );
+        await within(transport.socketClosed, "close after a refused handshake");
+      } finally {
+        transport.close();
+      }
+    },
+  );
+});
+
+test("socketClosed resolves for a close raced against connect and for an unexpected peer close", async () => {
+  await withLoopbackTransport(
+    { threads: [{ id: ROOT, parentThreadId: null, status: { type: "idle" } }] },
+    async (server, port) => {
+      const raced = new NativeCodexRpcTransport({
+        endpoint: {
+          kind: "loopback-ws",
+          host: "127.0.0.1",
+          port,
+          authorization: { scheme: "bearer", token: () => "socket-close-token" },
+        },
+      });
+      const connecting = raced.connect().catch(() => undefined);
+      raced.close();
+      await within(raced.socketClosed, "close during connect");
+      await connecting;
+
+      const peerClosed = new NativeCodexRpcTransport({
+        endpoint: {
+          kind: "loopback-ws",
+          host: "127.0.0.1",
+          port,
+          authorization: { scheme: "bearer", token: () => "socket-close-token" },
+        },
+      });
+      await peerClosed.connect();
+      await server.stop();
+      await within(peerClosed.socketClosed, "peer close proof");
+      peerClosed.close();
+      raced.close();
+    },
+  );
 });
 
 /* --------------------------------------------------------------- decoders */

@@ -2146,7 +2146,7 @@ export class MainPtyDriver {
       : selected.label === label;
   }
 
-  /** Actual sidebar pane width: 32 wide, or the full narrow-overlay width. */
+  /** Actual sidebar pane width: 35 wide, or the full narrow-overlay width. */
   private sidebarColumnCount(): number {
     const cols = this.surface.frame().cols;
     return this.sidebarVisible && cols >= SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS ? SIDEBAR_COLUMNS : cols;
@@ -2818,7 +2818,37 @@ export class MainPtyDriver {
     assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is alive before its native Ctrl+C exit`);
     assert.ok(renderedTitleMatches(frameHeader(this.currentText()), session.displayName),
       "the explicit native exit begins with the exact uniquely observed title as active owner");
-    const alreadyExitedCards = countExitedCards(this.currentText(), this.sidebarColumnCount());
+    // This census is a BASELINE, not a status read: the wait below requires
+    // exactly ONE more exited card than it reports, so a baseline seeded from a
+    // frame that is missing another row's card can never be satisfied.
+    // `SessionHostFrameWriter` emits only the rows that changed since the frame
+    // it last wrote, with no atomic frame marker, so the header match above can
+    // be a mid-repaint slice in which an already-exited sibling's card, or this
+    // row's own updated status row, is still pending. Fence on the COMPLETE
+    // roster whose single highlight is this exact native owner, then the real
+    // frame writer going quiet, then read that settled frame synchronously and
+    // take the baseline from it — the same discipline the witnessed activation
+    // uses, with the census, its requirements, and every later assertion
+    // unchanged. No key is sent and no frame is invented by the fence.
+    const exitedCardCensusFence = (text: string, sidebarColumns: number): boolean => {
+      if (!renderedTitleMatches(frameHeader(text), session.displayName)) return false;
+      // The shared witness already requires a COMPLETE roster with exactly ONE
+      // highlight, so an ambiguous frame (a second highlighted entry, or a
+      // partial roster) never authorizes the baseline either.
+      const selected = selectedRosterEntry(text, sidebarColumns);
+      return selected !== undefined && selected.kind === "native"
+        && renderedTitleMatches(selected.title, session.displayName);
+    };
+    await this.waitFrame((text) => exitedCardCensusFence(text, this.sidebarColumnCount()),
+    `the exact active owned ${session.rowProbe} row is drawn on a complete roster before its exited-card census`);
+    await this.waitForFrameQuiet(`the real Main frame writer finishes repainting ${session.rowProbe}'s frame before its exited-card census`);
+    // No reentrant step separates this read from the census below, and the
+    // census value is taken only from the frame that passed the fence again.
+    const censusFrame = this.currentText();
+    const censusSidebarColumns = this.sidebarColumnCount();
+    assert.equal(exitedCardCensusFence(censusFrame, censusSidebarColumns), true,
+      `the settled frame still draws ${session.rowProbe} on a complete roster before its exited-card census\nActual owned Main frame:\n${censusFrame}`);
+    const alreadyExitedCards = countExitedCards(censusFrame, censusSidebarColumns);
     const otherLiveOwners = this.ownedSessions().filter((candidate) => candidate.record.pid !== session.record.pid
       && !candidate.exitWatcher.observedExit);
     for (const owner of otherLiveOwners) assert.equal(processIsAlive(owner.record.pid), true,
@@ -2901,15 +2931,27 @@ export class MainPtyDriver {
     assert.equal(this.selectedCaptionMatches(this.currentText(), session.displayName), true,
       "the Delete key is directed at the selected row's actual exited caption");
     const remainingRows = this.sessions().filter((candidate) => candidate.workspace !== session.workspace);
-    const beforeDelete = this.frameRevision;
-    this.pty.write(KEYS.delete);
-    await this.waitFrame((text) => this.rosterIsComplete(text)
+    const deletionApplied = (text: string): boolean => this.rosterIsComplete(text)
       && text.includes(`Sessions (${beforeRows - 1})`)
       && !this.rosterHasCaption(text, session.displayName)
       && remainingRows.every((candidate) => this.rosterHasCaption(text, candidate.displayName))
       && ["Saved conversations", "New session", "Quit host"].every((entry) => text.includes(entry))
-      && this.selectedCardTitle(text) === undefined,
+      && this.selectedCardTitle(text) === undefined;
+    const beforeDelete = this.frameRevision;
+    this.pty.write(KEYS.delete);
+    await this.waitFrame(deletionApplied,
     `the public Delete action removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight`, beforeDelete);
+    // `SessionHostFrameWriter` rewrites only changed rows, top to bottom, with no
+    // atomic frame marker, so the complete roster above can share the screen
+    // with a lower native row (a sibling's editor) that is still being
+    // rewritten. Callers read `currentText()` straight after this returns, so
+    // fence on the real frame writer going quiet and re-check the SAME deletion
+    // postcondition on that settled frame, as `closeNativeNormally` does for its
+    // census. Nothing is waited away: a settled frame is returned as observed.
+    await this.waitForFrameQuiet(`the real Main frame writer finishes repainting after ${session.rowProbe}'s row removal`);
+    const settledFrame = this.currentText();
+    assert.equal(deletionApplied(settledFrame), true,
+      `the settled frame still removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight\nActual owned Main frame:\n${settledFrame}`);
     this.removedWorkspaces.add(session.workspace);
     this.selectedNativeTarget = undefined;
     if (this.displayedRow?.pid === session.record.pid) this.displayedRow = undefined;

@@ -236,7 +236,18 @@ class SpyPty implements InstancePty {
 
   readonly #errorListeners: ((error: Error) => void)[] = [];
 
-  write(data: string | Buffer): void { this.writes.push(data); }
+  /**
+   * Runs after a write's bytes were recorded, so a throw here models a write that
+   * partially reached the child and then failed. One-shot: cleared before it runs.
+   */
+  afterWrite: ((data: string | Buffer) => void) | undefined;
+
+  write(data: string | Buffer): void {
+    this.writes.push(data);
+    const hook = this.afterWrite;
+    this.afterWrite = undefined;
+    hook?.(data);
+  }
   resize(columns: number, rows: number): void { this.cols = columns; this.rows = rows; }
   kill(): void { this.emitExit(0, 15); }
   pause(): void { /* observed elsewhere */ }
@@ -616,6 +627,136 @@ test("the capture seam is bound to one run, and a Pi row keeps raw OSC 52 denied
     await harness.manager.surface(piId)?.flush();
     assert.equal(harness.piRoute.length, 0, "raw OSC 52 on a Pi row never reaches the Pi clipboard route");
     assert.equal(harness.localRoute.length, 0, "and never reaches the provider owner route either");
+  } finally {
+    await harness.manager.dispose();
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a viewer write that throws after it was invoked leaves no copy recipient until a fresh input succeeds", async () => {
+  const harness = makeHarness("viewer-unknown");
+  try {
+    const rowId = await createRow(harness);
+    const viewerA = openSurface(harness);
+    const viewerB = openSurface(harness);
+    assert.equal(harness.manager.updateViewer(viewerA, { sessionId: rowId, cols: 80, rows: 24 }).applied, true);
+    assert.equal(harness.manager.updateViewer(viewerB, { sessionId: rowId, cols: 80, rows: 24 }).applied, true);
+    const pty = harness.spawned.at(-1)!;
+    const seam = harness.manager.nativeCliCopyCapture(rowId);
+    assert.ok(seam !== undefined);
+    const sourceA = nativeScope(harness, viewerA);
+    const sourceB = nativeScope(harness, viewerB);
+
+    viewerInput(harness, viewerA, rowId, "a");
+    await childCopy(harness, rowId, "A is attributed");
+    assert.deepEqual(receiptsOf(harness, 0).map((receipt) => copiedText(receipt)), ["A is attributed"]);
+
+    // An ordinary pre-write refusal never touches the child and never moves A's attribution.
+    const writesBefore = pty.writes.length;
+    assert.deepEqual(harness.manager.writeViewerInput(viewerB, {
+      expectedSource: { ...sourceB, sourceToken: sourceA.sourceToken } as NativeViewerAnyInputSource,
+      expectedInputModes: modesOf(harness, rowId),
+      data: "refused",
+    }), { status: "refused", reason: "stale-source" });
+    assert.equal(pty.writes.length, writesBefore, "a refused write never reaches the child");
+    await childCopy(harness, rowId, "still A after a refusal");
+    assert.deepEqual(receiptsOf(harness, 0).map((receipt) => copiedText(receipt)),
+      ["A is attributed", "still A after a refusal"]);
+    assert.deepEqual(receiptsOf(harness, 1), []);
+
+    // B's valid write reaches the child and then throws: the outcome is unknown, and a
+    // copy the child emits while that write is still in progress has no recipient.
+    let inFlightCopy: boolean | undefined;
+    pty.afterWrite = () => {
+      inFlightCopy = seam.submit(b64("copied during the indeterminate write"));
+      throw new Error("synthetic partial PTY write");
+    };
+    assert.deepEqual(harness.manager.writeViewerInput(viewerB, {
+      expectedSource: sourceB as NativeViewerAnyInputSource,
+      expectedInputModes: modesOf(harness, rowId),
+      data: "b-partial",
+    }), { status: "unknown" });
+    assert.equal(pty.writes.at(-1), "b-partial", "the bytes were handed to the child before the throw");
+    assert.equal(pty.writes.length, writesBefore + 1, "an unknown write is never retried");
+    assert.equal(inFlightCopy, false, "no prior recipient is attributed while the outcome is indeterminate");
+
+    // A new copy after the unknown write reaches neither A, nor B, nor the owner.
+    await childCopy(harness, rowId, "after the unknown write");
+    assert.equal(receiptsOf(harness, 0).length, 2, "A is no longer attributed");
+    assert.deepEqual(receiptsOf(harness, 1), [], "an unknown write never attributes B");
+    assert.equal(harness.localRoute.length, 0, "an unattributed copy never falls back to the owner");
+    assert.equal(seam.submit(b64("adapter copy after the unknown write")), false);
+
+    // A fresh successful input from B establishes B, and only B.
+    viewerInput(harness, viewerB, rowId, "b");
+    await childCopy(harness, rowId, "B is attributed");
+    assert.equal(receiptsOf(harness, 0).length, 2);
+    assert.deepEqual((receiptsOf(harness, 1) as NativeViewerNativeCliClipboardReceipt[])
+      .map((receipt) => [copiedText(receipt), receipt.source.sourceToken]),
+    [["B is attributed", sourceB.sourceToken]]);
+    assert.equal(harness.localRoute.length, 0);
+    assert.equal(harness.piRoute.length, 0);
+  } finally {
+    await harness.manager.dispose();
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("an owner-local write that throws after it was invoked leaves no copy recipient until a fresh input succeeds", async () => {
+  const harness = makeHarness("local-unknown");
+  try {
+    const rowId = await createRow(harness);
+    const viewer = openSurface(harness);
+    assert.equal(harness.manager.updateViewer(viewer, { sessionId: rowId, cols: 80, rows: 24 }).applied, true);
+    const pty = harness.spawned.at(-1)!;
+    const seam = harness.manager.nativeCliCopyCapture(rowId);
+    assert.ok(seam !== undefined);
+    const localText = (event: NativeCliClipboardEvent): string => Buffer.from(event.encoded, "base64").toString("utf8");
+
+    viewerInput(harness, viewer, rowId, "a");
+
+    // An empty local write and a terminal protocol reply are not user input: neither
+    // seizes nor clears the viewer's attribution.
+    harness.manager.write(rowId, "");
+    pty.emitData(`${ESC}[6n`);
+    await harness.manager.surface(rowId)?.flush();
+    assert.match(pty.writes.map((entry) => String(entry)).join(""), /\x1b\[\d+;\d+R/,
+      "the host actually replied to the child's terminal query");
+    await childCopy(harness, rowId, "still the viewer's copy");
+    assert.deepEqual(receiptsOf(harness, 0).map((receipt) => copiedText(receipt)), ["still the viewer's copy"]);
+    assert.equal(harness.localRoute.length, 0);
+
+    // A no-write refusal (unknown row) leaves the attribution untouched as well.
+    assert.throws(() => harness.manager.write("no-such-row", "refused"), /unknown instance id/);
+    await childCopy(harness, rowId, "still the viewer after a refusal");
+    assert.equal(receiptsOf(harness, 0).length, 2);
+    assert.equal(harness.localRoute.length, 0);
+
+    // Owner-local input reaches the child and then throws: the outcome is unknown, and
+    // no prior recipient is attributed while it is in progress.
+    const writesBefore = pty.writes.length;
+    let inFlightCopy: boolean | undefined;
+    pty.afterWrite = () => {
+      inFlightCopy = seam.submit(b64("copied during the indeterminate local write"));
+      throw new Error("synthetic partial PTY write");
+    };
+    assert.throws(() => harness.manager.write(rowId, "local-partial"), /synthetic partial PTY write/);
+    assert.equal(pty.writes.at(-1), "local-partial", "the bytes were handed to the child before the throw");
+    assert.equal(pty.writes.length, writesBefore + 1, "an unknown write is never retried");
+    assert.equal(inFlightCopy, false, "no prior recipient is attributed while the outcome is indeterminate");
+
+    await childCopy(harness, rowId, "after the unknown local write");
+    assert.equal(receiptsOf(harness, 0).length, 2, "the viewer is no longer attributed");
+    assert.equal(harness.localRoute.length, 0, "an unknown local write never attributes the owner");
+    assert.equal(seam.submit(b64("adapter copy after the unknown local write")), false);
+
+    // A fresh successful local input establishes the owner, and only the owner.
+    harness.manager.write(rowId, "local keystroke");
+    await childCopy(harness, rowId, "now the owner's copy");
+    assert.deepEqual(harness.localRoute.map((entry) => [entry.instanceId, localText(entry.event)]),
+      [[rowId, "now the owner's copy"]]);
+    assert.equal(receiptsOf(harness, 0).length, 2);
+    assert.equal(harness.piRoute.length, 0);
   } finally {
     await harness.manager.dispose();
     rmSync(harness.root, { recursive: true, force: true });

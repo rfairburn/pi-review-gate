@@ -559,7 +559,7 @@ type TransportState = "idle" | "connecting" | "ready" | "closed";
  * One read-only connection to one host-owned native Codex app-server.
  *
  * The public surface is exactly: connect, the four allowlisted metadata reads,
- * dispose, and two read-only getters. There is no send, no reply, no notify, no
+ * dispose, and three read-only getters. There is no send, no reply, no notify, no
  * generic `request(method, params)`, and no way to address a frame to an id this
  * client did not mint, which is what makes "never answer the operator's approval
  * prompt" a structural property rather than a convention.
@@ -576,6 +576,7 @@ export class NativeCodexRpcTransport {
   readonly #onFailure: ((code: NativeCodexRpcFailureCode) => void) | undefined;
   readonly #onConnected: ((info: NativeCodexInitializeInfo) => void) | undefined;
   readonly #onClosed: ((code: NativeCodexRpcFailureCode | undefined) => void) | undefined;
+  readonly #socketClosed: Promise<void>;
 
   readonly #pending = new Map<string, PendingRequest>();
   #ws: WebSocket | null = null;
@@ -585,6 +586,11 @@ export class NativeCodexRpcTransport {
   #reportedProtocol = false;
   /** True once the peer exceeded the message cap, so the close is read as oversize. */
   #sawOversize = false;
+  /** A WebSocket was actually constructed for an attempted connection. */
+  #socketAttempted = false;
+  /** The physical-close proof has settled; it settles at most once and never rejects. */
+  #socketClosedSettled = false;
+  #socketClosedResolve!: () => void;
 
   constructor(options: NativeCodexRpcTransportOptions) {
     const read = readNativeCodexRpcEndpoint(options.endpoint);
@@ -610,10 +616,25 @@ export class NativeCodexRpcTransport {
     this.#onFailure = options.onFailure;
     this.#onConnected = options.onConnected;
     this.#onClosed = options.onClosed;
+    this.#socketClosed = new Promise<void>((resolve) => {
+      this.#socketClosedResolve = resolve;
+    });
   }
 
   get state(): TransportState {
     return this.#state;
+  }
+
+  /**
+   * Resolves exactly once when the underlying WebSocket's own `close` event has
+   * fired — including for a caller-initiated {@linkcode close} — or when no
+   * socket was ever opened and disposal is irreversible. It never rejects and
+   * is a physical-close proof, not the API `state` value. It is deliberately
+   * independent of {@linkcode onClosed}, which is never emitted after a
+   * deliberate close.
+   */
+  get socketClosed(): Promise<void> {
+    return this.#socketClosed;
   }
 
   /** In-flight request count; a leak or a stuck census is visible without content. */
@@ -638,9 +659,13 @@ export class NativeCodexRpcTransport {
         ws = this.#openSocket();
       } catch {
         this.#state = "closed";
+        // A synchronous constructor/refusal created no socket, so there is no
+        // close event to wait for; the proof is positively "never opened".
+        this.#resolveSocketClosed();
         reject(new NativeCodexRpcError("handshake"));
         return;
       }
+      this.#socketAttempted = true;
       this.#ws = ws;
 
       // Re-entrancy latch: failing during initialization closes the socket, and
@@ -751,6 +776,10 @@ export class NativeCodexRpcTransport {
         fail(this.#state === "ready" ? "socket" : "handshake");
       });
       ws.on("close", (code: number) => {
+        // The socket's own close is the one lifecycle proof that also holds
+        // after a deliberate close. It is resolved before this handler returns
+        // and is independent of the disposed/onClosed suppression below.
+        this.#resolveSocketClosed();
         const reason = code === 1009 || this.#sawOversize
           ? "oversize"
           : this.#disposed ? undefined : "socket";
@@ -825,10 +854,16 @@ export class NativeCodexRpcTransport {
     this.#disposed = true;
     const ws = this.#ws;
     this.#teardown("closed");
+    if (!this.#socketAttempted && ws === null) {
+      // Positively never opened, and disposal makes opening impossible: no
+      // close event can ever arrive, so the proof is already complete.
+      this.#resolveSocketClosed();
+    }
     try {
       ws?.close();
     } catch {
-      // Already gone.
+      // The socket may already be gone; its own close event (or the
+      // never-opened case above) remains the only proof.
     }
   }
 
@@ -1033,6 +1068,17 @@ export class NativeCodexRpcTransport {
     } catch {
       // A host sink cannot corrupt this transport.
     }
+  }
+
+  /**
+   * One physical-close proof. Deliberately independent of `#disposed` and
+   * {@linkcode onClosed}: it resolves from the underlying `ws` close event (or
+   * a positively never-opened disposal). It never rejects.
+   */
+  #resolveSocketClosed(): void {
+    if (this.#socketClosedSettled) return;
+    this.#socketClosedSettled = true;
+    this.#socketClosedResolve();
   }
 }
 

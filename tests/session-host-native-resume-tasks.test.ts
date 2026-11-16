@@ -174,7 +174,7 @@ function isMainFocusFrame(text: string): boolean {
   const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
   const offset = /^\s*Sessions \(/u.test(pane[0] ?? "") ? 0 : 1;
   const footer = pane.slice(offset + 1 + parsed.entryEnd).map((line) => line.trim()).filter(Boolean);
-  return footer.length === 2 && footer[0] === "F8 toggle | enter open" && footer[1] === "esc hide | q quit";
+  return footer.length === 2 && footer[0] === "F8 toggle | enter open | esc hide" && footer[1] === "q quit";
 }
 
 function activityCounts(text: string, caption: string): ActivityCounts | undefined {

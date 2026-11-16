@@ -32,7 +32,7 @@ import test from "node:test";
 
 import { SidebarController, type SidebarAction, type SidebarItem } from "../src/session-host/sidebar";
 import type { PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
-import { NETWORK_ACTION, ROSTER_ACTIONS, SETTINGS_ACTION } from "./helpers/session-host-native-roster-witness";
+import { NATIVE_PANE_START, NETWORK_ACTION, ROSTER_ACTIONS, SETTINGS_ACTION, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 
 import {
   KEYS,
@@ -98,7 +98,7 @@ interface ProviderRecord {
 const STOP_REPRESS_NOTICE = "Press d again to confirm stopping this session";
 
 function isCompleteRosterFrame(text: string): boolean {
-  return parseRosterFrame(text, 32).complete;
+  return parseRosterFrame(text, SIDEBAR_COLUMNS).complete;
 }
 
 function nativeCardCount(text: string): number {
@@ -106,7 +106,7 @@ function nativeCardCount(text: string): number {
 }
 
 function isSidebarFocus(text: string): boolean {
-  return isSidebarFocusedFrame(text, 32);
+  return isSidebarFocusedFrame(text, SIDEBAR_COLUMNS);
 }
 
 function selectedPosition(text: string): number | undefined {
@@ -168,10 +168,10 @@ function actionRows(labels: readonly string[]): string[] {
 /**
  * One complete five-row native card for the pure tail witness; no process or file.
  * The count row is the exact both-unknown row the formatter draws at this width:
- * both labels are named and the second value keeps the renderer's ellipsis.
+ * both labels are named and both values fit whole at the fixed production width.
  */
 function tailCard(title: string): string[] {
-  return [title, "  agent idle | input none", "  bg tasks unknown | shells u...", "    idle activity", "    idle activity"];
+  return [title, "  agent idle | input none", "  bg tasks unknown | shells unknown", "    idle activity", "    idle activity"];
 }
 
 /** A pane-only roster (header on line 0) of two cards followed by the drawn rows. */
@@ -265,7 +265,7 @@ async function activateRow(driver: SavedMainDriver, position: number, expectedHe
   driver.pty.write(KEYS.enter);
   await driver.waitFrame((text) => frameHeader(text) === expectedHeader
     && isCompleteMainFocusedRoster(text)
-    && text.split("\n").slice(1).map((line) => line.slice(33)).join("\n").includes(`• ${expectedHeader}`),
+    && text.split("\n").slice(1).map((line) => line.slice(NATIVE_PANE_START)).join("\n").includes(`• ${expectedHeader}`),
     "a deliberate host-row Enter completely paints the exact owner header, native name footer, roster, and Main-focus hints", before.frameRevision);
 }
 
@@ -384,19 +384,19 @@ test("row-lifecycle activation witness rejects old or mixed focus footers", () =
     backgroundTasks: 0, backgroundShells: 0, activity: [],
   }]);
   controller.select("focus-owner");
-  const sidebarFrame = controller.renderRoster(32, 50).lines.join("\n");
+  const sidebarFrame = controller.renderRoster(SIDEBAR_COLUMNS, 50).lines.join("\n");
   assert.equal(isCompleteMainFocusedRoster(sidebarFrame), false,
     "a caption that imitates the Main footer and a complete sidebar-focus roster do not establish Main focus");
   controller.handleInput(KEYS.enter);
-  const mainFrame = controller.renderRoster(32, 50).lines.join("\n");
+  const mainFrame = controller.renderRoster(SIDEBAR_COLUMNS, 50).lines.join("\n");
   assert.equal(isCompleteMainFocusedRoster(mainFrame), true);
   assert.equal(isCompleteMainFocusedRoster(`${mainFrame}\ne edit name | d stop/remove`), false,
     "stale sidebar-focus hints cannot coexist with a completed Main-focus witness");
-  assert.equal(isCompleteMainFocusedRoster(mainFrame.replace("esc hide | q quit", "")), false,
+  assert.equal(isCompleteMainFocusedRoster(mainFrame.replace("q quit", "")), false,
     "a partial Main footer is not completed activation");
 });
 
-test("public SidebarController renders the complete frozen Stop confirmation at the 32-column sidebar width", () => {
+test("public SidebarController renders the complete frozen Stop confirmation at the 35-column sidebar width", () => {
   const controller = new SidebarController();
   controller.updateItems([{
     id: "row-lifecycle-a3",
@@ -413,18 +413,18 @@ test("public SidebarController renders the complete frozen Stop confirmation at 
   // Explicitly select the fixture row and paint the complete roster so the
   // deliberate d targets it (the initial highlight is a host action, not the row).
   controller.select("row-lifecycle-a3");
-  controller.renderRoster(32, 50);
+  controller.renderRoster(SIDEBAR_COLUMNS, 50);
   assert.equal(controller.focus, "sidebar", "the actual public controller starts on the visible roster");
   controller.handleInput("d");
   assert.equal(controller.focus, "confirm",
     "a non-idle or unknown live row freezes an explicit Stop confirmation instead of stopping directly");
-  const rendered = controller.render(32, 50);
+  const rendered = controller.render(SIDEBAR_COLUMNS, 50);
   assert.equal(hasStopRemoveConfirmationContents(rendered.lines), true,
-    "the 32-column public renderer preserves the full wrapped stop warning and both complete hints (joined into one row at this width)");
+    "the 35-column public renderer preserves the full wrapped stop warning and both complete hints");
   const composedFrame = ["Session host", ...rendered.lines.map((line) =>
-    `${line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).padEnd(32)}│native surface`)].join("\n");
+    `${line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, SIDEBAR_COLUMNS).padEnd(SIDEBAR_COLUMNS)}│native surface`)].join("\n");
   assert.equal(isStopRemoveConfirmationFrame(composedFrame), true,
-    "the native-frame predicate reads only the rendered 32-column sidebar, not Main's wider content pane");
+    "the native-frame predicate reads only the rendered 35-column sidebar, not Main's wider content pane");
 });
 
 test("public SidebarController stops a positively idle live row directly without opening a confirmation", () => {
@@ -447,7 +447,7 @@ test("public SidebarController stops a positively idle live row directly without
   // Explicitly select the fixture row and paint the complete roster so the
   // deliberate d targets it (the initial highlight is a host action, not the row).
   controller.select("row-lifecycle-idle");
-  controller.renderRoster(32, 50);
+  controller.renderRoster(SIDEBAR_COLUMNS, 50);
   controller.handleInput("d");
   assert.equal(controller.focus, "sidebar",
     "a positively complete-idle row never opens the frozen stop confirmation");
@@ -471,7 +471,7 @@ test("the action-tail witness accepts only the two complete legal tails and reje
     assert.doesNotThrow(() => assertLegalRosterActionTail(tail, `legal tail [${tail.join(" > ")}]`));
     // The shared strict parser accepts the same drawn rows, so the witness is
     // anchored on the real grammar and not on a private label list.
-    const parsed = parseRosterFrame(tailPane(tail), 32);
+    const parsed = parseRosterFrame(tailPane(tail), SIDEBAR_COLUMNS);
     assert.equal(parsed.complete, true, `the parser draws a complete roster for [${tail.join(" > ")}]`);
     assert.deepEqual(parsed.actions.map((entry) => entry.label), [...tail]);
   }
@@ -506,7 +506,7 @@ test("the action-tail witness accepts only the two complete legal tails and reje
     assert.throws(() => assertLegalRosterActionTail(tail, "malformed tail"), /expected exactly one of/);
     // The shared parser is fail-closed on the same drawn rows, so a frame the
     // witness rejects never exposes entries either.
-    const parsed = parseRosterFrame(tailPane(tail), 32);
+    const parsed = parseRosterFrame(tailPane(tail), SIDEBAR_COLUMNS);
     assert.equal(parsed.complete, false, `the parser refuses [${tail.join(" > ")}]`);
     assert.deepEqual(parsed.actions, []);
     assert.deepEqual(parsed.entries, []);
@@ -562,8 +562,8 @@ test("the action-tail witness accepts exactly what the public renderer draws for
       });
       controller.updateItems([tailRosterItem("tail-a"), tailRosterItem("tail-b")]);
       if (withNetwork) controller.setPeerUiSnapshot(TAIL_PEER_SNAPSHOT);
-      const frame = controller.renderRoster(32, 50).lines.join("\n");
-      const parsed = parseRosterFrame(frame, 32);
+      const frame = controller.renderRoster(SIDEBAR_COLUMNS, 50).lines.join("\n");
+      const parsed = parseRosterFrame(frame, SIDEBAR_COLUMNS);
       const flags = `settings=${settingsAvailable}, network=${withNetwork}`;
       assert.equal(parsed.complete, true, `the public renderer paints a complete roster (${flags})`);
       assert.equal(parsed.cards.length, 2, `both cards stay parsed (${flags})`);
@@ -697,7 +697,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   // roster, never a partial first-output/divider repaint.
   await driver.waitFrame((text) => frameHeader(text) === "Session host"
     && text.includes("Welcome") && isSidebarFocus(text)
-    && parseRosterFrame(text, 32).count === 0,
+    && parseRosterFrame(text, SIDEBAR_COLUMNS).count === 0,
     "fresh real public Main completely paints its empty roster and sidebar-only focus footer before the first key");
   assert.deepEqual(driver.records(), [], "the public native observer has no fabricated pre-session events");
   assert.equal(driver.surface.frame().cols, OUTER_COLS);
@@ -731,7 +731,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.ok(processIsStillOwnedAndLive(processA));
   assert.ok(processIsStillOwnedAndLive(processB));
   const rosterAfterCreation = rosterEntries(driver.currentText());
-  const parsedRosterAfterCreation = parseRosterFrame(driver.currentText(), 32);
+  const parsedRosterAfterCreation = parseRosterFrame(driver.currentText(), SIDEBAR_COLUMNS);
   assert.equal(parsedRosterAfterCreation.complete, true);
   assert.equal(rosterAfterCreation.length, parsedRosterAfterCreation.entries.length,
     "the helper exposes exactly the entries actually rendered by the complete roster");
@@ -767,7 +767,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   // F8: sidebar focus -> hidden.
   const f8HideBefore = driver.snapshot();
   driver.pty.write(KEYS.f8);
-  await driver.waitFrame((text) => sidebarRosterHidden(text, 32),
+  await driver.waitFrame((text) => sidebarRosterHidden(text, SIDEBAR_COLUMNS),
     "one F8 press hides the sidebar-focused pane and returns Main", f8HideBefore.frameRevision);
   // F8: hidden -> shown and focused.
   const f8ShowBefore = driver.snapshot();

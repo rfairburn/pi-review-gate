@@ -32,7 +32,18 @@
  * labelled for another event) never sets the positional completion boundary; and
  * count-only monitoring reads the file for membership transitions without ever
  * erasing a healthy hook-derived foreground or question census; one-file-only
- * access; and that no raw transcript content ever leaves the controller.
+ * access; and that no raw transcript content ever leaves the controller. Two rows
+ * the provider appends only after the fact they describe are already observed are
+ * pinned too: the persisted invocation of a question request this run's own
+ * `PreToolUse` accepted is the same observed work — the pause, the pending census,
+ * the live counts, and the activity label all hold, while every other root row (an
+ * unseen identity, a mixed row, prose, a child question's identity, or a real
+ * prompt) still ends the pause — and a task-origin delivery of a member this run's
+ * ledger already settled asserts no new membership change — however its opaque body
+ * is marked up — while an unknown,
+ * still-active, reactivated, malformed, ambiguous, or non-task-origin delivery
+ * keeps its existing unattributable hole and a delivery is never an agent's fresh
+ * completion.
  */
 
 import assert from "node:assert/strict";
@@ -126,6 +137,9 @@ async function createHarness(options: {
     }),
     append: (row) => fs.appendFile(transcript, row, "utf8"),
     latest: () => snapshots[snapshots.length - 1] as NativeClaudeAcquisitionSnapshot,
+    // Any published `busy: false`, which in a trace with an open question also
+    // includes the stopped-on-input projection — not only the idle claim. Tests
+    // that need the idle claim itself check `activity` for `Ready`.
     readySnapshots: () => snapshots.filter((snapshot) => snapshot.busy === false),
   };
 }
@@ -357,7 +371,9 @@ test("a child, agent-scoped, sidechain, or non-Stop-labelled summary never close
     await h.append(summaryRow(extra));
     await settle();
     assert.deepEqual(h.readySnapshots(), [], `summary variant ${JSON.stringify(extra)} must not close root`);
-    assert.equal(h.latest().busy, null);
+    // Unclosed means unclosed: the turn this source observed running is still
+    // running, and a rejected row neither completes it nor withdraws it.
+    assert.equal(h.latest().busy, true);
     h.controller.dispose();
   }
 });
@@ -374,7 +390,8 @@ test("a turn_duration row is never a terminal witness, because it can be deferre
 
   await settle();
   assert.deepEqual(h.readySnapshots(), [], "a deferred runner row must not close the turn");
-  assert.equal(h.latest().busy, null);
+  // With no witness the turn stays the running turn this source observed.
+  assert.equal(h.latest().busy, true);
   h.controller.dispose();
 });
 
@@ -398,10 +415,98 @@ test("a Stop hook by itself is a boundary this observer cannot prove final", asy
   await settle();
   assert.deepEqual(h.readySnapshots(), []);
   const stopped = h.latest();
-  assert.equal(stopped.busy, null);
-  assert.deepEqual(stopped.activity, []);
+  // Still never Ready from this observer's own Stop. And because the boundary
+  // proves no end, it does not erase what this source positively observed: the
+  // accepted turn stays running with its activity, and the snapshot numbers from
+  // that same trusted edge stay exact.
+  assert.equal(stopped.busy, true);
+  assert.deepEqual(stopped.activity, ["Working"]);
   assert.equal(stopped.activeTasks, 2);
   assert.equal(stopped.activeShells, 1);
+  h.controller.dispose();
+});
+
+test("an answered turn keeps its observed foreground and counts across an unproven Stop", async () => {
+  // The shape native evidence actually showed: a real AskUserQuestion round trip
+  // answered, the turn underneath running again, the census empty, one shell
+  // active — then this observer's root `Stop` arrives, and the ordered terminal
+  // record has not landed yet.
+  const h = await createHarness();
+  await beginTurn(h);
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_q", prompt_id: "prompt-1" });
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_q", prompt_id: "prompt-1" });
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 1 } });
+
+  await settle();
+  const held = h.latest();
+  // Not Ready (no terminal witness yet), and not an unknown gap either: the
+  // observed working projection, the answered census, and both exact counts
+  // stand through the candidate boundary.
+  assert.equal(held.busy, true);
+  assert.notDeepEqual(held.activity, []);
+  assert.equal(held.pendingInput, false);
+  assert.equal(held.activeTasks, 0);
+  assert.equal(held.activeShells, 1);
+  // No snapshot carried the idle claim. The only `busy: false` publish in this
+  // trace was the stopped-on-input projection while the request was open.
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  assert.deepEqual(h.gaps, []);
+
+  await h.append(summaryRow({ preventedContinuation: true }));
+  await waitFor(() => h.latest().activity.includes("Ready"), "the terminal record confirms Ready");
+  const ready = h.latest();
+  assert.equal(ready.busy, false);
+  assert.deepEqual(ready.activity, ["Ready"]);
+  assert.equal(ready.pendingInput, false);
+  assert.equal(ready.activeTasks, 0);
+  assert.equal(ready.activeShells, 1);
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+});
+
+test("a genuine loss while the terminal witness is awaited still withdraws what it owns", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 1 } });
+  await settle();
+  assert.equal(h.latest().busy, true);
+
+  // A real authenticated hook-lane loss is not an unproven boundary: everything
+  // that lane vouched goes unknown — never a retained running row and never zero.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-malformed" });
+  await settle();
+  const withdrawn = h.latest();
+  assert.equal(withdrawn.busy, null);
+  assert.equal(withdrawn.pendingInput, null);
+  assert.equal(withdrawn.activeTasks, null);
+  assert.equal(withdrawn.activeShells, null);
+  assert.deepEqual(h.gaps, ["hook-failure"]);
+  h.controller.dispose();
+});
+
+test("a stale, foreign, or child Stop has no power over a retained projection", async () => {
+  const h = await createHarness();
+  await beginTurn(h, "prompt-2");
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 1 }, prompt_id: "prompt-2" });
+  await settle();
+  const held = h.latest();
+  assert.equal(held.busy, true);
+  const published = h.snapshots.length;
+
+  // An older prompt's Stop, another session's Stop, and a child's own boundary
+  // are all outside this run: they neither complete it, unknown it, nor move its
+  // counts.
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  h.hook("Stop", { session_id: OTHER_SESSION });
+  h.hook("SubagentStop", {
+    agent_id: "agent-1",
+    background_counts: { tasks: 9, shells: 9 },
+    background_tasks: [{ id: "b9", type: "shell", status: "running" }],
+  });
+  await settle();
+  assert.deepEqual(h.latest(), held);
+  assert.equal(h.snapshots.length, published);
+  assert.deepEqual(h.gaps, []);
   h.controller.dispose();
 });
 
@@ -435,7 +540,9 @@ test("a new prompt is not closed by the previous turn's summary", async () => {
   h.hook("Stop", { prompt_id: "prompt-2" });
   await settle();
   assert.equal(h.readySnapshots().length, readyCount, "the older summary must not close the new turn");
-  assert.equal(h.latest().busy, null);
+  // The new turn is not closed, and "not closed" keeps its observed shape: still
+  // running, never an invented Ready and never a gratuitous unknown.
+  assert.equal(h.latest().busy, true);
   h.controller.dispose();
 });
 
@@ -518,7 +625,9 @@ test("a malformed row after a sufficient summary withdraws instead of publishing
 
   await waitFor(() => h.gaps.includes("malformed"), "a malformed row anywhere in the window must be reported");
   assert.deepEqual(h.readySnapshots(), [], "Ready must never be published from a window that is not fully valid");
-  assert.equal(h.latest().busy, null);
+  // The running projection came from the hook lane, so a window this controller
+  // cannot parse neither completes it nor withdraws it.
+  assert.equal(h.latest().busy, true);
   // The unreadable file is the transcript lane. The snapshot came from the ROOT
   // `Stop` hook payload, so it survives as last-reported instead of being nulled.
   assert.equal(h.latest().activeTasks, 1);
@@ -623,10 +732,10 @@ test("a watcher that cannot be created withdraws published state instead of leav
 
   assert.ok(h.gaps.includes("watch-unavailable"), `expected a watch-unavailable gap: ${h.gaps.join(",")}`);
   const after = h.latest();
-  // What the failed lane supported is withdrawn: no witness can be read, so no
-  // Ready may be claimed. The ROOT `Stop` snapshot came from the hook lane, so it
-  // stays published as the last thing the provider stated.
-  assert.equal(after.busy, null);
+  // No witness can be read, so no Ready may ever be claimed here. What the hook
+  // lane positively stated survives a transcript lane that cannot watch: both the
+  // ROOT `Stop` snapshot and the running turn it was observing.
+  assert.equal(after.busy, true);
   assert.equal(after.activeTasks, 2, "a transcript lane that cannot watch never nulls a hook-payload count");
   assert.equal(after.activeShells, 2);
 
@@ -684,7 +793,9 @@ test("invalid UTF-8 bytes in the window withdraw rather than publishing Ready", 
 
   await waitFor(() => h.gaps.includes("unreadable"), "corrupt bytes must be reported as unreadable");
   assert.deepEqual(h.readySnapshots(), [], "a window with corrupt bytes must not publish Ready");
-  assert.equal(h.latest().busy, null);
+  // Corrupt bytes say nothing about the hook-observed foreground: it stays the
+  // running turn, and Ready is never inferred from the unreadable window.
+  assert.equal(h.latest().busy, true);
   // A transcript this controller cannot decode says nothing about background
   // membership: the hook-payload snapshot stays as last-reported.
   assert.equal(h.latest().activeTasks, 1);
@@ -800,11 +911,11 @@ test("unrelated hook activity keeps the last-reported counts, including a publis
   await h.append(summaryRow());
   await waitFor(() => h.readySnapshots().length > 0, "Ready should land");
 
-  // A late tool close, subagent metadata, and a child snapshot with different
-  // numbers are all unrelated to root background membership.
+  // A late tool close and a child boundary for an identity this run never saw
+  // start are unrelated to root background membership: neither is a live agent of
+  // this run, so the last-reported pair stands and nothing is published.
   const before = h.snapshots.length;
   h.hook("PostToolUse", { tool_name: "Read", tool_use_id: "tool-late" });
-  h.hook("SubagentStart", { agent_id: "agent-9" });
   h.hook("SubagentStop", { agent_id: "agent-9", background_counts: { tasks: 0, shells: 0 } });
   await settle();
   assert.equal(h.snapshots.length, before, "unrelated hooks publish nothing about membership");
@@ -813,6 +924,16 @@ test("unrelated hook activity keeps the last-reported counts, including a publis
   assert.deepEqual(kept.activity, ["Ready"]);
   assert.equal(kept.activeTasks, 2);
   assert.equal(kept.activeShells, 1);
+
+  // A `SubagentStart` is NOT unrelated activity. It positively establishes a live
+  // agent of this run, and a provider total counts only work currently in flight,
+  // so this observer can no longer say whether that total already contains the
+  // agent. The task axis is withdrawn on that uncertainty; the shell total, the
+  // published `Ready`, and the foreground are untouched.
+  h.hook("SubagentStart", { agent_id: "agent-9" });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 1 });
+  assert.equal(h.latest().busy, false, "a live agent never erases the foreground");
   h.controller.dispose();
 });
 
@@ -825,7 +946,9 @@ test("a transcript this controller cannot read never nulls a hook-payload count"
   h.hook("Stop", { background_counts: { tasks: 2, shells: 1 } });
   assert.ok(h.gaps.includes("unavailable"), `expected an unavailable gap: ${h.gaps.join(",")}`);
   const after = h.latest();
-  assert.equal(after.busy, null);
+  // The terminal claim cannot be read, so nothing closes; the running turn this
+  // source observed is untouched by a missing file.
+  assert.equal(after.busy, true);
   assert.equal(after.activeTasks, 2, "a transcript gap must not silently null a hook-reported count");
   assert.equal(after.activeShells, 1);
   await settle();
@@ -887,7 +1010,9 @@ test("truncation of the bound transcript withdraws instead of producing Ready", 
 
   await waitFor(() => h.gaps.includes("truncated"), "a shrink should be reported as a gap");
   assert.deepEqual(h.readySnapshots(), []);
-  assert.equal(h.latest().busy, null);
+  // A shrunk file cannot witness an end, and it never contradicts the observed
+  // running turn either: no Ready, no invented unknown.
+  assert.equal(h.latest().busy, true);
   // The hook-payload snapshot is not a claim about this file: it survives.
   assert.equal(h.latest().activeTasks, 1);
   assert.equal(h.latest().activeShells, 1);
@@ -921,7 +1046,7 @@ test("a malformed record in the scanned window withdraws the supported state", a
 
   await waitFor(() => h.gaps.includes("malformed"), "an unreadable record should be reported");
   assert.deepEqual(h.readySnapshots(), []);
-  assert.equal(h.latest().busy, null);
+  assert.equal(h.latest().busy, true, "the hook lane still holds the observed running turn");
   assert.equal(h.latest().activeShells, 1, "the transcript lane failed, not the hook lane");
   h.controller.dispose();
 });
@@ -1445,7 +1570,9 @@ test("without a positively bound transcript path there is no terminal claim", as
   // have made. The counts this Stop carried came from the hook payload, not from
   // that missing file, so they stay published as the last thing that was stated.
   const after = h.latest();
-  assert.equal(after.busy, null);
+  // There is no file to read a terminal record from, so nothing closes. The
+  // foreground stays what the hook lane observed, and the counts stay published.
+  assert.equal(after.busy, true);
   assert.equal(after.activeTasks, 1);
   assert.equal(after.activeShells, 1);
   await settle();
@@ -1930,7 +2057,8 @@ test("a tool-result row without its envelope and a task-notification row are not
     readNow(received);
     await settle();
     assert.deepEqual(h.readySnapshots(), [], `no witness has been read for ${label}`);
-    assert.equal(h.latest().busy, null);
+    // The pass stays armed and the turn stays the observed running turn.
+    assert.equal(h.latest().busy, true);
     assert.deepEqual(h.gaps, []);
 
     await h.append(summaryRow());
@@ -2084,6 +2212,7 @@ test("a notification landing after its own turn's summary still confirms Ready a
 // Provider-shaped opaque member ids: a one-character type prefix plus 8 base36
 // characters, the same namespace a launch result and a snapshot member share.
 const SHELL_1 = "b8k3n1p4q";
+const SHELL_2 = "b2s3h4e5l6";
 const TASK_1 = "a1a2b3c4d";
 const TASK_2 = "a5e6f7g8h";
 
@@ -2854,6 +2983,635 @@ test("rows written before a question hook settle the member without ending the p
   h.controller.dispose();
 });
 
+/* ---- the same question's own row, and a delivery of an already-settled end ---- */
+
+/*
+ * Two rows the provider appends only AFTER the fact they describe has already
+ * been observed on this run's own lanes, each of which used to withdraw facts the
+ * row contradicts nothing about:
+ *
+ * - the persisted INVOCATION of a question request this run's own `PreToolUse`
+ *   already accepted. It lands past the floor that hook established, but it is
+ *   the same tool call: the stopped-on-input foreground, the pending census, the
+ *   live counts, and the activity label all stand, and the request still closes
+ *   on its own edge and the turn still ends on its own witness.
+ * - the DELIVERY of a background completion whose structured record this run's
+ *   ledger already applied. It states no new membership fact, so it neither moves
+ *   a count nor opens a hole — and it is never an agent's fresh completion, since
+ *   a delivery can replay an old end long after that agent's own window reopened.
+ *
+ * Every row these two readings do not positively cover keeps its existing
+ * fail-closed outcome, and every genuine hole still withdraws what it reaches.
+ */
+
+const QUESTION_1 = "toolu-ask-q1";
+const QUESTION_ARG_SECRET = "secret-question-argument-text-never-read";
+
+/**
+ * The persisted ROOT `assistant` row of the question request itself: exactly one
+ * `tool_use` block whose identity is the request the hook lane already accepted.
+ * The tool name and arguments are here only to prove neither is ever read.
+ */
+function rootQuestionInvocationRow(requestId: string): string {
+  return jsonRow({
+    type: "assistant",
+    sessionId: SESSION,
+    isSidechain: false,
+    message: {
+      role: "assistant",
+      content: [{
+        type: "tool_use",
+        id: requestId,
+        name: "AskUserQuestion",
+        input: { questions: [{ question: QUESTION_ARG_SECRET }] },
+      }],
+    },
+    uuid: "root-question-invocation-row",
+    timestamp: "2026-01-01T00:01:10.000Z",
+  });
+}
+
+/** One ROOT `assistant` row carrying arbitrary `message.content`. */
+function rootAssistantContentRow(content: unknown): string {
+  return jsonRow({
+    type: "assistant",
+    sessionId: SESSION,
+    isSidechain: false,
+    message: { role: "assistant", content },
+    uuid: "root-assistant-content-row",
+    timestamp: "2026-01-01T00:01:10.000Z",
+  });
+}
+
+/**
+ * The provider's persisted DELIVERY of a background completion into this run's own
+ * root conversation: a `queued_command` attachment whose `prompt` carries the
+ * machine envelope. The delivery metadata and the envelope body are here only to
+ * prove none of them is read into state.
+ */
+function queuedCommandDeliveryRow(
+  prompt: string,
+  origin: Record<string, unknown> = { kind: "task-notification", producer: "session-task" },
+): string {
+  return jsonRow({
+    type: "attachment",
+    sessionId: SESSION,
+    isSidechain: false,
+    attachment: {
+      type: "queued_command",
+      origin,
+      prompt,
+      commandMode: "task-notification",
+      delivery_id: "delivery-1",
+      runId: "run-1",
+      source_uuid: "source-uuid-1",
+      timestamp: "2026-01-01T00:03:00.000Z",
+      toolsUsedDelta: 3,
+      usage: { input_tokens: 10, output_tokens: 2 },
+    },
+  });
+}
+
+/**
+ * A run stopped on an open ROOT question with live membership: one task and two
+ * shells counted, the row published as waiting for a human.
+ */
+async function pausedWithMembership(received: NativeClaudeWatchHandlers[]): Promise<Harness> {
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-b", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_2, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: QUESTION_1, prompt_id: "prompt-1" });
+  const paused = h.latest();
+  assert.equal(paused.busy, false, "the row is stopped on input");
+  assert.equal(paused.pendingInput, true);
+  assert.deepEqual(paused.activity, ["Working"]);
+  return h;
+}
+
+test("a question's own persisted invocation row holds the pause, the census, and the counts", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await pausedWithMembership(received);
+
+  // The provider appends the invocation of the SAME request, seconds after the
+  // `PreToolUse` that established this window's floor. One read consumes it.
+  const mark = h.snapshots.length;
+  await h.append(rootQuestionInvocationRow(QUESTION_1));
+  readNow(received);
+  await settle();
+  assert.deepEqual(h.snapshots.slice(mark), [], "the same question's own row publishes nothing at all");
+  const held = h.latest();
+  assert.equal(held.busy, false, "its own request's row contradicts no foreground claim");
+  assert.equal(held.pendingInput, true, "the request stays open");
+  assert.deepEqual(held.activity, ["Working"], "the activity label stands");
+  assert.deepEqual(countsOf(held), { tasks: 1, shells: 2 }, "live membership is untouched");
+  assert.deepEqual(h.gaps, [], "a row this run read is knowledge, not a source gap");
+  const leaked = JSON.stringify(h.snapshots);
+  for (const secret of [QUESTION_ARG_SECRET, h.transcript]) {
+    assert.ok(!leaked.includes(secret), `observation surface leaked ${secret}`);
+  }
+
+  // The read really consumed that window: a settlement appended behind the same
+  // kind of row still lands, and the pause still stands beside it.
+  await h.append(rootQuestionInvocationRow(QUESTION_1) + taskStatusRow(SHELL_1, "completed"));
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).shells === 1, "the settlement behind the row still settles");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  assert.equal(h.latest().busy, false);
+  assert.equal(h.latest().pendingInput, true);
+  assert.deepEqual(h.latest().activity, ["Working"]);
+
+  // Its own Post edge still closes the request, and the observed turn returns.
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: QUESTION_1, prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, false, "its own close edge still lands");
+  assert.equal(h.latest().busy, true, "the turn underneath the pause comes back");
+
+  // And that turn still ends on its own witness, with its counts intact.
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+  await h.append(summaryRow());
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "the turn's own summary still confirms Ready");
+  assert.deepEqual(h.latest().activity, ["Ready"]);
+  assert.equal(h.latest().busy, false);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  assert.deepEqual(h.gaps, [], "nothing on this path is a source gap");
+  h.controller.dispose();
+});
+
+test("every other root row still ends the pause, and the open request still survives it", async () => {
+  const own = { type: "tool_use", id: QUESTION_1, name: "AskUserQuestion", input: {} };
+  const unseen = { type: "tool_use", id: "toolu-root-new-9", name: "Bash", input: { command: SECRET_OUTPUT_FILE } };
+  const cases: Array<[string, string]> = [
+    ["a tool_use row for an identity this run never opened", rootAssistantContentRow([unseen])],
+    ["a row mixing the open request with an unseen tool", rootAssistantContentRow([own, unseen])],
+    ["a tool_use row with model prose beside it", rootAssistantContentRow([own, { type: "text", text: `root answer ${"a".repeat(64)}` }])],
+    ["a thinking row", rootAssistantContentRow([{ type: "thinking", thinking: `root reasoning ${"r".repeat(64)}` }])],
+    ["an assistant row whose content is plain text", rootAssistantContentRow(`root answer ${"a".repeat(64)}`)],
+    ["a tool_use block with no readable identity", rootAssistantContentRow([{ type: "tool_use", name: "Bash", input: {} }])],
+    ["a persisted new root prompt row", rootUserRow()],
+  ];
+  for (const [label, row] of cases) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await pausedWithMembership(received);
+    await h.append(row);
+    readNow(received);
+    await settle();
+    const after = h.latest();
+    assert.equal(after.busy, null, `newer root work must still end the pause: ${label}`);
+    assert.deepEqual(after.activity, [], `a withdrawal claims no label: ${label}`);
+    assert.equal(after.pendingInput, true, `the open request survives newer work: ${label}`);
+    assert.deepEqual(countsOf(after), { tasks: 1, shells: 2 }, `foreground work contradicts no count: ${label}`);
+    assert.deepEqual(h.gaps, [], `observed work is knowledge, not a gap: ${label}`);
+
+    // The request it did not erase still closes on its own persisted result.
+    await h.append(questionToolResultRow(QUESTION_1));
+    readNow(received);
+    await waitFor(() => h.latest().pendingInput === false, `its own result still closes it: ${label}`);
+    h.controller.dispose();
+  }
+});
+
+test("a child question's identity in a root row is newer root work, never its own invocation", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await pausedWithMembership(received);
+  // A SUBAGENT's question request: pending on its own edges, never part of this
+  // run's ROOT question census.
+  h.hook("PreToolUse", {
+    tool_name: "AskUserQuestion", tool_use_id: "q-child", agent_id: "agent-1", prompt_id: "prompt-1",
+  });
+  await h.append(rootAssistantContentRow([{ type: "tool_use", id: "q-child", name: "AskUserQuestion", input: {} }]));
+  readNow(received);
+  await settle();
+  assert.equal(h.latest().busy, null, "a root row naming a child's request is not this run's open question");
+  assert.equal(h.latest().pendingInput, true, "this run's own open request still counts as pending");
+  h.controller.dispose();
+});
+
+test("a sidechain, agent-scoped, or foreign row naming the open request is never this run's root work", async () => {
+  for (const marker of [
+    { isSidechain: true },
+    { agentId: "agent-9" },
+    { sessionId: OTHER_SESSION },
+  ]) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await pausedWithMembership(received);
+    const mark = h.snapshots.length;
+    await h.append(jsonRow({
+      type: "assistant",
+      sessionId: SESSION,
+      ...marker,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: QUESTION_1, name: "AskUserQuestion", input: {} }],
+      },
+    }));
+    readNow(received);
+    await settle();
+    assert.deepEqual(h.snapshots.slice(mark), [], `must publish nothing: ${JSON.stringify(marker)}`);
+    const held = h.latest();
+    assert.equal(held.busy, false, `someone else's row cannot end this pause: ${JSON.stringify(marker)}`);
+    assert.equal(held.pendingInput, true);
+    assert.deepEqual(countsOf(held), { tasks: 1, shells: 2 });
+    h.controller.dispose();
+  }
+});
+
+test("a delivery of a member this run's ledger already settled states no new membership change", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // The provider's structured record settles the task exactly. The ledger now
+  // remembers that identity as ended.
+  await h.append(taskStatusRow(TASK_1, "completed"));
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the structured record settles the task");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // A question is open, so the foreground axes are pinned alongside the counts.
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: QUESTION_1, prompt_id: "prompt-1" });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+  assert.equal(h.latest().busy, false, "stopped on input");
+  assert.equal(h.latest().pendingInput, true);
+
+  // The provider now DELIVERS that same completion into the root conversation.
+  const mark = h.snapshots.length;
+  await h.append(queuedCommandDeliveryRow(taskNotificationEnvelope(TASK_1, "completed", "tool-a")));
+  readNow(received);
+  await settle();
+  assert.deepEqual(h.snapshots.slice(mark), [], "a known-settled delivery publishes nothing at all");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "no hole, and no new zero");
+  assert.equal(h.latest().busy, false, "the foreground is untouched by a restated end");
+  assert.equal(h.latest().pendingInput, true, "the question census is untouched too");
+  assert.deepEqual(h.gaps, [], "a row this run read is knowledge, not a source gap");
+
+  // The read really consumed that window: a live settlement appended behind the
+  // same delivery still lands, and the known-settled one still moves nothing.
+  await h.append(
+    queuedCommandDeliveryRow(taskNotificationEnvelope(TASK_1, "completed", "tool-a"))
+      + taskStatusRow(SHELL_1, "completed"),
+  );
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).shells === 0, "the live settlement behind it still settles");
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: 0, shells: 0 },
+    "the settled delivery opened no hole in the very window that proves it",
+  );
+
+  // Neither the envelope body, the output path, nor the description crosses.
+  const leaked = JSON.stringify(h.snapshots);
+  for (const secret of [SECRET_OUTPUT_FILE, SECRET_TASK_DESCRIPTION, h.transcript]) {
+    assert.ok(!leaked.includes(secret), `observation surface leaked ${secret}`);
+  }
+  h.controller.dispose();
+});
+
+test("an unknown, active, malformed, or ambiguous delivery still withdraws both categories", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  const cases: Array<[string, string]> = [
+    ["an id this run never launched", taskNotificationEnvelope("bzzzzzzzz", "completed", "tool-z")],
+    ["an id this run still counts active", taskNotificationEnvelope(SHELL_1, "completed", "tool-c")],
+    ["a status the provider does not state as ended", taskNotificationEnvelope(TASK_1, "running", "tool-a")],
+    ["an envelope that never closes", `<task-notification><task-id>${TASK_1}</task-id><status>completed</status>`],
+    [
+      "two envelopes in one delivery",
+      taskNotificationEnvelope(TASK_1, "completed", "tool-a") + taskNotificationEnvelope(SHELL_1, "completed", "tool-c"),
+    ],
+    ["no envelope at all", "a queued command with no completion envelope"],
+    ["no readable id", "<task-notification><status>completed</status></task-notification>"],
+    ["an id past the value bound", taskNotificationEnvelope("a".repeat(200), "completed", "tool-a")],
+    [
+      "a payload past the envelope bound",
+      taskNotificationEnvelope(TASK_1, "completed", "tool-a") + "x".repeat(9 * 1024),
+    ],
+  ];
+  for (const [label, prompt] of cases) {
+    await h.append(queuedCommandDeliveryRow(prompt));
+    await waitFor(() => h.latest().activeTasks === null, `must withdraw both categories: ${label}`);
+    assert.equal(h.latest().activeShells, null, `must withdraw both categories: ${label}`);
+    // The provider's own complete root census states the whole set again.
+    h.hook("Stop", {
+      prompt_id: "prompt-1",
+      background_counts: { tasks: 1, shells: 1 },
+      background_members: [{ id: TASK_1, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    });
+    assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, `resync restores the exact census: ${label}`);
+  }
+  h.controller.dispose();
+});
+
+test("a malformed delivery naming an already-settled member still withdraws both categories", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // The task settles on the provider's own structured record, and a shell stays
+  // LIVE. Every payload below names that POSITIVELY SETTLED id: a delivery this
+  // lane cannot read cleanly must still withdraw both categories, because "I could
+  // not read it" is never evidence that nothing changed.
+  await h.append(taskStatusRow(TASK_1, "completed"));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the structured record settles the task");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // Only the CLOSED machine metadata decides anything: the two machine tags must
+  // read as one unambiguous terminal identity and status, and the envelope itself
+  // must be exactly one ordered block inside the byte bound. The body around them
+  // is OPAQUE (pinned by the next test), so no case below turns on the markup of a
+  // description or an output path.
+  const cases: Array<[string, string]> = [
+    [
+      "a repeated identity tag: which member ended cannot be decided",
+      `<task-notification><task-id>${TASK_1}</task-id><task-id>${TASK_1}</task-id><status>completed</status></task-notification>`,
+    ],
+    [
+      "a repeated status tag: which status was stated cannot be decided",
+      `<task-notification><task-id>${TASK_1}</task-id><status>completed</status><status>completed</status></task-notification>`,
+    ],
+    [
+      "an identity tag that never closes",
+      `<task-notification><task-id>${TASK_1}<status>completed</status></task-notification>`,
+    ],
+    [
+      "a status tag that never closes",
+      `<task-notification><task-id>${TASK_1}</task-id><status>completed</task-notification>`,
+    ],
+    [
+      "a crossed identity tag whose value never terminates",
+      `<task-notification><task-id>${TASK_1}</status><status>completed</status></task-notification>`,
+    ],
+    [
+      "a crossed status tag whose value is not one opaque token",
+      `<task-notification><task-id>${TASK_1}</task-id><status>completed</task-id></status></task-notification>`,
+    ],
+    ["a stray envelope closing tag behind the envelope", `${taskNotificationEnvelope(TASK_1, "completed", "tool-a")}</task-notification>`],
+    ["a stray envelope closing tag before the envelope", `</task-notification>${taskNotificationEnvelope(TASK_1, "completed", "tool-a")}`],
+    [
+      "two envelopes in one delivery",
+      taskNotificationEnvelope(TASK_1, "completed", "tool-a") + taskNotificationEnvelope(SHELL_1, "completed", "tool-c"),
+    ],
+  ];
+  for (const [label, prompt] of cases) {
+    await h.append(queuedCommandDeliveryRow(prompt));
+    await waitFor(() => h.latest().activeTasks === null, `a malformed delivery must withdraw: ${label}`);
+    assert.equal(h.latest().activeShells, null, `a malformed delivery withdraws both categories: ${label}`);
+    // The provider's complete census states the set again: the task stays settled
+    // because it really ended, and the shell stays live.
+    h.hook("Stop", {
+      prompt_id: "prompt-1",
+      background_counts: { tasks: 0, shells: 1 },
+      background_members: [{ id: SHELL_1, kind: "shell" }],
+    });
+    assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, `resync keeps the real set: ${label}`);
+  }
+
+  // The CANONICAL restated end of that same settled member stays inert, so the
+  // metadata strictness above costs the actual producer shape nothing.
+  const before = h.snapshots.length;
+  await h.append(queuedCommandDeliveryRow(taskNotificationEnvelope(TASK_1, "completed", "tool-a")));
+  await settle();
+  assert.deepEqual(h.snapshots.slice(before), [], "the canonical restated end still publishes nothing");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "and still moves no count");
+  assert.deepEqual(h.gaps, [], "none of this is a source gap");
+  h.controller.dispose();
+});
+
+test("a settled member's restated end stays inert however its opaque body is marked up", async () => {
+  const BODY_CANARY = "secret-delivery-body-text-never-read";
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  await h.append(taskStatusRow(TASK_1, "completed"));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the structured record settles the task");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // The machine tags are canonical in every case below; only the OPAQUE body
+  // around them varies — repeated, unclosed, custom, or crossed markup of the kind
+  // a description or an output path can legitimately carry. None of that is a
+  // membership fact, so none of it may open a census hole or publish anything.
+  const machine = `<task-id>${TASK_1}</task-id><status>completed</status>`;
+  const bodies: Array<[string, string]> = [
+    ["repeated HTML-like tags", `<summary>${BODY_CANARY} <code>a</code> and <code>b</code> and <code>c</code></summary>`],
+    ["a literal unclosed tag", `<summary>${BODY_CANARY} while writing <b>the report</summary>`],
+    ["custom nested tags", `<output-file><path>${BODY_CANARY}</path><note>anything</note></output-file>`],
+    ["crossed unrelated tags", `<summary><output-file>${BODY_CANARY}</summary></output-file>`],
+    ["a stray duplicate closing tag beside the machine tags", "</status>"],
+  ];
+  for (const [label, body] of bodies) {
+    const before = h.snapshots.length;
+    await h.append(queuedCommandDeliveryRow(`<task-notification>${machine}${body}</task-notification>`));
+    await settle();
+    assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, `opaque body markup moves nothing: ${label}`);
+    assert.deepEqual(h.snapshots.slice(before), [], `an inert restated end publishes nothing: ${label}`);
+  }
+  assert.deepEqual(h.gaps, [], "none of this is a source gap");
+
+  // The body never crosses into state, however it is marked up.
+  const leaked = JSON.stringify(h.snapshots);
+  for (const secret of [BODY_CANARY, SECRET_OUTPUT_FILE, SECRET_TASK_DESCRIPTION, h.transcript]) {
+    assert.ok(!leaked.includes(secret), `observation surface leaked ${secret}`);
+  }
+
+  // And the positives above did not soften a real metadata failure: the same
+  // settled id with an ambiguous machine tag still withdraws both categories.
+  await h.append(queuedCommandDeliveryRow(
+    `<task-notification><task-id>${TASK_1}</task-id><status>completed</status><status>completed</status></task-notification>`,
+  ));
+  await waitFor(() => h.latest().activeTasks === null, "an ambiguous machine tag still withdraws both categories");
+  assert.equal(h.latest().activeShells, null, "both categories, as an unattributed hole always did");
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 0, shells: 1 },
+    background_members: [{ id: SHELL_1, kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "the complete census states the set again");
+  h.controller.dispose();
+});
+
+test("a settled member's delivery never becomes a fresh terminal for a resumed agent", async () => {
+  const AGENT_L = "aa0liveagent";
+  const CHILD_TOOL = "21e7310361";
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+
+  // A is live and owns one background shell; its turn ends while the shell runs.
+  h.hook("SubagentStart", { agent_id: AGENT_L });
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: AGENT_L, kind: "task" }],
+  });
+  h.hook("PostToolUse", {
+    agent_id: AGENT_L, tool_name: "Bash", tool_use_id: CHILD_TOOL,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  h.hook("SubagentStop", {
+    agent_id: AGENT_L,
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: [{ id: AGENT_L, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "parking keeps A counted");
+
+  // The shell settles on its own record, A wakes and resumes, and its final clean
+  // boundary lands: one conjunct of an end, still not an end.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL),
+  }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "the shell settles on its own record");
+  h.hook("SubagentStart", { agent_id: AGENT_L });
+  h.hook("SubagentStop", {
+    agent_id: AGENT_L,
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [{ id: AGENT_L, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a clean boundary alone never ends A");
+
+  // A's OWN fresh completion lands in that same execution window: that is its
+  // actual end, and the census goes empty.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_L, "completed", "tool-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "A's own completion closes A");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+
+  // A resumes once more and its clean boundary lands again: one live task.
+  h.hook("SubagentStart", { agent_id: AGENT_L });
+  h.hook("SubagentStop", {
+    agent_id: AGENT_L,
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [{ id: AGENT_L, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a clean boundary alone never ends A");
+
+  // The provider now delivers A's OLD completion into the root conversation, in
+  // this new window. It restates an end this ledger already applied: it is never
+  // handed to the live-agent lifetime, so A stays live and the count is never a
+  // fabricated zero.
+  const mark = h.snapshots.length;
+  await h.append(queuedCommandDeliveryRow(taskNotificationEnvelope(AGENT_L, "completed", "tool-final")));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a delivery is never an agent's fresh completion");
+  assert.deepEqual(h.snapshots.slice(mark), [], "the restated end publishes nothing at all");
+  assert.equal(h.latest().activeShells, 0);
+
+  // The same restated end with OPAQUE markup around its canonical machine tags is
+  // equally inert: body shape never becomes lifetime authority either.
+  await h.append(queuedCommandDeliveryRow(
+    `<task-notification><task-id>${AGENT_L}</task-id><status>completed</status>`
+      + "<summary><code>x</code> and <b>y</summary></task-notification>",
+  ));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "opaque body markup never ends a live agent either");
+
+  // Once a complete census positively REACTIVATES that identity, the ledger can no
+  // longer claim it is already settled. The same delivery then keeps the existing
+  // unattributable hole for both categories — and still ends nothing.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: AGENT_L, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  await h.append(queuedCommandDeliveryRow(taskNotificationEnvelope(AGENT_L, "completed", "tool-final")));
+  await waitFor(() => h.latest().activeTasks === null, "a reactivated member's delivery still withdraws");
+  assert.equal(h.latest().activeShells, null, "and it withdraws both, as an unattributed hole always did");
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: AGENT_L, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "the delivery ended nothing: A is still live");
+  h.controller.dispose();
+});
+
+test("a peer delivery and a queue removal claim nothing, however their payload looks", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  const envelope = taskNotificationEnvelope(TASK_1, "completed", "tool-a");
+  const before = h.snapshots.length;
+  // A peer's queued command carrying a completion envelope is not this run's
+  // background lane's fact at all, and a queue removal only says queued text left
+  // the queue — neither is a terminal record.
+  await h.append(queuedCommandDeliveryRow(envelope, { kind: "peer", producer: "peer-session" }));
+  await h.append(queueOperationRow("remove", { content: envelope }));
+  // A foreign conversation's delivery is not this run's fact either.
+  await h.append(jsonRow({
+    type: "attachment",
+    sessionId: OTHER_SESSION,
+    isSidechain: false,
+    attachment: { type: "queued_command", origin: { kind: "task-notification", producer: "session-task" }, prompt: envelope },
+  }));
+  await settle();
+  assert.deepEqual(h.snapshots.slice(before), [], "none of these rows claims anything");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+});
+
 /* -------------------------------------------------------------------------- */
 /*  The order native actually delivers, against the file's real lifecycle.     */
 /* -------------------------------------------------------------------------- */
@@ -3119,5 +3877,1682 @@ test("a launch confirmed during an in-flight read is still resolved against its 
   await h.append(taskStatusRow(TASK_1, "completed"));
   readNow(received);
   await waitFor(() => h.latest().activeTasks === 0, "the tracked member settles on its own row");
+  h.controller.dispose();
+});
+
+/* --------------------- independent evidence axes (issue #277 native slice) */
+
+/*
+ * Each published category stands or falls on its own evidence. A payload this
+ * observer could not read degrades exactly the axes the reducer declares — the
+ * root foreground claim and/or the pending-input census — and nothing else: this
+ * run's session admission, its live background membership, its last-reported
+ * count snapshot, and the transcript lane all survive, because the unreadable
+ * field contradicted none of them. A background category is likewise withdrawn at
+ * the width its own hole proves: a task-side hole leaves a known shell census
+ * exact, and only a hole nobody can attribute (or a genuine lane or scope loss)
+ * takes both.
+ */
+
+/** A persisted async agent launch for an id this run's census never saw. */
+function asyncLaunchRow(agentId: string, extra: Record<string, unknown> = {}): string {
+  return jsonRow({
+    type: "user",
+    sessionId: SESSION,
+    isSidechain: false,
+    toolUseResult: { status: "async_launched", agentId, outputFile: SECRET_OUTPUT_FILE },
+    ...extra,
+  });
+}
+
+test("a question close hole costs the pending census alone, never the whole lane", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, true);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // The answer arrives and closes its own request: the turn underneath returns.
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, false);
+  assert.equal(h.latest().busy, true);
+  const before = h.latest();
+  assert.deepEqual(countsOf(before), { tasks: 0, shells: 1 });
+
+  // A second close edge for a request this run never opened (the identity it
+  // carried did not match this scope's open request). That is a hole in the
+  // pending-input census and NOTHING else.
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-never-opened", prompt_id: "prompt-1" });
+  const after = h.latest();
+  assert.equal(after.pendingInput, null, "the census is unknown, as the reducer declared");
+  assert.equal(after.busy, true, "the observed turn underneath is untouched");
+  assert.deepEqual(after.activity, before.activity, "no activity claim is withdrawn");
+  assert.deepEqual(countsOf(after), { tasks: 0, shells: 1 }, "a question edge is not a membership edge");
+  assert.deepEqual(h.gaps, [], "no source lane was lost, so no lane gap is reported");
+
+  // The run's own session admission survives: another native conversation still
+  // cannot publish foreign state here.
+  const snapshotsBefore = h.snapshots.length;
+  h.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "foreign-prompt" });
+  h.hook("Stop", { session_id: OTHER_SESSION, background_counts: { tasks: 9, shells: 9 } });
+  assert.equal(h.snapshots.length, snapshotsBefore, "a foreign conversation publishes nothing here");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // And the lane still works: a fresh membership edge still moves its own axis,
+  // while the unknown input answer stays unknown (no fabricated `false`).
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-b",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  const moved = h.latest();
+  assert.deepEqual(countsOf(moved), { tasks: 1, shells: 1 });
+  assert.equal(moved.pendingInput, null, "a membership edge does not re-vouch the census");
+  h.controller.dispose();
+});
+
+test("a typed root foreground invalidation taints only its genuinely proven axes", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PreToolUse", { tool_name: "Bash", tool_use_id: "tool-a", prompt_id: "prompt-1" });
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+  assert.deepEqual(h.latest().activity, ["bash"]);
+
+  // A root tool edge whose own tool name cannot be read: the foreground claim and
+  // the pending census are what that payload would have supported, so those go
+  // unknown. Membership, scope, and the transcript lane are not in its reach.
+  h.hook("PreToolUse", { tool_name: "Bash rm -rf /secret-working-directory", tool_use_id: "tool-x" });
+  const after = h.latest();
+  assert.equal(after.busy, null, "the foreground claim the payload would have supported is unknown");
+  assert.deepEqual(after.activity, []);
+  assert.equal(after.pendingInput, null);
+  assert.deepEqual(countsOf(after), { tasks: 0, shells: 1 }, "the payload said nothing about membership");
+  assert.ok(!h.gaps.includes("hook-failure"), "an unreadable field is not an authenticated lane loss");
+
+  // Trusted membership edges are still consumed under the same root/scope guards.
+  h.hook("PostToolUse", {
+    tool_name: "Agent",
+    tool_use_id: "tool-b",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // Foreign and child edges still cannot touch this run.
+  const snapshotsBefore = h.snapshots.length;
+  h.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "foreign-prompt" });
+  h.hook("PostToolUse", {
+    agent_id: "agent-9",
+    tool_name: "Bash",
+    tool_use_id: "tool-child",
+    background_started: { id: "bneverlaun", kind: "shell" },
+  });
+  assert.equal(h.snapshots.length, snapshotsBefore);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // This run's own complete census still resyncs it exactly.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("an unresolvable task-side transition leaves an independently known shell census", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  for (const [toolUseId, id] of [["tool-a", SHELL_1], ["tool-b", "b0zzzzzzzz"]] as const) {
+    h.hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_use_id: toolUseId,
+      prompt_id: "prompt-1",
+      background_started: { id, kind: "shell" },
+    });
+  }
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-c",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // The provider persisted an async agent launch this run's hook lane never
+  // reported. That positively names a TASK-side hole: the shells it says nothing
+  // about keep their exact number.
+  await h.append(asyncLaunchRow("a9z9z9z9z"));
+  await waitFor(() => h.latest().activeTasks === null, "the task category withdraws on its own hole");
+  const after = h.latest();
+  assert.equal(after.activeTasks, null);
+  assert.equal(after.activeShells, 2, "a task-side hole never erases a known shell census");
+  assert.equal(after.busy, true, "nor the foreground the hook lane observed");
+
+  // A complete authoritative census repairs the affected category.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 2 },
+    background_members: [
+      { id: SHELL_1, kind: "shell" },
+      { id: "b0zzzzzzzz", kind: "shell" },
+      { id: TASK_1, kind: "task" },
+    ],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+  h.controller.dispose();
+});
+
+test("an unkeyable shell in the provider snapshot leaves the task census exact", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  for (const [toolUseId, id] of [["tool-b", SHELL_1], ["tool-c", "b0zzzzzzzz"]] as const) {
+    h.hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_use_id: toolUseId,
+      prompt_id: "prompt-1",
+      background_started: { id, kind: "shell" },
+    });
+  }
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // The provider's own root snapshot held an active shell it could not key, and
+  // named the SHELL category. Tasks are stated identically, so they stand; the
+  // shell category loses both its ledger coverage and its last-reported number,
+  // because an unkeyable member cannot be settled by any later shell edge.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 3 },
+    background_unidentified_kinds: ["shell"],
+  });
+  const after = h.latest();
+  assert.equal(after.activeTasks, 1, "the category the gap does not name keeps its exact number");
+  assert.equal(after.activeShells, null, "the unkeyable category is unknown, never a stale 2 or a 3");
+
+  // The surviving category is still a LIVE exact census, not a frozen number:
+  // its own next edge moves it, while the gapped category stays unknown.
+  h.hook("PostToolUse", {
+    tool_name: "Agent",
+    tool_use_id: "tool-d",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_2, kind: "task" },
+  });
+  const moved = h.latest();
+  assert.deepEqual(countsOf(moved), { tasks: 2, shells: null });
+
+  // The next complete census states the whole set again.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 3 },
+    background_members: [
+      { id: TASK_1, kind: "task" },
+      { id: SHELL_1, kind: "shell" },
+      { id: "b0zzzzzzzz", kind: "shell" },
+      { id: "b3k3n1p4q", kind: "shell" },
+    ],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 3 });
+  h.controller.dispose();
+});
+
+test("a genuine whole-lane loss still withdraws both categories", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-b",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // Half the census already unknown from a task-side hole...
+  await h.append(asyncLaunchRow("a9z9z9z9z"));
+  await waitFor(() => h.latest().activeTasks === null, "the task category withdraws first");
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 1 });
+
+  // ...and a real authenticated lane loss still takes everything the lane
+  // supported. Per-category independence never weakens a genuine loss.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-too-large" });
+  const after = h.latest();
+  assert.ok(h.gaps.includes("hook-failure"));
+  assert.deepEqual(countsOf(after), { tasks: null, shells: null });
+  assert.equal(after.busy, null);
+  assert.equal(after.pendingInput, null);
+
+  // The provider's next complete census rebuilds both categories exactly.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 0, shells: 1 },
+    background_members: [{ id: SHELL_1, kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+  h.controller.dispose();
+});
+
+test("duplicate, stale, foreign, and child edges never contradict the other category", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  for (const [toolUseId, id] of [["tool-a", SHELL_1], ["tool-b", "b0zzzzzzzz"]] as const) {
+    h.hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_use_id: toolUseId,
+      prompt_id: "prompt-1",
+      background_started: { id, kind: "shell" },
+    });
+  }
+  await h.append(asyncLaunchRow("a9z9z9z9z"));
+  await waitFor(() => h.latest().activeTasks === null, "a proven task-side hole opens");
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 2 });
+
+  // One tracked shell settles exactly; the unknown category stays unknown and the
+  // known one moves on its own evidence.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await waitFor(() => h.latest().activeShells === 1, "the tracked member settles on its own row");
+  assert.equal(h.latest().activeTasks, null);
+
+  // The same settlement again: idempotent. A duplicate of a settlement this run
+  // positively observed must never become a hole, in either category.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 1 }, "a duplicate settle opens no hole");
+
+  // A child snapshot, a foreign conversation's census, and a stale-prompt edge are
+  // not this run's membership evidence at all.
+  const snapshotsBefore = h.snapshots.length;
+  h.hook("SubagentStop", {
+    agent_id: "agent-9",
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [],
+  });
+  h.hook("Stop", {
+    session_id: OTHER_SESSION,
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [],
+  });
+  h.hook("PreToolUse", { tool_name: "Read", tool_use_id: "tool-old", prompt_id: "prompt-older" });
+  assert.equal(h.snapshots.length, snapshotsBefore, "none of them publishes anything here");
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 1 });
+
+  // A complete authoritative census repairs BOTH categories at once.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: [{ id: TASK_1, kind: "task" }, { id: "b0zzzzzzzz", kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  h.controller.dispose();
+});
+
+/* ------------------- axis-scoped invalid edges keep their own evidence (pass 1) */
+
+/*
+ * A payload this observer could not read degrades the reducer's own axes and
+ * nothing else. These pin the three ways that boundary was still leaking: a
+ * membership projection carried by the same degraded payload was dropped with it;
+ * a foreground hole left a previously armed terminal pass alive, so a summary that
+ * surfaced later could publish `Ready` over the newer root edge; and a proven
+ * membership edge cleared the last-reported totals of the category it never
+ * touched. A degraded payload is still not a licence: an event that cannot be
+ * attributed, or a projection that cannot be read, still advances nothing.
+ */
+
+test("an unreadable tool identity still consumes the launch that same payload states", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+
+  // One real background launch projection with a request identity this observer
+  // cannot read. The reducer degrades the axes that identity supported; the launch
+  // it positively states is still this run's fact, and a census that stayed
+  // known-empty would now be a lie.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const after = h.latest();
+  assert.deepEqual(countsOf(after), { tasks: 0, shells: 1 }, "the positively stated shell launch counts");
+  assert.equal(after.busy, null, "the foreground the unreadable identity supported degrades");
+  assert.equal(after.pendingInput, null, "and so does the census that identity supported");
+
+  // A projection this run cannot read is not consumed on the strength of the
+  // payload around it: no category moves, and nothing is invented.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    prompt_id: "prompt-1",
+    background_started: { id: " ", kind: "not-a-kind" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // A child's own launch is not this run's root membership, degraded or not.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-child",
+    agent_id: "agent-9",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "a child edge never joins the root census");
+  assert.deepEqual(h.gaps, [], "a degraded payload is not a lane loss");
+  h.controller.dispose();
+});
+
+test("a foreground hole retires the armed terminal pass before a later summary can close the turn", async () => {
+  const h = await createHarness();
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 0, shells: 0 } });
+  await settle();
+  assert.equal(h.latest().busy, true, "the observed turn stands at the unproven boundary");
+
+  // A root tool edge whose own name this observer cannot read: the foreground
+  // axis degrades, and with it this run's authority to treat a summary read later
+  // as that turn's terminal record. The membership snapshot this Stop carried is
+  // not part of that judgement.
+  h.hook("PreToolUse", { tool_name: `Bash ${SECRET_OUTPUT_FILE}`, tool_use_id: "tool-x", prompt_id: "prompt-1" });
+  await settle();
+  assert.equal(h.latest().busy, null);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "the hook census survives the foreground hole");
+
+  await h.append(summaryRow());
+  await settle();
+  assert.equal(
+    h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")),
+    false,
+    "a summary cannot publish Ready over the newer root boundary",
+  );
+  assert.equal(h.latest().busy, null);
+  h.controller.dispose();
+});
+
+test("a confirmed launch clears the last-reported totals of its own category only", async () => {
+  // Totals that disagree with what this ledger can state put the hole exactly on
+  // the category they disagree about, and become that category's last-reported
+  // number.
+  const taskFirst = await createHarness();
+  taskFirst.controller.observeOwnedStartup();
+  await beginTurn(taskFirst, "prompt-1");
+  taskFirst.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 0, shells: 2 } });
+  assert.deepEqual(countsOf(taskFirst.latest()), { tasks: 0, shells: 2 });
+
+  // A confirmed TASK launch is a task-side membership edge. The ledger carries
+  // tasks from here; the shells this edge says nothing about keep their number.
+  taskFirst.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-t",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(taskFirst.latest()), { tasks: 1, shells: 2 },
+    "a task launch never erases an independently known shell census");
+
+  // The same holds for a task-side hole read from the transcript rather than a
+  // hook: the fallback-backed shell number is not collateral.
+  await taskFirst.append(asyncLaunchRow("a9z9z9z9z"));
+  await waitFor(() => taskFirst.latest().activeTasks === null, "the task category withdraws on its own hole");
+  assert.equal(taskFirst.latest().activeShells, 2, "and the fallback-backed shells stay published");
+  taskFirst.controller.dispose();
+
+  // The mirror image: a shell-side hole with an exact task total behind it, then
+  // a confirmed SHELL launch.
+  const shellFirst = await createHarness();
+  shellFirst.controller.observeOwnedStartup();
+  await beginTurn(shellFirst, "prompt-1");
+  shellFirst.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 0 } });
+  assert.deepEqual(countsOf(shellFirst.latest()), { tasks: 2, shells: 0 });
+  shellFirst.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-s",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(shellFirst.latest()), { tasks: 2, shells: 1 },
+    "a shell launch never erases an independently known task census");
+  shellFirst.controller.dispose();
+});
+
+test("a partial census never rides a scope boundary as if it were whole", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  // An async launch this run's hook lane never reported: the TASK category loses
+  // its coverage, and only that one.
+  await h.append(asyncLaunchRow("a9z9z9z9z"));
+  await waitFor(() => h.latest().activeTasks === null, "the task category withdraws");
+  assert.equal(h.latest().activeShells, 1);
+
+  // The tracked shell settles on its own row, so the member map is now EMPTY and
+  // shells reads exactly 0 — a partial pair, not a census.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await waitFor(() => h.latest().activeShells === 0, "the tracked shell settles on its own row");
+  assert.equal(h.latest().activeTasks, null, "and the task hole is still there");
+
+  // A genuine boundary this observer cannot see through withdraws BOTH categories.
+  // Carrying the surviving exact zero into the new scope would present a hole in
+  // the old one as a census in the new one.
+  h.hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+  h.controller.dispose();
+});
+
+/* ---------------- settlement and launch evidence, derived from the ledger (pass 2) */
+
+/*
+ * Whether a membership edge contradicts a last-reported totals snapshot is decided
+ * by what the ledger actually did with it. A settlement the ledger applied is
+ * membership change in that member's own category; a settlement it cannot
+ * attribute to one of its members proves a launch this run missed, which no row
+ * names, so it reaches both categories; and a repeat of an edge already applied is
+ * not news at all and may not delete a snapshot the provider stated afterwards.
+ * A present-but-unreadable agent identity is malformed scope, not root.
+ */
+
+test("a settlement this ledger cannot attribute reaches both categories beside a named one", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // A shell total this run can only hold as a last-reported number: it disagrees
+  // with the exact ledger census, so shells lose their ledger coverage and 2 is the
+  // fallback. A confirmed task launch then makes the task side exact again.
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 0, shells: 2 } });
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-t",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // One window carries BOTH the tracked task's own completion and a completion for
+  // an id this run never saw start. The second proves a lost launch nobody can
+  // attribute, so the fallback-backed shells go with the tasks rather than
+  // republishing a number that hole could contradict.
+  await h.append(taskStatusRow(TASK_1, "completed") + taskStatusRow("bzzzzzzzz", "completed"));
+  readNow(received);
+  await waitFor(
+    () => h.latest().activeTasks === null && h.latest().activeShells === null,
+    "an unattributable settlement reaches both categories",
+  );
+  h.controller.dispose();
+});
+
+test("a duplicate settlement is not membership change and never clears a fallback census", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 0, shells: 2 } });
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-t",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // The tracked task settles on its own row: the task side moves to the ledger's
+  // exact 0, and the shell fallback is untouched because nothing about shells
+  // changed.
+  await h.append(taskStatusRow(TASK_1, "completed"));
+  readNow(received);
+  await waitFor(() => h.latest().activeTasks === 0, "the tracked task settles on its own row");
+  assert.equal(h.latest().activeShells, 2);
+
+  // The same completion surfacing again repeats an edge already applied. It is not
+  // membership change, so the provider's last-reported shell number stands.
+  await h.append(taskStatusRow(TASK_1, "completed"));
+  readNow(received);
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 2 });
+  assert.equal(
+    h.snapshots.some((snapshot) => snapshot.activeShells === null),
+    false,
+    "no snapshot ever published an unknown shell census",
+  );
+  h.controller.dispose();
+});
+
+test("a replayed launch never deletes a totals snapshot that arrived after it", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-t",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  // A newer provider snapshot restates the task side. The ledger's exact 1
+  // disagrees, so the task category loses ledger coverage and 5 becomes this run's
+  // last-reported task number.
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 5, shells: 0 } });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 5, shells: 0 });
+
+  // The same member's launch edge arriving again is idempotent evidence: the ledger
+  // refuses it as a duplicate, and a refusal is not membership change.
+  h.hook("PostToolUse", {
+    tool_name: "Task",
+    tool_use_id: "tool-t",
+    prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 5, shells: 0 });
+  assert.equal(
+    h.snapshots.some((snapshot) => snapshot.activeTasks === null),
+    false,
+    "no snapshot ever published an unknown task census",
+  );
+  h.controller.dispose();
+});
+
+test("a present-but-unreadable agent identity is not root scope: no membership, no rebinding", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+
+  const elsewhere = path.join(h.dir, "other-transcript.jsonl");
+  await fs.writeFile(elsewhere, priorHistory(), "utf8");
+  // A whitespace agent identity is malformed scope to the landed reducer, and
+  // acquisition agrees: only an ABSENT identity is this run's root. So this event
+  // neither joins the root census nor moves this run's transcript binding.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-m",
+    prompt_id: "prompt-1",
+    agent_id: " ",
+    background_started: { id: TASK_1, kind: "task" },
+    transcript_path: elsewhere,
+  });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "no membership admission");
+
+  // The binding is still the original file: a completion persisted there settles
+  // this run's shell, which a rebound scope could not do.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await waitFor(() => h.latest().activeShells === 0, "the original transcript is still this run's source");
+  h.controller.dispose();
+});
+
+/* ---------------------------------- live Claude agent lifetime in the counts */
+
+/*
+ * The published task figure answers "which agents of this run are alive", not
+ * "which ids does the provider currently list as in flight". Claude Code 2.1.325
+ * excludes an agent whose own model turn has ended while it still owns background
+ * work from EVERY `background_tasks` array it emits — on `Stop` and on
+ * `SubagentStop` alike — so an in-flight-only census drops a live agent at its
+ * park edge and never brings it back. These tests replay the observed native
+ * child lifecycle in the closed shapes the provider actually produces, and pin
+ * the corrected outcome: one agent is one task from its own start edge until its
+ * own end is positively established; the shell it launched is a shell and never a
+ * second task; the wake and the same-id resume never duplicate it; and one
+ * agent's end never touches an unrelated root shell, another live agent, or the
+ * run's independent foreground and question axes.
+ */
+
+const AGENT_A = "aaacc46163";
+const AGENT_D = "dd00agent04";
+const CHILD_TOOL_USE = "21e731036d";
+
+/** One child-scoped agent edge, as the provider emits it for this run's root. */
+function childHook(h: Harness, name: string, agentId: string, extra: Record<string, unknown> = {}): void {
+  h.hook(name, { agent_id: agentId, ...extra });
+}
+
+test("one live agent is one task from its start through park, wake, and its own end", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "fresh owned run");
+
+  // The provider launches A and its own start edge lands: A is live.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a positive agent start is one task");
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: AGENT_A, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  // A starts ONE background shell. The shell is a shell: one task, one shell —
+  // never two tasks.
+  childHook(h, "PreToolUse", AGENT_A, { tool_name: "Bash", tool_use_id: CHILD_TOOL_USE });
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "A owns B; B is not a second task");
+
+  // A's turn ends while B is still running. That is a park, not a death.
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "parking keeps A counted");
+
+  // The next ROOT snapshot is session-wide and lists B only. Absence from an
+  // in-flight census is never evidence of death.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 0, shells: 1 },
+    background_members: [{ id: SHELL_1, kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "A stays counted while its shell runs");
+
+  // B finishes. The provider persists its own completion record in this run's
+  // root journal, and it is routed back into A: A becomes a pending wake.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE),
+  }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "B settles on its own record");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a pending wake is still one live agent");
+
+  // The SAME id resumes. One agent, still one task.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "reentry never duplicates the agent");
+
+  // A's final turn ends with only A's own self-membership in the payload, so it
+  // owns nothing pending. One conjunct is not an end: A is still counted.
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [{ id: AGENT_A, kind: "task" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a clean boundary alone never ends A");
+
+  // A's own fresh completion is emitted in the same execution window. That is the
+  // end of A, and of the census.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "A's own completion closes A");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("an agent ends on its own child evidence even while no root turn ever returns", async () => {
+  // The observed panel-open trace: exactly one root `Stop` exists (the root's
+  // initial turn), and after that the root is never woken again — A's two
+  // completions are enqueued and never delivered, and there is no later root
+  // snapshot. An agent's end must not be gated on the root noticing.
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: AGENT_A, kind: "task" }],
+  });
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+  // A's park-edge completion is enqueued and never delivered. It belongs to the
+  // first execution window, so it can neither end A nor later close the resumed
+  // window.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-park"),
+  }));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "A parks on its own shell");
+
+  // B settles and is routed back into A; A wakes with the same id.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE),
+  }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "B settles");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "A wakes on its own evidence");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  // A's final completion is enqueued and, like the first, never delivered to the
+  // root. Its emission is enough: no root delivery, root Stop, or empty session
+  // snapshot is required, and none of them ever arrives.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "A's own emission closes A with no root turn");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("one agent's end removes only that agent, never a root shell or a sibling", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // A root-launched shell, a second live agent, and A all coexist.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    prompt_id: "prompt-1",
+    background_started: { id: "brootshell", kind: "shell" },
+  });
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStart", AGENT_D);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 2, shells: 2 });
+
+  // A's own shell settles. A is still live (a pending wake is a counted state),
+  // and nothing else moved.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await waitFor(() => countsOf(h.latest()).shells === 1, "A's shell settles on its own row");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 2, shells: 1 });
+
+  // A ends cleanly. D never reached a turn boundary and the root shell never
+  // settled, so both stay counted, exactly as they were.
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await h.append(taskStatusRow(AGENT_A, "completed"));
+  await waitFor(() => countsOf(h.latest()).tasks === 1, "only A leaves the count");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "D and the root shell are untouched");
+
+  // D's own end is D's own evidence, and it lands independently.
+  childHook(h, "SubagentStop", AGENT_D, { background_members: [{ id: AGENT_D, kind: "task" }] });
+  await h.append(taskStatusRow(AGENT_D, "cancelled"));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "D closes on its own record");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "the root shell outlives both agents");
+  h.controller.dispose();
+});
+
+test("a root question and a live agent stay independent in both directions", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, true);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // A parks while the human still has not answered. A waiting question is not a
+  // death, and a death is not a waiting question.
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  assert.equal(h.latest().pendingInput, true, "the open request still stands");
+
+  // The child's own evidence closes it without waiting for the question, the
+  // answer, or a new prompt.
+  await h.append(taskStatusRow(SHELL_1, "completed"));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "the shell settles with the question open");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await h.append(taskStatusRow(AGENT_A, "failed"));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "a typed failure closes A on its own axis");
+  const after = h.latest();
+  assert.equal(after.pendingInput, true, "the question the child says nothing about still stands");
+  assert.deepEqual(countsOf(after), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("a delayed or replayed completion for an earlier turn cannot close a resumed one", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+
+  // The park-edge completion and the shell's completion both land while A is
+  // parked: neither can end it.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-park"),
+  }));
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE),
+  }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "B settles");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "A is a pending wake, not an end");
+
+  // A resumes. Its clean boundary alone is not an end, because the completion
+  // this observer already read belonged to the superseded window.
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "the old completion cannot close A");
+
+  // Only a typed root-queue EMISSION is a completion witness. A `dequeue` (the
+  // queued text was merely handed over), a provider request-replay row, and a
+  // queue record written under the CHILD conversation all claim nothing, so one
+  // completion is never inflated into several and a child-scoped record can never
+  // close this run's agent.
+  await h.append(queueOperationRow("dequeue"));
+  await h.append(jsonRow({
+    type: "queue-operation",
+    operation: "enqueue",
+    agentId: AGENT_A,
+    sessionId: SESSION,
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-child"),
+  }));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "none of those is a completion");
+
+  // The resumed window's own emission, at its own distinct journal offset, is
+  // what closes it.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the resumed window's own emission closes it");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("child edges that are not this run's known agent are inert, and never a hole", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+  const published = h.snapshots.length;
+
+  // An identity this run's own start evidence never named, another native
+  // conversation's child, and a child naming a child transcript are all
+  // unattributable here: they add no agent, erase no census, and open no hole.
+  childHook(h, "SubagentStop", "agent-unknown", { background_members: [] });
+  childHook(h, "PostToolUse", "agent-unknown", {
+    tool_name: "Bash",
+    tool_use_id: "tool-x",
+    background_started: { id: "bneverseen", kind: "shell" },
+  });
+  h.hook("SubagentStart", { agent_id: AGENT_A, session_id: OTHER_SESSION });
+  h.hook("PostToolUse", {
+    agent_id: AGENT_A,
+    tool_name: "Bash",
+    tool_use_id: "tool-y",
+    transcript_path: `${h.transcript}.child`,
+    background_started: { id: "balsonever", kind: "shell" },
+  });
+  await settle();
+  assert.equal(h.snapshots.length, published, "none of them publishes anything here");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 });
+  assert.deepEqual(h.gaps, [], "an unattributable child edge is not a source hole");
+
+  // Once the provider names A's start, its own launch edge on this run's root
+  // session and file is admitted, and it is admitted once.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  for (const toolUseId of ["tool-a1", "tool-a2"]) {
+    childHook(h, "PostToolUse", AGENT_A, {
+      tool_name: "Bash",
+      tool_use_id: toolUseId,
+      background_started: { id: "bchildshell", kind: "shell" },
+    });
+  }
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 }, "one launch edge per member");
+  h.controller.dispose();
+});
+
+test("a live agent never borrows a withdrawn category, and never loses the other", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  for (const [toolUseId, id] of [["tool-a", SHELL_1], ["tool-b", "b0zzzzzzzz"]] as const) {
+    h.hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_use_id: toolUseId,
+      prompt_id: "prompt-1",
+      background_started: { id, kind: "shell" },
+    });
+  }
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // A task-side hole the provider itself names withdraws TASKS only. The live
+  // agent is a task, so it goes unknown with the category — and the exact shell
+  // census keeps standing.
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 2 },
+    background_unidentified_kinds: ["task"],
+  });
+  const taskHoled = h.latest();
+  assert.equal(taskHoled.activeTasks, null);
+  assert.equal(taskHoled.activeShells, 2, "a task-side hole never erases a known shell census");
+
+  // The inverse: a shell-side hole leaves the live-agent task count exact.
+  const shellFirst = await createHarness();
+  shellFirst.controller.observeOwnedStartup();
+  await beginTurn(shellFirst, "prompt-1");
+  childHook(shellFirst, "SubagentStart", AGENT_A);
+  shellFirst.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-c",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(shellFirst.latest()), { tasks: 1, shells: 1 });
+  shellFirst.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 0, shells: 3 },
+    background_unidentified_kinds: ["shell"],
+  });
+  const shellHoled = shellFirst.latest();
+  assert.equal(shellHoled.activeTasks, 1, "the agent this run positively started stays one task");
+  assert.equal(shellHoled.activeShells, null);
+
+  // A genuine whole-lane loss still takes both.
+  shellFirst.controller.acceptFailure({ backend: "claude", reason: "input-too-large" });
+  assert.deepEqual(countsOf(shellFirst.latest()), { tasks: null, shells: null });
+  h.controller.dispose();
+  shellFirst.controller.dispose();
+});
+
+test("a scope boundary clears the live agent census it cannot carry across", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // A brand-new conversation inherits no agent lifetime. Carrying A over would
+  // present a hole in the old scope as a census in the new one.
+  h.hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+
+  // The provider's own complete empty census rebuilds the pair exactly, with no
+  // ghost of the previous conversation's agent.
+  h.hook("Stop", {
+    session_id: OTHER_SESSION,
+    background_counts: { tasks: 0, shells: 0 },
+    background_members: [],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+/**
+ * Review regressions: the four ways a live-agent count can be WRONG rather than
+ * merely coarse, each replayed as a deterministic manual watch — evidence that
+ * arrives late, evidence that arrives twice, a provider total that cannot contain
+ * the agent it is published beside, and a source that goes away while an agent is
+ * still counted. Plus the named child transcript the provider hands over on a
+ * child's own boundary, and the scope boundary that must not clear a live agent as
+ * though the census had been empty.
+ *
+ * None of these turns on a timer, a quiet interval, or prose in a transcript: each
+ * one is decided by file position, request identity, or a positively stated
+ * provider total.
+ */
+
+test("a completion read late cannot close the execution window that did not produce it", async () => {
+  // Nothing reads the journal until this test says so, which is what lets rows
+  // written long before an agent's resumed window be consumed long after it.
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+
+  // Two rows are appended while no read happens: A's PARK-edge completion, then
+  // B's. Both were produced by the first execution window.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-park"),
+  }));
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE),
+  }));
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "nothing has been read yet");
+
+  // The SAME agent resumes. Its new window's floor is where this file stands at
+  // this instant — past both rows above.
+  childHook(h, "SubagentStart", AGENT_A);
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).shells === 0, "B settles from its own row");
+  // B's row settles B. A's park-edge completion was written before this window
+  // opened, so consuming it now is not evidence that this window ended: A is a
+  // pending wake, and the count is never the premature 0/0.
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a late old completion never ends a resumed agent");
+
+  // A's final turn ends owning nothing. One conjunct is still not an end.
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a clean boundary alone never ends A");
+
+  // A's FINAL completion, written after this window opened, closes it.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the completion from this window closes A");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("a replayed child tool result resurrects no agent and re-owns no settled member", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+  });
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE),
+  }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "B settles");
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "A ends on its own completion");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+
+  // A's ORIGINAL Bash result arrives a second time, long after both the agent and
+  // the member it launched are done. One request identity, already consumed: it is
+  // not a newer execution edge, so it reopens no window, resurrects no agent, and
+  // hands ownership of a long-settled member to nobody.
+  const before = h.snapshots.length;
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "PreToolUse", AGENT_A, { tool_name: "Bash", tool_use_id: CHILD_TOOL_USE });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "a replayed result resurrects nothing");
+  assert.equal(h.snapshots.length, before, "a replayed result states nothing new about membership");
+  h.controller.dispose();
+});
+
+test("a totals snapshot is not published beside a live agent it cannot be reconciled with", async () => {
+  // A mid-stream observer: it adopted this run, so it cannot state exact
+  // membership, and the provider's own totals are all it has.
+  const h = await createHarness();
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 } });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "an adopted scope publishes the provider's own totals");
+
+  // A positively observed agent start. The provider's total counts work currently
+  // in flight, and this run now holds an agent no later snapshot has ever shown
+  // ending. Whether that total already contains it is not knowable from the number,
+  // so the task axis is withdrawn while the shell total stands.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: 0 },
+    "an unreconcilable total is withdrawn on the task axis only",
+  );
+  h.controller.dispose();
+
+  // Numerical capacity is not membership evidence. A total large enough to CONTAIN
+  // the agent proves nothing about whether it does: the two agents already counted
+  // may or may not include A, and an observer that published 2 here would be
+  // asserting an overlap it never saw.
+  const bigger = await createHarness();
+  await beginTurn(bigger, "prompt-1");
+  bigger.hook("Stop", { background_counts: { tasks: 2, shells: 2 } });
+  assert.deepEqual(countsOf(bigger.latest()), { tasks: 2, shells: 2 });
+  childHook(bigger, "SubagentStart", AGENT_A);
+  assert.deepEqual(
+    countsOf(bigger.latest()),
+    { tasks: null, shells: 2 },
+    "a total that could contain the agent still cannot be reconciled with it",
+  );
+  bigger.controller.dispose();
+});
+
+test("a source gap keeps a live agent counted but never restores it as an exact count", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  // The authenticated lane is lost. Whether A ended, parked, or was woken during
+  // the hole is unknowable, so nothing publishes.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-malformed" });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+
+  // A complete root census repairs the LEDGER — the provider positively states that
+  // nothing is in flight. It says nothing about an agent this observer stopped
+  // seeing mid-gap, so A is neither deleted nor republished as a stale exact 1.
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await settle();
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: 0 },
+    "a preserved identity across a gap is not an exact live census",
+  );
+
+  // That agent's OWN lane arriving again is the agent-specific recovery evidence:
+  // its lifetime is observable from here, and the count becomes exact again.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  h.controller.dispose();
+});
+
+test("a scope boundary never clears a lone live agent as an empty census", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // A live agent and NOTHING in the ledger's own map: the ledger alone would call
+  // this census whole and empty.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  h.hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" });
+  await settle();
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: null },
+    "a live agent is part of the census the boundary cannot carry",
+  );
+  h.controller.dispose();
+});
+
+test("a named child transcript routes a completion the root journal never records", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "A parks on its own shell");
+
+  // The provider delivers B's completion into A's OWN transcript as a conversation
+  // record — the envelope lives inside `message.content` — and never writes the
+  // root journal's row for it. A root append is what reaches the child lane.
+  await fs.appendFile(childFile, jsonRow({
+    type: "user",
+    isMeta: true,
+    sessionId: SESSION,
+    agentId: AGENT_A,
+    message: { role: "user", content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE) },
+  }), "utf8");
+  await h.append(queueOperationRow("remove", { reason: "delivered_to_agent" }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "the child lane settles the routed work");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a routed delivery wakes A, it never ends A");
+  h.controller.dispose();
+});
+
+test("a child transcript record that is not this agent's delivery settles nothing", async () => {
+  // The same lane, shown refusing the shapes that merely LOOK like a delivery. A
+  // real delivery in `text` blocks still settles, so the refusals below are scope
+  // and shape, not a lane that never works.
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  const envelope = taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE);
+  const noise = [
+    // A row from another conversation entirely.
+    jsonRow({
+      type: "user",
+      isMeta: true,
+      sessionId: OTHER_SESSION,
+      message: { role: "user", content: envelope },
+    }),
+    // A delivery belonging to a different agent of the same session.
+    jsonRow({
+      type: "user",
+      isMeta: true,
+      sessionId: SESSION,
+      agentId: AGENT_D,
+      message: { role: "user", content: envelope },
+    }),
+    // A replayed request body that mentions a task but is not a provider
+    // injection at all.
+    jsonRow({
+      type: "user",
+      commandMode: "api-request",
+      sessionId: SESSION,
+      message: { role: "user", content: `earlier request ${envelope}` },
+    }),
+    // The envelope sitting in a top-level field, which is not where the producer
+    // ever writes it.
+    jsonRow({ type: "user", isMeta: true, sessionId: SESSION, content: envelope }),
+  ];
+  for (const row of noise) {
+    await fs.appendFile(childFile, row, "utf8");
+  }
+  await h.append(queueOperationRow("remove", { reason: "unrelated" }));
+  await settle();
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: 1, shells: 1 },
+    "none of these records is this agent's delivery, so nothing settles",
+  );
+
+  // A genuine delivery carried in `text` blocks settles the same work.
+  await fs.appendFile(childFile, jsonRow({
+    type: "user",
+    isMeta: true,
+    sessionId: SESSION,
+    agentId: AGENT_A,
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: "" },
+        { type: "text", text: envelope },
+      ],
+    },
+  }), "utf8");
+  await h.append(queueOperationRow("remove", { reason: "delivered_to_agent" }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "a text-block delivery settles the routed work");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  h.controller.dispose();
+});
+
+test("a lost child transcript degrades only its own agent's task coverage", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // An unrelated root shell, so the loss can be shown not to reach the shells.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    background_started: { id: "b9rootshell", kind: "shell" },
+  });
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // The bind-time read lands first, so the identity the lane holds is the one the
+  // replacement is measured against.
+  await settle();
+
+  // The file behind the bound path is replaced. A cursor into the old file says
+  // nothing about the new one, so this lane's coverage is gone.
+  await fs.rm(childFile);
+  await fs.writeFile(childFile, "", "utf8");
+  await h.append(queueOperationRow("remove", { reason: "unrelated" }));
+  await waitFor(() => h.gaps.includes("replaced"), "the child lane reports its own loss");
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: 2 },
+    "one agent's lost lane costs that agent's exactness, and nothing else",
+  );
+  h.controller.dispose();
+});
+
+test("an explicit invalidation is never repaired by an empty in-flight snapshot", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // A live agent beside a root shell, so the two axes can be told apart.
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    background_started: { id: "b9rootshell", kind: "shell" },
+  });
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // The caller takes back every claim. That is a hole in this run's evidence: A may
+  // have parked, woken, or ended while nothing was observed.
+  h.controller.invalidate();
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+
+  // The provider's next complete census says nothing is IN FLIGHT. It repairs the
+  // ledger — the shell is positively gone — and says nothing whatsoever about an
+  // agent the provider excludes from an in-flight array by design. So the shell
+  // axis recovers exactly while the task axis stays unknown.
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await settle();
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: 0 },
+    "a complete census repairs membership, never a lifetime",
+  );
+
+  // A's own edge is the only thing that restores the task axis.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  h.controller.dispose();
+});
+
+test("deleting an already-read root transcript is lost evidence, not an absent file", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    background_started: { id: "b9rootshell", kind: "shell" },
+  });
+  childHook(h, "SubagentStart", AGENT_A);
+  // The file has been read, so it is a source with recorded history.
+  await waitFor(() => h.readySnapshots().length > 0 || h.snapshots.length > 0, "the transcript is read");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // The transcript disappears mid-run. Unlike a file that never existed, whatever
+  // it held can no longer be read: A's own completion may have been in it.
+  await fs.rm(h.transcript);
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await waitFor(() => h.gaps.includes("unavailable"), "the vanished transcript is reported");
+  // This hole strands a tracked member whose end can never be read again, so BOTH
+  // axes are holes: a transcript gap that loses rows reaches further than one
+  // agent's own lifetime does.
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+
+  // The provider's next complete in-flight census is refused as a repair of either
+  // axis, and it re-arms a read of a file that is still not there. The point this
+  // test pins is the one that matters: an empty `background_tasks` array never
+  // resurrects a stale A as an exact task count.
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await settle();
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: null },
+    "a complete in-flight census never republishes a stale agent as an exact count",
+  );
+
+  // A's own edge would make its lifetime observable again, but the census itself is
+  // still unreadable, so neither axis is published from a hole: each recovers on
+  // its own evidence and neither borrows the other's.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+  h.controller.dispose();
+});
+
+test("a deleted child transcript degrades its agent even when nothing replaces it", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  // An open root question, so the independent foreground/input axis can be shown
+  // untouched by this agent's lost source.
+  h.hook("PreToolUse", {
+    tool_name: "AskUserQuestion",
+    tool_use_id: "tool-q1",
+    prompt_id: "prompt-1",
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-root-shell",
+    background_started: { id: "b9rootshell", kind: "shell" },
+  });
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+  // The bind-time read establishes the file's identity: this lane HAS read it.
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+
+  // Deleted, with nothing behind it. An agent whose one speaking source was removed
+  // is not the same case as a transcript the provider has not created yet.
+  await fs.rm(childFile);
+  await h.append(queueOperationRow("remove", { reason: "unrelated" }));
+  await waitFor(() => h.gaps.includes("unavailable"), "the deleted child lane reports its loss");
+  assert.deepEqual(
+    countsOf(h.latest()),
+    { tasks: null, shells: 2 },
+    "only that agent's exactness goes; the known shell census stands",
+  );
+  assert.equal(
+    h.latest().pendingInput,
+    true,
+    "a lost child lane never touches the independent pending-input axis",
+  );
+  assert.notEqual(h.latest().activity, null, "nor the hook-derived foreground");
+
+  // That agent's own edge resumes its lifetime.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 });
+  h.controller.dispose();
+});
+
+test("two completions for one id in one window keep their own positions", async () => {
+  // A read window can hold BOTH an agent's superseded completion and its fresh
+  // one. Collapsing them by identity would keep whichever record came first — the
+  // one the resumed window's floor fences out — and an agent that really ended
+  // would stay counted forever, because the record that says otherwise was already
+  // consumed. Every record has to arrive with its own position.
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+
+  // The first window's completion is written, and nothing reads it.
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-first"),
+  }));
+
+  // The same agent resumes: the new window's floor sits after that record. Its
+  // final turn ends owning nothing, and its fresh completion is appended after.
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-second"),
+  }));
+
+  // One read consumes both rows at once. The older one is refused by the floor;
+  // the newer one closes A — with no further append and no second read.
+  readNow(received);
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "the fresh emission ends A from the same window");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.controller.dispose();
+});
+
+test("a named child transcript that appears late is still retried", async () => {
+  // A provider creates its child transcript when the child writes, which can be
+  // after the boundary that named it. That first absence costs nothing — but the
+  // binding came from the provider and stays true, so the lane must survive to be
+  // read by the root events that already exist.
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+  // The file is not there yet.
+  await waitFor(() => h.gaps.includes("unavailable"), "the absent child file is reported");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "a late file is not a coverage hole");
+
+  // It materializes with B's native delivery inside, and the root journal has no
+  // row for B at all. An ordinary root append reaches the retained lane.
+  await fs.writeFile(childFile, jsonRow({
+    type: "user",
+    isMeta: true,
+    sessionId: SESSION,
+    agentId: AGENT_A,
+    message: { role: "user", content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE) },
+  }), "utf8");
+  await h.append(queueOperationRow("remove", { reason: "unrelated" }));
+  await waitFor(() => countsOf(h.latest()).shells === 0, "the retried lane settles the routed work");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "A wakes; it is not ended by the delivery");
+  h.controller.dispose();
+});
+
+test("two child launches with no tool_use_id are two members, and replays stay inert", async () => {
+  // Omitting `tool_use_id` is permitted by the protocol, so it cannot be read as
+  // "one request per agent per event". Two distinct launches that happen to arrive
+  // without one must both reach membership and ownership, or the shell count is not
+  // merely coarse — it is simply wrong.
+  const SHELL_2 = "b7secondshell";
+  const launchOf = (id: string) => ({
+    tool_name: "Bash",
+    background_started: { id, kind: "shell" as const },
+  });
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_1));
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_2));
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 }, "one agent, two distinct shells");
+
+  // Replays of both launch results are the same results arriving twice: no new
+  // member, and nothing published about membership.
+  const before = h.snapshots.length;
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_1));
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_2));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 2 }, "replayed launches add nothing");
+  assert.equal(h.snapshots.length, before, "a replayed launch states nothing new");
+
+  // Both shells settle on their own records; A becomes a pending wake.
+  for (const id of [SHELL_1, SHELL_2]) {
+    await h.append(queueOperationRow("enqueue", {
+      content: taskNotificationEnvelope(id, "completed", `tool-${id}`),
+    }));
+  }
+  await waitFor(() => countsOf(h.latest()).shells === 0, "both shells settle");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  // A's actual end: a clean boundary owning nothing, then its own completion.
+  childHook(h, "SubagentStop", AGENT_A, { background_members: [{ id: AGENT_A, kind: "task" }] });
+  await h.append(queueOperationRow("enqueue", {
+    content: taskNotificationEnvelope(AGENT_A, "completed", "tool-a-final"),
+  }));
+  await waitFor(() => countsOf(h.latest()).tasks === 0, "A ends on its own completion");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+
+  // Both launch results arrive a third time, long after the agent and both members
+  // are gone. Neither resurrects the agent nor re-owns a settled member.
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_1));
+  childHook(h, "PostToolUse", AGENT_A, launchOf(SHELL_2));
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "late replays resurrect nothing");
   h.controller.dispose();
 });

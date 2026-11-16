@@ -1148,7 +1148,7 @@ test("the owned TUI render keeps every operator argument, inserts the lease conn
   });
 });
 
-test("the owned backend render routes the operator's global config and features, arms the prepared SessionStart hook only there, and keeps the closed control argv", async () => {
+test("the owned backend render routes the operator's global config and features, carries no status hook of ours even when armed, and keeps the closed control argv", async () => {
   await fixture(async (root, bin) => {
     await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
@@ -1167,21 +1167,21 @@ test("the owned backend render routes the operator's global config and features,
       targetId: "external:worker",
       nativeHook: { bootstrap: bootstrapFor("codex") },
     });
-    const hook = preparedHook(descriptor.nativeHook);
-    assert.equal(hook.route, "codex-session-start");
-    // This route stages no file at all, so a render has nothing to re-stage.
-    assert.equal(hook.lease.root, null);
+    // An owned Codex launch declines THIS HOST's own status hook, even though the
+    // request armed one: no outcome, so no lease, nothing to clean up, and nothing for
+    // the manager to own.
+    assert.equal(descriptor.nativeHook, undefined, "an owned launch says nothing about a hook of ours");
     const plan = ownedPlanOf(descriptor);
     const backendSnapshot = { ...plan.backendEnv };
 
     const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
     assert.deepEqual(backend.args, [
-      // The operator's global configuration and feature tokens, in configured
-      // order and exact spelling, then this launch's ONE prepared hook channel,
-      // then the closed control argv.
+      // The operator's global configuration and feature tokens, in configured order
+      // and exact spelling, then the closed control argv. Nothing of ours is inserted:
+      // the approved relay and its read-only RPC are this owned row's metadata channel,
+      // so the real argv stays exactly what the operator configured plus the control.
       "-c", 'model_reasoning_effort="high"', "--config", 'model_provider="corp"',
       "--enable", "feature_x", "--disable", "feature_y",
-      ...hook.args,
       ...ownedControlArgs(),
     ]);
     assert.equal(backend.file, descriptor.file);
@@ -1202,9 +1202,13 @@ test("the owned backend render routes the operator's global config and features,
     assert.equal(backend.env.PWD, workspace);
     assert.deepEqual(Object.keys(backend.env).filter((name) => name.toUpperCase() === "HERDR_ENV"), []);
     assert.equal(backend.env[OWNED_TUI_AUTH_ENV], undefined);
-    const marker = JSON.parse(backend.env[NATIVE_HOOK_BOOTSTRAP_ENV]!) as NativeHookBootstrap;
-    assert.equal(marker.token, HOOK_TOKEN);
-    assert.equal(marker.backend, "codex");
+    // No bootstrap marker anywhere: not on the backend, not on the descriptor the
+    // manager would spawn from, and not in the plan's reusable base.
+    assert.equal(backend.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+    assert.equal(descriptor.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+    assert.equal(plan.backendEnv[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+    assert.ok(!JSON.stringify([backend.env, descriptor.env]).includes(HOOK_TOKEN), "no broker token leaks");
+    assert.ok(!JSON.stringify([backend.env, descriptor.env]).includes("/prg-synthetic-status-broker.sock"));
     // Rendering is pure and repeatable: the same argv from an unchanged base,
     // with no second preparation and no marker duplication.
     const second = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
@@ -1212,7 +1216,12 @@ test("the owned backend render routes the operator's global config and features,
     assert.deepEqual(second.env, backend.env);
     assert.deepEqual(plan.backendEnv, backendSnapshot);
     assert.deepEqual(Object.keys(plan.backendEnv).filter((name) => name === NATIVE_HOOK_BOOTSTRAP_ENV), []);
-    assert.deepEqual(await hook.lease.cleanup(), { removed: [], preserved: [] });
+    // The TUI is rendered from the same hook-free base: no marker, and no generated
+    // hook flag in its argv either.
+    const tui = plan.renderTui(ownedConnection(plan.backendEnv));
+    assert.equal(tui.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+    assert.ok(!tui.args.some((token) => token.includes("session-start") || token.includes("hooks.")),
+      "no hook instruction reaches the interactive child either");
 
     // An attached spelling is routed as the single literal token it is, and the
     // TUI keeps it exactly as configured too.
@@ -1238,20 +1247,47 @@ test("the owned backend render routes the operator's global config and features,
     assert.equal(operatorClipboard.renderBackend(ownedControlArgs(), { ...operatorClipboard.backendEnv }).env.HERDR_ENV, "operator-value");
     assert.equal(operatorClipboard.renderTui(ownedConnection(operatorClipboard.backendEnv)).env.HERDR_ENV, "1");
 
-    // An operator who writes their own SessionStart override keeps it and gets no
-    // second one: their own `-c` token is still routed to the core.
+    // An operator who writes their own SessionStart override keeps it, in owned mode
+    // too: their own `-c` token is still routed to the core exactly once, and this host
+    // adds no second one and no marker.
     const operatorHooks = ["-c", 'hooks.SessionStart=[{type="command",command="operator.sh"}]'];
     const preserved = await createNativeCliLauncher(configWith({
       worker: { adapter: "codex-cli", command: join(bin, "codex"), args: operatorHooks, review: {} },
     }), { platform: "darwin", ownedCodexBackend: true })("codex", {
       workspace, env: { PATH: bin }, targetId: "external:worker", nativeHook: { bootstrap: bootstrapFor("codex") },
     });
-    assert.equal(unavailableHook(preserved.nativeHook).reason, "operator-hook-override");
+    assert.equal(preserved.nativeHook, undefined, "an owned launch never arms a hook of ours");
     const preservedPlan = ownedPlanOf(preserved);
     const preservedBackend = preservedPlan.renderBackend(ownedControlArgs(), { ...preservedPlan.backendEnv });
     assert.deepEqual(preservedBackend.args.slice(0, 2), operatorHooks);
     assert.equal(preservedBackend.args.filter((token) => token.startsWith("hooks.")).length, 1, "exactly the operator's own hook override");
     assert.equal(preservedBackend.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined, "a declined acquisition arms no marker anywhere");
+
+    // The control that makes this a scope claim and not a regression: the SAME targets,
+    // the SAME armed bootstrap, outside owned Codex mode. A normal Codex launch still
+    // prepares our one hook channel — flags in real option position, marker in the child
+    // environment, lease handed to the caller — and an operator who already wrote their
+    // own SessionStart override still gets the existing explicit refusal outcome, so
+    // every non-owned Codex, Claude, and Pi launch is byte-identical to before.
+    const nonOwned = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: configured, review: {} },
+    }), { platform: "darwin" });
+    const armed = await nonOwned("codex", {
+      workspace, env: { PATH: bin, CODEX_HOME: "/operator/.codex" }, targetId: "external:worker",
+      nativeHook: { bootstrap: bootstrapFor("codex") },
+    });
+    assert.equal(armed.ownedCodex, undefined, "the control launch is not an owned plan");
+    const armedHook = preparedHook(armed.nativeHook);
+    assert.equal(armedHook.route, "codex-session-start");
+    assert.ok(armed.args.some((token) => armedHook.args.includes(token)), "the generated flags stay in real option position");
+    assert.equal(JSON.parse(armed.env[NATIVE_HOOK_BOOTSTRAP_ENV]!)["token"], HOOK_TOKEN);
+    const armedOperator = await createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: operatorHooks, review: {} },
+    }), { platform: "darwin" })("codex", {
+      workspace, env: { PATH: bin }, targetId: "external:worker", nativeHook: { bootstrap: bootstrapFor("codex") },
+    });
+    assert.equal(unavailableHook(armedOperator.nativeHook).reason, "operator-hook-override");
+    assert.equal(armedOperator.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined, "a declined acquisition still arms nothing");
   });
 });
 
@@ -1272,20 +1308,22 @@ test("an owned Codex launch keeps a wrapper target's command prefix on both chil
     const descriptor = await launcher("codex", {
       workspace, env: { PATH: bin }, targetId: "external:worker", nativeHook: { bootstrap: bootstrapFor("codex") },
     });
-    const hook = preparedHook(descriptor.nativeHook);
+    // Armed, and still declined: an owned launch composes no hook of ours on a wrapper
+    // target either, so the wrapper's real argv is configured tokens plus the control.
+    assert.equal(descriptor.nativeHook, undefined);
     assert.equal(descriptor.file, join(bin, "node"));
-    // The ordinary (non-plan) composition is unchanged: the host flags land in
-    // real option position, before the terminator.
+    // The ordinary (non-plan) composition keeps the terminator and the prompt exactly
+    // where they belong, with no generated flag inserted before the terminator.
     assert.deepEqual(descriptor.args, [
       wrapper, "-c", 'model_provider="corp"', "--model", "gpt-5.1-codex",
-      "--no-daemon", ...hook.args,
+      "--no-daemon",
       "--", "fix the bug",
     ]);
 
     const plan = ownedPlanOf(descriptor);
     const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
     assert.deepEqual(backend.args, [
-      wrapper, "-c", 'model_provider="corp"', ...hook.args, ...ownedControlArgs(),
+      wrapper, "-c", 'model_provider="corp"', ...ownedControlArgs(),
     ], "the backend runs the configured wrapper with its prefix, plus only backend-routed configuration");
     assert.equal(backend.file, descriptor.file);
     assert.equal(backend.cwd, workspace);

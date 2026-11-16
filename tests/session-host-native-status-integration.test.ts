@@ -697,7 +697,10 @@ test("background membership: a real Bash launch counts one shell, its own persis
     // The turn still ends only on its own evidence: this observer's Stop is a
     // boundary, and Ready comes from the summary persisted after the relay's ACK.
     assert.equal((await harness.relay(bootstrap, claudeHook(transcript, "sess-a", "Stop", { prompt_id: "p-1" }))).status, "accepted");
-    assert.equal(harness.view(id).busy, null, "this observer's own Stop hook is never proof of Ready");
+    // A boundary is not a completion, and it is not a withdrawal either: the row
+    // keeps the observed running foreground and its settled shell census until the
+    // summary the source actually persisted closes the turn.
+    assert.equal(harness.view(id).busy, true, "this observer's own Stop hook is never proof of Ready");
     appendFileSync(transcript, claudeSummaryRow(), "utf8");
     const ready = await harness.waitView(id, (view) => view.busy === false, "the source-confirmed root turn end");
     assert.deepEqual(ready.activity, ["Ready"]);
@@ -757,8 +760,11 @@ test("Claude Ready comes only from the persisted root summary appended after the
     assert.equal(stop.status, "accepted");
     assert.equal(stop.delivered, "event", "the whole snapshot validated; it was not silently dropped");
     const stopped = harness.view(id);
-    assert.equal(stopped.busy, null, "this observer's own Stop hook is never proof of Ready or idle");
-    assert.deepEqual(stopped.activity, []);
+    // The Stop carries the counts and marks a candidate boundary: never Ready or
+    // idle, and it neither invents nor erases the running turn this source
+    // observed, nor its tool TYPE.
+    assert.equal(stopped.busy, true, "this observer's own Stop hook is never proof of Ready or idle");
+    assert.deepEqual(stopped.activity, ["Working"]);
     assert.equal(stopped.activeTasks, 2, "the root Stop snapshot is a real observed count");
     assert.equal(stopped.activeShells, 1);
 

@@ -48,7 +48,7 @@ import {
 } from "./helpers/session-host-main-remote";
 
 const SGR = /\x1b\[[0-9;]*m/g;
-const SIDEBAR_COLS = 32;
+const SIDEBAR_COLS = 35;
 const DRAG_MOTION = 32;
 
 // ---------------------------------------------------------------------------

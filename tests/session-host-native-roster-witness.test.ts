@@ -144,10 +144,10 @@ const IDLE_STATUS = "  agent idle | input none";
 const SELECTED_IDLE_STATUS = "> agent idle | input none";
 /**
  * The exact both-unknown count row the shared formatter draws at the witness
- * width. Both labeled cells are always present; the second value is clipped by
- * the renderer's existing pane-edge ellipsis, never replaced by a combined word.
+ * width. Both labeled cells are always present and fit whole at the fixed
+ * 35-column sidebar width; neither is replaced by a combined word.
  */
-const BACKGROUND = "  bg tasks unknown | shells u...";
+const BACKGROUND = "  bg tasks unknown | shells unknown";
 
 function expandedCard(title: string, status = IDLE_STATUS, activity: readonly string[] = ["", ""]): string[] {
   return [title, status, BACKGROUND, ...activity];
@@ -306,7 +306,7 @@ test("the wide sidebar boundary excludes the divider column and everything to it
     assert.ok(!line.includes("│"), JSON.stringify(line));
   }
   assert.equal(NATIVE_PANE_START, SIDEBAR_COLUMNS + 1);
-  // The 33rd column of a composed row is the divider, never sidebar content.
+  // The 36th column of a composed row is the divider, never sidebar content.
   assert.equal(lines[1]!.length, SIDEBAR_COLUMNS);
 });
 
@@ -360,7 +360,7 @@ test("clipped canonical titles match only their own canonical title", () => {
   assert.equal(renderedTitleMatches("Canonical ti...", "Canonical other"), false);
   assert.equal(renderedTitleMatches("Other", "Canonical title"), false);
   assert.equal(renderedTitleMatches(undefined, "Canonical title"), false);
-  const clippedTitle = `${"A".repeat(29)}...`;
+  const clippedTitle = `${"A".repeat(32)}...`;
   const clipped = compose([HEADER(1), ...collapsedCard(clippedTitle), ...ACTIONS]);
   assert.equal(rosterCards(clipped)[0]?.title, clippedTitle);
   assert.equal(renderedTitleMatches(rosterCards(clipped)[0]?.title, "A".repeat(60)), true);
@@ -394,6 +394,62 @@ test("incomplete rosters and duplicate highlights never authorize a selection or
   assert.equal(selectedRosterCard(duplicate), undefined);
 });
 
+test("a mid-repaint slice cannot seed an exited-card census; a settled complete exact-target frame can", () => {
+  // The Main close path takes its already-exited-card baseline from the frame it
+  // is handed and then requires exactly ONE more exited card, so it fences on a
+  // COMPLETE roster whose single highlight is the exact target. These are that
+  // fence's two observations, expressed with the shared witness alone.
+  const exitedSibling = collapsedCard("A", "  exited (code 0)");
+  const selectedTarget = expandedCard("B", SELECTED_IDLE_STATUS);
+  const exitedCards = (frame: string): number => rosterCards(frame)
+    .filter((card) => card.status === "exited (code 0)").length;
+  // The compositor draws the displayed owner's caption in the outer header, so
+  // a loose header-plus-nonempty-pane match can still be a partial slice.
+  const ownedFrame = (sidebar: readonly string[]): string =>
+    ["B", ...compose(sidebar).split("\n").slice(1)].join("\n");
+
+  const midRepaint = ownedFrame([HEADER(2), ...selectedTarget, ...ACTIONS]);
+  assert.equal(frameHeaderMatches(midRepaint, "B"), true,
+    "the partial slice carries the exact active owner header a loose match accepts");
+  assert.ok(midRepaint.includes("native pane"), "the partial slice also draws a non-empty native pane");
+  assert.equal(parseRosterFrame(midRepaint).complete, false,
+    "the undeclared exited sibling card leaves the roster incomplete");
+  assert.equal(selectedRosterEntry(midRepaint), undefined);
+  assert.equal(exitedCards(midRepaint), 0, "the partial slice would seed an undercounted baseline");
+
+  const settled = ownedFrame([HEADER(2), ...exitedSibling, ...selectedTarget, ...ACTIONS]);
+  assert.equal(parseRosterFrame(settled).complete, true);
+  const selected = selectedRosterEntry(settled);
+  assert.ok(selected !== undefined && selected.kind === "native",
+    "the settled roster authorizes exactly one highlighted native entry");
+  assert.equal(renderedTitleMatches(selected.title, "B"), true, "that highlight is the exact target row");
+  assert.equal(exitedCards(settled), 1, "the settled complete frame supplies the truthful baseline");
+
+  // The fence's selection observation is the shared witness, which admits
+  // exactly ONE highlight. The target drawn first plus any second highlighted
+  // entry still parses as a complete roster, so a first-match selection would
+  // accept it; the witness rejects it as ambiguous instead of guessing.
+  const duplicateHighlight = ownedFrame([HEADER(2), ...exitedSibling, ...selectedTarget,
+    "> Saved conversations", ...ACTIONS.slice(1)]);
+  assert.equal(parseRosterFrame(duplicateHighlight).complete, true,
+    "a second highlighted entry leaves the roster structurally complete");
+  const highlighted = parseRosterFrame(duplicateHighlight).entries.filter((entry) => entry.selected);
+  assert.equal(highlighted.length, 2, "both the exact target and a second entry are highlighted");
+  assert.equal(highlighted[0]?.kind === "native" && highlighted[0].title === "B", true,
+    "the first highlighted entry would still be the exact target a first-match selection accepts");
+  assert.equal(selectedRosterEntry(duplicateHighlight), undefined,
+    "the witness's single-highlight requirement is what rejects the ambiguous frame");
+  assert.equal(exitedCards(duplicateHighlight), exitedCards(settled),
+    "that rejected frame's card count alone looked like a valid baseline");
+
+  // The unchanged close wait requires exactly one NEW exited card on its own
+  // complete roster; only the settled baseline can satisfy that requirement.
+  const afterTargetExit = ownedFrame([HEADER(2), ...exitedSibling, ...expandedCard("B", "> exited (code 0)"), ...ACTIONS]);
+  assert.equal(exitedCards(afterTargetExit), exitedCards(settled) + 1);
+  assert.notEqual(exitedCards(afterTargetExit), exitedCards(midRepaint) + 1,
+    "a baseline taken from the partial slice is never satisfiable");
+});
+
 test("hide witness rejects partial hide repaints and accepts a divider-free native frame", () => {
   const partial = compose([HEADER(1), ...expandedCard("Only card")]);
   assert.equal(parseRosterFrame(partial).complete, false);
@@ -419,16 +475,16 @@ test("background rows validate the complete nullable grammar and the renderer's 
     HEADER(1),
     "Clipped",
     IDLE_STATUS,
-    "  bg tasks 9007199254740991 |...",
+    "  bg tasks 9007199254740991 | sh...",
     "",
     "",
     ...ACTIONS,
   ]);
   const parsed = parseRosterFrame(clipped);
   assert.equal(parsed.complete, true);
-  assert.equal(parsed.cards[0]!.background, "bg tasks 9007199254740991 |...");
+  assert.equal(parsed.cards[0]!.background, "bg tasks 9007199254740991 | sh...");
 
-  for (const bad of ["background unknown", "background unknown garbage", "bg tasks  | shells", "bg tasks 2 | shells", "bg tasks 2 | shells 3 extra", "background", "bg tasks unk | shells 12345..."]) {
+  for (const bad of ["background unknown", "background unknown garbage", "bg tasks  | shells", "bg tasks 2 | shells", "bg tasks 2 | shells 3 extra", "background", "bg tasks unk | shells 12345678..."]) {
     const frame = compose([HEADER(1), "Bad", IDLE_STATUS, `  ${bad}`, "", "", ...ACTIONS]);
     assert.equal(parseRosterFrame(frame).complete, false, `rejects ${JSON.stringify(bad)}`);
     assert.deepEqual(rosterCards(frame), []);
@@ -1178,7 +1234,7 @@ test("not-applicable count cells survive the renderer's clipped forms", () => {
   assert.equal(parsedNarrow.cards[0]?.status, "exited (code 0)");
 
   // A clipped cell that stops inside the not-applicable word is still that word.
-  const clippedToken = `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345`)}`;
+  const clippedToken = `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345678`)}`;
   assert.equal(parseRosterFrame(compose([
     HEADER(1), "Codex", IDLE_STATUS, clippedToken, "", "", ...ACTIONS,
   ])).complete, true);
@@ -1212,10 +1268,10 @@ test("not-applicable lookalikes, half-painted cells, and partial cards stay no p
     "bg tasks N/A | shell 1",
     "bg tasks N/A | shells 1 2",
     `bg tasks ${NA} | shells ${NA} extra`,
-    fakeClippedCounts("bg tasks N/ | shells 123456"),
-    fakeClippedCounts("bg tasks NA | shells 123456"),
-    fakeClippedCounts("bg tasks n/a | shells 12345"),
-    fakeClippedCounts("bg tasks N/A | shell 123456"),
+    fakeClippedCounts("bg tasks N/ | shells 123456789"),
+    fakeClippedCounts("bg tasks NA | shells 123456789"),
+    fakeClippedCounts("bg tasks n/a | shells 12345678"),
+    fakeClippedCounts("bg tasks N/A | shell 123456789"),
   ]) {
     const frame = compose([HEADER(1), "Card", IDLE_STATUS, drawnRow(background), "", "", ...ACTIONS]);
     assert.equal(parseRosterFrame(frame).complete, false, `rejects the counts ${JSON.stringify(background)}`);
@@ -1255,7 +1311,7 @@ test("a stale not-applicable row is never witnessed as a hidden sidebar", () => 
   for (const remnant of [
     `> agent unknown | input ${NA}`,
     `  bg tasks ${NA} | shells ${NA}`,
-    `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345`)}`,
+    `  ${fakeClippedCounts(`bg tasks ${NA} | shells 12345678`)}`,
     `> agent ${NA} | input ${NA}`,
   ]) {
     assert.equal(sidebarRosterHidden(remnant), false, `${JSON.stringify(remnant)} is still drawn`);

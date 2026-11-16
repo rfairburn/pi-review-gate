@@ -32,11 +32,16 @@
  * created and then hidden by a throw cannot be proven abandoned. Events are
  * expected to be emitted after the handle is returned, as Node does.
  *
- * `terminateOwnedBackend(child)` is the caller's platform-owned exact child or
- * tree termination. It receives the same captured handle and is invoked at
- * most once, and only while a genuine `exit` event has not been observed. It
- * must resolve/return normally on success and throw/reject on failure. This
- * module never signals a PID, scans process names, or kills the child itself.
+ * `terminateOwnedBackend(child, report)` is the caller's platform-owned exact
+ * child or tree termination. It receives the same captured handle and is
+ * invoked at most once, and only while a genuine `exit` event has not been
+ * observed. It must resolve/return normally on success and throw/reject on
+ * failure. This module never signals a PID, scans process names, or kills the
+ * child itself. The second argument is reporting only and may be ignored: a
+ * terminator that escalates to a forced signal calls `report.forceEscalationAttempted()`
+ * immediately before that forced attempt, and the lease exposes the sticky
+ * `forceEscalationAttempted` status bit. That bit is never exit, reader, or
+ * settlement evidence; a one-argument terminator simply never reports it.
  *
  * ## Settlement
  *
@@ -71,6 +76,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
 
 /** Reserved per-lease TUI auth environment name prefix. */
 export const NATIVE_CODEX_BACKEND_AUTH_ENV_PREFIX = "PI_REVIEW_GATE_OWNED_CODEX_RPC_";
@@ -136,8 +142,23 @@ export interface OwnedCodexBackendStatus {
   readonly settled: boolean;
   readonly terminationAttempted: boolean;
   readonly terminationFailed: boolean;
+  /**
+   * Sticky: true once this lease's own terminator reported that it was about to
+   * attempt forced escalation on the exact captured handle. Reporting only — it
+   * says nothing about whether the child exited or its readers ended.
+   */
+  readonly forceEscalationAttempted: boolean;
   readonly childErrorObserved: boolean;
   readonly readerErrorObserved: boolean;
+}
+
+/**
+ * Owner-private reporting handle the lease passes to its own terminator. It
+ * carries no control: calling it neither signals nor settles anything.
+ */
+export interface OwnedCodexBackendTerminationReport {
+  /** Call immediately before the forced escalation attempt, even if that attempt then fails. */
+  forceEscalationAttempted(): void;
 }
 
 /**
@@ -158,6 +179,12 @@ export interface OwnedCodexBackendReady {
   readObserverBearer(): string;
   /** Sensitive: builds a fresh child-only TUI env/argument set. */
   createTuiConnection(): OwnedCodexTuiConnection;
+  /**
+   * Owner-private retained fresh-root facts, present only on a composite lease
+   * that also owns the native TUI relay. Absent on a bare backend lease; this is
+   * not a wire, roster, status, or control shape and is never published.
+   */
+  readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
 }
 
 /**
@@ -183,7 +210,7 @@ export interface OwnedCodexBackendLaunchInput {
   readonly identity: OwnedCodexBackendLaunchIdentity;
   readonly baseEnv: NodeJS.ProcessEnv;
   readonly spawnBackend: (controlArgs: readonly string[], env: NodeJS.ProcessEnv) => ChildProcess;
-  readonly terminateOwnedBackend: (child: ChildProcess) => unknown;
+  readonly terminateOwnedBackend: (child: ChildProcess, report: OwnedCodexBackendTerminationReport) => unknown;
   readonly startupTimeoutMs?: number;
   /** Aborting (including generation retirement) cancels startup and requests the exact owned stop while unsettled. */
   readonly signal?: AbortSignal;
@@ -251,6 +278,7 @@ class OwnedCodexBackendLeaseImpl implements OwnedCodexBackendLease {
   #stopRequested = false;
   #terminationAttempted = false;
   #terminationFailed = false;
+  #forceEscalationAttempted = false;
   #childErrorObserved = false;
   #startupTimer: NodeJS.Timeout | undefined;
   #onAbort: (() => void) | undefined;
@@ -333,6 +361,7 @@ class OwnedCodexBackendLeaseImpl implements OwnedCodexBackendLease {
       settled: this.#settlementState === "settled",
       terminationAttempted: this.#terminationAttempted,
       terminationFailed: this.#terminationFailed,
+      forceEscalationAttempted: this.#forceEscalationAttempted,
       childErrorObserved: this.#childErrorObserved,
       readerErrorObserved: (this.#stdout?.errored ?? false) || (this.#stderr?.errored ?? false),
     });
@@ -497,7 +526,7 @@ class OwnedCodexBackendLeaseImpl implements OwnedCodexBackendLease {
     this.#terminationAttempted = true;
     let result: unknown;
     try {
-      result = this.#terminateOwnedBackend(child);
+      result = this.#terminateOwnedBackend(child, this.#terminationReport);
     } catch {
       this.#terminationFailed = true;
       return;
@@ -508,6 +537,13 @@ class OwnedCodexBackendLeaseImpl implements OwnedCodexBackendLease {
       });
     }
   }
+
+  // Reporting only, and sticky: it never clears and is never settlement evidence.
+  readonly #terminationReport: OwnedCodexBackendTerminationReport = Object.freeze({
+    forceEscalationAttempted: (): void => {
+      this.#forceEscalationAttempted = true;
+    },
+  });
 
   #handleChildSpawn = (): void => {
     this.#spawnObserved = true;

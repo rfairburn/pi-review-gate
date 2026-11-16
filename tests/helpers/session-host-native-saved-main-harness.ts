@@ -361,7 +361,7 @@ export function isSavedConversationsPane(text: string): boolean {
     && rows.some((line) => line.split(" | ").includes("F8 toggle / up/down select"));
 }
 
-/** Public 32-column Quit renderer assertion shared by native and synthetic coverage. */
+/** Public 35-column Quit renderer assertion shared by native and synthetic coverage. */
 export function hasQuitConfirmationContents(lines: readonly string[], liveCount: number): boolean {
   const paneLines = lines.map((line) => stripGeneratedSgr(line).slice(0, SIDEBAR_COLS).trim()).filter(Boolean);
   const normalized = paneLines.join(" ").replace(/\s+/g, " ");

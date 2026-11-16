@@ -215,7 +215,9 @@ import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest }
 import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
-import { createNativeStatusObserver } from "./native-observer-factory";
+import { createNativeStatusObserverFactory } from "./native-observer-factory";
+import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
+import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
 import {
   isNativeCliBackend,
   isNativeDisplayName,
@@ -238,6 +240,20 @@ import {
 } from "./terminal-diagnostics-log";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
+/**
+ * This host's internal owned-Codex route (issue #277 owned status slice).
+ *
+ * It is a build-time property of THIS host process, never a setting, a CLI flag, a
+ * per-request field, or anything a peer, a wire frame, or a provider can claim. The
+ * three places that read it are the same host's own: the interactive launcher is
+ * constructed in owned mode, the manager is given the composite backend factory that
+ * fronts each owned backend with the private TUI relay, and the observer factory may
+ * upgrade a run to the read-only RPC lane only when that run's own owned-backend
+ * capability actually arrives. Every other launch — Pi, Claude, a named provider
+ * profile this host refuses to route, and any descriptor without an owned plan —
+ * keeps exactly the behavior it had before this constant existed.
+ */
+const OWNED_NATIVE_CODEX_BACKEND = true;
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
 const ROW_RESUME_FAILURE = "This session could not be restarted; the previous row was kept.";
@@ -1469,7 +1485,10 @@ function productionDependencies(): MainDependencies {
     // policy.
     nativeCliHosting: (env) => {
       const config = loadConfig(env).config;
-      return { targets: listNativeCliTargets(config), launch: createNativeCliLauncher(config) };
+      return {
+        targets: listNativeCliTargets(config),
+        launch: createNativeCliLauncher(config, { ownedCodexBackend: OWNED_NATIVE_CODEX_BACKEND }),
+      };
     },
     createOwningHostService: (serviceDependencies) => createLocalOwningHostService(serviceDependencies),
     createSidebar: (options) => new SidebarController(options),
@@ -9257,6 +9276,19 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // launching native rows with the honest unknown provider fields it had before
     // this slice - it never gets a half-armed observation path.
     const nativeHookRegistrar = nativeHookRegistrarOf(broker);
+    // The observer factory is this host's own: with the owned route on, a Codex run
+    // still starts as the exact legacy hook source and only upgrades when the
+    // manager hands THAT run its own owned-backend capability. Claude rows and every
+    // host without the opt-in get the unchanged legacy factory behavior.
+    const nativeStatusObserverFactory = createNativeStatusObserverFactory({
+      ownedCodexBackend: OWNED_NATIVE_CODEX_BACKEND,
+    });
+    // The owned backend provider is the composite: the production owned launcher
+    // (this host's one exact owned-process authority) fronted by the private TUI
+    // relay, so the manager's existing owned-plan path keeps its exact contract.
+    const ownedCodexBackendFactory = nativeCliLaunch === undefined || !OWNED_NATIVE_CODEX_BACKEND
+      ? undefined
+      : createRelayedOwnedCodexBackendFactory({ backend: createOwnedCodexBackendLauncher() });
 
     manager = hostService.openManager({
       packageRoot,
@@ -9292,8 +9324,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // actually carries the native hook family.
       ...(nativeCliLaunch === undefined || nativeHookRegistrar === undefined ? {} : {
         nativeHookRegistrar,
-        nativeStatusObserverFactory: createNativeStatusObserver,
+        nativeStatusObserverFactory,
       }),
+      // The optional owned-Codex backend factory (issue #277 owning-manager slice).
+      // It is consulted ONLY for a launch whose provider attached an owned plan, so a
+      // host whose provider composes an ordinary descriptor — and a host with no
+      // native hosting at all — is unaffected by its presence or absence.
+      ...(ownedCodexBackendFactory === undefined ? {} : { ownedCodexBackendFactory }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

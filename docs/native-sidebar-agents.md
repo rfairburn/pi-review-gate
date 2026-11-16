@@ -39,11 +39,17 @@ boundaries; [Development](development.md) owns verification commands.
 
 - One native row is **one real full native interactive session**: the operator's
   own CLI as an ordinary PTY child of the existing host, under the same ownership
-  model as a Pi row — one row, one child process, one workspace, one frame. No
-  new detector, daemon, service, renderer, SDK client, or headless substitute was
-  added: a provider's print, `exec`, or app-server path drives *its own* thread,
+  model as a Pi row — one row, one interactive child, one workspace, one frame. A
+  hosted Codex row additionally owns one private backend child of its own, created for
+  that row and stopped and settled with it
+  ([Native status observation](#native-status-observation)). No
+  new host-side detector, daemon, service, renderer, SDK client, or headless
+  substitute was added: a provider's print or `exec` path drives *its own* thread,
   so running it beside a hosted TUI would be a second conversation rather than
-  the same session.
+  the same session, and it is never used that way. A hosted Codex row's backend is
+  the same provider's own app-server mode started for that row and driven by that
+  row's own interactive client — one conversation, not a second client with a thread
+  of its own.
 - Provider selection is the New-session form's **Provider** line, and it
   **defaults to Pi every time the form opens**; choosing a native provider is
   explicit. The offered choices belong to the destination on the **Host** line: this
@@ -167,23 +173,38 @@ boundaries; [Development](development.md) owns verification commands.
   approval posture rather than deciding which posture is safer. Nothing is
   silently stripped, translated, retried without the argument, or replaced with
   another target.
-- **Codex adds exactly one argument of its own, `--no-daemon`**, so the launched child
-  owns its backend instead of joining or starting the shared background server. An
-  older Codex build that rejects it fails rather than being launched onto the
-  shared daemon. `--no-alt-screen` is not added, and no approval flag is added.
-  Claude Code adds no arguments of its own. The only thing ever added on top of
-  these is the separately documented per-launch status-observer setup, which
-  changes nothing the operator configured
+- **A hosted Codex row's interactive client attaches to a private app-server
+  backend this host started for that row**, so no host-added `--no-daemon` is
+  needed on that route: the client and its backend are the same resolved target,
+  and neither one joins or starts the shared background server. A Codex launch this
+  host does not front with its own backend keeps `--no-daemon` as its one host-added
+  argument, and an operator who configured that flag themselves keeps it either way.
+  `--no-alt-screen` is never added, and no approval, sandbox, or headless flag is
+  ever added. Claude Code adds no arguments of its own. The only other thing ever
+  added is the separately documented per-launch status-observer setup, which changes
+  nothing the operator configured
   ([Native status observation](#native-status-observation)).
+- **A configured Codex target whose arguments choose one of the operator's named
+  provider profiles is refused clearly, before any process, socket, or file is
+  created.** This host does not route profile-scoped provider configuration into the
+  separate backend process it owns, so forwarding the choice would leave the
+  interactive client on one profile and the process that actually runs hooks and MCP
+  servers on another, while dropping it would run the default profile when the
+  operator asked for a named one. The refusal carries no profile name, path, or
+  argument, and the built-in default target and every explicit target that names no
+  profile start normally.
 - **The CLI's own configuration and authentication are preserved.** The child
   inherits `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and provider
   authentication as-is, and nothing is written into the operator's stored Claude or
   Codex settings, hooks, plugins, or trust stores. The status observer reaches the
   provider only through per-session flags — a private temporary file this host
   creates, owns, and cleans up for that one launch, or one added per-session
-  configuration entry — and never by editing anything the operator owns
+  configuration entry — and never by editing anything the operator owns; a hosted
+  Codex row needs no flag of ours at all, because its observer reads the private
+  backend this host started beside that row
   ([Native status observation](#native-status-observation)). The deliberate
-  additions to a child environment are `HERDR_ENV=1` on a Codex child only, for
+  additions to a child environment are `HERDR_ENV=1` on a hosted Codex interactive
+  child only, for
   terminal text copy, plus — when status observation is armed for a
   launch — the one provider hook-bootstrap marker described in
   [Native status observation](#native-status-observation). Both are child-only
@@ -203,12 +224,13 @@ boundaries; [Development](development.md) owns verification commands.
   subtask capture/review/landing guarantees**, and is never presented as a
   review-gate-managed worker.
 - **A hosted row can report its own foreground status.**
-  Where the provider's own documented hook surface states a fact this host can
-  read, the row's card shows it: the agent working or at rest, the current or last
-  **tool type**, an observed pending **question request**, and — on a Claude Code
-  row — that provider harness's own background task and shell counts taken from a
-  root `Stop` snapshot. A field shows an observed value — a `0` only when the
-  provider positively reported an empty set — or `unknown`.
+  Where the provider's own documented surface states a fact this host can read —
+  through that provider's per-session observer hooks, or through the read-only
+  connection to the private backend beside a Codex CLI row — the row's card shows
+  it: the agent working or at rest, the current or last
+  **tool type**, an observed pending **question request**, and that provider
+  harness's own background task and shell counts. A field shows an observed value —
+  a `0` only when the source positively reported an empty set — or `unknown`.
   None of it is scraped from the terminal, none of it is this host's own subtask or
   background-shell registry, and none of it weakens a stop confirmation
   ([Native status observation](#native-status-observation)).
@@ -240,18 +262,21 @@ boundaries; [Development](development.md) owns verification commands.
 ## What the host owns, and what it never infers
 
 - **Supported:** process spawn, addressed keyboard input, resize, the owned stop
-  ladder, and the child's exit. These are host-owned process facts.
+  ladder, and the child's exit — and, for a hosted Codex row, that row's own private
+  backend child beside it. These are host-owned process facts.
 - **Observed where this host armed a provider-side observer and that observer
   reached its source:** the agent's working/rest state, the current or last tool
-  **type**, an observed pending question request, and — on a Claude Code row — that
-  provider harness's own background task and shell counts. Everything the host has
+  **type**, an observed pending question request, and that provider harness's own
+  background task and shell counts. Everything the host has
   not observed stays unknown. See
   [Native status observation](#native-status-observation) for what each provider
   documents and for the two answers a field can hold.
-- **Unknown, always, whatever the observer reports:** a pending native
-  **approval**, and this host's own conservative ownership pair
+- **Never this host's own doing, whatever an observer reports:** a pending native
+  **approval** is never answered, resolved, requested, or inferred here — the only
+  approval fact a card can ever show is one the provider itself positively stated
+  about its own root — and this host's own conservative ownership pair
   (`backgroundTasks` / `backgroundShells`) that gates an idle-only stop or
-  removal. A provider's own task and shell numbers are activity facts about that
+  removal stays unknown for a hosted provider child. A provider's own task and shell numbers are activity facts about that
   provider's harness; they never enter the ownership channel, so no provider
   reading — including a displayed rest — ever authorizes stopping a
   row that would otherwise require confirmation.
@@ -259,8 +284,11 @@ boundaries; [Development](development.md) owns verification commands.
   that the provider has nothing to report. The capability tables below say what
   each provider documents, and where a genuine gap remains.
 - The host **never scrapes the terminal** to guess a provider's state, and never
-  infers idle from a missing PID, a quiet period, or an output gap. A row's exit
-  event is the only settlement witness.
+  infers idle from a missing PID, a quiet period, or an output gap. That row's own exit
+  event is the settlement witness for its interactive child; a hosted Codex row stays
+  unsettled additionally until that row's own private backend and relay have each
+  proved their own actual end
+  ([Launch and ownership rules](#launch-and-ownership-rules)).
 - Stop is an **explicit, confirmed owned stop**: an idle-only stop or removal of a
   native row always requires confirmation, exactly as an unobserved Pi row does.
   A displayed rest on a native card is a foreground display fact about the
@@ -303,11 +331,11 @@ boundaries; [Development](development.md) owns verification commands.
 | Cancel | Partially documented | `interrupt_turn` is a configurable [`tui.keymap` chat action](https://learn.chatgpt.com/docs/config-file/config-basic); its default binding was not confirmed in the reviewed pages |
 | Shutdown | Documented | `Ctrl+C` or `/exit` closes the session ([CLI reference](https://learn.chatgpt.com/docs/cli/reference)); an `Interrupt` hook event fires when a turn is interrupted ([hooks](https://learn.chatgpt.com/docs/hooks)) |
 | Resume | Documented | [`codex resume` (by id or name, `--last`, `--all`) and `codex fork`](https://learn.chatgpt.com/docs/cli/reference); `--worktree` cannot combine with resume. These are subcommands or startup switches, so a hosted row starts none of them and resumes only in-pane |
-| Native tasks and subagents | Documented in-client; **Unknown** as an external read | [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): `agents.enabled` defaults to `true`, built-ins are `default`, `worker`, and `explorer`, and custom agents are TOML files under `~/.codex/agents/` or project `.codex/agents/`; `SubagentStart` and `SubagentStop` [hook events](https://learn.chatgpt.com/docs/hooks) exist. No programmatic current-state census for an ordinary hosted TUI session was established by this source review |
-| Background shells | Documented in-client; **Unknown** as an external read | [`/ps` lists the session's background terminals with each one's command and up to three recent non-empty output lines, and `/stop` (alias `/clean`) stops them](https://learn.chatgpt.com/docs/cli/slash-commands); that list is populated when `unified_exec` is in use, otherwise it may be empty. A unified-exec `exec_command` matches as Bash and "a later `write_stdin` poll can deliver the original command's `PostToolUse` when that command finishes" ([hooks](https://learn.chatgpt.com/docs/hooks)), so settlement is observable only when something polls; no external per-session shell count is documented. Separately, app-server `thread/backgroundTerminals/list`, `/terminate`, and `/clean` are experimental and require the `experimentalApi` capability; `thread/shellCommand` runs outside the sandbox with full access and is never used |
-| External current-state read | Documented for an app-server client; **Unknown** for a TUI-owned session | [`thread/read` and `thread/list` report runtime status, and `thread/status/changed` notifies with e.g. `status.type: "active"` and `activeFlags: ["waitingOnApproval"]`](https://learn.chatgpt.com/docs/app-server). Whether a second app-server client can observe a thread owned by a hosted TUI is unverified |
-| Hooks | Documented; **one session-scoped observer hook is armed per launch** | [Lifecycle events](https://learn.chatgpt.com/docs/hooks) covering session start and end, prompt submit, tool pre and post, permission request, subagent start and stop, compaction, model request, stop, and interrupt. Hooks belong to the CLI itself, so they apply to a `--no-daemon` interactive row with no app-server connection — real transition signals, and still no current-state census; non-managed hooks must be reviewed and trusted by hash before running (`/hooks`). This host adds at most one per-launch `hooks.SessionStart` entry and only where it conflicts with nothing the operator wrote; it writes no hook file, no `hooks.state` trust record, and no bypass, and the provider's own review-and-trust step stays in front of it ([Native status observation](#native-status-observation)) |
-| app-server | Documented, experimental | JSON-RPC over stdio by default; the WebSocket transport is documented as experimental and unsupported, and status-reading methods can be gated behind the `experimentalApi` capability |
+| Native tasks and subagents | Documented in-client; **Unknown** as an external read | [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): `agents.enabled` defaults to `true`, built-ins are `default`, `worker`, and `explorer`, and custom agents are TOML files under `~/.codex/agents/` or project `.codex/agents/`; `SubagentStart` and `SubagentStop` [hook events](https://learn.chatgpt.com/docs/hooks) exist. No programmatic current-state census for an ordinary hosted TUI session was established by this source review; on the owned route the backend beside the row is this host's own, and that provider's documented descendant-thread listing is what the task figure reads |
+| Background shells | Documented in-client; **Unknown** as an external read | [`/ps` lists the session's background terminals with each one's command and up to three recent non-empty output lines, and `/stop` (alias `/clean`) stops them](https://learn.chatgpt.com/docs/cli/slash-commands); that list is populated when `unified_exec` is in use, otherwise it may be empty. A unified-exec `exec_command` matches as Bash and "a later `write_stdin` poll can deliver the original command's `PostToolUse` when that command finishes" ([hooks](https://learn.chatgpt.com/docs/hooks)), so settlement is observable only when something polls; no external per-session shell count is documented. Separately, app-server `thread/backgroundTerminals/list`, `/terminate`, and `/clean` are experimental and require the `experimentalApi` capability; `thread/shellCommand` runs outside the sandbox with full access and is never used, and the owned route reads only the list method against its own backend — a refusal there is `unknown`, never a zero |
+| External current-state read | Documented for an app-server client; **Unknown** for a session this host does not own the backend of | [`thread/read` and `thread/list` report runtime status, and `thread/status/changed` notifies with e.g. `status.type: "active"` and `activeFlags: ["waitingOnApproval"]`](https://learn.chatgpt.com/docs/app-server). On the owned route this host holds the backend and reads those methods read-only against its own endpoint; whether a second app-server client could observe a thread owned by some other, provider-started session is unverified and never relied on |
+| Hooks | Documented; **this host arms none of its own on the owned Codex route** | [Lifecycle events](https://learn.chatgpt.com/docs/hooks) covering session start and end, prompt submit, tool pre and post, permission request, subagent start and stop, compaction, model request, stop, and interrupt. Hooks belong to the CLI itself, so they apply to an interactive row with no app-server connection — real transition signals, and still no current-state census; non-managed hooks must be reviewed and trusted by hash before running (`/hooks`). For a hosted Codex row this host prepares no hook instruction, marker, or artifact of its own, because the read-only connection to the backend it owns is that row's metadata channel; every hook, override, and flag the operator wrote is still composed unchanged for both children. On a Codex launch this host does not front with its own backend it adds at most one per-launch `hooks.SessionStart` entry and only where it conflicts with nothing the operator wrote; it writes no hook file, no `hooks.state` trust record, and no bypass, and the provider's own review-and-trust step stays in front of it ([Native status observation](#native-status-observation)) |
+| app-server | Documented, experimental | JSON-RPC over stdio by default; the WebSocket transport is documented as experimental and unsupported, and status-reading methods can be gated behind the `experimentalApi` capability. The owned Codex route uses that WebSocket transport against the backend this host owns, and a method the backend declines simply leaves that field `unknown` |
 
 ## Native status observation
 
@@ -343,7 +371,7 @@ host's own ownership counts to be positively observed zeros, which a hosted
 provider child never reports. A displayed foreground rest is a display fact about
 the provider's turn, not complete idle proof.
 
-**How an observation reaches the host (both providers).** The provider's own
+**How an observation reaches the host (the hook lane).** The provider's own
 command hook runs a short-lived bounded relay: it connects to the **existing**
 authenticated local status broker, authenticates with a token issued for that one
 owned launch, sends exactly one bounded event — or one closed failure reason —
@@ -367,8 +395,49 @@ Claude's native transcript or Codex's root-thread rollout. It parses status meta
 without keeping a transcript history or logging or broadcasting record text;
 this is not a claim that no transcript is read.
 There is no `HOME` or history scan, no session-directory search, no global
-clipboard watch, no raw recording, no extra service or port, and no replacement
-conversation.
+clipboard watch, no raw recording, no extra service, and no replacement
+conversation; the hook lane itself adds no listener and no port.
+
+**How an owned Codex row's observations reach the host.** A hosted Codex row gets a
+private app-server backend of its own. This host starts one backend child for that
+row on numeric IPv4 loopback with an operating-system-chosen ephemeral port,
+authenticated by one fresh capability token of which only the SHA-256 digest ever
+reaches that child's generated arguments, and the interactive client is launched
+with the provider's own remote-connection arguments pointed at a private relay this
+host owns in front of that backend. The relay is an opaque byte forwarder with a
+read-only frame tap: the genuine client's handshake and frames are copied unchanged
+in both directions under real backpressure — the one rewrite is the `Host` header,
+which has to name the backend it dials — and the relay originates no
+application-layer byte ever, so it never subscribes, starts, resumes, forks, retries,
+answers, or approves anything, and a second concurrent client is refused. Its tap
+emits only a closed set of metadata projections — opaque ids, closed enums,
+booleans, and counts — never a prompt, command, output, question, option, answer,
+path, model text, or error message. The row's five sidebar categories then come from
+one read-only connection to that same backend, which reads status and the provider's
+own censuses and never replies to a provider request; a pending approval or question
+stays in the provider's own UI. The backend child inherits the same native
+configuration, `CODEX_HOME`, and authentication the interactive client does, and
+nothing is written into provider settings, trust stores, or credential files. Two
+loopback sockets exist for such a row — the backend's listener and the relay's — and
+both are private, ephemeral, and owned by that row alone.
+
+That route states anything about a root thread only on an ordinary fresh start,
+proved in order: the backend's loaded-thread census was empty before anything
+attached, one genuine provider-client `initialize` established the connection, exactly
+one initial non-helper, parentless, non-ephemeral thread start named the candidate,
+and that same connection's own first successful turn start named the same thread.
+Until all four hold, the row publishes `unknown` — not rest, not a zero, and not a
+declaration that Codex cannot report it — and the interactive session stays fully
+usable, because this route never waits on a provider session-start hook that itself
+only fires on a first turn. A consumer that attaches later is handed the current
+closed state, never a replay of the frames that produced it. A root the operator
+moves on deliberately — a side thread, a fork, a resume, a fresh thread, or a new
+connection — sits outside that proof, so the source withdraws to `unknown` rather than
+carrying a stale scope or guessing a replacement; the provider's own UI and transport
+keep working exactly as before, and nothing here needs a provider patch. Retiring
+that observer closes only its own read-only connection, its watcher, and its timers:
+the relay keeps forwarding, and the owner's stop of the row's own resources stays
+exactly as truthful as it was.
 
 **There is no liveness proof.** If the provider never runs the hook, or the relay
 never reaches the broker, nothing is reported to the row: no heartbeat, no queue,
@@ -392,19 +461,75 @@ No promise is made that every missed hook is detected.
 - A turn is **at rest** only from the positively bound, persisted **root**
   `stop_hook_summary` record, which the provider writes after every `Stop` hook
   has answered. This host's own `Stop` callback is never sufficient, because
-  another operator's `Stop` hook can block and continue the same turn. An
+  another operator's `Stop` hook can block and continue the same turn. That is why
+  a `Stop` this host cannot prove final also never forces an observed foreground
+  away: where a root turn was positively observed running, that running state and
+  its tool type stand through the unproven boundary until the ordered terminal
+  witness, newer observed root work, a real contradiction, or the loss of the lane
+  that observed it. An
   ambiguous, non-root, or gapped source leaves the foreground unknown. Trailing
   assistant and tool-result rows before the post-decision summary belong to the
   finishing turn; they do not discard its Ready witness. New root work after that
   boundary still withdraws the old Ready claim.
-- Task and shell counts come **only** from real **root** `Stop` snapshots of the
-  documented `background_tasks` array. Present — including an empty array, which
-  is a real 0/0 — is a real observed snapshot; absent is unknown; a subagent's
-  snapshot is never used as root scope. Numbers remain **last-reported** across
-  unrelated hooks, ordinary foreground work, and transcript-only failures. A new
-  root snapshot replaces them; an observed membership transition, scope change,
-  or hook-lane loss withdraws them. This component is not a continuously live
-  count source and does not infer membership from process counts or quietness.
+- Task and shell counts are a **live membership census of that run**, not only a
+  turn-boundary reading. One per-run ledger holds the active set, and it starts only
+  on evidence that can vouch for it — this host's own launch of that provider child
+  (no background member of a run it started can predate that child), or one complete
+  **root** membership snapshot — and it then moves on positively observed edges: a
+  confirmed background launch identity and its matching completion, read out of this
+  run's own persisted root rows. A keyed edge is an **update to an exact count**, not a
+  withdrawal: a confirmed launch takes the figure from 0 to 1 and its matching
+  completion brings it back, and the same is true of a complete root `Stop` snapshot of
+  the documented `background_tasks` array, which replaces the whole set and outranks
+  anything the ledger remembered — the recovery path after a hole. Present is a real
+  observation, absent is unknown, and a
+  subagent's snapshot is that child's own array and is never used as root scope. An
+  **empty** array is a real empty *in-flight* census: it makes the ledger's own set
+  empty, while the published task figure is still that set unioned with this run's live
+  agent identities — so an empty array beside one still-live parked agent publishes
+  tasks 1 / shells 0, and a `0` is claimed only for what this observer can actually
+  state.
+  Where the ledger has no exact set to publish, a root `Stop`'s own identity-free
+  totals stand as **last-reported**, and any membership edge clears them, because
+  totals cannot account for a member nobody saw; that fallback also stands only while
+  this run holds no live agent to reconcile it against, since a total says nothing about
+  whether it already counts one.
+- The published task figure is the **distinct union** of that run's non-shell
+  in-flight members and its **live agent identities**. An agent counts from the
+  provider's own agent-start edge and stops counting only on a positively
+  established actual end, scoped to one execution window: that window's own turn
+  boundary showed it owned nothing still running or pending, and its own terminal
+  completion was recorded in that same window. An agent parked on work it owns, one
+  whose owned work has just settled and is about to wake it, one held by a genuinely
+  blocking question, and one whose final turn ended without that end being
+  established are all still counted: a snapshot that stops listing an agent, a turn
+  boundary alone, a root question, or the rest of the session emptying out never ends
+  one, and no delivery to the root and no whole-session-empty condition is required.
+  The same id positively resuming is counted again. A background shell an agent
+  launched stays a shell and is never added to tasks, and an id counted by both
+  sources is one task. Two things make the task side alone unstateable rather than
+  merely large: an id the provider lists as a shell member that this run also knows as
+  a live agent — an identity conflict in one shared key namespace, so the task axis
+  goes `unknown` while the provider's own shell number keeps standing — and an agent
+  whose own lifetime crosses an evidence gap, which stays counted but is not published,
+  because a complete root snapshot repairs the ledger's census and cannot repair a
+  lifetime.
+- An exact figure changes only on evidence that changes membership, and it is withdrawn
+  **only by what can contradict it**: a settle for an id this ledger never launched, a
+  membership change whose member cannot be identified, an over-full member set, a
+  malformed snapshot, a confirmed gap in the lane, a scope change, or a loss of the
+  authenticated hook lane — never merely because some other event arrived, and never
+  because an ordinary keyed edge moved the number. Ordinary new foreground work says nothing about background membership, so a live
+  set or a last-reported snapshot survives it, and a transcript-only failure does not
+  silently null a count the provider itself reported. Nothing reconstructs a count
+  from process counts, activity, or quietness. The two categories are published
+  **independently**: a hole attributable to one of them — a member of a known kind
+  this ledger cannot key, a launch of a known kind it cannot track — makes that
+  category `unknown` while the other keeps stating exactly what it knows, while a
+  hole nobody can attribute, a scope change, or a lane loss withdraws both. These
+  counts are **advisory display only**: they are never this host's
+  `backgroundTasks` / `backgroundShells`, never ownership, and never stop or idle
+  authority.
 - Arming is by that provider's own per-session channel, with the operator's own
   configuration always first: a hooks-only `--settings` file is added **only**
   when the configured arguments carry no `--settings` of their own (a second one
@@ -418,7 +543,13 @@ No promise is made that every missed hook is detected.
   sideload-flag and marketplace policy, `disableAllHooks` — can withhold these
   hooks entirely, and this host bypasses none of it: the row simply stays unknown.
 
-**Codex: what the observer states.** Arming is one
+**Codex: what the observer states.** A hosted Codex row on the shipped route is
+observed through the read-only connection to its own private backend described
+above, and for such a launch this host prepares **no** observer hook of its own:
+neither child's real arguments or environment carry a hook instruction, marker, or
+staged artifact from us, while every hook, configuration override, and flag the
+operator wrote is composed unchanged for both children. The arming below is what a
+Codex launch this host does not front with its own backend uses: one
 `-c hooks.SessionStart=[…]` entry, and only when the operator writes no
 conflicting `hooks` or `hooks.SessionStart` override in real option position —
 same-layer paths are last-wins, so adding one there would replace theirs. An
@@ -429,6 +560,8 @@ bypass, so the provider's own review-and-trust step still runs in front of it.
 The generated command is stable across rows of one host; a changed package path
 or command can need the operator's approval again. Nothing here edits the
 operator's trust store.
+
+On the hook and rollout lane:
 
 - Agent turn state and tool activity come from the **exact owned root thread's**
   durable rollout records — `task_started`, `task_complete`, `turn_aborted`, and
@@ -444,6 +577,29 @@ operator's trust store.
   the only rest witness, and it grants rest once, for the held turn only.
 - Questions and approvals stay in Codex's own UI, and nothing on the card stands
   in for them.
+
+On the owned lane, once that row's own fresh root is bound, all five categories come
+from the read-only connection to the backend this host owns. The two lanes never
+blend: a row switches at most once, when its own owned-backend capability arrives,
+and a later observation loss publishes `unknown` rather than restoring the retired
+lane or guessing a value.
+
+- **Agent and activity** come from that root's live provider status — an idle root is
+  a real rest, an active root with no flags is real work — with the current or last
+  tool TYPE attributed only to the bound root's current turn, so a helper or child
+  thread is never labelled as the root's tool and an older turn's completion is
+  rejected. A tool completion is never presented as rest.
+- **Input** is the provider's own positive waiting-for-approval or
+  waiting-for-user-input flag on that root: the row shows a pending indication, and
+  this host never answers, forwards, or guesses it. A descendant's own pending prompt
+  never changes the root's agent or input axes.
+- **Tasks** count this row's own currently-active native sub-agents, and **shells**
+  come from the provider's complete background-terminal census for the bound root and
+  every proven descendant, deduplicated across pages and threads. A census publishes
+  only when it finished collecting: a refused, truncated, contradictory, or unfinished
+  walk withdraws its own axis to `unknown` rather than publishing a smaller number,
+  while an authoritative empty page is a real `0`. Bounds on how much provider traffic
+  one scheduling step may issue never shrink what a healthy row is allowed to report.
 
 **What a paired viewer sees.** A paired viewer sees the same card. The owner's
 observed status facts travel to an authorized viewer in the roster row fields the
@@ -469,7 +625,9 @@ actual PTY have settled.
 ## What a sidebar row shows
 
 The sidebar rules apply unchanged: an unobserved field stays `unknown`, never
-idle and never zero, and the child's exit is the only settlement witness
+idle and never zero, and that row's own exit is the settlement witness for its
+interactive child — a hosted Codex row additionally waits on its own backend and
+relay proving their actual end
 ([Sidebar status and activity](session-host-alpha.md#sidebar-status-and-activity)).
 Where this host armed a provider-side observer for a row and that observer reached
 its source, some of those fields are **observed**; an observer that armed but never
@@ -483,11 +641,11 @@ below names the gaps that survive any observer.
 | --- | --- | --- |
 | Lifecycle and exit code | Real: the host owns the child process | Real: the host owns the child process |
 | Conversation name | Unknown: never scraped | Unknown: never scraped |
-| Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
-| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes a question request; never an inferred value, and never a claim about Codex |
-| Background task count | Last-reported real root `Stop` snapshot — an empty snapshot is a real `0`; retained across unrelated foreground work and transcript-only loss, withdrawn on a membership transition, scope change, or hook-lane loss | `unknown` until this host observes one — never an inferred zero, while a positively observed empty set displays `0`; never a claim about Codex |
-| Background shell count | Last-reported from the same real root `Stop` snapshot, with the same retention and invalidation rules | `unknown` until this host observes one — never an inferred zero, while a positively observed empty set displays `0`; never a claim about Codex |
-| Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn; empty when nothing was observed or after a withdrawal |
+| Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary, and a positively observed running turn stands through an unproven `Stop` boundary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: on the owned lane, that backend's own live root status once the row's fresh root is bound; on the hook and rollout lane, running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
+| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes one; on the owned lane the provider's own positive waiting-for-approval or waiting-for-user-input flag on the bound root is what makes it `pending`, and this host never answers it — never an inferred value |
+| Background task count | Live membership of this run — exact while its own coverage holds, and a keyed launch or completion edge **updates** that exact number rather than making it unknown; the distinct union of this run's non-shell members and its live agent identities, so an empty in-flight census beside one still-live agent displays `1`, not `0`; a last-reported root `Stop` total stands only while the ledger holds no exact set and no live agent needs reconciling, and any membership edge clears it; `unknown` only for a genuine coverage hole — per category when attributable — a scope change, or a hook-lane loss | `unknown` before the row's own root is bound and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's census of this row's own active native sub-agents, while a positively observed empty census displays `0` |
+| Background shell count | Live membership from the same source and lifetime as the task figure — updated by the same keyed edges, cleared the same way when it is a last-reported total, and withdrawn only by a genuine hole (per category when attributable), a scope change, or a lane loss | `unknown` before the row's own root is bound and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's complete background-terminal census for the bound root and its proven descendants, while a positively observed empty census displays `0` |
+| Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn, attributed only to the bound root; empty when nothing was observed or after a withdrawal |
 | Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
 | Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
 | Roster title of a remembered row after a host restart (always unavailable) | `<caption or Provider> (unavailable)` | `<caption or Provider> (unavailable)` |
@@ -499,20 +657,23 @@ shared card formatter, and a paired owner's native row is drawn by that same
 formatter. The background row always names both categories independently
 (`bg tasks 2 | shells 0`), even when neither is observed
 (`bg tasks unknown | shells unknown`): there is no combined wording. A category
-whose value simply went missing reads `unknown`; a category the row's own observer
-declared unreportable reads `N/A`. An unobserved field is never rendered as a zero
+whose value is not observed reads `unknown` for the supported native categories.
+An unobserved field is never rendered as a zero
 or as rest, and a displayed foreground rest never grants idle-only stop authority.
 
 **Current state versus events, and freshness.** The host's status model is
-event-driven with no periodic polling, and the shipped observer keeps that rule:
-it reacts to that run's own hook events and to one watched transcript file, and it
-starts no polling loop. The Claude Code external read is a poll, so using it at
+event-driven with no periodic polling, and the shipped observer keeps that rule: the
+hook lane reacts to that run's own hook events and to one watched transcript file and
+starts no polling loop, and the owned Codex lane refreshes on the provider's own
+status and membership edges plus one provider-scoped refresh armed only while work is
+known to be in flight. The Claude Code external read is a poll, so using it at
 all would be a per-provider adapter exception with its own staleness-to-unknown
 transition rather than a global polling loop, and the host's event-driven
 resynchronization points are not provider events. Codex's `thread/status/changed`
-is a genuine event, but only for a client of that app-server connection, and
-whether it describes a thread owned by a hosted TUI is unverified; neither read is
-part of the shipped route. What both providers document for these fields is a
+is a genuine event for a client of that app-server connection; on the owned route
+this host is such a client of the backend it started for that row, while whether it
+describes a thread owned by some other, provider-started session stays unverified and
+is never relied on. What both providers document for these fields is a
 *transition* notification: `SubagentStart` and `SubagentStop` on both, plus
 `TaskCreated` and `TaskCompleted` on Claude Code. A transition stream is not a
 census, and the two providers are not alike here. Claude Code documents one live
@@ -524,7 +685,8 @@ session's subagents and teammates with their current statuses, and `turn.start` 
 read of one session by code running in that session, not an external read of a
 hosted TUI, and this host installs no mod — the shipped route reads the persisted
 records and hook payloads instead, and treats them the same honest way. Codex
-documents no equivalent census.
+documents no equivalent in-session census; the owned route's task figure comes from
+that provider's own documented descendant-thread census instead.
 The background-shell gap stands on **both** providers: neither documents any
 notification that a background shell count changed inside a live interactive
 session. Claude Code's `Stop` and `SubagentStop` payloads carry a
@@ -533,10 +695,15 @@ in-flight tasks known at that instant, which is a turn-end snapshot rather than 
 live count, and no completion event for one shell is documented; Codex's `/ps` list
 is in-client only, with a unified-exec settlement that arrives only if something
 polls it. The shipped route therefore does not pretend to answer "what exists
-right now" continuously: on a Claude row a count is published only as that root
-`Stop` snapshot and retained across unrelated foreground work or transcript-only
-loss; an actual membership transition, scope change, or hook-lane loss withdraws
-it. Missing observations are never turned into fabricated zeros.
+right now" from notifications alone: on a Claude row a count is a live membership
+set — exact while its own coverage holds, seeded by this host's own launch or a
+complete root snapshot, and **moved** by each keyed launch or completion edge rather
+than withdrawn by it — with a last-reported root `Stop` total standing behind it only
+while no exact set and no live agent contradict that total; the set is withdrawn only by
+a genuine coverage hole (category by category when attributable), a scope change, or a
+hook-lane loss. On an owned Codex row a count is the provider's own census, re-read on
+its own edges and withdrawn to `unknown` whenever a census
+cannot be finished. Missing observations are never turned into fabricated zeros.
 
 ## Copying text out of a hosted row
 
@@ -656,9 +823,15 @@ never a guarantee that the owner's clipboard was untouched.
   request the host can capture
   ([Copying text out of a hosted row](#copying-text-out-of-a-hosted-row)). It wins
   for that one key over an inherited or configured value, and no other entry, no
-  Claude or Pi child, and no multiplexer or SSH marker is touched.
+  Claude or Pi child, and no multiplexer or SSH marker is touched. On a hosted Codex
+  row it goes to the interactive client only; that row's private backend child starts
+  from the same sanitized operator environment without this host-imposed key.
 - **When status observation is armed for a launch, one more child-environment entry and
-  that provider's own per-launch hook flags are added — and nothing else.** The
+  that provider's own per-launch hook flags are added — and nothing else.** For a
+  hosted Codex row this host prepares no hook of its own at all, because that row's
+  metadata channel is the read-only connection to the private backend beside it: no
+  marker, generated flag, or staged artifact from us reaches either child, while every
+  hook, configuration override, and flag the operator wrote is composed unchanged. The
   marker is the fresh `PI_REVIEW_GATE_NATIVE_HOOK_BOOTSTRAP` value carrying that
   launch's broker endpoint, generation, instance id, backend, and one-shot token;
   it is stripped from any inherited environment before the fresh one is set, and no
@@ -692,11 +865,15 @@ never a guarantee that the owner's clipboard was untouched.
   when one is selected; otherwise the built-in default command is used. The
   `execution` and `review` role overlays are **not** inherited: a top-level
   native session is not a delegated execution or review role.
-- Codex adds only `--no-daemon` of its own, so the launched child owns its backend
-  instead of joining or starting the shared background server; the per-launch
-  status-observer flags described above are the only addition on top of it, and they
-  are skipped wherever they would conflict. An older Codex build that lacks the flag
-  fails with its own argument error; the flag is never silently dropped.
+- A hosted Codex row's interactive client carries no host-added `--no-daemon`, because
+  it attaches to the private app-server backend this host started for that row; a Codex
+  launch this host does not front with its own backend keeps `--no-daemon` as its one
+  host-added argument, and an operator who configured the flag themselves keeps it
+  either way. The per-launch
+  status-observer flags described above are the only other addition, and they
+  are skipped wherever they would conflict. An older Codex build that cannot start the
+  backend or rejects a flag fails rather than being quietly redirected; nothing is
+  silently dropped.
   `--no-alt-screen` and any headless or approval flag are not added. Claude Code
   adds no flags of its own.
 - Configured arguments that override the provider's permission, tool, sandbox, or
@@ -708,11 +885,17 @@ never a guarantee that the owner's clipboard was untouched.
   configuration — which the host neither reads nor rewrites — stays native.
   Past a `--` terminator the provider reads prompt text, so those tokens are
   forwarded exactly and are never re-read as options.
-- Stop uses the host's existing owned-handle ladder, and the child's exit is the
-  only settlement witness; a PID disappearing is not proof of settlement. Because
+- Stop uses the host's existing owned-handle ladder, and that child's own exit is the
+  settlement witness for that child; a PID disappearing is not proof of settlement.
+  Because
   a native row has no Pi status registration — the status observer above is a
   separate native family, never a Pi reporter — no Pi shutdown request is attempted
-  for it: the host signals the handle it owns and waits for that handle's exit.
+  for it: the host signals the handle it owns and waits for that handle's exit. For a
+  hosted Codex row the same owner also stops that row's own private backend and its
+  private relay, and the row is not reported settled until each of them proves its own
+  actual end — the backend child's genuine exit plus the natural end of both captured
+  readers, and the relay's own listener and socket closures — never from a stop
+  acknowledgement, a timer, or a stream being destroyed.
 - A native launch descriptor may carry one Windows batch command line beside its
   file, argv, environment, and workspace. The manager validates it as one printable
   non-empty string and refuses a descriptor carrying an unusable one — it is never
@@ -827,10 +1010,12 @@ What to expect, and what this does and does not prove:
 - If this host armed the row's status observer, the card is the other thing worth
   watching: the agent line moves between running and rest as the provider's own
   turns start and end, the activity line names the current or last tool type, and a
-  Claude row can show an observed pending question request and its root-snapshot
-  background counts. Two outcomes are also correct behavior: a card whose fields
-  stay `unknown` because the provider's own policy declined the observer's hooks, and —
-  on Codex — the provider's own hook review-and-trust prompt, which this host never
+  Claude row can show an observed pending question request and its background
+  membership counts; a Codex row's counts appear once that row's own root is bound.
+  Two outcomes are also correct behavior: a card whose fields
+  stay `unknown` because the provider's own policy declined the observer's hooks or
+  because that row's root is not yet bound, and — where the operator configured hooks
+  of their own — the provider's own hook review-and-trust prompt, which this host never
   answers or bypasses for you.
 - **No automated approvals.** Never try a provider's permission-bypass or
   approval-disabling flag to make a tryout easier; a configured target that names

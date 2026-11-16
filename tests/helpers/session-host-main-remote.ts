@@ -407,14 +407,14 @@ export function harnessManager(harness: Harness): FakeManager {
 
 /** Text the compositor actually drew in the native pane of the wide layout. */
 export function nativePaneText(frame: ComposedHostFrame | undefined): string {
-  return frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n") ?? "";
+  return frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36)).join("\n") ?? "";
 }
 
 /** Exact visible status in these wide, banner-free fixtures: the host's own line, clipped to the pane. */
 export function assertWideRemoteStatus(harness: Harness, message: string, description?: string): void {
-  const cols = harness.terminal.columns - 33;
+  const cols = harness.terminal.columns - 36;
   assert.equal(
-    plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33),
+    plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36),
     message.slice(0, cols).padEnd(cols, " "),
     description,
   );
@@ -480,9 +480,9 @@ export async function remoteNativeInputHarness(
   await nextTurn();
   assert.equal(harness.sidebar!.focus, "main", "the written remote source owns Main focus");
   assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("REMOTE-NATIVE-IO"));
-  // Wide layout: 32 sidebar columns plus one divider. The 40x20 frame is drawn at
+  // Wide layout: 35 sidebar columns plus one divider. The 40x20 frame is drawn at
   // the native pane's top-left corner, so everything past it is host padding.
-  return { harness, peer, content, manager, source, generation, rect: { column: 33, row: 1, cols: 40, rows: 20 } };
+  return { harness, peer, content, manager, source, generation, rect: { column: 36, row: 1, cols: 40, rows: 20 } };
 }
 
 /**

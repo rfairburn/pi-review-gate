@@ -55,6 +55,7 @@ import {
   isSidebarFocusedFrame,
   parseRosterFrame,
   selectedRosterEntry,
+  SIDEBAR_COLUMNS,
   sidebarPaneLines,
   sidebarRosterHidden,
 } from "./session-host-native-roster-witness";
@@ -513,7 +514,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 function selectedRosterLabel(frame: string): string | undefined {
-  return selectedRosterEntry(frame, 32)?.label;
+  return selectedRosterEntry(frame, SIDEBAR_COLUMNS)?.label;
 }
 
 /**
@@ -522,7 +523,7 @@ function selectedRosterLabel(frame: string): string | undefined {
  * hints must all be drawn. A partial repaint never authorizes a stop.
  */
 export function hasPosixStopConfirmation(frame: string, title: string): boolean {
-  const pane = sidebarPaneLines(frame, 32).slice(1);
+  const pane = sidebarPaneLines(frame, SIDEBAR_COLUMNS).slice(1);
   const warning = pane.slice(2, -1).join(" ").replace(/\s+/gu, " ").trim();
   return pane[0]?.trim() === "Stop session?"
     && pane[1]?.trim() === title
@@ -1009,8 +1010,8 @@ export class PosixLauncherPtyDriver {
     }
     const expectHidden = wasVisible && !wasMainFocus;
     await this.waitFrame((frame) => expectHidden
-      ? sidebarRosterHidden(frame, 32)
-      : isSidebarFocusedFrame(frame, 32),
+      ? sidebarRosterHidden(frame, SIDEBAR_COLUMNS)
+      : isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
     "public F8 sidebar toggle", before);
   }
 
@@ -1025,7 +1026,7 @@ export class PosixLauncherPtyDriver {
     if (!this.sidebarVisible || this.focus !== "sidebar") await this.toggleSidebar();
     assert.equal(this.focus, "sidebar");
     assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32), "the complete sidebar-only footer proves public sidebar focus");
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS), "the complete sidebar-only footer proves public sidebar focus");
   }
 
   async moveRosterTo(label: string): Promise<void> {
@@ -1181,11 +1182,11 @@ export class PosixLauncherPtyDriver {
     const shutdownBefore = this.shutdownCount(session);
     await this.ensureSidebarFocus();
     await this.moveRosterTo(session.displayName);
-    const selected = selectedRosterEntry(this.currentText(), 32);
+    const selected = selectedRosterEntry(this.currentText(), SIDEBAR_COLUMNS);
     if (selected === undefined || selected.kind !== "native" || selected.title !== session.displayName) {
       throw new Error("the exact selected native row is required before requesting a stop");
     }
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32),
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS),
       "the complete sidebar-only footer proves the stop action belongs to the visible sidebar");
     const beforeStop = this.frameRevision;
     this.write("d", "request stop of the exact selected native child");
@@ -1208,7 +1209,7 @@ export class PosixLauncherPtyDriver {
   }
 
   private nativeCardExited(frame: string): boolean {
-    const parsed = parseRosterFrame(frame, 32);
+    const parsed = parseRosterFrame(frame, SIDEBAR_COLUMNS);
     return parsed.complete && parsed.cards.some((card) => card.status === "exited (code 0)");
   }
 
@@ -1228,8 +1229,8 @@ export class PosixLauncherPtyDriver {
 
   private async assertNativeExitEvidence(session: PosixOwnedSession, rowRemoved = false): Promise<void> {
     await this.waitFrame((frame) => rowRemoved
-      ? parseRosterFrame(frame, 32).complete && parseRosterFrame(frame, 32).count === 0
-        && isSidebarFocusedFrame(frame, 32)
+      ? parseRosterFrame(frame, SIDEBAR_COLUMNS).complete && parseRosterFrame(frame, SIDEBAR_COLUMNS).count === 0
+        && isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS)
       : this.nativeCardExited(frame),
     rowRemoved
       ? "Main renders the complete empty roster after the exact native child is stopped and removed"
@@ -1292,7 +1293,7 @@ export class PosixLauncherPtyDriver {
   async finishHostNormally(): Promise<PtyExit> {
     await this.ensureSidebarFocus();
     assert.equal(this.focus, "sidebar", "the explicit host quit action belongs to the visible sidebar, not a native editor");
-    await this.waitFrame((frame) => isSidebarFocusedFrame(frame, 32),
+    await this.waitFrame((frame) => isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
       "the complete sidebar-only footer exposes the host-only quit action");
     this.write("q", "quit host");
     this.focus = "main";

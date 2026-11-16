@@ -94,7 +94,7 @@ function makeRemoteRow(id: string): RemoteSessionMetadata {
   };
 }
 
-function makeSnapshot(hosts: readonly { id: string; rows: readonly string[] }[]): PeerUiSnapshot {
+function makeSnapshot(hosts: readonly { id: string; rows: readonly (string | RemoteSessionMetadata)[] }[]): PeerUiSnapshot {
   const typed: (PeerUiHost & { roster: PeerUiHost["roster"] & { hostRunId?: string | null } })[] = hosts.map((host) => ({
     id: host.id,
     label: `host-${host.id}`,
@@ -105,7 +105,11 @@ function makeSnapshot(hosts: readonly { id: string; rows: readonly string[] }[])
     message: null,
     reconnectSuppressed: false,
     previouslyConnected: true,
-    roster: { state: "current", rows: host.rows.map(makeRemoteRow), hostRunId: `run-${host.id}` },
+    roster: {
+      state: "current",
+      rows: host.rows.map((row) => typeof row === "string" ? makeRemoteRow(row) : row),
+      hostRunId: `run-${host.id}`,
+    },
   }));
   return {
     revision: 1,
@@ -143,7 +147,8 @@ interface Harness {
 function makeHarness(
   options: {
     locals?: number;
-    hosts?: readonly { id: string; rows: readonly string[] }[];
+    items?: readonly SidebarItem[];
+    hosts?: readonly { id: string; rows: readonly (string | RemoteSessionMetadata)[] }[];
     controllerOptions?: SidebarControllerOptions;
   } = {},
 ): Harness {
@@ -155,13 +160,16 @@ function makeHarness(
     onAction: (action) => actions.push(action),
     getSessionOrder: (): readonly SidebarMainOwnerKey[] => [],
   });
-  if (locals > 0) controller.updateItems(Array.from({ length: locals }, (_unused, index) => makeItem(`l${index + 1}`)));
+  if (options.items !== undefined) controller.updateItems(options.items);
+  else if (locals > 0) controller.updateItems(Array.from({ length: locals }, (_unused, index) => makeItem(`l${index + 1}`)));
   if (options.hosts !== undefined) controller.setPeerUiSnapshot(makeSnapshot(options.hosts));
   controller.handleInput(TOGGLE); // show the pane and take roster focus
   assert.equal(controller.focus, "sidebar");
 
-  const localTitles = Array.from({ length: locals }, (_unused, index) => `local-l${index + 1}`);
-  const remoteTitles = (options.hosts ?? []).flatMap((host) => host.rows.map((row) => `remote-${row}`));
+  const localTitles = options.items?.map((item) => item.label)
+    ?? Array.from({ length: locals }, (_unused, index) => `local-l${index + 1}`);
+  const remoteTitles = (options.hosts ?? []).flatMap((host) => host.rows.map((row) =>
+    typeof row === "string" ? `remote-${row}` : row.label));
   // The renderer's fixed action tail, in its drawn order. The grouped Settings
   // row exists exactly when an entry point it offers does: a peer snapshot makes
   // Network available, so a roster with hosts carries it between New session and
@@ -357,8 +365,84 @@ test("the lane reserves its column: list rows are clipped one column narrower, h
   assert.ok(titleRows.length > 0, "the drawn window shows local cards");
   for (const row of titleRows) {
     assert.match((texts[row + 1] ?? "").trim(), /^(?:> )?agent /, `"${texts[row]}" keeps its status row below it`);
-    assert.match((texts[row + 2] ?? "").trim(), /^(?:> )?background /, `"${texts[row]}" keeps its background row`);
+    assert.match((texts[row + 2] ?? "").trim(), /^(?:> )?bg tasks /, `"${texts[row]}" keeps its background row`);
   }
+});
+
+test("the 35-column count row keeps every label and value whole beside a real overflow lane", () => {
+  const items: SidebarItem[] = [
+    { ...makeItem("pi-unknown"), label: "Pi unknown", busy: null, pendingInput: null },
+    { ...makeItem("native-unknown"), label: "Native unknown", backend: "claude", busy: true, pendingInput: true },
+    { ...makeItem("known"), label: "Known zero-two", busy: false, pendingInput: false, activeTasks: 0, activeShells: 2 },
+    { ...makeItem("partial-tasks"), label: "Partial tasks", busy: false, pendingInput: false, activeTasks: null, activeShells: 2 },
+  ];
+  const remoteRows: RemoteSessionMetadata[] = [
+    { ...makeRemoteRow("r-unknown"), label: "Remote unknown", activeTasks: null, activeShells: null },
+    { ...makeRemoteRow("r-known"), label: "Remote known", activeTasks: 0, activeShells: 2 },
+    { ...makeRemoteRow("r-partial"), label: "Remote partial", activeTasks: 2, activeShells: null },
+  ];
+  const harness = makeHarness({ items, hosts: [{ id: "h1", rows: remoteRows }] });
+  const cols = 35;
+  const rows = 24;
+  const first = harness.view(cols, rows);
+  const bounds = laneRows(first.lane);
+  assert.ok(bounds, "the mixed roster really overflows into a painted lane");
+  const thumb = thumbRows(first.lane)[0]!;
+  assert.ok(thumb !== undefined, "the lane paints its thumb");
+  const map = harness.presentation();
+  assert.equal(map.beginScrollbarAt(cols - 1, thumb, cols, rows), true,
+    "the real lane thumb is still a live pointer target beside the full count row");
+  assert.equal(map.endScrollbarAt(), true, "the unchanged lane gesture ends exactly once");
+  assert.equal(harness.presentation().jumpScrollbarAt(cols - 1, bounds[0], cols, rows), true,
+    "the real lane track still jumps to the top window");
+
+  const expected = [
+    "bg tasks unknown | shells unknown",
+    "bg tasks 0 | shells 2",
+    "bg tasks unknown | shells 2",
+    "bg tasks 2 | shells unknown",
+  ];
+  const expectedTitles = ["Pi unknown", "Native unknown", "Remote unknown", "Known zero-two", "Remote known", "Partial tasks", "Remote partial"];
+  const seen = new Set<string>();
+  const seenTitles = new Set<string>();
+  let sawShrunkUnknown = false;
+  let view = harness.view(cols, rows);
+  for (let step = 0; step < 20; step += 1) {
+    const stepBounds = laneRows(view.lane);
+    assert.ok(stepBounds, `the roster still overflows at scroll step ${step}`);
+    for (const line of view.texts) {
+      if (!line.includes("bg tasks")) continue;
+      const text = line.trimEnd();
+      assert.equal(text.includes("..."), false, `the complete count row is drawn: ${JSON.stringify(text)}`);
+      const content = text.replace(/^ +/u, "");
+      assert.match(content, /^bg tasks (?:\d+|unknown) \| shells (?:\d+|unknown)$/,
+        `both count labels and values stay whole: ${JSON.stringify(text)}`);
+      if (text === " bg tasks unknown | shells unknown") sawShrunkUnknown = true;
+      seen.add(content);
+    }
+    for (let row = 0; row < view.texts.length; row += 1) {
+      const title = (view.texts[row] ?? "").trim();
+      if (!expectedTitles.includes(title)) continue;
+      const count = view.texts.slice(row + 1, row + 5).find((line) => line.includes("bg tasks"));
+      if (count === undefined) continue;
+      assert.equal(count.includes("..."), false, `the ${title} count row is complete`);
+      seenTitles.add(title);
+    }
+    if (!harness.presentation().scrollRosterAt(1, stepBounds[0], cols, rows, 1)) break;
+    view = harness.view(cols, rows);
+  }
+  assert.deepEqual([...seen].sort(), [...expected].sort(),
+    "local Pi, native, and remote cards keep the same complete count rows while the lane is painted");
+  assert.deepEqual([...seenTitles].sort(), [...expectedTitles].sort(),
+    "every local Pi, native, and remote fixture card keeps its own complete count row beside the lane");
+  assert.equal(sawShrunkUnknown, true,
+    "the both-unknown row yields exactly one blank cell so its complete 33-cell text fits the 34-cell list width");
+
+  const fitting = makeHarness({ items: [{ ...makeItem("solo"), label: "Pi solo" }] });
+  const fittingView = fitting.view(cols, rows);
+  assert.equal(laneRows(fittingView.lane), undefined, "a fitting roster paints no lane");
+  assert.ok(fittingView.texts.some((line) => line.trimEnd() === "  bg tasks unknown | shells unknown"),
+    "without a lane the existing two-cell count-row indent is unchanged");
 });
 
 // ---------------------------------------------------------------------------

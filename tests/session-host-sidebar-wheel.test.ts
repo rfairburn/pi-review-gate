@@ -4,7 +4,7 @@
  * dependency seam), never by calling a sidebar helper directly.
  *
  * Every assertion reads the ACTUAL rows the host wrote into the sidebar pane
- * (scoped to the real 32-cell pane by the shipped pane witness), so a handler
+ * (scoped to the real 35-cell pane by the shipped pane witness), so a handler
  * that ran without changing what the operator sees can never pass. The shipped
  * strict roster parser is additionally required to be complete wherever the
  * whole tail (cards plus the fixed actions) is on screen.
@@ -34,6 +34,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { visibleWidth } from "pi-session-host-tui";
 
 import type { NativeInstanceView } from "../src/session-host/instances";
 import type { PeerUiHost } from "../src/session-host/peer-ui-protocol";
@@ -52,6 +53,7 @@ import {
   ready,
 } from "./helpers/session-host-main-harness";
 import {
+  SIDEBAR_COLUMNS,
   parseRosterFrame,
   sidebarPaneLines,
 } from "./helpers/session-host-native-roster-witness";
@@ -91,7 +93,11 @@ function managerOf(harness: Harness): NonNullable<Harness["manager"]> {
 }
 
 /** One live owned row whose surface reports a mouse-tracking native mode. */
-function seedSession(harness: Harness, index: number): void {
+function seedSession(
+  harness: Harness,
+  index: number,
+  counts: Partial<Pick<NativeInstanceView, "activeTasks" | "activeShells">> = {},
+): void {
   const manager = managerOf(harness);
   const id = `native-${index}`;
   const nativeSession: SessionHostNativeSession = { sessionId: `conversation-${index}`, epoch: 1, name: `Session ${index}` };
@@ -107,6 +113,7 @@ function seedSession(harness: Harness, index: number): void {
     inputSurface: false,
     activity: [],
     nativeSession,
+    ...counts,
   };
   manager.views.push(view);
   const surface = new FakeSurface(47, 23, `frame:${id}`);
@@ -143,19 +150,101 @@ function rosterRows(harness: Harness): string[] {
 }
 
 /**
+ * The raw composed lines behind `rosterRows`, in the same order. The pane
+ * witness pads every line to the pane width, so the raw line is where the
+ * writer's REAL text-column budget (and the painted lane, if any) is still
+ * visible.
+ */
+function rawRosterRows(harness: Harness): string[] {
+  const text = latestFrameText(harness);
+  const pane = sidebarPaneLines(text);
+  const header = pane.findIndex((line) => /^\s*Sessions \(\d+\)\s*$/u.test(line));
+  return header < 0 ? [] : text.split("\n").slice(header + 1);
+}
+
+/**
+ * The #613 lane glyphs the drawn roster scrollbar paints in its own last pane
+ * column: light box track, heavy box idle thumb, full block held thumb.
+ */
+const SCROLLBAR_LANE_GLYPHS = new Set(["\u2502", "\u2503", "\u2588"]);
+
+/**
+ * True only when the last written frame actually painted the #613 scrollbar
+ * lane. The lane takes exactly one of the pane's text columns; it is what can
+ * force a count row's blank prefix down, never a reason to shrink it by itself.
+ * Recognition is the shipped lane stripper's own rule: the pane's final cell
+ * before the divider carries a lane glyph on at least two rows (the track is
+ * always painted whole), so a content cell that merely ends in a box glyph is
+ * never mistaken for a rail.
+ */
+function rosterRailDrawn(harness: Harness): boolean {
+  const dividerCell = SIDEBAR_COLUMNS;
+  const railedRows = latestFrameText(harness).split("\n").filter((line) => {
+    const cells = Array.from(line);
+    return cells[dividerCell] === "\u2502" && SCROLLBAR_LANE_GLYPHS.has(cells[dividerCell - 1] ?? "");
+  });
+  return railedRows.length >= 2;
+}
+
+/**
+ * The drawn card's count row exactly as the approved 35-column pane writes it.
+ * The text is read CLOSED — both labels and both values complete, so no
+ * ellipsized, truncated, or partial row can pass — and the blank prefix is
+ * derived from the same fit rule as production `cardBackgroundLine`: keep the
+ * original two cells whenever the closed row fits, and give up cells only when
+ * the pane's text columns cannot spare them. A short known row therefore keeps
+ * two blanks even while the scrollbar lane is painted; only a row whose text
+ * needs the last cells (unknown/unknown with the lane) draws one. The raw frame
+ * line then proves the row fills the writer's real text-column budget, so a
+ * padded-short or clipped row still fails.
+ */
+function assertDrawnCountRow(harness: Harness, row: string, rawRow: string, title: string): void {
+  const rail = rosterRailDrawn(harness);
+  const textColumns = SIDEBAR_COLUMNS - (rail ? 1 : 0);
+  const drawn = row.trimEnd();
+  const closed = /^ {0,2}(bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A))$/u.exec(drawn);
+  assert.ok(closed !== null,
+    `"${title}" draws the complete closed bg tasks/shells count row, both labels and both values`);
+  const countText = closed[1]!;
+  const countTextColumns = visibleWidth(countText);
+  const expectedIndent = Math.min(2, Math.max(0, textColumns - countTextColumns));
+  assert.equal(visibleWidth(drawn) - countTextColumns, expectedIndent,
+    `"${title}" uses the exact ${expectedIndent}-cell blank prefix the ${textColumns} text columns leave beside its ` +
+    `${countTextColumns}-cell closed count row (rail ${rail ? "painted" : "absent"})`);
+  assert.ok(visibleWidth(drawn) <= textColumns,
+    `"${title}" keeps the complete count row inside the ${textColumns} text columns`);
+  const cells = Array.from(rawRow);
+  assert.equal(cells[SIDEBAR_COLUMNS], "\u2502", `"${title}" keeps its count row beside the pane divider`);
+  if (rail) {
+    assert.ok(SCROLLBAR_LANE_GLYPHS.has(cells[SIDEBAR_COLUMNS - 1] ?? ""),
+      `"${title}" leaves the pane's last terminal column to the painted scrollbar lane`);
+  }
+  assert.equal(cells.slice(0, textColumns).join(""), drawn + " ".repeat(textColumns - visibleWidth(drawn)),
+    `"${title}" fills exactly the writer's ${textColumns}-column text budget, padding included`);
+}
+
+/** The exact drawn count row of a title the pane currently shows, trimmed. */
+function countRowOf(harness: Harness, title: string): string {
+  const rows = rosterRows(harness);
+  const row = rows.findIndex((line) => line.trimEnd() === title);
+  assert.ok(row >= 0, `the written pane drew "${title}"`);
+  return (rows[row + 2] ?? "").trimEnd();
+}
+
+/**
  * The native card titles the pane actually drew. Fail closed on a partial
  * draw: a title without its own status, background, and reserved activity rows
  * is a clipped card and can never be counted as visible.
  */
 function drawnCardTitles(harness: Harness): string[] {
   const rows = rosterRows(harness);
+  const rawRows = rawRosterRows(harness);
   const titles: string[] = [];
   for (let row = 0; row < rows.length; row += 1) {
     const title = rows[row].trimEnd();
     if (!/^Session \d+$/u.test(title)) continue;
     assert.match(rows[row + 1]?.trimEnd() ?? "", /^(?:> |  )agent /u, `"${title}" is drawn with its status row`);
-    assert.match(rows[row + 2]?.trimEnd() ?? "", /^(?:> |  )bg tasks (?:unknown|\d+|N\/A) \| shells /u,
-      `"${title}" is drawn with both of its labeled background count cells`);
+    assertDrawnCountRow(harness, rows[row + 2] ?? "", rawRows[row + 2] ?? "", title);
     for (const activityRow of [rows[row + 3] ?? "", rows[row + 4] ?? ""]) {
       assert.ok(activityRow.trimEnd() === "" || /^ {4}/u.test(activityRow.trimEnd()),
         `"${title}" keeps its full expanded extent instead of a clipped card`);
@@ -340,6 +429,48 @@ test("a roster that fits one page is untouched by wheeling in either direction",
   assert.equal(harness.writer.frames.length, frames, "a refused scroll repaints nothing");
   assert.equal(parseRosterFrame(latestFrameText(harness)).complete, true,
     "the strict roster witness still accepts the untouched roster");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("known and mixed count rows keep the original two-cell blank budget beside the painted rail", async () => {
+  const harness = createHarness();
+  await ready(harness);
+  seedSession(harness, 1);
+  seedSession(harness, 2, { activeTasks: 0, activeShells: 0 });
+  seedSession(harness, 3, { activeTasks: 3, activeShells: null });
+  for (let index = 4; index <= 6; index += 1) seedSession(harness, index);
+  managerOf(harness).notify();
+  await nextTurn();
+  assert.equal(rosterRailDrawn(harness), true, "six cards overflow the page, so the scrollbar lane is painted");
+  await highlightFirstCard(harness);
+
+  // The closed unknown/unknown row is 33 cells, so the rail's 34 text columns
+  // leave it exactly the one blank cell it needs and no more.
+  assert.equal(countRowOf(harness, "Session 1"), " bg tasks unknown | shells unknown",
+    "unknown/unknown spends exactly one blank cell beside the painted lane");
+  assert.ok(drawnCardTitles(harness).includes("Session 1"),
+    "the long count row is drawn COMPLETE rather than clipped or padded short");
+
+  // A short KNOWN 0/0 row is only 21 cells: 34 - 21 still leaves the original
+  // two blanks, so the lane must not force a one-space prefix onto it.
+  harness.terminal.emitInput(DOWN);
+  await nextTurn();
+  assert.ok(drawnCardTitles(harness).includes("Session 2"));
+  assert.equal(countRowOf(harness, "Session 2"), "  bg tasks 0 | shells 0",
+    "a known 0/0 row keeps both blanks even while the lane is painted");
+
+  // A mixed known/unknown row is still short enough for the original indent.
+  harness.terminal.emitInput(DOWN);
+  await nextTurn();
+  assert.ok(drawnCardTitles(harness).includes("Session 3"));
+  assert.equal(countRowOf(harness, "Session 3"), "  bg tasks 3 | shells unknown",
+    "a mixed known/unknown row also keeps both blanks beside the lane");
+
+  // One window proves the rule is per-row: the long row is at one blank while
+  // the short rows keep two, all in the same painted-rail frame.
+  const drawn = drawnCardTitles(harness);
+  assert.ok(drawn.includes("Session 2") && drawn.includes("Session 3"),
+    `the window draws short and mixed count rows together: ${JSON.stringify(drawn)}`);
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -710,8 +841,7 @@ test("a keyboard move step re-follows its source after a wheel scroll moved it o
   assert.equal(markedCardTitle(harness), "Session 1", "the returned card is still marked as the one being moved");
   const markedRows = rosterRows(harness);
   const markedRow = markedRows.findIndex((line) => line.startsWith(">>"));
-  assert.ok(/^ {2}bg tasks (?:unknown|\d+|N\/A) \| shells /u.test(markedRows[markedRow + 1] ?? ""),
-    "the returned card keeps both labeled count cells and is drawn COMPLETE, not clipped at the window edge");
+  assertDrawnCountRow(harness, markedRows[markedRow + 1] ?? "", rawRosterRows(harness)[markedRow + 1] ?? "", "Session 1");
   assert.ok(markedRows.some((line) => /^(?:\^ |v )agent /u.test(line)),
     "the destination card and its insertion marker came back with it");
   assert.equal(harness.sidebar?.selectedId, selected, "the wheel and the step moved no highlight");

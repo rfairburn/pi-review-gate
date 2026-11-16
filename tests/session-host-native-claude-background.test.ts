@@ -457,6 +457,89 @@ test("a run keeps exact counts past the settled-id memory bound, and a resync re
   assert.equal(ledger.snapshot().membershipKnown, true);
 });
 
+test("hasSettled is a scoped, non-mutating one-bit read that never exposes the memory", () => {
+  const ledger = freshLedger();
+  // Nothing has settled, so nothing is known settled.
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), false);
+  assert.equal(ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" }).outcome, "applied");
+  // An ACTIVE member is never "already settled".
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), false);
+
+  // An unusable id, another run's scope, and an unbound ledger all answer no:
+  // the predicate is fenced exactly like every other ledger operation, and it
+  // never falls back to "yes" for an id or a scope it cannot attribute.
+  assert.equal(ledger.hasSettled(SCOPE, ""), false);
+  assert.equal(ledger.hasSettled(SCOPE, "b\u0001secret"), false);
+  assert.equal(ledger.hasSettled(SCOPE, undefined), false);
+  assert.equal(
+    ledger.hasSettled(SCOPE, `b${"x".repeat(MAX_NATIVE_CLAUDE_BACKGROUND_MEMBER_ID_BYTES)}`),
+    false,
+  );
+  assert.equal(ledger.hasSettled(SCOPE_B, SHELL_A), false);
+  assert.equal(new NativeClaudeBackgroundLedger().hasSettled(SCOPE, SHELL_A), false);
+
+  // The settle lands, and the same question now answers yes — for this scope only.
+  assert.equal(ledger.observeSettled(SCOPE, SHELL_A).outcome, "applied");
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), true);
+  assert.equal(ledger.hasSettled(SCOPE_B, SHELL_A), false, "another run's ledger claims nothing");
+
+  // Asking changes nothing at all: the same complete snapshot, still exact, still
+  // needing no resync, and the settled memory still refuses a resurrecting start.
+  const before = ledger.snapshot();
+  for (let attempt = 0; attempt < 3; attempt += 1) assert.equal(ledger.hasSettled(SCOPE, SHELL_A), true);
+  assert.deepEqual(ledger.snapshot(), before);
+  assert.equal(ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" }).reason, "late-start-after-settle");
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), true);
+
+  // An id this ledger never saw answers no: absence of knowledge is never stated
+  // as knowledge, and the read exposes no id list, no history, and no count.
+  assert.equal(ledger.hasSettled(SCOPE, TASK_A), false);
+
+  // Retirement releases the memory with the scope, so a later run cannot inherit
+  // an older run's claim.
+  ledger.retireScope(SCOPE);
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), false, "a retired scope answers nothing");
+});
+
+test("hasSettled follows reactivation and the bounded memory's own eviction", () => {
+  const ledger = freshLedger();
+  assert.equal(ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" }).outcome, "applied");
+  assert.equal(ledger.observeSettled(SCOPE, SHELL_A).outcome, "applied");
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), true);
+
+  // A complete census that lists the member again positively reactivates it, and
+  // with the active member the remembered settle is gone: while this ledger
+  // believes the member runs, no caller may claim it is already settled.
+  assert.deepEqual(
+    ledger.replaceFullRootMembers(SCOPE, [{ id: SHELL_A, kind: "shell" }]).counts,
+    { tasks: 0, shells: 1 },
+  );
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), false, "a reactivated member is not already settled");
+  assert.equal(ledger.observeSettled(SCOPE, SHELL_A).outcome, "applied");
+  assert.equal(ledger.hasSettled(SCOPE, SHELL_A), true, "its own fresh settle is remembered again");
+
+  // Past the memory bound the oldest remembered id is evicted first, and a
+  // forgotten id can never be claimed as known settled — while the counts this
+  // ledger can state stay exact the whole way.
+  const ids = Array.from(
+    { length: MAX_NATIVE_CLAUDE_BACKGROUND_TOMBSTONES + 1 },
+    (_unused, index) => `b${index}`,
+  );
+  const bounded = freshLedger();
+  for (const id of ids) {
+    assert.equal(bounded.observeStarted(SCOPE, { id, kind: "shell" }).outcome, "applied");
+    assert.equal(bounded.observeSettled(SCOPE, id).outcome, "applied");
+  }
+  assert.deepEqual(bounded.counts(), { tasks: 0, shells: 0 });
+  assert.equal(bounded.hasSettled(SCOPE, ids[0] as string), false, "an evicted id is not knowledge");
+  assert.equal(bounded.hasSettled(SCOPE, ids[1] as string), true, "the freshest remembered ids still answer");
+  assert.equal(
+    bounded.hasSettled(SCOPE, ids[ids.length - 1] as string),
+    true,
+    "the id just remembered answers yes",
+  );
+});
+
 test("a mid-stream adopted scope tracks members but publishes nothing until a complete snapshot", () => {
   const ledger = new NativeClaudeBackgroundLedger();
   assert.deepEqual(ledger.adoptRootSession(SCOPE), {
@@ -667,4 +750,193 @@ test("closed kind guard, membership reader, and launch reader stay strict and co
     { id: "m11111111", kind: "task" },
   ]), { tasks: 2, shells: 1 });
   assert.deepEqual(countNativeClaudeBackgroundMembers([]), { tasks: 0, shells: 0 });
+});
+
+/* --------------------------------- per-category coverage */
+
+/*
+ * A hole is withdrawn at the width of its own evidence. When the failed evidence
+ * positively names one count category, the OTHER category keeps its exact number,
+ * because nothing in the failed evidence contradicted it. When the hole cannot be
+ * attributed, both categories withdraw — guessing which half survived is exactly
+ * the fabricated certainty this ledger exists to refuse. A complete root
+ * membership snapshot states the whole set, so it repairs both.
+ */
+
+test("a category-attributed hole withdraws only that category and keeps the other exact", () => {
+  const ledger = freshLedger();
+  ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  ledger.observeStarted(SCOPE, { id: SHELL_B, kind: "shell" });
+  ledger.observeStarted(SCOPE, { id: TASK_A, kind: "task" });
+  assert.deepEqual(ledger.coverage(), { tasks: 1, shells: 2 });
+
+  // A task-side hole: the tasks go unknown, and the two shells the failed
+  // evidence never touched keep their exact number.
+  const withdrawn = ledger.noteCoverageGap(SCOPE, ["task"]);
+  assert.equal(withdrawn.outcome, "invalid");
+  assert.equal(withdrawn.reason, "coverage-gap");
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: 2 });
+  // The whole-pair reading stays honest: a partially unknown census is not an
+  // exact set, so `counts()` and `membershipKnown` still say unknown.
+  assert.equal(ledger.counts(), null);
+  assert.equal(ledger.snapshot().membershipKnown, false);
+  assert.equal(ledger.snapshot().needsResync, true);
+
+  // Edges on the healthy category keep moving while the other one is unknown.
+  ledger.observeSettled(SCOPE, SHELL_A);
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: 1 });
+  ledger.observeStarted(SCOPE, { id: "b0zzzzzzz9", kind: "shell" });
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: 2 });
+
+  // Only a complete root membership snapshot repairs BOTH categories.
+  assert.deepEqual(ledger.replaceFullRootMembers(SCOPE, [{ id: SHELL_A, kind: "shell" }]), {
+    outcome: "applied",
+    reason: "root-snapshot-applied",
+    counts: { tasks: 0, shells: 1 },
+  });
+  assert.deepEqual(ledger.coverage(), { tasks: 0, shells: 1 });
+  assert.equal(ledger.snapshot().needsResync, false);
+});
+
+test("the inverse category hole leaves the tasks exact and the shells unknown", () => {
+  const ledger = freshLedger();
+  ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  ledger.observeStarted(SCOPE, { id: TASK_A, kind: "task" });
+  ledger.observeStarted(SCOPE, { id: "a5e6f7g8h", kind: "task" });
+
+  ledger.noteCoverageGap(SCOPE, ["shell"]);
+  assert.deepEqual(ledger.coverage(), { tasks: 2, shells: null });
+
+  // A settle of a tracked TASK still moves the task axis exactly while the shell
+  // census is unknown, and it never touches the unknown half.
+  assert.deepEqual(ledger.observeSettled(SCOPE, TASK_A), {
+    outcome: "tracked",
+    reason: "settle-observed",
+    counts: null,
+  });
+  assert.deepEqual(ledger.coverage(), { tasks: 1, shells: null });
+});
+
+test("an unattributed hole, an empty kind list, and an unusable one all withdraw both", () => {
+  for (const kinds of [undefined, [], ["agent"], ["task", "bogus"], "task", null]) {
+    const ledger = freshLedger();
+    ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+    ledger.observeStarted(SCOPE, { id: TASK_A, kind: "task" });
+    assert.equal(ledger.noteCoverageGap(SCOPE, kinds as never).outcome, "invalid");
+    assert.deepEqual(
+      ledger.coverage(),
+      { tasks: null, shells: null },
+      `a hole nobody can attribute is a hole in the whole census: ${String(kinds)}`,
+    );
+  }
+});
+
+test("a settle whose member kind cannot be proven withdraws both categories", () => {
+  const ledger = freshLedger();
+  ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  ledger.observeStarted(SCOPE, { id: TASK_A, kind: "task" });
+
+  // A completion for an id this ledger never started: its launch edge went
+  // unobserved, and nothing about the id says which category it belonged to.
+  assert.deepEqual(ledger.observeSettled(SCOPE, "bneverlaun"), {
+    outcome: "invalid",
+    reason: "settle-unobserved",
+    counts: null,
+  });
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: null });
+});
+
+test("a duplicate or foreign settle never touches the other category", () => {
+  const ledger = freshLedger();
+  ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  ledger.observeStarted(SCOPE, { id: TASK_A, kind: "task" });
+  ledger.noteCoverageGap(SCOPE, ["shell"]);
+
+  // The settle lands on the healthy category: the outcome is `tracked` because
+  // the PAIR is not publishable, while `coverage()` still moves the exact half.
+  assert.deepEqual(ledger.observeSettled(SCOPE, TASK_A), {
+    outcome: "tracked",
+    reason: "settle-observed",
+    counts: null,
+  });
+  assert.deepEqual(ledger.coverage(), { tasks: 0, shells: null });
+  assert.equal(ledger.observeSettled(SCOPE, TASK_A).reason, "duplicate-settle");
+  assert.deepEqual(ledger.coverage(), { tasks: 0, shells: null });
+
+  // A foreign scope mutates nothing at all, in either direction.
+  assert.equal(ledger.observeSettled(SCOPE_B, SHELL_A).reason, "scope-mismatch");
+  assert.equal(ledger.noteCoverageGap(SCOPE_B, ["task"]).reason, "scope-mismatch");
+  assert.deepEqual(ledger.coverage(), { tasks: 0, shells: null });
+});
+
+test("scope retirement and a mid-stream adopt still withdraw the whole pair", () => {
+  const ledger = freshLedger();
+  ledger.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  ledger.noteCoverageGap(SCOPE, ["task"]);
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: 1 });
+
+  // Retirement is not a per-category event: nothing is carried into a later run.
+  assert.deepEqual(ledger.retireScope(SCOPE).counts, null);
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: null });
+  assert.equal(ledger.snapshot().scopeToken, null);
+
+  const adopted = new NativeClaudeBackgroundLedger();
+  adopted.adoptRootSession(SCOPE);
+  adopted.observeStarted(SCOPE, { id: SHELL_A, kind: "shell" });
+  assert.deepEqual(adopted.coverage(), { tasks: null, shells: null });
+  assert.deepEqual(adopted.replaceFullRootMembers(SCOPE, [{ id: SHELL_A, kind: "shell" }]).counts,
+    { tasks: 0, shells: 1 });
+});
+
+test("capacity overflow withdraws the overflowing member's own category, in both directions", () => {
+  const memberIds = (prefix: string, count: number): string[] => Array.from(
+    { length: count },
+    (_unused, index) => `${prefix}${index}`,
+  );
+
+  // A full shell set plus one untrackable TASK launch: the arriving member's kind
+  // was validated before the bound was checked, so the hole this overflow proves
+  // is a task-side hole, and the shells this ledger can still state stay exact.
+  const ledger = freshLedger();
+  const shells = memberIds("b", MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS);
+  for (const id of shells) {
+    assert.equal(ledger.observeStarted(SCOPE, { id, kind: "shell" }).outcome, "applied");
+  }
+  assert.deepEqual(ledger.coverage(), { tasks: 0, shells: MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS });
+  assert.deepEqual(ledger.observeStarted(SCOPE, { id: "aoverflow", kind: "task" }), {
+    outcome: "invalid",
+    reason: "capacity",
+    counts: null,
+  });
+  assert.deepEqual(ledger.coverage(), { tasks: null, shells: MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS },
+    "a task overflow never erases an exact shell census");
+  assert.equal(ledger.snapshot().needsResync, true, "the withdrawn category still demands a resync");
+
+  // The same bound reached from the other side: a full census carrying one task,
+  // overflowing on a SHELL launch. Only the shells lose their coverage.
+  const inverse = freshLedger();
+  for (const id of memberIds("b", MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS - 1)) {
+    assert.equal(inverse.observeStarted(SCOPE, { id, kind: "shell" }).outcome, "applied");
+  }
+  assert.equal(inverse.observeStarted(SCOPE, { id: TASK_A, kind: "task" }).outcome, "applied");
+  assert.deepEqual(inverse.coverage(), {
+    tasks: 1,
+    shells: MAX_NATIVE_CLAUDE_BACKGROUND_MEMBERS - 1,
+  });
+  assert.deepEqual(inverse.observeStarted(SCOPE, { id: "boverflow", kind: "shell" }), {
+    outcome: "invalid",
+    reason: "capacity",
+    counts: null,
+  });
+  assert.deepEqual(inverse.coverage(), { tasks: 1, shells: null },
+    "a shell overflow never erases the known task census");
+
+  // A complete root snapshot repairs both categories, as for any other hole.
+  assert.deepEqual(
+    inverse.replaceFullRootMembers(SCOPE, [
+      { id: memberIds("b", 2)[0], kind: "shell" },
+      { id: TASK_A, kind: "task" },
+    ]).counts,
+    { tasks: 1, shells: 1 },
+  );
 });

@@ -43,7 +43,7 @@ import { inspectPeerStateAcl, verifyPrivateAclEvidence } from "../src/session-ho
 import { createSessionHostStateDirectory } from "../src/session-host/roster-store";
 
 import { closeNetworkThroughSettings } from "./helpers/session-host-network-settings-return";
-import { isSidebarFocusedFrame } from "./helpers/session-host-native-roster-witness";
+import { isSidebarFocusedFrame, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 import {
   WINDOWS_KEYS,
   WINDOWS_REQUIRE_ENV,
@@ -199,7 +199,7 @@ async function openNetwork(driver: WindowsMainPtyDriver, ready: (pane: string) =
  */
 async function closeNetwork(driver: WindowsMainPtyDriver, label: string): Promise<void> {
   await closeNetworkThroughSettings(driver, label);
-  assert.ok(isSidebarFocusedFrame(driver.currentText(), 32),
+  assert.ok(isSidebarFocusedFrame(driver.currentText(), SIDEBAR_COLUMNS),
     `${label}: the written roster proves public sidebar focus before the roster is walked again`);
 }
 

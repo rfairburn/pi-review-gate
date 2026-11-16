@@ -27,6 +27,7 @@ import {
   type OwnedCodexBackendLease,
   type OwnedCodexBackendReady,
   type OwnedCodexBackendSettlement,
+  type OwnedCodexBackendTerminationReport,
   type OwnedCodexTuiConnection,
 } from "../src/session-host/native-codex-backend";
 
@@ -987,4 +988,52 @@ test("a lease with rejected readiness and unconfirmed stop remains observable", 
 test("exposes a positive bounded default startup deadline", () => {
   assert.ok(Number.isSafeInteger(NATIVE_CODEX_BACKEND_DEFAULT_STARTUP_TIMEOUT_MS));
   assert.ok(NATIVE_CODEX_BACKEND_DEFAULT_STARTUP_TIMEOUT_MS > 0);
+});
+
+test("the lease hands its terminator a report-only force handle whose bit is sticky and never settlement", async () => {
+  const child = new FakeChild();
+  const spawnChild = child as unknown as ChildProcess;
+  const reports: OwnedCodexBackendTerminationReport[] = [];
+  const lease = launchOwnedCodexBackend({
+    identity: { leaseId: "lease-force-report", generation: 4 },
+    baseEnv: { PATH: "/usr/bin" },
+    spawnBackend: () => spawnChild,
+    terminateOwnedBackend: (terminated, report) => {
+      assert.equal(terminated, spawnChild);
+      reports.push(report);
+      report.forceEscalationAttempted();
+      throw new Error("synthetic forced-send failure after the report");
+    },
+    startupTimeoutMs: 1_000,
+  });
+  child.emit("spawn");
+  assert.equal(lease.status().forceEscalationAttempted, false);
+  lease.requestStop();
+  assert.equal(reports.length, 1);
+  const stopped = lease.status();
+  assert.equal(stopped.forceEscalationAttempted, true, "recorded even though the terminator then threw");
+  assert.equal(stopped.terminationFailed, true);
+  assert.equal(stopped.exitObserved, false);
+  assert.equal(stopped.settled, false, "a force attempt is never settlement");
+  await expectPending(lease.settlement);
+
+  child.emitExit(null, "SIGKILL");
+  await finishReader(child.stdout);
+  await finishReader(child.stderr);
+  await bounded(lease.settlement);
+  assert.equal(lease.status().settled, true);
+  assert.equal(lease.status().forceEscalationAttempted, true, "sticky after settlement");
+});
+
+test("a one-argument terminator stays usable and never reports a force attempt", async () => {
+  const capture = launch();
+  capture.lease.requestStop();
+  assert.equal(capture.terminateCalls(), 1);
+  assert.equal(capture.lease.status().terminationAttempted, true);
+  assert.equal(capture.lease.status().forceEscalationAttempted, false);
+  capture.fake.emitExit(null, "SIGTERM");
+  await finishReader(capture.fake.stdout);
+  await finishReader(capture.fake.stderr);
+  await bounded(capture.lease.settlement);
+  assert.equal(capture.lease.status().forceEscalationAttempted, false);
 });

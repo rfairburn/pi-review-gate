@@ -23,6 +23,7 @@ import {
   type SidebarMainOwnerKey,
 } from "../src/session-host/sidebar";
 import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
+import { composeHostFrame, computeHostLayout } from "../src/session-host/compositor";
 import type { RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 import type { PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
@@ -310,6 +311,48 @@ test("the left roster projects remote cards alongside locals with honest facts a
     "local rows stay first, then host order and each host's own row order");
   assert.equal(harness.controller.selectedId, undefined, "projection alone selects nothing");
   assert.deepEqual(commandsSince(harness, baseline), [], "projection emits nothing");
+});
+
+test("the production 35-column layout keeps every local, native, and remote count and status row whole", () => {
+  const harness = makeHarness();
+  harness.controller.updateItems([
+    makeItem({ id: "pi", label: "Pi local", busy: null, pendingInput: null, activeTasks: null, activeShells: null }),
+    makeItem({ id: "claude", label: "Native Claude", backend: "claude", busy: true, pendingInput: true, activeTasks: null, activeShells: null }),
+    makeItem({ id: "partial-tasks", label: "Partial tasks", busy: false, pendingInput: false, activeTasks: null, activeShells: 2 }),
+    makeItem({ id: "partial-shells", label: "Partial shells", busy: false, pendingInput: false, activeTasks: 2, activeShells: null }),
+    makeItem({ id: "known", label: "Known counts", busy: false, pendingInput: false, activeTasks: 2, activeShells: 2 }),
+  ]);
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    hosts: [makeHost({
+      id: "h1",
+      label: "Studio",
+      rows: [makeRemoteRow({ id: "r1", label: "Remote Pi", activeTasks: null, activeShells: null })],
+    })],
+  }));
+  show(harness);
+
+  for (const cols of [80, 120]) {
+    const layout = computeHostLayout(cols, 50, { sidebarVisible: true, focus: "sidebar" });
+    assert.deepEqual(layout.sidebar, { column: 0, row: 1, cols: 35, rows: 49 });
+    assert.equal(layout.dividerColumn, 35);
+    assert.deepEqual(layout.native, { column: 36, row: 1, cols: cols - 36, rows: 49 });
+    const frame = composeHostFrame(layout, {
+      sidebar: harness.controller.renderRoster(layout.sidebar!.cols, layout.sidebar!.rows),
+      header: "Session host",
+      focus: "sidebar",
+    });
+    const left = frame.lines.slice(1).map((line) => line.replace(SGR_PATTERN, "").slice(0, layout.sidebar!.cols).trimEnd());
+    for (const row of [
+      "  bg tasks unknown | shells unknown",
+      "  bg tasks unknown | shells 2",
+      "  bg tasks 2 | shells unknown",
+      "  bg tasks 2 | shells 2",
+    ]) assert.ok(left.includes(row), `the actual ${cols}-column layout keeps ${JSON.stringify(row)} whole: ${JSON.stringify(left.filter((line) => line.includes("bg tasks")))}`);
+    assert.ok(left.some((line) => line.endsWith("agent running | input pending")),
+      `the actual ${cols}-column layout keeps the full agent/input status row`);
+    assert.equal(left.some((line) => line.includes("...")), false,
+      `no count or status row is ellipsized in the actual ${cols}-column layout`);
+  }
 });
 
 test("a stale card keeps its honest marker visible ahead of a long unicode owner label", () => {

@@ -231,7 +231,7 @@ export function requireFolderCompletedObservation(
 }
 
 /**
- * The complete canonical 32-column Quit confirmation sidebar rows for one
+ * The complete canonical 35-column Quit confirmation sidebar rows for one
  * expected owned-live count at the exact pane geometry. The rows are derived
  * from the real public `SidebarController` with a freshly rendered confirmation
  * pane, so they stay byte-identical to what production draws for that count
@@ -276,7 +276,7 @@ export function windowsQuitConfirmationCanonicalRows(
 }
 
 /**
- * Strict Windows-only Quit confirmation witness. Unlike the shared 32-column
+ * Strict Windows-only Quit confirmation witness. Unlike the shared 35-column
  * membership witness (which whitespace-normalizes the sidebar and substring
  * checks the count), this derives the complete canonical sidebar rows for the
  * exact expected owned-live count from the real public `SidebarController` at

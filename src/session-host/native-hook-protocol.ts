@@ -35,6 +35,11 @@
  *   carries only an id and a kind — never a description, command, prompt, tool
  *   argument, or result body. A `PreToolUse` backgrounding intent is never a
  *   launch, and a foreground agent never produces one.
+ *  `background_unidentified_kinds` names, for that same snapshot, only the
+ *   closed `task`/`shell` categories it held an active member of WITHOUT a usable
+ *   id — the categories whose membership this projection cannot key. It carries
+ *   no id, no count, and no provider label text, is never present beside
+ *   `background_members`, and never changes the counts, which stay exact.
  * - Identifiers and paths are bounded, strict text: no C0/DEL/C1 controls, no
  *   line/paragraph separators, and a fixed UTF-8 byte cap. A transcript path is
  *   the provider's own path string, never the transcript's contents.
@@ -265,7 +270,22 @@ export interface NativeHookEventMetadata {
   hook_event_name: NativeHookEventName;
   session_id?: string;
   transcript_path?: string;
+  /**
+   * The named transcript of the CHILD whose turn a `SubagentStop` closed, selected
+   * ONLY from that event and only when it validates as a bounded absolute path.
+   * It is a bound path, nothing more: this projection never derives one from a
+   * filename pattern, never searches for it, and never treats a path it was not
+   * given as evidence of anything. Consumers treat an unreadable or replaced child
+   * transcript as a coverage hole in the one agent it names, never as an end.
+   */
+  agent_transcript_path?: string;
   agent_id?: string;
+  /**
+   * Descriptive provider label only: `agent_id`, never this label, defines
+   * root/child scope. Claude's SubagentStop producer may emit `''`
+   * (`contextType ?? mainAgentType ?? ''`), which selection normalizes to
+   * absence before framing; it is neither identity nor liveness evidence.
+   */
   agent_type?: string;
   prompt_id?: string;
   turn_id?: string;
@@ -282,6 +302,15 @@ export interface NativeHookEventMetadata {
    * array is that hook's own whole array, never a claim of root scope.
    */
   background_members?: readonly NativeHookBackgroundMember[];
+  /**
+   * The closed count kinds the same validated snapshot held an active member of
+   * WITHOUT a usable id. Present only when `background_members` is absent
+   * because of such an entry, and never beside it: it names which categories
+   * this projection could not key, so a consumer can withdraw exactly those and
+   * keep the rest of its own census. It is never a count, an id, or a provider
+   * label, and it never contradicts `background_counts`, which stay exact.
+   */
+  background_unidentified_kinds?: readonly NativeHookBackgroundKind[];
   /** Present only for a `PostToolUse` whose actual result launched background work. */
   background_started?: NativeHookBackgroundStarted;
 }
@@ -363,6 +392,14 @@ export type NativeHookBackgroundSnapshotResult =
     readonly counts: NativeHookBackgroundCounts;
     /** Null when an active entry carried no identifiable id. Never partial. */
     readonly members: readonly NativeHookBackgroundMember[] | null;
+    /**
+     * The count kinds this snapshot held at least one active member of WITHOUT a
+     * usable id, in first-seen order. Empty when every active member was
+     * identifiable. This is the closed statement of WHICH category's membership
+     * is unkeyable, so a consumer withdraws that category instead of the whole
+     * census; it never carries an id, a count, or provider label text.
+     */
+    readonly unidentifiedKinds: readonly NativeHookBackgroundKind[];
   }
   | { readonly ok: false; readonly reason: "input-invalid" | "input-too-large" };
 
@@ -370,13 +407,18 @@ const METADATA_TEXT_LIMITS: Readonly<
   Record<
     Exclude<
       keyof NativeHookEventMetadata,
-      "hook_event_name" | "background_counts" | "background_members" | "background_started"
+      "hook_event_name"
+      | "background_counts"
+      | "background_members"
+      | "background_unidentified_kinds"
+      | "background_started"
     >,
     number
   >
 > = Object.freeze({
   session_id: MAX_NATIVE_HOOK_ID_BYTES,
   transcript_path: MAX_NATIVE_HOOK_PATH_BYTES,
+  agent_transcript_path: MAX_NATIVE_HOOK_PATH_BYTES,
   agent_id: MAX_NATIVE_HOOK_ID_BYTES,
   agent_type: MAX_NATIVE_HOOK_LABEL_BYTES,
   prompt_id: MAX_NATIVE_HOOK_ID_BYTES,
@@ -391,6 +433,7 @@ const METADATA_KEYS: ReadonlySet<string> = new Set([
   ...Object.keys(METADATA_TEXT_LIMITS),
   "background_counts",
   "background_members",
+  "background_unidentified_kinds",
   "background_started",
 ]);
 const BACKGROUND_COUNT_KEYS: ReadonlySet<string> = new Set(["tasks", "shells"]);
@@ -558,7 +601,10 @@ export function encodeNativeHookBootstrapEnv(bootstrap: NativeHookBootstrap): st
  * Membership is the same validated pass: every kept entry that the provider
  * identified becomes `{id, kind}`. If any kept entry carries no id the
  * projection is `null` rather than a shortened set, and a present-but-malformed
- * or duplicated id anywhere in the array fails the whole snapshot.
+ * or duplicated id anywhere in the array fails the whole snapshot. A `null`
+ * membership says which kinds it could not key: `unidentifiedKinds` names the
+ * closed categories of the kept entries that had no usable id, so the consumer
+ * can withdraw exactly those categories of its own census and keep the rest.
  */
 export function deriveNativeHookBackgroundSnapshot(value: unknown): NativeHookBackgroundSnapshotResult {
   if (!Array.isArray(value)) return { ok: false, reason: "input-invalid" };
@@ -566,6 +612,7 @@ export function deriveNativeHookBackgroundSnapshot(value: unknown): NativeHookBa
   let tasks = 0;
   let shells = 0;
   const members: NativeHookBackgroundMember[] = [];
+  const unidentifiedKinds: NativeHookBackgroundKind[] = [];
   const seenIds = new Set<string>();
   let memberIds = true;
   let idBytes = 0;
@@ -605,10 +652,16 @@ export function deriveNativeHookBackgroundSnapshot(value: unknown): NativeHookBa
         members.push({ id, kind });
       } else {
         memberIds = false;
+        if (!unidentifiedKinds.includes(kind)) unidentifiedKinds.push(kind);
       }
     }
   }
-  return { ok: true, counts: { tasks, shells }, members: memberIds ? members : null };
+  return {
+    ok: true,
+    counts: { tasks, shells },
+    members: memberIds ? members : null,
+    unidentifiedKinds,
+  };
 }
 
 /**
@@ -666,8 +719,10 @@ function selectNativeHookBackgroundStarted(value: Record<string, unknown>): Nati
  * happens BEFORE any wire encoding, so sensitive provider text has no path into
  * the frame. The optional `background_counts` projection is derived only for
  * the established Stop/SubagentStop snapshot field, together with its
- * `background_members` form, and `background_started` is derived only from a
- * `PostToolUse` result that actually launched background work.
+ * `background_members` form — or, when an active entry could not be keyed, the
+ * closed `background_unidentified_kinds` categories instead of it — and
+ * `background_started` is derived only from a `PostToolUse` result that actually
+ * launched background work.
  */
 export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProviderInputResult {
   if (!isRecord(value)) return { ok: false, reason: "input-invalid" };
@@ -680,8 +735,23 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
   for (const [key, limit] of Object.entries(METADATA_TEXT_LIMITS) as [keyof typeof METADATA_TEXT_LIMITS, number][]) {
     if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
     const field = value[key];
+    // Claude 2.1.325's SubagentStop producer writes
+    // `agent_type: contextType ?? mainAgentType ?? ''`, and the field's own
+    // schema has no minimum length. The label is descriptive only, so exactly
+    // the empty value is normalized to absence instead of failing the whole
+    // event and discarding its identity/membership facts. A nonempty label
+    // keeps the same bounded-text rule, and the strict wire decoder still
+    // refuses a present-empty value because the trusted producer omits it.
+    if (key === "agent_type" && field === "") continue;
     if (key === "transcript_path") {
       if (!isBoundedTranscriptPath(field)) return { ok: false, reason: "input-invalid" };
+    } else if (key === "agent_transcript_path") {
+      // Selected only on the one event whose producer names it. Anywhere else it
+      // is an unrecognised field on a trusted producer, and a path this projection
+      // would have to guess at is worse than no path at all.
+      if (name !== "SubagentStop" || !isBoundedTranscriptPath(field)) {
+        return { ok: false, reason: "input-invalid" };
+      }
     } else if (!isBoundedText(field, limit)) {
       return { ok: false, reason: "input-invalid" };
     }
@@ -693,6 +763,9 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
       if (!derived.ok) return { ok: false, reason: derived.reason };
       metadata.background_counts = derived.counts;
       if (derived.members !== null) metadata.background_members = derived.members;
+      else if (derived.unidentifiedKinds.length > 0) {
+        metadata.background_unidentified_kinds = derived.unidentifiedKinds;
+      }
     }
   }
   if (name === "PostToolUse") {
@@ -739,6 +812,27 @@ function parseNativeHookBackgroundMembers(value: unknown): readonly NativeHookBa
 }
 
 /**
+ * Strictly rebuilds the closed kind-gap projection from wire bytes: a nonempty
+ * set of distinct closed count kinds, and nothing else. The whole frame is
+ * refused for an unknown kind, a duplicate, an empty list, or a list wider than
+ * the closed kind set — a gap nobody can attribute is not a smaller gap.
+ */
+function parseNativeHookBackgroundUnidentifiedKinds(
+  value: unknown,
+): readonly NativeHookBackgroundKind[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > NATIVE_HOOK_BACKGROUND_KINDS.length) {
+    return undefined;
+  }
+  const kinds: NativeHookBackgroundKind[] = [];
+  for (const entry of value) {
+    if (!isNativeHookBackgroundKind(entry)) return undefined;
+    if (kinds.includes(entry)) return undefined;
+    kinds.push(entry);
+  }
+  return kinds;
+}
+
+/**
  * Strictly rebuilds one projected launch id/kind pair from wire bytes, and
  * re-checks the pairing the selection is built on: a `shell` launch is only
  * credible from the shell-launch tool and a `task` launch only from a
@@ -767,6 +861,10 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
   if (!isValidNativeHookInstanceId(value.instanceId)) return undefined;
   if (!isValidGeneration(value.generation)) return undefined;
   if (!isValidToken(value.token)) return undefined;
+  // The relay omits the provider's empty descriptive agent_type before framing,
+  // so a wire frame that still carries it present-empty is not relay output.
+  // Keep the strict wire shape refusing it rather than normalizing it here.
+  if (value.agent_type === "") return undefined;
   const selected = sanitizeNativeHookProviderInput(value);
   if (!selected.ok) return undefined;
   let backgroundCounts: NativeHookBackgroundCounts | undefined;
@@ -798,6 +896,28 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
       if (tasks !== backgroundCounts.tasks || shells !== backgroundCounts.shells) return undefined;
     }
   }
+  let backgroundUnidentifiedKinds: readonly NativeHookBackgroundKind[] | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "background_unidentified_kinds")) {
+    // The kind gap is the same Stop-family snapshot, in its unkeyable form, and
+    // it is Claude-only projection data like the membership set beside it.
+    if (value.hook_event_name !== "Stop" && value.hook_event_name !== "SubagentStop") return undefined;
+    if (backend !== "claude") return undefined;
+    // A complete membership view and a kind gap are mutually exclusive
+    // statements about one snapshot; a frame that claims both is refused.
+    if (backgroundMembers !== undefined) return undefined;
+    backgroundUnidentifiedKinds = parseNativeHookBackgroundUnidentifiedKinds(
+      value.background_unidentified_kinds,
+    );
+    if (!backgroundUnidentifiedKinds) return undefined;
+    if (backgroundCounts !== undefined) {
+      // A gap claims an ACTIVE member of that kind the projection could not key,
+      // so that kind's own count cannot be zero.
+      for (const kind of backgroundUnidentifiedKinds) {
+        const stated = kind === "shell" ? backgroundCounts.shells : backgroundCounts.tasks;
+        if (stated < 1) return undefined;
+      }
+    }
+  }
   let backgroundStarted: NativeHookBackgroundStarted | undefined;
   if (Object.prototype.hasOwnProperty.call(value, "background_started")) {
     // A launch edge exists only on the event that carries a real tool result,
@@ -816,6 +936,9 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
     ...selected.metadata,
     ...(backgroundCounts === undefined ? {} : { background_counts: backgroundCounts }),
     ...(backgroundMembers === undefined ? {} : { background_members: backgroundMembers }),
+    ...(backgroundUnidentifiedKinds === undefined
+      ? {}
+      : { background_unidentified_kinds: backgroundUnidentifiedKinds }),
     ...(backgroundStarted === undefined ? {} : { background_started: backgroundStarted }),
   };
 }
@@ -865,6 +988,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
       hook_event_name,
       session_id,
       transcript_path,
+      agent_transcript_path,
       agent_id,
       agent_type,
       prompt_id,
@@ -875,6 +999,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
       tool_use_id,
       background_counts,
       background_members,
+      background_unidentified_kinds,
       background_started,
     } = frame;
     return {
@@ -885,6 +1010,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
         hook_event_name,
         ...(session_id === undefined ? {} : { session_id }),
         ...(transcript_path === undefined ? {} : { transcript_path }),
+        ...(agent_transcript_path === undefined ? {} : { agent_transcript_path }),
         ...(agent_id === undefined ? {} : { agent_id }),
         ...(agent_type === undefined ? {} : { agent_type }),
         ...(prompt_id === undefined ? {} : { prompt_id }),
@@ -895,6 +1021,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
         ...(tool_use_id === undefined ? {} : { tool_use_id }),
         ...(background_counts === undefined ? {} : { background_counts }),
         ...(background_members === undefined ? {} : { background_members }),
+        ...(background_unidentified_kinds === undefined ? {} : { background_unidentified_kinds }),
         ...(background_started === undefined ? {} : { background_started }),
       },
     };

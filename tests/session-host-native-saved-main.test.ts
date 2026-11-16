@@ -62,7 +62,7 @@ import {
   type SessionRecord,
 } from "./helpers/session-host-native-saved-main-harness";
 
-import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
+import { NATIVE_PANE_START, SIDEBAR_COLUMNS, sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 
 interface ProviderRecord {
   readonly event?: string;
@@ -71,26 +71,26 @@ interface ProviderRecord {
 }
 
 function isCompleteRosterFrame(text: string): boolean {
-  return parseRosterFrame(text, 32).complete;
+  return parseRosterFrame(text, SIDEBAR_COLUMNS).complete;
 }
 
 function isCompleteMainFocus(text: string): boolean {
-  const parsed = parseRosterFrame(text, 32);
+  const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
   if (!parsed.complete) return false;
-  const pane = sidebarPaneLines(text, 32);
+  const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
   const offset = /^\s*Sessions \(/u.test(pane[0] ?? "") ? 0 : 1;
   const footer = pane.slice(offset + 1 + parsed.entryEnd).map((line) => line.trim()).filter(Boolean);
-  return footer.length === 2 && footer[0] === "F8 toggle | enter open" && footer[1] === "esc hide | q quit";
+  return footer.length === 2 && footer[0] === "F8 toggle | enter open | esc hide" && footer[1] === "q quit";
 }
 
 function isCompleteWelcome(text: string): boolean {
   return frameHeader(text) === "Session host" && text.includes("Welcome")
-    && parseRosterFrame(text, 32).count === 0 && isSidebarFocus(text)
+    && parseRosterFrame(text, SIDEBAR_COLUMNS).count === 0 && isSidebarFocus(text)
     && selectedRosterEntry(text)?.label === "New session";
 }
 
 function isSidebarFocus(text: string): boolean {
-  return isSidebarFocusedFrame(text, 32);
+  return isSidebarFocusedFrame(text, SIDEBAR_COLUMNS);
 }
 
 function selectedPosition(text: string): number | undefined {
@@ -466,8 +466,8 @@ test("native roster-position witness permits moving actions but rejects displace
   const entries = (rows: readonly SidebarItem[]): readonly RosterEntry[] => {
     const controller = new SidebarController({ toggleKey: "f8", settingsAvailable: true });
     controller.updateItems(rows);
-    const pane = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const text = ["Session host", ...pane.map((line) => `${line.padEnd(32)}│native pane`)].join("\n");
+    const pane = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const text = ["Session host", ...pane.map((line) => `${line.padEnd(SIDEBAR_COLUMNS)}│native pane`)].join("\n");
     assert.equal(isCompleteRosterFrame(text), true);
     return rosterEntries(text);
   };
@@ -493,7 +493,7 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
   const compose = (left: readonly string[], right: readonly string[]): string => {
     const rows = Math.max(left.length, right.length);
     return ["Session host", ...Array.from({ length: rows }, (_, index) =>
-      `${(left[index] ?? "").padEnd(32)}│${right[index] ?? ""}`)].join("\n");
+      `${(left[index] ?? "").padEnd(SIDEBAR_COLUMNS)}│${right[index] ?? ""}`)].join("\n");
   };
   const welcomeRoster = compose(
     ["Sessions (0)", "Saved conversations", "New session", "Quit host", "enter open"],
@@ -523,20 +523,20 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
     "after cancellation, left-roster text cannot make the native Main pane look like the picker");
 
   const controller = new SidebarController({ toggleKey: "f8" });
-  controller.renderRoster(32, 49);
+  controller.renderRoster(SIDEBAR_COLUMNS, 49);
   controller.handleInput(KEYS.up);
-  controller.renderRoster(32, 49); // The selected Saved action must be fully displayed before Enter.
+  controller.renderRoster(SIDEBAR_COLUMNS, 49); // The selected Saved action must be fully displayed before Enter.
   controller.handleInput(KEYS.enter);
   assert.equal(controller.focus, "form");
   const plain = (lines: readonly string[]): string[] =>
     lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  const publicRoster = plain(controller.renderRoster(32, 49).lines);
-  const publicForm = plain(controller.renderForm(87, 49).lines);
+  const publicRoster = plain(controller.renderRoster(SIDEBAR_COLUMNS, 49).lines);
+  const publicForm = plain(controller.renderForm(84, 49).lines);
   assert.ok(publicForm.some((line) => line.includes("Loading saved conversations")),
     "the current right-hand picker remains identifiable while its native catalog is loading");
   assert.ok(publicForm.some((line) =>
     line.trim() === "F8 toggle / up/down select | enter open / esc/ctrl+c back"),
-    "the actual 87-column Saved renderer combines picker navigation with native configurable cancel keys");
+    "the actual 84-column Saved renderer combines picker navigation with native configurable cancel keys");
   assert.ok(publicForm.some((line) => line.trim() === "ctrl+d delete / ctrl+backspace empty"),
     "the actual Saved renderer retains both native delete bindings in its footer");
   const publicPicker = compose(publicRoster, publicForm);
@@ -546,9 +546,9 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
 
 test("Saved startup and activation witnesses refuse partial or mixed focus frames", () => {
   const controller = new SidebarController({ toggleKey: "f8" });
-  const rows = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const rows = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const compose = (left: readonly string[]) => ["Session host", ...left.map((line, index) =>
-    `${line.padEnd(32)}│${index === 0 ? "Welcome — select a session" : ""}`)].join("\n");
+    `${line.padEnd(SIDEBAR_COLUMNS)}│${index === 0 ? "Welcome — select a session" : ""}`)].join("\n");
   const complete = compose(rows);
   assert.equal(isCompleteWelcome(complete), true);
   assert.equal(isCompleteMainFocus(complete), false);
@@ -560,7 +560,7 @@ test("Saved startup and activation witnesses refuse partial or mixed focus frame
   assert.equal(isCompleteWelcome(compose(incomplete)), false);
   // renderRoster's public pure contract renders independently of visibility.
   const mainController = new SidebarController({ toggleKey: "f8", initialVisible: false });
-  const main = mainController.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const main = mainController.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   assert.equal(isCompleteMainFocus(compose(main)), true);
   assert.equal(isCompleteWelcome(compose(main)), false);
   assert.equal(isCompleteMainFocus(compose([...main, "e edit name | d stop/remove"])), false);
@@ -569,9 +569,9 @@ test("Saved startup and activation witnesses refuse partial or mixed focus frame
 test("native Saved witness requires a single selected summary and complete recorded-workspace details", () => {
   const actions: SidebarAction[] = [];
   const controller = new SidebarController({ toggleKey: "f8", onAction: (action) => actions.push(action) });
-  controller.renderRoster(32, 49);
+  controller.renderRoster(SIDEBAR_COLUMNS, 49);
   controller.handleInput(KEYS.up);
-  controller.renderRoster(32, 49);
+  controller.renderRoster(SIDEBAR_COLUMNS, 49);
   controller.handleInput(KEYS.enter);
   const request = actions.at(-1);
   assert.ok(request?.type === "saved-list");
@@ -579,10 +579,10 @@ test("native Saved witness requires a single selected summary and complete recor
   const cwd = `/recorded/workspace/${"abcdef".repeat(16)}`;
   assert.equal(controller.completeSavedList(request.requestId, [{ id: "fixture", file: "/fixture.jsonl", caption, cwd }], 0), true);
   const plain = (lines: readonly string[]): string[] => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  const left = plain(controller.renderRoster(32, 49).lines);
-  const right = plain(controller.renderForm(87, 49).lines);
+  const left = plain(controller.renderRoster(SIDEBAR_COLUMNS, 49).lines);
+  const right = plain(controller.renderForm(84, 49).lines);
   const compose = (pane: readonly string[]): string => ["Session host", ...left.map((line, index) =>
-    `${line.padEnd(32)}│${pane[index] ?? ""}`)].join("\n");
+    `${line.padEnd(SIDEBAR_COLUMNS)}│${pane[index] ?? ""}`)].join("\n");
   const complete = compose(right);
   assert.equal(isCompleteSavedSelection(complete, caption, cwd), true);
   assert.equal(isCompleteSavedSelection(complete, caption, `${cwd}-wrong`), false);
@@ -602,8 +602,8 @@ test("native Saved witness requires a single selected summary and complete recor
   assert.ok(selectedSummary >= 2, "the selected summary follows the query row");
   duplicateRow[selectedSummary + 1] = right[selectedSummary]!;
   assert.equal(isCompleteSavedSelection(compose(duplicateRow), caption, cwd), false);
-  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(47)]), 87), false);
-  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(87)]), 87), true);
+  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(44)]), 84), false);
+  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(84)]), 84), true);
 });
 
 test("native position witness excludes shifting host actions by kind, not conversation title", () => {
@@ -614,9 +614,9 @@ test("native position witness excludes shifting host actions by kind, not conver
       agentDir: "/owned/agent", lifecycle: "alive" as const, busy: false,
       pendingInput: false, inputSurface: false, activity: [],
     })));
-    const lines = controller.renderRoster(32, 49).lines
+    const lines = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines
       .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const frame = ["Session host", ...lines.map((line) => `${line.padEnd(32)}│native pane`)].join("\n");
+    const frame = ["Session host", ...lines.map((line) => `${line.padEnd(SIDEBAR_COLUMNS)}│native pane`)].join("\n");
     assert.equal(isCompleteRosterFrame(frame), true);
     return rosterEntries(frame);
   };
@@ -640,9 +640,9 @@ test("pure complete-roster witness rejects duplicate action rows during incremen
     agentDir: "/owned/agent", lifecycle: "alive", busy: false, pendingInput: false,
     inputSurface: false, activity: [],
   }]);
-  const lines = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const lines = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const compose = (left: readonly string[]): string => ["Session host",
-    ...left.map((line) => `${line.padEnd(32)}│owned native pane`)].join("\n");
+    ...left.map((line) => `${line.padEnd(SIDEBAR_COLUMNS)}│owned native pane`)].join("\n");
   assert.equal(isCompleteRosterFrame(compose(lines)), true,
     "the public renderer has one native row and exactly three ordered actions");
   const newRow = lines.find((line) => line.trim() === "New session" || line.trim() === "> New session");
@@ -655,7 +655,7 @@ test("pure complete-roster witness rejects duplicate action rows during incremen
 
 // Exercise the actual public pure renderer so wrapped confirmation text cannot
 // be misrepresented by a terminal-wide substring assertion.
-test("public SidebarController renders wrapped Quit confirmation at the 32-column sidebar width", () => {
+test("public SidebarController renders wrapped Quit confirmation at the 35-column sidebar width", () => {
   const controller = new SidebarController();
   const liveItems: SidebarItem[] = ["saved-process-a", "new-process-b"].map((id) => ({
     id,
@@ -671,20 +671,20 @@ test("public SidebarController renders wrapped Quit confirmation at the 32-colum
   controller.updateItems(liveItems);
   controller.handleInput("q");
   assert.equal(controller.focus, "confirm", "the actual public controller opens Quit confirmation for live rows");
-  const rendered = controller.render(32, 50);
+  const rendered = controller.render(SIDEBAR_COLUMNS, 50);
   assert.equal(hasQuitConfirmationContents(rendered.lines, 2), true,
-    "the 32-column public renderer preserves the full live count and both distinct confirmation hint rows");
+    "the 35-column public renderer preserves the full live count and both distinct confirmation hint rows");
   const composedFrame = ["Session host", ...rendered.lines.map((line) =>
-    `${line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).padEnd(32)}│native surface`)].join("\n");
+    `${line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, SIDEBAR_COLUMNS).padEnd(SIDEBAR_COLUMNS)}│native surface`)].join("\n");
   assert.equal(isQuitConfirmationFrame(composedFrame, 2), true,
-    "the native-frame predicate reads only the rendered 32-column sidebar, not Main's wider content pane");
+    "the native-frame predicate reads only the rendered 35-column sidebar, not Main's wider content pane");
 });
 
 // The corrected geometry-aware witness must reject every partial, stale, or
 // foreign stand-in: a footer-only pane, a missing header/count, altered hints,
 // a mismatched live count, or the same text appearing only in the wider native
 // content pane are all non-evidence for the sidebar confirmation body.
-test("the 32-column Quit confirmation witness rejects missing, altered, count-drifted, and native-pane-only bodies", () => {
+test("the 35-column Quit confirmation witness rejects missing, altered, count-drifted, and native-pane-only bodies", () => {
   const renderConfirm = (liveIds: readonly string[]): string[] => {
     const controller = new SidebarController();
     controller.updateItems(liveIds.map((id) => ({
@@ -700,13 +700,13 @@ test("the 32-column Quit confirmation witness rejects missing, altered, count-dr
     })));
     controller.handleInput("q");
     assert.equal(controller.focus, "confirm");
-    return controller.render(32, 50).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    return controller.render(SIDEBAR_COLUMNS, 50).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   };
   const compose = (sidebar: readonly string[], native = "native surface"): string =>
-    ["Session host", ...sidebar.map((line) => `${line.slice(0, 32).padEnd(32)}│${native}`)].join("\n");
+    ["Session host", ...sidebar.map((line) => `${line.slice(0, SIDEBAR_COLUMNS).padEnd(SIDEBAR_COLUMNS)}│${native}`)].join("\n");
   const complete = renderConfirm(["saved-process-a", "new-process-b"]);
   assert.equal(isQuitConfirmationFrame(compose(complete), 2), true,
-    "the genuine complete rendered 32-column confirmation is accepted");
+    "the genuine complete rendered 35-column confirmation is accepted");
 
   const footerOnly = complete.filter((line) => /enter\/y = quit host|esc\/n = cancel/.test(line));
   assert.equal(isQuitConfirmationFrame(compose(footerOnly), 2), false,
@@ -728,12 +728,12 @@ test("the 32-column Quit confirmation witness rejects missing, altered, count-dr
   const corruptedHeader = compose(complete).replace("Quit host?", "Quit hosts");
   assert.equal(isQuitConfirmationFrame(corruptedHeader, 2), false,
     "a corrupted confirmation header is rejected");
-  const nativePaneOnly = ["Session host", ...complete.map((line) => `${" ".repeat(32)}│${line}`)].join("\n");
+  const nativePaneOnly = ["Session host", ...complete.map((line) => `${" ".repeat(SIDEBAR_COLUMNS)}│${line}`)].join("\n");
   assert.equal(isQuitConfirmationFrame(nativePaneOnly, 2), false,
     "the same text appearing only in the wider native content pane is never sidebar body authority");
   const staleSingleLine = compose([complete.join(" ")]);
   assert.equal(isQuitConfirmationFrame(staleSingleLine, 2), false,
-    "a single flattened line outside the canonical 32-column rows is rejected");
+    "a single flattened line outside the canonical 35-column rows is rejected");
 });
 
 // The synthetic contract is deliberately separate from native UI evidence: it
@@ -1037,7 +1037,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await driver.waitFrame((text) => frameHeader(text) === savedName
     && isCompleteMainFocus(text)
     && selectedRosterEntry(text)?.label === savedName
-    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - NATIVE_PANE_START)
     && text.includes(turnPrompt) && text.includes(turnResponse) && !text.includes(newDraft),
   "the auto-activated reopened child paints its own persisted surface without a second activation",
   beforeSuccessfulOpen.frameRevision);
@@ -1055,7 +1055,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await activateProcessRow(driver, processA, newBinding.displayName);
   await driver.waitFrame((text) => frameHeader(text) === newBinding.displayName
     && isCompleteMainFocus(text)
-    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - NATIVE_PANE_START)
     && text.includes(newDraft) && !text.includes(reopenedDraft),
   "the original /new sibling retains its independent draft after Saved auto-activation");
   assert.equal(exactCurrentHeader(driver), activeNewHeader,
@@ -1063,7 +1063,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await activateProcessRow(driver, opened.process, savedName);
   await driver.waitFrame((text) => frameHeader(text) === savedName
     && isCompleteMainFocus(text)
-    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - NATIVE_PANE_START)
     && text.includes(reopenedDraft) && !text.includes(newDraft),
   "the restored child's independent draft survives deliberate sibling navigation");
 
@@ -1072,7 +1072,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await ensureSidebarFocus(driver);
   await driver.waitFrame((text) => isSidebarFocus(text) && isCompleteRosterFrame(text)
     && text.includes(reopenedDraft)
-    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33),
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - NATIVE_PANE_START),
   "the current owner's complete editor and draft are visible before the sidebar input guard");
   const digitGuard = `271828182845${suffix.replace(/[a-f]/g, "9")}`;
   assert.match(digitGuard, /^\d+$/, "the sidebar guard contains only digits, never host commands");

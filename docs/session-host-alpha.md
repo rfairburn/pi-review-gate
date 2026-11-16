@@ -829,11 +829,14 @@ A native row is deliberately a plain provider child rather than a Pi child:
 
 - It gets no Pi status registration, no Pi bootstrap/preload/startup-payload/title
   environment, no input framing, and no Pi clipboard receiver, so no Pi
-  reporter is involved anywhere on the row and only the owned PTY's own exit
-  settles it. Local keyboard input is forwarded raw to the owning row. What the
+  reporter is involved anywhere on the row, and the owned PTY's own exit is what
+  settles that interactive child — on a row with no owned backend of its own that exit
+  is the whole settlement witness, while a hosted Codex row additionally stays
+  unsettled until its own private backend and relay have each proved their actual end.
+  Local keyboard input is forwarded raw to the owning row. What the
   row **can** report about its own provider — agent running or at rest, the current
-  or last tool type, an observed pending question request, and on a Claude Code row
-  that provider harness's own background task and shell counts — arrives through a
+  or last tool type, an observed pending question request, and that provider harness's
+  own background task and shell counts — arrives through a
   separate native observation family; anything the host has not observed stays
   `unknown`, never idle and never zero
   ([Native Claude Code and Codex sessions](native-sidebar-agents.md#native-status-observation)).
@@ -845,9 +848,13 @@ A native row is deliberately a plain provider child rather than a Pi child:
   a missing binary or a configured argument that names a headless or service mode, an
   approval, sandbox, or hook-trust bypass, an existing-session attach, or a
   workspace-scope change is a refusal: never silently stripped, retried another way,
-  or replaced with another target. Codex adds only `--no-daemon` of its own; the
-  status observer's per-session hook flags, described below, are the only addition on
-  top.
+  or replaced with another target. A hosted Codex row's interactive client attaches to
+  a private app-server backend this host started for that row, so it carries no
+  host-added `--no-daemon`; a Codex launch this host does not front with its own
+  backend keeps that flag, and an operator who configured it keeps it either way.
+  The status observer's per-session hook flags, described below, are the only other
+  addition — and a hosted Codex row gets none of those either, because its observer
+  reads that row's own private backend.
 - Its configuration, authentication, and conversation state stay in the provider's
   own directories. The host writes nothing into the operator's stored provider
   settings, hooks, plugins, or trust stores, and the host's Pi agent directory keeps
@@ -859,7 +866,8 @@ A native row is deliberately a plain provider child rather than a Pi child:
   plugin, never a trust-record write, and never a permission or hook-trust bypass —
   and the provider's normal trust, sideload, marketplace, and hook-disabling policy
   can still withhold the observer entirely, in which case the row simply stays
-  unknown
+  unknown; a hosted Codex row gets no such flag at all, because its observer reads
+  the private app-server backend this host started beside that row
   ([Native status observation](native-sidebar-agents.md#native-status-observation)).
 - It carries no review gate, no tool protection, and none of the subtask
   capture/review/landing guarantees, and it is never presented as a review-gate-managed
@@ -2252,10 +2260,17 @@ A native **Claude Code** or **Codex CLI** row keeps every one of those rules. Th
 host owns its process, so lifecycle and exit are real, and where that row's own
 provider-side observer is armed some further fields become observed too: the
 agent's running/rest state, the current or last tool type, an observed pending
-**question request**, and — on a Claude Code row — that provider harness's own
-task and shell counts taken from a real root `Stop` snapshot. These last-reported
-counts survive unrelated foreground work and transcript-only loss, but are
-withdrawn on a membership transition, scope change, or hook-lane loss. Two answers are
+**question request**, and that provider harness's own
+live task and shell counts — on a Claude Code row a per-run membership set seeded by
+this host's own launch or a complete root snapshot and **updated** by each keyed launch
+and completion edge, the task figure being that set unioned with the run's live agent
+identities (so an empty in-flight census beside one still-live agent reads `1`, not
+`0`), with a last-reported root snapshot standing behind it only while no exact set and
+no live agent contradict it; on a Codex row the provider's own census of that row's
+backend, once the row's own root is positively bound. A count is withdrawn only by what
+can contradict it — a genuine coverage hole, a scope change, or a loss of the lane that
+reported it, category by category when a hole belongs to just one category — and never
+because an ordinary keyed edge moved an exact number. Two answers are
 possible and they are never conflated: an observed value (a `0` only when the
 provider positively reported an empty set) or `unknown` for a value that
 was never observed, failed, or was withdrawn after a gap — never a zero
@@ -3190,7 +3205,7 @@ PI_CODING_AGENT_DIR="$proof/agent" pi --offline --no-extensions --extension "$fi
 4. Create a second session in `$proof/b` and run `/host-image-proof blue`.
    Switch repeatedly between A and B. Their images must stay with their own Main
    panes even though the fixture deliberately reuses the same child image ID.
-5. Show/hide the sidebar with F8, resize the terminal, and cross the 53-column
+5. Show/hide the sidebar with F8, resize the terminal, and cross the 56-column
    overlay boundary. Open and cancel New while an image is visible. No old image
    may remain over the sidebar, form, overlay, or the other session. When Main
    is visible again, its own image should return at its current placement.
@@ -3245,15 +3260,19 @@ widths use the pinned Unicode 11 behavior for CJK, combining marks, and basic
 emoji; newer emoji and complex ZWJ sequences are not guaranteed to match Pi's
 standalone layout.
 
-With the sidebar visible at 53 columns or wider, it uses 32 columns plus a
-divider and leaves at least 20 columns for the native frame. The New/Edit form
+With the sidebar visible at 56 columns or wider, it uses a fixed 35 columns plus a
+divider and leaves at least 20 columns for the native frame. That width keeps
+the complete `bg tasks unknown | shells unknown` count row visible without
+truncation, including when an overflowing roster's scrollbar lane reserves one
+column: the row yields a leading blank cell so both labels and values remain
+whole. The New/Edit form
 temporarily replaces that right (native) pane while the roster remains on the
 left; below that width the form is a full-content overlay instead. While the
 form is open, the underlying child keeps running unpaused with its geometry and
 input ownership unchanged; cancelling the form restores the same child frame,
 while completing a Local New or Local Saved open activates the new child as the
 Main input owner (completing Edit restores the same child frame; a remote New or
-Resume only selects the owner's returned row for display). Below 53 columns the
+Resume only selects the owner's returned row for display). Below 56 columns the
 sidebar is a frontend overlay while it has focus; native geometry remains
 full-width and unchanged across focus switches, and returning to native focus
 only removes the overlay. Sidebar hint text wraps across reserved footer rows

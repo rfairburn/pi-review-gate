@@ -20,6 +20,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  NATIVE_PANE_START,
+  SIDEBAR_COLUMNS,
+} from "./helpers/session-host-native-roster-witness";
+import {
   observePosixLauncherFreshStart,
   type NativeJournalRecord,
   type PtyJournalRecord,
@@ -33,9 +37,14 @@ import {
 
 const WORKSPACE = "/owned/scratch/workspace-alpha";
 const COMPLETED = `${WORKSPACE}/`;
-/** The real wide Main layout: 32 roster columns, one divider column, an 87-column form pane. */
-const ROSTER_COLUMNS = 32;
-const FORM_PANE_COLUMNS = 87;
+/**
+ * The real wide Main layout: the production 35-column roster, one divider
+ * column, and everything the 120-column outer terminal leaves as the form
+ * pane.
+ */
+const OUTER_COLUMNS = 120;
+const ROSTER_COLUMNS = SIDEBAR_COLUMNS;
+const FORM_PANE_COLUMNS = OUTER_COLUMNS - NATIVE_PANE_START;
 const NEW_FORM_FOOTER = "enter create | esc cancel | tab complete | ctrl+c clear | ctrl+g external editor";
 const LEFT_ROSTER = ["  Saved conversations", "> New session", "  Quit host"];
 

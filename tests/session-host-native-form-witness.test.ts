@@ -46,13 +46,13 @@ test("native form witness rejects missing borders/content rather than assuming e
 // The approved New form draws, in the right-hand form pane: the "New session"
 // header, the fixed `Host: [ Local ]` line, then the native Editor's own top
 // rule, its labelled Workspace body row, and its bottom rule. These fixtures
-// reproduce that geometry at the real 120-column outer width (32 roster columns
-// + 1 divider column + an 87-column form pane, a 13-column label gutter, and a
-// 74-column Editor rule). No PTY, runtime, timer, or production seam is involved.
+// reproduce that geometry at the real 120-column outer width (35 roster columns
+// + 1 divider column + an 84-column form pane, a 13-column label gutter, and a
+// 71-column Editor rule). No PTY, runtime, timer, or production seam is involved.
 
-const ROSTER_COLUMNS = 32;
-const ROSTER_AND_DIVIDER_COLUMNS = 33;
-const FORM_PANE_COLUMNS = 87;
+const ROSTER_COLUMNS = 35;
+const ROSTER_AND_DIVIDER_COLUMNS = 36;
+const FORM_PANE_COLUMNS = 84;
 const WORKSPACE_LABEL = "> Workspace: ";
 const EDITOR_RULE = "─".repeat(FORM_PANE_COLUMNS - WORKSPACE_LABEL.length);
 const LEFT_ROSTER = ["  Saved conversations", "> New session", "  Quit host"];

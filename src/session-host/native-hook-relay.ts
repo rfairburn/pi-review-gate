@@ -25,6 +25,10 @@
  * descriptions/commands/IDs, and any `tool_response` body never cross the wire,
  * and an invalid or oversized snapshot becomes an explicit authenticated failure
  * rather than a partial/zero count.
+ * When an active entry could not be keyed to an id, `background_members` is
+ * omitted and the closed `background_unidentified_kinds` categories are projected
+ * instead, so a consumer withdraws exactly the categories whose membership is
+ * unkeyable rather than the whole census.
  */
 
 import { createConnection, type Socket } from "node:net";
@@ -194,7 +198,12 @@ function projectSelectedMetadata(
   backend: NativeCliBackend,
 ): NativeHookEventMetadata {
   if (backend === "claude") return metadata;
-  const { background_started: _claudeStarted, background_members: _claudeMembers, ...rest } = metadata;
+  const {
+    background_started: _claudeStarted,
+    background_members: _claudeMembers,
+    background_unidentified_kinds: _claudeKindGaps,
+    ...rest
+  } = metadata;
   return rest;
 }
 

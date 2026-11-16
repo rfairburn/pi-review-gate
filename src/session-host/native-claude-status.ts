@@ -28,13 +28,22 @@
  * - Unknown is the initial state. A recognized payload whose own fields cannot
  *   be read withdraws exactly the observations that payload would have
  *   supported (foreground, or the pending-request census) instead of leaving a
- *   stale Ready, running, or "none remain" claim in place.
+ *   stale Ready, running, or "none remain" claim in place, and says which of
+ *   them it withdrew as closed `affects` facts on the outcome, so a caller never
+ *   has to widen that judgement or re-derive it from reason names.
  * - Nothing here fabricates a Ready/idle claim from a process that merely looks
  *   quiet, from missing data, from quiet output, or from the arrival of this
- *   observer's own `Stop` hook. A `Stop` or `StopFailure` boundary makes the
- *   foreground unverifiable; {@link NativeClaudeStatusReducer.confirmTurnEnd},
- *   driven by a terminal record the source actually read, establishes
- *   `busy: false` and `Ready` for a turn that ran. The only idle claim made
+ *   observer's own `Stop` hook. A `StopFailure` boundary makes the foreground
+ *   unverifiable, and so does a `Stop` whenever there is no positively observed
+ *   active turn to preserve. Where this source DID observe the root turn running,
+ *   that `busy: true` and its tool TYPE stand through an unproven `Stop` — a
+ *   candidate boundary is not evidence that the work it watched ended — until the
+ *   ordered terminal witness, newer observed root work, a real contradiction, or a
+ *   loss of the lane that observed it replaces that projection. Either way
+ *   {@link NativeClaudeStatusReducer.confirmTurnEnd}, driven by a terminal record
+ *   the source actually read, is what establishes `busy: false` and `Ready` for a
+ *   turn that ran, and a `Stop` never turns an unknown or idle foreground into a
+ *   running one. The only idle claim made
  *   BEFORE any prompt is the one the run's own owner is entitled to make about a
  *   process it launched itself
  *   ({@link NativeClaudeStatusReducer.observeOwnedStartup}) or restates from a
@@ -121,6 +130,18 @@ export type NativeClaudeForegroundObservation = Pick<
   "busy" | "pendingInput" | "activity"
 >;
 
+/**
+ * The observation axes this reducer owns, and the closed width a degradation can
+ * reach. `foreground` is the root busy claim and its activity label;
+ * `questionCensus` is the pending-input answer for this scope. Nothing else is a
+ * reducer fact: background membership, the run's scope binding, and the health of
+ * the lane a payload arrived on belong to the caller, and no unreadable payload
+ * here says anything about them.
+ */
+export const NATIVE_CLAUDE_OBSERVATION_AXES = Object.freeze(["foreground", "questionCensus"] as const);
+
+export type NativeClaudeObservationAxis = (typeof NATIVE_CLAUDE_OBSERVATION_AXES)[number];
+
 /** Stable, payload-free reason code for one reduce outcome. */
 export type NativeClaudeReduceReason =
   | "scope-rebound"
@@ -176,7 +197,14 @@ export type NativeClaudeReduceReason =
  * - `invalid`: a recognized event kind arrived with unusable payload, so the
  *   observations that payload would have supported are withdrawn as
  *   unverifiable; `snapshot` is the degraded value (never a fabricated zero,
- *   none, or Ready).
+ *   none, or Ready. `affects` states exactly which observation axes that payload
+ *   contradicted — the closed facts the reducer itself judges, so a caller never
+ *   has to re-derive them from a reason list and never has to guess how wide the
+ *   damage is. Everything outside `affects` is stated by the degraded snapshot
+ *   UNCHANGED on purpose, and a caller must not withdraw more than the reducer
+ *   declares: a payload that could not be read is not evidence about a category
+ *   it never touched. Losing the lane a payload arrived on is a separate,
+ *   authenticated fact and is never something this reducer can state.
  */
 export type NativeClaudeReduceResult =
   | {
@@ -188,6 +216,8 @@ export type NativeClaudeReduceResult =
   | {
       readonly outcome: "invalid";
       readonly reason: NativeClaudeReduceReason;
+      /** The closed axes this unreadable payload actually contradicted. */
+      readonly affects: readonly NativeClaudeObservationAxis[];
       readonly snapshot: NativeClaudeForegroundObservation;
     };
 
@@ -898,22 +928,42 @@ export class NativeClaudeStatusReducer {
 
   /**
    * A root `Stop` is a turn-end boundary this observer cannot prove final: a
-   * different operator's `Stop` hook may block and continue the same turn, so
-   * the foreground becomes unverifiable rather than Ready, and the turn's tool
-   * ledger is dropped so a late close cannot relabel it. An unresolved root
-   * question request is NOT cleared here: it was never observed closing, and a
-   * continuation may still be waiting on it. Only
-   * {@link NativeClaudeStatusReducer.confirmTurnEnd} or a scope boundary owns
-   * it.
+   * different operator's `Stop` hook may block and continue the same turn. It is
+   * therefore never Ready, and never a source failure. What it may do to the
+   * foreground depends on what this source positively holds underneath it:
+   *
+   * - A turn this source positively observed RUNNING stays running, with its
+   *   current tool TYPE. The boundary says the turn MAY be over; it says nothing
+   *   about the work this run watched start and never saw end, so withdrawing a
+   *   proven `busy: true` to `unknown` at this edge replaces a known fact with a
+   *   guess for exactly as long as the ordered terminal read takes. That
+   *   projection changes only on the source's own ordered terminal record
+   *   ({@link NativeClaudeStatusReducer.confirmTurnEnd}), newer observed root
+   *   work, a real contradiction, or a genuine loss of the lane that observed it.
+   * - A foreground that is unknown, or an IDLE claim, is not an observed active
+   *   turn: an unproven boundary cannot invent one, so it becomes (or stays)
+   *   unverifiable exactly as before. This path never publishes `busy: false` as
+   *   a completion, and never upgrades an idle or unknown baseline to running.
+   *
+   * The turn's tool ledger is dropped either way, so a late close cannot relabel
+   * it. An unresolved root question request is NOT cleared here: it was never
+   * observed closing, and a continuation may still be waiting on it — and while
+   * the turn it stands in is still positively running, that one request's
+   * stopped-on-input projection stands with it.
    */
   #reduceStop(scope: ObservedScope): NativeClaudeReduceResult {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
+    // The UNDERLYING observed value, not the published projection: a turn paused
+    // on one open request is still an observed running turn underneath it.
+    const observedRunning = this.#busy === true;
     this.#clearTurnToolState();
-    this.#busy = null;
-    this.#activity = [];
-    this.#blockingQuestion = null;
-    this.#waitingQuestionKey = null;
-    this.#foregroundOrigin = null;
+    if (!observedRunning) {
+      this.#busy = null;
+      this.#activity = [];
+      this.#blockingQuestion = null;
+      this.#waitingQuestionKey = null;
+      this.#foregroundOrigin = null;
+    }
     return { outcome: "applied", reason: "turn-end-candidate", snapshot: this.snapshot() };
   }
 
@@ -1223,12 +1273,21 @@ export class NativeClaudeStatusReducer {
   /**
    * Degrade what the unreadable payload would have supported: the root
    * foreground claim when the payload is root-scoped or cannot be attributed at
-   * all, and always the pending-request census.
+   * all, and always the pending-request census. The same judgement is returned
+   * as closed `affects` facts, because the width of a degradation belongs to the
+   * reducer that made it and must never be re-derived — or widened — by a caller
+   * matching reason names.
    */
-  #invalid(reason: NativeClaudeReduceReason, affectsRootForeground: boolean): NativeClaudeReduceResult {
+  #invalid(reason: NativeClaudeReduceReason, affectsRootForeground: boolean): Extract<
+    NativeClaudeReduceResult,
+    { outcome: "invalid" }
+  > {
+    const affects: readonly NativeClaudeObservationAxis[] = affectsRootForeground
+      ? ["foreground", "questionCensus"]
+      : ["questionCensus"];
     if (affectsRootForeground) this.#withdrawForeground();
     this.#markCensusIncomplete();
-    return { outcome: "invalid", reason, snapshot: this.snapshot() };
+    return { outcome: "invalid", reason, affects, snapshot: this.snapshot() };
   }
 }
 

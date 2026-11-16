@@ -31,11 +31,13 @@ import type {
   PeerRenameTarget,
 } from "../src/session-host/network/peer-rename";
 import type { PeerUiHost } from "../src/session-host/peer-ui-protocol";
+import { REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE } from "../src/session-host/sidebar";
 import { remotePeerHost, remoteRosterRow } from "./helpers/session-host-main-remote";
 import {
   ALT_LEFT, ENTER, FakePeerCoordinator, closeWithSignal, nextTurn, peerMainHarness, plain,
   type Harness,
 } from "./helpers/session-host-main-harness";
+import { NATIVE_PANE_START } from "./helpers/session-host-native-roster-witness";
 
 const NATIVE_ROW_ID = "native-1";
 const PI_ROW_ID = "pi-1";
@@ -342,10 +344,18 @@ test("a native host name that was never sent keeps the draft and sends nothing",
   await nextTurn();
   assert.equal(harness.sidebar!.focus, "form", "a not-sent answer keeps the operator's draft");
   assert.equal(peer.nativeRequests.length, 1);
-  // The narrow form pane truncates, so the assertion uses the longest prefix the
-  // operator can actually read.
-  assert.ok(drawnNotices(harness).includes("does not offer naming a native"),
-    drawnNotices(harness));
+  // The 80x24 host gives the form pane everything right of the 35-column roster
+  // and its divider, so the fixed capability notice is drawn as the exact
+  // ellipsized prefix the writer can show at that budget. The drawn row must be
+  // THAT restriction notice and nothing else: the same refusal at the form
+  // pane's full visible budget, never a different notice.
+  const formPaneColumns = harness.terminal.columns - NATIVE_PANE_START;
+  const noticeRow = ` ! ${REMOTE_NATIVE_NAME_UNSUPPORTED_NOTICE} `;
+  const drawnNotice = noticeRow.length <= formPaneColumns
+    ? noticeRow
+    : `${noticeRow.slice(0, formPaneColumns - 3)}...`;
+  assert.equal(drawnNotices(harness), drawnNotice.slice(2).trim(),
+    "the capability restriction is stated at the form pane's exact visible budget");
 });
 
 test("a native Edit target that moved while the form was open submits nothing", async (t) => {

@@ -16,7 +16,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { InstanceStatusUpdate } from "../src/session-host/instances";
 import {
+  NATIVE_CLAUDE_OBSERVATION_AXES,
   NativeClaudeStatusReducer,
+  type NativeClaudeObservationAxis,
   type NativeClaudeForegroundObservation,
   type NativeClaudeReduceResult,
   type NativeClaudeTerminalRecord,
@@ -82,6 +84,22 @@ function boundReducer(): NativeClaudeStatusReducer {
 function expectOutcome(result: NativeClaudeReduceResult, outcome: string, reason: string): void {
   assert.equal(result.outcome, outcome, `outcome for ${reason}`);
   assert.equal(result.reason, reason);
+}
+
+/**
+ * An `invalid` outcome and the closed axes it declares, in one assertion: the
+ * declared width is part of the outcome contract, not an afterthought a caller
+ * may widen or re-derive from the reason name.
+ */
+function expectDegraded(
+  result: NativeClaudeReduceResult,
+  reason: string,
+  affects: readonly NativeClaudeObservationAxis[],
+): Extract<NativeClaudeReduceResult, { outcome: "invalid" }> {
+  expectOutcome(result, "invalid", reason);
+  if (result.outcome !== "invalid") assert.fail("expected an invalid outcome");
+  assert.deepEqual(result.affects, affects, `declared axes for ${reason}`);
+  return result;
 }
 
 /** Narrow a non-ignored result to its snapshot; an ignored event carries none. */
@@ -355,8 +373,9 @@ test("a delayed event from an older root prompt cannot move the foreground or co
   // The current turn still settles, and only on a confirmed terminal record.
   const candidate = reducer.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p2" }));
   expectOutcome(candidate, "applied", "turn-end-candidate");
-  // The still-open request is untouched by an unprovable boundary.
-  assert.deepEqual(snapshotOf(candidate), { busy: null, pendingInput: true, activity: [] });
+  // An unprovable boundary touches neither the still-open request nor the work
+  // this source positively observed running under this turn.
+  assert.deepEqual(snapshotOf(candidate), { busy: true, pendingInput: true, activity: ["bash"] });
   expectOutcome(reducer.confirmTurnEnd({ promptId: "p1" }), "ignored", "stale-prompt");
   const confirmed = reducer.confirmTurnEnd({ promptId: "p2" });
   expectOutcome(confirmed, "applied", "turn-ended-confirmed");
@@ -394,12 +413,13 @@ test("subagent edges never mark the root foreground Ready or replace its tool ac
   assert.equal(reducer.snapshot().pendingInput, true);
   const rootStop = reducer.reduce(hook("Stop", { stop_hook_active: false }));
   expectOutcome(rootStop, "applied", "turn-end-candidate");
-  // The root boundary is unverifiable and leaves the subagent request untouched.
-  assert.deepEqual(snapshotOf(rootStop), { busy: null, pendingInput: true, activity: [] });
+  // The boundary proves no end, so it leaves this source's observed running root
+  // turn and the subagent request exactly as they were.
+  assert.deepEqual(snapshotOf(rootStop), { busy: true, pendingInput: true, activity: ["read"] });
 
   const subClose = reducer.reduce(subagentHook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_subq" }));
   expectOutcome(subClose, "applied", "question-request-closed");
-  assert.deepEqual(snapshotOf(subClose), { busy: null, pendingInput: false, activity: [] });
+  assert.deepEqual(snapshotOf(subClose), { busy: true, pendingInput: false, activity: ["read"] });
 });
 
 test("Stop is only a candidate boundary; a confirmed terminal record is what yields Ready", () => {
@@ -410,10 +430,12 @@ test("Stop is only a candidate boundary; a confirmed terminal record is what yie
   const candidate = reducer.reduce(hook("Stop", { stop_hook_active: false, last_assistant_message: "private reply text" }));
   expectOutcome(candidate, "applied", "turn-end-candidate");
   // Another operator's Stop hook can block and continue this same turn, so the
-  // arrival of this observer's Stop proves nothing: unverifiable, never Ready.
+  // arrival of this observer's Stop proves nothing: never Ready — and not unknown
+  // either. This source watched the turn begin and never saw it end, so the
+  // observed working projection stands until the source's own terminal record.
   // The question census is a separate observation: no request opened or closed
   // here, so the vouched "none pending" baseline survives the boundary.
-  assert.deepEqual(snapshotOf(candidate), { busy: null, pendingInput: false, activity: [] });
+  assert.deepEqual(snapshotOf(candidate), { busy: true, pendingInput: false, activity: ["Working"] });
   assert.equal(JSON.stringify(snapshotOf(candidate)).includes("private reply text"), false);
 
   const confirmed = reducer.confirmTurnEnd({ sessionId: SESSION, promptId: "p1" });
@@ -430,6 +452,39 @@ test("Stop is only a candidate boundary; a confirmed terminal record is what yie
   assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
+test("an unproven Stop never invents a running row and never keeps an idle claim as a completion", () => {
+  // A foreground this source never observed running stays unverifiable, and
+  // repeating the boundary invents nothing.
+  const neverRan = boundReducer();
+  assert.deepEqual(neverRan.snapshot(), { busy: null, pendingInput: false, activity: [] });
+  for (const _ of [0, 1]) {
+    expectOutcome(
+      neverRan.reduce(hook("Stop", { stop_hook_active: false })),
+      "applied",
+      "turn-end-candidate",
+    );
+    assert.equal(neverRan.snapshot().busy, null);
+  }
+
+  // A confirmed Ready is an IDLE claim, not an observed active turn: the next
+  // boundary makes the foreground unverifiable again instead of retaining
+  // `busy: false` as though the Stop had proved it.
+  const idle = boundReducer();
+  expectOutcome(idle.confirmTurnEnd(), "applied", "turn-ended-confirmed");
+  assert.deepEqual(idle.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+  expectOutcome(idle.reduce(hook("Stop", { stop_hook_active: false })), "applied", "turn-end-candidate");
+  assert.deepEqual(idle.snapshot(), { busy: null, pendingInput: false, activity: [] });
+
+  // Repeating the boundary on an observed running turn retains the SAME observed
+  // fact: it is not a fresh claim of work, and it is still never Ready.
+  const twice = boundReducer();
+  twice.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  const first = snapshotOf(twice.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" })));
+  const second = snapshotOf(twice.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" })));
+  assert.deepEqual(first, { busy: true, pendingInput: false, activity: ["Working"] });
+  assert.deepEqual(second, first);
+});
+
 test("a blocked continuation after a Stop candidate is never falsely Ready", () => {
   const reducer = boundReducer();
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
@@ -439,7 +494,9 @@ test("a blocked continuation after a Stop candidate is never falsely Ready", () 
     "applied",
     "turn-end-candidate",
   );
-  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: false, activity: [] });
+  // The unproven boundary keeps the observed bash turn standing; it is not a
+  // completion, and it is not a withdrawal of a fact this source observed.
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
 
   // A blocking operator hook continues the same turn: new work is observed
   // again, and the row stays non-Ready until the source confirms the end.
@@ -647,7 +704,8 @@ test("activity keeps the current/last tool TYPE only, with no payload text", () 
   const read = reducer.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_read", tool_input: { file_path: PATH_TEXT } }));
   assert.deepEqual(snapshotOf(read).activity, ["read"]);
 
-  // The close keeps the last observed tool TYPE; only a root Stop yields Ready.
+  // The close keeps the last observed tool TYPE; only a confirmed terminal
+  // record yields Ready.
   const done = reducer.reduce(hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_read", tool_response: { stdout: "private output" } }));
   expectOutcome(done, "applied", "tool-completed");
   assert.deepEqual(snapshotOf(done), { busy: true, pendingInput: false, activity: ["read"] });
@@ -659,7 +717,9 @@ test("activity keeps the current/last tool TYPE only, with no payload text", () 
 
   const stop = reducer.reduce(hook("Stop", { stop_hook_active: false }));
   expectOutcome(stop, "applied", "turn-end-candidate");
-  expectOutcome(reducer.confirmTurnEnd(), "applied", "turn-ended-confirmed");
+  // The Stop left the observed turn standing, so only a record bound to that turn
+  // can confirm it over.
+  expectOutcome(reducer.confirmTurnEnd({ promptId: "p1" }), "applied", "turn-ended-confirmed");
   assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
@@ -687,7 +747,8 @@ test("an older or late tool close never relabels newer tool state or Ready", () 
   );
 
   // After a turn-end boundary its whole ledger is gone, so a delayed close
-  // cannot relabel the foreground, and Ready arrives only from a confirmed end.
+  // cannot relabel the foreground, and Ready arrives only from a confirmed end
+  // bound to the turn that is still positively observed running.
   expectOutcome(reducer.reduce(hook("Stop", { stop_hook_active: false })), "applied", "turn-end-candidate");
   for (const event of [
     hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_a" }),
@@ -695,10 +756,10 @@ test("an older or late tool close never relabels newer tool state or Ready", () 
   ]) {
     expectOutcome(reducer.reduce(event), "ignored", "tool-close-unobserved");
   }
-  // The tool ledger is gone, but the question census is a separate observation:
-  // the vouched none-pending baseline survives an unverifiable boundary.
-  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: false, activity: [] });
-  expectOutcome(reducer.confirmTurnEnd(), "applied", "turn-ended-confirmed");
+  // The tool ledger is gone, while the observed running turn and the vouched
+  // none-pending census are separate observations that survive it.
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+  expectOutcome(reducer.confirmTurnEnd({ promptId: "p1" }), "applied", "turn-ended-confirmed");
   assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
@@ -753,6 +814,120 @@ test("a malformed payload withdraws an established Ready or cleared-pending clai
   const degraded = cleared.reduce(hook("PreToolUse", { tool_name: "AskUserQuestion" }));
   expectOutcome(degraded, "invalid", "question-request-unidentified");
   assert.equal(snapshotOf(degraded).pendingInput, null);
+});
+
+/*
+ * The width of a degradation belongs to the reducer that made it. An unreadable
+ * payload states which of the two axes it owns it contradicted, and everything
+ * outside that declaration is preserved ON PURPOSE. A caller that re-derives the
+ * blast radius from reason names — or that treats any `invalid` as a whole-lane
+ * loss — withdraws facts the payload never touched, which is exactly how an
+ * answered question once erased a healthy foreground, a live background census,
+ * and a run's own session binding at once.
+ */
+
+test("an invalid outcome declares exactly the axes its unreadable field contradicted", () => {
+  // The closed axis set is the reducer's own vocabulary, and it owns both.
+  assert.deepEqual([...NATIVE_CLAUDE_OBSERVATION_AXES], ["foreground", "questionCensus"]);
+
+  // Census-only: a close for a request this reducer never opened proves an
+  // observation hole in the pending-input answer and NOTHING about what is
+  // running, so busy and the tool label stand beside the unknown input.
+  const unobserved = boundReducer();
+  unobserved.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  unobserved.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_b" }));
+  assert.deepEqual(unobserved.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+
+  const closeHole = expectDegraded(
+    unobserved.reduce(questionClose("toolu_never_opened", { prompt_id: "p1" })),
+    "question-close-unobserved",
+    ["questionCensus"],
+  );
+  assert.deepEqual(snapshotOf(closeHole), { busy: true, pendingInput: null, activity: ["bash"] });
+
+  // Same width for a question close that carries no request identity at all.
+  const unidentified = boundReducer();
+  unidentified.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  unidentified.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_r" }));
+  const noId = expectDegraded(
+    unidentified.reduce(hook("PostToolUse", { tool_name: "AskUserQuestion" })),
+    "question-close-unidentified",
+    ["questionCensus"],
+  );
+  assert.deepEqual(snapshotOf(noId), { busy: true, pendingInput: null, activity: ["read"] });
+
+  // Root-attributable and unattributable payloads are the ones that also own the
+  // foreground: both axes, and the snapshot withdraws both.
+  const foreground = boundReducer();
+  foreground.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  foreground.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_r" }));
+  const unreadableTool = expectDegraded(
+    foreground.reduce(hook("PreToolUse", { tool_name: `Bash ${COMMAND_TEXT}`, tool_use_id: "toolu_x" })),
+    "tool-name-unavailable",
+    ["foreground", "questionCensus"],
+  );
+  expectUnknown(snapshotOf(unreadableTool));
+
+  const unattributable = boundReducer();
+  unattributable.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  const badScope = expectDegraded(
+    unattributable.reduce(hook("Stop", { agent_id: 7 })),
+    "malformed-scope",
+    ["foreground", "questionCensus"],
+  );
+  expectUnknown(snapshotOf(badScope));
+
+  // A subagent's own unreadable tool name is not root foreground evidence: the
+  // census is all it can reach.
+  const child = boundReducer();
+  child.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  child.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_r" }));
+  const childHole = expectDegraded(
+    child.reduce(subagentHook("PreToolUse", { tool_name: `Bash ${COMMAND_TEXT}`, tool_use_id: "toolu_c" })),
+    "tool-name-unavailable",
+    ["questionCensus"],
+  );
+  assert.deepEqual(snapshotOf(childHole), { busy: true, pendingInput: null, activity: ["read"] });
+});
+
+test("a declared census-only hole never re-vouches a cleared census and never fakes an answer", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.equal(reducer.snapshot().pendingInput, false);
+
+  const degraded = expectDegraded(
+    reducer.reduce(questionClose("toolu_never_opened", { prompt_id: "p1" })),
+    "question-close-unobserved",
+    ["questionCensus"],
+  );
+  assert.equal(snapshotOf(degraded).pendingInput, null);
+
+  // A definitive close of a DIFFERENT request does not launder the hole away:
+  // the unknown answer stays unknown, and no `false` is rebuilt on top of it.
+  reducer.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  const closed = reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" }));
+  expectOutcome(closed, "applied", "question-request-closed");
+  assert.equal(reducer.snapshot().pendingInput, null, "no false is rebuilt on top of a census hole");
+
+  // The hole is a boundary fact, not a permanent one: a genuine root
+  // `SessionStart` — the only boundary that shows a census from its beginning —
+  // is what clears it. Nothing short of that re-vouches an answer.
+  const fresh = new NativeClaudeStatusReducer();
+  expectOutcome(fresh.reduce(hook("SessionStart", { source: "startup" })), "applied", "scope-rebound");
+  expectOutcome(fresh.reduce(hook("UserPromptSubmit", { prompt_id: "p2" })), "applied", "turn-submitted");
+  expectDegraded(
+    fresh.reduce(questionClose("toolu_never_opened", { prompt_id: "p2" })),
+    "question-close-unobserved",
+    ["questionCensus"],
+  );
+  assert.equal(fresh.snapshot().pendingInput, null);
+  const rebound = fresh.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" }));
+  expectOutcome(rebound, "applied", "scope-rebound");
+  assert.equal(
+    fresh.snapshot().pendingInput,
+    false,
+    "a genuine root SessionStart is the boundary that shows a census from its beginning",
+  );
 });
 
 test("a genuine SessionStart rebinds scope, clears stale claims, and vouches the fresh census empty", () => {
@@ -940,7 +1115,8 @@ test("unrelated event kinds are ignored and never synthesize counts or Ready", (
     session_crons: [{ id: "c1", schedule: "0 9 * * 1-5", recurring: true, prompt: "private prompt" }],
   }));
   expectOutcome(stop, "applied", "turn-end-candidate");
-  assert.deepEqual(snapshotOf(stop), { busy: null, pendingInput: false, activity: [] });
+  // An unproven boundary neither completes nor withdraws the observed bash turn.
+  assert.deepEqual(snapshotOf(stop), { busy: true, pendingInput: false, activity: ["bash"] });
   assert.equal(JSON.stringify(snapshotOf(stop)).includes(COMMAND_TEXT), false);
   assert.equal(JSON.stringify(snapshotOf(stop)).includes("private prompt"), false);
 
@@ -992,7 +1168,9 @@ test("a healthy question-free turn preserves none pending from SessionStart thro
   // never strands the vouched empty census back to unknown.
   const candidate = reducer.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" }));
   expectOutcome(candidate, "applied", "turn-end-candidate");
-  assert.deepEqual(snapshotOf(candidate), { busy: null, pendingInput: false, activity: [] });
+  // The candidate proves no end, so the observed read stays observed and the
+  // vouched empty census is untouched; only the confirmed record moves it.
+  assert.deepEqual(snapshotOf(candidate), { busy: true, pendingInput: false, activity: ["read"] });
   const confirmed = reducer.confirmTurnEnd({ promptId: "p1" });
   expectOutcome(confirmed, "applied", "turn-ended-confirmed");
   assert.deepEqual(snapshotOf(confirmed), { busy: false, pendingInput: false, activity: ["Ready"] });
@@ -1318,7 +1496,7 @@ test("a request from an older prompt cannot keep the row waiting once the curren
   assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
 });
 
-test("newer root work or a turn-end boundary ends the stopped-on-input claim", () => {
+test("newer root work ends the stopped-on-input claim; an unproven boundary leaves it standing", () => {
   // A new accepted prompt is newer root work: the row runs again.
   const prompt = boundReducer();
   prompt.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
@@ -1344,13 +1522,22 @@ test("newer root work or a turn-end boundary ends the stopped-on-input claim", (
   tool.reduce(questionOpen("toolu_q3", { prompt_id: "p1" }));
   assert.equal(tool.snapshot().busy, false, "with nothing else running, the new request blocks");
 
-  // A `Stop` boundary proves neither a finished turn nor a still-standing answer:
-  // the foreground becomes unverifiable rather than waiting.
+  // A `Stop` boundary proves neither a finished turn nor a still-standing answer,
+  // so it retires neither observation: a request the source never saw closing
+  // stays waiting, and the turn it stands in stays the turn this source saw run.
   const stopped = boundReducer();
   stopped.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
   stopped.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
   stopped.reduce(hook("Stop", { prompt_id: "p1", stop_hook_active: true }));
-  assert.deepEqual(stopped.snapshot(), { busy: null, pendingInput: true, activity: [] });
+  assert.deepEqual(stopped.snapshot(), { busy: false, pendingInput: true, activity: ["Working"] });
+  // The source's own ordered terminal record is what owns both: it ends the turn
+  // and retires the unresolved request with it.
+  expectOutcome(
+    stopped.confirmTurnEnd({ promptId: "p1" }),
+    "applied",
+    "turn-ended-confirmed",
+  );
+  assert.deepEqual(stopped.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 
   // A request whose identity cannot be read can never be matched to a close, so
   // nothing is claimed as waiting either: the foreground withdraws to unknown.

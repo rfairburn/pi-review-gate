@@ -519,6 +519,161 @@ test("provider input selection drops all sensitive and arbitrary fields before t
   assert.deepEqual(sanitizeNativeHookProviderInput(null), { ok: false, reason: "input-invalid" });
 });
 
+test("an agent's named child transcript is selected only on that agent's own boundary", () => {
+  // Claude Code 2.1.325 names the closing child's own transcript on `SubagentStop`
+  // and nowhere else. It is selected as a bounded absolute path and nothing more:
+  // no filename is derived, no directory is searched, and an event that was not
+  // given one is not given a guess.
+  const child = sanitizeNativeHookProviderInput({
+    hook_event_name: "SubagentStop",
+    session_id: "session-child",
+    transcript_path: "/tmp/session-root.jsonl",
+    agent_transcript_path: "/tmp/session-child-agent.jsonl",
+    agent_id: "agent-child-1",
+  });
+  assert.deepEqual(child, {
+    ok: true,
+    metadata: {
+      hook_event_name: "SubagentStop",
+      session_id: "session-child",
+      transcript_path: "/tmp/session-root.jsonl",
+      agent_transcript_path: "/tmp/session-child-agent.jsonl",
+      agent_id: "agent-child-1",
+    },
+  });
+
+  // Anywhere else it is not a field this trusted producer emits, so a frame that
+  // carries it is refused rather than quietly given a path to open.
+  for (const name of ["Stop", "PostToolUse", "UserPromptSubmit", "SessionStart"]) {
+    assert.deepEqual(
+      sanitizeNativeHookProviderInput({ hook_event_name: name, agent_transcript_path: "/tmp/x.jsonl" }),
+      { ok: false, reason: "input-invalid" },
+      `${name} never selects a child transcript`,
+    );
+  }
+
+  // On the one event that may carry it, the same path rules apply: relative, empty,
+  // control-character, and oversized values fail the event instead of becoming a
+  // path a consumer would have to second-guess.
+  for (const bad of ["relative.jsonl", "", "/tmp/bad\u0001.jsonl", `/tmp/${"p".repeat(4096)}.jsonl`]) {
+    assert.equal(
+      sanitizeNativeHookProviderInput({
+        hook_event_name: "SubagentStop",
+        agent_id: "agent-child-1",
+        agent_transcript_path: bad,
+      }).ok,
+      false,
+      `an unusable child transcript path is refused: ${bad.slice(0, 24)}`,
+    );
+  }
+});
+
+test("an empty Claude agent_type is omitted as descriptive metadata without erasing the same hook's facts", () => {
+  // Claude Code 2.1.325's SubagentStop producer writes
+  // `agent_type: contextType ?? mainAgentType ?? ''`, and the field's own schema
+  // has no minimum length. The label is descriptive only: `agent_id` alone is
+  // scope, so the empty value is omitted instead of failing the whole raw hook
+  // and discarding the identity, session, and background facts beside it.
+  const child = sanitizeNativeHookProviderInput({
+    hook_event_name: "SubagentStop",
+    session_id: "session-child",
+    transcript_path: "/tmp/session-child.jsonl",
+    agent_id: "agent-child-1",
+    agent_type: "",
+    prompt_id: "prompt-1",
+    tool_name: "Task",
+    tool_use_id: "toolu-1",
+    background_tasks: [
+      { id: "a1a2b3c4d", type: "subagent", status: "running", description: "SECRET DESCRIPTION" },
+      { id: "b8k3n1p4q", type: "shell", status: "running", command: "SECRET COMMAND" },
+    ],
+  });
+  assert.deepEqual(child, {
+    ok: true,
+    metadata: {
+      hook_event_name: "SubagentStop",
+      session_id: "session-child",
+      transcript_path: "/tmp/session-child.jsonl",
+      agent_id: "agent-child-1",
+      prompt_id: "prompt-1",
+      tool_name: "Task",
+      tool_use_id: "toolu-1",
+      background_counts: { tasks: 1, shells: 1 },
+      background_members: [
+        { id: "a1a2b3c4d", kind: "task" },
+        { id: "b8k3n1p4q", kind: "shell" },
+      ],
+    },
+  });
+  assert.ok(!JSON.stringify(child).includes("SECRET"), "the raw background fields are never projected");
+
+  // Absent agent_id, never the type label, is what leaves an event at root
+  // scope; an empty label must not invent an identity or withdraw one.
+  assert.deepEqual(sanitizeNativeHookProviderInput({
+    hook_event_name: "SubagentStop",
+    session_id: "session-root",
+    agent_type: "",
+  }), {
+    ok: true,
+    metadata: { hook_event_name: "SubagentStop", session_id: "session-root" },
+  });
+
+  // A nonempty named type is descriptive metadata and stays unchanged.
+  assert.deepEqual(sanitizeNativeHookProviderInput({
+    hook_event_name: "SubagentStop",
+    agent_id: "agent-child-1",
+    agent_type: "worker",
+  }), {
+    ok: true,
+    metadata: {
+      hook_event_name: "SubagentStop",
+      agent_id: "agent-child-1",
+      agent_type: "worker",
+    },
+  });
+
+  // Only the exactly-empty descriptive label is normalized. Empty identities
+  // and paths, plus wrong-typed or oversized labels, still fail the whole event
+  // closed under the existing validation.
+  const stillInvalid: unknown[] = [
+    { hook_event_name: "SubagentStop", agent_id: "", agent_type: "" },
+    { hook_event_name: "SubagentStop", session_id: "", agent_type: "" },
+    { hook_event_name: "SubagentStop", transcript_path: "", agent_type: "" },
+    { hook_event_name: "SubagentStop", agent_id: "agent-child-1", agent_type: 7 },
+    { hook_event_name: "SubagentStop", agent_id: "agent-child-1", agent_type: "x".repeat(129) },
+  ];
+  for (const payload of stillInvalid) {
+    assert.deepEqual(sanitizeNativeHookProviderInput(payload), { ok: false, reason: "input-invalid" });
+  }
+
+  // The wire contract stays strict: the trusted relay omits the empty label,
+  // so a frame that still carries it present-empty is not relay output.
+  const bootstrap: NativeHookBootstrap = {
+    version: 1,
+    socketPath: "/tmp/broker.sock",
+    generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instanceId: INSTANCE_NATIVE,
+    backend: "claude",
+    token: "a".repeat(64),
+  };
+  assert.equal(decodeNativeHookFrame(encodeNativeHookFrame(nativeEventFrame(bootstrap, {
+    hook_event_name: "SubagentStop",
+    agent_id: "agent-child-1",
+    agent_type: "",
+  }))), undefined);
+  const named = decodeNativeHookFrame(encodeNativeHookFrame(nativeEventFrame(bootstrap, {
+    hook_event_name: "SubagentStop",
+    agent_id: "agent-child-1",
+    agent_type: "worker",
+  })));
+  assert.deepEqual(named?.kind === "event" ? named.event : undefined, {
+    backend: "claude",
+    hook_event_name: "SubagentStop",
+    agent_id: "agent-child-1",
+    agent_type: "worker",
+  });
+});
+
 test("Stop-family background snapshot projection is whole-array validated and count-only", () => {
   const entries = [
     { status: "running", backgrounded: true, type: "shell", description: "SECRET DESCRIPTION", command: "SECRET COMMAND", id: "secret-id" },
@@ -533,6 +688,10 @@ test("Stop-family background snapshot projection is whole-array validated and co
   assert.deepEqual(selected.metadata, {
     hook_event_name: "Stop",
     background_counts: { tasks: 2, shells: 1 },
+    // Two active tasks and one shell were counted, but only the shell carried an
+    // id: the projection names the TASK category as unkeyable and nothing else,
+    // so a consumer withdraws its task coverage while its shell coverage stands.
+    background_unidentified_kinds: ["task"],
   });
   assert.ok(!JSON.stringify(selected).includes("SECRET"), "no raw snapshot field reaches the selected metadata");
 
@@ -685,6 +844,9 @@ test("relay projects validated Stop/SubagentStop background counts and keeps abs
       hook_event_name: "Stop",
       session_id: "session-stop",
       background_counts: { tasks: 2, shells: 1 },
+      // None of these active entries carried an id, so the projection names both
+      // categories as unkeyable and publishes no shortened membership set.
+      background_unidentified_kinds: ["shell", "task"],
     },
     { backend: "claude", hook_event_name: "Stop" },
     {
@@ -699,12 +861,67 @@ test("relay projects validated Stop/SubagentStop background counts and keeps abs
       agent_id: "agent-child-1",
       agent_type: "worker",
       background_counts: { tasks: 1, shells: 1 },
+      background_unidentified_kinds: ["task", "shell"],
     },
   ]);
   assert.deepEqual(recorded.failures, []);
   const serialized = JSON.stringify(recorded.events);
   assert.ok(!serialized.includes("SECRET"), "raw snapshot fields are never projected or echoed");
   assert.ok(!serialized.includes("background_tasks"), "the raw provider array never crosses the wire");
+});
+
+test("a relay-delivered empty Claude agent_type keeps the hook's identity and membership facts", async () => {
+  const broker = await makeBroker();
+  const recorded = recordingNative();
+  const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, "claude", recorded.handlers);
+  const transcriptPath = path.join(process.cwd(), "child-transcript.jsonl");
+
+  const child = await runRelay(registration.bootstrap, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-child",
+    transcript_path: transcriptPath,
+    agent_id: "agent-child-1",
+    agent_type: "",
+    prompt_id: "prompt-1",
+    tool_name: "Task",
+    tool_use_id: "toolu-1",
+    background_tasks: [
+      { id: "a1a2b3c4d", type: "subagent", status: "running", description: "SECRET DESCRIPTION" },
+    ],
+  });
+  assert.equal(child.status, "accepted");
+  assert.equal(child.delivered, "event");
+
+  // The same empty descriptive label at root scope must not invent an
+  // identity: only an absent agent_id keeps this event at root.
+  const root = await runRelay(registration.bootstrap, {
+    hook_event_name: "SubagentStop",
+    session_id: "session-root",
+    agent_type: "",
+  });
+  assert.equal(root.status, "accepted");
+  assert.equal(root.delivered, "event");
+
+  assert.deepEqual(recorded.events, [{
+    backend: "claude",
+    hook_event_name: "SubagentStop",
+    session_id: "session-child",
+    transcript_path: transcriptPath,
+    agent_id: "agent-child-1",
+    prompt_id: "prompt-1",
+    tool_name: "Task",
+    tool_use_id: "toolu-1",
+    background_counts: { tasks: 1, shells: 0 },
+    background_members: [{ id: "a1a2b3c4d", kind: "task" }],
+  }, {
+    backend: "claude",
+    hook_event_name: "SubagentStop",
+    session_id: "session-root",
+  }]);
+  assert.deepEqual(recorded.failures, []);
+  const serialized = JSON.stringify(recorded.events);
+  assert.ok(!serialized.includes("agent_type"), "the empty descriptive label never crosses the wire");
+  assert.ok(!serialized.includes("SECRET"), "the raw snapshot description is never projected");
 });
 
 test("invalid Stop background snapshots are authenticated closed failures, never fallback 0/0", async () => {
@@ -1473,8 +1690,62 @@ test("an unidentified active entry makes membership unknown instead of a shorten
   assert.deepEqual(selected.metadata, {
     hook_event_name: "Stop",
     background_counts: { tasks: 1, shells: 1 },
+    // The unkeyable active entry was a task, so ONLY the task category is named:
+    // the counts stay exact and the identified shell is not implicated.
+    background_unidentified_kinds: ["task"],
   });
   assert.ok(!("background_members" in selected.metadata), "a partial membership view is never published");
+
+  // The inverse: an unkeyable SHELL names only the shell category.
+  const shellGap = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    background_tasks: [
+      { id: "a1a2b3c4d", type: "subagent", status: "running", description: "SECRET" },
+      { type: "shell", status: "running", description: "SECRET" },
+    ],
+  });
+  assert.equal(shellGap.ok, true);
+  if (!shellGap.ok) assert.fail("counts are still derivable");
+  assert.deepEqual(shellGap.metadata, {
+    hook_event_name: "Stop",
+    background_counts: { tasks: 1, shells: 1 },
+    background_unidentified_kinds: ["shell"],
+  });
+
+  // Both categories unkeyable: both are named, once each, in first-seen order.
+  const bothGaps = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    background_tasks: [
+      { type: "subagent", status: "running", description: "SECRET" },
+      { type: "shell", status: "running", description: "SECRET" },
+      { type: "monitor", status: "pending", description: "SECRET" },
+    ],
+  });
+  assert.equal(bothGaps.ok, true);
+  if (!bothGaps.ok) assert.fail("counts are still derivable");
+  assert.deepEqual(bothGaps.metadata, {
+    hook_event_name: "Stop",
+    background_counts: { tasks: 2, shells: 1 },
+    background_unidentified_kinds: ["task", "shell"],
+  });
+
+  // A FOREGROUND entry that happens to carry no id is not membership at all, so
+  // it never becomes a kind gap: the projection's claim is about ACTIVE members.
+  const foregroundOnly = sanitizeNativeHookProviderInput({
+    hook_event_name: "Stop",
+    background_tasks: [
+      { type: "shell", status: "running", backgrounded: false, description: "SECRET" },
+      { type: "subagent", status: "completed", description: "SECRET" },
+    ],
+  });
+  assert.deepEqual(foregroundOnly, {
+    ok: true,
+    metadata: {
+      hook_event_name: "Stop",
+      background_counts: { tasks: 0, shells: 0 },
+      background_members: [],
+    },
+  });
 
   // Foreground entries stay excluded exactly as before: an explicit
   // `backgrounded: false` is the provider's own foreground marker.
@@ -1641,6 +1912,21 @@ test("the wire family admits the closed membership and launch fields and refuses
     background_members: members,
   });
 
+  // The unkeyable form of the same snapshot: counts plus the closed kind gap,
+  // and no membership set.
+  const gapFrame = nativeEventFrame(bootstrap, {
+    hook_event_name: "Stop",
+    background_counts: { tasks: 2, shells: 1 },
+    background_unidentified_kinds: ["task"],
+  });
+  const decodedGap = decodeNativeHookFrame(encodeNativeHookFrame(gapFrame));
+  assert.deepEqual(decodedGap?.kind === "event" ? decodedGap.event : undefined, {
+    backend: "claude",
+    hook_event_name: "Stop",
+    background_counts: { tasks: 2, shells: 1 },
+    background_unidentified_kinds: ["task"],
+  });
+
   const refused: unknown[] = [
     // Counts and membership are one snapshot: they must agree.
     { ...stop, background_counts: { tasks: 2, shells: 0 } },
@@ -1678,6 +1964,21 @@ test("the wire family admits the closed membership and launch fields and refuses
     // The raw provider payload fields are still refused outright.
     { ...stop, background_tasks: REAL_STOP_SNAPSHOT },
     { ...nativeEventFrame(bootstrap, { hook_event_name: "PostToolUse", tool_name: "Bash" }), tool_response: { backgroundTaskId: "b8k3n1p4q" } },
+    // A complete membership view and a kind gap are mutually exclusive claims
+    // about one snapshot.
+    { ...stop, background_unidentified_kinds: ["task"] },
+    // The kind gap is the same Stop-family snapshot, Claude-only.
+    { ...gapFrame, hook_event_name: "PostToolUse" },
+    { ...gapFrame, backend: "codex" },
+    // Only the closed kind set, distinct, nonempty, and no wider than that set.
+    { ...gapFrame, background_unidentified_kinds: [] },
+    { ...gapFrame, background_unidentified_kinds: ["agent"] },
+    { ...gapFrame, background_unidentified_kinds: ["task", "task"] },
+    { ...gapFrame, background_unidentified_kinds: ["task", "shell", "task"] },
+    { ...gapFrame, background_unidentified_kinds: "task" },
+    // A gap claims an ACTIVE member of that kind, so that kind's own stated
+    // count cannot be zero.
+    { ...gapFrame, background_counts: { tasks: 0, shells: 1 } },
   ];
   for (const frame of refused) {
     assert.equal(decodeNativeHookFrame(encodeNativeHookFrame(frame as NativeHookEventFrame)), undefined,

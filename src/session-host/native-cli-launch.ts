@@ -92,6 +92,17 @@ import { type NativeCliBackend } from "./session-backend";
  *   stages no new artifact on any render. With the option absent or false —
  *   every existing call site, production included — no descriptor carries a
  *   plan and nothing about a launch changes.
+ * - **Owned Codex launches carry no owner-supplied status hook of ours.** The same
+ *   construction-time mode is also the only launch for which this module declines its
+ *   OWN hook preparation, even when the request armed it: the owning host already holds
+ *   a private backend whose approved relay and read-only RPC supply this row's session
+ *   metadata, so a hook instruction this host injected into the interactive child would
+ *   be a second, competing channel whose only effect is to change the real argv and
+ *   environment. Such a launch therefore stages no artifact, keeps `nativeHook` absent,
+ *   and gains no generated flag or marker anywhere. Every operator-configured hook,
+ *   configuration override, and CLI flag — including the operator's own
+ *   `hooks.SessionStart` spelling — is still composed verbatim by the one scanner: what
+ *   is declined is only this host's own instruction, never the operator's.
  * - **No inherited host capability.** The environment is a clone sanitized by
  *   the same provider-neutral sanitizer the native Pi launch uses: worker role
  *   authorization is rejected fail-closed, and stale session-host bootstrap,
@@ -187,15 +198,20 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
    * owns `lease` (release it only after the provider source and its PTY have
    * settled); `unavailable` means nothing was added and the row stays reported
    * unknown.
+	 *
+	 * An owned Codex launch (the field below present) never carries this outcome:
+	 * this module prepares no status hook of its own for a launch whose owning
+	 * host already owns the backend beside it.
    */
   readonly nativeHook?: NativeHookLaunchOutcome;
   /**
    * Present only for a Codex launch prepared by a launcher constructed with
    * `NativeCliLauncherOptions.ownedCodexBackend`. It is a rendering plan, not a
    * second child and not an ownership claim: the ordinary `file`, `args`,
-   * `commandLine`, `env`, `cwd`, and `nativeHook` fields above stay exactly
-   * what an unarmed launch composes, and the hook artifacts this launch staged
-   * remain owned through `nativeHook` alone.
+	 * `commandLine`, `env`, and `cwd` fields above stay exactly what an unarmed
+	 * launch composes. `nativeHook` is absent here by design: an owned launch
+	 * stages no hook artifact of ours, so there is nothing for a caller to own,
+	 * and neither rendered child receives a generated flag or marker.
    */
   readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
 }
@@ -227,6 +243,13 @@ export interface NativeCliLauncherOptions {
    * can claim. Absent or false — every existing call site — no launch carries a
    * plan and every descriptor is byte-identical to the one this module composed
    * before the mode existed.
+   *
+   * True also means this launcher prepares no owner-supplied status hook of ours
+   * for the Codex launches it plans, whether or not the request armed one: the
+   * approved relay and its read-only RPC are the metadata channel of an owned
+   * row, so the interactive child's real argv and environment gain no hook
+   * instruction, no marker, and no staged artifact from us. Operator-authored
+   * hook configuration is untouched either way.
    */
   ownedCodexBackend?: boolean;
 }
@@ -1365,8 +1388,11 @@ function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCod
  * - Only a launcher constructed with `ownedCodexBackend: true` attaches a
  *   `NativeCodexOwnedLaunchPlan` to a Codex result, and it attaches nothing to
  *   any other backend. The mode changes no resolution, no guard, and no
- *   descriptor: it adds one preparation-only plan, and one new refusal — a
- *   configured named profile, which this host cannot route to an owned backend.
+ *   descriptor: it adds one preparation-only plan, one new refusal — a
+ *   configured named profile, which this host cannot route to an owned backend —
+ *   and the decline of this module's OWN status-hook preparation for exactly those
+ *   planned Codex launches, so their real argv and environment carry no hook of
+ *   ours while every operator-configured flag survives.
  */
 export function createNativeCliLauncher(
   config: ReviewGateConfig,
@@ -1470,26 +1496,47 @@ export function createNativeCliLauncher(
     // authority like every other token, and the batch percent carrier still
     // covers them. The fresh marker is written after the sanitizer and after
     // the target overlay for the same reason.
+    //
+    // An OWNED Codex launch is the one launch this module declines to prepare a
+    // hook for, and that is decided by this launcher's own construction
+    // (`ownedCodexBackend: true`) — not by a new mode, flag, request field, or
+    // provider control. The owning host already owns the app-server backend
+    // beside this row's TUI, and the approved relay and its read-only RPC are
+    // that row's metadata channel; a hook instruction this host injected into the
+    // interactive child would be a second, competing channel whose only effect is
+    // to change the real launch argv and environment. So an armed bootstrap is
+    // still shape-validated here — a malformed option stays the same programming
+    // error it always was, and the named-profile refusal still wins over it — but
+    // nothing is acquired: no artifact, no lease, no generated flag in argv, no
+    // marker in either child's environment, and `nativeHook` stays absent, which
+    // the manager already reads as "this run keeps its source and observer and
+    // stays unknown" rather than as a refusal. What an operator configured for
+    // themselves — every `-c`/`--config` hook spelling, feature flag, and their
+    // own `hooks.SessionStart` override — is composed by the ONE scanner above and
+    // reaches both children exactly as before; only this host's own instruction is
+    // withheld.
     let nativeHook: NativeHookLaunchOutcome | undefined;
     if (request.nativeHook !== undefined) {
       const bootstrap = (request.nativeHook as { bootstrap?: unknown }).bootstrap;
       if (bootstrap === null || typeof bootstrap !== "object") {
         throw refuse("the native hook launch option must carry the broker's native hook bootstrap object");
       }
-      const scan = scanNativeArgPositions(backend, args, target.id);
-      nativeHook = await prepareNativeHookLaunch({
-        backend,
-        bootstrap: bootstrap as NativeHookBootstrap,
-        platform,
-        args,
-        scan,
-        env,
-        ...(platform === "win32"
-          ? { windowsCommandQuoter: (token: string): string => loadLauncherHelpers().cmdQuote(token) }
-          : {}),
-      });
-      if (nativeHook.observation === "prepared") {
-        applyNativeHookBootstrapEnvironment(env, nativeHook.environment, platform);
+      if (ownedFacts === undefined) {
+        const scan = scanNativeArgPositions(backend, args, target.id);
+        nativeHook = await prepareNativeHookLaunch({
+          backend,
+          bootstrap: bootstrap as NativeHookBootstrap,
+          platform,
+          args,
+          scan,
+          env,
+          ...(platform === "win32"
+            ? { windowsCommandQuoter: (token: string): string => loadLauncherHelpers().cmdQuote(token) }
+            : {}),
+        });
+        if (nativeHook.observation === "prepared") {
+          applyNativeHookBootstrapEnvironment(env, nativeHook.environment, platform);
+        }
       }
     }
 
@@ -1515,10 +1562,14 @@ export function createNativeCliLauncher(
           platform,
           parentEnvironment: options.parentEnvironment ?? process.env,
           backendEnv: ownedBackendEnv,
-          hookArgs: nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
-          hookEnvironment: nativeHook !== undefined && nativeHook.observation === "prepared"
-            ? nativeHook.environment
-            : {},
+          // An owned plan is built ONLY where `ownedFacts` exists, and that is exactly
+          // where this module declined its own hook preparation above — so the hook
+          // channel this render would otherwise merge is structurally empty: neither
+          // rendered child ever receives a generated flag or a bootstrap marker. The
+          // operator's own configuration and hook tokens are already inside
+          // `facts.backendConfigArgs` and `args`, composed by the one scanner.
+          hookArgs: [],
+          hookEnvironment: {},
         });
       if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
         const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);

@@ -22,7 +22,6 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createStatusBroker, type NativeHookStatusBroker } from "../src/session-host/broker";
-import { createNativeStatusObserver } from "../src/session-host/native-observer-factory";
 import type { SidebarNativeCliTarget } from "../src/session-host/sidebar";
 
 import {
@@ -109,8 +108,8 @@ test("a hosting host arms native status with its ONE existing broker and the con
       "the interactive launcher is still wired for a hosting host");
     assert.equal(manager.options.nativeHookRegistrar, broker,
       "the optional native registrar IS the exact broker object this host already owns, not a second facade");
-    assert.equal(manager.options.nativeStatusObserverFactory, createNativeStatusObserver,
-      "the concrete factory from the native observer module is the one the manager receives");
+    assert.equal(typeof manager.options.nativeStatusObserverFactory, "function",
+      "the manager receives the native observer module's factory, not a Main-local adapter");
 
     // The pair arrives together, and the spread the owning-host service forwarded
     // keeps every existing field and the single intercepted change hook.

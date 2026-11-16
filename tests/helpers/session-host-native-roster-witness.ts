@@ -22,7 +22,7 @@
  * session" and the final "Quit host" action.
  * There is no independent top-level "Network" or "Host shortcuts" row: those
  * are Settings submenus, drawn in the content pane, never in the roster. Only
- * the leftmost sidebar columns (the wide 32-column pane or the full
+ * the leftmost sidebar columns (the wide 35-column pane or the full
  * narrow-overlay width) are inspected, extracted by the pinned terminal-cell
  * width model so wide/combining characters can never pull the divider or native
  * right pane into scope.
@@ -54,12 +54,12 @@ function stripSgr(line: string): string {
 }
 
 /** Wide-layout sidebar pane width in columns (production compositor). */
-export const SIDEBAR_COLUMNS = 32;
+export const SIDEBAR_COLUMNS = 35;
 /** One divider column separates the wide sidebar from the native pane. */
 export const DIVIDER_COLUMNS = 1;
 /** First native-pane column in the wide layout (0-based). */
 export const NATIVE_PANE_START = SIDEBAR_COLUMNS + DIVIDER_COLUMNS;
-/** Below this outer width the sidebar is a full-width overlay, not a 32-col pane. */
+/** Below this outer width the sidebar is a full-width overlay, not a 35-col pane. */
 export const SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS = SIDEBAR_COLUMNS + DIVIDER_COLUMNS + 20;
 /** Marker drawn below a card title for the highlighted entry. */
 const MARKER_SELECTED = "> ";

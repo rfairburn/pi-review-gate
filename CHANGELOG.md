@@ -38,26 +38,51 @@ dates.
   `SystemRoot\System32\cmd.exe` for a `.cmd`/`.bat` shim). A missing binary, or a
   shared argument that names a headless or service mode, an approval, sandbox, or
   hook-trust bypass, an existing-session attach, or a workspace-scope change, is a
-  refusal with no silent strip and no fallback; Codex adds only `--no-daemon` of its
-  own, never `--no-alt-screen` and never an approval flag (the status observer's
-  per-session hook flags are the only addition on top). The child keeps the CLI's own
+  refusal with no silent strip and no fallback; a hosted Codex row's interactive client
+  attaches to a private app-server backend this host starts for that row, so it carries
+  no host-added `--no-daemon` (a Codex launch this host does not front with its own
+  backend keeps that flag), and `--no-alt-screen` and any approval or headless flag are
+  never added. The child keeps the CLI's own
   configuration, authentication, and state directories, and the host writes nothing
   into the operator's stored provider settings, hooks, plugins, or trust stores; the
   optional status observer reaches the provider only through that provider's own
   per-session hook flags — a private temporary file this host owns for that launch
-  alone, or one added per-session configuration entry. A native row carries
+  alone, or one added per-session configuration entry — and through no flag of ours at
+  all on a hosted Codex row, whose observer reads that row's own private backend. A native row carries
   no review gate, tool protection, or subtask capture/review/landing guarantee: its card
   reports the host-owned process facts (liveness, input, resize, exit) and, where that
   row's own provider-side observer is armed, an observed agent state, the
-  current or last tool type, an observed pending question request, and on a Claude
-  Code row that provider harness's own background task and shell counts taken from a
-  real root `Stop` snapshot. Every other field stays `unknown`, and a `0` appears only
+  current or last tool type, an observed pending question request, and that provider
+  harness's own live background task and shell counts.
+  Every other field stays `unknown`, and a `0` appears only
   for a positively observed empty set — with no terminal scraping and no idle
   inference. A paired owner can also start a native row when it advertises native
   targets. `SessionSpawn`, the existing Pi remote owner-create, the Saved picker, and
   the standalone launchers are unchanged. Windows sits inside this feature's
   supported-platform scope. See
   [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md).
+- **An owned private backend behind each hosted Codex row (#277)**: a hosted Codex
+  row's interactive client now attaches to one app-server child this host starts for
+  that row alone, on numeric IPv4 loopback with an operating-system-chosen ephemeral
+  port, authenticated by a fresh capability token of which only the SHA-256 digest
+  reaches that child's generated arguments, and reached through a private relay that
+  forwards the provider's own bytes unchanged (the `Host` header is the only rewrite),
+  originates no application-layer message, never subscribes, starts, resumes, answers,
+  or approves, and refuses a second concurrent client. The row's five sidebar
+  categories come from one read-only connection to that backend once an ordinary fresh
+  root is positively proved — an empty pre-attach loaded-thread census, one genuine
+  client `initialize`, one initial non-helper parentless thread start, and that
+  connection's own first successful turn start on the same thread — and stay `unknown`,
+  never rest and never zero, before that proof or after a deliberate thread change,
+  while the interactive session itself stays fully usable and no provider session-start
+  hook is waited on. This host arms no provider hook of its own for such a launch, a
+  configured target whose arguments choose a named provider profile is refused clearly
+  before any process, socket, or file exists, and stopping the row also stops its
+  backend and relay, which settle only on their own actual closures. Pi and Claude
+  rows, a Codex launch whose provider composed an ordinary descriptor,
+  `SessionSpawn`, the Saved picker, and the standalone
+  launchers are unchanged. See
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md#native-status-observation).
 - **Naming a native sidebar row (#277)**: `E` on a live native Claude or Codex row opens
   the host's Edit form and stores one host-side caption for that row, so the operator can
   tell several provider sessions apart and the row comes back under the same name with its
@@ -216,13 +241,24 @@ dates.
   record the provider writes after every `Stop` hook has answered — this observer's
   own `Stop` callback is never sufficient, because another operator's `Stop` hook
   can block and continue the same turn — and an ambiguous, non-root, or gapped
-  source leaves the foreground unknown rather than keeping a stale rest claim. Task
-  and shell counts come **only** from real **root** `Stop` snapshots of the
-  documented `background_tasks` array: a present snapshot — including an empty one,
-  which is a real 0/0 — is a real observation, an absent one is unknown, a
-  subagent's snapshot is never used as root scope. The last-reported numbers
-  survive unrelated hooks, ordinary foreground work, and transcript-only loss;
-  a membership transition, scope change, or hook-lane loss withdraws them. There is no continuous census, no
+  source leaves the foreground unknown rather than keeping a stale rest claim, and a
+  positively observed running turn stands through a `Stop` this host cannot prove final
+  until the ordered terminal witness, newer root work, a contradiction, or a lane loss.
+  Task and shell counts are a **live membership census of that run**: the per-run set
+  starts only on evidence that can vouch for it — this host's own launch of that
+  provider child, or one complete **root** membership snapshot — and each positively
+  observed launch identity and its matching completion **updates** that exact number
+  rather than withdrawing it, with a complete root `Stop` snapshot of the documented
+  `background_tasks` array replacing the whole set and outranking anything remembered.
+  An empty array is a real empty *in-flight* census, while the published task figure
+  stays that set unioned with the run's live agent identities — so an empty array beside
+  one still-live parked agent reads tasks 1 / shells 0 — and an absent snapshot is
+  unknown, while a subagent's snapshot is never used as root scope. A root `Stop`'s
+  identity-free totals stand last-reported only while no exact set exists and no live
+  agent needs reconciling, and any membership edge clears them. A genuine hole — a
+  settle for an id never launched, a member that cannot be keyed, a malformed snapshot,
+  a confirmed lane gap, or a scope change — withdraws the affected category, or both
+  when the hole cannot be attributed. There is no
   process counting, no quiet-period inference, and no reconstructed edges.
 - **Codex status from its own hook and rollout records (#277)**: a Codex row's observer
   binds its own owned root thread and
@@ -244,10 +280,13 @@ dates.
   the operator's settings layer); otherwise the host adds one extra session-scoped
   `--plugin-dir` holding a hooks-only plugin — a minimal manifest plus classic
   `hooks/hooks.json`, with no JavaScript mod, MCP server, tool, command, or skill in
-  it — and every existing entry stays exactly as configured. Codex gets exactly one
+  it — and every existing entry stays exactly as configured. A Codex launch this host
+  does not front with its own backend gets exactly one
   non-conflicting `-c hooks.SessionStart=[…]` entry, skipped entirely when the
   operator already writes `hooks` or `hooks.SessionStart` in real option position,
-  because adding one there would replace theirs; file-based hook layers from other
+  because adding one there would replace theirs, while a hosted Codex row gets no hook,
+  marker, or staged artifact of ours at all because its observer reads that row's own
+  private backend; file-based hook layers from other
   sources stay additive. Nothing is installed, no global or project settings or hook
   file is written, no trust record (`hooks.state`) is touched, nothing is
   auto-trusted, and no permission or hook-trust posture is overridden — the
@@ -262,7 +301,8 @@ dates.
   that run's own hook payload named — to confirm a real root turn end and to notice
   structured task transitions, retaining and relaying no record text. There is no
   `HOME` or history scan, no session-directory search, no global clipboard watch, no
-  raw recording, no extra service or port, and no replacement conversation. The
+  raw recording, no extra service, and no listener or port for the hook lane, and no
+  replacement conversation. The
   Claude routes stage their files in a freshly created private temporary root this
   host owns (`0700` directories, `0600` files, exclusive creation, never inside a
   workspace), and cleanup removes only the exact entries that one preparation
@@ -278,6 +318,35 @@ dates.
   have settled.
 
 ### Changed
+
+- **Live Claude background membership (#277)**: a Claude Code row's task and shell
+  figures are now a per-run membership set — exact from this host's own launch baseline
+  or a complete root membership snapshot, each positively observed launch and completion
+  edge **updating** that exact figure rather than withdrawing it, with a last-reported
+  root `Stop` total standing behind it only while no exact set and no live agent
+  contradict that total — and the task
+  figure is the distinct union of that run's non-shell members and its live agent
+  identities, so one agent is one task and a background shell it launched stays a
+  shell, and an empty in-flight census beside one still-live parked agent reads
+  tasks 1 / shells 0. An agent stops being counted only on its own established end (a clean turn
+  boundary in the same execution window plus its own recorded terminal completion),
+  never on a snapshot omission, a turn boundary alone, a genuinely blocking question,
+  or the rest of the session emptying out. A count is dropped only by what can
+  contradict it and never by an ordinary keyed edge; a hole withdraws only the category
+  it can be attributed to; a
+  positively observed running turn stands through an unproven `Stop` boundary, and the
+  figures stay advisory display with no stop or idle authority.
+
+- **Session-host sidebar width (#277)**: the shared sidebar pane is now a fixed
+  35 columns, so the always-present `bg tasks … | shells …` count row and the
+  agent/input status row fit at the actual production width even when both
+  counts are unknown. When an overflowing roster's scrollbar lane reserves one
+  column, the count row yields a leading blank cell so both labels and values
+  remain whole; the lane's own bounds and hit target are unchanged. The split
+  point moves to 56 outer columns; the divider, overlay boundary, hidden
+  full-width native pane, focus/input fences, wording, and colors are unchanged.
+  The width is fixed and never derived from counts. This is presentation only:
+  it does not change any unknown, liveness, or source observation.
 
 - **The native New form draws Provider above Workspace (#277)**: the session host's
   New-session form now draws its lines in the order **Host**, **Provider**, **Workspace**,

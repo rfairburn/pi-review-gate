@@ -122,7 +122,7 @@ async function reviewOldestPeerConsent(harness: Harness): Promise<void> {
   await nextTurn();
   for (let step = 0; step < 40; step++) {
     const frame = harness.writer.frames.at(-1)?.frame;
-    const selected = frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33))
+    const selected = frame?.lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36))
       .find((line) => line.startsWith("> "));
     // The narrow form can truncate the trailing countdown; the fixture's
     // unique consent label remains visible before that bounded truncation.
@@ -392,12 +392,12 @@ function fakeGraphicsFrame(base64: string): TerminalGraphicsFrame {
 
 function assertSavedDeleteConfirmationRightPanel(frame: { readonly lines: readonly string[] }, expectedFile: string): void {
   const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  const left = body.map((line) => line.slice(0, 32)).join("\n");
-  const right = body.map((line) => line.slice(33)).join("\n");
+  const left = body.map((line) => line.slice(0, 35)).join("\n");
+  const right = body.map((line) => line.slice(36)).join("\n");
   const normalize = (value: string): string => value.replace(/\s+/g, " ");
   const rightText = normalize(right);
   const leftText = normalize(left);
-  assert.equal(body[0]?.[32], "│", "the right/main panel begins at column 33 after the divider");
+  assert.equal(body[0]?.[35], "│", "the right/main panel begins at column 36 after the divider");
   assert.ok(leftText.includes("Sessions"), "the roster remains in columns 0..31");
   for (const text of ["Delete saved conversation?", "Conversation:", "Only this saved file is removed", "If trash fails"])
     assert.equal(leftText.includes(text), false, `left roster must not contain confirmation text: ${text}`);
@@ -422,12 +422,20 @@ function assertSavedPickerRightPanel(
   selectedCaption: string,
 ): void {
   const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  const left = body.map((line) => line.slice(0, 32)).join("\n");
-  const right = body.map((line) => line.slice(33)).join("\n");
+  const left = body.map((line) => line.slice(0, 35)).join("\n");
+  const right = body.map((line) => line.slice(36)).join("\n");
   assert.ok(left.includes("Sessions"), "the roster returns to the left pane");
   assert.ok(right.includes("Saved conversations"), "the same Saved picker returns to the right pane");
   assert.ok(right.includes(query), "the query draft remains displayed in the picker");
   assert.ok(right.includes(`> ${selectedCaption}`), "the same Saved row remains selected after cancel");
+}
+
+/** Right-pane text with host padding normalized so a wrapped notice still reads whole. */
+function rightPaneText(frame: { readonly lines: readonly string[] } | undefined): string {
+  return (frame?.lines.slice(1) ?? [])
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36))
+    .join(" ")
+    .replace(/\s+/g, " ");
 }
 
 async function emittedTerminalFrame(
@@ -641,7 +649,7 @@ test("a muted request arriving while the Add destination menu is open stays visi
     assert.ok(owner, "a live native owner exists before the request arrives");
     harness.terminal.emitInput(ALT_LEFT);
     await nextTurn();
-    harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
+    harness.terminal.setSize(40, 40); // narrow: below the 56-column split, tall enough for the band
     await nextTurn();
     await activateNetworkMenu(harness);
     assert.equal(harness.sidebar!.focus, "form", "the narrow Network pane opened before the request arrived");
@@ -695,7 +703,7 @@ test("a muted request arriving with one Add destination field editor open stays 
     assert.ok(owner, "a live native owner exists before the request arrives");
     harness.terminal.emitInput(ALT_LEFT);
     await nextTurn();
-    harness.terminal.setSize(40, 40); // narrow: below the 53-column split, tall enough for the band
+    harness.terminal.setSize(40, 40); // narrow: below the 56-column split, tall enough for the band
     await nextTurn();
     await activateNetworkMenu(harness);
     await openAddMenuInNarrowNetwork(harness);
@@ -790,7 +798,7 @@ test("a physically insufficient consent dialog refuses its own action while the 
     const owner = harness.sidebar!.activeMainOwnerID;
     harness.terminal.emitInput(ALT_LEFT);
     await nextTurn();
-    harness.terminal.setSize(40, 40); // below the 53-column split; tall enough for the dialog plus alert
+    harness.terminal.setSize(40, 40); // below the 56-column split; tall enough for the dialog plus alert
     await nextTurn();
     await deliverMutedIncomingRequest(peer, "narrow-consent");
     await reviewOldestPeerConsentNarrow(harness);
@@ -841,8 +849,8 @@ test("a wide roster beside an open form keeps its own alert and gains no redunda
     assert.equal(harness.sidebar!.focus, "form");
     const frame = harness.writer.frames.at(-1)?.frame;
     const body = frame!.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const left = body.map((line) => line.slice(0, 32)).join("\n");
-    const right = body.map((line) => line.slice(33)).join("\n");
+    const left = body.map((line) => line.slice(0, 35)).join("\n");
+    const right = body.map((line) => line.slice(36)).join("\n");
     assert.ok(left.includes("Sessions"), "the roster stays in the left pane");
     assert.ok(left.includes(INCOMING_ALERT), "the roster keeps announcing the pending request");
     assert.ok(right.includes("New session"), "the form stays in the right pane");
@@ -1618,12 +1626,12 @@ test("unchanged Main input forwards every packet without speculative frames; chi
   await nextTurn();
 
   const inputs: ReadonlyArray<readonly [string, string]> = [
-    ["\x1b[<64;35;2M", "\x1b[<64;2;1M"], // wheel up
-    ["\x1b[<64;36;2M", "\x1b[<64;3;1M"], // another wheel packet, a separate turn
-    ["\x1b[<65;35;2M", "\x1b[<65;2;1M"], // reverse wheel direction
+    ["\x1b[<64;38;2M", "\x1b[<64;2;1M"], // wheel up
+    ["\x1b[<64;39;2M", "\x1b[<64;3;1M"], // another wheel packet, a separate turn
+    ["\x1b[<65;38;2M", "\x1b[<65;2;1M"], // reverse wheel direction
     ["k", "k"],
     ["\x1b[200~pasted text\x1b[201~", "pasted text"],
-    ["\x1b[<0;35;2M", "\x1b[<0;2;1M"], // click
+    ["\x1b[<0;38;2M", "\x1b[<0;2;1M"], // click
   ];
   const writesBefore = manager.writes.length;
   const frameCallsBefore = surface.frameCalls;
@@ -2351,9 +2359,9 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   assert.ok(stopConfirmText.includes("Stop session?"), `the guarded stop confirmation is drawn: ${stopConfirmText}`);
   assert.ok(stopConfirmText.includes("esc/n = cancel"), "the confirmation exposes its cancel binding before any stop");
   const stopBody = stopConfirmFrame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  assert.ok(stopBody.map((line) => line.slice(0, 32)).join("\n").includes("Stop session?"),
+  assert.ok(stopBody.map((line) => line.slice(0, 35)).join("\n").includes("Stop session?"),
     "stop/remove confirmation stays in the left pane");
-  assert.ok(stopBody.map((line) => line.slice(33)).join("\n").includes("frame:native-1"),
+  assert.ok(stopBody.map((line) => line.slice(36)).join("\n").includes("frame:native-1"),
     "stop/remove confirmation does not replace the native right pane");
   assert.equal(manager.shutdownCalls, 0);
   assert.equal(harness.terminal.stopCount, 0);
@@ -2399,15 +2407,15 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
 
   const frame = harness.writer.frames.at(-1)?.frame;
   assert.ok(frame, "a composed frame exists while the form is open");
-  const left = plainLine(frame, 1).slice(0, 32);
-  const right = plainLine(frame, 1).slice(33);
+  const left = plainLine(frame, 1).slice(0, 35);
+  const right = plainLine(frame, 1).slice(36);
   assert.ok(left.includes("Sessions (1)"), `roster stays in the left pane: ${JSON.stringify(left)}`);
   assert.ok(right.trimStart().startsWith("New session"), `form owns the right pane: ${JSON.stringify(right)}`);
   assert.ok(!frame.lines.join("\n").includes("frame:native-1"), "the child frame is hidden, not destroyed, while the form is open");
   // The retained workspace draft ("first" + "draft label") puts the caret at
   // pane column 13 + 16 = 29, offset by the right pane origin. The Host selector
   // adds one row above the unchanged Workspace Editor content row.
-  assert.deepEqual(frame.cursor, { column: 62, row: 4, visible: true }, "form caret offsets into the right pane and native Editor completion viewport");
+  assert.deepEqual(frame.cursor, { column: 65, row: 4, visible: true }, "form caret offsets into the right pane and native Editor completion viewport");
   assert.equal(manager.resizeCalls.length, resizesBeforeForm, "opening the form never resizes the child");
   assert.deepEqual(manager.writes, [], "form input is never broadcast to the child");
 
@@ -2419,10 +2427,10 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   assert.equal(manager.resizeCalls.length, resizesBeforeForm, "cancelling the form does not resize the child either");
   const restored = harness.writer.frames.at(-1)?.frame;
   assert.ok(restored, "a composed frame exists after the form closes");
-  assert.ok(plainLine(restored, 1).slice(0, 32).includes("Sessions (1)"),
-    `the visible roster remains in the left pane: ${JSON.stringify(plainLine(restored, 1).slice(0, 32))}`);
-  assert.ok(plainLine(restored, 1).slice(33).startsWith("frame:native-1"),
-    `the same child frame returns to the right pane: ${JSON.stringify(plainLine(restored, 1).slice(33))}`);
+  assert.ok(plainLine(restored, 1).slice(0, 35).includes("Sessions (1)"),
+    `the visible roster remains in the left pane: ${JSON.stringify(plainLine(restored, 1).slice(0, 35))}`);
+  assert.ok(plainLine(restored, 1).slice(36).startsWith("frame:native-1"),
+    `the same child frame returns to the right pane: ${JSON.stringify(plainLine(restored, 1).slice(36))}`);
   harness.terminal.emitInput(ALT_LEFT); // deliberate hide: full-width native pane
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "main");
@@ -2512,10 +2520,10 @@ test("visible host panes own clicks while native Main mouse keeps child modes an
     await nextTurn();
     await nextTurn();
     const savedFrame = harness.writer.frames.at(-1)?.frame;
-    const savedRow = screenRowContaining(savedFrame, "First conversation");
+    const savedRow = screenRowContaining(savedFrame, "> First");
     assert.ok(savedRow > 0, "the admitted catalog row was drawn in the right-hand Saved pane");
-    emitMouse(harness.terminal, 35, savedRow);
-    emitMouse(harness.terminal, 35, savedRow); // duplicate click while the first open is pending
+    emitMouse(harness.terminal, 38, savedRow);
+    emitMouse(harness.terminal, 38, savedRow); // duplicate click while the first open is pending
     await nextTurn();
     await nextTurn();
     assert.equal(manager.createOptions.length, 2, "pending-click fencing admits exactly one Saved open");
@@ -2535,9 +2543,9 @@ test("visible host panes own clicks while native Main mouse keeps child modes an
     assert.equal(harness.sidebar?.focus, "form", "the reopened Saved roster entry opens its picker");
     await nextTurn();
     await nextTurn();
-    const duplicateRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "First");
+    const duplicateRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "> First");
     assert.ok(duplicateRow > 0);
-    emitMouse(harness.terminal, 35, duplicateRow);
+    emitMouse(harness.terminal, 38, duplicateRow);
     await nextTurn();
     assert.equal(manager.createOptions.length, 2, "known-owned catalog duplicate starts no child");
     const duplicateFrame = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
@@ -2566,7 +2574,7 @@ test("a click on the displayed native Main pane returns focus without forwarding
   assert.equal(harness.sidebar?.visible, true);
   assert.equal(harness.sidebar?.selectedId, "native-2");
   assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
-  assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+  assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36).startsWith("frame:native-1"),
     "the visible right pane is A's complete native frame");
 
   const selectedBefore = harness.sidebar?.selectedId;
@@ -2575,10 +2583,10 @@ test("a click on the displayed native Main pane returns focus without forwarding
   const resizeCountBefore = manager.resizeCalls.length;
   const viewStateBefore = manager.views.map(({ id, lifecycle, hasLiveProcess }) => [id, lifecycle, hasLiveProcess]);
   const writesBeforeClick = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1); // Native pane origin: focus only, never a Pi mouse press.
+  emitMouse(harness.terminal, 36, 1); // Native pane origin: focus only, never a Pi mouse press.
   assert.equal(harness.sidebar?.focus, "main");
   assert.equal(manager.writes.length, writesBeforeClick, "the activating click is consumed before Pi sees it");
-  emitMouse(harness.terminal, 33, 1, 0, "m"); // Its matching release is consumed as part of the same click.
+  emitMouse(harness.terminal, 36, 1, 0, "m"); // Its matching release is consumed as part of the same click.
   assert.equal(manager.writes.length, writesBeforeClick, "the activating click's release is not replayed to Pi");
   assert.equal(harness.sidebar?.selectedId, selectedBefore, "returning focus does not move the sidebar selection");
   assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "the existing Main owner remains A");
@@ -2593,8 +2601,8 @@ test("a click on the displayed native Main pane returns focus without forwarding
   ], "subsequent typing is routed only to the unchanged active owner A");
 
   const writesBeforeFocusedMouse = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1); // Once Main is focused, keep the existing native Pi behavior.
-  emitMouse(harness.terminal, 33, 1, 0, "m");
+  emitMouse(harness.terminal, 36, 1); // Once Main is focused, keep the existing native Pi behavior.
+  emitMouse(harness.terminal, 36, 1, 0, "m");
   assert.deepEqual(manager.writes.slice(writesBeforeFocusedMouse), [
     { id: "native-1", data: `${ESC}[<0;1;1M` },
     { id: "native-1", data: `${ESC}[<0;1;1m` },
@@ -2790,8 +2798,8 @@ test("native Main click focus requires a written frame for the current owner and
     assert.equal(harness.sidebar?.focus, "sidebar");
     assert.equal(output.queuedCount, 1, "the composed host frame is still waiting for output acceptance");
     const writesBeforeUndisplayedClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1);
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(harness.sidebar?.focus, "sidebar", "an undisplayed native pane cannot claim Main focus");
     assert.equal(manager.writes.length, writesBeforeUndisplayedClick, "no click is routed through a speculative frame");
 
@@ -2802,8 +2810,8 @@ test("native Main click focus requires a written frame for the current owner and
     assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("Native native-2")),
       "the real frame writer emitted the current active-owner frame");
     const writesBeforeDisplayedClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1);
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(harness.sidebar?.focus, "main", "the current displayed owner can receive focus");
     assert.equal(manager.writes.length, writesBeforeDisplayedClick, "the accepted activating click is still consumed");
 
@@ -2826,16 +2834,16 @@ test("native Main click focus requires a written frame for the current owner and
     assert.equal(harness.sidebar?.focus, "sidebar");
     assert.equal(harness.sidebar?.activeMainOwnerID, "native-2");
     const writesBeforeStaleOwnerClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1);
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(harness.sidebar?.focus, "sidebar", "A's still-displayed frame cannot authorize focus for active B");
     assert.equal(manager.writes.length, writesBeforeStaleOwnerClick, "the stale-owner click reaches neither child");
 
     output.drain();
     await nextTurn();
     const writesBeforeCurrentOwnerClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1);
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(harness.sidebar?.focus, "main", "B can receive focus after its own frame is emitted");
     assert.equal(manager.writes.length, writesBeforeCurrentOwnerClick);
 
@@ -2847,16 +2855,16 @@ test("native Main click focus requires a written frame for the current owner and
     assert.equal(output.queuedCount, 1);
     assert.equal(harness.sidebar?.focus, "sidebar");
     const writesBeforeStaleGeometryClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1);
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(harness.sidebar?.focus, "sidebar", "old displayed geometry cannot authorize the resized pane");
     assert.equal(manager.writes.length, writesBeforeStaleGeometryClick);
 
     output.drain();
     await nextTurn();
-    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 36, 1);
     assert.equal(harness.sidebar?.focus, "main", "the resized pane becomes eligible only after its frame is emitted");
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(await closeWithSignal(harness), 0);
     shutDown = true;
   } finally {
@@ -2904,7 +2912,7 @@ test("Main paints only the actual live Ghostty owner and cleans scoped graphics 
     assert.ok(firstGraphics.includes(`;${imageB}\x1b\\`), "active native-2's typed image is generated to the outer terminal");
     assert.equal(firstGraphics.includes(`;${imageA}\x1b\\`), false, "inactive native-1's same-numbered child image is not exposed");
     assert.match(firstGraphics, /\x1b_Ga=t,f=100,q=2,i=1;/, "the host assigns its own image id");
-    assert.ok(firstGraphics.includes("\x1b[3;36H"), "the image placement is offset into the actual native pane");
+    assert.ok(firstGraphics.includes("\x1b[3;39H"), "the image placement is offset into the actual native pane");
 
     const beforeSelection = harness.stdout.writes.length;
     harness.terminal.emitInput("\x1b[A"); // Highlight A without changing the actual Main owner.
@@ -3024,7 +3032,7 @@ test("real writer settles identical Main and too-small roster frames before nati
     assert.ok(mainSubmission);
     assert.equal(mainSubmission.disposition, "written");
     assert.equal(mainSubmission.frame.cursor.visible, false, "the native cursor is hidden");
-    assert.ok(plain(mainSubmission.frame).includes("pane 32x1 too small"), "the one-row roster uses its too-small fallback");
+    assert.ok(plain(mainSubmission.frame).includes("pane 35x1 too small"), "the one-row roster uses its too-small fallback");
 
     const ownerBefore = harness.sidebar?.activeMainOwnerID;
     const selectionBefore = harness.sidebar?.selectedId;
@@ -3039,10 +3047,10 @@ test("real writer settles identical Main and too-small roster frames before nati
     assert.ok(output.writes.length > writesBeforeFocus, "the invalidated byte-identical frame is emitted");
 
     const writesBeforeClick = manager.writes.length;
-    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 36, 1);
     assert.equal(harness.sidebar?.focus, "main");
     assert.equal(manager.writes.length, writesBeforeClick, "the activating press is consumed");
-    emitMouse(harness.terminal, 33, 1, 0, "m");
+    emitMouse(harness.terminal, 36, 1, 0, "m");
     assert.equal(manager.writes.length, writesBeforeClick, "the matching release is consumed");
     assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore);
     assert.equal(harness.sidebar?.selectedId, selectionBefore);
@@ -3065,7 +3073,7 @@ test("real writer settles identical Main and too-small roster frames before nati
 test("native Main focus clicks stay unavailable without an owner and on host-owned surfaces", async () => {
   const empty = createHarness();
   await ready(empty);
-  emitMouse(empty.terminal, 33, 1);
+  emitMouse(empty.terminal, 36, 1);
   assert.equal(empty.sidebar?.focus, "sidebar", "the welcome pane is not an active native Main owner");
   assert.equal(await closeWithSignal(empty), 0);
 
@@ -3084,8 +3092,8 @@ test("native Main focus clicks stay unavailable without an owner and on host-own
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "form");
   const writesBeforeFormClick = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1); // The right pane belongs to the New form, not native Main.
-  emitMouse(harness.terminal, 33, 1, 0, "m");
+  emitMouse(harness.terminal, 36, 1); // The right pane belongs to the New form, not native Main.
+  emitMouse(harness.terminal, 36, 1, 0, "m");
   assert.equal(harness.sidebar?.focus, "form");
   assert.equal(manager.writes.length, writesBeforeFormClick, "form clicks remain host-owned");
 
@@ -3094,8 +3102,8 @@ test("native Main focus clicks stay unavailable without an owner and on host-own
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "confirm");
   const writesBeforeConfirmClick = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1); // Main is visible, but the confirmation owns keyboard focus.
-  emitMouse(harness.terminal, 33, 1, 0, "m");
+  emitMouse(harness.terminal, 36, 1); // Main is visible, but the confirmation owns keyboard focus.
+  emitMouse(harness.terminal, 36, 1, 0, "m");
   assert.equal(harness.sidebar?.focus, "confirm", "a confirmation is not a native Main click-focus surface");
   assert.equal(manager.writes.length, writesBeforeConfirmClick, "confirmation-owned clicks do not reach Pi");
 
@@ -3105,8 +3113,8 @@ test("native Main focus clicks stay unavailable without an owner and on host-own
   await nextTurn();
   const selectedBeforeOverlayClick = harness.sidebar?.selectedId;
   const writesBeforeOverlayClick = manager.writes.length;
-  emitMouse(harness.terminal, 33, 22); // Blank lower overlay row, not a roster card.
-  emitMouse(harness.terminal, 33, 22, 0, "m");
+  emitMouse(harness.terminal, 36, 22); // Blank lower overlay row, not a roster card.
+  emitMouse(harness.terminal, 36, 22, 0, "m");
   assert.equal(harness.sidebar?.focus, "sidebar", "an overlay-covered coordinate cannot focus hidden native Main");
   assert.equal(harness.sidebar?.selectedId, selectedBeforeOverlayClick);
   assert.equal(harness.sidebar?.activeMainOwnerID, owner);
@@ -3152,9 +3160,9 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   // native gestures in that pane are translated.
   await nextTurn();
   const beforeNativeWhileHostHeld = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1, 1); // independent native middle-button press
-  emitMouse(harness.terminal, 34, 2, 33); // its motion remains native while host-left is held
-  emitMouse(harness.terminal, 34, 2, 1, "m");
+  emitMouse(harness.terminal, 36, 1, 1); // independent native middle-button press
+  emitMouse(harness.terminal, 37, 2, 33); // its motion remains native while host-left is held
+  emitMouse(harness.terminal, 37, 2, 1, "m");
   assert.deepEqual(manager.writes.slice(beforeNativeWhileHostHeld).map(({ id, data }) => [id, data]), [
     ["native-1", "\x1b[<1;1;1M"],
     ["native-1", "\x1b[<33;2;2M"],
@@ -3162,8 +3170,8 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   ], "independently started native buttons are not hidden by the host-left fence");
   const beforeHostDrag = manager.writes.length;
   emitMouse(harness.terminal, 1, aRow); // a fresh session-card press is held by the host
-  emitMouse(harness.terminal, 33, 1, 32); // its drag motion leaves the roster and lands over Main
-  emitMouse(harness.terminal, 34, 2, 0, "m"); // its release also lands over Main
+  emitMouse(harness.terminal, 36, 1, 32); // its drag motion leaves the roster and lands over Main
+  emitMouse(harness.terminal, 37, 2, 0, "m"); // its release also lands over Main
   assert.equal(manager.writes.length, beforeHostDrag, "host-originated motion and release never leak to A");
   assert.equal(harness.sidebar?.selectedId, "native-1", "a release outside the session cards cancels without activating anything");
   harness.terminal.emitInput("a-input");
@@ -3186,9 +3194,9 @@ test("visible roster mouse activates a clicked live owner; host gestures stay fe
   // The newly activated owner is drawn before its cells carry positional authority (#474).
   await nextTurn();
   const beforeNativeGesture = manager.writes.length;
-  emitMouse(harness.terminal, 33, 1); // native press: local (0,0)
-  emitMouse(harness.terminal, 34, 2, 32); // native drag motion: local (1,1)
-  emitMouse(harness.terminal, 34, 2, 0, "m"); // native release
+  emitMouse(harness.terminal, 36, 1); // native press: local (0,0)
+  emitMouse(harness.terminal, 37, 2, 32); // native drag motion: local (1,1)
+  emitMouse(harness.terminal, 37, 2, 0, "m"); // native release
   assert.deepEqual(manager.writes.slice(beforeNativeGesture).map(({ id, data }) => [id, data]), [
     ["native-2", "\x1b[<0;1;1M"],
     ["native-2", "\x1b[<32;2;2M"],
@@ -3261,19 +3269,19 @@ test("wide equal-sized panes dispatch Saved hit tests only in the right form", a
   const fixture = makeSavedMainFixture("mouse-pane-identity");
   const { overrides } = savedFixtureDependencies(fixture);
   const plainRow = (frame: ComposedHostFrame | undefined, row: number): string =>
-    plainLine(frame, row).slice(0, 32);
+    plainLine(frame, row).slice(0, 35);
   const leftRow = (frame: ComposedHostFrame | undefined, text: string): number =>
     frame?.lines.findIndex((line, row) => row >= 1
-      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).includes(text)) ?? -1;
+      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 35).includes(text)) ?? -1;
   const rightRow = (frame: ComposedHostFrame | undefined, text: string): number =>
     frame?.lines.findIndex((line, row) => row >= 1
-      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).includes(text)) ?? -1;
+      && line.replace(/\x1b\[[0-9;]*m/g, "").slice(36).includes(text)) ?? -1;
   const rightText = (frame: ComposedHostFrame | undefined): string =>
-    (frame?.lines.slice(1) ?? []).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    (frame?.lines.slice(1) ?? []).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36)).join("\n");
   try {
     const harness = createHarness({}, overrides);
-    harness.terminal.columns = 65; // sidebar and Saved form are both exactly 32 columns
-    harness.stdout.columns = 65;
+    harness.terminal.columns = 71; // sidebar and Saved form are both exactly 35 columns
+    harness.stdout.columns = 71;
     const manager = await ready(harness);
     const initial = harness.writer.frames.at(-1)?.frame;
     const savedAction = screenRowContaining(initial, "Saved conversations");
@@ -3328,8 +3336,8 @@ test("wide equal-sized panes dispatch Saved hit tests only in the right form", a
     const reopenedSavedRow = rightRow(reopened, "First");
     assert.ok(reopenedSavedRow > 0, rightText(reopened));
 
-    emitMouse(harness.terminal, 34, reopenedSavedRow); // the actual right-hand Saved row
-    emitMouse(harness.terminal, 34, reopenedSavedRow, 0, "m");
+    emitMouse(harness.terminal, 37, reopenedSavedRow); // the actual right-hand Saved row
+    emitMouse(harness.terminal, 37, reopenedSavedRow, 0, "m");
     await nextTurn();
     await nextTurn();
     assert.equal(manager.createOptions.length, 1);
@@ -3391,7 +3399,7 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)),
       "the actual frame writer has emitted the first Saved row");
     const emittedA = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows);
-    const emittedARight = emittedA.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    const emittedARight = emittedA.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36)).join("\n");
     assert.ok(emittedARight.includes("Saved conversations") && emittedARight.includes(savedA.caption),
       "the emitted Saved picker and selected row occupy the right/main pane");
 
@@ -3401,7 +3409,7 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     assert.equal(output.queuedCount, 1, "the real frame writer submitted B to a delayed Writable");
     const coalescedCandidate = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true);
     const candidateRight = coalescedCandidate.lines.slice(1)
-      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36)).join("\n");
     assert.ok(candidateRight.includes("Saved conversations") && candidateRight.includes(savedB.caption),
       "the coalesced candidate is still a right-pane Saved picker, not a left-only render");
 
@@ -3409,9 +3417,9 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     // render has already built B's newer mutable hit map, the pending map must
     // not authorize the same coordinate as B, even when write() returned true.
     // The native query field shifts the first result down one screen row.
-    emitMouse(harness.terminal, 34, 3);
+    emitMouse(harness.terminal, 37, 3);
     assert.equal(manager.createOptions.length, 0, "a click before callback completion cannot open undisplayed B");
-    emitMouse(harness.terminal, 34, 3, 0, "m");
+    emitMouse(harness.terminal, 37, 3, 0, "m");
 
     if (returnToOriginal) {
       harness.terminal.emitInput("\x1b[A"); // Return from B to A while B's write is still pending.
@@ -3425,7 +3433,7 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
         "a successful callback alone cannot settle a write() that returned false");
       output.emit("drain");
     }
-    emitMouse(harness.terminal, 34, 3);
+    emitMouse(harness.terminal, 37, 3);
     for (let attempt = 0; attempt < 10 && manager.createOptions.length === 0; attempt += 1) await nextTurn();
     assert.equal(manager.createOptions.length, 1,
       "the final emitted Saved row is clickable after its callback and any required drain settle the frame");
@@ -3621,8 +3629,8 @@ test("mouse routing uses active live child modes, mode-only changes, native view
   assert.deepEqual(harness.terminal.writes.slice(beforeModeOnly), ["\x1b[?1002l", "\x1b[?1000h"]);
 
   const beforeMouse = manager.writes.length;
-  harness.terminal.emitInput("\x1b[<0;35;2M"); // absolute (35,2) => native pane origin + (1,0)
-  harness.terminal.emitInput("\x1b[<0;33;2M"); // left of native pane: clipped, never edge-clamped
+  harness.terminal.emitInput("\x1b[<0;38;2M"); // absolute (38,2) => native pane origin + (1,0)
+  harness.terminal.emitInput("\x1b[<0;36;2M"); // left of native pane: clipped, never edge-clamped
   assert.deepEqual(manager.writes.slice(beforeMouse).map((entry) => entry.data), ["\x1b[<0;2;1M"]);
 
   const beforeFocusReset = harness.terminal.writes.length;
@@ -3649,7 +3657,7 @@ test("mouse routing uses active live child modes, mode-only changes, native view
 test("held synchronized frames keep outer mouse capture stable while native packets stay fenced (real TerminalSurface)", async () => {
   const BEGIN = "\x1b[?2026h";
   const END = "\x1b[?2026l";
-  const CLICK = "\x1b[<0;35;2M"; // absolute (35,2) => native pane origin + (1,0)
+  const CLICK = "\x1b[<0;38;2M"; // absolute (35,2) => native pane origin + (1,0)
   const FORWARDED_CLICK = "\x1b[<0;2;1M";
   const harness = createHarness();
   const manager = await ready(harness);
@@ -3738,7 +3746,7 @@ test("held synchronized frames keep outer mouse capture stable while native pack
     // gesture (geometry unchanged, so the hold is not dropped by a resize).
     const focusClickPackets = manager.writes.length;
     harness.terminal.emitInput(CLICK);
-    harness.terminal.emitInput("\x1b[<0;35;2m");
+    harness.terminal.emitInput("\x1b[<0;38;2m");
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "main");
     assert.equal(harness.sidebar?.visible, true);
@@ -3785,8 +3793,8 @@ test("responsive resize sizes the displayed session only when native geometry ch
   const hiddenGeometryBefore = manager.geometry.get("native-1");
   const hiddenSurfaceBefore = { cols: manager.surfaces.get("native-1")?.cols, rows: manager.surfaces.get("native-1")?.rows };
 
-  harness.terminal.setSize(60, 10); // wide: 32 + divider + 27 native, nine content rows
-  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 27, rows: 9, ids: ["native-2"] },
+  harness.terminal.setSize(60, 10); // wide: 35 + divider + 24 native, nine content rows
+  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 24, rows: 9, ids: ["native-2"] },
     "only the session the host actually displays is resized; each session is sized for its own viewers");
   assert.deepEqual(manager.geometry.get("native-1"), hiddenGeometryBefore,
     "a session nobody is displaying keeps its last canonical size");
@@ -3844,7 +3852,7 @@ test("a missing or malformed canonical size fails positional input closed while 
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "main");
 
-  const CLICK = "\x1b[<0;35;2M"; // inside the displayed native pane
+  const CLICK = "\x1b[<0;38;2M"; // inside the displayed native pane
   const forwarded = manager.writes.length;
   harness.terminal.emitInput(CLICK);
   assert.deepEqual(manager.writes.slice(forwarded).map((entry) => entry.data), ["\x1b[<0;2;1M"],
@@ -3899,7 +3907,7 @@ test("a missing or malformed canonical size fails positional input closed while 
 });
 
 test("a queued per-session resize authorizes neither newly exposed padding nor the not-yet-drawn size", async () => {
-  const INSIDE = "\x1b[<0;35;2M"; // one cell inside the drawn content
+  const INSIDE = "\x1b[<0;38;2M"; // one cell inside the drawn content
   const PAD = "\x1b[<0;70;2M";    // inside the pane, outside a 30-column session
   const harness = createHarness();
   const manager = await ready(harness);
@@ -4123,8 +4131,8 @@ test("a narrow overlay-capable layout copies only when Main is actually uncovere
 });
 
 test("a fully drawn padded session keeps copying, click-to-focus, and its image owner while padding stays host-owned", async () => {
-  const INSIDE = "\x1b[<0;35;2M";
-  const INSIDE_RELEASE = "\x1b[<0;35;2m";
+  const INSIDE = "\x1b[<0;38;2M";
+  const INSIDE_RELEASE = "\x1b[<0;38;2m";
   const PAD = "\x1b[<0;70;2M";
   const PAD_RELEASE = "\x1b[<0;70;2m";
   const harness = createHarness({ env: { PATH: process.env.PATH, HOME: "/synthetic-home", TERM: "xterm-ghostty" } });
@@ -4234,9 +4242,9 @@ test("a padded local owner keeps its native cursor visible while Main focus and 
   assert.ok(frame, "the padded session still renders a host frame");
   assert.ok(plain(frame).includes("padded native draft"), "the drawn content stays visible");
   // The fixture's surface reports its cursor at column 2, row 0 of its own frame.
-  assert.deepEqual(frame!.cursor, { column: 35, row: 1, visible: true },
+  assert.deepEqual(frame!.cursor, { column: 38, row: 1, visible: true },
     "#553: the padded owner's native cursor projects at the native pane origin plus its own position");
-  const paddedRow = plainLine(frame, 1 + 20).slice(33);
+  const paddedRow = plainLine(frame, 1 + 20).slice(36);
   assert.equal(paddedRow.trim(), "", "the first padded row below the drawn content stays blank host space");
 
   // Main keeps routing input to the owning child, padded pane or not.
@@ -4257,7 +4265,7 @@ test("a padded local owner keeps its native cursor visible while Main focus and 
   harness.terminal.emitInput("\x1b[1;3C"); // Alt+Right returns input ownership to Main, roster still visible
   await nextTurn();
   assert.equal(harness.sidebar?.focus, "main");
-  assert.deepEqual(harness.writer.frames.at(-1)?.frame.cursor, { column: 35, row: 1, visible: true },
+  assert.deepEqual(harness.writer.frames.at(-1)?.frame.cursor, { column: 38, row: 1, visible: true },
     "returning to Main restores the padded native cursor at the same padded position");
 
   assert.equal(manager.viewers.closeViewer(other.viewerId), true);
@@ -4933,17 +4941,17 @@ test("Saved picker uses native Input and private-catalog search without leaking 
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await nextTurn();
       const frame = plain(harness.writer.frames.at(-1)?.frame);
-      if (frame.includes("Deep Blue Phrase") && frame.includes("Second conversatio")) break;
+      if (frame.includes("Deep Blue Phrase") && frame.includes("Second conversat")) break;
     }
     let frame = plain(harness.writer.frames.at(-1)?.frame);
-    assert.ok(frame.includes("Deep Blue Phrase") && frame.includes("Second conversatio"), JSON.stringify(frame));
+    assert.ok(frame.includes("Deep Blue Phrase") && frame.includes("Second conversat"), JSON.stringify(frame));
     assert.ok(!frame.includes(nameSuffix), "native name remains private until the user searches for it");
     assert.ok(!frame.includes(transcriptNeedle), "full transcript search text never enters the picker display");
 
     harness.terminal.emitInput("\x0e"); // remapped native tui.select.down = Ctrl+N
     await nextTurn();
     frame = plain(harness.writer.frames.at(-1)?.frame);
-    assert.ok(frame.includes("> Second conversatio"), "Pi's remapped navigation binding moves the highlight: " + frame);
+    assert.ok(frame.includes("> Second conversat"), "Pi's remapped navigation binding moves the highlight: " + frame);
 
     harness.terminal.emitInput("d"); // ordinary d is query text, not deletion
     await nextTurn();
@@ -5164,10 +5172,10 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await nextTurn();
       const current = plain(harness.writer.frames.at(-1)?.frame);
-      if (current.includes("First conversation delete-confirmed") && current.includes("Sibling conversati")) break;
+      if (current.includes("First conversation delete-confirmed") && current.includes("Sibling conversa")) break;
     }
     assert.equal(harness.sidebar?.focus, "form");
-    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati"), JSON.stringify(plain(harness.writer.frames.at(-1)?.frame)));
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversa"), JSON.stringify(plain(harness.writer.frames.at(-1)?.frame)));
     const selectionBefore = harness.sidebar?.selectedId;
     const pickerBeforeQuery = harness.sidebar?.savedPickerRequestId;
     const revisionBeforeQuery = harness.sidebar?.savedQueryRevisionNumber;
@@ -5196,7 +5204,7 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.ok(filteredText.includes("> First convers"), "the selected saved row is actually drawn in the filtered list");
     assert.equal(filteredText.includes("No matching saved conversations"), false,
       "the written frame is a filtered result, not a loading or empty placeholder");
-    assert.equal(filteredText.includes("Sibling conversati"), false,
+    assert.equal(filteredText.includes("Sibling conversa"), false,
       "the sibling row's rendered text, witnessed before filtering, is excluded by the current query before deleting");
     const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
     const surface = manager.surface(ownerBefore!);
@@ -5220,7 +5228,7 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.deepEqual(trashCalls, [], "no mutation process starts before confirmation");
 
     const leftSavedRow = screenRowContaining(confirmationFrame, "Saved conversations");
-    assert.ok(leftSavedRow > 0 && plainLine(confirmationFrame, leftSavedRow).slice(0, 32).includes("Saved conversations"),
+    assert.ok(leftSavedRow > 0 && plainLine(confirmationFrame, leftSavedRow).slice(0, 35).includes("Saved conversations"),
       "the visible left roster is present beside the right-pane confirmation");
     const writesBeforeDialogInput = manager.writes.length;
     // The click lands on the row that already holds the LEFT highlight while
@@ -5230,8 +5238,8 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     // pane stays dialog-owned either way.
     emitMouse(harness.terminal, 2, leftSavedRow);
     emitMouse(harness.terminal, 2, leftSavedRow, 0, "m");
-    emitMouse(harness.terminal, 34, 1); // or the right/main confirmation pane
-    emitMouse(harness.terminal, 34, 1, 0, "m");
+    emitMouse(harness.terminal, 37, 1); // or the right/main confirmation pane
+    emitMouse(harness.terminal, 37, 1, 0, "m");
     harness.terminal.emitInput("x"); // confirmation owns all keyboard input; arbitrary text is not forwarded
     assert.equal(harness.sidebar?.focus, "confirm");
     assert.equal(harness.sidebar?.savedDeleteConfirmationActive, true,
@@ -5261,7 +5269,7 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
       await nextTurn();
       if (harness.sidebar?.savedQuery === ""
         && plain(harness.writer.frames.at(-1)?.frame).includes("First conversation delete-confirmed")
-        && plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati")) break;
+        && plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversa")) break;
     }
     let pickerFrame = harness.writer.frames.at(-1)!.frame;
     if (!plain(pickerFrame).includes("> First convers")) {
@@ -5340,8 +5348,8 @@ test("a different left-roster row cancels the open Saved-delete confirmation and
     emitMouse(harness.terminal, 2, leftNewRow, 0, "m"); // release without its press
     emitMouse(harness.terminal, 2, leftNewRow, 32); // drag motion across the row
     emitMouse(harness.terminal, 2, leftNewRow, 2); // right-button press
-    emitMouse(harness.terminal, 34, confirmationRow); // a press inside the confirmation
-    emitMouse(harness.terminal, 34, confirmationRow, 0, "m");
+    emitMouse(harness.terminal, 37, confirmationRow); // a press inside the confirmation
+    emitMouse(harness.terminal, 37, confirmationRow, 0, "m");
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "confirm", "only a left press on another written row acts");
     assert.equal(harness.sidebar?.savedPickerRequestId, pickerBefore);
@@ -5381,9 +5389,9 @@ test("a left-roster click beside the live network pane closes it and decides not
   const plainRow = (frame: ComposedHostFrame, row: number): string =>
     frame.lines[row]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "";
   const leftRow = (frame: ComposedHostFrame, text: string): number =>
-    frame.lines.findIndex((line, row) => row >= 1 && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).includes(text));
+    frame.lines.findIndex((line, row) => row >= 1 && line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 35).includes(text));
   const rightText = (frame: ComposedHostFrame): string =>
-    frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(36)).join("\n");
   try {
     assert.ok(harness.manager !== undefined, "Main created its single session manager");
     const manager = harness.manager!;
@@ -5423,7 +5431,7 @@ test("a left-roster click beside the live network pane closes it and decides not
     assert.equal(manager.createOptions.length, createsBefore, "no destination or session was added");
     assert.equal(manager.writes.length, writesBefore, "no mouse packet reaches the native child");
     assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "the native Main owner is unchanged");
-    assert.ok(plainRow(closedFrame, leftRow(closedFrame, SETTINGS_ROSTER_LABEL)).slice(0, 32)
+    assert.ok(plainRow(closedFrame, leftRow(closedFrame, SETTINGS_ROSTER_LABEL)).slice(0, 35)
       .includes(SETTINGS_ROSTER_LABEL),
       "the grouped Settings row is still drawn for a later deliberate visit");
 
@@ -5634,14 +5642,14 @@ test("an incomplete wide right-pane Saved warning cannot authorize deletion", as
     harness.terminal.emitInput("\x18");
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "confirm");
-    harness.terminal.setSize(53, 2); // still wide: 20-column right pane, one content row
+    harness.terminal.setSize(56, 2); // still wide: 20-column right pane, one content row
     harness.terminal.emitInput(ENTER); // resize synchronously revokes the previously settled wide warning
     assert.equal(deleteCalls, 0);
     await nextTurn();
 
-    const clipped = await emittedTerminalFrame(output, 53, 2);
+    const clipped = await emittedTerminalFrame(output, 56, 2);
     const body = clipped.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const right = body.map((line) => line.slice(33)).join("\n");
+    const right = body.map((line) => line.slice(36)).join("\n");
     assert.ok(right.includes("too small"), "the actual right/main pane emits its too-small refusal");
     assert.equal(right.includes("Delete saved conversation?"), false);
     assert.equal(right.includes("Saved file:"), false, "an incomplete exact target is not displayed as a confirmation");
@@ -5715,7 +5723,7 @@ test("Saved deletion refuses an unavailable current live binding despite unrelat
       await nextTurn();
       if (phase === "preparation") {
         assert.equal(harness.sidebar?.focus, "form", "unknown current binding refuses before confirmation opens");
-        assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+        assert.ok(rightPaneText(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
         assert.equal(trashCalls, 0);
         assert.equal(unlinkCalls, 0);
         assert.ok(existsSync(fixture.file));
@@ -5726,7 +5734,7 @@ test("Saved deletion refuses an unavailable current live binding despite unrelat
         harness.terminal.emitInput(ENTER);
         await nextTurn();
         assert.equal(harness.sidebar?.focus, "form");
-        assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"),
+        assert.ok(rightPaneText(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"),
           `${phase}: current-binding uncertainty produces the close-first warning`);
         assert.equal(trashCalls, phase === "fallback" ? 1 : 0,
           `${phase}: no trash attempt follows an uncertainty detected before that mutation stage`);
@@ -5776,7 +5784,7 @@ test("Saved deletion cancellation and current live/unknown bindings fail closed"
     harness.terminal.emitInput("\x18");
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "form", "unknown live ownership refuses before confirmation");
-    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+    assert.ok(rightPaneText(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
     assert.ok(existsSync(fixture.file));
     assert.equal(mutationCalls, 0);
 
@@ -5789,7 +5797,7 @@ test("Saved deletion cancellation and current live/unknown bindings fail closed"
     harness.terminal.emitInput(ENTER);
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "form", "Main rechecks current owned sessions immediately before mutation");
-    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+    assert.ok(rightPaneText(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
     assert.equal(mutationCalls, 0, "current live ownership prevents even starting trash");
     assert.ok(existsSync(fixture.file));
     assert.equal(harness.sidebar?.savedQuery, "");
@@ -6181,17 +6189,17 @@ test("a background child that finishes launching while the host quits is unknown
  * Row of the wide composed frame whose RIGHT-PANE (form-slot) text contains
  * `text`. The left roster is composed on the same lines, so a whole-line search
  * cannot tell a pane row from roster or alert text; the right pane begins at
- * column 33 after the divider.
+ * column 36 after the divider.
  */
 function formPaneRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
-    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).includes(text)) ?? -1;
+    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(36).includes(text)) ?? -1;
 }
 
 /** Row of the wide composed frame whose right-pane text trims exactly to a pane header. */
 function formPaneRowOfHeader(frame: ComposedHostFrame | undefined, header: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
-    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(33).trim() === header) ?? -1;
+    && line.replace(/\x1b\[[0-9;]*m/g, "").slice(36).trim() === header) ?? -1;
 }
 
 /**
@@ -6227,7 +6235,7 @@ test("Network menu pointer clicks act on the written row once and refuse unseen 
     return row;
   };
   const clickWide = (row: number, button = 0, final: "M" | "m" = "M"): void =>
-    emitMouse(harness.terminal, 34, row, button, final);
+    emitMouse(harness.terminal, 37, row, button, final);
   try {
     if (sidebar.focus !== "sidebar") {
       harness.terminal.emitInput(ALT_LEFT);
@@ -6705,7 +6713,7 @@ test("a displayed remote viewport without a written native source forwards no ke
     // refusal above came from the remote source, not from a blanket disable.
     dispatch({ type: "select", id: "native-1" });
     await nextTurn();
-    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36).startsWith("frame:native-1"),
       "the local row's own frame is displayed again");
     const localWritesBefore = manager.writes.length;
     emitMouse(harness.terminal, 40, 5);
@@ -6776,7 +6784,7 @@ test("layout changes forward one deduped viewport and a lost stream is reported 
     dispatch({ type: "select", id: "native-1" });
     await nextTurn();
     assert.equal(content.selections.at(-1), null, "a local selection releases the single remote stream");
-    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"));
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36).startsWith("frame:native-1"));
     assert.equal(manager.viewers.sessionViewers("native-1").length, 1, "the local row is displayed and sized again");
 
     // Selecting again is a new generation; detaching releases without a stop.
@@ -6854,7 +6862,7 @@ test("remote graphics keep their own owner key and an oversized owner frame keep
     const image = graphicsPngBase64(41);
     content.publish(remoteViewport({
       subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
-      cols: 47, rows: 22, marker: "REMOTE-GRAPHICS", graphics: fakeGraphicsFrame(image),
+      cols: 40, rows: 20, marker: "REMOTE-GRAPHICS", graphics: fakeGraphicsFrame(image),
     }));
     await nextTurn();
     const painted = harness.writer.frames.at(-1)?.frame;
@@ -6865,7 +6873,7 @@ test("remote graphics keep their own owner key and an oversized owner frame keep
     // A new native conversation is a new owner key: no image cache is reused.
     content.publish(remoteViewport({
       subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
-      cols: 47, rows: 22, marker: "REMOTE-GRAPHICS-EPOCH",
+      cols: 40, rows: 20, marker: "REMOTE-GRAPHICS-EPOCH",
       nativeSession: { sessionId: "conversation-a", epoch: 4 }, graphics: fakeGraphicsFrame(image),
     }));
     await nextTurn();
@@ -6918,9 +6926,9 @@ test("a selected remote viewport smaller than the pane keeps its own cursor at t
     assert.equal(harness.sidebar?.focus, "main");
     const padded = harness.writer.frames.at(-1)?.frame;
     assert.ok(plain(padded).includes("REMOTE-PADDED-DRAFT"), "the deliberate remote selection stays displayed");
-    assert.deepEqual(padded!.cursor, { column: 33 + 12, row: 1 + 7, visible: true },
+    assert.deepEqual(padded!.cursor, { column: 36 + 12, row: 1 + 7, visible: true },
       "#553: the remote owner's cursor projects at the native pane origin plus its own coordinates");
-    assert.equal(plainLine(padded, 1 + 20).slice(33).trim(), "",
+    assert.equal(plainLine(padded, 1 + 20).slice(36).trim(), "",
       "the first padded row below the drawn content stays blank host space");
 
     // A cursor position the owner's own frame does not draw keeps no claim even
@@ -7100,7 +7108,7 @@ test("an accepted remote viewport repaints without a new callback and a new conv
     harness.writer.settlementDisposition = "written";
     dispatch({ type: "select", id: "native-1" });
     await nextTurn();
-    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36).startsWith("frame:native-1"),
       "the local row's own frame is displayed again");
     assert.equal(content.selections.at(-1), null, "the local selection releases the one remote stream");
     const localWritesBefore = manager.writes.length;
@@ -7216,7 +7224,7 @@ test("a remote selection with a colliding row id and conversation tuple suspends
     harness.writer.settlementDisposition = "written";
     manager.notify("local-frame-written");
     await nextTurn();
-    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(36).startsWith("frame:native-1"),
       "the written local frame is the displayed source again");
     manager.options.onNativeClipboard?.("native-1", event);
     assert.deepEqual(copies(), [
@@ -7384,7 +7392,7 @@ test("an explicit New while a remote target is selected creates locally and neve
     assert.equal(harness.sidebar!.focus, "main", "the completed New child keeps its existing activation");
     assert.equal(harness.sidebar!.activeMainOwnerID, "native-1", "the local child is the Main owner");
     assert.deepEqual(harness.sidebar!.activeMainOwnerKey, { kind: "local", id: "native-1" });
-    assert.ok(plainLine(created, 1).slice(33).startsWith("frame:native-1"), "the local row's own frame is displayed");
+    assert.ok(plainLine(created, 1).slice(36).startsWith("frame:native-1"), "the local row's own frame is displayed");
     assert.equal(plain(created).includes("REMOTE-BEFORE-LOCAL-NEW"), false,
       "the released peer viewport stops being painted instead of lingering under a local owner");
     assert.deepEqual(manager.closeExitedCalls, [], "no local or remote session was stopped or removed");
@@ -9970,11 +9978,11 @@ test("a row observed before the started reply is never described as awaiting its
     assert.equal(afterLoss.some((text) => text.includes(awaitingNotice)), false,
       "an already observed row is never described as awaiting its first observation");
     const renderedLossFrame = plain(harness.writer.frames.at(-1)?.frame);
-    // The 87-column display pane clips this longer message. The 32-column left
+    // The 84-column display pane clips this longer message. The 35-column left
     // notice wraps it instead: reconstruct those actually drawn cells to check
     // the complete notice, not an impossible contiguous full-width substring.
     const renderedLeftNotice = renderedLossFrame.split("\n")
-      .map((line) => line.slice(0, 32).trim()).join(" ");
+      .map((line) => line.slice(0, 35).trim()).join(" ");
     assert.equal(renderedLeftNotice.includes(unavailableNotice), true,
       "the complete drawn notice reports the row's loss honestly instead of as pending");
     assert.equal(renderedLossFrame.includes("The selected remote session's display is unavailable;"), true,

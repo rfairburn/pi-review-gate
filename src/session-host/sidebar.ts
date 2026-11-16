@@ -10255,6 +10255,22 @@ export class SidebarController {
   }
 
   /**
+   * The count row's leading spacer. The two-cell indent is presentation, not a
+   * fixed field: when the pane leaves less room (for example the scrollbar lane
+   * reserves one column), keep the complete labelled row in the available text
+   * columns by reducing only that blank prefix. It never removes a label or
+   * value, wraps the row, or alters the count text itself.
+   */
+  private cardBackgroundLine(item: SessionStatusFacts, cols: number): string {
+    const text = this.cardBackgroundRuns(item);
+    // Only the production wide list widths adapt: 35 without the lane and 34
+    // with it. Narrow overlay panes keep the existing two-cell marker and
+    // ellipsis behavior rather than moving the count row into the activity shape.
+    const indent = cols >= 34 ? Math.min(2, Math.max(0, cols - visibleWidth(text))) : 2;
+    return `${" ".repeat(indent)}${text}`;
+  }
+
+  /**
    * One painted scrollbar cell: a single terminal column carrying exactly one
    * generated role sequence between explicit resets, so it composes with the
    * row it is appended to and never leaks a style past its own cell.
@@ -13887,7 +13903,7 @@ export class SidebarController {
       const lines = [
         wrapRow(cardTitle(item), cols, titleSgr),
         wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(item)}`, cols),
-        wrapRow(`  ${this.cardBackgroundRuns(item)}`, cols),
+        wrapRow(this.cardBackgroundLine(item, cols), cols),
       ];
       if (!this.collapsedItemIds.has(item.id)) {
         const activity = renderActivityLines(item.activity, cols);
@@ -13987,7 +14003,7 @@ export class SidebarController {
       wrapRow(cardTitle(remote.row), cols, titleSgr),
       wrapRow(`  host ${stale}${paintedHostLabel}`, cols),
       wrapRow(`${insertionMarker ?? marker}${this.cardStatusRuns(facts)}`, cols),
-      wrapRow(`  ${this.cardBackgroundRuns(facts)}`, cols),
+      wrapRow(this.cardBackgroundLine(facts, cols), cols),
     ];
     if (!this.collapsedRemoteEntryKeys.has(entry.key)) {
       const activity = renderActivityLines(remote.row.activity, cols);

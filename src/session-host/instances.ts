@@ -99,6 +99,17 @@ import type {
 	NativeHookEvent,
 	NativeHookFailure,
 } from "./native-hook-protocol";
+import {
+	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
+	type NativeCodexOwnedLaunchPlan,
+} from "./native-cli-launch";
+import type {
+	OwnedCodexBackendLaunchIdentity,
+	OwnedCodexBackendLease,
+	OwnedCodexBackendReady,
+	OwnedCodexBackendStatus,
+} from "./native-codex-backend";
+import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
 import type { StagedSessionHostPayload } from "./payload";
 import {
 	SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -243,6 +254,7 @@ import {
 
 export interface StopInstanceResult {
 	readonly status: "exited" | "confirmation-required" | "unavailable" | "unconfirmed";
+	/** Owned force escalation was attempted on this row's PTY or its owned backend; never exit proof. */
 	readonly forced: boolean;
 }
 
@@ -946,6 +958,18 @@ export interface NativeCliLaunchRequest {
  */
 export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	readonly nativeHook?: NativeHookLaunchOutcome;
+	/**
+	 * Present only for a Codex launch a provider prepared in owned backend mode:
+	 * the pure rendering plan of THIS launch's one owned app-server backend and the
+	 * interactive TUI that attaches to it. It is a plan, not a child and not an
+	 * ownership claim — the manager only consumes it (create the backend, render the
+	 * TUI from the fulfilled lease) and never reinterprets what it renders.
+	 *
+	 * Its absence is every existing launch: the ordinary `file`/`args`/`env`/`cwd`
+	 * descriptor is spawned exactly as it always was, with no backend, no endpoint,
+	 * and no bearer anywhere.
+	 */
+	readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
 }
 
 /**
@@ -964,6 +988,70 @@ export type NativeCliLaunch = (
 	backend: NativeCliBackend,
 	request: NativeCliLaunchRequest,
 ) => NativeCliLaunchDescriptor | Promise<NativeCliLaunchDescriptor>;
+
+/**
+ * What this manager asks its injected owned-Codex-backend factory for, once per
+ * owned run, synchronously, before it awaits anything.
+ *
+ * The factory owns the process: it must start the one backend child from
+ * `plan.renderBackend(…)` (the plan re-renders the SAME resolved target the TUI
+ * uses, and the lease hands it the closed control argv), return the exact lease
+ * synchronously, and terminate only that captured child. It never selects an
+ * endpoint, never adopts another server, and never scans a port.
+ */
+export interface OwnedCodexBackendLaunchRequest {
+	/** The identity this manager minted for exactly this run; the lease must echo it. */
+	readonly identity: OwnedCodexBackendLaunchIdentity;
+	/** This launch's rendering plan; the factory may only call `renderBackend` on it. */
+	readonly plan: NativeCodexOwnedLaunchPlan;
+	/**
+	 * Aborted when this run is retired (stop, removal, disposal, launch failure).
+	 * The manager also calls `requestStop()` on the returned lease, so honoring the
+	 * signal is an additional path and never the only one.
+	 */
+	readonly signal: AbortSignal;
+}
+
+/**
+ * The host-injected owner of one owned Codex backend process. It is called
+ * synchronously, and its answer is validated against the identity this manager
+ * minted BEFORE anything is awaited; a factory that throws, or that answers with
+ * anything that is not a usable lease for that identity, fails the row before any
+ * TUI child exists.
+ */
+export type OwnedCodexBackendFactory = (
+	request: OwnedCodexBackendLaunchRequest,
+) => OwnedCodexBackendLease;
+
+/**
+ * The owner-only, run-private view of one fulfilled owned Codex backend, handed
+ * to THIS run's own status observer exactly once.
+ *
+ * It is the settled next-phase seam for a fresh-session status reader: it carries
+ * the identity and endpoint of THIS lease and one private accessor for the
+ * observer bearer, and nothing else — no command line, no environment, no
+ * provider arguments, no root or conversation selection, and no wire or roster
+ * shape. It is never stored on a view, serialized, or logged; a consumer that
+ * needs a status registration builds it elsewhere from these facts.
+ */
+export interface NativeOwnedCodexBackendObservationSource {
+	readonly leaseId: string;
+	readonly generation: number;
+	readonly endpoint: string;
+	/** Sensitive: the observer bearer of THIS lease. Never log, store, or publish it. */
+	readonly readObserverBearer: () => string;
+	/**
+	 * Present only when this lease's factory also fronts the backend with the
+	 * private native TUI relay: the exact retained fresh-root facts source of
+	 * THIS run, forwarded verbatim from the lease's own fulfilled readiness value
+	 * (never re-minted, never re-read). Like the rest of this source it is
+	 * owner-private: it is not a wire, roster, status, or control shape, it is
+	 * never stored on a view, serialized, or logged, and the manager never reads
+	 * what it says. A consumer that attaches gets only the current closed state
+	 * and an unsubscribe that detaches itself.
+	 */
+	readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
+}
 
 /**
  * The owner-supplied native hook source registrar: structurally exactly
@@ -1029,6 +1117,26 @@ export interface NativeStatusObserver {
 	 * still refuses the claim if it has already observed work.
 	 */
 	observeOwnedStartup?(): void;
+	/**
+	 * Optional (issue #277 owning-manager slice): the ONE private statement that this
+	 * run's backend is a genuinely OWNED Codex backend, carrying the identity and
+	 * endpoint of THIS lease plus the private observer-bearer accessor
+	 * ({@linkcode NativeOwnedCodexBackendObservationSource}).
+	 *
+	 * It is called at most once for a run, synchronously, after this run's status
+	 * capture is already bound to the exact live TUI PTY handle and incarnation and
+	 * BEFORE {@linkcode NativeStatusObserver.observeOwnedStartup} is offered, so a
+	 * source can qualify its ownership claim before it states any baseline. An
+	 * observer that omits this hook keeps today's behavior unchanged, and a source
+	 * that arrives after activation is offered the same one delivery if the run, its
+	 * backend, and its capture are still the current ones.
+	 *
+	 * The manager draws no conclusion from it: this callback creates no registration,
+	 * no connection, no status value, and no ownership. A throw retires this run's
+	 * observation path only — never the backend, its child, or its artifacts — and it
+	 * never reports the observer's message anywhere.
+	 */
+	observeOwnedCodexBackend?(source: NativeOwnedCodexBackendObservationSource): void;
 	/** Retire this observer. Idempotent; it never signals or waits on the child. */
 	dispose(): void;
 }
@@ -1157,6 +1265,19 @@ export interface InstanceManagerOptions {
 	 * observer, no registration, and no observation path at all.
 	 */
 	nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	/**
+	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
+	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
+	 * whose descriptor carries a {@linkcode NativeCliLaunchDescriptor.ownedCodex}
+	 * plan, which only a provider constructed in owned mode produces; with that plan
+	 * present and no factory here, the row is refused before any child of any kind
+	 * exists, because a half-honored owned launch (a TUI attached to nothing owned)
+	 * is exactly the substitution this path refuses.
+	 *
+	 * Absence is every existing host and every existing launch: no backend, no
+	 * endpoint, no bearer, and no change to a Pi, Claude, or ordinary Codex row.
+	 */
+	ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 }
 
 export interface ShutdownOptions {
@@ -1360,6 +1481,39 @@ interface ManagedInstance {
 	 * or manager disposal.
 	 */
 	nativeStatusRun?: OwnedNativeStatusRun;
+	/**
+	 * The ONE owned Codex backend resource of THIS row's current provider child
+	 * (issue #277 owning-manager slice): the lease this manager retains from the
+	 * moment its factory answers until that backend's own positive settlement.
+	 *
+	 * It is ownership of a second process, not a second observation: the row's
+	 * `hasLiveProcess`, its removability, and this run's staged private files all
+	 * stay closed while it is unsettled, and no other row can reach it. Absence means
+	 * this launch carried no owned plan, which is every existing row.
+	 */
+	nativeCodexBackend?: OwnedNativeCodexBackendResource;
+	/**
+	 * Per-row owned-backend generation: the value minted for this row's next owned
+	 * backend, consumed once per backend. A row owns one backend per process
+	 * incarnation, so today this advances at most once per row; it exists so an
+	 * identity never depends on a row id alone.
+	 */
+	nativeCodexBackendGeneration?: number;
+	/**
+	 * True from the instant a native CLI row exists until its launch settles, i.e. while
+	 * no process of this launch can have been created yet. It is what makes that window
+	 * stoppable for an owned-capable Codex row, and it is cleared on every launch path so
+	 * a settled row is never "cancellable" again.
+	 */
+	nativeCliLaunchPending?: boolean;
+	/**
+	 * The row-level cancellation notification a confirmed Stop publishes while this row's
+	 * launch is still awaiting its provider. The launch races it, exactly as it races the
+	 * manager's shutdown notice, so a stopped row is answered immediately and a provider
+	 * that answers later can create nothing.
+	 */
+	launchCancel?: Promise<void>;
+	resolveLaunchCancel?: () => void;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -1410,6 +1564,16 @@ interface OwnedNativeStatusRun {
 	 */
 	capture?: NativeStatusCapture;
 	/**
+	 * The exact facts the ONE capture above was minted against: this row's live PTY handle
+	 * at activation, that incarnation's private key, and the observer generation the
+	 * capture closed over. An accepted invalidation retires that generation while leaving
+	 * the handle in place, so remembering the three is what lets a later delivery prove its
+	 * capture is still the current one instead of merely non-undefined.
+	 */
+	capturePty?: InstancePty;
+	captureIncarnation?: Buffer;
+	captureGeneration?: number;
+	/**
 	 * The private artifacts this launch's hook preparation staged, retained until this
 	 * run's own settlement. Absent means nothing was staged (or it was already
 	 * released), which is also the case for every declined or unprepared launch.
@@ -1441,6 +1605,53 @@ interface OwnedNativeStatusRun {
 }
 
 /**
+ * The manager's ownership record of one owned Codex backend process (issue #277
+ * owning-manager slice).
+ *
+ * The owner lifecycle token is this record's own object identity: the row's
+ * `nativeCodexBackend` slot says whether it is current, and `retired` says whether
+ * this manager still expects the run to reach a TUI. Every asynchronous
+ * continuation — a readiness answer, a settlement answer, an observer that arrived
+ * late — re-checks both, so a retired, replaced, stopped, or disposed run can never
+ * spawn or adopt a child.
+ *
+ * Retirement is a stop INTENT and never a settlement: `settled` is set only by the
+ * lease's own positive settlement, which requires that exact child's genuine exit
+ * and both captured readers' natural end. An unsettled resource keeps the row live
+ * for every authority that asks, however long it takes.
+ */
+interface OwnedNativeCodexBackendResource {
+	readonly rowId: string;
+	readonly identity: OwnedCodexBackendLaunchIdentity;
+	readonly lease: OwnedCodexBackendLease;
+	/** Aborted once at retirement, so a factory that honors it cancels startup too. */
+	readonly controller: AbortController;
+	/**
+	 * Fulfilled once at retirement, for the SAME reason {@linkcode
+	 * OwnedNativeCodexBackendResource.controller} exists but for a different consumer:
+	 * a stop, removal, or disposal that lands while this backend's readiness is pending
+	 * must unblock the launch that is waiting on it. A lease whose banner never arrives
+	 * cannot make a stopped row unanswerable, and racing this promise is what turns
+	 * "the row was stopped" into a finished launch instead of a hung one.
+	 */
+	readonly cancel: Promise<void>;
+	readonly resolveCancel: () => void;
+	/**
+	 * The one observation source of this backend, minted from the fulfilled readiness
+	 * value and handed to this run's observer as-is. Never published anywhere else.
+	 */
+	observationSource?: NativeOwnedCodexBackendObservationSource;
+	/** True only after THIS lease's readiness fulfilled. */
+	ready: boolean;
+	/** True only after THIS lease's own positive settlement. */
+	settled: boolean;
+	/** True once the single observer delivery happened (or was refused as stale). */
+	observationDelivered: boolean;
+	/** True once retirement was requested: no TUI of this launch may exist. */
+	retired: boolean;
+}
+
+/**
  * Reads the native hook preparation outcome a launch provider attached to its own
  * descriptor. Anything unrecognized is `undefined`, which the manager treats as
  * "this launch said nothing": the row keeps its unchanged interactive launch and
@@ -1468,6 +1679,162 @@ function readNativeHookLaunchOutcome(value: unknown): NativeHookLaunchOutcome | 
 		return hook as unknown as NativeHookLaunchOutcome;
 	}
 	return undefined;
+}
+
+/**
+ * Whether this row still owns an owned Codex backend whose settlement is not yet
+ * proven. It is the one authority on that question, and it is deliberately not
+ * inferred from the row's PTY: the TUI client exiting says nothing about the
+ * backend process this manager started, and vice versa.
+ */
+function ownsUnsettledCodexBackend(record: ManagedInstance): boolean {
+	const backend = record.nativeCodexBackend;
+	return backend !== undefined && !backend.settled;
+}
+
+/**
+ * The three answers this manager can have about a descriptor's owned Codex plan, and the
+ * distinction is the whole point: **absence** is every ordinary launch (spawn exactly what
+ * the provider composed, with no backend, endpoint, or bearer anywhere), while a **present
+ * value this manager cannot consume** is a provider that claimed an owned launch and
+ * attached something broken to it. Treating the second like the first would spawn the
+ * standalone descriptor behind an owned request — the substitution this path exists to
+ * refuse — so a malformed plan is refused instead, before either factory is called.
+ */
+type OwnedCodexPlanReading
+	= { readonly state: "absent" }
+	| { readonly state: "malformed" }
+	| { readonly state: "plan"; readonly plan: NativeCodexOwnedLaunchPlan };
+
+/**
+ * Read the owned Codex backend plan a launch provider attached to its own descriptor.
+ *
+ * Only a plan this module can actually consume counts as one: the two renderers and the
+ * backend base environment are what the owned path needs. A field that is not there at all
+ * is `absent`; anything else that is present — `null`, a non-object, a partial object, a
+ * non-function renderer, or a non-object base environment — is `malformed`. The value is
+ * never read further, echoed, or carried anywhere.
+ */
+function readNativeCodexOwnedPlan(value: unknown): OwnedCodexPlanReading {
+	if (!isPlainRecord(value)) {
+		return { state: "absent" };
+	}
+	const plan = (value as { readonly ownedCodex?: unknown }).ownedCodex;
+	if (plan === undefined) {
+		return { state: "absent" };
+	}
+	if (!isPlainRecord(plan)
+		|| typeof plan.renderBackend !== "function"
+		|| typeof plan.renderTui !== "function"
+		|| !isPlainRecord(plan.backendEnv)) {
+		return { state: "malformed" };
+	}
+	return { state: "plan", plan: plan as unknown as NativeCodexOwnedLaunchPlan };
+}
+
+/**
+ * Whether one launch-provider rejection is the provider's OWN typed owned-profile
+ * refusal, recognized by its published closed code alone. The exception object is
+ * never read further and never carried: this is a routing decision, not a message.
+ */
+function isOwnedCodexProfileRefusal(error: unknown): boolean {
+	return isPlainRecord(error)
+		&& (error as { readonly code?: unknown }).code === NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE;
+}
+
+/**
+ * Whether one factory answer is the lease this manager can actually own: the four
+ * members this module depends on, and the identity it minted for THIS launch. A
+ * lease for another id or generation is a foreign object and is refused before any
+ * continuation is attached, so a stale or mis-built answer can never be adopted.
+ */
+function isUsableOwnedCodexBackendLease(value: unknown, identity: OwnedCodexBackendLaunchIdentity): value is OwnedCodexBackendLease {
+	if (!isPlainRecord(value)) {
+		return false;
+	}
+	const lease = value as {
+		readonly identity?: unknown;
+		readonly readiness?: unknown;
+		readonly settlement?: unknown;
+		readonly status?: unknown;
+		readonly requestStop?: unknown;
+	};
+	const leaseIdentity = lease.identity;
+	return isPlainRecord(leaseIdentity)
+		&& leaseIdentity.leaseId === identity.leaseId
+		&& leaseIdentity.generation === identity.generation
+		&& isThenable(lease.readiness)
+		&& isThenable(lease.settlement)
+		&& typeof lease.status === "function"
+		&& typeof lease.requestStop === "function";
+}
+
+/** Whether a value is a promise-like this manager can attach handlers to. */
+function isThenable(value: unknown): boolean {
+	return (typeof value === "object" && value !== null || typeof value === "function")
+		&& typeof (value as { readonly then?: unknown }).then === "function";
+}
+
+/**
+ * Whether this exact row's owned force escalation was attempted, for the existing
+ * `stop().forced` and `shutdown().forcedIds` reports only.
+ *
+ * Two independent owned handles can be escalated: the row's PTY (`sigkillSent`, whose
+ * PTY-only meaning the stop ladder relies on and which this never sets) and the row's
+ * own retained backend resource, whose lease reports a sticky force bit immediately
+ * before its owned SIGKILL attempt. The resource is this record's one backend slot,
+ * so another row's or another incarnation's lease can never contribute. This is
+ * historical evidence only — never exit, reader, settlement, or liveness proof.
+ */
+function ownedForceEscalationAttempted(record: ManagedInstance): boolean {
+	return record.sigkillSent || ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend);
+}
+
+/** The backend half of {@linkcode ownedForceEscalationAttempted}: this exact resource's lease bit. */
+function ownedCodexBackendForceEscalationAttempted(backend: OwnedNativeCodexBackendResource | undefined): boolean {
+	if (backend === undefined) return false;
+	let status: unknown;
+	try {
+		status = backend.lease.status();
+	} catch {
+		return false;
+	}
+	return isPlainRecord(status)
+		&& (status as { readonly forceEscalationAttempted?: unknown }).forceEscalationAttempted === true;
+}
+
+/**
+ * Whether one owned backend's OWN lease reports that its process is already stopped,
+ * exited, or settled.
+ *
+ * This is a read of the lease's own observation of its child — never an inference from
+ * the row's PTY, which knows nothing about this second process, and never an inference
+ * from a stop acknowledgement, a stream close, or a timeout. A lease that cannot answer
+ * the question is treated as ended: this manager builds a TUI on, and hands out the
+ * private capability of, a backend it can positively see is still there.
+ */
+function ownedCodexBackendKnownEnded(resource: OwnedNativeCodexBackendResource): boolean {
+	let status: OwnedCodexBackendStatus;
+	try {
+		status = resource.lease.status();
+	} catch {
+		return true;
+	}
+	if (!isPlainRecord(status)) {
+		return true;
+	}
+	const facts = status as {
+		readonly phase?: unknown;
+		readonly settled?: unknown;
+		readonly stopRequested?: unknown;
+		readonly exitObserved?: unknown;
+	};
+	return facts.settled === true
+		|| facts.exitObserved === true
+		|| facts.stopRequested === true
+		|| facts.phase === "stopping"
+		|| facts.phase === "exited"
+		|| facts.phase === "settled";
 }
 
 /** The lazy loader for the pinned real native PTY implementation. */
@@ -2258,6 +2625,7 @@ export class InstanceManager {
 	readonly #nativeHookRegistrar?: NativeHookSourceRegistrar;
 	/** The OPTIONAL owner-side per-run status observer factory, paired with the registrar. */
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/**
@@ -2354,6 +2722,14 @@ export class InstanceManager {
 		}
 		this.#nativeHookRegistrar = options.nativeHookRegistrar;
 		this.#nativeStatusObserverFactory = options.nativeStatusObserverFactory;
+		// The owned Codex backend factory is a third, independent seam: it is neither
+		// implied by the optional status pair nor required by it, and it is consulted
+		// only for a launch whose descriptor actually carries an owned plan.
+		if (options.ownedCodexBackendFactory !== undefined
+			&& typeof options.ownedCodexBackendFactory !== "function") {
+			throw new Error("session-host: ownedCodexBackendFactory must be a function or absent");
+		}
+		this.#ownedCodexBackendFactory = options.ownedCodexBackendFactory;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
 
@@ -2370,7 +2746,9 @@ export class InstanceManager {
 				workspace: record.workspace,
 				agentDir: record.agentDir,
 				lifecycle: record.lifecycle,
-				hasLiveProcess: Boolean(record.pty && !record.ptyExited),
+				// One component's exit never makes this row "gone": the row stays live while
+				// either its TUI handle or its owned backend remains unsettled.
+				hasLiveProcess: Boolean((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)),
 				busy: record.busy,
 				pendingInput: record.pendingInput,
 				inputSurface: record.inputSurface,
@@ -2473,6 +2851,11 @@ export class InstanceManager {
 		if (!record || !record.pty || !record.ptyExited) {
 			return false;
 		}
+		// The TUI's exit is not this backend's exit: a row whose owned Codex backend has
+		// not settled still owns that process, and removing the row would strand it.
+		if (ownsUnsettledCodexBackend(record)) {
+			return false;
+		}
 		this.#detachRow(record);
 		return true;
 	}
@@ -2505,6 +2888,11 @@ export class InstanceManager {
 			// The original owned child exists: only its own confirmed exit may
 			// release it, through the strict exited-row path.
 			return record.ptyExited ? this.closeExited(id) : false;
+		}
+		// No TUI was ever created, but an owned backend child of this very launch may
+		// still be live: an unsettled one keeps this row, exactly as an unsettled PTY does.
+		if (ownsUnsettledCodexBackend(record)) {
+			return false;
 		}
 		// No child was ever created. Require positively completed cleanup of the
 		// failed launch (registration and profile release actually returned, and
@@ -2550,6 +2938,9 @@ export class InstanceManager {
 		record.profile = undefined;
 		record.pty = undefined;
 		record.stopPromise = undefined;
+		// Removability already required a settled owned backend; this is the idempotent
+		// latch, so a resource can never outlive the row that owns it.
+		this.#retireOwnedCodexBackend(record.nativeCodexBackend);
 		this.#releaseNativeStatusArtifacts(record, statusRun);
 		this.#safeChanged(record.id);
 	}
@@ -2557,13 +2948,43 @@ export class InstanceManager {
 	/** Stop ONLY this exact owned row; removal is a separate actual-exit-only operation. */
 	async stop(id: string, options: { readonly confirmed: boolean }): Promise<StopInstanceResult> {
 		const record = this.#records.get(id);
-		if (!record || !record.pty || this.#disposed || this.#stopping) return { status: "unavailable", forced: false };
-		const outcome = (): StopInstanceResult => ({ status: record.ptyExited ? "exited" : "unconfirmed", forced: record.sigkillSent });
-		if (record.ptyExited) return outcome();
+		if (!record || this.#disposed || this.#stopping) return { status: "unavailable", forced: false };
+		// A row can own live work with no TUI at all: an owned Codex backend retained while
+		// its launch is still awaiting readiness is exactly that. Such a row stays stoppable
+		// — its operator's stop retires the backend and finishes the pending launch — and it
+		// is never reported as "exited" while either of its two processes is unsettled.
+		const ownsBackendWork = ownsUnsettledCodexBackend(record);
+		if (!record.pty && !ownsBackendWork) {
+			// The third shape of owned work is a launch that has produced NOTHING yet: its
+			// provider is still preparing, so there is no PTY and no backend to retire. For
+			// an owned-capable Codex row that window is still this manager's own row and
+			// still its own responsibility, so a confirmed Stop closes admission, retires
+			// this run's observation path, and publishes the row-level cancellation the
+			// launch races — which is what makes a later provider answer create neither a
+			// backend nor a TUI. Without that intent retained here, a stopped row would
+			// simply launch when its provider finally returned.
+			if (this.#pendingOwnedCodexPreparation(record)) {
+				if (options?.confirmed !== true) return { status: "confirmation-required", forced: false };
+				record.stopAdmissionClosed = true;
+				this.#closeStartupInput(record, true);
+				this.#retireNativeStatusRun(record.nativeStatusRun);
+				this.#cancelNativeLaunch(record);
+				return { status: "unconfirmed", forced: ownedForceEscalationAttempted(record) };
+			}
+			return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
+		}
+		const outcome = (): StopInstanceResult => ({
+			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record) ? "exited" : "unconfirmed",
+			forced: ownedForceEscalationAttempted(record),
+		});
+		if (record.ptyExited && !ownsBackendWork) return outcome();
 		if (record.stopPromise) { await record.stopPromise; return outcome(); }
 		let alreadyRequested = false;
 		if (options?.confirmed !== true) {
-			if (!hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
+			// With no TUI yet there are no session facts to prove an idle child, so an
+			// unconfirmed stop is refused; a CONFIRMED stop below still closes admission,
+			// retires this row's owned backend, and unblocks its launch.
+			if (!record.pty || !hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
 			const registration = record.registration;
 			if (!registration || record.registrationReleased) return { status: "confirmation-required", forced: false };
 			let shutdown: InstanceStatusRegistration["shutdown"];
@@ -2593,12 +3014,12 @@ export class InstanceManager {
 				exit.then((exited) => ({ kind: "exit" as const, exited })),
 			]);
 			if (record.ptyExited) return outcome();
-			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: record.sigkillSent };
+			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
 			if (first.kind !== "request" || !validShutdownRequest(first.result)) {
 				if (first.kind === "request" && first.result?.status === "not-idle") {
 					record.stopAdmissionClosed = false;
 				}
-				return { status: "confirmation-required", forced: record.sigkillSent };
+				return { status: "confirmation-required", forced: ownedForceEscalationAttempted(record) };
 			}
 			alreadyRequested = true;
 		} else {
@@ -2701,6 +3122,9 @@ export class InstanceManager {
 			activityRefreshEpisodeOpen: false,
 			statusRevision: 0,
 			nativeStatusObserverGeneration: 0,
+			// A native CLI row's launch is in preparation from the moment this row exists,
+			// so a confirmed Stop can cancel it before any child of it is created.
+			nativeCliLaunchPending: isNativeCliBackend(options.backend),
 			activity: [],
 			cols: this.#cols,
 			rows: this.#rows,
@@ -3076,6 +3500,14 @@ export class InstanceManager {
 		// Local user input only. There is deliberately no origin parameter: a
 		// viewer cannot route input through this seam in this phase, and an opaque
 		// viewer token alone would be no grant.
+		if (data.length > 0 && isNativeCliBackend(record.backend)) {
+			// Nonempty owner-local user input is about to be handed to a hosted provider
+			// child, so the previous controller stops being the copy recipient NOW: a
+			// write that partially reaches the child and then throws leaves nobody
+			// attributed until a later input write actually returns. Empty writes,
+			// protocol replies, and Pi rows never reach here and change nothing.
+			record.nativeCliController = undefined;
+		}
 		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
 		// Only bytes that actually left for this child count. On a hosted provider row
 		// this makes the owner the current copy recipient; on a Pi row it changes
@@ -3601,11 +4033,18 @@ export class InstanceManager {
 		if (!this.#nativeCliInputAdmissible(record, pty)) {
 			return { status: "refused", reason: "row-unavailable" };
 		}
+		// Every refusal is behind us and this nonempty user input is about to be handed
+		// to the child, so the previous controller stops being the copy recipient NOW:
+		// a write that partially reaches the child and then throws must not leave a
+		// stale surface attributed for whatever the child copies next. A recipient is
+		// established again only once a write actually returns.
+		record.nativeCliController = undefined;
 		try {
 			pty.write(data);
 		} catch {
 			// The seam was open when it was last checked and the write was invoked, so
-			// whether the child received the bytes is genuinely unknown.
+			// whether the child received the bytes is genuinely unknown, and no surface
+			// is attributed until a later input write succeeds.
 			return { status: "unknown" };
 		}
 		// The bytes were handed to THIS child, so this surface is now the recipient of
@@ -3997,6 +4436,9 @@ export class InstanceManager {
 		// A run that activated while the factory was still answering publishes its static
 		// declaration now; otherwise activation does it.
 		this.#publishNativeStatusSupport(run);
+		// And it is offered this run's owned-backend facts now, once, only while the run,
+		// its backend, and its capture are all still the current ones.
+		this.#deliverOwnedCodexBackendObservation(record, run, record.nativeCodexBackend);
 	}
 
 	/**
@@ -4097,6 +4539,7 @@ export class InstanceManager {
 	#activateNativeStatusRun(
 		record: ManagedInstance,
 		run: OwnedNativeStatusRun | undefined,
+		ownedBackend?: OwnedNativeCodexBackendResource,
 	): void {
 		if (run === undefined || run.retired || record.nativeStatusRun !== run) {
 			return;
@@ -4109,8 +4552,18 @@ export class InstanceManager {
 			return;
 		}
 		run.capture = capture;
+		// Remembered alongside it, so every later use of this capture can re-prove that
+		// THIS generation of THIS handle is still what the row is running.
+		run.capturePty = record.pty;
+		run.captureIncarnation = record.nativeCliIncarnation;
+		run.captureGeneration = record.nativeStatusObserverGeneration;
 		run.activated = true;
 		this.#publishNativeStatusSupport(run);
+		// The capture is bound to this exact live handle and incarnation, so this is the
+		// first moment an owned backend's facts can be qualified, and it comes before any
+		// baseline claim: a source that can state "started idle" must first know whether the
+		// backend behind this row is genuinely this host's own.
+		this.#deliverOwnedCodexBackendObservation(record, run, ownedBackend ?? record.nativeCodexBackend);
 		// The child exists, this run's capture is bound to this exact handle and
 		// incarnation, and nothing has been typed into the row: that is the only
 		// moment a source may state its launch-time baseline, and the only fact the
@@ -4195,6 +4648,14 @@ export class InstanceManager {
 	 * Saying NOTHING is the legacy descriptor shape rather than a refusal: this run
 	 * keeps its source and its observer and stays unknown until and unless actual
 	 * observations arrive. Only an explicit refusal retires a run this early.
+	 *
+	 * That is also the load-bearing rule for an OWNED Codex launch, which composes no
+	 * status hook of this host's own at all (the provider declines it, because the
+	 * approved relay and its read-only RPC are that row's metadata channel): its
+	 * descriptor says NOTHING by design, so the run, its capture, and its one private
+	 * backend capability stay live exactly as they would for a hook-bearing run. An
+	 * explicit `unavailable` or `failed` outcome keeps its existing fail-closed meaning
+	 * even there, and in no case does any of this touch the row's two processes.
 	 */
 	#applyNativeHookOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
 		if (run === undefined || run.retired) {
@@ -4288,6 +4749,12 @@ export class InstanceManager {
 			// A live or unsettled child may still need the files it was told to read.
 			return;
 		}
+		if (ownsUnsettledCodexBackend(record)) {
+			// The owned backend is a SECOND child of this same launch, and it was given the
+			// same hook channel: the TUI's exit never says that child stopped reading, so an
+			// unsettled record preserves the files until that backend's own settlement.
+			return;
+		}
 		run.artifactsReleased = true;
 		run.lease = undefined;
 		const settlement = run.readerSettlement;
@@ -4336,6 +4803,318 @@ export class InstanceManager {
 			void Promise.resolve(lease.cleanup()).catch(() => undefined);
 		} catch {
 			// The lease reports its own refusals; a cleanup failure is never a row failure.
+		}
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OWNED Codex backend of one hosted run (issue #277 owning-manager)  *
+	 *                                                                        *
+	 * Everything in this block is inert for a launch whose provider attached  *
+	 * no owned plan — which is every Pi row, every Claude row, and every     *
+	 * ordinary Codex row. Where it IS active it adds exactly one thing: this *
+	 * manager becomes the owner of one backend process beside the row's TUI, *
+	 * and it adds no provider patching, no replacement UI, no headless      *
+	 * conversation, no shared-server adoption, no port scan, and no status   *
+	 * claim of its own.                                                      *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Create this row's owned Codex backend and RETAIN its lease on the record
+	 * SYNCHRONOUSLY, before anything is awaited.
+	 *
+	 * That ordering is the contract: the backend child exists the moment the factory
+	 * returns, so a lease kept only inside a pending promise would be a process this
+	 * manager cannot stop. The factory's answer is validated against the identity this
+	 * manager minted — same lease id, same generation, and the four lease members this
+	 * module actually depends on — before any continuation is attached.
+	 *
+	 * A throw here happens before any backend of this run exists, so it is an ordinary
+	 * preparation failure. It never falls back to the standalone descriptor: a TUI
+	 * attached to nothing owned is the substitution this path refuses.
+	 */
+	#createOwnedCodexBackend(
+		record: ManagedInstance,
+		plan: NativeCodexOwnedLaunchPlan,
+	): OwnedNativeCodexBackendResource {
+		const factory = this.#ownedCodexBackendFactory;
+		if (factory === undefined) {
+			// The provider prepared an owned launch this host cannot honor. Refusing is
+			// the only honest answer: no backend, no TUI, and no Pi or standalone fallback.
+			throw new Error("session-host: this host has no owned Codex backend factory");
+		}
+		if (record.nativeCodexBackend !== undefined) {
+			// One backend per row incarnation, always. A second one would be a process whose
+			// endpoint this row's TUI is not attached to.
+			throw new Error("session-host: this row already owns a Codex backend");
+		}
+		const generation = record.nativeCodexBackendGeneration ?? 0;
+		record.nativeCodexBackendGeneration = generation + 1;
+		const identity: OwnedCodexBackendLaunchIdentity = Object.freeze({ leaseId: randomUUID(), generation });
+		const controller = new AbortController();
+		let resolveCancel: () => void = () => undefined;
+		const cancel = new Promise<void>((fulfill) => {
+			resolveCancel = fulfill;
+		});
+		let created: unknown;
+		try {
+			created = factory({ identity, plan, signal: controller.signal });
+		} catch {
+			// The factory reports its own failure; no message, argument, or path of theirs
+			// is ever carried into this row's state.
+			throw new Error("session-host: the owned Codex backend factory produced no lease");
+		}
+		if (!isUsableOwnedCodexBackendLease(created, identity)) {
+			throw new Error("session-host: the owned Codex backend factory produced an unusable lease");
+		}
+		const lease = created;
+		const resource: OwnedNativeCodexBackendResource = {
+			rowId: record.id,
+			identity,
+			lease,
+			controller,
+			cancel,
+			resolveCancel,
+			ready: false,
+			settled: false,
+			observationDelivered: false,
+			retired: false,
+		};
+		// THE synchronous retention. From this statement until its settlement, this
+		// backend is this row's resource, and every stop, removal, disposal, and failure
+		// path below reaches it — including one whose readiness never arrives.
+		record.nativeCodexBackend = resource;
+		// Settlement is observed, never awaited: it is the only thing that may retire the
+		// row's ownership claim, release this run's staged private files, and let the row
+		// stop reporting a live process. A stop acknowledgement, a stream destroy, a
+		// close, or a timeout can never take its place.
+		void Promise.resolve(lease.settlement).then(
+			() => this.#onOwnedCodexBackendSettled(record, resource),
+			() => undefined,
+		);
+		return resource;
+	}
+
+	/**
+	 * Await this row's owned backend's readiness, bounded by this manager's own
+	 * shutdown notification exactly the way the launch provider is, and by this
+	 * resource's own retirement.
+	 *
+	 * A backend that never prints its banner can therefore never hold the host away
+	 * from stopping its existing children, and a row whose operator stopped it is answered
+	 * now rather than whenever its backend happens to speak. When either wins, this
+	 * resource is retired (which requests its exact owned termination) and the launch
+	 * aborts; the readiness answer, whenever it comes, can then spawn nothing.
+	 *
+	 * A rejected readiness value is NOT settlement and never treated as abandonment: the
+	 * backend child may outlive it, and the retained resource keeps the row's resources
+	 * and liveness until the lease itself settles.
+	 */
+	async #awaitOwnedCodexBackendReady(
+		record: ManagedInstance,
+		resource: OwnedNativeCodexBackendResource,
+	): Promise<OwnedCodexBackendReady> {
+		const outcome = await Promise.race([
+			Promise.resolve(resource.lease.readiness).then(
+				(ready) => ({ kind: "ready" as const, ready }),
+				() => ({ kind: "failed" as const }),
+			),
+			this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+			resource.cancel.then(() => ({ kind: "stopped" as const })),
+		]);
+		if (outcome.kind === "aborted" || this.#stopping || this.#disposed) {
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("shutting down; native CLI launch aborted before any child existed");
+		}
+		if (outcome.kind === "stopped") {
+			// A confirmed Stop of this row retired the resource while its readiness was still
+			// pending. The retirement already asked for the exact owned termination; this
+			// launch is over, and its row keeps the backend as unsettled owned work.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the row was stopped before its native CLI child existed");
+		}
+		if (outcome.kind !== "ready") {
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend did not become ready");
+		}
+		if (resource.retired || record.nativeCodexBackend !== resource || this.#records.get(record.id) !== record) {
+			// A stop, removal, or replacement landed while readiness was pending. The
+			// retirement that caused it already asked for the exact owned termination; this
+			// late answer adopts nothing and reveals nothing.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend is no longer this row's run");
+		}
+		if (resource.settled || ownedCodexBackendKnownEnded(resource)) {
+			// The backend ended between its banner and this continuation: its own status now
+			// reports a stop request, a witnessed exit, or a positive settlement. A TUI that
+			// attaches to an endpoint that is already gone is the substitution this path
+			// refuses, and an unsettled one stays retained and owned either way.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend ended before its TUI could start");
+		}
+		resource.ready = true;
+		const identity = resource.identity;
+		// The one observation source of this backend, minted once from this fulfilled
+		// lease: its endpoint comes from this lease's own banner, and the bearer stays
+		// reachable only through the accessor. Nothing here is stored on a view or a log.
+		resource.observationSource = Object.freeze({
+			leaseId: identity.leaseId,
+			generation: identity.generation,
+			endpoint: outcome.ready.endpoint,
+			readObserverBearer: (): string => outcome.ready.readObserverBearer(),
+			// Forwarded once, as the exact value this lease's readiness carried: a
+			// bare backend lease simply has none, and the manager never invents one.
+			...(outcome.ready.tuiRootFacts === undefined
+				? {}
+				: { tuiRootFacts: outcome.ready.tuiRootFacts }),
+		});
+		return outcome.ready;
+	}
+
+	/**
+	 * Request this row's owned backend's exact owned termination, once.
+	 *
+	 * Retirement is a stop INTENT, never a settlement: the record stays on the row with
+	 * `settled` false until the lease's own positive settlement arrives, so the row keeps
+	 * reporting a live process, keeps refusing removal, and keeps its staged private
+	 * files. Both routes below are idempotent by contract, and neither ever signals a
+	 * pid, scans a process name, or touches another row's child.
+	 */
+	#retireOwnedCodexBackend(resource: OwnedNativeCodexBackendResource | undefined): void {
+		if (resource === undefined || resource.retired) {
+			return;
+		}
+		resource.retired = true;
+		// A launch waiting on this backend's banner stops waiting here, so a stopped row is
+		// answered even if its backend never prints anything and never settles.
+		try {
+			resource.resolveCancel();
+		} catch {
+			// A resolver failure cannot leave the lease unrequested; the calls below are the
+			// authoritative stop either way.
+		}
+		try {
+			resource.controller.abort();
+		} catch {
+			// An accessor failure cannot leave the lease unrequested; the call below is the
+			// authoritative stop and the record stays unsettled either way.
+		}
+		try {
+			resource.lease.requestStop();
+		} catch {
+			// A failed stop request is not a gone process: ownership and barriers stay held.
+		}
+	}
+
+	/**
+	 * This row's owned backend positively settled. It is the only place `settled` is
+	 * ever set, and it never claims anything about the TUI: a backend that settled while
+	 * its row's PTY is still live leaves that row live, and the row's own exit stays the
+	 * only witness of the TUI's end.
+	 *
+	 * Settlement also retires the resource: a lease that has finished is not a capability
+	 * this manager may still build a TUI on, so a readiness answer that arrives afterwards
+	 * is refused by the same fence every other stale continuation is.
+	 */
+	#onOwnedCodexBackendSettled(record: ManagedInstance, resource: OwnedNativeCodexBackendResource): void {
+		if (resource.settled) {
+			return;
+		}
+		resource.settled = true;
+		this.#retireOwnedCodexBackend(resource);
+		// The backend is one of the children this launch was told to give its hook files
+		// to, so its settlement is what can finally make that release safe.
+		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
+		if (this.#records.get(record.id) === record) {
+			if (this.#disposed && record.nativeCodexBackend === resource
+				&& (record.pty === undefined || record.ptyExited)) {
+				// Disposal deliberately preserved this row's registration and terminal surface
+				// while either of its two processes was unsettled. A TUI that already exited can
+				// never come back to finish that teardown, so this settlement — the last
+				// outstanding proof — completes the deferred per-row cleanup instead of retaining
+				// a terminal surface, its buffers, and its subscriptions for the rest of the
+				// process. A still-live TUI is left entirely alone: its own exit owns that.
+				this.#releaseRegistration(record);
+				try {
+					record.surface?.dispose();
+				} catch {
+					// Contained, exactly as on the late PTY-exit path.
+				}
+				record.surface = undefined;
+			}
+			this.#safeChanged(record.id);
+		}
+	}
+
+	/**
+	 * Offer this run's backend facts to this run's own observer, once.
+	 *
+	 * Every fence is re-proved at delivery: the run is this row's current, unretired,
+	 * activated run with its capture bound to the live handle; the backend is this row's
+	 * current, unretired, ready resource; and the delivery has not happened before. A
+	 * source that arrives late is offered the same single delivery only while all of that
+	 * is still true, so an old callback can never adopt a lease it did not run with.
+	 *
+	 * A throw retires the OBSERVATION path only — never the backend, its child, or its
+	 * artifacts — and the observer's own message is never read or reported.
+	 */
+	#deliverOwnedCodexBackendObservation(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		resource: OwnedNativeCodexBackendResource | undefined,
+	): void {
+		if (resource === undefined || resource.observationDelivered) {
+			return;
+		}
+		if (run === undefined || run.retired || record.nativeStatusRun !== run) {
+			return;
+		}
+		if (!run.activated || run.capture === undefined) {
+			// Before the capture is bound to the exact live PTY and incarnation, a source has
+			// nothing to qualify, so it is offered nothing.
+			return;
+		}
+		if (run.capturePty === undefined
+			|| run.captureIncarnation === undefined
+			|| run.captureGeneration === undefined
+			|| run.captureGeneration !== record.nativeStatusObserverGeneration
+			|| run.captureIncarnation !== record.nativeCliIncarnation
+			|| !this.#nativeCliInputAdmissible(record, run.capturePty)) {
+			// The capture this run was activated against is no longer CURRENT, which is a
+			// weaker claim than "a capture object exists". An accepted invalidation retires
+			// this capture's observer generation and leaves the handle in place, and a
+			// replaced incarnation, a stopping row, or a closed admission retires it the same
+			// way. A retired capture is never a reason to hand a source a live private
+			// capability, and nothing is submitted here to find out — the same fences
+			// #submitNativeCliStatus applies to real observations, applied without one.
+			return;
+		}
+		if (resource.retired || !resource.ready || record.nativeCodexBackend !== resource) {
+			return;
+		}
+		if (resource.settled || ownedCodexBackendKnownEnded(resource)) {
+			// A backend that was stopped, exited, or settled is not a live capability, however
+			// long this row's TUI keeps running. A source that arrives that late is offered
+			// nothing rather than the credentials of an endpoint that is already gone.
+			return;
+		}
+		if (this.#records.get(record.id) !== record) {
+			return;
+		}
+		const observer = run.observer;
+		if (observer === undefined || typeof observer.observeOwnedCodexBackend !== "function") {
+			return;
+		}
+		const source = resource.observationSource;
+		if (source === undefined) {
+			return;
+		}
+		resource.observationDelivered = true;
+		try {
+			observer.observeOwnedCodexBackend(source);
+		} catch {
+			// The observer's own failure retires its callbacks, exactly as a throwing hook
+			// callback does; the backend resource and its ownership are untouched.
+			this.#retireNativeStatusObserver(record, run);
 		}
 	}
 
@@ -4670,6 +5449,11 @@ export class InstanceManager {
 			if (record.pty && !record.ptyExited) {
 				return true;
 			}
+			// An owned backend this manager started is its own process: a row whose TUI has
+			// exited but whose backend has not settled is still owned work, never "gone".
+			if (ownsUnsettledCodexBackend(record)) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -4686,10 +5470,12 @@ export class InstanceManager {
 		if (this.#disposed) {
 			return {
 				forcedIds: [...this.#records.values()]
-					.filter((record) => record.pty && record.sigkillSent)
+					.filter((record) => (record.pty && record.sigkillSent) || ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend))
 					.map((record) => record.id),
+				// Same truth as the live pass below: a row whose owned backend has not
+				// settled still owns that process, whether or not its TUI ever existed.
 				remainingIds: [...this.#records.values()]
-					.filter((record) => record.pty && !record.ptyExited)
+					.filter((record) => (record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record))
 					.map((record) => record.id),
 			};
 		}
@@ -4754,6 +5540,10 @@ export class InstanceManager {
 			// preserved — an uncertain ownership chain is never cleaned as if it had
 			// finished — and the retained exit listener releases them if it ever does.
 			this.#retireNativeStatusRun(record.nativeStatusRun);
+			// An owned backend process goes the same way: its exact owned termination is
+			// requested now, and an unsettled one keeps its record, its files, and this row's
+			// liveness until it settles on its own.
+			this.#retireOwnedCodexBackend(record.nativeCodexBackend);
 			record.busy = null;
 			record.pendingInput = null;
 			record.inputSurface = false;
@@ -4763,9 +5553,11 @@ export class InstanceManager {
 			record.activeShells = null;
 			record.activity = [];
 			this.#disposeDataListener(record);
-			if (record.pty && !record.ptyExited) {
+			if ((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)) {
 				// Preserve the authenticated owner and terminal surface until actual
-				// PTY exit. The retained exit/error listeners complete this teardown.
+				// PTY exit — and until an owned backend of this same launch settles, which
+				// the TUI's own exit never proves. The retained exit/error listeners
+				// complete this teardown.
 				continue;
 			}
 			this.#releaseRegistration(record);
@@ -4842,6 +5634,49 @@ export class InstanceManager {
 		this.#shutdownNoticeResolve?.();
 	}
 
+	/**
+	 * Whether this row is an owned-capable Codex launch still in preparation: neither its
+	 * TUI nor its backend exists yet, so the only thing a Stop can act on is the launch
+	 * itself. "Owned-capable" is entirely this manager's own fact — it can honor an owned
+	 * plan, and this row's recorded backend is Codex — so no Pi, Claude, or ordinary
+	 * non-owned Codex row's answers change here, and no provider is consulted or asked
+	 * what it intends to return.
+	 */
+	#pendingOwnedCodexPreparation(record: ManagedInstance): boolean {
+		return record.nativeCliLaunchPending === true
+			&& this.#ownedCodexBackendFactory !== undefined
+			&& record.backend === "codex";
+	}
+
+	/**
+	 * This row's cancellation notification, created on first need. It is the row-level
+	 * counterpart of {@linkcode InstanceManager.#awaitShutdownNotice}: a native CLI launch
+	 * races it against its provider, so a confirmed Stop of a row whose provider has not
+	 * answered is answered immediately instead of whenever that provider happens to return,
+	 * and a provider that answers later can create neither a backend nor a TUI.
+	 */
+	#awaitNativeLaunchCancellation(record: ManagedInstance): Promise<void> {
+		if (record.launchCancel === undefined) {
+			let resolve: () => void = () => undefined;
+			record.launchCancel = new Promise<void>((fulfill) => { resolve = fulfill; });
+			record.resolveLaunchCancel = resolve;
+		}
+		return record.launchCancel;
+	}
+
+	/** Publish that notification once. Idempotent, and it never signals a process. */
+	#cancelNativeLaunch(record: ManagedInstance): void {
+		// Created before it is resolved, so a launch that reaches the race afterwards still
+		// sees an already-cancelled row rather than a fresh, unresolved notification.
+		this.#awaitNativeLaunchCancellation(record);
+		try {
+			record.resolveLaunchCancel?.();
+		} catch {
+			// A resolver failure cannot un-stop the row: the launch also rechecks this row's
+			// closed admission immediately before it would create anything.
+		}
+	}
+
 	#sidebarTitleColumnsSnapshot(): number | undefined {
 		try {
 			const columns = this.#getSidebarTitleColumns?.();
@@ -4894,6 +5729,11 @@ export class InstanceManager {
 		// The OPTIONAL native status source of this launch, armed below before the provider
 		// runs. Declared outside the try so every failure path can retire it.
 		let statusRun: OwnedNativeStatusRun | undefined;
+		// The owned Codex backend of this launch, when its provider attached a plan. Also
+		// declared outside the try: a backend created before a later failure stays this
+		// manager's ownership until its own settlement, and every path below must request
+		// its exact owned termination rather than forget it.
+		let ownedBackend: OwnedNativeCodexBackendResource | undefined;
 		try {
 			// 1. The selected workspace is the only setup fact this row needs: an
 			// existing absolute directory, canonicalized. No provider configuration,
@@ -4942,6 +5782,10 @@ export class InstanceManager {
 				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
 				...(nativeHook === undefined ? {} : { nativeHook }),
 			}));
+			// The provider is raced against three notifications, never against a timeout of
+			// its own: this manager shutting down, and THIS row being stopped by its operator
+			// (a confirmed Stop of a row that has produced no process yet has nothing else to
+			// act on, so the launch itself is what it cancels).
 			const outcome = await Promise.race([
 				pendingProvider.then(
 					(descriptor) => {
@@ -4953,9 +5797,10 @@ export class InstanceManager {
 						this.#adoptNativeHookLease(record, statusRun, descriptor);
 						return { kind: "provided" as const, descriptor };
 					},
-					() => ({ kind: "failed" as const }),
+					(error: unknown) => ({ kind: "failed" as const, refusedOwnedProfile: isOwnedCodexProfileRefusal(error) }),
 				),
 				this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+				this.#awaitNativeLaunchCancellation(record).then(() => ({ kind: "cancelled" as const })),
 			]);
 			// The provider ran across an await: a stop that began meanwhile takes this
 			// launch, so no child is ever created after the host began shutting down,
@@ -4963,10 +5808,24 @@ export class InstanceManager {
 			if (this.#stopping || this.#disposed) {
 				throw new Error("shutting down; native CLI launch aborted before any child existed");
 			}
+			if (outcome.kind === "cancelled") {
+				// The operator stopped this row while its provider was still preparing. The
+				// Stop already closed admission and retired this run's observation path; here
+				// the launch simply ends, so a provider fulfillment that arrives afterwards —
+				// or one that won this race by a microtask — creates no backend and no TUI.
+				throw new Error("session-host: the row was stopped before its native CLI child existed");
+			}
 			if (outcome.kind !== "provided") {
+				// The typed owned-profile refusal is mapped HERE, to one fixed existing row
+				// error and nothing else: the provider's exception object, its message, the
+				// configured profile spelling, its path, and its arguments never reach the row,
+				// a view, or a log. Every other provider failure keeps the same fixed text, so
+				// no lane can tell a caller anything about what the operator configured.
 				throw new Error(outcome.kind === "aborted"
 					? "shutting down; native CLI launch aborted before any child existed"
-					: "session-host: the native CLI launch provider did not produce a descriptor");
+					: outcome.refusedOwnedProfile === true
+						? "session-host: the native CLI launch provider refused an owned Codex backend launch"
+						: "session-host: the native CLI launch provider did not produce a descriptor");
 			}
 			const descriptor = validatedNativeCliDescriptor(outcome.descriptor, workspace);
 			// What the provider made of the bootstrap it was handed, for the OBSERVATION
@@ -4974,22 +5833,85 @@ export class InstanceManager {
 			// staged files this fulfillment carried were already adopted above.
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
 
+			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
+			// constructed in owned mode attaches a plan, and only such a launch enters here:
+			// the lease is created and RETAINED ON THE RECORD SYNCHRONOUSLY before anything
+			// is awaited, so a backend child that exists is a child this manager owns from
+			// its first instruction — never one hidden inside an unresolved promise. The TUI
+			// is then rendered from THAT lease's connection, so the interactive client and
+			// the backend are the same resolved target and endpoint, and a launch that never
+			// became ready never spawns a TUI at all.
+			const ownedPlanReading = readNativeCodexOwnedPlan(outcome.descriptor);
+			if (ownedPlanReading.state === "malformed") {
+				// A provider that attached an owned Codex plan this manager cannot consume is
+				// refused HERE, before the backend factory and before the pinned spawn. The
+				// alternative is the one outcome this path exists to prevent: quietly spawning
+				// the standalone descriptor as if the caller had never asked for an owned
+				// backend. The malformed value is never inspected further, echoed, or stored,
+				// and the fixed lane below carries no field, path, or message of theirs; no
+				// capability, endpoint, or observation source can exist for this row.
+				throw new Error("session-host: the owned Codex backend plan is unusable");
+			}
+			const ownedPlan = ownedPlanReading.state === "plan" ? ownedPlanReading.plan : undefined;
+			let ownedConnection: { readonly args: readonly string[]; readonly env: Readonly<Record<string, string | undefined>> } | undefined;
+			if (ownedPlan !== undefined) {
+				// The last look before a process of this launch can exist. The race above
+				// already answers a Stop that arrived during preparation; this re-checks the
+				// row's own admission, because a Stop that wins by a microtask must still not
+				// end up with a backend and a TUI behind it.
+				if (record.stopAdmissionClosed) {
+					throw new Error("session-host: the row was stopped before its native CLI child existed");
+				}
+				ownedBackend = this.#createOwnedCodexBackend(record, ownedPlan);
+				const ready = await this.#awaitOwnedCodexBackendReady(record, ownedBackend);
+				// THE final fence, re-proved on THIS caller's continuation and not on the
+				// helper's: returning from an await is itself a gap in which a confirmed row
+				// Stop, a removal, a manager shutdown, or this backend's own exit can land — and
+				// a row Stop sets none of the manager-wide flags. Everything below is a
+				// synchronous stretch, so re-reading the exact resource here is what guarantees
+				// that no TUI, and no read of its private connection material, follows a backend
+				// this manager no longer owns.
+				if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+					|| ownedBackend.retired || ownedBackend.settled
+					|| record.nativeCodexBackend !== ownedBackend
+					|| this.#records.get(record.id) !== record
+					|| ownedCodexBackendKnownEnded(ownedBackend)) {
+					// Retirement (if anything about this row is still outstanding) was requested
+					// by whoever changed the answer, and an unsettled backend stays owned by this
+					// row's record until its own settlement proves it gone.
+					this.#retireOwnedCodexBackend(ownedBackend);
+					throw new Error("session-host: the owned Codex backend is no longer available for TUI startup");
+				}
+				// Read the private connection material once, in the same synchronous stretch
+				// that spawns from it: a fresh child-only environment carrying the bearer, and
+				// nothing that ever enters a view, a log, or the row's stored state.
+				ownedConnection = ready.createTuiConnection();
+			}
+
 			// 3. Synchronous spawn stretch: nothing yields until the handlers and the
 			// terminal surface are attached, so ownership is recorded before any child
 			// callback can fire. The descriptor is applied verbatim.
 			let pty: InstancePty | undefined;
 			try {
+				// An owned launch spawns what its OWN lease renders, never the standalone
+				// descriptor: same canonical executable, same workspace, the lease's private
+				// connection arguments in real option position, and the lease's fresh child
+				// environment. A plan that renders anything unusable is refused here, before
+				// the pinned spawn, exactly as a provider descriptor would be.
+				const launchTarget = ownedPlan === undefined || ownedConnection === undefined
+					? descriptor
+					: validatedNativeCliDescriptor(ownedPlan.renderTui(ownedConnection), workspace);
 				// The private fact of the process about to exist, minted in the same
 				// synchronous stretch as the spawn: a row never owns a live provider child
 				// whose input scope key does not exist yet, and a replacement child never
 				// inherits its predecessor's. Nothing derived from it is ever published.
 				record.nativeCliIncarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
 				pty = this.#ptyFactory({
-					file: descriptor.file,
-					args: descriptor.args,
-					...(descriptor.commandLine === undefined ? {} : { commandLine: descriptor.commandLine }),
-					env: nativeCliChildEnv(descriptor.env),
-					cwd: descriptor.cwd,
+					file: launchTarget.file,
+					args: launchTarget.args,
+					...(launchTarget.commandLine === undefined ? {} : { commandLine: launchTarget.commandLine }),
+					env: nativeCliChildEnv(launchTarget.env),
+					cwd: launchTarget.cwd,
 					cols: record.cols,
 					rows: record.rows,
 				});
@@ -5050,6 +5972,10 @@ export class InstanceManager {
 					}
 				}
 			} catch {
+				// Whatever happened in this stretch, no TUI of this launch is running: an owned
+				// backend created by it gets its exact owned termination requested now, and its
+				// record stays until that backend's own settlement proves it gone.
+				this.#retireOwnedCodexBackend(ownedBackend);
 				if (pty) {
 					// A child of this launch exists, so its staged files stay: the owned stop
 					// below reaches the real exit, and that exit is what releases them.
@@ -5089,7 +6015,9 @@ export class InstanceManager {
 				// Failed spawn before any child exists: nothing was ever acquired. Any
 				// file this launch staged has no child that could ever read it, so it goes now
 				// — and the launch is marked abandoned so a provider that answers LATER has
-				// its own staged files released by the same decision.
+				// its own staged files released by the same decision. An owned backend child of
+				// THIS launch is outside that decision: its unsettled record keeps those files,
+				// and only its own settlement releases them.
 				this.#abandonNativeStatusLaunch(record, statusRun);
 				record.error = publicInstanceError("ptySetup");
 				record.lifecycle = "error";
@@ -5101,7 +6029,7 @@ export class InstanceManager {
 			// The child exists and is fully wired: bind this run's optional status source
 			// to the exact live handle and incarnation now, in the same synchronous stretch
 			// as the spawn, so no observation can ever land on a row this run is not it.
-			this.#activateNativeStatusRun(record, statusRun);
+			this.#activateNativeStatusRun(record, statusRun, ownedBackend);
 			if (this.#records.get(record.id) === record) {
 				this.#safeChanged(record.id);
 			}
@@ -5112,12 +6040,22 @@ export class InstanceManager {
 			// Marking this launch abandoned also covers a provider that fulfills after we
 			// stopped waiting for it: its staged files are released on arrival rather than
 			// stranded, and shutdown still never waits on it.
+			//
+			// A backend this launch already created is not covered by that decision: it is
+			// asked for its exact owned termination here, and its unsettled record keeps the
+			// row's resources and its liveness until that backend's own settlement arrives.
+			this.#retireOwnedCodexBackend(ownedBackend);
 			this.#abandonNativeStatusLaunch(record, statusRun);
 			record.error = publicInstanceError("launchPreparation");
 			record.lifecycle = "error";
 			this.#releaseRegistration(record);
 			this.#releaseProfile(record);
 			this.#safeChanged(record.id);
+		} finally {
+			// Every path ends this row's preparation window, so a row that has settled — as a
+			// live child or as an error row — can never be "cancelled" again by a later Stop;
+			// those rows are answered by the process truth they actually hold.
+			record.nativeCliLaunchPending = false;
 		}
 	}
 
@@ -5471,6 +6409,11 @@ export class InstanceManager {
 		// THIS genuine exit — not this bookkeeping — is what makes that cleanup safe.
 		const statusRun = record.nativeStatusRun;
 		this.#retireNativeStatusRun(statusRun);
+		// The TUI client is gone, so nothing will talk to this row's owned backend again:
+		// its exact owned termination is requested now. This exit is NOT that backend's
+		// proof — the unsettled record keeps the row live, keeps it unremovable, and keeps
+		// its staged files until the lease itself settles.
+		this.#retireOwnedCodexBackend(record.nativeCodexBackend);
 		// The routing convention belonged to that process incarnation and goes with it:
 		// a replacement child starts with no known recipient at all.
 		record.nativeCliController = undefined;
@@ -5875,27 +6818,89 @@ export class InstanceManager {
 	 */
 	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		const pty = record.pty;
-		if (!pty || record.ptyExited) {
+		const hasPty = pty !== undefined && !record.ptyExited;
+		const backend = record.nativeCodexBackend;
+		const hasBackend = backend !== undefined && !backend.settled;
+		if (!hasPty && !hasBackend) {
 			return Promise.resolve(true);
 		}
 		if (record.stopPromise) {
 			return record.stopPromise;
 		}
-		// #666: this ladder's forced escalation is one of the paths that can end the
-		// child and so trigger the owned reader's release. That release must fit
-		// inside this same stop budget: the cap is shortening-only, so a natural exit
-		// well inside the window keeps its existing confirmation time, while a late
-		// exit after an exhausted ladder can never renew time this stop already spent.
-		ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(Date.now() + graceMs + killMs);
+		if (hasPty && pty !== undefined) {
+			// #666: this ladder's forced escalation is one of the paths that can end the
+			// child and so trigger the owned reader's release. That release must fit
+			// inside this same stop budget: the cap is shortening-only, so a natural exit
+			// well inside the window keeps its existing confirmation time, while a late
+			// exit after an exhausted ladder can never renew time this stop already spent.
+			ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(Date.now() + graceMs + killMs);
+		}
 		// This row has begun its owned stop ladder, so its OPTIONAL native status source
 		// is retired now: its callbacks stop immediately rather than reporting for a child
 		// that is on its way out. Its staged private files are NOT released here — a child
 		// that is stopping has not settled, and only its actual exit (or a required
 		// reader's positive settlement) may say otherwise.
 		this.#retireNativeStatusRun(record.nativeStatusRun);
-		const stopPromise = this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
+		// The same stop reaches a second owned process: an owned backend of this row is
+		// asked for its exact owned termination alongside the PTY ladder, and its record
+		// stays unsettled — and this row stays live — until that backend settles itself.
+		this.#retireOwnedCodexBackend(backend);
+		// That request then gets its own settlement window INSIDE this same stop budget,
+		// observed in parallel with the PTY ladder below so it never lengthens the stop.
+		const backendSettled = this.#awaitOwnedCodexBackendSettled(backend, graceMs + killMs);
+		const stopPromise = this.#runOwnedStop(record, hasPty ? pty : undefined, graceMs, killMs, alreadyRequested, backendSettled);
 		record.stopPromise = stopPromise;
 		return stopPromise;
+	}
+
+	/**
+	 * One row's complete owned stop: its PTY ladder and its owned backend's settlement
+	 * window, both bounded, both required. The result is this row's honest answer — true
+	 * only when every process this row owns positively settled — and a false here never
+	 * releases ownership: the unsettled record, its barriers, and its private files stay.
+	 */
+	async #runOwnedStop(
+		record: ManagedInstance,
+		pty: InstancePty | undefined,
+		graceMs: number,
+		killMs: number,
+		alreadyRequested: boolean,
+		backendSettled: Promise<boolean>,
+	): Promise<boolean> {
+		const ptySettled = pty === undefined
+			? true
+			: await this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
+		return ptySettled && await backendSettled;
+	}
+
+	/**
+	 * Bounded observation of one owned backend's OWN settlement, as part of a stop.
+	 *
+	 * Retirement asks for the exact owned termination; this gives that request a window
+	 * inside the stop budget that already exists, so a backend that does exit is honestly
+	 * reported as settled, while one whose child or readers never finish is reported as
+	 * remaining — with this manager still owning it, still refusing removal, and still
+	 * keeping its files. Nothing here ever claims a settlement a timeout produced.
+	 */
+	async #awaitOwnedCodexBackendSettled(
+		resource: OwnedNativeCodexBackendResource | undefined,
+		budgetMs: number,
+	): Promise<boolean> {
+		if (resource === undefined || resource.settled) {
+			return true;
+		}
+		let timer: NodeJS.Timeout | undefined;
+		const window = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), budgetMs);
+		});
+		await Promise.race([
+			// Settlement is already observed for its own sake; this second, bounded view of
+			// the same promise exists only so a stop can report the truth it produced.
+			Promise.resolve(resource.lease.settlement).then(() => undefined, () => undefined),
+			window,
+		]);
+		if (timer) clearTimeout(timer);
+		return resource.settled;
 	}
 
 	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
@@ -5990,16 +6995,30 @@ export class InstanceManager {
 
 	/** Bounded stopping pass over owned children, sharing any existing stop ladder. */
 	async #stopOwnedProcesses(graceMs: number, killMs: number): Promise<ShutdownResult> {
-		const targets = [...this.#records.values()].filter((record) => record.pty && !record.ptyExited);
+		const ownsWork = (record: ManagedInstance): boolean =>
+			(record.pty !== undefined && !record.ptyExited) || ownsUnsettledCodexBackend(record);
+		const targets = [...this.#records.values()].filter(ownsWork);
 		const outcomes = await Promise.all(targets.map(async (record) => {
 			await this.#gracefulStop(record, graceMs, killMs);
-			return { id: record.id, forced: record.sigkillSent };
+			return { id: record.id, forced: ownedForceEscalationAttempted(record) };
 		}));
 		// Escalation is historical, but remaining is current truth after every
-		// targeted ladder has completed: a late confirmed exit is not remaining.
+		// targeted ladder has completed: a late confirmed exit is not remaining. A row
+		// counts as remaining while EITHER process it owns is unsettled, because an owned
+		// backend whose child or readers never finished is a live process this manager
+		// still owns even when its row's TUI already exited.
+		// An owned backend's force attempt is historical too, so a retained row whose own
+		// settled backend was force-escalated earlier is still reported, even though it is
+		// no longer a stop target. Reporting only: targets and remaining are unchanged.
+		const forcedIds = outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id);
+		for (const record of this.#records.values()) {
+			if (!forcedIds.includes(record.id) && ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend)) {
+				forcedIds.push(record.id);
+			}
+		}
 		return {
-			forcedIds: outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id),
-			remainingIds: targets.filter((record) => record.pty && !record.ptyExited).map((record) => record.id),
+			forcedIds,
+			remainingIds: [...this.#records.values()].filter(ownsWork).map((record) => record.id),
 		};
 	}
 

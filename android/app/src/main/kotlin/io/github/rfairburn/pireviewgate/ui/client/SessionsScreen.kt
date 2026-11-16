@@ -78,6 +78,7 @@ import io.github.rfairburn.pireviewgate.core.client.ui.HostCapabilities
 import io.github.rfairburn.pireviewgate.core.client.ui.HostConnectionState
 import io.github.rfairburn.pireviewgate.core.client.ui.HostUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.InputObservation
+import io.github.rfairburn.pireviewgate.core.client.ui.NativeRenameTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.RenameTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.RosterFreshness
 import io.github.rfairburn.pireviewgate.core.client.ui.SessionActionTarget
@@ -622,6 +623,7 @@ private fun SessionCard(
     val capabilities: HostCapabilities = host?.capabilities ?: HostCapabilities.UNKNOWN
     val live = isLiveHost(host)
     val renameTarget = RenameTarget.of(row)
+    val nativeRenameTarget = NativeRenameTarget.of(row)
     val rowKey = SessionRowKey.of(row)
     // Opening the terminal selects a row for the controller to write, so it is
     // attributed to that row's own commit proof. The semantic key keeps the drawn
@@ -757,12 +759,28 @@ private fun SessionCard(
                     },
                 ) {
                     DropdownMenuItem(
-                        text = { Text(stringResource(R.string.action_rename)) },
-                        enabled = live &&
-                            capabilities.supports(RosterWire.RENAME_CAPABILITY) &&
-                            renameTarget != null,
+                        text = {
+                            Text(stringResource(
+                                if (nativeRenameTarget != null) {
+                                    R.string.action_rename_native
+                                } else {
+                                    R.string.action_rename
+                                },
+                            ))
+                        },
+                        enabled = live && if (nativeRenameTarget != null) {
+                            capabilities.supports(RosterWire.NATIVE_NAME_CAPABILITY)
+                        } else {
+                            capabilities.supports(RosterWire.RENAME_CAPABILITY) && renameTarget != null
+                        },
                         onClick = {
-                            act { renameTarget?.let { onIntent(ClientIntent.RequestSessionRename(it)) } }
+                            act {
+                                if (nativeRenameTarget != null) {
+                                    onIntent(ClientIntent.RequestNativeSessionRename(nativeRenameTarget))
+                                } else {
+                                    renameTarget?.let { onIntent(ClientIntent.RequestSessionRename(it)) }
+                                }
+                            }
                         },
                     )
                     DropdownMenuItem(
@@ -934,35 +952,28 @@ private fun inputChipText(observation: InputObservation, style: SessionStatusSty
  *
  * Each count is painted on its own from the desktop band of its own observed number
  * in the current native [theme], so one count never colours the other and the red of
- * the highest band is activity intensity only, never an error state or a status. A
- * missing or invalid count has no observed number and stays a plain neutral
- * "unknown". The neutral chip surfaces, the neutral labels, the exact wording, and
- * the full-size numbers are unchanged, and neither chip is interactive.
+ * the highest band is activity intensity only, never an error state or a status. Both
+ * labeled chips are always drawn: a missing or invalid count has no observed number
+ * and stays a plain neutral "unknown" on its own chip, even when neither count is
+ * known. The neutral chip surfaces, the neutral labels, the exact wording, and the
+ * full-size numbers are unchanged, and neither chip is interactive.
  */
 @Composable
 private fun backgroundChipTexts(
     background: SessionCardBackground,
     theme: SessionStatusTheme,
 ): List<AnnotatedString> {
-    val taskCount = when (background) {
-        SessionCardBackground.Unknown -> null
-        is SessionCardBackground.Counts -> background.activeTasks
-    }
-    val shellCount = when (background) {
-        SessionCardBackground.Unknown -> null
-        is SessionCardBackground.Counts -> background.activeShells
-    }
     val unknown = stringResource(R.string.session_card_count_unknown)
     return listOf(
         sessionStatusChipText(
             stringResource(R.string.session_card_background_tasks_label),
-            taskCount?.toString() ?: unknown,
-            sessionCountStatusRole(taskCount)?.style(theme),
+            background.activeTasks?.toString() ?: unknown,
+            sessionCountStatusRole(background.activeTasks)?.style(theme),
         ),
         sessionStatusChipText(
             stringResource(R.string.session_card_background_shells_label),
-            shellCount?.toString() ?: unknown,
-            sessionCountStatusRole(shellCount)?.style(theme),
+            background.activeShells?.toString() ?: unknown,
+            sessionCountStatusRole(background.activeShells)?.style(theme),
         ),
     )
 }
@@ -1000,6 +1011,8 @@ private fun SessionDetails(row: SessionUiState) {
         metadata.exitCode?.let { it.toInt().toString() } ?: stringResource(R.string.value_unknown),
     )
     FactRow(stringResource(R.string.fact_error), metadata.error ?: stringResource(R.string.value_none))
+
+    row.providerLabel?.let { FactRow(stringResource(R.string.fact_provider), it) }
 
     val native = metadata.nativeSession
     if (native == null) {

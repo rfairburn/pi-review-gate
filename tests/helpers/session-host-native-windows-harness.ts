@@ -115,9 +115,9 @@ export const WINDOWS_OUTER_COLS = 120;
 export const WINDOWS_OUTER_ROWS = 50;
 /**
  * Wide-layout native pane width at the outer geometry: 120 outer columns minus
- * the 32-column sidebar and its one divider column.
+ * the 35-column sidebar and its one divider column.
  */
-export const WINDOWS_NATIVE_COLS = WINDOWS_OUTER_COLS - 32 - 1;
+export const WINDOWS_NATIVE_COLS = WINDOWS_OUTER_COLS - SIDEBAR_COLUMNS - 1;
 export const WINDOWS_REQUIRE_ENV = "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST";
 export const WINDOWS_OBSERVER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-exit-watcher.ps1");
 export const WINDOWS_RUNNER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-main-runner.cjs");
@@ -690,10 +690,10 @@ function samePath(left: string, right: string): boolean {
 }
 
 function selectedRosterLabel(frame: string): string | undefined {
-  // Main's settled wide layout gives the sidebar its leftmost 32 columns. The
+  // Main's settled wide layout gives the sidebar its leftmost 35 columns. The
   // strict roster parser reads the complete title-only card and the ordered
   // actions, and never mistakes the right-pane Editor prompt for a row.
-  return selectedRosterEntry(frame, 32)?.label;
+  return selectedRosterEntry(frame, SIDEBAR_COLUMNS)?.label;
 }
 
 /**
@@ -721,7 +721,7 @@ function requireRecordedDisplayName(record: NativeJournalRecord, description: st
  */
 export function isWindowsMainOwnerFrame(text: string, displayName: string): boolean {
   return isWindowsOwnerSurface(text, displayName)
-    && nativeEditorBlockEmpty(text, 32, WINDOWS_NATIVE_COLS);
+    && nativeEditorBlockEmpty(text, SIDEBAR_COLUMNS, WINDOWS_NATIVE_COLS);
 }
 
 /** Owner header, single highlight, and complete Main-focused footer. */
@@ -763,7 +763,7 @@ export function isWindowsOwnerDraftFrame(text: string, displayName: string, draf
     && restoredNativeEditorFrame(text, {
       ownerLabel: displayName,
       draft,
-      sidebarColumns: 32,
+      sidebarColumns: SIDEBAR_COLUMNS,
       nativeWidth: WINDOWS_NATIVE_COLS,
     });
 }
@@ -1336,8 +1336,8 @@ export class WindowsMainPtyDriver {
     }
     const expectHidden = wasVisible && !wasMainFocus;
     await this.waitFrame((frame) => expectHidden
-      ? sidebarRosterHidden(frame, 32)
-      : isSidebarFocusedFrame(frame, 32),
+      ? sidebarRosterHidden(frame, SIDEBAR_COLUMNS)
+      : isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
     `public F8 ${expectHidden
       ? "hides the sidebar-focused pane and returns Main"
       : wasVisible
@@ -1369,7 +1369,7 @@ export class WindowsMainPtyDriver {
     if (!this.sidebarVisible || this.focus !== "sidebar") await this.toggleSidebar();
     assert.equal(this.focus, "sidebar");
     assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32),
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS),
       "the complete sidebar-only footer proves public sidebar focus");
   }
 

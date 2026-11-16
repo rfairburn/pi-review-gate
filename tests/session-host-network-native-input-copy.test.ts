@@ -62,10 +62,12 @@ import {
   SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
   SESSION_CONTENT_NATIVE_IO_CAPABILITY,
   decodeSessionContentFrame,
+  isNativeIoNativeCliSource,
   isNativeIoStartupSource,
   nativeIoSourceEquals,
   type NativeIoCompletedCopy,
   type NativeIoInputSource,
+  type NativeIoCopyEvent,
   type NativeIoSource,
   type SessionContentCopyBeginFrame,
   type SessionContentCopyChunkFrame,
@@ -1033,11 +1035,14 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
 
       // Every published viewport is written into this test's own commit before any
       // input is admitted; the endpoint's snapshot is never used as its own authority.
-      // This copy case commits only a conversation source: a startup source names no
-      // conversation and can never be a copy source.
+      // This copy case commits only a conversation source: a tuple-less source names
+      // no conversation and can never be a copy source.
       const sourceOf = (snapshot: SessionContentSnapshot): NativeIoSource | undefined => {
         const stated = snapshot.meta.inputSource;
-        return stated === undefined || stated === null || isNativeIoStartupSource(stated) ? undefined : stated;
+        return stated === undefined || stated === null || isNativeIoStartupSource(stated)
+          || isNativeIoNativeCliSource(stated)
+          ? undefined
+          : stated;
       };
       const liveViewer = attachSessionContentViewer({
         channel: viewerWire,
@@ -1212,7 +1217,9 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
         assert.ok(committed, "a written snapshot commit exists for the current viewport");
         const live = liveViewer.readNativeInputSource();
         assert.ok(live, "the endpoint still states its own current source");
-        if (isNativeIoStartupSource(live)) throw new Error("a copy-case gesture requires a conversation source");
+        if (isNativeIoStartupSource(live) || isNativeIoNativeCliSource(live)) {
+          throw new Error("a copy-case gesture requires a conversation source");
+        }
         assert.equal(nativeIoSourceEquals(live, committed.source), true,
           "the committed source and the endpoint's current source agree before the gesture");
         assert.equal(live.hostRunId, hostRunId);
@@ -1241,6 +1248,8 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       await signal.waitFor(() => copies.some((copy) => copy.event.kind === "copy"), 20_000,
         "the resumed conversation's last-assistant copy routes back to the initiating viewer");
       const firstCopy = copies.find((copy) => copy.event.kind === "copy")!;
+      // Every case here is a Pi conversation copy; narrow before reading its tuple.
+      const firstCopyEvent = firstCopy.event as NativeIoCopyEvent;
       assert.equal(helperRecords().length, 1, "the unchanged native helper ran exactly once");
       assert.equal(helperRecords()[0], ASSISTANT_TEXT, "the bytes handed to the recording helper are the seeded assistant text exactly");
       assert.equal(nativeIoSourceEquals(firstCopy.source, source), true,
@@ -1251,8 +1260,8 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(Buffer.from(firstCopy.event.encoded, "base64").toString("utf8"), ASSISTANT_TEXT,
         "the payload is the resumed conversation's assistant text byte-exactly");
       assert.equal(Buffer.from(firstCopy.event.encoded, "base64").length, 75_000);
-      assert.equal(firstCopy.event.sessionId, admission.sessionId, "the copy names the resumed conversation id");
-      assert.equal(firstCopy.event.sessionEpoch, resumed.epoch, "the copy names the resumed conversation epoch");
+      assert.equal(firstCopyEvent.sessionId, admission.sessionId, "the copy names the resumed conversation id");
+      assert.equal(firstCopyEvent.sessionEpoch, resumed.epoch, "the copy names the resumed conversation epoch");
       assert.equal(ownerDelivered.filter((event) => event.kind === "copy").length, 0,
         "a viewer-origin copy never reaches the owner-local clipboard route");
 
@@ -1325,8 +1334,9 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(units.length, 2, "one whole copy emission per native copy, and nothing else claimed a copy id");
       for (const unit of units) {
         assert.equal(unit.begin.source.sessionId, rowId);
-        assert.equal(unit.begin.source.nativeSession.sessionId, admission.sessionId);
-        assert.equal(unit.begin.source.nativeSession.epoch, resumed.epoch);
+        const beginSource = unit.begin.source as NativeIoSource;
+        assert.equal(beginSource.nativeSession.sessionId, admission.sessionId);
+        assert.equal(beginSource.nativeSession.epoch, resumed.epoch);
         assert.equal(nativeIoSourceEquals(unit.begin.source, source), true,
           "the wire header names the exact source this viewer committed");
         assert.equal(unit.begin.byteLength, ASSISTANT_ENCODED.length,
@@ -2410,7 +2420,7 @@ module.exports=()=>{};
       const fresh = await openViewer("conversation selection");
       await signal.waitFor(() => {
         const current = fresh.readCommit();
-        if (current === null || isStartupSource(current.source)) return false;
+        if (current === null || isStartupSource(current.source) || isNativeIoNativeCliSource(current.source)) return false;
         return current.source.hostRunId === hostRunId && current.source.sessionId === rowId
           && current.source.nativeSession.sessionId === conversation.sessionId
           && current.source.nativeSession.epoch === conversation.epoch;
@@ -2418,7 +2428,9 @@ module.exports=()=>{};
       const conversationCommit = fresh.readCommit();
       assert.ok(conversationCommit, "a written conversation commit exists");
       const conversationSource = conversationCommit.source;
-      if (isStartupSource(conversationSource)) throw new Error("the conversation leg must hold a conversation source");
+      if (isStartupSource(conversationSource) || isNativeIoNativeCliSource(conversationSource)) {
+        throw new Error("the conversation leg must hold a conversation source");
+      }
       assert.match(conversationSource.sourceToken, /^nvs1\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.[0-9a-f]{32}$/,
         "the conversation source keeps its unchanged nvs1 commitment domain");
       assert.notEqual(conversationSource.sourceToken, startupSource.sourceToken,

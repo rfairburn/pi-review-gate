@@ -2,6 +2,7 @@ package io.github.rfairburn.pireviewgate.core.client.roster
 
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerCloseFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerCreateFacts
+import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerNativeRenameFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerRenameFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedDeleteFacts
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedEntry
@@ -56,6 +57,9 @@ public enum class RosterDeadlineKind {
 
     /** Requester patience for one `rename_result`. */
     RENAME_RESULT,
+
+    /** Requester patience for one SEPARATE `rename_native_result`. */
+    NATIVE_RENAME_RESULT,
 
     /** Requester patience for one Saved answer or window transfer. */
     SAVED_RESULT,
@@ -199,6 +203,7 @@ public sealed interface RosterOwnerOutcome {
     public data class Close(public val facts: OwnerCloseFacts) : RosterOwnerOutcome
     public data class Create(public val facts: OwnerCreateFacts) : RosterOwnerOutcome
     public data class Rename(public val facts: OwnerRenameFacts) : RosterOwnerOutcome
+    public data class NativeRename(public val facts: OwnerNativeRenameFacts) : RosterOwnerOutcome
     public data class SavedWindow(public val facts: RosterSavedWindowFacts) : RosterOwnerOutcome
     public data class SavedResume(public val facts: OwnerSavedResumeFacts) : RosterOwnerOutcome
     public data class SavedDelete(public val facts: OwnerSavedDeleteFacts) : RosterOwnerOutcome

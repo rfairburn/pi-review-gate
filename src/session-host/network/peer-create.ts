@@ -49,6 +49,12 @@
  */
 
 import type { PeerCoordinator } from "../peer-ui-protocol";
+import type { NativeCliTarget } from "../native-cli-launch";
+import {
+	isNativeCliBackend,
+	isNativeCliTargetId,
+	type NativeCliBackend,
+} from "../session-backend";
 
 /** One owner-routed create of one blank child in exactly one owner run. */
 export interface OwnerCreateRequest {
@@ -300,6 +306,24 @@ export interface PeerCreateOptions {
  */
 export interface PeerCreateController {
 	createSession(target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult>;
+	/**
+	 * Ask the same owner to create one NATIVE child in exactly one of its runs,
+	 * selecting one target that OWNER advertised.
+	 *
+	 * Optional so an older or fake controller that never learned the native lane
+	 * stays representable: a caller must prove the method exists before asking,
+	 * and its absence is never answered by a Pi create, a local create, or a
+	 * default backend. Where it exists it shares the ONE in-flight create and the
+	 * ONE monotonic per-channel attempt number with {@link
+	 * PeerCreateController.createSession}, so a native create can never run beside
+	 * a Pi create on the same destination or reuse an attempt number. The result
+	 * union is the same three-way {@link PeerCreateResult}, and the owner's own
+	 * authoritative roster stays the only thing that produces a row.
+	 */
+	createNativeSession?(
+		target: PeerNativeCreateTarget,
+		options: PeerCreateOptions,
+	): Promise<PeerCreateResult>;
 }
 
 /**
@@ -310,4 +334,197 @@ export interface PeerCreateController {
  */
 export interface PeerCoordinatorWithCreate extends PeerCoordinator {
 	readonly ownerCreate: PeerCreateController;
+}
+
+// ------------------------------------------------------------- native create
+
+/**
+ * One owner-advertised native interactive CLI launch target.
+ *
+ * This is exactly the host's own {@link NativeCliTarget} descriptor shape —
+ * `id`, `backend`, `label` — and nothing else. No command, argument,
+ * environment, credential, working directory, executable path, or private
+ * configuration is expressible in it: the requester selects an OWNER-advertised
+ * target by its exact identity, and the owner resolves that identity against its
+ * own configuration at launch time. A requester's own configured target ids are
+ * never reinterpreted here, and a target this owner does not advertise is never
+ * mapped onto a default, another backend, or Pi.
+ */
+export type RemoteNativeCliTarget = NativeCliTarget;
+
+/**
+ * Bound for one advertised target label. A target label is an operator-facing
+ * name only (the host composes it from its own configured entry), so it follows
+ * the same single-line display-name discipline the roster row applies to labels;
+ * the target ID itself is bounded by the host's one shared native target-id
+ * rule in `session-backend.ts`, which this module never redefines.
+ */
+export const MAX_REMOTE_NATIVE_TARGET_LABEL_CHARS = 128;
+/** Derived, not tunable: one code point occupies at most 4 UTF-8 bytes. */
+export const MAX_REMOTE_NATIVE_TARGET_LABEL_BYTES = MAX_REMOTE_NATIVE_TARGET_LABEL_CHARS * 4;
+
+/** A target label is bounded, non-empty, single-line display text. */
+const UNSAFE_LABEL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+function isRemoteNativeTargetLabel(value: unknown): value is string {
+	if (typeof value !== "string" || value.length === 0) return false;
+	if (UNSAFE_LABEL_RE.test(value)) return false;
+	let codePoints = 0;
+	for (const character of value) {
+		const point = character.codePointAt(0);
+		// A lone surrogate survives the regex but is not representable UTF-8.
+		if (point === undefined || (point >= 0xd800 && point <= 0xdfff)) return false;
+		codePoints += 1;
+		if (codePoints > MAX_REMOTE_NATIVE_TARGET_LABEL_CHARS) return false;
+	}
+	return Buffer.byteLength(value, "utf8") <= MAX_REMOTE_NATIVE_TARGET_LABEL_BYTES;
+}
+
+/**
+ * True only for one complete, closed target descriptor. The key set is exact:
+ * an extra field (a command, an environment, a path, an auth record) is refused
+ * rather than ignored, so private owner configuration cannot ride along inside a
+ * descriptor this side believes it validated.
+ */
+export function isRemoteNativeCliTarget(value: unknown): value is RemoteNativeCliTarget {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.length !== 3) return false;
+	if (!isNativeCliTargetId(record.id)) return false;
+	if (!isNativeCliBackend(record.backend)) return false;
+	return isRemoteNativeTargetLabel(record.label);
+}
+
+/**
+ * Validate and copy one advertised catalog: at most `maxTargets` entries, each a
+ * closed descriptor, each id unique, every field copied into a fresh frozen
+ * object. Anything this boundary cannot represent — an over-long catalog, a
+ * duplicate id, a malformed or private-field-bearing entry — returns `null` so
+ * the caller refuses whole rather than truncating into a different, shorter
+ * choice list. Nothing is sorted, deduplicated, or dropped.
+ *
+ * `maxTargets` is supplied by the caller and is a transport-derived loop guard
+ * (the most entries one complete frame could carry), never a product limit on how
+ * many targets an owner may configure: this contract owns no target count of its
+ * own, and whether a catalog can actually be sent is settled by the encoded frame
+ * at the transport boundary.
+ */
+export function copyRemoteNativeCliTargets(
+	value: unknown,
+	maxTargets: number,
+): readonly RemoteNativeCliTarget[] | null {
+	if (!Array.isArray(value)) return null;
+	if (!Number.isSafeInteger(maxTargets) || maxTargets < 0) return null;
+	if (value.length > maxTargets) return null;
+	const seen = new Set<string>();
+	const copied: RemoteNativeCliTarget[] = [];
+	for (const entry of value) {
+		if (!isRemoteNativeCliTarget(entry)) return null;
+		if (seen.has(entry.id)) return null;
+		seen.add(entry.id);
+		copied.push(Object.freeze({ id: entry.id, backend: entry.backend, label: entry.label }));
+	}
+	return Object.freeze(copied);
+}
+
+/**
+ * The exact owner-advertised descriptor for one backend and id, or `null`.
+ *
+ * Matching is by BOTH fields: a configured id that exists under another backend
+ * never matches, and no miss falls back to a default target, to the other
+ * backend, or to Pi. This is the one lookup both the owner's admission/final
+ * re-proof and a requester's own selection check use, so neither side keeps a
+ * private variant of the rule.
+ */
+export function findRemoteNativeCliTarget(
+	targets: readonly RemoteNativeCliTarget[] | null | undefined,
+	backend: unknown,
+	targetId: unknown,
+): RemoteNativeCliTarget | null {
+	if (!Array.isArray(targets) || !isNativeCliBackend(backend) || !isNativeCliTargetId(targetId)) {
+		return null;
+	}
+	for (const target of targets) {
+		if (target.backend === backend && target.id === targetId) return target;
+	}
+	return null;
+}
+
+/**
+ * One owner-routed native create: this owner's exact run, the canonical
+ * workspace text forwarded verbatim, and the exact owner-advertised backend and
+ * target id the requester selected.
+ *
+ * Like the Pi create it is ROWLESS and carries no arbitrary command, argument,
+ * environment, role, approval, selection, or viewer fact. The backend and target
+ * id are not a request to configure anything: they are an identity the owner
+ * must find in its own current advertised catalog, immediately and again
+ * immediately before it launches.
+ */
+export interface OwnerNativeCreateRequest {
+	/** Exact owner run id the request was authorized against and must match. */
+	readonly hostRunId: string;
+	/** Canonical workspace text exactly as the requester's form held it. */
+	readonly workspace: string;
+	/** Backend of the exact owner-advertised target this request names. */
+	readonly backend: NativeCliBackend;
+	/** Exact owner-advertised target id; never a requester-side configured id. */
+	readonly targetId: string;
+}
+
+/**
+ * The owner's ONE live native target catalog reader.
+ *
+ * It is read at the moments that matter — when a snapshot is about to be
+ * published, when a native create is admitted, and again immediately before the
+ * create provider is invoked — so a withdrawn or replaced target is never
+ * launched from a stale description. It is a read of the owner's own already
+ * authoritative configuration, never a second catalog: this transport stores no
+ * copy of it, refreshes it on no timer, and never resolves, expands, or launches
+ * anything itself. A throw, a non-array, or one malformed entry means "this
+ * owner cannot represent its native targets right now", which is a refusal, not
+ * a partial offer.
+ */
+export type OwnerNativeCliTargetProvider = () => readonly RemoteNativeCliTarget[];
+
+/**
+ * The ONE owner-side native create provider: one request naming one exact
+ * advertised target, plus the same minimal re-proof the Pi create hands over,
+ * and one fixed {@link OwnerCreateFacts} set out.
+ *
+ * It is the injected analogue of {@link OwnerCreateHandler}: the owner's Main
+ * already owns the only manager, run identity, and launch path, and it will
+ * apply its own existing `startSession({ workspace, backend, nativeCliTarget })`
+ * semantics. It must never call a local interactive create, prompt, select, or
+ * focus path, and it reports the same fixed facts: nothing here invents a
+ * status registration, a native conversation id, or a durable roster write.
+ */
+export type OwnerNativeCreateHandler = (
+	request: OwnerNativeCreateRequest,
+	stillAuthorized: OwnerCreateAuthorizationGuard,
+) => Promise<OwnerCreateFacts>;
+
+/**
+ * One deliberate native create from a requester's own coordinator: the local
+ * saved-destination handle, the exact owner run its written form named, the
+ * canonical workspace text that form held, and the exact owner-ADVERTISED
+ * backend and target id the operator chose.
+ *
+ * `hostId` is never sent on the wire. `hostRunId` is a request input, never a
+ * value this side may rewrite to a newer run. The backend and target id must
+ * come from this destination's current advertised catalog: a requester's own
+ * configured native target is never addressed here, and nothing is defaulted.
+ */
+export interface PeerNativeCreateTarget {
+	/** Local saved-destination handle. Never a native instance id or identity. */
+	readonly hostId: string;
+	/** Exact owner run id the written form destination named. Never rewritten. */
+	readonly hostRunId: string;
+	/** Canonical workspace text exactly as the form held it. */
+	readonly workspace: string;
+	/** Backend of the exact owner-advertised target that was selected. */
+	readonly backend: NativeCliBackend;
+	/** Exact owner-advertised target id. */
+	readonly targetId: string;
 }

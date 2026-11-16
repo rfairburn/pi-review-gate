@@ -166,7 +166,7 @@ import {
 const PROVIDER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-native-provider.cjs");
 const JOB_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-background-count-job.cjs");
 
-/** Short row label so the three-row card always fits the 32-column pane. */
+/** Short row label so the three-row card always fits the 35-column pane. */
 const ROW_LABEL = "BGT";
 const JOB_LABEL = "bg-count-probe";
 const PROMPT_START = "Please start the background probe service.";
@@ -439,7 +439,7 @@ function activatedRowFrame(text: string): boolean {
   if (card === undefined || !renderedTitleMatches(card.title, ROW_LABEL)) return false;
   const footer = sidebarFooterText(text);
   if (footer === undefined) return false;
-  if (footer !== "F8 toggle | enter open esc hide | q quit") return false;
+  if (footer !== "F8 toggle | enter open | esc hide q quit") return false;
   return mainFocusedFooter(text);
 }
 
@@ -1912,16 +1912,16 @@ test("scenario frame witnesses reject partial and mixed footers", () => {
     "",
   ];
   const actions = ["  Saved conversations", "  New session", "  Quit host"];
-  const mainFooter = ["F8 toggle | enter open", "esc hide | q quit"];
+  const mainFooter = ["F8 toggle | enter open | esc hide", "q quit"];
   const sidebarFocusFooter = [
     "F8 toggle | enter open",
     "e edit name | d stop/remove",
-    "esc hide | q quit",
+    "m move | esc hide | q quit",
     "space expand | alt+right main",
   ];
   const frame = (header: string, footer: string[]): string =>
     [header, ...[" Sessions (1) ", ...card, ...actions, ...footer].map((line, index) =>
-      `${line.padEnd(32)}│${index === 0 ? "Welcome" : ""}`)].join("\n");
+      `${line.padEnd(SIDEBAR_COLUMNS)}│${index === 0 ? "Welcome" : ""}`)].join("\n");
 
   // Complete witnesses are admitted: the Main-focused frame right after a New
   // completion, and the sidebar-focused frame right after an Edit completion.

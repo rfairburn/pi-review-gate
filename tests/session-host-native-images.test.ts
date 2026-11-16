@@ -37,7 +37,13 @@ import {
   removeOwnedScratchTree,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
-import { frameHeaderMatches, isSidebarFocusedFrame, parseRosterFrame } from "./helpers/session-host-native-roster-witness";
+import {
+  frameHeaderMatches,
+  isSidebarFocusedFrame,
+  NATIVE_PANE_START,
+  parseRosterFrame,
+  SIDEBAR_COLUMNS,
+} from "./helpers/session-host-native-roster-witness";
 
 interface ImageProofFixture {
   readonly FIXED_IMAGE_ID: number;
@@ -47,7 +53,7 @@ interface ImageProofFixture {
 
 const proofFixture = require(join(process.cwd(), "tests", "fixtures", "pi-host-image-proof.cjs")) as ImageProofFixture;
 const IMAGE_FIXTURE = join(process.cwd(), "tests", "fixtures", "pi-host-image-proof.cjs");
-const SIDEBAR_NATIVE_LEFT = 33; // 32 sidebar columns plus the divider.
+const SIDEBAR_NATIVE_LEFT = NATIVE_PANE_START; // 35 sidebar columns plus the divider.
 const TRACE_APC_LIMIT = 128 * 1024;
 
 interface TracedImage {
@@ -648,8 +654,8 @@ for (const mode of ["regular", "fullscreen"] as const) {
     driver.pty.write(KEYS.escape);
     driver.focus = "sidebar";
     await driver.waitFrame((text) => !text.includes("Workspace:")
-      && parseRosterFrame(text, 32).complete
-      && isSidebarFocusedFrame(text, 32)
+      && parseRosterFrame(text, SIDEBAR_COLUMNS).complete
+      && isSidebarFocusedFrame(text, SIDEBAR_COLUMNS)
       && frameHeaderMatches(text, "Image proof A"),
     "Escape cancels only the host form and returns to A's complete visible roster", beforeCancel);
     await waitForOnlyImage(driver, trace, proofFixture.RED_PNG_BASE64,
@@ -672,7 +678,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     // alone takes the narrow overlay pane while the unviewed A keeps its last
     // wide pane. The narrow overlay covers the pane, so no image may stay placed.
     await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
-    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
       "the unviewed A keeps its wide pane while the displayed B is resized narrow");
     assert.equal(driver.surface.frame().cols, 52, "the outer terminal is now in the narrow overlay geometry");
     await driver.waitFrame((text) => parseRosterFrame(text, 52).complete && isSidebarFocusedFrame(text, 52),
@@ -680,10 +686,10 @@ for (const mode of ["regular", "fullscreen"] as const) {
     await waitForNoPlacedImages(trace, "the narrow sidebar overlay contains no stale native image placement",
       narrowWatermark, blueBeforeNarrow.image.id);
     const wideRestoreWatermark = trace.watermark();
-    await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - 32 - 1, 49);
-    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - SIDEBAR_COLUMNS - 1, 49);
+    assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
       "restoring the wide outer geometry resizes only the displayed row; A's pane is untouched");
-    assert.deepEqual(driver.paneGeometry(sessionB), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+    assert.deepEqual(driver.paneGeometry(sessionB), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
       "the displayed row returns to the wide 87x49 pane");
     assert.equal(driver.surface.frame().cols, OUTER_COLS, "the outer terminal returns to wide geometry");
     await waitForOnlyImage(driver, trace, proofFixture.BLUE_PNG_BASE64,

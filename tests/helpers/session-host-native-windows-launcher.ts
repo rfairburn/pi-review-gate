@@ -552,7 +552,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 function selectedRosterLabel(frame: string): string | undefined {
-  return selectedRosterEntry(frame, 32)?.label;
+  return selectedRosterEntry(frame, SIDEBAR_COLUMNS)?.label;
 }
 
 /**
@@ -1026,8 +1026,8 @@ export class LauncherPtyDriver {
     }
     const expectHidden = wasVisible && !wasMainFocus;
     await this.waitFrame((frame) => expectHidden
-      ? sidebarRosterHidden(frame, 32)
-      : isSidebarFocusedFrame(frame, 32),
+      ? sidebarRosterHidden(frame, SIDEBAR_COLUMNS)
+      : isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
     "public F8 sidebar toggle", before);
   }
 
@@ -1042,7 +1042,7 @@ export class LauncherPtyDriver {
     if (!this.sidebarVisible || this.focus !== "sidebar") await this.toggleSidebar();
     assert.equal(this.focus, "sidebar");
     assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32), "the complete sidebar-only footer proves public sidebar focus");
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS), "the complete sidebar-only footer proves public sidebar focus");
   }
 
   async moveRosterTo(label: string): Promise<void> {

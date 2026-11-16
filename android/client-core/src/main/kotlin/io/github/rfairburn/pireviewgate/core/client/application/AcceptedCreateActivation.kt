@@ -7,6 +7,7 @@ import io.github.rfairburn.pireviewgate.core.client.roster.RosterPendingOperatio
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterRequestResult
 import io.github.rfairburn.pireviewgate.core.client.runtime.TerminalTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientRoute
+import io.github.rfairburn.pireviewgate.core.client.ui.CreateProviderChoice
 import io.github.rfairburn.pireviewgate.core.client.ui.CreateSessionDialog
 import io.github.rfairburn.pireviewgate.core.client.ui.UiActionProof
 import io.github.rfairburn.pireviewgate.core.client.ui.UiProofScreen
@@ -38,6 +39,8 @@ class AcceptedCreateActivation private constructor(
     val connectionGeneration: Long,
     val hostRunId: String,
     val workspace: String,
+    /** The exact provider the submitted form chose; native and Pi use different capabilities. */
+    val provider: CreateProviderChoice,
     val formProof: UiActionProof,
     val originRoute: ClientRoute,
     private val click: FrozenAction,
@@ -167,7 +170,8 @@ class AcceptedCreateActivation private constructor(
                 token.screen != UiProofScreen.SESSION_CREATE || token.hostId != hostId ||
                 token.hostRunId != hostRunId || token.rowId != null ||
                 form.selectedHostId != hostId || form.workspaceDraft != workspace) return null
-            return AcceptedCreateActivation(hostId, connectionGeneration, hostRunId, workspace,
+            val provider = form.provider ?: return null
+            return AcceptedCreateActivation(hostId, connectionGeneration, hostRunId, workspace, provider,
                 form.proof, originRoute, click)
         }
     }

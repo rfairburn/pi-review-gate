@@ -7,7 +7,8 @@
  * variable-height card inside the sidebar pane:
  *
  *   row 1  ONLY the sanitized canonical title (no marker, no badge, no status)
- *   row 2  the selection marker plus the observed/unknown agent + input status
+ *   row 2  the selection marker plus the observed/unknown/not-applicable agent
+ *          and input status
  *   row 3  honest nullable background counts, never inferred zero
  *   row 4  generic sanitized activity (expanded only)
  *   row 5  generic sanitized activity (expanded only)
@@ -21,7 +22,7 @@
  * session" and the final "Quit host" action.
  * There is no independent top-level "Network" or "Host shortcuts" row: those
  * are Settings submenus, drawn in the content pane, never in the roster. Only
- * the leftmost sidebar columns (the wide 32-column pane or the full
+ * the leftmost sidebar columns (the wide 35-column pane or the full
  * narrow-overlay width) are inspected, extracted by the pinned terminal-cell
  * width model so wide/combining characters can never pull the divider or native
  * right pane into scope.
@@ -53,12 +54,12 @@ function stripSgr(line: string): string {
 }
 
 /** Wide-layout sidebar pane width in columns (production compositor). */
-export const SIDEBAR_COLUMNS = 32;
+export const SIDEBAR_COLUMNS = 35;
 /** One divider column separates the wide sidebar from the native pane. */
 export const DIVIDER_COLUMNS = 1;
 /** First native-pane column in the wide layout (0-based). */
 export const NATIVE_PANE_START = SIDEBAR_COLUMNS + DIVIDER_COLUMNS;
-/** Below this outer width the sidebar is a full-width overlay, not a 32-col pane. */
+/** Below this outer width the sidebar is a full-width overlay, not a 35-col pane. */
 export const SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS = SIDEBAR_COLUMNS + DIVIDER_COLUMNS + 20;
 /** Marker drawn below a card title for the highlighted entry. */
 const MARKER_SELECTED = "> ";
@@ -168,10 +169,26 @@ export interface ParsedRoster {
 }
 
 const HEADER_PATTERN = /^\s*Sessions \((\d+)\)\s*$/u;
-const STATUS_PATTERN = /^(?:starting \| input (?:pending|none|unknown)|agent (?:running|waiting|idle|unknown) \| input (?:pending|none|unknown)|exited(?: \(code -?\d+\))?|error(?: \(code -?\d+\))?)$/u;
-const BACKGROUND_CANONICAL = /^(?:background unknown|bg tasks (?:unknown|\d+) \| shells (?:unknown|\d+))$/u;
+/**
+ * The closed value lexemes the sidebar card formatter can actually emit.
+ * `N/A` is `NATIVE_STATUS_NOT_APPLICABLE_TEXT`
+ * (`src/session-host/native-status.ts`): the word the renderer draws in the
+ * agent cell, the input cell, or either count cell for a category the row's own
+ * observer POSITIVELY declared unreportable. It is a value word exactly like
+ * `unknown` — a different fact, never zero, never rest — and it is admitted
+ * literally: `n/a`, `NA`, `N/A (…)` or any other annotation stays no parse.
+ */
+const STATUS_PATTERN = /^(?:starting \| input (?:pending|none|unknown|N\/A)|agent (?:running|waiting|idle|unknown|N\/A) \| input (?:pending|none|unknown|N\/A)|exited(?: \(code -?\d+\))?|error(?: \(code -?\d+\))?)$/u;
+/**
+ * The two independently labeled count cells the shared card formatter emits.
+ * There is no combined-unknown alternative: both `bg tasks` and `shells` are
+ * always named, even when neither was observed.
+ */
+const BACKGROUND_CANONICAL = /^bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A)$/u;
 const ROOT_HEAD = "bg tasks ";
 const SHELLS_MID = " | shells";
+/** One completely rendered nullable count cell: `unknown`, digits, or `N/A`. */
+const COUNT_TOKEN_COMPLETE = /^(?:unknown|\d+|N\/A)$/u;
 
 function isBlank(line: string): boolean {
   return line.trim().length === 0;
@@ -181,11 +198,16 @@ function isActivityRow(line: string): boolean {
   return line.startsWith(ACTIVITY_PREFIX);
 }
 
-/** A complete or partial prefix of a nullable count token ("unknown" | digits). */
+/**
+ * A complete or partial prefix of a nullable count token: `unknown`, digits, or
+ * the not-applicable word. Prefixes only ever matter for a row the renderer
+ * clipped with its `...` ellipsis, so `N`, `N/`, and `N/A` are prefixes here,
+ * while `N/A ` or `N/A/` are not.
+ */
 function isCountTokenPrefix(text: string): boolean {
   if (text.length === 0) return false;
   if (/^\d+$/u.test(text)) return true;
-  return "unknown".startsWith(text);
+  return "unknown".startsWith(text) || "N/A".startsWith(text);
 }
 
 /** True when `tail` is a prefix of the canonical " | shells" suffix (optionally a count). */
@@ -208,8 +230,8 @@ function isBackgroundPrefix(core: string): boolean {
     const token = rest.slice(0, end);
     if (!isCountTokenPrefix(token)) continue;
     // A separator proves the preceding token was completely rendered; an
-    // incomplete "unknown" prefix (e.g. "unk") before it cannot be clipping.
-    if (end < rest.length && !/^(?:unknown|\d+)$/u.test(token)) continue;
+    // incomplete token prefix (e.g. "unk" or "N/") before it cannot be clipping.
+    if (end < rest.length && !COUNT_TOKEN_COMPLETE.test(token)) continue;
     if (isShellsSuffixPrefix(rest.slice(end))) return true;
   }
   return false;

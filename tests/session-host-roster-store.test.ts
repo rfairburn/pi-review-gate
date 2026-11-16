@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { piAgentDir } from "../src/config-path";
+import { MAX_NATIVE_DISPLAY_NAME_CHARS } from "../src/session-host/session-backend";
 import {
   HOST_COORDINATION_FILENAME,
   HOST_OWNERSHIP_FILENAME,
@@ -15,6 +16,7 @@ import {
   ROSTER_STORE_LEGACY_VERSION,
   ROSTER_STORE_VERSION,
   hostOwnershipPath,
+  isLocalRosterEntry,
   isValidRosterName,
   openHostState,
   parseStoredRoster,
@@ -22,6 +24,7 @@ import {
   rosterStorePath,
   sessionHostStateDir,
   writeRosterStore,
+  type RosterEntry,
   type StoredRoster,
 } from "../src/session-host/roster-store";
 
@@ -784,6 +787,323 @@ test("the 64 remembered-slot allowance is local-only and independent of remote p
     assert.match(refused.status === "unavailable" ? refused.reason : "", /exceeds the .* supported size/);
     assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries.length, 400,
       "an oversized document is left exactly as it was found");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Optional provider backend (issue #277 host-UI slice)
+//
+// The remembered LOCAL slot may carry ONE closed provider identity. Absence is
+// Pi and publishes nothing at all, so every document this host wrote before
+// native CLI hosting stays byte-identical; an unknown value is a malformed
+// document, never a value normalized to Pi or to the first known backend.
+// ---------------------------------------------------------------------------
+
+function localSlot(roster: StoredRoster | undefined, index = 0): RosterEntry | undefined {
+  const entry = roster?.entries[index];
+  return entry !== undefined && isLocalRosterEntry(entry) ? entry : undefined;
+}
+
+test("the remembered roster keeps the optional closed provider backend and refuses anything else", () => {
+  // Absence is Pi: no field is invented, and the existing payload is unchanged.
+  const plain = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", sessionId: "conv-1", workspace: "/ws", name: "Pi", persistence: "saved" }],
+  });
+  assert.ok(plain);
+  assert.equal("backend" in (localSlot(plain) ?? {}), false, "a Pi slot publishes no backend field at all");
+
+  // Every closed member round-trips; the field order stays after persistence.
+  for (const backend of ["pi", "claude", "codex"] as const) {
+    const parsed = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend }],
+    });
+    assert.equal(localSlot(parsed)?.backend, backend);
+  }
+
+  // A native slot needs no conversation id, and none is invented for it.
+  const native = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "codex" }],
+  });
+  assert.equal(native?.entries.length, 1);
+  assert.equal(localSlot(native)?.sessionId, undefined, "no provider conversation id is ever invented");
+
+  // Anything outside the closed set refuses the WHOLE document.
+  for (const backend of ["kittens", "", null, 1, true, "Claude"]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend }],
+    }), undefined, `backend ${JSON.stringify(backend)} is not a provider identity`);
+  }
+  // One malformed entry poisons the document even beside a valid one.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude" },
+      { slotId: "s2", workspace: "/ws", backend: "first-match" },
+    ],
+  }), undefined);
+
+  // Publication validates too: an invalid backend never reaches the store.
+  const root = makeRoot("backend");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend: "claude-codex" as never }],
+    }));
+    assert.equal(readRosterStore(agentDir).status, "absent", "the refused publication wrote nothing");
+
+    writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude" }],
+    });
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.equal(localSlot(loaded.status === "loaded" ? loaded.roster : undefined)?.backend, "claude");
+
+    // A damaged backend on disk is reported truthfully and left untouched.
+    writeFileSync(rosterStorePath(agentDir), JSON.stringify({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "who-knows" }],
+    }), "utf8");
+    const damaged = readRosterStore(agentDir);
+    assert.equal(damaged.status, "unavailable");
+    assert.match(damaged.status === "unavailable" ? damaged.reason : "", /malformed/);
+    assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries[0].backend, "who-knows",
+      "a damaged roster is never rewritten or silently repaired");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The remembered native row's host-side display name (issue #277 host-UI slice)
+//
+// One native slot may carry ONE operator caption so it can come back under the
+// same name after a restart, when the row itself is a remembered placeholder.
+// Absence publishes no field at all, so every document this host wrote before
+// native naming stays byte-identical, and an unusable caption is a malformed
+// document — never a value truncated, coerced to the provider label, or dropped
+// while the rest of the entry survives.
+// ---------------------------------------------------------------------------
+
+test("the remembered roster keeps one native display name and refuses anything unusable", () => {
+  // Absence publishes nothing: an existing document keeps its exact payload.
+  const plain = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude" }],
+  });
+  assert.equal("displayName" in (localSlot(plain) ?? {}), false,
+    "a row nobody named publishes no caption field at all");
+
+  const named = parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "Fleet work" }],
+  });
+  assert.equal(localSlot(named)?.displayName, "Fleet work");
+  assert.equal(localSlot(named)?.backend, "claude", "a caption never replaces the provider identity");
+  assert.equal(localSlot(named)?.name, undefined, "a caption is not the remembered conversation name");
+
+  // A caption the Pi rename path would refuse, and one the sidebar would refuse,
+  // are both malformed: the two rules cannot drift apart silently.
+  for (const displayName of [
+    "",
+    "   ",
+    " Fleet ",
+    "one\nline",
+    "line\u2028break",
+    "bell\u0007",
+    "c1\u0085control",
+    "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS + 1),
+    null,
+    1,
+    true,
+  ]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName }],
+    }), undefined, `caption ${JSON.stringify(displayName)} is not a usable name`);
+  }
+  // One unusable caption poisons the whole document, even beside a valid slot.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", displayName: "fine" },
+      { slotId: "s2", workspace: "/ws", displayName: "no\u0000control" },
+    ],
+  }), undefined);
+  // The bound itself is admissible.
+  assert.equal(localSlot(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [{ slotId: "s1", workspace: "/srv/app", backend: "codex", displayName: "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS) }],
+  }))?.displayName, "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS));
+
+  // Publication validates too, and a damaged caption on disk is reported, not repaired.
+  const root = makeRoot("display-name");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "bad\nname" as never }],
+    }));
+    assert.equal(readRosterStore(agentDir).status, "absent", "the refused publication wrote nothing");
+
+    writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "Fleet work" }],
+    });
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.equal(localSlot(loaded.status === "loaded" ? loaded.roster : undefined)?.displayName, "Fleet work");
+
+    writeFileSync(rosterStorePath(agentDir), JSON.stringify({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName: "line\nbreak" }],
+    }), "utf8");
+    const damaged = readRosterStore(agentDir);
+    assert.equal(damaged.status, "unavailable");
+    assert.match(damaged.status === "unavailable" ? damaged.reason : "", /malformed/);
+    assert.deepEqual(JSON.parse(readFileSync(rosterStorePath(agentDir), "utf8")).entries[0].displayName, "line\nbreak",
+      "a damaged roster is never rewritten or silently repaired");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The remembered native restart identity (issue #277 restoration identity slice)
+//
+// A native CLI slot may carry the exact launch-target id and the exact
+// provider-issued conversation UUID, independently. Absence publishes no field,
+// so every older document stays byte-identical; a malformed value, or either
+// field on a Pi slot, refuses the whole document.
+// ---------------------------------------------------------------------------
+
+const NATIVE_UUID = "0b9c3e5a-1f2d-4c6b-8a7e-9d0f1e2a3b4c";
+
+test("the remembered roster keeps the exact native target and conversation identity and refuses misuse", () => {
+  // Every field combination round-trips on a native slot; neither field is invented.
+  for (const backend of ["claude", "codex"] as const) {
+    const both = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", displayName: "Build", backend, nativeTargetId: "work-profile", nativeConversationId: NATIVE_UUID }],
+    });
+    assert.deepEqual(localSlot(both), { slotId: "s1", workspace: "/srv/app", displayName: "Build", backend, nativeTargetId: "work-profile", nativeConversationId: NATIVE_UUID });
+    assert.equal(localSlot(both)?.sessionId, undefined, "the opaque native id never becomes the Pi sessionId");
+    const targetOnly = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend, nativeTargetId: backend }],
+    });
+    assert.deepEqual(localSlot(targetOnly), { slotId: "s1", workspace: "/srv/app", backend, nativeTargetId: backend });
+    const conversationOnly = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend, nativeConversationId: NATIVE_UUID.toUpperCase() }],
+    });
+    assert.equal(localSlot(conversationOnly)?.nativeConversationId, NATIVE_UUID.toUpperCase());
+    assert.equal("nativeTargetId" in (localSlot(conversationOnly) ?? {}), false);
+  }
+
+  // Malformed identities refuse the WHOLE document, even beside a valid entry.
+  const badConversations: unknown[] = [
+    "", "latest", "last", "my session", "/home/me/.claude/projects/x.jsonl", NATIVE_UUID.slice(0, -1),
+    `${NATIVE_UUID}0`, `{${NATIVE_UUID}}`, `urn:uuid:${NATIVE_UUID}`, ` ${NATIVE_UUID}`, `${NATIVE_UUID}\n`,
+    NATIVE_UUID.replace(/-/g, ""), NATIVE_UUID.replace("0b", "0g"), 1, null, true, {},
+  ];
+  for (const nativeConversationId of badConversations) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        { slotId: "ok", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+        { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId },
+      ],
+    }), undefined, `conversation ${JSON.stringify(nativeConversationId)} is not an exact provider id`);
+  }
+  for (const nativeTargetId of ["", "x".repeat(129), "bad\ntarget", "bad\u0085target", 7, null, false]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend: "codex", nativeTargetId }],
+    }), undefined, `target ${JSON.stringify(nativeTargetId)} is not a native target id`);
+  }
+
+  // Either native field on a Pi slot, explicit or default, refuses the document.
+  for (const piBackend of [{}, { backend: "pi" }]) {
+    for (const field of [{ nativeTargetId: "claude" }, { nativeConversationId: NATIVE_UUID }]) {
+      assert.equal(parseStoredRoster({
+        version: ROSTER_STORE_VERSION,
+        entries: [{ slotId: "s1", sessionId: "conv-1", workspace: "/ws", ...piBackend, ...field }],
+      }), undefined, `a Pi slot never carries ${Object.keys(field)[0]}`);
+    }
+  }
+
+  // Duplicate-slot handling is unchanged, and two slots may share a conversation id.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+      { slotId: "s1", workspace: "/ws", backend: "claude" },
+    ],
+  }), undefined);
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+      { slotId: "s2", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+    ],
+  })?.entries.length, 2, "no new duplicate conversation policy is imposed");
+});
+
+test("old documents publish byte-identically and native identity round-trips beside Pi and remote order", () => {
+  const root = makeRoot("native-identity");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    const old: StoredRoster = {
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        { slotId: "pi", sessionId: "conv-1", workspace: "/ws", name: "Pi", persistence: "saved" },
+        { kind: "remote", hostId: "dest-1", owner: { kind: "slot", id: "remote-slot" } },
+        { slotId: "cl", workspace: "/srv/app", displayName: "Caption", backend: "claude" },
+      ],
+      activeSlotId: "cl",
+    };
+    writeRosterStore(agentDir, old);
+    assert.equal(readFileSync(rosterStorePath(agentDir), "utf8"), `${JSON.stringify(old)}\n`,
+      "a document without native identity is published byte-for-byte as before");
+
+    const withIdentity: StoredRoster = {
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        old.entries[0],
+        old.entries[1],
+        { slotId: "cl", workspace: "/srv/app", displayName: "Caption", backend: "claude", nativeTargetId: "claude", nativeConversationId: NATIVE_UUID },
+        { slotId: "cx", workspace: "/srv/other", backend: "codex", nativeTargetId: "codex-alt" },
+      ],
+      activeSlotId: "cx",
+    };
+    writeRosterStore(agentDir, withIdentity);
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.deepEqual(loaded.status === "loaded" ? loaded.roster : undefined, withIdentity,
+      "order, Pi sessionId, remote placement, active slot, and native identity all round-trip exactly");
+    const text = readFileSync(rosterStorePath(agentDir), "utf8");
+    for (const forbidden of ["file", "args", "env", "command", "executable", "credential"]) {
+      assert.equal(text.includes(`"${forbidden}"`), false, `no ${forbidden} is ever persisted`);
+    }
+
+    // Publication validates too: Pi misuse never reaches the store.
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "pi", sessionId: "conv-1", workspace: "/ws", nativeConversationId: NATIVE_UUID }],
+    }));
+    const after = readRosterStore(agentDir);
+    assert.deepEqual(after.status === "loaded" ? after.roster : undefined, withIdentity, "the refused publication changed nothing");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

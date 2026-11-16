@@ -22,6 +22,7 @@ import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
+import { NATIVE_PANE_START, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 import { skipOrFail } from "./bridge-fakes";
 
 /**
@@ -1110,10 +1111,10 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const pairs = [["VISIBLE466-A", "VISIBLE466-B"], ["VISIBLE466-Q", "VISIBLE466-R"]] as const;
     const region = (): { top: number; bottom: number; pair: (typeof pairs)[number] } | undefined => {
       const lines = popupPane.frame().lines.map(stripGeneratedSgr);
-      const rule = "─".repeat(87); // actual native pane: 120 - sidebar32 - divider1
+      const rule = "─".repeat(120 - SIDEBAR_COLUMNS - 1); // actual native pane: 120 - sidebar35 - divider1
       for (let top = 1; top < lines.length; top += 1) {
-        if (lines[top]!.slice(33) !== rule) continue;
-        const bottom = lines.findIndex((line, row) => row > top && line.slice(33) === rule);
+        if (lines[top]!.slice(NATIVE_PANE_START) !== rule) continue;
+        const bottom = lines.findIndex((line, row) => row > top && line.slice(NATIVE_PANE_START) === rule);
         if (bottom <= top) continue;
         const body = lines.slice(top + 1, bottom).join("\n");
         const pair = pairs.find(([first, last]) => body.includes(first) && body.includes(last));

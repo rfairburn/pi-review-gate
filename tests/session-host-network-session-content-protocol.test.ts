@@ -29,7 +29,9 @@ import {
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	SessionContentProtocolError,
@@ -54,6 +56,8 @@ import {
 	type NativeIoCompletedCopy,
 	type NativeIoCompletedInput,
 	type NativeIoCopyEvent,
+	type NativeIoCopyFrameEvent,
+	type NativeIoCopySource,
 	type NativeIoCopyUnavailableReason,
 	type NativeIoInputKind,
 	type NativeIoSource,
@@ -1317,6 +1321,22 @@ test("metadata-v1 framing keeps its unknown-key fail-closed behavior", () => {
  * Optional native IO frames (native input and native text copy)
  * ------------------------------------------------------------------------- */
 
+/**
+ * Narrow a completed/decoded copy event to the Pi CONVERSATION family. Every case
+ * using this helper is a conversation copy; a hosted CLI event there is a genuine
+ * test failure, so the helper throws rather than hiding it.
+ */
+function conversationCopyEvent(event: NativeIoCopyFrameEvent): NativeIoCopyEvent {
+	if (!("sessionId" in event)) throw new Error("expected a Pi conversation copy event");
+	return event;
+}
+
+/** Narrow a copy source to the Pi CONVERSATION family, for the same reason. */
+function conversationCopySource(source: NativeIoCopySource): NativeIoSource {
+	if ("phase" in source) throw new Error("expected a Pi conversation copy source");
+	return source;
+}
+
 function nativeSource(overrides: Partial<NativeIoSource> = {}): NativeIoSource {
 	return {
 		hostRunId: "run-1",
@@ -1437,6 +1457,8 @@ test("the native IO capability is implementable but never offered or acknowledge
 	assert.deepEqual([...SESSION_CONTENT_IMPLEMENTABLE_OPTIONAL_CAPABILITIES], [
 		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+		SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+		SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 	]);
 	const hello: SessionContentHelloFrame = {
 		type: "hello",
@@ -1989,8 +2011,8 @@ test("a full native text copy crosses bounded pages and completes atomically", (
 	assert.equal(completed.event.kind, "copy");
 	if (completed.event.kind !== "copy") throw new Error("expected a copy event");
 	assert.equal(completed.event.encoded, encoded, "the entire 100,000-character payload survives");
-	assert.equal(completed.event.sessionId, nativeSource().nativeSession.sessionId, "the event tuple follows the header source");
-	assert.equal(completed.event.sessionEpoch, nativeSource().nativeSession.epoch);
+	assert.equal(conversationCopyEvent(completed.event).sessionId, nativeSource().nativeSession.sessionId, "the event tuple follows the header source");
+	assert.equal(conversationCopyEvent(completed.event).sessionEpoch, nativeSource().nativeSession.epoch);
 	assert.equal(completed.sequence, 1);
 	assert.deepEqual(completed.source, nativeSource());
 
@@ -2080,8 +2102,8 @@ test("a copy names one authenticated native tuple in both its source and its eve
 	const built = buildNativeCopyInline(copyInlineOptions(copyEvent(encoded)));
 	const decoded = decodeSessionContentFrame(built.frames[0] as Buffer);
 	if (decoded.type !== "copy") throw new Error("expected copy");
-	assert.equal(decoded.event.sessionId, nativeSource().nativeSession.sessionId);
-	assert.equal(decoded.event.sessionEpoch, nativeSource().nativeSession.epoch);
+	assert.equal(conversationCopyEvent(decoded.event).sessionId, nativeSource().nativeSession.sessionId);
+	assert.equal(conversationCopyEvent(decoded.event).sessionEpoch, nativeSource().nativeSession.epoch);
 	const completed = createNativeCopyAssembler().accept(decoded);
 	assert.deepEqual(completed?.event, copyEvent(encoded));
 
@@ -2122,10 +2144,10 @@ test("a copy names one authenticated native tuple in both its source and its eve
 	}));
 	const pagedCompleted = assembleCopy(decodedFrames(paged));
 	assert.equal(pagedCompleted?.event.kind, "copy");
-	assert.equal(pagedCompleted?.event.sessionId, "native-session-9");
-	assert.equal(pagedCompleted?.event.sessionEpoch, 5);
-	assert.equal(pagedCompleted?.source.nativeSession.sessionId, "native-session-9", "the header source is preserved");
-	assert.equal(pagedCompleted?.source.nativeSession.epoch, 5);
+	assert.equal(conversationCopyEvent(pagedCompleted!.event).sessionId, "native-session-9");
+	assert.equal(conversationCopyEvent(pagedCompleted!.event).sessionEpoch, 5);
+	assert.equal(conversationCopySource(pagedCompleted!.source).nativeSession.sessionId, "native-session-9", "the header source is preserved");
+	assert.equal(conversationCopySource(pagedCompleted!.source).nativeSession.epoch, 5);
 });
 
 test("a paged copy publishes nothing unless every part is contiguous and exact", () => {

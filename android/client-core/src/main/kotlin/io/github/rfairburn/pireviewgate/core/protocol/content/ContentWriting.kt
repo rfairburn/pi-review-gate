@@ -253,6 +253,16 @@ private fun nativeIoSourceNode(source: NativeIoInputSource): WireNode.WireObject
 		"sourceToken" to text(source.sourceToken),
 	)
 
+	is NativeIoNativeCliSource -> wireObject(
+		"hostRunId" to text(source.hostRunId),
+		"sessionId" to text(source.sessionId),
+		"phase" to text("native-cli"),
+		"backend" to text(source.backend.wireName),
+		"geometry" to geometryNode(source.geometry),
+		"viewerRevision" to number(source.viewerRevision),
+		"sourceToken" to text(source.sourceToken),
+	)
+
 	is NativeIoSource -> wireObject(
 		"hostRunId" to text(source.hostRunId),
 		"sessionId" to text(source.sessionId),
@@ -263,7 +273,7 @@ private fun nativeIoSourceNode(source: NativeIoInputSource): WireNode.WireObject
 	)
 }
 
-private fun copyEventNode(event: NativeIoCopyEvent): WireNode.WireObject = when (event) {
+private fun copyEventNode(event: NativeIoCopyFrameEvent): WireNode.WireObject = when (event) {
 	is NativeIoCopyEvent.Copy -> wireObject(
 		"kind" to text("copy"),
 		"encoded" to text(event.encoded),
@@ -276,6 +286,12 @@ private fun copyEventNode(event: NativeIoCopyEvent): WireNode.WireObject = when 
 		"reason" to text(event.reason.wireValue),
 		"sessionId" to text(event.sessionId),
 		"sessionEpoch" to number(event.sessionEpoch),
+	)
+
+	is NativeIoNativeCliCopyEvent -> wireObject(
+		"kind" to text("copy"),
+		"encoded" to text(event.encoded),
+		"backend" to text(event.backend.wireName),
 	)
 }
 

@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.protocol.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.SessionBackend
 import io.github.rfairburn.pireviewgate.core.protocol.roster.internal.RosterErrorText
 import io.github.rfairburn.pireviewgate.core.protocol.roster.internal.RosterJson
 import io.github.rfairburn.pireviewgate.core.protocol.roster.internal.RosterText
@@ -62,6 +63,7 @@ object RosterMetadataRow {
         "id",
         "rosterSlotId",
         "label",
+        "backend",
         "workspace",
         "lifecycle",
         "hasLiveProcess",
@@ -105,6 +107,7 @@ object RosterMetadataRow {
         return RemoteSessionMetadata(
             id = requiredText(record["id"], MAX_REMOTE_ROW_ID_BYTES, null),
             label = requiredText(record["label"], MAX_REMOTE_LABEL_BYTES, MAX_REMOTE_LABEL_CHARS),
+            backend = backend(record["backend"]),
             workspace = exactText(record["workspace"], MAX_REMOTE_WORKSPACE_BYTES),
             lifecycle = lifecycleOf(record["lifecycle"]),
             hasLiveProcess = requiredBoolean(record["hasLiveProcess"]),
@@ -137,6 +140,18 @@ object RosterMetadataRow {
         if (RosterJson.utf8Length(value) > maxBytes) reject()
         if (RosterText.isUnsafeText(value)) reject()
         return value
+    }
+
+    /**
+     * The owner's closed backend identity, or honest absence. Absence is the legacy
+     * Pi row. A PRESENT value must belong to the closed set: `null`, a foreign
+     * string, or a number is a malformed row, never a value to normalize into Pi or
+     * a backend to infer from a label, status, or conversation.
+     */
+    private fun backend(element: JsonElement?): SessionBackend? {
+        if (element == null) return null
+        val value = stringOf(element) ?: reject()
+        return SessionBackend.fromWireName(value) ?: reject()
     }
 
     /** Workspace paths are exact owner data: bounded in size, never rewritten. */
@@ -286,6 +301,7 @@ object RosterMetadataRow {
         fields += "label" to RosterJson.stringOf(
             writeText(row.label, MAX_REMOTE_LABEL_BYTES, MAX_REMOTE_LABEL_CHARS),
         )
+        row.backend?.let { fields += "backend" to RosterJson.stringOf(it.wireName) }
         fields += "workspace" to RosterJson.stringOf(writeExact(row.workspace, MAX_REMOTE_WORKSPACE_BYTES))
         fields += "lifecycle" to RosterJson.stringOf(row.lifecycle.wireName)
         fields += "hasLiveProcess" to row.hasLiveProcess.toString()

@@ -236,7 +236,7 @@ for (const leg of LAUNCHER_LEGS) {
       "both public native children use the same ordinary per-leg shared native agent root");
     for (const session of sessions) {
       assert.equal(session.record.tty, true, `${session.label} is a real Pi TTY process`);
-      assert.equal(session.record.columns, 87, `${session.label} receives the actual 87-column pane geometry`);
+      assert.equal(session.record.columns, 84, `${session.label} receives the actual 84-column pane geometry`);
       assert.equal(session.record.rows, 49, `${session.label} receives the actual 49-row pane geometry`);
       assert.ok(session.record.sessionFile && isAbsoluteNativePath(session.record.sessionFile),
         `${session.label} reports its public absolute planned native session path`);

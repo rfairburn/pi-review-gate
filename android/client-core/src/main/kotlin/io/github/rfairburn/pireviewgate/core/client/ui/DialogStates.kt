@@ -10,6 +10,7 @@ public enum class ClientDialogKind {
     FIRST_CONTACT_CONSENT,
     CREATE_SESSION,
     RENAME_SESSION,
+    NATIVE_RENAME_SESSION,
     CLOSE_SESSION,
     SAVED_DELETE,
 }
@@ -82,15 +83,40 @@ public data class CreateSessionDialog(
     public val selectedHostId: HostId? = null,
     public val workspaceDraft: String = "",
     public val proof: UiActionProof,
+    /**
+     * The exact provider this form chose. [CreateProviderChoice.Pi] is the fresh-form
+     * default; `null` means a previously chosen native provider is no longer
+     * advertised and the operator must choose again. It is never converted back to
+     * Pi on the operator's behalf.
+     */
+    public val provider: CreateProviderChoice? = CreateProviderChoice.Pi,
 ) {
     /** The explicitly chosen owner, or `null` when nothing is chosen yet. */
     public val selectedOwner: OwnerChoice?
         get() = selectedHostId?.let { id -> owners.firstOrNull { it.hostId == id } }
+
+    /** Providers this owner may be addressed with right now, in Host -> Provider order. */
+    public val providerOptions: List<CreateProviderChoice>
+        get() = CreateProviderSelection.options(selectedOwner)
 }
 
 /** Rename one row, fenced to the native conversation tuple frozen in [target]. */
 public data class RenameSessionDialog(
     public val target: RenameTarget,
+    public val nameDraft: String = "",
+    public val proof: UiActionProof,
+)
+
+/**
+ * Caption one native CLI row.
+ *
+ * This is the native HOST ROW NAME form, not the Pi conversation rename: the
+ * target carries no conversation tuple, the backend is the one the owner reported,
+ * and the replacement caption is never sent to the provider or typed into its
+ * child. It is gated by the SEPARATE native-name capability.
+ */
+public data class NativeRenameSessionDialog(
+    public val target: NativeRenameTarget,
     public val nameDraft: String = "",
     public val proof: UiActionProof,
 )
@@ -134,14 +160,15 @@ public data class ClientDialogs(
     public val firstContactConsent: FirstContactConsentDialog? = null,
     public val createSession: CreateSessionDialog? = null,
     public val renameSession: RenameSessionDialog? = null,
+    public val nativeRenameSession: NativeRenameSessionDialog? = null,
     public val closeSession: CloseSessionDialog? = null,
     public val savedDelete: SavedDeleteDialog? = null,
 ) {
     /** True when any modal dialog covers the screen. */
     public val hasModal: Boolean
         get() = addHost != null || editHostAddress != null || removeHost != null || firstContactConsent != null ||
-            createSession != null || renameSession != null || closeSession != null ||
-            savedDelete != null
+            createSession != null || renameSession != null || nativeRenameSession != null ||
+            closeSession != null || savedDelete != null
 
     /**
      * The open dialogs in the order their layers are composed, bottom first.
@@ -159,6 +186,7 @@ public data class ClientDialogs(
             if (firstContactConsent != null) add(ClientDialogKind.FIRST_CONTACT_CONSENT)
             if (createSession != null) add(ClientDialogKind.CREATE_SESSION)
             if (renameSession != null) add(ClientDialogKind.RENAME_SESSION)
+            if (nativeRenameSession != null) add(ClientDialogKind.NATIVE_RENAME_SESSION)
             if (closeSession != null) add(ClientDialogKind.CLOSE_SESSION)
             if (savedDelete != null) add(ClientDialogKind.SAVED_DELETE)
         }
@@ -183,6 +211,7 @@ public data class ClientDialogs(
         ClientDialogKind.FIRST_CONTACT_CONSENT -> copy(firstContactConsent = null)
         ClientDialogKind.CREATE_SESSION -> copy(createSession = null)
         ClientDialogKind.RENAME_SESSION -> copy(renameSession = null)
+        ClientDialogKind.NATIVE_RENAME_SESSION -> copy(nativeRenameSession = null)
         ClientDialogKind.CLOSE_SESSION -> copy(closeSession = null)
         ClientDialogKind.SAVED_DELETE -> copy(savedDelete = null)
     }

@@ -172,8 +172,8 @@ export function isCompleteMainFocusedRoster(text: string): boolean {
   const offset = /^\s*Sessions \(/u.test(pane[0] ?? "") ? 0 : 1;
   const footer = pane.slice(offset + 1 + parsed.entryEnd).map((line) => line.trim()).filter(Boolean);
   return footer.length === 2
-    && footer[0] === "F8 toggle | enter open"
-    && footer[1] === "esc hide | q quit";
+    && footer[0] === "F8 toggle | enter open | esc hide"
+    && footer[1] === "q quit";
 }
 
 /**
@@ -201,7 +201,7 @@ export function hasStopRemoveConfirmationContents(lines: readonly string[]): boo
     && hintSegments.has("esc/n = cancel");
 }
 
-/** Native-frame wrapper: reads only the rendered 32-column sidebar, never Main's wider content pane. */
+/** Native-frame wrapper: reads only the rendered 35-column sidebar, never Main's wider content pane. */
 export function isStopRemoveConfirmationFrame(text: string): boolean {
   return hasStopRemoveConfirmationContents(text.split("\n").map((line) => line.slice(0, SIDEBAR_COLUMNS)));
 }

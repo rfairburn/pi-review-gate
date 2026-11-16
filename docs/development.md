@@ -446,6 +446,43 @@ optional `native-input-startup-v1` capability and its dependency on
 `native-input-copy-v1`, the tuple-less startup source, and the separate startup
 scope token domain. It runs no PTY, transport, or native Pi.
 
+#### Hosted native CLI input (#277)
+
+Rows the owner hosts as a native CLI child (`claude` or `codex`) have no Pi
+registration, no bootstrap readiness, and no per-registration encoder. The
+optional `native-input-cli-v1` capability, which also depends on
+`native-input-copy-v1`, gives those rows their own phase `native-cli` input
+source whose token commitment key is private to the current process incarnation.
+After `npm run build:test`, the focused files are:
+
+```sh
+node --test dist-test/tests/session-host-native-cli-remote-input.test.js
+node --test dist-test/tests/session-host-native-cli-input.test.js
+node --test dist-test/tests/session-host-native-cli-content-lane.test.js
+```
+
+`session-host-native-cli-remote-input.test.ts` is the pure codec tier: the third
+scope token domain and its mutual unparseability with both Pi families, the
+incarnation key, the capability's implementable-but-never-known default and its
+dependency, the wire source and publish coherence, variant-aware source equality,
+and the viewer's actually-written receipt key. It runs no PTY, transport, or
+provider binary.
+
+`session-host-native-cli-input.test.ts` is the manager tier on synthetic in-memory
+PTYs: separate sources per hosted row, exact raw keyboard/paste/mouse bytes to the
+addressed child only, no Pi framing on a provider child, refusal of every
+cross-source, ABA, mode, forged, closed-viewer, exited-child, and stopped-row case
+with zero bytes, and no clipboard receipt from a hosted row. It needs no status
+registration or bootstrap readiness.
+
+`session-host-native-cli-content-lane.test.ts` is the endpoint tier on a synthetic
+loopback content channel and a thin fake of the owning-host service: what a
+tuple-less publish of a hosted row states and what it must never state, the one
+raw handoff behind a re-proved current source, and a protocol violation with zero
+bytes on a channel that never negotiated the variant. The real-child tier for
+hosted rows remains `session-host-native-cli-pty.test.ts`, which drives owned
+POSIX PTY children of the recorded CLI targets.
+
 The other two are different proof levels. Both exercise the native I/O bridge
 wiring directly (manager framing option and coordinator callbacks) rather than a
 physical production Main; production Main enables that bridge by default, with a

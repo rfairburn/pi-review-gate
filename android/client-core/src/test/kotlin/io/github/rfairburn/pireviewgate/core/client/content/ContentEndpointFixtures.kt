@@ -1,6 +1,7 @@
 package io.github.rfairburn.pireviewgate.core.client.content
 
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentBounds
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentBeginFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentChunkFrame
@@ -13,8 +14,11 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.CopyEndFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.CopyFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.HelloAckFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopyEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopySource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputKind
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputSource
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliCopyEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoStartupSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeSessionRef
@@ -25,6 +29,7 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.TerminalInputModes
 import io.github.rfairburn.pireviewgate.core.protocol.content.INPUT_MODES
 import io.github.rfairburn.pireviewgate.core.protocol.content.contentSource
+import io.github.rfairburn.pireviewgate.core.protocol.content.nativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.sampleFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.startupSource
 
@@ -93,6 +98,21 @@ internal fun nativeIoOptions(startup: Boolean = true): ContentNativeIoOptions = 
 		if (startup) add(ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY)
 	},
 )
+
+/**
+ * The native IO opt-in with the hosted provider CLI variants added, each optional so a
+ * suite can prove what an unacknowledged extension refuses. Offering grants nothing:
+ * the owner's acknowledgement is the only authority.
+ */
+internal fun nativeCliIoOptions(cliInput: Boolean = true, cliCopy: Boolean = true): ContentNativeIoOptions =
+	ContentNativeIoOptions(
+		offeredCapabilities = buildList {
+			add(ContentProtocol.NATIVE_IO_CAPABILITY)
+			add(ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY)
+			if (cliInput) add(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY)
+			if (cliCopy) add(ContentProtocol.NATIVE_COPY_CLI_CAPABILITY)
+		},
+	)
 
 /** One acknowledgement of exactly the baseline capability. */
 internal fun ackFrame(capabilities: List<String> = listOf(ContentProtocol.REQUIRED_CAPABILITY)): HelloAckFrame =
@@ -190,7 +210,7 @@ internal fun pagedCopyFrames(
 	subscriptionId: String = SUB_ID,
 	copyId: String = "copy-1",
 	sequence: Long = 1L,
-	source: NativeIoSource = contentSource(geometry = TARGET_GEOMETRY),
+	source: NativeIoCopySource = contentSource(geometry = TARGET_GEOMETRY),
 	dispatchId: Long = 11L,
 	chunkBytes: Int = 8,
 ): List<ContentFrame> {
@@ -374,8 +394,14 @@ internal class ContentEndpointHarness(
 		sequence: Long = nextSequence,
 		frame: TerminalFrame = sampleFrame(),
 		policyGeneration: Long = observation.inputPolicy.generation,
+		nativeSession: NativeSessionRef? = NativeSessionRef("native-session-1", 3),
 	): ContentWrittenFrameOutcome {
-		publish(frame = frame, sequence = sequence, inputSource = OptionalNativeIoSource.Stated(source))
+		publish(
+			frame = frame,
+			sequence = sequence,
+			inputSource = OptionalNativeIoSource.Stated(source),
+			nativeSession = nativeSession,
+		)
 		return endpoint.recordWrittenFrame(
 			writtenProof(this, sequence, frame.geometry(), policyGeneration),
 		)
@@ -433,6 +459,50 @@ internal fun nativeIoConfig(
 	viewport = viewport,
 	nativeIo = nativeIoOptions(startup = startup),
 	inputPolicy = policy,
+)
+
+/** The acknowledgement that turns on the hosted provider CLI input and text copy too. */
+internal val NATIVE_CLI_IO_ACK: List<String> = listOf(
+	ContentProtocol.REQUIRED_CAPABILITY,
+	ContentProtocol.NATIVE_IO_CAPABILITY,
+	ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY,
+	ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY,
+	ContentProtocol.NATIVE_COPY_CLI_CAPABILITY,
+)
+
+/** A config that offers the hosted provider CLI variants, with the preference on. */
+internal fun nativeCliIoConfig(
+	cliInput: Boolean = true,
+	cliCopy: Boolean = true,
+	policy: ContentInputPolicy = ContentInputPolicy(enabled = true, generation = 1L),
+	viewport: ContentViewportRequest = ContentViewportRequest(cols = 80, rows = 24),
+): ContentEndpointConfig = endpointConfig(
+	viewport = viewport,
+	nativeIo = nativeCliIoOptions(cliInput = cliInput, cliCopy = cliCopy),
+	inputPolicy = policy,
+)
+
+/** The hosted provider CLI source of the sample publish: same run, row, and geometry. */
+internal fun sampleNativeCliSource(backend: NativeCliBackend = NativeCliBackend.CLAUDE): NativeIoNativeCliSource =
+	nativeCliSource(backend = backend, geometry = TARGET_GEOMETRY)
+
+/** The frames of one inline hosted provider TEXT copy. */
+internal fun inlineCliCopyFrames(
+	copyId: String = "copy-1",
+	subscriptionId: String = SUB_ID,
+	sequence: Long = 1L,
+	source: NativeIoNativeCliSource = sampleNativeCliSource(),
+	dispatchId: Long = 11L,
+	encoded: String = "aGVsbG8=",
+): List<ContentFrame> = listOf(
+	CopyFrame(
+		subscriptionId = subscriptionId,
+		copyId = copyId,
+		sequence = sequence,
+		source = source,
+		dispatchId = dispatchId,
+		event = NativeIoNativeCliCopyEvent(encoded = encoded, backend = source.backend),
+	),
 )
 
 /** One keyboard packet admitted against the current publication and its written receipt. */

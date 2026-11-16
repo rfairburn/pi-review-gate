@@ -22,6 +22,8 @@ import io.github.rfairburn.pireviewgate.core.client.roster.RosterCreateCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterOperationKind
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterProjection
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterProjectionState
+import io.github.rfairburn.pireviewgate.core.client.roster.RosterNativeCreateCommand
+import io.github.rfairburn.pireviewgate.core.client.roster.RosterNativeRenameCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterRenameCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterSavedDeleteCommand
 import io.github.rfairburn.pireviewgate.core.client.roster.RosterSavedListCommand
@@ -239,10 +241,22 @@ class ClientRuntime(
         return lane.createSession(command)
     }
 
+    suspend fun createNativeSession(hostId: HostId, command: RosterNativeCreateCommand): RosterOperationAdmission {
+        val lane = liveRosterLane(hostId)
+            ?: return RosterOperationAdmission.NotReached(RosterOperationKind.CREATE, intakeReason(hostId))
+        return lane.createNativeSession(command)
+    }
+
     suspend fun renameSession(hostId: HostId, command: RosterRenameCommand): RosterOperationAdmission {
         val lane = liveRosterLane(hostId)
             ?: return RosterOperationAdmission.NotReached(RosterOperationKind.RENAME, intakeReason(hostId))
         return lane.renameSession(command)
+    }
+
+    suspend fun renameNativeSession(hostId: HostId, command: RosterNativeRenameCommand): RosterOperationAdmission {
+        val lane = liveRosterLane(hostId)
+            ?: return RosterOperationAdmission.NotReached(RosterOperationKind.NATIVE_RENAME, intakeReason(hostId))
+        return lane.renameNativeSession(command)
     }
 
     suspend fun savedList(hostId: HostId, command: RosterSavedListCommand): RosterOperationAdmission {

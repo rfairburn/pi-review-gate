@@ -6,7 +6,7 @@
  * The production contract (src/session-host/sidebar.ts) renders a roster
  * error as `! ${noticeError}` word-wrapped across consecutive pane rows above
  * the footer, each row padded to the sidebar width. In the wide layout those
- * rows occupy the leftmost 32 columns of the composed frame, separated from
+ * rows occupy the leftmost 35 columns of the composed frame, separated from
  * the native right pane by one divider column; a wrap therefore places the
  * divider inside any full-frame join and can never be matched by a contiguous
  * substring.

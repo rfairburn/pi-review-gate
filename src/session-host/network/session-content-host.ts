@@ -120,6 +120,8 @@ import type {
 	NativeViewerInputRequest,
 	NativeViewerInputResult,
 	NativeViewerInputSource,
+	NativeViewerNativeCliClipboardReceipt,
+	NativeViewerNativeCliInputSource,
 	OwningHostInventorySnapshot,
 	OwningHostInputReadinessWatch,
 	OwningHostService,
@@ -128,6 +130,7 @@ import type {
 	SessionViewerState,
 	SessionViewerUpdateResult,
 } from "../owning-host-service";
+import { isNativeViewerNativeCliClipboardReceipt } from "../owning-host-service";
 import type { TerminalInputModes } from "../terminal-surface";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
@@ -136,8 +139,10 @@ import {
 	NATIVE_TEXT_PASTE_MAX_BYTES,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	buildNativeCopyInline,
@@ -146,6 +151,7 @@ import {
 	createNativeInputAssembler,
 	decodeSessionContentFrame,
 	encodeSessionContentFrame,
+	isNativeIoNativeCliSource,
 	isNativeIoStartupSource,
 	isSessionContentProtocolError,
 	negotiateSessionContentHello,
@@ -155,7 +161,12 @@ import {
 	type NativeInputAssembler,
 	type NativeIoBuiltTransfer,
 	type NativeIoCompletedInput,
+	type NativeIoCopyEvent,
+	type NativeIoCopyFrameEvent,
+	type NativeIoCopySource,
 	type NativeIoInputSource,
+	type NativeIoNativeCliCopyEvent,
+	type NativeIoNativeCliSource,
 	type NativeIoSource,
 	type SessionContentBounds,
 	type SessionContentBuiltTransfer,
@@ -463,7 +474,7 @@ interface QueuedNativeCopy {
 	readonly frames: readonly Buffer[];
 	readonly subscriptionId: string;
 	readonly hostRunId: string;
-	readonly source: NativeIoSource;
+	readonly source: NativeIoCopySource;
 	readonly generation: number;
 	index: number;
 	/**
@@ -503,6 +514,8 @@ function toNativeIoSource(lower: NativeViewerInputSource | undefined): NativeIoS
 	if (!lower) return null;
 	// A startup scope is never a conversation (copy) source, whatever else it says.
 	if (isLowerStartupSource(lower)) return null;
+	// Neither is a hosted native CLI scope: that row has no conversation to copy from.
+	if (isLowerNativeCliSource(lower)) return null;
 	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
 	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
 	return Object.freeze({
@@ -527,13 +540,49 @@ function isLowerStartupSource(lower: NativeViewerAnyInputSource): boolean {
 	return (lower as { readonly phase?: unknown }).phase === "startup";
 }
 
+/** True for the owner-private hosted native CLI variant of an input-path scope. */
+function isLowerNativeCliSource(lower: NativeViewerAnyInputSource): boolean {
+	return (lower as { readonly phase?: unknown }).phase === "native-cli";
+}
+
 /**
- * Map the owner-private current INPUT scope (conversation or startup) to the exact
- * wire shape a peer may echo. A startup scope maps to the tuple-less startup wire
+ * Map the owner-private current INPUT scope of one hosted provider CLI row to the
+ * exact wire shape a peer may echo: run, owner row, the explicit `native-cli` phase,
+ * the row's recorded backend, canonical geometry, viewer revision, and the
+ * host-minted token. The private viewer id stays owner-only, and the process
+ * incarnation the token commits to never appears at all — only the owner holds its
+ * key, so the wire can neither name nor choose a child process.
+ */
+function toNativeIoNativeCliSource(lower: NativeViewerNativeCliInputSource): NativeIoNativeCliSource | null {
+	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
+	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
+	if (lower.backend !== "claude" && lower.backend !== "codex") return null;
+	return Object.freeze({
+		hostRunId: lower.hostRunId,
+		sessionId: lower.rowId,
+		phase: "native-cli" as const,
+		backend: lower.backend,
+		geometry: Object.freeze({
+			cols: lower.geometry.cols,
+			rows: lower.geometry.rows,
+			revision: lower.geometry.revision,
+		}),
+		viewerRevision: lower.viewerRevision,
+		sourceToken: lower.sourceToken,
+	});
+}
+
+/**
+ * Map the owner-private current INPUT scope (conversation, startup, or hosted native
+ * CLI) to the exact wire shape a peer may echo. A startup scope maps to the tuple-less
+ * startup wire source and a native CLI scope to the tuple-less `native-cli` wire
  * source; nothing here fabricates a tuple, and owner-only identity stays private.
  */
 function toNativeIoInputSource(lower: NativeViewerAnyInputSource | undefined): NativeIoInputSource | null {
 	if (!lower) return null;
+	if (isLowerNativeCliSource(lower)) {
+		return toNativeIoNativeCliSource(lower as NativeViewerNativeCliInputSource);
+	}
 	if (!isLowerStartupSource(lower)) return toNativeIoSource(lower as NativeViewerInputSource);
 	if (typeof lower.sourceToken !== "string" || lower.sourceToken.length === 0) return null;
 	if (!Number.isSafeInteger(lower.viewerRevision) || lower.viewerRevision < 1) return null;
@@ -568,6 +617,28 @@ function sameNativeViewerScope(left: NativeViewerInputSource, right: NativeViewe
 		&& left.geometry.revision === right.geometry.revision
 		&& left.registrationIdentity === right.registrationIdentity
 		&& left.registrationGeneration === right.registrationGeneration
+		&& left.sourceToken === right.sourceToken;
+}
+
+/**
+ * Exact equality of every owner-private hosted provider scope fact, including the
+ * private viewer id that never crosses the wire. This is how a provider copy proves
+ * it belongs to THIS surface and to no sibling; it grants nothing and selects no
+ * destination, and it can never equal a Pi conversation or startup scope.
+ */
+function sameNativeViewerNativeCliScope(
+	left: NativeViewerNativeCliInputSource,
+	right: NativeViewerNativeCliInputSource,
+): boolean {
+	return left.hostRunId === right.hostRunId
+		&& left.viewerId === right.viewerId
+		&& left.viewerRevision === right.viewerRevision
+		&& left.rowId === right.rowId
+		&& left.phase === right.phase
+		&& left.backend === right.backend
+		&& left.geometry.cols === right.geometry.cols
+		&& left.geometry.rows === right.geometry.rows
+		&& left.geometry.revision === right.geometry.revision
 		&& left.sourceToken === right.sourceToken;
 }
 
@@ -760,6 +831,18 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * peer-sent startup source is a protocol violation.
 	 */
 	#startupInputNegotiated = false;
+	/**
+	 * True only when THIS channel ALSO negotiated hosted native CLI input (which
+	 * depends on native IO). Without it no `native-cli` source is ever published and a
+	 * peer-sent one is a protocol violation.
+	 */
+	#nativeCliInputNegotiated = false;
+	/**
+	 * True only when THIS channel ALSO negotiated hosted native CLI TEXT copy (which
+	 * depends on hosted native CLI input). Without it no copy frame may carry a
+	 * `native-cli` source, and one that arrives anyway is a protocol violation.
+	 */
+	#nativeCopyCliNegotiated = false;
 	/** The one native input assembly belonging to the current subscription. */
 	#inputAssembler: NativeInputAssembler | null = null;
 	/** The open paged paste's identifier, while one is open. */
@@ -1015,6 +1098,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 			// acknowledge it alone.
 			if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY)) {
 				this.#startupInputNegotiated = true;
+			}
+			if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY)) {
+				this.#nativeCliInputNegotiated = true;
+				// Hosted native CLI TEXT copy is acknowledged only beside that input.
+				if (decision.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY)) {
+					this.#nativeCopyCliNegotiated = true;
+				}
 			}
 		}
 		this.#state = "ready";
@@ -1468,12 +1558,15 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 */
 	#nativeIoOffer(): SessionContentNegotiationOptions | undefined {
 		if (this.#provider === null) return undefined;
-		// The strict manager seam implements startup-phase input, so it is offered
-		// beside (and only beside) native IO; an older peer simply never gets it.
+		// The strict manager seam implements startup-phase input and hosted native CLI
+		// input, so both are offered beside (and only beside) native IO; an older peer
+		// simply never gets them.
 		return {
 			supportedOptionalCapabilities: [
 				SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 				SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+				SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+				SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
 			],
 		};
 	}
@@ -1498,6 +1591,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 			&& isNativeIoStartupSource(frame.source) && !this.#startupInputNegotiated) {
 			// Startup data on a channel that never negotiated it is not a stale input:
 			// it is a protocol violation, refused without touching any child.
+			this.#violation();
+			return;
+		}
+		if ((frame.type === "input" || frame.type === "input_begin")
+			&& isNativeIoNativeCliSource(frame.source) && !this.#nativeCliInputNegotiated) {
+			// Hosted native CLI input on a channel that never negotiated it is treated
+			// the same way: no byte reaches any child and the lane fails closed.
 			this.#violation();
 			return;
 		}
@@ -1992,6 +2092,8 @@ class OwnerBinding implements SessionContentChannelBinding {
 		if (lower === undefined || wire === null) return null;
 		// A startup scope is a target only on a channel that negotiated startup input.
 		if (isNativeIoStartupSource(wire) && !this.#startupInputNegotiated) return null;
+		// A hosted native CLI scope is a target only on a channel that negotiated it.
+		if (isNativeIoNativeCliSource(wire) && !this.#nativeCliInputNegotiated) return null;
 		if (lower.hostRunId !== this.#subscriptionRun || lower.rowId !== this.#sessionId) return null;
 		if (!nativeIoSourceEquals(expected, wire)) return null;
 		const modes = this.#inputModes;
@@ -2131,16 +2233,23 @@ class OwnerBinding implements SessionContentChannelBinding {
 		const viewerId = this.#viewerId;
 		if (provider === null || !this.#nativeIoNegotiated || viewerId === null) return null;
 		if (snapshot.hostRunId !== this.#subscriptionRun || snapshot.sessionId !== this.#sessionId) return null;
-		// A publish that names no native conversation may state ONLY a startup source,
-		// and only on a channel that negotiated it; a v1-only peer keeps the exact
-		// tuple-less publish with no source.
-		if (snapshot.nativeSession === null && !this.#startupInputNegotiated) return null;
+		// A publish that names no native conversation may state ONLY a startup source
+		// or a hosted native CLI source, and only on a channel that negotiated that
+		// variant; a v1-only peer keeps the exact tuple-less publish with no source.
+		if (snapshot.nativeSession === null && !this.#startupInputNegotiated && !this.#nativeCliInputNegotiated) {
+			return null;
+		}
 		const wire = toNativeIoInputSource(provider.readSource(viewerId));
 		if (wire === null) return null;
 		if (wire.hostRunId !== snapshot.hostRunId || wire.sessionId !== snapshot.sessionId) return null;
 		if (isNativeIoStartupSource(wire)) {
-			// Never stamped onto a publish that carries a tuple.
-			if (snapshot.nativeSession !== null) return null;
+			// Never stamped onto a publish that carries a tuple, and never stated on a
+			// channel that did not negotiate startup input.
+			if (snapshot.nativeSession !== null || !this.#startupInputNegotiated) return null;
+		} else if (isNativeIoNativeCliSource(wire)) {
+			// Same rule for a hosted provider child: no tuple to stamp, and no source on
+			// a channel that did not negotiate native CLI input.
+			if (snapshot.nativeSession !== null || !this.#nativeCliInputNegotiated) return null;
 		} else if (snapshot.nativeSession === null
 			|| wire.nativeSession.sessionId !== snapshot.nativeSession.sessionId
 			|| wire.nativeSession.epoch !== snapshot.nativeSession.epoch) {
@@ -2209,7 +2318,7 @@ class OwnerBinding implements SessionContentChannelBinding {
 	 * outer terminal, a sibling viewer, the last or highest input dispatch, or a PTY
 	 * write, and a receipt that arrives after this binding retired is simply dropped.
 	 */
-	#onNativeCopy(receipt: NativeViewerClipboardReceipt): void {
+	#onNativeCopy(receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt): void {
 		if (this.#provider === null || !this.#nativeIoNegotiated) return;
 		if (this.#state !== "subscribed" || this.#fenced) return;
 		const subscriptionId = this.#subscriptionId;
@@ -2219,27 +2328,18 @@ class OwnerBinding implements SessionContentChannelBinding {
 		const generation = this.#generation;
 		if (!this.#authorize()) return;
 		const currentScope = this.#provider.readSource(viewerId);
-		// A startup scope is never a copy scope: no conversation exists to attribute a
-		// copy to, so nothing is routed against it.
-		if (currentScope === undefined || isLowerStartupSource(currentScope)) {
+		if (currentScope === undefined) {
 			this.#diagnostic("copy_dropped");
 			return;
 		}
-		const current = currentScope as NativeViewerInputSource;
-		// The exact initiating surface: same viewer, registration, generation, row,
-		// run, native tuple, geometry, viewer revision, and token as right now.
-		if (!sameNativeViewerScope(current, receipt.source)) {
-			this.#diagnostic("copy_dropped");
-			return;
-		}
-		// The producer's own event must name the same native conversation.
-		if (receipt.event.sessionId !== current.nativeSession.sessionId
-			|| receipt.event.sessionEpoch !== current.nativeSession.epoch) {
-			this.#diagnostic("copy_dropped");
-			return;
-		}
-		const source = toNativeIoSource(current);
-		if (source === null) {
+		// Two producer families, never merged: an unchanged Pi conversation copy is
+		// proved against the conversation scope exactly as it always was, and a hosted
+		// provider TEXT copy is proved against the native CLI scope of a channel that
+		// explicitly negotiated it. A startup scope is never a copy scope at all.
+		const prepared = isNativeViewerNativeCliClipboardReceipt(receipt)
+			? this.#prepareNativeCliCopy(currentScope, receipt)
+			: this.#prepareConversationCopy(currentScope, receipt);
+		if (prepared === null) {
 			this.#diagnostic("copy_dropped");
 			return;
 		}
@@ -2247,13 +2347,13 @@ class OwnerBinding implements SessionContentChannelBinding {
 			subscriptionId,
 			copyId: randomUUID(),
 			sequence: this.#nextCopySequence + 1,
-			source,
+			source: prepared.source,
 			dispatchId: receipt.dispatchId,
 			bounds: this.#bounds,
 		};
 		let built: NativeIoBuiltTransfer;
 		try {
-			built = this.#buildCopyUnit(identity, receipt.event);
+			built = this.#buildCopyUnit(identity, prepared.event);
 		} catch {
 			// A copy this side cannot represent whole is refused whole: no partial
 			// emission, no truncated clipboard text, and no claim of delivery.
@@ -2273,12 +2373,76 @@ class OwnerBinding implements SessionContentChannelBinding {
 			frames: built.frames,
 			subscriptionId,
 			hostRunId,
-			source,
+			source: identity.source,
 			generation,
 			index: 0,
 			started: false,
 		});
 		this.#drain();
+	}
+
+	/**
+	 * Prove one Pi conversation copy against the CURRENT conversation scope of THIS
+	 * binding's own viewer. The exact initiating surface — viewer, registration,
+	 * generation, row, run, native tuple, geometry, viewer revision, and token — must
+	 * be what it is right now, and the producer's own event must name the same native
+	 * conversation. A startup or hosted CLI current scope is never a conversation copy
+	 * scope. `null` means nothing is emitted.
+	 */
+	#prepareConversationCopy(
+		currentScope: NativeViewerAnyInputSource,
+		receipt: NativeViewerClipboardReceipt,
+	): { readonly source: NativeIoSource; readonly event: NativeIoCopyEvent } | null {
+		if (isLowerStartupSource(currentScope) || isLowerNativeCliSource(currentScope)) {
+			// A startup scope names no conversation, and a hosted provider row has no Pi
+			// copy producer: neither can route a conversation copy.
+			return null;
+		}
+		const current = currentScope as NativeViewerInputSource;
+		if (!sameNativeViewerScope(current, receipt.source)) {
+			return null;
+		}
+		if (receipt.event.sessionId !== current.nativeSession.sessionId
+			|| receipt.event.sessionEpoch !== current.nativeSession.epoch) {
+			return null;
+		}
+		const source = toNativeIoSource(current);
+		if (source === null) return null;
+		return { source, event: receipt.event };
+	}
+
+	/**
+	 * Prove one hosted provider TEXT copy against the CURRENT native CLI scope of THIS
+	 * binding's own viewer, and only on a channel that explicitly negotiated hosted
+	 * native CLI copy. Every owner-private fact of the scope the copy names — viewer,
+	 * row, run, backend, geometry, viewer revision, and token — must be what it is
+	 * right now, and the event must name that same recorded backend. Nothing here
+	 * invents a conversation tuple, and `null` means nothing is emitted: never a
+	 * downgrade to the conversation family and never a fallback to another viewer.
+	 */
+	#prepareNativeCliCopy(
+		currentScope: NativeViewerAnyInputSource,
+		receipt: NativeViewerNativeCliClipboardReceipt,
+	): { readonly source: NativeIoNativeCliSource; readonly event: NativeIoNativeCliCopyEvent } | null {
+		if (!this.#nativeCopyCliNegotiated) {
+			// This channel never agreed to carry provider copies: the receipt is dropped
+			// where it arrived, and no frame is ever minted for it.
+			return null;
+		}
+		if (!isLowerNativeCliSource(currentScope)) {
+			// A Pi conversation or startup scope is never a hosted provider copy scope.
+			return null;
+		}
+		const current = currentScope as NativeViewerNativeCliInputSource;
+		if (!sameNativeViewerNativeCliScope(current, receipt.source)) {
+			return null;
+		}
+		if (receipt.event.backend !== current.backend) {
+			return null;
+		}
+		const source = toNativeIoNativeCliSource(current);
+		if (source === null) return null;
+		return { source, event: receipt.event };
 	}
 
 	/**
@@ -2292,11 +2456,11 @@ class OwnerBinding implements SessionContentChannelBinding {
 			readonly subscriptionId: string;
 			readonly copyId: string;
 			readonly sequence: number;
-			readonly source: NativeIoSource;
+			readonly source: NativeIoCopySource;
 			readonly dispatchId: number;
 			readonly bounds: SessionContentBounds;
 		},
-		event: NativeViewerClipboardReceipt["event"],
+		event: NativeIoCopyFrameEvent,
 	): NativeIoBuiltTransfer {
 		if (event.kind !== "copy") return buildNativeCopyInline({ ...identity, event });
 		try {

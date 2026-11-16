@@ -3,7 +3,7 @@ import type { HostGraphicsLayer } from "./graphics-output";
 import type { TerminalFrame } from "./terminal-surface";
 
 const MAX_DIMENSION = 1000;
-const SIDEBAR_WIDTH = 32;
+const SIDEBAR_WIDTH = 35;
 const DIVIDER_WIDTH = 1;
 const MIN_NATIVE_WIDTH = 20;
 const SGR_RESET = "\x1b[0m";

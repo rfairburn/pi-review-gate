@@ -1,5 +1,10 @@
 package io.github.rfairburn.pireviewgate.core.protocol.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeCliTargetId
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeDisplayName
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeTargetLabel
 import io.github.rfairburn.pireviewgate.core.protocol.roster.internal.RosterJson
 import io.github.rfairburn.pireviewgate.core.protocol.roster.internal.RosterText
 import kotlinx.serialization.json.JsonArray
@@ -139,13 +144,19 @@ object RosterProtocol {
                 "pageIndex" to n(encRange(frame.pageIndex, 0L, MAX_SAFE_INTEGER)),
                 "rows" to encodeRows(frame.rows, bounds),
             )
-            is RosterFrame.SnapshotEnd -> obj(
-                "type" to q("snapshot_end"),
-                "subscriptionId" to q(encIdentifier(frame.subscriptionId, bounds)),
-                "transferId" to q(encIdentifier(frame.transferId, bounds)),
-                "revision" to n(encRange(frame.revision, 1L, MAX_SAFE_INTEGER)),
-                "totalRows" to n(encRange(frame.totalRows, 0L, bounds.maxSnapshotRows)),
-            )
+            is RosterFrame.SnapshotEnd -> {
+                val fields = mutableListOf(
+                    "type" to q("snapshot_end"),
+                    "subscriptionId" to q(encIdentifier(frame.subscriptionId, bounds)),
+                    "transferId" to q(encIdentifier(frame.transferId, bounds)),
+                    "revision" to n(encRange(frame.revision, 1L, MAX_SAFE_INTEGER)),
+                    "totalRows" to n(encRange(frame.totalRows, 0L, bounds.maxSnapshotRows)),
+                )
+                frame.nativeCliTargets?.let {
+                    fields += "nativeCliTargets" to encodeNativeCliTargets(it, bounds)
+                }
+                obj(fields)
+            }
             is RosterFrame.CloseRequest -> obj(
                 "type" to q("close_request"),
                 "requestId" to q(encIdentifier(frame.requestId, bounds)),
@@ -182,6 +193,34 @@ object RosterProtocol {
             )
             is RosterFrame.RenameResult -> obj(
                 "type" to q("rename_result"),
+                "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                "outcome" to obj("kind" to q(frame.outcome.wireName)),
+            )
+            is RosterFrame.NativeCreateRequest -> obj(
+                "type" to q("create_native_request"),
+                "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
+                "workspace" to q(encWorkspace(frame.workspace)),
+                "backend" to q(frame.backend.wireName),
+                "targetId" to q(encNativeTargetId(frame.targetId)),
+                "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+            )
+            is RosterFrame.NativeCreateResult -> obj(
+                "type" to q("create_native_result"),
+                "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                "outcome" to encodeCreateOutcome(frame.outcome, bounds),
+            )
+            is RosterFrame.NativeRenameRequest -> obj(
+                "type" to q("rename_native_request"),
+                "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
+                "rowId" to q(encIdentifier(frame.rowId, bounds)),
+                "backend" to q(frame.backend.wireName),
+                "name" to q(encNativeDisplayName(frame.name)),
+                "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+            )
+            is RosterFrame.NativeRenameResult -> obj(
+                "type" to q("rename_native_result"),
                 "requestId" to q(encIdentifier(frame.requestId, bounds)),
                 "outcome" to obj("kind" to q(frame.outcome.wireName)),
             )
@@ -337,6 +376,40 @@ object RosterProtocol {
             if (!seen.add(capability)) fail(RosterFailureCode.INVALID_FRAME)
             q(capability)
         }.joinToString(",", "[", "]")
+    }
+
+    /**
+     * One advertised native catalog in its canonical array text. Every descriptor
+     * is closed to exactly `id`/`backend`/`label`, ids are unique, and the catalog
+     * is measured in actual UTF-8 bytes against the frame bound. A malformed,
+     * duplicated, or byte-unrepresentable catalog refuses the whole frame rather
+     * than being clipped into a shorter list a viewer would read as complete.
+     */
+    private fun encodeNativeCliTargets(targets: List<NativeCliTarget>, bounds: RosterBounds): String {
+        if (targets.size.toLong() > bounds.nativeCatalogMaxEntries) fail(RosterFailureCode.INVALID_FRAME)
+        val seen = mutableSetOf<String>()
+        val text = targets.joinToString(",", "[", "]") { target ->
+            if (!seen.add(target.id)) fail(RosterFailureCode.INVALID_FRAME)
+            obj(
+                "id" to q(encNativeTargetId(target.id)),
+                "backend" to q(target.backend.wireName),
+                "label" to q(encNativeTargetLabel(target.label)),
+            )
+        }
+        if (RosterJson.utf8Length(text) > bounds.maxFrameBytes) fail(RosterFailureCode.INVALID_FRAME)
+        return text
+    }
+
+    private fun encNativeTargetId(value: String): String = value.also {
+        if (!isNativeCliTargetId(it)) fail(RosterFailureCode.INVALID_FRAME)
+    }
+
+    private fun encNativeTargetLabel(value: String): String = value.also {
+        if (!isNativeTargetLabel(it)) fail(RosterFailureCode.INVALID_FRAME)
+    }
+
+    private fun encNativeDisplayName(value: String): String = value.also {
+        if (!isNativeDisplayName(it)) fail(RosterFailureCode.INVALID_FRAME)
     }
 
     private fun encodeRows(rows: List<RemoteSessionMetadata>, bounds: RosterBounds): String {
@@ -516,7 +589,7 @@ object RosterProtocol {
         )
         put(
             "snapshot_end",
-            listOf("type", "subscriptionId", "transferId", "revision", "totalRows"),
+            listOf("type", "subscriptionId", "transferId", "revision", "totalRows", "nativeCliTargets"),
             listOf("subscriptionId", "transferId", "revision", "totalRows"),
         )
         put("unsubscribe", listOf("type", "subscriptionId"), listOf("subscriptionId"))
@@ -533,6 +606,18 @@ object RosterProtocol {
             listOf("requestId", "hostRunId", "workspace", "sequence"),
         )
         put("create_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
+        put(
+            "create_native_request",
+            listOf("type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence"),
+            listOf("requestId", "hostRunId", "workspace", "backend", "targetId", "sequence"),
+        )
+        put("create_native_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
+        put(
+            "rename_native_request",
+            listOf("type", "requestId", "hostRunId", "rowId", "backend", "name", "sequence"),
+            listOf("requestId", "hostRunId", "rowId", "backend", "name", "sequence"),
+        )
+        put("rename_native_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
         put(
             "rename_request",
             listOf(
@@ -639,12 +724,20 @@ object RosterProtocol {
                 pageIndex = readInteger(record["pageIndex"], 0L, bounds.maxSnapshotRows),
                 rows = readRows(record["rows"], bounds),
             )
-            "snapshot_end" -> RosterFrame.SnapshotEnd(
-                subscriptionId = id("subscriptionId"),
-                transferId = id("transferId"),
-                revision = readInteger(record["revision"], 1L, MAX_SAFE_INTEGER),
-                totalRows = readInteger(record["totalRows"], 0L, bounds.maxSnapshotRows),
-            )
+            "snapshot_end" -> {
+                val nativeCliTargets = if (record.containsKey("nativeCliTargets")) {
+                    readNativeCliTargets(record["nativeCliTargets"], bounds)
+                } else {
+                    null
+                }
+                RosterFrame.SnapshotEnd(
+                    subscriptionId = id("subscriptionId"),
+                    transferId = id("transferId"),
+                    revision = readInteger(record["revision"], 1L, MAX_SAFE_INTEGER),
+                    totalRows = readInteger(record["totalRows"], 0L, bounds.maxSnapshotRows),
+                    nativeCliTargets = nativeCliTargets,
+                )
+            }
             "close_request" -> RosterFrame.CloseRequest(
                 requestId = id("requestId"),
                 hostRunId = id("hostRunId"),
@@ -659,6 +752,30 @@ object RosterProtocol {
                 sequence = readInteger(record["sequence"], 1L, MAX_SAFE_INTEGER),
             )
             "create_result" -> RosterFrame.CreateResult(id("requestId"), readCreateOutcome(record["outcome"], bounds))
+            "create_native_request" -> RosterFrame.NativeCreateRequest(
+                requestId = id("requestId"),
+                hostRunId = id("hostRunId"),
+                workspace = readWorkspace(record["workspace"]),
+                backend = readNativeCliBackend(record["backend"]),
+                targetId = readNativeCliTargetId(record["targetId"]),
+                sequence = readInteger(record["sequence"], 1L, MAX_SAFE_INTEGER),
+            )
+            "create_native_result" -> RosterFrame.NativeCreateResult(
+                id("requestId"),
+                readCreateOutcome(record["outcome"], bounds),
+            )
+            "rename_native_request" -> RosterFrame.NativeRenameRequest(
+                requestId = id("requestId"),
+                hostRunId = id("hostRunId"),
+                rowId = id("rowId"),
+                backend = readNativeCliBackend(record["backend"]),
+                name = readNativeDisplayName(record["name"]),
+                sequence = readInteger(record["sequence"], 1L, MAX_SAFE_INTEGER),
+            )
+            "rename_native_result" -> RosterFrame.NativeRenameResult(
+                id("requestId"),
+                readNativeRenameOutcome(record["outcome"]),
+            )
             "rename_request" -> RosterFrame.RenameRequest(
                 requestId = id("requestId"),
                 hostRunId = id("hostRunId"),
@@ -770,6 +887,68 @@ object RosterProtocol {
         val value = stringOf(element) ?: fail(RosterFailureCode.BAD_FRAME)
         if (!RosterText.isRenameName(value)) fail(RosterFailureCode.BAD_FRAME)
         return value
+    }
+
+    /**
+     * One closed advertised native catalog: `id`/`backend`/`label` only, ids unique,
+     * entry count a frame-derived loop guard, and the catalog's own UTF-8 bytes
+     * inside the frame bound. A malformed entry, an extra private field, a duplicate
+     * id, or an oversized catalog refuses the WHOLE frame instead of clipping it.
+     */
+    private fun readNativeCliTargets(element: JsonElement?, bounds: RosterBounds): List<NativeCliTarget> {
+        val array = element as? JsonArray ?: fail(RosterFailureCode.BAD_FRAME)
+        if (array.size.toLong() > bounds.nativeCatalogMaxEntries) fail(RosterFailureCode.BAD_FRAME)
+        val seen = mutableSetOf<String>()
+        val targets = array.map { entry ->
+            val record = entry as? JsonObject ?: fail(RosterFailureCode.BAD_FRAME)
+            if (record.keys != setOf("id", "backend", "label")) fail(RosterFailureCode.BAD_FRAME)
+            val id = readNativeCliTargetId(record["id"])
+            if (!seen.add(id)) fail(RosterFailureCode.BAD_FRAME)
+            NativeCliTarget(
+                id = id,
+                backend = readNativeCliBackend(record["backend"]),
+                label = readNativeTargetLabel(record["label"]),
+            )
+        }
+        val serialized = try {
+            encodeNativeCliTargets(targets, bounds)
+        } catch (ignored: RosterProtocolException) {
+            fail(RosterFailureCode.BAD_FRAME)
+        }
+        if (RosterJson.utf8Length(serialized) > bounds.maxFrameBytes) fail(RosterFailureCode.BAD_FRAME)
+        return targets
+    }
+
+    private fun readNativeCliBackend(element: JsonElement?): NativeCliBackend {
+        val value = stringOf(element) ?: fail(RosterFailureCode.BAD_FRAME)
+        return NativeCliBackend.fromWireName(value) ?: fail(RosterFailureCode.BAD_FRAME)
+    }
+
+    private fun readNativeCliTargetId(element: JsonElement?): String {
+        val value = stringOf(element) ?: fail(RosterFailureCode.BAD_FRAME)
+        if (!isNativeCliTargetId(value)) fail(RosterFailureCode.BAD_FRAME)
+        return value
+    }
+
+    private fun readNativeTargetLabel(element: JsonElement?): String {
+        val value = stringOf(element) ?: fail(RosterFailureCode.BAD_FRAME)
+        if (!isNativeTargetLabel(value)) fail(RosterFailureCode.BAD_FRAME)
+        return value
+    }
+
+    /** One native host caption: the owner's shared display-name rule, never trimmed. */
+    private fun readNativeDisplayName(element: JsonElement?): String {
+        val value = stringOf(element) ?: fail(RosterFailureCode.BAD_FRAME)
+        if (!isNativeDisplayName(value)) fail(RosterFailureCode.BAD_FRAME)
+        return value
+    }
+
+    /** The closed native host-name fact set: exactly one fixed kind, nothing else. */
+    private fun readNativeRenameOutcome(element: JsonElement?): OwnerNativeRenameFacts {
+        val record = element as? JsonObject ?: fail(RosterFailureCode.BAD_FRAME)
+        if (record.keys != setOf("kind")) fail(RosterFailureCode.BAD_FRAME)
+        return OwnerNativeRenameFacts.fromWireName(stringOf(record["kind"]) ?: fail(RosterFailureCode.BAD_FRAME))
+            ?: fail(RosterFailureCode.BAD_FRAME)
     }
 
     /**

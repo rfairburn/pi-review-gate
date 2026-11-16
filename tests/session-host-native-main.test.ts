@@ -36,7 +36,14 @@ import {
   sessionFileHasStoredName,
   sha256,
 } from "./helpers/session-host-native-main-harness";
-import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame, parseRosterFrame } from "./helpers/session-host-native-roster-witness";
+import {
+  frameHeader,
+  frameHeaderMatches,
+  isSidebarFocusedFrame,
+  NATIVE_PANE_START,
+  parseRosterFrame,
+  SIDEBAR_COLUMNS,
+} from "./helpers/session-host-native-roster-witness";
 
 // Scope boundary: this is an owned virtual-PTY proof of the public Main API,
 // not a physical-keyboard or full-CLI test. The question flow and live-child
@@ -336,21 +343,21 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
     controllerItem("owned-native-row-b", highlightedLabel),
   ]);
   const draft = "nativeDraftA";
-  const nativeWidth = OUTER_COLS - 32 - 1;
+  const nativeWidth = OUTER_COLS - SIDEBAR_COLUMNS - 1;
   // A visible controller starts sidebar-focused on New. Draw the roster, move
   // through Quit to highlight A, then highlight B while keeping A as the
   // separate Main owner. The complete-card fence authorizes the roster-only
   // Alt+Right Main-focus return.
-  controller.renderRoster(32, 49);
+  controller.renderRoster(SIDEBAR_COLUMNS, 49);
   controller.handleInput(KEYS.down); // New -> Quit host
   controller.handleInput(KEYS.down); // Quit host -> A
-  const ownerSelected = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  const ownerSelected = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => stripGeneratedSgr(line));
   controller.handleInput(KEYS.down); // A -> B
-  const sidebarFocused = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => stripGeneratedSgr(line));
   controller.handleInput(KEYS.altRight);
   assert.equal(controller.focus, "main");
   assert.equal(controller.visible, true);
-  const left = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  const left = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => stripGeneratedSgr(line));
   const nativePane = (top: string, content: string, closing: string): string[] => {
     const rows = Array.from({ length: 49 }, () => "");
     rows[20] = top;
@@ -359,9 +366,9 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
     return rows;
   };
   const compose = (sidebar: readonly string[], main: readonly string[], header = ownerLabel): string =>
-    [header, ...sidebar.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
+    [header, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}│${main[index] ?? ""}`)].join("\n");
   const rule = "─".repeat(nativeWidth);
-  const options = { ownerLabel, draft, sidebarColumns: 32, nativeWidth };
+  const options = { ownerLabel, draft, sidebarColumns: SIDEBAR_COLUMNS, nativeWidth };
   const selectedOptions = { ...options, selectedRosterLabel: highlightedLabel };
   assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)), selectedOptions), true,
     "the complete restored A editor is accepted while B is the highlighted roster row");
@@ -434,14 +441,14 @@ function activationFrameSet(): {
     controllerItem("owned-native-row-a", previousOwnerLabel),
     controllerItem("owned-native-row-b", ownerLabel),
   ]);
-  controller.renderRoster(32, 49);
+  controller.renderRoster(SIDEBAR_COLUMNS, 49);
   controller.handleInput(KEYS.down); // New -> Quit host
   controller.handleInput(KEYS.down); // Quit host -> A
   controller.handleInput(KEYS.down); // A -> B
   controller.handleInput(KEYS.altRight); // Main owns input, as immediately after an Enter activation
   assert.equal(controller.focus, "main");
-  const roster = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
-  const nativeWidth = OUTER_COLS - 32 - 1;
+  const roster = controller.renderRoster(SIDEBAR_COLUMNS, 49).lines.map((line) => stripGeneratedSgr(line));
+  const nativeWidth = OUTER_COLS - SIDEBAR_COLUMNS - 1;
   const rule = "─".repeat(nativeWidth);
   const rows = Array.from({ length: 49 }, () => "");
   rows[12] = `                   > ${staleDraftA}`; // the previous owner's not-yet-overwritten row
@@ -449,7 +456,7 @@ function activationFrameSet(): {
   rows[21] = `                   > ${draftB}`;
   rows[22] = rule;
   const compose = (main: readonly string[]): string => [ownerLabel,
-    ...roster.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
+    ...roster.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}│${main[index] ?? ""}`)].join("\n");
   const partialRows = [...rows];
   partialRows[22] = "";
   const settledRows = [...rows];
@@ -459,7 +466,7 @@ function activationFrameSet(): {
     draftB,
     staleDraftA,
     nativeWidth,
-    options: { ownerLabel, draft: draftB, sidebarColumns: 32, nativeWidth, focus: "main" },
+    options: { ownerLabel, draft: draftB, sidebarColumns: SIDEBAR_COLUMNS, nativeWidth, focus: "main" },
     partial: compose(partialRows),
     transitional: compose(rows),
     settled: compose(settledRows),
@@ -538,7 +545,7 @@ test("the settled-frame activation fence waits past a mixed frame and still fail
   // fence waiting it away.
   const frames = activationFrameSet();
   const witness = { ownerLabel: frames.ownerLabel, draft: frames.draftB, nativeWidth: frames.nativeWidth,
-    focus: "main" as const, sidebarColumns: 32 };
+    focus: "main" as const, sidebarColumns: SIDEBAR_COLUMNS };
 
   const driver = activationFenceDriver(frames.partial, [
     { frame: frames.transitional, afterMs: 20 },
@@ -567,19 +574,152 @@ test("the settled-frame activation fence waits past a mixed frame and still fail
     "the retained isolation assertion still fails a persistent cross-session row");
 });
 
+/**
+ * Synthetic composed frames for one inactive exited-row deletion: exited A is
+ * highlighted beside live active B, whose unsent draft sits on a lower native
+ * editor row. `deleted` draws the complete one-card roster with no card
+ * highlight, and is the frame the deletion wait accepts. `sidebarRows` lets a
+ * frame keep A's card; `draftRow: false` is the same frame with B's editor row
+ * still erased by the writer's per-row `CUP + ERASE_ROW` prefix, exactly as a
+ * capture taken before that row's text arrives. Controlled text only.
+ */
+function inactiveDeletionFrames() {
+  const titleA = "Exited A";
+  const titleB = "Native B";
+  const draftB = "unsent-draft-for-B";
+  const background = "  bg tasks unknown | shells unknown";
+  const compose = (sidebarRows: readonly string[], draftRow: boolean): string => {
+    const right = Array.from({ length: 16 }, () => "");
+    right[2] = " B conversation";
+    right[13] = " ────────────";
+    right[14] = ` ${draftB}`;
+    right[15] = " ────────────";
+    return [titleB, ...right.map((native, index) => (index === 14 && !draftRow
+      ? "" // the erased, not-yet-rewritten editor row
+      : `${(sidebarRows[index] ?? "").padEnd(SIDEBAR_COLUMNS)}│${native}`))].join("\n");
+  };
+  const beforeRows = [" Sessions (2) ", titleA, "> exited (code 0)", background,
+    titleB, "  agent idle | input none", background,
+    "  Saved conversations", "  New session", "  Quit host"];
+  const afterRows = [" Sessions (1) ", titleB, "  agent idle | input none", background,
+    "  Saved conversations", "> New session", "  Quit host"];
+  return {
+    titleA, titleB, draftB,
+    before: compose(beforeRows, true),
+    deletedDraftPending: compose(afterRows, false),
+    deleted: compose(afterRows, true),
+    stillListsA: compose(beforeRows.map((row) => row.replace("> exited", "  exited")), true),
+  };
+}
+
+/**
+ * Drive the actual `MainPtyDriver.removeExitedNativeSession` on a controlled
+ * frame-signal fixture, like `activationFenceDriver`: the same `ChangeSignal`,
+ * frame text/revision, and removal bookkeeping the method reads, with the
+ * already-confirmed exit evidence (kernel, PTY onExit, quit shutdown, existing
+ * conversation file) it requires. Only the sidebar Delete key moves the fixture:
+ * each later frame is delivered on its own timer, as further outer output.
+ */
+function inactiveDeletionDriver(
+  frames: ReturnType<typeof inactiveDeletionFrames>,
+  afterDelete: readonly { readonly frame: string; readonly afterMs: number }[],
+) {
+  const existingFile = RUNNER_FIXTURE; // only existence is read
+  const owned = (title: string, pid: number) => ({
+    workspace: `/owned/${pid}`, rowProbe: title, displayName: title, currentName: title,
+    record: { pid, sessionId: `session-${pid}`, sessionFile: existingFile },
+    exitWatcher: { observedExit: pid === 101 },
+  }) as unknown as OwnedSession;
+  const sessionA = owned(frames.titleA, 101);
+  const sessionB = owned(frames.titleB, 202);
+  const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  const removedWorkspaces = new Set<string>();
+  const keys: string[] = [];
+  let revision = 1;
+  Object.assign(driver, {
+    frameSignal: new ChangeSignal(),
+    currentFrame: frames.before,
+    frameRevision: revision,
+    parserError: undefined,
+    exitEvent: undefined,
+    removedWorkspaces,
+    displayedRow: undefined,
+    sidebarColumnCount: () => SIDEBAR_COLUMNS,
+    sessions: () => [sessionA, sessionB].filter((session) => !removedWorkspaces.has(session.workspace)),
+    ptyExits: () => [{ type: "pty_exit", pid: 101, exitCode: 0 }],
+    records: () => [{ type: "session_shutdown", pid: 101, reason: "quit" }],
+    ensureSidebarFocus: async () => undefined,
+    moveRosterTo: async () => undefined,
+    pty: {
+      write: (data: string) => {
+        keys.push(data);
+        if (data !== KEYS.delete) return;
+        afterDelete.forEach((delivery) => setTimeout(() => {
+          revision += 1;
+          Object.assign(driver, { currentFrame: delivery.frame, frameRevision: revision });
+          driver.frameSignal.notify();
+        }, delivery.afterMs));
+      },
+    },
+  });
+  return { driver, sessionA, keys };
+}
+
+test("inactive exited-row deletion returns only a settled frame and still fails a settled roster that keeps the row", async () => {
+  // `SessionHostFrameWriter` rewrites changed rows top to bottom, each behind a
+  // `CUP + ERASE_ROW` prefix and with no atomic frame marker, so the roster rows
+  // can already be complete while a lower native editor row is still erased.
+  // The deletion wait must not hand such a frame to its caller's draft
+  // assertion. It must also never wait away a genuine fault: a settled frame
+  // that lost the draft is returned as observed, and a settled frame that
+  // breaks the deletion postcondition fails the helper itself.
+  const frames = inactiveDeletionFrames();
+  assert.equal(parseRosterFrame(frames.deletedDraftPending).complete, true,
+    "the pending-draft frame already draws the complete post-deletion roster");
+  assert.equal(frames.deletedDraftPending.includes(frames.draftB), false,
+    "the pending-draft frame has not drawn B's editor row yet");
+
+  const racing = inactiveDeletionDriver(frames, [
+    { frame: frames.deletedDraftPending, afterMs: 20 },
+    { frame: frames.deleted, afterMs: 60 },
+  ]);
+  await racing.driver.removeExitedNativeSession(racing.sessionA);
+  assert.deepEqual(racing.keys, [KEYS.delete], "only the one real Delete key is sent");
+  assert.equal(racing.driver.currentText(), frames.deleted,
+    "deletion returns the settled frame, never the roster-complete frame whose editor row was still pending");
+  assert.ok(racing.driver.currentText().includes(frames.draftB),
+    "the caller's retained draft assertion reads the settled frame");
+
+  const lost = inactiveDeletionDriver(frames, [{ frame: frames.deletedDraftPending, afterMs: 20 }]);
+  await lost.driver.removeExitedNativeSession(lost.sessionA);
+  assert.equal(lost.driver.currentText(), frames.deletedDraftPending,
+    "a settled frame without the draft is returned as observed, never waited away");
+  assert.throws(() => assert.ok(lost.driver.currentText().includes(frames.draftB),
+    "inactive A removal preserves B's unsent native draft"),
+  "the retained draft assertion still fails a draft that is genuinely gone");
+
+  const regressed = inactiveDeletionDriver(frames, [
+    { frame: frames.deleted, afterMs: 20 },
+    { frame: frames.stillListsA, afterMs: 60 },
+  ]);
+  await assert.rejects(regressed.driver.removeExitedNativeSession(regressed.sessionA),
+    /settled frame still removes only Exited A's confirmed exited row/,
+    "a settled roster that still lists A fails the helper's own deletion postcondition");
+});
+
 // Guards the immutable startup-option contract as well as this alpha's
 // local-scripted-provider/no-session-override fixture boundary.
 test("roster navigation sends no key when its fresh complete frame already selects the destination", async () => {
   const frame = ["Session host", ...[
     " Sessions (0)", "  Saved conversations", "> New session", "  Settings", "  Quit host",
-  ].map((line) => line.padEnd(32) + "│Welcome")].join("\n");
+  ].map((line) => line.padEnd(SIDEBAR_COLUMNS) + "│Welcome")].join("\n");
   let displayed = ""; // The first synchronous probe is still an incomplete paint.
   let waits = 0;
   const keys: string[] = [];
   const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
   Object.assign(driver, {
     currentText: () => displayed,
-    sidebarColumnCount: () => 32,
+    sidebarColumnCount: () => SIDEBAR_COLUMNS,
     sessions: () => [],
     pty: { write: (key: string) => { keys.push(key); } },
     waitFrame: async (predicate: (text: string) => boolean) => {
@@ -775,7 +915,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(afterUnselectedBGuard.includes(labelB), "B's active native surface remains visible while the roster owns focus");
   const initialSessions = [sessionA, sessionB];
   for (const session of initialSessions) {
-    assert.equal(session.record.columns, 87, "the outer wide sidebar rectangle determines the initial native child width");
+    assert.equal(session.record.columns, 84, "the outer wide sidebar rectangle determines the initial native child width");
     assert.equal(session.record.rows, 49, "the native child excludes the outer header row");
     assert.equal(processIsAlive(session.record.pid), true, "the native child remains independently alive while another row is selected");
   }
@@ -830,7 +970,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // pane. Require its complete current-width repaint before inspecting B's
   // draft; a merely hidden roster is not a settled native-editor witness.
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
-    ownerLabel: labelB, draft: draftB, sidebarColumns: 32,
+    ownerLabel: labelB, draft: draftB, sidebarColumns: SIDEBAR_COLUMNS,
     nativeWidth: OUTER_COLS, focus: "hidden",
   }), "returning from inactive A's Edit repaints B's exact full-width native draft and owner", beforeInactiveEditReturn);
   assert.equal(driver.focus, "main", "editing inactive A leaves B as the active input owner");
@@ -887,8 +1027,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => text.includes("too small") && !text.includes("Workspace:"),
     "the real New form paints its bounded tiny-pane message without fabricating a field");
   await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
-  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
-    "three outer resizes of the displayed row leave the unviewed A on its original 87x49 pane");
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
+    "three outer resizes of the displayed row leave the unviewed A on its original 84x49 pane");
   assert.deepEqual(driver.paneGeometry(sessionB), { cols: 52, rows: 29 },
     "the displayed row tracks the current pane exactly");
   await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
@@ -951,14 +1091,14 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.focus = "main";
   driver.sidebarVisible = true;
   const beforeRestoredNative = driver.frameRevision;
-  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - 32 - 1, 49);
+  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - SIDEBAR_COLUMNS - 1, 49);
   // setOuterSize only observes first outer output and the resize records, so
   // require the COMPLETE restored editor: the exact owner header, the complete
   // roster with its Main-focused footer (no stale sidebar-only hints), a
   // width-correct bordered editor block, and B's exact unchanged draft. A
   // stale narrow frame, a partial repaint, or an altered draft never passes.
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
-    ownerLabel: labelB, draft: draftB, sidebarColumns: 32, nativeWidth: OUTER_COLS - 32 - 1,
+    ownerLabel: labelB, draft: draftB, sidebarColumns: SIDEBAR_COLUMNS, nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1,
   }),
   "Main completely repaints the restored wide native editor with B's unchanged exact draft",
   beforeRestoredNative);
@@ -997,19 +1137,19 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const recordCountBeforeWideShow = driver.records().length;
   await driver.toggleSidebar();
   await driver.waitForRecords((records) => records.slice(recordCountBeforeWideShow).some((record) => record.type === "resize"
-    && record.pid === sessionB.record.pid && record.columns === 87 && record.rows === 49),
-  "showing the wide sidebar creates a fresh 87x49 resize for the displayed row B");
+    && record.pid === sessionB.record.pid && record.columns === 84 && record.rows === 49),
+  "showing the wide sidebar creates a fresh 84x49 resize for the displayed row B");
   await driver.assertPanesUnchanged([sessionA], recordCountBeforeWideShow,
     "showing the wide sidebar does not resize the row this host does not display");
-  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
-    "the unviewed row still reports its original 87x49 pane after both hide and show transitions");
-  // Reopening reflows B's native child back to the 87-column pane while the
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
+    "the unviewed row still reports its original 84x49 pane after both hide and show transitions");
+  // Reopening reflows B's native child back to the 84-column pane while the
   // sidebar owns focus, so its repaint is asynchronous. Require the complete
   // restored sidebar-focused frame for B before reading the draft, exactly as
   // for A's show transition: a mid-redraw right pane can never pass.
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
-    ownerLabel: labelB, draft: draftB, sidebarColumns: 32,
-    nativeWidth: OUTER_COLS - 32 - 1, focus: "sidebar",
+    ownerLabel: labelB, draft: draftB, sidebarColumns: SIDEBAR_COLUMNS,
+    nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "sidebar",
   }), "the reopened wide sidebar completely redraws B's exact restored sidebar-focused native editor");
   assert.ok(driver.currentText().includes(draftB), "B's native prompt remains visible behind the reopened sidebar");
   assert.equal(processIsAlive(bPid), true, "opening the sidebar does not pause the child");
@@ -1028,7 +1168,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // only focuses the sidebar (no hide, no native resize), and a second
   // deliberate press from that focused state hides it back to Main.
   await driver.waitFrame((text) => frameHeaderMatches(text, labelA)
-    && text.includes(draftA) && parseRosterFrame(text, 32).complete,
+    && text.includes(draftA) && parseRosterFrame(text, SIDEBAR_COLUMNS).complete,
   "A's exact active header, private draft, and complete roster are drawn before the focus-only press");
   // The witnessed Enter made A the row this host displays and therefore sizes.
   driver.noteDisplayedRow(sessionA);
@@ -1037,35 +1177,35 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.toggleSidebar();
   assert.equal(driver.sidebarVisible, true, "the first F8 press keeps the visible sidebar shown");
   assert.equal(driver.focus, "sidebar", "the first F8 press moves ownership to the visible sidebar");
-  assert.ok(isSidebarFocusedFrame(driver.currentText(), 32), "the first F8 press draws the complete sidebar-only roster");
+  assert.ok(isSidebarFocusedFrame(driver.currentText(), SIDEBAR_COLUMNS), "the first F8 press draws the complete sidebar-only roster");
   assert.equal(frameHeader(driver.currentText()), headerBeforeFocus, "the focus-first press leaves A as the active Main owner");
   assert.ok(driver.currentText().includes(draftA), "the focus-first press preserves A's native draft");
   assert.equal(processIsAlive(sessionA.record.pid), true, "the focus-first press never stops A's child");
   assert.equal(driver.records().filter((record) => record.type === "resize").length, resizeCountBeforeFocus,
     "the focus-first press does not resize any native child");
   await driver.toggleSidebar();
-  // Hiding the sidebar reflows A's native child from the 87-column pane to the
+  // Hiding the sidebar reflows A's native child from the 84-column pane to the
   // full outer width; its repaint is asynchronous and the focus/hide fence in
   // toggleSidebar observes only the sidebar pane. Require the genuinely
   // complete hidden-layout redraw — A's exact owner header, no roster remnant,
   // and the full-width bordered native editor whose content row is exactly the
   // unchanged draft — so a mid-reflow or partial child repaint can never pass.
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
-    ownerLabel: labelA, draft: draftA, sidebarColumns: 32, nativeWidth: OUTER_COLS, focus: "hidden",
+    ownerLabel: labelA, draft: draftA, sidebarColumns: SIDEBAR_COLUMNS, nativeWidth: OUTER_COLS, focus: "hidden",
   }), "the hide transition completely redraws A's exact full-width native editor");
   assert.equal(driver.sidebarVisible, false, "the next deliberate F8 press hides the sidebar-focused pane");
   assert.equal(driver.focus, "main", "hiding the sidebar returns ownership to Main");
   assert.ok(driver.currentText().includes(draftA), "A's draft remains intact when the second press hides the sidebar");
   assert.equal(processIsAlive(sessionA.record.pid), true, "the actual second F8 press leaves A's child alive");
   await driver.toggleSidebar();
-  // Reopening reflows the child back to the 87-column pane, again with an
+  // Reopening reflows the child back to the 84-column pane, again with an
   // asynchronous repaint; the sidebar fence alone can pass while the right pane
   // is still mid-redraw. Require the complete restored sidebar-focused frame:
   // A's exact owner header, the full roster with its sidebar-only footer, and
   // the width-correct bordered editor whose content row is exactly draftA.
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
-    ownerLabel: labelA, draft: draftA, sidebarColumns: 32,
-    nativeWidth: OUTER_COLS - 32 - 1, focus: "sidebar",
+    ownerLabel: labelA, draft: draftA, sidebarColumns: SIDEBAR_COLUMNS,
+    nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "sidebar",
   }), "the show transition completely redraws A's exact restored sidebar-focused native editor");
   assert.ok(driver.currentText().includes(draftA), "F8 reopens the sidebar without altering A's native draft");
   // Sidebar navigation fences only the complete selected roster row. A fresh
@@ -1077,8 +1217,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
     ownerLabel: labelA,
     draft: draftA,
-    sidebarColumns: 32,
-    nativeWidth: OUTER_COLS - 32 - 1,
+    sidebarColumns: SIDEBAR_COLUMNS,
+    nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1,
     focus: "sidebar",
     selectedRosterLabel: labelB,
   }), "after B is highlighted, a fresh complete frame retains A's owner, draft, native geometry, and sidebar focus",
@@ -1094,10 +1234,10 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // overwritten. Isolation is asserted on that settled frame, and the frame is
   // recorded whenever the assertion fails.
   await driver.waitFrame((text) => frameHeaderMatches(text, labelB)
-    && text.includes(draftB) && parseRosterFrame(text, 32).complete,
+    && text.includes(draftB) && parseRosterFrame(text, SIDEBAR_COLUMNS).complete,
     "only explicit Enter returns ownership to B with its exact header, private draft, and complete roster", beforeSelectB);
   const settledSelectB = await driver.settledNativeEditorFrame({
-    ownerLabel: labelB, draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+    ownerLabel: labelB, draft: draftB, nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "main",
   });
   assert.ok(settledSelectB.includes(draftB),
     "only explicit Enter returns ownership to B with its exact private draft on a settled frame");
@@ -1108,12 +1248,12 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
       + "(row-delta output mid-frame); isolation was judged on the settled frame");
   }
 
-  await driver.setOuterSize(100, 30, { viewed: sessionB, retained: [sessionA] }, 67, 29);
+  await driver.setOuterSize(100, 30, { viewed: sessionB, retained: [sessionA] }, 64, 29);
   assert.equal(driver.surface.frame().cols, 100, "the real outer PTY and terminal emulator observe the resized outer width");
   // A native resize receipt or first output byte is not a complete outer redraw.
   // Observe B's exact owner and the full roster before capturing the header for F8.
   await driver.waitFrame((text) => frameHeaderMatches(text, labelB)
-    && text.includes(draftB) && parseRosterFrame(text, 32).complete,
+    && text.includes(draftB) && parseRosterFrame(text, SIDEBAR_COLUMNS).complete,
   "the 100-column redraw completes B's exact active header, private draft, and full roster before F8");
   // A narrow pane overlays only while the roster owns focus. Establish that
   // state before testing a visible overlay's close/reopen transitions.
@@ -1134,7 +1274,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // takes the 52x19 pane this host shows, and the row this host stops
   // displaying keeps the pane it last reported instead of being re-flowed.
   const bPaneBeforeNarrowSelect = driver.paneGeometry(sessionB);
-  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+  assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
     "A still reports its last wide pane until this host actually displays it");
   const narrowSelectMarker = driver.recordCount();
   await driver.moveRosterTo(labelA);
@@ -1165,7 +1305,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     `switching to A preserves the separate B draft\nActual settled owned Main frame:\n${settledNarrowA}`);
 
   // Restore enough width for the real nested gate menu/editor interaction.
-  // A is the displayed row now, so only A takes the restored 87x49 pane; B
+  // A is the displayed row now, so only A takes the restored 84x49 pane; B
   // stays on the 52x19 pane it last reported (#474).
   const resizeOutputBefore = driver.outputRevision;
   const resizeRecordCountBeforeRestore = driver.records().length;
@@ -1173,8 +1313,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.surface.resize(OUTER_COLS, OUTER_ROWS);
   await driver.waitForOuterOutput(resizeOutputBefore, "the real Main redraws after restoring wide outer geometry");
   await driver.waitForRecords((records) => records.slice(resizeRecordCountBeforeRestore).some((record) =>
-    record.type === "resize" && record.pid === sessionA.record.pid && record.columns === 87 && record.rows === 49),
-  "A receives a fresh restored 87x49 native geometry record as the displayed row");
+    record.type === "resize" && record.pid === sessionA.record.pid && record.columns === 84 && record.rows === 49),
+  "A receives a fresh restored 84x49 native geometry record as the displayed row");
   await driver.assertPanesUnchanged([sessionB], resizeRecordCountBeforeRestore,
     "restoring the wide outer geometry does not resize the row this host does not display");
   assert.deepEqual(driver.paneGeometry(sessionB), bPaneBeforeNarrowSelect,
@@ -1186,7 +1326,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.pty.write(KEYS.ctrlC);
   await driver.waitFrame((text) => !text.includes(draftA), "native Ctrl+C clears A's draft before issuing a slash command", afterCtrlC);
   assert.equal(processIsAlive(sessionA.record.pid), true, "native Ctrl+C remains an editor action, not a host quit");
-  // The native field's complete help line is wider than the 87-column pane.
+  // The native field's complete help line is wider than the 84-column pane.
   // Two explicit presses provide the verified full 120-column native surface:
   // the first only focuses the visible sidebar, the second deliberately hides
   // it. Never bundle presses that could silently hide a visible Main frame.
@@ -1216,7 +1356,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   "the owned editor changed the field through the real Pi Ctrl+G action");
 
   const settledB = await driver.activateRoster(labelB, draftB, {
-    draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+    draft: draftB, nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "main",
   });
   // Live evidence of the transitional-paint mechanism: if the first frame that
   // already showed B's header and draft still carried A's text, the frame writer
@@ -1230,7 +1370,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(!settledB.includes(draftA),
     `A's text is not copied into B\nActual settled owned Main frame:\n${settledB}`);
   const settledA = await driver.activateRoster(labelA, draftA, {
-    draft: draftA, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+    draft: draftA, nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "main",
   });
   if (driver.lastActivationEvidence?.looseFrame.includes(draftB) === true) {
     t.diagnostic("activating A: the first frame showing A's header and draft still carried B's row "
@@ -1244,7 +1384,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(driver.records().some((record) => record.type === "session_shutdown" && record.pid === sessionA.record.pid),
     "the actual public Pi session_shutdown lifecycle ran for A");
   const settledAfterExit = await driver.activateRoster(labelB, draftB, {
-    draft: draftB, nativeWidth: OUTER_COLS - 32 - 1, focus: "main",
+    draft: draftB, nativeWidth: OUTER_COLS - SIDEBAR_COLUMNS - 1, focus: "main",
   });
   assert.ok(settledAfterExit.includes(draftB), "B's prompt survived A's normal native exit");
   const activeBHeaderBeforeARemoval = driver.currentText().split("\n")[0];
@@ -1281,8 +1421,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const bStartCountBeforeResume = driver.records().filter((record) => record.type === "session_start"
     && record.pid === sessionB.record.pid).length;
   const nativeResumeSelectsB = (text: string): boolean => text.includes("Resume Session (Current Folder)")
-    && text.split("\n").some((line) => line.slice(33).trimStart().startsWith(`› ${labelB} `));
-  await driver.writeAndWait("/resume", (text) => text.split("\n").some((line) => line.slice(33).trim() === "/resume"),
+    && text.split("\n").some((line) => line.slice(NATIVE_PANE_START).trimStart().startsWith(`› ${labelB} `));
+  await driver.writeAndWait("/resume", (text) => text.split("\n").some((line) => line.slice(NATIVE_PANE_START).trim() === "/resume"),
     "the exact public Pi /resume picker command is entered in B's native editor");
   await driver.writeAndWait(KEYS.enter, nativeResumeSelectsB,
     "Pi's real current-folder resume picker visibly highlights B's own saved native conversation");

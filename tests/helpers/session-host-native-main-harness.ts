@@ -70,6 +70,14 @@ import {
   sidebarRosterHidden,
   type RosterNavigationTarget,
 } from "./session-host-native-roster-witness";
+import {
+  captureStartIdentities,
+  newFormWorkspaceValue,
+  observeFreshStart,
+  observeWorkspaceSubmitWitness,
+  requiresSecondWorkspaceEnter,
+  type WorkspaceSubmitWitness,
+} from "./session-host-native-new-form-witness";
 import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./node-security-floor";
 
 export const TEST_TIMEOUT_MS = 8 * 60_000;
@@ -2138,7 +2146,7 @@ export class MainPtyDriver {
       : selected.label === label;
   }
 
-  /** Actual sidebar pane width: 32 wide, or the full narrow-overlay width. */
+  /** Actual sidebar pane width: 35 wide, or the full narrow-overlay width. */
   private sidebarColumnCount(): number {
     const cols = this.surface.frame().cols;
     return this.sidebarVisible && cols >= SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS ? SIDEBAR_COLUMNS : cols;
@@ -2514,24 +2522,40 @@ export class MainPtyDriver {
     await this.clearWorkspaceField("the native `ctrl+c clear` action removes any retained Workspace draft");
     await this.writeAndWait(canonicalWorkspace, (text) => text.includes(canonicalWorkspace.slice(-18)),
       "the explicit workspace is entered in the real native field");
-    const visibleWorkspace = (text: string): string | undefined => {
-      const fieldRows = text.split("\n");
-      const fieldIndex = fieldRows.findIndex((line) => line.includes("> Workspace:"));
-      if (fieldIndex < 0) return undefined;
-      const fieldColumn = fieldRows[fieldIndex]!.indexOf("> Workspace:") + "> Workspace: ".length;
-      // The label sits beside the editable content row, so the value is read
-      // from the labelled row itself, never from the Editor's rule above it.
-      return fieldRows[fieldIndex]!.slice(fieldColumn).trim();
-    };
+    // The one intended Enter is pressed, and the branch that may follow is
+    // chosen ONLY by a positive witness captured on the frame that matched it:
+    // the host's pending-create row, a fresh observer `session_start` for this
+    // exact workspace fenced against every identity already recorded, or the
+    // exact completed owned folder inside a complete New form. A repaint that
+    // merely lost the `> Workspace:` row is never evidence of a submission, and
+    // no later transient frame is re-read to decide the branch.
     const beforeFirstEnter = this.frameRevision;
+    const preexistingStarts = captureStartIdentities(this.records());
     this.pty.write(KEYS.enter);
-    await this.waitFrame((text) => !text.includes("> Workspace:") || text.includes("Starting (request")
-      || visibleWorkspace(text) === `${canonicalWorkspace}/`,
-    "native Enter accepts the exact folder completion or actually submits New", beforeFirstEnter);
-    const afterFirstEnter = this.currentText();
-    if (afterFirstEnter.includes("> Workspace:") && !afterFirstEnter.includes("Starting (request")) {
-      assert.equal(visibleWorkspace(afterFirstEnter), `${canonicalWorkspace}/`,
+    let firstEnter: WorkspaceSubmitWitness<SessionRecord> | undefined;
+    await this.waitFrame((text) => {
+      const witness = observeWorkspaceSubmitWitness(text, {
+        completedPath: `${canonicalWorkspace}/`,
+        freshStart: () => observeFreshStart(this.records(), {
+          workspace: canonicalWorkspace,
+          startType: "session_start",
+          fence: preexistingStarts,
+        }),
+      });
+      if (witness === undefined) return false;
+      firstEnter = witness; // the matched frame and record ARE the branch's evidence
+      return true;
+    },
+    "native Enter positively shows the completed owned folder in a complete New form, "
+      + "the host's pending-create row, or this workspace's fresh session_start",
+    beforeFirstEnter);
+    assert.ok(firstEnter !== undefined,
+      "the bounded frame wait resolves only once a positive New-form witness was captured");
+    if (requiresSecondWorkspaceEnter(firstEnter)) {
+      assert.equal(newFormWorkspaceValue(firstEnter.frame), `${canonicalWorkspace}/`,
         "first native Enter accepted the exact owned folder completion, not another path or an error");
+      // Exactly one further Enter, and only while the complete form still owns
+      // the field: a pending create or a fresh start never receives one.
       await this.writeKeys(KEYS.enter, "a separate native Enter submits the accepted Workspace path");
     }
     this.pendingWorkspace = canonicalWorkspace;
@@ -2794,7 +2818,37 @@ export class MainPtyDriver {
     assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is alive before its native Ctrl+C exit`);
     assert.ok(renderedTitleMatches(frameHeader(this.currentText()), session.displayName),
       "the explicit native exit begins with the exact uniquely observed title as active owner");
-    const alreadyExitedCards = countExitedCards(this.currentText(), this.sidebarColumnCount());
+    // This census is a BASELINE, not a status read: the wait below requires
+    // exactly ONE more exited card than it reports, so a baseline seeded from a
+    // frame that is missing another row's card can never be satisfied.
+    // `SessionHostFrameWriter` emits only the rows that changed since the frame
+    // it last wrote, with no atomic frame marker, so the header match above can
+    // be a mid-repaint slice in which an already-exited sibling's card, or this
+    // row's own updated status row, is still pending. Fence on the COMPLETE
+    // roster whose single highlight is this exact native owner, then the real
+    // frame writer going quiet, then read that settled frame synchronously and
+    // take the baseline from it — the same discipline the witnessed activation
+    // uses, with the census, its requirements, and every later assertion
+    // unchanged. No key is sent and no frame is invented by the fence.
+    const exitedCardCensusFence = (text: string, sidebarColumns: number): boolean => {
+      if (!renderedTitleMatches(frameHeader(text), session.displayName)) return false;
+      // The shared witness already requires a COMPLETE roster with exactly ONE
+      // highlight, so an ambiguous frame (a second highlighted entry, or a
+      // partial roster) never authorizes the baseline either.
+      const selected = selectedRosterEntry(text, sidebarColumns);
+      return selected !== undefined && selected.kind === "native"
+        && renderedTitleMatches(selected.title, session.displayName);
+    };
+    await this.waitFrame((text) => exitedCardCensusFence(text, this.sidebarColumnCount()),
+    `the exact active owned ${session.rowProbe} row is drawn on a complete roster before its exited-card census`);
+    await this.waitForFrameQuiet(`the real Main frame writer finishes repainting ${session.rowProbe}'s frame before its exited-card census`);
+    // No reentrant step separates this read from the census below, and the
+    // census value is taken only from the frame that passed the fence again.
+    const censusFrame = this.currentText();
+    const censusSidebarColumns = this.sidebarColumnCount();
+    assert.equal(exitedCardCensusFence(censusFrame, censusSidebarColumns), true,
+      `the settled frame still draws ${session.rowProbe} on a complete roster before its exited-card census\nActual owned Main frame:\n${censusFrame}`);
+    const alreadyExitedCards = countExitedCards(censusFrame, censusSidebarColumns);
     const otherLiveOwners = this.ownedSessions().filter((candidate) => candidate.record.pid !== session.record.pid
       && !candidate.exitWatcher.observedExit);
     for (const owner of otherLiveOwners) assert.equal(processIsAlive(owner.record.pid), true,
@@ -2877,15 +2931,27 @@ export class MainPtyDriver {
     assert.equal(this.selectedCaptionMatches(this.currentText(), session.displayName), true,
       "the Delete key is directed at the selected row's actual exited caption");
     const remainingRows = this.sessions().filter((candidate) => candidate.workspace !== session.workspace);
-    const beforeDelete = this.frameRevision;
-    this.pty.write(KEYS.delete);
-    await this.waitFrame((text) => this.rosterIsComplete(text)
+    const deletionApplied = (text: string): boolean => this.rosterIsComplete(text)
       && text.includes(`Sessions (${beforeRows - 1})`)
       && !this.rosterHasCaption(text, session.displayName)
       && remainingRows.every((candidate) => this.rosterHasCaption(text, candidate.displayName))
       && ["Saved conversations", "New session", "Quit host"].every((entry) => text.includes(entry))
-      && this.selectedCardTitle(text) === undefined,
+      && this.selectedCardTitle(text) === undefined;
+    const beforeDelete = this.frameRevision;
+    this.pty.write(KEYS.delete);
+    await this.waitFrame(deletionApplied,
     `the public Delete action removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight`, beforeDelete);
+    // `SessionHostFrameWriter` rewrites only changed rows, top to bottom, with no
+    // atomic frame marker, so the complete roster above can share the screen
+    // with a lower native row (a sibling's editor) that is still being
+    // rewritten. Callers read `currentText()` straight after this returns, so
+    // fence on the real frame writer going quiet and re-check the SAME deletion
+    // postcondition on that settled frame, as `closeNativeNormally` does for its
+    // census. Nothing is waited away: a settled frame is returned as observed.
+    await this.waitForFrameQuiet(`the real Main frame writer finishes repainting after ${session.rowProbe}'s row removal`);
+    const settledFrame = this.currentText();
+    assert.equal(deletionApplied(settledFrame), true,
+      `the settled frame still removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight\nActual owned Main frame:\n${settledFrame}`);
     this.removedWorkspaces.add(session.workspace);
     this.selectedNativeTarget = undefined;
     if (this.displayedRow?.pid === session.record.pid) this.displayedRow = undefined;

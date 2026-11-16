@@ -15,6 +15,394 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.288]
+
+### Added
+
+- **Native Claude Code and Codex sidebar rows (#277)**: the session host can now start
+  a real, full-screen interactive Claude Code or Codex CLI session as its own sidebar
+  row beside the Pi sessions, through the same owned PTY and terminal surfaces. The
+  New-session form gains a **Provider** line that still names **Pi** every time it
+  opens, and the **Workspace** field and its initial focus are unchanged. A native provider
+  is offered for this host and, separately, for a connected owner that advertises its own
+  targets, while an owner that advertises nothing
+  draws no Provider line and stays Pi-only. A host restart automatically resumes all
+  remembered native rows at their exact provider conversations, preserving workspace,
+  caption, roster order and active content. The provider-confirmed conversation UUID
+  and target id are remembered; executables, arguments and environment are not stored,
+  and the current target is revalidated before each restore. A row that cannot be
+  verified or restarted returns titled `<caption or Provider> (unavailable)`, never as
+  a latest, fresh or Pi substitute. A newly owned Claude run with exact resume proof
+  starts with the display baseline idle, input none, 0 tasks and 0 shells before any
+  prompt; current work or observation loss supersedes or withdraws it, and display
+  counts never become ownership or stop authority. Each new session still selects its
+  native target anew. A native target is the built-in default or an
+  explicit shared `externalAgents` entry — its command, base arguments, and base
+  environment — never the reviewer or executor role overlay, its model, or its
+  reasoning, and the command is located by the same discovery the settings
+  availability probe uses (an explicit path, a relative wrapper anchored to the chosen
+  workspace, `PATH` order, Windows `PATHEXT`, and the trusted parent
+  `SystemRoot\System32\cmd.exe` for a `.cmd`/`.bat` shim). A missing binary, or a
+  shared argument that names a headless or service mode, an approval, sandbox, or
+  hook-trust bypass, an existing-session attach, or a workspace-scope change, is a
+  refusal with no silent strip and no fallback; a hosted Codex row's interactive client
+  attaches to a private app-server backend this host starts for that row, so it carries
+  no host-added `--no-daemon` (a Codex launch this host does not front with its own
+  backend keeps that flag), and `--no-alt-screen` and any approval or headless flag are
+  never added. The child keeps the CLI's own
+  configuration, authentication, and state directories, and the host writes nothing
+  into the operator's stored provider settings, hooks, plugins, or trust stores; the
+  optional status observer reaches the provider only through that provider's own
+  per-session hook flags — a private temporary file this host owns for that launch
+  alone, or one added per-session configuration entry — and through no flag of ours at
+  all on a hosted Codex row, whose observer reads that row's own private backend. A native row carries
+  no review gate, tool protection, or subtask capture/review/landing guarantee: its card
+  reports the host-owned process facts (liveness, input, resize, exit) and, where that
+  row's own provider-side observer is armed, an observed agent state, the
+  current or last tool type, an observed pending question request, and that provider
+  harness's own live background task and shell counts.
+  Every other field stays `unknown`, and a `0` appears only
+  for a positively observed empty set — with no terminal scraping and no idle
+  inference. A paired owner can also start a native row when it advertises native
+  targets. `SessionSpawn`, the existing Pi remote owner-create, the Saved picker, and
+  the standalone launchers are unchanged. Windows sits inside this feature's
+  supported-platform scope. See
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md).
+- **An owned private backend behind each hosted Codex row (#277)**: a hosted Codex
+  row's interactive client now attaches to one app-server child this host starts for
+  that row alone, on numeric IPv4 loopback with an operating-system-chosen ephemeral
+  port, authenticated by a fresh capability token of which only the SHA-256 digest
+  reaches that child's generated arguments, and reached through a private relay that
+  forwards the provider's own bytes unchanged (the `Host` header is the only rewrite),
+  originates no application-layer message, never subscribes, starts, resumes, answers,
+  or approves, and refuses a second concurrent client. The row's five sidebar
+  categories come from one read-only connection to that backend once an ordinary fresh
+  candidate is positively proved — an empty pre-attach loaded-thread census, one genuine
+  client `initialize`, and one initial non-helper parentless thread start — so a
+  freshly launched, still unprompted row shows `Ready`, `input none`, and `0`/`0` only
+  from that thread's own complete idle read and complete empty sub-agent and
+  background-terminal censuses. That connection's own first successful turn start must
+  then name the same thread, which binds it on the same connection without a redial and
+  discards any read that may predate that turn. Fields stay `unknown`, never rest and
+  never zero, before that proof, after a failed read, or after a deliberate thread
+  change, while the interactive session itself stays fully usable and no provider
+  session-start hook is waited on. Input is `pending` while the provider flags the
+  thread as waiting or while one of that thread's own asynchronous questions is
+  unanswered, including while the provider's question queue is collapsed and while the
+  agent keeps working. Such a question clears only on the backend's committed native
+  reply naming it — partial answers clear only their own questions — or when the
+  provider retires its whole queue at that thread's current live turn end, which is not
+  reported as an answer. An ordinary new prompt from that same provider client drops
+  the provider's unanswered questions, but a question still on its way to the UI is not
+  dropped, so the questions held before that prompt become `unknown` rather than a stale
+  `pending` or a guessed `none`. A question asked after the prompt is `pending` again,
+  and a helper's prompt, another thread's or connection's prompt, or a backend
+  user-message echo clears nothing. No question, option, or answer text is kept. Question
+  or user-message metadata that cannot be read in full makes input `unknown`, never
+  `none`, without touching the other fields. That uncertainty recovers as soon as fresh
+  scoped evidence resolves it, such as committed replies naming every uncertain
+  question, or a complete copy of an unreadable question message on its current turn.
+  An unseen-question gap is never resolved by a reply to a different question, and
+  otherwise lasts until the current live turn end. This host arms no provider hook of its own for such a launch, a
+  configured target whose arguments choose a named provider profile is refused clearly
+  before any process, socket, or file exists, and stopping the row also stops its
+  backend and relay, which settle only on their own actual closures. Pi and Claude
+  rows, a Codex launch whose provider composed an ordinary descriptor,
+  `SessionSpawn`, the Saved picker, and the standalone
+  launchers are unchanged. See
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md#native-status-observation).
+- **Naming a native sidebar row (#277)**: `E` on a live native Claude or Codex row opens
+  the host's Edit form and stores one host-side caption for that row, so the operator can
+  tell several provider sessions apart and the row comes back under the same name with its
+  remembered slot. The caption belongs to the owning host and is shared with its authorized
+  viewers; it is not sent to the child or provider, never becomes provider conversation
+  identity, never resumes or auto-starts
+  anything, and does not touch the authenticated Pi rename path, which still requires a
+  row's observed native session tuple and behaves exactly as before. A name must be one
+  trimmed line of at most 80 characters with no control characters; an empty, padded,
+  multi-line, control-bearing, or oversized name is refused and changes nothing. A
+  remembered native placeholder is not a live row to caption, so `E` there states that
+  truthfully and opens nothing.
+  Naming also reports its own durability: if this host's roster publication for that
+  operation did not take — an unreadable store, an overflowed remembered sequence, or an
+  earlier failed write — the live row is still captioned and the host says the name
+  applies to this session only and will not return after a restart, instead of reusing an
+  earlier one-time roster warning as if it described this naming.
+- **Starting a native Claude Code or Codex row on a paired owner (#277)**: the New form's
+  **Provider** line is now scoped to the destination on the **Host** line. A Local choice
+  still offers this host's own configured targets; a connected remote owner offers only the
+  native targets that owner advertises, with its own labels and ids, and this host's ids are
+  never merged in or substituted. Choosing one sends one native owner-create request over
+  the existing paired roster channel under a new independent `roster-native-v1` capability,
+  and the owner starts the row with its own existing manager, run identity, and native launch
+  path — only the workspace comes from the request, and no target is selected, activated, or
+  focused. The provider identity is part of the written-form proof, so a frame that drew Pi,
+  another target, or another backend can never authorize this submission. A native choice
+  never carries into another destination: changing **Host**, reconnecting, a replacement owner
+  run, or a target the owner withdrew drops the choice and says so, and the submission is
+  refused rather than reinterpreted as a same-named Local id or silently retried as Pi. An
+  owner that advertises nothing draws no Provider line and keeps its ordinary Pi-only path,
+  and a destination whose channel never negotiated the lane reports one fixed unsupported
+  notice with nothing sent. Existing Pi remote create keeps its exact previous request shape.
+- **Renaming one of a paired owner's native rows (#277)**: `e` on a remote row the owner
+  itself reported as native opens the same shared Edit form and renames that row **on the
+  owner** under a second independent capability, `roster-native-name-v1`, which the create
+  lane never implies. The request carries only the exact owner run, the row id, the backend
+  the owner reported, and the bounded replacement caption — no Pi conversation id, session id,
+  or title — so it can never reach the Pi rename path, and the Pi remote rename keeps its
+  exact existing tuple-shaped request. Whether a row is native comes only from typed roster
+  metadata the owner sent: a caption, a label, a missing status, and this host's local
+  configuration never make a row look native. The owner answers with one of four distinct
+  truths — renamed and saved, renamed for this run only, refused, or unknown — and the
+  requester states each separately: it never claims a saved name for a temporary one, never
+  edits its own caption in advance, and never falls back to a Pi rename, a local mutation, or
+  a reconnect. An unknown result stays `UNCERTAIN: the host may have renamed that row; verify
+  its current name before retrying` and is never retried automatically.
+- **Native Windows batch and direct launches (#277)**: a native Claude or Codex
+  target that resolves to a `.cmd`/`.bat` shim now runs as one batch command line —
+  the trusted parent `SystemRoot\System32\cmd.exe` invoked as
+  `/d /s /v:off /c "<quoted command text>"` — delivered to the pinned PTY spawn as
+  its public pre-escaped command-line string rather than an argv array it would
+  re-escape, because cmd.exe does not treat a backslash as an escape. `/v:off`
+  names delayed expansion off, so a `!name!` in an operator's own argument stays
+  literal even on a machine that turns it on for every `cmd.exe`. cmd.exe expands
+  `%NAME%` while it reads the line and offers no escape, so each percent in the
+  batch text is delivered as one expansion of an internal carrier variable whose
+  value is exactly `%`, allocated under a name already checked free in the child's
+  environment and cleared by the same line before the shim runs — and so before the
+  CLI process inherits the environment. No argument is refused, expanded, or
+  reclassified to make the batch path work, and a native descriptor carrying an
+  unusable command line is refused rather than dropped or spawned as a bare
+  interpreter. A direct `.exe` — including one configured with a `node wrapper.js`
+  prefix — never touches `cmd.exe`: it keeps its argv, carries no command line, and
+  the owned PTY handle is the CLI process itself. Pi launches, POSIX launches, and
+  the shipped launcher's own Pi batch `/d /s /c` invocation are unchanged.
+- **Copying text out of a hosted native row (#277)**: a hosted Claude Code or Codex
+  row can now copy **text** out. That row's terminal surface is the only surface in
+  the host that opts into a hosted-provider OSC 52 text sink, and it parses rather
+  than relays: exactly one standard clipboard-selection field (empty is the standard
+  default-selection spelling) and one payload, a clipboard query refused outright
+  because this host never answers one and never sends clipboard content back toward a
+  child, and a payload required to be canonical base64 decoding to non-empty strict
+  UTF-8 text inside the unchanged 100,000-encoded-character producer bound (at most
+  75,000 decoded bytes); binary, empty, malformed, or over-bound payloads are refused
+  whole and never truncated. The recipient is the origin of the most recent **actual
+  accepted** nonempty input forwarded to that exact child — the owner's local Main
+  input or one viewer's verified input — never a selected form, a refused or rejected
+  request, a received copy request, or a terminal protocol reply, and it is frozen when
+  the owner accepts the copy, so input arriving later never retargets a copy already in
+  flight: viewer A then viewer B typing means B receives the next copy, while a copy
+  accepted for A before B typed stays A or is dropped. An ineligible recipient delivers
+  nothing — no fallback to the other peer, no broadcast, no retry, no queue, and no
+  global clipboard monitor — and a row nobody has typed into copies nowhere. Existing
+  pairing, consent, the per-viewer Remote input/copy setting, and the actual
+  written/uncovered/current-Main/source/backend/PTY-incarnation/geometry/run guards are
+  all still required, and the owner's own outer-terminal write keeps the Pi route's
+  actual-display proof. The copy rides a tuple-less `native-cli` source naming the row's
+  recorded backend and never a Pi conversation, under a new optional
+  `native-copy-cli-v1` capability negotiated only beside native IO and hosted native CLI
+  input; an acknowledgement naming it without them is a protocol violation, a peer that
+  never negotiated it gains nothing and refuses such a source, and the two producer
+  families never mix on one frame. Pi's existing authenticated per-dispatch copy support,
+  capsule authentication, and producer provenance are unchanged, raw OSC 52 stays
+  default-denied on every surface that did not opt in, and no image, file, clipboard
+  read, paste, right-click, status, notice, or count changed. Capture means the owner
+  accepted the request and wrote the outer one, not that any desktop clipboard changed:
+  tmux/screen-wrapped requests are not captured, and the reviewed Claude build's Linux
+  VTE helper-only path may emit nothing capturable. See
+  [Copying text out of a hosted row](docs/native-sidebar-agents.md#copying-text-out-of-a-hosted-row).
+- **One Codex child environment marker for terminal text copy (#277)**: a hosted Codex
+  child — built-in or an explicitly configured target — now carries `HERDR_ENV=1`, the
+  one value of an undocumented upstream branch (reviewed at the pinned `rust-v0.167.2`
+  tag) under which Codex writes one extra terminal OSC 52 copy request to its own
+  controlling terminal **in addition to** its own native OS clipboard write, which keeps
+  happening. It is applied to that composed child environment only, after every
+  environment source has merged, so the host-owned mode intentionally wins for that
+  single key over an inherited or configured value while every other entry keeps what the
+  ordinary composition gave it; the host process, the launcher options, a caller's
+  request object, a Claude child, and a native Pi child receive nothing. This is a
+  narrow compatibility use, not an integration: no HERDR code, repository, or dependency
+  is involved, upstream owns the semantics and they can change in a future release, and
+  no other provider argument, permission, authentication, or session setting is added.
+  `SSH_TTY`, `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, and `STY` stay exactly as inherited.
+  Pretending to be an SSH session would also switch off Codex's own clipboard-text
+  read, right-click paste, and local image links; multiplexer markers have other
+  unrelated effects. A hosted Codex row can still write
+  the owner's OS clipboard itself, and the host's forwarding is additional to the single
+  controller it routes to rather than a guarantee that the owner's clipboard was
+  untouched.
+- **Native sidebar status for a hosted provider row (#277)**: a hosted Claude Code or
+  Codex row can now report its own foreground state through the same shared sidebar
+  components that draw a Pi card — locally, and identically for a native row the
+  operator sees through a paired owner — covering the agent's working or rest state,
+  the current or last **tool type**, the existing `Working` / `Ready` activity
+  wording, an observed pending **question request**, and on a Claude Code row that
+  provider harness's own background task and shell counts. Each field holds one of
+  two answers and they are never conflated: an **observed value** — a
+  `0` only when the provider positively reported an empty set — or **`unknown`** for
+  a value that was never observed, failed, or was withdrawn after a gap. `unknown` is
+  ordinary pane text, never a zero and never painted as rest, and a
+  value that merely went missing stays `unknown` rather than
+  being relabelled. The background row always names both categories independently
+  (`bg tasks 2 | shells 0`), even when neither is observed
+  (`bg tasks unknown | shells unknown`); there is no combined fallback wording. A provider's
+  own subtasks and
+  shells are that provider's harness work, never this host's subtask or
+  background-shell registries: a provider number never enters the conservative
+  `backgroundTasks` / `backgroundShells` ownership channel, so no provider reading and
+  no displayed rest ever authorize an idle-only stop or removal, and a displayed
+  foreground rest is never complete idle proof. There is no terminal scraping, no
+  idle inference from a quiet period or a missing PID, and no heartbeat, queue,
+  retry, or replay — an observer that armed but never reached its provider, or that
+  lost its source, reports nothing and the row stays unknown. See
+  [Native status observation](docs/native-sidebar-agents.md#native-status-observation).
+- **Claude Code status from its own hooks and persisted turn end (#277)**: a Claude
+  row's observer consumes that run's own authenticated per-launch hook metadata —
+  session start and end, prompt submit, tool pre, post, and failure, stop and stop
+  failure, subagent start and stop. A question is a **request lifecycle**: a
+  question-tool `PreToolUse` opens a request and a matching `Post*` closes it, and
+  `Pre` means a question was *requested* — it is not proof that a human-visible
+  dialog was painted or that anything was answered. A valid observed root session
+  start establishes input `none` before the first request. Tool activity is **type-only**;
+  arguments, results, and question content never enter state. A turn is reported at
+  rest **only** from the positively bound persisted **root** `stop_hook_summary`
+  record the provider writes after every `Stop` hook has answered — this observer's
+  own `Stop` callback is never sufficient, because another operator's `Stop` hook
+  can block and continue the same turn — and an ambiguous, non-root, or gapped
+  source leaves the foreground unknown rather than keeping a stale rest claim, and a
+  positively observed running turn stands through a `Stop` this host cannot prove final
+  until the ordered terminal witness, newer root work, a contradiction, or a lane loss.
+  Task and shell counts are a **live membership census of that run**: the per-run set
+  starts only on evidence that can vouch for it — this host's own launch of that
+  provider child, or one complete **root** membership snapshot — and each positively
+  observed launch identity and its matching completion **updates** that exact number
+  rather than withdrawing it, with a complete root `Stop` snapshot of the documented
+  `background_tasks` array replacing the whole set and outranking anything remembered.
+  An empty array is a real empty *in-flight* census, while the published task figure
+  stays that set unioned with the run's live agent identities — so an empty array beside
+  one still-live parked agent reads tasks 1 / shells 0 — and an absent snapshot is
+  unknown, while a subagent's snapshot is never used as root scope. A root `Stop`'s
+  identity-free totals stand last-reported only while no exact set exists and no live
+  agent needs reconciling, and any membership edge clears them. A genuine hole — a
+  settle for an id never launched, a member that cannot be keyed, a malformed snapshot,
+  a confirmed lane gap, or a scope change — withdraws the affected category, or both
+  when the hole cannot be attributed. There is no
+  process counting, no quiet-period inference, and no reconstructed edges.
+- **Codex status from its own hook and rollout records (#277)**: a Codex row's observer
+  binds its own owned root thread and
+  reads that thread's durable records — turn start, durable turn terminal, abort, and
+  persisted tool items — together with that run's own hook metadata, refusing
+  descendant-scoped events and nested turns as root authority and refusing a replayed
+  or ambiguous terminal any second rest claim. A raw hook `Stop`, and a notification,
+  is **never** a terminal: a blocking `Stop` hook continues the same turn, so the
+  durable terminal in the rollout is the only rest witness. Nothing the host has not
+  observed is reported as a value, and questions and approvals stay in Codex's own UI.
+- **Arming a native row's observer without touching operator configuration (#277)**:
+  observation is armed per launch and never by editing anything the operator owns. A
+  fresh child-only `PI_REVIEW_GATE_NATIVE_HOOK_BOOTSTRAP` environment marker carries
+  that launch's one-shot bootstrap, so no token ever appears in provider hook command
+  text — which is also what keeps one host's generated hook command byte-identical
+  from row to row, while a changed package path or command can still need the
+  operator's approval again. Claude Code gets a hooks-only `--settings` file **only**
+  when the configured arguments carry none of their own (a second one would replace
+  the operator's settings layer); otherwise the host adds one extra session-scoped
+  `--plugin-dir` holding a hooks-only plugin — a minimal manifest plus classic
+  `hooks/hooks.json`, with no JavaScript mod, MCP server, tool, command, or skill in
+  it — and every existing entry stays exactly as configured. A Codex launch this host
+  does not front with its own backend gets exactly one
+  non-conflicting `-c hooks.SessionStart=[…]` entry, skipped entirely when the
+  operator already writes `hooks` or `hooks.SessionStart` in real option position,
+  because adding one there would replace theirs, while a hosted Codex row gets no hook,
+  marker, or staged artifact of ours at all because its observer reads that row's own
+  private backend; file-based hook layers from other
+  sources stay additive. Nothing is installed, no global or project settings or hook
+  file is written, no trust record (`hooks.state`) is touched, nothing is
+  auto-trusted, and no permission or hook-trust posture is overridden — the
+  provider's own workspace-trust, sideload-flag, marketplace, and hook-disabling
+  policy and Codex's own hook review-and-trust step stay fully in front, and a hook
+  they decline simply leaves that row unknown while its launch stays exactly as
+  configured. Only selected event metadata and one validated native count projection
+  are forwarded: no question text, answer, prompt text, tool argument, tool result,
+  transcript line, or terminal output is relayed, logged, or broadcast. The one
+  deliberate read, stated plainly: on a Claude row the owner **does** read bounded
+  bytes from **one** provider-named, already-owned native JSONL transcript — the path
+  that run's own hook payload named — to confirm a real root turn end and to notice
+  structured task transitions, retaining and relaying no record text. There is no
+  `HOME` or history scan, no session-directory search, no global clipboard watch, no
+  raw recording, no extra service, and no listener or port for the hook lane, and no
+  replacement conversation. The
+  Claude routes stage their files in a freshly created private temporary root this
+  host owns (`0700` directories, `0600` files, exclusive creation, never inside a
+  workspace), and cleanup removes only the exact entries that one preparation
+  created, deepest first, and only where each is still the object it created — same
+  device and inode, of the expected kind, checked without following a link, under a
+  recorded root and ancestry that still carry the identities they were created with.
+  An unprovable or changed ancestor fails closed; a symlink standing where a recorded
+  directory was is another object, so nothing below it is removed through it; a
+  directory now holding an entry that preparation never created is not removed and
+  keeps it; contents are never read or digested, so an in-place edit of a created
+  file keeps its identity and is removed with the rest. Nothing is swept or deleted
+  recursively, and the lease is released only after that row's provider source and PTY
+  have settled.
+
+### Changed
+
+- **Live Claude background membership (#277)**: a Claude Code row's task and shell
+  figures are now a per-run membership set — exact from this host's own launch baseline
+  or a complete root membership snapshot, each positively observed launch and completion
+  edge **updating** that exact figure rather than withdrawing it, with a last-reported
+  root `Stop` total standing behind it only while no exact set and no live agent
+  contradict that total — and the task
+  figure is the distinct union of that run's non-shell members and its live agent
+  identities, so one agent is one task and a background shell it launched stays a
+  shell, and an empty in-flight census beside one still-live parked agent reads
+  tasks 1 / shells 0. An agent stops being counted only on its own established end (a clean turn
+  boundary in the same execution window plus its own recorded terminal completion),
+  never on a snapshot omission, a turn boundary alone, a genuinely blocking question,
+  or the rest of the session emptying out. A count is dropped only by what can
+  contradict it and never by an ordinary keyed edge; a hole withdraws only the category
+  it can be attributed to; a
+  positively observed running turn stands through an unproven `Stop` boundary, and the
+  figures stay advisory display with no stop or idle authority.
+
+- **Session-host sidebar width (#277)**: the shared sidebar pane is now a fixed
+  35 columns, so the always-present `bg tasks … | shells …` count row and the
+  agent/input status row fit at the actual production width even when both
+  counts are unknown. When an overflowing roster's scrollbar lane reserves one
+  column, the count row yields a leading blank cell so both labels and values
+  remain whole; the lane's own bounds and hit target are unchanged. The split
+  point moves to 56 outer columns; the divider, overlay boundary, hidden
+  full-width native pane, focus/input fences, wording, and colors are unchanged.
+  The width is fixed and never derived from counts. This is presentation only:
+  it does not change any unknown, liveness, or source observation.
+
+- **The native New form draws Provider above Workspace (#277)**: the session host's
+  New-session form now draws its lines in the order **Host**, **Provider**, **Workspace**,
+  and the keyboard ring follows that drawn order — one `Shift+Tab` from the workspace field
+  reaches **Provider** (or **Host** when no Provider line is drawn), another reaches
+  **Host**, and `Tab` steps back down through **Provider** to the field. The field still
+  opens focused and still submits on `Enter`, the Provider line still costs exactly one
+  spare row, and a pane with nothing to spare still draws no Provider line and gives focus
+  to nothing undrawn. The native workspace field now accepts the same spellings the Pi
+  workspace field accepts, because both share the host's existing resolver: `~`, `~/…`, a
+  path relative to the process working directory, and an absolute path all resolve to one
+  canonical existing directory before anything spawns, with no shell, no `~otheruser`
+  expansion, and no `$VAR` expansion for either backend.
+
+### Tests
+
+- **Native Windows launch acceptance (#277)**: a real-ConPTY tier drives the production
+  native launcher and the session manager through their default pinned
+  `@lydell/node-pty` factory on a real Windows host — batch command-line delivery,
+  percent- and bang-literal handling with no carrier left behind, the `--no-daemon`
+  option position, addressed input and resize isolation between sibling rows, and the
+  Windows stop and exit semantics with no POSIX signal requested by the host — and
+  three cross-platform cases pin the command-line wiring those cases depend on. Both
+  existing Windows jobs run those files as their own step, and a missing Windows
+  prerequisite fails the cases instead of skipping them. Every child there is a
+  synthetic Node program behind a synthetic batch shim: no provider CLI, credential,
+  or model call.
+
 ## [0.1.0-dev.287]
 
 ### Changed

@@ -11,6 +11,7 @@ import type { HostPaneRect } from "./compositor";
 import {
   DEFAULT_SESSION_CONTENT_BOUNDS,
   NATIVE_IO_MAX_SOURCE_TOKEN_BYTES,
+  isNativeIoNativeCliSource,
   isNativeIoStartupSource,
   type NativeIoInputSource,
 } from "./network/session-content-protocol";
@@ -44,10 +45,10 @@ export interface WrittenRemoteNativeInput {
   readonly selectionGeneration: number;
   readonly subscriptionId: string;
   /**
-   * Exact host-written source of the drawn viewport: a conversation source, or the
-   * explicit tuple-less startup source of a publish that named no conversation. A
-   * startup receipt is input-only: a copy (always conversation-sourced) never
-   * matches it.
+   * Exact host-written source of the drawn viewport: a conversation source, the
+   * explicit tuple-less startup source of a Pi publish that named no conversation, or
+   * the tuple-less native CLI source of a hosted provider row. A tuple-less receipt is
+   * input-only: a copy (always conversation-sourced) never matches it.
    */
   readonly source: NativeIoInputSource;
   /** Exact observed input modes of that same drawn publish. */
@@ -182,19 +183,36 @@ export function readRemoteNativeIoSource(
   if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > maxIdentifier) return undefined;
   if (hostRunId !== expected.hostRunId || sessionId !== expected.sessionId) return undefined;
   if (Object.prototype.hasOwnProperty.call(record, "phase")) {
-    // The explicit startup source: coherent only with a publish that names NO
-    // native conversation, and never carrying a tuple key of its own.
-    if (record.phase !== "startup" || expected.nativeSession !== null
-      || Object.prototype.hasOwnProperty.call(record, "nativeSession")) return undefined;
-    const startupFacts = readRemoteSourceFacts(record, expected.geometry);
-    if (startupFacts === undefined) return undefined;
+    // A tuple-less source: coherent only with a publish that names NO native
+    // conversation, and never carrying a tuple key of its own. The startup variant
+    // names a Pi row's explicit startup phase; the native CLI variant names a hosted
+    // provider backend and nothing else.
+    const nativeCli = record.phase === "native-cli";
+    if (!nativeCli && record.phase !== "startup") return undefined;
+    if (expected.nativeSession !== null || Object.prototype.hasOwnProperty.call(record, "nativeSession")) {
+      return undefined;
+    }
+    if (nativeCli && record.backend !== "claude" && record.backend !== "codex") return undefined;
+    const tuplelessFacts = readRemoteSourceFacts(record, expected.geometry);
+    if (tuplelessFacts === undefined) return undefined;
+    if (nativeCli) {
+      return Object.freeze({
+        hostRunId,
+        sessionId,
+        phase: "native-cli" as const,
+        backend: record.backend as "claude" | "codex",
+        geometry: tuplelessFacts.geometry,
+        viewerRevision: tuplelessFacts.viewerRevision,
+        sourceToken: tuplelessFacts.sourceToken,
+      });
+    }
     return Object.freeze({
       hostRunId,
       sessionId,
       phase: "startup" as const,
-      geometry: startupFacts.geometry,
-      viewerRevision: startupFacts.viewerRevision,
-      sourceToken: startupFacts.sourceToken,
+      geometry: tuplelessFacts.geometry,
+      viewerRevision: tuplelessFacts.viewerRevision,
+      sourceToken: tuplelessFacts.sourceToken,
     });
   }
   if (expected.nativeSession === null) return undefined;
@@ -254,15 +272,20 @@ function nativeIoReceiptKey(receipt: WrittenRemoteNativeInput | undefined): stri
   const source = receipt.source;
   const modes = receipt.inputModes;
   const rect = receipt.nativeContent;
-  // The phase and the tuple are explicit key facts: a startup receipt and a
-  // conversation receipt can never share a key, so a phase/source-only change is a
-  // genuine writer boundary even when the pixels are identical.
-  const phase = isNativeIoStartupSource(source) ? "startup" : "conversation";
-  const tupleId = isNativeIoStartupSource(source) ? null : source.nativeSession.sessionId;
-  const tupleEpoch = isNativeIoStartupSource(source) ? null : source.nativeSession.epoch;
+  // The phase, the backend, and the tuple are explicit key facts: a startup receipt,
+  // a native CLI receipt, and a conversation receipt can never share a key, and
+  // neither can a claude and a codex native CLI receipt, so a phase, backend, or
+  // source-only change is a genuine writer boundary even when the pixels are
+  // identical.
+  const startup = isNativeIoStartupSource(source);
+  const nativeCli = isNativeIoNativeCliSource(source);
+  const phase = nativeCli ? "native-cli" : startup ? "startup" : "conversation";
+  const backend = nativeCli ? source.backend : null;
+  const tupleId = startup || nativeCli ? null : source.nativeSession.sessionId;
+  const tupleEpoch = startup || nativeCli ? null : source.nativeSession.epoch;
   return JSON.stringify([
     receipt.hostId, receipt.hostRunId, receipt.rowId, receipt.selectionGeneration, receipt.subscriptionId,
-    phase, source.hostRunId, source.sessionId, tupleId, tupleEpoch,
+    phase, source.hostRunId, source.sessionId, backend, tupleId, tupleEpoch,
     source.geometry.cols, source.geometry.rows, source.geometry.revision,
     source.viewerRevision, source.sourceToken,
     modes.kittyFlags, modes.applicationCursorKeys, modes.applicationKeypad, modes.bracketedPaste,

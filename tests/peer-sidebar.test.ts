@@ -1153,7 +1153,7 @@ test("remote host rows stay honest metadata and never emit a local session actio
   assert.ok(text.includes("roster stale (1 last seen)") && text.includes("auto retry suppressed until Connect"));
   assert.ok(text.includes("roster never observed"), "never-observed rosters are stated, never empty");
   assert.ok(text.includes("build | agent unknown"));
-  assert.ok(text.includes("background unknown"), "unknown counts are never zero");
+  assert.ok(text.includes("bg tasks unknown | shells unknown"), "unknown counts are never zero");
   assert.ok(text.includes("input unknown"));
   assert.ok(text.includes("/owner/work/build"), "the exact owner workspace stays display-only data");
   assert.ok(text.includes("old-row [stale]"), "stale rows are marked");

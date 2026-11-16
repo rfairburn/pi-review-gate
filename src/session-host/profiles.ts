@@ -204,8 +204,15 @@ export function expandUserPath(input: string, homeDir: string = homedir()): stri
  * An existing directory in canonical real form. Tilde prefixes are expanded,
  * relative paths resolve against the process working directory, the path must
  * exist and be a directory, and the result is the canonical real path.
+ *
+ * This is the host's ONE workspace-shaped directory resolution. Every caller
+ * shares the same meanings — a leading bare `~`/`~/`, the process working
+ * directory for a relative spelling, and the canonical real path on success —
+ * so no surface keeps a second resolver, and no surface resolves through a
+ * shell. Nothing here expands environment variables or `~otheruser` forms:
+ * those stay the invoking shell's business, exactly as for Pi.
  */
-function resolveExistingDirectory(input: string, label: string): string {
+export function resolveExistingDirectory(input: string, label: string): string {
   const expanded = expandUserPath(input);
   const absolute = resolve(expanded);
   let stats;

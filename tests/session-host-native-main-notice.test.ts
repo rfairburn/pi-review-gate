@@ -39,6 +39,7 @@ import {
   NATIVE_PANE_START,
   renderedTitleMatches,
   rosterCards,
+  SIDEBAR_COLUMNS,
   type RosterCardEntry,
 } from "./helpers/session-host-native-roster-witness";
 
@@ -155,7 +156,7 @@ function providerJournalRecords(path: string): ProviderJournalRecord[] {
 }
 
 function cardFor(text: string, label: string): RosterCardEntry | undefined {
-  const matches = rosterCards(text, 32).filter((card) => renderedTitleMatches(card.title, label));
+  const matches = rosterCards(text, SIDEBAR_COLUMNS).filter((card) => renderedTitleMatches(card.title, label));
   return matches.length === 1 ? matches[0] : undefined;
 }
 

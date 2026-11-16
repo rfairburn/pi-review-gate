@@ -172,6 +172,8 @@ class RosterNegotiationTest {
                 RosterWire.SAVED_CAPABILITY,
                 RosterWire.RENAME_CAPABILITY,
                 RosterWire.ROSTER_SLOT_CAPABILITY,
+                RosterWire.NATIVE_CAPABILITY,
+                RosterWire.NATIVE_NAME_CAPABILITY,
             ),
             RosterWire.KNOWN_OPTIONAL_CAPABILITIES,
         )

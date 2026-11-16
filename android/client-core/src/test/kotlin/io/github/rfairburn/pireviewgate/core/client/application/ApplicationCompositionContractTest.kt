@@ -150,6 +150,10 @@ class ApplicationCompositionContractTest {
                 "positive", activity = "[\"Ready\"]", activeTasks = "2", activeShells = "1",
                 backgroundTasks = "0", backgroundShells = "0",
             ),
+            deliveredRow(
+                "unreported", activity = "[]", activeTasks = "null", activeShells = "null",
+                backgroundTasks = "6", backgroundShells = "2",
+            ),
         )
         val projected = ClientProjection()
             .hosts(registry(), runtime(roster(1, complete(delivered))))
@@ -159,17 +163,18 @@ class ApplicationCompositionContractTest {
         // own: zero is a count, a missing member stays unknown, and they are independent.
         assertEquals(
             listOf(
-                SessionCardBackground.Counts(0L, 0L),
-                SessionCardBackground.Counts(null, 3L),
-                SessionCardBackground.Counts(2L, 1L),
+                SessionCardBackground(0L, 0L),
+                SessionCardBackground(null, 3L),
+                SessionCardBackground(2L, 1L),
+                SessionCardBackground(null, null),
             ),
             projected.map { sessionCardBackground(it.metadata) },
         )
         // Ownership counts are a different fact and never become intent counts.
-        assertEquals(listOf(9L, 5L, 0L), projected.map { it.metadata.backgroundTasks })
-        assertEquals(listOf(8L, null, 0L), projected.map { it.metadata.backgroundShells })
+        assertEquals(listOf(9L, 5L, 0L, 6L), projected.map { it.metadata.backgroundTasks })
+        assertEquals(listOf(8L, null, 0L, 2L), projected.map { it.metadata.backgroundShells })
         // The compact card line is the delivered nonblank line; an empty delivery invents none.
-        assertEquals(listOf(null, "Working", "Ready"), projected.map { sessionCardActivityLine(it.metadata) })
+        assertEquals(listOf(null, "Working", "Ready", null), projected.map { sessionCardActivityLine(it.metadata) })
         // Decoding and projection added nothing to the delivered rows.
         assertEquals(delivered, projected.map { it.metadata })
     }
@@ -197,7 +202,7 @@ class ApplicationCompositionContractTest {
 
         assertEquals(SessionRowKey.of(first), SessionRowKey.of(second))
         assertEquals(first.presentationIdentity, second.presentationIdentity)
-        assertEquals(SessionCardBackground.Counts(1L, 0L), sessionCardBackground(second.metadata))
+        assertEquals(SessionCardBackground(1L, 0L), sessionCardBackground(second.metadata))
         assertEquals("Working", sessionCardActivityLine(second.metadata))
     }
 

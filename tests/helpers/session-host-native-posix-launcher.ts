@@ -55,10 +55,21 @@ import {
   isSidebarFocusedFrame,
   parseRosterFrame,
   selectedRosterEntry,
+  SIDEBAR_COLUMNS,
   sidebarPaneLines,
   sidebarRosterHidden,
 } from "./session-host-native-roster-witness";
 import { isCompleteMainFocusedRoster } from "./session-host-native-row-lifecycle";
+import {
+  captureStartIdentities,
+  newFormPendingCreateDrawn,
+  newFormWorkspaceValue,
+  observeFreshStart,
+  observeWorkspaceSubmitWitness,
+  requiresSecondWorkspaceEnter,
+  type StartIdentityFence,
+  type WorkspaceSubmitWitness,
+} from "./session-host-native-new-form-witness";
 import {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
@@ -503,7 +514,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 function selectedRosterLabel(frame: string): string | undefined {
-  return selectedRosterEntry(frame, 32)?.label;
+  return selectedRosterEntry(frame, SIDEBAR_COLUMNS)?.label;
 }
 
 /**
@@ -512,7 +523,7 @@ function selectedRosterLabel(frame: string): string | undefined {
  * hints must all be drawn. A partial repaint never authorizes a stop.
  */
 export function hasPosixStopConfirmation(frame: string, title: string): boolean {
-  const pane = sidebarPaneLines(frame, 32).slice(1);
+  const pane = sidebarPaneLines(frame, SIDEBAR_COLUMNS).slice(1);
   const warning = pane.slice(2, -1).join(" ").replace(/\s+/gu, " ").trim();
   return pane[0]?.trim() === "Stop session?"
     && pane[1]?.trim() === title
@@ -527,6 +538,28 @@ function workspaceFieldEmpty(frame: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** One start this launcher run itself reported for one exact workspace. */
+export type PosixLauncherStartRecord = NativeJournalRecord | PtyJournalRecord;
+
+/**
+ * The launcher's fresh-start half of the shared positive New-form witness: the
+ * native observer's public `session_start`, or — once the real host has spawned
+ * the child but before that child's lifecycle is observed — the original public
+ * PTY's `pty_spawn` receipt. Both go through the shared fenced observer, so a
+ * record naming a PID or conversation id that already existed before the
+ * witnessed keystroke (an older row, an earlier create) is never read as this
+ * create's start, and a record for another workspace is never read at all.
+ */
+export function observePosixLauncherFreshStart(
+  nativeRecords: readonly NativeJournalRecord[],
+  ptyRecords: readonly PtyJournalRecord[],
+  options: { readonly workspace: string; readonly fence: StartIdentityFence },
+): PosixLauncherStartRecord | undefined {
+  const { workspace, fence } = options;
+  return observeFreshStart(nativeRecords, { workspace, startType: "session_start", fence })
+    ?? observeFreshStart(ptyRecords, { workspace, startType: "pty_spawn", fence });
 }
 
 function writeMetadata(path: string, record: Record<string, unknown>): void {
@@ -977,8 +1010,8 @@ export class PosixLauncherPtyDriver {
     }
     const expectHidden = wasVisible && !wasMainFocus;
     await this.waitFrame((frame) => expectHidden
-      ? sidebarRosterHidden(frame, 32)
-      : isSidebarFocusedFrame(frame, 32),
+      ? sidebarRosterHidden(frame, SIDEBAR_COLUMNS)
+      : isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
     "public F8 sidebar toggle", before);
   }
 
@@ -993,7 +1026,7 @@ export class PosixLauncherPtyDriver {
     if (!this.sidebarVisible || this.focus !== "sidebar") await this.toggleSidebar();
     assert.equal(this.focus, "sidebar");
     assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32), "the complete sidebar-only footer proves public sidebar focus");
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS), "the complete sidebar-only footer proves public sidebar focus");
   }
 
   async moveRosterTo(label: string): Promise<void> {
@@ -1032,18 +1065,45 @@ export class PosixLauncherPtyDriver {
         }
       });
     const acceptedPath = `${canonicalWorkspace}/`;
+    // Whether this one Enter already took the New submission or only accepted
+    // the field's exact owned-folder completion is decided ONLY by a positive
+    // witness captured on the frame that matched it: the host's own
+    // pending-create row, a start this launcher run reported for this exact
+    // workspace fenced against every native-observer and public-PTY-spawn
+    // identity recorded before the keystroke, or the exact completed owned
+    // folder inside a completely drawn New form. A repaint that merely lost the
+    // `> Workspace:` row proves nothing, and no later transient frame is
+    // re-read to choose the branch, so the one intended second Enter is never
+    // skipped and never sent into a child that has taken input ownership.
     const beforeFirstEnter = this.frameRevision;
+    const preexistingStarts = captureStartIdentities([...this.records(), ...this.ptyRecords()]);
+    const freshStart = () => observePosixLauncherFreshStart(this.records(), this.ptyRecords(),
+      { workspace: canonicalWorkspace, fence: preexistingStarts });
     this.write(KEYS.enter, "accept workspace completion or submit");
-    await this.waitFrame((frame) => !frame.includes("> Workspace:") || frame.includes("Starting (request")
-      || (() => { try { return borderedEditorContentMatches(frame, "> Workspace:", acceptedPath); } catch { return false; } })(),
-    "first native Enter accepts the exact owned folder completion or actually submits New", beforeFirstEnter);
-    const afterFirstEnter = this.currentText();
-    if (afterFirstEnter.includes("> Workspace:") && !afterFirstEnter.includes("Starting (request")) {
-      assert.ok(borderedEditorContentMatches(afterFirstEnter, "> Workspace:", acceptedPath),
+    let firstEnter: WorkspaceSubmitWitness<PosixLauncherStartRecord> | undefined;
+    await this.waitFrame((frame) => {
+      const witness = observeWorkspaceSubmitWitness(frame, { completedPath: acceptedPath, freshStart });
+      if (witness === undefined) return false;
+      firstEnter = witness; // the matched frame and record ARE the branch's evidence
+      return true;
+    },
+    "first native Enter positively shows the completed owned folder in a complete New form, "
+      + "the host's pending-create row, or this workspace's fresh launcher start",
+    beforeFirstEnter);
+    assert.ok(firstEnter !== undefined,
+      "the bounded frame wait resolves only once a positive New-form witness was captured");
+    if (requiresSecondWorkspaceEnter(firstEnter)) {
+      // Exactly one further Enter, and only while the complete form still owns
+      // the field: a pending create or a fresh start never receives one.
+      assert.equal(newFormWorkspaceValue(firstEnter.frame), acceptedPath,
         "first native Enter accepted exactly the owned directory completion, not another path or an error");
+      assert.ok(borderedEditorContentMatches(firstEnter.frame, "> Workspace:", acceptedPath),
+        "the accepted completion fills the complete visible public Editor content body with that exact path");
+      const beforeSecondEnter = this.frameRevision;
       this.write(KEYS.enter, "submit the accepted exact workspace");
-      await this.waitFrame((frame) => frame.includes("Starting (request ") || !frame.includes("Workspace:"),
-        "a separate native Enter submits the accepted Workspace path");
+      await this.waitFrame((frame) => newFormPendingCreateDrawn(frame) || freshStart() !== undefined,
+        "a separate native Enter positively draws the host's pending-create row or reports this workspace's fresh launcher start",
+        beforeSecondEnter);
     }
 
     // Retain the kernel incarnation from the original public PTY spawn receipt,
@@ -1122,11 +1182,11 @@ export class PosixLauncherPtyDriver {
     const shutdownBefore = this.shutdownCount(session);
     await this.ensureSidebarFocus();
     await this.moveRosterTo(session.displayName);
-    const selected = selectedRosterEntry(this.currentText(), 32);
+    const selected = selectedRosterEntry(this.currentText(), SIDEBAR_COLUMNS);
     if (selected === undefined || selected.kind !== "native" || selected.title !== session.displayName) {
       throw new Error("the exact selected native row is required before requesting a stop");
     }
-    assert.ok(isSidebarFocusedFrame(this.currentText(), 32),
+    assert.ok(isSidebarFocusedFrame(this.currentText(), SIDEBAR_COLUMNS),
       "the complete sidebar-only footer proves the stop action belongs to the visible sidebar");
     const beforeStop = this.frameRevision;
     this.write("d", "request stop of the exact selected native child");
@@ -1149,7 +1209,7 @@ export class PosixLauncherPtyDriver {
   }
 
   private nativeCardExited(frame: string): boolean {
-    const parsed = parseRosterFrame(frame, 32);
+    const parsed = parseRosterFrame(frame, SIDEBAR_COLUMNS);
     return parsed.complete && parsed.cards.some((card) => card.status === "exited (code 0)");
   }
 
@@ -1169,8 +1229,8 @@ export class PosixLauncherPtyDriver {
 
   private async assertNativeExitEvidence(session: PosixOwnedSession, rowRemoved = false): Promise<void> {
     await this.waitFrame((frame) => rowRemoved
-      ? parseRosterFrame(frame, 32).complete && parseRosterFrame(frame, 32).count === 0
-        && isSidebarFocusedFrame(frame, 32)
+      ? parseRosterFrame(frame, SIDEBAR_COLUMNS).complete && parseRosterFrame(frame, SIDEBAR_COLUMNS).count === 0
+        && isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS)
       : this.nativeCardExited(frame),
     rowRemoved
       ? "Main renders the complete empty roster after the exact native child is stopped and removed"
@@ -1233,7 +1293,7 @@ export class PosixLauncherPtyDriver {
   async finishHostNormally(): Promise<PtyExit> {
     await this.ensureSidebarFocus();
     assert.equal(this.focus, "sidebar", "the explicit host quit action belongs to the visible sidebar, not a native editor");
-    await this.waitFrame((frame) => isSidebarFocusedFrame(frame, 32),
+    await this.waitFrame((frame) => isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS),
       "the complete sidebar-only footer exposes the host-only quit action");
     this.write("q", "quit host");
     this.focus = "main";

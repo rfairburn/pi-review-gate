@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Instrumented-test manifest for the :app module.
+
+  `extractNativeLibs` is set here, and only here, because the test-only
+  clipboard-write meter (ClipWriteMeter.kt and the JVMTI agent under
+  src/androidTest/native) is loaded by absolute path from this test APK's own
+  native library directory: android.os.Debug.attachJvmtiAgent opens a real file,
+  which a library left packed inside the APK is not.
+
+  The production application keeps its existing packaging. This file belongs to
+  the androidTest component only, so no app APK or release artifact is affected.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:extractNativeLibs="true" />
+</manifest>

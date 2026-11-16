@@ -63,8 +63,10 @@ import {
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
 import {
+  NATIVE_PANE_START,
   renderedTitleMatches,
   rosterCards,
+  SIDEBAR_COLUMNS,
   type RosterCardEntry,
 } from "./helpers/session-host-native-roster-witness";
 
@@ -98,11 +100,11 @@ const FORBIDDEN_SESSION_ARGS = new Set([
 ]);
 
 function sidebarPaneText(frame: string): string {
-  return frame.split("\n").slice(1).map((line) => line.slice(0, 32)).join("\n");
+  return frame.split("\n").slice(1).map((line) => line.slice(0, SIDEBAR_COLUMNS)).join("\n");
 }
 
 function nativePaneText(frame: string): string {
-  return frame.split("\n").slice(1).map((line) => line.slice(33)).join("\n");
+  return frame.split("\n").slice(1).map((line) => line.slice(NATIVE_PANE_START)).join("\n");
 }
 
 /** Match wrapped native text without interleaved sidebar/divider columns. */
@@ -119,7 +121,7 @@ function frameContains(frame: string, needle: string): boolean {
  * glyphs are never taken for the frame; unpadded transcript rules are skipped.
  */
 function nativePopupRows(frame: string): string[] | undefined {
-  const paneWidth = OUTER_COLS - 33;
+  const paneWidth = OUTER_COLS - NATIVE_PANE_START;
   const rule = "─".repeat(paneWidth);
   const blank = " ".repeat(paneWidth);
   const rows = nativePaneText(frame).split("\n").map((line) => line.slice(0, paneWidth));
@@ -144,7 +146,7 @@ function popupContains(frame: string, needle: string): boolean {
 }
 
 function assertPopupSpansConversationPane(frame: string, view: string): void {
-  const paneWidth = OUTER_COLS - 33;
+  const paneWidth = OUTER_COLS - NATIVE_PANE_START;
   const popup = nativePopupRows(frame);
   assert.ok(popup, `${view} has a ruled, padded popup in the native conversation pane`);
   assert.equal(popup[0], "─".repeat(paneWidth), `${view} top rule reaches both conversation-pane margins`);
@@ -188,7 +190,7 @@ function providerJournalRecords(path: string): ProviderJournalRecord[] {
 
 /** The one native card whose complete title line belongs to `label`, if any. */
 function cardFor(text: string, label: string): RosterCardEntry | undefined {
-  const matches = rosterCards(text, 32).filter((card) => renderedTitleMatches(card.title, label));
+  const matches = rosterCards(text, SIDEBAR_COLUMNS).filter((card) => renderedTitleMatches(card.title, label));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -448,7 +450,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 
   await driver.waitFrame((text) => text.includes("Welcome") && text.includes("New session") && text.includes("Quit host"),
     "fresh real Main displays its empty welcome/sidebar state");
-  // Short labels: the 32-column sidebar truncates owner labels to five
+  // Short labels: the 35-column sidebar truncates owner labels to five
   // columns while a running row carries both badges, so only labels that fit
   // the smallest width can be matched against their real rendered rows.
   const labelA = "QA";
@@ -716,13 +718,13 @@ test("confirmed Quit in the real public Main exits both live native children gra
   assert.equal(processIsAlive(setup.sessionA.record.pid), true, "A is still alive before the confirmed Quit");
   assert.equal(processIsAlive(setup.sessionB.record.pid), true, "B is still alive before the confirmed Quit");
   await setup.driver.ensureSidebarFocus();
-  // The 32-column sidebar truncates the confirmation lines; resize the owned
+  // The 35-column sidebar truncates the confirmation lines; resize the owned
   // outer PTY to a narrow overlay width where the full confirmation renders.
   // Per-session viewer sizing (#474): the row this host displays (B, the last
   // deliberate New) takes the narrow pane, while the unviewed row A keeps the
   // pane it last reported. Both facts are awaited before confirming Quit.
   await setup.driver.setOuterSize(52, 50, { viewed: setup.sessionB, retained: [setup.sessionA] }, 52, 49);
-  assert.deepEqual(setup.driver.paneGeometry(setup.sessionA), { cols: OUTER_COLS - 32 - 1, rows: 49 },
+  assert.deepEqual(setup.driver.paneGeometry(setup.sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
     "the unviewed row keeps the wide pane it was created with while the displayed row goes narrow");
   await setup.driver.moveRosterTo("Quit host");
   const beforeConfirm = setup.driver.frameRevision;

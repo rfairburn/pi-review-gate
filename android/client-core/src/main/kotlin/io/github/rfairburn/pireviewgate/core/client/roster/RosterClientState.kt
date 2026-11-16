@@ -1,5 +1,6 @@
 package io.github.rfairburn.pireviewgate.core.client.roster
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetadata
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterWire
 
@@ -68,6 +69,24 @@ public data class RosterSavedPolicy(
     public val deleteExposed: Boolean,
 )
 
+/**
+ * The endpoint-local invalidation lifetime of one owner's advertised native
+ * catalog.
+ *
+ * It is NOT a wire value, an identity, or authority: callers freeze it only to
+ * prove a native create still belongs to the catalog observation it was built from.
+ * [epoch] advances whenever the effective catalog changes in any way — a target
+ * added, removed, relabelled, reordered, withdrawn, or re-advertised — and does not
+ * advance for an unchanged catalog on a later roster revision. [hostRunId] keeps a
+ * scope from being reused across owner runs or channel attempts.
+ */
+public data class NativeCatalogScope(
+    public val hostRunId: String,
+    /** The channel attempt this observation belongs to; a reconnect is a new lifetime. */
+    public val channelGeneration: Long,
+    public val epoch: Long,
+)
+
 /** The published roster projection of exactly one owner. */
 public data class RosterProjection(
     public val state: RosterProjectionState,
@@ -84,6 +103,19 @@ public data class RosterProjection(
     /** Subscription that produced the published snapshot. */
     public val subscriptionId: String?,
     public val reason: RosterStalenessReason?,
+    /**
+     * Native targets the owner advertised on THIS complete snapshot, or `null` when
+     * none was advertised. It is committed with [rows] and cleared whenever the
+     * projection stops being current, so a stale catalog is never offered as a live
+     * choice. Absence is not an empty catalog and never a default target.
+     */
+    public val nativeCliTargets: List<NativeCliTarget>? = null,
+    /**
+     * The exact catalog observation lifetime the targets above belong to, or `null`
+     * when no catalog is current. It is committed and cleared with
+     * [nativeCliTargets] and never travels on the wire.
+     */
+    public val nativeCatalogScope: NativeCatalogScope? = null,
 ) {
     public companion object {
         /** The state before any hello: nothing observed, and honestly so. */
@@ -94,6 +126,8 @@ public data class RosterProjection(
             revision = null,
             subscriptionId = null,
             reason = null,
+            nativeCliTargets = null,
+            nativeCatalogScope = null,
         )
     }
 }
@@ -103,6 +137,7 @@ public enum class RosterOperationKind {
     CLOSE,
     CREATE,
     RENAME,
+    NATIVE_RENAME,
     SAVED_LIST,
     SAVED_SEARCH,
     SAVED_WINDOW,
@@ -249,6 +284,8 @@ public data class RosterClientState(
      * no automatic follow-up happens from this endpoint.
      */
     public val armedCloseConfirmationRows: List<String>,
+    /** The SEPARATE native host-caption attempt scalar, never shared with Pi rename. */
+    public val nativeRenameSequence: Long = 0L,
 ) {
     /** True only when this owner acknowledged the optional Close exchange. */
     public val supportsClose: Boolean get() = capabilities.contains(RosterWire.CLOSE_CAPABILITY)
@@ -258,6 +295,12 @@ public data class RosterClientState(
 
     /** True only when this owner acknowledged the optional rename exchange. */
     public val supportsRename: Boolean get() = capabilities.contains(RosterWire.RENAME_CAPABILITY)
+
+    /** True only when this owner acknowledged the native create/catalog lane. */
+    public val supportsNative: Boolean get() = capabilities.contains(RosterWire.NATIVE_CAPABILITY)
+
+    /** True only when this owner acknowledged the SEPARATE native host-caption lane. */
+    public val supportsNativeName: Boolean get() = capabilities.contains(RosterWire.NATIVE_NAME_CAPABILITY)
 
     /** True only when this owner acknowledged the optional Saved catalog exchange. */
     public val supportsSaved: Boolean get() = capabilities.contains(RosterWire.SAVED_CAPABILITY)

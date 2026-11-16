@@ -65,6 +65,15 @@ class RosterBounds(
     }
 
     /**
+     * Frame-derived loop guard for the number of advertised native targets one
+     * `snapshot_end` can carry. It is not a product limit on an owner's configured
+     * catalog: the authoritative all-or-nothing check remains the encoded frame
+     * fitting [maxFrameBytes], so a catalog that cannot be carried is refused whole.
+     */
+    val nativeCatalogMaxEntries: Long
+        get() = (maxFrameBytes - 2L).coerceAtLeast(0L)
+
+    /**
      * Upper bound on frames (pages plus fragments) in one Saved window: every row
      * as a page, plus room for fragments of the window byte budget. It is a sanity
      * cap derived from the per-transfer bounds and is never used to size an

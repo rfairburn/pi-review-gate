@@ -117,6 +117,96 @@ require separate native-platform validation. This IPC support does not establish
 Windows host parity, delivery readiness, security equivalence with the POSIX
 filesystem boundary, or a private Windows ACL guarantee.
 
+**Native provider status observation rides a separate one-shot family on that same
+broker.** A hosted Claude Code row — and a Codex row this host does not front with its
+own backend — can be armed per launch to report a bounded set of its own state through
+the provider's own command hooks. Each hook
+invocation is one short-lived relay: it authenticates with a token issued for that
+single owned launch, sends exactly one bounded event — or one closed failure
+reason — reads one fixed-size acknowledgement, and closes. The native family keeps
+its own registration map, token, and delivery limits; it never becomes a Pi
+reporter, never shares Pi status sequencing, reconnect handling, or command
+authority, and a duplicate active id in either family is refused. A native
+observation is bound to one exact row and one exact child-process incarnation, and
+a retired capture generation can write nothing further. Recoverable source gaps
+withdraw observations to unknown under the source's own stale-read fences;
+a malformed or foreign-field observation is refused whole rather than partially
+applied. This lane is observation only: it never authorizes, denies, or blocks a
+provider operation, and it carries no Pi conversation identity, bootstrap, or
+attestation.
+
+**What the observer may and may not carry.** Only a closed allowlist of provider
+event metadata — event name plus bounded, control-free identifier, label, and
+transcript-path strings — and one validated numeric projection of that provider's
+own background-task snapshot cross the wire. Question text, answers, prompt text,
+tool arguments, tool results, transcript lines, terminal output, and arbitrary
+provider fields are selected out before any frame is built and are never stored,
+logged, or broadcast. The per-launch token travels in one child-environment marker
+and never in provider hook command text, which is what lets one host's generated
+hook command stay byte-identical from row to row; that marker is stripped from any
+inherited environment before the fresh one is set. The observer's staged files live
+in a freshly created private temporary root this host owns (`0700` directories,
+`0600` files, exclusive creation, never inside a workspace), and cleanup removes
+only the exact entries that one preparation created, deepest first, and only where
+each is still the object it created — same device and inode, of the expected kind,
+checked without following any link, and reached through the recorded root and
+directories that still carry the identities they were created with (an unrecorded or
+changed ancestor fails closed, and a symlink standing where a recorded directory was
+is a different object, so nothing below it is removed through it). A directory that
+now holds an entry this preparation never created is not removed and survives with
+that entry. Artifact cleanup does not read or digest contents, so an in-place edit of a
+created file keeps its identity and is removed with the rest. The lease is released
+only after that row's provider source and PTY have settled.
+
+**What this is not.** It is not a claim that the provider ran anything: there is no
+heartbeat, queue, retry, or replay, so a hook that never fires or a relay that never
+connects reports nothing: fields stay unknown. Source loss is lane-specific: a
+transcript-only failure does not erase a count reported by an authenticated hook;
+that number remains the last reported reading, not a value reconstructed from activity
+or quietness. The
+owner *does* read bounded bytes from the
+exact provider-named JSONL file—Claude's native transcript or Codex's root-thread
+rollout—to derive status metadata. Record text is not kept as a history, logged or
+broadcast; this is not a transcript-free or attestation-grade channel. There is no `HOME` or
+history scan, no session-directory search, no global clipboard watch, no raw
+recording, no extra listener or port for the hook lane, and no second conversation. Arming the
+observer changes no provider authentication, permission, model, or configuration
+default: it adds only that provider's documented per-session hook flags — pointing
+at the host's own private per-session artifacts, or adding one per-session
+configuration entry — and for a hosted Codex row it adds no flag, marker, or artifact
+of its own at all; it writes nothing to global or project settings,
+plugins, or any trust record, and bypasses no workspace-trust, sideload,
+marketplace, hook-disabling, or hook-review gate — those operator decisions can
+withhold the observation entirely. A provider's own task and shell numbers are
+activity facts about that provider's harness: they never enter this host's
+conservative background-ownership channel, so no provider reading — including a
+displayed rest — ever authorizes an idle-only stop or
+removal. See
+[Native status observation](native-sidebar-agents.md#native-status-observation).
+
+**An owned Codex row observes through a private local relay instead.** For such a row
+this host starts one provider app-server child on numeric IPv4 loopback with an
+operating-system-chosen ephemeral port, authenticated by one fresh capability token of
+which only the SHA-256 digest ever reaches that child's generated arguments, and the
+row's interactive client is pointed at a private relay this host owns in front of that
+backend. The relay forwards the provider's own bytes unchanged — the only rewrite is
+the `Host` header, which has to name the backend it dials — originates no
+application-layer message of its own, never subscribes, starts, resumes, forks,
+retries, answers, or approves anything, and refuses a second concurrent client; its
+read-only tap emits only closed metadata projections (opaque ids, closed enums,
+booleans, counts) and never prompt, command, output, question, option, answer, path,
+model text, or error text. The row's status then comes from one read-only connection
+to that same backend, which never replies to a provider request, so a live approval or
+question prompt can never be resolved by this host. Those two loopback listeners belong
+to that row alone and are closed with it; no routable address is bound, no port is
+scanned, no shared or unauthenticated daemon is adopted, and no provider credential is
+read, written, or migrated. The backend child inherits the same native configuration
+and authentication the interactive client does, and this host arms no provider hook of
+its own for such a launch. Retiring the observer closes only its own connection,
+watcher, and timers: the relay keeps forwarding, and the owner's stop of the row's own
+resources — backend, relay, and PTY — is unchanged, and nothing about that row is
+reported settled until each of them proves its own actual end.
+
 ### Session-host peer network (optional)
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for
@@ -222,7 +312,9 @@ below, each re-authorized and performed by the owner. Roster rows carry bounded
 display facts, including the exact owner-side workspace path, and never the
 native current-file guard, agent/account directories, configuration, providers,
 credentials, prompts, transcripts, question text, terminal/output bytes, or
-image data. A lost projection is stale or unavailable, never idle or zero.
+image data. A lost projection is stale or unavailable, never idle or zero. A row
+the owner hosts as a native provider session projects the same bounded display
+facts, and an unobserved field stays unknown.
 
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app`
@@ -287,6 +379,27 @@ decision and persistence are unchanged, nothing is trusted automatically, and
 copy is unsupported until a real conversation exists. A network `SessionSpawn`
 and human handoff remain unimplemented. Close remains owner-routed from the
 requesting sidebar's actually written highlighted row, as described below.
+
+The optional `native-input-cli-v1` capability, which also depends on
+`native-input-copy-v1`, extends the same content lane to rows the owner hosts as
+a native CLI child (`claude` or `codex`) instead of a Pi conversation. Such a row
+has no Pi registration, no bootstrap readiness, and no per-registration encoder,
+so its bytes are handed to that row's PTY raw, exactly as the owner's own Main
+types them. The source states phase `native-cli`, the recorded backend, and no
+native session field, under a third token domain whose commitment key is private
+to the current process incarnation: a replaced child invalidates every identical
+public fact instead of accepting a re-labelled handle. This is terminal-process
+control only, never an attestation of provider conversation state. A hosted provider
+row's own text copy is a separate closed family on this lane under the optional
+`native-copy-cli-v1` capability, never the Pi conversation copy route, and it is
+described under
+[Session-host clipboard transport](#session-host-clipboard-transport). Every other
+fence is unchanged: current owner
+facts, live ownership of that exact PTY, a non-stopping row, current input modes,
+geometry and policy generations, bounded dispatch, and the viewer's own Remote
+input/copy setting. A peer that never negotiated the capability publishes no such
+source, and one that sends such input without negotiating it is refused as a
+protocol violation with zero bytes written.
 
 The optional owner Close capability runs over the existing roster channel, not a
 new listener or permission kind. The current TLS-proved key, pin, and owner's
@@ -363,7 +476,10 @@ unknown outcome stays so. See
 
 ### Session-host clipboard transport
 
-Raw child OSC 52 is still default-denied. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
+Raw child OSC 52 is still default-denied on every surface that did not explicitly
+opt into the one hosted provider text-copy sink described below; that sink is the
+only exception, it is scoped to a single owned hosted provider row, and it changes
+nothing about the Pi path below. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
 and 1.5.2 runtimes, the owned Node stdio adapter distinguishes native
 clipboard-producer/copy-surface provenance from arbitrary rendered or PTY
 output, without changing Pi's selection or copy callbacks. Input delivery
@@ -401,7 +517,7 @@ bootstrap modes or requested installation failures refuse without downgrade or
 raw fallback. Non-user input cannot authorize a copy. A viewer's Remote
 input/copy setting never toggles this owner-side framing.
 
-Native children created with that bridge receive a cloned environment with Pi's
+Pi children created with that bridge receive a cloned environment with Pi's
 static `PI_CLIPBOARD_OSC52=1` capture flag; normal descendant inheritance stays
 inside that hosted process tree, and standalone launches and the system
 environment are unchanged. Native owner OS clipboard writes stay unchanged.
@@ -413,7 +529,50 @@ the unchanged 100,000-character producer bound retained whole, and that viewer
 writes it to its own terminal only while its Remote input/copy setting is on. A
 copy cannot originate from the pre-conversation startup phase. No native Pi
 change or live retrofit is involved. Authenticated local and SSH clipboard
-copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied.
+copying is unchanged, nothing is broadcast, and raw PTY OSC 52 stays denied on every
+surface that did not opt into the hosted provider sink.
+
+A hosted provider (Claude or Codex) row has no audited Pi producer to pin, so its text
+copy is a separate, closed family, and its trust is the owned PTY rather than producer
+provenance: a standard OSC 52 TEXT request that appeared inside the PTY this host owns
+and opened for that provider is accepted as a copy request whether the provider's own
+UI, a tool it ran, or a program it started wrote it. Only text crosses that fence:
+exactly one standard clipboard-selection field and one payload, a clipboard **query**
+refused outright because this host never answers one and never sends clipboard content
+back toward a child, and a canonical-base64 payload decoding to non-empty strict UTF-8
+text inside the unchanged 100,000-character producer bound. Binary, empty, malformed,
+or over-bound payloads are refused whole and never truncated, no control sequence is
+re-emitted, and capture is bound to one row and one child-process incarnation. The
+recipient is the origin of the most recent **actual accepted** nonempty input
+forwarded to that exact child — the owner's own local Main input or one viewer's
+verified input — never a currently selected form, a refused or rejected request, a
+received copy request, or a terminal protocol query/reply; it is frozen when the owner
+accepts the copy, so input arriving later never retargets a copy already in flight, and
+the ordinal that travels with it is that routing convention rather than causal proof.
+An ineligible recipient delivers nothing: no fallback to the other peer, no broadcast,
+no retry, no queue, and no global clipboard monitor, and a row nobody has typed into
+copies nowhere. The wire family is tuple-less and names only that row's recorded
+backend under the optional `native-copy-cli-v1` capability, which is negotiated only
+beside native IO and hosted native CLI input, so no Pi conversation identity is
+invented and the two producer families never mix on one frame. Existing pairing and
+consent, the per-viewer Remote input/copy setting, and the actual
+written/uncovered/current-Main/source/backend/PTY-incarnation/geometry/run guards are
+all still required, and the owner's own terminal write keeps the same actual-display
+proof the Pi route uses. A hosted Codex child is additionally given `HERDR_ENV=1` —
+the one value of an undocumented upstream branch, reviewed at the pinned
+`rust-v0.167.2` tag, under which Codex writes that extra terminal request *beside* its
+own native OS clipboard write — applied to that composed child environment only, after
+every environment source merged, so the host-owned mode intentionally wins for that
+single key and reaches no other child, no Claude or Pi child, and never the host
+process. No `SSH_TTY`, `SSH_CONNECTION`, `TMUX`, `TMUX_PANE`, or `STY` value is faked.
+Pretending to be an SSH session would also switch off Codex's own clipboard-text
+read, right-click paste, and local image links; multiplexer markers have other
+unrelated effects. Because the provider's own OS write continues, the
+host's forwarding is additional to the one controller it routes to, never a guarantee
+that the owner's clipboard was untouched. tmux/screen DCS-wrapped requests are not
+captured, the evidence is focused synthetic capture and wire testing with synthetic PTY
+children, and "captured" means only that the owner accepted the request and wrote the
+outer one — not that any desktop clipboard changed.
 
 The selected text is transient transport data, not a new diagnostic, roster, or clipboard
 history. Source stacks are inspected in memory and not logged. HMAC authenticates but

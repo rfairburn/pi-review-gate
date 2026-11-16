@@ -18,8 +18,9 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.ErrorFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.HelloAckFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.HelloFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.InputChunkFrame
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopySource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoInputSource
-import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoSource
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.OptionalNativeIoSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.ResizeFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.SubscribedFrame
@@ -118,6 +119,8 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	private var acknowledgedCapabilities: List<String> = emptyList()
 	private var nativeIoNegotiated = false
 	private var startupInputNegotiated = false
+	private var nativeCliInputNegotiated = false
+	private var nativeCliCopyNegotiated = false
 
 	/** Positive monotonic publish fence; jumps are allowed, duplicates and regressions are not. */
 	private var lastSequence = 0L
@@ -151,7 +154,7 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 	private var nextInputOrdinal = 1L
 
 	private var copyHeaderId: String? = null
-	private var copyHeaderSource: NativeIoInputSource? = null
+	private var copyHeaderSource: NativeIoCopySource? = null
 	/** The policy generation the in-flight copy header was admitted under. */
 	private var copyHeaderPolicyGeneration: Long? = null
 	private var copyDiscardId: String? = null
@@ -457,6 +460,12 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 			if (decision.capabilities.contains(ContentProtocol.NATIVE_INPUT_STARTUP_CAPABILITY)) {
 				startupInputNegotiated = true
 			}
+			if (decision.capabilities.contains(ContentProtocol.NATIVE_INPUT_CLI_CAPABILITY)) {
+				nativeCliInputNegotiated = true
+			}
+			if (decision.capabilities.contains(ContentProtocol.NATIVE_COPY_CLI_CAPABILITY)) {
+				nativeCliCopyNegotiated = true
+			}
 		}
 		phase = ContentEndpointPhase.SUBSCRIBING
 		val dims = requestedViewport
@@ -518,6 +527,14 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 			isNativeIoStartupSource(stated.source) &&
 			!startupInputNegotiated
 		) {
+			throw ContentProtocolFailure
+		}
+		if (stated is OptionalNativeIoSource.Stated &&
+			stated.source is NativeIoNativeCliSource &&
+			!nativeCliInputNegotiated
+		) {
+			// A hosted provider source on a channel that never negotiated it is not stale
+			// data: it is an extension this side never agreed to.
 			throw ContentProtocolFailure
 		}
 		if (frame.sequence <= lastSequence) {
@@ -1109,9 +1126,18 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		return deliverCopy(completed, events)
 	}
 
-	private fun noteCopyHeader(copyId: String, source: NativeIoSource, events: MutableList<ContentEndpointEvent>) {
+	private fun noteCopyHeader(
+		copyId: String,
+		source: NativeIoCopySource,
+		events: MutableList<ContentEndpointEvent>,
+	) {
 		if (source.hostRunId != target.ownerRunId || source.sessionId != target.rowId) {
 			// Another run or another owner row is never this endpoint's copy.
+			throw ContentProtocolFailure
+		}
+		if (source is NativeIoNativeCliSource && !nativeCliCopyNegotiated) {
+			// A hosted provider copy on a channel that never negotiated it is refused
+			// outright, without reaching any clipboard delivery.
 			throw ContentProtocolFailure
 		}
 		// The header's exact source decides routability for this one assembly, so the
@@ -1159,13 +1185,15 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 
 	/**
 	 * Whether a copy's exact source is this endpoint's own current published source
-	 * AND the live remote input/copy preference permits delivery.
+	 * AND the live remote input/copy preference permits delivery. A hosted provider
+	 * copy is routable only to a hosted provider publication, and a startup publication
+	 * is never a copy source at all.
 	 *
 	 * A copy is delivered only to the current initiating viewer: with the preference
 	 * Off, or under a policy generation other than the one the header was admitted
 	 * under, nothing is routed.
 	 */
-	private fun copyRoutable(source: NativeIoSource): Boolean {
+	private fun copyRoutable(source: NativeIoCopySource): Boolean {
 		if (!nativeIoNegotiated || retired || stopRequested) return false
 		if (!policy.enabled) return false
 		if (phase != ContentEndpointPhase.STREAMING) return false
@@ -1180,8 +1208,9 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 			return false
 		}
 		val current = snapshot.meta.inputSource as? OptionalNativeIoSource.Stated ?: return false
-		// Exact equality, so an A → B → A change never routes the old A data. A copy is
-		// conversation-only, so a startup publication is never routable either.
+		// Exact variant-aware equality, so an A → B → A change never routes the old A
+		// data, a hosted provider copy never routes to a Pi publication, and a startup
+		// publication is never routable at all.
 		return nativeIoSourceEquals(source, current.source)
 	}
 
@@ -1276,6 +1305,10 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		if (isNativeIoStartupSource(stated.source) && !startupInputNegotiated) {
 			return refuse(ContentNotSentReason.STALE_SOURCE)
 		}
+		// A hosted provider source is usable only on a channel that negotiated it.
+		if (stated.source is NativeIoNativeCliSource && !nativeCliInputNegotiated) {
+			return refuse(ContentNotSentReason.STALE_SOURCE)
+		}
 		// Exact expected source against this endpoint's own current published facts:
 		// token, run, row, native tuple and epoch, geometry revision, viewer revision.
 		if (!nativeIoSourceEquals(request.source, stated.source)) return refuse(ContentNotSentReason.STALE_SOURCE)
@@ -1355,6 +1388,8 @@ class ContentEndpoint(private val config: ContentEndpointConfig) {
 		acknowledgedCapabilities = acknowledgedCapabilities,
 		nativeIoNegotiated = nativeIoNegotiated,
 		startupInputNegotiated = startupInputNegotiated,
+		nativeCliInputNegotiated = nativeCliInputNegotiated,
+		nativeCliCopyNegotiated = nativeCliCopyNegotiated,
 		requestedViewport = requestedViewport,
 		publishedGeometry = snapshot?.meta?.geometry,
 		writtenReceipt = writtenReceipt,

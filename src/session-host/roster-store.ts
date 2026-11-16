@@ -24,6 +24,14 @@ import { isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
+import { isNativeConversationId } from "./native-conversation";
+import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  isSessionBackend,
+  isNativeDisplayName,
+  type SessionBackend,
+} from "./session-backend";
 
 /**
  * Global session-host roster store and single-host ownership (#331).
@@ -69,7 +77,12 @@ import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protoc
  * sidebar placement entry a host actually draws:
  *
  * - a remembered LOCAL slot, whose payload shape is exactly the version-1
- *   `RosterEntry` shape (no identity wrapper around it), and
+ *   `RosterEntry` shape (no identity wrapper around it), plus the optional
+ *   closed-set `backend` identity issue #277 added and, on a native CLI slot
+ *   only, the optional opaque `nativeTargetId`/`nativeConversationId` restart
+ *   identity. An absent `backend` is Pi, so a version-2 document that never
+ *   hosted a native row is byte-for-byte the document this host wrote before
+ *   native CLI hosting.
  * - a remote presentation identity (#477): the owner-side durable slot, or the
  *   legacy owner-run-plus-row tuple, plus the local saved-destination handle.
  *   A remote entry carries presentation identity ONLY — no remote status, no
@@ -163,8 +176,50 @@ export interface RosterEntry {
   readonly workspace?: string;
   /** Last observed native conversation name (display only). */
   readonly name?: string;
+  /**
+   * The operator's own host-side DISPLAY NAME of a native CLI row, keyed to this
+   * stable slot.
+   *
+   * This is a caption this host chose for its own row, NOT a conversation name:
+   * a native slot has no observable provider conversation NAME, so a remembered
+   * native slot restores this text as its row caption and nothing else. It is
+   * never a provider identity, never sent to a provider, and never itself a
+   * session, a resume target, or an auto-start. A Pi slot never carries it (a
+   * Pi row's name is the observed `name` above).
+   */
+  readonly displayName?: string;
   /** Last observed native persistence evidence for this binding. */
   readonly persistence?: RosterPersistence;
+  /**
+   * Which provider backend this remembered slot belongs to (issue #277).
+   * Absence means `pi`, exactly as for every roster written before native CLI
+   * hosting; a value outside the closed backend set refuses the whole document.
+   *
+   * This is IDENTITY ONLY. A native slot's provider conversation identity lives
+   * in the separate opaque native fields below, never in the Pi `sessionId`.
+   * Nothing here persists an executable, command, argument, environment, or
+   * target secret.
+   */
+  readonly backend?: SessionBackend;
+  /**
+   * Native CLI slots only (issue #277 restart restoration): the exact configured
+   * launch-target id this slot's row was launched with (an explicit target, or
+   * the backend's default target id). It is an id ONLY — never the target's
+   * executable, arguments, environment, configuration, or credentials — and it
+   * must satisfy the shared native target-id rule. Present on a Pi slot (or a
+   * slot with no recorded native backend) it refuses the whole document.
+   */
+  readonly nativeTargetId?: string;
+  /**
+   * Native CLI slots only (issue #277 restart restoration): the last exact
+   * provider-issued conversation UUID this host proved for the slot's row. It is
+   * opaque and separate from every Pi identity field: never a Pi `sessionId`, a
+   * human session name, a `latest` alias, or a path. Absence means no exact
+   * identity is known, so the slot stays an unavailable placeholder. Present on a
+   * Pi slot (or a slot with no recorded native backend) it refuses the whole
+   * document. It is independent of `nativeTargetId`: either may be absent.
+   */
+  readonly nativeConversationId?: string;
 }
 
 /**
@@ -343,7 +398,20 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
     if (entry.sessionId !== undefined && !isValidNativeSessionId(entry.sessionId)) return undefined;
     if (entry.workspace !== undefined && !isValidRosterWorkspace(entry.workspace)) return undefined;
     if (entry.name !== undefined && !isValidRosterName(entry.name)) return undefined;
+    // A remembered host-side row caption follows the shared native display-name
+    // rule, not the provider conversation-name rule: an unbounded or
+    // control-bearing caption is a malformed document, never a truncated guess.
+    if (entry.displayName !== undefined && !isNativeDisplayName(entry.displayName)) return undefined;
     if (entry.persistence !== undefined && !isPersistence(entry.persistence)) return undefined;
+    // The closed backend set only: an unknown provider identity is a malformed
+    // document, never a value normalized to Pi or to the first known backend.
+    if (entry.backend !== undefined && !isSessionBackend(entry.backend)) return undefined;
+    // The opaque native identity belongs to a native CLI slot only: on a Pi (or
+    // backend-less) slot it is a malformed document, never an ignored extra.
+    if (entry.nativeTargetId !== undefined
+      && (!isNativeCliBackend(entry.backend) || !isNativeCliTargetId(entry.nativeTargetId))) return undefined;
+    if (entry.nativeConversationId !== undefined
+      && (!isNativeCliBackend(entry.backend) || !isNativeConversationId(entry.nativeConversationId))) return undefined;
     seen.add(entry.slotId);
     localEntries += 1;
     entries.push({
@@ -351,7 +419,11 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
       ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
       ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
       ...(entry.name !== undefined ? { name: entry.name } : {}),
+      ...(entry.displayName !== undefined ? { displayName: entry.displayName } : {}),
       ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
+      ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
+      ...(entry.nativeTargetId !== undefined ? { nativeTargetId: entry.nativeTargetId } : {}),
+      ...(entry.nativeConversationId !== undefined ? { nativeConversationId: entry.nativeConversationId } : {}),
     });
   }
   // The remembered active entry is a LOCAL slot; a remote card never owns this

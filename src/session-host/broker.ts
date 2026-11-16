@@ -35,6 +35,25 @@
  * read consumes only that verified file inode; the namespace is removed only
  * when its own identity still matches and it is empty.
  *
+ * A separate native-only one-shot family (see ./native-hook-protocol) lets
+ * provider command hooks report closed lifecycle metadata on the same local
+ * listener. A native source is registered before its provider child spawns and
+ * gets its own token/record map; it never becomes a Pi reporter. Each hook
+ * delivery is one bounded frame authenticated before any event handling, one
+ * fixed-size ACK with no source data echoed, and a normal close. Native
+ * deliveries cannot evict/supersede the active Pi reporter, advance the Pi
+ * sequence, fire Pi reconnect/disconnect callbacks, or exercise any Pi command
+ * authority. Wrong/stale/cross-family tokens and mismatched backends close
+ * silently with no callback. Authenticated native concurrency has its own
+ * post-auth bound; the existing 32-pending/2s pre-auth listener pool remains
+ * honestly shared rather than being claimed as isolated. Stop/SubagentStop may
+ * carry a relay-derived `background_counts` projection of a whole validated
+ * provider snapshot; those are native provider observations only, never Pi
+ * `backgroundTasks`/`backgroundShells`, host ownership, or Stop authority. This
+ * lane is observation only: a hook that never runs or never reaches the broker
+ * is an unreported unknown, never a heartbeat/liveness claim or a fabricated
+ * state.
+ *
  * Safety contract (fail closed):
  *
  * - Hello frames are authenticated FIRST, timing-safe on instance id, host
@@ -122,6 +141,17 @@ import {
   readSessionHostPayload,
   type SessionHostPayloadDirectoryIdentity,
 } from "./payload";
+import {
+  decodeNativeHookFrame,
+  encodeNativeHookFrame,
+  isValidNativeHookInstanceId,
+  type DecodedNativeHookFrame,
+  type NativeHookAckFrame,
+  type NativeHookBootstrap,
+  type NativeHookEvent,
+  type NativeHookFailure,
+} from "./native-hook-protocol";
+import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 
 /** Options accepted by {@link createStatusBroker}. */
 export interface StatusBrokerOptions {
@@ -194,6 +224,43 @@ export interface StatusRegistration {
   requestActivity?: () => Promise<StatusActivityRefreshResult>;
 }
 
+/** Callbacks bound to one native hook source; always guard-wrapped by the broker. */
+export interface NativeHookSourceHandlers {
+  /**
+   * One sanitized, closed-metadata hook event. The callback never receives a
+   * token, provider prompt/answer text, tool arguments/results, transcript
+   * lines, or arbitrary provider fields. A throwing consumer is contained.
+   * Stop/SubagentStop may carry `background_counts`, a relay-derived whole-array
+   * projection of native provider observations; those counts are never Pi
+   * ownership, `backgroundTasks`/`backgroundShells`, or Stop authority, and a
+   * SubagentStop snapshot is not proof of root scope.
+   */
+  onEvent: (event: NativeHookEvent) => void;
+  /**
+   * One closed failure reason for an authenticated delivery: a relay-reported
+   * provider/input failure, or the host-local `delivery-refused` when this
+   * exact current source's delivery was discarded by post-auth admission.
+   * Supported observations stay unknown; a normal acknowledgement or socket
+   * close is never reported here, and a discarded delivery never becomes an
+   * event or a fabricated busy/idle value.
+   */
+  onFailure: (failure: NativeHookFailure) => void;
+}
+
+/**
+ * One owned launch's native hook registration. It is issued BEFORE the
+ * corresponding native child spawns and belongs to exactly that launch: release
+ * (or broker disposal) invalidates the bootstrap and every later delivery. The
+ * parent binds the callbacks to its native status-capture row's exact
+ * record/PTY/incarnation; the broker never binds, adopts, or reuses a row.
+ */
+export interface NativeHookRegistration {
+  /** Separate native-family bootstrap, never a Pi reporter bootstrap. */
+  readonly bootstrap: NativeHookBootstrap;
+  /** Idempotent invalidation: later deliveries get no callback and no queue/retry. */
+  release: () => void;
+}
+
 export type StatusActivityRefreshStatus = "complete" | "unavailable" | "stale" | "unsupported" | "busy" | "timeout" | "disconnected";
 
 /** Observed outcome of one host-requested activity census; never a token or snapshot. */
@@ -256,6 +323,26 @@ export interface StatusBroker {
   dispose(): Promise<void>;
 }
 
+/**
+ * Broker facade including the separate native hook family. The production
+ * broker returned by {@link createStatusBroker} always implements this; the
+ * narrower {@link StatusBroker} type stays source-compatible with existing Pi
+ * registration-only fakes and call sites.
+ */
+export interface NativeHookStatusBroker extends StatusBroker {
+  /**
+   * Registers one native hook source BEFORE its corresponding provider child
+   * spawns. This is a separate closed family from {@link StatusBroker.register}:
+   * its token authenticates only one-shot native hook frames, it never becomes
+   * a Pi reporter, and a duplicate active id in either family is refused.
+   */
+  registerNativeHookSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    handlers: NativeHookSourceHandlers,
+  ): NativeHookRegistration;
+}
+
 /** Maximum unauthenticated connections held in parallel (beyond the registered active connections). */
 const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 
@@ -275,6 +362,33 @@ const MAX_COMPLETED_RENAME_IDS = 64;
 const MAX_COMPLETED_SHUTDOWN_IDS = 64;
 const MAX_COMPLETED_SPAWN_IDS = 64;
 const MAX_COMPLETED_ACTIVITY_IDS = 64;
+
+/**
+ * Per-source simultaneous authenticated native hook deliveries. Native hooks
+ * may overlap inside one launch, but each one-shot delivery occupies a bounded
+ * authenticated slot until its acknowledgement close.
+ */
+const MAX_NATIVE_HOOK_DELIVERIES_PER_SOURCE = 8;
+
+/**
+ * Broker-wide simultaneous authenticated native hook deliveries. The existing
+ * shared pre-auth listener pool (32 pending, 2s auth deadline) is unchanged and
+ * honestly shared by both families; this separate bound is applied only AFTER
+ * a native source authenticates.
+ */
+const MAX_NATIVE_HOOK_DELIVERIES = 32;
+
+/** Bound on an authenticated native one-shot socket lingering after its ACK. */
+const NATIVE_HOOK_CLOSE_TIMEOUT_MS = 2000;
+
+/**
+ * Separate bound for authenticated native deliveries refused by post-auth
+ * admission. Each refused socket remains counted only until its fixed ACK is
+ * flushed and the socket is destroyed; the cap prevents a half-open client
+ * that never sends FIN from retaining connections outside both admission pools.
+ */
+const MAX_NATIVE_HOOK_REFUSED_CONNECTIONS = 8;
+const NATIVE_HOOK_REFUSED_CLOSE_TIMEOUT_MS = 250;
 
 /**
  * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
@@ -332,6 +446,17 @@ interface RegistrationRecord {
   payloadDirIdentity: SessionHostPayloadDirectoryIdentity;
 }
 
+/** A single native hook source's broker-side state; separate from every Pi registration record. */
+interface NativeHookSourceRecord {
+  readonly instanceId: string;
+  readonly backend: NativeCliBackend;
+  readonly token: string;
+  released: boolean;
+  handlers: NativeHookSourceHandlers;
+  /** Active one-shot deliveries counted until their acknowledgement closes. */
+  activeDeliveries: number;
+}
+
 interface PendingRename {
   connection: ConnectionState;
   request: SessionHostRenameRequest;
@@ -383,6 +508,15 @@ interface ConnectionState {
   registration: RegistrationRecord | undefined;
   /** True while counted against the unauthenticated backlog bound. */
   pending: boolean;
+  /** True once this connection's one native frame has been considered; never a second callback. */
+  nativeHandled: boolean;
+  /** Set only after a native frame authenticates; never a Pi registration/active connection. */
+  native: NativeHookSourceRecord | undefined;
+  /** True while this connection occupies an authenticated native delivery slot. */
+  nativeSlotted: boolean;
+  /** True while this authenticated native connection is a counted admission refusal. */
+  nativeRefused: boolean;
+  nativeCloseTimer: NodeJS.Timeout | undefined;
   /** At most four bounded rename/shutdown control frames are coalesced per socket write turn. */
   renameWriteQueue: string[];
   renameWriteScheduled: boolean;
@@ -511,6 +645,7 @@ let windowsPipeListenTimeoutForTests: number | undefined;
 let windowsPipeCloseTimeoutForTests: number | undefined;
 let spawnTimeoutMsForTests: number | undefined;
 let activityTimeoutMsForTests: number | undefined;
+let nativeHookDeliveryLimitForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
@@ -535,6 +670,10 @@ export const __test = Object.freeze({
   },
   setActivityTimeoutForTests(timeoutMs: number | undefined): void {
     activityTimeoutMsForTests = timeoutMs;
+  },
+  /** Focused native-lane admission test seam; absence keeps the production bound. */
+  setNativeHookDeliveryLimitForTests(limit: number | undefined): void {
+    nativeHookDeliveryLimitForTests = limit;
   },
 });
 
@@ -651,7 +790,7 @@ function createOwnedPayloadNamespace(parent: string): OwnedPayloadNamespace {
   }
 }
 
-class LocalStatusBroker implements StatusBroker {
+class LocalStatusBroker implements NativeHookStatusBroker {
 
   readonly socketPath: string;
   readonly generation: string;
@@ -663,6 +802,9 @@ class LocalStatusBroker implements StatusBroker {
   #listenHandleClosed = false;
   #latePipeCloseStarted = false;
   #registrations = new Map<string, RegistrationRecord>();
+  #nativeSources = new Map<string, NativeHookSourceRecord>();
+  #nativeDeliveries = 0;
+  #nativeRefusedConnections = 0;
   #connections = new Set<ConnectionState>();
   #payloadCleanups = new Set<Promise<void>>();
   #unauthCount = 0;
@@ -829,6 +971,15 @@ class LocalStatusBroker implements StatusBroker {
         `pi-review-gate: an active session-host registration already exists for instance id ${instanceId}`,
       );
     }
+    const existingNative = this.#nativeSources.get(instanceId);
+    if (existingNative && !existingNative.released) {
+      // The same row may not carry a Pi reporter and a native hook source at the
+      // same time: the two families have distinct tokens and semantics, and an
+      // ambiguous id would make the owning launch unclear.
+      throw new Error(
+        `pi-review-gate: an active native hook source already exists for instance id ${instanceId}`,
+      );
+    }
 
     const token = randomBytes(32).toString("hex");
     const payloadNamespace = createOwnedPayloadNamespace(
@@ -875,6 +1026,88 @@ class LocalStatusBroker implements StatusBroker {
       shutdown: (options) => this.#shutdown(record, options),
       release: () => this.#releaseRegistration(record),
       requestActivity: () => this.#requestActivity(record),
+    };
+  }
+
+  /**
+   * Registers one native hook source before its provider child exists. This
+   * family owns a separate token/record map and a separate one-shot delivery
+   * path; it never creates a Pi registration, active connection, status
+   * sequence, reconnect callback, or command authority. Duplicate active ids in
+   * either family are refused so one launch can never have two ambiguous
+   * observers.
+   */
+  registerNativeHookSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    handlers: NativeHookSourceHandlers,
+  ): NativeHookRegistration {
+    if (this.#disposed) {
+      throw new Error("pi-review-gate: the session-host status broker is disposed; no further registrations are accepted");
+    }
+    if (typeof handlers?.onEvent !== "function" || typeof handlers?.onFailure !== "function") {
+      throw new Error("pi-review-gate: the native hook source requires onEvent and onFailure callbacks");
+    }
+    if (!isNativeCliBackend(backend)) {
+      throw new Error("pi-review-gate: the native hook source backend must be claude or codex");
+    }
+    const instanceIdValue: unknown = instanceId;
+    if (!isValidNativeHookInstanceId(instanceIdValue)) {
+      throw new Error(
+        `pi-review-gate: the native hook source instance id is malformed (UUID-like id, at most 128 characters): ${instanceId.length <= 64 ? instanceId : `${instanceId.slice(0, 64)}…`}`,
+      );
+    }
+    const existingNative = this.#nativeSources.get(instanceId);
+    if (existingNative && !existingNative.released) {
+      throw new Error(
+        `pi-review-gate: an active native hook source already exists for instance id ${instanceId}`,
+      );
+    }
+    const existingPi = this.#registrations.get(instanceId);
+    if (existingPi && !existingPi.released) {
+      throw new Error(
+        `pi-review-gate: an active session-host registration already exists for instance id ${instanceId}; a native hook source is a separate family`,
+      );
+    }
+    const record: NativeHookSourceRecord = {
+      instanceId,
+      backend,
+      token: randomBytes(32).toString("hex"),
+      released: false,
+      handlers,
+      activeDeliveries: 0,
+    };
+    this.#nativeSources.set(instanceId, record);
+    return {
+      bootstrap: {
+        version: 1,
+        socketPath: this.socketPath,
+        generation: this.generation,
+        instanceId,
+        backend,
+        token: record.token,
+      },
+      release: () => this.#releaseNativeHookSource(record),
+    };
+  }
+
+  /**
+   * Focused test introspection only: broker-retained native one-shot state.
+   * Production callers never use this; it exposes no token, event, or source data.
+   */
+  __nativeHookLaneCountsForTests(): {
+    readonly refused: number;
+    readonly deliveries: number;
+    readonly activeConnections: number;
+  } {
+    let activeConnections = 0;
+    for (const conn of this.#connections) {
+      if (conn.native !== undefined && !conn.destroyed && !conn.superseded) activeConnections += 1;
+    }
+    return {
+      refused: this.#nativeRefusedConnections,
+      deliveries: this.#nativeDeliveries,
+      activeConnections,
     };
   }
 
@@ -1221,6 +1454,8 @@ class LocalStatusBroker implements StatusBroker {
 
   async #performDispose(): Promise<void> {
     this.#disposed = true;
+    for (const nativeRecord of this.#nativeSources.values()) nativeRecord.released = true;
+    this.#nativeSources.clear();
     const records = [...this.#registrations.values()];
     for (const record of records) {
       record.released = true;
@@ -1244,9 +1479,17 @@ class LocalStatusBroker implements StatusBroker {
     this.#registrations.clear();
     for (const conn of [...this.#connections]) {
       // Mark everything superseded so late close callbacks stay silent: an
-      // intentional dispose never fires onDisconnect.
+      // intentional dispose never fires onDisconnect or a native failure.
       conn.superseded = true;
       conn.registration = undefined;
+      conn.nativeHandled = true;
+      this.#releaseNativeHookSlot(conn);
+      this.#releaseNativeRefused(conn);
+      conn.native = undefined;
+      if (conn.nativeCloseTimer) {
+        clearTimeout(conn.nativeCloseTimer);
+        conn.nativeCloseTimer = undefined;
+      }
       if (conn.authTimer) {
         clearTimeout(conn.authTimer);
         conn.authTimer = undefined;
@@ -1259,6 +1502,8 @@ class LocalStatusBroker implements StatusBroker {
       }
     }
     this.#connections.clear();
+    this.#nativeDeliveries = 0;
+    this.#nativeRefusedConnections = 0;
     this.#unauthCount = 0;
     if (this.#transport.kind === "pipe") {
       // A failed listen never owns the named-pipe endpoint. In particular, a
@@ -1458,6 +1703,11 @@ class LocalStatusBroker implements StatusBroker {
       authTimer: undefined,
       registration: undefined,
       pending: false,
+      nativeHandled: false,
+      native: undefined,
+      nativeSlotted: false,
+      nativeRefused: false,
+      nativeCloseTimer: undefined,
       renameWriteQueue: [],
       renameWriteScheduled: false,
     };
@@ -1532,6 +1782,15 @@ class LocalStatusBroker implements StatusBroker {
 
   /** Routes one bounded line; false means the connection is no longer usable. */
   #handleLine(conn: ConnectionState, lineBytes: Buffer): boolean {
+    // The native family is strictly one-shot. Once a native frame has been
+    // considered, no later byte on this socket may be decoded or dispatched as
+    // either family: a coalesced Pi hello/status after a native event must never
+    // supersede an active Pi reporter. Stop the current chunk and destroy on
+    // any later input.
+    if (conn.nativeHandled || conn.native !== undefined) {
+      this.#destroyConnection(conn);
+      return false;
+    }
     let line: string;
     try {
       line = new TextDecoder("utf-8", { fatal: true }).decode(lineBytes);
@@ -1548,6 +1807,20 @@ class LocalStatusBroker implements StatusBroker {
       message = undefined;
     }
     if (message === undefined) {
+      // The line may belong to the separate native hook family. Decode it with
+      // that family's own strict parser (never inside Pi hello/status semantics)
+      // and route it to the native-only path.
+      let native: DecodedNativeHookFrame | undefined;
+      try {
+        native = decodeNativeHookFrame(line);
+      } catch {
+        native = undefined;
+      }
+      if (native !== undefined) {
+        this.#onNativeHookFrame(conn, native);
+        // Do not process any remaining coalesced frames from this chunk.
+        return false;
+      }
       // Malformed or oversized-on-decode frames (including forbidden terminal
       // controls) close the connection; no callback and no diagnostic output.
       this.#destroyConnection(conn);
@@ -1571,9 +1844,180 @@ class LocalStatusBroker implements StatusBroker {
     return !conn.destroyed && !conn.superseded;
   }
 
+  /**
+   * Authenticates and delivers exactly one native hook frame. This path never
+   * touches a Pi registration's `active` connection, sequence, reconnect
+   * callback, or command authority: native authentication sets only the
+   * separate `conn.native` family marker, and the one-shot connection closes
+   * after its fixed-size ACK. Unknown/stale/wrong-token/cross-family/backend
+   * failures close silently with no callback, so they cannot disturb a valid
+   * row. A normal ACK close is never reported as a failure.
+   */
+  #onNativeHookFrame(conn: ConnectionState, decoded: DecodedNativeHookFrame): void {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled) {
+      // A Pi-authenticated socket can never switch families, and one connection
+      // carries at most one native delivery.
+      this.#destroyConnection(conn);
+      return;
+    }
+    conn.nativeHandled = true;
+    const frame = decoded.frame;
+    const record = this.#nativeSources.get(frame.instanceId);
+    if (!record || record.released) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    // A Pi registration with the same id is a different family. Registration
+    // refuses this overlap up front; keeping the check here makes any raced or
+    // future ambiguity fail closed rather than authenticate by accident.
+    const piRecord = this.#registrations.get(frame.instanceId);
+    if (piRecord && !piRecord.released) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!timingSafeTextEqual(frame.instanceId, record.instanceId)
+      || !timingSafeTextEqual(frame.generation, this.generation)
+      || !timingSafeTextEqual(frame.token, record.token)
+      || frame.backend !== record.backend) {
+      // Wrong token, stale host generation, cross-family token, or mismatched
+      // backend: close without any callback or row mutation.
+      this.#destroyConnection(conn);
+      return;
+    }
+
+    // Native authentication is committed only on this separate marker. It does
+    // not set `conn.authed`, bind a registration, or become record.active.
+    conn.native = record;
+    if (conn.authTimer) {
+      clearTimeout(conn.authTimer);
+      conn.authTimer = undefined;
+    }
+    if (conn.pending) {
+      conn.pending = false;
+      this.#unauthCount -= 1;
+    }
+
+    if (!this.#reserveNativeHookSlot(record)) {
+      // Authenticated but over the separate post-auth native bound. The
+      // delivery is discarded, so this exact current source has a known
+      // host-local observation loss: report it once through the callback-only
+      // closed reason, then still answer the fixed rejection. The callback
+      // carries no event data, is never a wire value, and a throwing consumer
+      // is contained without accepting the discarded delivery.
+      try {
+        record.handlers.onFailure({ backend: record.backend, reason: "delivery-refused" });
+      } catch {
+        // Contained: a throwing consumer cannot change the refusal or Pi state.
+      }
+      this.#refuseNativeHookDelivery(conn);
+      return;
+    }
+    conn.nativeSlotted = true;
+    try {
+      if (decoded.kind === "event") record.handlers.onEvent(decoded.event);
+      else record.handlers.onFailure(decoded.failure);
+    } catch {
+      // Contained: a throwing consumer never crashes the native process or the broker.
+    }
+    // The callback is never invoked twice on this connection. A release inside
+    // the callback may already have destroyed the socket, in which case the ACK
+    // is simply skipped.
+    this.#sendNativeHookAck(conn, true);
+  }
+
+  /**
+   * Counts one authenticated refusal until its fixed ACK is flushed and the
+   * socket destroyed. The separate cap means a half-open client that never
+   * sends FIN cannot retain refused sockets outside both admission pools, and
+   * the Pi listener never accumulates unbounded refusal descriptors/timers.
+   */
+  #refuseNativeHookDelivery(conn: ConnectionState): void {
+    if (conn.destroyed || conn.superseded) return;
+    if (this.#nativeRefusedConnections >= MAX_NATIVE_HOOK_REFUSED_CONNECTIONS) {
+      // Prompt refusal at the refusal bound: no ACK, no lingering socket.
+      this.#destroyConnection(conn);
+      return;
+    }
+    this.#nativeRefusedConnections += 1;
+    conn.nativeRefused = true;
+    this.#sendNativeHookAck(conn, false);
+  }
+
+  /** Idempotently frees a counted native admission refusal. */
+  #releaseNativeRefused(conn: ConnectionState): void {
+    if (!conn.nativeRefused) return;
+    conn.nativeRefused = false;
+    if (this.#nativeRefusedConnections > 0) this.#nativeRefusedConnections -= 1;
+  }
+
+  #reserveNativeHookSlot(record: NativeHookSourceRecord): boolean {
+    const limit = nativeHookDeliveryLimitForTests ?? MAX_NATIVE_HOOK_DELIVERIES;
+    if (limit < 1
+      || this.#nativeDeliveries >= limit
+      || record.activeDeliveries >= MAX_NATIVE_HOOK_DELIVERIES_PER_SOURCE) return false;
+    this.#nativeDeliveries += 1;
+    record.activeDeliveries += 1;
+    return true;
+  }
+
+  /** Idempotently frees a native delivery slot; never touches Pi state. */
+  #releaseNativeHookSlot(conn: ConnectionState): void {
+    if (!conn.nativeSlotted) return;
+    conn.nativeSlotted = false;
+    const record = conn.native;
+    if (record && record.activeDeliveries > 0) record.activeDeliveries -= 1;
+    if (this.#nativeDeliveries > 0) this.#nativeDeliveries -= 1;
+  }
+
+  /** Writes one fixed-size ACK and bounds how long the one-shot socket may linger. */
+  #sendNativeHookAck(conn: ConnectionState, accepted: boolean): void {
+    if (conn.destroyed || conn.superseded) {
+      this.#releaseNativeRefused(conn);
+      return;
+    }
+    const ack: NativeHookAckFrame = { version: 1, type: "native_hook_ack", accepted };
+    let frame: string;
+    try {
+      frame = encodeNativeHookFrame(ack);
+    } catch {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!accepted) {
+      // Refusal is bounded separately: flush the fixed ACK, then destroy
+      // promptly. A write callback normally runs as soon as the tiny frame is
+      // flushed; the short timer is only a fallback for a stuck transport.
+      if (conn.nativeCloseTimer) clearTimeout(conn.nativeCloseTimer);
+      conn.nativeCloseTimer = setTimeout(
+        () => this.#destroyConnection(conn),
+        NATIVE_HOOK_REFUSED_CLOSE_TIMEOUT_MS,
+      );
+      conn.nativeCloseTimer.unref?.();
+      try {
+        conn.socket.write(frame, () => this.#destroyConnection(conn));
+      } catch {
+        this.#destroyConnection(conn);
+      }
+      return;
+    }
+    try {
+      // `end` flushes the fixed ACK and then closes this one-shot socket; no
+      // source data is echoed and no further frame is accepted.
+      conn.socket.end(frame);
+    } catch {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (conn.nativeCloseTimer) clearTimeout(conn.nativeCloseTimer);
+    conn.nativeCloseTimer = setTimeout(() => this.#destroyConnection(conn), NATIVE_HOOK_CLOSE_TIMEOUT_MS);
+    conn.nativeCloseTimer.unref?.();
+  }
+
   #onHello(conn: ConnectionState, hello: SessionHostHello): void {
-    if (conn.authed) {
-      // A repeated hello is a protocol violation, never a re-authentication.
+    if (conn.authed || conn.nativeHandled || conn.native !== undefined) {
+      // A repeated hello is a protocol violation, never a re-authentication. A
+      // native-authenticated/one-shot socket must also never enter the Pi
+      // family, even if a later dispatch path reaches this handler.
       this.#destroyConnection(conn);
       return;
     }
@@ -2062,6 +2506,14 @@ class LocalStatusBroker implements StatusBroker {
       clearTimeout(conn.authTimer);
       conn.authTimer = undefined;
     }
+    if (conn.nativeCloseTimer) {
+      clearTimeout(conn.nativeCloseTimer);
+      conn.nativeCloseTimer = undefined;
+    }
+    // Native delivery slots and bounded refusal accounting are independent of
+    // the Pi connection lifecycle; free both before tearing the socket down.
+    this.#releaseNativeHookSlot(conn);
+    this.#releaseNativeRefused(conn);
     try {
       conn.socket.destroy();
     } catch {
@@ -2075,6 +2527,15 @@ class LocalStatusBroker implements StatusBroker {
       clearTimeout(conn.authTimer);
       conn.authTimer = undefined;
     }
+    if (conn.nativeCloseTimer) {
+      clearTimeout(conn.nativeCloseTimer);
+      conn.nativeCloseTimer = undefined;
+    }
+    // A native one-shot close is normal after its ACK and never becomes a
+    // failure or a Pi disconnect callback. Free only its separate slot and
+    // refusal accounting.
+    this.#releaseNativeHookSlot(conn);
+    this.#releaseNativeRefused(conn);
     if (conn.pending && !conn.authed) {
       conn.pending = false;
       this.#unauthCount -= 1;
@@ -2095,6 +2556,19 @@ class LocalStatusBroker implements StatusBroker {
       } catch {
         // Contained: never throw into the native process.
       }
+    }
+  }
+
+  /** Idempotent native source invalidation; no adoption, queue, replay, or later callback. */
+  #releaseNativeHookSource(record: NativeHookSourceRecord): void {
+    if (record.released) return;
+    record.released = true;
+    this.#nativeSources.delete(record.instanceId);
+    // Any authenticated one-shot socket still owned by this launch is closed
+    // silently. Its callback (if any) already ran synchronously; late frames and
+    // late closes can never invoke another callback or mutate a valid row.
+    for (const conn of [...this.#connections]) {
+      if (conn.native === record) this.#destroyConnection(conn);
     }
   }
 
@@ -2148,7 +2622,7 @@ class LocalStatusBroker implements StatusBroker {
  * cryptorandom public-Node named pipe in the local `\\.\pipe\prg-st-` namespace.
  * No daemon adoption, foreign-endpoint cleanup, or child-process/profile work.
  */
-export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<StatusBroker> {
+export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<NativeHookStatusBroker> {
   const platform = brokerPlatformForTests ?? process.platform;
   if (platform === "win32") {
     const socketPath = `${WINDOWS_PIPE_PREFIX}${randomBytes(16).toString("hex")}`;

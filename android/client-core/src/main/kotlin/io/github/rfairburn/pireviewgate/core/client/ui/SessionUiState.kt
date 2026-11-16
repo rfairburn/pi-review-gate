@@ -2,6 +2,8 @@ package io.github.rfairburn.pireviewgate.core.client.ui
 
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.presentation.RemotePresentationIdentity
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
+import io.github.rfairburn.pireviewgate.core.protocol.native.nativeDisplayCaption
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetadata
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
 
@@ -81,8 +83,40 @@ public data class SessionUiState(
     /** The owner's row id. Never a path, and never unique across hosts on its own. */
     public val rowId: String get() = metadata.id
 
-    /** Canonical title: the owner's native conversation name, else the row label. */
-    public val displayTitle: String get() = metadata.nativeSession?.name ?: metadata.label
+    /**
+     * The owner's typed native backend for this row, or `null` for Pi and for every
+     * row that reports no backend. It is copied from [metadata] and never inferred
+     * from a label, caption, status, native conversation, or missing Pi telemetry.
+     */
+    public val nativeBackend: NativeCliBackend? get() = metadata.backend?.nativeCliOrNull()
+
+    /** The owner's reported provider label (including Pi), or `null` when unreported. */
+    public val providerLabel: String? get() = metadata.backend?.displayLabel
+
+    /**
+     * The exact native host caption this row owns, with the provider fallback and
+     * the host's JS-trim rule, but WITHOUT the display-only "(unavailable)" suffix.
+     * It is the value a native caption form edits and never carries display grammar.
+     */
+    public val nativeCaption: String?
+        get() = nativeBackend?.let { nativeDisplayCaption(metadata.label, it.displayLabel) }
+
+    /**
+     * Canonical card title.
+     *
+     * A Pi row keeps the existing validated native-conversation name, else the row
+     * label. A native CLI row has no Pi conversation name to show: its title is the
+     * host-side caption this owner holds for it ([metadata.label]) and nothing else,
+     * falling back to the stable provider label when the caption is blank. A row the
+     * owner reports as errored says it is unavailable with the desktop card's exact
+     * grammar, so an unavailable native row can never look like a working session.
+     */
+    public val displayTitle: String
+        get() {
+            val native = nativeBackend ?: return metadata.nativeSession?.name ?: metadata.label
+            val caption = nativeDisplayCaption(metadata.label, native.displayLabel)
+            return if (metadata.lifecycle == RosterLifecycle.ERROR) "$caption (unavailable)" else caption
+        }
 
     /** Agent activity for an ALIVE row; `null` for any other lifecycle. */
     public val agentActivity: AgentActivity? get() = classifyAgentActivity(metadata)
@@ -243,6 +277,36 @@ public data class RenameTarget(
                 expectedSessionId = native.sessionId,
                 expectedSessionEpoch = native.epoch,
                 currentName = native.name,
+            )
+        }
+    }
+}
+
+/**
+ * One frozen HOST ROW NAME target: the exact drawn owner row plus the native
+ * backend the owner reported on it. It carries NO Pi native conversation tuple,
+ * because a native row has no conversation identity to fence a caption to.
+ *
+ * [currentCaption] is the caption the card drew; it is display context only. No
+ * caption is applied locally and no backend is inferred from it.
+ */
+public data class NativeRenameTarget(
+    public val base: SessionActionTarget,
+    public val backend: NativeCliBackend,
+    public val currentCaption: String,
+) {
+    public companion object {
+        /**
+         * Freeze a native caption target, or `null` when this row does not report a
+         * native CLI backend. A Pi row is never converted into a native target, and a
+         * row with no reported backend is not guessed into one.
+         */
+        public fun of(row: SessionUiState): NativeRenameTarget? {
+            val native = row.nativeBackend ?: return null
+            return NativeRenameTarget(
+                base = SessionActionTarget.of(row),
+                backend = native,
+                currentCaption = row.nativeCaption ?: row.displayTitle,
             )
         }
     }

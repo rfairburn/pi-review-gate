@@ -8,6 +8,10 @@ import io.github.rfairburn.pireviewgate.core.protocol.content.CopyEndFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.CopyFrame
 import io.github.rfairburn.pireviewgate.core.protocol.content.ContentProtocol
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopyEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopyFrameEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoCopySource
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliCopyEvent
+import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoNativeCliSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.NativeIoSource
 import io.github.rfairburn.pireviewgate.core.protocol.content.Utf8Wire
 
@@ -16,9 +20,9 @@ internal data class AssembledCopy(
 	val subscriptionId: String,
 	val copyId: String,
 	val sequence: Long,
-	val source: NativeIoSource,
+	val source: NativeIoCopySource,
 	val dispatchId: Long,
-	val event: NativeIoCopyEvent,
+	val event: NativeIoCopyFrameEvent,
 )
 
 /**
@@ -32,10 +36,11 @@ internal data class AssembledCopy(
  * twice.
  *
  * The assembled paged payload must be the producer's canonical base64 of strict
- * UTF-8 text, validated whole, and it inherits the header source's authenticated
- * native tuple, which is re-checked against the event. A partial, over-long,
- * reordered, or non-canonical payload yields no event at all, and no raw OSC 52
- * byte is ever produced or forwarded here.
+ * UTF-8 text, validated whole, and it inherits the header source's own producer
+ * facts — a conversation tuple or a hosted backend, never both — so the completed
+ * event and the header source stay consistent by construction and are re-checked.
+ * A partial, over-long, reordered, or non-canonical payload yields no event at all,
+ * and no raw OSC 52 byte is ever produced or forwarded here.
  */
 internal class ContentCopyAssembly(private val bounds: ContentBounds) {
 	private var staged: Staged? = null
@@ -48,7 +53,7 @@ internal class ContentCopyAssembly(private val bounds: ContentBounds) {
 	fun inline(frame: CopyFrame): AssembledCopy? {
 		if (staged != null) return null
 		if (frame.sequence <= completedSequence) return null
-		if (!tuplesAgree(frame.source, frame.event)) return null
+		if (!producersAgree(frame.source, frame.event)) return null
 		completedSequence = frame.sequence
 		return AssembledCopy(
 			subscriptionId = frame.subscriptionId,
@@ -108,12 +113,17 @@ internal class ContentCopyAssembly(private val bounds: ContentBounds) {
 		}
 		staged = null
 		val encoded = canonicalCopyPayload(transfer.buffer.copyOf(transfer.written)) ?: return null
-		val event = NativeIoCopyEvent.Copy(
-			encoded = encoded,
-			sessionId = transfer.source.nativeSession.sessionId,
-			sessionEpoch = transfer.source.nativeSession.epoch,
-		)
-		if (!tuplesAgree(transfer.source, event)) return null
+		// The assembled payload names the header source's producer, never the other
+		// family's: a hosted provider copy carries the recorded backend and no tuple.
+		val event: NativeIoCopyFrameEvent = when (val source = transfer.source) {
+			is NativeIoNativeCliSource -> NativeIoNativeCliCopyEvent(encoded = encoded, backend = source.backend)
+			is NativeIoSource -> NativeIoCopyEvent.Copy(
+				encoded = encoded,
+				sessionId = source.nativeSession.sessionId,
+				sessionEpoch = source.nativeSession.epoch,
+			)
+		}
+		if (!producersAgree(transfer.source, event)) return null
 		completedSequence = transfer.sequence
 		return AssembledCopy(
 			subscriptionId = transfer.subscriptionId,
@@ -143,14 +153,22 @@ internal class ContentCopyAssembly(private val bounds: ContentBounds) {
 		return encoded
 	}
 
-	private fun tuplesAgree(source: NativeIoSource, event: NativeIoCopyEvent): Boolean =
-		event.sessionId == source.nativeSession.sessionId && event.sessionEpoch == source.nativeSession.epoch
+	/** The event names the header source's own producer family, and the same producer. */
+	private fun producersAgree(source: NativeIoCopySource, event: NativeIoCopyFrameEvent): Boolean =
+		when (source) {
+			is NativeIoNativeCliSource ->
+				event is NativeIoNativeCliCopyEvent && event.backend == source.backend
+
+			is NativeIoSource -> event is NativeIoCopyEvent &&
+				event.sessionId == source.nativeSession.sessionId &&
+				event.sessionEpoch == source.nativeSession.epoch
+		}
 
 	private class Staged(
 		val subscriptionId: String,
 		val copyId: String,
 		val sequence: Long,
-		val source: NativeIoSource,
+		val source: NativeIoCopySource,
 		val dispatchId: Long,
 		val byteLength: Int,
 		val chunkCount: Int,

@@ -244,7 +244,9 @@ function makeDefaultFactoryHarness(label: string, agentShapeFor: () => unknown):
       spawnOptions.push({ ...options });
       const descriptor: InstanceSpawnDescriptor = {
         file,
-        args,
+        // The pinned public spawn takes argv OR one pre-escaped Windows command
+        // line; these controls only ever exercise the argv form.
+        args: Array.isArray(args) ? args : [],
         env: options.env,
         cwd: options.cwd,
         cols: options.cols,

@@ -190,14 +190,10 @@ function assertCountRow(
   where: string,
 ): void {
   assert.equal(plainText(raw), expectedPlaintext,
-    `${where}: the painted row's plaintext is the exact existing text`);
-  if (tasks.text === "background unknown") {
-    // The both-unknown special case: one ordinary phrase, no colour inside it.
-    assert.ok(raw.includes("  background unknown"),
-      `${where}: the unknown special row keeps its exact wording with nothing painted inside`);
-    return;
-  }
-  // The labels and separator never borrow a colour: the sequence for a value
+    `${where}: the painted row's plaintext is the exact expected text`);
+  // Both labeled cells are always on the row, including when both are unknown:
+  // there is no combined row to special-case. The labels and separator never
+  // borrow a colour: the sequence for a value
   // begins immediately after its own label, and the separator follows a reset.
   assert.ok(raw.includes("  bg tasks "), `${where}: the tasks label stays ordinary pane text`);
   assert.ok(raw.includes("| shells "), `${where}: the shells label stays ordinary pane text`);
@@ -277,9 +273,27 @@ test("the two counts are banded independently, and the number is never capped", 
   }
 });
 
+test("an unknown count keeps the other axis's observed 2 visible beside it", () => {
+  for (const theme of THEMES) {
+    const palette = sidebarPaletteFor(theme);
+    const harness = makeHarness([
+      makeItem({ id: "tasks", label: "UnknownTasksTwo", activeTasks: null, activeShells: 2 }),
+      makeItem({ id: "shells", label: "UnknownShellsTwo", activeTasks: 2, activeShells: null }),
+    ], { theme });
+    const lines = drawnRows(harness.controller, 60, 16);
+
+    // Neither unknown hides the other cell's observed number, and the number keeps
+    // its own band: the example shape `bg tasks unknown | shells 2` is drawn whole.
+    assertCountRow(rowBelow(lines, "UnknownTasksTwo", 2), countText("unknown", "2"),
+      { text: "unknown", role: null }, { text: "2", role: "statusRunning" }, palette, `${theme} unknown/2`);
+    assertCountRow(rowBelow(lines, "UnknownShellsTwo", 2), countText("2", "unknown"),
+      { text: "2", role: "statusRunning" }, { text: "unknown", role: null }, palette, `${theme} 2/unknown`);
+  }
+});
+
 // ---------------------------------------------------------------------------
-// 2. Unknown, mixed, and invalid counts keep their exact existing text and stay
-//    ordinary pane text — no new dim colour, no invented zero.
+// 2. Unknown, mixed, and invalid counts keep their exact per-cell text and stay
+//    ordinary pane text — no combined row, no new dim colour, no invented zero.
 // ---------------------------------------------------------------------------
 
 test("unknown, mixed, and invalid counts keep their exact text and stay unpainted", () => {
@@ -303,15 +317,15 @@ test("unknown, mixed, and invalid counts keep their exact text and stay unpainte
     ], { theme });
     const lines = drawnRows(harness.controller, 60, 44);
 
-    assertCountRow(rowBelow(lines, "BothUnknown", 2), "  background unknown",
-      { text: "background unknown", role: null }, { text: "", role: null }, palette, `${theme} both unknown`);
+    assertCountRow(rowBelow(lines, "BothUnknown", 2), countText("unknown", "unknown"),
+      { text: "unknown", role: null }, { text: "unknown", role: null }, palette, `${theme} both unknown`);
     assertCountRow(rowBelow(lines, "Mixed", 2), countText("unknown", "3"),
       { text: "unknown", role: null }, { text: "3", role: "statusWaiting" }, palette, `${theme} mixed`);
     assertCountRow(rowBelow(lines, "Mixed2", 2), countText("4", "unknown"),
       { text: "4", role: "statusWaiting" }, { text: "unknown", role: null }, palette, `${theme} mixed2`);
     for (const entry of invalid) {
-      assertCountRow(rowBelow(lines, entry.label, 2), "  background unknown",
-        { text: "background unknown", role: null }, { text: "", role: null }, palette, `${theme} ${entry.label}`);
+      assertCountRow(rowBelow(lines, entry.label, 2), countText("unknown", "unknown"),
+        { text: "unknown", role: null }, { text: "unknown", role: null }, palette, `${theme} ${entry.label}`);
     }
   }
 });
@@ -576,9 +590,7 @@ test("the terminal's effective cells band each activity count and leave labels, 
         const where = `${theme} ${testCase.label}`;
         const drawn = runs.map((run) => run.text).join("");
         const shown = (value: number | null): string => value === null ? "unknown" : String(value);
-        const expected = testCase.label === "BothUnknown"
-          ? "  background unknown"
-          : countText(shown(testCase.tasks), shown(testCase.shells));
+        const expected = countText(shown(testCase.tasks), shown(testCase.shells));
         assert.equal(drawn.trimEnd(), expected, `${where}: the drawn row's plaintext is unchanged`);
         // Every cell on the row: an explicit 24-bit foreground and the terminal's
         // own default background, never a painted ground.
@@ -602,8 +614,8 @@ test("the terminal's effective cells band each activity count and leave labels, 
         for (const run of runs.filter((cell) => cell.fg?.value === canvasRgb)) {
           assert.notEqual(run.bold, true, `${where}: canvas cells stay unemphasized`);
         }
-        assert.ok(drawn.includes("  bg tasks ") && drawn.includes(" | shells ") || testCase.label === "BothUnknown",
-          `${where}: the labels and separator are drawn as ordinary text`);
+        assert.ok(drawn.includes("  bg tasks ") && drawn.includes(" | shells "),
+          `${where}: both labels and the separator are drawn as ordinary text, even when both counts are unknown`);
       }
       // The red band changes nothing about the status row's own cells: the same
       // running/none pair as any other running card, and no cell on that row

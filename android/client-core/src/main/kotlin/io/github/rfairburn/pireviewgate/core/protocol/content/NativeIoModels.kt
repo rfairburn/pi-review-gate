@@ -1,5 +1,7 @@
 package io.github.rfairburn.pireviewgate.core.protocol.content
 
+import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
+
 /** Exact session geometry carried by a transfer; identical to the native session geometry. */
 data class SessionGeometry(val cols: Int, val rows: Int, val revision: Long)
 
@@ -44,7 +46,7 @@ data class NativeIoSource(
 	override val geometry: SessionGeometry,
 	override val viewerRevision: Long,
 	override val sourceToken: String,
-) : NativeIoInputSource
+) : NativeIoInputSource, NativeIoCopySource
 
 /**
  * Exact host-written STARTUP-phase input source. It describes one publish whose
@@ -61,6 +63,33 @@ data class NativeIoStartupSource(
 	override val viewerRevision: Long,
 	override val sourceToken: String,
 ) : NativeIoInputSource
+
+/**
+ * Exact host-written NATIVE CLI source: one hosted provider CLI row its owner runs
+ * as a plain PTY process. The same run, owner row, geometry, viewer revision, and
+ * opaque token facts as [NativeIoSource], plus the explicit `native-cli` phase and
+ * the owner's recorded backend of that row, and NO native tuple, registration, PID,
+ * path, or command — a hosted provider child has no Pi conversation, and the owner
+ * binds this source to the child process only through its own private
+ * per-incarnation key behind [sourceToken].
+ */
+data class NativeIoNativeCliSource(
+	override val hostRunId: String,
+	override val sessionId: String,
+	/** The owner's recorded backend of this row; never inferred from output or a label. */
+	val backend: NativeCliBackend,
+	override val geometry: SessionGeometry,
+	override val viewerRevision: Long,
+	override val sourceToken: String,
+) : NativeIoInputSource, NativeIoCopySource
+
+/**
+ * The closed source shape one copy frame may carry: the unchanged Pi conversation
+ * source, or the tuple-less hosted provider CLI source of a channel that negotiated
+ * the hosted copy capability. A startup source is never a copy source on either side,
+ * and the type says so rather than relying on a runtime check.
+ */
+sealed interface NativeIoCopySource : NativeIoInputSource
 
 /** True for the startup variant of an input-path source. */
 fun isNativeIoStartupSource(source: NativeIoInputSource): Boolean = source is NativeIoStartupSource
@@ -125,7 +154,7 @@ enum class NativeIoCopyUnavailableReason(val wireValue: String) {
  * frame's source native tuple, so a payload can never be attributed to a
  * different native conversation than the one it was emitted for.
  */
-sealed interface NativeIoCopyEvent {
+sealed interface NativeIoCopyEvent : NativeIoCopyFrameEvent {
 	val sessionId: String
 	val sessionEpoch: Long
 
@@ -145,22 +174,46 @@ sealed interface NativeIoCopyEvent {
 }
 
 /**
+ * The copy event union: an unchanged Pi conversation event carrying the producer's
+ * own tuple, or a hosted provider CLI event carrying that row's recorded backend.
+ */
+sealed interface NativeIoCopyFrameEvent
+
+/**
+ * Copy payload of one hosted provider TEXT copy: canonical base64 UTF-8 text plus
+ * the row's own recorded backend, and NO tuple at all. A hosted provider child has
+ * no Pi conversation, so stating one here would be a fabricated attribution; the
+ * child process it rode in on is bound only through the owner's private
+ * per-incarnation key behind the source's opaque token.
+ */
+data class NativeIoNativeCliCopyEvent(
+	val encoded: String,
+	val backend: NativeCliBackend,
+) : NativeIoCopyFrameEvent
+
+/** True only for the hosted provider variant of a copy event. */
+fun isNativeIoNativeCliCopyEvent(event: NativeIoCopyFrameEvent): Boolean = event is NativeIoNativeCliCopyEvent
+
+/**
  * Exact structural, variant-aware equality of two sources.
  *
  * Equal dimensions are never enough: the epoch, the geometry revision, the viewer
  * revision, and the host token must all agree, so an A-to-B-to-A viewport change
  * is never treated as the original A, and a startup source never equals a
- * conversation source. This is a comparison only; it grants and implies no
- * authority.
+ * conversation source or a hosted provider CLI source. Two hosted provider CLI
+ * sources also have to name the same backend. This is a comparison only; it grants
+ * and implies no authority.
  */
 fun nativeIoSourceEquals(left: NativeIoInputSource, right: NativeIoInputSource): Boolean {
-	val leftStartup = left is NativeIoStartupSource
-	val rightStartup = right is NativeIoStartupSource
-	if (leftStartup != rightStartup) return false
-	if (!leftStartup && !rightStartup) {
+	val leftVariant = nativeIoSourceVariant(left)
+	if (leftVariant != nativeIoSourceVariant(right)) return false
+	if (leftVariant == NativeIoSourceVariant.CONVERSATION) {
 		val leftTuple = (left as NativeIoSource).nativeSession
 		val rightTuple = (right as NativeIoSource).nativeSession
 		if (leftTuple.sessionId != rightTuple.sessionId || leftTuple.epoch != rightTuple.epoch) return false
+	}
+	if (leftVariant == NativeIoSourceVariant.NATIVE_CLI) {
+		if ((left as NativeIoNativeCliSource).backend != (right as NativeIoNativeCliSource).backend) return false
 	}
 	return left.hostRunId == right.hostRunId &&
 		left.sessionId == right.sessionId &&
@@ -169,4 +222,13 @@ fun nativeIoSourceEquals(left: NativeIoInputSource, right: NativeIoInputSource):
 		left.geometry.revision == right.geometry.revision &&
 		left.viewerRevision == right.viewerRevision &&
 		left.sourceToken == right.sourceToken
+}
+
+/** The closed variant of one source, for the variant-aware comparison. */
+internal enum class NativeIoSourceVariant { STARTUP, NATIVE_CLI, CONVERSATION }
+
+internal fun nativeIoSourceVariant(source: NativeIoInputSource): NativeIoSourceVariant = when (source) {
+	is NativeIoStartupSource -> NativeIoSourceVariant.STARTUP
+	is NativeIoNativeCliSource -> NativeIoSourceVariant.NATIVE_CLI
+	is NativeIoSource -> NativeIoSourceVariant.CONVERSATION
 }

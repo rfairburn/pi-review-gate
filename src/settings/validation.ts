@@ -6,8 +6,9 @@
  * contract.
  */
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
-import { delimiter, extname, isAbsolute, join, win32 } from "node:path";
+import { access } from "node:fs/promises";
+import { delimiter, isAbsolute, join } from "node:path";
+import { resolveApplicationCommand } from "../application-command";
 import {
   MAX_EXECUTION_WORKERS,
   externalAgentCatalog,
@@ -202,33 +203,19 @@ export async function validateSelection(
   return undefined;
 }
 
-/** Application-only availability probe; platform/environment injection keeps tests hermetic. */
+/**
+ * Application-only availability probe: a thin delegate onto the shared
+ * `resolveApplicationCommand` so settings discovery and a native interactive
+ * launch descriptor can never disagree about which file a configured command
+ * names (filesystem/PATH/PATHEXT/case semantics live in one place).
+ * Platform/environment injection keeps tests hermetic.
+ */
 export async function applicationCommandAvailable(
   command: string,
   environment: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): Promise<boolean> {
-  const windows = platform === "win32";
-  // Match Node's first case-insensitive environment key on Windows when
-  // shared/role overrides produce a plain object (rather than process.env).
-  const environmentValue = (name: string): string | undefined => {
-    if (!windows) return environment[name];
-    const key = Object.keys(environment).sort().find((candidate) => candidate.toUpperCase() === name);
-    return key === undefined ? undefined : environment[key];
-  };
-  const suffixes = windows && !extname(command)
-    ? ["", ...(environmentValue("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((suffix) => /^\.[a-z0-9]+$/i.test(suffix)).map((suffix) => suffix.toLowerCase())]
-    : [""];
-  const explicitPath = isAbsolute(command) || (windows && win32.isAbsolute(command)) || command.includes("/") || (windows && command.includes("\\"));
-  const locations = explicitPath ? [command] : (environmentValue("PATH") ?? "").split(windows ? ";" : delimiter).filter(Boolean).map((directory) => join(directory, command));
-  for (const location of locations) {
-    for (const suffix of suffixes) {
-      const candidate = location + suffix;
-      if (await stat(candidate).then((entry) => entry.isFile(), () => false)
-        && await access(candidate, constants.X_OK).then(() => true, () => false)) return true;
-    }
-  }
-  return false;
+  return (await resolveApplicationCommand(command, environment, platform)) !== undefined;
 }
 
 async function commandAvailable(command: string): Promise<boolean> {

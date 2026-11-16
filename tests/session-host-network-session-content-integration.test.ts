@@ -52,6 +52,7 @@ import {
 	DEFAULT_INSTANCE_COLS,
 	DEFAULT_INSTANCE_ROWS,
 	InstanceManager,
+	isNativeViewerNativeCliInputSource,
 	isNativeViewerStartupInputSource,
 	type InstanceManagerOptions,
 	type InstancePty,
@@ -59,6 +60,9 @@ import {
 	type InstanceStatusHandlers,
 	type InstanceStatusRegistration,
 	type InstanceStatusUpdate,
+	type NativeCliClipboardEvent,
+	type NativeCliLaunch,
+	type NativeCliLaunchRequest,
 	type PtyFactory,
 	type StatusRegistrar,
 } from "../src/session-host/instances";
@@ -103,16 +107,22 @@ import {
 	encodeSessionContentViewport,
 	NATIVE_COPY_MAX_ENCODED_CHARS,
 	NATIVE_TEXT_PASTE_MAX_BYTES,
+	isNativeIoNativeCliSource,
+	isNativeIoNativeCliCopyEvent,
 	isNativeIoStartupSource,
 	nativeIoSourceEquals,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
 	SESSION_CONTENT_SERVICE,
 	type NativeIoCompletedCopy,
 	type NativeIoInputSource,
+	type NativeIoNativeCliCopyEvent,
+	type NativeIoNativeCliSource,
 	type NativeIoSource,
 	type SessionContentBeginFrame,
 	type SessionContentErrorFrame,
@@ -122,6 +132,7 @@ import {
 import {
 	stripGeneratedSgr,
 	type TerminalFrame,
+	type TerminalInputModes,
 	type TerminalSurface,
 } from "../src/session-host/terminal-surface";
 import {
@@ -2036,6 +2047,12 @@ interface NativeRow {
 	readonly entry: NativeRegistrarEntry;
 }
 
+/** One hosted provider row: its id and its synthetic child, and nothing Pi-shaped. */
+interface NativeCliRow {
+	readonly id: string;
+	readonly pty: NativePty;
+}
+
 interface NativeOwnerFixture {
 	readonly root: string;
 	readonly manager: InstanceManager;
@@ -2049,15 +2066,22 @@ interface NativeOwnerFixture {
 	readonly ownerDiagnostics: SessionContentHostDiagnosticCode[];
 	/** Everything the manager's OWN owner-local clipboard route was handed. */
 	readonly localCopies: { readonly instanceId: string; readonly event: NativeClipboardEvent }[];
+	/** Everything the manager's owner-local HOSTED PROVIDER copy route was handed. */
+	readonly localCliCopies: { readonly instanceId: string; readonly event: NativeCliClipboardEvent }[];
 	createRow(label: string): Promise<NativeRow>;
+	/**
+	 * One hosted provider row (a synthetic Claude child): no Pi registration, no
+	 * status capsule, no framing — and therefore no conversation tuple anywhere.
+	 */
+	createNativeCliRow(label: string, backend?: "claude" | "codex"): Promise<NativeCliRow>;
 	setConversation(row: NativeRow, sessionId: string, epoch: number): void;
 	/** Deliver one arbitrary status (for example a null tuple) through the real status path. */
 	emitStatus(row: NativeRow, update: InstanceStatusUpdate): void;
 	/** Deliver this row's own readiness capsule and await the parse that verifies it. */
 	markReady(row: NativeRow): Promise<void>;
-	ptyFor(row: NativeRow): NativePty;
-	surfaceFor(row: NativeRow): TerminalSurface;
-	feed(row: NativeRow, chunks: readonly string[]): Promise<void>;
+	ptyFor(row: NativeRow | NativeCliRow): NativePty;
+	surfaceFor(row: NativeRow | NativeCliRow): TerminalSurface;
+	feed(row: NativeRow | NativeCliRow, chunks: readonly string[]): Promise<void>;
 	/** The dispatches this row's child actually received, verified independently. */
 	dispatches(row: NativeRow): readonly NativeDispatch[];
 	lastDispatch(row: NativeRow): NativeDispatch;
@@ -2110,6 +2134,16 @@ async function startNativeOwner(
 	const statusHandlers = new Map<string, InstanceStatusHandlers>();
 	const registrar = nativeStatusRegistrar(statusHandlers);
 	const localCopies: { readonly instanceId: string; readonly event: NativeClipboardEvent }[] = [];
+	const localCliCopies: { readonly instanceId: string; readonly event: NativeCliClipboardEvent }[] = [];
+	// A synthetic provider of production SHAPE only: it hands back one complete
+	// interactive descriptor for this row's own workspace. It discovers nothing, runs
+	// no real Claude or Codex binary, and reads no real provider configuration.
+	const provider: NativeCliLaunch = (backend, request: NativeCliLaunchRequest) => ({
+		file: `/synthetic/bin/${backend}`,
+		args: ["--interactive"],
+		env: { PATH: "/synthetic/bin", HOME: home },
+		cwd: request.workspace,
+	});
 	let managerChange: InstanceManagerOptions["onChange"];
 	const manager = new InstanceManager({
 		packageRoot: pkg.packageRoot,
@@ -2128,6 +2162,10 @@ async function startNativeOwner(
 		// The owner's own local clipboard route: a viewer-origin copy must never
 		// appear here, so this records every claim that it did.
 		onNativeClipboard: (instanceId, event) => { localCopies.push({ instanceId, event }); },
+		// The owner's hosted provider copy route: a viewer-routed provider copy must
+		// never appear here, so this records every claim that it did.
+		onNativeCliClipboard: (instanceId, event) => { localCliCopies.push({ instanceId, event }); },
+		nativeCliLaunch: provider,
 		ptyFactory,
 	});
 	cleanup.own("instance manager and its synthetic children", async () => {
@@ -2214,12 +2252,27 @@ async function startNativeOwner(
 		assert.equal(entry.bootstrap.inputOriginFraming, 1, "the closed mode is recorded before the child exists");
 		return { id, pty, bootstrap: entry.bootstrap, entry };
 	};
-	const surfaceFor = (row: NativeRow): TerminalSurface => {
+	const createNativeCliRow = async (label: string, backend: "claude" | "codex" = "claude"): Promise<NativeCliRow> => {
+		const id = await manager.create({ workspace: workspaceFor(), backend });
+		const view = service.readRow(id);
+		assert.ok(view, `row ${id} is not listed (${label})`);
+		assert.equal(view.lifecycle, "alive", `the hosted provider row launched (${view.error ?? "none"}) for ${label}`);
+		assert.equal(view.backend, backend, "the row records its own provider backend");
+		assert.equal(view.nativeSession, null, "a hosted provider child has no Pi conversation to attribute");
+		const pty = ptysByWorkspace.get(view.workspace);
+		assert.ok(pty, `no synthetic PTY was spawned for ${label}`);
+		// No Pi registration exists for this row at all, so there is no bootstrap, no
+		// capsule key, and no framing mode a copy could be attributed through.
+		assert.equal(registrar.entries.some((entry) => entry.instanceId === id), false,
+			"a hosted provider row registers nothing with the Pi status registrar");
+		return { id, pty };
+	};
+	const surfaceFor = (row: NativeRow | NativeCliRow): TerminalSurface => {
 		const surface = manager.surface(row.id);
 		assert.ok(surface, `row ${row.id} has no terminal surface`);
 		return surface;
 	};
-	const ptyFor = (row: NativeRow): NativePty => {
+	const ptyFor = (row: NativeRow | NativeCliRow): NativePty => {
 		const pty = ptysByWorkspace.get(service.readRow(row.id)?.workspace ?? "");
 		assert.ok(pty, `no synthetic PTY was spawned for row ${row.id}`);
 		return pty;
@@ -2247,7 +2300,9 @@ async function startNativeOwner(
 		bindings,
 		ownerDiagnostics,
 		localCopies,
+		localCliCopies,
 		createRow,
+		createNativeCliRow,
 		setConversation(row, sessionId, epoch) {
 			const handlers = statusHandlers.get(row.id);
 			assert.ok(handlers, `row ${row.id} has no live status registration`);
@@ -2272,7 +2327,7 @@ async function startNativeOwner(
 		},
 		ptyFor,
 		surfaceFor,
-		async feed(row, chunks) {
+		async feed(row: NativeRow | NativeCliRow, chunks: readonly string[]) {
 			const pty = ptyFor(row);
 			for (const chunk of chunks) pty.emitData(chunk);
 			await surfaceFor(row).flush();
@@ -2322,6 +2377,11 @@ interface NativeViewerFixture {
 	commit(source: NativeIoInputSource | undefined): void;
 	/** The next published snapshot that states a CONVERSATION native input source. */
 	nextSource(label: string): Promise<NativeIoSource>;
+	/** The next published snapshot that states a HOSTED PROVIDER (tuple-less) source. */
+	nextNativeCliSource(label: string): Promise<{
+		readonly source: NativeIoNativeCliSource;
+		readonly inputModes: TerminalInputModes;
+	}>;
 	/** The next copy delivered to this viewer. */
 	nextCopy(label: string): Promise<NativeIoCompletedCopy>;
 }
@@ -2451,8 +2511,19 @@ async function connectNativeViewer(
 			for (;;) {
 				const snapshot = await inbox.next(label);
 				const source = snapshot.meta.inputSource;
-				// Only a conversation source qualifies; a startup source names no tuple.
-				if (source !== undefined && source !== null && !isNativeIoStartupSource(source)) return source;
+				// Only a conversation source qualifies; a tuple-less source names no tuple.
+				if (source !== undefined && source !== null
+					&& !isNativeIoStartupSource(source) && !isNativeIoNativeCliSource(source)) return source;
+			}
+		},
+		async nextNativeCliSource(label) {
+			for (;;) {
+				const snapshot = await inbox.next(label);
+				const source = snapshot.meta.inputSource;
+				// Only a hosted provider source qualifies; it carries no tuple at all.
+				if (source !== undefined && source !== null && isNativeIoNativeCliSource(source)) {
+					return { source, inputModes: snapshot.meta.inputModes };
+				}
 			}
 		},
 		nextCopy(label) {
@@ -2501,7 +2572,14 @@ interface RawNativeSubscription {
 async function openRawNativeSubscription(
 	t: TestContext,
 	owner: NativeOwnerFixture,
-	options: { readonly label: string; readonly sessionId: string; readonly cols: number; readonly rows: number },
+	options: {
+		readonly label: string;
+		readonly sessionId: string;
+		readonly cols: number;
+		readonly rows: number;
+		/** What this peer offers in its hello; the default is the native IO pair. */
+		readonly capabilities?: readonly string[];
+	},
 ): Promise<RawNativeSubscription> {
 	const identity = await newIdentity(options.label);
 	const clientFixture = startClient(t, identity);
@@ -2576,7 +2654,7 @@ async function openRawNativeSubscription(
 		service: SESSION_CONTENT_SERVICE,
 		major: SESSION_CONTENT_MAJOR,
 		minor: SESSION_CONTENT_MINOR,
-		capabilities: [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
+		capabilities: options.capabilities ?? [SESSION_CONTENT_REQUIRED_CAPABILITY, SESSION_CONTENT_NATIVE_IO_CAPABILITY],
 	}));
 	await wire.nextFrame("hello_ack", "the raw native subscriber was acknowledged");
 	await fixture.subscribe(options.cols, options.rows, options.label);
@@ -2589,7 +2667,9 @@ async function openRawNativeSubscription(
 
 function statedSource(source: NativeIoInputSource | null | undefined): NativeIoSource {
 	assert.ok(source !== undefined && source !== null, "this publish states the owner's own native input source");
-	if (isNativeIoStartupSource(source)) throw new Error("this publish was expected to state a conversation source");
+	if (isNativeIoStartupSource(source) || isNativeIoNativeCliSource(source)) {
+		throw new Error("this publish was expected to state a conversation source");
+	}
 	return source;
 }
 
@@ -2684,8 +2764,9 @@ test("a native viewer's input crosses TLS into the framed child under the owner'
 	await withTimeout(viewer.viewer.ready, 5_000, "the native viewer never became ready");
 	const first = await viewer.nextSource("a published viewport that states a native input source");
 	const lower = owner.service.readViewerInputSource(viewerIdOf(viewer.binding));
-	assert.ok(lower !== undefined && !isNativeViewerStartupInputSource(lower),
-		"the manager resolves this binding's own conversation input scope");
+	if (lower === undefined || isNativeViewerStartupInputSource(lower) || isNativeViewerNativeCliInputSource(lower)) {
+		throw new Error("the manager resolves this binding's own conversation input scope");
+	}
 	// The exact settled schema: one `nativeSession` tuple, the canonical geometry
 	// with its revision, this viewer's revision, and the host-minted token.
 	assert.deepEqual(first, {
@@ -3707,7 +3788,9 @@ test("startup-phase input crosses TLS before the first status, carries only the 
 		SESSION_CONTENT_REQUIRED_CAPABILITY,
 		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
-	], "startup input is acknowledged beside native IO");
+		SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+		SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
+	], "startup input is acknowledged beside native IO, with hosted provider copy beside hosted input");
 
 	const startupView = await nextSnapshotMatching(viewer.inbox, "the null-tuple viewport with a startup source",
 		(snapshot) => snapshot.meta.inputSource !== undefined && snapshot.meta.inputSource !== null
@@ -3772,5 +3855,142 @@ test("startup-phase input crosses TLS before the first status, carries only the 
 	assert.equal(owner.service.readViewerInputSource(viewerIdOf(viewer.binding)), undefined,
 		"a once-known, now lost tuple never becomes startup again");
 	assert.deepEqual(owner.localCopies, []);
+	owner.succeeded();
+});
+
+/* ------------------------------------------------------------------------- *
+ * Hosted provider TEXT copy across the real endpoints (issue 277 slice)
+ * ------------------------------------------------------------------------- */
+
+/** One standard OSC 52 TEXT copy request, exactly as a provider child emits it. */
+function providerOsc52(selection: string, text: string): string {
+	return `\x1b]52;${selection};${Buffer.from(text, "utf8").toString("base64")}\x07`;
+}
+
+test("a hosted provider's TEXT copy crosses TLS to the viewer whose input the owner last accepted, whole and paged when wide", async (t) => {
+	const owner = await startNativeOwner(t);
+	const row = await owner.createNativeCliRow("provider-copy");
+	await owner.feed(row, ["\x1b[2J\x1b[H", "provider prompt\n"]);
+
+	const viewer = await connectNativeViewer(t, owner, { label: "provider-copy-viewer", sessionId: row.id, cols: 100, rows: 30 });
+	await withTimeout(viewer.viewer.ready, 5_000, "the provider copy viewer never became ready");
+	// The real host negotiated provider copy with the real client, beside hosted input.
+	const acknowledged = lastFrameOfType(viewer.wire, "hello_ack");
+	assert.ok(acknowledged !== undefined, "the owner acknowledged the hello");
+	assert.equal(acknowledged.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY), true,
+		"a real native IO viewer offers hosted provider copy and the owner acknowledges it");
+
+	const view = await viewer.nextNativeCliSource("the hosted provider viewport states its tuple-less source");
+	const source = view.source;
+	assert.equal(isNativeIoNativeCliSource(source), true,
+		"a hosted provider row publishes its own tuple-less input source");
+	assert.equal(source.backend, "claude");
+	assert.equal(Object.hasOwn(source, "nativeSession"), false, "no conversation tuple is stated for a provider row");
+	viewer.commit(source);
+
+	assert.deepEqual(
+		await viewer.viewer.sendInput({ source, inputModes: view.inputModes, kind: "keyboard", text: "y\r" }),
+		{ status: "submitted" },
+	);
+	await row.pty.whenWrites(1, "the viewer's input reached the provider child");
+	assert.equal(row.pty.writes[0], "y\r", "a hosted provider child takes its bytes raw, with no Pi framing");
+
+	// The child emits one standard TEXT copy request. Nothing about it names a Pi
+	// conversation, and nothing here invents one.
+	const small = "text the provider child copied out \u{1f4cc}";
+	row.pty.emitData(providerOsc52("c", small));
+	await owner.surfaceFor(row).flush();
+
+	const delivered = await viewer.nextCopy("the provider copy reached its own viewer");
+	assert.equal(isNativeIoNativeCliSource(delivered.source), true);
+	assert.deepEqual(delivered.source, source, "the copy is addressed to this viewer's exact current provider scope");
+	assert.equal(isNativeIoNativeCliCopyEvent(delivered.event), true, "the payload is the hosted provider copy family");
+	if (!isNativeIoNativeCliCopyEvent(delivered.event)) return;
+	assert.deepEqual(Object.keys(delivered.event).sort(), ["backend", "encoded", "kind"],
+		"backend and text only: no sessionId, no sessionEpoch, no fabricated tuple");
+	assert.equal(delivered.event.backend, "claude");
+	assert.equal(Buffer.from(delivered.event.encoded, "base64").toString("utf8"), small);
+	assert.equal(delivered.dispatchId, 1, "the owner's own ordinal of the accepted input this copy is frozen to");
+	assert.equal(viewer.wire.framesOf("copy").length, 1, "one whole inline emission");
+
+	// A wide copy crosses as pages of the SAME family and still arrives byte-exact.
+	const wide = "\u{1f4dd} ".repeat(12_000); // 60,000 bytes -> 80,000 encoded chars
+	assert.ok(Buffer.from(wide, "utf8").toString("base64").length > 65_536, "wide enough to need pages");
+	assert.ok(Buffer.from(wide, "utf8").toString("base64").length <= NATIVE_COPY_MAX_ENCODED_CHARS,
+		"and still inside the unchanged producer bound");
+	row.pty.emitData(providerOsc52("", wide));
+	await owner.surfaceFor(row).flush();
+
+	const deliveredWide = await viewer.nextCopy("the wide provider copy assembled whole");
+	if (!isNativeIoNativeCliCopyEvent(deliveredWide.event)) {
+		throw new Error("the wide copy arrived outside the hosted provider family");
+	}
+	assert.equal(Buffer.from(deliveredWide.event.encoded, "base64").toString("utf8"), wide,
+		"the whole text arrives, never a truncated prefix");
+	assert.equal(viewer.wire.framesOf("copy").length, 1, "the paged form adds no inline copy frame");
+	assert.equal(viewer.wire.framesOf("copy_begin").length, 1, "the wide copy crossed as one paged transfer");
+	assert.ok(viewer.wire.framesOf("copy_chunk").length > 1, "and as more than one page");
+	assert.equal(viewer.wire.framesOf("copy_end").length, 1);
+	assert.equal(deliveredWide.dispatchId, 1, "the recipient stays frozen to the input accepted before either copy");
+
+	// A refusal of any kind never reroutes a provider copy to the owner.
+	assert.deepEqual(owner.localCliCopies, [], "a viewer-routed provider copy never becomes the owner's own route");
+	assert.deepEqual(owner.localCopies, [], "and never touches the Pi conversation clipboard route");
+	owner.succeeded();
+});
+
+test("a peer that negotiated hosted input but not hosted provider copy receives no copy frame at all", async (t) => {
+	const owner = await startNativeOwner(t);
+	const row = await owner.createNativeCliRow("provider-copy-legacy");
+	await owner.feed(row, ["\x1b[2J\x1b[H", "provider prompt\n"]);
+
+	// A LEGACY build of this client: hosted input yes, hosted provider copy never
+	// offered. The owner must not gain the extension on its behalf.
+	const peer = await openRawNativeSubscription(t, owner, {
+		label: "legacy-provider-copy-peer",
+		sessionId: row.id,
+		cols: 100,
+		rows: 30,
+		capabilities: [
+			SESSION_CONTENT_REQUIRED_CAPABILITY,
+			SESSION_CONTENT_NATIVE_IO_CAPABILITY,
+			SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
+			SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+		],
+	});
+	// The helper performed this peer's own hello and subscribe; its published viewport
+	// is what it was given. The owner's acknowledgement is read from what this channel
+	// was actually written, never from a wait.
+	const acknowledged = lastFrameOfType(peer.wire, "hello_ack");
+	assert.ok(acknowledged !== undefined, "the owner acknowledged this peer's hello");
+	assert.equal(acknowledged.capabilities.includes(SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY), false,
+		"an identifier this peer never offered is never acknowledged");
+	const begin = peer.begin;
+	const source = begin.inputSource;
+	assert.ok(source !== undefined && source !== null && isNativeIoNativeCliSource(source),
+		"hosted provider INPUT itself is still negotiated on this channel");
+
+	const built = buildNativeInputInline({
+		subscriptionId: peer.subscriptionId,
+		inputId: randomUUID(),
+		ordinal: 1,
+		source,
+		inputModes: begin.inputModes,
+		kind: "keyboard",
+		data: "y\r",
+	});
+	for (const frame of built.frames) await peer.sendBytes(frame);
+	await row.pty.whenWrites(1, "the legacy peer's accepted input reached the provider child");
+
+	// The copy is accepted by the manager and routed to this viewer's sink, where the
+	// owner's own endpoint refuses it: the whole emission is dropped, never minted.
+	row.pty.emitData(providerOsc52("c", "a copy this peer never asked to receive"));
+	await owner.surfaceFor(row).flush();
+	await withTimeout(owner.whenDiagnostic("copy_dropped"), 5_000,
+		"the owner never recorded the provider copy it had to drop for an unnegotiated family");
+	assert.deepEqual(peer.wire.framesOf("copy"), [], "no inline copy frame is ever minted here");
+	assert.deepEqual(peer.wire.framesOf("copy_begin"), [], "nor a paged one");
+	assert.deepEqual(peer.wire.framesOf("copy_chunk"), []);
+	assert.deepEqual(owner.localCliCopies, [], "a refused provider copy never falls back to the owner's route");
 	owner.succeeded();
 });

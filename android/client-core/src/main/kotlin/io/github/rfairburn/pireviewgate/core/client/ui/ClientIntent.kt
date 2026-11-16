@@ -35,6 +35,9 @@ public sealed interface ClientDraft {
     /** Rename draft for one frozen target. */
     public data class Rename(public val target: RenameTarget, public val value: String) : ClientDraft
 
+    /** Native host-caption draft for one frozen native row target. */
+    public data class NativeRename(public val target: NativeRenameTarget, public val value: String) : ClientDraft
+
     /** Saved search draft. Typing changes nothing until it is submitted. */
     public data class SavedSearch(public val value: String) : ClientDraft
 }
@@ -196,11 +199,22 @@ public sealed interface ClientIntent {
     /** Choose the owner the create form is addressed to. */
     public data class SelectCreateOwner(public val hostId: HostId) : ClientIntent
 
-    /** Create one session on one explicitly chosen owner, workspace verbatim. */
+    /**
+     * Choose the provider the create form is addressed to.
+     *
+     * [provider] is one exact choice from the selected owner's drawn options. A
+     * native choice names the owner-advertised backend/id pair; Pi remains the
+     * existing create lane. Nothing is created by the choice itself.
+     */
+    public data class SelectCreateProvider(public val provider: CreateProviderChoice) : ClientIntent
+
+    /** Create one session on one explicitly chosen owner and provider, workspace verbatim. */
     public data class SubmitSessionCreate(
         public val hostId: HostId,
         public val workspace: String,
         public val proof: UiActionProof,
+        /** Fresh forms default to Pi; an existing caller keeps that exact lane. */
+        public val provider: CreateProviderChoice = CreateProviderChoice.Pi,
     ) : ClientIntent
 
     /** Arm the rename form for one row that reports a native conversation. */
@@ -223,6 +237,19 @@ public sealed interface ClientIntent {
     /** Submit a rename fenced to the frozen native tuple. */
     public data class SubmitSessionRename(
         public val target: RenameTarget,
+        public val name: String,
+        public val proof: UiActionProof,
+    ) : ClientIntent
+
+    /** Arm the native host-caption form for one native row. */
+    public data class RequestNativeSessionRename(public val target: NativeRenameTarget) : ClientIntent
+
+    /**
+     * Submit a native host caption fenced to the frozen owner row and the backend
+     * the owner reported on it. It carries no Pi conversation tuple.
+     */
+    public data class SubmitNativeSessionRename(
+        public val target: NativeRenameTarget,
         public val name: String,
         public val proof: UiActionProof,
     ) : ClientIntent

@@ -60,7 +60,7 @@ import {
   sameFileIdentity,
   type PosixOwnedSession,
 } from "./helpers/session-host-native-posix-launcher";
-import { frameHeader, isSidebarFocusedFrame, parseRosterFrame } from "./helpers/session-host-native-roster-witness";
+import { frameHeader, isSidebarFocusedFrame, parseRosterFrame, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 
 const restorationFixtures = require("../../tests/fixtures/session-host-posix-launcher-restoration.cjs") as {
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
@@ -143,7 +143,7 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   // build, so the first real Main frame legitimately takes minutes.
   await driver.waitFrame(
     (frame) => frameHeader(frame) === "Session host" && frame.includes("Welcome")
-      && isSidebarFocusedFrame(frame, 32) && parseRosterFrame(frame, 32).count === 0,
+      && isSidebarFocusedFrame(frame, SIDEBAR_COLUMNS) && parseRosterFrame(frame, SIDEBAR_COLUMNS).count === 0,
     "actual POSIX source launcher completely paints its empty welcome roster and sidebar-only focus footer before input",
     -1,
     POSIX_LAUNCHER_STARTUP_TIMEOUT_MS,
@@ -187,7 +187,7 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   assert.equal(session.record.contextCwd, session.workspace, "the native context independently confirms the workspace");
   assert.equal(session.record.agentDir, layout.nativeAgentDir, "the native child uses the ordinary per-leg shared native agent root");
   assert.equal(session.record.tty, true, "the native child is a real Pi TTY process");
-  assert.equal(session.record.columns, 87, "the native child receives the actual 87-column pane geometry");
+  assert.equal(session.record.columns, 84, "the native child receives the actual 84-column pane geometry");
   assert.equal(session.record.rows, 49, "the native child receives the actual 49-row pane geometry");
   const sessionRel = relative(layout.nativeAgentDir, session.record.sessionFile!);
   assert.ok(sessionRel !== ".." && !sessionRel.startsWith(`..${sep}`) && !isAbsolute(sessionRel),

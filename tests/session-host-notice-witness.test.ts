@@ -12,7 +12,7 @@ import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 
 const MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 
-/** The actual 32-column word wrap of the complete notice. */
+/** The actual 35-column word wrap of the complete notice. */
 const WRAPPED = [
   "! Session not removed; it may be",
   "live, unconfirmed, or no longer",
@@ -24,7 +24,8 @@ const ROSTER = [
   " Sessions (1) ",
   "Native native-1",
   "> exited",
-  "  background unknown",
+  // The exact both-unknown count row drawn at the sidebar width.
+  "  bg tasks unknown | shells unknown",
   "    Waiting for input",
   "",
   "  Saved conversations",

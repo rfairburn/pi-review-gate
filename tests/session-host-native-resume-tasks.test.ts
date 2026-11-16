@@ -102,6 +102,8 @@ const RECOVERY_PROMPT = "synthetic-repaired-record-activity-recovery-user";
 const RECOVERY_RESPONSE = "synthetic-repaired-record-recovery-returned";
 const RECOVERY_COMPLETION_WAKE_RESPONSE = "synthetic-recovery-completion-wake-ack";
 const ROW_COUNTS = /^bg tasks (unknown|\d+) \| shells (unknown|\d+)$/u;
+/** The exact both-unknown row the formatter draws at the sidebar width. */
+const BOTH_UNKNOWN_BACKGROUND = "bg tasks unknown | shells u...";
 const FIXTURE_TIMEOUT_MS = 240_000;
 const EXCLUDED_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
@@ -172,13 +174,13 @@ function isMainFocusFrame(text: string): boolean {
   const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
   const offset = /^\s*Sessions \(/u.test(pane[0] ?? "") ? 0 : 1;
   const footer = pane.slice(offset + 1 + parsed.entryEnd).map((line) => line.trim()).filter(Boolean);
-  return footer.length === 2 && footer[0] === "F8 toggle | enter open" && footer[1] === "esc hide | q quit";
+  return footer.length === 2 && footer[0] === "F8 toggle | enter open | esc hide" && footer[1] === "q quit";
 }
 
 function activityCounts(text: string, caption: string): ActivityCounts | undefined {
   const cards = rosterCards(text, SIDEBAR_COLUMNS).filter((card) => renderedTitleMatches(card.title, caption));
   if (cards.length !== 1) return undefined;
-  if (cards[0]!.background === "background unknown") {
+  if (cards[0]!.background === BOTH_UNKNOWN_BACKGROUND) {
     return { tasks: null, shells: null, status: cards[0]!.status };
   }
   const match = ROW_COUNTS.exec(cards[0]!.background);

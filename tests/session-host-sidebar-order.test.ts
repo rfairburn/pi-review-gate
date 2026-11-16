@@ -891,8 +891,8 @@ test("a keyboard move down across the BOTTOM edge keeps the complete moving card
   assert.notEqual(titleRow(view, "label-d"), -1, "and drew the destination card its marker sits on");
   const marked = view.findIndex((line) => line.trim().startsWith(">>"));
   assert.ok(marked >= 1, "the moving card is marked");
-  assert.ok(/^ {2}background /u.test(view[marked + 1] ?? ""),
-    "the moving card stays COMPLETE rather than clipped at the window edge");
+  assert.ok(/^ {2}bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A)$/u.test(view[marked + 1]?.trimEnd() ?? ""),
+    "the moving card keeps both labeled count cells and stays COMPLETE rather than clipped at the window edge");
   assert.ok(view.some((line) => /(?:\^ |v )agent /u.test(line)), "the destination shows its insertion marker");
   assert.deepEqual(harness.focusedActions(), [], "a preview emits nothing at all");
   assert.equal(harness.controller.selectedId, "c", "the highlight stayed on the moving card");
@@ -913,8 +913,8 @@ test("a window that fits only one card keeps the COMPLETE moving card when the p
   assert.notEqual(titleRow(view, "label-a"), -1, "the moving card stayed drawn");
   const marked = view.findIndex((line) => line.trim().startsWith(">>"));
   assert.ok(marked >= 1, "it is still marked as the card being moved");
-  assert.ok(/^ {2}background /u.test(view[marked + 1] ?? ""),
-    "and it is drawn COMPLETE: the window keeps the moving card, not the pair");
+  assert.ok(/^ {2}bg tasks (?:unknown|\d+|N\/A) \| shells (?:unknown|\d+|N\/A)$/u.test(view[marked + 1]?.trimEnd() ?? ""),
+    "both labeled count cells are drawn COMPLETE: the window keeps the moving card, not the pair");
   assert.equal(titleRow(view, "label-b"), -1, "the destination gives way when both cannot fit");
   assert.deepEqual(harness.focusedActions(), [], "the preview emitted nothing");
 

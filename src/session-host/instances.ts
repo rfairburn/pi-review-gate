@@ -1,33 +1,57 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { realpathSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
+import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
-import { NativeAgentRegistry, PreparedProfile, ProfilePreparer } from "./profiles";
+import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveExistingDirectory } from "./profiles";
 import {
+  NODE_OPTIONS_RESTORE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
   NativeLaunchDescriptor,
   composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
 } from "./launch";
+import {
+  isNativeCliBackend,
+  isNativeCliTargetId,
+  isNativeDisplayName,
+  resolveSessionBackend,
+  sessionBackendDisplayLabel,
+  type NativeCliBackend,
+  type SessionBackend,
+} from "./session-backend";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
-import { createNativeClipboardReceiver, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
+import { createNativeClipboardReceiver, isNativeCliCopyEncoded, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
+import {
+	mergeNativeStatusSupport,
+	nativeStatusAccepted,
+	nativeStatusRejected,
+	readNativeStatusObservation,
+	readNativeStatusSupport,
+	type NativeStatusObservation,
+	type NativeStatusSubmitResult,
+	type NativeStatusSupportMap,
+} from "./native-status";
 import {
 	createNativeInputEncoder,
 	mintNativeViewerScopeToken,
 	mintNativeViewerStartupScopeToken,
+	mintNativeViewerNativeCliScopeToken,
 	parseNativeViewerScopeToken,
 	verifyNativeViewerScopeToken,
+	verifyNativeViewerNativeCliScopeToken,
 	NATIVE_INPUT_VIEWER_MAX_PAYLOAD_BYTES,
 	type NativeInputEncoder,
 	type NativeInputExpectedFence,
 	type NativeInputOrigin,
 	type NativeViewerScopeFacts,
 	type NativeViewerStartupScopeFacts,
+	type NativeViewerNativeCliScopeFacts,
 } from "./native-input-origin";
 import {
 	hasCompleteSessionIdle,
@@ -59,11 +83,35 @@ import {
 	type OwnedConptyReaderSettlement,
 } from "./windows-conpty-reader";
 import type {
+	NativeHookRegistration,
+	NativeHookSourceHandlers,
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
 	StatusRenameResult,
 	StatusShutdownResult,
 } from "./broker";
+import type {
+	NativeHookArtifactLease,
+	NativeHookLaunchOutcome,
+} from "./native-hook-launch-prep";
+import type {
+	NativeHookBootstrap,
+	NativeHookEvent,
+	NativeHookFailure,
+} from "./native-hook-protocol";
+import {
+	NATIVE_CLI_DEFAULT_TARGET_IDS,
+	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
+	type NativeCodexOwnedLaunchPlan,
+} from "./native-cli-launch";
+import { isNativeConversationId } from "./native-conversation";
+import type {
+	OwnedCodexBackendLaunchIdentity,
+	OwnedCodexBackendLease,
+	OwnedCodexBackendReady,
+	OwnedCodexBackendStatus,
+} from "./native-codex-backend";
+import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
 import type { StagedSessionHostPayload } from "./payload";
 import {
 	SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -166,6 +214,21 @@ import {
  *   Nothing here grants or withholds input: input remains addressed-only and every
  *   existing displayed-owner fence stays where it is.
  *
+ * - Per-row backend identity (issue 277 core slice): every row belongs to one
+ *   closed backend (src/session-host/session-backend.ts), and an absent backend
+ *   means Pi. A native CLI row (Claude or Codex) is an ordinary provider PTY
+ *   child: its launch descriptor comes only from the host-injected
+ *   {@linkcode InstanceManagerOptions.nativeCliLaunch} provider, it gets NO
+ *   status registration, no Pi bootstrap/preload/startup-payload/title
+ *   environment, no input framing, and no native clipboard receiver, so every
+ *   provider field stays truthfully unknown and only the owned PTY's own exit
+ *   settles the row. Its workspace is validated and canonicalized here without
+ *   any Pi agent-directory setup. Local input is forwarded raw, exactly as for
+ *   a legacy unframed row; the viewer input seam refuses it because that row has
+ *   no registration to fence a scope against. A known native CLI row owns no Pi
+ *   conversation, so it contributes nothing to the saved-conversation censuses,
+ *   while an unknown Pi row keeps refusing exactly as before.
+ *
  * - Deliberate saved-conversation creation (issue 323) accepts a branded
  *   SavedSessionAdmission, reserves its session id/exact file synchronously
  *   before any await so concurrent deliberate opens cannot spawn duplicates,
@@ -193,6 +256,7 @@ import {
 
 export interface StopInstanceResult {
 	readonly status: "exited" | "confirmation-required" | "unavailable" | "unconfirmed";
+	/** Owned force escalation was attempted on this row's PTY or its owned backend; never exit proof. */
 	readonly forced: boolean;
 }
 
@@ -430,14 +494,63 @@ export interface NativeViewerStartupInputSource {
 	readonly sourceToken: string;
 }
 
-/** The input-path union: an unchanged conversation source or a startup source. */
-export type NativeViewerAnyInputSource = NativeViewerInputSource | NativeViewerStartupInputSource;
+/**
+ * The host's own immutable description of one viewer's input scope on a NATIVE
+ * CLI row (issue 277 native remote-input slice): a hosted provider child this
+ * manager owns only as a PTY process, with no Pi status registration, no bootstrap
+ * token, no input framing, and no Pi native conversation.
+ *
+ * It carries the host run, viewer identity and revision, row, the row's positively
+ * recorded provider backend, and the canonical geometry and its revision — and NO
+ * `nativeSession`, `registrationIdentity`, or `registrationGeneration` key at all,
+ * because inventing any of them would claim a fact the row does not have. The
+ * process this scope is bound to is deliberately NOT a public fact: it is carried by
+ * an owner-private per-incarnation secret the manager minted when it took ownership
+ * of this child's PTY, which appears nowhere here and never crosses a wire.
+ *
+ * Its token lives in the separate `nvcli1` commitment domain, so it can never be
+ * read or verified as a Pi conversation-copy scope or a Pi startup scope. Input
+ * only: no copy receipt ever carries it, and a native CLI row has no copy producer.
+ * The scope describes terminal-process control and nothing more — it is never a
+ * claim about what the provider conversation is doing, and none of its facts are
+ * derived from child output or process liveness beyond the manager's own ownership.
+ */
+export interface NativeViewerNativeCliInputSource {
+	readonly hostRunId: string;
+	readonly viewerId: string;
+	readonly viewerRevision: number;
+	readonly rowId: string;
+	readonly phase: "native-cli";
+	readonly backend: NativeCliBackend;
+	readonly geometry: NativeViewerInputGeometry;
+	/** Descriptive, echoable host-minted `nvcli1` token; never a grant by itself. */
+	readonly sourceToken: string;
+}
+
+/** The closed phase marker of a native CLI input source. */
+const NATIVE_CLI_INPUT_PHASE = "native-cli" as const;
+
+/**
+ * The input-path union: an unchanged Pi conversation source, a Pi startup source,
+ * or a hosted native CLI process source.
+ */
+export type NativeViewerAnyInputSource =
+	| NativeViewerInputSource
+	| NativeViewerStartupInputSource
+	| NativeViewerNativeCliInputSource;
 
 /** True for the startup variant of an input-path source. */
 export function isNativeViewerStartupInputSource(
 	source: NativeViewerAnyInputSource,
 ): source is NativeViewerStartupInputSource {
 	return (source as { readonly phase?: unknown }).phase === "startup";
+}
+
+/** True for the hosted native CLI variant of an input-path source. */
+export function isNativeViewerNativeCliInputSource(
+	source: NativeViewerAnyInputSource,
+): source is NativeViewerNativeCliInputSource {
+	return (source as { readonly phase?: unknown }).phase === NATIVE_CLI_INPUT_PHASE;
 }
 
 /**
@@ -481,7 +594,10 @@ export type NativeViewerInputResult =
 
 /** One strict viewer input request: current facts, current modes, and the bytes. */
 export interface NativeViewerInputRequest {
-	/** The exact current source: a conversation source or, before the first status, a startup source. */
+	/**
+	 * The exact current source: a Pi conversation source, a Pi startup source, or a
+	 * hosted provider CLI process source.
+	 */
 	readonly expectedSource: NativeViewerAnyInputSource;
 	readonly expectedInputModes: TerminalInputModes;
 	/**
@@ -505,8 +621,50 @@ export interface NativeViewerClipboardReceipt {
 	readonly dispatchId: number;
 }
 
-/** One viewer's own copy destination, supplied by the host that owns that surface. */
-export type NativeViewerClipboardSink = (receipt: NativeViewerClipboardReceipt) => void;
+/**
+ * One captured TEXT copy from one owned hosted provider child (issue 277 native
+ * text-copy slice).
+ *
+ * It states only what the owner actually observed: a normalized canonical-base64
+ * UTF-8 text payload captured inside this row's own PTY, and the row's own
+ * positively recorded provider backend. There is deliberately NO `sessionId`,
+ * `sessionEpoch`, registration, PID, path, or command field: a hosted provider
+ * child has no Pi conversation, and inventing a tuple here would be a fabricated
+ * attribution. The child process the copy rode in on is bound only through this
+ * row's owner-private per-incarnation key.
+ */
+export interface NativeCliClipboardEvent {
+	readonly kind: "copy";
+	readonly encoded: string;
+	readonly backend: NativeCliBackend;
+}
+
+/**
+ * One hosted provider copy routed to the ONE viewer surface this manager last
+ * accepted input from on that exact child incarnation. `dispatchId` is the owner's
+ * own ordinal of that accepted input: a routing convention frozen when the copy was
+ * accepted, never causal proof that the input produced the copy.
+ */
+export interface NativeViewerNativeCliClipboardReceipt {
+	readonly source: NativeViewerNativeCliInputSource;
+	readonly event: NativeCliClipboardEvent;
+	readonly dispatchId: number;
+}
+
+/** True only for the hosted provider variant of a viewer copy receipt. */
+export function isNativeViewerNativeCliClipboardReceipt(
+	receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt,
+): receipt is NativeViewerNativeCliClipboardReceipt {
+	return (receipt.source as { readonly phase?: unknown }).phase === NATIVE_CLI_INPUT_PHASE;
+}
+
+/**
+ * One viewer's own copy destination, supplied by the host that owns that surface.
+ * It receives either an unchanged Pi conversation copy or a hosted provider TEXT
+ * copy; the variant is the surface's own business and is never merged.
+ */
+export type NativeViewerClipboardSink =
+	(receipt: NativeViewerClipboardReceipt | NativeViewerNativeCliClipboardReceipt) => void;
 
 /**
  * Local-only registration options for one viewing surface. Both are immutable for
@@ -551,6 +709,13 @@ export interface InstancePty {
 export interface InstanceSpawnDescriptor {
 	file: string;
 	args: string[];
+	/**
+	 * Windows only, for a batch (`.cmd`/`.bat`) child: the invocation in the
+	 * pinned implementation's public pre-escaped `CommandLine` form, delivered
+	 * verbatim after `file` instead of as an argv array the pinned spawn would
+	 * re-escape. Absent for every direct executable child.
+	 */
+	commandLine?: string;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
 	cols: number;
@@ -655,9 +820,23 @@ export interface InstanceStatusRegistrationOptions {
 /** Immutable, copied view row for one instance (later SidebarItem shape). */
 export interface NativeInstanceView {
 	readonly id: string;
+	/**
+	 * The row's display label, in the shape every presentation of this host (and
+	 * the roster projection built from it) already transmits. For a native CLI row
+	 * this is the stable provider label until the operator captions the row; for a
+	 * Pi row it is the observed native conversation name. It is never a provider
+	 * conversation identity, never observed child output, and never something the
+	 * provider was told.
+	 */
 	readonly label: string;
 	readonly workspace: string;
 	readonly agentDir: string;
+	/**
+	 * The backend this row was created with, present only when the creation was
+	 * explicit. Absence means Pi, exactly as for every row written before native
+	 * CLI hosting. A native CLI row never reports a Pi native conversation.
+	 */
+	readonly backend?: SessionBackend;
 	readonly lifecycle: InstanceLifecycle;
 	readonly busy: boolean | null;
 	readonly pendingInput: boolean | null;
@@ -674,6 +853,14 @@ export interface NativeInstanceView {
 	readonly activeTasks?: number | null;
 	/** Observed starting/running background shell intent; null means unknown, never 0. */
 	readonly activeShells?: number | null;
+	/**
+	 * The row's own declared per-category applicability (native status slice), present
+	 * only once that row's observer declared something. A Pi row never carries it, so a
+	 * Pi view renders exactly as before; on a hosted provider row it is what lets a
+	 * category that backend cannot report render as not-applicable instead of unknown,
+	 * while a supported-but-unobserved category stays unknown and never becomes 0.
+	 */
+	readonly statusSupport?: NativeStatusSupportMap;
 	/** True only while this manager still owns a PTY without a confirmed exit. */
 	readonly hasLiveProcess: boolean;
 	readonly activity: readonly string[];
@@ -681,6 +868,17 @@ export interface NativeInstanceView {
 	/** Bounded single-line public failure text; set only on `error` rows. */
 	readonly error?: string;
 }
+
+/** Closed outcome of one {@linkcode InstanceManager.setNativeDisplayName} call. */
+export type NativeDisplayNameResult =
+	| "set"
+	| "unchanged"
+	/** No such row (or the manager is shutting down): nothing changed. */
+	| "no-row"
+	/** The row is not a native CLI row: its name belongs to the Pi rename path. */
+	| "not-native"
+	/** The value failed the shared native display-name bound: nothing changed. */
+	| "invalid-name";
 
 export interface CreateInstanceOptions {
 	/** Legacy/test-only initial display label; production creation omits it and waits for native metadata. */
@@ -701,7 +899,333 @@ export interface CreateInstanceOptions {
 	savedSession?: SavedSessionAdmission;
 	/** Fresh model-request child only: the exact title and prompt to deliver at native session start. */
 	initialRequest?: { readonly title: string; readonly prompt: string };
+	/**
+	 * Which backend this row belongs to. Absence means `pi` (every existing caller
+	 * and every older row). A native CLI backend (`claude`, `codex`) launches the
+	 * provider's own interactive CLI through the host-injected
+	 * {@linkcode InstanceManagerOptions.nativeCliLaunch} provider instead of the
+	 * Pi launch composition, and therefore never receives a status registration,
+	 * Pi bootstrap, preload, startup payload, title token, or input framing.
+	 */
+	backend?: SessionBackend;
+	/**
+	 * Native CLI rows only: the operator's explicit configured launch-target
+	 * selection, forwarded unchanged to the launch provider as
+	 * {@linkcode NativeCliLaunchRequest.targetId}. This manager never persists,
+	 * resolves, or interprets it, and never selects a target itself. Combining it
+	 * with a Pi backend is refused before anything is posted.
+	 */
+	nativeCliTarget?: string;
+	/**
+	 * INTERNAL owner-only restart restoration intent (issue #277): the exact
+	 * provider-issued conversation UUID this native CLI row is asked to resume.
+	 * It is validated before any row exists (a native backend only, and an exact
+	 * UUID — never a name, alias, or path), and forwarded only through the private
+	 * launch request, owned-backend request, and observer context. It is never a Pi
+	 * `sessionId`, never a status value, and never part of a public, peer, or
+	 * network view. Combining it with a Pi backend is refused before anything is
+	 * posted.
+	 */
+	nativeResumeConversationId?: string;
 }
+
+/**
+ * The OPTIONAL native status hook arming for exactly one launch
+ * (issue #277 native status owner slice). It carries ONLY the fresh bootstrap
+ * the owner's broker-issued native hook registration handed back for this row
+ * before the provider child existed — nothing else. With no such option (every
+ * existing call site, and every manager constructed without the optional
+ * registrar/observer pair) the provider composes exactly the descriptor it
+ * composed before status observation existed: no added argument, no added
+ * environment entry, no artifact.
+ */
+export interface NativeCliNativeHookLaunchOption {
+	readonly bootstrap: NativeHookBootstrap;
+}
+
+/**
+ * One native CLI launch request from this manager to the host's launch provider.
+ * `workspace` is the row's already-validated canonical workspace (the child cwd
+ * the manager will spawn with), and `env` is a fresh copy of the manager's
+ * environment snapshot that neither the provider nor the manager mutates.
+ * `targetId` is the unchanged operator selection when one was given.
+ * `nativeHook` is present ONLY for a row this host armed a native status source
+ * for, and carries ONLY that registration's bootstrap.
+ */
+export interface NativeCliLaunchRequest {
+	readonly workspace: string;
+	readonly env: NodeJS.ProcessEnv;
+	readonly targetId?: string;
+	readonly nativeHook?: NativeCliNativeHookLaunchOption;
+	/**
+	 * Owner-private restart restoration intent: the exact admitted conversation
+	 * UUID, present only when the row was created with
+	 * {@linkcode CreateInstanceOptions.nativeResumeConversationId}. Absence is every
+	 * fresh launch, exactly as before.
+	 */
+	readonly resumeConversationId?: string;
+}
+
+/**
+ * What a launch provider hands back: the ordinary interactive descriptor, plus
+ * (when the request armed them) the closed outcome of this launch's native status
+ * hook preparation. `prepared` transfers ownership of `lease` to this manager,
+ * which releases it only after this row's own settlement; `unavailable` means this
+ * launch armed nothing, so the run's source and observer are released and its
+ * provider status stays unknown. Absence is the legacy shape: nothing was staged,
+ * so there is no lease, and the row simply stays unknown until real observations
+ * arrive.
+ */
+export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
+	readonly nativeHook?: NativeHookLaunchOutcome;
+	/**
+	 * Present only for a Codex launch a provider prepared in owned backend mode:
+	 * the pure rendering plan of THIS launch's one owned app-server backend and the
+	 * interactive TUI that attaches to it. It is a plan, not a child and not an
+	 * ownership claim — the manager only consumes it (create the backend, render the
+	 * TUI from the fulfilled lease) and never reinterprets what it renders.
+	 *
+	 * Its absence is every existing launch: the ordinary `file`/`args`/`env`/`cwd`
+	 * descriptor is spawned exactly as it always was, with no backend, no endpoint,
+	 * and no bearer anywhere.
+	 */
+	readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
+}
+
+/**
+ * The host-injected provider that turns one native CLI backend selection into a
+ * complete interactive launch descriptor. Provider discovery, argv composition,
+ * configured-target resolution, and provider-side environment sanitization all
+ * belong to the provider; the manager only validates the returned descriptor,
+ * requires its cwd to be this row's selected canonical workspace, and spawns it
+ * verbatim. It may be asynchronous. It runs BEFORE the synchronous spawn stretch,
+ * and the manager races it against its own shutdown/disposal notification: a
+ * provider that never answers can never hold the host away from stopping its
+ * existing children, and an answer that arrives later is discarded rather than
+ * spawned. A provider must therefore tolerate being abandoned.
+ */
+export type NativeCliLaunch = (
+	backend: NativeCliBackend,
+	request: NativeCliLaunchRequest,
+) => NativeCliLaunchDescriptor | Promise<NativeCliLaunchDescriptor>;
+
+/**
+ * What this manager asks its injected owned-Codex-backend factory for, once per
+ * owned run, synchronously, before it awaits anything.
+ *
+ * The factory owns the process: it must start the one backend child from
+ * `plan.renderBackend(…)` (the plan re-renders the SAME resolved target the TUI
+ * uses, and the lease hands it the closed control argv), return the exact lease
+ * synchronously, and terminate only that captured child. It never selects an
+ * endpoint, never adopts another server, and never scans a port.
+ */
+export interface OwnedCodexBackendLaunchRequest {
+	/** The identity this manager minted for exactly this run; the lease must echo it. */
+	readonly identity: OwnedCodexBackendLaunchIdentity;
+	/** This launch's rendering plan; the factory may only call `renderBackend` on it. */
+	readonly plan: NativeCodexOwnedLaunchPlan;
+	/**
+	 * Aborted when this run is retired (stop, removal, disposal, launch failure).
+	 * The manager also calls `requestStop()` on the returned lease, so honoring the
+	 * signal is an additional path and never the only one.
+	 */
+	readonly signal: AbortSignal;
+	/**
+	 * Owner-private metadata: this row's canonical workspace (the TUI's cwd). It is
+	 * descriptive for the factory and changes nothing the plan renders.
+	 */
+	readonly workspace?: string;
+	/**
+	 * Owner-private metadata: the exact admitted restart restoration conversation
+	 * UUID, present only for a row created with a resume intent. It changes nothing
+	 * the plan renders.
+	 */
+	readonly resumeConversationId?: string;
+}
+
+/**
+ * The host-injected owner of one owned Codex backend process. It is called
+ * synchronously, and its answer is validated against the identity this manager
+ * minted BEFORE anything is awaited; a factory that throws, or that answers with
+ * anything that is not a usable lease for that identity, fails the row before any
+ * TUI child exists.
+ */
+export type OwnedCodexBackendFactory = (
+	request: OwnedCodexBackendLaunchRequest,
+) => OwnedCodexBackendLease;
+
+/**
+ * The owner-only, run-private view of one fulfilled owned Codex backend, handed
+ * to THIS run's own status observer exactly once.
+ *
+ * It is the settled next-phase seam for a fresh-session status reader: it carries
+ * the identity and endpoint of THIS lease and one private accessor for the
+ * observer bearer, and nothing else — no command line, no environment, no
+ * provider arguments, no root or conversation selection, and no wire or roster
+ * shape. It is never stored on a view, serialized, or logged; a consumer that
+ * needs a status registration builds it elsewhere from these facts.
+ */
+export interface NativeOwnedCodexBackendObservationSource {
+	readonly leaseId: string;
+	readonly generation: number;
+	readonly endpoint: string;
+	/** Sensitive: the observer bearer of THIS lease. Never log, store, or publish it. */
+	readonly readObserverBearer: () => string;
+	/**
+	 * Present only when this lease's factory also fronts the backend with the
+	 * private native TUI relay: the exact retained fresh-root facts source of
+	 * THIS run, forwarded verbatim from the lease's own fulfilled readiness value
+	 * (never re-minted, never re-read). Like the rest of this source it is
+	 * owner-private: it is not a wire, roster, status, or control shape, it is
+	 * never stored on a view, serialized, or logged, and the manager never reads
+	 * what it says. A consumer that attaches gets only the current closed state
+	 * and an unsubscribe that detaches itself.
+	 */
+	readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
+}
+
+/**
+ * The owner-supplied native hook source registrar: structurally exactly
+ * `NativeHookStatusBroker.registerNativeHookSource`, so the production broker is
+ * passed through without an adapter and this module never becomes a second
+ * listener, socket, or token authority. The manager calls it for one hosted
+ * provider row, BEFORE that row's child is spawned, and releases the returned
+ * registration when that row's run is retired. A registrar that throws, or that
+ * hands back a bootstrap for another backend or another row, leaves this row
+ * unobserved with its interactive launch unchanged.
+ */
+export interface NativeHookSourceRegistrar {
+	registerNativeHookSource(
+		instanceId: string,
+		backend: NativeCliBackend,
+		handlers: NativeHookSourceHandlers,
+	): NativeHookRegistration;
+}
+
+/**
+ * One host-supplied native status OBSERVER for exactly one owned provider run.
+ *
+ * It is the only shape through which provider knowledge can reach a row: the
+ * manager forwards the broker's already-authenticated, already-sanitized hook
+ * events and closed failures to it, and reads back only complete
+ * {@linkcode NativeStatusObservation} values through the run's own status
+ * capture. It is not a status registration and it never becomes one — no Pi
+ * bootstrap, broker reporter namespace, native conversation tuple, input
+ * framing, startup payload, or ownership count exists on this path — and nothing
+ * here can mark a process settled, synthesize an exit, or change a stop decision.
+ *
+ * The OBSERVER (not the manager) owns its own session/prompt/read-generation
+ * fences: a recoverable data gap is reported as a fresh all-unknown snapshot, and
+ * stale internal callbacks are refused inside the source. The manager only retires
+ * the whole run, which invalidates the run's capture for good.
+ */
+export interface NativeStatusObserver {
+	/**
+	 * This actual source's own static applicability declaration. It is a statement
+	 * about what THIS observer can report, never a value the manager may guess: an
+	 * observer that declares nothing leaves the row on the legacy unknown path.
+	 */
+	readonly support?: NativeStatusSupportMap;
+	/** One authenticated, sanitized hook event for this run's own backend. */
+	acceptHook(event: NativeHookEvent): void;
+	/** One closed failure report from this run's own authenticated relay. */
+	acceptFailure(failure: NativeHookFailure): void;
+	/**
+	 * Optional: retire THIS observer's own internal callbacks and generations. It is
+	 * called before {@linkcode NativeStatusObserver.dispose} when present. The
+	 * manager's authoritative retirement stays what it always was — invalidating the
+	 * run's status capture — so an observer without this hook behaves identically.
+	 */
+	invalidate?(): void;
+	/**
+	 * Optional: state the baseline this source can state for a native run the HOST
+	 * itself launched. It is called once, synchronously, when this run's status
+	 * capture is already bound to the exact live PTY handle and incarnation and no
+	 * input has been sent to the child — the source therefore does not have to wait
+	 * for a provider hook to know the run started idle with nothing pending. A
+	 * source that cannot state a launch-time baseline omits this hook and keeps
+	 * today's all-unknown-until-first-observation behaviour, and a source that can
+	 * still refuses the claim if it has already observed work.
+	 */
+	observeOwnedStartup?(): void;
+	/**
+	 * Optional (issue #277 owning-manager slice): the ONE private statement that this
+	 * run's backend is a genuinely OWNED Codex backend, carrying the identity and
+	 * endpoint of THIS lease plus the private observer-bearer accessor
+	 * ({@linkcode NativeOwnedCodexBackendObservationSource}).
+	 *
+	 * It is called at most once for a run, synchronously, after this run's status
+	 * capture is already bound to the exact live TUI PTY handle and incarnation and
+	 * BEFORE {@linkcode NativeStatusObserver.observeOwnedStartup} is offered, so a
+	 * source can qualify its ownership claim before it states any baseline. An
+	 * observer that omits this hook keeps today's behavior unchanged, and a source
+	 * that arrives after activation is offered the same one delivery if the run, its
+	 * backend, and its capture are still the current ones.
+	 *
+	 * The manager draws no conclusion from it: this callback creates no registration,
+	 * no connection, no status value, and no ownership. A throw retires this run's
+	 * observation path only — never the backend, its child, or its artifacts — and it
+	 * never reports the observer's message anywhere.
+	 */
+	observeOwnedCodexBackend?(source: NativeOwnedCodexBackendObservationSource): void;
+	/** Retire this observer. Idempotent; it never signals or waits on the child. */
+	dispose(): void;
+}
+
+/** Everything the owner's observer factory is allowed to know about one run. */
+export interface NativeStatusObserverContext {
+	/** The owner row id this observer belongs to; descriptive, never a lookup key. */
+	readonly rowId: string;
+	/** The row's own recorded backend. */
+	readonly backend: NativeCliBackend;
+	/**
+	 * Deliver one COMPLETE observation of what this observer knows right now.
+	 * Before this run's status capture exists — and after the run is retired — this
+	 * claims nothing: it returns a rejection, never queues, retries, or replays.
+	 */
+	emit(observation: NativeStatusObservation): NativeStatusSubmitResult;
+	/**
+	 * Owner-private: this row's canonical workspace. The production manager always
+	 * supplies it; it is optional only for direct callers of an observer factory.
+	 */
+	readonly workspace?: string;
+	/**
+	 * Owner-private: the exact admitted restart restoration conversation UUID,
+	 * present only for a row created with a resume intent. It is an expectation to
+	 * prove, never a proof.
+	 */
+	readonly resumeConversationId?: string;
+	/**
+	 * Owner-private IDENTITY channel (issue #277 restart restoration), separate from
+	 * {@linkcode NativeStatusObserverContext.emit}: report the exact provider
+	 * conversation UUID this source has positively proved is the run's CURRENT
+	 * conversation, or an EXPLICIT `null` when a previously proved identity was
+	 * lost while the run is live. A source must not report `null` merely because it
+	 * has no proof yet, and an unknown busy/input/count status is never an identity
+	 * loss. It is not a status value and proves nothing about persistence, idleness,
+	 * input, or counts.
+	 *
+	 * The manager accepts it only through the same exact run fences as `emit`
+	 * (current record and run, activated capture, same live PTY handle, process
+	 * incarnation, and observer generation); before activation and after retirement
+	 * it returns `false` and never queues, retries, or replays. A malformed id is
+	 * refused. For a restoring row, until the expected id itself is proved, any other
+	 * id is refused and an explicit `null` changes nothing. `true` means the identity
+	 * was accepted.
+	 */
+	readonly emitConversationIdentity?: (conversationId: string | null) => boolean;
+}
+
+/**
+ * The owner-supplied factory of one status observer per owned hosted run. It is
+ * called only for a native CLI row this host armed, before that row's child
+ * spawns, with the exact row id and backend and the run's own `emit` seam. It may
+ * resolve asynchronously; an observer that arrives after its run was retired is
+ * disposed and never bound, and can never write anything.
+ */
+export type NativeStatusObserverFactory = (
+	context: NativeStatusObserverContext,
+) => NativeStatusObserver | Promise<NativeStatusObserver>;
 
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
@@ -740,6 +1264,16 @@ export interface InstanceManagerOptions {
 	 * encoded payload are never logged, rendered, or retained by this module.
 	 */
 	onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	/**
+	 * The owner-local route of one captured hosted provider TEXT copy, reached only
+	 * when this manager's own last accepted input on that exact child incarnation was
+	 * owner-local input. It carries no Pi conversation tuple, so it is deliberately a
+	 * separate callback: the existing native Pi route stays exactly as it was and can
+	 * never be fed a provider copy, and this route can never be fed a Pi copy. The
+	 * host still owes its own live row, focus, display, and coverage proof before any
+	 * clipboard request leaves it.
+	 */
+	onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
@@ -761,6 +1295,50 @@ export interface InstanceManagerOptions {
 	 * accident.
 	 */
 	nativeInputOriginFraming?: boolean;
+	/**
+	 * Host-injected launch provider for the native CLI backends (issue 277). It is
+	 * required only when a row is created with a native backend; a manager without
+	 * it keeps every existing Pi behavior and refuses a native creation before it
+	 * posts a row. The manager never composes, repairs, or extends what the
+	 * provider returns beyond validating it, and it never injects its own
+	 * bootstrap, preload, startup-payload, or title environment into a native
+	 * child.
+	 */
+	nativeCliLaunch?: NativeCliLaunch;
+	/**
+	 * OPTIONAL owner-supplied native status hook registrar
+	 * (issue #277 native status owner slice). It is the broker's own
+	 * `registerNativeHookSource` shape, and it is used for one thing only: issuing
+	 * one launch's fresh native hook bootstrap BEFORE that launch's provider child
+	 * exists, so the bootstrap can be handed to {@linkcode NativeCliLaunchRequest}
+	 * and the row's own authenticated events can come back. It is never called for a
+	 * Pi row, never called after a spawn, and never called when no observer factory
+	 * was supplied. Absence (with no factory) is every existing manager and every
+	 * existing launch: no registration, no hook option, no artifact, and every
+	 * provider field on the row stays truthfully unknown.
+	 */
+	nativeHookRegistrar?: NativeHookSourceRegistrar;
+	/**
+	 * OPTIONAL owner-supplied factory of the per-run native status OBSERVER. It
+	 * supplies the only reader of the row's hook events and the only writer of
+	 * native status observations, and it is called only together with
+	 * {@linkcode InstanceManagerOptions.nativeHookRegistrar}. Absence means no
+	 * observer, no registration, and no observation path at all.
+	 */
+	nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	/**
+	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
+	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
+	 * whose descriptor carries a {@linkcode NativeCliLaunchDescriptor.ownedCodex}
+	 * plan, which only a provider constructed in owned mode produces; with that plan
+	 * present and no factory here, the row is refused before any child of any kind
+	 * exists, because a half-honored owned launch (a TUI attached to nothing owned)
+	 * is exactly the substitution this path refuses.
+	 *
+	 * Absence is every existing host and every existing launch: no backend, no
+	 * endpoint, no bearer, and no change to a Pi, Claude, or ordinary Codex row.
+	 */
+	ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 }
 
 export interface ShutdownOptions {
@@ -787,12 +1365,56 @@ interface ManagedInstance {
 	 * the global create set.
 	 */
 	launchSettled: boolean;
+	/**
+	 * The row's display label. A Pi row's label is the last authenticated native
+	 * conversation name (or a placeholder until one is observed). A native CLI
+	 * row's label is the stable provider label until the operator captions the row
+	 * through {@linkcode InstanceManager.setNativeDisplayName}, which replaces this
+	 * one field: there is no second name field, so every surface that already
+	 * transmits `label` carries the caption without any new identity.
+	 */
 	label: string;
 	nativeSession: SessionHostNativeSession | null;
 	lastNativeSession?: SessionHostNativeSession;
 	workspace: string;
 	agentDir: string;
 	lifecycle: InstanceLifecycle;
+	/**
+	 * The creation's explicit backend, or undefined for an unrecorded (Pi) row.
+	 * Only ever `claude`/`codex` here: a Pi row keeps the unchanged launch path and
+	 * needs no second marker.
+	 */
+	backend?: SessionBackend;
+	/**
+	 * Native CLI rows only: the exact launch-target id this row was launched with —
+	 * the explicit operator target, or the backend's default target id. Owner-private
+	 * restart identity; never in a view, wire frame, status value, or log.
+	 */
+	nativeCliTarget?: string;
+	/**
+	 * Native CLI rows only: the admitted restart restoration intent this row was
+	 * created with. Immutable for the row; owner-private.
+	 */
+	nativeResumeConversationId?: string;
+	/**
+	 * Native CLI rows only: the last exact provider conversation UUID this host may
+	 * durably remember for the row — the admitted resume intent until proof, then the
+	 * last positively proved identity. It survives the child's exit, a stop, and an
+	 * observer's retirement; only an accepted explicit live withdrawal clears it.
+	 * Owner-private: never a Pi `sessionId`, status value, view field, or log line.
+	 */
+	nativeConversationId?: string;
+	/**
+	 * True once the restoring row's expected conversation was positively proved by
+	 * its own live run (or, for a fresh row, once any identity was proved). Until
+	 * then a restoring row accepts only its expected id.
+	 */
+	nativeConversationConfirmed?: boolean;
+	/**
+	 * True while a positively proved identity is active in the current live run; only
+	 * then can an explicit `null` withdraw it.
+	 */
+	nativeConversationLive?: boolean;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
@@ -885,6 +1507,104 @@ interface ManagedInstance {
 	 * extension reload; a new child/registration gets a new encoder.
 	 */
 	inputEncoder?: NativeInputEncoder;
+	/**
+	 * Owner-private secret of THIS row's current provider-child process incarnation
+	 * (issue 277 native remote-input slice). Minted once, right before the owned PTY
+	 * is spawned, and never exposed: it appears in no view, no wire frame, no token,
+	 * and no log. It is the key material of the `nvcli1` viewer input scope
+	 * commitment, so a replacement child — even one with the same row id, workspace,
+	 * backend, geometry, and PID after reuse — yields a different token and every
+	 * source minted for the old incarnation becomes stale. Cleared at the child's
+	 * confirmed exit, which is also when the row stops being an input target.
+	 */
+	nativeCliIncarnation?: Buffer;
+	/**
+	 * What THIS hosted provider row's own observer has positively declared about the
+	 * sidebar categories it can and cannot report (native status slice). Absence means
+	 * no declaration at all, which is the legacy unknown path — never not-applicable.
+	 *
+	 * It is a capability statement, not an observation: an invalidation, an observer
+	 * failure, and the child's own exit all clear the OBSERVED values to unknown while
+	 * this declaration stays, because "this backend cannot report background shells"
+	 * does not stop being true when the observer loses its footing. It is never
+	 * inferred from a missing value, a quiet PTY, or this host's own configuration, and
+	 * it carries no observed value of its own.
+	 */
+	nativeStatusSupport?: NativeStatusSupportMap;
+	/**
+	 * Private status-observer generation, independent of the input/clipboard run
+	 * incarnation. A capture is minted against the value current at mint time, and an
+	 * accepted invalidation advances it, which retires every capture of the failed
+	 * generation: a callback that was queued before the failure can never write again,
+	 * while recovery acquires a fresh capture. Nothing else reads or advances it, and
+	 * it never becomes a status registration or a second ownership source.
+	 */
+	nativeStatusObserverGeneration: number;
+	/**
+	 * Owner-private routing convention of THIS row's current provider-child incarnation
+	 * (issue 277 native text-copy slice): the most recent ACTUAL accepted nonempty
+	 * input forwarded to that PTY, either owner-local or one viewer's verified input.
+	 *
+	 * It is set only when bytes really left this manager for that child — never by a
+	 * selected form, a refused or rejected request, a received copy request, or a
+	 * terminal protocol query/reply — and it is dropped with the incarnation itself.
+	 * It states who this manager last typed for, which is a routing choice and NOT
+	 * proof of which action caused a later copy; nothing in a child's output can
+	 * confirm or change it. Absent means no origin is known, which is a refusal, never
+	 * a fallback to some other viewer or the owner.
+	 */
+	nativeCliController?: NativeCliCopyController;
+	/**
+	 * Monotonic owner ordinal of accepted nonempty input on this incarnation, starting
+	 * at 0. Each accepted input takes the next value, and a copy frozen at acceptance
+	 * carries the ordinal of the input that established its recipient.
+	 */
+	nativeCliInputOrdinal: number;
+	/**
+	 * The owner-side OPTIONAL native status source of THIS row's current provider
+	 * child (issue #277 native status owner slice): the broker registration issued
+	 * before the child existed, the host's per-run observer, the one status capture
+	 * minted after the spawn, and the private artifacts the launch preparation staged
+	 * for them. Absence means this host armed no status source (or this launch
+	 * declined to arm one): the row keeps every existing native behavior, and its
+	 * provider fields stay truthfully unknown. It is replaced only together with the
+	 * row's process incarnation, and retired by stop, removal, exit, spawn failure,
+	 * or manager disposal.
+	 */
+	nativeStatusRun?: OwnedNativeStatusRun;
+	/**
+	 * The ONE owned Codex backend resource of THIS row's current provider child
+	 * (issue #277 owning-manager slice): the lease this manager retains from the
+	 * moment its factory answers until that backend's own positive settlement.
+	 *
+	 * It is ownership of a second process, not a second observation: the row's
+	 * `hasLiveProcess`, its removability, and this run's staged private files all
+	 * stay closed while it is unsettled, and no other row can reach it. Absence means
+	 * this launch carried no owned plan, which is every existing row.
+	 */
+	nativeCodexBackend?: OwnedNativeCodexBackendResource;
+	/**
+	 * Per-row owned-backend generation: the value minted for this row's next owned
+	 * backend, consumed once per backend. A row owns one backend per process
+	 * incarnation, so today this advances at most once per row; it exists so an
+	 * identity never depends on a row id alone.
+	 */
+	nativeCodexBackendGeneration?: number;
+	/**
+	 * True from the instant a native CLI row exists until its launch settles, i.e. while
+	 * no process of this launch can have been created yet. It is what makes that window
+	 * stoppable for an owned-capable Codex row, and it is cleared on every launch path so
+	 * a settled row is never "cancellable" again.
+	 */
+	nativeCliLaunchPending?: boolean;
+	/**
+	 * The row-level cancellation notification a confirmed Stop publishes while this row's
+	 * launch is still awaiting its provider. The launch races it, exactly as it races the
+	 * manager's shutdown notice, so a stopped row is answered immediately and a provider
+	 * that answers later can create nothing.
+	 */
+	launchCancel?: Promise<void>;
+	resolveLaunchCancel?: () => void;
 	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
 	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
@@ -896,9 +1616,321 @@ interface ManagedInstance {
 	readErrorDisposable?: { dispose(): void };
 }
 
+/**
+ * The manager's own ownership record of one optional native status source for one
+ * owned hosted provider run (issue #277 native status owner slice).
+ *
+ * It is minted BEFORE the provider child exists (so the broker registration can
+ * precede the spawn and its bootstrap can travel to the launch provider), bound to
+ * the exact live run only after the synchronous spawn stretch, and retired exactly
+ * once by the first of: the child's own exit, a stop, the row's removal, a failed
+ * spawn, or manager disposal.
+ *
+ * The owner lifecycle token is this record's own object identity: the row's
+ * `nativeStatusRun` slot is the one authority on whether it is current, so every
+ * callback, factory answer, and asynchronous continuation re-checks
+ * `record.nativeStatusRun === run` (and `retired`). A replacement child, a re-armed
+ * row, or a detached row therefore makes anything carrying an older run claim
+ * nothing — it is never queued, retried, or replayed, and it can never touch
+ * another row.
+ */
+interface OwnedNativeStatusRun {
+	readonly rowId: string;
+	readonly backend: NativeCliBackend;
+	/** The broker registration issued for THIS launch, or absent if it never armed. */
+	registration?: NativeHookRegistration;
+	/**
+	 * The fresh bootstrap issued for exactly this launch and this backend. It is the
+	 * ONLY thing this manager hands to the launch provider through
+	 * {@linkcode NativeCliLaunchRequest.nativeHook}; a row with no bootstrap was never
+	 * armed, and its provider receives no hook option at all.
+	 */
+	bootstrap?: NativeHookBootstrap;
+	/** The host's observer for this run, once its factory has answered. */
+	observer?: NativeStatusObserver;
+	/**
+	 * The ONE status capture of this run, minted after the spawn from the exact live
+	 * PTY handle and process incarnation, and never reminted for this run. Absent
+	 * means the run never activated, so nothing it reports can land.
+	 */
+	capture?: NativeStatusCapture;
+	/**
+	 * The exact facts the ONE capture above was minted against: this row's live PTY handle
+	 * at activation, that incarnation's private key, and the observer generation the
+	 * capture closed over. An accepted invalidation retires that generation while leaving
+	 * the handle in place, so remembering the three is what lets a later delivery prove its
+	 * capture is still the current one instead of merely non-undefined.
+	 */
+	capturePty?: InstancePty;
+	captureIncarnation?: Buffer;
+	captureGeneration?: number;
+	/**
+	 * The private artifacts this launch's hook preparation staged, retained until this
+	 * run's own settlement. Absent means nothing was staged (or it was already
+	 * released), which is also the case for every declined or unprepared launch.
+	 */
+	lease?: NativeHookArtifactLease;
+	/**
+	 * The required reader settlement of this run's exact PTY handle, when that handle
+	 * is a real Windows ConPTY child whose reader this manager owns. A staged artifact
+	 * the child was told to read stays while such a reader is still draining, and a
+	 * confirmation that never arrives preserves it rather than pretending.
+	 */
+	readerSettlement?: OwnedConptyReaderSettlement;
+	/**
+	 * True once this launch is known to be abandoned: NO child of it can ever exist,
+	 * which is the only condition under which staged private files may be released
+	 * without waiting for a settlement. Retirement of the OBSERVATION SOURCE is not
+	 * abandonment — a run whose observer or registration was released can still own a
+	 * child that is reading those files.
+	 */
+	abandoned: boolean;
+	/** True once this run's static applicability declaration has been published. */
+	supportPublished: boolean;
+	/** True once this run is retired: no callback, observer, or capture may act. */
+	retired: boolean;
+	/** True once this run's status capture has been minted. */
+	activated: boolean;
+	/** True once this run's staged artifacts were released (or none existed). */
+	artifactsReleased: boolean;
+}
+
+/**
+ * The manager's ownership record of one owned Codex backend process (issue #277
+ * owning-manager slice).
+ *
+ * The owner lifecycle token is this record's own object identity: the row's
+ * `nativeCodexBackend` slot says whether it is current, and `retired` says whether
+ * this manager still expects the run to reach a TUI. Every asynchronous
+ * continuation — a readiness answer, a settlement answer, an observer that arrived
+ * late — re-checks both, so a retired, replaced, stopped, or disposed run can never
+ * spawn or adopt a child.
+ *
+ * Retirement is a stop INTENT and never a settlement: `settled` is set only by the
+ * lease's own positive settlement, which requires that exact child's genuine exit
+ * and both captured readers' natural end. An unsettled resource keeps the row live
+ * for every authority that asks, however long it takes.
+ */
+interface OwnedNativeCodexBackendResource {
+	readonly rowId: string;
+	readonly identity: OwnedCodexBackendLaunchIdentity;
+	readonly lease: OwnedCodexBackendLease;
+	/** Aborted once at retirement, so a factory that honors it cancels startup too. */
+	readonly controller: AbortController;
+	/**
+	 * Fulfilled once at retirement, for the SAME reason {@linkcode
+	 * OwnedNativeCodexBackendResource.controller} exists but for a different consumer:
+	 * a stop, removal, or disposal that lands while this backend's readiness is pending
+	 * must unblock the launch that is waiting on it. A lease whose banner never arrives
+	 * cannot make a stopped row unanswerable, and racing this promise is what turns
+	 * "the row was stopped" into a finished launch instead of a hung one.
+	 */
+	readonly cancel: Promise<void>;
+	readonly resolveCancel: () => void;
+	/**
+	 * The one observation source of this backend, minted from the fulfilled readiness
+	 * value and handed to this run's observer as-is. Never published anywhere else.
+	 */
+	observationSource?: NativeOwnedCodexBackendObservationSource;
+	/** True only after THIS lease's readiness fulfilled. */
+	ready: boolean;
+	/** True only after THIS lease's own positive settlement. */
+	settled: boolean;
+	/** True once the single observer delivery happened (or was refused as stale). */
+	observationDelivered: boolean;
+	/** True once retirement was requested: no TUI of this launch may exist. */
+	retired: boolean;
+}
+
+/**
+ * Reads the native hook preparation outcome a launch provider attached to its own
+ * descriptor. Anything unrecognized is `undefined`, which the manager treats as
+ * "this launch said nothing": the row keeps its unchanged interactive launch and
+ * its truthfully-unknown provider status. A `prepared` outcome is only honored
+ * when it carries a usable artifact lease, since that lease is the manager's only
+ * route to the private files the child was told to read.
+ */
+function readNativeHookLaunchOutcome(value: unknown): NativeHookLaunchOutcome | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const outcome = value as { readonly nativeHook?: unknown };
+	const hook = outcome.nativeHook;
+	if (!isPlainRecord(hook) || typeof hook.observation !== "string") {
+		return undefined;
+	}
+	if (hook.observation === "prepared") {
+		const lease = hook.lease;
+		if (!isPlainRecord(lease) || typeof lease.cleanup !== "function") {
+			return undefined;
+		}
+		return hook as unknown as NativeHookLaunchOutcome;
+	}
+	if (hook.observation === "unavailable") {
+		return hook as unknown as NativeHookLaunchOutcome;
+	}
+	return undefined;
+}
+
+/**
+ * Whether this row still owns an owned Codex backend whose settlement is not yet
+ * proven. It is the one authority on that question, and it is deliberately not
+ * inferred from the row's PTY: the TUI client exiting says nothing about the
+ * backend process this manager started, and vice versa.
+ */
+function ownsUnsettledCodexBackend(record: ManagedInstance): boolean {
+	const backend = record.nativeCodexBackend;
+	return backend !== undefined && !backend.settled;
+}
+
+/**
+ * The three answers this manager can have about a descriptor's owned Codex plan, and the
+ * distinction is the whole point: **absence** is every ordinary launch (spawn exactly what
+ * the provider composed, with no backend, endpoint, or bearer anywhere), while a **present
+ * value this manager cannot consume** is a provider that claimed an owned launch and
+ * attached something broken to it. Treating the second like the first would spawn the
+ * standalone descriptor behind an owned request — the substitution this path exists to
+ * refuse — so a malformed plan is refused instead, before either factory is called.
+ */
+type OwnedCodexPlanReading
+	= { readonly state: "absent" }
+	| { readonly state: "malformed" }
+	| { readonly state: "plan"; readonly plan: NativeCodexOwnedLaunchPlan };
+
+/**
+ * Read the owned Codex backend plan a launch provider attached to its own descriptor.
+ *
+ * Only a plan this module can actually consume counts as one: the two renderers and the
+ * backend base environment are what the owned path needs. A field that is not there at all
+ * is `absent`; anything else that is present — `null`, a non-object, a partial object, a
+ * non-function renderer, or a non-object base environment — is `malformed`. The value is
+ * never read further, echoed, or carried anywhere.
+ */
+function readNativeCodexOwnedPlan(value: unknown): OwnedCodexPlanReading {
+	if (!isPlainRecord(value)) {
+		return { state: "absent" };
+	}
+	const plan = (value as { readonly ownedCodex?: unknown }).ownedCodex;
+	if (plan === undefined) {
+		return { state: "absent" };
+	}
+	if (!isPlainRecord(plan)
+		|| typeof plan.renderBackend !== "function"
+		|| typeof plan.renderTui !== "function"
+		|| !isPlainRecord(plan.backendEnv)) {
+		return { state: "malformed" };
+	}
+	return { state: "plan", plan: plan as unknown as NativeCodexOwnedLaunchPlan };
+}
+
+/**
+ * Whether one launch-provider rejection is the provider's OWN typed owned-profile
+ * refusal, recognized by its published closed code alone. The exception object is
+ * never read further and never carried: this is a routing decision, not a message.
+ */
+function isOwnedCodexProfileRefusal(error: unknown): boolean {
+	return isPlainRecord(error)
+		&& (error as { readonly code?: unknown }).code === NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE;
+}
+
+/**
+ * Whether one factory answer is the lease this manager can actually own: the four
+ * members this module depends on, and the identity it minted for THIS launch. A
+ * lease for another id or generation is a foreign object and is refused before any
+ * continuation is attached, so a stale or mis-built answer can never be adopted.
+ */
+function isUsableOwnedCodexBackendLease(value: unknown, identity: OwnedCodexBackendLaunchIdentity): value is OwnedCodexBackendLease {
+	if (!isPlainRecord(value)) {
+		return false;
+	}
+	const lease = value as {
+		readonly identity?: unknown;
+		readonly readiness?: unknown;
+		readonly settlement?: unknown;
+		readonly status?: unknown;
+		readonly requestStop?: unknown;
+	};
+	const leaseIdentity = lease.identity;
+	return isPlainRecord(leaseIdentity)
+		&& leaseIdentity.leaseId === identity.leaseId
+		&& leaseIdentity.generation === identity.generation
+		&& isThenable(lease.readiness)
+		&& isThenable(lease.settlement)
+		&& typeof lease.status === "function"
+		&& typeof lease.requestStop === "function";
+}
+
+/** Whether a value is a promise-like this manager can attach handlers to. */
+function isThenable(value: unknown): boolean {
+	return (typeof value === "object" && value !== null || typeof value === "function")
+		&& typeof (value as { readonly then?: unknown }).then === "function";
+}
+
+/**
+ * Whether this exact row's owned force escalation was attempted, for the existing
+ * `stop().forced` and `shutdown().forcedIds` reports only.
+ *
+ * Two independent owned handles can be escalated: the row's PTY (`sigkillSent`, whose
+ * PTY-only meaning the stop ladder relies on and which this never sets) and the row's
+ * own retained backend resource, whose lease reports a sticky force bit immediately
+ * before its owned SIGKILL attempt. The resource is this record's one backend slot,
+ * so another row's or another incarnation's lease can never contribute. This is
+ * historical evidence only — never exit, reader, settlement, or liveness proof.
+ */
+function ownedForceEscalationAttempted(record: ManagedInstance): boolean {
+	return record.sigkillSent || ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend);
+}
+
+/** The backend half of {@linkcode ownedForceEscalationAttempted}: this exact resource's lease bit. */
+function ownedCodexBackendForceEscalationAttempted(backend: OwnedNativeCodexBackendResource | undefined): boolean {
+	if (backend === undefined) return false;
+	let status: unknown;
+	try {
+		status = backend.lease.status();
+	} catch {
+		return false;
+	}
+	return isPlainRecord(status)
+		&& (status as { readonly forceEscalationAttempted?: unknown }).forceEscalationAttempted === true;
+}
+
+/**
+ * Whether one owned backend's OWN lease reports that its process is already stopped,
+ * exited, or settled.
+ *
+ * This is a read of the lease's own observation of its child — never an inference from
+ * the row's PTY, which knows nothing about this second process, and never an inference
+ * from a stop acknowledgement, a stream close, or a timeout. A lease that cannot answer
+ * the question is treated as ended: this manager builds a TUI on, and hands out the
+ * private capability of, a backend it can positively see is still there.
+ */
+function ownedCodexBackendKnownEnded(resource: OwnedNativeCodexBackendResource): boolean {
+	let status: OwnedCodexBackendStatus;
+	try {
+		status = resource.lease.status();
+	} catch {
+		return true;
+	}
+	if (!isPlainRecord(status)) {
+		return true;
+	}
+	const facts = status as {
+		readonly phase?: unknown;
+		readonly settled?: unknown;
+		readonly stopRequested?: unknown;
+		readonly exitObserved?: unknown;
+	};
+	return facts.settled === true
+		|| facts.exitObserved === true
+		|| facts.stopRequested === true
+		|| facts.phase === "stopping"
+		|| facts.phase === "exited"
+		|| facts.phase === "settled";
+}
+
 /** The lazy loader for the pinned real native PTY implementation. */
 interface LoadedNodePty {
-	spawn(file: string, args: string[], options: {
+	spawn(file: string, args: string[] | string, options: {
 		name: string;
 		cols: number;
 		rows: number;
@@ -943,7 +1975,11 @@ export function createDefaultPtyFactory(): PtyFactory {
 		}
 		// The pinned implementation satisfies the InstancePty subset
 		// structurally (data/exit events, write, resize, kill, pause/resume).
-		const pty = nodePty.spawn(descriptor.file, descriptor.args, {
+		// A batch child carries the public pre-escaped `CommandLine` string, so
+		// the pinned Windows spawn appends it verbatim instead of MSDN-escaping
+		// the quotes cmd.exe needs out of an argv array. Every other child keeps
+		// the argv form, and POSIX never sees a command line.
+		const pty = nodePty.spawn(descriptor.file, descriptor.commandLine ?? descriptor.args, {
 			name: "xterm-256color",
 			cols: descriptor.cols,
 			rows: descriptor.rows,
@@ -981,6 +2017,87 @@ function validateShutdownMs(value: number, label: string): void {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`session-host: shutdown ${label} must be a non-negative safe integer, got ${value}`);
 	}
+}
+
+/**
+ * Owner-private record of the most recent actual accepted input on one hosted
+ * provider child incarnation. `viewer` carries that viewer's id and the exact scope
+ * token its input was verified under, so a later copy re-proves the CURRENT viewer
+ * facts instead of trusting a cached destination.
+ */
+type NativeCliCopyController =
+	| { readonly kind: "local"; readonly ordinal: number }
+	| { readonly kind: "viewer"; readonly viewerId: string; readonly sourceToken: string; readonly ordinal: number };
+
+/**
+ * The owner-private capture/submit seam of ONE live hosted provider run (issue 277
+ * native text-copy slice), handed to host code that already owns the manager.
+ *
+ * It is bound to one exact row AND one exact child-process incarnation: the
+ * incarnation's private key is captured when the seam is created and re-checked on
+ * EVERY submit, so a replaced child, an exited row, a stop, a removed row, or a
+ * disposed manager submits nothing, and this object can never address another row.
+ * It is not a public clipboard endpoint: it accepts only an already-normalized
+ * canonical-base64 UTF-8 text payload, performs no clipboard write itself, chooses
+ * no destination beyond this row's own last accepted input, and is never reachable
+ * from a peer, a wire frame, or a child.
+ */
+export interface NativeCliCopyCapture {
+	/** Owner row id this seam is bound to; descriptive, never a lookup key. */
+	readonly rowId: string;
+	/** The row's own recorded backend at binding time. */
+	readonly backend: NativeCliBackend;
+	/**
+	 * Submit one captured TEXT copy through this row's own fences. True means the
+	 * copy was handed to exactly one eligible recipient route; false means nothing
+	 * was delivered and nothing is queued, retried, or fallen back.
+	 */
+	submit(encoded: string): boolean;
+}
+
+/**
+ * The owner-private capture/submit/invalidate seam of ONE live hosted provider
+ * run's STATUS (native status slice), handed to host code that already owns the
+ * manager — the dependent provider observer adapter that will attach later.
+ *
+ * It is bound to one exact row AND one exact child-process incarnation, exactly
+ * like the row's text-copy seam: the incarnation's private key is captured when
+ * the seam is created and re-checked on EVERY call, so a replaced child, an exited
+ * or erroring row, a stop in progress, a removed row, or a disposed manager accepts
+ * nothing, and this object can never address another row. It is not a status
+ * registration: it never mints or impersonates a Pi bootstrap, token, broker
+ * namespace, native conversation tuple, or input framing, and it changes no Pi
+ * bridge, input, or clipboard provenance path. It is never reachable from a peer,
+ * a wire frame, or a child.
+ *
+ * `submit` applies a complete, validated observation of the categories this
+ * observer reports; `invalidate` is that observer's honest failure statement — the
+ * row's observed values become unknown, never zero, never a stale Ready, while the
+ * row's declared capabilities stay truthful. Neither call is queued or retried, and
+ * neither ever touches the conservative ownership counts that gate a stop.
+ */
+export interface NativeStatusCapture {
+	/** Owner row id this seam is bound to; descriptive, never a lookup key. */
+	readonly rowId: string;
+	/** The row's own recorded backend at binding time. */
+	readonly backend: NativeCliBackend;
+	/**
+	 * Submit one complete observation through this row's own fences. A malformed
+	 * observation changes nothing; an accepted one replaces the row's observed values
+	 * for the categories this contract carries and merges any applicability it declares.
+	 * A capture whose observer generation was retired by an accepted invalidation is
+	 * refused for good, so a callback the observer queued before its own failure can
+	 * never restore anything.
+	 */
+	submit(observation: NativeStatusObservation): NativeStatusSubmitResult;
+	/**
+	 * Report that this observer can no longer vouch for what it last submitted. Every
+	 * observed value on the row collapses to unknown; the applicability declaration
+	 * stays, because a backend's inability to report a category is not a new fact. This
+	 * retires the capture's whole generation: recovery acquires a NEW capture from the
+	 * manager, and the row itself stays live throughout.
+	 */
+	invalidate(): NativeStatusSubmitResult;
 }
 
 /** Internal viewer record: one surface's facts, its host run identity, and its own sink. */
@@ -1048,6 +2165,13 @@ const PUBLIC_INSTANCE_ERRORS = {
 } as const;
 
 type InstanceErrorCode = keyof typeof PUBLIC_INSTANCE_ERRORS;
+
+/**
+ * Size of the owner-private per-incarnation secret of one hosted provider child.
+ * It matches the native CLI scope family's minimum key material and is never
+ * exported, published, or derived from anything observable about the child.
+ */
+const NATIVE_CLI_INCARNATION_BYTES = 32;
 
 /**
  * The host's own local-user input origin. It is a closed classification of
@@ -1166,29 +2290,80 @@ function isViewerStartupInputSource(value: unknown): value is NativeViewerStartu
 
 /** Variant-aware shape check for an expected input source handed back by a caller. */
 function isAnyViewerInputSource(value: unknown): value is NativeViewerAnyInputSource {
-	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) return isViewerStartupInputSource(value);
+	if (isPlainRecord(value) && Object.hasOwn(value, "phase")) {
+		return value.phase === NATIVE_CLI_INPUT_PHASE
+			? isViewerNativeCliInputSource(value)
+			: isViewerStartupInputSource(value);
+	}
 	return isViewerInputSource(value);
 }
 
 /**
+ * Closed shape check for a hosted native CLI source: exactly its own keys, an
+ * explicit `phase: "native-cli"`, one of the two closed backends, and no
+ * `nativeSession`, `registrationIdentity`, or `registrationGeneration` key at all
+ * (a null or fabricated one fails).
+ */
+function isViewerNativeCliInputSource(value: unknown): value is NativeViewerNativeCliInputSource {
+	if (!isPlainRecord(value)
+		|| !hasExactKeys(value, [
+			"hostRunId", "viewerId", "viewerRevision", "rowId", "phase", "backend", "geometry", "sourceToken",
+		])) {
+		return false;
+	}
+	return value.phase === NATIVE_CLI_INPUT_PHASE
+		&& isNativeCliBackend(value.backend)
+		&& isBoundedFactField(value.hostRunId)
+		&& isBoundedFactField(value.sourceToken)
+		&& isBoundedFactField(value.rowId)
+		&& isOrdinal(value.viewerRevision)
+		&& isViewerInputGeometry(value.geometry);
+}
+
+/** The closed variant of one input-path source, for the variant-aware comparisons. */
+type InputSourceVariant = "startup" | "native-cli" | "conversation";
+
+function sourceVariant(source: NativeViewerAnyInputSource): InputSourceVariant {
+	if (isNativeViewerStartupInputSource(source)) return "startup";
+	return isNativeViewerNativeCliInputSource(source) ? "native-cli" : "conversation";
+}
+
+/**
  * Variant-aware exact equality of two input-path sources. A startup source never
- * equals a conversation source, whatever their other facts say.
+ * equals a conversation source or a hosted native CLI source, and a native CLI
+ * source never equals either of the others whatever its other facts say.
  */
 function sameAnyViewerInputSource(left: NativeViewerAnyInputSource, right: NativeViewerAnyInputSource): boolean {
-	const leftStartup = isNativeViewerStartupInputSource(left);
-	const rightStartup = isNativeViewerStartupInputSource(right);
-	if (leftStartup !== rightStartup) return false;
-	if (leftStartup && rightStartup) {
-		return left.hostRunId === right.hostRunId
-			&& left.viewerId === right.viewerId
-			&& left.viewerRevision === right.viewerRevision
-			&& left.rowId === right.rowId
-			&& left.geometry.cols === right.geometry.cols
-			&& left.geometry.rows === right.geometry.rows
-			&& left.geometry.revision === right.geometry.revision
-			&& left.registrationIdentity === right.registrationIdentity
-			&& left.registrationGeneration === right.registrationGeneration
-			&& left.sourceToken === right.sourceToken;
+	const variant = sourceVariant(left);
+	if (variant !== sourceVariant(right)) return false;
+	if (variant === "native-cli") {
+		const a = left as NativeViewerNativeCliInputSource;
+		const b = right as NativeViewerNativeCliInputSource;
+		return a.hostRunId === b.hostRunId
+			&& a.viewerId === b.viewerId
+			&& a.viewerRevision === b.viewerRevision
+			&& a.rowId === b.rowId
+			&& a.backend === b.backend
+			&& a.geometry.cols === b.geometry.cols
+			&& a.geometry.rows === b.geometry.rows
+			&& a.geometry.revision === b.geometry.revision
+			// The token commits to the current process incarnation as well as every
+			// fact above, so a source rebuilt from older facts is caught here too.
+			&& a.sourceToken === b.sourceToken;
+	}
+	if (variant === "startup") {
+		const a = left as NativeViewerStartupInputSource;
+		const b = right as NativeViewerStartupInputSource;
+		return a.hostRunId === b.hostRunId
+			&& a.viewerId === b.viewerId
+			&& a.viewerRevision === b.viewerRevision
+			&& a.rowId === b.rowId
+			&& a.geometry.cols === b.geometry.cols
+			&& a.geometry.rows === b.geometry.rows
+			&& a.geometry.revision === b.geometry.revision
+			&& a.registrationIdentity === b.registrationIdentity
+			&& a.registrationGeneration === b.registrationGeneration
+			&& a.sourceToken === b.sourceToken;
 	}
 	return sameViewerInputSource(left as NativeViewerInputSource, right as NativeViewerInputSource);
 }
@@ -1393,6 +2568,111 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 	return { title: request.title, prompt: request.prompt };
 }
 
+/**
+ * Bounds for one operator's opaque native CLI launch-target selection. The
+ * target-id bound itself is owned by `session-backend.ts`, where the sidebar's
+ * ingestion reads the same value; this re-export only keeps the manager's own
+ * historical import path working.
+ */
+export { MAX_NATIVE_CLI_TARGET_CHARS } from "./session-backend";
+/** Upper bound for one native CLI launch descriptor's argument array. */
+export const MAX_NATIVE_CLI_ARGS = 256;
+
+/**
+ * The host's own capability environment keys. They are never injected into a
+ * native CLI child and never forwarded to one: provider-side sanitization stays
+ * with the launch provider, while these host-owned tokens never leak past this
+ * module's own spawn seam.
+ */
+const HOST_CAPABILITY_ENV_KEYS: readonly string[] = Object.freeze([
+	SESSION_HOST_BOOTSTRAP_ENV,
+	SESSION_HOST_STARTUP_REQUEST_ENV,
+	SESSION_HOST_TITLE_COLUMNS_ENV,
+	NODE_OPTIONS_RESTORE_ENV,
+]);
+
+function validateNativeCliTarget(value: unknown): string {
+	if (!isNativeCliTargetId(value)) {
+		throw new Error(`session-host: the native CLI launch target must be bounded single-line text`);
+	}
+	return value;
+}
+
+/**
+ * Validate and canonicalize the workspace one native CLI row was explicitly
+ * given. This is the whole setup an ordinary provider child needs: an existing
+ * directory, canonically resolved so the descriptor cwd is
+ * cwd-independent. No Pi agent directory, config, profile, or skill work happens
+ * here or anywhere else on this path.
+ *
+ * The resolution IS the host's shared Pi workspace resolution
+ * ({@linkcode resolveExistingDirectory}): a leading bare `~`/`~/` expands
+ * against the home directory, a relative spelling resolves against this
+ * process's working directory, and the result is the canonical real path. A
+ * native row therefore accepts exactly the spellings a Pi row accepts, because
+ * both rows go through the one resolver — this adds no second rule, and it
+ * never asks a shell to expand anything. No environment-variable or
+ * `~otheruser` form is expanded here any more than it is for Pi.
+ */
+function canonicalNativeWorkspace(workspace: string): string {
+	return resolveExistingDirectory(workspace, "the native CLI workspace");
+}
+
+/**
+ * Validate one native CLI launch descriptor the provider composed, against this
+ * row's own selected canonical workspace, and return a private copy. The
+ * descriptor is the full interactive launch: one executable plus its argv and
+ * environment, applied verbatim at spawn. Requiring the cwd to be exactly the
+ * selected workspace is what keeps one row = one workspace true for a child the
+ * manager did not compose; anything else about the provider's argv or environment
+ * is the provider's own decision.
+ */
+function validatedNativeCliDescriptor(value: unknown, workspace: string): NativeLaunchDescriptor {
+	if (!isPlainRecord(value)) {
+		throw new Error("session-host: the native CLI launch provider returned no launch descriptor");
+	}
+	const file = value.file;
+	if (typeof file !== "string" || file.length === 0 || /[\u0000-\u001f\u007f-\u009f]/.test(file)) {
+		throw new Error("session-host: the native CLI launch descriptor must name exactly one executable file");
+	}
+	const args = value.args;
+	if (!Array.isArray(args) || args.length > MAX_NATIVE_CLI_ARGS
+		|| args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+		throw new Error(`session-host: the native CLI launch descriptor requires at most ${MAX_NATIVE_CLI_ARGS} string arguments`);
+	}
+	// A batch child's Windows command line reaches the pinned public spawn
+	// verbatim, so it is validated as one printable non-empty string and never
+	// silently dropped: a descriptor that carries an unusable one is refused
+	// rather than spawned as a bare interpreter with no command.
+	const commandLine = value.commandLine;
+	if (commandLine !== undefined
+		&& (typeof commandLine !== "string" || commandLine.length === 0 || /[\u0000-\u001f\u007f]/.test(commandLine))) {
+		throw new Error("session-host: the native CLI launch descriptor's Windows command line must be one printable non-empty string");
+	}
+	const env = value.env;
+	if (!isPlainRecord(env)
+		|| Object.values(env).some((entry) => entry !== undefined && typeof entry !== "string")) {
+		throw new Error("session-host: the native CLI launch descriptor requires an environment of string values");
+	}
+	const cwd = value.cwd;
+	if (typeof cwd !== "string" || !isAbsolute(cwd) || realpathSync(cwd) !== workspace) {
+		throw new Error("session-host: the native CLI launch descriptor does not target this row's selected workspace");
+	}
+	return { file, args: [...args], ...(commandLine === undefined ? {} : { commandLine }), env: { ...env } as NodeJS.ProcessEnv, cwd };
+}
+
+/** A fresh child environment with this host's own capability tokens removed. */
+function nativeCliChildEnv(descriptorEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env = { ...descriptorEnv };
+	for (const key of HOST_CAPABILITY_ENV_KEYS) delete env[key];
+	return env;
+}
+
+/** True only for a row whose recorded backend is a native CLI backend. */
+function isNativeCliRow(record: ManagedInstance): boolean {
+	return isNativeCliBackend(record.backend);
+}
+
 /** The caller's final guard: only an exact `true` authorizes; a throw refuses. */
 function callerAuthorized(authorize: SavedMutationAuthorization): boolean {
 	try {
@@ -1427,9 +2707,16 @@ export class InstanceManager {
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
 	readonly #onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
+	readonly #onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
+	readonly #nativeCliLaunch?: NativeCliLaunch;
+	/** The OPTIONAL owner-side native hook registrar, or absent for every existing host. */
+	readonly #nativeHookRegistrar?: NativeHookSourceRegistrar;
+	/** The OPTIONAL owner-side per-run status observer factory, paired with the registrar. */
+	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/**
@@ -1445,6 +2732,15 @@ export class InstanceManager {
 	#stopping = false;
 	#disposed = false;
 	#disposePromise?: Promise<void>;
+	/**
+	 * One-shot notification that this manager began shutting down or being disposed.
+	 * It exists so an unbounded pre-spawn wait — the native CLI launch provider —
+	 * can settle without holding `shutdown()`/`dispose()` away from the owned stop
+	 * ladder. It releases no resource, signals no process, and is never a claim that
+	 * anything settled: it only lets an unspawned creation stop waiting.
+	 */
+	#shutdownNotice?: Promise<void>;
+	#shutdownNoticeResolve?: () => void;
 
 	constructor(options: InstanceManagerOptions) {
 		if (!options || typeof options !== "object") {
@@ -1491,9 +2787,40 @@ export class InstanceManager {
 		this.#onChange = options.onChange;
 		this.#onTerminalDiagnostic = options.onTerminalDiagnostic;
 		this.#onNativeClipboard = options.onNativeClipboard;
+		this.#onNativeCliClipboard = options.onNativeCliClipboard;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
+		if (options.nativeCliLaunch !== undefined && typeof options.nativeCliLaunch !== "function") {
+			throw new Error("session-host: nativeCliLaunch must be a function or absent");
+		}
+		this.#nativeCliLaunch = options.nativeCliLaunch;
+		// The optional native status source is ONE feature with two halves: a
+		// registrar with no reader, or a reader with no source, is a wiring mistake
+		// that would either stage private artifacts for nothing or leave a hosted row
+		// silently unobserved. Fail at construction instead.
+		if ((options.nativeHookRegistrar === undefined)
+			!== (options.nativeStatusObserverFactory === undefined)) {
+			throw new Error("session-host: nativeHookRegistrar and nativeStatusObserverFactory are supplied together or not at all");
+		}
+		if (options.nativeHookRegistrar !== undefined
+			&& typeof options.nativeHookRegistrar.registerNativeHookSource !== "function") {
+			throw new Error("session-host: nativeHookRegistrar must provide registerNativeHookSource()");
+		}
+		if (options.nativeStatusObserverFactory !== undefined
+			&& typeof options.nativeStatusObserverFactory !== "function") {
+			throw new Error("session-host: nativeStatusObserverFactory must be a function");
+		}
+		this.#nativeHookRegistrar = options.nativeHookRegistrar;
+		this.#nativeStatusObserverFactory = options.nativeStatusObserverFactory;
+		// The owned Codex backend factory is a third, independent seam: it is neither
+		// implied by the optional status pair nor required by it, and it is consulted
+		// only for a launch whose descriptor actually carries an owned plan.
+		if (options.ownedCodexBackendFactory !== undefined
+			&& typeof options.ownedCodexBackendFactory !== "function") {
+			throw new Error("session-host: ownedCodexBackendFactory must be a function or absent");
+		}
+		this.#ownedCodexBackendFactory = options.ownedCodexBackendFactory;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
 
@@ -1504,12 +2831,15 @@ export class InstanceManager {
 			const view: NativeInstanceView & { exitCode?: number; error?: string } = {
 				id: record.id,
 				label: record.label,
+				...(record.backend === undefined ? {} : { backend: record.backend }),
 				nativeSession: record.nativeSession ? Object.freeze(nativeSessionForPresentation(record.nativeSession)) : null,
 				...(record.lastNativeSession ? { lastNativeSession: Object.freeze(nativeSessionForPresentation(record.lastNativeSession)) } : {}),
 				workspace: record.workspace,
 				agentDir: record.agentDir,
 				lifecycle: record.lifecycle,
-				hasLiveProcess: Boolean(record.pty && !record.ptyExited),
+				// One component's exit never makes this row "gone": the row stays live while
+				// either its TUI handle or its owned backend remains unsettled.
+				hasLiveProcess: Boolean((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)),
 				busy: record.busy,
 				pendingInput: record.pendingInput,
 				inputSurface: record.inputSurface,
@@ -1518,6 +2848,9 @@ export class InstanceManager {
 				activeTasks: record.activeTasks,
 				activeShells: record.activeShells,
 				activity: Object.freeze([...record.activity]),
+				...(record.nativeStatusSupport === undefined
+					? {}
+					: { statusSupport: record.nativeStatusSupport }),
 			};
 			if (record.exitCode !== undefined) {
 				view.exitCode = record.exitCode;
@@ -1528,6 +2861,33 @@ export class InstanceManager {
 			views.push(Object.freeze(view));
 		}
 		return views;
+	}
+
+	/**
+	 * Caption exactly one native CLI row by replacing the ONE display label field
+	 * this host already transmits for it.
+	 *
+	 * The name is a caption on THIS host's row presentation and nothing else. It
+	 * is never written to the child, never typed into its input, never sent to a
+	 * provider, and never a Pi conversation rename: {@linkcode rename} through the
+	 * authenticated registration stays the only conversation-name path, and a row
+	 * that is not a native CLI row is refused here so no call can be mistaken for
+	 * one. The value is validated against the shared native display-name rule
+	 * before anything changes, so an empty, oversized, or control-bearing value
+	 * updates nothing. A settled row is captioned too — the caption belongs to the
+	 * row, not to the live process — and the row's stable provider label stays in
+	 * charge until a name is actually set.
+	 */
+	setNativeDisplayName(id: string, name: string): NativeDisplayNameResult {
+		if (this.#disposed || this.#stopping) return "no-row";
+		const record = this.#records.get(id);
+		if (record === undefined) return "no-row";
+		if (!isNativeCliBackend(record.backend)) return "not-native";
+		if (!isNativeDisplayName(name)) return "invalid-name";
+		if (record.label === name) return "unchanged";
+		record.label = name;
+		this.#safeChanged(record.id);
+		return "set";
 	}
 
 	/**
@@ -1582,6 +2942,11 @@ export class InstanceManager {
 		if (!record || !record.pty || !record.ptyExited) {
 			return false;
 		}
+		// The TUI's exit is not this backend's exit: a row whose owned Codex backend has
+		// not settled still owns that process, and removing the row would strand it.
+		if (ownsUnsettledCodexBackend(record)) {
+			return false;
+		}
 		this.#detachRow(record);
 		return true;
 	}
@@ -1615,6 +2980,11 @@ export class InstanceManager {
 			// release it, through the strict exited-row path.
 			return record.ptyExited ? this.closeExited(id) : false;
 		}
+		// No TUI was ever created, but an owned backend child of this very launch may
+		// still be live: an unsettled one keeps this row, exactly as an unsettled PTY does.
+		if (ownsUnsettledCodexBackend(record)) {
+			return false;
+		}
 		// No child was ever created. Require positively completed cleanup of the
 		// failed launch (registration and profile release actually returned, and
 		// any saved-session reservation was cleared) instead of an idempotency
@@ -1640,6 +3010,11 @@ export class InstanceManager {
 		this.#records.delete(record.id);
 		// No surface may keep displaying (or sizing) a row that is gone.
 		this.#retireViewerTargets(record.id);
+		// A removed row retires its OPTIONAL native status source too: its broker
+		// callbacks stop now, and its staged private files are released at the end of this
+		// teardown, once this row's own settlement gate below can be evaluated.
+		const statusRun = record.nativeStatusRun;
+		this.#retireNativeStatusRun(statusRun);
 		this.#releaseRegistration(record);
 		this.#disposeDataListener(record);
 		this.#disposeExitListener(record);
@@ -1654,19 +3029,53 @@ export class InstanceManager {
 		record.profile = undefined;
 		record.pty = undefined;
 		record.stopPromise = undefined;
+		// Removability already required a settled owned backend; this is the idempotent
+		// latch, so a resource can never outlive the row that owns it.
+		this.#retireOwnedCodexBackend(record.nativeCodexBackend);
+		this.#releaseNativeStatusArtifacts(record, statusRun);
 		this.#safeChanged(record.id);
 	}
 
 	/** Stop ONLY this exact owned row; removal is a separate actual-exit-only operation. */
 	async stop(id: string, options: { readonly confirmed: boolean }): Promise<StopInstanceResult> {
 		const record = this.#records.get(id);
-		if (!record || !record.pty || this.#disposed || this.#stopping) return { status: "unavailable", forced: false };
-		const outcome = (): StopInstanceResult => ({ status: record.ptyExited ? "exited" : "unconfirmed", forced: record.sigkillSent });
-		if (record.ptyExited) return outcome();
+		if (!record || this.#disposed || this.#stopping) return { status: "unavailable", forced: false };
+		// A row can own live work with no TUI at all: an owned Codex backend retained while
+		// its launch is still awaiting readiness is exactly that. Such a row stays stoppable
+		// — its operator's stop retires the backend and finishes the pending launch — and it
+		// is never reported as "exited" while either of its two processes is unsettled.
+		const ownsBackendWork = ownsUnsettledCodexBackend(record);
+		if (!record.pty && !ownsBackendWork) {
+			// The third shape of owned work is a launch that has produced NOTHING yet: its
+			// provider is still preparing, so there is no PTY and no backend to retire. For
+			// an owned-capable Codex row that window is still this manager's own row and
+			// still its own responsibility, so a confirmed Stop closes admission, retires
+			// this run's observation path, and publishes the row-level cancellation the
+			// launch races — which is what makes a later provider answer create neither a
+			// backend nor a TUI. Without that intent retained here, a stopped row would
+			// simply launch when its provider finally returned.
+			if (this.#pendingOwnedCodexPreparation(record)) {
+				if (options?.confirmed !== true) return { status: "confirmation-required", forced: false };
+				record.stopAdmissionClosed = true;
+				this.#closeStartupInput(record, true);
+				this.#retireNativeStatusRun(record.nativeStatusRun);
+				this.#cancelNativeLaunch(record);
+				return { status: "unconfirmed", forced: ownedForceEscalationAttempted(record) };
+			}
+			return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
+		}
+		const outcome = (): StopInstanceResult => ({
+			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record) ? "exited" : "unconfirmed",
+			forced: ownedForceEscalationAttempted(record),
+		});
+		if (record.ptyExited && !ownsBackendWork) return outcome();
 		if (record.stopPromise) { await record.stopPromise; return outcome(); }
 		let alreadyRequested = false;
 		if (options?.confirmed !== true) {
-			if (!hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
+			// With no TUI yet there are no session facts to prove an idle child, so an
+			// unconfirmed stop is refused; a CONFIRMED stop below still closes admission,
+			// retires this row's owned backend, and unblocks its launch.
+			if (!record.pty || !hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
 			const registration = record.registration;
 			if (!registration || record.registrationReleased) return { status: "confirmation-required", forced: false };
 			let shutdown: InstanceStatusRegistration["shutdown"];
@@ -1696,12 +3105,12 @@ export class InstanceManager {
 				exit.then((exited) => ({ kind: "exit" as const, exited })),
 			]);
 			if (record.ptyExited) return outcome();
-			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: record.sigkillSent };
+			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
 			if (first.kind !== "request" || !validShutdownRequest(first.result)) {
 				if (first.kind === "request" && first.result?.status === "not-idle") {
 					record.stopAdmissionClosed = false;
 				}
-				return { status: "confirmation-required", forced: record.sigkillSent };
+				return { status: "confirmation-required", forced: ownedForceEscalationAttempted(record) };
 			}
 			alreadyRequested = true;
 		} else {
@@ -1727,7 +3136,15 @@ export class InstanceManager {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
-		const label = options?.label === undefined ? "(session starting)" : validateLabel(options.label);
+		const backend = resolveSessionBackend(options?.backend);
+		const nativeCliTarget = options?.nativeCliTarget === undefined
+			? undefined
+			: validateNativeCliTarget(options.nativeCliTarget);
+		// A native CLI row has no observable native conversation name, so it carries a
+		// stable provider label instead of a name that never arrives.
+		const label = options?.label === undefined
+			? (isNativeCliBackend(backend) ? sessionBackendDisplayLabel(backend) : "(session starting)")
+			: validateLabel(options.label);
 		if (typeof options?.workspace !== "string" || options.workspace === "") {
 			throw new Error("session-host: create requires an explicit workspace directory");
 		}
@@ -1748,6 +3165,38 @@ export class InstanceManager {
 		if (initialRequest !== undefined && savedSession !== undefined) {
 			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
+		// A native CLI row is an ordinary provider child, so every Pi-specific launch
+		// input is refused here — before any row, reservation, or callback exists —
+		// and a native request is never quietly served as a Pi launch. A Pi row never
+		// gets a configured native launch target either: an explicit operator choice
+		// that cannot apply is refused rather than silently ignored.
+		if (isNativeCliBackend(backend)) {
+			if (this.#nativeCliLaunch === undefined) {
+				throw new Error("session-host: this host has no native CLI launch provider, so the requested backend cannot start");
+			}
+			if (profile !== undefined) {
+				throw new Error("session-host: a native CLI row never uses a Pi profile directory");
+			}
+			if (savedSession !== undefined) {
+				throw new Error("session-host: a native CLI row never opens a Pi saved conversation");
+			}
+			if (initialRequest !== undefined) {
+				throw new Error("session-host: a native CLI row never receives a Pi startup request");
+			}
+		} else if (nativeCliTarget !== undefined) {
+			throw new Error("session-host: a native CLI launch target is only valid for a native CLI backend");
+		}
+		// The owner-only restoration intent is admitted only as one exact provider UUID
+		// for a native CLI row, before any row, reservation, or callback exists.
+		const nativeResumeConversationId = options.nativeResumeConversationId;
+		if (nativeResumeConversationId !== undefined) {
+			if (!isNativeCliBackend(backend)) {
+				throw new Error("session-host: a native conversation resume is only valid for a native CLI backend");
+			}
+			if (!isNativeConversationId(nativeResumeConversationId)) {
+				throw new Error("session-host: the native conversation resume id must be an exact provider conversation id");
+			}
+		}
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
 		// cannot both spawn, including pending creations of siblings.
@@ -1763,6 +3212,17 @@ export class InstanceManager {
 			workspace: options.workspace,
 			agentDir: "",
 			lifecycle: "starting",
+			...(options.backend === undefined ? {} : { backend }),
+			...(isNativeCliBackend(backend)
+				? {
+					nativeCliTarget: nativeCliTarget ?? NATIVE_CLI_DEFAULT_TARGET_IDS[backend],
+					...(nativeResumeConversationId === undefined
+						? {}
+						: { nativeResumeConversationId, nativeConversationId: nativeResumeConversationId }),
+					nativeConversationConfirmed: false,
+					nativeConversationLive: false,
+				}
+				: {}),
 			busy: null,
 			pendingInput: null,
 			inputSurface: false,
@@ -1773,12 +3233,17 @@ export class InstanceManager {
 			activityRefreshAttempts: 0,
 			activityRefreshEpisodeOpen: false,
 			statusRevision: 0,
+			nativeStatusObserverGeneration: 0,
+			// A native CLI row's launch is in preparation from the moment this row exists,
+			// so a confirmed Stop can cancel it before any child of it is created.
+			nativeCliLaunchPending: isNativeCliBackend(options.backend),
 			activity: [],
 			cols: this.#cols,
 			rows: this.#rows,
 			geometryRevision: 0,
 			inputFramingRequested: false,
 			inputFramingReady: false,
+			nativeCliInputOrdinal: 0,
 			startupInputOpen: false,
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -1796,7 +3261,13 @@ export class InstanceManager {
 		};
 		this.#records.set(id, record);
 		this.#safeChanged(id);
-		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession, initialRequest });
+		const launch = this.#launchInstance(record, {
+			workspace: options.workspace,
+			profile,
+			savedSession,
+			initialRequest,
+			...(nativeCliTarget === undefined ? {} : { nativeCliTarget }),
+		});
 		this.#inflightCreates.add(launch);
 		try {
 			await launch;
@@ -1836,7 +3307,9 @@ export class InstanceManager {
 	 * fencing: separately tagged current ID/file observations, exact admitted
 	 * reservations (including pending creations), and historical ID-only
 	 * launch fences. Data only — no process discovery, scan, daemon, or lock.
-	 * Exited and removed rows contribute nothing.
+	 * Exited and removed rows contribute nothing, and so does every row this
+	 * manager knows to be a native CLI child: a Claude or Codex row never loads,
+	 * reserves, or rebinds a Pi conversation, so it is not evidence about one.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
 		return this.#ownedSessionCensus();
@@ -1851,6 +3324,11 @@ export class InstanceManager {
 	#ownedSessionCensus(): OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
+			// A known native CLI row owns no Pi conversation at all: it contributes
+			// neither a current binding nor an unknown-binding placeholder, so a
+			// provider child never blocks a Pi saved conversation. An unknown Pi row
+			// still contributes exactly what it did before.
+			if (isNativeCliRow(record)) continue;
 			const live = Boolean(record.pty && !record.ptyExited);
 			if (!live && record.savedReservation === undefined) continue;
 			if (record.savedReservation !== undefined) {
@@ -1892,6 +3370,7 @@ export class InstanceManager {
 	#savedDeletionCensus(): OwnedLiveSession[] {
 		const sessions = this.#ownedSessionCensus();
 		for (const record of this.#records.values()) {
+			if (isNativeCliRow(record)) continue;
 			if (record.pty && !record.ptyExited && !record.nativeSession) {
 				sessions.push({});
 				break;
@@ -2133,7 +3612,19 @@ export class InstanceManager {
 		// Local user input only. There is deliberately no origin parameter: a
 		// viewer cannot route input through this seam in this phase, and an opaque
 		// viewer token alone would be no grant.
+		if (data.length > 0 && isNativeCliBackend(record.backend)) {
+			// Nonempty owner-local user input is about to be handed to a hosted provider
+			// child, so the previous controller stops being the copy recipient NOW: a
+			// write that partially reaches the child and then throws leaves nobody
+			// attributed until a later input write actually returns. Empty writes,
+			// protocol replies, and Pi rows never reach here and change nothing.
+			record.nativeCliController = undefined;
+		}
 		this.#writeChildInput(record, pty, data, LOCAL_INPUT_ORIGIN);
+		// Only bytes that actually left for this child count. On a hosted provider row
+		// this makes the owner the current copy recipient; on a Pi row it changes
+		// nothing, because Pi copies carry their own per-dispatch origin.
+		this.#noteNativeCliLocalInput(record, data);
 	}
 
 	/**
@@ -2333,11 +3824,14 @@ export class InstanceManager {
 	/**
 	 * The CURRENT immutable input scope of one registered surface, or undefined when
 	 * this surface cannot take viewer input right now: it is unknown or retired, was
-	 * registered without this host's run identity or without its own copy sink, shows
-	 * no row or a row that is gone/finished/stopping, is not a framed row whose own
-	 * readiness was verified, or has no current native conversation. Resolving never
-	 * writes, resizes, queues, spawns, or changes any state, and the returned token
-	 * describes the facts rather than granting anything.
+	 * registered without this host's run identity (or, for a Pi row, without its own
+	 * copy sink), shows no row or a row that is gone/finished/stopping, is a Pi row
+	 * whose framing was not requested or whose readiness was never verified, or has no
+	 * current native conversation outside its explicit startup phase. A hosted
+	 * provider CLI row yields its process-incarnation source only while this manager
+	 * still owns its live PTY and surface. Resolving never writes, resizes, queues,
+	 * spawns, or changes any state, and the returned token describes the facts rather
+	 * than granting anything.
 	 *
 	 * There is no terminal-text field on purpose: the input owner is the surface and
 	 * its conversation, not the newest line on screen.
@@ -2355,21 +3849,26 @@ export class InstanceManager {
 	 * 1. the request shape (a malformed request, empty bytes, or a dispatch larger
 	 *    than the child's technical whole-dispatch assembly bound is refused);
 	 * 2. the CURRENT scope — same manager, live row, exact unreleased registration,
-	 *    framed and ready, known native tuple, and a mintable scope token;
+	 *    framed and ready, known native tuple, and a mintable scope token; or, for a
+	 *    hosted provider CLI row, this manager's live ownership of its PTY and surface
+	 *    and that process incarnation's current private scope key;
 	 * 3. EVERY expected source fact against the current one, including the canonical
-	 *    geometry revision, this viewer's revision, the native tuple, the
-	 *    registration identity/generation, and the host run — an ABA change (resized
-	 *    away and back, reselected, new run, new registration, new epoch, row exit,
-	 *    stop, release) is a refusal, and nothing is ever inferred from the bytes;
+	 *    geometry revision, this viewer's revision, the native tuple (or the native
+	 *    CLI backend), the registration identity/generation, and the host run — an ABA
+	 *    change (resized away and back, reselected, new run, new registration, new
+	 *    epoch, a replaced child process, row exit, stop, release) is a refusal, and
+	 *    nothing is ever inferred from the bytes;
 	 * 4. the CURRENT input modes against the modes the bytes were made for, because
 	 *    the same bytes mean something else in another mode (modes, descriptors, and
 	 *    tokens are freshness evidence, never authority);
 	 * 5. one more core-scope recheck after the modes read, in case a reentrant
 	 *    observer changed the facts in between.
 	 *
-	 * The row's input is then framed with this registration's own encoder under the
+	 * A Pi row's input is then framed with this registration's own encoder under the
 	 * viewer origin, carrying the current native tuple as the child-side fence. A
-	 * refusal never touches the child. Once the write seam was invoked, a throw is
+	 * hosted provider CLI row's input is written RAW to its own PTY, because no Pi
+	 * registration, encoder, or child-side decoder exists for it.
+	 * A refusal never touches the child. Once the write seam was invoked, a throw is
 	 * reported as `unknown` — never retried, queued, replayed, or re-routed.
 	 */
 	writeViewerInput(viewerId: string, request: NativeViewerInputRequest): NativeViewerInputResult {
@@ -2401,6 +3900,13 @@ export class InstanceManager {
 		const pty = current.record.pty;
 		if (pty === undefined) {
 			return { status: "refused", reason: "row-unavailable" };
+		}
+		if (isNativeViewerNativeCliInputSource(current.source)) {
+			// A hosted provider child takes its bytes RAW: there is no Pi registration,
+			// no per-registration encoder, no framed origin, and no child-side fence for
+			// it. The remaining fences are the owner's own: the current incarnation key,
+			// live ownership of this exact handle, and a non-stopping row.
+			return this.#writeNativeCliViewerInput(current.viewer, current.record, pty, current.source, request.data);
 		}
 		let fence: NativeInputExpectedFence;
 		if (isNativeViewerStartupInputSource(current.source)) {
@@ -2463,18 +3969,30 @@ export class InstanceManager {
 		if (viewer === undefined) {
 			return { ok: false, reason: "unknown-viewer" };
 		}
-		if (viewer.hostRunId === undefined || viewer.nativeClipboardSink === undefined) {
-			// No host run identity and no copy destination means no verifiable scope:
-			// this path has no intentional permanent copy drop.
+		// The row is read first only to learn whether this is a hosted provider row:
+		// a hosted child has no copy producer, so requiring a copy destination of it
+		// would be a rule about a thing that cannot exist. For every Pi row the
+		// verifiable-scope requirement below is exactly what it always was.
+		const rowId = viewer.sessionId;
+		const record = rowId === undefined ? undefined : this.#records.get(rowId);
+		const hostedCli = record !== undefined && isNativeCliBackend(record.backend);
+		if (viewer.hostRunId === undefined || (!hostedCli && viewer.nativeClipboardSink === undefined)) {
+			// Without this host's own run identity (and, for a Pi row, its own copy
+			// destination) there is no verifiable scope at all.
 			return { ok: false, reason: "no-input-source" };
 		}
-		const rowId = viewer.sessionId;
 		if (rowId === undefined) {
 			return { ok: false, reason: "row-unavailable" };
 		}
-		const record = this.#records.get(rowId);
 		if (record === undefined) {
 			return { ok: false, reason: "row-unavailable" };
+		}
+		if (hostedCli) {
+			// A hosted provider child has no Pi registration, no bootstrap, no input
+			// framing, and no copy producer, so every registration-based check below is
+			// meaningless for it. Its scope is proven against this manager's own
+			// ownership of the live PTY and the private key of that process incarnation.
+			return this.#nativeCliViewerScope(viewer, record);
 		}
 		const registration = record.registration;
 		if (registration === undefined || record.registrationReleased) {
@@ -2509,6 +4027,1447 @@ export class InstanceManager {
 			return { ok: false, reason: "no-input-source" };
 		}
 		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * Resolve one viewer's current input scope on a hosted provider CLI row and mint
+	 * its `nvcli1` scope token (issue 277 native remote-input slice).
+	 *
+	 * A source exists only while every one of these is true of THIS record: the row's
+	 * own recorded backend is a native CLI backend (never inferred from output or
+	 * from a missing Pi tuple), the manager still holds its live, unexited PTY, the
+	 * row has a surface whose modes can be read, the row is running and not inside a
+	 * stop, the viewer has this host's run identity, and this incarnation's private
+	 * scope key exists. A replacement child, an exit, a stop, a removed row, or a
+	 * retired viewer yields no source. Nothing here writes, resizes, queues, spawns,
+	 * or changes any state, and the returned token describes these facts instead of
+	 * granting anything.
+	 */
+	#nativeCliViewerScope(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+	):
+		| { readonly ok: true; readonly viewer: ManagedViewer; readonly record: ManagedInstance; readonly source: NativeViewerNativeCliInputSource }
+		| { readonly ok: false; readonly reason: NativeViewerInputRefusal } {
+		if (this.#disposed || this.#stopping) {
+			return { ok: false, reason: "disposed" };
+		}
+		if (record.pty === undefined || record.ptyExited || record.lifecycle !== "alive"
+			|| record.stopAdmissionClosed || record.surface === undefined) {
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const incarnation = record.nativeCliIncarnation;
+		if (incarnation === undefined) {
+			// No private key for the current process incarnation means no describable
+			// scope: this is a refusal, never a source with a placeholder identity.
+			return { ok: false, reason: "row-unavailable" };
+		}
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (facts === undefined) {
+			return { ok: false, reason: "no-input-source" };
+		}
+		const sourceToken = mintNativeViewerNativeCliScopeToken(incarnation, facts);
+		if (sourceToken === undefined) {
+			return { ok: false, reason: "no-input-source" };
+		}
+		const source: NativeViewerNativeCliInputSource = Object.freeze({
+			hostRunId: facts.hostRunId,
+			viewerId: facts.viewerId,
+			viewerRevision: facts.viewerRevision,
+			rowId: facts.rowId,
+			phase: NATIVE_CLI_INPUT_PHASE,
+			backend: facts.backend,
+			geometry: Object.freeze({
+				cols: facts.cols,
+				rows: facts.rows,
+				revision: facts.geometryRevision,
+			}),
+			sourceToken,
+		});
+		return { ok: true, viewer, record, source };
+	}
+
+	/**
+	 * The immutable facts one viewer's native CLI scope commits to, read from the
+	 * CURRENT record: run, viewer and revision, row, the row's own recorded backend,
+	 * and canonical geometry and revision. Undefined when the row is not positively a
+	 * native CLI row or the viewer carries no run identity. There is deliberately no
+	 * conversation, registration, or PID field: a hosted provider child has none of
+	 * those as public facts, and the process itself is bound only through the
+	 * owner-private incarnation key these facts are committed under.
+	 */
+	#viewerNativeCliScopeFacts(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+	): NativeViewerNativeCliScopeFacts | undefined {
+		const hostRunId = viewer.hostRunId;
+		const backend = record.backend;
+		if (hostRunId === undefined || !isNativeCliBackend(backend)) {
+			return undefined;
+		}
+		return Object.freeze({
+			hostRunId,
+			viewerId: viewer.id,
+			viewerRevision: viewer.revision,
+			rowId: record.id,
+			backend,
+			cols: record.cols,
+			rows: record.rows,
+			geometryRevision: record.geometryRevision,
+		});
+	}
+
+	/**
+	 * The one raw handoff of viewer input to a hosted provider child, reached only
+	 * after the shared scope, source-equality, and mode fences have passed.
+	 *
+	 * The token is re-proved under the CURRENT incarnation key immediately before the
+	 * write, so a source minted for an earlier child — or carrying a backend the row
+	 * never recorded — verifies to false even when every public fact still matches.
+	 * Ownership is then re-proved against the live record and this exact handle.
+	 * Bytes go to the PTY exactly as the caller's translator produced them: no Pi
+	 * framing, no encoder, and no child-side fence exists for this child. A throw
+	 * after the write was invoked is `unknown`, never a retry.
+	 */
+	#writeNativeCliViewerInput(
+		viewer: ManagedViewer,
+		record: ManagedInstance,
+		pty: InstancePty,
+		source: NativeViewerNativeCliInputSource,
+		data: string | Buffer,
+	): NativeViewerInputResult {
+		const incarnation = record.nativeCliIncarnation;
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (incarnation === undefined || facts === undefined
+			|| !verifyNativeViewerNativeCliScopeToken(incarnation, source.sourceToken, facts)) {
+			return { status: "refused", reason: "stale-source" };
+		}
+		if (!this.#nativeCliInputAdmissible(record, pty)) {
+			return { status: "refused", reason: "row-unavailable" };
+		}
+		// Every refusal is behind us and this nonempty user input is about to be handed
+		// to the child, so the previous controller stops being the copy recipient NOW:
+		// a write that partially reaches the child and then throws must not leave a
+		// stale surface attributed for whatever the child copies next. A recipient is
+		// established again only once a write actually returns.
+		record.nativeCliController = undefined;
+		try {
+			pty.write(data);
+		} catch {
+			// The seam was open when it was last checked and the write was invoked, so
+			// whether the child received the bytes is genuinely unknown, and no surface
+			// is attributed until a later input write succeeds.
+			return { status: "unknown" };
+		}
+		// The bytes were handed to THIS child, so this surface is now the recipient of
+		// any later copy capture on this incarnation. A refusal above never reaches here.
+		this.#noteNativeCliViewerInput(record, viewer.id, source.sourceToken);
+		return { status: "submitted" };
+	}
+
+	/**
+	 * Ownership admission evaluated immediately before one raw native CLI write, and
+	 * re-evaluated on every native status submit and invalidation: still the current
+	 * record for its id, still holding this exact live PTY, not
+	 * exited, not inside a stop, still a positively recorded native CLI row, and with
+	 * this incarnation's private key still in hand. `false` means no byte leaves now and
+	 * no observation is recorded; nothing is queued, retried, or retargeted.
+	 */
+	#nativeCliInputAdmissible(record: ManagedInstance, pty: InstancePty): boolean {
+		return !this.#disposed && !this.#stopping
+			&& this.#records.get(record.id) === record
+			&& record.pty === pty && !record.ptyExited
+			&& !record.stopAdmissionClosed
+			&& record.lifecycle === "alive"
+			&& isNativeCliBackend(record.backend)
+			&& record.nativeCliIncarnation !== undefined;
+	}
+
+	/**
+	 * Record that nonempty bytes actually left for one hosted provider child as
+	 * owner-local input, making the owner the recipient of any later copy capture on
+	 * THIS incarnation. Called only after the write seam was invoked; an empty write,
+	 * a refused write, a terminal protocol reply, or a Pi row never reaches it, and a
+	 * prior viewer recipient is replaced rather than kept as a fallback.
+	 */
+	#noteNativeCliLocalInput(record: ManagedInstance, data: string | Buffer): void {
+		if (data.length === 0 || !isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({ kind: "local" as const, ordinal: record.nativeCliInputOrdinal });
+	}
+
+	/**
+	 * Record that one viewer's verified nonempty input actually left for this hosted
+	 * provider child, making that surface the recipient of any later copy capture on
+	 * THIS incarnation. The viewer id and the exact scope token its input verified
+	 * under are kept so a later copy re-proves the CURRENT facts instead of trusting
+	 * this cached destination.
+	 */
+	#noteNativeCliViewerInput(record: ManagedInstance, viewerId: string, sourceToken: string): void {
+		if (!isNativeCliBackend(record.backend)) {
+			return;
+		}
+		const pty = record.pty;
+		if (pty === undefined || !this.#nativeCliInputAdmissible(record, pty)) {
+			return;
+		}
+		record.nativeCliInputOrdinal += 1;
+		record.nativeCliController = Object.freeze({
+			kind: "viewer" as const,
+			viewerId,
+			sourceToken,
+			ordinal: record.nativeCliInputOrdinal,
+		});
+	}
+
+	/**
+	 * This row's own CLOSED OSC 52 TEXT capture sink, attached to a hosted provider
+	 * surface only. The incarnation whose private key a captured copy is bound to is
+	 * captured here, once, beside the exact PTY handle this surface parses.
+	 */
+	#nativeCliOsc52Sink(record: ManagedInstance, pty: InstancePty): (encoded: string) => void {
+		const incarnation = record.nativeCliIncarnation;
+		return (encoded) => {
+			try {
+				this.#submitNativeCliCopy(record, pty, incarnation, encoded);
+			} catch {
+				// Containment: a capture or routing failure never escapes into xterm's
+				// parser, and nothing here ever becomes a clipboard action by accident.
+			}
+		};
+	}
+
+	/**
+	 * Mint the capture/submit seam of ONE live hosted provider run for the host code
+	 * that already owns this manager (the dependent provider copy-path adapter).
+	 *
+	 * The returned object is bound to this exact record, this exact PTY handle, and
+	 * this exact process-incarnation key: every submit re-proves all three plus the
+	 * row's live ownership, so a replaced child, an exited or stopping row, a removed
+	 * row, or a disposed manager submits nothing. It cannot address any other row, it
+	 * is never reachable from a peer or a wire frame, and it performs no clipboard
+	 * write and no destination choice beyond this row's own last accepted input.
+	 * `undefined` means no live run to bind to — never a late-binding handle.
+	 */
+	nativeCliCopyCapture(instanceId: string): NativeCliCopyCapture | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend)) {
+			return undefined;
+		}
+		const pty = record.pty;
+		const incarnation = record.nativeCliIncarnation;
+		if (pty === undefined || incarnation === undefined) {
+			return undefined;
+		}
+		const backend = record.backend;
+		return Object.freeze({
+			rowId: record.id,
+			backend,
+			submit: (encoded: string): boolean => this.#submitNativeCliCopy(record, pty, incarnation, encoded),
+		});
+	}
+
+	/**
+	 * Mint the STATUS capture/submit/invalidate seam of ONE live hosted provider run
+	 * for the host code that already owns this manager (the dependent provider status
+	 * observer adapter).
+	 *
+	 * The returned object is bound to this exact record, this exact PTY handle, and
+	 * this exact process-incarnation key: every call re-proves all three plus the
+	 * row's live ownership through the SAME provider-run ownership fence the row's
+	 * input and copy paths use, so a replaced child, an exited or erroring row, a
+	 * stop in progress, a removed row, or a disposed manager accepts nothing. It
+	 * cannot address another row, it is never reachable from a peer or a wire frame,
+	 * and it never becomes a status registration: no Pi bootstrap, token, broker
+	 * namespace, native conversation tuple, startup payload, or input framing is
+	 * created, consulted, or changed by anything here. `undefined` means there is no
+	 * live hosted run to bind to — never a late-binding handle.
+	 */
+	nativeStatusCapture(instanceId: string): NativeStatusCapture | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend)) {
+			return undefined;
+		}
+		const pty = record.pty;
+		const incarnation = record.nativeCliIncarnation;
+		if (pty === undefined || incarnation === undefined) {
+			return undefined;
+		}
+		const backend = record.backend;
+		const observerGeneration = record.nativeStatusObserverGeneration;
+		return Object.freeze({
+			rowId: record.id,
+			backend,
+			submit: (observation: NativeStatusObservation): NativeStatusSubmitResult =>
+				this.#submitNativeCliStatus(record, pty, incarnation, observerGeneration, observation),
+			invalidate: (): NativeStatusSubmitResult =>
+				this.#invalidateNativeCliStatus(record, pty, incarnation, observerGeneration),
+		});
+	}
+
+	/**
+	 * Apply one hosted provider observation, or nothing at all.
+	 *
+	 * Everything is re-proved here, at delivery time: the row is still the current
+	 * record holding this exact live, unexited, un-stopping PTY under this exact
+	 * incarnation key AND under the observer generation this capture was minted against,
+	 * and the observation itself is well-shaped. A malformed
+	 * observation (a wrongly typed field, an unknown field such as an ownership count
+	 * or a native conversation tuple, or a malformed applicability declaration) is
+	 * refused as a whole and leaves the row exactly as it was — it never becomes zero,
+	 * idle, or a partial update. A value for a category this row declared
+	 * unreportable is not a value: the declaration wins, so that one category stays
+	 * unknown (and renders N/A) while the rest of the snapshot still lands.
+	 *
+	 * An accepted observation replaces the row's observed agent state, pending input,
+	 * activity lines, and this provider harness's own task and shell counts, through
+	 * the SAME normalization and sanitization the Pi status path uses, so a category
+	 * the observer omitted or reported as unknown is unknown rather than stale. The
+	 * conservative OWNERSHIP pair is never written from here: a hosted provider child
+	 * owns no Pi background work, so it stays unknown and a stop keeps requiring its
+	 * explicit confirmation no matter what a provider reports about its own jobs.
+	 */
+	#submitNativeCliStatus(
+		record: ManagedInstance,
+		pty: InstancePty,
+		incarnation: Buffer,
+		observerGeneration: number,
+		observation: NativeStatusObservation,
+	): NativeStatusSubmitResult {
+		if (record.nativeCliIncarnation !== incarnation
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return nativeStatusRejected("no-live-run");
+		}
+		// The observer-generation fence is separate from the run fence on purpose: the
+		// row can be perfectly live while THIS capture's generation is already retired by
+		// an invalidation, which is exactly when a queued pre-failure callback arrives.
+		if (record.nativeStatusObserverGeneration !== observerGeneration) {
+			return nativeStatusRejected("retired-capture");
+		}
+		const read = readNativeStatusObservation(observation, record.nativeStatusSupport);
+		if (read.status !== "valid") {
+			return nativeStatusRejected("malformed-observation");
+		}
+		const snapshot = read.snapshot;
+		record.busy = snapshot.busy;
+		record.pendingInput = snapshot.pendingInput;
+		record.activeTasks = snapshot.activeTasks;
+		record.activeShells = snapshot.activeShells;
+		record.activity = boundedActivity(snapshot.activity);
+		if (snapshot.support !== undefined) {
+			record.nativeStatusSupport = mergeNativeStatusSupport(record.nativeStatusSupport, snapshot.support);
+		}
+		// The same revision fence the Pi status path uses: an observation this row
+		// accepted is never reinterpreted by an older one's later failure.
+		record.statusRevision += 1;
+		this.#safeChanged(record.id);
+		return nativeStatusAccepted();
+	}
+
+	/**
+	 * One hosted provider observer's honest failure statement about the run it just
+	 * lost track of. The row's observed values collapse to unknown — never a kept-over
+	 * "Ready", never a zero, never not-applicable — while the row's declared
+	 * applicability stays, because a backend's inability to report a category is a
+	 * fact about the backend, not about this lost observation. A replaced, exited,
+	 * stopping, removed, or disposed run changes nothing at all.
+	 */
+	#invalidateNativeCliStatus(
+		record: ManagedInstance,
+		pty: InstancePty,
+		incarnation: Buffer,
+		observerGeneration: number,
+	): NativeStatusSubmitResult {
+		if (record.nativeCliIncarnation !== incarnation
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return nativeStatusRejected("no-live-run");
+		}
+		if (record.nativeStatusObserverGeneration !== observerGeneration) {
+			return nativeStatusRejected("retired-capture");
+		}
+		record.busy = null;
+		record.pendingInput = null;
+		record.activeTasks = null;
+		record.activeShells = null;
+		record.activity = [];
+		// This is loss of the live observation generation, not an ordinary unknown
+		// status snapshot. Once it can no longer track conversation switches, its
+		// last proved identity cannot remain a current restart target. A run that
+		// never confirmed its restore keeps the admitted id for retry instead.
+		if (record.nativeConversationLive === true) {
+			record.nativeConversationLive = false;
+			delete record.nativeConversationId;
+		}
+		// Retiring the generation is part of the accepted invalidation, not a later step:
+		// no callback of this generation — submit or invalidate — can land after it.
+		record.nativeStatusObserverGeneration += 1;
+		record.statusRevision += 1;
+		this.#safeChanged(record.id);
+		return nativeStatusAccepted();
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL owner-side native status source (issue #277 owner slice)   *
+	 *                                                                         *
+	 * Everything in this block is inert for a manager built without the       *
+	 * optional registrar/observer pair — which is every existing host, every   *
+	 * Pi row, and every existing native test. Where it IS active it adds one   *
+	 * thing and only one thing: this manager becomes the owner of one broker   *
+	 * registration, one host-supplied observer, and one status capture per     *
+	 * hosted provider run. It adds no listener, socket, token, registry,       *
+	 * retry, resume, or adoption path, and it never touches what the child is  *
+	 * actually spawned with.                                                  *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Arm this row's optional native status source, BEFORE its provider child exists.
+	 *
+	 * The order is the whole point: the broker registration must be issued before the
+	 * spawn so its fresh bootstrap can travel to the launch provider in the launch
+	 * request, and so no child can ever exist whose hook source is not already bound
+	 * to this exact record. The observer is created in the same stretch, so the
+	 * broker's later dispatch reaches `acceptHook`/`acceptFailure` DIRECTLY — no
+	 * promise, queue, or microtask stands between an authenticated hook callback and
+	 * the observer's own synchronous read barrier.
+	 *
+	 * Every failure here is contained and leaves the interactive launch untouched: a
+	 * registrar that throws, a registration without a usable bootstrap, a bootstrap for
+	 * another backend or another row, and a factory that throws all mean "this row is
+	 * unobserved", never "this row failed".
+	 */
+	#armNativeStatusRun(
+		record: ManagedInstance,
+		backend: NativeCliBackend,
+	): OwnedNativeStatusRun | undefined {
+		const registrar = this.#nativeHookRegistrar;
+		const observerFactory = this.#nativeStatusObserverFactory;
+		if (registrar === undefined || observerFactory === undefined) {
+			// No optional source was configured: no registration, no launch option, no
+			// artifact, and no observation path.
+			return undefined;
+		}
+		const run: OwnedNativeStatusRun = {
+			rowId: record.id,
+			backend,
+			retired: false,
+			activated: false,
+			supportPublished: false,
+			artifactsReleased: false,
+			abandoned: false,
+		};
+		// Published before the source exists so every routing guard below has one
+		// authority for "this run is still this row's current one".
+		record.nativeStatusRun = run;
+		let registration: NativeHookRegistration;
+		try {
+			registration = registrar.registerNativeHookSource(record.id, backend, {
+				onEvent: (event) => this.#routeNativeHookEvent(record, run, event),
+				onFailure: (failure) => this.#routeNativeHookFailure(record, run, failure),
+			});
+		} catch {
+			this.#retireNativeStatusRun(run);
+			return undefined;
+		}
+		const bootstrap = registration?.bootstrap;
+		if (typeof registration?.release !== "function"
+			|| bootstrap === undefined
+			|| bootstrap.backend !== backend
+			|| bootstrap.instanceId !== record.id) {
+			// A half-built, foreign, or cross-backend registration can never route here, so
+			// it is released rather than trusted, and this provider receives no hook option.
+			// The release is direct: this run never adopted that registration.
+			try {
+				registration?.release();
+			} catch {
+				// The broker owns its own refusal to release.
+			}
+			this.#retireNativeStatusRun(run);
+			return undefined;
+		}
+		run.registration = registration;
+		run.bootstrap = bootstrap;
+		let created: NativeStatusObserver | Promise<NativeStatusObserver>;
+		try {
+			created = observerFactory({
+				rowId: record.id,
+				backend,
+				emit: (observation) => this.#emitNativeStatus(record, run, observation),
+				workspace: record.workspace,
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
+				emitConversationIdentity: (conversationId) =>
+					this.#emitNativeConversationIdentity(record, run, conversationId),
+			});
+		} catch {
+			this.#retireNativeStatusRun(run);
+			return undefined;
+		}
+		if (typeof (created as PromiseLike<NativeStatusObserver> | undefined)?.then === "function") {
+			// An asynchronous observer may answer after its row was stopped, removed, or
+			// replaced; the binding fence below disposes it rather than adopting it.
+			void Promise.resolve(created).then(
+				(observer) => {
+					this.#bindNativeStatusObserver(record, run, observer);
+				},
+				() => {
+					this.#retireNativeStatusRun(run);
+				},
+			);
+			return run;
+		}
+		this.#bindNativeStatusObserver(record, run, created as NativeStatusObserver);
+		if (run.observer === undefined) {
+			// A factory that answered with nothing usable leaves this row unobserved, so
+			// the provider is not asked to stage artifacts nobody will read.
+			this.#retireNativeStatusRun(run);
+			return undefined;
+		}
+		return run;
+	}
+
+	/**
+	 * Adopt one factory answer. A malformed observer leaves the row unobserved; an
+	 * answer for a run that was retired, replaced, or removed in the meantime is
+	 * disposed and never bound, so it can neither receive nor write anything.
+	 */
+	#bindNativeStatusObserver(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		observer: NativeStatusObserver,
+	): void {
+		const usable = observer !== null
+			&& typeof observer === "object"
+			&& typeof observer.acceptHook === "function"
+			&& typeof observer.acceptFailure === "function"
+			&& typeof observer.dispose === "function";
+		if (!usable) {
+			return;
+		}
+		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			try {
+				observer.dispose();
+			} catch {
+				// A stale observer's own teardown cannot affect anything.
+			}
+			return;
+		}
+		run.observer = observer;
+		// A run that activated while the factory was still answering publishes its static
+		// declaration now; otherwise activation does it.
+		this.#publishNativeStatusSupport(run);
+		// And it is offered this run's owned-backend facts now, once, only while the run,
+		// its backend, and its capture are all still the current ones.
+		this.#deliverOwnedCodexBackendObservation(record, run, record.nativeCodexBackend);
+	}
+
+	/**
+	 * The broker's authenticated event callback for this run: verify the owner
+	 * lifecycle token and the run's own backend, then dispatch DIRECTLY into the
+	 * observer. Nothing is queued, retried, or replayed for a row that was not
+	 * observable at this instant, and a throwing observer cannot disturb the row.
+	 */
+	#routeNativeHookEvent(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		event: NativeHookEvent,
+	): void {
+		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return;
+		}
+		if (event === null || typeof event !== "object" || event.backend !== run.backend) {
+			return;
+		}
+		const observer = run.observer;
+		if (observer === undefined) {
+			// Before the observer exists: claim nothing, and never hold the event.
+			return;
+		}
+		try {
+			observer.acceptHook(event);
+		} catch {
+			// A status source can never break the row it reports on — but it also cannot
+			// leave that row displaying facts it just failed to produce.
+			this.#retireNativeStatusObserver(record, run);
+		}
+	}
+
+	/** The same direct dispatch for the relay's closed failure reports. */
+	#routeNativeHookFailure(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		failure: NativeHookFailure,
+	): void {
+		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return;
+		}
+		if (failure === null || typeof failure !== "object" || failure.backend !== run.backend) {
+			return;
+		}
+		const observer = run.observer;
+		if (observer === undefined) {
+			return;
+		}
+		try {
+			observer.acceptFailure(failure);
+		} catch {
+			this.#retireNativeStatusObserver(record, run);
+		}
+	}
+
+	/**
+	 * Retire a throwing observer's lifetime even before its capture exists.
+	 * Callback retirement preserves static support, child ownership, and artifacts.
+	 */
+	#retireNativeStatusObserver(record: ManagedInstance, run: OwnedNativeStatusRun): void {
+		if (run.retired || record.nativeStatusRun !== run) {
+			return;
+		}
+		this.#retireNativeStatusRun(run);
+	}
+
+	/**
+	 * The ONLY write path this run's observer has: one COMPLETE observation through
+	 * this run's own capture. Before the capture exists — and after the run is retired
+	 * — it claims nothing and never queues, so a source can neither pre-load a row nor
+	 * resurrect one. The capture re-proves the record, the exact live PTY, the process
+	 * incarnation, and the observation generation on every call; this adds nothing to
+	 * those fences and weakens none of them.
+	 */
+	#emitNativeStatus(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		observation: NativeStatusObservation,
+	): NativeStatusSubmitResult {
+		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return nativeStatusRejected("no-live-run");
+		}
+		const capture = run.capture;
+		if (capture === undefined) {
+			return nativeStatusRejected("no-live-run");
+		}
+		return capture.submit(observation);
+	}
+
+	/**
+	 * The ONLY write path for this run's provider conversation IDENTITY (issue #277
+	 * restart restoration). It is fenced exactly like {@linkcode #emitNativeStatus}
+	 * and its capture: the current record and run, an activated capture, and that
+	 * capture's own live PTY handle, process incarnation, and observer generation, on
+	 * an unexited, un-stopping, undisposed row. Anything else claims nothing and is
+	 * never queued, retried, or replayed.
+	 *
+	 * A string must be one exact provider UUID. A restoring row whose expected id is
+	 * not yet proved accepts only that id (which confirms it); once confirmed, a
+	 * later positively proved id follows the provider's own current conversation. An
+	 * explicit `null` clears the remembered identity only while a proved identity is
+	 * active in this live run; before any proof it changes nothing, so a restoring
+	 * row keeps its admitted id for a durable retry. Normal retirement never clears.
+	 */
+	#emitNativeConversationIdentity(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		conversationId: string | null,
+	): boolean {
+		if (run.retired || !run.activated || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		if (conversationId === null) {
+			if (record.nativeConversationLive !== true) {
+				return false;
+			}
+			record.nativeConversationLive = false;
+			if (record.nativeConversationId === undefined) {
+				return true;
+			}
+			delete record.nativeConversationId;
+			this.#safeChanged(record.id);
+			return true;
+		}
+		if (!isNativeConversationId(conversationId)) {
+			return false;
+		}
+		const expected = record.nativeResumeConversationId;
+		if (expected !== undefined && record.nativeConversationConfirmed !== true && conversationId !== expected) {
+			return false;
+		}
+		record.nativeConversationConfirmed = true;
+		record.nativeConversationLive = true;
+		if (record.nativeConversationId === conversationId) {
+			return true;
+		}
+		record.nativeConversationId = conversationId;
+		this.#safeChanged(record.id);
+		return true;
+	}
+
+	/**
+	 * Owner-only restart identity of one local native CLI row (issue #277): the exact
+	 * launch-target id and, when known, the last exact provider conversation UUID this
+	 * host may durably remember for it (including a restoring row's admitted id while
+	 * its proof is still pending — a retry fact, never a live status claim). Exited
+	 * rows still answer; a Pi row or an absent row answers `undefined`. It is for the
+	 * owner's own roster projection only and is never part of a public, peer, or
+	 * network view.
+	 */
+	readNativeConversationIdentity(instanceId: string): { readonly targetId: string; readonly conversationId?: string } | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend) || record.nativeCliTarget === undefined) {
+			return undefined;
+		}
+		return Object.freeze({
+			targetId: record.nativeCliTarget,
+			...(record.nativeConversationId === undefined ? {} : { conversationId: record.nativeConversationId }),
+		});
+	}
+
+	/**
+	 * Owner-only proof fact of one local native CLI row (issue #277): `true` once
+	 * this row's own live run positively proved a conversation identity (for a
+	 * restoring row, its exact admitted id), `false` while that proof is still
+	 * pending or never arrived, and `false` for a Pi or absent row. It distinguishes
+	 * a restoring row's still-unproved retry intent from a proved identity for the
+	 * owner's own presentation only; it is never persisted, never a status value,
+	 * and never part of a public, peer, or network view.
+	 */
+	hasProvedNativeConversation(instanceId: string): boolean {
+		const record = this.#records.get(instanceId);
+		return record !== undefined && isNativeCliBackend(record.backend) && record.nativeConversationConfirmed === true;
+	}
+
+	/**
+	 * Bind this run to the live child, in the same synchronous stretch as the spawn:
+	 * mint the ONE status capture of this run from the exact record, the actual raw
+	 * PTY handle, and this incarnation, and record this handle's required reader (if
+	 * any) for the single artifact-release decision this run may later make. A run
+	 * whose child never became live is simply never activated.
+	 */
+	#activateNativeStatusRun(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		ownedBackend?: OwnedNativeCodexBackendResource,
+	): void {
+		if (run === undefined || run.retired || record.nativeStatusRun !== run) {
+			return;
+		}
+		if (this.#records.get(record.id) !== record || record.pty === undefined || record.ptyExited) {
+			return;
+		}
+		const capture = this.nativeStatusCapture(record.id);
+		if (capture === undefined) {
+			return;
+		}
+		run.capture = capture;
+		// Remembered alongside it, so every later use of this capture can re-prove that
+		// THIS generation of THIS handle is still what the row is running.
+		run.capturePty = record.pty;
+		run.captureIncarnation = record.nativeCliIncarnation;
+		run.captureGeneration = record.nativeStatusObserverGeneration;
+		run.activated = true;
+		this.#publishNativeStatusSupport(run);
+		// The capture is bound to this exact live handle and incarnation, so this is the
+		// first moment an owned backend's facts can be qualified, and it comes before any
+		// baseline claim: a source that can state "started idle" must first know whether the
+		// backend behind this row is genuinely this host's own.
+		this.#deliverOwnedCodexBackendObservation(record, run, ownedBackend ?? record.nativeCodexBackend);
+		// The child exists, this run's capture is bound to this exact handle and
+		// incarnation, and nothing has been typed into the row: that is the only
+		// moment a source may state its launch-time baseline, and the only fact the
+		// manager contributes to it — that it owns this spawn. A source without the
+		// hook, and a source that refuses because it already observed work, change
+		// nothing, and a throw here can never disturb the live run.
+		try {
+			run.observer?.observeOwnedStartup?.();
+		} catch {
+			// An observer's own baseline claim is contained: the run stays live.
+		}
+	}
+
+	/**
+	 * Publish THIS actual source's static applicability declaration, once, as the
+	 * run's first observation: the declared categories are stated and every observed
+	 * value stays unknown. A source that declares nothing publishes nothing, which
+	 * keeps the row on exactly the legacy unknown path.
+	 */
+	#publishNativeStatusSupport(run: OwnedNativeStatusRun): void {
+		if (run.retired || !run.activated || run.supportPublished) {
+			return;
+		}
+		const capture = run.capture;
+		const observer = run.observer;
+		if (capture === undefined || observer === undefined) {
+			return;
+		}
+		const declared = readNativeStatusSupport(observer.support);
+		if (declared.status !== "declared" || Object.keys(declared.support).length === 0) {
+			return;
+		}
+		run.supportPublished = true;
+		capture.submit({ support: declared.support });
+	}
+
+	/**
+	 * Account for the private files THIS launch's hook preparation staged, on EVERY
+	 * provider fulfillment — including a fulfillment this launch never waited for.
+	 *
+	 * A provider may stage files long before it answers, and this launch may be
+	 * abandoned, or its descriptor refused, in between. Those files are this manager's
+	 * ownership from the moment the provider hands them over, so this handler is
+	 * attached to the provider promise itself and adopts them exactly once. It releases
+	 * them only when this launch is already known to be abandoned (no child of it can
+	 * ever exist); otherwise ownership passes to the run, which follows that child's
+	 * actual settlement. A run whose OBSERVATION SOURCE was retired still owns them:
+	 * the child it is about to spawn may have been told to read them.
+	 */
+	#adoptNativeHookLease(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		descriptor: unknown,
+	): void {
+		if (run === undefined || run.artifactsReleased) {
+			// No source was armed for this launch, so nothing here was staged by us and
+			// nothing here is ours to delete.
+			return;
+		}
+		const outcome = readNativeHookLaunchOutcome(descriptor);
+		if (outcome === undefined || outcome.observation !== "prepared" || run.lease !== undefined) {
+			return;
+		}
+		run.lease = outcome.lease;
+		if (run.abandoned) {
+			this.#releaseNativeStatusArtifacts(record, run);
+			return;
+		}
+	}
+
+	/**
+	 * Record what this launch's provider made of the bootstrap it was handed, for the
+	 * OBSERVATION SOURCE only (the staged files are adopted separately, on every
+	 * fulfillment).
+	 *
+	 * `prepared` says the child was given its own instruction to invoke the relay, and
+	 * nothing else changes here. An explicit `unavailable` means this launch armed
+	 * nothing: the source and observer are released, this row's provider status stays
+	 * truthfully unknown, and its interactive launch (argv, environment, cwd) is exactly
+	 * what the provider composed without status.
+	 *
+	 * Saying NOTHING is the legacy descriptor shape rather than a refusal: this run
+	 * keeps its source and its observer and stays unknown until and unless actual
+	 * observations arrive. Only an explicit refusal retires a run this early.
+	 *
+	 * That is also the load-bearing rule for an OWNED Codex launch, which composes no
+	 * status hook of this host's own at all (the provider declines it, because the
+	 * approved relay and its read-only RPC are that row's metadata channel): its
+	 * descriptor says NOTHING by design, so the run, its capture, and its one private
+	 * backend capability stay live exactly as they would for a hook-bearing run. An
+	 * explicit `unavailable` or `failed` outcome keeps its existing fail-closed meaning
+	 * even there, and in no case does any of this touch the row's two processes.
+	 */
+	#applyNativeHookOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		if (run === undefined || run.retired) {
+			return;
+		}
+		const outcome = readNativeHookLaunchOutcome(descriptor);
+		if (outcome === undefined || outcome.observation === "prepared") {
+			return;
+		}
+		this.#retireNativeStatusRun(run);
+	}
+
+	/**
+	 * Retire this run's CALLBACKS, once and immediately: the broker registration is
+	 * released so no further delivery can arrive, the run's capture is invalidated so
+	 * its observation generation is retired for good, and the observer is disposed so
+	 * it stops its own internal work.
+	 *
+	 * It deliberately does NOT touch the child, its shutdown ladder, its reader, this
+	 * run's staged files, or the row's reference to this run. Those are RESOURCE
+	 * ownership, and they outlive the callbacks: a row stopped, disposed, or wired
+	 * incorrectly still has a child that may be reading the files this launch staged,
+	 * and only that child's actual settlement (below) may release them. Every callback
+	 * path is fenced by `retired`, so keeping the reference open cannot resurrect the
+	 * observation path.
+	 */
+	#retireNativeStatusRun(run: OwnedNativeStatusRun | undefined): void {
+		if (run === undefined || run.retired) {
+			return;
+		}
+		run.retired = true;
+		const registration = run.registration;
+		run.registration = undefined;
+		run.bootstrap = undefined;
+		if (registration !== undefined) {
+			try {
+				registration.release();
+			} catch {
+				// The broker owns its own refusal to release; the token is gone either way.
+			}
+		}
+		const capture = run.capture;
+		run.capture = undefined;
+		if (capture !== undefined) {
+			try {
+				capture.invalidate();
+			} catch {
+				// Contained: the run fence and the incarnation fence already refuse it.
+			}
+		}
+		const observer = run.observer;
+		run.observer = undefined;
+		if (observer !== undefined) {
+			try {
+				observer.invalidate?.();
+			} catch {
+				// The observer's own fence is best-effort; the capture is already retired.
+			}
+			try {
+				observer.dispose();
+			} catch {
+				// Contained.
+			}
+		}
+	}
+
+	/**
+	 * Release this run's staged private artifacts — at most once, and only when this
+	 * run's own settlement makes the cleanup safe.
+	 *
+	 * A run whose child never existed, or whose child has genuinely exited, may clean
+	 * them. A run whose child is still live, or whose required owned reader has not
+	 * positively settled, preserves them: an uncertain ownership chain is never treated
+	 * as if it had finished, and the existing shortening-only confirmation deadline is
+	 * awaited rather than replaced with a fresher window. The lease itself refuses to
+	 * remove anything it did not stage; this manager never guesses at a path.
+	 */
+	#releaseNativeStatusArtifacts(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+	): void {
+		const lease = run?.lease;
+		if (lease === undefined || run === undefined || run.artifactsReleased) {
+			return;
+		}
+		if (!run.retired) {
+			// The source is still armed and its child may still be reading.
+			return;
+		}
+		if (record.pty !== undefined && !record.ptyExited) {
+			// A live or unsettled child may still need the files it was told to read.
+			return;
+		}
+		if (ownsUnsettledCodexBackend(record)) {
+			// The owned backend is a SECOND child of this same launch, and it was given the
+			// same hook channel: the TUI's exit never says that child stopped reading, so an
+			// unsettled record preserves the files until that backend's own settlement.
+			return;
+		}
+		run.artifactsReleased = true;
+		run.lease = undefined;
+		const settlement = run.readerSettlement;
+		if (settlement !== undefined && !settlement.settled) {
+			void settlement.confirmSettlement().then(
+				(confirmed) => {
+					if (confirmed) {
+						this.#cleanupNativeStatusLease(lease);
+					}
+					// An unconfirmed settlement preserves the artifacts instead of pretending.
+				},
+				() => undefined,
+			);
+			return;
+		}
+		this.#cleanupNativeStatusLease(lease);
+	}
+
+	/**
+	 * Declare that NO child of this launch can ever exist, and release what its hook
+	 * preparation staged. This is the only place that decision is made, and it is made
+	 * exactly twice in this module: a spawn that failed before any child, and a
+	 * pre-spawn or stop-aborted launch.
+	 *
+	 * Marking the run abandoned is what makes the accounting complete for a provider
+	 * that answers after the launch was given up on: its late fulfillment adopts its
+	 * own staged files and releases them on the spot, while shutdown never waits for
+	 * it. Retirement of an OBSERVATION SOURCE never implies abandonment — a retired
+	 * run can still own a live child that is reading those files.
+	 */
+	#abandonNativeStatusLaunch(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+	): void {
+		if (run === undefined) {
+			return;
+		}
+		run.abandoned = true;
+		this.#retireNativeStatusRun(run);
+		this.#releaseNativeStatusArtifacts(record, run);
+	}
+
+	/** The one call that actually removes this run's own staged files. */
+	#cleanupNativeStatusLease(lease: NativeHookArtifactLease): void {
+		try {
+			void Promise.resolve(lease.cleanup()).catch(() => undefined);
+		} catch {
+			// The lease reports its own refusals; a cleanup failure is never a row failure.
+		}
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OWNED Codex backend of one hosted run (issue #277 owning-manager)  *
+	 *                                                                        *
+	 * Everything in this block is inert for a launch whose provider attached  *
+	 * no owned plan — which is every Pi row, every Claude row, and every     *
+	 * ordinary Codex row. Where it IS active it adds exactly one thing: this *
+	 * manager becomes the owner of one backend process beside the row's TUI, *
+	 * and it adds no provider patching, no replacement UI, no headless      *
+	 * conversation, no shared-server adoption, no port scan, and no status   *
+	 * claim of its own.                                                      *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Create this row's owned Codex backend and RETAIN its lease on the record
+	 * SYNCHRONOUSLY, before anything is awaited.
+	 *
+	 * That ordering is the contract: the backend child exists the moment the factory
+	 * returns, so a lease kept only inside a pending promise would be a process this
+	 * manager cannot stop. The factory's answer is validated against the identity this
+	 * manager minted — same lease id, same generation, and the four lease members this
+	 * module actually depends on — before any continuation is attached.
+	 *
+	 * A throw here happens before any backend of this run exists, so it is an ordinary
+	 * preparation failure. It never falls back to the standalone descriptor: a TUI
+	 * attached to nothing owned is the substitution this path refuses.
+	 */
+	#createOwnedCodexBackend(
+		record: ManagedInstance,
+		plan: NativeCodexOwnedLaunchPlan,
+	): OwnedNativeCodexBackendResource {
+		const factory = this.#ownedCodexBackendFactory;
+		if (factory === undefined) {
+			// The provider prepared an owned launch this host cannot honor. Refusing is
+			// the only honest answer: no backend, no TUI, and no Pi or standalone fallback.
+			throw new Error("session-host: this host has no owned Codex backend factory");
+		}
+		if (record.nativeCodexBackend !== undefined) {
+			// One backend per row incarnation, always. A second one would be a process whose
+			// endpoint this row's TUI is not attached to.
+			throw new Error("session-host: this row already owns a Codex backend");
+		}
+		const generation = record.nativeCodexBackendGeneration ?? 0;
+		record.nativeCodexBackendGeneration = generation + 1;
+		const identity: OwnedCodexBackendLaunchIdentity = Object.freeze({ leaseId: randomUUID(), generation });
+		const controller = new AbortController();
+		let resolveCancel: () => void = () => undefined;
+		const cancel = new Promise<void>((fulfill) => {
+			resolveCancel = fulfill;
+		});
+		let created: unknown;
+		try {
+			created = factory({
+				identity,
+				plan,
+				signal: controller.signal,
+				workspace: record.workspace,
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
+			});
+		} catch {
+			// The factory reports its own failure; no message, argument, or path of theirs
+			// is ever carried into this row's state.
+			throw new Error("session-host: the owned Codex backend factory produced no lease");
+		}
+		if (!isUsableOwnedCodexBackendLease(created, identity)) {
+			throw new Error("session-host: the owned Codex backend factory produced an unusable lease");
+		}
+		const lease = created;
+		const resource: OwnedNativeCodexBackendResource = {
+			rowId: record.id,
+			identity,
+			lease,
+			controller,
+			cancel,
+			resolveCancel,
+			ready: false,
+			settled: false,
+			observationDelivered: false,
+			retired: false,
+		};
+		// THE synchronous retention. From this statement until its settlement, this
+		// backend is this row's resource, and every stop, removal, disposal, and failure
+		// path below reaches it — including one whose readiness never arrives.
+		record.nativeCodexBackend = resource;
+		// Settlement is observed, never awaited: it is the only thing that may retire the
+		// row's ownership claim, release this run's staged private files, and let the row
+		// stop reporting a live process. A stop acknowledgement, a stream destroy, a
+		// close, or a timeout can never take its place.
+		void Promise.resolve(lease.settlement).then(
+			() => this.#onOwnedCodexBackendSettled(record, resource),
+			() => undefined,
+		);
+		return resource;
+	}
+
+	/**
+	 * Await this row's owned backend's readiness, bounded by this manager's own
+	 * shutdown notification exactly the way the launch provider is, and by this
+	 * resource's own retirement.
+	 *
+	 * A backend that never prints its banner can therefore never hold the host away
+	 * from stopping its existing children, and a row whose operator stopped it is answered
+	 * now rather than whenever its backend happens to speak. When either wins, this
+	 * resource is retired (which requests its exact owned termination) and the launch
+	 * aborts; the readiness answer, whenever it comes, can then spawn nothing.
+	 *
+	 * A rejected readiness value is NOT settlement and never treated as abandonment: the
+	 * backend child may outlive it, and the retained resource keeps the row's resources
+	 * and liveness until the lease itself settles.
+	 */
+	async #awaitOwnedCodexBackendReady(
+		record: ManagedInstance,
+		resource: OwnedNativeCodexBackendResource,
+	): Promise<OwnedCodexBackendReady> {
+		const outcome = await Promise.race([
+			Promise.resolve(resource.lease.readiness).then(
+				(ready) => ({ kind: "ready" as const, ready }),
+				() => ({ kind: "failed" as const }),
+			),
+			this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+			resource.cancel.then(() => ({ kind: "stopped" as const })),
+		]);
+		if (outcome.kind === "aborted" || this.#stopping || this.#disposed) {
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("shutting down; native CLI launch aborted before any child existed");
+		}
+		if (outcome.kind === "stopped") {
+			// A confirmed Stop of this row retired the resource while its readiness was still
+			// pending. The retirement already asked for the exact owned termination; this
+			// launch is over, and its row keeps the backend as unsettled owned work.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the row was stopped before its native CLI child existed");
+		}
+		if (outcome.kind !== "ready") {
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend did not become ready");
+		}
+		if (resource.retired || record.nativeCodexBackend !== resource || this.#records.get(record.id) !== record) {
+			// A stop, removal, or replacement landed while readiness was pending. The
+			// retirement that caused it already asked for the exact owned termination; this
+			// late answer adopts nothing and reveals nothing.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend is no longer this row's run");
+		}
+		if (resource.settled || ownedCodexBackendKnownEnded(resource)) {
+			// The backend ended between its banner and this continuation: its own status now
+			// reports a stop request, a witnessed exit, or a positive settlement. A TUI that
+			// attaches to an endpoint that is already gone is the substitution this path
+			// refuses, and an unsettled one stays retained and owned either way.
+			this.#retireOwnedCodexBackend(resource);
+			throw new Error("session-host: the owned Codex backend ended before its TUI could start");
+		}
+		resource.ready = true;
+		const identity = resource.identity;
+		// The one observation source of this backend, minted once from this fulfilled
+		// lease: its endpoint comes from this lease's own banner, and the bearer stays
+		// reachable only through the accessor. Nothing here is stored on a view or a log.
+		resource.observationSource = Object.freeze({
+			leaseId: identity.leaseId,
+			generation: identity.generation,
+			endpoint: outcome.ready.endpoint,
+			readObserverBearer: (): string => outcome.ready.readObserverBearer(),
+			// Forwarded once, as the exact value this lease's readiness carried: a
+			// bare backend lease simply has none, and the manager never invents one.
+			...(outcome.ready.tuiRootFacts === undefined
+				? {}
+				: { tuiRootFacts: outcome.ready.tuiRootFacts }),
+		});
+		return outcome.ready;
+	}
+
+	/**
+	 * Request this row's owned backend's exact owned termination, once.
+	 *
+	 * Retirement is a stop INTENT, never a settlement: the record stays on the row with
+	 * `settled` false until the lease's own positive settlement arrives, so the row keeps
+	 * reporting a live process, keeps refusing removal, and keeps its staged private
+	 * files. Both routes below are idempotent by contract, and neither ever signals a
+	 * pid, scans a process name, or touches another row's child.
+	 */
+	#retireOwnedCodexBackend(resource: OwnedNativeCodexBackendResource | undefined): void {
+		if (resource === undefined || resource.retired) {
+			return;
+		}
+		resource.retired = true;
+		// A launch waiting on this backend's banner stops waiting here, so a stopped row is
+		// answered even if its backend never prints anything and never settles.
+		try {
+			resource.resolveCancel();
+		} catch {
+			// A resolver failure cannot leave the lease unrequested; the calls below are the
+			// authoritative stop either way.
+		}
+		try {
+			resource.controller.abort();
+		} catch {
+			// An accessor failure cannot leave the lease unrequested; the call below is the
+			// authoritative stop and the record stays unsettled either way.
+		}
+		try {
+			resource.lease.requestStop();
+		} catch {
+			// A failed stop request is not a gone process: ownership and barriers stay held.
+		}
+	}
+
+	/**
+	 * This row's owned backend positively settled. It is the only place `settled` is
+	 * ever set, and it never claims anything about the TUI: a backend that settled while
+	 * its row's PTY is still live leaves that row live, and the row's own exit stays the
+	 * only witness of the TUI's end.
+	 *
+	 * Settlement also retires the resource: a lease that has finished is not a capability
+	 * this manager may still build a TUI on, so a readiness answer that arrives afterwards
+	 * is refused by the same fence every other stale continuation is.
+	 */
+	#onOwnedCodexBackendSettled(record: ManagedInstance, resource: OwnedNativeCodexBackendResource): void {
+		if (resource.settled) {
+			return;
+		}
+		resource.settled = true;
+		this.#retireOwnedCodexBackend(resource);
+		// The backend is one of the children this launch was told to give its hook files
+		// to, so its settlement is what can finally make that release safe.
+		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
+		if (this.#records.get(record.id) === record) {
+			if (this.#disposed && record.nativeCodexBackend === resource
+				&& (record.pty === undefined || record.ptyExited)) {
+				// Disposal deliberately preserved this row's registration and terminal surface
+				// while either of its two processes was unsettled. A TUI that already exited can
+				// never come back to finish that teardown, so this settlement — the last
+				// outstanding proof — completes the deferred per-row cleanup instead of retaining
+				// a terminal surface, its buffers, and its subscriptions for the rest of the
+				// process. A still-live TUI is left entirely alone: its own exit owns that.
+				this.#releaseRegistration(record);
+				try {
+					record.surface?.dispose();
+				} catch {
+					// Contained, exactly as on the late PTY-exit path.
+				}
+				record.surface = undefined;
+			}
+			this.#safeChanged(record.id);
+		}
+	}
+
+	/**
+	 * Offer this run's backend facts to this run's own observer, once.
+	 *
+	 * Every fence is re-proved at delivery: the run is this row's current, unretired,
+	 * activated run with its capture bound to the live handle; the backend is this row's
+	 * current, unretired, ready resource; and the delivery has not happened before. A
+	 * source that arrives late is offered the same single delivery only while all of that
+	 * is still true, so an old callback can never adopt a lease it did not run with.
+	 *
+	 * A throw retires the OBSERVATION path only — never the backend, its child, or its
+	 * artifacts — and the observer's own message is never read or reported.
+	 */
+	#deliverOwnedCodexBackendObservation(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		resource: OwnedNativeCodexBackendResource | undefined,
+	): void {
+		if (resource === undefined || resource.observationDelivered) {
+			return;
+		}
+		if (run === undefined || run.retired || record.nativeStatusRun !== run) {
+			return;
+		}
+		if (!run.activated || run.capture === undefined) {
+			// Before the capture is bound to the exact live PTY and incarnation, a source has
+			// nothing to qualify, so it is offered nothing.
+			return;
+		}
+		if (run.capturePty === undefined
+			|| run.captureIncarnation === undefined
+			|| run.captureGeneration === undefined
+			|| run.captureGeneration !== record.nativeStatusObserverGeneration
+			|| run.captureIncarnation !== record.nativeCliIncarnation
+			|| !this.#nativeCliInputAdmissible(record, run.capturePty)) {
+			// The capture this run was activated against is no longer CURRENT, which is a
+			// weaker claim than "a capture object exists". An accepted invalidation retires
+			// this capture's observer generation and leaves the handle in place, and a
+			// replaced incarnation, a stopping row, or a closed admission retires it the same
+			// way. A retired capture is never a reason to hand a source a live private
+			// capability, and nothing is submitted here to find out — the same fences
+			// #submitNativeCliStatus applies to real observations, applied without one.
+			return;
+		}
+		if (resource.retired || !resource.ready || record.nativeCodexBackend !== resource) {
+			return;
+		}
+		if (resource.settled || ownedCodexBackendKnownEnded(resource)) {
+			// A backend that was stopped, exited, or settled is not a live capability, however
+			// long this row's TUI keeps running. A source that arrives that late is offered
+			// nothing rather than the credentials of an endpoint that is already gone.
+			return;
+		}
+		if (this.#records.get(record.id) !== record) {
+			return;
+		}
+		const observer = run.observer;
+		if (observer === undefined || typeof observer.observeOwnedCodexBackend !== "function") {
+			return;
+		}
+		const source = resource.observationSource;
+		if (source === undefined) {
+			return;
+		}
+		resource.observationDelivered = true;
+		try {
+			observer.observeOwnedCodexBackend(source);
+		} catch {
+			// The observer's own failure retires its callbacks, exactly as a throwing hook
+			// callback does; the backend resource and its ownership are untouched.
+			this.#retireNativeStatusObserver(record, run);
+		}
+	}
+
+	/**
+	 * The ONE route a captured hosted provider TEXT copy can take, shared by the
+	 * surface's OSC 52 sink and this run's capture seam.
+	 *
+	 * Everything is re-proved here, at delivery time: the payload is re-validated as
+	 * normalized text; the row is still the current record holding this exact live,
+	 * unexited, un-stopping PTY under this exact incarnation key; and a recipient
+	 * exists at all. The recipient is frozen from the row's last accepted input, so
+	 * input that arrives after this copy was accepted never retargets it — and a
+	 * recipient that is no longer eligible delivers nothing. There is never a
+	 * broadcast, never an owner-local fallback for a viewer-routed copy, never a
+	 * sibling viewer, and never a queue or retry.
+	 */
+	#submitNativeCliCopy(
+		record: ManagedInstance,
+		pty: InstancePty,
+		incarnation: Buffer | undefined,
+		encoded: string,
+	): boolean {
+		if (!isNativeCliCopyEncoded(encoded)) {
+			return false;
+		}
+		const backend = record.backend;
+		if (!isNativeCliBackend(backend)
+			|| incarnation === undefined
+			|| record.nativeCliIncarnation !== incarnation
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		// Frozen at acceptance: this snapshot is the whole recipient decision.
+		const controller = record.nativeCliController;
+		if (controller === undefined) {
+			// No known origin on this incarnation: nothing is forwarded, and nothing
+			// falls back to the owner or to another surface.
+			return false;
+		}
+		const event: NativeCliClipboardEvent = Object.freeze({ kind: "copy" as const, encoded, backend });
+		if (controller.kind === "local") {
+			return this.#forwardNativeCliLocalCopy(record, event);
+		}
+		return this.#forwardNativeCliViewerCopy(record, controller, event);
+	}
+
+	/**
+	 * Owner-local hosted provider copy route. The manager holds no terminal and makes
+	 * no display claim: it hands the copy to the host's separate owner-local route,
+	 * which owes its own live-row, focus, and actual-coverage proof. Absent that route
+	 * there is no delivery and no substitute.
+	 */
+	#forwardNativeCliLocalCopy(record: ManagedInstance, event: NativeCliClipboardEvent): boolean {
+		const forward = this.#onNativeCliClipboard;
+		if (forward === undefined) {
+			return false;
+		}
+		try {
+			forward(record.id, event);
+		} catch {
+			// The host's own route contains its failures; a refusal cannot break a row.
+		}
+		return true;
+	}
+
+	/**
+	 * Route one captured copy to the ONE viewer this manager last accepted input from
+	 * on this incarnation, and to nobody else.
+	 *
+	 * The stored token is only a lookup commitment: delivery happens only after the
+	 * viewer record is re-read and its CURRENT facts re-verify that exact token under
+	 * this incarnation's private key, the viewer still displays this exact row, and it
+	 * still carries its own copy sink. A retired viewer, a viewer now showing another
+	 * row, a viewer revision, a geometry or backend change, a replacement child, a
+	 * released row, or a missing sink delivers nothing — quietly, with no sibling,
+	 * owner-local, broadcast, or retry.
+	 */
+	#forwardNativeCliViewerCopy(
+		record: ManagedInstance,
+		controller: {
+			readonly kind: "viewer";
+			readonly viewerId: string;
+			readonly sourceToken: string;
+			readonly ordinal: number;
+		},
+		event: NativeCliClipboardEvent,
+	): boolean {
+		const viewer = this.#viewers.get(controller.viewerId);
+		if (viewer === undefined || viewer.sessionId !== record.id) {
+			return false;
+		}
+		const sink = viewer.nativeClipboardSink;
+		if (sink === undefined) {
+			return false;
+		}
+		const incarnation = record.nativeCliIncarnation;
+		const facts = this.#viewerNativeCliScopeFacts(viewer, record);
+		if (incarnation === undefined || facts === undefined
+			|| !verifyNativeViewerNativeCliScopeToken(incarnation, controller.sourceToken, facts)) {
+			return false;
+		}
+		const receipt: NativeViewerNativeCliClipboardReceipt = Object.freeze({
+			source: Object.freeze({
+				hostRunId: facts.hostRunId,
+				viewerId: facts.viewerId,
+				viewerRevision: facts.viewerRevision,
+				rowId: facts.rowId,
+				phase: NATIVE_CLI_INPUT_PHASE,
+				backend: facts.backend,
+				geometry: Object.freeze({
+					cols: facts.cols,
+					rows: facts.rows,
+					revision: facts.geometryRevision,
+				}),
+				sourceToken: controller.sourceToken,
+			}),
+			event,
+			dispatchId: controller.ordinal,
+		});
+		try {
+			sink(receipt);
+		} catch {
+			// A viewer's own refusal cannot break a row or escape into the parser.
+		}
+		return true;
 	}
 
 	/**
@@ -2718,6 +5677,11 @@ export class InstanceManager {
 			if (record.pty && !record.ptyExited) {
 				return true;
 			}
+			// An owned backend this manager started is its own process: a row whose TUI has
+			// exited but whose backend has not settled is still owned work, never "gone".
+			if (ownsUnsettledCodexBackend(record)) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -2734,10 +5698,12 @@ export class InstanceManager {
 		if (this.#disposed) {
 			return {
 				forcedIds: [...this.#records.values()]
-					.filter((record) => record.pty && record.sigkillSent)
+					.filter((record) => (record.pty && record.sigkillSent) || ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend))
 					.map((record) => record.id),
+				// Same truth as the live pass below: a row whose owned backend has not
+				// settled still owns that process, whether or not its TUI ever existed.
 				remainingIds: [...this.#records.values()]
-					.filter((record) => record.pty && !record.ptyExited)
+					.filter((record) => (record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record))
 					.map((record) => record.id),
 			};
 		}
@@ -2746,6 +5712,9 @@ export class InstanceManager {
 		validateShutdownMs(graceMs, "graceMs");
 		validateShutdownMs(killMs, "killMs");
 		this.#stopping = true;
+		// An in-flight pre-spawn wait (a native CLI launch provider) stops waiting
+		// here, so a provider that never answers cannot postpone this stop ladder.
+		this.#publishShutdownNotice();
 		// A stopping manager admits no startup input again, in any row.
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		// Late async creates settle or abort here; none can spawn after stop.
@@ -2780,6 +5749,8 @@ export class InstanceManager {
 
 	async #runDispose(): Promise<void> {
 		this.#stopping = true;
+		// Same abort as shutdown(): disposal never waits on an unresolved provider.
+		this.#publishShutdownNotice();
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
@@ -2791,6 +5762,16 @@ export class InstanceManager {
 		// No surface survives this host's manager: every viewer fact is dropped.
 		this.#viewers.clear();
 		for (const record of this.#records.values()) {
+			// Every OPTIONAL native status source this host armed is retired here, live
+			// child or not: no observer, registration, or capture outlives the manager that
+			// created it. Files staged for a child that has NOT settled are deliberately
+			// preserved — an uncertain ownership chain is never cleaned as if it had
+			// finished — and the retained exit listener releases them if it ever does.
+			this.#retireNativeStatusRun(record.nativeStatusRun);
+			// An owned backend process goes the same way: its exact owned termination is
+			// requested now, and an unsettled one keeps its record, its files, and this row's
+			// liveness until it settles on its own.
+			this.#retireOwnedCodexBackend(record.nativeCodexBackend);
 			record.busy = null;
 			record.pendingInput = null;
 			record.inputSurface = false;
@@ -2800,9 +5781,11 @@ export class InstanceManager {
 			record.activeShells = null;
 			record.activity = [];
 			this.#disposeDataListener(record);
-			if (record.pty && !record.ptyExited) {
+			if ((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)) {
 				// Preserve the authenticated owner and terminal surface until actual
-				// PTY exit. The retained exit/error listeners complete this teardown.
+				// PTY exit — and until an owned backend of this same launch settles, which
+				// the TUI's own exit never proves. The retained exit/error listeners
+				// complete this teardown.
 				continue;
 			}
 			this.#releaseRegistration(record);
@@ -2859,6 +5842,69 @@ export class InstanceManager {
 		}
 	}
 
+	/**
+	 * The current shutdown/disposal notification, resolved as soon as this manager
+	 * has begun either. A creation that starts after that point is already aborted.
+	 */
+	#awaitShutdownNotice(): Promise<void> {
+		if (this.#shutdownNotice === undefined) {
+			let resolve: () => void = () => undefined;
+			this.#shutdownNotice = new Promise<void>((fulfill) => { resolve = fulfill; });
+			this.#shutdownNoticeResolve = resolve;
+		}
+		if (this.#stopping) this.#shutdownNoticeResolve?.();
+		return this.#shutdownNotice;
+	}
+
+	/** Publish the notification once, immediately after the stopping latch is set. */
+	#publishShutdownNotice(): void {
+		this.#awaitShutdownNotice();
+		this.#shutdownNoticeResolve?.();
+	}
+
+	/**
+	 * Whether this row is an owned-capable Codex launch still in preparation: neither its
+	 * TUI nor its backend exists yet, so the only thing a Stop can act on is the launch
+	 * itself. "Owned-capable" is entirely this manager's own fact — it can honor an owned
+	 * plan, and this row's recorded backend is Codex — so no Pi, Claude, or ordinary
+	 * non-owned Codex row's answers change here, and no provider is consulted or asked
+	 * what it intends to return.
+	 */
+	#pendingOwnedCodexPreparation(record: ManagedInstance): boolean {
+		return record.nativeCliLaunchPending === true
+			&& this.#ownedCodexBackendFactory !== undefined
+			&& record.backend === "codex";
+	}
+
+	/**
+	 * This row's cancellation notification, created on first need. It is the row-level
+	 * counterpart of {@linkcode InstanceManager.#awaitShutdownNotice}: a native CLI launch
+	 * races it against its provider, so a confirmed Stop of a row whose provider has not
+	 * answered is answered immediately instead of whenever that provider happens to return,
+	 * and a provider that answers later can create neither a backend nor a TUI.
+	 */
+	#awaitNativeLaunchCancellation(record: ManagedInstance): Promise<void> {
+		if (record.launchCancel === undefined) {
+			let resolve: () => void = () => undefined;
+			record.launchCancel = new Promise<void>((fulfill) => { resolve = fulfill; });
+			record.resolveLaunchCancel = resolve;
+		}
+		return record.launchCancel;
+	}
+
+	/** Publish that notification once. Idempotent, and it never signals a process. */
+	#cancelNativeLaunch(record: ManagedInstance): void {
+		// Created before it is resolved, so a launch that reaches the race afterwards still
+		// sees an already-cancelled row rather than a fresh, unresolved notification.
+		this.#awaitNativeLaunchCancellation(record);
+		try {
+			record.resolveLaunchCancel?.();
+		} catch {
+			// A resolver failure cannot un-stop the row: the launch also rechecks this row's
+			// closed admission immediately before it would create anything.
+		}
+	}
+
 	#sidebarTitleColumnsSnapshot(): number | undefined {
 		try {
 			const columns = this.#getSidebarTitleColumns?.();
@@ -2867,6 +5913,380 @@ export class InstanceManager {
 				: undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * The manager's own shared native Pi root, read only for native-row ownership
+	 * bookkeeping. It comes from the injected setup preparer's canonical root when
+	 * that preparer publishes one (production's native registry). Nothing is
+	 * admitted, prepared, initialized, or released here, and the recorded value
+	 * never says where the provider keeps its own configuration: a native row's
+	 * provider state stays entirely the provider's own.
+	 */
+	#hostAgentDir(): string {
+		const preparer = this.#profilePreparer as { readonly agentDir?: unknown };
+		const agentDir = preparer?.agentDir;
+		return typeof agentDir === "string" ? agentDir : "";
+	}
+
+	/**
+	 * Launch one native CLI row (issue 277 core slice): an ordinary interactive
+	 * provider child running in this row's explicitly selected workspace.
+	 *
+	 * What this path deliberately never does is the point of it: no setup admission
+	 * and no Pi agent-directory initialization, no Pi launch composition, no status
+	 * registration (so no bootstrap token exists for this child anywhere), no
+	 * startup payload, no preload/NODE_OPTIONS or title-columns environment, no
+	 * input framing, and no native clipboard receiver. The injected provider owns
+	 * the executable, argv, and provider-side environment sanitization; the manager
+	 * contributes nothing to the child's environment except the removal of its own
+	 * host capability tokens.
+	 *
+	 * Everything else is the same ownership machinery as a Pi row: the row is
+	 * already posted, the provider is resolved BEFORE the synchronous spawn stretch
+	 * and this manager's shutdown latch is rechecked after that await so a
+	 * concurrent stop never spawns, ownership of the exact PTY handle is recorded
+	 * before any child callback can fire, and that handle's own exit event remains
+	 * the only settlement witness.
+	 */
+	async #launchNativeCliInstance(
+			record: ManagedInstance,
+			options: { workspace: string; backend: NativeCliBackend; targetId?: string },
+		): Promise<void> {
+		// The OPTIONAL native status source of this launch, armed below before the provider
+		// runs. Declared outside the try so every failure path can retire it.
+		let statusRun: OwnedNativeStatusRun | undefined;
+		// The owned Codex backend of this launch, when its provider attached a plan. Also
+		// declared outside the try: a backend created before a later failure stays this
+		// manager's ownership until its own settlement, and every path below must request
+		// its exact owned termination rather than forget it.
+		let ownedBackend: OwnedNativeCodexBackendResource | undefined;
+		try {
+			// 1. The selected workspace is the only setup fact this row needs: an
+			// existing absolute directory, canonicalized. No provider configuration,
+			// agent directory, profile, or skill work happens on this path.
+			const workspace = canonicalNativeWorkspace(options.workspace);
+			record.workspace = workspace;
+			record.agentDir = this.#hostAgentDir();
+			this.#safeChanged(record.id);
+
+			await yieldCheckpoint();
+			if (this.#stopping) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+
+			// 2. Resolve the provider's full interactive descriptor before the spawn
+			// stretch. The provider receives a fresh copy of this manager's environment
+			// snapshot (never mutated) plus the unchanged operator target selection.
+			//
+			// The provider lives outside this module and may take arbitrarily long, so
+			// its resolution is raced against this manager's shutdown notification:
+			// `shutdown()`/`dispose()` must reach the owned stop ladder for the
+			// manager's other children even when a provider never answers. Both outcome
+			// handlers are attached to the provider promise itself, so a late
+			// fulfillment is simply discarded and a late rejection can never surface as
+			// an unhandled rejection. Nothing below the race can spawn before #stopping
+			// is rechecked, and the spawn stretch itself never yields.
+			const launch = this.#nativeCliLaunch;
+			if (launch === undefined) {
+				// create() refused this combination already; a manager reconfigured after
+				// posting the row still never falls back to a Pi launch.
+				throw new Error("session-host: this host has no native CLI launch provider");
+			}
+			// The OPTIONAL owner-side native status source (issue #277 owner slice). It is
+			// armed HERE — before the provider runs, and therefore before any child of this
+			// launch can exist — so the broker bootstrap it issues is genuinely this
+			// launch's own and can be handed to the provider. A manager without the
+			// optional pair returns undefined and this request is exactly the request it
+			// always sent.
+			statusRun = this.#armNativeStatusRun(record, options.backend);
+			const nativeHook = statusRun?.bootstrap === undefined
+				? undefined
+				: { bootstrap: statusRun.bootstrap };
+			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
+				workspace,
+				env: { ...this.#env },
+				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
+				...(nativeHook === undefined ? {} : { nativeHook }),
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
+			}));
+			// The provider is raced against three notifications, never against a timeout of
+			// its own: this manager shutting down, and THIS row being stopped by its operator
+			// (a confirmed Stop of a row that has produced no process yet has nothing else to
+			// act on, so the launch itself is what it cancels).
+			const outcome = await Promise.race([
+				pendingProvider.then(
+					(descriptor) => {
+						// EVERY provider fulfillment is accounted for here, including one that
+						// arrives after this launch was already abandoned: whatever that
+						// preparation staged becomes this manager's ownership at once, so a late
+						// or discarded descriptor can never strand it. Nothing here waits for an
+						// unresolved provider — shutdown keeps its existing bound.
+						this.#adoptNativeHookLease(record, statusRun, descriptor);
+						return { kind: "provided" as const, descriptor };
+					},
+					(error: unknown) => ({ kind: "failed" as const, refusedOwnedProfile: isOwnedCodexProfileRefusal(error) }),
+				),
+				this.#awaitShutdownNotice().then(() => ({ kind: "aborted" as const })),
+				this.#awaitNativeLaunchCancellation(record).then(() => ({ kind: "cancelled" as const })),
+			]);
+			// The provider ran across an await: a stop that began meanwhile takes this
+			// launch, so no child is ever created after the host began shutting down,
+			// and a provider that answers later can never resurrect this creation.
+			if (this.#stopping || this.#disposed) {
+				throw new Error("shutting down; native CLI launch aborted before any child existed");
+			}
+			if (outcome.kind === "cancelled") {
+				// The operator stopped this row while its provider was still preparing. The
+				// Stop already closed admission and retired this run's observation path; here
+				// the launch simply ends, so a provider fulfillment that arrives afterwards —
+				// or one that won this race by a microtask — creates no backend and no TUI.
+				throw new Error("session-host: the row was stopped before its native CLI child existed");
+			}
+			if (outcome.kind !== "provided") {
+				// The typed owned-profile refusal is mapped HERE, to one fixed existing row
+				// error and nothing else: the provider's exception object, its message, the
+				// configured profile spelling, its path, and its arguments never reach the row,
+				// a view, or a log. Every other provider failure keeps the same fixed text, so
+				// no lane can tell a caller anything about what the operator configured.
+				throw new Error(outcome.kind === "aborted"
+					? "shutting down; native CLI launch aborted before any child existed"
+					: outcome.refusedOwnedProfile === true
+						? "session-host: the native CLI launch provider refused an owned Codex backend launch"
+						: "session-host: the native CLI launch provider did not produce a descriptor");
+			}
+			const descriptor = validatedNativeCliDescriptor(outcome.descriptor, workspace);
+			// What the provider made of the bootstrap it was handed, for the OBSERVATION
+			// SOURCE only. The spawn descriptor above is unaffected either way, and the
+			// staged files this fulfillment carried were already adopted above.
+			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
+
+			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
+			// constructed in owned mode attaches a plan, and only such a launch enters here:
+			// the lease is created and RETAINED ON THE RECORD SYNCHRONOUSLY before anything
+			// is awaited, so a backend child that exists is a child this manager owns from
+			// its first instruction — never one hidden inside an unresolved promise. The TUI
+			// is then rendered from THAT lease's connection, so the interactive client and
+			// the backend are the same resolved target and endpoint, and a launch that never
+			// became ready never spawns a TUI at all.
+			const ownedPlanReading = readNativeCodexOwnedPlan(outcome.descriptor);
+			if (ownedPlanReading.state === "malformed") {
+				// A provider that attached an owned Codex plan this manager cannot consume is
+				// refused HERE, before the backend factory and before the pinned spawn. The
+				// alternative is the one outcome this path exists to prevent: quietly spawning
+				// the standalone descriptor as if the caller had never asked for an owned
+				// backend. The malformed value is never inspected further, echoed, or stored,
+				// and the fixed lane below carries no field, path, or message of theirs; no
+				// capability, endpoint, or observation source can exist for this row.
+				throw new Error("session-host: the owned Codex backend plan is unusable");
+			}
+			const ownedPlan = ownedPlanReading.state === "plan" ? ownedPlanReading.plan : undefined;
+			let ownedConnection: { readonly args: readonly string[]; readonly env: Readonly<Record<string, string | undefined>> } | undefined;
+			if (ownedPlan !== undefined) {
+				// The last look before a process of this launch can exist. The race above
+				// already answers a Stop that arrived during preparation; this re-checks the
+				// row's own admission, because a Stop that wins by a microtask must still not
+				// end up with a backend and a TUI behind it.
+				if (record.stopAdmissionClosed) {
+					throw new Error("session-host: the row was stopped before its native CLI child existed");
+				}
+				ownedBackend = this.#createOwnedCodexBackend(record, ownedPlan);
+				const ready = await this.#awaitOwnedCodexBackendReady(record, ownedBackend);
+				// THE final fence, re-proved on THIS caller's continuation and not on the
+				// helper's: returning from an await is itself a gap in which a confirmed row
+				// Stop, a removal, a manager shutdown, or this backend's own exit can land — and
+				// a row Stop sets none of the manager-wide flags. Everything below is a
+				// synchronous stretch, so re-reading the exact resource here is what guarantees
+				// that no TUI, and no read of its private connection material, follows a backend
+				// this manager no longer owns.
+				if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+					|| ownedBackend.retired || ownedBackend.settled
+					|| record.nativeCodexBackend !== ownedBackend
+					|| this.#records.get(record.id) !== record
+					|| ownedCodexBackendKnownEnded(ownedBackend)) {
+					// Retirement (if anything about this row is still outstanding) was requested
+					// by whoever changed the answer, and an unsettled backend stays owned by this
+					// row's record until its own settlement proves it gone.
+					this.#retireOwnedCodexBackend(ownedBackend);
+					throw new Error("session-host: the owned Codex backend is no longer available for TUI startup");
+				}
+				// Read the private connection material once, in the same synchronous stretch
+				// that spawns from it: a fresh child-only environment carrying the bearer, and
+				// nothing that ever enters a view, a log, or the row's stored state.
+				ownedConnection = ready.createTuiConnection();
+			}
+
+			// 3. Synchronous spawn stretch: nothing yields until the handlers and the
+			// terminal surface are attached, so ownership is recorded before any child
+			// callback can fire. The descriptor is applied verbatim.
+			let pty: InstancePty | undefined;
+			try {
+				// An owned launch spawns what its OWN lease renders, never the standalone
+				// descriptor: same canonical executable, same workspace, the lease's private
+				// connection arguments in real option position, and the lease's fresh child
+				// environment. A plan that renders anything unusable is refused here, before
+				// the pinned spawn, exactly as a provider descriptor would be.
+				const launchTarget = ownedPlan === undefined || ownedConnection === undefined
+					? descriptor
+					: validatedNativeCliDescriptor(ownedPlan.renderTui(ownedConnection), workspace);
+				// The private fact of the process about to exist, minted in the same
+				// synchronous stretch as the spawn: a row never owns a live provider child
+				// whose input scope key does not exist yet, and a replacement child never
+				// inherits its predecessor's. Nothing derived from it is ever published.
+				record.nativeCliIncarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
+				pty = this.#ptyFactory({
+					file: launchTarget.file,
+					args: launchTarget.args,
+					...(launchTarget.commandLine === undefined ? {} : { commandLine: launchTarget.commandLine }),
+					env: nativeCliChildEnv(launchTarget.env),
+					cwd: launchTarget.cwd,
+					cols: record.cols,
+					rows: record.rows,
+				});
+				record.pty = pty;
+				// #666: the same owned-reader contract as a Pi row. A native CLI child
+				// spawned by the default factory on Windows leaks the same addon reader,
+				// so its settlement is recorded here for the disposal-time confirmation;
+				// the release itself is still triggered only by that handle's own exit.
+				// Settled readers are already history, so they are dropped here instead of
+				// retaining a finished handle graph for the manager's whole lifetime.
+				for (const settled of this.#ownedConptyReaders) {
+					if (settled.settled) this.#ownedConptyReaders.delete(settled);
+				}
+				const ownedReader = ownedConptyReaderRecord(pty);
+				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
+				// This run's required reader is recorded HERE, before ANY callback that can
+				// report an exit is attached. A handle that reports an exit synchronously
+				// while its listener is being registered must reach the artifact-release
+				// decision with this run's settlement already known, never as though no
+				// reader were required at all.
+				if (statusRun !== undefined) {
+					statusRun.readerSettlement = ownedReader?.settlement;
+				}
+				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+				if (record.ptyExited) {
+					this.#disposeExitListener(record);
+					if (this.#records.get(record.id) !== record) {
+						// An exit observer may synchronously close the row while onExit()
+						// registers its listener: allocate nothing else for a detached record.
+						return;
+					}
+				}
+				record.surface = new TerminalSurface(record.cols, record.rows, {
+					onReply: (data) => this.#onQueryReply(record, undefined, data),
+					onChange: () => this.#safeChanged(record.id),
+					onBackpressure: (paused) => this.#onBackpressure(record, paused),
+					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+					// The closed TEXT copy capture of THIS child: bound to this exact
+					// handle and incarnation, and installed on no other surface.
+					onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
+					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+					graphicsBudget: this.#graphicsBudget,
+				});
+				if (!record.ptyExited) {
+					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+				}
+				if (!record.ptyExited) {
+					record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
+					if (record.ptyExited) {
+						// An injected/fake event source may emit synchronously while listener
+						// registration is returning; never revive its row.
+						this.#disposeDataListener(record);
+					} else if (record.lifecycle === "starting") {
+						record.lifecycle = "alive";
+					}
+				}
+			} catch {
+				// Whatever happened in this stretch, no TUI of this launch is running: an owned
+				// backend created by it gets its exact owned termination requested now, and its
+				// record stays until that backend's own settlement proves it gone.
+				this.#retireOwnedCodexBackend(ownedBackend);
+				if (pty) {
+					// A child of this launch exists, so its staged files stay: the owned stop
+					// below reaches the real exit, and that exit is what releases them.
+					this.#retireNativeStatusRun(statusRun);
+					// The child exists but could not be wired: keep ownership and initiate a
+					// bounded graceful owned stop rather than leaving an untracked process.
+					record.error = publicInstanceError("ptySetup");
+					record.lifecycle = "error";
+					if (!record.exitDisposable && !record.ptyExited) {
+						try {
+							record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+						} catch {
+							// Without an exit event, ownership remains held fail-closed.
+						}
+					}
+					if (record.ptyExited) {
+						this.#disposeExitListener(record);
+					}
+					try {
+						record.dataDisposable?.dispose();
+					} catch {
+						// Continue toward an owned stop even if listener cleanup fails.
+					}
+					record.dataDisposable = undefined;
+					if (record.ptyExited) {
+						this.#disposeReadErrorListener(record);
+					}
+					this.#safeChanged(record.id);
+					if (record.ptyExited) {
+						this.#releaseRegistration(record);
+						this.#releaseProfile(record);
+					} else {
+						void this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS).catch(() => {});
+					}
+					return;
+				}
+				// Failed spawn before any child exists: nothing was ever acquired. Any
+				// file this launch staged has no child that could ever read it, so it goes now
+				// — and the launch is marked abandoned so a provider that answers LATER has
+				// its own staged files released by the same decision. An owned backend child of
+				// THIS launch is outside that decision: its unsettled record keeps those files,
+				// and only its own settlement releases them.
+				this.#abandonNativeStatusLaunch(record, statusRun);
+				record.error = publicInstanceError("ptySetup");
+				record.lifecycle = "error";
+				this.#releaseRegistration(record);
+				this.#releaseProfile(record);
+				this.#safeChanged(record.id);
+				return;
+			}
+			// The child exists and is fully wired: bind this run's optional status source
+			// to the exact live handle and incarnation now, in the same synchronous stretch
+			// as the spawn, so no observation can ever land on a row this run is not it.
+			this.#activateNativeStatusRun(record, statusRun, ownedBackend);
+			if (this.#records.get(record.id) === record) {
+				this.#safeChanged(record.id);
+			}
+		} catch {
+			// Pre-spawn failure or a stop-aborted launch: no child ever existed, and a
+			// native row owns no registration, profile admission, startup payload, or
+			// saved-session reservation, so the row simply reports the bounded error.
+			// Marking this launch abandoned also covers a provider that fulfills after we
+			// stopped waiting for it: its staged files are released on arrival rather than
+			// stranded, and shutdown still never waits on it.
+			//
+			// A backend this launch already created is not covered by that decision: it is
+			// asked for its exact owned termination here, and its unsettled record keeps the
+			// row's resources and its liveness until that backend's own settlement arrives.
+			this.#retireOwnedCodexBackend(ownedBackend);
+			this.#abandonNativeStatusLaunch(record, statusRun);
+			record.error = publicInstanceError("launchPreparation");
+			record.lifecycle = "error";
+			this.#releaseRegistration(record);
+			this.#releaseProfile(record);
+			this.#safeChanged(record.id);
+		} finally {
+			// Every path ends this row's preparation window, so a row that has settled — as a
+			// live child or as an error row — can never be "cancelled" again by a later Stop;
+			// those rows are answered by the process truth they actually hold.
+			record.nativeCliLaunchPending = false;
 		}
 	}
 
@@ -2880,8 +6300,20 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string } },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string },
 		): Promise<void> {
+		const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
+		if (nativeBackend !== undefined) {
+			// One dispatch point, chosen from the row's own recorded backend: a native
+			// CLI row never reaches the Pi setup, descriptor, registration, or framing
+			// path below, and a Pi row's launch is unchanged.
+			await this.#launchNativeCliInstance(record, {
+				workspace: options.workspace,
+				backend: nativeBackend,
+				...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
+			});
+			return;
+		}
 		let stagedStartup: ReturnType<typeof stageSessionHostStartupRequest> | undefined;
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
@@ -3139,7 +6571,7 @@ export class InstanceManager {
 		this.#failRunningInstance(record, "ptyRead");
 	}
 
-	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration, data: string): void {
+	#onQueryReply(record: ManagedInstance, registration: InstanceStatusRegistration | undefined, data: string): void {
 		if (this.#records.get(record.id) !== record || this.#disposed) {
 			return;
 		}
@@ -3198,6 +6630,24 @@ export class InstanceManager {
 			return; // stale or already-final exit
 		}
 		record.ptyExited = true;
+		// This process incarnation is over. Its private scope key goes with it, so no
+		// source minted for it can be re-proven even by a caller holding every public
+		// fact unchanged.
+		record.nativeCliIncarnation = undefined;
+		// The OPTIONAL native status source of this run goes with the process it observed:
+		// its broker callbacks are released, its capture generation is retired, and its
+		// observer is disposed. Its staged private files are released further below, because
+		// THIS genuine exit — not this bookkeeping — is what makes that cleanup safe.
+		const statusRun = record.nativeStatusRun;
+		this.#retireNativeStatusRun(statusRun);
+		// The TUI client is gone, so nothing will talk to this row's owned backend again:
+		// its exact owned termination is requested now. This exit is NOT that backend's
+		// proof — the unsettled record keeps the row live, keeps it unremovable, and keeps
+		// its staged files until the lease itself settles.
+		this.#retireOwnedCodexBackend(record.nativeCodexBackend);
+		// The routing convention belonged to that process incarnation and goes with it:
+		// a replacement child starts with no known recipient at all.
+		record.nativeCliController = undefined;
 		// The process incarnation is over, so its startup phase is over for good.
 		this.#closeStartupInput(record, false);
 		// A finished child displays nothing: every surface's participation in this
@@ -3227,6 +6677,10 @@ export class InstanceManager {
 		this.#disposeExitListener(record);
 		this.#disposeReadErrorListener(record);
 		this.#releaseProfile(record);
+		// The exact child that was told to read this run's staged private files is now
+		// known to have exited, so they may be released — still only once a required owned
+		// reader has positively settled, and never under an unsettled one.
+		this.#releaseNativeStatusArtifacts(record, statusRun);
 		record.savedReservation = undefined;
 		this.#resolveExitWaiters(record);
 		this.#safeChanged(record.id);
@@ -3595,21 +7049,89 @@ export class InstanceManager {
 	 */
 	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		const pty = record.pty;
-		if (!pty || record.ptyExited) {
+		const hasPty = pty !== undefined && !record.ptyExited;
+		const backend = record.nativeCodexBackend;
+		const hasBackend = backend !== undefined && !backend.settled;
+		if (!hasPty && !hasBackend) {
 			return Promise.resolve(true);
 		}
 		if (record.stopPromise) {
 			return record.stopPromise;
 		}
-		// #666: this ladder's forced escalation is one of the paths that can end the
-		// child and so trigger the owned reader's release. That release must fit
-		// inside this same stop budget: the cap is shortening-only, so a natural exit
-		// well inside the window keeps its existing confirmation time, while a late
-		// exit after an exhausted ladder can never renew time this stop already spent.
-		ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(Date.now() + graceMs + killMs);
-		const stopPromise = this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
+		if (hasPty && pty !== undefined) {
+			// #666: this ladder's forced escalation is one of the paths that can end the
+			// child and so trigger the owned reader's release. That release must fit
+			// inside this same stop budget: the cap is shortening-only, so a natural exit
+			// well inside the window keeps its existing confirmation time, while a late
+			// exit after an exhausted ladder can never renew time this stop already spent.
+			ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(Date.now() + graceMs + killMs);
+		}
+		// This row has begun its owned stop ladder, so its OPTIONAL native status source
+		// is retired now: its callbacks stop immediately rather than reporting for a child
+		// that is on its way out. Its staged private files are NOT released here — a child
+		// that is stopping has not settled, and only its actual exit (or a required
+		// reader's positive settlement) may say otherwise.
+		this.#retireNativeStatusRun(record.nativeStatusRun);
+		// The same stop reaches a second owned process: an owned backend of this row is
+		// asked for its exact owned termination alongside the PTY ladder, and its record
+		// stays unsettled — and this row stays live — until that backend settles itself.
+		this.#retireOwnedCodexBackend(backend);
+		// That request then gets its own settlement window INSIDE this same stop budget,
+		// observed in parallel with the PTY ladder below so it never lengthens the stop.
+		const backendSettled = this.#awaitOwnedCodexBackendSettled(backend, graceMs + killMs);
+		const stopPromise = this.#runOwnedStop(record, hasPty ? pty : undefined, graceMs, killMs, alreadyRequested, backendSettled);
 		record.stopPromise = stopPromise;
 		return stopPromise;
+	}
+
+	/**
+	 * One row's complete owned stop: its PTY ladder and its owned backend's settlement
+	 * window, both bounded, both required. The result is this row's honest answer — true
+	 * only when every process this row owns positively settled — and a false here never
+	 * releases ownership: the unsettled record, its barriers, and its private files stay.
+	 */
+	async #runOwnedStop(
+		record: ManagedInstance,
+		pty: InstancePty | undefined,
+		graceMs: number,
+		killMs: number,
+		alreadyRequested: boolean,
+		backendSettled: Promise<boolean>,
+	): Promise<boolean> {
+		const ptySettled = pty === undefined
+			? true
+			: await this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
+		return ptySettled && await backendSettled;
+	}
+
+	/**
+	 * Bounded observation of one owned backend's OWN settlement, as part of a stop.
+	 *
+	 * Retirement asks for the exact owned termination; this gives that request a window
+	 * inside the stop budget that already exists, so a backend that does exit is honestly
+	 * reported as settled, while one whose child or readers never finish is reported as
+	 * remaining — with this manager still owning it, still refusing removal, and still
+	 * keeping its files. Nothing here ever claims a settlement a timeout produced.
+	 */
+	async #awaitOwnedCodexBackendSettled(
+		resource: OwnedNativeCodexBackendResource | undefined,
+		budgetMs: number,
+	): Promise<boolean> {
+		if (resource === undefined || resource.settled) {
+			return true;
+		}
+		let timer: NodeJS.Timeout | undefined;
+		const window = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), budgetMs);
+		});
+		await Promise.race([
+			// Settlement is already observed for its own sake; this second, bounded view of
+			// the same promise exists only so a stop can report the truth it produced.
+			Promise.resolve(resource.lease.settlement).then(() => undefined, () => undefined),
+			window,
+		]);
+		if (timer) clearTimeout(timer);
+		return resource.settled;
 	}
 
 	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
@@ -3704,16 +7226,30 @@ export class InstanceManager {
 
 	/** Bounded stopping pass over owned children, sharing any existing stop ladder. */
 	async #stopOwnedProcesses(graceMs: number, killMs: number): Promise<ShutdownResult> {
-		const targets = [...this.#records.values()].filter((record) => record.pty && !record.ptyExited);
+		const ownsWork = (record: ManagedInstance): boolean =>
+			(record.pty !== undefined && !record.ptyExited) || ownsUnsettledCodexBackend(record);
+		const targets = [...this.#records.values()].filter(ownsWork);
 		const outcomes = await Promise.all(targets.map(async (record) => {
 			await this.#gracefulStop(record, graceMs, killMs);
-			return { id: record.id, forced: record.sigkillSent };
+			return { id: record.id, forced: ownedForceEscalationAttempted(record) };
 		}));
 		// Escalation is historical, but remaining is current truth after every
-		// targeted ladder has completed: a late confirmed exit is not remaining.
+		// targeted ladder has completed: a late confirmed exit is not remaining. A row
+		// counts as remaining while EITHER process it owns is unsettled, because an owned
+		// backend whose child or readers never finished is a live process this manager
+		// still owns even when its row's TUI already exited.
+		// An owned backend's force attempt is historical too, so a retained row whose own
+		// settled backend was force-escalated earlier is still reported, even though it is
+		// no longer a stop target. Reporting only: targets and remaining are unchanged.
+		const forcedIds = outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id);
+		for (const record of this.#records.values()) {
+			if (!forcedIds.includes(record.id) && ownedCodexBackendForceEscalationAttempted(record.nativeCodexBackend)) {
+				forcedIds.push(record.id);
+			}
+		}
 		return {
-			forcedIds: outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id),
-			remainingIds: targets.filter((record) => record.pty && !record.ptyExited).map((record) => record.id),
+			forcedIds,
+			remainingIds: [...this.#records.values()].filter(ownsWork).map((record) => record.id),
 		};
 	}
 
@@ -3845,6 +7381,10 @@ export class InstanceManager {
 	/**
 	 * Route one authenticated viewer-origin copy to the ONE viewer that caused it.
 	 *
+	 * A hosted provider CLI row is refused here first: it has no copy producer, no
+	 * Pi conversation to attribute a copy to, and its `nvcli1` input scope is
+	 * input-only, so a native CLI row can never reach a clipboard sink.
+	 *
 	 * The token is only a lookup aid: its handle names the viewer record to consult,
 	 * and the copy is delivered only after that record is re-read and its CURRENT
 	 * facts re-commit to exactly the received token under THIS registration's key.
@@ -3861,6 +7401,11 @@ export class InstanceManager {
 		receipt: NativeClipboardOriginEvent,
 	): void {
 		if (!this.#clipboardEventLive(record, registration, receipt.event)) {
+			return;
+		}
+		if (isNativeCliBackend(record.backend)) {
+			// Input-only by construction: a native CLI input source can never carry a
+			// copy receipt, and nothing on this row is a copy producer.
 			return;
 		}
 		const origin = receipt.origin;
@@ -3898,8 +7443,11 @@ export class InstanceManager {
 	 * PTY passes, for exactly the three admitted sources: local user input
 	 * ({@linkcode write}), TerminalSurface protocol replies
 	 * ({@linkcode #onQueryReply}), and strict viewer-origin input
-	 * ({@linkcode writeViewerInput}). There is no raw unframed bypass and no fourth
-	 * caller.
+	 * ({@linkcode writeViewerInput}) on a Pi row. There is no raw unframed bypass of
+	 * a Pi row's framing and no fourth caller here. A hosted provider CLI row never
+	 * enters this seam: it has no registration and no encoder, and its viewer input is
+	 * handed to its own PTY by {@linkcode #writeNativeCliViewerInput}, which carries
+	 * its own ownership and process-incarnation fences.
 	 *
 	 * - Legacy rows (mode absent) forward the bytes exactly as before.
 	 * - Framing rows encode EVERY write with this registration's single encoder:

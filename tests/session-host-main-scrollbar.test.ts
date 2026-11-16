@@ -58,7 +58,7 @@ import {
 import { parseRosterFrame, sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
 
 const SGR = /\x1b\[[0-9;]*m/g;
-const SIDEBAR_COLS = 32;
+const SIDEBAR_COLS = 35;
 /** The SGR button value a held-drag motion report carries. */
 const DRAG_MOTION = 32;
 /** The three glyphs the renderer owns for the lane. */

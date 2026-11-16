@@ -306,13 +306,20 @@ function isFullyQualifiedWindowsPath(candidate) {
 }
 
 /**
- * Resolve only the parent's OS-provided SystemRoot. The supplied child env,
- * ComSpec, PATH, and working directory are deliberately irrelevant: a default
- * Pi batch shim must never select its interpreter from any of them.
+ * Resolve only the parent's OS-provided SystemRoot. The child environment,
+ * ComSpec, PATH, and working directory are deliberately irrelevant: a batch
+ * shim must never select its interpreter from any of them.
+ *
+ * This is the one trusted Windows interpreter resolver in the product. Launch
+ * callers pass nothing and read the parent's own `process.env`; the optional
+ * `parentEnvironment` seam exists so another in-process consumer of THIS
+ * authority (the native interactive CLI launch adapter, issue #277) can pass
+ * the parent environment it was handed instead of duplicating the rule. It is
+ * never a child-environment override.
  */
-function resolveTrustedWindowsCmd() {
-  const systemRootKey = Object.keys(process.env).find((key) => key.toLowerCase() === "systemroot");
-  const systemRoot = systemRootKey ? process.env[systemRootKey] : undefined;
+function resolveTrustedWindowsCmd(parentEnvironment = process.env) {
+  const systemRootKey = Object.keys(parentEnvironment).find((key) => key.toLowerCase() === "systemroot");
+  const systemRoot = systemRootKey ? parentEnvironment[systemRootKey] : undefined;
   if (!isFullyQualifiedWindowsPath(systemRoot)) return null;
   const candidate = path.win32.join(path.win32.normalize(systemRoot), "System32", "cmd.exe");
   if (!isFullyQualifiedWindowsPath(candidate) || !isUsableRegularFile(candidate)) return null;
@@ -546,6 +553,9 @@ module.exports = {
   resolvePiAgentDir: prepare.resolvePiAgentDir,
   resolvePiInvocation,
   resolvePiChildSpawnSpec,
+  // The single trusted Windows cmd.exe authority, shared with the native
+  // interactive CLI launch adapter so no consumer keeps a second detector.
+  resolveTrustedWindowsCmd,
   // Kept as a compatibility seam for launcher tests and consumers of this
   // helper; it is the same authoritative resolver, not a second path.
   resolveLauncherPiInvocation: resolvePiInvocation,

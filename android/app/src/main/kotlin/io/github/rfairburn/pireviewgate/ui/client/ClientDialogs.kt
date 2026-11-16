@@ -39,11 +39,15 @@ import io.github.rfairburn.pireviewgate.core.client.ui.ClientDraft
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientIntent
 import io.github.rfairburn.pireviewgate.core.client.ui.ClientUiState
 import io.github.rfairburn.pireviewgate.core.client.ui.CloseSessionDialog
+import io.github.rfairburn.pireviewgate.core.client.ui.CreateProviderChoice
+import io.github.rfairburn.pireviewgate.core.client.ui.CreateProviderSelection
 import io.github.rfairburn.pireviewgate.core.client.ui.CreateSessionDialog
 import io.github.rfairburn.pireviewgate.core.client.ui.FirstContactConsentDialog
 import io.github.rfairburn.pireviewgate.core.client.ui.FirstContactConsentTarget
+import io.github.rfairburn.pireviewgate.core.client.ui.HostConnectionState
 import io.github.rfairburn.pireviewgate.core.hosts.Endpoint
 import io.github.rfairburn.pireviewgate.core.hosts.HostLabel
+import io.github.rfairburn.pireviewgate.core.client.ui.NativeRenameSessionDialog
 import io.github.rfairburn.pireviewgate.core.client.ui.RemoveHostDialog
 import io.github.rfairburn.pireviewgate.core.client.ui.RemoveHostTarget
 import io.github.rfairburn.pireviewgate.core.client.ui.RenameSessionDialog
@@ -96,6 +100,9 @@ fun ClientDialogLayer(
     }
     dialogs.renameSession?.let {
         RenameDialogView(it, dialogs.isCovered(ClientDialogKind.RENAME_SESSION), onIntent)
+    }
+    dialogs.nativeRenameSession?.let {
+        NativeRenameDialogView(it, dialogs.isCovered(ClientDialogKind.NATIVE_RENAME_SESSION), onIntent)
     }
     dialogs.closeSession?.let {
         CloseDialogView(it, dialogs.isCovered(ClientDialogKind.CLOSE_SESSION), onIntent)
@@ -429,6 +436,14 @@ private fun ConsentDialogView(
 // Create session
 // ---------------------------------------------------------------------------
 
+/** The exact display text of one provider choice; a target label never implies a backend. */
+@Composable
+private fun providerText(choice: CreateProviderChoice?): String = when (choice) {
+    null -> stringResource(R.string.create_provider_none)
+    CreateProviderChoice.Pi -> stringResource(R.string.create_provider_pi)
+    is CreateProviderChoice.Native -> "${choice.label} · ${choice.backend.displayLabel}"
+}
+
 @Composable
 private fun CreateSessionDialogView(
     dialog: CreateSessionDialog,
@@ -436,25 +451,32 @@ private fun CreateSessionDialogView(
     onIntent: (ClientIntent) -> Unit,
 ) {
     var ownerMenuOpen by remember { mutableStateOf(false) }
+    var providerMenuOpen by remember { mutableStateOf(false) }
     val selected = dialog.selectedOwner
-    // The controller states whether that owner can take a create right now: live
-    // connection and positively acknowledged create capability. An unknown capability
-    // is never eligible, and the form never guesses from history or another host.
-    val eligible = selected?.createEligible == true
+    val provider = dialog.provider
+    // The controller states which exact provider is admissible now: Pi by its own
+    // create capability, a native target only while that owner's committed catalog
+    // still advertises the exact backend/id/label. An unknown or stale choice is
+    // never eligible, and the form never guesses from history or another host.
+    val eligible = CreateProviderSelection.admits(selected, provider)
+    val showProvider = selected != null &&
+        (provider == null || selected.nativeCreateEligible && selected.nativeTargets.isNotEmpty())
     ClientAlertDialog(
         title = stringResource(R.string.create_title),
         onDismiss = { onIntent(ClientIntent.DismissDialog(ClientDialogKind.CREATE_SESSION)) },
         covered = covered,
         proof = dialog.proof,
         requiredCriticalLines = if (selected == null) 0 else 1,
-        // The chosen owner and the workspace draft are what the committed frame showed,
-        // so both belong in the key: switching owner or editing the workspace retires
-        // the previous standing instead of letting it address a different form.
+        // The chosen owner, provider, and workspace draft are what the committed frame
+        // showed, so all belong in the key: changing any of them retires the previous
+        // standing instead of letting it address a different form.
         semanticKey = listOf(
             dialog.proof.target,
             selected?.hostId,
             selected?.label,
             selected?.endpointDisplayText,
+            selected?.hostRunId,
+            dialog.provider,
             dialog.workspaceDraft,
         ),
     ) { gate ->
@@ -493,8 +515,45 @@ private fun CreateSessionDialogView(
 
             // A chosen owner that is not connected stays chosen and says so. The form
             // never swaps in another host behind the operator's back.
-            if (selected != null && !eligible) {
+            if (selected != null && selected.connection != HostConnectionState.CONNECTED) {
                 NoticeText(stringResource(R.string.create_owner_not_connected))
+            }
+
+            // Host -> Provider -> Workspace. A provider row appears only when this
+            // owner advertises native targets or a previously chosen native target
+            // must be re-chosen; a Pi-only owner keeps the existing form shape.
+            if (showProvider) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = stringResource(
+                            R.string.create_provider_field,
+                            providerText(provider),
+                        ),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { providerMenuOpen = true }) {
+                        Text(stringResource(R.string.create_provider_choose))
+                    }
+                    DropdownMenu(
+                        expanded = providerMenuOpen,
+                        onDismissRequest = { providerMenuOpen = false },
+                    ) {
+                        dialog.providerOptions.forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(providerText(option)) },
+                                onClick = {
+                                    gate.retireForEdit()
+                                    providerMenuOpen = false
+                                    onIntent(ClientIntent.SelectCreateProvider(option))
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            if (provider == null) {
+                NoticeText(stringResource(R.string.create_provider_stale))
             }
 
             OutlinedTextField(
@@ -514,11 +573,13 @@ private fun CreateSessionDialogView(
                 onClick = {
                     gate.attempt {
                         selected?.let {
-                            onIntent(ClientIntent.SubmitSessionCreate(it.hostId, dialog.workspaceDraft, dialog.proof))
+                            onIntent(ClientIntent.SubmitSessionCreate(
+                                it.hostId, dialog.workspaceDraft, dialog.proof, provider ?: return@let,
+                            ))
                         }
                     }
                 },
-                enabled = eligible && dialog.workspaceDraft.isNotBlank(),
+                enabled = eligible && provider != null && dialog.workspaceDraft.isNotBlank(),
             ) { Text(stringResource(R.string.create_submit)) }
         }
     }
@@ -570,6 +631,55 @@ private fun RenameDialogView(
                 },
                 enabled = dialog.nameDraft.isNotBlank(),
             ) { Text(stringResource(R.string.rename_submit)) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native host caption
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun NativeRenameDialogView(
+    dialog: NativeRenameSessionDialog,
+    covered: Boolean,
+    onIntent: (ClientIntent) -> Unit,
+) {
+    ClientAlertDialog(
+        title = stringResource(R.string.native_rename_title),
+        onDismiss = { onIntent(ClientIntent.DismissDialog(ClientDialogKind.NATIVE_RENAME_SESSION)) },
+        covered = covered,
+        proof = dialog.proof,
+        requiredCriticalLines = 1,
+        semanticKey = dialog,
+    ) { gate ->
+        gate.Body {
+            gate.CriticalIdentityText(key = "row", value = dialog.target.base.drawnTitle)
+            FactRow(stringResource(R.string.native_rename_caption_field), dialog.target.currentCaption)
+            FactRow(stringResource(R.string.native_rename_backend_field), dialog.target.backend.displayLabel)
+            NoticeText(stringResource(R.string.native_rename_note))
+            OutlinedTextField(
+                value = dialog.nameDraft,
+                onValueChange = {
+                    gate.retireForEdit()
+                    onIntent(ClientIntent.UpdateDraft(ClientDraft.NativeRename(dialog.target, it)))
+                },
+                label = { Text(stringResource(R.string.native_rename_name_field)) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            DismissButton { onIntent(ClientIntent.DismissDialog(ClientDialogKind.NATIVE_RENAME_SESSION)) }
+            Button(
+                onClick = {
+                    gate.attempt {
+                        onIntent(ClientIntent.SubmitNativeSessionRename(
+                            dialog.target, dialog.nameDraft, dialog.proof,
+                        ))
+                    }
+                },
+                enabled = dialog.nameDraft.isNotBlank(),
+            ) { Text(stringResource(R.string.native_rename_submit)) }
         }
     }
 }

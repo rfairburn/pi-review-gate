@@ -23,6 +23,8 @@ import {
 	DEFAULT_SESSION_CONTENT_BOUNDS,
 	SESSION_CONTENT_MAJOR,
 	SESSION_CONTENT_MINOR,
+	SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
+	SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
 	SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
 	SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 	SESSION_CONTENT_REQUIRED_CAPABILITY,
@@ -1753,7 +1755,9 @@ test("explicit callbacks offer and acknowledge the optional capability, and type
 		SESSION_CONTENT_REQUIRED_CAPABILITY,
 		SESSION_CONTENT_NATIVE_IO_CAPABILITY,
 		SESSION_CONTENT_NATIVE_INPUT_STARTUP_CAPABILITY,
-	], "only explicit callbacks offer the optional capabilities, startup input only beside native IO");
+		SESSION_CONTENT_NATIVE_INPUT_CLI_CAPABILITY,
+		SESSION_CONTENT_NATIVE_COPY_CLI_CAPABILITY,
+	], "only explicit callbacks offer the optional capabilities, each variant only beside native IO");
 
 	const source = nativeSource();
 	assert.equal(viewer.readNativeInputSource(), undefined, "no source before a source-carrying publish");

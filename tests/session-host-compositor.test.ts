@@ -52,28 +52,31 @@ test("wide layout reserves the header and composes the exact sidebar/divider/nat
 		cols: 60,
 		rows: 4,
 		headerRows: 1,
-		native: { column: 33, row: 1, cols: 27, rows: 3 },
-		sidebar: { column: 0, row: 1, cols: 32, rows: 3 },
-		dividerColumn: 32,
+		native: { column: 36, row: 1, cols: 24, rows: 3 },
+		sidebar: { column: 0, row: 1, cols: 35, rows: 3 },
+		dividerColumn: 35,
 		sidebarOverlay: false,
 	});
 	const result = composeHostFrame(layout, {
-		main: mainFrame(27, 3, ["native", "", "last"]),
+		main: mainFrame(24, 3, ["native", "", "last"]),
 		sidebar: { lines: ["side", "", "third"] },
 		header: "Host status",
 		focus: "main",
 	});
 	assertBounded(result.lines, 60, 4);
 	assert.ok(plain(result.lines[0]).startsWith("Host status"));
-	assert.equal(plain(result.lines[1]).slice(0, 32), "side" + " ".repeat(28));
-	assert.equal(plain(result.lines[1])[32], "│");
-	assert.equal(plain(result.lines[1]).slice(33), "native" + " ".repeat(21));
+	assert.equal(plain(result.lines[1]).slice(0, 35), "side" + " ".repeat(31));
+	assert.equal(plain(result.lines[1])[35], "│");
+	assert.equal(plain(result.lines[1]).slice(36), "native" + " ".repeat(18));
 	assert.equal(result.cursor.visible, true);
-	assert.deepEqual(result.cursor, { column: 33, row: 1, visible: true });
+	assert.deepEqual(result.cursor, { column: 36, row: 1, visible: true });
 
-	const minimumWide = computeHostLayout(53, 2, { sidebarVisible: true, focus: "main" });
+	const minimumWide = computeHostLayout(56, 2, { sidebarVisible: true, focus: "main" });
 	assert.equal(minimumWide.sidebarOverlay, false);
-	assert.deepEqual(minimumWide.native, { column: 33, row: 1, cols: 20, rows: 1 });
+	assert.deepEqual(minimumWide.native, { column: 36, row: 1, cols: 20, rows: 1 });
+	const belowMinimum = computeHostLayout(55, 2, { sidebarVisible: true, focus: "main" });
+	assert.equal(belowMinimum.sidebarOverlay, true);
+	assert.deepEqual(belowMinimum.native, { column: 0, row: 1, cols: 55, rows: 1 });
 });
 
 test("host alert band stays visible with hidden or narrow Main focus without taking its cursor", () => {
@@ -194,12 +197,12 @@ test("narrow layout keeps native geometry stable and overlays only for non-main 
 test("wide form focus replaces only the right native pane while the roster stays left", () => {
 	const layout = computeHostLayout(80, 10, { sidebarVisible: true, focus: "form" });
 	assert.equal(layout.sidebarOverlay, false);
-	assert.deepEqual(layout.sidebar, { column: 0, row: 1, cols: 32, rows: 9 });
-	assert.equal(layout.dividerColumn, 32);
+	assert.deepEqual(layout.sidebar, { column: 0, row: 1, cols: 35, rows: 9 });
+	assert.equal(layout.dividerColumn, 35);
 	assert.deepEqual(layout.form, layout.native, "the form mirrors the native rect");
-	assert.deepEqual(layout.native, { column: 33, row: 1, cols: 47, rows: 9 });
+	assert.deepEqual(layout.native, { column: 36, row: 1, cols: 44, rows: 9 });
 
-	const main = mainFrame(47, 9, ["native frame", "second", "third"], { column: 5, row: 0, visible: true });
+	const main = mainFrame(44, 9, ["native frame", "second", "third"], { column: 5, row: 0, visible: true });
 	const result = composeHostFrame(layout, {
 		main,
 		sidebar: { lines: ["Sessions (1)", "> New session"] },
@@ -208,11 +211,11 @@ test("wide form focus replaces only the right native pane while the roster stays
 		focus: "form",
 	});
 	assertBounded(result.lines, 80, 10);
-	assert.equal(plain(result.lines[1]).slice(0, 32), "Sessions (1)" + " ".repeat(20));
-	assert.equal(plain(result.lines[1])[32], "│");
-	assert.ok(plain(result.lines[1]).slice(33).startsWith("New session"), "form owns the right pane");
+	assert.equal(plain(result.lines[1]).slice(0, 35), "Sessions (1)" + " ".repeat(23));
+	assert.equal(plain(result.lines[1])[35], "│");
+	assert.ok(plain(result.lines[1]).slice(36).startsWith("New session"), "form owns the right pane");
 	assert.ok(!result.lines.join("\n").includes("native frame"), "the child frame is hidden, not destroyed");
-	assert.deepEqual(result.cursor, { column: 53, row: 2, visible: true }, "form cursor offsets into the right pane");
+	assert.deepEqual(result.cursor, { column: 56, row: 2, visible: true }, "form cursor offsets into the right pane");
 
 	// Closing the form (sidebar focus) restores the native pane without any layout churn.
 	const closed = computeHostLayout(80, 10, { sidebarVisible: true, focus: "sidebar" });
@@ -224,7 +227,7 @@ test("wide form focus replaces only the right native pane while the roster stays
 		header: "host",
 		focus: "sidebar",
 	});
-	assert.ok(plain(closedResult.lines[1]).slice(33).startsWith("native frame"), "same child frame returns after the form closes");
+	assert.ok(plain(closedResult.lines[1]).slice(36).startsWith("native frame"), "same child frame returns after the form closes");
 	assert.equal(closedResult.cursor.visible, false);
 });
 
@@ -361,7 +364,7 @@ test("only the explicit Saved-delete placement replaces the right pane while con
 	});
 	assert.deepEqual(layout.form, layout.native, "the confirmation uses the existing right-pane slot without changing native geometry");
 	const result = composeHostFrame(layout, {
-		main: mainFrame(47, 9, ["native child frame"]),
+		main: mainFrame(44, 9, ["native child frame"]),
 		sidebar: { lines: ["Sessions (1)", "Saved conversations"] },
 		form: { lines: [
 			"Delete saved conversation?",
@@ -379,8 +382,8 @@ test("only the explicit Saved-delete placement replaces the right pane while con
 	});
 	assertBounded(result.lines, 80, 10);
 	const rows = result.lines.slice(1).map(plain);
-	const left = rows.map((line) => line.slice(0, 32)).join("\n");
-	const right = rows.map((line) => line.slice(33)).join("\n").replace(/\s+/g, " ");
+	const left = rows.map((line) => line.slice(0, 35)).join("\n");
+	const right = rows.map((line) => line.slice(36)).join("\n").replace(/\s+/g, " ");
 	assert.ok(left.includes("Sessions (1)"));
 	assert.ok(left.includes("Saved conversations"));
 	assert.equal(left.includes("Delete saved conversation?"), false);
@@ -400,23 +403,23 @@ test("only the explicit Saved-delete placement replaces the right pane while con
 	const ordinaryConfirm = computeHostLayout(80, 10, { sidebarVisible: true, focus: "confirm" });
 	assert.equal(ordinaryConfirm.form, undefined, "quit and stop/remove confirmations keep their original placement");
 	const ordinaryResult = composeHostFrame(ordinaryConfirm, {
-		main: mainFrame(47, 9, ["native child frame"]),
+		main: mainFrame(44, 9, ["native child frame"]),
 		sidebar: { lines: ["Stop session?"] },
 		form: { lines: ["must not be composed"] },
 		header: "host",
 		focus: "confirm",
 	});
-	assert.ok(plain(ordinaryResult.lines[1]!).slice(0, 32).includes("Stop session?"));
-	assert.ok(plain(ordinaryResult.lines[1]!).slice(33).includes("native child frame"));
+	assert.ok(plain(ordinaryResult.lines[1]!).slice(0, 35).includes("Stop session?"));
+	assert.ok(plain(ordinaryResult.lines[1]!).slice(36).includes("native child frame"));
 	assert.equal(ordinaryResult.lines.join("\n").includes("must not be composed"), false);
 	const quitResult = composeHostFrame(ordinaryConfirm, {
-		main: mainFrame(47, 9, ["native child frame"]),
+		main: mainFrame(44, 9, ["native child frame"]),
 		sidebar: { lines: ["Quit host?"] },
 		header: "host",
 		focus: "confirm",
 	});
-	assert.ok(plain(quitResult.lines[1]!).slice(0, 32).includes("Quit host?"));
-	assert.ok(plain(quitResult.lines[1]!).slice(33).includes("native child frame"));
+	assert.ok(plain(quitResult.lines[1]!).slice(0, 35).includes("Quit host?"));
+	assert.ok(plain(quitResult.lines[1]!).slice(36).includes("native child frame"));
 
 	const narrow = computeHostLayout(52, 4, {
 		sidebarVisible: true,
@@ -428,7 +431,7 @@ test("only the explicit Saved-delete placement replaces the right pane while con
 });
 
 test("wide form focus keeps a hidden-cursor fallback when the form is too small for its pane", () => {
-	const layout = computeHostLayout(53, 4, { sidebarVisible: true, focus: "form" });
+	const layout = computeHostLayout(56, 4, { sidebarVisible: true, focus: "form" });
 	assert.deepEqual(layout.form, layout.native); // 20-column native pane
 	const result = composeHostFrame(layout, {
 		sidebar: { lines: ["Sessions (0)"] },
@@ -436,8 +439,8 @@ test("wide form focus keeps a hidden-cursor fallback when the form is too small 
 		header: "host",
 		focus: "form",
 	});
-	assertBounded(result.lines, 53, 4);
-	assert.ok(plain(result.lines[1]).slice(33).startsWith("too small"), "truthful too-small fallback in the right pane");
+	assertBounded(result.lines, 56, 4);
+	assert.ok(plain(result.lines[1]).slice(36).startsWith("too small"), "truthful too-small fallback in the right pane");
 	assert.equal(result.cursor.visible, false, "a cursor-less form cannot claim the hardware cursor");
 });
 
@@ -462,7 +465,7 @@ test("missing native content shows the welcome fallback despite supplied but hid
 		{ sidebar, header: "host", focus: "sidebar" },
 	);
 	assert.ok(plain(visibleSidebar.lines[1]).startsWith("sidebar data"), "visible sidebar content is preserved");
-	assert.ok(plain(visibleSidebar.lines[1]).slice(33).startsWith("Welcome —"), "native pane still receives the fallback");
+	assert.ok(plain(visibleSidebar.lines[1]).slice(36).startsWith("Welcome —"), "native pane still receives the fallback");
 });
 
 test("one-column and tiny-height layouts remain bounded and reserve a header only when possible", () => {
@@ -545,7 +548,7 @@ test("real styled TerminalSurface snapshots compose with independent pane SGR re
 		assert.ok(result.lines[1].includes(`${ESC}[0m│${ESC}[0m`), "divider owns and resets its styling");
 		assert.ok(result.lines[1].includes(`${ESC}[31mMAIN${ESC}[0m`));
 		assert.ok(resetCount(result.lines[1]) >= 5, "each panel and divider is reset independently");
-		assert.equal(plain(result.lines[1]).slice(33, 37), "MAIN");
+		assert.equal(plain(result.lines[1]).slice(36, 40), "MAIN");
 	} finally {
 		surface.dispose();
 	}
@@ -663,24 +666,24 @@ test("a valid smaller padded frame keeps clipped display, padding, and its own c
 
 test("a padded native owner in the wide layout projects its cursor from the native pane origin across focus handoffs", () => {
 	const mainLayout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "main" });
-	assert.deepEqual(mainLayout.native, { column: 33, row: 1, cols: 47, rows: 11 });
-	// A 30x8 session displayed in the 47x11 native pane (#474 geometry).
+	assert.deepEqual(mainLayout.native, { column: 36, row: 1, cols: 44, rows: 11 });
+	// A 30x8 session displayed in the 44x11 native pane (#474 geometry).
 	const padded = mainFrame(30, 8, Array.from({ length: 8 }, (unused, row) => `native row ${row}`), { column: 12, row: 7, visible: true });
 	const roster: RenderedSidebar = { lines: ["Sessions (1)", "> padded owner"], cursor: { column: 3, row: 1 } };
 
 	const mainResult = composeHostFrame(mainLayout, { main: padded, sidebar: roster, header: "host", focus: "main" });
 	assertBounded(mainResult.lines, 80, 12);
-	assert.ok(plain(mainResult.lines[1]).slice(33).startsWith("native row 0"), "the padded owner draws at the pane's top-left corner");
-	assert.ok(plain(mainResult.lines[1])[32] === "│", "the roster divider stays host-owned beside a padded session");
-	assert.equal(plain(mainResult.lines[1 + 8]).slice(33).trim(), "", "rows below the drawn content stay blank host padding");
-	assert.deepEqual(mainResult.cursor, { column: 33 + 12, row: 1 + 7, visible: true },
+	assert.ok(plain(mainResult.lines[1]).slice(36).startsWith("native row 0"), "the padded owner draws at the pane's top-left corner");
+	assert.ok(plain(mainResult.lines[1])[35] === "│", "the roster divider stays host-owned beside a padded session");
+	assert.equal(plain(mainResult.lines[1 + 8]).slice(36).trim(), "", "rows below the drawn content stay blank host padding");
+	assert.deepEqual(mainResult.cursor, { column: 36 + 12, row: 1 + 7, visible: true },
 		"the padded cursor offsets from the native pane origin, not from the pane's far edge");
 
 	const rosterLayout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "sidebar" });
 	assert.deepEqual(mainLayout.native, rosterLayout.native, "the handoff never changes the child's geometry");
 	const rosterResult = composeHostFrame(rosterLayout, { main: padded, sidebar: roster, header: "host", focus: "sidebar" });
 	assert.deepEqual(rosterResult.cursor, { column: 3, row: 2, visible: true }, "only the focused pane claims the cursor");
-	assert.ok(plain(rosterResult.lines[1]).slice(33).startsWith("native row 0"), "the padded frame stays displayed while the roster is focused");
+	assert.ok(plain(rosterResult.lines[1]).slice(36).startsWith("native row 0"), "the padded frame stays displayed while the roster is focused");
 
 	const back = composeHostFrame(mainLayout, { main: padded, sidebar: roster, header: "host", focus: "main" });
 	assert.deepEqual(back.cursor, mainResult.cursor, "returning to Main restores the same padded native cursor");
@@ -689,7 +692,7 @@ test("a padded native owner in the wide layout projects its cursor from the nati
 
 test("a real padded VT editor stream keeps its cursor visible, moving, hidden, and restored through composition", async () => {
 	const layout = computeHostLayout(80, 12, { sidebarVisible: true, focus: "main" });
-	const surface = new TerminalSurface(30, 8); // smaller than the 47x11 native pane
+	const surface = new TerminalSurface(30, 8); // smaller than the 44x11 native pane
 	const compose = (frame: TerminalFrame, focus: "main" | "sidebar" = "main") => composeHostFrame(
 		computeHostLayout(80, 12, { sidebarVisible: true, focus }),
 		{ main: frame, sidebar: { lines: ["Sessions (1)", "> draft owner"], cursor: { column: 3, row: 1 } }, header: "host", focus },
@@ -701,14 +704,14 @@ test("a real padded VT editor stream keeps its cursor visible, moving, hidden, a
 		const entered = surface.frame();
 		assert.ok(entered.cols < layout.native.cols && entered.rows < layout.native.rows, "the fixture really is padded");
 		const entry = compose(entered);
-		assert.ok(plain(entry.lines[1]).slice(33).startsWith("Draft note"), "the draft content stays visible");
-		assert.deepEqual(entry.cursor, { column: 33 + 10, row: 1, visible: true },
+		assert.ok(plain(entry.lines[1]).slice(36).startsWith("Draft note"), "the draft content stays visible");
+		assert.deepEqual(entry.cursor, { column: 36 + 10, row: 1, visible: true },
 			"the native caret projects at its real position inside the padded frame");
 
 		// Cursor movement inside the padded frame follows the child, not the pane.
 		surface.write(`${ESC}[3;5H`);
 		await surface.flush();
-		assert.deepEqual(compose(surface.frame()).cursor, { column: 33 + 4, row: 1 + 2, visible: true },
+		assert.deepEqual(compose(surface.frame()).cursor, { column: 36 + 4, row: 1 + 2, visible: true },
 			"a cursor move re-projects at the new native coordinates");
 
 		// The child hides its own cursor; composition never forces it visible.
@@ -720,7 +723,7 @@ test("a real padded VT editor stream keeps its cursor visible, moving, hidden, a
 		surface.write(`${ESC}[?25h${ESC}[5;9H`);
 		await surface.flush();
 		const restored = compose(surface.frame());
-		assert.deepEqual(restored.cursor, { column: 33 + 8, row: 1 + 4, visible: true },
+		assert.deepEqual(restored.cursor, { column: 36 + 8, row: 1 + 4, visible: true },
 			"the returning editor's cursor is restored at its actual position");
 
 		// A focus handoff to the roster and back keeps the same native cursor.
@@ -735,10 +738,10 @@ test("a real padded VT editor stream keeps its cursor visible, moving, hidden, a
 
 test("focus handoff chooses only the focused pane cursor; exited frames remain last-frame text", async () => {
 	const layoutMain = computeHostLayout(60, 3, { sidebarVisible: true, focus: "main" });
-	const frame = mainFrame(27, 2, ["EXITED: final output", ""], { column: 4, row: 0, visible: true });
+	const frame = mainFrame(24, 2, ["EXITED: final output", ""], { column: 4, row: 0, visible: true });
 	const sidebar: RenderedSidebar = { lines: ["picker"], cursor: { column: 1, row: 0 } };
 	const mainResult = composeHostFrame(layoutMain, { main: frame, sidebar, header: "host", focus: "main" });
-	assert.deepEqual(mainResult.cursor, { column: 37, row: 1, visible: true });
+	assert.deepEqual(mainResult.cursor, { column: 40, row: 1, visible: true });
 	assert.ok(plain(mainResult.lines[1]).includes("EXITED: final output"));
 
 	const sidebarLayout = computeHostLayout(60, 3, { sidebarVisible: true, focus: "sidebar" });
@@ -770,7 +773,7 @@ test("repeated composition reuses rows without changing clipping, width, or sani
 	const unsafe = `${ESC}]0;title\x07safe ${ESC}[31mred${ESC}[0m 世界文字 tail-that-is-long-enough-to-clip-at-narrow-widths`;
 	const sidebar: RenderedSidebar = { lines: ["roster", unsafe] };
 	const options = (lines: string[]) => ({
-		main: mainFrame(27, 3, lines),
+		main: mainFrame(24, 3, lines),
 		sidebar,
 		header: "Host",
 		focus: "main" as const,

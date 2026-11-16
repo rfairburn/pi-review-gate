@@ -102,7 +102,7 @@ afterEach(() => {
 describe("bg-shell against real processes", () => {
   const T = 20_000;
   it("starts a job, buffers its output, and wakes on clean exit", async () => {
-    const { sent, call } = wire();
+    const { sent, call, tools } = wire();
     const readiness = new BackgroundProcessReadiness();
     const result = await call("ShellStart", {
       command: "echo first; echo second; sleep 0.5; exit 0",
@@ -113,8 +113,12 @@ describe("bg-shell against real processes", () => {
     expect(started).toContain("currently running");
     expect(started).toContain("Future wake triggers (not current events): exit.");
     // The description promises the model it does not need to poll; the start
-    // message must say so too or the model will poll anyway.
-    expect(started).toContain("do not poll");
+    // message must say so too, while still allowing a purposeful status read.
+    expect(started).toContain("there is no need to poll");
+    expect(started).toContain("A purposeful status read is fine");
+    expect(tools.ShellStart.description).toContain("there is no need to poll the job in a loop");
+    expect(tools.ShellStart.description).toContain("keep the foreground available for other work");
+    expect(tools.ShellStart.description).not.toContain("do NOT poll");
     readiness.observeToolResult("ShellStart", result);
     expect(readiness.snapshot().running.length).toBe(1);
 
@@ -648,7 +652,8 @@ describe("wake coalescing", () => {
   });
 });
 
-// #281: ShellStart promises "You will be notified automatically; do not poll".
+// #281: ShellStart promises "You will be notified automatically; there is no
+// need to poll".
 // These tests model an exit wake queued into an active run that settles without
 // draining its steering queue (including the aborted-run path). They do not
 // establish that this was the cause of the original report. pi.sendMessage

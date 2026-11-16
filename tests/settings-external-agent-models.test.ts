@@ -23,13 +23,24 @@ test("all eight pinned Codex models preserve exact labels, native capabilities a
   ]);
 });
 
-test("all four versioned Claude models have exact native defaults and Haiku has no effort", () => {
+test("all five versioned Claude models have exact native defaults and Haiku has no effort", () => {
   assert.deepEqual(metadata(EXTERNAL_AGENT_MODEL_CATALOG["claude-cli"].models), [
     ["claude-opus-5-5", "Opus 5.5 (claude-opus-5-5)", toMax, "medium"],
     ["claude-fable-5-1", "Fable 5.1 (claude-fable-5-1)", toMax, "high"],
+    ["claude-fable-5-2", "Fable 5.2 (claude-fable-5-2)", toMax, "medium"],
     ["claude-sonnet-5-5", "Sonnet 5.5 (claude-sonnet-5-5)", toMax, "medium"],
     ["claude-haiku-4-5", "Haiku 4.5 (claude-haiku-4-5)", [], undefined],
   ]);
+});
+
+test("Fable 5.2 has its five native levels, CLI medium default, and no non-native effort choices", () => {
+  const model = externalAgentModelCapability("claude-cli", "claude-fable-5-2")!;
+  assert.deepEqual(model.effortLevels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(model.defaultEffort, "medium");
+  assert.notEqual(model.effortLevels.indexOf("xhigh"), model.effortLevels.indexOf("max"));
+  for (const unsupported of ["ultra", "adaptive", "ultracode"]) {
+    assert.ok(!(model.effortLevels as readonly string[]).includes(unsupported));
+  }
 });
 
 test("native Max remains distinct from xhigh and Ultra is retained as data", () => {
@@ -77,16 +88,32 @@ test("every entry carries catalog source/date provenance and Codex is release pi
   assert.equal(codex.release, "https://github.com/openai/codex/releases/tag/rust-v0.160.0");
   assert.equal(codex.sourceBlob, "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/models-manager/models.json");
   assert.equal(codex.effortSource, codex.sourceBlob);
-  for (const catalog of [claude, codex]) {
-    assert.equal(catalog.verifiedOn, "2026-10-05");
-    for (const model of catalog.models) {
-      assert.equal(model.provenance.source, catalog.source);
-      assert.equal(model.provenance.effortSource, catalog.effortSource);
-      assert.equal(model.provenance.verifiedOn, catalog.verifiedOn);
-      if ("version" in catalog) assert.deepEqual(model.provenance, {
-        source: catalog.source, effortSource: catalog.effortSource, verifiedOn: catalog.verifiedOn,
-        version: catalog.version, release: catalog.release, sourceBlob: catalog.sourceBlob,
+  assert.equal(codex.verifiedOn, "2026-10-05");
+  for (const model of codex.models) {
+    assert.equal(model.provenance.source, codex.source);
+    assert.equal(model.provenance.effortSource, codex.effortSource);
+    assert.equal(model.provenance.verifiedOn, codex.verifiedOn);
+    assert.deepEqual(model.provenance, {
+      source: codex.source, effortSource: codex.effortSource, verifiedOn: codex.verifiedOn,
+      version: codex.version, release: codex.release, sourceBlob: codex.sourceBlob,
+    });
+  }
+  assert.equal(claude.verifiedOn, "2026-10-05");
+  for (const model of claude.models) {
+    if (model.value === "claude-fable-5-2") {
+      assert.deepEqual(model.provenance, {
+        source: "https://code.claude.com/docs/en/model-config",
+        effortSource: "https://code.claude.com/docs/en/model-config#adjust-effort-level",
+        verifiedOn: "2026-11-15",
+        version: "2.1.321",
+      });
+    } else {
+      assert.deepEqual(model.provenance, {
+        source: claude.source, effortSource: claude.effortSource, verifiedOn: claude.verifiedOn,
       });
     }
   }
+  assert.deepEqual(externalAgentModelCapability("claude-cli", "claude-fable-5-1")!.provenance, {
+    source: claude.source, effortSource: claude.effortSource, verifiedOn: claude.verifiedOn,
+  });
 });

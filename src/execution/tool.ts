@@ -115,7 +115,7 @@ const SHARED_PROMPT_GUIDELINES = [
   "Use SubtasksAdd to top off a running execution without waiting for slower tasks.",
   "Each task captures main independently when dispatched and lands independently when accepted.",
   "Use SubtasksInspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
-  "Use SubtasksWatch only when a future one-shot checkpoint would be decision-relevant. It returns immediately, replaces any prior watch for that execution, cancels when an earlier completion/failure/conflict/recovery event arrives, and must be explicitly rearmed after firing. It is not a polling loop or recurring heartbeat.",
+  "Use SubtasksWatch only when a future one-shot checkpoint would be decision-relevant. It returns immediately, replaces any prior watch for that execution, cancels when an earlier completion/failure/conflict/recovery event arrives, and must be explicitly rearmed after firing. It arms one future checkpoint, not a recurring heartbeat.",
   "Use SubtasksSteer for queued, starting, or live tasks: queued steering is durably incorporated before startup and live steering uses the executor transport.",
   "SubtasksSteer accepts an optional interrupt boolean: true interrupts the task's active executor turn first and delivers the instructions to the same task and workspace without cancelling, landing, or terminating it; omitted or false preserves normal steering. If the adapter cannot interrupt an in-flight turn, the request reports a concrete unsupported status instead of claiming interruption.",
   "Steering wins over review: a steer received while reviewing interrupts that review, resumes the executor with the changed request, and reviews the replacement result.",
@@ -157,7 +157,7 @@ function toolPromptSnippet(action: Action): string {
   switch (action) {
     case "start": return "Start bounded background implementation work with SubtasksStart.";
     case "add": return "Top off an existing background execution with SubtasksAdd.";
-    case "inspect": return "Use SubtasksInspect for a decision-relevant diagnostic snapshot, never as a polling loop.";
+    case "inspect": return "Use SubtasksInspect for a decision-relevant diagnostic snapshot; purposeful checks are fine, and prefer event notifications when sufficient, moving repeated monitoring to the background to keep the foreground responsive.";
     case "watch": return "Use SubtasksWatch for one deliberate future checkpoint; it is one-shot and must be explicitly rearmed.";
     case "continue": return "Resume stopped work from a verified checkpoint with SubtasksContinue.";
     case "steer": return "Change queued or in-flight work with SubtasksSteer, optionally interrupting the active turn first (interrupt: true); steering supersedes review.";
@@ -1006,7 +1006,7 @@ export class ExecutionToolManager {
           const subscription = this.controller.watch(normalized.executionId, normalized.afterMs!);
           const replacement = subscription.replaced ? " It replaced the prior watch for this execution." : "";
           return result(
-            `SubtasksWatch armed for ${subscription.executionId}; if work is still active after ${formatDuration(subscription.afterMs)}, one checkpoint notification will trigger a turn.${replacement} An earlier completion, failure, conflict, or recovery notification cancels it. Call SubtasksWatch again after it fires if another checkpoint is useful.`,
+            `SubtasksWatch armed for ${subscription.executionId}; if work is still active after ${formatDuration(subscription.afterMs)}, one checkpoint notification will trigger a turn.${replacement} An earlier completion, failure, conflict, or recovery notification cancels it. There is no need to poll while it is armed. Call SubtasksWatch again after it fires if another checkpoint is useful.`,
             { action: "watch", ...subscription },
             false,
           );
@@ -1562,7 +1562,7 @@ function backgroundResult(
     : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
   let summary = action === "start" || action === "add"
-    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. DO NOT POLL for task-state changes. Do not create a timer, sleep job, repeated inspect loop, or other waiting surrogate; continue other work or yield. Use SubtasksInspect only when a current diagnostic snapshot is independently useful for a decision.`
+    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield. A purposeful SubtasksInspect or background monitor is fine when it informs a decision, and a harmless status check alone is not a violation to correct; avoid a timer, sleep job, or tight repeated inspect loop that occupies the foreground.`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))

@@ -68,9 +68,12 @@ Decide per piece of work; both use existing semantics, no new tools.
   test runs, and dependency installs even when no stdin interaction is needed.
   Keep the returned handle; read output with `ShellLog`, send input with
   `ShellSend`, and stop explicitly with `ShellStop`. Completion and output
-  arrive as event notifications and wakes: never poll, sleep, or spin on
-  handles. Only genuinely quick commands — seconds, not minutes — belong in
-  the foreground inside an ordinary tool call.
+  arrive as event notifications and wakes, so there is no need to poll, sleep,
+  or spin on handles; a purposeful `ShellLog` or status read is fine when it
+  informs a decision. Keep the foreground responsive: for minute-scale work, a
+  background shell with its completion wake is preferable to a foreground
+  `sleep 300` or a long polling loop. Only genuinely quick commands — seconds,
+  not minutes — belong in the foreground inside an ordinary tool call.
 - **Delegation** (`SubtasksStart` with kind `execute`, primary mode only): separate,
   isolated Git worktree at a captured base, its own review/correction loop, and an
   independently landed result. Use it when the work is a bounded phase that benefits

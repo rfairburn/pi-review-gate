@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.285]
+## [0.1.0-dev.288]
 
 ### Added
 
@@ -374,6 +374,46 @@ dates.
   prerequisite fails the cases instead of skipping them. Every child there is a
   synthetic Node program behind a synthetic batch shim: no provider CLI, credential,
   or model call.
+
+## [0.1.0-dev.287]
+
+### Changed
+
+- Orchestration and execution guidance now keeps the foreground responsive by
+  preferring background shells/tasks, completion signals, callbacks, and a
+  one-shot `SubtasksWatch` over a foreground `sleep 300` or long polling loop.
+  There is no need to poll when those notifications provide the signal;
+  purposeful status checks and background monitoring remain allowed, and
+  harmless monitoring alone is not a reason to steer or correct a worker.
+  Runtime watch/background-shell behavior, tool permissions, bounded deadlines,
+  review gates, and CI obligations are unchanged (#668).
+
+## [0.1.0-dev.286]
+
+### Fixed
+
+- The session title inside the Android Keys popup now follows the saved Light or Dark
+  appearance instead of staying dark on the popup's dark translucent surface (#680).
+  The title text, host context, controls, sizing, and selected-session input routing are
+  unchanged.
+
+## [0.1.0-dev.285]
+
+### Added
+
+- Claude Code definitions in `/review-settings` can select Fable 5.2
+  (`claude-fable-5-2`) with its five native effort levels — `low`, `medium`,
+  `high`, `xhigh`, and `max`. The catalog records Claude Code's documented
+  `medium` default for Fable 5.2 as model metadata; it is not an applied or
+  overriding effort. Choosing CLI default sends no app-owned effort flag, so
+  Claude Code and any native settings choose the effective effort. Max remains
+  distinct from Extra High (`xhigh`).
+  The entry records verification on 2026-11-15 against the official model
+  configuration, including effort availability; Claude Code 2.1.321 is version
+  evidence for when the model was introduced, not an account-access or
+  installed-runtime certification. Fable 5.1, every other catalog entry,
+  custom model strings, existing saved settings, and role behavior are
+  unchanged (#678).
 
 ## [0.1.0-dev.284]
 

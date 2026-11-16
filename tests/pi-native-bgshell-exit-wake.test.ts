@@ -1,6 +1,6 @@
 /**
  * Issue #281 regression: a primary-session ShellStart with wake_on.exit
- * promises "You will be notified automatically; do not poll", but for
+ * promises "You will be notified automatically; there is no need to poll", but for
  * immediate and short-lived jobs the owning session received no completion
  * notification before a manual ShellLog/ShellList even though the retained
  * job state was complete.

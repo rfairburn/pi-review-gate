@@ -130,7 +130,13 @@ test("shared lifecycle guidance is derived from the wake state tables", () => {
   assert.ok(line.includes("Noisy mode additionally triggers RUNNING (steerable) and REVIEWING (steering can supersede review)."));
   assert.ok(line.includes(`${passiveStateList()} remain visible in SubtasksInspect and /subtasks-view but do not trigger turns.`));
   assert.equal(passiveStateList(), "CAPTURING, ACCEPTED, WAITING_TO_LAND, and LANDING");
-  assert.ok(line.includes("DO NOT POLL for task-state changes"));
+  assert.ok(line.includes("there is no need to poll for them"));
+  assert.ok(line.includes("continue other useful work or yield"));
+  assert.ok(line.includes("Keep waiting or repeated monitoring in the background"));
+  assert.ok(line.includes("use a purposeful status check when it informs a decision"));
+  assert.ok(line.includes("do not treat a harmless check alone as a violation to correct"));
+  assert.ok(!line.includes("DO NOT POLL"), "guidance is advisory rather than a hard polling ban");
+  assert.ok(!line.includes("waiting surrogate"), "guidance does not invent a correction-worthy waiting surrogate");
   assert.equal(quietTurnWakeStateList(), QUIET_TURN_WAKE_STATE_LABELS.join(", "));
   assert.equal(quietTurnWakeStateList(), "LANDED, REPORTED, FAILED, CONFLICTED");
   assert.equal(interactiveWakeStateList(), "RUNNING and REVIEWING");
@@ -154,7 +160,9 @@ test("terminal wake guidance separates completion/failure/conflict turns from no
   // synchronous landings confirmed by their own tool result.
   assert.ok(line.includes(synchronousLandingNotificationCarveOut()));
   assert.ok(line.includes("Ordinary running/reviewing transitions do so only in noisy mode."));
-  assert.ok(line.includes("avoid tight repetitive polling"));
+  assert.ok(line.includes("a purposeful check is fine"));
+  assert.ok(line.includes("prefer event notifications when sufficient"));
+  assert.ok(line.includes("move repeated monitoring to the background to keep the foreground responsive"));
 });
 
 test("notification mode prose is derived from the policy state lists", () => {

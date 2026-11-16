@@ -126,8 +126,11 @@ told.
   are mechanical landing attempts, not verification; the main workspace must
   always be inspected manually afterward
   ([Delegated execution](docs/delegated-execution.md#conflicts-and-gates)).
-- **No polling loops.** Completions, failures, and conflicts are delivered proactively;
-  `SubtasksWatch` arms one explicit checkpoint and never becomes a recurring heartbeat.
+- **Keep the foreground responsive.** Completions, failures, and conflicts are delivered
+  proactively, and `SubtasksWatch` arms one explicit checkpoint rather than a recurring
+  heartbeat. Prefer a background shell/task with its completion signal or a one-shot watch
+  over a foreground `sleep 300` or long polling loop; purposeful status checks and
+  background monitoring remain allowed.
 - **No token budget imposition.** Telemetry measures behavior without capping
   reviewer output; reasoning effort stays owned by Pi and the selected provider
   ([Configuration](docs/configuration.md#reviewers)).

@@ -497,6 +497,8 @@ test("SubtasksWatch replaces an earlier watch and emits one bounded checkpoint w
     assert.equal(replacement.isError, false);
     assert.equal(replacement.details.replaced, true);
     assert.match(replacement.content[0].text, /one checkpoint notification/);
+    assert.match(replacement.content[0].text, /There is no need to poll while it is armed/);
+    assert.match(replacement.content[0].text, /Call SubtasksWatch again after it fires if another checkpoint is useful/);
 
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 1_200));
     const watchNotices = notices.filter((notice) => notice.includes("[pi-review-subtask-watch]"));
@@ -770,8 +772,11 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(result.content[0].text, /Quiet notification mode is active/);
   assert.match(result.content[0].text, /Every task still triggers a turn when it lands/);
   assert.match(result.content[0].text, /Internal progress stays available in SubtasksInspect and \/subtasks-view without triggering turns/);
-  assert.match(result.content[0].text, /DO NOT POLL for task-state changes/);
-  assert.match(result.content[0].text, /repeated inspect loop, or other waiting surrogate/);
+  assert.match(result.content[0].text, /there is no need to poll for them/);
+  assert.match(result.content[0].text, /purposeful SubtasksInspect or background monitor is fine/);
+  assert.match(result.content[0].text, /a harmless status check alone is not a violation to correct/);
+  assert.match(result.content[0].text, /avoid a timer, sleep job, or tight repeated inspect loop/);
+  assert.doesNotMatch(result.content[0].text, /DO NOT POLL/);
   assert.match(result.content[0].text, new RegExp(result.details.tasks[0].taskId));
   assert.match(result.content[0].text, /Task handles \(retain these for SubtasksSteer, SubtasksInterrupt, and SubtasksInspect\)/);
   assert.match(result.content[0].text, /executor assigned; startup in progress/);

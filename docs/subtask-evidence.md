@@ -269,9 +269,10 @@ an invalid read mutates neither the task record nor the workspace, and an
 in-range index with a limit beyond the remaining entries (or a filtered read
 with no matches) is a valid clamped/empty result, not an error.
 
-Prefer `SubtasksWatch` when you must wait for a state change (it returns immediately
-and arms one deliberate future checkpoint while work remains active; it never waits
-synchronously or rearms itself); use evidence-mode `SubtasksInspect` when you need to
-understand *what happened* — locating a failure, checking whether a command result was
-observed versus merely claimed, reading reviewer findings, or confirming unlanded
-changes.
+Use `SubtasksWatch` for a deliberate future checkpoint when a state change matters
+(it returns immediately and arms one future checkpoint while work remains active; it
+never waits synchronously or rearms itself). A purposeful status check or background
+monitor is fine when it informs a decision; use evidence-mode `SubtasksInspect` when
+you need to understand *what happened* — locating a failure, checking whether a
+command result was observed versus merely claimed, reading reviewer findings, or
+confirming unlanded changes.

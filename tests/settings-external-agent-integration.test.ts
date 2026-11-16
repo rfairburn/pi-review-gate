@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import Module from "node:module";
-import { effectiveReviewSettings, externalAgentCatalog, normalizeConfig, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
+import { ClaudeCliAdapter } from "../src/adapters/claude-cli";
+import { effectiveReviewSettings, externalAgentCatalog, normalizeConfig, resolveReviewers, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
 import { validateSelection } from "../src/settings/validation";
 import { validateScheduledTasks } from "../src/settings/scheduled-tasks";
 import * as realExternalAgents from "../src/settings/external-agents";
@@ -269,6 +270,117 @@ test("real creation forms share the resource/reviewer draft and persist advanced
     }
   });
 });
+
+const fable52Efforts = [
+  { choice: "Extra High (xhigh)", display: "Extra High (xhigh)", effort: "xhigh" },
+  { choice: "Max", display: "Max", effort: "max" },
+  { choice: "CLI default", display: "CLI default", effort: "default" },
+] as const;
+
+for (const { choice, display, effort } of fable52Efforts) {
+  test(`registered settings edit an existing Fable 5.1 definition to Fable 5.2 with ${display} and the real Claude adapter forwards the model${effort === "default" ? " without effort" : ` and ${effort}`}`, async (t) => {
+    await workspace(async (path, config) => {
+      // Seed an already-saved Claude definition: Fable 5.1 with delegated CLI
+      // effort, both roles, and both reviewer layers already authorized.
+      Object.assign(config, normalizeConfig({
+        ...config,
+        externalAgents: { fable: { adapter: "claude-cli", model: "claude-fable-5-1", reasoningEffort: "default", execution: {}, review: {} } },
+        review: { ...config.review, primaryReviewers: [{ source: "external", id: "fable" }], subtaskReviewers: [{ source: "external", id: "fable" }] },
+      }));
+      const original = JSON.stringify(config);
+      await writeFile(path, original);
+      const activeBefore = structuredClone(config);
+      const rolesBefore = {
+        execution: structuredClone(config.externalAgents!.fable.execution),
+        review: structuredClone(config.externalAgents!.fable.review),
+      };
+
+      // Real registered /review-settings edit of the EXISTING definition — no
+      // creation form — then Apply and the root persistent Save.
+      await menu(path, config, [
+        "External workers", "fable [claude-cli]",
+        (options) => {
+          assert.ok(options.includes("Shared model: claude-fable-5-1"), options.join(" | "));
+          assert.ok(options.includes("Shared reasoning: CLI default"), options.join(" | "));
+          return "Shared model:";
+        },
+        "Fable 5.2 (claude-fable-5-2)",
+        "Shared reasoning:", choice,
+        "Apply edit", "Back",
+        "Save changes",
+      ], async () => {
+        assert.deepEqual(config, activeBefore);
+        assert.equal(await readFile(path, "utf8"), original);
+      });
+      const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+      assert.deepEqual(config, saved);
+      assert.equal(saved.externalAgents!.fable.model, "claude-fable-5-2");
+      assert.equal(saved.externalAgents!.fable.reasoningEffort, effort);
+      assert.deepEqual(saved.externalAgents!.fable.execution, rolesBefore.execution);
+      assert.deepEqual(saved.externalAgents!.fable.review, rolesBefore.review);
+      assert.deepEqual(effectiveReviewSettings(saved).primaryReviewers, [{ source: "external", id: "fable" }]);
+      assert.deepEqual(effectiveReviewSettings(saved).subtaskReviewers, [{ source: "external", id: "fable" }]);
+
+      // Reopen the saved definition, verify the exact saved labels and that the
+      // new model offers only its five native levels plus CLI default.
+      const opening = structuredClone(config);
+      await menu(path, config, [
+        "External workers", "fable [claude-cli]",
+        (options) => {
+          assert.ok(options.includes("Shared model: claude-fable-5-2"), options.join(" | "));
+          assert.ok(options.includes(`Shared reasoning: ${display}`), options.join(" | "));
+          return "Shared reasoning:";
+        },
+        (options) => {
+          assert.deepEqual(options, [
+            "CLI default (no app-owned effort flag)", "Low", "Medium", "High", "Extra High (xhigh)", "Max",
+          ]);
+          return undefined;
+        },
+        "Cancel", "Back", "Cancel",
+      ]);
+      assert.deepEqual(config, opening);
+
+      // The recording executable below is a POSIX .mjs fixture spawned
+      // directly; settings persistence above is platform-independent, while
+      // argv forwarding is verified only on POSIX runs rather than claiming
+      // Windows coverage.
+      if (process.platform === "win32") {
+        t.skip("POSIX executable fixture: Claude adapter argv forwarding is not verified on Windows");
+        return;
+      }
+
+      const dir = join(path, "..");
+      const argvPath = join(dir, "fable-argv.json");
+      const commandPath = join(dir, "fake-fable-claude.mjs");
+      const reviewJson = JSON.stringify({ verdict: "pass", summary: "fable ok", guidance: null, findings: [], error: null });
+      await writeFile(commandPath, [
+        "#!/usr/bin/env node",
+        "import { writeFileSync } from 'node:fs';",
+        `writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)));`,
+        "process.stdin.resume();",
+        `process.stdin.on('end',()=>process.stdout.write(JSON.stringify({type:'result',result:${JSON.stringify(reviewJson)},usage:{input_tokens:1,output_tokens:2}})));`,
+      ].join("\n"), "utf8");
+      await chmod(commandPath, 0o755);
+
+      const reviewer = resolveReviewers(saved).reviewers[0]!;
+      if (reviewer.adapter !== "claude-cli") throw new Error(`expected Claude reviewer, got ${reviewer.adapter}`);
+      assert.deepEqual(reviewer.args, effort === "default" ? [] : ["--effort", effort]);
+      const result = await new ClaudeCliAdapter({ ...reviewer, command: commandPath }).run({
+        id: reviewer.id, cwd: dir, prompt: "review", bundleDir: dir, timeoutMs: 15000,
+      });
+      assert.equal(result.verdict, "pass");
+      const argv: string[] = JSON.parse(await readFile(argvPath, "utf8"));
+      assert.equal(argv[argv.indexOf("--model") + 1], "claude-fable-5-2");
+      if (effort === "default") {
+        assert.equal(argv.includes("--effort"), false);
+      } else {
+        assert.equal(argv[argv.indexOf("--effort") + 1], effort);
+        assert.equal(argv.filter((token) => token === "--effort").length, 1);
+      }
+    });
+  });
+}
 
 for (const availableOnDisk of [true, false]) test(`warnings reflect the saved latest catalog (available: ${availableOnDisk})`, async () => {
   await workspace(async (path, config) => {

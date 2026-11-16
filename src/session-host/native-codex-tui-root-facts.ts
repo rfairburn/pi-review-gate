@@ -124,8 +124,12 @@
  *   successful start is later confirmed, the stored terminal WAS the current
  *   turn's live terminal: everything held from before it retires at once,
  *   with no second terminal needed, while questions, gaps, and uncertainty
- *   first observed after it keep their own knowledge. Another turn's
- *   confirmation, slot replacement, or withdrawal drops the witness unused.
+ *   first observed after it keep their own knowledge. The slot may hold no
+ *   question at all: a turn-only publication gap on an unconfirmed turn takes
+ *   the free slot only to carry this same witness, never inventing a question
+ *   or count, and that terminal alone still leaves input unknown. Another
+ *   turn's confirmation, slot replacement, or withdrawal drops the witness
+ *   unused.
  *   A retirement is never an answer, and the terminal is one recovery path,
  *   not the only one.
  * - Only the first or the confirmed CURRENT root turn's questions are pending
@@ -283,7 +287,9 @@ interface QuestionItemGap {
  * Questions for ONE root turn this source has not yet confirmed (its item can
  * precede the own `turn/start` response projection). They are never pending
  * proof until that exact turn is confirmed; until then any unresolved entry
- * makes input unknown.
+ * makes input unknown. It may hold no item when that turn's only knowledge is
+ * a turn-only publication gap (kept on the turn itself); the slot then only
+ * carries the turn's early terminal witness.
  */
 interface ProvisionalQuestionTurn {
   readonly turnId: string;
@@ -507,20 +513,30 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       this.#questions.set(itemId, item);
       return;
     }
-    let provisional = this.#provisional;
-    if (provisional !== undefined && provisional.turnId !== item.turnId) {
-      if ([...provisional.items.values()].some(isUnresolved)) {
-        this.#gapUnattributedAt = this.#ingested;
-        return;
-      }
-      // Replacing the slot also drops its turn's held terminal witness.
-      provisional = undefined;
-    }
+    const provisional = this.#claimProvisional(item.turnId);
     if (provisional === undefined) {
-      provisional = { turnId: item.turnId, items: new Map(), terminalAt: undefined };
-      this.#provisional = provisional;
+      this.#gapUnattributedAt = this.#ingested;
+      return;
     }
     provisional.items.set(itemId, item);
+  }
+
+  /**
+   * The one provisional slot for unconfirmed root turn `turnId`: the held slot
+   * when it is that turn's, otherwise a new empty one replacing a slot that
+   * holds nothing unresolved. Replacing a slot drops its turn's held terminal
+   * witness. A slot holding another turn's unresolved questions is never
+   * displaced, so there is no slot for `turnId` (undefined).
+   */
+  #claimProvisional(turnId: string): ProvisionalQuestionTurn | undefined {
+    const provisional = this.#provisional;
+    if (provisional !== undefined) {
+      if (provisional.turnId === turnId) return provisional;
+      if ([...provisional.items.values()].some(isUnresolved)) return undefined;
+    }
+    const claimed: ProvisionalQuestionTurn = { turnId, items: new Map(), terminalAt: undefined };
+    this.#provisional = claimed;
+    return claimed;
   }
 
   #observeAsyncQuestions(event: AsyncQuestionsEvent): void {
@@ -694,7 +710,16 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     }
     if (turnId === undefined) this.#gapUnattributedAt = this.#ingested;
     else if (itemId !== undefined) this.#registerItem(itemId, newQuestionItem(turnId, undefined, this.#ingested));
-    else this.#gapTurns.set(turnId, this.#ingested);
+    else {
+      this.#gapTurns.set(turnId, this.#ingested);
+      // A turn-only gap on a turn other than the confirmed current one also
+      // takes the provisional slot when it is free (or already that turn's),
+      // holding no item: only so that turn's early terminal can be witnessed
+      // and later authenticated by its own exact confirmation. The gap itself
+      // stays on its turn; the slot adds no question, count, or pending proof.
+      const current = this.#rootTurnId;
+      if (current !== undefined && turnId !== current) this.#claimProvisional(turnId);
+    }
   }
 
   #observeTurnTerminal(event: TurnTerminalEvent): void {

@@ -1325,16 +1325,20 @@ test("a terminal matching an unconfirmed provisional replay is not retirement pr
   replied.observe(replyEvent(A, [{ itemId: "call-old", index: 0 }]));
   assert.equal(replied.current().asyncInput, "none");
 
-  // A genuine next turn whose terminal precedes its own start projection never
-  // leaves a stale pending once that turn is confirmed.
+  // A genuine next turn whose terminal precedes its own start projection:
+  // unknown until that exact turn is confirmed, then none at once — no second
+  // terminal or reply is needed, and a later duplicate changes nothing.
   const early = boundBinder();
   early.observe(terminalEvent(A, "turn-1"));
   early.observe(questionsEvent(A, "call-next", 1, "turn-2"));
   early.observe(terminalEvent(A, "turn-2"));
-  early.observe(work(A, "turn-2"));
   assert.equal(early.current().asyncInput, "unknown");
-  early.observe(terminalEvent(A, "turn-2"));
+  early.observe(work(A, "turn-2"));
   assert.equal(early.current().asyncInput, "none");
+  assert.equal(early.current().rootTurnId, "turn-2");
+  early.observe(terminalEvent(A, "turn-2"));
+  early.observe(questionsEvent(A, "call-next", 1, "turn-2"));
+  assert.equal(early.current().asyncInput, "none", "a duplicate or replay reopens nothing");
 });
 
 test("a stale terminal cannot resolve an unconfirmed turn-only publication gap", () => {
@@ -1352,6 +1356,258 @@ test("a stale terminal cannot resolve an unconfirmed turn-only publication gap",
   assert.equal(binder.current().asyncInput, "unknown");
   binder.observe(terminalEvent(A, "turn-10"));
   assert.equal(binder.current().asyncInput, "none");
+});
+
+/* ================================== early provisional terminal reconciliation */
+
+function itemGapEvent(itemId: string, turnId: string): NativeCodexTuiRelayMetadataEvent {
+  return { kind: "async-input-unreadable", connectionId: C, sequence: 12, source: "questions", itemId, threadId: A, turnId };
+}
+
+/** Turn 1 is confirmed and ended; turn 2's question precedes its own start projection. */
+function earlyTurnTwo(): NativeCodexTuiRootFactsBinder {
+  const binder = boundBinder();
+  binder.observe(terminalEvent(A, "turn-1"));
+  binder.observe(questionsEvent(A, "call-q2", 1, "turn-2"));
+  return binder;
+}
+
+test("an early terminal becomes the whole-queue boundary only on its own exact turn confirmation", () => {
+  // The confirmation publishes one consistent change: none on the new turn.
+  const binder = earlyTurnTwo();
+  binder.observe(terminalEvent(A, "turn-2"));
+  const seen: NativeCodexTuiRootFactsSnapshot[] = [];
+  binder.watch((snapshot) => seen.push(snapshot));
+  binder.observe(work(A, "turn-2"));
+  assert.deepEqual(seen.map((snapshot) => [snapshot.rootTurnId, snapshot.asyncInput]), [
+    ["turn-1", "unknown"],
+    ["turn-2", "none"],
+  ]);
+
+  // Held current-turn knowledge stays authoritative until that confirmation:
+  // an unconfirmed terminal, helper work, and repeats retire nothing.
+  const whole = boundBinder();
+  whole.observe(questionsEvent(A, "call-q1", 1, "turn-1"));
+  whole.observe(questionsEvent(A, "call-q2", 1, "turn-2"));
+  whole.observe(terminalEvent(A, "turn-2"));
+  assert.equal(whole.current().asyncInput, "pending", "an unconfirmed terminal is no authority");
+  whole.observe(work(A, "turn-2", "native-helper"));
+  whole.observe(terminalEvent("helper-thread", "turn-2"));
+  whole.observe(terminalEvent(A, "turn-2"));
+  assert.equal(whole.current().asyncInput, "pending");
+  assert.equal(whole.current().rootTurnId, "turn-1");
+  // The exact own confirmation: the native UI cleared its WHOLE root queue at
+  // that terminal, so the earlier turn's held question retired too.
+  whole.observe(work(A, "turn-2"));
+  assert.equal(whole.current().asyncInput, "none");
+  whole.observe(terminalEvent(A, "turn-2"));
+  whole.observe(questionsEvent(A, "call-q1", 1, "turn-1"));
+  whole.observe(questionsEvent(A, "call-q2", 1, "turn-2"));
+  assert.equal(whole.current().asyncInput, "none", "retired identities never resurrect");
+  // A later turn's question is fresh pending proof once confirmed.
+  whole.observe(work(A, "turn-3"));
+  whole.observe(questionsEvent(A, "call-q3", 1, "turn-3"));
+  assert.equal(whole.current().asyncInput, "pending");
+
+  // Pre-boundary publication gaps (unattributed, item-scoped) are covered.
+  const gaps = earlyTurnTwo();
+  gaps.observe(questionsEvent(undefined, "call-x", 1));
+  gaps.observe(itemGapEvent("call-g", "turn-2"));
+  gaps.observe(unreadableEvent("questions", A, "turn-2"));
+  gaps.observe(terminalEvent(A, "turn-2"));
+  assert.equal(gaps.current().asyncInput, "unknown");
+  gaps.observe(work(A, "turn-2"));
+  assert.equal(gaps.current().asyncInput, "none");
+  gaps.observe(questionsEvent(A, "call-g", 2, "turn-2"));
+  assert.equal(gaps.current().asyncInput, "none", "a full read of a retired gap item never reopens");
+});
+
+test("a held early terminal is consumed by no foreign, helper, or wrong-turn work", () => {
+  // Wrong-turn confirmation discards the slot and its witness unused: the
+  // still-current turn's held question is not retired by it.
+  const wrong = boundBinder();
+  wrong.observe(questionsEvent(A, "call-q1", 1, "turn-1"));
+  wrong.observe(questionsEvent(A, "call-q2", 1, "turn-2"));
+  wrong.observe(terminalEvent(A, "turn-2"));
+  wrong.observe(work(A, "turn-3"));
+  assert.equal(wrong.current().asyncInput, "pending");
+  wrong.observe(work(A, "turn-2"));
+  assert.equal(wrong.current().asyncInput, "pending", "the dropped witness never revives");
+  wrong.observe(replyEvent(A, [{ itemId: "call-q1", index: 0 }]));
+  assert.equal(wrong.current().asyncInput, "none");
+
+  // A pre-boundary gap likewise stays unknown until a usable boundary.
+  const gap = earlyTurnTwo();
+  gap.observe(unreadableEvent("questions", undefined));
+  gap.observe(terminalEvent(A, "turn-2"));
+  gap.observe(work(A, "turn-2", "native-helper"));
+  assert.equal(gap.current().asyncInput, "unknown");
+  gap.observe(work(A, "turn-3"));
+  assert.equal(gap.current().asyncInput, "unknown");
+  gap.observe(terminalEvent(A, "turn-3"));
+  assert.equal(gap.current().asyncInput, "none");
+
+  // Foreign-thread work or another connection's work is a withdrawal, never a confirmation.
+  const foreign = earlyTurnTwo();
+  foreign.observe(terminalEvent(A, "turn-2"));
+  foreign.observe(work("thread-b", "turn-2"));
+  assert.deepEqual(foreign.current(), { phase: "withdrawn", connectionId: C, withdrawal: "work-on-another-thread" });
+  const otherConnection = earlyTurnTwo();
+  otherConnection.observe(terminalEvent(A, "turn-2"));
+  otherConnection.observe({ kind: "turn-work-target", connectionId: C2, sequence: 3, requestIdKind: "native", threadId: A, turnId: "turn-2" });
+  assert.equal(otherConnection.current().phase, "withdrawn");
+  otherConnection.observe(work(A, "turn-2"));
+  assert.equal(otherConnection.current().asyncInput, undefined);
+
+  // An old replay's terminal held beyond the retired-turn window never clears
+  // current knowledge, and the next confirmed turn drops it unused.
+  const stale = boundBinder();
+  stale.observe(terminalEvent(A, "turn-1"));
+  for (let turn = 2; turn <= 10; turn += 1) {
+    stale.observe(work(A, `turn-${turn}`));
+    if (turn < 10) stale.observe(terminalEvent(A, `turn-${turn}`));
+  }
+  stale.observe(questionsEvent(A, "call-old", 1, "turn-1"));
+  stale.observe(questionsEvent(A, "call-t10", 1, "turn-10"));
+  stale.observe(terminalEvent(A, "turn-1"));
+  assert.equal(stale.current().asyncInput, "pending");
+  stale.observe(questionsEvent(undefined, "call-x", 1));
+  stale.observe(work(A, "turn-11"));
+  assert.equal(stale.current().asyncInput, "unknown");
+  stale.observe(terminalEvent(A, "turn-11"));
+  assert.equal(stale.current().asyncInput, "none");
+});
+
+test("knowledge first observed after an early terminal survives its confirmation", () => {
+  // A fresh question for the confirmed turn after its early terminal.
+  const fresh = earlyTurnTwo();
+  fresh.observe(questionsEvent(undefined, "call-x", 1));
+  fresh.observe(terminalEvent(A, "turn-2"));
+  fresh.observe(questionsEvent(A, "call-q3", 1, "turn-2"));
+  fresh.observe(work(A, "turn-2"));
+  assert.equal(fresh.current().asyncInput, "pending");
+  fresh.observe(replyEvent(A, [{ itemId: "call-q3", index: 0 }]));
+  assert.equal(fresh.current().asyncInput, "none", "only pre-boundary knowledge retired");
+
+  // A repeated early terminal never widens the boundary over later evidence:
+  // the question between the two copies is uncertain, never retired.
+  const repeated = earlyTurnTwo();
+  repeated.observe(terminalEvent(A, "turn-2"));
+  repeated.observe(questionsEvent(A, "call-q3", 1, "turn-2"));
+  repeated.observe(terminalEvent(A, "turn-2"));
+  repeated.observe(work(A, "turn-2"));
+  assert.equal(repeated.current().asyncInput, "unknown");
+  repeated.observe(replyEvent(A, [{ itemId: "call-q3", index: 0 }]));
+  assert.equal(repeated.current().asyncInput, "none");
+
+  // Publication gaps after the boundary: unattributed, turn-scoped, item-scoped.
+  const later: readonly [string, NativeCodexTuiRelayMetadataEvent][] = [
+    ["unattributed gap", unreadableEvent("questions", undefined)],
+    ["turn-scoped gap", unreadableEvent("questions", A, "turn-2")],
+    ["item-scoped gap", itemGapEvent("call-h", "turn-2")],
+    ["unattributed question", questionsEvent(undefined, "call-y", 1)],
+  ];
+  for (const [label, gap] of later) {
+    const binder = earlyTurnTwo();
+    binder.observe(terminalEvent(A, "turn-2"));
+    binder.observe(gap);
+    binder.observe(work(A, "turn-2"));
+    assert.equal(binder.current().asyncInput, "unknown", `${label}: never emptied by the confirmation`);
+    binder.observe(terminalEvent(A, "turn-2"));
+    assert.equal(binder.current().asyncInput, "unknown", `${label}: a repeat terminal is no new boundary`);
+    binder.observe(work(A, "turn-3"));
+    binder.observe(terminalEvent(A, "turn-3"));
+    assert.equal(binder.current().asyncInput, "none", `${label}: the next live terminal retires it`);
+  }
+  const itemScoped = earlyTurnTwo();
+  itemScoped.observe(terminalEvent(A, "turn-2"));
+  itemScoped.observe(itemGapEvent("call-h", "turn-2"));
+  itemScoped.observe(work(A, "turn-2"));
+  itemScoped.observe(replyEvent(A, [{ itemId: "call-h" }]));
+  assert.equal(itemScoped.current().asyncInput, "none", "its own whole-item reply resolves it");
+
+  // Its own authoritative full read still repairs it after confirmation.
+  const emptyRead = earlyTurnTwo();
+  emptyRead.observe(terminalEvent(A, "turn-2"));
+  emptyRead.observe(itemGapEvent("call-h", "turn-2"));
+  emptyRead.observe(work(A, "turn-2"));
+  emptyRead.observe(questionsEvent(A, "call-h", 0, "turn-2"));
+  assert.equal(emptyRead.current().asyncInput, "none", "a complete empty read resolves it at once");
+
+  const fullRead = earlyTurnTwo();
+  fullRead.observe(terminalEvent(A, "turn-2"));
+  fullRead.observe(itemGapEvent("call-h", "turn-2"));
+  fullRead.observe(work(A, "turn-2"));
+  fullRead.observe(questionsEvent(A, "call-h", 2, "turn-2"));
+  assert.equal(fullRead.current().asyncInput, "pending", "a nonempty repair is pending proof");
+  // Retired pre-boundary identities, new items of the retired turn, and a
+  // second copy of the repaired item all stay fenced.
+  fullRead.observe(questionsEvent(A, "call-q2", 1, "turn-2"));
+  fullRead.observe(questionsEvent(A, "call-new", 1, "turn-2"));
+  fullRead.observe(itemGapEvent("call-h", "turn-2"));
+  fullRead.observe(questionsEvent(A, "call-h", 3, "turn-2"));
+  fullRead.observe(replyEvent(A, [{ itemId: "call-h", index: 0 }, { itemId: "call-h", index: 1 }]));
+  assert.equal(fullRead.current().asyncInput, "none");
+
+  // Possible clearing since the gap makes the repair uncertain, never pending.
+  const clearedRead = earlyTurnTwo();
+  clearedRead.observe(terminalEvent(A, "turn-2"));
+  clearedRead.observe(itemGapEvent("call-h", "turn-2"));
+  clearedRead.observe(work(A, "turn-2"));
+  clearedRead.observe(ordinaryInput(A));
+  clearedRead.observe(questionsEvent(A, "call-h", 1, "turn-2"));
+  assert.equal(clearedRead.current().asyncInput, "unknown");
+  clearedRead.observe(replyEvent(A, [{ itemId: "call-h", index: 0 }]));
+  assert.equal(clearedRead.current().asyncInput, "none");
+
+  // Once a later turn is current, that read is no repair proof.
+  const laterRead = earlyTurnTwo();
+  laterRead.observe(terminalEvent(A, "turn-2"));
+  laterRead.observe(itemGapEvent("call-h", "turn-2"));
+  laterRead.observe(work(A, "turn-2"));
+  laterRead.observe(work(A, "turn-3"));
+  laterRead.observe(questionsEvent(A, "call-h", 0, "turn-2"));
+  assert.equal(laterRead.current().asyncInput, "unknown");
+  laterRead.observe(terminalEvent(A, "turn-3"));
+  assert.equal(laterRead.current().asyncInput, "none");
+
+  // Uncertainty arising after the boundary on a post-boundary question.
+  const uncertain = earlyTurnTwo();
+  uncertain.observe(terminalEvent(A, "turn-2"));
+  uncertain.observe(questionsEvent(A, "call-q3", 1, "turn-2"));
+  uncertain.observe(ordinaryInput(A));
+  uncertain.observe(work(A, "turn-2"));
+  assert.equal(uncertain.current().asyncInput, "unknown");
+  uncertain.observe(replyEvent(A, [{ itemId: "call-q3", index: 0 }]));
+  assert.equal(uncertain.current().asyncInput, "none");
+
+  // A competing turn's question after the boundary is a coverage loss that survives.
+  const competing = earlyTurnTwo();
+  competing.observe(terminalEvent(A, "turn-2"));
+  competing.observe(questionsEvent(A, "call-q4", 1, "turn-4"));
+  competing.observe(work(A, "turn-2"));
+  assert.equal(competing.current().asyncInput, "unknown");
+});
+
+test("slot replacement and withdrawal drop a held early terminal witness", () => {
+  // Once its slot holds nothing unresolved, a newer provisional turn replaces
+  // it and the witness goes with it: confirming turn 2 then proves nothing,
+  // and the now-current turn's own live terminal still recovers.
+  const replaced = earlyTurnTwo();
+  replaced.observe(unreadableEvent("questions", undefined));
+  replaced.observe(terminalEvent(A, "turn-2"));
+  replaced.observe(replyEvent(A, [{ itemId: "call-q2", index: 0 }]));
+  replaced.observe(questionsEvent(A, "call-q3", 1, "turn-3"));
+  replaced.observe(work(A, "turn-2"));
+  assert.equal(replaced.current().asyncInput, "unknown");
+  replaced.observe(terminalEvent(A, "turn-2"));
+  assert.equal(replaced.current().asyncInput, "none");
+
+  const withdrawn = earlyTurnTwo();
+  withdrawn.observe(terminalEvent(A, "turn-2"));
+  withdrawn.observe({ kind: "metadata-unavailable", connectionId: C, sequence: 30, scope: "message", reason: "json-unreadable" });
+  withdrawn.observe(work(A, "turn-2"));
+  assert.deepEqual(withdrawn.current(), { phase: "withdrawn", connectionId: C, withdrawal: "metadata-unavailable" });
 });
 
 test("a complete empty copy resolves its own item-scoped gap, never an unrelated one", () => {

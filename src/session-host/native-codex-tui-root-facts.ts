@@ -8,7 +8,9 @@
  * connection generation, one candidate/bound root id, one current root turn id,
  * one current rooted tool fact, one bounded provisional tool fact, one
  * withdrawal reason, and the closed identities of the CURRENT async question
- * queue (see below), which a live terminal retires.
+ * queue (see below), which a live terminal retires, each tagged with this
+ * source's own ingestion position so one held provisional terminal witness can
+ * be applied to exactly the knowledge that preceded it.
  *
  * ## What "fresh root" means here
  *
@@ -117,8 +119,15 @@
  *   non-current terminal. The current root turn's terminal is a complete
  *   queue boundary that retires every held question, uncertainty, and gap. A
  *   terminal for the unconfirmed provisional turn is not retirement proof: its
- *   held questions only become uncertain. A retirement is never an answer,
- *   and the terminal is one recovery path, not the only one.
+ *   held questions only become uncertain, and the slot keeps one bounded
+ *   witness of where that terminal was observed. When that exact turn's own
+ *   successful start is later confirmed, the stored terminal WAS the current
+ *   turn's live terminal: everything held from before it retires at once,
+ *   with no second terminal needed, while questions, gaps, and uncertainty
+ *   first observed after it keep their own knowledge. Another turn's
+ *   confirmation, slot replacement, or withdrawal drops the witness unused.
+ *   A retirement is never an answer, and the terminal is one recovery path,
+ *   not the only one.
  * - Only the first or the confirmed CURRENT root turn's questions are pending
  *   proof. Another turn's questions (the next own turn before its start
  *   projection, or an old turn's replay) occupy one provisional slot that makes
@@ -244,6 +253,8 @@ type TurnTerminalEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly ki
  */
 interface QuestionItem {
   readonly turnId: string;
+  /** Ingestion position at which this source first registered the item. */
+  readonly since: number;
   /** Indices positively published and still unanswered. */
   readonly pending: Set<number>;
   /**
@@ -277,13 +288,21 @@ interface QuestionItemGap {
 interface ProvisionalQuestionTurn {
   readonly turnId: string;
   readonly items: Map<string, QuestionItem>;
+  /**
+   * The ingestion position of the first live terminal observed for THIS turn
+   * while it was unconfirmed. It has no authority on its own; only this exact
+   * turn's own successful start confirmation makes it usable, and then only
+   * for knowledge first observed before that position.
+   */
+  terminalAt: number | undefined;
 }
 
-function newQuestionItem(turnId: string, questionCount: number | undefined): QuestionItem {
+function newQuestionItem(turnId: string, questionCount: number | undefined, since: number): QuestionItem {
   const pending = new Set<number>();
   if (questionCount !== undefined) for (let index = 0; index < questionCount; index += 1) pending.add(index);
   return {
     turnId,
+    since,
     pending,
     uncertain: new Set<number>(),
     gap: questionCount === undefined ? { answered: new Set<number>(), mayBeCleared: false } : undefined,
@@ -338,10 +357,22 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   readonly #questions = new Map<string, QuestionItem>();
   /** The one not-yet-confirmed turn's questions; never pending proof. */
   #provisional: ProvisionalQuestionTurn | undefined;
-  /** Turns with a question-publication gap no single item can name. */
-  readonly #gapTurns = new Set<string>();
-  /** A publication gap that could not be attributed to one turn of the root. */
-  #gapUnattributed = false;
+  /**
+   * Turns with a question-publication gap no single item can name, each with
+   * the ingestion position of its latest gap.
+   */
+  readonly #gapTurns = new Map<string, number>();
+  /**
+   * Ingestion position of the latest publication gap that could not be
+   * attributed to one turn of the root, while one is unresolved.
+   */
+  #gapUnattributedAt: number | undefined;
+  /**
+   * Monotonic count of ingested metadata events: this source's own observed
+   * order, never a provider id or wire sequence. It only orders retained
+   * knowledge against a held provisional terminal.
+   */
+  #ingested = 0;
   /** The most recent root turns whose live terminal retired the native queue (bounded). */
   readonly #retiredTurns: string[] = [];
   #snapshot: NativeCodexTuiRootFactsSnapshot = EMPTY_SNAPSHOT;
@@ -384,13 +415,14 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     this.#questions.clear();
     this.#provisional = undefined;
     this.#gapTurns.clear();
-    this.#gapUnattributed = false;
+    this.#gapUnattributedAt = undefined;
     this.#retiredTurns.length = 0;
     this.#publish();
   }
 
   observe(event: NativeCodexTuiRelayMetadataEvent): void {
     if (this.#withdrawn !== undefined) return;
+    this.#ingested += 1;
 
     if (event.kind === "genuine-tui-initialize") {
       this.#observeInitialize(event);
@@ -478,13 +510,14 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     let provisional = this.#provisional;
     if (provisional !== undefined && provisional.turnId !== item.turnId) {
       if ([...provisional.items.values()].some(isUnresolved)) {
-        this.#gapUnattributed = true;
+        this.#gapUnattributedAt = this.#ingested;
         return;
       }
+      // Replacing the slot also drops its turn's held terminal witness.
       provisional = undefined;
     }
     if (provisional === undefined) {
-      provisional = { turnId: item.turnId, items: new Map() };
+      provisional = { turnId: item.turnId, items: new Map(), terminalAt: undefined };
       this.#provisional = provisional;
     }
     provisional.items.set(itemId, item);
@@ -502,14 +535,22 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       this.#publish();
       return;
     }
-    if (this.#retiredTurns.includes(turnId)) return; // Late replay of a retired turn.
+    const existing = this.#lookupItem(event.itemId);
+    // A retired turn's publication is a late replay. The one exception is a
+    // confirmed gap item still held on that turn: retirement deletes every
+    // confirmed item of the turn observed before its boundary, so such an item
+    // was first observed AFTER it and kept its knowledge; its full read stays
+    // repair proof below, under the same same-turn/current-turn rule.
+    if (
+      this.#retiredTurns.includes(turnId)
+      && (existing?.gap === undefined || existing.turnId !== turnId || this.#questions.get(event.itemId) !== existing)
+    ) return;
     const count = event.questionCount;
     if (!Number.isSafeInteger(count) || count < 0) {
       this.#invalidateForGap(turnId, event.itemId);
       this.#publish();
       return;
     }
-    const existing = this.#lookupItem(event.itemId);
     if (existing !== undefined) {
       // The native UI never registers an item id twice, so a replay is never
       // fresh proof. The one exception is this source's OWN missing knowledge:
@@ -532,11 +573,19 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     }
     // The native queue ignores an empty list and does not register its id.
     if (count === 0) return;
-    this.#registerItem(event.itemId, newQuestionItem(turnId, count));
+    this.#registerItem(event.itemId, newQuestionItem(turnId, count, this.#ingested));
     this.#publish();
   }
 
-  /** A root turn was confirmed as current: promote or discard the provisional slot. */
+  /**
+   * A root turn was confirmed as current: promote or discard the provisional
+   * slot. A terminal this exact turn already reported while unconfirmed was
+   * then that turn's live terminal, and this confirmation is what makes it
+   * usable: it is the native UI's complete queue boundary at the point it was
+   * observed, so everything held from before it retires now, while anything
+   * first observed after it keeps its own knowledge. Another turn's
+   * confirmation discards the slot together with its terminal witness.
+   */
   #confirmQueueTurn(turnId: string): void {
     const provisional = this.#provisional;
     if (provisional === undefined) return;
@@ -545,6 +594,7 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     for (const [itemId, item] of provisional.items) {
       if (!this.#questions.has(itemId)) this.#questions.set(itemId, item);
     }
+    if (provisional.terminalAt !== undefined) this.#retireQueue(turnId, true, provisional.terminalAt);
   }
 
   #observeAsyncReply(event: AsyncReplyEvent): void {
@@ -642,9 +692,9 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     for (const item of this.#allItems()) {
       if (turnId === undefined || item.turnId === turnId) invalidateQuestionItem(item);
     }
-    if (turnId === undefined) this.#gapUnattributed = true;
-    else if (itemId !== undefined) this.#registerItem(itemId, newQuestionItem(turnId, undefined));
-    else this.#gapTurns.add(turnId);
+    if (turnId === undefined) this.#gapUnattributedAt = this.#ingested;
+    else if (itemId !== undefined) this.#registerItem(itemId, newQuestionItem(turnId, undefined, this.#ingested));
+    else this.#gapTurns.set(turnId, this.#ingested);
   }
 
   #observeTurnTerminal(event: TurnTerminalEvent): void {
@@ -666,42 +716,61 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     // A terminal for a turn this source neither holds nor knows as current is
     // stale: it retires nothing and clears no current input knowledge.
     if (!isCurrent && !isProvisional && !tracked) return;
-    if (isProvisional && !isCurrent) {
+    const provisional = this.#provisional;
+    if (provisional !== undefined && isProvisional && !isCurrent) {
       // A terminal for the held, UNCONFIRMED provisional turn is no queue
-      // boundary: it may be a stale copy of a long ended turn. It is not
-      // retirement proof, so the slot is kept. It may equally be that turn's
-      // real end, so its held questions are no longer pending proof either:
-      // they become finite uncertainty that a scoped reply or the current
-      // turn's live terminal still resolves.
-      for (const item of this.#provisional?.items.values() ?? []) invalidateQuestionItem(item);
+      // boundary yet: it may be a stale copy of a long ended turn. It is not
+      // retirement proof, so the slot is kept and nothing else is cleared. It
+      // may equally be that turn's real end, so its held questions are no
+      // longer pending proof either: they become finite uncertainty that a
+      // scoped reply or the current turn's live terminal still resolves. Its
+      // ingestion position is kept as this slot's one bounded witness (the
+      // first such terminal, so a repeat never widens it); only this exact
+      // turn's own successful confirmation can later make it a boundary.
+      for (const item of provisional.items.values()) invalidateQuestionItem(item);
+      provisional.terminalAt ??= this.#ingested;
       if (!tracked) {
         this.#publish();
         return;
       }
     }
-    // The native UI clears its pending questions on this live terminal, so that
-    // turn's questions retire. A retirement is never reported as an answer.
-    // The retired-turn fence below rejects their late replays.
-    for (const [itemId, item] of [...this.#questions]) {
-      if (item.turnId === turnId) this.#questions.delete(itemId);
-    }
-    this.#gapTurns.delete(turnId);
-    if (isCurrent) {
-      // The native UI clears its WHOLE pending queue on its live terminal, so
-      // the current turn's terminal is a complete queue boundary: every other
-      // held question, uncertainty, and publication gap retires too. Other
-      // turns' identities stay registered so their replays cannot reopen them.
-      for (const item of this.#allItems()) retireQuestionItem(item);
-      this.#gapTurns.clear();
-      this.#gapUnattributed = false;
-    }
-    this.#retiredTurns.push(turnId);
-    if (this.#retiredTurns.length > RETIRED_TURN_FENCE) this.#retiredTurns.shift();
+    this.#retireQueue(turnId, isCurrent, Number.POSITIVE_INFINITY);
     this.#publish();
   }
 
+  /**
+   * Apply the native UI's live terminal for root turn `turnId`, observed at
+   * ingestion position `cutoff` (unbounded for the terminal being ingested
+   * now). Only knowledge first observed BEFORE that position is covered:
+   * that turn's questions retire, and when it is the current root turn's
+   * terminal (`whole`) the native UI cleared its WHOLE queue, so every other
+   * held question, uncertainty, and publication gap from before it retires
+   * too. Questions, gaps, and uncertainty first observed after the cutoff keep
+   * their own knowledge. A retirement is never reported as an answer; other
+   * turns' identities stay registered and the retired-turn fence rejects the
+   * turn's late replays, so nothing retired can reopen. The caller publishes.
+   */
+  #retireQueue(turnId: string, whole: boolean, cutoff: number): void {
+    for (const [itemId, item] of [...this.#questions]) {
+      if (item.turnId === turnId && item.since < cutoff) this.#questions.delete(itemId);
+    }
+    for (const [gapTurn, at] of [...this.#gapTurns]) {
+      if ((whole || gapTurn === turnId) && at < cutoff) this.#gapTurns.delete(gapTurn);
+    }
+    if (whole) {
+      for (const item of this.#allItems()) {
+        if (item.since < cutoff) retireQuestionItem(item);
+      }
+      if (this.#gapUnattributedAt !== undefined && this.#gapUnattributedAt < cutoff) {
+        this.#gapUnattributedAt = undefined;
+      }
+    }
+    this.#retiredTurns.push(turnId);
+    if (this.#retiredTurns.length > RETIRED_TURN_FENCE) this.#retiredTurns.shift();
+  }
+
   #asyncInput(): NativeCodexTuiRootAsyncInput {
-    let unknown = this.#gapUnattributed || this.#gapTurns.size > 0;
+    let unknown = this.#gapUnattributedAt !== undefined || this.#gapTurns.size > 0;
     for (const item of this.#questions.values()) {
       if (item.pending.size > 0) return "pending";
       if (item.uncertain.size > 0 || item.gap !== undefined) unknown = true;

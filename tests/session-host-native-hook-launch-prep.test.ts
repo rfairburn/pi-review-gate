@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   rename,
   rm,
@@ -228,9 +229,18 @@ test("staged artifacts are private, and cleanup removes only its own inodes", as
     const secondRoot = second.lease.root as string;
     const secondFile = second.args[1]!;
     const ownedInode = (await lstat(secondFile)).ino;
-    await unlink(secondFile);
-    await writeFile(secondFile, "replaced by someone else\n");
-    assert.notEqual((await lstat(secondFile)).ino, ownedInode, "the fixture really replaced the inode");
+    // Fixture precondition: an unlink followed by a fresh create lets the
+    // filesystem reuse the freed inode, so the "replacement" could be the very
+    // inode the lease owns. Hold the owned inode open across the unlink so it
+    // stays allocated, then create the replacement exclusively at the path.
+    const retainedOwned = await open(secondFile, "r");
+    try {
+      await unlink(secondFile);
+      await writeFile(secondFile, "replaced by someone else\n", { flag: "wx" });
+      assert.notEqual((await lstat(secondFile)).ino, ownedInode, "the fixture really replaced the inode");
+    } finally {
+      await retainedOwned.close();
+    }
     const secondCleanup = await second.lease.cleanup();
     assert.ok(existsSync(secondFile), "a replaced entry is never unlinked");
     assert.ok(existsSync(secondRoot), "the root survives its own preserved entry");

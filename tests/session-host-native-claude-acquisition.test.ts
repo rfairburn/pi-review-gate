@@ -5282,8 +5282,20 @@ test("a lost child transcript degrades only its own agent's task coverage", asyn
 
   // The file behind the bound path is replaced. A cursor into the old file says
   // nothing about the new one, so this lane's coverage is gone.
-  await fs.rm(childFile);
-  await fs.writeFile(childFile, "", "utf8");
+  //
+  // Fixture precondition: the replacement must be a genuinely DISTINCT file. An
+  // unlink followed by a fresh create lets the filesystem hand the freed inode
+  // straight back, which would make the "replacement" indistinguishable from
+  // the bound file. The original is therefore moved to a reserved fixture path
+  // (keeping its inode allocated) before the new file is created exclusively.
+  const original = await fs.lstat(childFile, { bigint: true });
+  await fs.rename(childFile, path.join(h.dir, "agent-child.retained-original.jsonl"));
+  await fs.writeFile(childFile, "", { encoding: "utf8", flag: "wx" });
+  const replacement = await fs.lstat(childFile, { bigint: true });
+  assert.ok(
+    replacement.dev !== original.dev || replacement.ino !== original.ino,
+    "the fixture really replaced the bound file with a distinct dev/ino",
+  );
   await h.append(queueOperationRow("remove", { reason: "unrelated" }));
   await waitFor(() => h.gaps.includes("replaced"), "the child lane reports its own loss");
   assert.deepEqual(

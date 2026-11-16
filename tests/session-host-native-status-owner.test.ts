@@ -21,6 +21,7 @@ import {
   type NativeStatusObserverContext,
   type StatusRegistrar,
 } from "../src/session-host/instances";
+import { NativeAgentRegistry } from "../src/session-host/profiles";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
 import type {
   NativeHookRegistration,
@@ -441,27 +442,44 @@ test("without the optional pair: no native source, no hook option, and every pro
   }
 });
 
-test("a manager rejects a half-configured optional pair instead of silently arming nothing", () => {
-  const registrar = new SpyNativeRegistrar();
-  const observerFactory = (context: NativeStatusObserverContext): NativeStatusObserver => new SpyObserver(context);
-  assert.throws(() => new InstanceManager({
-    packageRoot: "/nonexistent",
-    piExecutable: "/nonexistent",
-    statusRegistrar: new RecordingPiRegistrar(),
-    env: {},
-    args: [],
-    nativeCliLaunch: () => { throw new Error("unused"); },
-    nativeHookRegistrar: registrar,
-  } as never), /supplied together or not at all/);
-  assert.throws(() => new InstanceManager({
-    packageRoot: "/nonexistent",
-    piExecutable: "/nonexistent",
-    statusRegistrar: new RecordingPiRegistrar(),
-    env: {},
-    args: [],
-    nativeCliLaunch: () => { throw new Error("unused"); },
-    nativeStatusObserverFactory: observerFactory,
-  } as never), /supplied together or not at all/);
+test("a manager rejects a half-configured optional pair instead of silently arming nothing", async () => {
+  // The default native registry resolves its agent directory before the pair is
+  // validated, so the guard is exercised against this test's own valid, private
+  // HOME and agent directory — never the real user's — and independently of
+  // whether any real default agent directory exists on this machine.
+  const harness = makeOwnerHarness("half-pair", { pair: "absent" });
+  try {
+    const home = join(harness.root, "home");
+    const agentDir = join(harness.root, "native-agent");
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, PI_CODING_AGENT_DIR: agentDir };
+    assert.ok(lstatSync(agentDir).isDirectory(), "the owned agent directory exists");
+    assert.throws(() => lstatSync(join(home, ".pi", "agent")), { code: "ENOENT" }, "the owned HOME has no default agent directory to fall back on");
+    assert.equal(new NativeAgentRegistry({ env }).agentDir, agentDir, "the default registry resolves only the owned agent directory");
+
+    const registrar = new SpyNativeRegistrar();
+    const observerFactory = (context: NativeStatusObserverContext): NativeStatusObserver => new SpyObserver(context);
+    assert.throws(() => new InstanceManager({
+      packageRoot: "/nonexistent",
+      piExecutable: "/nonexistent",
+      statusRegistrar: new RecordingPiRegistrar(),
+      env,
+      args: [],
+      nativeCliLaunch: () => { throw new Error("unused"); },
+      nativeHookRegistrar: registrar,
+    } as never), /supplied together or not at all/);
+    assert.throws(() => new InstanceManager({
+      packageRoot: "/nonexistent",
+      piExecutable: "/nonexistent",
+      statusRegistrar: new RecordingPiRegistrar(),
+      env,
+      args: [],
+      nativeCliLaunch: () => { throw new Error("unused"); },
+      nativeStatusObserverFactory: observerFactory,
+    } as never), /supplied together or not at all/);
+    assert.equal(harness.spawned.length, 0, "the owned harness never launched a child");
+  } finally {
+    await harness.manager.dispose();
+  }
 });
 
 /* -------------------------------------------------------------------------- *

@@ -7673,9 +7673,9 @@ export class SidebarController {
         // input owner: refusing here leaves focus and input ownership exactly
         // where they were instead of handing the child input to a sibling.
         this.noticeError = isNativeCliBackend(entry.item.backend)
-          // A remembered native row is a placeholder only (#277): this host
-          // never resumes a provider conversation, so the refusal names why.
-          ? `${sessionBackendDisplayLabel(entry.item.backend)} sessions are not restored; open New to start one`
+          // An unavailable native row (#277) owns no process this host could
+          // hand input to; its own activity line states why it did not restore.
+          ? `This ${sessionBackendDisplayLabel(entry.item.backend)} conversation is unavailable; remove it to forget it`
           : "This remembered conversation is unavailable; remove it to forget it";
         return;
       }

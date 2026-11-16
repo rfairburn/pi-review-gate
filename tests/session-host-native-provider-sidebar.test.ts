@@ -791,7 +791,7 @@ test("rename, exited resume, and unavailable activation all refuse a native row 
     NATIVE_ITEM,
     { ...NATIVE_ITEM, id: "native-2", label: "Codex", backend: "codex", lifecycle: "exited", hasLiveProcess: false },
     { ...NATIVE_ITEM, id: "native-3", label: "Claude (unavailable)", backend: "claude", lifecycle: "error",
-      hasLiveProcess: false, unavailable: true, activity: ["Claude sessions are not restored; open New to start one"] },
+      hasLiveProcess: false, unavailable: true, activity: ["This remembered Claude session has no known conversation; it was not restarted"] },
   ]);
   void rosterText(harness);
 
@@ -802,8 +802,8 @@ test("rename, exited resume, and unavailable activation all refuse a native row 
   assert.deepEqual(harness.focusedActions(), [], "an unavailable native placeholder is never activated");
   assert.ok(drawnNotice(
     harness.controller.render(40, 30).lines.map((line) => line.replace(SGR_PATTERN, "")),
-    "Claude sessions are not restored; open New to start one",
-  ), "the refusal states why, without offering a Pi resume");
+    "This Claude conversation is unavailable; remove it to forget it",
+  ), "the refusal states what it is, without offering a Pi resume");
 
   harness.send(UP); // -> native-2 (exited)
   assert.equal(harness.controller.selectedId, "native-2");
@@ -833,7 +833,7 @@ test("rename, exited resume, and unavailable activation all refuse a native row 
 test("E on a remembered native placeholder refuses instead of captioning a stale slot", () => {
   const harness = rosterWith([
     { ...NATIVE_ITEM, id: "native-3", lifecycle: "error", hasLiveProcess: false, unavailable: true,
-      activity: ["Claude sessions are not restored; open New to start one"] },
+      activity: ["This remembered Claude session has no known conversation; it was not restarted"] },
   ]);
   void rosterText(harness);
   harness.send(UP); // New -> Saved conversations

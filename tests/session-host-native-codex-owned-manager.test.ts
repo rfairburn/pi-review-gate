@@ -1820,3 +1820,54 @@ test("a descriptor with no plan is the unchanged standalone launch, and Claude a
     rmSync(harness.root, { recursive: true, force: true });
   }
 });
+
+test("an owned Codex restore intent reaches the provider, the backend factory, and the observer context as private metadata only", async () => {
+  const harness = makeHarness("resume-intent");
+  const resumeId = "7c1e2d3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
+  try {
+    const created = harness.manager.create({ workspace: harness.workspace, backend: "codex", nativeResumeConversationId: resumeId } as CreateInstanceOptions);
+    await until(() => harness.factoryRequests.length === 1, "the backend factory runs");
+    const canonical = realpathSync(harness.workspace);
+    assert.equal(harness.providerCalls[0]?.resumeConversationId, resumeId, "the provider receives the private intent");
+    const request = harness.factoryRequests[0]!;
+    assert.equal(request.workspace, canonical, "the factory receives the row's canonical workspace");
+    assert.equal(request.resumeConversationId, resumeId, "the factory receives the private intent");
+    assert.equal(harness.observers[0]?.context.resumeConversationId, resumeId);
+    assert.equal(harness.observers[0]?.context.workspace, canonical);
+    lastLease(harness).fulfillReady();
+    const id = await created;
+    // The rendered TUI argv is exactly the fresh owned argv: nothing here adds a resume argument.
+    assert.deepEqual(lastPty(harness).spawnDescriptor.args, [
+      "--interactive",
+      "--remote", SYNTHETIC_ENDPOINT,
+      "--remote-auth-token-env", SYNTHETIC_AUTH_ENV,
+    ]);
+    assert.equal(JSON.stringify(harness.manager.list()).includes(resumeId), false, "the intent never reaches a public view");
+    assert.deepEqual(harness.manager.readNativeConversationIdentity(id), { targetId: "codex", conversationId: resumeId });
+    lastPty(harness).emitExit(0);
+    harness.settleAll();
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a fresh owned Codex launch forwards its canonical workspace and no resume intent", async () => {
+  const harness = makeHarness("fresh-workspace");
+  try {
+    const created = createCodex(harness);
+    await until(() => harness.factoryRequests.length === 1, "the backend factory runs");
+    const request = harness.factoryRequests[0]!;
+    assert.equal(request.workspace, realpathSync(harness.workspace));
+    assert.equal("resumeConversationId" in request, false);
+    assert.equal("resumeConversationId" in harness.providerCalls[0]!, false);
+    lastLease(harness).fulfillReady();
+    const id = await created;
+    assert.deepEqual(harness.manager.readNativeConversationIdentity(id), { targetId: "codex" });
+    lastPty(harness).emitExit(0);
+    harness.settleAll();
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});

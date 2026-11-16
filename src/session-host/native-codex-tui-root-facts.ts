@@ -1,5 +1,5 @@
 /**
- * Owner-private, retained ordinary-fresh Codex root facts.
+ * Owner-private, retained ordinary-fresh (or exact restored) Codex root facts.
  *
  * This module is a PURE closed-metadata state machine over the private TUI
  * relay's existing event union. It performs no I/O, starts no timer, opens no
@@ -7,7 +7,8 @@
  * message, or event history. Its complete retained state is bounded: one
  * connection generation, one candidate/bound root id, one current root turn id,
  * one current rooted tool fact, one bounded provisional tool fact, one
- * withdrawal reason, and the closed identities of the CURRENT async question
+ * withdrawal reason, the optional expected restored thread id fixed at
+ * construction, and the closed identities of the CURRENT async question
  * queue (see below), which a live terminal retires, each tagged with this
  * source's own ingestion position so one held provisional terminal witness can
  * be applied to exactly the knowledge that preceded it.
@@ -43,7 +44,8 @@
  *
  * Withdrawal is sticky and never rebinds: a second genuine TUI connection, any
  * closed generation, any metadata loss (message or connection scope), a native
- * non-helper `thread/resume` or `thread/fork`, a second native primary
+ * non-helper `thread/resume` or `thread/fork` (for restore mode's mirrored
+ * fences see "Exact restored root" below), a second native primary
  * `thread/start`, or work on a thread other than A. Positive native helper
  * traffic (the relay's own `native-helper` request-id classifier plus a
  * parentless/non-ephemeral start shape) is ignored and never withdraws an
@@ -140,11 +142,67 @@
  *   turn this source neither holds nor knows as current retires nothing, so
  *   duplicates and late items never resurrect and stale terminals never rewind.
  * - Helper and foreign threads can neither add nor clear a question.
+ *
+ * ## Exact restored root (restore mode)
+ *
+ * A binder created with `resumeConversationId` B proves an EXACT restored
+ * root instead of a fresh one. Absent that option the binder is exactly the
+ * fresh-only binder above. Knowing B selects and publishes nothing by itself:
+ * the candidate binding is named only when ALL of the following were
+ * positively observed:
+ *
+ * 1. the same EMPTY owned-backend pre-attach witness;
+ * 2. the same one genuine native `codex-tui` initialize;
+ * 3. the first successful non-helper `thread/resume` whose request's own
+ *    `params.threadId` (the relay's `requestedThreadId`), the response's
+ *    `thread.id`, and the expected B are all the same id, with a parentless,
+ *    non-ephemeral shape.
+ *
+ * It then publishes `candidateThreadId` B in the same candidate snapshot shape
+ * as a fresh candidate, so the owner can save the identity and start its
+ * read-only observation before any prompt. The first own successful
+ * `turn/start` on B binds it exactly as a fresh A is bound. Every fresh fence
+ * still applies, mirrored for the mode: a primary `thread/start`, any
+ * `thread/fork`, a second non-helper resume (of B or of any other thread, such
+ * as an attached child), a requested/response/expected mismatch or a child or
+ * ephemeral resume shape, work on another thread, a second connection, metadata
+ * loss, and a closed generation each withdraw permanently. Native helper
+ * traffic stays ignored. Nothing is adopted from a read, a list, history, the
+ * newest thread, or the UI. This module validates only that B is a bounded
+ * opaque id; whether B is a well-formed provider id and belongs to the saved
+ * workspace is the launcher's and owner's admission, not this binder's.
+ *
+ * The restored native UI starts a NEW, empty question queue and its history
+ * replay never queues a question, so with no contrary live evidence a restored
+ * candidate starts at `none`. Live questions on B can still precede the
+ * candidate response (buffered live notifications, or a restored active goal
+ * running a turn with no own `turn/start`). Because B is known in advance, once
+ * the empty-backend witness and the genuine generation are known this source
+ * PRIVATELY applies B's question, reply, gap, ordinary-input, and live terminal
+ * metadata to the SAME bounded queue it uses for a candidate, publishing
+ * nothing until the candidate proof is complete. A B question metadata gap seen
+ * while that witness is still missing cannot be attributed exactly and becomes
+ * the existing unattributed publication gap (unknown), never pending or none.
+ * There is no second queue, history, timer, or ordering of its own.
+ *
+ * ## Closed generation evidence
+ *
+ * When this source's own generation ends, the withdrawal also carries the
+ * relay's own closed `closeReason` for it (for example `client-closed` when the
+ * TUI ended its connection). It is lifecycle EVIDENCE only, never a claim that
+ * the native session ended normally, and it changes nothing about the sticky
+ * status withdrawal: no root or status is ever rebound. It is retained only
+ * until this source ingests ANY later metadata event (a later connection, a
+ * stray event, or a loss), which drops it and republishes, so an identity-only
+ * consumer can tell "nothing has happened since the generation closed" from
+ * "something did".
  */
 
-import type {
-  NativeCodexTuiRelayMetadataEvent,
-  NativeCodexTuiRelayToolCategory,
+import {
+  NATIVE_CODEX_TUI_RELAY_MAX_ID_CHARS,
+  type NativeCodexTuiRelayGenerationCloseReason,
+  type NativeCodexTuiRelayMetadataEvent,
+  type NativeCodexTuiRelayToolCategory,
 } from "./native-codex-tui-relay";
 
 /** Closed reasons a retained fresh-root observation becomes permanently unusable. */
@@ -153,6 +211,7 @@ export type NativeCodexTuiRootWithdrawalReason =
   | "backend-not-empty"
   | "generation-closed"
   | "metadata-unavailable"
+  | "restored-thread-mismatch"
   | "second-connection"
   | "second-primary-thread-start"
   | "thread-selection-advanced"
@@ -210,6 +269,12 @@ export interface NativeCodexTuiRootFactsSnapshot {
   readonly tool?: NativeCodexTuiRootToolFact;
   /** Present only after a permanent withdrawal. */
   readonly withdrawal?: NativeCodexTuiRootWithdrawalReason;
+  /**
+   * Present only on a `generation-closed` withdrawal: the relay's own closed
+   * reason for this source's generation, and only until any later metadata
+   * event is ingested. Evidence of how the connection ended, never of intent.
+   */
+  readonly closeReason?: NativeCodexTuiRelayGenerationCloseReason;
 }
 
 /**
@@ -345,14 +410,45 @@ const RETIRED_TURN_FENCE = 8;
 
 const EMPTY_SNAPSHOT: NativeCodexTuiRootFactsSnapshot = Object.freeze({ phase: "empty" as const });
 
-/** Create one bounded, pure fresh-root facts binder. */
-export function createNativeCodexTuiRootFactsBinder(): NativeCodexTuiRootFactsBinder {
-  return new NativeCodexTuiRootFactsBinderImpl();
+/** Construction options for {@linkcode createNativeCodexTuiRootFactsBinder}. */
+export interface NativeCodexTuiRootFactsBinderOptions {
+  /**
+   * Expected provider thread B of an exact restored root. Absent: the binder
+   * proves a fresh root only. Present: it proves only the exact restored B and
+   * never a fresh root. A bounded opaque id; by itself it selects nothing.
+   */
+  readonly resumeConversationId?: string;
+}
+
+/** The binder's own bounded closed id rule, matching the relay's id bound. */
+function isBoundedId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= NATIVE_CODEX_TUI_RELAY_MAX_ID_CHARS
+    && !/[\u0000-\u001F\u007F]/.test(value);
+}
+
+/** Create one bounded, pure fresh-root (or exact restored-root) facts binder. */
+export function createNativeCodexTuiRootFactsBinder(
+  options?: NativeCodexTuiRootFactsBinderOptions,
+): NativeCodexTuiRootFactsBinder {
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    throw new TypeError("native Codex TUI root facts options must be an object");
+  }
+  const resumeConversationId = options?.resumeConversationId;
+  if (resumeConversationId !== undefined && !isBoundedId(resumeConversationId)) {
+    throw new TypeError("native Codex TUI root facts resumeConversationId must be a bounded id");
+  }
+  return new NativeCodexTuiRootFactsBinderImpl(resumeConversationId);
 }
 
 class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder {
+  /** Expected restored thread B; undefined for the fresh-only binder. */
+  readonly #expectedThreadId: string | undefined;
   #attestedEmpty = false;
   #withdrawn: NativeCodexTuiRootWithdrawalReason | undefined;
+  /** The relay's reason for this source's own generation close, until any later event. */
+  #closeReason: NativeCodexTuiRelayGenerationCloseReason | undefined;
   #connectionId: string | undefined;
   #candidateThreadId: string | undefined;
   #rootThreadId: string | undefined;
@@ -383,6 +479,10 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   readonly #retiredTurns: string[] = [];
   #snapshot: NativeCodexTuiRootFactsSnapshot = EMPTY_SNAPSHOT;
   #watcher: ((snapshot: NativeCodexTuiRootFactsSnapshot) => void) | undefined;
+
+  constructor(expectedThreadId: string | undefined) {
+    this.#expectedThreadId = expectedThreadId;
+  }
 
   current(): NativeCodexTuiRootFactsSnapshot {
     return this.#snapshot;
@@ -427,7 +527,15 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   }
 
   observe(event: NativeCodexTuiRelayMetadataEvent): void {
-    if (this.#withdrawn !== undefined) return;
+    if (this.#withdrawn !== undefined) {
+      // Status stays withdrawn for good. The only thing a later event changes
+      // is the closed-generation evidence: something happened after the close.
+      if (this.#closeReason !== undefined) {
+        this.#closeReason = undefined;
+        this.#publish();
+      }
+      return;
+    }
     this.#ingested += 1;
 
     if (event.kind === "genuine-tui-initialize") {
@@ -449,6 +557,7 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
         this.withdraw("metadata-unavailable");
         return;
       case "generation-closed":
+        this.#closeReason = isGenerationCloseReason(event.reason) ? event.reason : undefined;
         this.withdraw("generation-closed");
         return;
       case "thread-candidate":
@@ -483,9 +592,34 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     }
   }
 
-  /** The candidate or bound root thread async questions are attributed to. */
+  /**
+   * The candidate or bound root thread async questions are attributed to. In
+   * restore mode, before the candidate response, it is the expected B once
+   * the empty-backend witness and the genuine generation are known: the queue
+   * is then kept PRIVATELY (the snapshot names no candidate and no input yet),
+   * so live B evidence arriving before the response is not lost.
+   */
   #queueThread(): string | undefined {
-    return this.#rootThreadId ?? this.#candidateThreadId;
+    return this.#rootThreadId ?? this.#candidateThreadId ?? this.#privateRestoreQueueThread();
+  }
+
+  #privateRestoreQueueThread(): string | undefined {
+    if (this.#expectedThreadId === undefined || !this.#attestedEmpty || this.#connectionId === undefined) return undefined;
+    return this.#expectedThreadId;
+  }
+
+  /**
+   * Restore mode only, while no queue thread is known yet because the
+   * empty-backend witness is still missing: a question-metadata event that is
+   * or could be B's cannot be retained exactly, so it becomes the existing
+   * unattributed publication gap (unknown) rather than being dropped into a
+   * later false `none`. Nothing is published: no candidate is named yet.
+   */
+  #absorbUnprovableRestoreGap(threadId: string | undefined): void {
+    const expected = this.#expectedThreadId;
+    if (expected === undefined || this.#queueThread() !== undefined) return;
+    if (threadId !== undefined && threadId !== expected) return;
+    this.#gapUnattributedAt = this.#ingested;
   }
 
   /** The registered item (confirmed or provisional) with this id, if any. */
@@ -541,7 +675,10 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
 
   #observeAsyncQuestions(event: AsyncQuestionsEvent): void {
     const root = this.#queueThread();
-    if (root === undefined) return;
+    if (root === undefined) {
+      this.#absorbUnprovableRestoreGap(event.threadId);
+      return;
+    }
     if (event.threadId !== undefined && event.threadId !== root) return; // Helper or foreign thread.
     const turnId = event.turnId;
     if (event.threadId === undefined || turnId === undefined) {
@@ -648,7 +785,10 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
 
   #observeAsyncUnreadable(event: AsyncUnreadableEvent): void {
     const root = this.#queueThread();
-    if (root === undefined) return;
+    if (root === undefined) {
+      if (event.source === "questions") this.#absorbUnprovableRestoreGap(event.threadId);
+      return;
+    }
     if (event.threadId !== undefined && event.threadId !== root) return;
     if (event.source === "questions") {
       const turnId = event.threadId === undefined ? undefined : event.turnId;
@@ -831,6 +971,11 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     // internal, never a root; it must not withdraw a healthy ordinary root.
     if (event.requestIdKind === "native-helper") return;
 
+    if (this.#expectedThreadId !== undefined) {
+      this.#observeRestoreThreadCandidate(event, this.#expectedThreadId);
+      return;
+    }
+
     if (event.origin !== "thread-start") {
       // A native resume/fork advances thread selection instead of proving a
       // fresh start. It is unsupported, not silently adopted.
@@ -848,6 +993,45 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     }
 
     this.#candidateThreadId = event.threadId;
+    this.#publish();
+  }
+
+  /**
+   * Restore mode's non-helper thread candidates. Only the first resume whose
+   * requested id, response id, and expected id are all B, with a parentless,
+   * non-ephemeral shape, names the candidate. The candidate's queue is the one
+   * already kept privately for B, so held live knowledge carries over without
+   * a duplicate event.
+   */
+  #observeRestoreThreadCandidate(event: ThreadCandidateEvent, expected: string): void {
+    if (event.origin === "thread-start") {
+      // A parented or ephemeral start is child/helper structure, ignored
+      // exactly as in fresh mode. A primary start is a fresh selection, which
+      // a restored root never adopts.
+      if (event.parentThreadId !== undefined || event.ephemeral === true) return;
+      this.withdraw(
+        this.#candidateThreadId !== undefined || this.#rootThreadId !== undefined
+          ? "second-primary-thread-start"
+          : "thread-selection-advanced",
+      );
+      return;
+    }
+    if (event.origin === "thread-fork" || this.#candidateThreadId !== undefined || this.#rootThreadId !== undefined) {
+      // A fork, or any later non-helper resume (of B again, a child, or any
+      // other thread), advances selection beyond the one exact restore.
+      this.withdraw("thread-selection-advanced");
+      return;
+    }
+    if (
+      event.requestedThreadId !== expected
+      || event.threadId !== expected
+      || event.parentThreadId !== undefined
+      || event.ephemeral === true
+    ) {
+      this.withdraw("restored-thread-mismatch");
+      return;
+    }
+    this.#candidateThreadId = expected;
     this.#publish();
   }
 
@@ -983,10 +1167,12 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   #buildSnapshot(): NativeCodexTuiRootFactsSnapshot {
     const connectionId = this.#connectionId;
     if (this.#withdrawn !== undefined) {
+      const closeReason = this.#closeReason;
       return Object.freeze({
         phase: "withdrawn" as const,
         ...(connectionId === undefined ? {} : { connectionId }),
         withdrawal: this.#withdrawn,
+        ...(closeReason === undefined ? {} : { closeReason }),
       });
     }
     const rootThreadId = this.#rootThreadId;
@@ -1027,7 +1213,21 @@ function sameSnapshot(a: NativeCodexTuiRootFactsSnapshot, b: NativeCodexTuiRootF
     && a.candidateThreadId === b.candidateThreadId
     && a.asyncInput === b.asyncInput
     && a.withdrawal === b.withdrawal
+    && a.closeReason === b.closeReason
     && sameTool(a.tool, b.tool);
+}
+
+const GENERATION_CLOSE_REASONS: ReadonlySet<string> = new Set<NativeCodexTuiRelayGenerationCloseReason>([
+  "client-closed",
+  "backend-closed",
+  "backend-handshake-rejected",
+  "handshake-timeout",
+  "preflight-overflow",
+  "relay-stopped",
+]);
+
+function isGenerationCloseReason(value: unknown): value is NativeCodexTuiRelayGenerationCloseReason {
+  return typeof value === "string" && GENERATION_CLOSE_REASONS.has(value);
 }
 
 function sameTool(a: NativeCodexTuiRootToolFact | undefined, b: NativeCodexTuiRootToolFact | undefined): boolean {

@@ -25,6 +25,20 @@
  *   to publish.
  * - `expectedCodexHome` (when supplied) is the `CODEX_HOME` the host launched
  *   that exact backend with; a mismatch is a fail-closed `binding` failure.
+ * - `expectedWorkspace` (when supplied) is the row's own exact canonical
+ *   workspace. The census's EXISTING root `thread/read` then also compares the
+ *   provider's cwd for the bound root against it, in place at the transport's
+ *   decode edge (the cwd is never retained). Until that same root read has
+ *   positively matched on the current connection, every published axis stays
+ *   unknown — no Ready, no zero, no count, no input — and after it matches,
+ *   each axis keeps exactly its ordinary complete-census authority. Only then,
+ *   and only after the same generation/root/transport/connection/census stale
+ *   checks, is `onRootValidated` called; staleness is re-checked after it. A
+ *   later POSITIVE contradiction by that same read (another thread's row, or
+ *   the root in another workspace) retires the proof and calls
+ *   `onRootContradicted` under the same fences; an unreadable or failed read
+ *   is neither. A caller that omits these options gets exactly the
+ *   unvalidated behavior.
  *
  * The observer never adopts a thread, never subscribes (`thread/resume` is not
  * something it can send), and never answers a provider request. See
@@ -216,6 +230,11 @@ export type NativeCodexRpcStatusDiagnosticCode =
   | "root-not-loaded"
   /** The sub-agent census could not be completed; tasks published unknown. */
   | "tasks-incomplete"
+  /**
+   * The bound root's provider cwd did not positively match the caller's
+   * expected workspace (or the row describing it named another thread).
+   */
+  | "root-workspace-unverified"
   /** The sub-agent census found a parent cycle. */
   | "tasks-cycle"
   /** The background-terminal census could not be completed; shells published unknown. */
@@ -349,6 +368,27 @@ export interface NativeCodexRpcStatusObserverOptions {
   readonly generation: string;
   /** Optional `CODEX_HOME` equality corroboration. Never retained. */
   readonly expectedCodexHome?: string;
+  /**
+   * Optional exact canonical workspace the bound root must positively belong to.
+   * Present: nothing but all-unknown is published until the census's own root
+   * read matched it on the current connection. Absent: unchanged behavior.
+   */
+  readonly expectedWorkspace?: string;
+  /**
+   * Called after a census's own root read positively matched `expectedWorkspace`
+   * for the bound root on the current connection, once its stale checks passed.
+   * It carries nothing; it may be called again by later censuses. Never called
+   * without `expectedWorkspace`.
+   */
+  readonly onRootValidated?: () => void;
+  /**
+   * Called after a census's own root read POSITIVELY contradicted the binding —
+   * a readable row for another thread, or the bound root in a different
+   * workspace — once the same stale checks passed. An unreadable or failed read
+   * is not a contradiction and never calls it. Never called without
+   * `expectedWorkspace`.
+   */
+  readonly onRootContradicted?: () => void;
   /** One complete, de-duplicated snapshot. */
   readonly onObservation: (observation: NativeStatusObservation) => void;
   /** Closed diagnostic codes only. */
@@ -494,6 +534,16 @@ export class NativeCodexRpcStatusObserver {
   #rootThreadId: string;
   #generation: string;
   #expectedCodexHome: string | undefined;
+  readonly #expectedWorkspace: string | undefined;
+  readonly #onRootValidated: (() => void) | undefined;
+  readonly #onRootContradicted: (() => void) | undefined;
+  /**
+   * True once the census's own root read positively matched the expected
+   * workspace on the CURRENT connection and binding. Cleared by any
+   * disconnect, retirement, rebind, or contrary root read. Meaningless (and
+   * never consulted) without an expected workspace.
+   */
+  #rootValidated = false;
 
   #transport: NativeCodexRpcTransport | null = null;
   #connectionSeq = 0;
@@ -555,6 +605,13 @@ export class NativeCodexRpcStatusObserver {
     this.#generation = generation;
     this.#endpoint = options.endpoint;
     this.#expectedCodexHome = options.expectedCodexHome;
+    this.#expectedWorkspace = typeof options.expectedWorkspace === "string" && options.expectedWorkspace.length > 0
+      ? options.expectedWorkspace
+      : undefined;
+    this.#onRootValidated = typeof options.onRootValidated === "function" ? options.onRootValidated : undefined;
+    this.#onRootContradicted = typeof options.onRootContradicted === "function"
+      ? options.onRootContradicted
+      : undefined;
     this.#limits = normalizeLimits(options.limits);
     this.#scheduler = options.scheduler ?? REAL_SCHEDULER;
     this.#onObservation = options.onObservation;
@@ -754,6 +811,7 @@ export class NativeCodexRpcStatusObserver {
     this.#queued = false;
     this.#forceQueued = false;
     this.#currentCensus = null;
+    this.#rootValidated = false;
     this.#rootStatus = null;
     this.#tasks = null;
     this.#shells = null;
@@ -867,7 +925,9 @@ export class NativeCodexRpcStatusObserver {
     this.#inFlight = false;
     this.#queued = false;
     // A real failure withdraws every axis: a stale number must never be
-    // republished as fresh, and it must never be laundered into a zero.
+    // republished as fresh, and it must never be laundered into a zero. A
+    // workspace proof belongs to the connection that made it.
+    this.#rootValidated = false;
     this.#rootStatus = null;
     this.#tasks = null;
     this.#shells = null;
@@ -1000,6 +1060,19 @@ export class NativeCodexRpcStatusObserver {
   }
 
   #buildObservation(): NativeStatusObservation {
+    if (this.#expectedWorkspace !== undefined && !this.#rootValidated) {
+      // The bound root is not yet proved to belong to the caller's workspace on
+      // this connection: no axis may claim anything about it, so a wrong
+      // workspace can never surface a Ready, a zero, a count, or an input none.
+      return {
+        busy: null,
+        pendingInput: null,
+        activity: [],
+        activeTasks: null,
+        activeShells: null,
+        support: NATIVE_CODEX_RPC_STATUS_SUPPORT,
+      };
+    }
     const projected = projectNativeCodexRootStatus(this.#rootStatus);
     const status = this.#rootStatus;
     const activity: string[] = [];
@@ -1040,6 +1113,7 @@ export class NativeCodexRpcStatusObserver {
 
   /** Retire everything the current binding proved, without reconnecting. */
   #retireObservation(): void {
+    this.#rootValidated = false;
     this.#rootStatus = null;
     this.#tasks = null;
     this.#shells = null;
@@ -1183,17 +1257,63 @@ export class NativeCodexRpcStatusObserver {
       // 1. Root snapshot. Status broadcasts are additive, not authoritative:
       //    every census re-reads the bound root.
       try {
-        const rootRow = await transport.readThread(rootThreadId);
+        const expectedWorkspace = this.#expectedWorkspace;
+        let rootRow: NativeCodexThreadRow | null;
+        let workspaceVerdict: "match" | "contrary" | "unread" = "unread";
+        if (expectedWorkspace === undefined) {
+          rootRow = await transport.readThread(rootThreadId);
+        } else {
+          // The SAME root read, compared against the caller's exact workspace
+          // at the transport's decode edge; only the closed verdict comes back.
+          const read = await transport.readThreadInWorkspace(rootThreadId, expectedWorkspace);
+          rootRow = read?.row ?? null;
+          if (read !== null) {
+            workspaceVerdict = read.row.threadId === rootThreadId && read.workspaceMatches ? "match" : "contrary";
+          }
+        }
         if (stale()) return;
-        if (rootRow === null || rootRow.threadId !== rootThreadId) {
+        if (expectedWorkspace !== undefined && workspaceVerdict !== "match") {
+          // A positive contrary answer retires this connection's proof. An
+          // unreadable answer proves nothing either way: it neither validates
+          // nor un-validates the root, and the read failure stays its own fact.
+          this.#rootStatus = null;
+          if (workspaceVerdict === "contrary") {
+            this.#rootValidated = false;
+            this.#diagnostic("root-workspace-unverified");
+            if (this.#onRootContradicted !== undefined) {
+              // Same fences as a validation, and the caller may retire this
+              // observer from inside its callback.
+              try {
+                this.#onRootContradicted();
+              } catch {
+                // A caller's throw cannot corrupt this census.
+              }
+              if (stale()) return;
+            }
+          } else {
+            this.#diagnostic("root-read-failed");
+          }
+        } else if (rootRow === null || rootRow.threadId !== rootThreadId) {
           this.#rootStatus = null;
           this.#diagnostic("root-read-failed");
         } else {
+          if (expectedWorkspace !== undefined) this.#rootValidated = true;
           this.#noteRootStatus(rootRow.status);
           // A thread the provider just described is in its in-memory model unless
           // it explicitly reports `notLoaded`, and only such a thread can own a
           // running background terminal.
           walk.rootLive = rootRow.status.kind !== "notLoaded";
+          if (expectedWorkspace !== undefined && this.#onRootValidated !== undefined) {
+            // Every fence above already passed for this exact read. The caller
+            // may retire this observer from inside its callback, so staleness
+            // is checked again before the census continues.
+            try {
+              this.#onRootValidated();
+            } catch {
+              // A caller's throw cannot corrupt this census.
+            }
+            if (stale()) return;
+          }
         }
       } catch {
         if (stale()) return;

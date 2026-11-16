@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { NativeStatusObserver } from "../src/session-host/instances";
-import { createNativeStatusObserver } from "../src/session-host/native-observer-factory";
+import {
+  createNativeStatusObserver,
+  createNativeStatusObserverFactory,
+} from "../src/session-host/native-observer-factory";
 import type { NativeStatusObservation } from "../src/session-host/native-status";
 
 test("Claude factory supplies the actual source applicability and unknown initial observation", () => {
@@ -101,4 +107,109 @@ test("only the Claude source can state a launch baseline; Codex keeps its unknow
     claude.dispose();
     codex.dispose();
   }
+});
+
+const RESTORED_ID = "1d6f2b9e-3c4a-4e5f-9a0b-1c2d3e4f5a6b";
+
+function withWorkspace(run: (workspace: string) => void): void {
+  const workspace = realpathSync(mkdtempSync(join(tmpdir(), "prg-observer-factory-")));
+  try {
+    run(workspace);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+test("the factory forwards the owner-private restoration inputs to the Claude source, which proves its own resume", () => {
+  withWorkspace((workspace) => {
+    for (const factory of [createNativeStatusObserver, createNativeStatusObserverFactory({ ownedCodexBackend: true })]) {
+      const observations: NativeStatusObservation[] = [];
+      const identities: (string | null)[] = [];
+      const observer = factory({
+        rowId: "claude-row",
+        backend: "claude",
+        emit: (value) => { observations.push(value); return { accepted: true } as never; },
+        workspace,
+        resumeConversationId: RESTORED_ID,
+        emitConversationIdentity: (id) => { identities.push(id); return true; },
+      }) as NativeStatusObserver;
+      try {
+        observer.observeOwnedStartup?.();
+        assert.equal(observations.length, 0, "an unproved restored Claude spawn states no idle or empty baseline");
+        assert.deepEqual(identities, [], "the admitted id is an expectation, never reported unproved");
+        observer.acceptHook({
+          backend: "claude", hook_event_name: "SessionStart", session_id: RESTORED_ID, source: "resume", cwd: workspace,
+        } as never);
+        assert.deepEqual(identities, [RESTORED_ID], "the run's own root resume in the workspace proves the id");
+        for (const observation of observations) {
+          assert.equal(JSON.stringify(observation).includes(RESTORED_ID), false, "no private id rides a status observation");
+          assert.equal("backgroundTasks" in observation || "backgroundShells" in observation, false, "never ownership counts");
+        }
+        // Activation plus the exact proof is the owner's ordinary launch baseline.
+        const latest = observations[observations.length - 1];
+        assert.equal(latest?.busy, false);
+        assert.equal(latest?.pendingInput, false);
+        assert.deepEqual(latest?.activity, ["Ready"]);
+        assert.equal(latest?.activeTasks, 0);
+        assert.equal(latest?.activeShells, 0);
+      } finally {
+        observer.dispose();
+      }
+    }
+  });
+});
+
+test("without the optional inputs the Claude source proves nothing, and the legacy Codex lane never reports identity", () => {
+  withWorkspace((workspace) => {
+    const fresh: (string | null)[] = [];
+    const claude = createNativeStatusObserver({
+      rowId: "claude-row", backend: "claude", emit: () => undefined,
+      emitConversationIdentity: (id) => { fresh.push(id); return true; },
+    });
+    const legacyIdentities: (string | null)[] = [];
+    const codex = createNativeStatusObserver({
+      rowId: "codex-row", backend: "codex", emit: () => undefined,
+      workspace, resumeConversationId: RESTORED_ID,
+      emitConversationIdentity: (id) => { legacyIdentities.push(id); return true; },
+    });
+    try {
+      claude.acceptHook({
+        backend: "claude", hook_event_name: "SessionStart", session_id: RESTORED_ID, source: "startup", cwd: workspace,
+      } as never);
+      assert.deepEqual(fresh, [], "with no workspace the source cannot prove a root conversation");
+      codex.acceptHook({
+        backend: "codex", hook_event_name: "SessionStart", session_id: RESTORED_ID, source: "resume", cwd: workspace,
+      } as never);
+      assert.deepEqual(legacyIdentities, [], "the legacy Codex hook lane proves no conversation identity");
+      assert.deepEqual(codex.support, {
+        agent: "supported", input: "unsupported", tasks: "unsupported", shells: "unsupported", activity: "supported",
+      }, "the legacy Codex declaration is unchanged");
+    } finally {
+      claude.dispose();
+      codex.dispose();
+    }
+  });
+});
+
+test("an owned-Codex host builds its restoring Codex consumer from the same context without touching identity unproved", () => {
+  withWorkspace((workspace) => {
+    const identities: (string | null)[] = [];
+    const observer = createNativeStatusObserverFactory({ ownedCodexBackend: true })({
+      rowId: "codex-row",
+      backend: "codex",
+      emit: () => ({ accepted: true }) as never,
+      workspace,
+      resumeConversationId: RESTORED_ID,
+      emitConversationIdentity: (id) => { identities.push(id); return true; },
+    }) as NativeStatusObserver;
+    try {
+      observer.acceptHook({
+        backend: "codex", hook_event_name: "SessionStart", session_id: RESTORED_ID, source: "resume", cwd: workspace,
+      } as never);
+      observer.invalidate?.();
+      assert.deepEqual(identities, [], "no relay hook or invalidation alone proves or withdraws an unproved restore");
+    } finally {
+      observer.dispose();
+    }
+  });
 });

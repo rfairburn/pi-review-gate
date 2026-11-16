@@ -976,3 +976,135 @@ test("the remembered roster keeps one native display name and refuses anything u
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The remembered native restart identity (issue #277 restoration identity slice)
+//
+// A native CLI slot may carry the exact launch-target id and the exact
+// provider-issued conversation UUID, independently. Absence publishes no field,
+// so every older document stays byte-identical; a malformed value, or either
+// field on a Pi slot, refuses the whole document.
+// ---------------------------------------------------------------------------
+
+const NATIVE_UUID = "0b9c3e5a-1f2d-4c6b-8a7e-9d0f1e2a3b4c";
+
+test("the remembered roster keeps the exact native target and conversation identity and refuses misuse", () => {
+  // Every field combination round-trips on a native slot; neither field is invented.
+  for (const backend of ["claude", "codex"] as const) {
+    const both = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", displayName: "Build", backend, nativeTargetId: "work-profile", nativeConversationId: NATIVE_UUID }],
+    });
+    assert.deepEqual(localSlot(both), { slotId: "s1", workspace: "/srv/app", displayName: "Build", backend, nativeTargetId: "work-profile", nativeConversationId: NATIVE_UUID });
+    assert.equal(localSlot(both)?.sessionId, undefined, "the opaque native id never becomes the Pi sessionId");
+    const targetOnly = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend, nativeTargetId: backend }],
+    });
+    assert.deepEqual(localSlot(targetOnly), { slotId: "s1", workspace: "/srv/app", backend, nativeTargetId: backend });
+    const conversationOnly = parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend, nativeConversationId: NATIVE_UUID.toUpperCase() }],
+    });
+    assert.equal(localSlot(conversationOnly)?.nativeConversationId, NATIVE_UUID.toUpperCase());
+    assert.equal("nativeTargetId" in (localSlot(conversationOnly) ?? {}), false);
+  }
+
+  // Malformed identities refuse the WHOLE document, even beside a valid entry.
+  const badConversations: unknown[] = [
+    "", "latest", "last", "my session", "/home/me/.claude/projects/x.jsonl", NATIVE_UUID.slice(0, -1),
+    `${NATIVE_UUID}0`, `{${NATIVE_UUID}}`, `urn:uuid:${NATIVE_UUID}`, ` ${NATIVE_UUID}`, `${NATIVE_UUID}\n`,
+    NATIVE_UUID.replace(/-/g, ""), NATIVE_UUID.replace("0b", "0g"), 1, null, true, {},
+  ];
+  for (const nativeConversationId of badConversations) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        { slotId: "ok", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+        { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId },
+      ],
+    }), undefined, `conversation ${JSON.stringify(nativeConversationId)} is not an exact provider id`);
+  }
+  for (const nativeTargetId of ["", "x".repeat(129), "bad\ntarget", "bad\u0085target", 7, null, false]) {
+    assert.equal(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/ws", backend: "codex", nativeTargetId }],
+    }), undefined, `target ${JSON.stringify(nativeTargetId)} is not a native target id`);
+  }
+
+  // Either native field on a Pi slot, explicit or default, refuses the document.
+  for (const piBackend of [{}, { backend: "pi" }]) {
+    for (const field of [{ nativeTargetId: "claude" }, { nativeConversationId: NATIVE_UUID }]) {
+      assert.equal(parseStoredRoster({
+        version: ROSTER_STORE_VERSION,
+        entries: [{ slotId: "s1", sessionId: "conv-1", workspace: "/ws", ...piBackend, ...field }],
+      }), undefined, `a Pi slot never carries ${Object.keys(field)[0]}`);
+    }
+  }
+
+  // Duplicate-slot handling is unchanged, and two slots may share a conversation id.
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+      { slotId: "s1", workspace: "/ws", backend: "claude" },
+    ],
+  }), undefined);
+  assert.equal(parseStoredRoster({
+    version: ROSTER_STORE_VERSION,
+    entries: [
+      { slotId: "s1", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+      { slotId: "s2", workspace: "/ws", backend: "claude", nativeConversationId: NATIVE_UUID },
+    ],
+  })?.entries.length, 2, "no new duplicate conversation policy is imposed");
+});
+
+test("old documents publish byte-identically and native identity round-trips beside Pi and remote order", () => {
+  const root = makeRoot("native-identity");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  try {
+    const old: StoredRoster = {
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        { slotId: "pi", sessionId: "conv-1", workspace: "/ws", name: "Pi", persistence: "saved" },
+        { kind: "remote", hostId: "dest-1", owner: { kind: "slot", id: "remote-slot" } },
+        { slotId: "cl", workspace: "/srv/app", displayName: "Caption", backend: "claude" },
+      ],
+      activeSlotId: "cl",
+    };
+    writeRosterStore(agentDir, old);
+    assert.equal(readFileSync(rosterStorePath(agentDir), "utf8"), `${JSON.stringify(old)}\n`,
+      "a document without native identity is published byte-for-byte as before");
+
+    const withIdentity: StoredRoster = {
+      version: ROSTER_STORE_VERSION,
+      entries: [
+        old.entries[0],
+        old.entries[1],
+        { slotId: "cl", workspace: "/srv/app", displayName: "Caption", backend: "claude", nativeTargetId: "claude", nativeConversationId: NATIVE_UUID },
+        { slotId: "cx", workspace: "/srv/other", backend: "codex", nativeTargetId: "codex-alt" },
+      ],
+      activeSlotId: "cx",
+    };
+    writeRosterStore(agentDir, withIdentity);
+    const loaded = readRosterStore(agentDir);
+    assert.equal(loaded.status, "loaded");
+    assert.deepEqual(loaded.status === "loaded" ? loaded.roster : undefined, withIdentity,
+      "order, Pi sessionId, remote placement, active slot, and native identity all round-trip exactly");
+    const text = readFileSync(rosterStorePath(agentDir), "utf8");
+    for (const forbidden of ["file", "args", "env", "command", "executable", "credential"]) {
+      assert.equal(text.includes(`"${forbidden}"`), false, `no ${forbidden} is ever persisted`);
+    }
+
+    // Publication validates too: Pi misuse never reaches the store.
+    assert.throws(() => writeRosterStore(agentDir, {
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "pi", sessionId: "conv-1", workspace: "/ws", nativeConversationId: NATIVE_UUID }],
+    }));
+    const after = readRosterStore(agentDir);
+    assert.deepEqual(after.status === "loaded" ? after.roster : undefined, withIdentity, "the refused publication changed nothing");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

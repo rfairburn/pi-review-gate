@@ -100,9 +100,11 @@ import type {
 	NativeHookFailure,
 } from "./native-hook-protocol";
 import {
+	NATIVE_CLI_DEFAULT_TARGET_IDS,
 	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
 	type NativeCodexOwnedLaunchPlan,
 } from "./native-cli-launch";
+import { isNativeConversationId } from "./native-conversation";
 import type {
 	OwnedCodexBackendLaunchIdentity,
 	OwnedCodexBackendLease,
@@ -914,6 +916,17 @@ export interface CreateInstanceOptions {
 	 * with a Pi backend is refused before anything is posted.
 	 */
 	nativeCliTarget?: string;
+	/**
+	 * INTERNAL owner-only restart restoration intent (issue #277): the exact
+	 * provider-issued conversation UUID this native CLI row is asked to resume.
+	 * It is validated before any row exists (a native backend only, and an exact
+	 * UUID — never a name, alias, or path), and forwarded only through the private
+	 * launch request, owned-backend request, and observer context. It is never a Pi
+	 * `sessionId`, never a status value, and never part of a public, peer, or
+	 * network view. Combining it with a Pi backend is refused before anything is
+	 * posted.
+	 */
+	nativeResumeConversationId?: string;
 }
 
 /**
@@ -944,6 +957,13 @@ export interface NativeCliLaunchRequest {
 	readonly env: NodeJS.ProcessEnv;
 	readonly targetId?: string;
 	readonly nativeHook?: NativeCliNativeHookLaunchOption;
+	/**
+	 * Owner-private restart restoration intent: the exact admitted conversation
+	 * UUID, present only when the row was created with
+	 * {@linkcode CreateInstanceOptions.nativeResumeConversationId}. Absence is every
+	 * fresh launch, exactly as before.
+	 */
+	readonly resumeConversationId?: string;
 }
 
 /**
@@ -1010,6 +1030,17 @@ export interface OwnedCodexBackendLaunchRequest {
 	 * signal is an additional path and never the only one.
 	 */
 	readonly signal: AbortSignal;
+	/**
+	 * Owner-private metadata: this row's canonical workspace (the TUI's cwd). It is
+	 * descriptive for the factory and changes nothing the plan renders.
+	 */
+	readonly workspace?: string;
+	/**
+	 * Owner-private metadata: the exact admitted restart restoration conversation
+	 * UUID, present only for a row created with a resume intent. It changes nothing
+	 * the plan renders.
+	 */
+	readonly resumeConversationId?: string;
 }
 
 /**
@@ -1153,6 +1184,36 @@ export interface NativeStatusObserverContext {
 	 * claims nothing: it returns a rejection, never queues, retries, or replays.
 	 */
 	emit(observation: NativeStatusObservation): NativeStatusSubmitResult;
+	/**
+	 * Owner-private: this row's canonical workspace. The production manager always
+	 * supplies it; it is optional only for direct callers of an observer factory.
+	 */
+	readonly workspace?: string;
+	/**
+	 * Owner-private: the exact admitted restart restoration conversation UUID,
+	 * present only for a row created with a resume intent. It is an expectation to
+	 * prove, never a proof.
+	 */
+	readonly resumeConversationId?: string;
+	/**
+	 * Owner-private IDENTITY channel (issue #277 restart restoration), separate from
+	 * {@linkcode NativeStatusObserverContext.emit}: report the exact provider
+	 * conversation UUID this source has positively proved is the run's CURRENT
+	 * conversation, or an EXPLICIT `null` when a previously proved identity was
+	 * lost while the run is live. A source must not report `null` merely because it
+	 * has no proof yet, and an unknown busy/input/count status is never an identity
+	 * loss. It is not a status value and proves nothing about persistence, idleness,
+	 * input, or counts.
+	 *
+	 * The manager accepts it only through the same exact run fences as `emit`
+	 * (current record and run, activated capture, same live PTY handle, process
+	 * incarnation, and observer generation); before activation and after retirement
+	 * it returns `false` and never queues, retries, or replays. A malformed id is
+	 * refused. For a restoring row, until the expected id itself is proved, any other
+	 * id is refused and an explicit `null` changes nothing. `true` means the identity
+	 * was accepted.
+	 */
+	readonly emitConversationIdentity?: (conversationId: string | null) => boolean;
 }
 
 /**
@@ -1324,6 +1385,36 @@ interface ManagedInstance {
 	 * needs no second marker.
 	 */
 	backend?: SessionBackend;
+	/**
+	 * Native CLI rows only: the exact launch-target id this row was launched with —
+	 * the explicit operator target, or the backend's default target id. Owner-private
+	 * restart identity; never in a view, wire frame, status value, or log.
+	 */
+	nativeCliTarget?: string;
+	/**
+	 * Native CLI rows only: the admitted restart restoration intent this row was
+	 * created with. Immutable for the row; owner-private.
+	 */
+	nativeResumeConversationId?: string;
+	/**
+	 * Native CLI rows only: the last exact provider conversation UUID this host may
+	 * durably remember for the row — the admitted resume intent until proof, then the
+	 * last positively proved identity. It survives the child's exit, a stop, and an
+	 * observer's retirement; only an accepted explicit live withdrawal clears it.
+	 * Owner-private: never a Pi `sessionId`, status value, view field, or log line.
+	 */
+	nativeConversationId?: string;
+	/**
+	 * True once the restoring row's expected conversation was positively proved by
+	 * its own live run (or, for a fresh row, once any identity was proved). Until
+	 * then a restoring row accepts only its expected id.
+	 */
+	nativeConversationConfirmed?: boolean;
+	/**
+	 * True while a positively proved identity is active in the current live run; only
+	 * then can an explicit `null` withdraw it.
+	 */
+	nativeConversationLive?: boolean;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
@@ -3095,6 +3186,17 @@ export class InstanceManager {
 		} else if (nativeCliTarget !== undefined) {
 			throw new Error("session-host: a native CLI launch target is only valid for a native CLI backend");
 		}
+		// The owner-only restoration intent is admitted only as one exact provider UUID
+		// for a native CLI row, before any row, reservation, or callback exists.
+		const nativeResumeConversationId = options.nativeResumeConversationId;
+		if (nativeResumeConversationId !== undefined) {
+			if (!isNativeCliBackend(backend)) {
+				throw new Error("session-host: a native conversation resume is only valid for a native CLI backend");
+			}
+			if (!isNativeConversationId(nativeResumeConversationId)) {
+				throw new Error("session-host: the native conversation resume id must be an exact provider conversation id");
+			}
+		}
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
 		// cannot both spawn, including pending creations of siblings.
@@ -3111,6 +3213,16 @@ export class InstanceManager {
 			agentDir: "",
 			lifecycle: "starting",
 			...(options.backend === undefined ? {} : { backend }),
+			...(isNativeCliBackend(backend)
+				? {
+					nativeCliTarget: nativeCliTarget ?? NATIVE_CLI_DEFAULT_TARGET_IDS[backend],
+					...(nativeResumeConversationId === undefined
+						? {}
+						: { nativeResumeConversationId, nativeConversationId: nativeResumeConversationId }),
+					nativeConversationConfirmed: false,
+					nativeConversationLive: false,
+				}
+				: {}),
 			busy: null,
 			pendingInput: null,
 			inputSurface: false,
@@ -4284,6 +4396,14 @@ export class InstanceManager {
 		record.activeTasks = null;
 		record.activeShells = null;
 		record.activity = [];
+		// This is loss of the live observation generation, not an ordinary unknown
+		// status snapshot. Once it can no longer track conversation switches, its
+		// last proved identity cannot remain a current restart target. A run that
+		// never confirmed its restore keeps the admitted id for retry instead.
+		if (record.nativeConversationLive === true) {
+			record.nativeConversationLive = false;
+			delete record.nativeConversationId;
+		}
 		// Retiring the generation is part of the accepted invalidation, not a later step:
 		// no callback of this generation — submit or invalidate — can land after it.
 		record.nativeStatusObserverGeneration += 1;
@@ -4378,6 +4498,12 @@ export class InstanceManager {
 				rowId: record.id,
 				backend,
 				emit: (observation) => this.#emitNativeStatus(record, run, observation),
+				workspace: record.workspace,
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
+				emitConversationIdentity: (conversationId) =>
+					this.#emitNativeConversationIdentity(record, run, conversationId),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -4527,6 +4653,100 @@ export class InstanceManager {
 			return nativeStatusRejected("no-live-run");
 		}
 		return capture.submit(observation);
+	}
+
+	/**
+	 * The ONLY write path for this run's provider conversation IDENTITY (issue #277
+	 * restart restoration). It is fenced exactly like {@linkcode #emitNativeStatus}
+	 * and its capture: the current record and run, an activated capture, and that
+	 * capture's own live PTY handle, process incarnation, and observer generation, on
+	 * an unexited, un-stopping, undisposed row. Anything else claims nothing and is
+	 * never queued, retried, or replayed.
+	 *
+	 * A string must be one exact provider UUID. A restoring row whose expected id is
+	 * not yet proved accepts only that id (which confirms it); once confirmed, a
+	 * later positively proved id follows the provider's own current conversation. An
+	 * explicit `null` clears the remembered identity only while a proved identity is
+	 * active in this live run; before any proof it changes nothing, so a restoring
+	 * row keeps its admitted id for a durable retry. Normal retirement never clears.
+	 */
+	#emitNativeConversationIdentity(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		conversationId: string | null,
+	): boolean {
+		if (run.retired || !run.activated || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		if (conversationId === null) {
+			if (record.nativeConversationLive !== true) {
+				return false;
+			}
+			record.nativeConversationLive = false;
+			if (record.nativeConversationId === undefined) {
+				return true;
+			}
+			delete record.nativeConversationId;
+			this.#safeChanged(record.id);
+			return true;
+		}
+		if (!isNativeConversationId(conversationId)) {
+			return false;
+		}
+		const expected = record.nativeResumeConversationId;
+		if (expected !== undefined && record.nativeConversationConfirmed !== true && conversationId !== expected) {
+			return false;
+		}
+		record.nativeConversationConfirmed = true;
+		record.nativeConversationLive = true;
+		if (record.nativeConversationId === conversationId) {
+			return true;
+		}
+		record.nativeConversationId = conversationId;
+		this.#safeChanged(record.id);
+		return true;
+	}
+
+	/**
+	 * Owner-only restart identity of one local native CLI row (issue #277): the exact
+	 * launch-target id and, when known, the last exact provider conversation UUID this
+	 * host may durably remember for it (including a restoring row's admitted id while
+	 * its proof is still pending — a retry fact, never a live status claim). Exited
+	 * rows still answer; a Pi row or an absent row answers `undefined`. It is for the
+	 * owner's own roster projection only and is never part of a public, peer, or
+	 * network view.
+	 */
+	readNativeConversationIdentity(instanceId: string): { readonly targetId: string; readonly conversationId?: string } | undefined {
+		const record = this.#records.get(instanceId);
+		if (record === undefined || !isNativeCliBackend(record.backend) || record.nativeCliTarget === undefined) {
+			return undefined;
+		}
+		return Object.freeze({
+			targetId: record.nativeCliTarget,
+			...(record.nativeConversationId === undefined ? {} : { conversationId: record.nativeConversationId }),
+		});
+	}
+
+	/**
+	 * Owner-only proof fact of one local native CLI row (issue #277): `true` once
+	 * this row's own live run positively proved a conversation identity (for a
+	 * restoring row, its exact admitted id), `false` while that proof is still
+	 * pending or never arrived, and `false` for a Pi or absent row. It distinguishes
+	 * a restoring row's still-unproved retry intent from a proved identity for the
+	 * owner's own presentation only; it is never persisted, never a status value,
+	 * and never part of a public, peer, or network view.
+	 */
+	hasProvedNativeConversation(instanceId: string): boolean {
+		const record = this.#records.get(instanceId);
+		return record !== undefined && isNativeCliBackend(record.backend) && record.nativeConversationConfirmed === true;
 	}
 
 	/**
@@ -4857,7 +5077,15 @@ export class InstanceManager {
 		});
 		let created: unknown;
 		try {
-			created = factory({ identity, plan, signal: controller.signal });
+			created = factory({
+				identity,
+				plan,
+				signal: controller.signal,
+				workspace: record.workspace,
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
+			});
 		} catch {
 			// The factory reports its own failure; no message, argument, or path of theirs
 			// is ever carried into this row's state.
@@ -5781,6 +6009,9 @@ export class InstanceManager {
 				env: { ...this.#env },
 				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
 				...(nativeHook === undefined ? {} : { nativeHook }),
+				...(record.nativeResumeConversationId === undefined
+					? {}
+					: { resumeConversationId: record.nativeResumeConversationId }),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator

@@ -77,7 +77,10 @@
  *   turn that this connection's own successful response named. They are NOT a
  *   root selection, NOT proof of the row's primary session, and NOT a claim that
  *   any thread is the root. Native helper request ids are labelled so a consumer
- *   can exclude them; nothing here infers a root from the last success.
+ *   can exclude them; nothing here infers a root from the last success. A
+ *   resume/fork candidate also carries the request's own original
+ *   `params.threadId` as `requestedThreadId`, so a consumer can compare what
+ *   was asked for with what the success named; it is an id only.
  * - `input-request` / `input-response` cover only the allowlisted human-input
  *   and approval methods. Other backend requests (a clock read, a tool call,
  *   an auth refresh, any future method) are forwarded untouched and are never
@@ -286,6 +289,14 @@ export interface NativeCodexTuiRelayThreadCandidateEvent extends NativeCodexTuiR
   readonly origin: NativeCodexTuiRelayThreadOrigin;
   readonly requestIdKind: NativeCodexTuiRelayRequestIdKind;
   readonly threadId: string;
+  /**
+   * For `thread-resume` and `thread-fork` only: the request's OWN original
+   * `params.threadId` (the thread the TUI asked to resume, or forked from),
+   * paired with this exact successful response. It is never copied from the
+   * response and is absent when the request named no bounded id. An id only:
+   * no other request parameter is retained or projected.
+   */
+  readonly requestedThreadId?: string;
   readonly parentThreadId?: string;
   readonly ephemeral?: boolean;
 }
@@ -1242,6 +1253,10 @@ class MetadataTap {
       requestIdKind: isHelperRequestId(pending.idText) ? "native-helper" : "native",
       threadId,
     };
+    // The requested thread is the request's own captured `params.threadId`,
+    // correlated to THIS success only; an error response projected nothing
+    // above. A thread/start carries no requested thread.
+    if (pending.origin !== "thread-start" && pending.threadId !== null) event.requestedThreadId = pending.threadId;
     const parentThreadId = readBoundedId(nestedValue(message.result, ["parentThreadId"]))
       ?? readBoundedId(nestedValue(message.result, ["thread", "parentThreadId"]));
     if (parentThreadId !== null) event.parentThreadId = parentThreadId;

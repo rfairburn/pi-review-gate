@@ -248,7 +248,7 @@ test("the native card title is the operator's caption, or the stable provider la
     lifecycle: "error",
     hasLiveProcess: false,
     unavailable: true,
-    activity: ["Claude sessions are not restored; open New to start one"],
+    activity: ["This remembered Claude session has no known conversation; it was not restarted"],
   })]);
   assert.ok(placeholder.includes("Fleet work (unavailable)"),
     `a remembered placeholder keeps its caption and still states it is unavailable: ${placeholder}`);
@@ -257,7 +257,7 @@ test("the native card title is the operator's caption, or the stable provider la
     lifecycle: "error",
     hasLiveProcess: false,
     unavailable: true,
-    activity: ["Claude sessions are not restored; open New to start one"],
+    activity: ["This remembered Claude session has no known conversation; it was not restarted"],
   })]);
   assert.ok(unnamedPlaceholder.includes("Claude (unavailable)"), unnamedPlaceholder);
 });
@@ -267,7 +267,7 @@ test("E on a remembered native placeholder refuses instead of captioning a stale
     lifecycle: "error",
     hasLiveProcess: false,
     unavailable: true,
-    activity: ["Claude sessions are not restored; open New to start one"],
+    activity: ["This remembered Claude session has no known conversation; it was not restarted"],
   })]);
   assert.equal(drawnText(harness).includes("e edit name"), false,
     "the footer advertises no naming affordance the placeholder would refuse");

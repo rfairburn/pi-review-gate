@@ -916,3 +916,632 @@ test("an own async question stays input pending while the root keeps working, un
     await h.close();
   }
 });
+
+/* ======================================= exact restore and private identity */
+
+const RESTORED = "7a3c9a52-41d4-4f55-9a0e-8b0b6f3d2c11";
+const FRESH_UUID = "0f1e2d3c-4b5a-4968-8776-655443322110";
+const WORKSPACE = "/owned/restore-workspace";
+const OTHER_WORKSPACE = "/owned/someone-elses-workspace";
+
+interface IdentityHarness {
+  readonly server: FakeCodexAppServer;
+  readonly facts: NativeCodexTuiRootFactsBinder;
+  readonly observations: NativeStatusObservation[];
+  /** Every identity report, accepted or not, in order. */
+  readonly identities: Array<string | null>;
+  readonly consumer: NativeStatusObserver;
+  deliverCap(facts?: NativeCodexTuiRootFactsSource): void;
+  latest(): NativeStatusObservation;
+  dials(): number;
+  close(): Promise<void>;
+}
+
+async function startIdentityHarness(options: {
+  readonly threads: readonly FakeThread[];
+  readonly loadedIds: readonly string[];
+  readonly resume?: string;
+  readonly workspace?: string;
+  /** Owner acceptance for each identity report; defaults to accepting. */
+  readonly accept?: (conversationId: string | null) => boolean;
+}): Promise<IdentityHarness> {
+  const server = new FakeCodexAppServer({
+    threads: options.threads,
+    loadedIds: options.loadedIds,
+    backgroundTerminals: Object.fromEntries(options.threads.map((thread) => [thread.id, []])),
+    requireAuthorization: BEARER,
+  });
+  const port = await server.listenLoopback();
+  // The composite configures the retained binder with the same B for a restore.
+  const facts = createNativeCodexTuiRootFactsBinder(
+    options.resume === undefined ? undefined : { resumeConversationId: options.resume },
+  );
+  const observations: NativeStatusObservation[] = [];
+  const identities: Array<string | null> = [];
+  const emit = (observation: NativeStatusObservation): void => {
+    observations.push(observation);
+  };
+  const legacy = createNativeStatusObserver({ rowId: "row-restore", backend: "codex", emit });
+  const consumer = createOwnedNativeCodexStatusObserver({
+    legacy,
+    emit,
+    limits: LIMITS,
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+    ...(options.resume === undefined ? {} : { resumeConversationId: options.resume }),
+    onConversationIdentity: (conversationId) => {
+      identities.push(conversationId);
+      return options.accept === undefined ? true : options.accept(conversationId);
+    },
+  });
+  return {
+    server,
+    facts,
+    observations,
+    identities,
+    consumer,
+    deliverCap: (override) => consumer.observeOwnedCodexBackend?.(makeSource(port, override ?? facts)),
+    latest: () => observations[observations.length - 1] as NativeStatusObservation,
+    dials: () => server.upgradeCount,
+    close: async () => {
+      consumer.dispose();
+      await server.stop();
+    },
+  };
+}
+
+function resumeEvent(
+  threadId: string,
+  extra: Partial<Extract<NativeCodexTuiRelayMetadataEvent, { kind: "thread-candidate" }>> = {},
+): NativeCodexTuiRelayMetadataEvent {
+  return threadStartEvent(threadId, { origin: "thread-resume", requestedThreadId: threadId, ...extra });
+}
+
+/** The restored candidate proof, in the order the composite and relay produce it. */
+function restoredCandidate(facts: NativeCodexTuiRootFactsBinder, threadId = RESTORED): void {
+  facts.attestEmptyBackend();
+  facts.observe(initializeEvent());
+  facts.observe(resumeEvent(threadId));
+}
+
+function restoredThread(cwd: string, status = idleStatus): FakeThread {
+  return { id: RESTORED, parentThreadId: null, status, sourceKind: "cli", cwd };
+}
+
+async function censusLanded(h: IdentityHarness): Promise<void> {
+  await until(
+    () => h.server.requests.some((request) => request.method === "thread/backgroundTerminals/list")
+      || h.server.requests.filter((request) => request.method === "thread/read").length > 0,
+    "the first census",
+  );
+  await settle(80);
+}
+
+test("a restored candidate B confirms its identity before any prompt and reads none, Ready, 0, 0", async () => {
+  const h = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    assert.equal(h.facts.current().phase, "candidate");
+    assert.equal(h.facts.current().asyncInput, "none", "a restored native UI starts with an empty question queue");
+    await until(() => h.identities.length === 1, "the private identity confirmation");
+    assert.deepEqual(h.identities, [RESTORED], "the exact restored root, before the first prompt");
+    await until(() => h.observations.some((o) => o.activeShells !== null), "the pre-prompt census");
+    assert.deepEqual(
+      { busy: h.latest().busy, pendingInput: h.latest().pendingInput, activeTasks: h.latest().activeTasks, activeShells: h.latest().activeShells, activity: h.latest().activity },
+      { busy: false, pendingInput: false, activeTasks: 0, activeShells: 0, activity: ["Ready"] },
+    );
+    assert.deepEqual(
+      h.server.requests.find((request) => request.method === "thread/read")?.params,
+      { threadId: RESTORED, includeTurns: false },
+    );
+    for (const request of h.server.requests) {
+      assert.ok(["initialize", "thread/read", "thread/list", "thread/loaded/list", "thread/backgroundTerminals/list"].includes(request.method),
+        `unexpected ${request.method}`);
+    }
+
+    // The first own turn binds the SAME B on the SAME observer and supersedes
+    // any census that may predate it; the identity is not reported twice.
+    h.server.setStatus(RESTORED, activeStatus([]));
+    h.facts.observe(turnWorkTargetEvent(RESTORED, TURN_ONE));
+    await until(() => h.latest().busy === true, "the own turn's work without a broadcast");
+    assert.equal(h.dials(), 1, "never redialed");
+    assert.equal(h.server.connectionCount, 1, "no second observer connection for the identity");
+    await settle(120);
+    assert.deepEqual(h.identities, [RESTORED], "an accepted identity is reported once");
+
+    // No id or path ever rides on a published observation.
+    const surfaced = JSON.stringify(h.observations);
+    assert.equal(surfaced.includes(RESTORED), false);
+    assert.equal(surfaced.includes(WORKSPACE), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a restored B whose saved workspace is not this row's never confirms and publishes nothing but unknown", async () => {
+  const h = await startIdentityHarness({
+    threads: [restoredThread(OTHER_WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    await censusLanded(h);
+    h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+    await settle(120);
+    assert.deepEqual(h.identities, [], "a wrong workspace is never a confirmation");
+    for (const observation of h.observations) {
+      assert.equal(observation.busy, null);
+      assert.equal(observation.pendingInput, null);
+      assert.equal(observation.activeTasks, null);
+      assert.equal(observation.activeShells, null);
+      assert.deepEqual(observation.activity, []);
+    }
+    // Missing initial proof is not a loss: a later withdrawal reports no null.
+    h.facts.withdraw("metadata-unavailable");
+    await settle(30);
+    assert.deepEqual(h.identities, []);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a restore consumer never dials an unexpected root, an unusable B, or a root without a workspace", async () => {
+  // A source naming another thread for a restoring row (the real binder cannot
+  // produce one; the consumer's own fence is what is proved here).
+  const foreign = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE), { id: FRESH_UUID, parentThreadId: null, status: idleStatus, sourceKind: "cli", cwd: WORKSPACE }],
+    loadedIds: [RESTORED, FRESH_UUID],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    const controllable = new ControllableFacts();
+    foreign.deliverCap(controllable);
+    controllable.publish(Object.freeze({ phase: "candidate" as const, connectionId: CONNECTION, candidateThreadId: FRESH_UUID, asyncInput: "none" as const }));
+    await settle(80);
+    assert.equal(foreign.dials(), 0);
+    assert.deepEqual(foreign.identities, []);
+    assert.equal(controllable.watching, false, "the watcher detached on the withdrawal");
+  } finally {
+    await foreign.close();
+  }
+
+  // No workspace to prove against: a restore cannot be observed or confirmed.
+  const noWorkspace = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+  });
+  try {
+    noWorkspace.deliverCap();
+    restoredCandidate(noWorkspace.facts);
+    await settle(80);
+    assert.equal(noWorkspace.dials(), 0);
+    assert.deepEqual(noWorkspace.identities, []);
+    assert.equal(noWorkspace.latest().busy, null);
+  } finally {
+    await noWorkspace.close();
+  }
+
+  // An expectation that is not one exact provider UUID is never matched.
+  const unusable = await startIdentityHarness({
+    threads: [{ id: "not-a-uuid", parentThreadId: null, status: idleStatus, sourceKind: "cli", cwd: WORKSPACE }],
+    loadedIds: ["not-a-uuid"],
+    resume: "not-a-uuid",
+    workspace: WORKSPACE,
+  });
+  try {
+    unusable.deliverCap();
+    restoredCandidate(unusable.facts, "not-a-uuid");
+    await settle(80);
+    assert.equal(unusable.dials(), 0);
+    assert.deepEqual(unusable.identities, []);
+  } finally {
+    await unusable.close();
+  }
+});
+
+test("an accepted live identity survives an unknown input gap and is withdrawn with null on source loss", async () => {
+  const h = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    h.server.setStatus(RESTORED, activeStatus([]));
+    h.facts.observe(turnWorkTargetEvent(RESTORED, TURN_ONE));
+    await until(() => h.latest().busy === true, "the working restored root");
+    assert.deepEqual(h.identities, [RESTORED]);
+
+    // An unknown input axis alone is not a root identity loss.
+    h.facts.observe(Object.freeze({
+      kind: "async-input-unreadable",
+      connectionId: CONNECTION,
+      sequence: 30,
+      source: "questions",
+      threadId: RESTORED,
+      turnId: TURN_ONE,
+    } as NativeCodexTuiRelayMetadataEvent));
+    assert.equal(h.latest().pendingInput, null);
+    assert.equal(h.latest().busy, true);
+    assert.deepEqual(h.identities, [RESTORED], "no null for an input gap");
+
+    // A live source loss withdraws status and clears the accepted identity once.
+    h.facts.observe(initializeEvent("conn-second"));
+    assert.equal(h.facts.current().phase, "withdrawn");
+    assert.deepEqual(h.identities, [RESTORED, null]);
+    assert.equal(h.latest().busy, null);
+    assert.equal(h.latest().activeTasks, null);
+    await until(() => h.server.connectionCount === 0, "the read-only socket's close");
+    await settle(30);
+    assert.deepEqual(h.identities, [RESTORED, null], "reported once, never repeated");
+  } finally {
+    await h.close();
+  }
+});
+
+test("an identity refused before activation is retried by the next validated read, then deduplicated", async () => {
+  let accepting = false;
+  const h = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+    accept: () => accepting,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    await until(() => h.identities.length === 1, "the first (refused) report");
+    accepting = true;
+    // The next census's own root read is the retry; no timer or queue exists.
+    h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+    await until(() => h.identities.length === 2, "the retried report");
+    assert.deepEqual(h.identities, [RESTORED, RESTORED]);
+    h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+    await settle(150);
+    assert.deepEqual(h.identities, [RESTORED, RESTORED], "accepted once, then deduplicated");
+  } finally {
+    await h.close();
+  }
+});
+
+test("owner retirement never clears the saved identity and no callback follows it", async () => {
+  for (const retire of ["invalidate", "dispose"] as const) {
+    const h = await startIdentityHarness({
+      threads: [restoredThread(WORKSPACE)],
+      loadedIds: [RESTORED],
+      resume: RESTORED,
+      workspace: WORKSPACE,
+    });
+    try {
+      h.deliverCap();
+      restoredCandidate(h.facts);
+      await until(() => h.identities.length === 1, `${retire}: identity`);
+      const published = h.observations.length;
+      if (retire === "invalidate") h.consumer.invalidate?.();
+      else h.consumer.dispose();
+      h.facts.withdraw("generation-closed");
+      h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+      await settle(120);
+      assert.deepEqual(h.identities, [RESTORED], `${retire}: no null and no later report`);
+      assert.equal(h.observations.length, published, `${retire}: nothing published after retirement`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("a fresh root reports its identity only with real workspace corroboration", async () => {
+  const freshThread = (cwd: string): FakeThread => ({ id: FRESH_UUID, parentThreadId: null, status: idleStatus, sourceKind: "cli", cwd });
+
+  const matched = await startIdentityHarness({ threads: [freshThread(WORKSPACE)], loadedIds: [FRESH_UUID], workspace: WORKSPACE });
+  try {
+    matched.deliverCap();
+    freshCandidate(matched.facts, FRESH_UUID);
+    await until(() => matched.identities.length === 1, "the fresh identity");
+    assert.deepEqual(matched.identities, [FRESH_UUID], "a fresh candidate is confirmed before its first prompt");
+    await until(() => matched.observations.some((o) => o.activeShells !== null), "the census");
+    assert.equal(matched.latest().busy, false);
+  } finally {
+    await matched.close();
+  }
+
+  const elsewhere = await startIdentityHarness({ threads: [freshThread(OTHER_WORKSPACE)], loadedIds: [FRESH_UUID], workspace: WORKSPACE });
+  try {
+    elsewhere.deliverCap();
+    freshCandidate(elsewhere.facts, FRESH_UUID);
+    await censusLanded(elsewhere);
+    assert.deepEqual(elsewhere.identities, []);
+    assert.equal(elsewhere.latest().busy, null);
+    assert.equal(elsewhere.latest().activeShells, null);
+  } finally {
+    await elsewhere.close();
+  }
+
+  // A caller that supplies no workspace keeps the old fresh behavior exactly and
+  // never reports an identity it could not corroborate.
+  const legacyShape = await startIdentityHarness({ threads: [freshThread(OTHER_WORKSPACE)], loadedIds: [FRESH_UUID] });
+  try {
+    legacyShape.deliverCap();
+    freshCandidate(legacyShape.facts, FRESH_UUID);
+    await until(() => legacyShape.observations.some((o) => o.activeShells !== null), "the census");
+    assert.equal(legacyShape.latest().busy, false, "unchanged fresh card");
+    assert.deepEqual(legacyShape.identities, []);
+  } finally {
+    await legacyShape.close();
+  }
+});
+
+test("the legacy lane never reports an identity for a restoring row", async () => {
+  const h = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    // No capability is ever delivered: the row stays on the legacy hook lane.
+    restoredCandidate(h.facts);
+    h.consumer.acceptHook(HOOK_EVENT);
+    h.consumer.acceptFailure(HOOK_FAILURE);
+    await settle(60);
+    assert.equal(h.dials(), 0);
+    assert.deepEqual(h.identities, []);
+  } finally {
+    await h.close();
+  }
+});
+
+/* ============================ contradiction and the bound connection's own end */
+
+function generationClosed(reason: string, connectionId = CONNECTION): NativeCodexTuiRelayMetadataEvent {
+  return Object.freeze({ kind: "generation-closed", connectionId, sequence: 40, reason } as NativeCodexTuiRelayMetadataEvent);
+}
+
+/** Both orders in which the adopted connection's stream can end. */
+const STREAM_ENDS = ["client-closed", "backend-closed"] as const;
+
+/**
+ * A restore whose exact B the owner ACCEPTED, either still the pre-prompt
+ * candidate or already bound by its first own turn.
+ */
+async function acceptedRestore(stage: "candidate" | "bound" = "bound"): Promise<IdentityHarness> {
+  const h = await startIdentityHarness({
+    threads: [restoredThread(WORKSPACE)],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  h.deliverCap();
+  restoredCandidate(h.facts);
+  if (stage === "bound") h.facts.observe(turnWorkTargetEvent(RESTORED, TURN_ONE));
+  await until(() => h.identities.length === 1 && h.observations.some((o) => o.activeShells !== null), "the accepted identity");
+  return h;
+}
+
+test("a positive root contradiction after confirmation clears the accepted identity; a read gap does not", async () => {
+  for (const contradiction of ["workspace", "root"] as const) {
+    const h = await acceptedRestore();
+    try {
+      // A transient unreadable read keeps the identity.
+      h.server.unreadable.add(RESTORED);
+      h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+      await settle(150);
+      assert.deepEqual(h.identities, [RESTORED], `${contradiction}: no null for a read gap`);
+      h.server.unreadable.delete(RESTORED);
+
+      if (contradiction === "workspace") h.server.setThread(restoredThread(OTHER_WORKSPACE));
+      else h.server.mismatched.add(RESTORED);
+      h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+      await until(() => h.identities.length === 2, `${contradiction}: the explicit loss`);
+      assert.deepEqual(h.identities, [RESTORED, null]);
+      await until(() => h.latest().busy === null && h.latest().activeShells === null, `${contradiction}: unknown status`);
+      assert.equal(h.latest().activeTasks, null);
+
+      // Disposal afterwards reports nothing further.
+      h.consumer.dispose();
+      await settle(30);
+      assert.deepEqual(h.identities, [RESTORED, null]);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("either stream-end order before PTY exit keeps the identity through the owner's retirement", async () => {
+  for (const reason of STREAM_ENDS) {
+    for (const stage of ["candidate", "bound"] as const) {
+      for (const retire of ["invalidate", "dispose"] as const) {
+        const label = `${reason}/${stage}/${retire}`;
+        const h = await acceptedRestore(stage);
+        try {
+          const before = h.observations.length;
+          h.facts.observe(generationClosed(reason));
+          // Status is withdrawn exactly as for any withdrawal: one unknown snapshot,
+          // and the read-only socket really closes.
+          assert.equal(h.observations.length, before + 1, label);
+          assert.equal(h.latest().busy, null, label);
+          assert.equal(h.latest().pendingInput, null, label);
+          assert.equal(h.latest().activeTasks, null, label);
+          assert.equal(h.latest().activeShells, null, label);
+          await until(() => h.server.connectionCount === 0, `${label}: the read-only socket's close`);
+          assert.deepEqual(h.identities, [RESTORED], `${label}: the connection end alone clears nothing`);
+          assert.equal(h.facts.current().phase, "withdrawn", `${label}: status stays withdrawn`);
+          const requests = h.server.requests.length;
+
+          // The owner then sees the PTY exit and retires the run: still nothing.
+          if (retire === "invalidate") h.consumer.invalidate?.();
+          else h.consumer.dispose();
+          h.facts.observe(initializeEvent("conn-after-retire"));
+          h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: { type: "idle" } });
+          await settle(60);
+          assert.deepEqual(h.identities, [RESTORED], `${label}: retirement never clears the saved identity`);
+          assert.equal(h.observations.length, before + 1, `${label}: nothing published after retirement`);
+          assert.equal(h.dials(), 1, `${label}: never redialed`);
+          assert.equal(h.server.connectionCount, 0, `${label}: no reconnection`);
+          assert.equal(h.server.requests.length, requests, `${label}: no request after the close`);
+        } finally {
+          await h.close();
+        }
+      }
+    }
+  }
+});
+
+test("after either stream end, any later connection or event clears the held identity once", async () => {
+  const later: Array<{ readonly label: string; readonly event: NativeCodexTuiRelayMetadataEvent }> = [
+    { label: "a new genuine connection", event: initializeEvent("conn-reconnected") },
+    { label: "a stray event on the closed connection", event: turnWorkTargetEvent(RESTORED, TURN_TWO) },
+    { label: "a second selection on the closed connection", event: resumeEvent(RESTORED) },
+    { label: "a new selection on the closed connection", event: threadStartEvent(FRESH_UUID) },
+    {
+      label: "a metadata loss",
+      event: Object.freeze({ kind: "metadata-unavailable", connectionId: "conn-reconnected", sequence: 41, scope: "connection", reason: "compressed-stream" } as NativeCodexTuiRelayMetadataEvent),
+    },
+    {
+      label: "a stray metadata loss on the closed connection",
+      event: Object.freeze({ kind: "metadata-unavailable", connectionId: CONNECTION, sequence: 41, scope: "connection", reason: "compressed-stream" } as NativeCodexTuiRelayMetadataEvent),
+    },
+    { label: "a stray second close on the closed connection", event: generationClosed("client-closed") },
+  ];
+  for (const reason of STREAM_ENDS) {
+    for (const stage of ["candidate", "bound"] as const) {
+      for (const { label: what, event } of later) {
+        const label = `${reason}/${stage}: ${what}`;
+        const h = await acceptedRestore(stage);
+        try {
+          h.facts.observe(generationClosed(reason));
+          assert.deepEqual(h.identities, [RESTORED], `${label}: held`);
+          const published = h.observations.length;
+          h.facts.observe(event);
+          assert.deepEqual(h.identities, [RESTORED, null], `${label}: a later event ends the hold as a live loss`);
+          assert.equal(h.observations.length, published, `${label}: status was already withdrawn; nothing republished`);
+          assert.equal(h.facts.current().phase, "withdrawn", `${label}: status stays withdrawn`);
+          // The consumer detached: the source serves a new watcher again.
+          let delivered = false;
+          const unsubscribe = h.facts.watch(() => {
+            delivered = true;
+          });
+          assert.equal(delivered, true, `${label}: watcher detached`);
+          unsubscribe();
+          h.facts.observe(initializeEvent("conn-third"));
+          await settle(30);
+          assert.deepEqual(h.identities, [RESTORED, null], `${label}: reported once`);
+          assert.equal(h.observations.length, published, `${label}: never recreates status`);
+          assert.equal(h.dials(), 1, `${label}: no status rebind, no redial`);
+
+          // Disposal afterwards reports nothing further.
+          h.consumer.dispose();
+          await settle(10);
+          assert.deepEqual(h.identities, [RESTORED, null], `${label}: nothing after retirement`);
+        } finally {
+          await h.close();
+        }
+      }
+    }
+  }
+});
+
+test("any other close reason is an ordinary live loss of the accepted identity", async () => {
+  for (const reason of ["handshake-timeout", "backend-handshake-rejected", "preflight-overflow", "relay-stopped"]) {
+    const h = await acceptedRestore();
+    try {
+      h.facts.observe(generationClosed(reason));
+      assert.deepEqual(h.identities, [RESTORED, null], reason);
+      assert.equal(h.latest().busy, null, reason);
+      // No identity-only watcher stays attached.
+      let delivered = false;
+      const unsubscribe = h.facts.watch(() => {
+        delivered = true;
+      });
+      assert.equal(delivered, true, `${reason}: watcher detached`);
+      unsubscribe();
+      h.facts.observe(initializeEvent("conn-reconnected"));
+      await settle(30);
+      assert.deepEqual(h.identities, [RESTORED, null], `${reason}: reported once`);
+    } finally {
+      await h.close();
+    }
+  }
+
+  // A close of a stream end on a connection that never was the adopted one is
+  // the source's own loss, never a hold.
+  const foreign = await acceptedRestore();
+  try {
+    foreign.facts.observe(generationClosed("backend-closed", "conn-foreign"));
+    assert.deepEqual(foreign.identities, [RESTORED, null], "foreign close");
+    assert.equal(foreign.latest().busy, null, "foreign close");
+  } finally {
+    await foreign.close();
+  }
+});
+
+test("a stream end with no accepted identity is never a hold and never a null", async () => {
+  for (const reason of STREAM_ENDS) {
+    // The restored B is the initial seed, but its workspace never matched.
+    const unconfirmed = await startIdentityHarness({
+      threads: [restoredThread(OTHER_WORKSPACE)],
+      loadedIds: [RESTORED],
+      resume: RESTORED,
+      workspace: WORKSPACE,
+    });
+    try {
+      unconfirmed.deliverCap();
+      restoredCandidate(unconfirmed.facts);
+      await censusLanded(unconfirmed);
+      unconfirmed.facts.observe(generationClosed(reason));
+      unconfirmed.facts.observe(initializeEvent("conn-reconnected"));
+      await settle(30);
+      assert.deepEqual(unconfirmed.identities, [], reason);
+      let delivered = false;
+      const unsubscribe = unconfirmed.facts.watch(() => {
+        delivered = true;
+      });
+      assert.equal(delivered, true, `${reason}: no identity was held, so nothing stayed attached`);
+      unsubscribe();
+    } finally {
+      await unconfirmed.close();
+    }
+
+    // A validated B the owner REFUSED is reported but never accepted.
+    const refused = await startIdentityHarness({
+      threads: [restoredThread(WORKSPACE)],
+      loadedIds: [RESTORED],
+      resume: RESTORED,
+      workspace: WORKSPACE,
+      accept: () => false,
+    });
+    try {
+      refused.deliverCap();
+      restoredCandidate(refused.facts);
+      await until(() => refused.identities.length === 1, `${reason}: the refused report`);
+      refused.facts.observe(generationClosed(reason));
+      await until(() => refused.server.connectionCount === 0, `${reason}: the read-only socket's close`);
+      assert.equal(refused.latest().busy, null, `${reason}: refused`);
+      refused.facts.observe(initializeEvent("conn-reconnected"));
+      refused.consumer.dispose();
+      await settle(30);
+      assert.deepEqual(refused.identities, [RESTORED], `${reason}: a refused identity gets no hold and no null`);
+      let delivered = false;
+      const unsubscribe = refused.facts.watch(() => {
+        delivered = true;
+      });
+      assert.equal(delivered, true, `${reason}: refused: nothing stayed attached`);
+      unsubscribe();
+    } finally {
+      await refused.close();
+    }
+  }
+});

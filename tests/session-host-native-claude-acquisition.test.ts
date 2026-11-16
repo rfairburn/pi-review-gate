@@ -101,6 +101,9 @@ async function createHarness(options: {
   maxLineBytes?: number;
   bindTranscript?: boolean;
   watchFile?: NativeClaudeWatchFactory;
+  workspace?: string;
+  resumeConversationId?: string;
+  onConversationIdentity?: (conversationId: string | null) => boolean | void;
 } = {}): Promise<Harness> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prg-native-claude-acq-"));
   dirs.push(dir);
@@ -120,6 +123,9 @@ async function createHarness(options: {
     ...(options.maxTailBytes === undefined ? {} : { maxTailBytes: options.maxTailBytes }),
     ...(options.maxLineBytes === undefined ? {} : { maxLineBytes: options.maxLineBytes }),
     ...(options.watchFile === undefined ? {} : { watchFile: options.watchFile }),
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+    ...(options.resumeConversationId === undefined ? {} : { resumeConversationId: options.resumeConversationId }),
+    ...(options.onConversationIdentity === undefined ? {} : { onConversationIdentity: options.onConversationIdentity }),
   });
   const bind = options.bindTranscript !== false;
   return {
@@ -5812,4 +5818,797 @@ test("two child launches with no tool_use_id are two members, and replays stay i
   await settle();
   assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "late replays resurrect nothing");
   h.controller.dispose();
+});
+
+/* ------------------------------------- conversation identity and restoration */
+
+/** A real selected workspace directory this test owns; nothing else is created. */
+async function makeWorkspace(): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prg-native-claude-ws-"));
+  dirs.push(dir);
+  return dir;
+}
+
+interface IdentityRecorder {
+  readonly calls: (string | null)[];
+  accept: boolean;
+  readonly report: (conversationId: string | null) => boolean;
+}
+
+/** The owner's private identity channel: records every report, accepts on demand. */
+function identityRecorder(accept = true): IdentityRecorder {
+  const recorder: IdentityRecorder = {
+    calls: [],
+    accept,
+    report: (conversationId) => {
+      recorder.calls.push(conversationId);
+      return recorder.accept;
+    },
+  };
+  return recorder;
+}
+
+async function restoredHarness(
+  workspace: string,
+  identity: IdentityRecorder,
+  extra: Parameters<typeof createHarness>[0] = {},
+): Promise<Harness> {
+  return createHarness({
+    workspace,
+    resumeConversationId: SESSION,
+    onConversationIdentity: identity.report,
+    ...extra,
+  });
+}
+
+function isAllUnknown(snapshot: NativeClaudeAcquisitionSnapshot): boolean {
+  return snapshot.busy === null
+    && snapshot.activity.length === 0
+    && snapshot.activeTasks === null
+    && snapshot.activeShells === null;
+}
+
+/** The owner's ordinary launch baseline: idle, nothing pending, Ready, 0/0. */
+function isOwnedBaseline(snapshot: NativeClaudeAcquisitionSnapshot | undefined): boolean {
+  return snapshot !== undefined
+    && snapshot.busy === false
+    && snapshot.pendingInput === false
+    && snapshot.activity.length === 1
+    && snapshot.activity[0] === "Ready"
+    && snapshot.activeTasks === 0
+    && snapshot.activeShells === 0;
+}
+
+test("restoration: activation, then the run's own root resume of the expected id, confirms identity and states the launch baseline without a prompt", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.controller.observeOwnedStartup();
+  assert.deepEqual(h.snapshots, [], "activation alone states nothing for an unproved restored run");
+  assert.deepEqual(identity.calls, [], "the persisted id is an expectation, never reported unproved");
+
+  // The provider reports its cwd as the canonical directory; the owner selected
+  // the same directory through another spelling. One exact directory either way.
+  h.hook("SessionStart", { source: "resume", cwd: await fs.realpath(workspace) });
+  assert.deepEqual(identity.calls, [SESSION], "proved once, with no model prompt");
+  assert.ok(isOwnedBaseline(h.latest()), "activation plus exact proof: idle, none, Ready, 0/0 before any prompt");
+  assert.ok(h.snapshots.slice(0, -1).every(isAllUnknown), "nothing was stated before the proof");
+  assert.deepEqual(h.gaps, []);
+
+  // A repeat of the same boundary re-proves the same id: never a duplicate report,
+  // and it neither resets nor re-mints the baseline. A repeated activation is inert.
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  h.controller.observeOwnedStartup();
+  await settle(30);
+  assert.deepEqual(identity.calls, [SESSION]);
+  assert.ok(isOwnedBaseline(h.latest()));
+  h.controller.dispose();
+});
+
+test("restoration: the proof, then activation, states the same launch baseline; anything of the run in between forfeits it", async () => {
+  const workspace = await makeWorkspace();
+
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION]);
+  assert.ok(isAllUnknown(h.latest()), "proof alone is not the owner's baseline");
+  h.controller.observeOwnedStartup();
+  assert.ok(isOwnedBaseline(h.latest()), "proof plus activation: idle, none, Ready, 0/0 before any prompt");
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  await settle(30);
+  assert.ok(isOwnedBaseline(h.latest()), "a late repeat of either half changes nothing");
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+
+  // A prompt between the proof and activation: activation never idles it.
+  const prompted = await restoredHarness(workspace, identityRecorder());
+  prompted.hook("SessionStart", { source: "resume", cwd: workspace });
+  prompted.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  prompted.controller.observeOwnedStartup();
+  await settle(30);
+  assert.equal(prompted.latest().busy, true);
+  assert.equal(prompted.latest().activeTasks, null, "no launch zeros claimed over unseen work");
+  assert.ok(prompted.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)));
+  prompted.controller.dispose();
+
+  // Any other hook of the run in between — even a non-work Stop snapshot or a
+  // child edge — also forfeits it: the late baseline could not stand over it.
+  for (const between of [
+    (r: Harness) => r.hook("Stop", { background_counts: { tasks: 2, shells: 1 } }),
+    (r: Harness) => childHook(r, "SubagentStart", AGENT_A),
+  ]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    r.hook("SessionStart", { source: "resume", cwd: workspace });
+    between(r);
+    r.controller.observeOwnedStartup();
+    await settle(30);
+    assert.ok(r.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)), "a forfeited baseline is never minted");
+    r.controller.dispose();
+  }
+
+  // A lane loss, a session end, or an unproved switch between the proof and
+  // activation leaves nothing for activation to vouch.
+  for (const between of [
+    (r: Harness) => r.controller.acceptFailure({ backend: "claude", reason: "input-too-large" }),
+    (r: Harness) => r.hook("SessionEnd", { reason: "other" }),
+    (r: Harness) => r.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION }),
+  ]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    r.hook("SessionStart", { source: "resume", cwd: workspace });
+    between(r);
+    r.controller.observeOwnedStartup();
+    await settle(30);
+    assert.ok(r.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)), "no baseline after a loss or switch");
+    r.controller.dispose();
+  }
+
+  // A wrong proof followed by activation states nothing at all.
+  const wrong = await restoredHarness(workspace, identityRecorder());
+  wrong.hook("SessionStart", { source: "resume", session_id: OTHER_SESSION, cwd: workspace });
+  wrong.controller.observeOwnedStartup();
+  await settle(30);
+  assert.deepEqual(wrong.snapshots, []);
+  wrong.controller.dispose();
+});
+
+test("restoration: work of the resumed conversation seen before the proof forfeits the baseline in either order; foreign or unattributable hooks do not", async () => {
+  const workspace = await makeWorkspace();
+  const preProofWork: readonly { readonly label: string; readonly send: (r: Harness) => void }[] = [
+    { label: "prompt", send: (r) => r.hook("UserPromptSubmit", { prompt_id: "prompt-1" }) },
+    {
+      label: "question",
+      send: (r) => r.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" }),
+    },
+    {
+      label: "background launch",
+      send: (r) => r.hook("PostToolUse", {
+        tool_name: "Bash",
+        tool_use_id: "tool-a",
+        prompt_id: "prompt-1",
+        background_started: { id: SHELL_1, kind: "shell" },
+      }),
+    },
+    { label: "child edge", send: (r) => childHook(r, "SubagentStart", AGENT_A) },
+  ];
+  for (const work of preProofWork) {
+    for (const activationFirst of [true, false]) {
+      const identity = identityRecorder();
+      const r = await restoredHarness(workspace, identity);
+      if (activationFirst) r.controller.observeOwnedStartup();
+      work.send(r);
+      assert.deepEqual(r.snapshots, [], `${work.label}: nothing is admitted before the proof`);
+      assert.deepEqual(identity.calls, [], `${work.label}: nothing confirms the identity before the proof`);
+      r.hook("SessionStart", { source: "resume", cwd: workspace });
+      r.controller.observeOwnedStartup();
+      r.controller.observeOwnedStartup();
+      await settle(30);
+      assert.deepEqual(identity.calls, [SESSION], `${work.label}: the proof still confirms the identity`);
+      assert.ok(
+        r.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)),
+        `${work.label} (activation ${activationFirst ? "first" : "last"}): the baseline is never minted over unseen work`,
+      );
+      r.controller.dispose();
+    }
+  }
+
+  // Another conversation's hooks, and a hook naming no session, are not the
+  // resumed conversation's work and leave the baseline to the proof.
+  for (const send of [
+    (r: Harness) => r.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "prompt-9" }),
+    (r: Harness) => r.hook("UserPromptSubmit", { session_id: undefined, prompt_id: "prompt-9" }),
+  ]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    r.controller.observeOwnedStartup();
+    send(r);
+    r.hook("SessionStart", { source: "resume", cwd: workspace });
+    assert.ok(isOwnedBaseline(r.latest()), "a hook that is not this conversation's does not forfeit it");
+    r.controller.dispose();
+  }
+});
+
+test("restoration: foreign hooks between an early proof and activation do not forfeit the baseline", async () => {
+  const workspace = await makeWorkspace();
+  for (const name of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    try {
+      r.hook("SessionStart", { source: "resume", cwd: workspace });
+      const before = r.snapshots.length;
+      r.hook(name, { session_id: OTHER_SESSION, prompt_id: "prompt-9" });
+      assert.equal(r.snapshots.length, before, `${name}: a foreign hook is refused without effect`);
+      r.controller.observeOwnedStartup();
+      assert.ok(isOwnedBaseline(r.latest()), `${name}: foreign evidence cannot poison eligibility`);
+    } finally {
+      r.controller.dispose();
+    }
+  }
+
+  // The same hooks naming THIS conversation still forfeit it.
+  for (const name of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    try {
+      r.hook("SessionStart", { source: "resume", cwd: workspace });
+      r.hook(name, { prompt_id: "prompt-1" });
+      r.controller.observeOwnedStartup();
+      await settle(30);
+      assert.ok(r.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)), `${name}: this conversation's hook forfeits it`);
+    } finally {
+      r.controller.dispose();
+    }
+  }
+});
+
+test("restoration: transcript rows appended between an early proof and activation are never skipped as history", async () => {
+  const workspace = await makeWorkspace();
+  for (const row of [rootUserRow(), taskStatusRow("current-task", "completed"), summaryRow({ uuid: "current-summary" })]) {
+    const r = await restoredHarness(workspace, identityRecorder());
+    r.hook("SessionStart", { source: "resume", cwd: workspace });
+    await r.append(row);
+    r.controller.observeOwnedStartup();
+    await settle(30);
+    assert.ok(
+      r.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)),
+      "a row the provider wrote after the proof is current evidence the late baseline cannot stand over",
+    );
+    r.controller.dispose();
+  }
+
+  // A replaced, shorter transcript between the proof and activation is not
+  // vouched for either.
+  const replaced = await restoredHarness(workspace, identityRecorder());
+  replaced.hook("SessionStart", { source: "resume", cwd: workspace });
+  await fs.rm(replaced.transcript);
+  await fs.writeFile(replaced.transcript, jsonRow({ type: "system" }), "utf8");
+  replaced.controller.observeOwnedStartup();
+  await settle(30);
+  assert.ok(replaced.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)));
+  replaced.controller.dispose();
+
+  // An unchanged file still gets the baseline, and monitoring starts at the
+  // position fixed by the proof: a later current row withdraws the idle claim.
+  const quiet = await restoredHarness(workspace, identityRecorder());
+  quiet.hook("SessionStart", { source: "resume", cwd: workspace });
+  quiet.controller.observeOwnedStartup();
+  assert.ok(isOwnedBaseline(quiet.latest()));
+  await quiet.append(rootUserRow());
+  await waitFor(() => quiet.latest().busy === null, "a current root row after the baseline still withdraws it");
+  quiet.controller.dispose();
+});
+
+test("restoration: two restored rows in one workspace keep independent baselines and live status", async () => {
+  const workspace = await makeWorkspace();
+  const firstIdentity = identityRecorder();
+  const secondIdentity = identityRecorder();
+  const first = await restoredHarness(workspace, firstIdentity);
+  const second = await createHarness({
+    workspace,
+    resumeConversationId: OTHER_SESSION,
+    onConversationIdentity: secondIdentity.report,
+  });
+  const secondHook = (name: string, extra: Record<string, unknown> = {}): void =>
+    second.hook(name, { session_id: OTHER_SESSION, ...extra });
+
+  // Opposite orderings: the first row activates before its proof, the second
+  // proves before activation.
+  first.controller.observeOwnedStartup();
+  secondHook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(first.snapshots, [], "the other row's proof is nothing to this row");
+  assert.ok(isAllUnknown(second.latest()), "the second row's proof waits for its own activation");
+
+  first.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.ok(isOwnedBaseline(first.latest()));
+  assert.ok(isAllUnknown(second.latest()), "the first row's baseline is not the second row's");
+  second.controller.observeOwnedStartup();
+  assert.ok(isOwnedBaseline(second.latest()));
+  assert.deepEqual(firstIdentity.calls, [SESSION]);
+  assert.deepEqual(secondIdentity.calls, [OTHER_SESSION]);
+
+  // Live work on one row moves that row only.
+  first.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  assert.equal(first.latest().busy, true);
+  assert.ok(isOwnedBaseline(second.latest()), "another row's prompt leaves this row idle");
+  secondHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-9" });
+  assert.equal(second.latest().pendingInput, true);
+  assert.equal(first.latest().pendingInput, false, "another row's question is not this row's input");
+  await settle(30);
+  assert.equal(first.latest().busy, true);
+  first.controller.dispose();
+  second.controller.dispose();
+});
+
+test("restoration: wrong source, session, workspace, scope, or shape can neither confirm the id nor publish status", async () => {
+  const workspace = await makeWorkspace();
+  const elsewhere = await makeWorkspace();
+  const variants: { readonly label: string; readonly event: Record<string, unknown> }[] = [
+    { label: "startup source", event: { source: "startup", cwd: workspace } },
+    { label: "clear source", event: { source: "clear", cwd: workspace } },
+    { label: "compact source", event: { source: "compact", cwd: workspace } },
+    { label: "no source", event: { cwd: workspace } },
+    { label: "fork/different id", event: { source: "resume", session_id: OTHER_SESSION, cwd: workspace } },
+    { label: "another workspace", event: { source: "resume", cwd: elsewhere } },
+    { label: "missing workspace dir", event: { source: "resume", cwd: path.join(workspace, "absent") } },
+    { label: "relative cwd", event: { source: "resume", cwd: "." } },
+    { label: "no cwd", event: { source: "resume" } },
+    { label: "child scope", event: { source: "resume", cwd: workspace, agent_id: "agent-1" } },
+  ];
+  for (const variant of variants) {
+    const identity = identityRecorder();
+    const h = await restoredHarness(workspace, identity);
+    h.controller.observeOwnedStartup();
+    h.hook("SessionStart", variant.event);
+    // Nothing that follows is admitted either: these are not this conversation's hooks.
+    h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+    h.hook("Stop", { prompt_id: "prompt-1", background_members: [], background_counts: { tasks: 0, shells: 0 } });
+    await h.append(summaryRow());
+    await settle(30);
+    assert.deepEqual(identity.calls, [], `${variant.label} never confirms the restoration`);
+    assert.deepEqual(h.snapshots, [], `${variant.label} publishes no status for this row`);
+    h.controller.dispose();
+  }
+
+  // A malformed expectation can never be proved, whatever arrives.
+  const identity = identityRecorder();
+  const latest = await createHarness({ workspace, resumeConversationId: "latest", onConversationIdentity: identity.report });
+  latest.hook("SessionStart", { source: "resume", session_id: "latest", cwd: workspace });
+  latest.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, []);
+  assert.deepEqual(latest.snapshots, []);
+  latest.controller.dispose();
+
+  // The expectation is the exact id spelling: another spelling of it is not it.
+  const hexId = "abcdef12-3456-4789-8abc-def123456789";
+  const spelled = identityRecorder();
+  const upper = await createHarness({ workspace, resumeConversationId: hexId, onConversationIdentity: spelled.report });
+  upper.hook("SessionStart", { source: "resume", session_id: hexId.toUpperCase(), cwd: workspace });
+  assert.deepEqual(spelled.calls, []);
+  assert.deepEqual(upper.snapshots, []);
+  upper.hook("SessionStart", { source: "resume", session_id: hexId, cwd: workspace });
+  assert.deepEqual(spelled.calls, [hexId]);
+  upper.controller.dispose();
+
+  // Without a selected workspace nothing is provable either.
+  const unscoped = identityRecorder();
+  const blind = await createHarness({ resumeConversationId: SESSION, onConversationIdentity: unscoped.report });
+  blind.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(unscoped.calls, []);
+  assert.deepEqual(blind.snapshots, []);
+  blind.controller.dispose();
+
+  // Refused events leave the expectation intact: the genuine proof still lands.
+  const later = identityRecorder();
+  const h = await restoredHarness(workspace, later);
+  h.hook("SessionStart", { source: "startup", session_id: OTHER_SESSION, cwd: workspace });
+  h.hook("SessionStart", { source: "resume", cwd: workspace, agent_id: "agent-1" });
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(later.calls, [SESSION]);
+  h.controller.dispose();
+});
+
+test("restoration: a missing proof keeps every axis unknown and a lane loss before proof reports no identity loss", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.controller.observeOwnedStartup();
+  h.controller.observeOwnedStartup();
+  await settle(30);
+  assert.deepEqual([...h.snapshots], [], "activation without proof states no idle, none-pending, or 0/0 baseline");
+
+  h.controller.acceptFailure({ backend: "claude", reason: "input-too-large" });
+  assert.deepEqual(identity.calls, [], "nothing was proved, so nothing is withdrawn: the owner keeps its retry id");
+  assert.ok(h.snapshots.every(isAllUnknown), "a failure before proof never states a value");
+  assert.ok(h.snapshots.every((snapshot) => snapshot.pendingInput === null));
+
+  // The proof can still confirm the identity afterwards, but the gap before it
+  // forfeits the launch baseline: the row is not idled over a hole.
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION]);
+  assert.ok(h.snapshots.every((snapshot) => !isOwnedBaseline(snapshot)));
+  h.controller.dispose();
+});
+
+test("restoration: old history neither grants nor disturbs the baseline, and this run's own prompt, Stop snapshot, and summary move every axis", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  // The resumed conversation's file already holds a completed turn, a settled
+  // task, a running task, and summaries: none of it is a live fact about the new
+  // run — it neither replaces the owner's baseline nor stands in for this run's
+  // own turn-end witness.
+  const h = await restoredHarness(workspace, identity, {
+    seed: priorHistory()
+      + summaryRow({ uuid: "old-summary" })
+      + taskStatusRow("old-task", "completed")
+      + taskStatusRow("old-running", "running")
+      + summaryRow({ uuid: "old-summary-2" }),
+  });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  await settle();
+  assert.deepEqual(identity.calls, [SESSION]);
+  assert.ok(isOwnedBaseline(h.latest()), "the owner's baseline, not anything read from history");
+  assert.ok(h.snapshots.every((snapshot) => snapshot.busy !== false || isOwnedBaseline(snapshot)));
+  assert.deepEqual(h.gaps, []);
+
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  assert.equal(h.latest().busy, true);
+  assert.deepEqual(h.latest().activity, ["Working"]);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "foreground work is not a membership edge");
+  h.hook("Stop", { prompt_id: "prompt-1", background_members: [], background_counts: { tasks: 0, shells: 0 } });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 }, "the run's own complete snapshot is the census");
+  await settle(30);
+  assert.equal(h.latest().busy, true, "the Stop hook alone is not a witness");
+  await h.append(summaryRow({ uuid: "new-summary" }));
+  await waitFor(() => h.latest().activity[0] === "Ready", "this run's own summary confirms Ready");
+  assert.equal(h.latest().busy, false);
+  assert.equal(h.latest().pendingInput, false);
+  assert.deepEqual(identity.calls, [SESSION], "status progress never re-reports the identity");
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+});
+
+test("restoration: current work after the restored baseline keeps its own authority and late halves never re-mint", async () => {
+  const workspace = await makeWorkspace();
+
+  // A question, a background launch, and a lane loss each move the axes they own.
+  const h = await restoredHarness(workspace, identityRecorder());
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.ok(isOwnedBaseline(h.latest()));
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  assert.equal(h.latest().pendingInput, true, "a live question supersedes the empty baseline");
+  h.hook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-1", prompt_id: "prompt-1" });
+  h.hook("PostToolUse", {
+    tool_name: "Bash",
+    tool_use_id: "tool-a",
+    prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 1 }, "a launch moves the census from the baseline");
+  // A late repeat of either half restates nothing over live work.
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  await settle(30);
+  assert.ok(!isOwnedBaseline(h.latest()), "a duplicate start or activation never re-mints the baseline");
+  h.controller.acceptFailure({ backend: "claude", reason: "input-too-large" });
+  assert.ok(isAllUnknown(h.latest()), "a lane loss withdraws to unknown, never to the baseline");
+  h.controller.observeOwnedStartup();
+  await settle(30);
+  assert.ok(isAllUnknown(h.latest()));
+  h.controller.dispose();
+
+  // A new root row this run's own provider appends past the scan floor withdraws
+  // the idle claim, exactly as for a fresh run.
+  const watched = await restoredHarness(workspace, identityRecorder());
+  watched.controller.observeOwnedStartup();
+  watched.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.ok(isOwnedBaseline(watched.latest()));
+  await watched.append(rootUserRow());
+  await waitFor(() => watched.latest().busy === null, "newer root work withdraws the idle baseline");
+  assert.deepEqual(watched.latest().activity, []);
+  watched.controller.dispose();
+
+  // A root session end closes the restored scope: the baseline does not survive it.
+  const ended = await restoredHarness(workspace, identityRecorder());
+  ended.controller.observeOwnedStartup();
+  ended.hook("SessionStart", { source: "resume", cwd: workspace });
+  ended.hook("SessionEnd", { reason: "other" });
+  ended.controller.observeOwnedStartup();
+  await settle(30);
+  assert.ok(!isOwnedBaseline(ended.latest()), "an ended scope is never idled again");
+  ended.controller.dispose();
+});
+
+test("fresh capture: a root SessionStart in the selected workspace reports identity with the baseline unchanged", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await createHarness({ workspace, onConversationIdentity: identity.report });
+  h.controller.observeOwnedStartup();
+  const baseline = h.latest();
+  assert.equal(baseline.busy, false);
+  assert.equal(baseline.pendingInput, false);
+  assert.deepEqual(countsOf(baseline), { tasks: 0, shells: 0 });
+  assert.deepEqual(identity.calls, []);
+
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION], "no prompt is needed to state the identity");
+  assert.equal(h.latest().busy, false, "the owned baseline survives its own start notice");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION], "a duplicate start is not a second report");
+  h.controller.dispose();
+
+  // The same run with no usable cwd keeps its status behaviour and proves nothing.
+  const unproved = identityRecorder();
+  const plain = await createHarness({ workspace, onConversationIdentity: unproved.report });
+  plain.controller.observeOwnedStartup();
+  plain.hook("SessionStart", { source: "startup" });
+  assert.equal(plain.latest().busy, false);
+  assert.deepEqual(unproved.calls, []);
+  plain.controller.dispose();
+});
+
+test("activation: a refused identity is offered again from activation, only as the current candidate", async () => {
+  const workspace = await makeWorkspace();
+
+  const identity = identityRecorder(false);
+  const h = await createHarness({ workspace, onConversationIdentity: identity.report });
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION], "offered once; the owner was not activated yet");
+  identity.accept = true;
+  h.controller.observeOwnedStartup();
+  assert.deepEqual(identity.calls, [SESSION, SESSION], "the same current candidate, offered from activation");
+  h.controller.observeOwnedStartup();
+  assert.deepEqual(identity.calls, [SESSION, SESSION], "accepted once, never replayed");
+  h.controller.dispose();
+
+  // A refused candidate that a later boundary replaced is never offered again.
+  const replaced = identityRecorder(false);
+  const r = await createHarness({ workspace, onConversationIdentity: replaced.report });
+  r.hook("SessionStart", { source: "startup", cwd: workspace });
+  r.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  replaced.accept = true;
+  r.controller.observeOwnedStartup();
+  assert.deepEqual(replaced.calls, [SESSION, OTHER_SESSION, OTHER_SESSION]);
+  r.controller.dispose();
+
+  // A refused candidate withdrawn by an unproved boundary leaves nothing to offer.
+  const withdrawn = identityRecorder(false);
+  const w = await createHarness({ workspace, onConversationIdentity: withdrawn.report });
+  w.hook("SessionStart", { source: "startup", cwd: workspace });
+  w.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION });
+  withdrawn.accept = true;
+  w.controller.observeOwnedStartup();
+  assert.deepEqual(withdrawn.calls, [SESSION], "no historical replay, and no null for something never accepted");
+  w.controller.dispose();
+
+  // A restored run's proof refused before activation is offered at activation,
+  // and activation then states that proved run's launch baseline.
+  const restored = identityRecorder(false);
+  const rr = await restoredHarness(workspace, restored);
+  rr.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.ok(isAllUnknown(rr.latest()), "proof without activation states no baseline");
+  restored.accept = true;
+  rr.controller.observeOwnedStartup();
+  assert.deepEqual(restored.calls, [SESSION, SESSION]);
+  assert.ok(isOwnedBaseline(rr.latest()), "activation after the proof states the launch baseline");
+
+  // A disposed controller offers nothing.
+  restored.accept = false;
+  rr.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  rr.controller.dispose();
+  restored.accept = true;
+  rr.controller.observeOwnedStartup();
+  assert.deepEqual(restored.calls, [SESSION, SESSION, OTHER_SESSION]);
+});
+
+test("switches: a proved root boundary after the restored id follows it; an unproved one or a replacement end withdraws it", async () => {
+  const workspace = await makeWorkspace();
+  const elsewhere = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION]);
+
+  // Child and foreign events never touch the root identity.
+  h.hook("SessionStart", { source: "startup", session_id: OTHER_SESSION, cwd: workspace, agent_id: "agent-1" });
+  h.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "foreign" });
+  assert.deepEqual(identity.calls, [SESSION]);
+
+  // A genuine `/clear` in the same workspace follows the provider's new conversation.
+  const next = path.join(h.dir, "next.jsonl");
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, transcript_path: next, cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION, OTHER_SESSION]);
+  // And a `/resume` back to the first one is followed too.
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION, OTHER_SESSION, SESSION]);
+
+  // A root boundary that replaces the binding without proof withdraws the old id.
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, transcript_path: next, cwd: elsewhere });
+  assert.deepEqual(identity.calls, [SESSION, OTHER_SESSION, SESSION, null]);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION, OTHER_SESSION, SESSION, null, SESSION]);
+  h.hook("SessionStart", { source: "clear", session_id: "not-a-uuid", cwd: workspace });
+  assert.deepEqual(identity.calls.at(-1), null, "a non-UUID boundary is unproved");
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+
+  // An exit ends the process's session, not the conversation's standing.
+  h.hook("SessionEnd", { reason: "prompt_input_exit" });
+  const beforeEnd = identity.calls.length;
+  assert.deepEqual(identity.calls.at(-1), SESSION);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.equal(identity.calls.length, beforeEnd, "the same conversation again is no new report");
+  // A clear's end states the conversation is being replaced in this live process.
+  h.hook("SessionEnd", { reason: "clear" });
+  assert.deepEqual(identity.calls.at(-1), null);
+  h.controller.dispose();
+});
+
+test("loss: a lane loss withdraws the identity, unreadable status does not, and the bound conversation's own hook restores it", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+  assert.deepEqual(identity.calls, [SESSION]);
+
+  // An unreadable transcript is a status gap, not an identity loss.
+  await fs.rm(h.transcript, { force: true });
+  await fs.mkdir(h.transcript);
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  assert.ok(h.gaps.length > 0, "the transcript lane reported its own gap");
+  // Nor is an unreadable recognized payload.
+  h.hook("PreToolUse", { prompt_id: "prompt-1", tool_name: "Bash", tool_use_id: "" });
+  assert.deepEqual(identity.calls, [SESSION]);
+
+  // An authenticated loss of the lane may have hidden a conversation switch.
+  h.controller.acceptFailure({ backend: "claude", reason: "delivery-refused" });
+  assert.deepEqual(identity.calls, [SESSION, null]);
+  // Another session's hook is refused and restores nothing.
+  h.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "foreign" });
+  assert.deepEqual(identity.calls, [SESSION, null]);
+  // This run's own root hook naming the bound conversation is new evidence for it.
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  assert.deepEqual(identity.calls, [SESSION, null, SESSION]);
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-3" });
+  assert.deepEqual(identity.calls, [SESSION, null, SESSION], "no duplicate report");
+  h.controller.dispose();
+});
+
+test("retirement: invalidation and disposal never withdraw the identity, and nothing reports after disposal", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  assert.deepEqual(identity.calls, [SESSION]);
+  h.controller.invalidate();
+  h.controller.dispose();
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  h.controller.observeOwnedStartup();
+  assert.deepEqual(identity.calls, [SESSION], "the owner's remembered id survives normal retirement");
+});
+
+test("shutdown: an ordinary native SessionEnd, the hook losses racing it, and disposal keep the proved id", async () => {
+  const workspace = await makeWorkspace();
+  // Every ordinary end reason the provider uses for a process exit, plus an
+  // unknown and an absent one: none of them states the conversation was replaced.
+  for (const reason of ["prompt_input_exit", "other", "logout", "bypass_permissions_disabled", "made-up-reason", undefined]) {
+    const identity = identityRecorder();
+    const h = await restoredHarness(workspace, identity);
+    h.controller.observeOwnedStartup();
+    h.hook("SessionStart", { source: "resume", cwd: workspace });
+    h.hook("UserPromptSubmit", { prompt_id: "prompt-1" });
+    assert.deepEqual(identity.calls, [SESSION]);
+
+    // The end lands while the owner still sees a live PTY (it would accept a null).
+    h.hook("SessionEnd", reason === undefined ? {} : { reason });
+    // Hooks racing the closing process fail; late hooks of the ended scope arrive.
+    h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+    h.controller.acceptFailure({ backend: "claude", reason: "input-unavailable" });
+    h.hook("Stop", { prompt_id: "prompt-1" });
+    // Then the PTY exits and the owner retires the run.
+    h.controller.invalidate();
+    h.controller.dispose();
+    h.controller.acceptFailure({ backend: "claude", reason: "delivery-refused" });
+    assert.deepEqual(identity.calls, [SESSION], `an ordinary end (${String(reason)}) never erases the saved id`);
+  }
+
+  // The same holds for a fresh run whose identity was captured from its startup.
+  const fresh = identityRecorder();
+  const f = await createHarness({ workspace, onConversationIdentity: fresh.report });
+  f.controller.observeOwnedStartup();
+  f.hook("SessionStart", { source: "startup", cwd: workspace });
+  f.hook("SessionEnd", { reason: "prompt_input_exit" });
+  f.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  f.controller.dispose();
+  assert.deepEqual(fresh.calls, [SESSION]);
+});
+
+test("shutdown: a replacement end, or a new unproved root after an ordinary end, still withdraws the stale id", async () => {
+  const workspace = await makeWorkspace();
+  const elsewhere = await makeWorkspace();
+
+  // `/clear` (and an in-session `/resume`) end the conversation by REPLACING it.
+  for (const reason of ["clear", "resume"]) {
+    const identity = identityRecorder();
+    const h = await restoredHarness(workspace, identity);
+    h.hook("SessionStart", { source: "resume", cwd: workspace });
+    h.hook("SessionEnd", { reason });
+    assert.deepEqual(identity.calls, [SESSION, null], `a ${reason} end withdraws the replaced id`);
+    h.controller.dispose();
+    assert.deepEqual(identity.calls, [SESSION, null]);
+  }
+
+  // After an ordinary end, a new root binding decides afresh: unproved withdraws...
+  const unproved = identityRecorder();
+  const u = await restoredHarness(workspace, unproved);
+  u.hook("SessionStart", { source: "resume", cwd: workspace });
+  u.hook("SessionEnd", { reason: "other" });
+  u.hook("SessionStart", { source: "startup", session_id: OTHER_SESSION, cwd: elsewhere });
+  assert.deepEqual(unproved.calls, [SESSION, null]);
+  u.controller.dispose();
+
+  // ...a proved one follows, and a lane loss in that live new binding withdraws again.
+  const proved = identityRecorder();
+  const p = await restoredHarness(workspace, proved);
+  p.hook("SessionStart", { source: "resume", cwd: workspace });
+  p.hook("SessionEnd", { reason: "other" });
+  p.hook("SessionStart", { source: "startup", session_id: OTHER_SESSION, cwd: workspace });
+  assert.deepEqual(proved.calls, [SESSION, OTHER_SESSION]);
+  p.controller.acceptFailure({ backend: "claude", reason: "input-too-large" });
+  assert.deepEqual(proved.calls, [SESSION, OTHER_SESSION, null]);
+  p.controller.dispose();
+
+  // A foreign session's end is not this conversation's end and changes nothing.
+  const foreign = identityRecorder();
+  const g = await restoredHarness(workspace, foreign);
+  g.hook("SessionStart", { source: "resume", cwd: workspace });
+  g.hook("SessionEnd", { session_id: OTHER_SESSION, reason: "clear" });
+  g.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  assert.deepEqual(foreign.calls, [SESSION, null], "only the lane loss withdrew, not the foreign end");
+  g.controller.dispose();
+});
+
+test("shutdown: another root adopted without its own SessionStart after an ordinary end withdraws the stale id", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const h = await restoredHarness(workspace, identity);
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  h.hook("SessionEnd", { reason: "other" });
+  // A lane loss after the ordinary end keeps B: it is the closing process.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  assert.deepEqual(identity.calls, [SESSION]);
+
+  // An authenticated root hook of ANOTHER conversation is admitted and adopted
+  // with no proving SessionStart: B no longer names the current conversation.
+  h.hook("UserPromptSubmit", { session_id: OTHER_SESSION, prompt_id: "prompt-c" });
+  assert.equal(h.latest().busy, true, "the adopted root's own status is published as before");
+  assert.deepEqual(identity.calls, [SESSION, null], "the stale id is withdrawn, never left saved beside C");
+  h.hook("Stop", { session_id: OTHER_SESSION, prompt_id: "prompt-c" });
+  h.controller.dispose();
+  assert.deepEqual(identity.calls, [SESSION, null]);
+
+  // Late hooks of B itself, after the same end and loss, re-adopt the same
+  // conversation and keep B; its own later disposal keeps it too.
+  const late = identityRecorder();
+  const l = await restoredHarness(workspace, late);
+  l.hook("SessionStart", { source: "resume", cwd: workspace });
+  l.hook("SessionEnd", { reason: "prompt_input_exit" });
+  l.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  l.hook("UserPromptSubmit", { prompt_id: "late-b" });
+  l.hook("Stop", { prompt_id: "late-b" });
+  l.controller.acceptFailure({ backend: "claude", reason: "input-unavailable" });
+  l.controller.dispose();
+  assert.deepEqual(late.calls, [SESSION]);
+
+  // A child hook naming another session never counts as a root binding.
+  const child = identityRecorder();
+  const c = await restoredHarness(workspace, child);
+  c.hook("SessionStart", { source: "resume", cwd: workspace });
+  c.hook("SessionEnd", { reason: "other" });
+  c.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  c.hook("PreToolUse", { session_id: OTHER_SESSION, agent_id: "agent-1", tool_name: "Bash", tool_use_id: "t-1" });
+  c.controller.dispose();
+  assert.deepEqual(child.calls, [SESSION]);
 });

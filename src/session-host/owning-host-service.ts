@@ -115,7 +115,11 @@ export type OwningHostManager = Pick<InstanceManager,
   // The guarded saved Resume/Delete primitives are optional the same way: a manager
   // without them is unavailable for guarded mutation, never served through the
   // older nonatomic admit/validate/start methods.
-  | "startSavedSession" | "deleteSavedSession">>;
+  | "startSavedSession" | "deleteSavedSession"
+  // The owner-private native restart identity and its proof fact are optional the
+  // same way: a manager without them simply remembers no provider conversation for
+  // a native slot, so that slot can only ever come back as unavailable.
+  | "readNativeConversationIdentity" | "hasProvedNativeConversation">>;
 
 export type {
   GuardedSavedDeletionRefusalReason,

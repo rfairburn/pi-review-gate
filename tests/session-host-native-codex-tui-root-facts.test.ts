@@ -17,6 +17,7 @@ import {
   type NativeCodexTuiRootFactsBinder,
   type NativeCodexTuiRootFactsSnapshot,
   type NativeCodexTuiRootToolFact,
+  type NativeCodexTuiRootWithdrawalReason,
 } from "../src/session-host/native-codex-tui-root-facts";
 
 /* --------------------------------------------------------------- fixtures */
@@ -266,7 +267,12 @@ test("work on another thread or work without a fresh start withdraws", () => {
 });
 
 test("connection loss, metadata loss, and a second connection are sticky withdrawals", () => {
-  const cases: Array<{ readonly label: string; readonly event: NativeCodexTuiRelayMetadataEvent; readonly reason: string }> = [
+  const cases: Array<{
+    readonly label: string;
+    readonly event: NativeCodexTuiRelayMetadataEvent;
+    readonly reason: string;
+    readonly closeReason?: string;
+  }> = [
     {
       label: "message metadata loss",
       event: {
@@ -293,6 +299,7 @@ test("connection loss, metadata loss, and a second connection are sticky withdra
       label: "generation closed",
       event: { kind: "generation-closed", connectionId: C, sequence: 5, reason: "client-closed" },
       reason: "generation-closed",
+      closeReason: "client-closed",
     },
     {
       label: "second genuine connection",
@@ -306,12 +313,12 @@ test("connection loss, metadata loss, and a second connection are sticky withdra
     },
   ];
 
-  for (const { label, event, reason } of cases) {
+  for (const { label, event, reason, closeReason } of cases) {
     const binder = boundBinder();
     binder.observe(event);
     assert.deepEqual(
       binder.current(),
-      { phase: "withdrawn", connectionId: C, withdrawal: reason },
+      { phase: "withdrawn", connectionId: C, withdrawal: reason, ...(closeReason === undefined ? {} : { closeReason }) },
       label,
     );
     assert.equal("rootThreadId" in binder.current(), false, label);
@@ -562,6 +569,7 @@ test("withdrawal discards every retained root fact", () => {
     phase: "withdrawn",
     connectionId: C,
     withdrawal: "generation-closed",
+    closeReason: "relay-stopped",
   });
   assert.equal("rootThreadId" in binder.current(), false);
   assert.equal("rootTurnId" in binder.current(), false);
@@ -1884,4 +1892,401 @@ test("a complete empty copy resolves its own item-scoped gap, never an unrelated
   assert.equal(unrelated.current().asyncInput, "unknown", "the turn-scoped gap remains");
   unrelated.observe(terminalEvent(A, "turn-1"));
   assert.equal(unrelated.current().asyncInput, "none");
+});
+
+/* ============================================ exact restored root (restore mode) */
+
+const B = "019a0000-0000-7000-8000-00000000000b";
+
+interface ResumeOptions {
+  /** The request's own `params.threadId`; `null` omits it. Defaults to the response id. */
+  readonly requested?: string | null;
+  readonly origin?: "thread-resume" | "thread-fork";
+  readonly requestIdKind?: "native" | "native-helper";
+  readonly parentThreadId?: string;
+  readonly ephemeral?: boolean;
+}
+
+function resumeCandidate(threadId: string, options: ResumeOptions = {}): NativeCodexTuiRelayMetadataEvent {
+  const requested = options.requested === undefined ? threadId : options.requested;
+  return {
+    kind: "thread-candidate",
+    connectionId: C,
+    sequence: 2,
+    origin: options.origin ?? "thread-resume",
+    requestIdKind: options.requestIdKind ?? "native",
+    threadId,
+    ...(requested === null ? {} : { requestedThreadId: requested }),
+    ...(options.parentThreadId === undefined ? {} : { parentThreadId: options.parentThreadId }),
+    ...(options.ephemeral === undefined ? {} : { ephemeral: options.ephemeral }),
+  };
+}
+
+/** Restore-mode binder with the empty witness and the genuine generation. */
+function restoring(): NativeCodexTuiRootFactsBinder {
+  const binder = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  return binder;
+}
+
+/** Restore-mode binder holding the exact restored candidate B. */
+function restored(): NativeCodexTuiRootFactsBinder {
+  const binder = restoring();
+  binder.observe(resumeCandidate(B, { ephemeral: false }));
+  return binder;
+}
+
+function withdrawnWith(withdrawal: NativeCodexTuiRootWithdrawalReason): NativeCodexTuiRootFactsSnapshot {
+  return { phase: "withdrawn", connectionId: C, withdrawal };
+}
+
+test("restore options are validated, and absent options keep the exact fresh-only binder", () => {
+  for (const bad of ["", "x".repeat(257), "bad\nid", "bad\u007Fid", 42, null]) {
+    assert.throws(
+      () => createNativeCodexTuiRootFactsBinder({ resumeConversationId: bad as unknown as string }),
+      TypeError,
+    );
+  }
+  assert.throws(() => createNativeCodexTuiRootFactsBinder(null as unknown as undefined), TypeError);
+  assert.doesNotThrow(() => createNativeCodexTuiRootFactsBinder({ resumeConversationId: "x".repeat(256) }));
+
+  // Absent and undefined options both keep the fresh rule: a start is the
+  // candidate and any resume (even of an id it asked for) withdraws.
+  for (const binder of [createNativeCodexTuiRootFactsBinder(), createNativeCodexTuiRootFactsBinder({})]) {
+    binder.attestEmptyBackend();
+    binder.observe(initialize());
+    binder.observe(startCandidate(A));
+    assert.equal(binder.current().candidateThreadId, A);
+  }
+  const fresh = attested();
+  fresh.observe(initialize());
+  fresh.observe(resumeCandidate(B));
+  assert.deepEqual(fresh.current(), withdrawnWith("thread-selection-advanced"));
+});
+
+test("an expected restored id alone selects nothing; the exact resume names B before any prompt with input none", () => {
+  const binder = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  const seen: NativeCodexTuiRootFactsSnapshot[] = [];
+  binder.watch((snapshot) => seen.push(snapshot));
+  assert.deepEqual(binder.current(), { phase: "empty" });
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  assert.deepEqual(binder.current(), { phase: "connected", connectionId: C });
+
+  binder.observe(resumeCandidate(B));
+  assert.deepEqual(binder.current(), { phase: "candidate", connectionId: C, candidateThreadId: B, asyncInput: "none" });
+  assert.equal("rootThreadId" in binder.current(), false, "a restored candidate is not yet a root");
+  assert.deepEqual(seen.map((snapshot) => snapshot.phase), ["empty", "connected", "candidate"]);
+
+  // The first own successful turn on the SAME B binds it exactly as fresh A.
+  binder.observe(work(B, "turn-1"));
+  assert.deepEqual(binder.current(), { phase: "bound", connectionId: C, rootThreadId: B, rootTurnId: "turn-1", asyncInput: "none" });
+
+  // Without the empty witness, the candidate is not named and binding withdraws.
+  const unattested = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  unattested.observe(initialize());
+  unattested.observe(resumeCandidate(B));
+  assert.deepEqual(unattested.current(), { phase: "candidate", connectionId: C });
+  unattested.observe(work(B, "turn-1"));
+  assert.deepEqual(unattested.current(), withdrawnWith("backend-attestation-unavailable"));
+
+  // A late witness completes the proof and names the same candidate.
+  const late = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  late.observe(initialize());
+  late.observe(resumeCandidate(B));
+  late.attestEmptyBackend();
+  assert.equal(late.current().candidateThreadId, B);
+  assert.equal(late.current().asyncInput, "none");
+});
+
+test("requested, response, and expected ids must all be B with a primary root shape", () => {
+  const cases: readonly [string, NativeCodexTuiRelayMetadataEvent][] = [
+    ["response names another thread", resumeCandidate("thread-other", { requested: B })],
+    ["request asked for another thread", resumeCandidate(B, { requested: "thread-other" })],
+    ["request and response agree on a non-expected thread", resumeCandidate("thread-other")],
+    ["request id missing (never copied from the response)", resumeCandidate(B, { requested: null })],
+    ["parented resume", resumeCandidate(B, { parentThreadId: "thread-parent" })],
+    ["ephemeral resume", resumeCandidate(B, { ephemeral: true })],
+  ];
+  for (const [label, event] of cases) {
+    const binder = restoring();
+    binder.observe(event);
+    assert.deepEqual(binder.current(), withdrawnWith("restored-thread-mismatch"), label);
+    binder.observe(resumeCandidate(B));
+    binder.observe(work(B, "turn-1"));
+    assert.equal(binder.current().phase, "withdrawn", `${label}: withdrawal is sticky`);
+    assert.equal(binder.current().candidateThreadId, undefined);
+  }
+});
+
+test("restore mode never adopts a start or fork, and helpers stay ignored in both modes", () => {
+  const startFirst = restoring();
+  startFirst.observe(startCandidate(A));
+  assert.deepEqual(startFirst.current(), withdrawnWith("thread-selection-advanced"));
+
+  const startAfter = restored();
+  startAfter.observe(startCandidate(A));
+  assert.deepEqual(startAfter.current(), withdrawnWith("second-primary-thread-start"));
+
+  const forkFirst = restoring();
+  forkFirst.observe(resumeCandidate(B, { origin: "thread-fork" }));
+  assert.deepEqual(forkFirst.current(), withdrawnWith("thread-selection-advanced"));
+
+  const forkAfterBind = restored();
+  forkAfterBind.observe(work(B, "turn-1"));
+  forkAfterBind.observe(resumeCandidate("thread-forked", { origin: "thread-fork", requested: B, parentThreadId: B }));
+  assert.deepEqual(forkAfterBind.current(), withdrawnWith("thread-selection-advanced"));
+
+  // Helper traffic and child/ephemeral starts are ignored before and after.
+  const helpers = restoring();
+  helpers.observe(startCandidate("helper", { requestIdKind: "native-helper" }));
+  helpers.observe(resumeCandidate("helper-r", { requestIdKind: "native-helper" }));
+  helpers.observe(resumeCandidate("helper-f", { origin: "thread-fork", requestIdKind: "native-helper" }));
+  helpers.observe(startCandidate("ephemeral", { ephemeral: true }));
+  helpers.observe(startCandidate("child", { parentThreadId: "parent" }));
+  assert.deepEqual(helpers.current(), { phase: "connected", connectionId: C });
+  helpers.observe(resumeCandidate(B));
+  helpers.observe(resumeCandidate(B, { requestIdKind: "native-helper" }));
+  helpers.observe(startCandidate("helper-2", { requestIdKind: "native-helper" }));
+  helpers.observe(work("helper-thread", "turn-h", "native-helper"));
+  assert.equal(helpers.current().candidateThreadId, B);
+  helpers.observe(work(B, "turn-1"));
+  helpers.observe(resumeCandidate("helper-3", { requestIdKind: "native-helper" }));
+  assert.equal(helpers.current().rootThreadId, B);
+});
+
+test("one candidate per restore: a second resume, other work, another connection, or loss withdraws", () => {
+  // A native pagination retry projects one success (the relay drops the error
+  // response), so exactly one candidate event names B; a second success is a
+  // second selection.
+  const again = restored();
+  again.observe(resumeCandidate(B));
+  assert.deepEqual(again.current(), withdrawnWith("thread-selection-advanced"));
+
+  const child = restored();
+  child.observe(work(B, "turn-1"));
+  child.observe(resumeCandidate("thread-child", { parentThreadId: B }));
+  assert.deepEqual(child.current(), withdrawnWith("thread-selection-advanced"));
+
+  const other = restored();
+  other.observe(work("thread-other", "turn-x"));
+  assert.deepEqual(other.current(), withdrawnWith("work-on-another-thread"));
+
+  const early = restoring();
+  early.observe(work(B, "turn-1"));
+  assert.deepEqual(early.current(), withdrawnWith("work-without-fresh-thread"));
+
+  const second = restored();
+  second.observe(initialize(C2));
+  assert.deepEqual(second.current(), withdrawnWith("second-connection"));
+
+  const lost = restored();
+  lost.observe({ kind: "metadata-unavailable", connectionId: C, sequence: 9, scope: "message", reason: "json-unreadable" });
+  assert.deepEqual(lost.current(), withdrawnWith("metadata-unavailable"));
+
+  const closed = restored();
+  closed.observe(work(B, "turn-1"));
+  closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.deepEqual(closed.current(), { ...withdrawnWith("generation-closed"), closeReason: "client-closed" });
+
+  const stray = restored();
+  stray.observe(questionsEvent(B, "call-q", 1, "turn-g", C2));
+  assert.deepEqual(stray.current(), withdrawnWith("metadata-unavailable"));
+});
+
+test("live B questions after the candidate go pending; a live goal turn's terminal and a steer behave as for any current turn", () => {
+  const binder = restored();
+  assert.equal(binder.current().asyncInput, "none");
+
+  // A restored active goal runs turn turn-g server-side with no own turn/start.
+  binder.observe(questionsEvent(B, "call-g", 2, "turn-g"));
+  assert.equal(binder.current().asyncInput, "pending");
+  binder.observe(questionsEvent("helper-thread", "call-h", 1, "turn-h"));
+  binder.observe(terminalEvent("helper-thread", "turn-h"));
+  binder.observe(replyEvent("helper-thread", [{ itemId: "call-g" }]));
+  assert.equal(binder.current().asyncInput, "pending", "helper and foreign traffic clear nothing");
+  binder.observe(terminalEvent(B, "turn-g"));
+  assert.equal(binder.current().asyncInput, "none", "with no own root turn yet, the goal turn's live terminal is the current boundary");
+  binder.observe(questionsEvent(B, "call-g", 2, "turn-g"));
+  binder.observe(questionsEvent(B, "call-g2", 1, "turn-g"));
+  assert.equal(binder.current().asyncInput, "none", "the retired goal turn never resurrects");
+
+  // A second goal turn asks; the user steers it with ordinary input.
+  binder.observe(questionsEvent(B, "call-s", 1, "turn-s"));
+  assert.equal(binder.current().asyncInput, "pending");
+  binder.observe(ordinaryInput(B, "native-helper"));
+  assert.equal(binder.current().asyncInput, "pending", "helper input clears nothing");
+  binder.observe(ordinaryInput(B));
+  assert.equal(binder.current().asyncInput, "unknown", "a steer makes held questions uncertain, not none");
+  binder.observe(terminalEvent(B, "turn-s"));
+  assert.equal(binder.current().asyncInput, "none");
+  assert.equal(binder.current().phase, "candidate", "no own prompt was needed for any of this");
+
+  // The first own prompt binds the same B; its question is pending proof.
+  binder.observe(work(B, "turn-1"));
+  assert.equal(binder.current().phase, "bound");
+  binder.observe(questionsEvent(B, "call-1", 1, "turn-1"));
+  assert.equal(binder.current().asyncInput, "pending");
+  binder.observe(replyEvent(B, [{ itemId: "call-1", index: 0 }]));
+  assert.equal(binder.current().asyncInput, "none");
+});
+
+test("pre-candidate live B evidence is held privately and carried into the candidate without duplicates", () => {
+  // A held complete question publishes nothing before the proof, then pending.
+  const held = restoring();
+  held.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  assert.deepEqual(held.current(), { phase: "connected", connectionId: C });
+  held.observe(resumeCandidate(B));
+  assert.equal(held.current().asyncInput, "pending");
+  held.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  held.observe(replyEvent(B, [{ itemId: "call-q", index: 0 }]));
+  assert.equal(held.current().asyncInput, "none", "the observed committed reply resolves it, no duplicate needed");
+
+  // An observed committed reply before the response already resolved it.
+  const replied = restoring();
+  replied.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  replied.observe(replyEvent(B, [{ itemId: "call-q", index: 0 }]));
+  replied.observe(resumeCandidate(B));
+  assert.equal(replied.current().asyncInput, "none");
+
+  // A live terminal before the response retired it; replays never resurrect.
+  const ended = restoring();
+  ended.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  ended.observe(terminalEvent(B, "turn-g"));
+  ended.observe(resumeCandidate(B));
+  assert.equal(ended.current().asyncInput, "none");
+  ended.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  ended.observe(questionsEvent(B, "call-late", 1, "turn-g"));
+  assert.equal(ended.current().asyncInput, "none");
+
+  // A held gap is unknown, and the turn's live terminal recovers it.
+  const gap = restoring();
+  gap.observe(unreadableEvent("questions", B, "turn-g"));
+  gap.observe(resumeCandidate(B));
+  assert.equal(gap.current().asyncInput, "unknown");
+  gap.observe(terminalEvent(B, "turn-g"));
+  assert.equal(gap.current().asyncInput, "none");
+
+  // An unattributed question could be B's: unknown, never pending or none.
+  const unattributed = restoring();
+  unattributed.observe(questionsEvent(undefined, "call-x", 1));
+  unattributed.observe(resumeCandidate(B));
+  assert.equal(unattributed.current().asyncInput, "unknown");
+
+  // A held ordinary steer makes the held question uncertain.
+  const steered = restoring();
+  steered.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  steered.observe(ordinaryInput(B));
+  steered.observe(resumeCandidate(B));
+  assert.equal(steered.current().asyncInput, "unknown");
+  steered.observe(replyEvent(B, [{ itemId: "call-q", index: 0 }]));
+  assert.equal(steered.current().asyncInput, "none");
+
+  // Helper and foreign threads add nothing.
+  const foreign = restoring();
+  foreign.observe(questionsEvent("thread-other", "call-o", 1, "turn-o"));
+  foreign.observe(unreadableEvent("questions", "thread-other", "turn-o"));
+  foreign.observe(resumeCandidate(B));
+  assert.equal(foreign.current().asyncInput, "none");
+
+  // A failed proof publishes none of the held knowledge.
+  const mismatched = restoring();
+  mismatched.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  mismatched.observe(resumeCandidate("thread-other", { requested: B }));
+  assert.deepEqual(mismatched.current(), withdrawnWith("restored-thread-mismatch"));
+  const disconnected = restoring();
+  disconnected.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  disconnected.observe(initialize(C2));
+  assert.deepEqual(disconnected.current(), withdrawnWith("second-connection"));
+
+  // The fresh binder is unchanged: nothing is attributed before its start.
+  const fresh = attested();
+  fresh.observe(initialize());
+  fresh.observe(questionsEvent(A, "call-q", 1, "turn-g"));
+  fresh.observe(startCandidate(A));
+  assert.equal(fresh.current().asyncInput, "none");
+});
+
+test("B question evidence before the empty witness becomes a conservative gap, recovered only by a live terminal", () => {
+  const binder = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  binder.observe(initialize());
+  binder.observe(questionsEvent(B, "call-q", 1, "turn-g"));
+  // A reply cannot be attributed to an item that was never retained.
+  binder.observe(replyEvent(B, [{ itemId: "call-q", index: 0 }]));
+  binder.attestEmptyBackend();
+  binder.observe(resumeCandidate(B));
+  assert.equal(binder.current().asyncInput, "unknown", "never invented pending, never a false none");
+  binder.observe(terminalEvent(B, "turn-g"));
+  assert.equal(binder.current().asyncInput, "none");
+
+  // Unreadable B question metadata is the same gap; foreign and user-input
+  // unreadability before the witness are not.
+  const unreadable = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  unreadable.observe(initialize());
+  unreadable.observe(unreadableEvent("questions", B, "turn-g"));
+  unreadable.attestEmptyBackend();
+  unreadable.observe(resumeCandidate(B));
+  assert.equal(unreadable.current().asyncInput, "unknown");
+  const unrelated = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+  unrelated.observe(initialize());
+  unrelated.observe(questionsEvent("thread-other", "call-o", 1, "turn-o"));
+  unrelated.observe(unreadableEvent("user-input", B, "turn-g"));
+  unrelated.attestEmptyBackend();
+  unrelated.observe(resumeCandidate(B));
+  assert.equal(unrelated.current().asyncInput, "none");
+});
+
+test("restore binding keeps early provisional terminal reconciliation immediate", () => {
+  const binder = restored();
+  binder.observe(work(B, "turn-1"));
+  binder.observe(terminalEvent(B, "turn-1"));
+  binder.observe(questionsEvent(B, "call-q2", 1, "turn-2"));
+  assert.equal(binder.current().asyncInput, "unknown", "another turn's question is provisional");
+  binder.observe(terminalEvent(B, "turn-2"));
+  binder.observe(work(B, "turn-2"));
+  assert.equal(binder.current().rootTurnId, "turn-2");
+  assert.equal(binder.current().asyncInput, "none", "the held terminal is the boundary at confirmation");
+  binder.observe(questionsEvent(B, "call-q2", 1, "turn-2"));
+  assert.equal(binder.current().asyncInput, "none");
+});
+
+/* ======================================== closed generation evidence lifetime */
+
+test("a generation close carries its closed reason only until any later event, and status stays withdrawn", () => {
+  const delivered: NativeCodexTuiRootFactsSnapshot[] = [];
+  const binder = boundBinder();
+  binder.watch((snapshot) => delivered.push(snapshot));
+  binder.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.deepEqual(binder.current(), { phase: "withdrawn", connectionId: C, withdrawal: "generation-closed", closeReason: "client-closed" });
+
+  // A later connection drops the evidence; it never rebinds a root or status.
+  binder.observe(initialize(C2));
+  assert.deepEqual(binder.current(), { phase: "withdrawn", connectionId: C, withdrawal: "generation-closed" });
+  assert.equal(delivered.length, 3, "current, the close, and exactly one evidence drop");
+  binder.observe(startCandidate(A, { connectionId: C2 }));
+  binder.observe(item(A, "command", "started", { connectionId: C2 }));
+  assert.deepEqual(binder.current(), { phase: "withdrawn", connectionId: C, withdrawal: "generation-closed" });
+  assert.equal(delivered.length, 3, "nothing further is published");
+
+  // Any later event at all — even on the closed connection — also drops it.
+  const stray = boundBinder();
+  stray.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  stray.observe(item(A, "command", "started"));
+  assert.equal(stray.current().closeReason, undefined);
+  assert.equal(stray.current().withdrawal, "generation-closed");
+
+  // Other withdrawals, and a close after another withdrawal, carry no reason.
+  const lost = boundBinder();
+  lost.observe({ kind: "metadata-unavailable", connectionId: C, sequence: 5, scope: "message", reason: "json-unreadable" });
+  lost.observe({ kind: "generation-closed", connectionId: C, sequence: 6, reason: "client-closed" });
+  assert.deepEqual(lost.current(), { phase: "withdrawn", connectionId: C, withdrawal: "metadata-unavailable" });
+  const external = boundBinder();
+  external.withdraw("generation-closed");
+  assert.equal(external.current().closeReason, undefined, "only the relay's own close carries evidence");
+
+  // A reason outside the relay's closed vocabulary is never recorded.
+  const odd = boundBinder();
+  odd.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "user-quit" as never });
+  assert.deepEqual(odd.current(), { phase: "withdrawn", connectionId: C, withdrawal: "generation-closed" });
 });

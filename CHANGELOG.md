@@ -26,10 +26,17 @@ dates.
   opens, and the **Workspace** field and its initial focus are unchanged. A native provider
   is offered for this host and, separately, for a connected owner that advertises its own
   targets, while an owner that advertises nothing
-  draws no Provider line and stays Pi-only. A remembered
-  native row that cannot start returns titled `<caption or Provider> (unavailable)`, and every new
-  session selects its native target again because the target id, executable, arguments,
-  and environment are not persisted. A native target is the built-in default or an
+  draws no Provider line and stays Pi-only. A host restart automatically resumes all
+  remembered native rows at their exact provider conversations, preserving workspace,
+  caption, roster order and active content. The provider-confirmed conversation UUID
+  and target id are remembered; executables, arguments and environment are not stored,
+  and the current target is revalidated before each restore. A row that cannot be
+  verified or restarted returns titled `<caption or Provider> (unavailable)`, never as
+  a latest, fresh or Pi substitute. A newly owned Claude run with exact resume proof
+  starts with the display baseline idle, input none, 0 tasks and 0 shells before any
+  prompt; current work or observation loss supersedes or withdraws it, and display
+  counts never become ownership or stop authority. Each new session still selects its
+  native target anew. A native target is the built-in default or an
   explicit shared `externalAgents` entry — its command, base arguments, and base
   environment — never the reviewer or executor role overlay, its model, or its
   reasoning, and the command is located by the same discovery the settings

@@ -43,6 +43,13 @@
  * - Identifiers and paths are bounded, strict text: no C0/DEL/C1 controls, no
  *   line/paragraph separators, and a fixed UTF-8 byte cap. A transcript path is
  *   the provider's own path string, never the transcript's contents.
+ * - `cwd` is the provider's own generic hook base field, selected ONLY from a
+ *   `SessionStart` and only as a bounded absolute path. It exists so the host can
+ *   compare a root conversation boundary against the row's own selected
+ *   workspace; it is never selected from any other event, never derived from a
+ *   transcript path or filename, and never used to discover anything. An
+ *   unusable value is omitted (unproven), not guessed, and a Codex frame never
+ *   carries it to a callback.
  * - Normal success/failure emits no stdout, no permission/control JSON, and no
  *   diagnostics. A provider hook observer never authorizes, denies, or blocks a
  *   native operation.
@@ -279,6 +286,14 @@ export interface NativeHookEventMetadata {
    * transcript as a coverage hole in the one agent it names, never as an end.
    */
   agent_transcript_path?: string;
+  /**
+   * The provider's own working directory for a `SessionStart`, selected ONLY from
+   * that event and only when it validates as a bounded absolute path. It is
+   * root-context proof material for an exact workspace comparison, nothing more:
+   * it is never selected from another event, never derived from any other path,
+   * and an absent value proves nothing. It is Claude-only on the callback side.
+   */
+  cwd?: string;
   agent_id?: string;
   /**
    * Descriptive provider label only: `agent_id`, never this label, defines
@@ -419,6 +434,7 @@ const METADATA_TEXT_LIMITS: Readonly<
   session_id: MAX_NATIVE_HOOK_ID_BYTES,
   transcript_path: MAX_NATIVE_HOOK_PATH_BYTES,
   agent_transcript_path: MAX_NATIVE_HOOK_PATH_BYTES,
+  cwd: MAX_NATIVE_HOOK_PATH_BYTES,
   agent_id: MAX_NATIVE_HOOK_ID_BYTES,
   agent_type: MAX_NATIVE_HOOK_LABEL_BYTES,
   prompt_id: MAX_NATIVE_HOOK_ID_BYTES,
@@ -743,6 +759,17 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
     // keeps the same bounded-text rule, and the strict wire decoder still
     // refuses a present-empty value because the trusted producer omits it.
     if (key === "agent_type" && field === "") continue;
+    if (key === "cwd") {
+      // Every provider hook carries `cwd` as a base field, but only a
+      // `SessionStart` needs it: it is the one boundary whose root context the
+      // host must compare against the row's selected workspace. Anywhere else it
+      // is simply not selected. On a `SessionStart` an unusable value (relative,
+      // oversized, control characters) proves nothing, so it is omitted rather
+      // than failing the whole boundary: the scope rebind that event already
+      // carried must not be lost to a field that only ever adds proof.
+      if (name === "SessionStart" && isBoundedTranscriptPath(field)) metadata.cwd = field;
+      continue;
+    }
     if (key === "transcript_path") {
       if (!isBoundedTranscriptPath(field)) return { ok: false, reason: "input-invalid" };
     } else if (key === "agent_transcript_path") {
@@ -865,8 +892,23 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
   // so a wire frame that still carries it present-empty is not relay output.
   // Keep the strict wire shape refusing it rather than normalizing it here.
   if (value.agent_type === "") return undefined;
+  // `cwd` is SessionStart-only proof material. The relay omits an unusable value
+  // before framing, so a wire frame carrying one anywhere else, or carrying an
+  // unusable one, is not relay output and is refused rather than normalized.
+  if (Object.prototype.hasOwnProperty.call(value, "cwd")
+    && (value.hook_event_name !== "SessionStart" || !isBoundedTranscriptPath(value.cwd))) {
+    return undefined;
+  }
   const selected = sanitizeNativeHookProviderInput(value);
   if (!selected.ok) return undefined;
+  // The Claude restoration identity proof is the only consumer of `cwd`. The
+  // relay frames whatever the shared selection produced, so a Codex frame may
+  // carry it on the wire; it is dropped here so the Codex callback keeps its
+  // exact pre-existing shape and no new path field rides into that projection.
+  const { cwd: selectedCwd, ...selectedRest } = selected.metadata;
+  const metadata: NativeHookEventMetadata = backend === "claude" || selectedCwd === undefined
+    ? selected.metadata
+    : selectedRest;
   let backgroundCounts: NativeHookBackgroundCounts | undefined;
   if (Object.prototype.hasOwnProperty.call(value, "background_counts")) {
     // Only the established Stop-family snapshot projection may carry counts.
@@ -933,7 +975,7 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
     generation: value.generation,
     backend,
     token: value.token,
-    ...selected.metadata,
+    ...metadata,
     ...(backgroundCounts === undefined ? {} : { background_counts: backgroundCounts }),
     ...(backgroundMembers === undefined ? {} : { background_members: backgroundMembers }),
     ...(backgroundUnidentifiedKinds === undefined
@@ -989,6 +1031,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
       session_id,
       transcript_path,
       agent_transcript_path,
+      cwd,
       agent_id,
       agent_type,
       prompt_id,
@@ -1011,6 +1054,7 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
         ...(session_id === undefined ? {} : { session_id }),
         ...(transcript_path === undefined ? {} : { transcript_path }),
         ...(agent_transcript_path === undefined ? {} : { agent_transcript_path }),
+        ...(cwd === undefined ? {} : { cwd }),
         ...(agent_id === undefined ? {} : { agent_id }),
         ...(agent_type === undefined ? {} : { agent_type }),
         ...(prompt_id === undefined ? {} : { prompt_id }),

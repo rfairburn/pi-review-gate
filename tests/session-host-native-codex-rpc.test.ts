@@ -10,6 +10,9 @@
  */
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   NATIVE_CODEX_RPC_CLIENT_NAME,
@@ -20,7 +23,9 @@ import {
   decodeNativeCodexLoadedPage,
   decodeNativeCodexTerminalPage,
   decodeNativeCodexThreadPage,
+  decodeNativeCodexThreadReadInWorkspace,
   decodeNativeCodexThreadRow,
+  nativeCodexWorkspaceMatches,
   readNativeCodexRpcEndpoint,
   type NativeCodexRpcFailureCode,
 } from "../src/session-host/native-codex-rpc";
@@ -319,6 +324,9 @@ test("builds only the allowlisted read-only census requests", async () => {
       "listLoadedThreadIds",
       "pendingRequestCount",
       "readThread",
+      // The same allowlisted `thread/read`, compared in place against a caller's
+      // exact workspace; it is not a new request method.
+      "readThreadInWorkspace",
       "socketClosed",
       "state",
     ]);
@@ -793,4 +801,102 @@ test("decoders keep ids, status enums, flags, and cursors and drop the rest", ()
     { method: "thread/deleted", threadId: "t" });
   assert.equal(decodeNativeCodexNotification("thread/status/changed", { threadId: "t" }), null);
   assert.equal(decodeNativeCodexNotification("turn/started", { threadId: "t" }), null);
+});
+
+/* ------------------------------------------- caller-supplied workspace match */
+
+function withWorkspaceDirs(run: (dirs: { readonly real: string; readonly alias: string; readonly other: string }) => Promise<void> | void): Promise<void> {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "prg-codex-ws-"));
+  const real = path.join(base, "workspace");
+  const other = path.join(base, "other");
+  const alias = path.join(base, "alias");
+  fs.mkdirSync(real);
+  fs.mkdirSync(other);
+  fs.symlinkSync(real, alias, "dir");
+  return Promise.resolve()
+    .then(() => run({ real: fs.realpathSync.native(real), alias, other }))
+    .finally(() => fs.rmSync(base, { recursive: true, force: true }));
+}
+
+test("the workspace comparison matches only the same existing directory and never scans", async () => {
+  await withWorkspaceDirs(({ real, alias, other }) => {
+    assert.equal(nativeCodexWorkspaceMatches(real, real), true);
+    assert.equal(nativeCodexWorkspaceMatches(alias, real), true, "a symlinked spelling is the same directory");
+    assert.equal(nativeCodexWorkspaceMatches(real, alias), true);
+    assert.equal(nativeCodexWorkspaceMatches(other, real), false);
+    assert.equal(nativeCodexWorkspaceMatches(path.join(real, "missing"), real), false, "a missing path never matches");
+    assert.equal(nativeCodexWorkspaceMatches("workspace", real), false, "a relative path is never a workspace");
+    assert.equal(nativeCodexWorkspaceMatches(`${real}\u0000`, real), false);
+    assert.equal(nativeCodexWorkspaceMatches(undefined, real), false);
+    assert.equal(nativeCodexWorkspaceMatches(null, real), false);
+    assert.equal(nativeCodexWorkspaceMatches(42, real), false);
+    assert.equal(nativeCodexWorkspaceMatches(real, ""), false);
+    assert.equal(nativeCodexWorkspaceMatches(`/${"x".repeat(5_000)}`, real), false);
+  });
+});
+
+test("the workspace-comparing decode keeps the row closed and drops the provider cwd", () => {
+  const wire = {
+    thread: {
+      id: ROOT,
+      parentThreadId: null,
+      status: { type: "notLoaded" },
+      cwd: "/definitely/not/the/workspace",
+      path: `${FAKE_MARKER}/rollout.jsonl`,
+      preview: `${FAKE_MARKER} preview`,
+    },
+  };
+  const read = decodeNativeCodexThreadReadInWorkspace(wire, "/owned/workspace");
+  assert.deepEqual(read, {
+    row: { threadId: ROOT, parentThreadId: null, status: { kind: "notLoaded", activeFlags: [] } },
+    workspaceMatches: false,
+  });
+  const text = JSON.stringify(read);
+  assert.equal(text.includes("/definitely"), false, "the provider cwd never leaves the decode edge");
+  assert.equal(text.includes(FAKE_MARKER), false);
+  // An unreadable row stays unreadable rather than becoming a workspace verdict.
+  assert.equal(decodeNativeCodexThreadReadInWorkspace({ thread: { ...wire.thread, status: { type: "unheardOf" } } }, "/owned/workspace"), null);
+  assert.equal(decodeNativeCodexThreadReadInWorkspace("nope", "/owned/workspace"), null);
+});
+
+test("readThreadInWorkspace is the same read-only thread/read and returns only a closed verdict", async () => {
+  await withWorkspaceDirs(async ({ real, alias, other }) => {
+    await withUnixTransport({
+      threads: [
+        { id: ROOT, parentThreadId: null, status: { type: "idle" }, sourceKind: "cli", cwd: alias },
+        { id: "child-1", parentThreadId: ROOT, status: { type: "idle" }, sourceKind: "subAgentThreadSpawn", cwd: other },
+      ],
+      loadedIds: ["child-1"],
+    }, async (server, socketPath) => {
+      const transport = new NativeCodexRpcTransport({ endpoint: { kind: "unix", socketPath } });
+      await transport.connect();
+
+      const matched = await transport.readThreadInWorkspace(ROOT, real);
+      assert.deepEqual(matched, {
+        row: { threadId: ROOT, parentThreadId: null, status: { kind: "notLoaded", activeFlags: [] } },
+        workspaceMatches: true,
+      }, "a saved thread that is not loaded is an ordinary cold row");
+      const elsewhere = await transport.readThreadInWorkspace("child-1", real);
+      assert.equal(elsewhere?.workspaceMatches, false);
+      await assert.rejects(transport.readThreadInWorkspace("missing-thread", real),
+        (error: unknown) => (error as NativeCodexRpcError).code === "rejected");
+      await assert.rejects(transport.readThreadInWorkspace(ROOT, "relative/workspace"),
+        (error: unknown) => (error as NativeCodexRpcError).code === "malformed");
+
+      const reads = server.requests.filter((request) => request.method === "thread/read");
+      assert.deepEqual(reads.map((request) => request.params), [
+        { threadId: ROOT, includeTurns: false },
+        { threadId: "child-1", includeTurns: false },
+        { threadId: "missing-thread", includeTurns: false },
+      ], "the workspace never goes on the wire; history is excluded");
+      for (const request of server.requests) {
+        assert.ok(["initialize", "thread/read"].includes(request.method), `unexpected ${request.method}`);
+      }
+      const surfaced = JSON.stringify([matched, elsewhere]);
+      assert.equal(surfaced.includes(alias), false);
+      assert.equal(surfaced.includes(other), false);
+      assert.equal(surfaced.includes(FAKE_MARKER), false);
+      transport.close();
+    });
+  });
 });

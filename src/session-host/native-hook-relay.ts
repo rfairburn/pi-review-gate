@@ -187,7 +187,7 @@ function failureFrame(bootstrap: NativeHookBootstrap, reason: NativeHookFailureR
 }
 
 /**
- * Drops the Claude-only background projections for a backend whose provider
+ * Drops the Claude-only workspace and background projections for a backend whose provider
  * issues no such ids. The Codex selection and wire shape stay exactly as they
  * were before this lane existed, and the broker's strict decoder never has to
  * refuse an otherwise valid Codex event because a Claude-shaped field rode
@@ -199,6 +199,7 @@ function projectSelectedMetadata(
 ): NativeHookEventMetadata {
   if (backend === "claude") return metadata;
   const {
+    cwd: _claudeCwd,
     background_started: _claudeStarted,
     background_members: _claudeMembers,
     background_unidentified_kinds: _claudeKindGaps,

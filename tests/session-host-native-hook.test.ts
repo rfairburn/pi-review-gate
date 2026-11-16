@@ -568,6 +568,103 @@ test("an agent's named child transcript is selected only on that agent's own bou
   }
 });
 
+test("a SessionStart cwd is selected only from that boundary, as a bounded absolute path, and never from any other event", () => {
+  // `cwd` is a generic provider hook base field. It is root-context proof material
+  // for the row's selected workspace and is selected from a SessionStart alone.
+  const start = sanitizeNativeHookProviderInput({
+    hook_event_name: "SessionStart",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    transcript_path: "/tmp/session.jsonl",
+    source: "resume",
+    cwd: "/tmp/workspace",
+    model: "SECRET MODEL",
+    prompt: "SECRET PROMPT",
+  });
+  assert.deepEqual(start, {
+    ok: true,
+    metadata: {
+      hook_event_name: "SessionStart",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      transcript_path: "/tmp/session.jsonl",
+      source: "resume",
+      cwd: "/tmp/workspace",
+    },
+  });
+
+  // Every other event carries cwd too, and it is simply not selected: the event
+  // keeps its pre-existing shape and does not fail.
+  for (const name of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStop", "SessionEnd"]) {
+    const selected = sanitizeNativeHookProviderInput({ hook_event_name: name, session_id: "s-1", cwd: "/tmp/workspace" });
+    assert.equal(selected.ok, true, `${name} still selects`);
+    assert.equal(selected.ok && "cwd" in selected.metadata, false, `${name} never selects cwd`);
+  }
+
+  // On a SessionStart an unusable cwd proves nothing and is omitted rather than
+  // failing the boundary (its scope rebind must survive).
+  for (const bad of ["relative/dir", "", "/tmp/bad\u0001dir", "/tmp/bad\u2028dir", `/${"d".repeat(4096)}`, 7, null, { path: "/tmp" }]) {
+    const selected = sanitizeNativeHookProviderInput({ hook_event_name: "SessionStart", session_id: "s-1", cwd: bad });
+    assert.deepEqual(selected, { ok: true, metadata: { hook_event_name: "SessionStart", session_id: "s-1" } });
+  }
+});
+
+test("the wire decoder carries a SessionStart cwd only for Claude and refuses it anywhere else", () => {
+  const claude: NativeHookBootstrap = {
+    version: 1,
+    socketPath: "/tmp/broker.sock",
+    generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instanceId: INSTANCE_NATIVE,
+    backend: "claude",
+    token: "a".repeat(64),
+  };
+  const start = nativeEventFrame(claude, {
+    hook_event_name: "SessionStart",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    transcript_path: "/tmp/session.jsonl",
+    source: "resume",
+    cwd: "/tmp/workspace",
+  });
+  const decoded = decodeNativeHookFrame(encodeNativeHookFrame(start));
+  assert.equal(decoded?.kind, "event");
+  assert.deepEqual(decoded?.kind === "event" ? decoded.frame : undefined, start);
+  assert.deepEqual(decoded?.kind === "event" ? decoded.event : undefined, {
+    backend: "claude",
+    hook_event_name: "SessionStart",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    transcript_path: "/tmp/session.jsonl",
+    source: "resume",
+    cwd: "/tmp/workspace",
+  });
+
+  // A frame carrying cwd on another event, or an unusable one, is not relay output.
+  const prompt = nativeEventFrame(claude, { hook_event_name: "UserPromptSubmit", session_id: "s-1" });
+  assert.equal(decodeNativeHookFrame(`${JSON.stringify({ ...prompt, cwd: "/tmp/workspace" })}\n`), undefined);
+  for (const bad of ["relative", "", "/tmp/bad\u0001", 7, null]) {
+    assert.equal(decodeNativeHookFrame(`${JSON.stringify({ ...start, cwd: bad })}\n`), undefined);
+  }
+  // The fixed frame bound still applies: a combination that cannot fit is refused.
+  const oversized = { ...start, transcript_path: `/${"t".repeat(2040)}`, cwd: `/${"c".repeat(2040)}` };
+  assert.throws(() => encodeNativeHookFrame(oversized), RangeError);
+  assert.equal(decodeNativeHookFrame(`${JSON.stringify(oversized)}\n`), undefined);
+
+  // A Codex frame keeps its pre-existing callback shape: the shared relay may have
+  // framed cwd, but it never reaches a Codex callback.
+  const codex = nativeEventFrame({ ...claude, backend: "codex" }, {
+    hook_event_name: "SessionStart",
+    session_id: "s-codex",
+    source: "startup",
+    cwd: "/tmp/workspace",
+  });
+  const codexDecoded = decodeNativeHookFrame(encodeNativeHookFrame(codex));
+  assert.equal(codexDecoded?.kind, "event");
+  assert.deepEqual(codexDecoded?.kind === "event" ? codexDecoded.event : undefined, {
+    backend: "codex",
+    hook_event_name: "SessionStart",
+    session_id: "s-codex",
+    source: "startup",
+  });
+  assert.equal(codexDecoded?.kind === "event" && "cwd" in codexDecoded.frame, false);
+});
+
 test("an empty Claude agent_type is omitted as descriptive metadata without erasing the same hook's facts", () => {
   // Claude Code 2.1.325's SubagentStop producer writes
   // `agent_type: contextType ?? mainAgentType ?? ''`, and the field's own schema
@@ -805,6 +902,76 @@ test("authenticated native event is accepted once with closed metadata and no se
   const serialized = JSON.stringify(recorded.events);
   assert.ok(!serialized.includes("SECRET"), "no sensitive provider field reaches the callback");
   assert.ok(!serialized.includes(registration.bootstrap.token), "the token never reaches the callback");
+});
+
+test("a relayed SessionStart delivers the provider cwd to a Claude source and nothing else new", async () => {
+  const broker = await makeBroker();
+  const recorded = recordingNative();
+  const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, "claude", recorded.handlers);
+  const transcriptPath = path.join(process.cwd(), "transcript.jsonl");
+  const outcome = await runRelay(registration.bootstrap, {
+    hook_event_name: "SessionStart",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    transcript_path: transcriptPath,
+    source: "resume",
+    cwd: process.cwd(),
+    model: "SECRET MODEL",
+    permission_mode: "SECRET MODE",
+  });
+  assert.equal(outcome.status, "accepted");
+  assert.deepEqual(recorded.events, [{
+    backend: "claude",
+    hook_event_name: "SessionStart",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    transcript_path: transcriptPath,
+    source: "resume",
+    cwd: process.cwd(),
+  }]);
+  assert.ok(!JSON.stringify(recorded.events).includes("SECRET"));
+  assert.deepEqual(recorded.failures, []);
+});
+
+test("the relay's raw wire frame carries a SessionStart cwd for Claude only, before any broker decoding", async () => {
+  for (const backend of ["claude", "codex"] as const) {
+    const broker = await makeBroker();
+    const recorded = recordingNative();
+    const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, backend, recorded.handlers);
+    const written: string[] = [];
+    const outcome = await runNativeHookRelay({
+      env: { [NATIVE_HOOK_BOOTSTRAP_ENV]: JSON.stringify(registration.bootstrap) },
+      stdin: relayInput({
+        hook_event_name: "SessionStart",
+        session_id: "11111111-1111-4111-8111-111111111111",
+        source: "resume",
+        cwd: process.cwd(),
+      }),
+      // Observe the exact bytes the relay writes to the local socket; the real
+      // connection and the real broker decoder are otherwise untouched.
+      connect: (socketPath) => {
+        const socket = net.createConnection({ path: socketPath });
+        const write = socket.write.bind(socket) as (chunk: unknown, ...rest: unknown[]) => boolean;
+        (socket as unknown as { write: (chunk: unknown, ...rest: unknown[]) => boolean }).write = (chunk, ...rest) => {
+          written.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+          return write(chunk, ...rest);
+        };
+        return socket;
+      },
+    });
+    assert.equal(outcome.status, "accepted", backend);
+    const raw = written.join("");
+    const frames = raw.split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(frames.length, 1, `${backend}: one event frame was written`);
+    const metadata = JSON.stringify(frames[0]);
+    if (backend === "claude") {
+      assert.ok(metadata.includes(JSON.stringify(process.cwd())), "the Claude frame keeps the proof cwd");
+    } else {
+      assert.equal(raw.includes(JSON.stringify(process.cwd()).slice(1, -1)), false,
+        "the Codex frame never carries the provider cwd on the local socket");
+      assert.equal(metadata.includes("\"cwd\""), false);
+    }
+    assert.equal(recorded.events.length, 1, `${backend}: the event is still delivered`);
+    registration.release();
+  }
 });
 
 test("relay projects validated Stop/SubagentStop background counts and keeps absent distinct from zero", async () => {

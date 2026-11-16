@@ -28,6 +28,7 @@ import {
   createRelayedOwnedCodexBackendFactory,
   NativeCodexOwnedCompositeError,
   type RelayedOwnedCodexBackendOptions,
+  type RelayedOwnedCodexRestoreExpectation,
 } from "../src/session-host/native-codex-owned-composite";
 import type { NativeCodexTuiRootFactsSnapshot } from "../src/session-host/native-codex-tui-root-facts";
 import {
@@ -39,7 +40,7 @@ import {
   type NativeCodexTuiRelaySettlement,
   type NativeCodexTuiRelayStatus,
 } from "../src/session-host/native-codex-tui-relay";
-import { FakeCodexAppServer } from "./session-host-native-codex-rpc-fixture";
+import { FakeCodexAppServer, type FakeThread } from "./session-host-native-codex-rpc-fixture";
 
 /* --------------------------------------------------------------- fixtures */
 
@@ -281,6 +282,8 @@ class FakeRelay implements NativeCodexTuiRelayLease {
 interface ProbeCall {
   readonly backend: OwnedCodexBackendReady;
   readonly signal: AbortSignal;
+  /** The restore expectation the composite handed the probe, if any. */
+  readonly restore?: RelayedOwnedCodexRestoreExpectation;
 }
 
 interface Harness {
@@ -298,13 +301,24 @@ interface HarnessOptions {
   /** Use the module's real read-only RPC census instead of the focused seam. */
   readonly realProbe?: boolean;
   readonly startRelay?: (input: NativeCodexTuiRelayInput) => NativeCodexTuiRelayLease;
+  /** Owner-private request metadata (workspace, restore conversation). */
+  readonly request?: Pick<OwnedCodexBackendLaunchRequest, "workspace" | "resumeConversationId">;
+  /**
+   * The focused seam's restore admission answer. Absent: the seam supplies NO
+   * restore proof at all, which a restore must never assume.
+   */
+  readonly restoredThread?: (restore: RelayedOwnedCodexRestoreExpectation | undefined) => Promise<boolean>;
 }
 
-function launchRequest(signal: AbortSignal): OwnedCodexBackendLaunchRequest {
+function launchRequest(
+  signal: AbortSignal,
+  extra: Pick<OwnedCodexBackendLaunchRequest, "workspace" | "resumeConversationId"> = {},
+): OwnedCodexBackendLaunchRequest {
   return {
     identity: IDENTITY,
     plan: {} as NativeCodexOwnedLaunchPlan,
     signal,
+    ...extra,
   };
 }
 
@@ -324,13 +338,21 @@ function createHarness(options: HarnessOptions = {}): Harness {
     ...(options.realProbe === true
       ? {}
       : {
-          preAttachCensus: (ready: OwnedCodexBackendReady, signal: AbortSignal) => {
-            probeCalls.push({ backend: ready, signal });
+          preAttachCensus: (
+            ready: OwnedCodexBackendReady,
+            signal: AbortSignal,
+            restore?: RelayedOwnedCodexRestoreExpectation,
+          ) => {
+            probeCalls.push({ backend: ready, signal, ...(restore === undefined ? {} : { restore }) });
             const threadIds = options.probe === undefined
               ? Promise.resolve<readonly string[]>([])
               : Promise.resolve(options.probe(ready, signal));
             const closed = options.probeClosed === undefined ? Promise.resolve() : options.probeClosed();
-            return { threadIds, closed };
+            return {
+              threadIds,
+              closed,
+              ...(options.restoredThread === undefined ? {} : { restoredThread: options.restoredThread(restore) }),
+            };
           },
         }),
     startRelay: (input) => {
@@ -341,7 +363,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
     },
   };
   const factory = createRelayedOwnedCodexBackendFactory(compositeOptions);
-  const lease = factory(launchRequest(abort.signal));
+  const lease = factory(launchRequest(abort.signal, options.request));
   // The factory seam above is synchronous, so a successful harness always has
   // exactly one backend lease by this point.
   assert.equal(backendCalls, 1);
@@ -889,5 +911,288 @@ test("the production census withdraws a non-empty loaded set without blocking th
     await bounded(harness.lease.settlement, "settlement");
   } finally {
     await server.stop();
+  }
+});
+
+/* ================================================== exact restore admission */
+
+const RESTORED = "5b2f7c1e-9d3a-4e6b-8a1f-2c4d6e8f0a1b";
+const WORKSPACE = "/owned/restore-workspace";
+const RESTORE_REQUEST = Object.freeze({ resumeConversationId: RESTORED, workspace: WORKSPACE });
+
+function resumeEvent(threadId: string): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "thread-candidate",
+    connectionId: CONNECTION,
+    sequence: 2,
+    origin: "thread-resume",
+    requestIdKind: "native",
+    threadId,
+    requestedThreadId: threadId,
+  };
+}
+
+async function expectRestoreRefused(harness: Harness, label: string): Promise<void> {
+  const error = await rejectionOf(harness.lease.readiness);
+  assert.ok(error instanceof NativeCodexOwnedCompositeError, label);
+  assert.equal(error.code, "restore-unavailable", label);
+  assert.equal(harness.relays.length, 0, `${label}: no relay, so no TUI endpoint, ever exists`);
+  assert.equal(harness.backend.stopCalls, 1, `${label}: the retained backend is asked to stop once`);
+  await expectPending(harness.lease.settlement, `${label}: settlement still needs the backend's own proof`);
+  harness.backend.settle();
+  assert.deepEqual(await bounded(harness.lease.settlement, `${label}: settlement`), NOT_CREATED, label);
+  harness.lease.requestStop();
+  assert.equal(harness.backend.stopCalls, 1, `${label}: stop stays idempotent`);
+}
+
+test("a fresh launch carrying only its workspace keeps the exact fresh probe and binder", async () => {
+  const harness = createHarness({
+    request: { workspace: WORKSPACE },
+    restoredThread: () => Promise.resolve(false),
+  });
+  harness.backend.resolveReady();
+  await until(() => harness.relays.length === 1, "relay start");
+  assert.equal(harness.probeCalls.length, 1);
+  assert.equal(harness.probeCalls[0]!.restore, undefined, "no restore read for a fresh launch");
+  const relay = harness.relays[0]!;
+  relay.resolveReady();
+  const ready = await bounded(harness.lease.readiness, "readiness");
+  relay.emit(initializeEvent());
+  relay.emit(startEvent("thread-a"));
+  assert.equal(ready.tuiRootFacts?.current().candidateThreadId, "thread-a", "the fresh-only binder");
+  harness.lease.requestStop();
+  harness.backend.settle();
+  relay.resolveSettled();
+  await bounded(harness.lease.settlement, "settlement");
+});
+
+test("a restore admits only after the exact B/workspace read and configures the binder with B", async () => {
+  const admission = deferred<boolean>();
+  const harness = createHarness({ request: RESTORE_REQUEST, restoredThread: () => admission.promise });
+  harness.backend.resolveReady();
+  await until(() => harness.probeCalls.length === 1, "probe start");
+  assert.deepEqual(harness.probeCalls[0]!.restore, { conversationId: RESTORED, workspace: WORKSPACE });
+  // The census already answered (empty), but no relay exists until B is admitted.
+  await expectPending(harness.lease.readiness, "readiness waits for admission");
+  assert.equal(harness.relays.length, 0, "no TUI endpoint before admission");
+
+  admission.resolve(true);
+  await until(() => harness.relays.length === 1, "relay start after admission");
+  const relay = harness.relays[0]!;
+  relay.resolveReady();
+  const ready = await bounded(harness.lease.readiness, "readiness");
+  assert.deepEqual(ready.createTuiConnection(), RELAY_TUI);
+  const facts = ready.tuiRootFacts;
+  assert.ok(facts);
+  // Admission bound nothing: only the genuine TUI's own resume of B names it.
+  assert.deepEqual(facts.current(), { phase: "empty" });
+  relay.emit(initializeEvent());
+  assert.equal(facts.current().phase, "connected");
+  relay.emit(resumeEvent(RESTORED));
+  assert.deepEqual(facts.current(), {
+    phase: "candidate",
+    connectionId: CONNECTION,
+    candidateThreadId: RESTORED,
+    asyncInput: "none",
+  });
+
+  harness.lease.requestStop();
+  harness.backend.settle();
+  relay.resolveSettled();
+  await bounded(harness.lease.settlement, "settlement");
+});
+
+test("a restore binder never adopts a fresh start in place of B", async () => {
+  const harness = createHarness({ request: RESTORE_REQUEST, restoredThread: () => Promise.resolve(true) });
+  harness.backend.resolveReady();
+  await until(() => harness.relays.length === 1, "relay start");
+  const relay = harness.relays[0]!;
+  relay.resolveReady();
+  const ready = await bounded(harness.lease.readiness, "readiness");
+  relay.emit(initializeEvent());
+  relay.emit(startEvent("thread-fresh"));
+  assert.equal(ready.tuiRootFacts?.current().phase, "withdrawn");
+  assert.equal(ready.tuiRootFacts?.current().candidateThreadId, undefined);
+  harness.lease.requestStop();
+  harness.backend.settle();
+  relay.resolveSettled();
+  await bounded(harness.lease.settlement, "settlement");
+});
+
+test("a missing, refused, unreadable, or unproven restore is refused before any TUI", async () => {
+  const cases: Array<{ readonly label: string; readonly options: HarnessOptions }> = [
+    { label: "refused B (missing, wrong workspace, or child)", options: { request: RESTORE_REQUEST, restoredThread: () => Promise.resolve(false) } },
+    { label: "failed admission read", options: { request: RESTORE_REQUEST, restoredThread: () => Promise.reject(new Error("read failed")) } },
+    { label: "a probe that supplied no restore proof", options: { request: RESTORE_REQUEST } },
+    { label: "a probe seam that threw", options: { request: RESTORE_REQUEST, restoredThread: () => { throw new Error("seam threw"); } } },
+    { label: "a malformed B", options: { request: { resumeConversationId: "latest", workspace: WORKSPACE }, restoredThread: () => Promise.resolve(true) } },
+    { label: "no workspace", options: { request: { resumeConversationId: RESTORED }, restoredThread: () => Promise.resolve(true) } },
+  ];
+  for (const { label, options } of cases) {
+    const harness = createHarness(options);
+    harness.backend.resolveReady();
+    await expectRestoreRefused(harness, label);
+  }
+});
+
+test("a non-empty census withdraws restore status facts but admission is decided by B alone", async () => {
+  const harness = createHarness({
+    request: RESTORE_REQUEST,
+    probe: () => Promise.resolve(["some-loaded-thread"]),
+    restoredThread: () => Promise.resolve(true),
+  });
+  harness.backend.resolveReady();
+  await until(() => harness.relays.length === 1, "relay start");
+  const relay = harness.relays[0]!;
+  relay.resolveReady();
+  const ready = await bounded(harness.lease.readiness, "readiness");
+  assert.deepEqual(ready.tuiRootFacts?.current(), { phase: "withdrawn", withdrawal: "backend-not-empty" });
+  harness.lease.requestStop();
+  harness.backend.settle();
+  relay.resolveSettled();
+  await bounded(harness.lease.settlement, "settlement");
+});
+
+test("stop during the admission read aborts the probe, creates nothing, and waits for its close", async () => {
+  const admission = deferred<boolean>();
+  const closed = deferred<void>();
+  const harness = createHarness({
+    request: RESTORE_REQUEST,
+    restoredThread: () => admission.promise,
+    probeClosed: () => closed.promise,
+  });
+  harness.backend.resolveReady();
+  await until(() => harness.probeCalls.length === 1, "probe start");
+  harness.lease.requestStop();
+  assert.equal(harness.probeCalls[0]!.signal.aborted, true);
+  const error = await rejectionOf(harness.lease.readiness);
+  assert.ok(error instanceof NativeCodexOwnedCompositeError);
+  assert.equal(error.code, "stopped");
+  harness.backend.settle();
+  await expectPending(harness.lease.settlement, "the admission read has not finished");
+  admission.resolve(true);
+  await tick();
+  assert.equal(harness.relays.length, 0, "a late admission starts nothing");
+  await expectPending(harness.lease.settlement, "the probe socket has not closed");
+  closed.resolve();
+  assert.deepEqual(await bounded(harness.lease.settlement, "settlement"), NOT_CREATED);
+});
+
+test("a refused restore's settlement still waits for the probe's own late close proof", async () => {
+  const closed = deferred<void>();
+  const harness = createHarness({
+    request: RESTORE_REQUEST,
+    restoredThread: () => Promise.resolve(false),
+    probeClosed: () => closed.promise,
+  });
+  harness.backend.resolveReady();
+  const error = await rejectionOf(harness.lease.readiness);
+  assert.equal((error as NativeCodexOwnedCompositeError).code, "restore-unavailable");
+  harness.backend.settle();
+  await expectPending(harness.lease.settlement, "the probe is still open");
+  closed.resolve();
+  assert.deepEqual(await bounded(harness.lease.settlement, "settlement"), NOT_CREATED);
+  assert.equal(harness.relays.length, 0);
+});
+
+test("a confirmed backend exit during admission is never admitted", async () => {
+  const admission = deferred<boolean>();
+  const harness = createHarness({ request: RESTORE_REQUEST, restoredThread: () => admission.promise });
+  harness.backend.resolveReady();
+  await until(() => harness.probeCalls.length === 1, "probe start");
+  harness.backend.exit();
+  admission.resolve(true);
+  const error = await rejectionOf(harness.lease.readiness);
+  assert.equal((error as NativeCodexOwnedCompositeError).code, "backend-ended");
+  assert.equal(harness.relays.length, 0);
+  harness.backend.settle();
+  await bounded(harness.lease.settlement, "settlement");
+});
+
+/* ------------------------------------- production restore admission probe */
+
+async function productionRestore(
+  threads: readonly FakeThread[],
+  request: Pick<OwnedCodexBackendLaunchRequest, "workspace" | "resumeConversationId">,
+  extra: { readonly unreadable?: readonly string[] } = {},
+): Promise<{ readonly server: FakeCodexAppServer; readonly harness: Harness; readonly relay: () => FakeRelay | undefined }> {
+  const server = new FakeCodexAppServer({
+    threads,
+    loadedIds: [],
+    requireAuthorization: BACKEND_BEARER,
+    ...(extra.unreadable === undefined ? {} : { unreadableThreadIds: extra.unreadable }),
+  });
+  const port = await server.listenLoopback();
+  const ready: OwnedCodexBackendReady = Object.freeze({
+    endpoint: `ws://127.0.0.1:${port}`,
+    readObserverBearer: (): string => BACKEND_BEARER,
+    createTuiConnection: (): OwnedCodexTuiConnection => BACKEND_TUI,
+  });
+  let relay: FakeRelay | undefined;
+  const harness = createHarness({
+    realProbe: true,
+    request,
+    startRelay: (input) => {
+      relay = new FakeRelay(input);
+      return relay;
+    },
+  });
+  harness.backend.resolveReady(ready);
+  return { server, harness, relay: () => relay };
+}
+
+test("the production probe admits a cold saved B after the census on the same read-only connection", async () => {
+  const { server, harness, relay } = await productionRestore(
+    [{ id: RESTORED, parentThreadId: null, status: { type: "idle" }, cwd: WORKSPACE }],
+    RESTORE_REQUEST,
+  );
+  try {
+    await until(() => relay() !== undefined, "relay start after admission");
+    assert.deepEqual(server.requests.map((request) => request.method), ["initialize", "thread/loaded/list", "thread/read"],
+      "census first, then exactly B; no resume, start, turn, or reply");
+    assert.deepEqual(server.requests[2]!.params, { threadId: RESTORED, includeTurns: false });
+    assert.equal(server.upgradeCount, 1, "one probe connection, no extra observer socket");
+    await until(() => server.connectionCount === 0, "probe socket close");
+    const started = relay()!;
+    started.resolveReady();
+    const ready = await bounded(harness.lease.readiness, "readiness");
+    assert.deepEqual(ready.tuiRootFacts?.current(), { phase: "empty" }, "admission attested the empty census only");
+    harness.lease.requestStop();
+    harness.backend.settle();
+    started.resolveSettled();
+    await bounded(harness.lease.settlement, "settlement");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("the production probe refuses a missing, foreign-workspace, child, or unreadable B before any TUI", async () => {
+  const cases: Array<{
+    readonly label: string;
+    readonly threads: readonly FakeThread[];
+    readonly unreadable?: readonly string[];
+  }> = [
+    { label: "missing B", threads: [] },
+    { label: "B in another workspace", threads: [{ id: RESTORED, parentThreadId: null, status: { type: "idle" }, cwd: "/owned/another-workspace" }] },
+    { label: "B is a child thread", threads: [
+      { id: "parent-thread", parentThreadId: null, status: { type: "idle" }, cwd: WORKSPACE },
+      { id: RESTORED, parentThreadId: "parent-thread", status: { type: "idle" }, cwd: WORKSPACE },
+    ] },
+    { label: "unreadable B metadata", threads: [{ id: RESTORED, parentThreadId: null, status: { type: "idle" }, cwd: WORKSPACE }], unreadable: [RESTORED] },
+  ];
+  for (const { label, threads, unreadable } of cases) {
+    const { server, harness, relay } = await productionRestore(threads, RESTORE_REQUEST, unreadable === undefined ? {} : { unreadable });
+    try {
+      const error = await rejectionOf(harness.lease.readiness);
+      assert.equal((error as NativeCodexOwnedCompositeError).code, "restore-unavailable", label);
+      assert.equal(relay(), undefined, `${label}: no relay`);
+      assert.equal(harness.backend.stopCalls, 1, label);
+      assert.deepEqual(server.requests.map((request) => request.method), ["initialize", "thread/loaded/list", "thread/read"], label);
+      await until(() => server.connectionCount === 0, `${label}: probe socket close`);
+      harness.backend.settle();
+      await bounded(harness.lease.settlement, `${label}: settlement`);
+    } finally {
+      await server.stop();
+    }
   }
 });

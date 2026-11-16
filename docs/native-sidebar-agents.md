@@ -248,16 +248,90 @@ boundaries; [Development](development.md) owns verification commands.
   **out** of such a row is a separate, closed mechanism of its own —
   [Copying text out of a hosted row](#copying-text-out-of-a-hosted-row) — not part of
   the input lane.
-- A remembered native row keeps its own backend and workspace and **always** comes
-  back as a truthful **unavailable placeholder** titled `<name> (unavailable)`, where
-  `<name>` is the caption the operator gave the row or, if it was never named, its
-  provider label:
-  a remembered native row is never restarted automatically by a host restart, so
-  there is no conditional auto-restart to wait for. The row states
-  `<Provider> sessions are not restored; open New to start one`. It is never
-  restarted as a Pi row, never adopted into a live provider process, and never
-  bound to an arbitrary recent provider conversation; starting one again is always the
-  operator's own New submission.
+- A remembered native row keeps its own backend, workspace, and caption across a
+  host restart, and is **restored automatically** when it can be verified — see
+  [Restart restoration of native rows](#restart-restoration-of-native-rows). A row
+  that cannot be restored comes back as a truthful **unavailable placeholder** titled
+  `<name> (unavailable)`, where `<name>` is the caption the operator gave the row or,
+  if it was never named, its provider label. It is never restarted as a Pi row, never
+  adopted into a live provider process, and never bound to an arbitrary recent
+  provider conversation.
+
+### Restart restoration of native rows
+
+A host restart restores **every** remembered native row automatically, the same way
+it restores a remembered Pi conversation: in the remembered mixed order beside Pi rows
+and remote cards, with its caption, and with the remembered active row selected
+unless you already acted during startup. Each restored row is a **new** process this
+host owns, asked to resume exactly one conversation:
+
+- **What is remembered.** For a native row the roster keeps the exact provider
+  conversation UUID the row's own run last proved, and the exact id of the configured
+  launch target it was started with. No executable, argument, environment, or
+  credential is stored. The UUID is the host's private restart identity: it is never a
+  Pi conversation id, never shown on a card, and never sent to a paired viewer.
+- **What is checked before anything starts.** The remembered UUID and target id are
+  both present; that target is still in this host's **current** configuration for the
+  same backend; the recorded workspace still exists; and this host can start native
+  rows at all. The launch then goes through the same configured launcher as New, with
+  the target named explicitly, so a launcher that cannot resume that target exactly
+  (for example a Codex row whose backend this host does not own, or a configured
+  argument set that cannot be combined with a resume) refuses instead of starting a
+  fresh conversation.
+- **What proves it.** The resumed run's own provider must still prove the
+  conversation: for Claude Code, that run's own root `SessionStart` resuming exactly
+  that UUID in the recorded workspace; for an owned Codex row, a read-only check of
+  exactly that thread before the interactive TUI starts and then that TUI's own
+  resume of the same thread. Until then the row is an ordinary live row whose status
+  stays `unknown`. A later conversation change that the same run's own provider
+  positively proves replaces the remembered UUID; a positive loss of the proved
+  identity, or a loss of the observer that could follow it, forgets it. An ordinary
+  exit or stop keeps the last proved UUID.
+- **Status after a restore.** A restored Claude Code row gets the same launch
+  baseline as a fresh row — agent idle, input `none`, `Ready`, and 0 background
+  tasks and 0 shells — once, before any new prompt, as soon as **both** of two facts
+  hold, in either order: this host activated the new process it launched for the row,
+  and that run's own root `SessionStart` proved the exact conversation as described
+  above. No prompt is sent to obtain it. Before that proof, or when the proof is
+  missing, names another conversation or workspace, or comes from a child, every
+  field stays `unknown`. The baseline describes the new process, not the resumed
+  history: earlier transcript rows, summaries, and task records are never read as
+  current state. Anything the run reports itself — a prompt, a question, a tool or
+  background launch, a membership snapshot, newer root transcript rows, a session
+  end, or a hook-lane loss — replaces or withdraws the baseline exactly as on a fresh
+  row. The baseline is forfeited, rather than idling the row over something unseen,
+  by a hook-lane loss before the proof, by a hook naming the resumed conversation
+  that arrives before the proof (it is still not admitted as status), and — when the
+  proof comes first — by any hook of the run or any new transcript row between the
+  proof and activation. A repeated activation or start notice never re-mints it.
+  Each restored row is judged on its own run's evidence only, so two restored Claude
+  rows in the same workspace never affect each other. These counts are display
+  only: they never become ownership counts or stop/idle authority. A restored owned Codex row
+  starts with a fresh native question queue: without contrary live evidence it can
+  show `none` before the first prompt; live questions or gaps still mean `pending`
+  or `unknown`. Its counts and `Ready` come only from that thread's current complete
+  census, exactly as for a fresh row. No input is replayed into a restored
+  conversation, and this host does not answer provider authentication, trust, or
+  approval prompts. While initial restoration proof is pending, the row stays live,
+  selectable, and `unknown`, with no deadline; later status follows the provider's
+  actual observations rather than the presence of a prompt alone.
+- **What stays unavailable.** A remembered row with no proved UUID — including every
+  row remembered before this restoration existed, which is never retrofitted from
+  provider history, file times, or names — or with a missing or no-longer-configured
+  target, a vanished workspace, or no native hosting, comes back as the unavailable
+  placeholder with a bounded reason, and nothing is started for it. A resume refused
+  before it started, or one whose provider exited before proving the conversation,
+  stays on its real row as `<name> (unavailable)`; that row still owns its resources
+  until they settle and is removed only by your deliberate Delete. In every case the
+  remembered UUID, target, and caption are kept, so the next restart tries again;
+  Delete is the only way to forget the row.
+- **What this does not add.** Restoration happens at host startup only. Resuming an
+  exited native row from its card in the same run, or following an in-pane Codex
+  resume or switch to another thread, is still unsupported (see below), and in-pane
+  `/resume` remains the provider's own feature.
+- **Qualification is pending.** This restoration is covered by the repository's
+  component tests with synthetic providers. It has not yet been qualified against a
+  live Claude Code or Codex release, and it is not Windows runtime evidence.
 
 ## What the host owns, and what it never infers
 
@@ -295,10 +369,12 @@ boundaries; [Development](development.md) owns verification commands.
   provider's own turn, never the complete-idle proof the stop gate reads; that
   gate keeps requiring this host's own ownership counts to be positively observed
   zeros, which a hosted provider child never reports.
-- Resume is **in-pane only**, through whatever the provider itself offers (for
-  example `/resume` in a running Claude Code session). Pi's rename, Saved
-  conversation open, and exited-row resume are unavailable for a native row,
-  because they are Pi APIs.
+- Within a running host, resume is **in-pane only**, through whatever the provider
+  itself offers (for example `/resume` in a running Claude Code session). Pi's
+  rename, Saved conversation open, and exited-row resume are unavailable for a native
+  row, because they are Pi APIs. The one resume this host starts itself is the
+  automatic one at host startup
+  ([Restart restoration of native rows](#restart-restoration-of-native-rows)).
 
 ## Claude Code capabilities
 
@@ -311,7 +387,7 @@ boundaries; [Development](development.md) owns verification commands.
 | Native questions | Documented | [`AskUserQuestion`](https://code.claude.com/docs/en/tools-reference) multiple-choice questions **stay open until answered** unless `askUserQuestionTimeout` (`60s`, `5m`, `10m`) is set; permission prompts, including plan approval, never auto-resolve on idle |
 | Cancel | Documented | [`Esc` interrupts the running turn](https://code.claude.com/docs/en/interactive-mode) and keeps a queued draft; `Ctrl+C` interrupts a running operation or clears input |
 | Shutdown | Documented, non-interactive only | `/exit` closes an interactive session. The documented SIGTERM contract (Bash process tree terminated, exit 143) is described for non-interactive runs, so interactive stop and settlement semantics are unverified |
-| Resume | Documented | [`claude -c`, `claude -r` with a session id or name, `/resume`, `--fork-session`, `--session-id <UUID>`](https://code.claude.com/docs/en/sessions); not everything is restored — plan mode only under conditions, and a forked process starts without the earlier session's permission grants. A hosted row starts no resume argument of its own |
+| Resume | Documented | [`claude -c`, `claude -r` with a session id or name, `/resume`, `--fork-session`, `--session-id <UUID>`](https://code.claude.com/docs/en/sessions); not everything is restored — plan mode only under conditions, and a forked process starts without the earlier session's permission grants. A hosted row passes `--resume <UUID>` only when [restart restoration](#restart-restoration-of-native-rows) resumes its own remembered conversation; it never uses `-c`, a name, or `--fork-session` |
 | Native tasks and subagents | Documented in-client and in-process; **Unknown** as an external read | [`--agents` definitions and the `SubagentStart`, `SubagentStop`, `TaskCreated`, `TaskCompleted` hook events](https://code.claude.com/docs/en/hooks) report transitions. Inside a running session a [mod](https://code.claude.com/docs/en/plugins/mods/reference) can take a live census: `$.agent.list()` "returns this session's subagents and teammates, each with a status of `pending`, `running`, `waiting`, `idle`, `completed`, `failed`, or `killed`", where `waiting` and `idle` need Claude Code v2.1.289 or later. [Agent view](https://code.claude.com/docs/en/agent-view) documents that those subagents and teammates are **not** listed as separate rows there, and no read from outside the running provider process is documented |
 | Background shells | Documented in-client; **Unknown** as an external read | [`Ctrl+B`](https://code.claude.com/docs/en/interactive-mode) moves a running Bash command to the background (tmux users press twice); `!` shell mode runs a command directly; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` turns backgrounding off. A tool hook can see a `Bash` call with `run_in_background: true`, but the running set is listed only in-client with `/tasks`, no completion event is documented, no per-change notification is documented, and no external per-session shell count is documented ([Tools reference](https://code.claude.com/docs/en/tools-reference#background-commands), [PreToolUse input](https://code.claude.com/docs/en/hooks#pretooluse-input)) |
 | External current-state read | Documented; **unverified** for a row this host starts | [`claude agents --json [--all]`](https://code.claude.com/docs/en/agent-view) is documented as the way to read session state from outside Claude Code — "every live session, plus background sessions that are still working or blocked even when their process has exited" — where entries carry `cwd`, `kind`, and `startedAt`, and a live entry carries `pid`, `status` (`busy`, `waiting`, `idle`) and, while waiting, `waitingFor` naming the cause (permission prompt, question or MCP input request, sandbox request, open dialog). The same page's agent-view list also says an interactive session open in another terminal does not appear until it is backgrounded, and the documented `state` values cover background sessions, so whether a session this host started in its own PTY is listed at all is **unverified** — not documented as impossible |
@@ -330,7 +406,7 @@ boundaries; [Development](development.md) owns verification commands.
 | Native questions | **Unknown** in the TUI; Documented for app-server | No TUI multiple-choice question tool is documented. [app-server](https://learn.chatgpt.com/docs/app-server) exposes `item/tool/requestUserInput` (experimental: 1–3 short questions, optional free-form option) and MCP elicitation |
 | Cancel | Partially documented | `interrupt_turn` is a configurable [`tui.keymap` chat action](https://learn.chatgpt.com/docs/config-file/config-basic); its default binding was not confirmed in the reviewed pages |
 | Shutdown | Documented | `Ctrl+C` or `/exit` closes the session ([CLI reference](https://learn.chatgpt.com/docs/cli/reference)); an `Interrupt` hook event fires when a turn is interrupted ([hooks](https://learn.chatgpt.com/docs/hooks)) |
-| Resume | Documented | [`codex resume` (by id or name, `--last`, `--all`) and `codex fork`](https://learn.chatgpt.com/docs/cli/reference); `--worktree` cannot combine with resume. These are subcommands or startup switches, so a hosted row starts none of them and resumes only in-pane |
+| Resume | Documented | [`codex resume` (by id or name, `--last`, `--all`) and `codex fork`](https://learn.chatgpt.com/docs/cli/reference); `--worktree` cannot combine with resume. A hosted row starts `resume` with one exact thread id only when [restart restoration](#restart-restoration-of-native-rows) resumes its own remembered conversation on a row whose backend this host owns; it never uses a name, `--last`, `--all`, or `fork`, and otherwise resumes only in-pane |
 | Native tasks and subagents | Documented in-client; **Unknown** as an external read | [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): `agents.enabled` defaults to `true`, built-ins are `default`, `worker`, and `explorer`, and custom agents are TOML files under `~/.codex/agents/` or project `.codex/agents/`; `SubagentStart` and `SubagentStop` [hook events](https://learn.chatgpt.com/docs/hooks) exist. No programmatic current-state census for an ordinary hosted TUI session was established by this source review; on the owned route the backend beside the row is this host's own, and that provider's documented descendant-thread listing is what the task figure reads |
 | Background shells | Documented in-client; **Unknown** as an external read | [`/ps` lists the session's background terminals with each one's command and up to three recent non-empty output lines, and `/stop` (alias `/clean`) stops them](https://learn.chatgpt.com/docs/cli/slash-commands); that list is populated when `unified_exec` is in use, otherwise it may be empty. A unified-exec `exec_command` matches as Bash and "a later `write_stdin` poll can deliver the original command's `PostToolUse` when that command finishes" ([hooks](https://learn.chatgpt.com/docs/hooks)), so settlement is observable only when something polls; no external per-session shell count is documented. Separately, app-server `thread/backgroundTerminals/list`, `/terminate`, and `/clean` are experimental and require the `experimentalApi` capability; `thread/shellCommand` runs outside the sandbox with full access and is never used, and the owned route reads only the list method against its own backend — a refusal there is `unknown`, never a zero |
 | External current-state read | Documented for an app-server client; **Unknown** for a session this host does not own the backend of | [`thread/read` and `thread/list` report runtime status, and `thread/status/changed` notifies with e.g. `status.type: "active"` and `activeFlags: ["waitingOnApproval"]`](https://learn.chatgpt.com/docs/app-server). On the owned route this host holds the backend and reads those methods read-only against its own endpoint; whether a second app-server client could observe a thread owned by some other, provider-started session is unverified and never relied on |
@@ -421,7 +497,10 @@ nothing is written into provider settings, trust stores, or credential files. Tw
 loopback sockets exist for such a row — the backend's listener and the relay's — and
 both are private, ephemeral, and owned by that row alone.
 
-That route states anything about a thread only on an ordinary fresh start, proved
+That route states anything about a thread only on an ordinary fresh start or a
+verified [restart restoration](#restart-restoration-of-native-rows) — where the
+remembered thread itself is read before the TUI starts and the TUI's own resume of
+exactly that thread stands in for the thread start below. A fresh start is proved
 in order: the backend's loaded-thread census was empty before anything attached, one
 genuine provider-client `initialize` established the connection, and exactly one
 initial non-helper, parentless, non-ephemeral thread start named the candidate. Those
@@ -695,7 +774,7 @@ below names the gaps that survive any observer.
 | Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn, attributed only to the bound root; empty when nothing was observed or after a withdrawal |
 | Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
 | Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
-| Roster title of a remembered row after a host restart (always unavailable) | `<caption or Provider> (unavailable)` | `<caption or Provider> (unavailable)` |
+| Roster title of a remembered row after a host restart | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)` | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)` |
 | Idle-only stop | Confirmation required, always | Confirmation required, always |
 | Provider conversation rename, saved-conversation open, exited-row resume | Unavailable: Pi APIs | Unavailable: Pi APIs |
 
@@ -1068,10 +1147,13 @@ What to expect, and what this does and does not prove:
 - **No automated approvals.** Never try a provider's permission-bypass or
   approval-disabling flag to make a tryout easier; a configured target that names
   one is refused by design, and that refusal is the behavior under test.
-- Restarting the host in the same stage shows a remembered native row as
-  `<Provider> (unavailable)`, and the next New session asks you to choose the target
-  again: a native target's id, executable, arguments, and environment are not
-  persisted.
+- Restarting the host in the same stage restores a remembered native row whose own
+  run proved its conversation, through the same configured target, and shows any
+  other remembered native row as `<Provider> (unavailable)`
+  ([Restart restoration of native rows](#restart-restoration-of-native-rows)). Only
+  the target's id is remembered; its executable, arguments, and environment come from
+  the current configuration, and the next New session still asks you to choose a
+  target.
 - If your terminal implements OSC 52 clipboard writes, select and copy text in the
   provider the provider's own way and see whether your connecting terminal's
   clipboard changed. For a hosted Codex row this is exactly what the `HERDR_ENV=1`

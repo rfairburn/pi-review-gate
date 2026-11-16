@@ -9,19 +9,44 @@ import {
 } from "./native-codex-acquisition";
 import type { NativeHookEvent, NativeHookFailure } from "./native-hook-protocol";
 import { createOwnedNativeCodexStatusObserver } from "./native-codex-owned-status";
-import type { NativeStatusObserverFactory } from "./instances";
+import type { NativeStatusObserverContext, NativeStatusObserverFactory } from "./instances";
 import type { NativeStatusObservation } from "./native-status";
 
-/** Owner-only construction context; no provider conversation is created here. */
+/**
+ * Owner-only construction context; no provider conversation is created here.
+ *
+ * The optional owner-private fields are exactly the manager's own context
+ * (issue #277): the row's canonical workspace, the exact admitted restoration
+ * UUID this run must still prove, and the separate identity channel. They are
+ * forwarded only to the source that consumes them; none of them is ever folded
+ * into a {@link NativeStatusObservation}.
+ */
 export type NativeObserverFactoryContext = Pick<NativeClaudeAcquisitionOptions, "rowId" | "backend"> & {
   readonly emit: (observation: NativeStatusObservation) => void;
-};
+} & Pick<NativeStatusObserverContext, "workspace" | "resumeConversationId" | "emitConversationIdentity">;
+
+/** The owner-private identity inputs one consuming source receives, absent fields omitted. */
+function identityOptions(context: NativeObserverFactoryContext): {
+  readonly workspace?: string;
+  readonly resumeConversationId?: string;
+  readonly onConversationIdentity?: (conversationId: string | null) => boolean;
+} {
+  return {
+    ...(context.workspace === undefined ? {} : { workspace: context.workspace }),
+    ...(context.resumeConversationId === undefined ? {} : { resumeConversationId: context.resumeConversationId }),
+    ...(context.emitConversationIdentity === undefined
+      ? {}
+      : { onConversationIdentity: context.emitConversationIdentity }),
+  };
+}
 
 /** Construct one independent observation source for one already-owned native run. */
 export function createNativeStatusObserver(context: NativeObserverFactoryContext) {
   const options = { rowId: context.rowId, backend: context.backend, onSnapshot: context.emit };
   if (context.backend === "claude") {
-    const controller = new NativeClaudeAcquisitionController(options);
+    // Claude proves its own root conversation from its authenticated hooks, so it
+    // alone of the legacy sources receives the owner-private identity inputs.
+    const controller = new NativeClaudeAcquisitionController({ ...options, ...identityOptions(context) });
     return Object.freeze({
       support: NATIVE_CLAUDE_ACQUISITION_SUPPORT,
       // Keep hook dispatch synchronous: Claude takes its read barrier before the broker ACK.
@@ -38,6 +63,7 @@ export function createNativeStatusObserver(context: NativeObserverFactoryContext
     });
   }
   if (context.backend === "codex") {
+    // The legacy Codex hook lane proves no conversation identity; it is unchanged.
     const controller = new NativeCodexAcquisitionController(options);
     return Object.freeze({
       support: NATIVE_CODEX_ACQUISITION_SUPPORT,
@@ -86,6 +112,8 @@ export function createNativeStatusObserverFactory(
     // is owned, it is the only source, with the only declaration it ever had.
     const legacy = createNativeStatusObserver(context);
     if (!ownedCodexBackend || context.backend !== "codex") return legacy;
-    return createOwnedNativeCodexStatusObserver({ legacy, emit: context.emit });
+    // The owned consumer validates a restoring run and proves its identity on the
+    // read-only RPC lane; the legacy source it wraps stays exactly as built above.
+    return createOwnedNativeCodexStatusObserver({ legacy, emit: context.emit, ...identityOptions(context) });
   };
 }

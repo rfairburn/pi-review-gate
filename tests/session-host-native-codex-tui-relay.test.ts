@@ -1822,3 +1822,89 @@ test("own ordinary turn/start and turn/steer input projects at the client frame;
     await harness.teardown();
   }
 });
+
+test("resume and fork candidates carry the request's own threadId as id-only provenance; bytes are unchanged", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    const clientFrames: Buffer[] = [];
+    const serverFrames: Buffer[] = [];
+    const afterHandshake = tui.received.length;
+    const request = async (message: Record<string, unknown>, maskKey: number[]): Promise<void> => {
+      const frame = jsonFrame(message, { maskKey: Buffer.from(maskKey) });
+      clientFrames.push(frame);
+      await tuiRequest(tui, harness.upstream, frame);
+    };
+    const respond = (message: Record<string, unknown>): void => {
+      const frame = jsonFrame(message);
+      serverFrames.push(frame);
+      harness.upstream.send(frame);
+    };
+    const restored = "019a0000-0000-7000-8000-00000000000b";
+
+    await request({ id: "init", method: "initialize", params: { clientInfo: { name: "codex-tui" }, capabilities: { requiredHumanApproval: true } } }, [1, 2, 3, 4]);
+    // A start never carries a requested thread.
+    await request({ id: "s1", method: "thread/start", params: { cwd: CWD_SENTINEL, threadId: "019a-ignored" } }, [5, 6, 7, 8]);
+    respond({ id: "s1", result: { thread: { id: "019a-start", ephemeral: false } } });
+    // A native pagination retry: the error projects nothing; only the paired
+    // success is a candidate, carrying the request's own threadId.
+    await request({ id: 7, method: "thread/resume", params: { threadId: restored, cwd: CWD_SENTINEL, excludeTurns: true } }, [9, 9, 9, 9]);
+    respond({ id: 7, error: { code: -32600, message: ERROR_MESSAGE_SENTINEL } });
+    await request({ id: 8, method: "thread/resume", params: { threadId: restored, cwd: CWD_SENTINEL, excludeTurns: false } }, [2, 4, 6, 8]);
+    respond({ id: 8, result: { thread: { id: restored, ephemeral: false, name: NAME_SENTINEL, path: ROLLOUT_SENTINEL }, cwd: CWD_SENTINEL } });
+    // A response naming another thread is reported faithfully, never copied
+    // into the requested slot.
+    await request({ id: "r3", method: "thread/resume", params: { threadId: "019a-asked" } }, [3, 3, 3, 3]);
+    respond({ id: "r3", result: { thread: { id: "019a-other" } } });
+    // A request without a bounded threadId projects no requested thread.
+    await request({ id: "r4", method: "thread/resume", params: { path: ROLLOUT_SENTINEL } }, [4, 4, 4, 4]);
+    respond({ id: "r4", result: { thread: { id: "019a-by-path" } } });
+    await request({ id: "f1", method: "thread/fork", params: { threadId: restored } }, [6, 6, 6, 6]);
+    respond({ id: "f1", result: { thread: { id: "019a-fork", ephemeral: false }, parentThreadId: restored } });
+    // A helper resume keeps its label and its own provenance.
+    await request({ id: "temporary-structured-9", method: "thread/resume", params: { threadId: "019a-helper" } }, [7, 7, 7, 7]);
+    respond({ id: "temporary-structured-9", result: { thread: { id: "019a-helper" } } });
+
+    await until(() => eventsOfKind(harness.events, "thread-candidate").length === 6, "six candidates");
+    const serverBytes = Buffer.concat(serverFrames);
+    await tui.waitForReceived(afterHandshake + serverBytes.length);
+
+    const candidates = eventsOfKind(harness.events, "thread-candidate");
+    assert.deepEqual(candidates.map((event) => event.kind === "thread-candidate"
+      ? {
+        origin: event.origin,
+        requestIdKind: event.requestIdKind,
+        threadId: event.threadId,
+        requestedThreadId: event.requestedThreadId,
+        parentThreadId: event.parentThreadId,
+        ephemeral: event.ephemeral,
+      }
+      : null), [
+      { origin: "thread-start", requestIdKind: "native", threadId: "019a-start", requestedThreadId: undefined, parentThreadId: undefined, ephemeral: false },
+      { origin: "thread-resume", requestIdKind: "native", threadId: restored, requestedThreadId: restored, parentThreadId: undefined, ephemeral: false },
+      { origin: "thread-resume", requestIdKind: "native", threadId: "019a-other", requestedThreadId: "019a-asked", parentThreadId: undefined, ephemeral: undefined },
+      { origin: "thread-resume", requestIdKind: "native", threadId: "019a-by-path", requestedThreadId: undefined, parentThreadId: undefined, ephemeral: undefined },
+      { origin: "thread-fork", requestIdKind: "native", threadId: "019a-fork", requestedThreadId: restored, parentThreadId: restored, ephemeral: false },
+      { origin: "thread-resume", requestIdKind: "native-helper", threadId: "019a-helper", requestedThreadId: "019a-helper", parentThreadId: undefined, ephemeral: undefined },
+    ]);
+    for (const event of candidates) {
+      assert.deepEqual(
+        Object.keys(event).filter((key) => !["kind", "connectionId", "sequence", "origin", "requestIdKind", "threadId", "requestedThreadId", "parentThreadId", "ephemeral"].includes(key)),
+        [],
+        "no other request or response field is projected",
+      );
+      if (event.kind === "thread-candidate" && event.origin === "thread-start") assert.equal("requestedThreadId" in event, false);
+    }
+    assert.equal(eventsOfKind(harness.events, "metadata-unavailable").length, 0);
+    assertNoSentinels(JSON.stringify(harness.events));
+
+    // Transport is byte-opaque in both directions.
+    const clientBytes = Buffer.concat(clientFrames);
+    assert.equal(harness.upstream.postHead(0).equals(clientBytes), true, "client frames forwarded unchanged");
+    assert.equal(tui.received.subarray(afterHandshake).equals(serverBytes), true, "backend frames forwarded unchanged");
+    assert.equal(harness.lease.status().forwardedBytesToBackend, clientBytes.length);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});

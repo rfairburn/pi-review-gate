@@ -1519,3 +1519,178 @@ test("a superseded census that read the root before its own work never publishes
     await h.close();
   }
 });
+
+/* ------------------------------------------- caller-supplied workspace proof */
+
+const UNKNOWN_CARD = Object.freeze({
+  busy: null,
+  pendingInput: null,
+  activity: [] as string[],
+  activeTasks: null,
+  activeShells: null,
+});
+
+function axes(observation: NativeStatusObservation): Record<string, unknown> {
+  return {
+    busy: observation.busy,
+    pendingInput: observation.pendingInput,
+    activity: observation.activity,
+    activeTasks: observation.activeTasks,
+    activeShells: observation.activeShells,
+  };
+}
+
+test("an expected workspace the root's own read matches validates it and keeps the ordinary card", async () => {
+  let validated = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootValidated: () => {
+      validated += 1;
+    },
+  });
+  try {
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    assert.equal(h.observations.length, 1, "validation adds no extra publication");
+    assert.equal(validated, 1, "the SAME root read validated the root once per census");
+    assert.equal(h.requests("thread/read") >= 1, true);
+    // The workspace never goes on the wire, and the root read is the ordinary one.
+    assert.deepEqual(h.server.requests.find((request) => request.method === "thread/read")?.params,
+      { threadId: ROOT, includeTurns: false });
+    assert.equal(h.server.connectionCount, 1, "no additional observer connection");
+    const surfaced = JSON.stringify(h.observations);
+    assert.equal(surfaced.includes("/owned/worktree"), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a root in another workspace publishes nothing but unknown and is never validated", async () => {
+  let validated = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/elsewhere",
+    onRootValidated: () => {
+      validated += 1;
+    },
+  });
+  try {
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD, "no Ready, zero, count, or input none for a wrong workspace");
+    assert.equal(validated, 0);
+    assert.ok(h.diagnostics.includes("root-workspace-unverified"));
+
+    // Live provider traffic for the root still cannot surface anything.
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+    assert.equal(validated, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an unreadable root proves nothing, and a later matching read of the same root validates it", async () => {
+  let validated = 0;
+  const h = await startHarness({ unreadableThreadIds: [ROOT] }, {
+    expectedWorkspace: "/owned/worktree",
+    onRootValidated: () => {
+      validated += 1;
+    },
+  });
+  try {
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD, "counts stay unknown until the root is proved");
+    assert.equal(validated, 0);
+
+    h.server.unreadable.delete(ROOT);
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(validated >= 1, true);
+    assert.equal(h.latest().busy, false);
+    assert.equal(h.latest().activeTasks, 2);
+
+    // A root row naming another thread is a contrary answer, not a validation.
+    h.server.mismatched.add(ROOT);
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an observer retired from inside its validation callback publishes nothing further", async () => {
+  let observer: NativeCodexRpcStatusObserver | undefined;
+  let validated = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootValidated: () => {
+      validated += 1;
+      observer?.dispose();
+    },
+  });
+  try {
+    // The first census validated before `observer` was captured; retire on the next.
+    observer = h.observer;
+    const before = h.observations.length;
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.observer.refresh();
+    await settle(100);
+    assert.equal(validated, 2);
+    assert.equal(h.observations.length, before, "a census whose caller retired it cannot publish");
+    assert.equal(h.scheduler.pendingTimerCount, 0, "no timer survives the retirement");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a positive root contradiction after validation is reported; an unreadable read is not", async () => {
+  let validated = 0;
+  let contradicted = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootValidated: () => {
+      validated += 1;
+    },
+    onRootContradicted: () => {
+      contradicted += 1;
+    },
+  });
+  try {
+    assert.equal(validated, 1);
+    assert.equal(contradicted, 0);
+
+    // An unreadable answer proves nothing either way.
+    h.server.unreadable.add(ROOT);
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(contradicted, 0, "a read gap is not a contradiction");
+    h.server.unreadable.delete(ROOT);
+
+    // The same root now reported in another workspace.
+    h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(contradicted, 1);
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+
+    // A readable row naming another thread is also a contradiction.
+    h.server.setThread({ ...POPULATION[0]! });
+    h.server.mismatched.add(ROOT);
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(contradicted, 2);
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+  } finally {
+    await h.close();
+  }
+});

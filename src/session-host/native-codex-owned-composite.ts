@@ -14,7 +14,8 @@
  * - `status()` is the backend lease's own status verbatim. No relay or probe
  *   fact is allowed to rewrite the backend's process truth.
  * - readiness resolves only after the backend's own readiness, the owner's
- *   read-only pre-attach loaded-thread census, and the relay's own readiness.
+ *   read-only pre-attach loaded-thread census (plus, for a restore launch, the
+ *   exact saved conversation's admission read), and the relay's own readiness.
  *   A confirmed backend `exitObserved` is never admitted, even while both
  *   captured readers are still draining and settlement is still pending.
  * - the ready value's `endpoint` and `readObserverBearer()` are the ACTUAL
@@ -34,7 +35,9 @@
  *    endpoint, before the relay is listening and before any TUI exists. An
  *    empty terminal page is the only fresh-backend witness this module can
  *    produce. It is a fact, never a root selection: no thread id, page item,
- *    or "only loaded thread" is adopted from it;
+ *    or "only loaded thread" is adopted from it. A restore launch then reads
+ *    exactly its saved conversation on the same connection (admission only;
+ *    see "Exact restored conversation admission" below);
  * 3. relay start, synchronously in the same continuation, with the retained
  *    relay lease;
  * 4. relay readiness.
@@ -49,6 +52,31 @@
  * a launch whose TUI endpoint did not bind cannot proceed, so both owned
  * resources are asked to stop and readiness rejects with a closed composite
  * error without widening the backend's own failure codes.
+ *
+ * ## Exact restored conversation admission (restore mode)
+ *
+ * A launch request carrying `resumeConversationId` B is a RESTORE launch. Fresh
+ * launches (no B) are exactly unchanged: `workspace` is ignored for them and a
+ * census failure still never blocks their TUI.
+ *
+ * For a restore launch the retained binder is created with B, and the SAME
+ * read-only pre-attach probe, after its loaded-thread census, additionally
+ * reads exactly B (`thread/read` with `includeTurns: false`) and compares B's
+ * provider cwd with the request's exact workspace at the transport's decode
+ * edge. The read is ADMISSION only: it proves that THIS owned backend knows B as
+ * a parentless thread of this workspace, it binds nothing, and it never adopts
+ * anything from the census, history, or a list. A saved B that is not loaded
+ * (`notLoaded`) is the ordinary cold state and is admitted. Only the genuine
+ * TUI's own successful resume of B (proved later inside the binder) can name a
+ * candidate. The census still decides only the binder's empty-backend witness.
+ *
+ * A malformed B, a missing workspace, a missing or refused B, an unreadable
+ * row, another thread's row, a child row, a different workspace, or any probe
+ * failure is a closed `restore-unavailable` readiness failure BEFORE the relay
+ * (and therefore any TUI) exists. It uses the existing creation-failure path:
+ * both owned resources are asked to stop exactly once, and settlement still
+ * waits for the backend's own proof and the probe's own socket-close proof.
+ * There is no fresh or picker fallback.
  *
  * ## Stop and settlement algebra
  *
@@ -71,7 +99,8 @@ import type {
   OwnedCodexBackendSettlement,
   OwnedCodexBackendStatus,
 } from "./native-codex-backend";
-import type { OwnedCodexBackendFactory } from "./instances";
+import type { OwnedCodexBackendFactory, OwnedCodexBackendLaunchRequest } from "./instances";
+import { isNativeConversationId } from "./native-conversation";
 import {
   NativeCodexRpcTransport,
   readNativeCodexRpcEndpoint,
@@ -106,6 +135,22 @@ export interface RelayedOwnedCodexPreAttachCensus {
    * draining can never block the genuine native TUI.
    */
   readonly closed: Promise<void>;
+  /**
+   * Restore mode only: whether THIS backend positively knows the expected
+   * conversation as a parentless thread whose provider cwd is the expected
+   * workspace. Absent means unproven (a restore is then refused); it is never
+   * assumed. Fresh mode ignores it.
+   */
+  readonly restoredThread?: Promise<boolean>;
+}
+
+/**
+ * The exact restore expectation handed to the pre-attach probe: the admitted
+ * conversation UUID and the row's exact canonical workspace. Owner-private.
+ */
+export interface RelayedOwnedCodexRestoreExpectation {
+  readonly conversationId: string;
+  readonly workspace: string;
 }
 
 /**
@@ -124,6 +169,7 @@ export interface RelayedOwnedCodexBackendOptions {
   readonly preAttachCensus?: (
     backend: OwnedCodexBackendReady,
     signal: AbortSignal,
+    restore?: RelayedOwnedCodexRestoreExpectation,
   ) => RelayedOwnedCodexPreAttachCensus;
   /** Test seam: the one relay start. Production omits it. */
   readonly startRelay?: (input: NativeCodexTuiRelayInput) => NativeCodexTuiRelayLease;
@@ -133,6 +179,8 @@ export interface RelayedOwnedCodexBackendOptions {
 export type NativeCodexOwnedCompositeFailureCode =
   | "backend-ended"
   | "relay-failed"
+  /** Restore mode: the exact saved conversation/workspace was not admitted. */
+  | "restore-unavailable"
   | "stopped";
 
 /** A composite failure whose message is its closed code and carries no provider text. */
@@ -160,7 +208,7 @@ export function createRelayedOwnedCodexBackendFactory(
     // the wrapper before any await. A throw here happens before this composite
     // owns anything, and propagates unchanged.
     const backend = options.backend(request);
-    return new RelayedOwnedCodexBackendLease(backend, request.identity, options, request.signal);
+    return new RelayedOwnedCodexBackendLease(backend, request, options);
   };
 }
 
@@ -173,6 +221,15 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
   readonly #readiness: Promise<OwnedCodexBackendReady>;
   readonly #settlement: Promise<OwnedCodexBackendSettlement>;
   readonly #abortSignal: AbortSignal | undefined;
+  /**
+   * Restore launches only: `"admissible"` carries the exact expectation, and
+   * `"refused"` means the request already cannot be admitted (malformed B or
+   * no workspace). Undefined is a fresh launch, exactly as before.
+   */
+  readonly #restore:
+    | { readonly status: "admissible"; readonly expectation: RelayedOwnedCodexRestoreExpectation }
+    | { readonly status: "refused" }
+    | undefined;
 
   #readinessResolve!: (ready: OwnedCodexBackendReady) => void;
   #readinessReject!: (error: unknown) => void;
@@ -195,17 +252,35 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
 
   constructor(
     backend: OwnedCodexBackendLease,
-    identity: OwnedCodexBackendLaunchIdentity,
+    request: OwnedCodexBackendLaunchRequest,
     options: RelayedOwnedCodexBackendOptions,
-    signal: AbortSignal | undefined,
   ) {
+    // The backend lease is already retained on this object's caller frame; the
+    // first assignment below keeps it before anything else can throw.
+    this.#backend = backend;
+    const identity = request.identity;
+    const signal: AbortSignal | undefined = request.signal;
     this.#identity = Object.freeze({
       leaseId: identity.leaseId,
       generation: identity.generation,
     });
-    this.#backend = backend;
     this.#options = options;
-    this.#facts = createNativeCodexTuiRootFactsBinder();
+    // Only an admissible restore configures the binder with B. A fresh launch
+    // keeps the exact fresh-only binder; a refused restore never reaches a TUI.
+    // Nothing here may throw past the retained backend: a binder refusal turns
+    // the restore into a refused one instead.
+    let restore = readRestoreRequest(request);
+    let facts: NativeCodexTuiRootFactsBinder;
+    try {
+      facts = restore?.status === "admissible"
+        ? createNativeCodexTuiRootFactsBinder({ resumeConversationId: restore.expectation.conversationId })
+        : createNativeCodexTuiRootFactsBinder();
+    } catch {
+      restore = Object.freeze({ status: "refused" as const });
+      facts = createNativeCodexTuiRootFactsBinder();
+    }
+    this.#restore = restore;
+    this.#facts = facts;
     this.#factsSource = Object.freeze({
       current: (): NativeCodexTuiRootFactsSnapshot => this.#facts.current(),
       watch: (listener: (snapshot: NativeCodexTuiRootFactsSnapshot) => void): (() => void) => this.#facts.watch(listener),
@@ -311,14 +386,28 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
 
     // Pre-attach census: read-only, owned endpoint, no relay and no TUI yet.
     // Its outcome is a fresh-backend witness only; failure withdraws facts and
-    // never blocks the native TUI.
+    // never blocks the native TUI. A restore launch additionally reads exactly
+    // its saved conversation in the same probe (admission only, never binding).
+    const restore = this.#restore;
+    const probe = this.#startProbe(
+      backendReady,
+      restore?.status === "admissible" ? restore.expectation : undefined,
+    );
     let census: "empty" | "not-empty" | "unavailable";
     try {
-      const ids: unknown = await this.#startProbe(backendReady);
+      const ids: unknown = await probe.threadIds;
       if (!Array.isArray(ids)) census = "unavailable";
       else census = ids.length === 0 ? "empty" : "not-empty";
     } catch {
       census = "unavailable";
+    }
+    let restoreAdmitted = false;
+    if (restore?.status === "admissible") {
+      try {
+        restoreAdmitted = (await probe.restoredThread) === true;
+      } catch {
+        restoreAdmitted = false;
+      }
     }
     if (census === "empty") this.#facts.attestEmptyBackend();
     else this.#facts.withdraw(census === "not-empty" ? "backend-not-empty" : "backend-attestation-unavailable");
@@ -330,6 +419,15 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
     }
     if (this.#backendEnded()) {
       this.#rejectComposite("backend-ended");
+      return;
+    }
+    if (restore !== undefined && !restoreAdmitted) {
+      // The exact saved conversation was not admitted on THIS backend. No relay
+      // and no TUI exist yet; the existing creation-failure path asks both owned
+      // resources to stop, and settlement still waits for their real proofs.
+      this.#relayDeclined = true;
+      this.#stopOwnedResources();
+      this.#rejectComposite("restore-unavailable");
       return;
     }
 
@@ -396,7 +494,10 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
 
   /* ------------------------------------------------------------ probe */
 
-  #startProbe(backend: OwnedCodexBackendReady): Promise<readonly string[]> {
+  #startProbe(
+    backend: OwnedCodexBackendReady,
+    restore: RelayedOwnedCodexRestoreExpectation | undefined,
+  ): { readonly threadIds: Promise<readonly string[]>; readonly restoredThread: Promise<boolean> } {
     const controller = new AbortController();
     this.#probe = controller;
     this.#probeFinished = false;
@@ -404,7 +505,9 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
     let census: RelayedOwnedCodexPreAttachCensus;
     try {
       const create = this.#options.preAttachCensus ?? createOwnedBackendPreAttachCensus;
-      census = create(backend, controller.signal);
+      census = restore === undefined
+        ? create(backend, controller.signal)
+        : create(backend, controller.signal, restore);
     } catch {
       census = {
         threadIds: Promise.reject(new Error("pre-attach census seam threw")),
@@ -412,20 +515,23 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
       };
     }
     const threadIds = Promise.resolve(census.threadIds);
-    // Readiness progression uses only the result. The close proof is a separate
+    void threadIds.catch(() => undefined);
+    // A restore proof the probe did not supply is unproven, never assumed.
+    const restoredThread = restore === undefined
+      ? Promise.resolve(false)
+      : census.restoredThread === undefined
+        ? Promise.resolve(false)
+        : Promise.resolve(census.restoredThread).then((admitted) => admitted === true, () => false);
+    // Readiness progression uses only the results. The close proof is a separate
     // settlement gate, so a slowly closing (or failed) probe cannot block the
     // genuine native TUI, while settlement can never claim a still-open probe.
-    void threadIds.then(
-      () => this.#finishProbe(),
-      () => this.#finishProbe(),
-    );
-    void threadIds.catch(() => undefined);
+    void Promise.allSettled([threadIds, restoredThread]).then(() => this.#finishProbe());
     void Promise.resolve(census.closed).then(
       () => this.#closeProbe(),
       // A rejected close proof is not proof: settlement stays pending.
       () => undefined,
     );
-    return threadIds;
+    return { threadIds, restoredThread };
   }
 
   #finishProbe(): void {
@@ -557,8 +663,10 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
 /**
  * The production pre-attach census: the existing read-only observer transport's
  * `initialize` plus ONE `thread/loaded/list` page against the exact owned
- * backend endpoint. The transport's own handshake/request deadlines bound the
- * whole census, and the socket is closed in `finally` (and on abort).
+ * backend endpoint (plus, for a restore launch, ONE `thread/read` of exactly the
+ * saved conversation after it, on the same connection). The transport's own
+ * handshake/request deadlines bound the whole probe, and the socket is closed
+ * once every read it made has settled (and on abort).
  *
  * `closed` is a distinct proof from the census result: it is the transport's
  * own `socketClosed` promise, which settles only on the underlying WebSocket's
@@ -574,19 +682,22 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
 function createOwnedBackendPreAttachCensus(
   backend: OwnedCodexBackendReady,
   signal: AbortSignal,
+  restore?: RelayedOwnedCodexRestoreExpectation,
 ): RelayedOwnedCodexPreAttachCensus {
+  const refused = (error: unknown): RelayedOwnedCodexPreAttachCensus => ({
+    threadIds: Promise.reject(error),
+    closed: Promise.resolve(),
+    ...(restore === undefined ? {} : { restoredThread: Promise.resolve(false) }),
+  });
   let endpoint: NativeCodexRpcEndpoint;
   try {
     endpoint = readNativeCodexOwnedObserverEndpoint(backend);
   } catch (error) {
     // No socket was created, so the close proof is already complete.
-    return { threadIds: Promise.reject(error), closed: Promise.resolve() };
+    return refused(error);
   }
   if (signal.aborted) {
-    return {
-      threadIds: Promise.reject(new Error("pre-attach census aborted")),
-      closed: Promise.resolve(),
-    };
+    return refused(new Error("pre-attach census aborted"));
   }
 
   let transport: NativeCodexRpcTransport;
@@ -594,7 +705,7 @@ function createOwnedBackendPreAttachCensus(
     transport = new NativeCodexRpcTransport({ endpoint });
   } catch (error) {
     // Construction refusal happens before any socket exists.
-    return { threadIds: Promise.reject(error), closed: Promise.resolve() };
+    return refused(error);
   }
   // The transport's own physical-close proof, retained for the whole probe
   // lifetime and independent of the census result. `close()` below only
@@ -612,23 +723,66 @@ function createOwnedBackendPreAttachCensus(
   const onAbort = (): void => closeTransport();
   signal.addEventListener("abort", onAbort, { once: true });
 
+  const connected = transport.connect();
+  void connected.catch(() => undefined);
   const threadIds = (async (): Promise<readonly string[]> => {
-    try {
-      await transport.connect();
-      const page = await transport.listLoadedThreadIds();
-      if (page.threadIds.length === 0 && page.nextCursor !== null) {
-        throw new Error("pre-attach census page is not terminal");
-      }
-      return page.threadIds;
-    } finally {
-      signal.removeEventListener("abort", onAbort);
-      closeTransport();
+    await connected;
+    const page = await transport.listLoadedThreadIds();
+    if (page.threadIds.length === 0 && page.nextCursor !== null) {
+      throw new Error("pre-attach census page is not terminal");
     }
+    return page.threadIds;
   })();
   // The composite observes this rejection; this branch only prevents an
   // unhandled rejection if readiness was already rejected by a stop.
   void threadIds.catch(() => undefined);
-  return { threadIds, closed };
+
+  // Restore admission runs strictly AFTER the census on the same connection, so
+  // reading B can never make the census itself observe a loaded thread. It is
+  // the exact known B only: no list, no history, no other thread.
+  const restoredThread = restore === undefined
+    ? undefined
+    : threadIds.then(() => undefined, () => undefined).then(async (): Promise<boolean> => {
+        await connected;
+        const read = await transport.readThreadInWorkspace(restore.conversationId, restore.workspace);
+        return read !== null
+          && read.row.threadId === restore.conversationId
+          && read.row.parentThreadId === null
+          && read.workspaceMatches;
+      }).catch(() => false);
+
+  // One close for the whole probe, after every read it makes has settled (or
+  // on abort, which rejects whatever is still pending).
+  void Promise.allSettled([threadIds, restoredThread ?? Promise.resolve(false)]).then(() => {
+    signal.removeEventListener("abort", onAbort);
+    closeTransport();
+  });
+  return { threadIds, closed, ...(restoredThread === undefined ? {} : { restoredThread }) };
+}
+
+/**
+ * Read the restore expectation off one launch request. Fresh requests (no
+ * `resumeConversationId`) answer undefined and keep the exact fresh behavior;
+ * `workspace` alone never makes a launch a restore. A restore whose B is not one
+ * exact provider UUID, or which carries no usable workspace, is refused here so
+ * it can never reach a TUI.
+ */
+function readRestoreRequest(
+  request: OwnedCodexBackendLaunchRequest,
+):
+  | { readonly status: "admissible"; readonly expectation: RelayedOwnedCodexRestoreExpectation }
+  | { readonly status: "refused" }
+  | undefined {
+  const conversationId: unknown = request.resumeConversationId;
+  if (conversationId === undefined) return undefined;
+  const workspace: unknown = request.workspace;
+  if (!isNativeConversationId(conversationId) || typeof workspace !== "string" || workspace.length === 0) {
+    return Object.freeze({ status: "refused" as const });
+  }
+  return Object.freeze({
+    status: "admissible" as const,
+    expectation: Object.freeze({ conversationId, workspace }),
+  });
 }
 
 /**

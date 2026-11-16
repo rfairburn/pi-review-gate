@@ -39,7 +39,9 @@
  *    the owner holds; a controller that already observed work refuses the claim, a
  *    second call changes nothing, and any accepted prompt, tool edge, provider
  *    count snapshot, session end, hook-lane loss, or newer observed root row ends
- *    the vouch. Independently, a root `SessionStart` whose own payload names
+ *    the vouch. A restored run's spawn receives the same baseline only once its
+ *    own exact resume proof is also held (see 9). Independently, a root
+ *    `SessionStart` whose own payload names
  *    `source` `startup` or `clear` can establish the same baseline, but only after
  *    ONE bounded read of the run's own transcript proves the file holds no
  *    conversation row — `resume`, `compact`, `fork`, an unreadable source, an
@@ -222,6 +224,55 @@
  *    committed, so a malformed row after a sufficient summary withdraws rather
  *    than publishing Ready.
  *
+ * 9. Conversation identity and restoration (issue #277). This controller can
+ *    report, through the owner's private `onConversationIdentity` channel, the
+ *    exact provider conversation UUID its OWN positively bound root scope proved:
+ *    a genuine authenticated ROOT `SessionStart` of this run whose `session_id`
+ *    is one exact UUID and whose provider `cwd` resolves to the same existing
+ *    directory as the row's selected workspace. That identity is the controller's
+ *    current root binding, never a second tracker: no history, filename, prose,
+ *    birthtime, or other conversation is consulted, and it proves identity only —
+ *    never persistence, idleness, input, or counts. No model prompt is required.
+ *    A later genuine root `SessionStart` that proves another UUID follows it, one
+ *    that replaces the binding WITHOUT proof (no UUID, no usable `cwd`, another
+ *    workspace) explicitly withdraws it (`null`) instead of leaving the old id, a
+ *    root `SessionEnd` whose reason is a conversation replacement (`clear`,
+ *    `resume`) withdraws it, and an authenticated hook-lane loss withdraws it
+ *    until this run's own admitted root hooks positively name the same bound
+ *    conversation again. Ordinary status uncertainty — an unreadable payload, an
+ *    unreadable transcript, an unknown axis — and any other `SessionEnd`, an
+ *    invalidation, or disposal never withdraw it: a normal native exit usually
+ *    lands while the owner still sees a live PTY, and the conversation it ends is
+ *    exactly the one this row must restore, so after that ordinary `SessionEnd`
+ *    even a lane failure (hooks racing the closing process) keeps it. A report the owner refused
+ *    before activation is kept as the ONE current candidate and offered again
+ *    from {@link NativeClaudeAcquisitionController.observeOwnedStartup}; nothing
+ *    is queued, timed, or replayed, and a disposed controller reports nothing.
+ *    A RESTORED run (`resumeConversationId` present) additionally admits NOTHING
+ *    from its hook lane until that proof names the expected id with
+ *    `source: "resume"`: a child, a foreign or malformed session, another source,
+ *    another workspace, or a missing hook leaves every axis unknown and the
+ *    expected id unconfirmed — the persisted id is an expectation, not
+ *    authority. A restored run gets the owner's ordinary idle/none/0/0 launch
+ *    baseline ONCE, and only when BOTH facts hold, in either order: the owner's
+ *    activation of this exact new process ({@link
+ *    NativeClaudeAcquisitionController.observeOwnedStartup}) and that run's own
+ *    exact resume proof. Activation before proof only records that the owner
+ *    vouched the spawn; the baseline lands with the proof, before any later hook
+ *    of the run is admitted. Proof before activation leaves the baseline to
+ *    activation, but ANY further hook of this run in between forfeits it, and so
+ *    does any change to the bound transcript after the position fixed at the
+ *    proof, so a late activation never states idle over something it did not
+ *    see. Before the proof nothing is admitted, but a hook naming the expected
+ *    conversation (other than a root start notice) still forfeits the baseline:
+ *    that conversation was already doing something this run could not observe. The
+ *    baseline is the same owner fact a fresh run gets — a new process with no
+ *    input and no background work of its own — never a reading of the resumed
+ *    history: the scan floor still excludes every older row, and this run's own
+ *    later prompts, questions, tool and task edges, snapshots, newer transcript
+ *    rows, scope ends, and lane losses replace or withdraw it exactly as for a
+ *    fresh run. A refused, missing, or foreign proof mints nothing.
+ *
  * Failures withdraw, per lane. A missing/unreadable/replaced/truncated
  * transcript, a malformed or oversized record inside the scanned window, a window
  * too small to cover the barrier, or a watcher error retires the in-flight
@@ -247,10 +298,11 @@
  * failure of the lane itself withdraws everything the lane supported.
  */
 
-import { lstatSync, watch, type Stats } from "node:fs";
-import { dirname } from "node:path";
+import { lstatSync, realpathSync, statSync, watch, type Stats } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 
 import { isRecord } from "../record-guard";
+import { isNativeConversationId } from "./native-conversation";
 import {
   NativeClaudeAgentLifetime,
   type NativeClaudeAgentLifetimeMark,
@@ -359,6 +411,29 @@ export interface NativeClaudeAcquisitionOptions {
    * {@link fs.watch} on that path.
    */
   readonly watchFile?: NativeClaudeWatchFactory;
+  /**
+   * Owner-private: this row's selected workspace. It is compared, as one existing
+   * directory, against a root `SessionStart`'s own provider `cwd`; it is never
+   * scanned, listed, or used to locate anything. Without it no conversation
+   * identity can be proved.
+   */
+  readonly workspace?: string;
+  /**
+   * Owner-private: the exact conversation UUID this run was launched to RESUME.
+   * Its presence makes this a restored run: nothing from the hook lane is admitted
+   * until this run's own authenticated root `SessionStart` with `source: "resume"`
+   * names exactly this id in the selected workspace, and the owner's spawn never
+   * vouches an idle/empty baseline. It is an expectation to prove, never proof; a
+   * value that is not one exact UUID can never be proved.
+   */
+  readonly resumeConversationId?: string;
+  /**
+   * Owner-private identity channel: the exact UUID this run's current root binding
+   * proved, or `null` when a previously reported identity was positively lost
+   * while live. `false` means the owner refused it (for example before
+   * activation); `true` or no value means accepted. It is never a status value.
+   */
+  readonly onConversationIdentity?: (conversationId: string | null) => boolean | void;
 }
 
 /** One file watch this controller owns. `close` is idempotent by contract. */
@@ -503,6 +578,15 @@ const ADOPTABLE_EVENTS: ReadonlySet<string> = new Set([
   "PostToolUseFailure",
 ]);
 
+/**
+ * Root `SessionEnd` reasons that positively state the current conversation is
+ * being REPLACED in this live process, so a proved identity no longer names the
+ * current conversation. Every other reason (an exit, a logout, an unknown value)
+ * ends the process's session, not the conversation's standing as the one this
+ * row last ran, so the identity is kept for restoration.
+ */
+const CONVERSATION_REPLACED_END_REASONS: ReadonlySet<string> = new Set(["clear", "resume"]);
+
 /** Hook kinds that are positively observed new root work, ending an armed pass. */
 const NEW_ROOT_WORK_EVENTS: ReadonlySet<string> = new Set(["UserPromptSubmit", "PreToolUse"]);
 
@@ -600,6 +684,43 @@ export class NativeClaudeAcquisitionController {
   readonly #maxTailBytes: number | undefined;
   readonly #maxLineBytes: number | undefined;
   readonly #watchFile: NativeClaudeWatchFactory;
+  /** Owner-selected workspace for identity proof, or null (nothing provable). */
+  readonly #workspace: string | null;
+  readonly #onConversationIdentity: ((conversationId: string | null) => boolean | void) | undefined;
+  /** True for a run launched to resume one exact conversation. Never changes. */
+  readonly #restoring: boolean;
+  /** The exact UUID a restored run must prove, or null when none can be. */
+  readonly #restoreExpected: string | null;
+  /** True while a restored run has not yet proved its expected conversation. */
+  #restoreAwaitingProof: boolean;
+  /**
+   * A restored run's one-time launch-baseline gate. `waiting` until one of its
+   * two facts arrives: `activated` once the owner vouched the spawn first,
+   * `proved` once the exact resume proof was admitted first; `spent` once the
+   * baseline was minted, forfeited, or never applicable (a fresh run).
+   */
+  #restoredBaseline: "waiting" | "activated" | "proved" | "spent";
+  /**
+   * The exact UUID the CURRENT root binding was proved for by this run's own root
+   * `SessionStart` and workspace comparison, or null when the binding is unproved.
+   * It is this controller's own binding, not a separate tracker.
+   */
+  #boundIdentity: string | null = null;
+  /** True after an authenticated lane loss until the bound conversation is named again. */
+  #identitySuspended = false;
+  /**
+   * True once the bound conversation's own root `SessionEnd` with an ordinary
+   * (non-replacement) reason was admitted: the provider is ending this process's
+   * session, normally while the owner still sees a live PTY. The proved identity
+   * is the conversation this row last ran and must survive that shutdown, so a
+   * later lane failure — the expected fate of hooks racing a closing process — is
+   * not treated as a hidden switch. Only a new root `SessionStart` clears it.
+   */
+  #conversationEnded = false;
+  /** The identity value the owner last accepted from this controller. */
+  #reportedIdentity: string | null = null;
+  /** True while the current candidate was refused and may be offered once more. */
+  #identityOfferPending = false;
 
   readonly #reducer = new NativeClaudeStatusReducer();
   /** This run's live background membership census. Never published as ownership. */
@@ -743,6 +864,16 @@ export class NativeClaudeAcquisitionController {
     this.#maxLineBytes = options.maxLineBytes;
     this.#watchFile = typeof options.watchFile === "function" ? options.watchFile : defaultWatchFile;
     this.#ledgerScope = `native-claude-run-${++ledgerScopeSequence}`;
+    this.#workspace = typeof options.workspace === "string" && options.workspace !== "" ? options.workspace : null;
+    this.#onConversationIdentity = typeof options.onConversationIdentity === "function"
+      ? options.onConversationIdentity
+      : undefined;
+    this.#restoring = options.resumeConversationId !== undefined;
+    this.#restoreExpected = isNativeConversationId(options.resumeConversationId)
+      ? options.resumeConversationId
+      : null;
+    this.#restoreAwaitingProof = this.#restoring;
+    this.#restoredBaseline = this.#restoring ? "waiting" : "spent";
   }
 
   /**
@@ -752,6 +883,28 @@ export class NativeClaudeAcquisitionController {
   acceptHook(event: NativeHookEvent): void {
     if (this.#disposed) return;
     if (!isRecord(event) || event.backend !== this.#backend) return;
+
+    // A restored run admits nothing until its own authenticated root resume of the
+    // expected conversation, in the selected workspace, has arrived. Everything
+    // else — a child, another session, another source, a malformed payload — is
+    // not evidence about the conversation this row is supposed to be, so it may
+    // neither confirm the expectation nor populate the row with another root's
+    // status. Nothing is held for later: a dropped event is simply not this run's.
+    let restoreProof = false;
+    if (this.#restoreAwaitingProof) {
+      if (!this.#provesRestoredRoot(event)) {
+        // Still not admitted — it publishes nothing and confirms nothing — but a
+        // hook naming the very conversation this run is resuming, other than a
+        // root start notice, is that conversation already doing something. The
+        // launch baseline could only be stated over it unseen, so it is forfeited.
+        // A foreign or unattributable hook is not this conversation and changes
+        // nothing.
+        if (this.#namesRestoredConversation(event)) this.#restoredBaseline = "spent";
+        return;
+      }
+      this.#restoreAwaitingProof = false;
+      restoreProof = true;
+    }
 
     const hookEventName = typeof event.hook_event_name === "string" ? event.hook_event_name : "";
     // Only an ABSENT agent identity is this run's root scope. A present identity
@@ -791,7 +944,40 @@ export class NativeClaudeAcquisitionController {
     let reduction = this.#reducer.reduce(event);
     if (reduction.outcome === "ignored" && STALE_REDUCTION_REASONS.has(reduction.reason)) return;
 
+    if (!restoreProof && this.#restoredBaseline === "proved") {
+      // The proof landed before activation, and now another hook that survived
+      // this run's admission fences has arrived before activation too. Whatever it
+      // is, a later launch baseline would have to stand over it unseen, so the
+      // one-time baseline is forfeited. A foreign or stale hook, already refused
+      // above, changes nothing here.
+      this.#restoredBaseline = "spent";
+    }
+
     this.#noteScope(event, isRoot, hookEventName);
+    if (isRoot && hookEventName === "SessionStart") {
+      // The root binding was just replaced by this run's own boundary: the
+      // identity follows it exactly — the proved UUID, or an explicit withdrawal
+      // when the new binding cannot be proved — and never keeps the old one.
+      this.#boundIdentity = this.#provesRootContext(event) ? eventSession : null;
+      this.#identitySuspended = false;
+      this.#conversationEnded = false;
+      this.#syncIdentity();
+    } else if (isRoot
+      && this.#boundIdentity !== null
+      && this.#sessionId !== null
+      && this.#sessionId !== this.#boundIdentity) {
+      // The root binding this controller now holds names ANOTHER conversation
+      // without that conversation's own proving `SessionStart` — a scope adopted
+      // from an ordinary root hook after the proved one ended and the lane lost
+      // its closed-scope fence. The binding is the identity's only authority, so
+      // the old id no longer names the current conversation and is withdrawn
+      // rather than left saved beside another root's status. Late hooks of the
+      // proved conversation itself re-adopt the same id and change nothing.
+      this.#boundIdentity = null;
+      this.#identitySuspended = false;
+      this.#conversationEnded = false;
+      this.#syncIdentity();
+    }
     if (pathRebound) reduction = this.#reducer.reduce(event);
     if (reduction.outcome === "invalid") {
       // A recognized payload this observer cannot read degrades exactly the
@@ -862,6 +1048,37 @@ export class NativeClaudeAcquisitionController {
       this.#armed = null;
     }
 
+    if (admitted && sameScope && isRoot && hookEventName === "SessionEnd"
+      && eventSession !== null
+      && eventSession === this.#boundIdentity
+      && CONVERSATION_REPLACED_END_REASONS.has(readToken((event as { reason?: unknown }).reason) ?? "")) {
+      // The provider states this conversation is being replaced in the live
+      // process: the proved identity no longer names the current conversation.
+      this.#boundIdentity = null;
+      this.#identitySuspended = false;
+      this.#syncIdentity();
+    } else if (admitted && sameScope && isRoot && hookEventName === "SessionEnd"
+      && eventSession !== null
+      && eventSession === this.#boundIdentity) {
+      // An ordinary end (an exit, a logout, `other`, an absent or unknown reason)
+      // closes this process's session, not the conversation's standing as the one
+      // this row last ran: the identity is kept, never reported as `null`, and it
+      // stays the restoration target across the shutdown that follows.
+      this.#conversationEnded = true;
+    } else if (admitted && sameScope && isRoot
+      && hookEventName !== "SessionEnd"
+      && this.#identitySuspended
+      && eventSession !== null
+      && eventSession === this.#boundIdentity
+      && eventSession === this.#sessionId) {
+      // After a lane loss, this run's own admitted ROOT hook positively names the
+      // conversation its binding proved. A switch hidden by the gap would have
+      // named another session and been refused above, so this is the bound
+      // conversation still being the current one — new evidence, not a replay.
+      this.#identitySuspended = false;
+      this.#syncIdentity();
+    }
+
     // A root `SessionStart` whose own payload names a new owned startup or a
     // `/clear` is the only boundary that can show a row idle before its first
     // prompt, and only once this controller has actually read the run's own
@@ -872,6 +1089,29 @@ export class NativeClaudeAcquisitionController {
       && !this.#startupVouched
       && isNativeClaudeFreshStartSource((event as { source?: unknown }).source)) {
       this.#armFreshStartProbe();
+    }
+
+    // A restored run's exact resume proof is the second half of its launch
+    // baseline. If the owner already activated this process, the baseline lands
+    // now — on the freshly rebound proved scope, before any later hook of this run
+    // is admitted. Otherwise activation will state it, unless something else of
+    // this run arrives first. A gate already forfeited before the proof stays so.
+    if (restoreProof && this.#restoredBaseline !== "spent") {
+      const activated = this.#restoredBaseline === "activated";
+      const current = admitted && this.#restoredProofCurrent();
+      if (activated) {
+        this.#restoredBaseline = "spent";
+        if (current) this.#mintRestoredBaseline();
+      } else if (current) {
+        this.#restoredBaseline = "proved";
+        // Fix the bound transcript's position at the proof itself, so the rows the
+        // provider appends before activation are never mistaken for prior history:
+        // activation compares against this floor instead of starting a new one at
+        // whatever the end of the file has become by then.
+        if (this.#transcriptPath !== null) this.#ensureScanFloor();
+      } else {
+        this.#restoredBaseline = "spent";
+      }
     }
 
     this.#syncWatcher();
@@ -889,6 +1129,17 @@ export class NativeClaudeAcquisitionController {
     if (this.#disposed) return;
     if (!isRecord(failure) || failure.backend !== this.#backend) return;
     this.#hookLaneFailure("hook-failure");
+    // The lost event may have been a root boundary that replaced the conversation,
+    // so the proved identity can no longer be stated as current while live. Once
+    // the bound conversation's own ordinary `SessionEnd` was admitted, a failure is
+    // the expected loss of hooks racing a closing process, not evidence of a
+    // switch: the identity this row last ran is kept for restoration. A real new
+    // root binding after that end still decides afresh through its own
+    // `SessionStart`.
+    if (this.#boundIdentity !== null && !this.#conversationEnded) {
+      this.#identitySuspended = true;
+      this.#syncIdentity();
+    }
   }
 
   /**
@@ -900,12 +1151,106 @@ export class NativeClaudeAcquisitionController {
    * having arrived yet. It is not a general "the process looks quiet" shortcut:
    * if this controller already observed work, or the run's scope ended, the
    * reducer refuses it and nothing changes, and every later provider observation
-   * replaces or withdraws the baseline exactly like any other source.
+   * replaces or withdraws the baseline exactly like any other source. For a
+   * restored run this is only the owner's half: the baseline is stated once, when
+   * this run's own exact resume proof is also held (see 9 in the module notes).
    */
   observeOwnedStartup(): void {
-    if (this.#disposed || this.#startupVouched || this.#baselineRetired) return;
+    if (this.#disposed) return;
+    // Activation is the first moment the owner can accept an identity, so the ONE
+    // current candidate it refused earlier is offered again here — not a history,
+    // and never a candidate this controller has since withdrawn or replaced.
+    if (this.#identityOfferPending) this.#syncIdentity();
+    // A restored run states this baseline only once its own exact resume proof is
+    // also in hand. Activation first merely records the owner's half and leaves the
+    // baseline to the proof; activation after a proof that nothing else followed
+    // states it now. A repeated or later activation finds the gate spent.
+    if (this.#restoring) {
+      if (this.#restoredBaseline === "waiting") {
+        this.#restoredBaseline = "activated";
+        return;
+      }
+      if (this.#restoredBaseline !== "proved") return;
+      this.#restoredBaseline = "spent";
+      if (!this.#restoredProofCurrent()
+        || !this.#restoredTranscriptUntouched()
+        || !this.#mintRestoredBaseline()) return;
+      this.#syncWatcher();
+      this.#emit();
+      return;
+    }
+    if (!this.#mintOwnedBaseline()) return;
+    this.#syncWatcher();
+    this.#emit();
+  }
+
+  /**
+   * Whether the CURRENT root binding is still exactly the restored conversation
+   * this run proved: bound, identity proved for that id, and not suspended by a
+   * lane loss. A switched, withdrawn, or unbound scope never receives the
+   * restored baseline.
+   */
+  #restoredProofCurrent(): boolean {
+    return this.#restoreExpected !== null
+      && !this.#restoreAwaitingProof
+      && !this.#identitySuspended
+      && this.#boundIdentity === this.#restoreExpected
+      && this.#sessionId === this.#restoreExpected;
+  }
+
+  /**
+   * Whether one not-yet-admitted hook names the exact conversation this restored
+   * run is resuming, other than a ROOT `SessionStart` (a start notice — the proof
+   * itself, or a failed attempt at it — is not work). A hook naming another
+   * session, or none, is not attributable to it.
+   */
+  #namesRestoredConversation(event: NativeHookEvent): boolean {
+    if (this.#restoreExpected === null) return false;
+    if (readToken((event as { session_id?: unknown }).session_id) !== this.#restoreExpected) return false;
+    const agentId = (event as { agent_id?: unknown }).agent_id;
+    const isRoot = agentId === undefined || agentId === null;
+    return !(isRoot && event.hook_event_name === "SessionStart");
+  }
+
+  /**
+   * For a proof that arrived before activation: whether the bound transcript is
+   * still exactly the file, at exactly the position, fixed at that proof. Anything
+   * appended since — a new root turn, a task transition, or any other row — is
+   * current evidence that a launch baseline minted now would sit above unread, and
+   * a replaced, truncated, unreadable, or never-floored file cannot be vouched for
+   * either. A run with no bound transcript has no file lane to skip.
+   */
+  #restoredTranscriptUntouched(): boolean {
+    if (this.#transcriptPath === null) return true;
+    if (this.#cursor === null || this.#identity === null) return false;
+    const bound = this.#statBound();
+    if ("gap" in bound) return false;
+    return bound.stats.size === this.#cursor
+      && bound.stats.dev === this.#identity.dev
+      && bound.stats.ino === this.#identity.ino;
+  }
+
+  /**
+   * Mint the owner's launch baseline for a restored run whose proof is current.
+   * The ledger must still be unbound — nothing of this run's membership has been
+   * observed — so a census this run already tracks is never reset to zero.
+   * Returns whether it was applied; publication is the caller's.
+   */
+  #mintRestoredBaseline(): boolean {
+    if (this.#ledger.snapshot().scopeToken !== null || this.#snapshotCounts !== null) return false;
+    return this.#mintOwnedBaseline();
+  }
+
+  /**
+   * The one place the owner's launch baseline is minted, for a fresh run at
+   * activation and for a restored run once both its activation and its proof hold.
+   * Refused over observed work, an ended scope, a retired baseline, or an existing
+   * vouch; returns whether it was applied. Publication is the caller's.
+   */
+  #mintOwnedBaseline(): boolean {
+    if (this.#startupVouched || this.#baselineRetired) return false;
     const baseline = this.#reducer.observeOwnedStartup();
-    if (baseline.outcome !== "applied") return;
+    if (baseline.outcome !== "applied") return false;
     this.#startupVouched = true;
     // A process this host started a moment ago has registered no background work
     // of its own: that is a positively observed zero for this run, not a
@@ -917,8 +1262,7 @@ export class NativeClaudeAcquisitionController {
     // session id can neither reset it nor have it re-minted over live work.
     this.#ledger.initializeFreshOwnedRun(this.#ledgerScope);
     this.#snapshotCounts = { tasks: 0, shells: 0 };
-    this.#syncWatcher();
-    this.#emit();
+    return true;
   }
 
   /**
@@ -960,6 +1304,9 @@ export class NativeClaudeAcquisitionController {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    // Disposal is normal retirement, never identity loss: nothing is reported, and
+    // no candidate survives to be offered by anything later.
+    this.#identityOfferPending = false;
     this.#startupVouched = false;
     this.#baselineRetired = true;
     this.#retire();
@@ -973,6 +1320,76 @@ export class NativeClaudeAcquisitionController {
     this.#settledChildRequests.clear();
     this.#sessionId = null;
     this.#transcriptPath = null;
+  }
+
+  // --- conversation identity -----------------------------------------------
+
+  /**
+   * The initial proof a restored run waits for: this run's own authenticated ROOT
+   * `SessionStart` with `source: "resume"`, naming exactly the expected UUID, in
+   * the selected workspace. Nothing weaker confirms the expectation.
+   */
+  #provesRestoredRoot(event: NativeHookEvent): boolean {
+    if (this.#restoreExpected === null) return false;
+    const agentId = (event as { agent_id?: unknown }).agent_id;
+    if (agentId !== undefined && agentId !== null) return false;
+    if (event.hook_event_name !== "SessionStart") return false;
+    if ((event as { source?: unknown }).source !== "resume") return false;
+    if ((event as { session_id?: unknown }).session_id !== this.#restoreExpected) return false;
+    return this.#provesRootContext(event);
+  }
+
+  /**
+   * Whether one root `SessionStart` proves the conversation it names: an exact
+   * provider UUID, and a provider `cwd` that is the same existing directory as the
+   * row's selected workspace. No path is guessed, searched, or derived.
+   */
+  #provesRootContext(event: NativeHookEvent): boolean {
+    if (!isNativeConversationId((event as { session_id?: unknown }).session_id)) return false;
+    const workspace = this.#workspace;
+    const cwd = (event as { cwd?: unknown }).cwd;
+    if (workspace === null || typeof cwd !== "string") return false;
+    return sameExistingDirectory(cwd, workspace);
+  }
+
+  /**
+   * Bring the owner's view of this run's identity in line with the current root
+   * binding: the proved UUID, or an explicit `null` only when something this
+   * controller previously reported is no longer current. A value the owner
+   * already accepted is never sent twice, and an unproved binding that was never
+   * reported sends nothing.
+   */
+  #syncIdentity(): void {
+    if (this.#disposed) return;
+    const target = this.#identitySuspended ? null : this.#boundIdentity;
+    if (target === null) {
+      this.#identityOfferPending = false;
+      if (this.#reportedIdentity === null) return;
+      this.#reportedIdentity = null;
+      this.#offerIdentity(null);
+      return;
+    }
+    if (target === this.#reportedIdentity) {
+      this.#identityOfferPending = false;
+      return;
+    }
+    if (this.#offerIdentity(target)) {
+      this.#reportedIdentity = target;
+      this.#identityOfferPending = false;
+    } else {
+      this.#identityOfferPending = true;
+    }
+  }
+
+  #offerIdentity(conversationId: string | null): boolean {
+    const report = this.#onConversationIdentity;
+    if (report === undefined) return false;
+    try {
+      return report(conversationId) !== false;
+    } catch {
+      // The owner's channel is contained: a throw is a refusal, nothing more.
+      return false;
+    }
   }
 
   // --- scope binding -------------------------------------------------------
@@ -2662,6 +3079,30 @@ export class NativeClaudeAcquisitionController {
     } catch {
       // The host sink is contained: a throw cannot corrupt this controller.
     }
+  }
+}
+
+/**
+ * Whether two absolute paths name the same EXISTING directory: both resolve,
+ * through the platform's own canonical resolution, to a directory, and either the
+ * canonical paths are equal or the two resolve to the same directory object
+ * (device and inode). One resolution per path; nothing is listed or scanned, and
+ * any failure is simply "not proved".
+ */
+function sameExistingDirectory(left: string, right: string): boolean {
+  if (!isAbsolute(left) || !isAbsolute(right)) return false;
+  try {
+    const leftReal = realpathSync.native(left);
+    const rightReal = realpathSync.native(right);
+    const leftStats = statSync(leftReal, { bigint: true });
+    const rightStats = statSync(rightReal, { bigint: true });
+    if (!leftStats.isDirectory() || !rightStats.isDirectory()) return false;
+    if (leftReal === rightReal) return true;
+    return leftStats.ino !== 0n
+      && leftStats.dev === rightStats.dev
+      && leftStats.ino === rightStats.ino;
+  } catch {
+    return false;
   }
 }
 

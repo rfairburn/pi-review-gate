@@ -12,6 +12,7 @@ import {
   snapshotNativeEnvironment,
   type NativeLaunchDescriptor,
 } from "./launch";
+import { isNativeConversationId } from "./native-conversation";
 import { type NativeHookBootstrap } from "./native-hook-protocol";
 import {
   prepareNativeHookLaunch,
@@ -103,6 +104,13 @@ import { type NativeCliBackend } from "./session-backend";
  *   configuration override, and CLI flag — including the operator's own
  *   `hooks.SessionStart` spelling — is still composed verbatim by the one scanner: what
  *   is declined is only this host's own instruction, never the operator's.
+ * - **Exact restoration only by private owner intent.** A request's
+ *   `resumeConversationId` (one exact UUID, explicit target) is the only resume
+ *   authority: Claude gains `--resume <uuid>` in real option position, an owned
+ *   Codex TUI renders `resume --remote … --remote-auth-token-env … <uuid>`, and
+ *   a non-owned Codex restore is refused. Configured args that would replay
+ *   startup input are refused for a restore, never stripped; a fresh launch is
+ *   composed exactly as before.
  * - **No inherited host capability.** The environment is a clone sanitized by
  *   the same provider-neutral sanitizer the native Pi launch uses: worker role
  *   authorization is rejected fail-closed, and stale session-host bootstrap,
@@ -170,6 +178,24 @@ export interface NativeCliLaunchRequest {
    * derives everything else and never mutates the caller's option object.
    */
   nativeHook?: NativeCliNativeHookOption;
+  /**
+   * OPTIONAL owner-private restart restoration intent: one exact admitted
+   * provider conversation UUID. This is the ONLY resume authority a native
+   * launch has; configured resume/continue/fork spellings stay refused exactly
+   * as before, with or without it.
+   *
+   * Absence composes exactly the fresh descriptor. Presence requires an exact
+   * UUID and an explicit `targetId` (a restore never falls back to a default
+   * target), and refuses any configured argument list that would replay startup
+   * input — a positional prompt, prompt data after `--`, or an input-bearing
+   * option such as an initial image or file — rather than stripping it. Claude
+   * resumes with its documented `--resume <uuid>` in real option position; Codex
+   * resumes only through the owned backend plan's `renderTui`, whose argv
+   * becomes `… resume --remote <relay> --remote-auth-token-env <ENV> <uuid>`.
+   * A non-owned Codex restore is refused, never started fresh. The value is
+   * never logged, echoed in a refusal, or exposed on the descriptor.
+   */
+  resumeConversationId?: string;
 }
 
 /** The whole owner-supplied hook option: the registration bootstrap, nothing else. */
@@ -346,6 +372,13 @@ export interface NativeCodexOwnedLaunchPlan {
    * who configured the flag themselves keeps it. The connection environment is
    * preserved exactly, plus the existing clipboard marker the hosted TUI has
    * always carried and, on Windows, the batch percent carrier.
+   *
+   * For a launch that carried a private `resumeConversationId`, the same
+   * position instead receives the provider's exact resume subcommand with its
+   * own remote options — `resume --remote <relay> --remote-auth-token-env <ENV>
+   * <uuid>` — so the TUI attaches to the owned backend and opens exactly that
+   * conversation. The connection must then be exactly those two remote options;
+   * anything else is refused rather than shifting the conversation operand.
    */
   renderTui(connection: NativeCodexOwnedTuiConnection): NativeLaunchDescriptor;
 }
@@ -724,13 +757,17 @@ export function scanNativeArgPositions(
  * in the same real option position as the daemon isolation flag, before any
  * terminator or pending operand, and never move or drop an operator token. An
  * empty list — every launch with no hook option — composes exactly what this
- * function composed before hook support existed.
+ * function composed before hook support existed. `restoreArgs` are the
+ * validated restoration tokens of a launch that carried a private resume id;
+ * they follow every other generated token in that same position, and an empty
+ * list — every fresh launch — changes nothing.
  */
 function composeNativeArgs(
   backend: NativeCliBackend,
   args: readonly string[],
   targetId: string,
   sourceFlags: readonly string[] = [],
+  restoreArgs: readonly string[] = [],
 ): string[] {
   const scan = scanNativeArgPositions(backend, args, targetId);
   const argv = [...args];
@@ -741,6 +778,7 @@ function composeNativeArgs(
   const generated: string[] = [];
   if (backend === "codex" && !daemonIsolationActive) generated.push(CODEX_NO_DAEMON_ARG);
   generated.push(...sourceFlags);
+  generated.push(...restoreArgs);
   if (generated.length === 0) return argv;
   argv.splice(scan.insertionIndex, 0, ...generated);
   return argv;
@@ -1151,6 +1189,189 @@ const DIRECT_PROVIDER_COMMAND: Readonly<Record<NativeCliBackend, RegExp>> = {
 };
 
 /**
+ * Where the provider's own argv begins inside a configured argument list: the
+ * one program-prefix rule shared by the owned backend split and restoration.
+ *
+ * A direct provider executable owns no argv of its own, so nothing ahead of
+ * its first option is a program prefix: those tokens are its prompt. Any other
+ * program keeps the configured tokens ahead of the provider's option parsing,
+ * exactly as the TUI receives them.
+ */
+function nativeProgramArgvStart(
+  backend: NativeCliBackend,
+  command: string,
+  scan: NativeArgPositionScan,
+  argsLength: number,
+): number {
+  return DIRECT_PROVIDER_COMMAND[backend].test(command)
+    ? 0
+    : (scan.options.length > 0
+      ? scan.options[0].tokenIndex
+      : (scan.terminatorIndex !== -1 ? scan.terminatorIndex : argsLength));
+}
+
+/**
+ * Configured options that can carry startup INPUT into the first turn, which a
+ * restored conversation must never receive again. Restoration refuses them in
+ * real option position (any spelling) rather than proving they do not submit,
+ * and a fresh launch never consults this list. Claude `--file` downloads file
+ * resources into the startup; Codex `-i`/`--image` attaches images to the
+ * initial prompt.
+ */
+const NATIVE_RESTORE_INPUT_OPTIONS: Readonly<Record<NativeCliBackend, readonly string[]>> = {
+  claude: ["--file"],
+  codex: ["-i", "--image"],
+};
+
+/**
+ * Configured options that would let the provider pick a DIFFERENT conversation
+ * than the exact restored one. Claude `--from-pr` resumes a pull-request-linked
+ * session or opens a picker; combined with `--resume <uuid>` the outcome would
+ * no longer be one proven conversation. Restoration only; a fresh launch never
+ * consults this list.
+ */
+const NATIVE_RESTORE_SELECTION_OPTIONS: Readonly<Record<NativeCliBackend, readonly string[]>> = {
+  claude: ["--from-pr"],
+  codex: [],
+};
+
+/** The exact Codex subcommand word of a native resume. */
+const CODEX_RESUME_SUBCOMMAND = "resume";
+
+/** Claude's documented exact-resume option. */
+const CLAUDE_RESUME_OPTION = "--resume";
+
+/** The two remote options a Codex `resume` subcommand receives from the owned lease, in order. */
+const CODEX_REMOTE_CONNECTION_OPTIONS: readonly string[] = ["--remote", "--remote-auth-token-env"];
+
+/** A refusal of one restoration; fixed text that never carries the id, a value, or a path. */
+function refuseRestore(targetId: string, reason: string): Error {
+  return refuse(`target "${targetId}" cannot restore a native conversation because ${reason}`);
+}
+
+/**
+ * Claude options whose split operand is system-prompt CONFIGURATION that the
+ * shared scanner does not list as value-taking. Restoration alone reads the
+ * token after one of these as that option's operand (never as a positional
+ * prompt); the fresh scanner, its insertion position, and every fresh launch
+ * stay exactly as they were. An occurrence with no usable operand — last in
+ * the option area, or followed by an option spelling or `--` — is ambiguous and
+ * refuses the restore instead of letting the restoration tokens become its value.
+ */
+/**
+ * The one supported script-consuming interpreter command shape a restore
+ * accepts a program prefix for: `node`, optionally `.exe`, by its final path
+ * component. Restoration only; fresh composition never consults it.
+ */
+const NODE_INTERPRETER_COMMAND = /(?:^|[/\\])node(?:\.exe)?$/iu;
+
+const NATIVE_RESTORE_CONFIG_VALUE_OPTIONS: Readonly<Record<NativeCliBackend, readonly string[]>> = {
+  claude: ["--system-prompt"],
+  codex: [],
+};
+
+/**
+ * Prove that a configured argument list carries no startup input before a
+ * restoration composes it, using the ONE scan's real option positions.
+ *
+ * Restoration refuses — never strips or rewrites — every token the provider
+ * would read as user input: every token past a `--` terminator, every
+ * input-bearing or conversation-selecting option above, and every positional
+ * that is not a proven program-prefix token or an option operand. Option
+ * operands (`--model x`, `--append-system-prompt …`, `--system-prompt …`,
+ * `-c key=value`) are configuration, not input. A bare trailing `--` carries
+ * nothing and stays, because the restoration tokens are inserted before it.
+ * Configured resume/continue/fork/permission/workspace spellings were already
+ * refused by the scan itself and stay refused.
+ *
+ * The program prefix is PROVED here, not assumed. The fresh owned split treats
+ * every positional ahead of a wrapper's first option as the wrapper's own argv,
+ * which is a permissive heuristic: a wrapper that forwards its arguments would
+ * replay `wrapper.js "initial prompt" --model x`'s prompt, and a passthrough
+ * wrapper (`exec claude "$@"`) would forward even a lone existing filename as a
+ * prompt. File existence alone therefore proves nothing about how a command
+ * consumes its first positional. A restore accepts a program prefix only for
+ * the one supported script-consuming interpreter shape, the documented
+ * `node wrapper.js <provider args>`: the command is `node` (or `node.exe`), the
+ * prefix is exactly ONE leading positional, and it names an existing regular
+ * file (absolute, or relative to the workspace the child is spawned in).
+ * Anything else — any other wrapper command with a leading positional, a
+ * second leading positional, a prefix token that is not an existing file, or
+ * any positional after it — is ambiguous and refuses the restore. A direct
+ * provider executable has no program prefix at all. All of this is
+ * restore-only: fresh composition keeps its existing prefix behavior.
+ */
+function assertRestorableNativeArgs(
+  backend: NativeCliBackend,
+  args: readonly string[],
+  targetId: string,
+  command: string,
+  scan: NativeArgPositionScan,
+  cwd: string,
+): void {
+  if (scan.terminatorIndex !== -1 && scan.terminatorIndex < args.length - 1) {
+    throw refuseRestore(targetId, "its shared args carry prompt data after the -- terminator, which would be replayed into the restored conversation");
+  }
+  const optionAreaEnd = scan.terminatorIndex === -1 ? args.length : scan.terminatorIndex;
+  const operandIndices = new Set<number>();
+  for (const option of scan.options) {
+    if (option.operand !== undefined) operandIndices.add(option.tokenIndex + 1);
+    if (NATIVE_RESTORE_INPUT_OPTIONS[backend].includes(option.name)) {
+      throw refuseRestore(targetId, `its shared args include the startup input option ${option.name}, which cannot be proved not to submit input into the restored conversation`);
+    }
+    if (NATIVE_RESTORE_SELECTION_OPTIONS[backend].includes(option.name)) {
+      throw refuseRestore(targetId, `its shared args include the conversation selection option ${option.name}`);
+    }
+    if (option.attached === undefined && NATIVE_RESTORE_CONFIG_VALUE_OPTIONS[backend].includes(option.name)) {
+      const operandIndex = option.tokenIndex + 1;
+      if (operandIndex >= optionAreaEnd || parseOption(args[operandIndex]) !== undefined) {
+        throw refuseRestore(targetId, `its shared args spell ${option.name} without a value it can be proved to carry`);
+      }
+      operandIndices.add(operandIndex);
+    }
+  }
+  const programStart = nativeProgramArgvStart(backend, command, scan, args.length);
+  if (programStart > 1) {
+    throw refuseRestore(targetId, "its wrapper command carries more than one leading positional, which cannot be proved not to be a forwarded initial prompt");
+  }
+  if (programStart === 1) {
+    // Only the supported Node interpreter shape establishes that the first
+    // positional selects a script instead of being forwarded provider input.
+    if (!NODE_INTERPRETER_COMMAND.test(command)) {
+      throw refuseRestore(targetId, "its wrapper command has no proven script-consuming interpreter prefix");
+    }
+    const prefix = args[0];
+    if (!isUsableRegularFile(isAbsolute(prefix) ? prefix : join(cwd, prefix))) {
+      throw refuseRestore(targetId, "its wrapper command's leading positional is not an existing script file, so it cannot be proved not to be a forwarded initial prompt");
+    }
+  }
+  for (let index = programStart; index < optionAreaEnd; index += 1) {
+    if (operandIndices.has(index)) continue;
+    if (parseOption(args[index]) === undefined) {
+      throw refuseRestore(targetId, "its shared args include a positional initial prompt, which would be replayed into the restored conversation");
+    }
+  }
+}
+
+/**
+ * Validate the owned lease's connection for a restoration: exactly the Codex
+ * `resume` subcommand's two remote options, each with one non-option value.
+ * Anything else could consume or shift the conversation operand that follows,
+ * so it is refused with fixed text; nothing of it is echoed.
+ */
+function assertOwnedResumeConnectionArgs(connectionArgs: readonly string[]): void {
+  const shaped = connectionArgs.length === CODEX_REMOTE_CONNECTION_OPTIONS.length * 2
+    && CODEX_REMOTE_CONNECTION_OPTIONS.every((name, position) => {
+      const value = connectionArgs[position * 2 + 1];
+      return connectionArgs[position * 2] === name
+        && typeof value === "string" && value.length > 0 && !value.startsWith("-");
+    });
+  if (!shaped) {
+    throw refuse("the owned Codex TUI connection is not exactly the resume subcommand's --remote and --remote-auth-token-env options");
+  }
+}
+
+/**
  * Validate the CLOSED control argv the lease generated. Every message is fixed
  * text: a rejected list is never echoed, because its final operand is the
  * token digest.
@@ -1260,15 +1481,7 @@ function prepareOwnedCodexLaunchFacts(
   if (scan.options.some((option) => CODEX_NAMED_PROFILE_OPTIONS.includes(option.name))) {
     throw new NativeCodexOwnedProfileUnsupportedError();
   }
-  // A direct provider executable owns no argv of its own, so nothing ahead of
-  // its first option is a program prefix: those tokens are its prompt. Any other
-  // program keeps the configured tokens ahead of the provider's option parsing,
-  // exactly as the TUI receives them.
-  const programArgvStart = DIRECT_PROVIDER_COMMAND[backend].test(command)
-    ? 0
-    : (scan.options.length > 0
-      ? scan.options[0].tokenIndex
-      : (scan.terminatorIndex !== -1 ? scan.terminatorIndex : args.length));
+  const programArgvStart = nativeProgramArgvStart(backend, command, scan, args.length);
   const backendConfigArgs: string[] = [];
   for (const option of scan.options) {
     if (!CODEX_BACKEND_CONFIG_OPTIONS.includes(option.name)) continue;
@@ -1321,6 +1534,12 @@ interface OwnedCodexLaunchPlanInput {
   readonly hookArgs: readonly string[];
   /** The hook marker entries of that same preparation, empty when it armed nothing. */
   readonly hookEnvironment: Readonly<Record<string, string>>;
+  /**
+   * The validated private restoration id of this launch, absent for a fresh
+   * launch. Held in the TUI renderer's closure only: never a plan field, never
+   * part of the backend render.
+   */
+  readonly resumeConversationId?: string;
 }
 
 /**
@@ -1336,7 +1555,9 @@ interface OwnedCodexLaunchPlanInput {
  * convention for both children.
  */
 function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCodexOwnedLaunchPlan {
-  const { file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment } = input;
+  const {
+    file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment, resumeConversationId,
+  } = input;
   const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor => {
     if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
       const batch = adaptWindowsBatchShim(file, argv, parentEnvironment, env);
@@ -1366,7 +1587,16 @@ function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCod
       // connection environment it arrives in is otherwise preserved exactly.
       applyCodexTerminalClipboardMode(env, platform);
       const insertion = facts.scan.insertionIndex;
-      const argv = [...args.slice(0, insertion), ...connectionArgs, ...args.slice(insertion)];
+      // A restoration renders the provider's exact resume subcommand in the same
+      // real option position: every configured (already proved input-free)
+      // global option ahead of it, the subcommand's own remote options, then the
+      // one exact conversation operand. No prompt operand ever follows it.
+      let inserted = connectionArgs;
+      if (resumeConversationId !== undefined) {
+        assertOwnedResumeConnectionArgs(connectionArgs);
+        inserted = [CODEX_RESUME_SUBCOMMAND, ...connectionArgs, resumeConversationId];
+      }
+      const argv = [...args.slice(0, insertion), ...inserted, ...args.slice(insertion)];
       return render(argv, env);
     },
   };
@@ -1443,6 +1673,45 @@ export function createNativeCliLauncher(
     const ownedFacts = ownedCodexBackend && backend === "codex"
       ? prepareOwnedCodexLaunchFacts(backend, args, target.id, command)
       : undefined;
+
+    // Private restoration intent: validated here, still before the environment
+    // clone, the hook preparation, any artifact, and any process, so a refusal
+    // stages nothing and reaches the caller's ordinary launch failure path. An
+    // absent id leaves every step below exactly as a fresh launch composes it.
+    let restoreArgs: readonly string[] = [];
+    const resumeConversationId = request.resumeConversationId;
+    if (resumeConversationId !== undefined) {
+      if (!isNativeConversationId(resumeConversationId)) {
+        throw refuse("the native conversation restore id is not one exact provider conversation UUID");
+      }
+      // A restore is the remembered target or nothing: the default target is
+      // never substituted for a missing identity.
+      if (targetId === undefined) {
+        throw refuse("a native conversation restore requires its exact remembered launch target");
+      }
+      if (backend === "codex" && ownedFacts === undefined) {
+        // Only the owned plan's remote resume form is the proven Codex restore.
+        throw refuseRestore(target.id, "an ordinary (non-owned) Codex launch has no proven exact resume form; it is refused rather than started fresh");
+      }
+      const scan = ownedFacts?.scan ?? scanNativeArgPositions(backend, args, target.id);
+      // The restore's program-prefix proof reads the workspace the child is
+      // spawned in; the same canonicalization runs again below, unchanged.
+      assertRestorableNativeArgs(backend, args, target.id, command, scan, canonicalNativeWorkspace(request.workspace));
+      if (backend === "codex") {
+        // The owned TUI attaches to its own backend over `--remote`, which an
+        // operator-configured daemon isolation flag contradicts; it is refused,
+        // never silently dropped.
+        if (scan.options.some((option) => option.name === CODEX_NO_DAEMON_ARG)) {
+          throw refuseRestore(target.id, `its shared args include ${CODEX_NO_DAEMON_ARG}, which a remote resume of the owned backend cannot combine with`);
+        }
+        // The ordinary descriptor of an owned launch is never what the owner
+        // spawns (it spawns `renderTui`), but it still names this exact
+        // conversation so it can never describe a fresh one.
+        restoreArgs = [CODEX_RESUME_SUBCOMMAND, resumeConversationId];
+      } else {
+        restoreArgs = [CLAUDE_RESUME_OPTION, resumeConversationId];
+      }
+    }
 
     // The child environment first, so a configured PATH override is the PATH
     // discovery actually searches (same rule the settings availability probe
@@ -1551,6 +1820,7 @@ export function createNativeCliLauncher(
         args,
         target.id,
         nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
+        restoreArgs,
       );
       const ownedCodex = ownedFacts === undefined || ownedBackendEnv === undefined
         ? undefined
@@ -1570,6 +1840,7 @@ export function createNativeCliLauncher(
           // `facts.backendConfigArgs` and `args`, composed by the one scanner.
           hookArgs: [],
           hookEnvironment: {},
+          ...(resumeConversationId === undefined ? {} : { resumeConversationId }),
         });
       if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
         const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);

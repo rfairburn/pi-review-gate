@@ -58,9 +58,19 @@
  * answers, model text, reasoning, token usage, diffs, outputs, and error
  * messages are never placed in a returned value, a callback argument, or an
  * error message. Failures cross the boundary as closed codes only.
+ *
+ * The one deliberate exception is a CALLER-SUPPLIED workspace comparison: a
+ * `thread/read` made through {@linkcode NativeCodexRpcTransport.readThreadInWorkspace}
+ * compares the provider's own `cwd` for that one thread against the exact
+ * workspace the caller already knows, in place, and returns only a closed
+ * boolean. The provider's cwd is never stored, returned, logged, or placed in
+ * an error; only the caller's own exact known path (and the provider's exact
+ * path, when the two strings differ) is canonicalized, and nothing is scanned.
  */
 
+import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 import WebSocket from "ws";
 import { isRecord } from "../record-guard";
 
@@ -427,6 +437,67 @@ export function decodeNativeCodexThreadReadResult(result: unknown): NativeCodexT
   return decodeNativeCodexThreadRow(nested);
 }
 
+/** Longest workspace path either side of a comparison may name. */
+export const NATIVE_CODEX_RPC_MAX_WORKSPACE_CHARS = 4_096;
+
+/**
+ * One `thread/read` decoded together with a closed workspace verdict. The
+ * provider's cwd is consumed by the comparison and never carried here.
+ */
+export interface NativeCodexThreadWorkspaceRead {
+  readonly row: NativeCodexThreadRow;
+  /**
+   * True only when the provider's own cwd for this thread canonically names the
+   * caller's expected workspace. A missing, unusable, or different cwd is false.
+   */
+  readonly workspaceMatches: boolean;
+}
+
+/**
+ * Compare one provider-reported cwd with the caller's exact expected workspace.
+ *
+ * Both values must be bounded absolute paths. Identical strings match. Otherwise
+ * both exact paths are canonicalized with the platform's own `realpath`, so a
+ * symlinked spelling, a platform alias (for example `/var` versus
+ * `/private/var`), or a case-preserving filesystem's own canonical case compares
+ * as the same existing directory. A path that does not exist, cannot be
+ * resolved, or resolves elsewhere never matches. Nothing is listed or scanned,
+ * no value is retained, and no error text escapes.
+ */
+export function nativeCodexWorkspaceMatches(actual: unknown, expected: unknown): boolean {
+  if (!isUsableWorkspacePath(actual) || !isUsableWorkspacePath(expected)) return false;
+  if (actual === expected) return true;
+  try {
+    return fs.realpathSync.native(actual) === fs.realpathSync.native(expected);
+  } catch {
+    return false;
+  }
+}
+
+function isUsableWorkspacePath(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= NATIVE_CODEX_RPC_MAX_WORKSPACE_CHARS
+    && !value.includes("\u0000")
+    && path.isAbsolute(value);
+}
+
+/**
+ * Decodes one `thread/read` result and compares its cwd with the caller's
+ * expected workspace in place. Null when the row itself is unreadable; the
+ * returned value never contains the provider's cwd or any other path.
+ */
+export function decodeNativeCodexThreadReadInWorkspace(
+  result: unknown,
+  expectedWorkspace: string,
+): NativeCodexThreadWorkspaceRead | null {
+  if (!isRecord(result)) return null;
+  const nested = isRecord(result.thread) ? result.thread : result;
+  const row = decodeNativeCodexThreadRow(nested);
+  if (row === null) return null;
+  return { row, workspaceMatches: nativeCodexWorkspaceMatches(nested.cwd, expectedWorkspace) };
+}
+
 /** Decodes one `thread/loaded/list` page. */
 export function decodeNativeCodexLoadedPage(result: unknown): NativeCodexLoadedPage | null {
   if (!isRecord(result) || !Array.isArray(result.data)) return null;
@@ -558,7 +629,8 @@ type TransportState = "idle" | "connecting" | "ready" | "closed";
 /**
  * One read-only connection to one host-owned native Codex app-server.
  *
- * The public surface is exactly: connect, the four allowlisted metadata reads,
+ * The public surface is exactly: connect, the four allowlisted metadata reads
+ * (one of which also has a workspace-comparing form over the same request),
  * dispose, and three read-only getters. There is no send, no reply, no notify, no
  * generic `request(method, params)`, and no way to address a frame to an id this
  * client did not mint, which is what makes "never answer the operator's approval
@@ -799,6 +871,21 @@ export class NativeCodexRpcTransport {
     if (id === null) return Promise.reject(new NativeCodexRpcError("malformed"));
     return this.#request("thread/read", { threadId: id, includeTurns: false })
       .then((result) => decodeNativeCodexThreadReadResult(result));
+  }
+
+  /**
+   * The same read-only `thread/read` (history excluded) plus an in-place
+   * comparison of that thread's provider cwd with the caller's exact known
+   * workspace. Only the closed verdict is returned; the cwd is dropped at this
+   * edge. Null when the row is unreadable.
+   */
+  readThreadInWorkspace(threadId: string, expectedWorkspace: string): Promise<NativeCodexThreadWorkspaceRead | null> {
+    const id = readBoundedText(threadId, NATIVE_CODEX_RPC_MAX_ID_CHARS);
+    if (id === null || !isUsableWorkspacePath(expectedWorkspace)) {
+      return Promise.reject(new NativeCodexRpcError("malformed"));
+    }
+    return this.#request("thread/read", { threadId: id, includeTurns: false })
+      .then((result) => decodeNativeCodexThreadReadInWorkspace(result, expectedWorkspace));
   }
 
   /** One `thread/loaded/list` page of bare loaded thread ids. */

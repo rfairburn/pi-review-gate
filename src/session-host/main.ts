@@ -218,8 +218,10 @@ import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-laun
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
+import { isNativeConversationId } from "./native-conversation";
 import {
   isNativeCliBackend,
+  isNativeCliTargetId,
   isNativeDisplayName,
   sessionBackendDisplayLabel,
   type NativeCliBackend,
@@ -1060,10 +1062,28 @@ interface RosterRecord {
   /**
    * The provider backend this slot's row was created with, present only for an
    * explicit native row. Absence is Pi. Identity only: a native slot carries no
-   * provider conversation id, no executable, and no environment, and it can
-   * only ever be restored as a bounded unavailable placeholder.
+   * executable, no environment, and no credential.
    */
   backend?: SessionBackend;
+  /**
+   * Native slots only (issue #277): the exact configured launch-target id the row
+   * was launched with. Owner-private restart identity, revalidated against this
+   * host's CURRENT configured targets before any restoration; never a Pi field.
+   */
+  nativeTargetId?: string;
+  /**
+   * Native slots only (issue #277): the last exact provider conversation UUID the
+   * manager may durably remember for this slot's row. Owner-private restart
+   * identity; never a Pi `sessionId`, name, or persistence fact, never a caption,
+   * and never part of a public, peer, or network view.
+   */
+  nativeConversationId?: string;
+  /**
+   * Memory only, never persisted: this run's startup restoration created this
+   * slot's current native row from its remembered conversation, so a settled
+   * exit before that conversation was proved is presented as unavailable.
+   */
+  nativeRestoreAttempted?: boolean;
   /** Bounded truthful reason this remembered conversation is not restorable. */
   unavailableReason?: string;
 }
@@ -3396,6 +3416,36 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * The presentation of one restored native row whose resume settled before its
+   * own run proved the remembered conversation (issue #277). It keeps the ACTUAL
+   * manager row id, so the existing Delete, activation, and settlement guards
+   * still act on the real row and its owned resources; only the drawn state is
+   * the bounded unavailable placeholder, with a fixed reason rather than any raw
+   * provider or launcher text. The slot keeps its remembered conversation, target,
+   * and caption, so a later restart can try again.
+   */
+  function toUnprovedRestoreItem(record: RosterRecord, view: NativeInstanceView): SidebarItem {
+    const backend = isNativeCliBackend(view.backend) ? view.backend : undefined;
+    return {
+      id: view.id,
+      label: view.label,
+      workspace: view.workspace.length > 0 ? view.workspace : record.workspace ?? "",
+      agentDir: view.agentDir,
+      lifecycle: "error",
+      hasLiveProcess: false,
+      unavailable: true,
+      ...(backend === undefined ? {} : { backend }),
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [backend === undefined
+        ? "This conversation could not be restored; it was not replaced"
+        : `This ${sessionBackendDisplayLabel(backend)} conversation could not be restored; it was not replaced`],
+      nativeSession: null,
+    };
+  }
+
+  /**
    * The ONE deterministic durable-slot rule of this host, applied to a row the
    * manager currently lists: the slot already bound to that row while its
    * remembered record still exists, else the slot reserved for an in-flight
@@ -3447,6 +3497,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // The row's own recorded backend, never a guess: an unrecorded row keeps
       // no backend field, so the persisted roster stays byte-identical for Pi.
       if (view.backend !== undefined) record.backend = view.backend;
+      if (isNativeCliBackend(view.backend)) syncNativeRestartIdentity(record, view.id);
       const observed = view.nativeSession ?? view.lastNativeSession;
       if (observed !== undefined && observed !== null && isValidNativeSessionId(observed.sessionId)) {
         record.sessionId = observed.sessionId;
@@ -3469,6 +3520,44 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * Refresh one native slot's owner-private restart identity from the manager's
+   * own record of its CURRENT row (issue #277). A manager without the accessor,
+   * or one that no longer answers for the row, changes nothing, so a remembered
+   * identity is never wiped by a missing read. When the row answers without a
+   * conversation id, the previously remembered id was positively withdrawn and
+   * is forgotten rather than kept stale. Nothing here touches the Pi `sessionId`,
+   * name, or persistence fields, or the operator's caption.
+   */
+  function syncNativeRestartIdentity(record: RosterRecord, rowId: string): void {
+    const owner = manager;
+    if (owner === undefined || typeof owner.readNativeConversationIdentity !== "function") return;
+    const identity = owner.readNativeConversationIdentity(rowId);
+    if (identity === undefined) return;
+    if (isNativeCliTargetId(identity.targetId)) record.nativeTargetId = identity.targetId;
+    if (identity.conversationId !== undefined && isNativeConversationId(identity.conversationId)) {
+      record.nativeConversationId = identity.conversationId;
+    } else {
+      delete record.nativeConversationId;
+    }
+  }
+
+  /**
+   * Whether one native row created by this run's startup restoration settled
+   * before its own run proved the remembered conversation (issue #277). Read at
+   * presentation time, never cached: a refused or failed resume whose process is
+   * gone is unavailable, while a row still starting, alive, or waiting on the
+   * provider's own authentication or trust prompt is never judged here, and a row
+   * that proved its conversation and then exited is an ordinary exited row.
+   */
+  function restoredNativeRowUnproved(record: RosterRecord, view: NativeInstanceView): boolean {
+    if (record.nativeRestoreAttempted !== true || !isNativeCliBackend(view.backend)) return false;
+    if (view.hasLiveProcess !== false || (view.lifecycle !== "exited" && view.lifecycle !== "error")) return false;
+    const owner = manager;
+    if (owner === undefined || typeof owner.hasProvedNativeConversation !== "function") return false;
+    return owner.hasProvedNativeConversation(view.id) !== true;
+  }
+
+  /**
    * Roster DTOs at their stable remembered positions: each remembered slot
    * contributes either its current manager row or, when it has none, its
    * bounded unavailable error row. A slot still awaiting its restore attempt is
@@ -3483,7 +3572,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (view !== undefined) {
         if (emitted.has(view.id)) continue;
         emitted.add(view.id);
-        items.push(toSidebarItem(view));
+        items.push(restoredNativeRowUnproved(record, view)
+          ? toUnprovedRestoreItem(record, view)
+          : toSidebarItem(view));
         continue;
       }
       if (record.rowId !== undefined || record.unavailableReason === undefined) continue;
@@ -3731,6 +3822,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? { displayName: record.displayName } : {}),
         ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
         ...(record.backend === undefined ? {} : { backend: record.backend }),
+        // Owner-private native restart identity, only on a native slot and only
+        // in the exact validated shapes the store accepts.
+        ...(isNativeCliBackend(record.backend) && isNativeCliTargetId(record.nativeTargetId)
+          ? { nativeTargetId: record.nativeTargetId } : {}),
+        ...(isNativeCliBackend(record.backend) && isNativeConversationId(record.nativeConversationId)
+          ? { nativeConversationId: record.nativeConversationId } : {}),
       });
     }
     const localId = localActiveId();
@@ -3820,6 +3917,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           ...(entry.displayName !== undefined ? { displayName: entry.displayName } : {}),
           ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
           ...(entry.backend !== undefined ? { backend: entry.backend } : {}),
+          ...(isNativeCliBackend(entry.backend) && entry.nativeTargetId !== undefined
+            ? { nativeTargetId: entry.nativeTargetId } : {}),
+          ...(isNativeCliBackend(entry.backend) && entry.nativeConversationId !== undefined
+            ? { nativeConversationId: entry.nativeConversationId } : {}),
         });
       }
     }
@@ -3848,12 +3949,17 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
   }
 
   /**
-   * Automatic global roster restoration (issue 331). Every remembered entry is
+   * Automatic global roster restoration (issue 331). Every remembered Pi entry is
    * revalidated against a FRESH saved-conversation catalog and restarted only
    * through a new exact branded admission as a NEW independently owned child in
-   * the conversation's recorded workspace. Nothing is adopted, guessed, or
-   * substituted; an entry that cannot be freshly admitted stays visible as a
-   * bounded error row and never starts a fresh session.
+   * the conversation's recorded workspace. Every remembered native entry (#277)
+   * is restarted only when it remembers one exact provider conversation UUID and
+   * its exact launch target, that target is still in this host's CURRENT
+   * configured catalog for the same backend, and its recorded workspace still
+   * exists: it then becomes a NEW independently owned child asked to resume
+   * exactly that conversation, which its own run must still prove. Nothing is
+   * adopted, guessed, or substituted; an entry that cannot be restarted stays
+   * visible as a bounded error row and never starts a fresh session.
    */
   async function restorePersistedRoster(): Promise<void> {
     const handle = hostState;
@@ -3881,8 +3987,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     let catalog: SavedSessionCatalog | undefined;
     // A remembered native slot has no Pi conversation to look for (#277), so a
     // roster made ONLY of native slots never starts the Pi saved-conversation
-    // scan at all: its unavailable placeholders appear without reading unrelated
-    // Pi history. As soon as one remembered slot could be a Pi conversation, the
+    // scan at all: its restorations and placeholders never read unrelated Pi
+    // history. As soon as one remembered slot could be a Pi conversation, the
     // existing single catalog snapshot is taken exactly as before.
     const needsPiCatalog = remembered.some((entry) => !isNativeCliBackend(entry.backend));
     if (needsPiCatalog
@@ -3907,13 +4013,37 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       let createOptions: CreateInstanceOptions | undefined;
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
-      // A remembered native row is never started again automatically (#277):
-      // this host has no provider conversation identity to resume, no saved
-      // provider file to search, and no authority to adopt the newest provider
-      // session. It comes back as a bounded unavailable placeholder, and it is
-      // never quietly served as a new Pi session or a fresh native conversation.
+      // A remembered native row (#277) is restarted only from its OWN remembered
+      // exact conversation UUID and exact launch target, re-proved against this
+      // host's CURRENT configured catalog and its recorded workspace. There is no
+      // provider file search, no newest-session adoption, no default target, and
+      // no Pi lookup; anything missing or refused stays a bounded unavailable
+      // placeholder and is never served as a Pi session or a fresh conversation.
       if (isNativeCliBackend(entry.backend)) {
-        reason = `${sessionBackendDisplayLabel(entry.backend)} sessions are not restored; open New to start one`;
+        const provider = sessionBackendDisplayLabel(entry.backend);
+        const conversationId = entry.nativeConversationId;
+        const targetId = entry.nativeTargetId;
+        const workspace = canonicalExistingDirectory(entry.workspace);
+        if (conversationId === undefined || !isNativeConversationId(conversationId)) {
+          reason = `This remembered ${provider} session has no known conversation; it was not restarted`;
+        } else if (targetId === undefined || !isNativeCliTargetId(targetId)) {
+          reason = `This remembered ${provider} session has no known launch target; it was not restarted`;
+        } else if (nativeCliLaunch === undefined) {
+          reason = `This host cannot start ${provider} sessions; this conversation was not restarted`;
+        } else if (findRemoteNativeCliTarget(advertisedNativeCliTargets(), entry.backend, targetId) === null) {
+          reason = `This conversation's ${provider} launch target is no longer configured; it was not restarted`;
+        } else if (workspace === undefined) {
+          reason = "This conversation's recorded workspace is unavailable; it was not restarted";
+        } else {
+          createOptions = {
+            workspace,
+            backend: entry.backend,
+            // Always explicit: a resume never falls back to a backend default.
+            nativeCliTarget: targetId,
+            nativeResumeConversationId: conversationId,
+            ...(isNativeDisplayName(entry.displayName) ? { label: entry.displayName } : {}),
+          };
+        }
         return { entry, createOptions, reason };
       }
       // The remembered workspace is part of the contract: a conversation whose
@@ -3956,6 +4086,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         record.unavailableReason = decision.reason;
         continue;
       }
+      // Memory only: this slot's next row is a native resume whose settlement
+      // before proof must be presented as unavailable, not as a plain exit.
+      if (decision.createOptions.nativeResumeConversationId !== undefined) record.nativeRestoreAttempted = true;
       adoptingSlot = decision.entry.slotId;
       let created: Promise<string>;
       try {

@@ -65,6 +65,56 @@
  * claim, and this consumer never replies to, requests, or controls anything on
  * either lane.
  *
+ * ## Exact restored root and the private conversation identity
+ *
+ * A consumer built with `resumeConversationId` B is a RESTORE consumer. It
+ * accepts only a candidate or bound root that names exactly B; any other
+ * thread, a restore expectation that is not one exact provider UUID, or a
+ * restore without the row's workspace is never dialed and withdraws instead.
+ * The binder (configured with the same B by the composite) is what proves that
+ * the genuine TUI's own resume of B on this connection produced the candidate;
+ * this consumer adds no second root proof, no rebind, and no history read.
+ *
+ * When the row's `workspace` is known, the ONE read-only observer is dialed with
+ * it as its expected workspace, so the census's existing root `thread/read`
+ * also positively compares that root's provider cwd with the workspace (at the
+ * transport's decode edge, without retaining the cwd). Until it matches on the
+ * current connection the observer publishes only unknown values; afterwards
+ * every axis keeps exactly its ordinary complete-census authority. That same
+ * validated root read is the only thing that lets `onConversationIdentity`
+ * report the root's exact UUID — before the first prompt for a candidate, and
+ * for a fresh root as well as a restored one. No other observer, bootstrap, or
+ * read exists for it. An accepted identity is reported once; a refused one
+ * (for example before the owner's activation) is retried by the next validated
+ * root read, with no timer or queue of its own.
+ *
+ * A live loss of the source this identity rests on — a facts withdrawal, a
+ * contradicting snapshot, the observer's own root read positively naming
+ * another thread or another workspace, or any other observation withdrawal
+ * while the run is live — reports an explicit `null` (alongside the single
+ * unknown snapshot for a withdrawal), but only when an identity was previously
+ * accepted: missing initial proof is not a loss, and an unknown input, tool, or
+ * count axis, or an unreadable/failed root read, is never one either. The
+ * owner's own retirement (`invalidate`, `dispose`) reports nothing, so a normal
+ * stop never clears the saved identity and no callback can follow it. The
+ * legacy hook lane never reports an identity.
+ *
+ * ## The bound TUI connection's stream ending
+ *
+ * The adopted connection's stream ending (`generation-closed` with the relay's
+ * `client-closed` OR `backend-closed` reason, on the adopted connection)
+ * commonly precedes the owner seeing the PTY exit of an ordinary quit, and
+ * either socket may close first. That closure is NOT treated as proof of a
+ * normal quit, and NOT as a loss either: once the connection is gone no root
+ * can be selected without a later connection, and the source reports any
+ * later event. So status is withdrawn exactly as for every other withdrawal
+ * (socket closed, one unknown snapshot, sticky), while an already ACCEPTED
+ * identity is held and only the facts watcher stays attached, identity-only.
+ * The first later snapshot (a new connection, a stray event, any loss — the
+ * source drops its close evidence on any of them) reports `null` and detaches.
+ * The owner's retirement ends the hold silently. Every other close reason
+ * (handshake, overflow, relay stopped) is an ordinary live loss.
+ *
  * ## Failure and retirement
  *
  * A permanent facts withdrawal, a bound snapshot naming a connection or root other
@@ -98,6 +148,7 @@ import type {
   NativeCodexTuiRootToolFact,
 } from "./native-codex-tui-root-facts";
 import type { NativeCodexTuiRelayToolCategory } from "./native-codex-tui-relay";
+import { isNativeConversationId } from "./native-conversation";
 import type { NativeStatusObservation, NativeStatusSupportMap } from "./native-status";
 
 /**
@@ -154,6 +205,25 @@ export interface OwnedNativeCodexStatusObserverOptions {
   readonly scheduler?: NativeCodexRpcStatusScheduler;
   /** Bounds passed through to the RPC lane. */
   readonly limits?: Partial<NativeCodexRpcStatusLimits>;
+  /**
+   * Owner-private: this row's exact canonical workspace. When present, the RPC
+   * lane publishes nothing but unknown until its own root read positively
+   * matched it, and only such a root can be reported as the run's identity.
+   */
+  readonly workspace?: string;
+  /**
+   * Owner-private: the exact admitted restored conversation UUID B. Present only
+   * for a restoring row; an expectation to prove, never a proof.
+   */
+  readonly resumeConversationId?: string;
+  /**
+   * Owner-private identity channel: the exact provider conversation UUID this
+   * consumer positively proved is the run's current root, or an explicit `null`
+   * when a previously ACCEPTED identity was lost while the run is live. Returns
+   * whether the owner accepted it. Never called by the legacy lane, never after
+   * retirement, and never with a path or any other value.
+   */
+  readonly onConversationIdentity?: (conversationId: string | null) => boolean;
 }
 
 /**
@@ -184,6 +254,29 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   readonly #emit: (observation: NativeStatusObservation) => void;
   readonly #scheduler: NativeCodexRpcStatusScheduler | undefined;
   readonly #limits: Partial<NativeCodexRpcStatusLimits> | undefined;
+  /** The row's exact canonical workspace, when the owner supplied one. */
+  readonly #workspace: string | undefined;
+  /** True for a restoring row, whether or not its expectation is usable. */
+  readonly #restoreMode: boolean;
+  /** The exact restored UUID B; undefined in fresh mode or when unusable. */
+  readonly #restoreConversationId: string | undefined;
+  readonly #onConversationIdentity: ((conversationId: string | null) => boolean) | undefined;
+  /**
+   * The root whose provider cwd the CURRENT observer positively matched to the
+   * workspace. Evidence retained across a refused report so the next validated
+   * read can retry; cleared by any withdrawal.
+   */
+  #validatedRootId: string | undefined;
+  /** The identity the owner last ACCEPTED from this consumer. */
+  #acceptedIdentity: string | undefined;
+  /**
+   * True while status is withdrawn because the adopted TUI connection's stream
+   * ended (`client-closed` or `backend-closed`) and an accepted identity is
+   * held, identity-only, until any later source event or the owner's retirement.
+   */
+  #closeHold = false;
+  /** The adopted connection whose own stream end started the hold. */
+  #heldConnectionId: string | undefined;
 
   /** The hook lane, until the exclusive switch retires it. */
   #legacy: NativeStatusObserver | undefined;
@@ -222,6 +315,16 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#emit = options.emit;
     this.#scheduler = options.scheduler;
     this.#limits = options.limits;
+    this.#workspace = typeof options.workspace === "string" && options.workspace.length > 0
+      ? options.workspace
+      : undefined;
+    this.#restoreMode = options.resumeConversationId !== undefined;
+    this.#restoreConversationId = isNativeConversationId(options.resumeConversationId)
+      ? options.resumeConversationId
+      : undefined;
+    this.#onConversationIdentity = typeof options.onConversationIdentity === "function"
+      ? options.onConversationIdentity
+      : undefined;
   }
 
   /**
@@ -317,7 +420,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     // The initial delivery is synchronous, so a withdrawal can already have
     // happened inside `watch`. Detach immediately rather than keeping a watcher
     // whose consumer is gone.
-    if (this.#withdrawn || this.#retired || this.#disposed) {
+    if ((this.#withdrawn && !this.#closeHold) || this.#retired || this.#disposed) {
       try {
         unsubscribe();
       } catch {
@@ -329,13 +432,22 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   }
 
   #onFacts(snapshot: NativeCodexTuiRootFactsSnapshot | undefined): void {
-    // A retired or withdrawn consumer publishes nothing further, and a snapshot
-    // from a lane this run never adopted claims nothing.
-    if (!this.#switched || this.#withdrawn || this.#retired || this.#disposed) return;
+    if (!this.#switched || this.#retired || this.#disposed) return;
+    if (this.#closeHold) {
+      // Identity-only hold after the adopted connection ended. Anything the
+      // source says beyond that same close evidence means something happened
+      // after it, so the held identity can no longer be the current one.
+      if (!this.#isOwnConnectionStreamEnd(snapshot, this.#heldConnectionId)) this.#endCloseHold();
+      return;
+    }
+    // A withdrawn consumer publishes nothing further, and a snapshot from a
+    // lane this run never adopted claims nothing.
+    if (this.#withdrawn) return;
     if (snapshot === null || typeof snapshot !== "object") return;
 
     if (snapshot.phase === "withdrawn") {
-      this.#withdraw();
+      this.#withdraw(this.#acceptedIdentity !== undefined
+        && this.#isOwnConnectionStreamEnd(snapshot, this.#boundConnectionId));
       return;
     }
 
@@ -361,6 +473,16 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       || typeof connectionId !== "string" || connectionId.length === 0) {
       // A binding this consumer cannot fence contradicts the source's own
       // contract: it is a binding loss, never a thread to guess at.
+      this.#withdraw();
+      return;
+    }
+
+    if (this.#restoreMode
+      && (this.#restoreConversationId === undefined
+        || threadId !== this.#restoreConversationId
+        || this.#workspace === undefined)) {
+      // A restoring row observes only its exact admitted B, and only where the
+      // workspace can be proved. Anything else is never dialed or retained.
       this.#withdraw();
       return;
     }
@@ -423,6 +545,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#boundConnectionId = connectionId;
     this.#boundRootThreadId = rootThreadId;
     this.#currentTool = tool;
+    const workspace = this.#workspace;
     let observer: NativeCodexRpcStatusObserver;
     try {
       observer = new NativeCodexRpcStatusObserver({
@@ -434,6 +557,19 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
           if (this.#restoring) this.#restorePublished = true;
           this.#onRpcObservation(observation, epoch);
         },
+        // The SAME observer's own root read corroborates the workspace; no
+        // second observer, socket, or bootstrap read exists for the identity.
+        ...(workspace === undefined
+          ? {}
+          : {
+              expectedWorkspace: workspace,
+              onRootValidated: () => {
+                this.#onRootValidated(rootThreadId, epoch);
+              },
+              onRootContradicted: () => {
+                this.#onRootContradicted(rootThreadId, epoch);
+              },
+            }),
         ...(this.#scheduler === undefined ? {} : { scheduler: this.#scheduler }),
         ...(this.#limits === undefined ? {} : { limits: this.#limits }),
       });
@@ -452,6 +588,81 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     // own closed failure: it withdraws its axes and keeps recovering on its own
     // bounded backoff, and this consumer never surfaces or logs it.
     void Promise.resolve(observer.start()).catch(() => undefined);
+  }
+
+  /**
+   * The current observer's own root read positively matched the workspace for
+   * the adopted root under every observer fence. Re-checked here against this
+   * consumer's own epoch and binding before it becomes identity evidence.
+   */
+  #onRootValidated(rootThreadId: string, epoch: number): void {
+    if (this.#disposed || this.#retired || this.#withdrawn || epoch !== this.#epoch) return;
+    if (this.#rpc === undefined || this.#boundRootThreadId !== rootThreadId) return;
+    if (this.#restoreMode && rootThreadId !== this.#restoreConversationId) return;
+    this.#validatedRootId = rootThreadId;
+    this.#reportIdentity();
+  }
+
+  /**
+   * The current observer's own root read POSITIVELY contradicted the adopted
+   * root (another thread's row, or another workspace) under every observer
+   * fence. The status axes are already unknown inside the observer; a
+   * previously accepted identity is withdrawn explicitly while live.
+   */
+  #onRootContradicted(rootThreadId: string, epoch: number): void {
+    if (this.#disposed || this.#retired || this.#withdrawn || epoch !== this.#epoch) return;
+    if (this.#rpc === undefined || this.#boundRootThreadId !== rootThreadId) return;
+    this.#validatedRootId = undefined;
+    if (this.#acceptedIdentity === undefined) return;
+    this.#acceptedIdentity = undefined;
+    this.#reportIdentityLoss();
+  }
+
+  /**
+   * The adopted connection's own stream-end evidence (`client-closed` or
+   * `backend-closed`, in either socket order), unchanged since. Handshake,
+   * overflow, and relay-stopped reasons are never a stream end.
+   */
+  #isOwnConnectionStreamEnd(
+    snapshot: NativeCodexTuiRootFactsSnapshot | undefined,
+    connectionId: string | undefined,
+  ): boolean {
+    return snapshot !== null
+      && typeof snapshot === "object"
+      && snapshot.phase === "withdrawn"
+      && snapshot.withdrawal === "generation-closed"
+      && (snapshot.closeReason === "client-closed" || snapshot.closeReason === "backend-closed")
+      && connectionId !== undefined
+      && snapshot.connectionId === connectionId;
+  }
+
+  /** A later source event ended the identity-only hold: a live identity loss. */
+  #endCloseHold(): void {
+    this.#closeHold = false;
+    this.#heldConnectionId = undefined;
+    this.#detachFacts();
+    if (this.#acceptedIdentity === undefined) return;
+    this.#acceptedIdentity = undefined;
+    this.#reportIdentityLoss();
+  }
+
+  /**
+   * Report the validated root's exact UUID once it is accepted. A refusal keeps
+   * the evidence so the next validated read retries; nothing is queued.
+   */
+  #reportIdentity(): void {
+    const report = this.#onConversationIdentity;
+    const conversationId = this.#validatedRootId;
+    if (report === undefined || conversationId === undefined) return;
+    if (this.#acceptedIdentity === conversationId) return;
+    if (!isNativeConversationId(conversationId)) return;
+    let accepted = false;
+    try {
+      accepted = report(conversationId) === true;
+    } catch {
+      accepted = false;
+    }
+    if (accepted) this.#acceptedIdentity = conversationId;
   }
 
   /**
@@ -520,21 +731,52 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#publish(observation);
   }
 
-  /** Sticky observation withdrawal: close the lane, detach, publish unknown once. */
-  #withdraw(): void {
+  /**
+   * Sticky observation withdrawal: close the lane, publish unknown once, and
+   * (unless `holdIdentity`) detach and report a held identity's loss. With
+   * `holdIdentity` — only for the adopted connection's own stream end
+   * (`client-closed` or `backend-closed`) with an accepted identity — the
+   * status withdrawal is identical, but the accepted identity and the facts
+   * watcher are kept identity-only until a later source event or the owner's
+   * retirement.
+   */
+  #withdraw(holdIdentity = false): void {
     if (this.#withdrawn) return;
     this.#withdrawn = true;
     this.#epoch += 1;
+    const hold = holdIdentity && this.#acceptedIdentity !== undefined;
+    const lostIdentity = !hold && this.#acceptedIdentity !== undefined;
+    if (hold) {
+      this.#closeHold = true;
+      this.#heldConnectionId = this.#boundConnectionId;
+    } else {
+      this.#acceptedIdentity = undefined;
+    }
+    this.#validatedRootId = undefined;
     this.#currentTool = undefined;
     this.#boundConnectionId = undefined;
     this.#boundRootThreadId = undefined;
     this.#rootBound = false;
     this.#closeRpc();
-    this.#detachFacts();
+    if (!hold) this.#detachFacts();
     // Deliberately NOT a capture invalidation and NOT a manager retirement: the
     // row stays live, its generation stays current, and the backend, the relay,
     // and the interactive child keep running.
     this.#publish(ownedUnknownObservation());
+    // A previously accepted identity rested on the source just lost while the
+    // run is live: the owner is told explicitly. Missing initial proof is not a
+    // loss and reports nothing. Retirement never reaches here.
+    if (lostIdentity && !this.#retired && !this.#disposed) this.#reportIdentityLoss();
+  }
+
+  #reportIdentityLoss(): void {
+    const report = this.#onConversationIdentity;
+    if (report === undefined) return;
+    try {
+      report(null);
+    } catch {
+      // The owner's refusal or throw cannot affect this consumer.
+    }
   }
 
   /* -------------------------------------------------------------- teardown */
@@ -550,6 +792,8 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     if (this.#disposed || this.#retired) return;
     this.#retired = true;
     this.#epoch += 1;
+    // Retirement ends an identity-only hold silently: the saved identity stays.
+    this.#closeHold = false;
     this.#closeRpc();
     this.#detachFacts();
     const legacy = this.#legacy;
@@ -568,6 +812,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#disposed = true;
     this.#retired = true;
     this.#epoch += 1;
+    this.#closeHold = false;
     this.#closeRpc();
     this.#detachFacts();
     const legacy = this.#legacy;

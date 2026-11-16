@@ -421,12 +421,22 @@ nothing is written into provider settings, trust stores, or credential files. Tw
 loopback sockets exist for such a row — the backend's listener and the relay's — and
 both are private, ephemeral, and owned by that row alone.
 
-That route states anything about a root thread only on an ordinary fresh start,
-proved in order: the backend's loaded-thread census was empty before anything
-attached, one genuine provider-client `initialize` established the connection, exactly
-one initial non-helper, parentless, non-ephemeral thread start named the candidate,
-and that same connection's own first successful turn start named the same thread.
-Until all four hold, the row publishes `unknown` — not rest, not a zero, and not a
+That route states anything about a thread only on an ordinary fresh start, proved
+in order: the backend's loaded-thread census was empty before anything attached, one
+genuine provider-client `initialize` established the connection, and exactly one
+initial non-helper, parentless, non-ephemeral thread start named the candidate. Those
+three facts are the fresh candidate: the read-only observer starts on that one thread
+before any prompt, so a freshly launched, still unprompted row can show `idle`,
+`input none`, `0` tasks, `0` shells, and `Ready` — but only once the provider's own
+complete read of that thread reports it idle, its sub-agent census is complete and
+empty, its background-terminal census is complete and empty, and no question of its
+own is waiting. A launch default, a quiet period, or the empty-backend census alone
+never produces any of those values, and a failed or unfinished read leaves its own
+field `unknown`. That same connection's own first successful turn start must then
+name the same thread, which binds it as the root on the same read-only connection
+with no new dial; a status read that may predate that turn is discarded and re-read
+rather than allowed to show a stale `Ready` over the new work. Until the fresh
+candidate holds, the row publishes `unknown` — not rest, not a zero, and not a
 declaration that Codex cannot report it — and the interactive session stays fully
 usable, because this route never waits on a provider session-start hook that itself
 only fires on a first turn. A consumer that attaches later is handed the current
@@ -578,7 +588,7 @@ On the hook and rollout lane:
 - Questions and approvals stay in Codex's own UI, and nothing on the card stands
   in for them.
 
-On the owned lane, once that row's own fresh root is bound, all five categories come
+On the owned lane, once that row's own fresh candidate is proved, all five categories come
 from the read-only connection to the backend this host owns. The two lanes never
 blend: a row switches at most once, when its own owned-backend capability arrives,
 and a later observation loss publishes `unknown` rather than restoring the retired
@@ -589,10 +599,47 @@ lane or guessing a value.
   tool TYPE attributed only to the bound root's current turn, so a helper or child
   thread is never labelled as the root's tool and an older turn's completion is
   rejected. A tool completion is never presented as rest.
-- **Input** is the provider's own positive waiting-for-approval or
-  waiting-for-user-input flag on that root: the row shows a pending indication, and
-  this host never answers, forwards, or guesses it. A descendant's own pending prompt
-  never changes the root's agent or input axes.
+- **Input** is `pending` when the provider's own waiting-for-approval or
+  waiting-for-user-input flag is set on that root, or when one of that root's own
+  asynchronous questions is still unanswered. It is `none` only when both are
+  positively known to be clear, and `unknown` otherwise. This host never answers,
+  forwards, or guesses either kind. A descendant's own pending prompt, or a helper
+  thread's question, never changes the root's agent or input axes.
+- **Asynchronous questions** are not provider requests and raise no status flag, so
+  the relay's tap tracks them. It records only the asking item's id, its thread and
+  turn, and how many questions it asked; no question, option, or answer text is kept.
+  A question counts from the moment the provider completes the message that asks it.
+  It stays `pending` while the question queue is collapsed or expanded in the
+  provider's UI, while focus moves, while tools complete, and while the root keeps
+  working — the agent line can read running at the same time. It clears only when
+  the backend commits that thread's native reply naming that exact question. In a
+  multi-question set, each answer clears only its own question. The relay does not
+  treat the provider client's own answer submission, or the backend acknowledging or
+  rejecting it, as that commit. Sending an
+  ordinary new prompt from that same provider client makes the provider's UI drop its
+  unanswered questions. A question can still be on its way to the UI when that
+  happens, though, so the row cannot prove which ones were dropped. When the relay
+  sees that client's own ordinary prompt for the root, each question it was holding
+  becomes uncertain: input reads `unknown`, never a stale `pending` and never a
+  guessed `none`. Acknowledging that prompt changes nothing. A question asked after
+  it counts as `pending` again. A helper's prompt, a prompt on another thread or
+  connection, or the backend echoing a user message clears nothing. The provider's
+  UI drops its whole remaining queue when that thread's current live turn ends, and
+  the row retires everything it held at the same point. That is not reported as an
+  answer. Repeated or late copies of a question never bring it back. If a user message
+  could not be read in full, or a reply naming a question carried no thread, the
+  questions it might have answered become uncertain in the same way. Input reads
+  `unknown`, not `none`, and the other fields keep their values. This uncertainty is
+  limited to the named questions and can be recovered: as soon as the backend commits
+  replies naming all of them, input returns to `none` without waiting for the turn to
+  end. If a question message itself could not be read in full, the row cannot see
+  which questions it asked, so no reply to a different question can prove `none`. A
+  reply to that whole message resolves it, and so does a later complete copy of the
+  same message while its turn is still current. Otherwise the gap stays until the
+  current live turn ends. A turn end is one way to recover, not the only one. A fresh
+  question or the provider's current waiting flag can independently prove `pending`
+  in the meantime. Whether a reply is visible before the backend commits it depends
+  on the provider's own queueing, so the row waits for the committed reply.
 - **Tasks** count this row's own currently-active native sub-agents, and **shells**
   come from the provider's complete background-terminal census for the bound root and
   every proven descendant, deduplicated across pages and threads. A census publishes
@@ -641,10 +688,10 @@ below names the gaps that survive any observer.
 | --- | --- | --- |
 | Lifecycle and exit code | Real: the host owns the child process | Real: the host owns the child process |
 | Conversation name | Unknown: never scraped | Unknown: never scraped |
-| Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary, and a positively observed running turn stands through an unproven `Stop` boundary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: on the owned lane, that backend's own live root status once the row's fresh root is bound; on the hook and rollout lane, running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
-| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes one; on the owned lane the provider's own positive waiting-for-approval or waiting-for-user-input flag on the bound root is what makes it `pending`, and this host never answers it — never an inferred value |
-| Background task count | Live membership of this run — exact while its own coverage holds, and a keyed launch or completion edge **updates** that exact number rather than making it unknown; the distinct union of this run's non-shell members and its live agent identities, so an empty in-flight census beside one still-live agent displays `1`, not `0`; a last-reported root `Stop` total stands only while the ledger holds no exact set and no live agent needs reconciling, and any membership edge clears it; `unknown` only for a genuine coverage hole — per category when attributable — a scope change, or a hook-lane loss | `unknown` before the row's own root is bound and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's census of this row's own active native sub-agents, while a positively observed empty census displays `0` |
-| Background shell count | Live membership from the same source and lifetime as the task figure — updated by the same keyed edges, cleared the same way when it is a last-reported total, and withdrawn only by a genuine hole (per category when attributable), a scope change, or a lane loss | `unknown` before the row's own root is bound and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's complete background-terminal census for the bound root and its proven descendants, while a positively observed empty census displays `0` |
+| Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary, and a positively observed running turn stands through an unproven `Stop` boundary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: on the owned lane, that backend's own live status for the row's thread once its fresh candidate is proved; on the hook and rollout lane, running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
+| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes it; on the owned lane, `pending` from the provider's own waiting-for-approval or waiting-for-user-input flag on the row's thread or from that thread's own unanswered asynchronous question, `none` only when both are positively clear, and `unknown` after an input-metadata gap or an own ordinary prompt that may have dropped a held question, until fresh evidence resolves it — this host never answers it, and it is never an inferred value |
+| Background task count | Live membership of this run — exact while its own coverage holds, and a keyed launch or completion edge **updates** that exact number rather than making it unknown; the distinct union of this run's non-shell members and its live agent identities, so an empty in-flight census beside one still-live agent displays `1`, not `0`; a last-reported root `Stop` total stands only while the ledger holds no exact set and no live agent needs reconciling, and any membership edge clears it; `unknown` only for a genuine coverage hole — per category when attributable — a scope change, or a hook-lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's census of this row's own active native sub-agents, while a positively observed empty census displays `0` |
+| Background shell count | Live membership from the same source and lifetime as the task figure — updated by the same keyed edges, cleared the same way when it is a last-reported total, and withdrawn only by a genuine hole (per category when attributable), a scope change, or a lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's complete background-terminal census for the bound root and its proven descendants, while a positively observed empty census displays `0` |
 | Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn, attributed only to the bound root; empty when nothing was observed or after a withdrawal |
 | Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
 | Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
@@ -1011,10 +1058,11 @@ What to expect, and what this does and does not prove:
   watching: the agent line moves between running and rest as the provider's own
   turns start and end, the activity line names the current or last tool type, and a
   Claude row can show an observed pending question request and its background
-  membership counts; a Codex row's counts appear once that row's own root is bound.
+  membership counts; a Codex row's counts appear once that row's own fresh candidate is
+  proved, before any prompt.
   Two outcomes are also correct behavior: a card whose fields
   stay `unknown` because the provider's own policy declined the observer's hooks or
-  because that row's root is not yet bound, and — where the operator configured hooks
+  because that Codex row's fresh candidate is not yet proved, and — where the operator configured hooks
   of their own — the provider's own hook review-and-trust prompt, which this host never
   answers or bypasses for you.
 - **No automated approvals.** Never try a provider's permission-bypass or

@@ -47,6 +47,14 @@
  *   are neither Ready nor zero: they publish unknown plus a closed diagnostic.
  *   Background counts never hold the foreground running, and a descendant's own
  *   pending prompt never changes the root's agent/input axes.
+ * - **input (async questions)** — asynchronous questions are not server requests
+ *   and raise no provider status flag, so their queue state reaches this lane
+ *   from the caller through {@link NativeCodexRpcStatusObserver.observeAsyncInput}.
+ *   The input axis is `true` when the root is provider-blocked OR an own async
+ *   question is positively pending, `false` only when BOTH are positively none,
+ *   and unknown otherwise. Without a caller-supplied queue state the queue is
+ *   unknown, so the axis can never be a guessed none. Async pending never
+ *   changes the agent axis: a root may keep working while questions wait.
  * - **tasks** — the count of this row's OWNED, currently ACTIVE native
  *   sub-agents. The census is `thread/list` filtered by `ancestorThreadId` (the
  *   provider's own descendant filter, which is also the privacy/ownership
@@ -308,6 +316,23 @@ export function countActiveNativeCodexDescendants(
 
 /* ----------------------------------------------------------------- options */
 
+/** Closed async question queue state supplied by the caller's own source. */
+export type NativeCodexRpcAsyncInput = "none" | "pending" | "unknown";
+
+/**
+ * Combine the root's provider-status input projection with the caller's async
+ * question queue state: positive pending from either side wins, `false` needs
+ * both sides positively none, and anything else stays unknown.
+ */
+export function combineNativeCodexInputAxes(
+  rootPendingInput: boolean | null,
+  asyncInput: NativeCodexRpcAsyncInput,
+): boolean | null {
+  if (rootPendingInput === true || asyncInput === "pending") return true;
+  if (rootPendingInput === false && asyncInput === "none") return false;
+  return null;
+}
+
 export interface NativeCodexRpcStatusBinding {
   readonly rootThreadId?: string;
   readonly generation?: string;
@@ -328,6 +353,11 @@ export interface NativeCodexRpcStatusObserverOptions {
   readonly onObservation: (observation: NativeStatusObservation) => void;
   /** Closed diagnostic codes only. */
   readonly onDiagnostic?: (code: NativeCodexRpcStatusDiagnosticCode) => void;
+  /**
+   * Initial async question queue state from the caller's own source. Absent
+   * means no queue knowledge (`unknown`), never a guessed none.
+   */
+  readonly asyncInput?: NativeCodexRpcAsyncInput;
   readonly scheduler?: NativeCodexRpcStatusScheduler;
   readonly limits?: Partial<NativeCodexRpcStatusLimits>;
 }
@@ -451,7 +481,7 @@ function createCensusWalk(rootThreadId: string): CensusWalk {
  * Read-only observer of one owned native Codex endpoint.
  *
  * Public surface is exactly: `start`, `refresh`, `rebind`, `observeToolActivity`,
- * `dispose`, and read-only getters. There is no method that sends a provider
+ * `observeAsyncInput`, `supersedeCensus`, `dispose`, and read-only getters. There is no method that sends a provider
  * request the census does not need, no control call, and no raw frame path.
  */
 export class NativeCodexRpcStatusObserver {
@@ -491,6 +521,8 @@ export class NativeCodexRpcStatusObserver {
   #workWitness = false;
   /** Tool type from the caller's hook/rollout lane; only while the root is active. */
   #toolLabel: string | null = null;
+  /** Async question queue state from the caller's source; unknown until stated. */
+  #asyncInput: NativeCodexRpcAsyncInput = "unknown";
 
   /** Known descendants of the bound root and their last known status. */
   readonly #descendants = new Map<string, NativeCodexThreadStatus>();
@@ -528,6 +560,7 @@ export class NativeCodexRpcStatusObserver {
     this.#onObservation = options.onObservation;
     this.#onDiagnostic = options.onDiagnostic;
     this.#reconnectDelayMs = this.#limits.reconnectBackoffMs;
+    if (isAsyncInput(options.asyncInput)) this.#asyncInput = options.asyncInput;
   }
 
   /* ------------------------------------------------------------- read-only */
@@ -674,6 +707,33 @@ export class NativeCodexRpcStatusObserver {
     if (this.#toolLabel === next) return;
     this.#toolLabel = next;
     this.#publish();
+  }
+
+  /**
+   * The documented merge seam for the async question queue. The caller's own
+   * closed source states whether an own async question is positively pending,
+   * positively none, or unknown; this lane combines it with the provider's
+   * blocked flags for the input axis only. A malformed value is unknown.
+   */
+  observeAsyncInput(state: NativeCodexRpcAsyncInput): void {
+    if (this.#disposed) return;
+    const next: NativeCodexRpcAsyncInput = isAsyncInput(state) ? state : "unknown";
+    if (this.#asyncInput === next) return;
+    this.#asyncInput = next;
+    this.#publish();
+  }
+
+  /**
+   * The caller positively observed the bound root's own work start (its first
+   * own turn). Any census already in flight may have read the root before that
+   * work began, so it is superseded and can never publish; an immediate re-pull
+   * replaces it. A census that already landed is re-pulled the same way. This
+   * withdraws nothing and publishes nothing by itself.
+   */
+  supersedeCensus(): void {
+    if (this.#disposed) return;
+    this.#invalidateWalk();
+    this.#requestRefresh(true);
   }
 
   /**
@@ -954,8 +1014,9 @@ export class NativeCodexRpcStatusObserver {
       if (line !== null) activity.push(line);
     }
     return {
+      // Async questions never change the agent axis: the root may keep working.
       busy: projected.busy,
-      pendingInput: projected.pendingInput,
+      pendingInput: combineNativeCodexInputAxes(projected.pendingInput, this.#asyncInput),
       activity: activity.slice(0, MAX_ACTIVITY_LINES),
       activeTasks: this.#tasks,
       activeShells: this.#shells,
@@ -1714,6 +1775,10 @@ function sameEndpoint(left: NativeCodexRpcEndpoint, right: NativeCodexRpcEndpoin
       && left.authorization.token === right.authorization.token;
   }
   return false;
+}
+
+function isAsyncInput(value: unknown): value is NativeCodexRpcAsyncInput {
+  return value === "none" || value === "pending" || value === "unknown";
 }
 
 function boundedText(value: unknown, maxChars: number): string | null {

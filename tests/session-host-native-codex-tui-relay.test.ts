@@ -1622,3 +1622,203 @@ test("an orderly backend EOF with a stalled TUI forwards the whole queued tail",
     await harness.teardown();
   }
 });
+
+/* ------------------------------------------------ async question projections */
+
+const QUESTION_SENTINEL = "SENTINEL-QUESTION-TITLE";
+const THREAD_Q = "019a-thread-q";
+const TURN_Q = "019a-turn-q";
+
+function replyEnvelope(replies: unknown): string {
+  return `<send_user_message_question_reply>\n${JSON.stringify(replies)}\n</send_user_message_question_reply>`;
+}
+
+function questionKey(itemId: string, index: number): string {
+  return JSON.stringify(["request_user_input_async", itemId, index]);
+}
+
+test("async questions, committed reply envelopes, and live terminals project closed identities only", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    await tuiRequest(tui, harness.upstream, jsonFrame({ id: "i", method: "initialize", params: { clientInfo: { name: "codex-tui" }, capabilities: { requiredHumanApproval: true } } },
+      { maskKey: Buffer.from([3, 1, 2, 2]) }));
+    await until(() => eventsOfKind(harness.events, "genuine-tui-initialize").length === 1, "genuine initialize");
+
+    const questions = [
+      { title: QUESTION_SENTINEL, options: [OPTION_SENTINEL, "second"] },
+      { title: "free text", options: null },
+    ];
+    const send = (method: string, params: Record<string, unknown>): void => {
+      harness.upstream.send(jsonFrame({ method, params }));
+    };
+    const reply = (content: unknown, threadId: string = THREAD_Q): void => {
+      send("item/completed", { threadId, turnId: TURN_Q, item: { type: "userMessage", id: "user-1", content } });
+    };
+
+    // A started item may already carry questions; the native TUI registers them
+    // only on completion, so started projects no question.
+    send("item/started", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "call-q", text: "", delivery: "async", questions } });
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "call-q", text: "", delivery: "async", questions } });
+    // An empty list is ignored by the native queue, but it is a complete read
+    // of that item's question set and is projected with a zero count.
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "call-empty", text: "", delivery: "async", questions: [] } });
+    // An ordinary agent message carries no question at all.
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "msg-plain", text: OUTPUT_SENTINEL } });
+    // Unreadable question shapes are gaps, never "none".
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "call-bad", delivery: "async", questions: [{ title: 7 }] } });
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "call-nodelivery", questions } });
+    // An unbounded item id cannot scope the gap: it stays turn-scoped.
+    send("item/completed", { threadId: THREAD_Q, turnId: TURN_Q, item: { type: "agentMessage", id: "x".repeat(300), delivery: "async", questions } });
+
+    // The canonical machine envelope: one exact key, one whole-item identity,
+    // a skill attachment ignored, and the canonical IDE context prefix.
+    reply([
+      { type: "skill", name: "s", path: "/skills/s" },
+      {
+        type: "text",
+        text: `# Context from my IDE setup:\n${PROMPT_SENTINEL}\n## My request for Codex:\n${replyEnvelope([
+          { questionItemId: questionKey("call-q", 1), question: QUESTION_SENTINEL, answer: ANSWER_SENTINEL },
+          { questionItemId: "call-older", question: QUESTION_SENTINEL, answer: ANSWER_SENTINEL },
+          // An identity longer than any bounded native item id cannot match and is skipped.
+          { questionItemId: "x".repeat(300), question: "q", answer: "a" },
+        ])}`,
+      },
+    ]);
+    // Not replies: malformed envelope, prose, two text items, missing markers.
+    reply([{ type: "text", text: replyEnvelope([{ questionItemId: questionKey("call-q", 0), question: "q" }]) }]);
+    reply([{ type: "text", text: `please answer ${questionKey("call-q", 0)}` }]);
+    reply([{ type: "text", text: replyEnvelope([{ questionItemId: questionKey("call-q", 0), question: "q", answer: "a" }]) }, { type: "text", text: "more" }]);
+    reply([{ type: "text", text: JSON.stringify([{ questionItemId: questionKey("call-q", 0), question: "q", answer: "a" }]) }]);
+    reply([{ type: "text", text: replyEnvelope([]) }]);
+    // Ordinary text that happens to spell an internal outcome name is just text:
+    // no reply and no input gap.
+    reply([{ type: "text", text: "unreadable" }]);
+    reply([{ type: "text", text: "not-reply" }]);
+    // An unreadable committed user item could have hidden a reply.
+    reply({ not: "a list" });
+
+    // Live terminals: only a terminal status projects.
+    send("turn/completed", { threadId: THREAD_Q, turn: { id: "019a-turn-running", status: "inProgress", items: [] } });
+    send("turn/completed", { threadId: THREAD_Q, turn: { id: TURN_Q, status: "interrupted", items: [], error: { message: ERROR_MESSAGE_SENTINEL } } });
+
+    await until(() => eventsOfKind(harness.events, "turn-terminal").length === 1, "the terminal projection");
+    const asyncEvents = harness.events
+      .filter((event) => event.kind === "async-questions" || event.kind === "async-question-reply"
+        || event.kind === "async-input-unreadable" || event.kind === "turn-terminal")
+      .map((event) => {
+        const { connectionId: _connection, sequence: _sequence, ...rest } = event;
+        return rest;
+      });
+    assert.deepEqual(asyncEvents, [
+      { kind: "async-questions", itemId: "call-q", questionCount: 2, threadId: THREAD_Q, turnId: TURN_Q },
+      { kind: "async-questions", itemId: "call-empty", questionCount: 0, threadId: THREAD_Q, turnId: TURN_Q },
+      // A readable item id scopes each question gap to its own item.
+      { kind: "async-input-unreadable", source: "questions", itemId: "call-bad", threadId: THREAD_Q, turnId: TURN_Q },
+      { kind: "async-input-unreadable", source: "questions", itemId: "call-nodelivery", threadId: THREAD_Q, turnId: TURN_Q },
+      { kind: "async-input-unreadable", source: "questions", threadId: THREAD_Q, turnId: TURN_Q },
+      {
+        kind: "async-question-reply",
+        answers: [{ itemId: "call-q", index: 1 }, { itemId: "call-older" }],
+        threadId: THREAD_Q,
+        turnId: TURN_Q,
+      },
+      { kind: "async-input-unreadable", source: "user-input", threadId: THREAD_Q, turnId: TURN_Q },
+      { kind: "turn-terminal", threadId: THREAD_Q, turnId: TURN_Q, status: "interrupted" },
+    ]);
+    // The existing item-phase projection is unchanged for the same items.
+    assert.ok(eventsOfKind(harness.events, "item-phase").some((event) => event.kind === "item-phase"
+      && event.itemKind === "agentMessage" && event.itemId === "call-q" && event.phase === "completed"));
+    // No question, option, answer, prompt, or error text crosses the projection.
+    const serialized = JSON.stringify(harness.events);
+    assertNoSentinels(serialized);
+    assert.equal(serialized.includes(QUESTION_SENTINEL), false);
+    assert.equal(serialized.includes("free text"), false);
+    // Nothing was ever answered or generated by the relay.
+    assert.equal(eventsOfKind(harness.events, "input-request").length, 0);
+    assert.equal(eventsOfKind(harness.events, "input-response").length, 0);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("own ordinary turn/start and turn/steer input projects at the client frame; reply envelopes and empty input do not", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    let mask = 0;
+    const request = async (value: Record<string, unknown>): Promise<void> => {
+      mask += 1;
+      await tuiRequest(tui, harness.upstream, jsonFrame({ jsonrpc: "2.0", ...value }, { maskKey: Buffer.from([mask, 7, 3, mask]) }));
+    };
+    const text = (value: string): Record<string, unknown> => ({ type: "text", text: value, text_elements: [] });
+    const envelope = replyEnvelope([{ questionItemId: questionKey("call-q", 0), question: QUESTION_SENTINEL, answer: ANSWER_SENTINEL }]);
+
+    // Before the genuine initialize nothing this client sends is metadata.
+    await request({ id: "pre-1", method: "turn/start", params: { threadId: THREAD_Q, input: [text(PROMPT_SENTINEL)] } });
+    await request({ id: "i", method: "initialize", params: { clientInfo: { name: "codex-tui" }, capabilities: { requiredHumanApproval: true } } });
+    await until(() => eventsOfKind(harness.events, "genuine-tui-initialize").length === 1, "genuine initialize");
+    assert.equal(eventsOfKind(harness.events, "ordinary-input").length, 0);
+
+    // An ordinary prompt projects as soon as the client frame is observed,
+    // before (and independent of) any backend response.
+    await request({ id: 7, method: "turn/start", params: { threadId: THREAD_Q, input: [text(PROMPT_SENTINEL)] } });
+    await until(() => eventsOfKind(harness.events, "ordinary-input").length === 1, "ordinary turn/start");
+    // A steer is the same ordinary submission; it registers no correlation.
+    await request({ id: 8, method: "turn/steer", params: { threadId: THREAD_Q, expectedTurnId: TURN_Q, input: [text(PROMPT_SENTINEL)] } });
+    // The TUI's own question-answer submission (the canonical envelope, with an
+    // ignored skill attachment) keeps its questions until the committed reply.
+    await request({ id: 9, method: "turn/start", params: { threadId: THREAD_Q, input: [{ type: "skill", name: "s", path: "/skills/s" }, text(envelope)] } });
+    await request({ id: 10, method: "turn/steer", params: { threadId: THREAD_Q, expectedTurnId: TURN_Q, input: [text(envelope)] } });
+    // No model input at all is not a submission.
+    await request({ id: 11, method: "turn/start", params: { threadId: THREAD_Q, input: [] } });
+    await request({ id: 12, method: "turn/start", params: { threadId: THREAD_Q, input: [{ type: "mention", name: "m", path: "app://m" }] } });
+    await request({ id: 13, method: "turn/start", params: { threadId: THREAD_Q, input: [text("")] } });
+    // Other client requests (status reads, shell commands) are not model input.
+    await request({ id: 14, method: "thread/read", params: { threadId: THREAD_Q, input: [text(PROMPT_SENTINEL)] } });
+    // Not exactly the envelope: an image beside it, a malformed envelope, prose.
+    await request({ id: 15, method: "turn/start", params: { threadId: THREAD_Q, input: [text(envelope), { type: "image", url: "data:x" }] } });
+    await request({ id: 16, method: "turn/start", params: { threadId: THREAD_Q, input: [text(replyEnvelope([{ questionItemId: questionKey("call-q", 0), question: "q" }]))] } });
+    await request({ id: 17, method: "turn/start", params: { threadId: THREAD_Q, input: [{ type: "localImage", path: "/tmp/x.png" }] } });
+    // Unreadable input or thread scope is projected, never dropped as "none".
+    await request({ id: 18, method: "turn/start", params: { threadId: THREAD_Q, input: { not: "a list" } } });
+    await request({ id: 19, method: "turn/steer", params: { input: [text(PROMPT_SENTINEL)] } });
+    await request({ id: 20, method: "turn/start", params: { threadId: THREAD_Q, input: [{ type: "text", text: 5 }] } });
+    // Helper traffic is labelled, not deleted; a notification carries nothing.
+    await request({ id: "temporary-structured-9", method: "turn/start", params: { threadId: "019a-helper", input: [text(PROMPT_SENTINEL)] } });
+    await request({ method: "turn/start", params: { threadId: THREAD_Q, input: [text(PROMPT_SENTINEL)] } });
+
+    await until(() => eventsOfKind(harness.events, "ordinary-input").length === 9, "every ordinary projection");
+    // Acknowledgements and errors add nothing and never become a work target for a steer.
+    harness.upstream.send(jsonFrame({ id: 8, result: { turnId: TURN_Q } }));
+    harness.upstream.send(jsonFrame({ id: 7, error: { code: -32600, message: ERROR_MESSAGE_SENTINEL } }));
+    harness.upstream.send(jsonFrame({ id: 9, result: { turn: { id: "019a-turn-answer" } } }));
+    await until(() => eventsOfKind(harness.events, "turn-work-target").length === 1, "the answer turn's own work target");
+    await sleep(40);
+
+    const ordinary = eventsOfKind(harness.events, "ordinary-input").map((event) => {
+      const { connectionId: _connection, sequence: _sequence, ...rest } = event;
+      return rest;
+    });
+    const native = { kind: "ordinary-input", requestIdKind: "native", threadId: THREAD_Q };
+    assert.deepEqual(ordinary, [
+      native, // ordinary turn/start
+      native, // ordinary turn/steer
+      native, // envelope beside an image
+      native, // malformed envelope
+      native, // local image only
+      native, // unreadable input list
+      { kind: "ordinary-input", requestIdKind: "native" }, // unscoped steer
+      native, // unreadable text entry
+      { kind: "ordinary-input", requestIdKind: "native-helper", threadId: "019a-helper" },
+    ]);
+    // No prompt, answer, question, or error text crosses the projection.
+    const serialized = JSON.stringify(harness.events);
+    assertNoSentinels(serialized);
+    assert.equal(serialized.includes(QUESTION_SENTINEL), false);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});

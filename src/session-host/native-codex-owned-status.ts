@@ -28,17 +28,26 @@
  * withdrawal publishes unknown values under the RPC declaration; it never restores
  * the retired hook lane, and it never opts a healthy owned row out of a category.
  *
- * ## The fresh-root precondition
+ * ## The fresh-candidate and fresh-root preconditions
  *
- * The RPC observer needs a positively bound ROOT thread, and this consumer never
+ * The RPC observer needs a positively proven thread, and this consumer never
  * guesses one. It attaches to the retained facts source of THIS lease's relay only
  * after the live capability delivery, and it starts exactly one RPC observer when
- * that source states a BOUND fresh root — the empty owned-backend census, one
- * genuine TUI `initialize`, one fresh parentless `thread/start`, and this
- * connection's own first successful `turn/start`, all proved inside the relay and
- * the composite, not here. Before that it publishes no root, no Ready, and no zero.
- * A candidate, a connected-only, an empty, or a withdrawn source publishes nothing
- * beyond the switch's single unknown snapshot.
+ * that source states either the owner-private FRESH CANDIDATE binding — the empty
+ * owned-backend census, one genuine TUI `initialize`, and exactly one initial
+ * non-helper, parentless, non-ephemeral `thread/start` naming thread A — or a
+ * BOUND fresh root, which additionally has this connection's own first successful
+ * `turn/start` on that same A. All of it is proved inside the relay and the
+ * composite, not here. Starting on the candidate is what lets a fresh, still
+ * unprompted session reach a positively read `Ready`, `input none`, and `0`/`0`:
+ * those values come only from the observer's own complete `thread/read` of A and
+ * its complete descendant and background-terminal censuses plus the source's
+ * positively empty async question queue — never from a default, a quiet period,
+ * or the empty-backend witness alone. When A later binds, the SAME observer keeps
+ * running (no redial), and any census that may have read A before its own first
+ * turn is superseded so it can never land a stale Ready over that work. A
+ * connected-only, an empty, a candidate without the fresh binding, or a withdrawn
+ * source publishes nothing beyond the switch's single unknown snapshot.
  *
  * ## What the facts may and may not say
  *
@@ -49,8 +58,10 @@
  * through the RPC lane's documented merge seam, clearing it with `null` when a new
  * root turn has no tool or the tool completed. That retained current fact is also
  * what lets a recovered read-only connection restore its label without a new relay
- * event. The RPC lane keeps authority over Ready/Working, the pending-input axes,
- * and both background counts; a tool completion is never fed to the row as a Ready
+ * event. The source's CURRENT async question queue state is forwarded the same
+ * way through the RPC lane's async-input merge seam, which combines it with the
+ * provider's blocked flags for the input axis only. The RPC lane keeps authority
+ * over Ready/Working, the pending-input axes, and both background counts; a tool completion is never fed to the row as a Ready
  * claim, and this consumer never replies to, requests, or controls anything on
  * either lane.
  *
@@ -81,6 +92,7 @@ import {
   type NativeCodexRpcStatusScheduler,
 } from "./native-codex-rpc-status";
 import type {
+  NativeCodexTuiRootAsyncInput,
   NativeCodexTuiRootFactsSnapshot,
   NativeCodexTuiRootFactsSource,
   NativeCodexTuiRootToolFact,
@@ -186,6 +198,8 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
    */
   #boundConnectionId: string | undefined;
   #boundRootThreadId: string | undefined;
+  /** True once the adopted thread's first own turn bound it as the root. */
+  #rootBound = false;
   /**
    * The last validated CURRENT rooted tool fact under that binding. It is the
    * consumer's own memory of the relay's current state, which is what lets a
@@ -324,40 +338,70 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       this.#withdraw();
       return;
     }
-    // `empty`, `connected`, and `candidate` are all pre-root states: no root, no
-    // Ready, no zero, and no observer dialing a root this row never proved.
-    if (snapshot.phase !== "bound") return;
 
-    const rootThreadId = snapshot.rootThreadId;
+    let threadId: string | undefined;
+    let bound: boolean;
+    if (snapshot.phase === "bound") {
+      threadId = snapshot.rootThreadId;
+      bound = true;
+    } else if (snapshot.phase === "candidate" && snapshot.candidateThreadId !== undefined) {
+      threadId = snapshot.candidateThreadId;
+      bound = false;
+    } else {
+      // `empty`, `connected`, and a candidate without the fresh binding are all
+      // pre-observation states: no thread, no Ready, no zero, and nothing dialed.
+      // The source is sticky, so such a state after an adopted binding is a
+      // contradiction of what this observer was built on.
+      if (this.#rpc !== undefined) this.#withdraw();
+      return;
+    }
+
     const connectionId = snapshot.connectionId;
-    if (typeof rootThreadId !== "string" || rootThreadId.length === 0
+    if (typeof threadId !== "string" || threadId.length === 0
       || typeof connectionId !== "string" || connectionId.length === 0) {
-      // A `bound` state this consumer cannot fence contradicts the source's own
-      // contract: it is a binding loss, never a root to guess at.
+      // A binding this consumer cannot fence contradicts the source's own
+      // contract: it is a binding loss, never a thread to guess at.
       this.#withdraw();
       return;
     }
 
+    const tool = bound ? snapshot.tool : undefined;
+    const asyncInput = snapshot.asyncInput ?? "unknown";
     if (this.#rpc === undefined) {
-      this.#startRpc(rootThreadId, connectionId, snapshot.tool);
+      this.#rootBound = bound;
+      this.#startRpc(threadId, connectionId, tool, asyncInput);
       return;
     }
-    // The adopted connection generation and root thread are the whole identity of
+    // The adopted connection generation and thread are the whole identity of
     // what this card describes. A later snapshot naming either differently is not
     // an update to apply and never a reason to re-dial: it is the loss of the
-    // fresh-root premise this observer was built on.
-    if (this.#boundConnectionId !== connectionId || this.#boundRootThreadId !== rootThreadId) {
+    // fresh premise this observer was built on. A bound root never regresses.
+    if (this.#boundConnectionId !== connectionId || this.#boundRootThreadId !== threadId
+      || (this.#rootBound && !bound)) {
       this.#withdraw();
       return;
     }
-    this.#currentTool = snapshot.tool;
-    this.#applyTool(snapshot.tool);
+    if (bound && !this.#rootBound) {
+      // The fresh candidate's own first turn bound it: the same observer keeps
+      // reading the same thread, and a census that may predate that work is
+      // superseded so it can never publish a stale Ready over it.
+      this.#rootBound = true;
+      try {
+        this.#rpc.supersedeCensus();
+      } catch {
+        // Contained.
+      }
+    }
+    this.#currentTool = tool;
+    this.#applyTool(tool);
+    this.#applyAsyncInput(asyncInput);
   }
 
   #startRpc(
     rootThreadId: string,
     connectionId: string,
     tool: NativeCodexTuiRootToolFact | undefined,
+    asyncInput: NativeCodexTuiRootAsyncInput,
   ): void {
     const source = this.#source;
     if (source === undefined) {
@@ -385,6 +429,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
         endpoint,
         rootThreadId,
         generation: ownedRpcGeneration(source, connectionId, epoch),
+        asyncInput,
         onObservation: (observation) => {
           if (this.#restoring) this.#restorePublished = true;
           this.#onRpcObservation(observation, epoch);
@@ -395,6 +440,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     } catch {
       this.#boundConnectionId = undefined;
       this.#boundRootThreadId = undefined;
+      this.#rootBound = false;
       this.#withdraw();
       return;
     }
@@ -415,6 +461,17 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
    */
   #applyTool(tool: NativeCodexTuiRootToolFact | undefined): void {
     this.#applyLabel(this.#labelFor(tool));
+  }
+
+  /** Forward the source's CURRENT async question queue state (input axis only). */
+  #applyAsyncInput(state: NativeCodexTuiRootAsyncInput): void {
+    const rpc = this.#rpc;
+    if (rpc === undefined) return;
+    try {
+      rpc.observeAsyncInput(state);
+    } catch {
+      // The merge seam is total; a throw cannot break the row.
+    }
   }
 
   #labelFor(tool: NativeCodexTuiRootToolFact | undefined): string | null {
@@ -471,6 +528,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#currentTool = undefined;
     this.#boundConnectionId = undefined;
     this.#boundRootThreadId = undefined;
+    this.#rootBound = false;
     this.#closeRpc();
     this.#detachFacts();
     // Deliberately NOT a capture invalidation and NOT a manager retirement: the

@@ -496,6 +496,7 @@ test("root facts retain a pre-readiness private candidate and publish one curren
     rootThreadId: "thread-a",
     rootTurnId: "turn-1",
     tool: { itemId: "item-1", category: "command", phase: "started", turnId: "turn-1" },
+    asyncInput: "none",
   });
 
   const seen: NativeCodexTuiRootFactsSnapshot[] = [];

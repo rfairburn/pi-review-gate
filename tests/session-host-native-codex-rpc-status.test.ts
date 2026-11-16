@@ -16,6 +16,7 @@ import {
   NATIVE_CODEX_RPC_ACTIVITY_WORKING,
   NATIVE_CODEX_RPC_STATUS_SUPPORT,
   NativeCodexRpcStatusObserver,
+  combineNativeCodexInputAxes,
   countActiveNativeCodexDescendants,
   isActiveNativeCodexDescendantStatus,
   projectNativeCodexRootStatus,
@@ -155,6 +156,9 @@ async function startHarness(
     rootThreadId: ROOT,
     generation: "gen-1",
     expectedCodexHome: "/owned/codex-home",
+    // These suites state a positively empty async question queue; the input
+    // axis needs that knowledge before it can be a positive none.
+    asyncInput: "none",
     scheduler,
     onObservation: (observation) => observations.push(observation),
     onDiagnostic: (code) => diagnostics.push(code),
@@ -670,6 +674,9 @@ test("a rebind that recovers cancels the superseded reconnect attempt", async ()
     rootThreadId: ROOT,
     generation: "gen-1",
     expectedCodexHome: "/owned/codex-home",
+    // These suites state a positively empty async question queue; the input
+    // axis needs that knowledge before it can be a positive none.
+    asyncInput: "none",
     scheduler,
     onObservation: (observation) => observations.push(observation),
   });
@@ -799,6 +806,9 @@ test("rebinding while a connect is pending establishes the replacement, not the 
     rootThreadId: ROOT,
     generation: "gen-1",
     expectedCodexHome: "/owned/codex-home",
+    // These suites state a positively empty async question queue; the input
+    // axis needs that knowledge before it can be a positive none.
+    asyncInput: "none",
     scheduler,
     onObservation: (observation) => observations.push(observation),
   });
@@ -1369,8 +1379,15 @@ test("the public surface is observation-only: no control call is reachable", () 
   }
   methods.sort();
   accessors.sort();
-  assert.deepEqual(methods, ["dispose", "observeToolActivity", "rebind", "refresh", "start"],
-    "the only callable behavior is start, a coalesced refresh, a rebinding, and the caller's tool-type merge");
+  assert.deepEqual(methods, [
+    "dispose",
+    "observeAsyncInput",
+    "observeToolActivity",
+    "rebind",
+    "refresh",
+    "start",
+    "supersedeCensus",
+  ], "the only callable behavior is start, a coalesced refresh or supersede, a rebinding, and the caller's tool-type and async-input merges");
   assert.deepEqual(accessors, [
     "censusInFlight",
     "connected",
@@ -1420,4 +1437,85 @@ test("pure census helpers agree with the provider's active predicate", () => {
   });
   assert.equal(countActiveNativeCodexDescendants([row("active"), row("idle"), row("notLoaded"), row("active")]), 2);
   assert.equal(countActiveNativeCodexDescendants([]), 0);
+});
+
+/* ------------------------------------------- async input and supersede */
+
+test("without stated async queue knowledge the input axis is unknown, never a guessed none", async () => {
+  const h = await startHarness({}, { asyncInput: undefined });
+  try {
+    const card = h.latest();
+    assert.equal(card.pendingInput, null, "an idle root alone cannot prove that no async question waits");
+    assert.equal(card.busy, false, "the agent axis is untouched");
+    assert.deepEqual(card.activity, [NATIVE_CODEX_RPC_ACTIVITY_READY]);
+    assert.equal(card.activeTasks, 2, "unrelated known axes stay intact");
+    assert.equal(card.activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("async pending combines with the provider input axis and never changes the agent axis", async () => {
+  assert.equal(combineNativeCodexInputAxes(true, "none"), true);
+  assert.equal(combineNativeCodexInputAxes(true, "unknown"), true, "a current provider block proves pending");
+  assert.equal(combineNativeCodexInputAxes(null, "pending"), true);
+  assert.equal(combineNativeCodexInputAxes(false, "pending"), true);
+  assert.equal(combineNativeCodexInputAxes(false, "none"), false);
+  assert.equal(combineNativeCodexInputAxes(false, "unknown"), null);
+  assert.equal(combineNativeCodexInputAxes(null, "none"), null);
+
+  const h = await startHarness();
+  try {
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await settle(25);
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.latest().pendingInput, true, "an own unanswered async question is pending");
+    assert.equal(h.latest().busy, true, "the root keeps working while the question waits");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+
+    h.observer.observeAsyncInput("unknown");
+    assert.equal(h.latest().pendingInput, null, "lost queue knowledge is unknown, not none");
+    assert.equal(h.latest().busy, true);
+    assert.equal(h.latest().activeTasks, 2, "an input-only gap leaves every other axis intact");
+
+    h.observer.observeAsyncInput("none");
+    assert.equal(h.latest().pendingInput, false);
+
+    // A malformed state is unknown.
+    h.observer.observeAsyncInput("bogus" as never);
+    assert.equal(h.latest().pendingInput, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a superseded census that read the root before its own work never publishes a stale Ready", async () => {
+  const h = await startHarness({ delayMs: { "thread/backgroundTerminals/list": 80 } });
+  try {
+    assert.equal(h.latest().busy, false, "the first census positively read an idle root");
+    await h.quiet();
+    const readsBefore = h.requests("thread/read");
+    h.observer.refresh();
+    // Wait until the in-flight census has read the still-idle root.
+    for (let waited = 0; h.requests("thread/read") === readsBefore && waited < 2_000; waited += 5) {
+      await settle(5);
+    }
+    assert.ok(h.observer.censusInFlight, "the census is held after its root read");
+    // The root's own work starts; no broadcast has reached this lane yet.
+    h.server.setStatus(ROOT, activeStatus([]));
+    const mark = h.observations.length;
+    h.observer.supersedeCensus();
+    for (let waited = 0; h.latest().busy !== true && waited < 4_000; waited += 10) {
+      await settle(10);
+    }
+    await h.quiet();
+    assert.equal(h.latest().busy, true, "the re-pull saw the root's own work without a broadcast");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "the superseded census never landed its stale idle read");
+    }
+  } finally {
+    await h.close();
+  }
 });

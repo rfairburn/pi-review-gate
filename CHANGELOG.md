@@ -70,12 +70,33 @@ dates.
   originates no application-layer message, never subscribes, starts, resumes, answers,
   or approves, and refuses a second concurrent client. The row's five sidebar
   categories come from one read-only connection to that backend once an ordinary fresh
-  root is positively proved — an empty pre-attach loaded-thread census, one genuine
-  client `initialize`, one initial non-helper parentless thread start, and that
-  connection's own first successful turn start on the same thread — and stay `unknown`,
-  never rest and never zero, before that proof or after a deliberate thread change,
-  while the interactive session itself stays fully usable and no provider session-start
-  hook is waited on. This host arms no provider hook of its own for such a launch, a
+  candidate is positively proved — an empty pre-attach loaded-thread census, one genuine
+  client `initialize`, and one initial non-helper parentless thread start — so a
+  freshly launched, still unprompted row shows `Ready`, `input none`, and `0`/`0` only
+  from that thread's own complete idle read and complete empty sub-agent and
+  background-terminal censuses. That connection's own first successful turn start must
+  then name the same thread, which binds it on the same connection without a redial and
+  discards any read that may predate that turn. Fields stay `unknown`, never rest and
+  never zero, before that proof, after a failed read, or after a deliberate thread
+  change, while the interactive session itself stays fully usable and no provider
+  session-start hook is waited on. Input is `pending` while the provider flags the
+  thread as waiting or while one of that thread's own asynchronous questions is
+  unanswered, including while the provider's question queue is collapsed and while the
+  agent keeps working. Such a question clears only on the backend's committed native
+  reply naming it — partial answers clear only their own questions — or when the
+  provider retires its whole queue at that thread's current live turn end, which is not
+  reported as an answer. An ordinary new prompt from that same provider client drops
+  the provider's unanswered questions, but a question still on its way to the UI is not
+  dropped, so the questions held before that prompt become `unknown` rather than a stale
+  `pending` or a guessed `none`. A question asked after the prompt is `pending` again,
+  and a helper's prompt, another thread's or connection's prompt, or a backend
+  user-message echo clears nothing. No question, option, or answer text is kept. Question
+  or user-message metadata that cannot be read in full makes input `unknown`, never
+  `none`, without touching the other fields. That uncertainty recovers as soon as fresh
+  scoped evidence resolves it, such as committed replies naming every uncertain
+  question, or a complete copy of an unreadable question message on its current turn.
+  An unseen-question gap is never resolved by a reply to a different question, and
+  otherwise lasts until the current live turn end. This host arms no provider hook of its own for such a launch, a
   configured target whose arguments choose a named provider profile is refused clearly
   before any process, socket, or file exists, and stopping the row also stops its
   backend and relay, which settle only on their own actual closures. Pi and Claude

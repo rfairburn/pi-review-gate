@@ -85,6 +85,21 @@
  *   the TUI something, and whether the TUI's own reply carried an error. It
  *   never answers, never forwards an answer it did not see the TUI send, and
  *   never reads the question, its options, or the answer.
+ * - Asynchronous questions are NOT server requests. `async-questions` projects a
+ *   completed `agentMessage` item carrying `delivery: "async"` questions as its
+ *   item id, envelope thread/turn ids, and question count only.
+ *   `async-question-reply` projects a committed `userMessage` whose single text
+ *   is the native reply envelope as the answered question identities only; the
+ *   envelope is parsed transiently with the native parser's whole-shape rules,
+ *   and its question and answer strings are dropped. `async-input-unreadable`
+ *   reports a question or user item that could not be read in full, and
+ *   `turn-terminal` projects a live `turn/completed` terminal status (the native
+ *   TUI's own queue retirement point). `ordinary-input` reports that this
+ *   connection's own client `turn/start`/`turn/steer` carried ordinary model
+ *   input (anything but exactly the reply envelope), observed on the client
+ *   frame itself: the native TUI clears its unanswered queue on such a
+ *   submission, so earlier questions may have been dropped locally. None of
+ *   these is a reply or a control.
  * - Prompts, previews, thread names, cwds, rollout paths, model text, commands,
  *   diffs, outputs, error MESSAGES, questions, options, answers, auth headers,
  *   and secrets are never placed in an event, a status value, or an error. Raw
@@ -316,6 +331,97 @@ export interface NativeCodexTuiRelayItemPhaseEvent extends NativeCodexTuiRelayEv
   readonly toolCategory?: NativeCodexTuiRelayToolCategory;
 }
 
+/**
+ * A completed backend `agentMessage` item carrying asynchronous questions
+ * (`delivery: "async"` plus a fully readable `questions` array, possibly empty:
+ * the native queue ignores an empty list, which still completes that item's
+ * question set). It is
+ * NOT a server request and has no reply frame: the native TUI registers the
+ * questions from the completed item under `itemId` and keys each one by its
+ * index. Only the item id, the envelope's thread/turn ids, and the question count
+ * are projected — never a title, an option, or any other text.
+ */
+export interface NativeCodexTuiRelayAsyncQuestionsEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "async-questions";
+  readonly itemId: string;
+  readonly questionCount: number;
+  readonly threadId?: string;
+  readonly turnId?: string;
+}
+
+/** One answered async question named by a committed native reply envelope. */
+export interface NativeCodexTuiRelayAsyncQuestionAnswer {
+  /** The asking `agentMessage` item id. */
+  readonly itemId: string;
+  /**
+   * The question's index inside that item. Absent when the reply named the whole
+   * item (the older native whole-message reply identity).
+   */
+  readonly index?: number;
+}
+
+/**
+ * A committed backend `userMessage` item whose content is exactly the native
+ * async-question reply envelope. Only the answered question identities are
+ * projected; the question and answer strings are parsed transiently and dropped.
+ */
+export interface NativeCodexTuiRelayAsyncQuestionReplyEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "async-question-reply";
+  readonly answers: readonly NativeCodexTuiRelayAsyncQuestionAnswer[];
+  readonly threadId?: string;
+  readonly turnId?: string;
+}
+
+/**
+ * A completed item that could have published async questions (`questions`) or
+ * committed a reply to them (`user-input`) could not be read in full. It is an
+ * input-knowledge gap for that thread only, never a statement that nothing is
+ * pending.
+ */
+export interface NativeCodexTuiRelayAsyncInputUnreadableEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "async-input-unreadable";
+  readonly source: "questions" | "user-input";
+  /**
+   * For `questions` only: the asking item's bounded id when it was readable, so
+   * the gap is scoped to that item. Absent when the id itself was unreadable.
+   */
+  readonly itemId?: string;
+  readonly threadId?: string;
+  readonly turnId?: string;
+}
+
+/**
+ * This connection's own client `turn/start` or `turn/steer` REQUEST carried
+ * non-empty model input that is NOT exactly the native async-question reply
+ * envelope (an ordinary prompt), or input this tap could not read in full.
+ *
+ * The native TUI clears its unanswered async question queue when it submits an
+ * ordinary model prompt, so this is emitted when the client frame is observed —
+ * never on the backend's acknowledgement or error — and it means only that the
+ * questions held BEFORE this submission may have been dropped locally. It is
+ * not proof that any question was dropped (one still in flight toward the TUI
+ * was not), not an answer, not a root selection, and not a reply or control.
+ * Only the request's ORIGINAL `params.threadId` and its id kind are projected;
+ * the input itself is read transiently and dropped.
+ */
+export interface NativeCodexTuiRelayOrdinaryInputEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "ordinary-input";
+  readonly requestIdKind: NativeCodexTuiRelayRequestIdKind;
+  readonly threadId?: string;
+}
+
+/**
+ * A live `turn/completed` notification whose turn reached a terminal status.
+ * The native TUI retires its remaining async questions on exactly this event; it
+ * is a queue retirement, never a human answer.
+ */
+export interface NativeCodexTuiRelayTurnTerminalEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "turn-terminal";
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly status: "completed" | "interrupted" | "failed";
+}
+
 /** Metadata was withdrawn; forwarding is unaffected. */
 export interface NativeCodexTuiRelayMetadataUnavailableEvent extends NativeCodexTuiRelayEventBase {
   readonly kind: "metadata-unavailable";
@@ -337,6 +443,11 @@ export type NativeCodexTuiRelayMetadataEvent =
   | NativeCodexTuiRelayInputRequestEvent
   | NativeCodexTuiRelayInputResponseEvent
   | NativeCodexTuiRelayItemPhaseEvent
+  | NativeCodexTuiRelayAsyncQuestionsEvent
+  | NativeCodexTuiRelayAsyncQuestionReplyEvent
+  | NativeCodexTuiRelayAsyncInputUnreadableEvent
+  | NativeCodexTuiRelayOrdinaryInputEvent
+  | NativeCodexTuiRelayTurnTerminalEvent
   | NativeCodexTuiRelayMetadataUnavailableEvent
   | NativeCodexTuiRelayGenerationClosedEvent;
 
@@ -499,6 +610,173 @@ function nestedValue(value: unknown, path: readonly string[]): unknown {
     current = current[key];
   }
   return current;
+}
+
+/* ------------------------------------------------- async question metadata */
+
+/** The native async-question tool name embedded in every question key. */
+const ASYNC_QUESTION_TOOL_NAME = "request_user_input_async";
+/** The native reply envelope markers (`AnsweredQuestion::type_markers`). */
+const ASYNC_REPLY_START_MARKER = "<send_user_message_question_reply>";
+const ASYNC_REPLY_END_MARKER = "</send_user_message_question_reply>";
+/** The canonical IDE context prefix the native reply parser accepts. */
+const IDE_CONTEXT_PREFIX = "# Context from my IDE setup:\n";
+const IDE_REQUEST_DELIMITER = "\n## My request for Codex:\n";
+
+/**
+ * The native question key for one question: the exact string the provider UI
+ * builds with `JSON.stringify([tool name, item id, question index])`.
+ */
+export function nativeCodexAsyncQuestionKey(itemId: string, index: number): string {
+  return JSON.stringify([ASYNC_QUESTION_TOOL_NAME, itemId, index]);
+}
+
+/**
+ * The number of questions in a fully readable native `questions` array (each a
+ * `{ title: string, options?: string[] | null }`), or null when any part of the
+ * shape is unreadable. Titles and options are inspected for type only and are
+ * never retained.
+ */
+function readAsyncQuestionCount(value: unknown): number | null {
+  if (!Array.isArray(value)) return null;
+  for (const question of value) {
+    if (!isRecord(question) || typeof question.title !== "string") return null;
+    const options = question.options;
+    if (options === undefined || options === null) continue;
+    if (!Array.isArray(options) || !options.every((option) => typeof option === "string")) return null;
+  }
+  return value.length;
+}
+
+/**
+ * The single text of a committed `userMessage` content list, following the
+ * native reply reader: skill and mention attachments are ignored, and the
+ * message qualifies only when exactly one text item remains. The result is
+ * tagged, so no user text can ever be mistaken for the unreadable outcome.
+ */
+type UserTextRead =
+  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "not-reply" }
+  | { readonly kind: "unreadable" };
+
+const USER_TEXT_NOT_REPLY: UserTextRead = Object.freeze({ kind: "not-reply" as const });
+const USER_TEXT_UNREADABLE: UserTextRead = Object.freeze({ kind: "unreadable" as const });
+
+function readSingleUserText(content: unknown): UserTextRead {
+  if (!Array.isArray(content)) return USER_TEXT_UNREADABLE;
+  let text: string | null = null;
+  let count = 0;
+  for (const entry of content) {
+    if (!isRecord(entry) || typeof entry.type !== "string") return USER_TEXT_UNREADABLE;
+    if (entry.type === "skill" || entry.type === "mention") continue;
+    count += 1;
+    if (entry.type === "text") {
+      if (typeof entry.text !== "string") return USER_TEXT_UNREADABLE;
+      if (count === 1) text = entry.text;
+    }
+  }
+  return count === 1 && text !== null ? { kind: "text", text } : USER_TEXT_NOT_REPLY;
+}
+
+/** Rust `str::trim`: Unicode `White_Space` on both ends. */
+function trimWhiteSpace(value: string): string {
+  return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+}
+
+function isAsyncReplyRecord(value: unknown): value is Record<string, unknown> {
+  return isRecord(value)
+    && typeof value.questionItemId === "string"
+    && typeof value.question === "string"
+    && typeof value.answer === "string";
+}
+
+/**
+ * Parse the canonical native reply envelope and project ONLY the answered
+ * question identities. The whole envelope must have the native shape — the
+ * markers around a non-empty array of (or one) `{questionItemId, question,
+ * answer}` record(s) — or nothing is projected. The question and answer
+ * strings are type-checked and discarded. An identity that is neither an exact
+ * canonical question key nor a bounded whole-item id cannot equal any native
+ * pending key, so it is skipped rather than guessed at.
+ */
+function parseAsyncQuestionReplyIds(text: string): NativeCodexTuiRelayAsyncQuestionAnswer[] | null {
+  let body = trimWhiteSpace(text);
+  if (body.startsWith(IDE_CONTEXT_PREFIX)) {
+    const at = body.lastIndexOf(IDE_REQUEST_DELIMITER);
+    if (at < 0) return null;
+    body = trimWhiteSpace(body.slice(at + IDE_REQUEST_DELIMITER.length));
+  }
+  if (!body.startsWith(ASYNC_REPLY_START_MARKER) || !body.endsWith(ASYNC_REPLY_END_MARKER)) return null;
+  const json = body.slice(ASYNC_REPLY_START_MARKER.length, body.length - ASYNC_REPLY_END_MARKER.length);
+  if (json.length === 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  const replies: unknown[] = Array.isArray(parsed) ? parsed : [parsed];
+  if (replies.length === 0 || !replies.every(isAsyncReplyRecord)) return null;
+  const answers: NativeCodexTuiRelayAsyncQuestionAnswer[] = [];
+  const seen = new Set<string>();
+  for (const reply of replies as Record<string, unknown>[]) {
+    const id = reply.questionItemId as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const answer = readAsyncQuestionIdentity(id);
+    if (answer !== null) answers.push(answer);
+  }
+  return answers;
+}
+
+/** The native TUI's client requests that submit model input. */
+const MODEL_INPUT_TUI_REQUEST_METHODS: ReadonlySet<string> = new Set(["turn/start", "turn/steer"]);
+
+/**
+ * Classify one client model-input list (the native `UserInput` items) without
+ * retaining any of it: no model content at all, exactly the canonical native
+ * reply envelope (the TUI's own question-answer submission, which never clears
+ * its queue), ordinary model input, or input that could not be read in full.
+ */
+function classifyTuiModelInput(input: unknown): "none" | "question-answer" | "ordinary" | "unreadable" {
+  const single = readSingleUserText(input);
+  if (single.kind === "unreadable") return "unreadable";
+  if (single.kind === "text") {
+    if (single.text.length === 0) return "none";
+    return parseAsyncQuestionReplyIds(single.text) === null ? "ordinary" : "question-answer";
+  }
+  // Not a single text: ordinary multi-part or non-text model content, or only
+  // skill/mention attachments with no model content at all.
+  const entries = input as readonly Record<string, unknown>[];
+  return entries.some((entry) => entry.type !== "skill" && entry.type !== "mention") ? "ordinary" : "none";
+}
+
+function readAsyncQuestionIdentity(id: string): NativeCodexTuiRelayAsyncQuestionAnswer | null {
+  if (id.startsWith("[")) {
+    let key: unknown;
+    try {
+      key = JSON.parse(id);
+    } catch {
+      key = undefined;
+    }
+    if (
+      Array.isArray(key)
+      && key.length === 3
+      && key[0] === ASYNC_QUESTION_TOOL_NAME
+      && typeof key[1] === "string"
+      && typeof key[2] === "number"
+      && Number.isSafeInteger(key[2])
+      && key[2] >= 0
+    ) {
+      const itemId = readBoundedId(key[1]);
+      // Only the exact native spelling matches; a re-spaced key never would.
+      if (itemId !== null && nativeCodexAsyncQuestionKey(itemId, key[2]) === id) {
+        return Object.freeze({ itemId, index: key[2] });
+      }
+    }
+  }
+  const whole = readBoundedId(id);
+  return whole === null ? null : Object.freeze({ itemId: whole });
 }
 
 /* --------------------------------------------------- handshake header work */
@@ -994,6 +1272,7 @@ class MetadataTap {
 
   #handleTuiRequest(method: string, message: Record<string, unknown>): void {
     if (method === "initialize") return;
+    if (MODEL_INPUT_TUI_REQUEST_METHODS.has(method)) this.#handleModelInputRequest(message);
     const origin = PROJECTED_TUI_REQUEST_METHODS.get(method);
     if (origin === undefined) return;
     const key = idKeyOf(message.id);
@@ -1007,6 +1286,27 @@ class MetadataTap {
       this.#onOverflow();
     }
     this.#pendingTuiRequests.set(key.key, { origin, idText: key.text, threadId });
+  }
+
+  /**
+   * Project an ordinary model-input submission at the moment the client frame
+   * is observed. No correlation is registered: the backend's acknowledgement or
+   * error never changes what the TUI already did to its local queue, and a
+   * question arriving after this frame is a post-submission question.
+   */
+  #handleModelInputRequest(message: Record<string, unknown>): void {
+    const key = idKeyOf(message.id);
+    if (key === null) return;
+    const params = isRecord(message.params) ? message.params : null;
+    const input = classifyTuiModelInput(params === null ? undefined : params.input);
+    if (input === "none" || input === "question-answer") return;
+    const event: Record<string, unknown> = {
+      kind: "ordinary-input",
+      requestIdKind: isHelperRequestId(key.text) ? "native-helper" : "native",
+    };
+    const threadId = params === null ? null : readBoundedId(params.threadId);
+    if (threadId !== null) event.threadId = threadId;
+    this.#emit(event);
   }
 
   #handleTuiReply(message: Record<string, unknown>): void {
@@ -1047,11 +1347,87 @@ class MetadataTap {
   }
 
   #handleServerNotification(method: string, message: Record<string, unknown>): void {
+    if (method === "turn/completed") {
+      this.#handleTurnCompleted(message);
+      return;
+    }
     if (method !== "item/started" && method !== "item/completed") return;
     const params = isRecord(message.params) ? message.params : null;
     if (params === null) return;
     const item = isRecord(params.item) ? params.item : null;
     if (item === null) return;
+    this.#handleItemPhase(method, params, item);
+    // Async questions are registered by the native TUI from the COMPLETED item
+    // only (a started item may already carry them but is not yet drawn), and
+    // a reply is acknowledged only by the backend's committed user item.
+    if (method === "item/completed") {
+      if (item.type === "agentMessage") this.#handleAsyncQuestions(params, item);
+      else if (item.type === "userMessage") this.#handleAsyncQuestionReply(params, item);
+    }
+  }
+
+  #handleTurnCompleted(message: Record<string, unknown>): void {
+    const params = isRecord(message.params) ? message.params : null;
+    if (params === null) return;
+    const threadId = readBoundedId(params.threadId);
+    const turn = isRecord(params.turn) ? params.turn : null;
+    if (threadId === null || turn === null) return;
+    const turnId = readBoundedId(turn.id);
+    const status = turn.status;
+    if (turnId === null) return;
+    // `inProgress` and any unknown status are not terminal and retire nothing.
+    if (status !== "completed" && status !== "interrupted" && status !== "failed") return;
+    this.#emit({ kind: "turn-terminal", threadId, turnId, status });
+  }
+
+  #handleAsyncQuestions(params: Record<string, unknown>, item: Record<string, unknown>): void {
+    const questions = item.questions;
+    // An ordinary agent message carries no questions at all.
+    if (questions === undefined || questions === null) return;
+    const envelope: Record<string, unknown> = {};
+    const threadId = readBoundedId(params.threadId);
+    if (threadId !== null) envelope.threadId = threadId;
+    const turnId = readBoundedId(params.turnId);
+    if (turnId !== null) envelope.turnId = turnId;
+    const count = readAsyncQuestionCount(questions);
+    // The native question key embeds the item id verbatim, so only a bounded
+    // string id can name a question.
+    const itemId = typeof item.id === "string" ? readBoundedId(item.id) : null;
+    if (item.delivery !== "async" || count === null || itemId === null) {
+      // Question metadata this tap cannot read in full is a gap, never "none".
+      // A readable item id scopes the gap to that one item.
+      this.#emit({
+        kind: "async-input-unreadable",
+        source: "questions",
+        ...(itemId === null ? {} : { itemId }),
+        ...envelope,
+      });
+      return;
+    }
+    // A complete empty list is projected too: the native queue ignores it, but
+    // it is authoritative evidence about that one item's question set.
+    this.#emit({ kind: "async-questions", itemId, questionCount: count, ...envelope });
+  }
+
+  #handleAsyncQuestionReply(params: Record<string, unknown>, item: Record<string, unknown>): void {
+    const envelope: Record<string, unknown> = {};
+    const threadId = readBoundedId(params.threadId);
+    if (threadId !== null) envelope.threadId = threadId;
+    const turnId = readBoundedId(params.turnId);
+    if (turnId !== null) envelope.turnId = turnId;
+    const content = readSingleUserText(item.content);
+    if (content.kind === "unreadable") {
+      // An unreadable committed user item could have hidden a reply.
+      this.#emit({ kind: "async-input-unreadable", source: "user-input", ...envelope });
+      return;
+    }
+    if (content.kind === "not-reply") return;
+    const answers = parseAsyncQuestionReplyIds(content.text);
+    if (answers === null || answers.length === 0) return;
+    this.#emit({ kind: "async-question-reply", answers: Object.freeze(answers), ...envelope });
+  }
+
+  #handleItemPhase(method: string, params: Record<string, unknown>, item: Record<string, unknown>): void {
     // The provider discriminates item payloads with the serde tag `type`; the
     // projection key stays the closed `itemKind`.
     const itemType = typeof item.type === "string" ? item.type : null;

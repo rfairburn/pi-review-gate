@@ -40,6 +40,7 @@ import type { NativeStatusObservation, NativeStatusSupportMap } from "../src/ses
 import {
   FakeCodexAppServer,
   activeStatus,
+  notLoadedStatus,
   idleStatus,
   type FakeCodexServerOptions,
   type FakeThread,
@@ -327,16 +328,20 @@ test("the capability attaches the current facts and publishes the real five-axis
   const h = await startHarness();
   try {
     h.deliverCap();
-    // A candidate is not a root: still nothing beyond the switch.
-    h.facts.attestEmptyBackend();
+    // A connected-only source dials nothing.
     h.facts.observe(initializeEvent());
-    h.facts.observe(threadStartEvent(ROOT));
-    assert.equal(h.dials(), 0, "a candidate thread is never dialed as a root");
+    await settle(30);
+    assert.equal(h.dials(), 0, "no thread is proven before the fresh candidate");
     assert.equal(h.observations.length, 1);
 
-    // This connection's own first successful turn names the root.
+    // The fresh candidate starts the one read-only observer; the first own turn
+    // later binds the same thread on the same observer.
+    h.facts.attestEmptyBackend();
+    h.facts.observe(threadStartEvent(ROOT));
     h.facts.observe(turnWorkTargetEvent(ROOT, TURN_ONE));
     await until(() => h.observations.some((o) => o.activeTasks !== null), "the first census to land");
+    await settle(30);
+    assert.equal(h.dials(), 1, "binding the candidate never redials");
     const card = h.latest();
     assert.equal(card.busy, false, "an idle owned root is a positive Ready");
     assert.equal(card.pendingInput, false);
@@ -672,3 +677,242 @@ test("a recovered read-only connection restores the retained running tool with n
   }
 });
 
+
+/* ------------------------------------------- fresh pre-prompt startup census */
+
+const FRESH_POPULATION: readonly FakeThread[] = [
+  { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli", cwd: "/owned/worktree" },
+];
+
+function freshServer(extra: Partial<FakeCodexServerOptions> = {}): Partial<FakeCodexServerOptions> {
+  return { threads: FRESH_POPULATION, loadedIds: [ROOT], backgroundTerminals: { [ROOT]: [] }, ...extra };
+}
+
+function freshCandidate(facts: NativeCodexTuiRootFactsBinder, threadId = ROOT): void {
+  facts.attestEmptyBackend();
+  facts.observe(initializeEvent());
+  facts.observe(threadStartEvent(threadId));
+}
+
+function asyncQuestions(threadId: string, itemId: string, count: number, turnId = TURN_ONE): NativeCodexTuiRelayMetadataEvent {
+  return Object.freeze({
+    kind: "async-questions",
+    connectionId: CONNECTION,
+    sequence: 20,
+    itemId,
+    questionCount: count,
+    threadId,
+    turnId,
+  });
+}
+
+function asyncReply(threadId: string, itemId: string, index: number): NativeCodexTuiRelayMetadataEvent {
+  return Object.freeze({
+    kind: "async-question-reply",
+    connectionId: CONNECTION,
+    sequence: 21,
+    answers: Object.freeze([Object.freeze({ itemId, index })]),
+    threadId,
+    turnId: TURN_ONE,
+  });
+}
+
+test("a fresh unprompted candidate reaches a positively read Ready, none, 0, 0 before any turn", async () => {
+  const h = await startHarness(freshServer());
+  try {
+    h.deliverCap();
+    freshCandidate(h.facts);
+    assert.equal(h.facts.current().phase, "candidate", "no own turn exists");
+    await until(() => h.observations.some((o) => o.activeShells !== null), "the pre-prompt census");
+    const card = h.latest();
+    assert.deepEqual(
+      { busy: card.busy, pendingInput: card.pendingInput, activeTasks: card.activeTasks, activeShells: card.activeShells, activity: card.activity },
+      { busy: false, pendingInput: false, activeTasks: 0, activeShells: 0, activity: ["Ready"] },
+    );
+    const read = h.server.requests.find((request) => request.method === "thread/read");
+    assert.deepEqual(read?.params, { threadId: ROOT, includeTurns: false }, "the read is the candidate's own");
+    assert.equal(h.server.requests.find((request) => request.method === "thread/list")?.params.ancestorThreadId, ROOT);
+    assert.equal(h.server.requests.find((request) => request.method === "thread/backgroundTerminals/list")?.params.threadId, ROOT);
+    // Read-only: nothing that starts, resumes, or answers anything was sent.
+    for (const request of h.server.requests) {
+      assert.ok(["initialize", "thread/read", "thread/list", "thread/loaded/list", "thread/backgroundTerminals/list"].includes(request.method),
+        `unexpected ${request.method}`);
+    }
+
+    // The first own turn binds the SAME thread on the SAME observer: no redial,
+    // and a re-pull replaces any census that may predate that work.
+    const readsBefore = h.server.requests.filter((request) => request.method === "thread/read").length;
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.facts.observe(turnWorkTargetEvent(ROOT, TURN_ONE));
+    await until(() => h.latest().busy === true, "the own turn's work reaches the row without a broadcast");
+    assert.ok(h.server.requests.filter((request) => request.method === "thread/read").length > readsBefore);
+    assert.equal(h.dials(), 1, "the bound root keeps the candidate's observer");
+    assert.equal(h.server.connectionCount, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("no pre-prompt Ready without the fresh proof or a complete census", async () => {
+  // No empty-backend witness: no candidate binding, nothing dialed.
+  const unattested = await startHarness(freshServer());
+  try {
+    unattested.deliverCap();
+    unattested.facts.observe(initializeEvent());
+    unattested.facts.observe(threadStartEvent(ROOT));
+    await settle(60);
+    assert.equal(unattested.dials(), 0);
+    assert.equal(unattested.observations.length, 1);
+    assert.equal(unattested.latest().busy, null);
+  } finally {
+    await unattested.close();
+  }
+
+  // A non-empty backend census withdraws.
+  const notEmpty = await startHarness(freshServer());
+  try {
+    notEmpty.deliverCap();
+    notEmpty.facts.withdraw("backend-not-empty");
+    notEmpty.facts.observe(initializeEvent());
+    notEmpty.facts.observe(threadStartEvent(ROOT));
+    await settle(60);
+    assert.equal(notEmpty.dials(), 0);
+    assert.equal(notEmpty.latest().busy, null);
+    assert.equal(notEmpty.latest().activeShells, null);
+  } finally {
+    await notEmpty.close();
+  }
+
+  // Only a helper start: nothing is a candidate.
+  const helper = await startHarness(freshServer());
+  try {
+    helper.deliverCap();
+    helper.facts.attestEmptyBackend();
+    helper.facts.observe(initializeEvent());
+    helper.facts.observe(threadStartEvent(ROOT, { requestIdKind: "native-helper", ephemeral: true }));
+    await settle(60);
+    assert.equal(helper.dials(), 0);
+  } finally {
+    await helper.close();
+  }
+
+  // A failed terminal census and an unreadable root stay unknown, never zero/Ready.
+  const failing = await startHarness(freshServer({ failCalls: { "thread/backgroundTerminals/list": 1 } }));
+  try {
+    failing.deliverCap();
+    freshCandidate(failing.facts);
+    await until(() => failing.observations.some((o) => o.activeTasks !== null), "the census");
+    assert.equal(failing.latest().activeShells, null);
+    assert.equal(failing.latest().activeTasks, 0);
+  } finally {
+    await failing.close();
+  }
+  const notLoaded = await startHarness(freshServer({
+    threads: [{ id: ROOT, parentThreadId: null, status: notLoadedStatus, sourceKind: "cli" }],
+  }));
+  try {
+    notLoaded.deliverCap();
+    freshCandidate(notLoaded.facts);
+    await until(() => notLoaded.observations.some((o) => o.activeTasks !== null), "the census");
+    assert.equal(notLoaded.latest().busy, null, "a root that is not loaded is not Ready");
+    assert.equal(notLoaded.latest().pendingInput, null);
+    assert.equal(notLoaded.latest().activeShells, null);
+  } finally {
+    await notLoaded.close();
+  }
+});
+
+test("the candidate observer withdraws on a second primary, advanced selection, or foreign work", async () => {
+  for (const contradiction of [
+    threadStartEvent("thread-second"),
+    threadStartEvent("thread-resumed", { origin: "thread-resume" }),
+    turnWorkTargetEvent("thread-foreign", "turn-foreign"),
+  ]) {
+    const h = await startHarness(freshServer());
+    try {
+      h.deliverCap();
+      freshCandidate(h.facts);
+      await until(() => h.observations.some((o) => o.activeShells !== null), "the pre-prompt census");
+      const before = h.observations.length;
+      h.facts.observe(contradiction);
+      assert.equal(h.observations.length, before + 1);
+      assert.equal(h.latest().busy, null);
+      assert.equal(h.latest().pendingInput, null);
+      assert.equal(h.latest().activeShells, null);
+      await until(() => h.server.connectionCount === 0, "the read-only socket's close");
+      assert.equal(h.dials(), 1, "never redialed");
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("an own async question stays input pending while the root keeps working, until its committed reply", async () => {
+  const h = await startHarness(freshServer());
+  try {
+    h.deliverCap();
+    freshCandidate(h.facts);
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.facts.observe(turnWorkTargetEvent(ROOT, TURN_ONE));
+    await until(() => h.latest().busy === true, "the working root");
+    assert.equal(h.latest().pendingInput, false);
+
+    h.facts.observe(asyncQuestions(ROOT, "call-q", 2));
+    assert.equal(h.latest().pendingInput, true, "a published unanswered question is pending");
+    assert.equal(h.latest().busy, true, "the root keeps working; pending never forces busy false");
+
+    // Root work, tool completion, an unrelated helper question, and a provider
+    // status refresh never clear it.
+    h.facts.observe(itemPhaseEvent("started", "tool-1", "command", ROOT, TURN_ONE));
+    h.facts.observe(itemPhaseEvent("completed", "tool-1", "command", ROOT, TURN_ONE));
+    h.facts.observe(asyncQuestions("helper-thread", "call-h", 1));
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await settle(60);
+    assert.equal(h.latest().pendingInput, true);
+    assert.equal(h.latest().busy, true);
+
+    h.facts.observe(asyncReply(ROOT, "call-q", 0));
+    assert.equal(h.latest().pendingInput, true, "the second question still waits");
+    h.facts.observe(asyncReply(ROOT, "call-q", 1));
+    assert.equal(h.latest().pendingInput, false);
+
+    // An input-only gap is unknown and leaves every other axis intact.
+    h.facts.observe(Object.freeze({
+      kind: "async-input-unreadable",
+      connectionId: CONNECTION,
+      sequence: 30,
+      source: "questions",
+      threadId: ROOT,
+      turnId: TURN_ONE,
+    } as NativeCodexTuiRelayMetadataEvent));
+    assert.equal(h.latest().pendingInput, null);
+    assert.equal(h.latest().busy, true);
+    assert.equal(h.latest().activeTasks, 0);
+    assert.equal(h.latest().activeShells, 0);
+
+    // An independent CURRENT provider block still proves pending over the gap,
+    // and once it clears the input axis returns to unknown, not none.
+    h.server.setStatus(ROOT, activeStatus(["waitingOnUserInput"]));
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: ["waitingOnUserInput"] } });
+    await until(() => h.latest().pendingInput === true, "the provider block");
+    assert.equal(h.latest().busy, false, "a provider block keeps its canonical waiting shape");
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await until(() => h.latest().busy === true, "the block to clear");
+    assert.equal(h.latest().pendingInput, null);
+
+    // The turn's own live terminal retires the native queue: knowledge is complete again.
+    h.facts.observe(Object.freeze({
+      kind: "turn-terminal",
+      connectionId: CONNECTION,
+      sequence: 31,
+      threadId: ROOT,
+      turnId: TURN_ONE,
+      status: "completed",
+    } as NativeCodexTuiRelayMetadataEvent));
+    assert.equal(h.latest().pendingInput, false);
+    assert.equal(h.dials(), 1);
+  } finally {
+    await h.close();
+  }
+});

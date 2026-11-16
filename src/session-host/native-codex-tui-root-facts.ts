@@ -6,8 +6,9 @@
  * socket, and retains no wire frame, payload, prompt, command, output, error
  * message, or event history. Its complete retained state is bounded: one
  * connection generation, one candidate/bound root id, one current root turn id,
- * one current rooted tool fact, one bounded provisional tool fact, and one
- * withdrawal reason.
+ * one current rooted tool fact, one bounded provisional tool fact, one
+ * withdrawal reason, and the closed identities of the CURRENT async question
+ * queue (see below), which a live terminal retires.
  *
  * ## What "fresh root" means here
  *
@@ -22,13 +23,19 @@
  * 4. this same connection's FIRST own successful `turn/start` response named
  *    thread A (the relay's `turn-work-target`).
  *
- * Step 4 is required for publication: a start response alone is never treated
- * as a root selection. Before step 4 the candidate is private and no root
- * observation is published. After it, the source publishes the CURRENT closed
- * state only — never a replay of the events that produced it — so a consumer
- * that attaches during root execution still sees the positively known current
- * tool, and a consumer that attaches later sees the same current state without
- * reconstructing history.
+ * Step 4 is required for a BOUND root: a start response alone is never treated
+ * as a root selection. Steps 1–3 together form the owner-private FRESH
+ * CANDIDATE binding: the `candidate` snapshot names candidate thread A only once
+ * the empty-backend witness, the genuine connection, and exactly one initial
+ * primary start are all positively known. It lets the owner start its read-only
+ * status observation of A before the first prompt; it is not a root adoption
+ * from history, a loaded list, a last success, prose, or the UI, and every
+ * strict binding and withdrawal fence below still applies to it. A later bound
+ * snapshot names the SAME thread A and connection, or the source withdraws. The
+ * source publishes the CURRENT closed state only — never a replay of the events
+ * that produced it — so a consumer that attaches during root execution still
+ * sees the positively known current tool, and a consumer that attaches later
+ * sees the same current state without reconstructing history.
  *
  * ## Fail-closed invalidation
  *
@@ -58,9 +65,68 @@
  * exact turn is confirmed, then becomes the current tool instead of being lost.
  * It is still one scalar and is never event history.
  *
- * The input request/response events are deliberately ignored: this source adds
- * no shadow input axis, no reply/control surface, and no request map. The RPC
- * lane remains the input authority for a later consumer.
+ * The legacy server-request input request/response events are deliberately
+ * ignored: the RPC lane's provider status remains their authority, and this
+ * source adds no request map, reply, or control surface for them.
+ *
+ * ## Asynchronous question queue
+ *
+ * Asynchronous questions are not server requests, so no provider status flag
+ * reports them. This source therefore keeps the candidate/root thread's
+ * CURRENT async question queue as closed identities only: per asking item id,
+ * its envelope turn id, the indices positively unanswered, the indices whose
+ * proof a finite known cause made uncertain, and whether the item's own
+ * question list was unreadable. No title, option, question, answer, or text is
+ * ever retained. `asyncInput` states it:
+ *
+ * - `pending` while any own question is positively unanswered, even while
+ *   other knowledge is uncertain. Collapsing or backgrounding the native
+ *   queue, focus, tool completion, root idleness, new work, a backend
+ *   user-message echo, and helper or foreign-thread prompts never clear it.
+ * - An answered question leaves the queue only on the backend's committed
+ *   native reply envelope naming its exact key (or its whole item), on this
+ *   connection and this root thread; other questions stay pending. The TUI's
+ *   own reply-envelope submission (and its acknowledgement or error) is not
+ *   that commit and changes nothing.
+ * - The native UI clears its unanswered queue when it submits an ORDINARY
+ *   model prompt. On this connection's own non-helper `ordinary-input` for the
+ *   root, every question held before that submission becomes UNCERTAIN, not
+ *   none: a question still in flight toward the UI was not cleared, so which
+ *   ones were dropped is unprovable. Its acknowledgement changes nothing, a
+ *   question published afterwards is fresh pending proof, and with nothing
+ *   held the knowledge (normally `none` for a first prompt) is unchanged.
+ * - An unreadable committed user item, or a matching reply whose thread is
+ *   unknown, likewise makes the questions it could have answered uncertain.
+ * - Uncertainty is finite and RECOVERABLE: it names exact item indices, and a
+ *   later committed reply on this root naming them (or their whole item)
+ *   resolves them as soon as it arrives. With nothing else unresolved, input
+ *   is `none` again before any terminal.
+ * - A question item whose list could not be read in full is a PUBLICATION gap
+ *   (its questions are unseen, so no reply to another question can prove
+ *   none). A gap naming its item is resolved by that item's whole-item reply,
+ *   or repaired by a later full read of the same item on its still-current
+ *   turn (pending, or uncertain if something since could have cleared it). A
+ *   gap that names no item stays on its turn, and an unattributed one on the
+ *   root, until a live terminal: no unrelated item, reply, or idleness is
+ *   treated as completeness. A gap for an already registered item is a replay
+ *   the native UI ignores and changes nothing; the affected turn's other
+ *   pending witnesses become uncertain. Gaps change no other fact.
+ * - The native UI clears its WHOLE queue on its thread's LIVE turn terminal.
+ *   A held confirmed turn's terminal retires that turn's questions (and any
+ *   gap on that turn), while a turn-only gap alone never authenticates a
+ *   non-current terminal. The current root turn's terminal is a complete
+ *   queue boundary that retires every held question, uncertainty, and gap. A
+ *   terminal for the unconfirmed provisional turn is not retirement proof: its
+ *   held questions only become uncertain. A retirement is never an answer,
+ *   and the terminal is one recovery path, not the only one.
+ * - Only the first or the confirmed CURRENT root turn's questions are pending
+ *   proof. Another turn's questions (the next own turn before its start
+ *   projection, or an old turn's replay) occupy one provisional slot that makes
+ *   input unknown until that exact turn is confirmed. A bounded window of
+ *   recently retired turns rejects late replays outright, and a terminal for a
+ *   turn this source neither holds nor knows as current retires nothing, so
+ *   duplicates and late items never resurrect and stale terminals never rewind.
+ * - Helper and foreign threads can neither add nor clear a question.
  */
 
 import type {
@@ -79,6 +145,12 @@ export type NativeCodexTuiRootWithdrawalReason =
   | "thread-selection-advanced"
   | "work-on-another-thread"
   | "work-without-fresh-thread";
+
+/**
+ * Closed current state of the candidate/root's async question queue: positively
+ * pending, positively none, or unknown after an input-metadata gap.
+ */
+export type NativeCodexTuiRootAsyncInput = "none" | "pending" | "unknown";
 
 /** Closed lifecycle of the retained source. */
 export type NativeCodexTuiRootPhase =
@@ -109,6 +181,14 @@ export interface NativeCodexTuiRootFactsSnapshot {
   readonly phase: NativeCodexTuiRootPhase;
   /** First genuine TUI connection generation; the consumer's opaque fence. */
   readonly connectionId?: string;
+  /**
+   * Owner-private fresh candidate thread A, present only in the `candidate`
+   * phase and only once the empty-backend witness, the genuine connection, and
+   * exactly one initial primary start are positively known. Not a root.
+   */
+  readonly candidateThreadId?: string;
+  /** Current async question queue state; present with a candidate or bound root. */
+  readonly asyncInput?: NativeCodexTuiRootAsyncInput;
   /** Present only while bound. */
   readonly rootThreadId?: string;
   /** Latest own successful turn on the bound root. */
@@ -151,6 +231,92 @@ type InitializeEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind
 type ThreadCandidateEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "thread-candidate" }>;
 type TurnWorkTargetEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-work-target" }>;
 type ItemPhaseEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "item-phase" }>;
+type AsyncQuestionsEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "async-questions" }>;
+type AsyncReplyEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "async-question-reply" }>;
+type AsyncUnreadableEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "async-input-unreadable" }>;
+type OrdinaryInputEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "ordinary-input" }>;
+type TurnTerminalEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-terminal" }>;
+
+/**
+ * One asking item's closed question knowledge, keyed by its item id. Indices
+ * and flags only — never a title, option, question, or answer. Every set is
+ * bounded by the item's own question count.
+ */
+interface QuestionItem {
+  readonly turnId: string;
+  /** Indices positively published and still unanswered. */
+  readonly pending: Set<number>;
+  /**
+   * Indices whose pending proof was lost to a FINITE, known cause (a possible
+   * local cancellation or a possible answer). A matching committed reply
+   * resolves them; they never hide an unseen question.
+   */
+  readonly uncertain: Set<number>;
+  /**
+   * Present while this item's question list could not be read in full: a
+   * publication gap whose question set is unknown. A whole-item reply resolves
+   * it; a later full read of this same item on its turn repairs it.
+   */
+  gap: QuestionItemGap | undefined;
+}
+
+/** What is known about an unreadable item while its question set is unknown. */
+interface QuestionItemGap {
+  /** Indices a committed reply on this root positively answered meanwhile. */
+  readonly answered: Set<number>;
+  /** Whether anything since could have cleared or answered its questions. */
+  mayBeCleared: boolean;
+}
+
+/**
+ * Questions for ONE root turn this source has not yet confirmed (its item can
+ * precede the own `turn/start` response projection). They are never pending
+ * proof until that exact turn is confirmed; until then any unresolved entry
+ * makes input unknown.
+ */
+interface ProvisionalQuestionTurn {
+  readonly turnId: string;
+  readonly items: Map<string, QuestionItem>;
+}
+
+function newQuestionItem(turnId: string, questionCount: number | undefined): QuestionItem {
+  const pending = new Set<number>();
+  if (questionCount !== undefined) for (let index = 0; index < questionCount; index += 1) pending.add(index);
+  return {
+    turnId,
+    pending,
+    uncertain: new Set<number>(),
+    gap: questionCount === undefined ? { answered: new Set<number>(), mayBeCleared: false } : undefined,
+  };
+}
+
+function isUnresolved(item: QuestionItem): boolean {
+  return item.pending.size > 0 || item.uncertain.size > 0 || item.gap !== undefined;
+}
+
+/** Retire an item's whole native queue entry while keeping its identity. */
+function retireQuestionItem(item: QuestionItem): void {
+  item.pending.clear();
+  item.uncertain.clear();
+  item.gap = undefined;
+}
+
+/**
+ * A possible local cancellation or possible answer: positive pending becomes
+ * finite uncertainty, and a gap item may have lost what a repair would show.
+ */
+function invalidateQuestionItem(item: QuestionItem): void {
+  for (const index of item.pending) item.uncertain.add(index);
+  item.pending.clear();
+  if (item.gap !== undefined) item.gap.mayBeCleared = true;
+}
+
+/**
+ * How many recently retired root turns stay fenced against late replays. A
+ * replay older than this window is not rejected outright, but it can only ever
+ * reach the provisional slot (input unknown), never pending.
+ */
+const RETIRED_TURN_FENCE = 8;
 
 const EMPTY_SNAPSHOT: NativeCodexTuiRootFactsSnapshot = Object.freeze({ phase: "empty" as const });
 
@@ -168,6 +334,16 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   #rootTurnId: string | undefined;
   #tool: NativeCodexTuiRootToolFact | undefined;
   #pendingTool: NativeCodexTuiRootToolFact | undefined;
+  /** Asking item id → closed question knowledge, for the current queue only. */
+  readonly #questions = new Map<string, QuestionItem>();
+  /** The one not-yet-confirmed turn's questions; never pending proof. */
+  #provisional: ProvisionalQuestionTurn | undefined;
+  /** Turns with a question-publication gap no single item can name. */
+  readonly #gapTurns = new Set<string>();
+  /** A publication gap that could not be attributed to one turn of the root. */
+  #gapUnattributed = false;
+  /** The most recent root turns whose live terminal retired the native queue (bounded). */
+  readonly #retiredTurns: string[] = [];
   #snapshot: NativeCodexTuiRootFactsSnapshot = EMPTY_SNAPSHOT;
   #watcher: ((snapshot: NativeCodexTuiRootFactsSnapshot) => void) | undefined;
 
@@ -193,6 +369,7 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   attestEmptyBackend(): void {
     if (this.#withdrawn !== undefined || this.#attestedEmpty) return;
     this.#attestedEmpty = true;
+    this.#publish();
   }
 
   withdraw(reason: NativeCodexTuiRootWithdrawalReason): void {
@@ -204,6 +381,11 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     this.#rootTurnId = undefined;
     this.#tool = undefined;
     this.#pendingTool = undefined;
+    this.#questions.clear();
+    this.#provisional = undefined;
+    this.#gapTurns.clear();
+    this.#gapUnattributed = false;
+    this.#retiredTurns.length = 0;
     this.#publish();
   }
 
@@ -240,12 +422,298 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       case "item-phase":
         this.#observeItemPhase(event);
         return;
+      case "async-questions":
+        this.#observeAsyncQuestions(event);
+        return;
+      case "async-question-reply":
+        this.#observeAsyncReply(event);
+        return;
+      case "async-input-unreadable":
+        this.#observeAsyncUnreadable(event);
+        return;
+      case "ordinary-input":
+        this.#observeOrdinaryInput(event);
+        return;
+      case "turn-terminal":
+        this.#observeTurnTerminal(event);
+        return;
       case "input-request":
       case "input-response":
-        // Deliberately unretained: this source owns no input axis, no reply
-        // surface, and no request map.
+        // Deliberately unretained: legacy server-request input stays with the
+        // RPC lane's provider status; this source keeps no request map.
         return;
     }
+  }
+
+  /** The candidate or bound root thread async questions are attributed to. */
+  #queueThread(): string | undefined {
+    return this.#rootThreadId ?? this.#candidateThreadId;
+  }
+
+  /** The registered item (confirmed or provisional) with this id, if any. */
+  #lookupItem(itemId: string): QuestionItem | undefined {
+    return this.#questions.get(itemId) ?? this.#provisional?.items.get(itemId);
+  }
+
+  /** Every registered item, confirmed and provisional. */
+  *#allItems(): IterableIterator<QuestionItem> {
+    yield* this.#questions.values();
+    if (this.#provisional !== undefined) yield* this.#provisional.items.values();
+  }
+
+  /**
+   * Register a new item for its turn: the first or confirmed current root turn
+   * holds it as current knowledge; any other turn takes the one provisional
+   * slot. A competing turn cannot silently erase unresolved knowledge the slot
+   * holds, so its questions become an unattributed publication gap; a slot
+   * holding nothing unresolved (for example after a live terminal retired the
+   * queue) is simply replaced, so past ambiguity never latches a later gap.
+   */
+  #registerItem(itemId: string, item: QuestionItem): void {
+    const current = this.#rootTurnId;
+    if (current === undefined || item.turnId === current) {
+      this.#questions.set(itemId, item);
+      return;
+    }
+    let provisional = this.#provisional;
+    if (provisional !== undefined && provisional.turnId !== item.turnId) {
+      if ([...provisional.items.values()].some(isUnresolved)) {
+        this.#gapUnattributed = true;
+        return;
+      }
+      provisional = undefined;
+    }
+    if (provisional === undefined) {
+      provisional = { turnId: item.turnId, items: new Map() };
+      this.#provisional = provisional;
+    }
+    provisional.items.set(itemId, item);
+  }
+
+  #observeAsyncQuestions(event: AsyncQuestionsEvent): void {
+    const root = this.#queueThread();
+    if (root === undefined) return;
+    if (event.threadId !== undefined && event.threadId !== root) return; // Helper or foreign thread.
+    const turnId = event.turnId;
+    if (event.threadId === undefined || turnId === undefined) {
+      // Questions this source cannot attribute to one root turn might be this
+      // root's: never "none", and never retained as pending proof either.
+      this.#invalidateForGap(undefined, undefined);
+      this.#publish();
+      return;
+    }
+    if (this.#retiredTurns.includes(turnId)) return; // Late replay of a retired turn.
+    const count = event.questionCount;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      this.#invalidateForGap(turnId, event.itemId);
+      this.#publish();
+      return;
+    }
+    const existing = this.#lookupItem(event.itemId);
+    if (existing !== undefined) {
+      // The native UI never registers an item id twice, so a replay is never
+      // fresh proof. The one exception is this source's OWN missing knowledge:
+      // a full read of an item it could not read before, on that item's same
+      // turn while that turn is still current (or still the held provisional
+      // turn), repairs that item's question set — a complete empty list
+      // resolves it outright.
+      const gap = existing.gap;
+      if (gap === undefined || existing.turnId !== turnId) return;
+      const current = this.#rootTurnId;
+      const inProvisional = this.#provisional?.items.get(event.itemId) === existing;
+      if (!inProvisional && current !== undefined && current !== turnId) return;
+      existing.gap = undefined;
+      const target = gap.mayBeCleared ? existing.uncertain : existing.pending;
+      for (let index = 0; index < count; index += 1) {
+        if (!gap.answered.has(index)) target.add(index);
+      }
+      this.#publish();
+      return;
+    }
+    // The native queue ignores an empty list and does not register its id.
+    if (count === 0) return;
+    this.#registerItem(event.itemId, newQuestionItem(turnId, count));
+    this.#publish();
+  }
+
+  /** A root turn was confirmed as current: promote or discard the provisional slot. */
+  #confirmQueueTurn(turnId: string): void {
+    const provisional = this.#provisional;
+    if (provisional === undefined) return;
+    this.#provisional = undefined;
+    if (provisional.turnId !== turnId || this.#retiredTurns.includes(turnId)) return;
+    for (const [itemId, item] of provisional.items) {
+      if (!this.#questions.has(itemId)) this.#questions.set(itemId, item);
+    }
+  }
+
+  #observeAsyncReply(event: AsyncReplyEvent): void {
+    const root = this.#queueThread();
+    if (root === undefined) return;
+    if (event.threadId !== undefined && event.threadId !== root) return; // Foreign thread.
+    let changed = false;
+    for (const answer of event.answers) {
+      const item = this.#lookupItem(answer.itemId);
+      if (item === undefined) continue;
+      changed = true;
+      if (event.threadId === undefined) {
+        // A committed reply naming this question whose thread is unknown may or
+        // may not have answered it: its pending proof becomes finite
+        // uncertainty that a later scoped reply can still resolve.
+        if (answer.index === undefined) invalidateQuestionItem(item);
+        else {
+          if (item.pending.delete(answer.index)) item.uncertain.add(answer.index);
+          if (item.gap !== undefined) item.gap.mayBeCleared = true;
+        }
+        continue;
+      }
+      if (answer.index === undefined) {
+        // The older whole-item reply identity answers every question it asked,
+        // including any this source could not read or was uncertain about.
+        retireQuestionItem(item);
+        continue;
+      }
+      item.pending.delete(answer.index);
+      item.uncertain.delete(answer.index);
+      item.gap?.answered.add(answer.index);
+    }
+    if (changed) this.#publish();
+  }
+
+  #observeAsyncUnreadable(event: AsyncUnreadableEvent): void {
+    const root = this.#queueThread();
+    if (root === undefined) return;
+    if (event.threadId !== undefined && event.threadId !== root) return;
+    if (event.source === "questions") {
+      const turnId = event.threadId === undefined ? undefined : event.turnId;
+      if (turnId !== undefined && this.#retiredTurns.includes(turnId)) return; // Late.
+      this.#invalidateForGap(turnId, turnId === undefined ? undefined : event.itemId);
+      this.#publish();
+      return;
+    }
+    // An unreadable committed user item could have answered any held question:
+    // each becomes finite uncertainty rather than staying stale pending.
+    this.#invalidatePendingWitnesses();
+    this.#publish();
+  }
+
+  /**
+   * This connection's own ordinary model-input submission on the root (or an
+   * unattributed one that could be the root's). The native UI clears its
+   * unanswered queue on such a submission, but a question still in flight
+   * toward it was not cleared, so which question was dropped is not provable:
+   * every pre-submission witness becomes finite uncertainty — never none, and
+   * a question published after this point is fresh pending proof. Helper and
+   * foreign-thread submissions change nothing, and with nothing pending or
+   * provisional the input knowledge (none or unknown) is unchanged.
+   */
+  #observeOrdinaryInput(event: OrdinaryInputEvent): void {
+    if (event.requestIdKind === "native-helper") return;
+    const root = this.#queueThread();
+    if (root === undefined) return;
+    if (event.threadId !== undefined && event.threadId !== root) return;
+    this.#invalidatePendingWitnesses();
+    this.#publish();
+  }
+
+  /**
+   * Turn every held pending witness (confirmed and provisional) into finite
+   * uncertainty. Identities stay registered so a replay cannot resurrect them;
+   * a matching committed reply or the live terminal resolves them. Items with
+   * nothing unanswered gain no uncertainty.
+   */
+  #invalidatePendingWitnesses(): void {
+    for (const item of this.#allItems()) invalidateQuestionItem(item);
+  }
+
+  /**
+   * A question-publication gap for one turn (or, unattributed, for any turn of
+   * the root). The affected pre-gap pending witnesses become finite
+   * uncertainty — a retained entry is no longer fresh proof — while their
+   * identities stay registered so a replay cannot resurrect them. A gap that
+   * names its item is held on that item, so a whole-item reply or a later full
+   * read of that item resolves it; one that names none stays on its turn (or
+   * the root) until a live terminal retires the native queue. A gap for an
+   * item already registered is a replay the native UI ignores: it changes
+   * nothing. A later fresh question may prove pending again.
+   */
+  #invalidateForGap(turnId: string | undefined, itemId: string | undefined): void {
+    if (turnId !== undefined && itemId !== undefined && this.#lookupItem(itemId) !== undefined) return;
+    for (const item of this.#allItems()) {
+      if (turnId === undefined || item.turnId === turnId) invalidateQuestionItem(item);
+    }
+    if (turnId === undefined) this.#gapUnattributed = true;
+    else if (itemId !== undefined) this.#registerItem(itemId, newQuestionItem(turnId, undefined));
+    else this.#gapTurns.add(turnId);
+  }
+
+  #observeTurnTerminal(event: TurnTerminalEvent): void {
+    const root = this.#queueThread();
+    if (root === undefined || event.threadId !== root) return;
+    const turnId = event.turnId;
+    // A repeated terminal never rewinds retirement state.
+    if (this.#retiredTurns.includes(turnId)) return;
+    const current = this.#rootTurnId;
+    const isCurrent = current === undefined || turnId === current;
+    const isProvisional = this.#provisional?.turnId === turnId;
+    // Only a confirmed question record authenticates a non-current turn's
+    // terminal as that turn's retirement. A turn-only gap may come from an
+    // unconfirmed old-turn replay, so it waits for the current live boundary.
+    let tracked = false;
+    for (const item of this.#questions.values()) {
+      if (item.turnId === turnId && isUnresolved(item)) tracked = true;
+    }
+    // A terminal for a turn this source neither holds nor knows as current is
+    // stale: it retires nothing and clears no current input knowledge.
+    if (!isCurrent && !isProvisional && !tracked) return;
+    if (isProvisional && !isCurrent) {
+      // A terminal for the held, UNCONFIRMED provisional turn is no queue
+      // boundary: it may be a stale copy of a long ended turn. It is not
+      // retirement proof, so the slot is kept. It may equally be that turn's
+      // real end, so its held questions are no longer pending proof either:
+      // they become finite uncertainty that a scoped reply or the current
+      // turn's live terminal still resolves.
+      for (const item of this.#provisional?.items.values() ?? []) invalidateQuestionItem(item);
+      if (!tracked) {
+        this.#publish();
+        return;
+      }
+    }
+    // The native UI clears its pending questions on this live terminal, so that
+    // turn's questions retire. A retirement is never reported as an answer.
+    // The retired-turn fence below rejects their late replays.
+    for (const [itemId, item] of [...this.#questions]) {
+      if (item.turnId === turnId) this.#questions.delete(itemId);
+    }
+    this.#gapTurns.delete(turnId);
+    if (isCurrent) {
+      // The native UI clears its WHOLE pending queue on its live terminal, so
+      // the current turn's terminal is a complete queue boundary: every other
+      // held question, uncertainty, and publication gap retires too. Other
+      // turns' identities stay registered so their replays cannot reopen them.
+      for (const item of this.#allItems()) retireQuestionItem(item);
+      this.#gapTurns.clear();
+      this.#gapUnattributed = false;
+    }
+    this.#retiredTurns.push(turnId);
+    if (this.#retiredTurns.length > RETIRED_TURN_FENCE) this.#retiredTurns.shift();
+    this.#publish();
+  }
+
+  #asyncInput(): NativeCodexTuiRootAsyncInput {
+    let unknown = this.#gapUnattributed || this.#gapTurns.size > 0;
+    for (const item of this.#questions.values()) {
+      if (item.pending.size > 0) return "pending";
+      if (item.uncertain.size > 0 || item.gap !== undefined) unknown = true;
+    }
+    // Provisional questions are never pending proof: unresolved ones are unknown.
+    const provisional = this.#provisional;
+    if (provisional !== undefined) {
+      for (const item of provisional.items.values()) {
+        if (isUnresolved(item)) unknown = true;
+      }
+    }
+    return unknown ? "unknown" : "none";
   }
 
   #observeInitialize(event: InitializeEvent): void {
@@ -317,11 +785,13 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
         this.#tool = undefined;
       }
       this.#pendingTool = undefined;
+      this.#confirmQueueTurn(event.turnId);
       this.#publish();
       return;
     }
 
     if (this.#rootTurnId === event.turnId) return;
+    this.#confirmQueueTurn(event.turnId);
     // A new root turn replaces the previous turn's current tool. A rooted tool
     // start already observed for THIS newly confirmed turn (its item notification
     // can precede the turn/start response projection) is preserved rather than
@@ -435,13 +905,19 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
         rootThreadId,
         ...(rootTurnId === undefined ? {} : { rootTurnId }),
         ...(tool === undefined ? {} : { tool }),
+        asyncInput: this.#asyncInput(),
       });
     }
-    if (this.#candidateThreadId !== undefined) {
-      // The candidate is private: no root thread id or tool is published yet.
+    const candidateThreadId = this.#candidateThreadId;
+    if (candidateThreadId !== undefined) {
+      // No root thread id or tool is published for a candidate. Its owner-only
+      // fresh binding is named only when the whole fresh proof short of the
+      // first own turn is positively known.
+      const fresh = this.#attestedEmpty && connectionId !== undefined;
       return Object.freeze({
         phase: "candidate" as const,
         ...(connectionId === undefined ? {} : { connectionId }),
+        ...(fresh ? { candidateThreadId, asyncInput: this.#asyncInput() } : {}),
       });
     }
     if (connectionId !== undefined) return Object.freeze({ phase: "connected" as const, connectionId });
@@ -454,6 +930,8 @@ function sameSnapshot(a: NativeCodexTuiRootFactsSnapshot, b: NativeCodexTuiRootF
     && a.connectionId === b.connectionId
     && a.rootThreadId === b.rootThreadId
     && a.rootTurnId === b.rootTurnId
+    && a.candidateThreadId === b.candidateThreadId
+    && a.asyncInput === b.asyncInput
     && a.withdrawal === b.withdrawal
     && sameTool(a.tool, b.tool);
 }

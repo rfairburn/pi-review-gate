@@ -47,11 +47,11 @@
  */
 
 import assert from "node:assert/strict";
-import { watch } from "node:fs";
+import { promises as fsPromises, watch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import test, { afterEach } from "node:test";
+import test, { afterEach, mock } from "node:test";
 
 import type { NativeHookEvent } from "../src/session-host/native-hook-protocol";
 import { MAX_NATIVE_CLAUDE_BACKGROUND_TOMBSTONES } from "../src/session-host/native-claude-background";
@@ -286,6 +286,78 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = 40
 /** A pause long enough that any real watcher/read would already have landed. */
 async function settle(ms = 250): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** One open the tail reader made of an observed path. */
+interface ObservedOpen {
+  /** Resolves once the reader has asked to close this handle, its window already read. */
+  readonly closing: Promise<void>;
+  /** Resolves once the handle is closed (or the open failed): the read's last I/O. */
+  readonly released: Promise<void>;
+  /** Lets a held close proceed. A no-op for an open that was not held. */
+  release(): void;
+}
+
+/**
+ * Observe the tail reader's opens through the shared `fs.promises` binding it
+ * calls, with no delay and no timer. Each open is recorded the moment the reader
+ * asks for it; `released` says when that read did its last I/O, after which its
+ * commit is synchronous. The FIRST open of each path in `holdFirstOf` keeps its
+ * close pending until the test releases it, parking that read after it has sized
+ * and read its window and before it commits. Nothing is read or changed here.
+ */
+function observeOpens(holdFirstOf: readonly string[] = []): {
+  of(target: string): ObservedOpen[];
+  restore(): void;
+} {
+  const opens = new Map<string, ObservedOpen[]>();
+  const original = fsPromises.open;
+  const tracked = mock.method(fsPromises, "open", async (...args: Parameters<typeof fsPromises.open>) => {
+    const target = String(args[0]);
+    const list = opens.get(target) ?? [];
+    opens.set(target, list);
+    const held = holdFirstOf.includes(target) && list.length === 0;
+    let release = (): void => {};
+    const gate = held ? new Promise<void>((resolve) => { release = () => resolve(); }) : Promise.resolve();
+    let markClosing = (): void => {};
+    const closing = new Promise<void>((resolve) => { markClosing = () => resolve(); });
+    let markReleased = (): void => {};
+    const released = new Promise<void>((resolve) => { markReleased = () => resolve(); });
+    list.push({ closing, released, release: () => release() });
+    let handle: Awaited<ReturnType<typeof fsPromises.open>>;
+    try {
+      handle = await original(...args);
+    } catch (error) {
+      markClosing();
+      markReleased();
+      throw error;
+    }
+    const close = handle.close.bind(handle);
+    handle.close = async () => {
+      markClosing();
+      await gate;
+      try {
+        await close();
+      } finally {
+        markReleased();
+      }
+    };
+    return handle;
+  });
+  return {
+    of: (target) => opens.get(target) ?? [],
+    restore: () => tracked.mock.restore(),
+  };
+}
+
+/**
+ * Wait until every listed read has done its last I/O, then let the synchronous
+ * commit that follows it run to completion: one macrotask turn drains every
+ * microtask the read's continuation queued, so this is ordering, not a delay.
+ */
+async function committed(reads: readonly ObservedOpen[]): Promise<void> {
+  await Promise.all(reads.map((read) => read.released));
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 /** Start one owned turn: root SessionStart then the accepted root prompt. */
@@ -3757,6 +3829,67 @@ test("the file's own creation wakes the read, and a completion written before it
   h.controller.dispose();
 });
 
+for (const [label, firstBytes] of [
+  ["an empty", (_row: string) => ""],
+  ["a partial first-record", (row: string) => row.slice(0, 24)],
+] as const) {
+  test(`${label} materialization read keeps the missing file's foreground fence until a record is consumed`, async () => {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ createEmpty: true, watchFile: manualWatch(received) });
+    const opens = observeOpens();
+    try {
+      h.controller.observeOwnedStartup();
+      // Every hook — the question and the confirmed launch included — arrives while
+      // the provider's root JSONL still does not exist, so no position can fence it.
+      liveOrderHooks(h);
+      liveLaunch(h);
+      await committed(opens.of(h.transcript));
+      assert.equal(h.latest().busy, false, "stopped on the standing request");
+      assert.equal(h.latest().activeShells, 1, "the launch counts on the hook lane");
+
+      // The provider creates the file before it writes its first record, and the
+      // creation wakes a read that finds no whole record in it.
+      const prompt = jsonRow({
+        type: "user",
+        sessionId: SESSION,
+        isSidechain: false,
+        message: { role: "user", content: "the prompt the operator submitted" },
+      });
+      const early = firstBytes(prompt);
+      await fs.writeFile(h.transcript, early, "utf8");
+      const before = opens.of(h.transcript).length;
+      readNow(received);
+      assert.equal(opens.of(h.transcript).length, before + 1, "the creation itself woke one read");
+      await committed(opens.of(h.transcript));
+      assert.equal(h.latest().busy, false, "a read that consumed no record changes nothing");
+
+      // The rest of the turn the hooks already described lands: its prompt, its own
+      // model row, and the completion. None of it is newer than those hooks.
+      await h.append(prompt.slice(early.length) + rootAssistantToolUseRow() + queueOperationRow("enqueue", {
+        content: taskNotificationEnvelope(SHELL_1, "completed", "tool-a"),
+      }));
+      readNow(received);
+      await committed(opens.of(h.transcript));
+      assert.equal(h.latest().activeShells, 0, "the completion settles its member");
+      assert.equal(h.latest().pendingInput, true, "the request is still open");
+      assert.equal(h.latest().busy, false, "and the turn's own rows never ended the pause");
+
+      // The first window that consumed records gave the fence a real position, so a
+      // root row appended after it — work no hook reported — still ends the pause.
+      await h.append(rootAssistantTextRow());
+      readNow(received);
+      await committed(opens.of(h.transcript));
+      assert.equal(h.latest().busy, null, "genuine newer root work ends the pause");
+      assert.equal(h.latest().pendingInput, true, "without erasing the open request");
+      assert.equal(h.latest().activeShells, 0, "or touching the settled census");
+      assert.deepEqual(h.gaps, [], "a file that appeared late was never a coverage hole");
+    } finally {
+      opens.restore();
+      h.controller.dispose();
+    }
+  });
+}
+
 test("a creation watch that cannot be built is reported and fails closed", async () => {
   const h = await createHarness({
     createEmpty: true,
@@ -5169,6 +5302,118 @@ test("a named child transcript routes a completion the root journal never record
   await waitFor(() => countsOf(h.latest()).shells === 0, "the child lane settles the routed work");
   assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a routed delivery wakes A, it never ends A");
   h.controller.dispose();
+});
+
+/** A run with A parked on its own shell, its named child transcript bound and empty. */
+async function parkedAgentWithChildLane(
+  h: Harness,
+  childFile: string,
+): Promise<void> {
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  childHook(h, "PostToolUse", AGENT_A, {
+    tool_name: "Bash",
+    tool_use_id: CHILD_TOOL_USE,
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  childHook(h, "SubagentStop", AGENT_A, {
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+    agent_transcript_path: childFile,
+  });
+}
+
+function childDeliveryRow(): string {
+  return jsonRow({
+    type: "user",
+    isMeta: true,
+    sessionId: SESSION,
+    agentId: AGENT_A,
+    message: { role: "user", content: taskNotificationEnvelope(SHELL_1, "completed", CHILD_TOOL_USE) },
+  });
+}
+
+test("a child-lane read requested while one is in flight is drained after it commits", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  const opens = observeOpens([childFile]);
+  try {
+    await parkedAgentWithChildLane(h, childFile);
+    // The binding's own read has sized and read the still-empty file and is parked
+    // before it commits.
+    const [first] = opens.of(childFile);
+    assert.ok(first !== undefined, "the binding read the child lane");
+    await first.closing;
+    await committed(opens.of(h.transcript));
+    assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "A parks on its own shell");
+
+    // The provider delivers into A's own transcript and records the root row. The
+    // root read that append wakes asks for a child read while the first is still in
+    // flight: one read at a time, so it must be remembered, not run concurrently.
+    await fs.appendFile(childFile, childDeliveryRow(), "utf8");
+    await h.append(queueOperationRow("remove", { reason: "delivered_to_agent" }));
+    readNow(received);
+    await committed(opens.of(h.transcript));
+    assert.equal(opens.of(childFile).length, 1, "no second read runs beside the first");
+    assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "nothing has read the delivery yet");
+
+    // The first read commits what it saw — nothing — and the remembered request is
+    // drained after it. No further root append is needed.
+    first.release();
+    await committed([first]);
+    assert.equal(opens.of(childFile).length, 2, "the request made during the first read is drained after it");
+    await committed(opens.of(childFile));
+    assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "the routed work settles; A is woken, never ended");
+    assert.equal(opens.of(childFile).length, 2, "one drain for one request: nothing spins");
+    assert.deepEqual(h.gaps, []);
+  } finally {
+    opens.restore();
+    h.controller.dispose();
+  }
+});
+
+test("a child-lane request queued behind a read never resurrects a lane replaced meanwhile", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  const childFile = path.join(h.dir, "agent-child.jsonl");
+  const reboundFile = path.join(h.dir, "agent-child-rebound.jsonl");
+  await fs.writeFile(childFile, "", "utf8");
+  await fs.writeFile(reboundFile, "", "utf8");
+  const opens = observeOpens([childFile]);
+  try {
+    await parkedAgentWithChildLane(h, childFile);
+    const [first] = opens.of(childFile);
+    assert.ok(first !== undefined, "the binding read the child lane");
+    await first.closing;
+    await committed(opens.of(h.transcript));
+
+    // A request is queued behind the parked read, and then the provider names a
+    // different transcript for A: the old lane is discarded, not re-pointed.
+    await fs.appendFile(childFile, childDeliveryRow(), "utf8");
+    await h.append(queueOperationRow("remove", { reason: "delivered_to_agent" }));
+    readNow(received);
+    await committed(opens.of(h.transcript));
+    childHook(h, "SubagentStop", AGENT_A, {
+      background_members: [{ id: AGENT_A, kind: "task" }, { id: SHELL_1, kind: "shell" }],
+      agent_transcript_path: reboundFile,
+    });
+    await committed([...opens.of(h.transcript), ...opens.of(reboundFile)]);
+    await committed(opens.of(reboundFile));
+    const reboundReads = opens.of(reboundFile).length;
+    assert.ok(reboundReads > 0, "the replacement lane is read on its own binding");
+
+    first.release();
+    await committed([first]);
+    assert.equal(opens.of(childFile).length, 1, "the discarded lane's queued request dies with it");
+    assert.equal(opens.of(reboundFile).length, reboundReads,
+      "and is not spent on the replacement lane, which owns its own requests");
+    assert.equal(countsOf(h.latest()).shells, 1, "nothing read from the discarded file settles work");
+  } finally {
+    opens.restore();
+    h.controller.dispose();
+  }
 });
 
 test("a child transcript record that is not this agent's delivery settles nothing", async () => {

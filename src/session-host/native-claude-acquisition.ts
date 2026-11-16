@@ -401,6 +401,13 @@ interface NativeChildTranscriptLane {
   identity: NativeJsonlFileIdentity | null;
   cursor: number;
   reading: boolean;
+  /**
+   * True when a read was requested while one was already in flight. The bytes that
+   * request was for may have landed after the in-flight read sized its window, so
+   * it is never dropped: it is drained once that read has committed, while this
+   * lane is still the one its agent owns.
+   */
+  readAgain: boolean;
 }
 
 /** One whole-window classification pass. Nothing is applied until it completes. */
@@ -1402,7 +1409,7 @@ export class NativeClaudeAcquisitionController {
     const existing = this.#childLanes.get(agentId);
     if (existing !== undefined && existing.path !== childPath) this.#childLanes.delete(agentId);
     if (!this.#childLanes.has(agentId)) {
-      this.#childLanes.set(agentId, { path: childPath, identity: null, cursor: 0, reading: false });
+      this.#childLanes.set(agentId, { path: childPath, identity: null, cursor: 0, reading: false, readAgain: false });
     }
     void this.#readChildLane(agentId);
   }
@@ -1413,10 +1420,20 @@ export class NativeClaudeAcquisitionController {
    * about THAT agent's own evidence: it never reaches another agent's lifetime,
    * the shell census, or the root foreground, and it is never read as "nothing was
    * routed" — an unreadable file states nothing, which is not the same fact.
+   *
+   * A request that arrives while a read is in flight is coalesced, never dropped,
+   * and drained only after that read has committed — and only while the lane, its
+   * agent's ownership of it, and the generation are all still the ones it was made
+   * under. A lane that was discarded, rebound, or gapped meanwhile is not read again
+   * on its behalf, and nothing is retried that was not actually requested.
    */
   async #readChildLane(agentId: string): Promise<void> {
     const lane = this.#childLanes.get(agentId);
-    if (lane === undefined || this.#disposed || lane.reading) return;
+    if (lane === undefined || this.#disposed) return;
+    if (lane.reading) {
+      lane.readAgain = true;
+      return;
+    }
     lane.reading = true;
     const generation = this.#generation;
     let gap: NativeClaudeAcquisitionGapReason | null = null;
@@ -1447,49 +1464,61 @@ export class NativeClaudeAcquisitionController {
     } finally {
       lane.reading = false;
     }
-    // A retired scope, a newer generation, or a lane this agent no longer owns
-    // discards the read outright.
-    if (this.#disposed || generation !== this.#generation || this.#childLanes.get(agentId) !== lane) return;
-    if (gap !== null) {
-      this.#childLaneGap(agentId, gap);
-      return;
-    }
-    lane.identity = readIdentity;
-    // A window that ended inside a record advances nothing: that record stays
-    // unread and is read again whole once the provider finishes appending it.
-    if (scannedTo !== null) lane.cursor = scannedTo;
-    for (const record of records) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(record);
-      } catch {
-        // A row this lane cannot parse is a hole in THIS agent's routed-completion
-        // evidence, not a fact about the run's membership.
-        this.#childLaneGap(agentId, "malformed");
+    try {
+      // A retired scope, a newer generation, or a lane this agent no longer owns
+      // discards the read outright.
+      if (this.#disposed || generation !== this.#generation || this.#childLanes.get(agentId) !== lane) return;
+      if (gap !== null) {
+        this.#childLaneGap(agentId, gap);
         return;
       }
-      if (!isRecord(parsed)) {
-        this.#childLaneGap(agentId, "malformed");
-        return;
+      lane.identity = readIdentity;
+      // A window that ended inside a record advances nothing: that record stays
+      // unread and is read again whole once the provider finishes appending it.
+      if (scannedTo !== null) lane.cursor = scannedTo;
+      for (const record of records) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(record);
+        } catch {
+          // A row this lane cannot parse is a hole in THIS agent's routed-completion
+          // evidence, not a fact about the run's membership.
+          this.#childLaneGap(agentId, "malformed");
+          return;
+        }
+        if (!isRecord(parsed)) {
+          this.#childLaneGap(agentId, "malformed");
+          return;
+        }
+        const routed = readRoutedTaskCompletion(parsed, this.#sessionId, agentId);
+        if (routed === null) continue;
+        // Work the provider delivered INTO this agent. It is a positive routed
+        // completion witness for this agent rather than a queued wake — the delivery
+        // names the agent that received it — and no position is needed, because
+        // settling a member is monotone. The lifetime still refuses to read this as
+        // the agent's own end.
+        const applied = this.#agents.observeSettled(this.#ledgerScope, routed, null);
+        // The same envelope the root journal carries, read from the file it was
+        // delivered into. It settles work this run's OWN census holds; it never
+        // reaches a member this run never tracked, because a lane bound to one agent
+        // states nothing about the rest of the census and must not open a hole there.
+        const tracked = this.#ledger.snapshot().members.find((member) => member.id === routed);
+        if (tracked !== undefined) {
+          const settled = this.#ledger.observeSettled(this.#ledgerScope, routed);
+          if (settled.reason !== "duplicate-settle") this.#invalidateSnapshotKinds([tracked.kind]);
+        }
+        if (applied.changed) this.#emit();
       }
-      const routed = readRoutedTaskCompletion(parsed, this.#sessionId, agentId);
-      if (routed === null) continue;
-      // Work the provider delivered INTO this agent. It is a positive routed
-      // completion witness for this agent rather than a queued wake — the delivery
-      // names the agent that received it — and no position is needed, because
-      // settling a member is monotone. The lifetime still refuses to read this as
-      // the agent's own end.
-      const applied = this.#agents.observeSettled(this.#ledgerScope, routed, null);
-      // The same envelope the root journal carries, read from the file it was
-      // delivered into. It settles work this run's OWN census holds; it never
-      // reaches a member this run never tracked, because a lane bound to one agent
-      // states nothing about the rest of the census and must not open a hole there.
-      const tracked = this.#ledger.snapshot().members.find((member) => member.id === routed);
-      if (tracked !== undefined) {
-        const settled = this.#ledger.observeSettled(this.#ledgerScope, routed);
-        if (settled.reason !== "duplicate-settle") this.#invalidateSnapshotKinds([tracked.kind]);
+    } finally {
+      // A request made while this read was in flight is drained now that it has
+      // committed. The lane must still be the one this agent owns under the same
+      // generation: a discarded, rebound, or gapped lane is not resurrected, and the
+      // pending bit dies with it.
+      const drain = lane.readAgain;
+      lane.readAgain = false;
+      if (drain && !this.#disposed && generation === this.#generation && this.#childLanes.get(agentId) === lane) {
+        void this.#readChildLane(agentId);
       }
-      if (applied.changed) this.#emit();
     }
   }
 
@@ -2227,7 +2256,14 @@ export class NativeClaudeAcquisitionController {
           // meant to cover the window this read just consumed: from here the file
           // has a real size, so the floor becomes finite and a newer root row this
           // run's hook lane never saw can end a published waiting state again.
-          if (this.#foregroundFloor === Number.POSITIVE_INFINITY) {
+          //
+          // Only a window that actually consumed a whole record ends it. The
+          // provider creates the file before it writes its first record, so the
+          // creation can wake a read that finds it empty, or holding only the
+          // first record's leading bytes: that read consumed nothing, the rows the
+          // suppressed hook described are all still ahead of it, and a finite
+          // floor here would present them as newer work than the hook observed.
+          if (this.#foregroundFloor === Number.POSITIVE_INFINITY && windowRecords.length > 0) {
             this.#foregroundFloor = windowFileSize;
           }
           if (armedFor !== null) this.#applyWitness(armedFor, sessionId, scan.candidates);

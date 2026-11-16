@@ -953,9 +953,17 @@ test("a source loss withdraws observed activity, and only fresh activity restore
 });
 
 test("a window that cannot cover the cursor is a gap, not a partial claim", async () => {
-  const h = await createHarness({ maxTailBytes: 128 });
+  // The bind's first snapshot is published synchronously, before the seeding read
+  // commits a cursor; an overflow appended before that read would just be the
+  // initial tail. A compact pre-bind root start that fits the 128-byte window makes
+  // the seeding read publish running only AFTER it committed a steady cursor, so
+  // the overflow below is a steady-state append that must skip past that cursor.
+  const TURN_0 = "019a0000-0000-7000-8000-000000000000";
+  const seed = `${JSON.stringify({ ordinal: nextOrdinal(), type: "event_msg", payload: { type: "task_started", turn_id: TURN_0 } })}\n`;
+  assert.ok(Buffer.byteLength(seed, "utf8") <= 128, "the seed must fit the window it proves");
+  const h = await createHarness({ maxTailBytes: 128, seed });
   h.bind();
-  await waitFor(() => h.snapshots.length > 0, "the bind publishes a snapshot");
+  await waitFor(() => h.running().length > 0, "the seeding read committed a steady cursor");
   await h.append(taskStarted(TURN_1) + taskComplete(TURN_1) + responseItem(SECRET_REASONING) + taskStarted(TURN_2));
 
   await waitFor(() => h.gaps.includes("skipped-window"), "records between the cursor and the window went unread");

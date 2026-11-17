@@ -4,13 +4,14 @@ import path from "node:path";
 import test from "node:test";
 import { projectRoot } from "./helpers/release-scripts";
 
-// Dependency-vulnerability floor guard (issue #329).
+// Dependency-vulnerability floor guard (issues #329 and #665).
 //
 // `npm audit` needs the advisory registry, so CI cannot re-derive vulnerability
 // state offline. What *is* checkable offline is the committed resolution: every
-// package the audit reported when #329 was fixed must stay at or above the first
-// release outside its vulnerable range, and the one direct dependency among them
-// must keep a range floor that a previously hoisted vulnerable copy cannot satisfy.
+// package the audit reported when #329 was fixed, or when #665 refreshed a locked
+// resolution, must stay at or above the first release outside its vulnerable range,
+// and the one direct dependency among them must keep a range floor that a previously
+// hoisted vulnerable copy cannot satisfy.
 //
 // Each floor below is that first fixed release, with the advisories it clears.
 // A package that is absent from the tree, or a later version above the floor, passes:
@@ -19,6 +20,11 @@ import { projectRoot } from "./helpers/release-scripts";
 // audit, not this static guard.
 
 const FIXED_FLOORS: ReadonlyArray<{ name: string; floor: string; advisories: readonly string[] }> = [
+  {
+    name: "@hono/node-server",
+    floor: "2.1.6",
+    advisories: ["GHSA-rmxm-3fg6-px4f", "GHSA-qv5m-9pm6-hqp3", "GHSA-jpvv-r467-5p4w"],
+  },
   {
     name: "@modelcontextprotocol/sdk",
     floor: "1.31.0",
@@ -31,8 +37,18 @@ const FIXED_FLOORS: ReadonlyArray<{ name: string; floor: string; advisories: rea
   },
   {
     name: "hono",
-    floor: "4.13.7",
-    advisories: ["GHSA-gqvv-2mrq-wpjv", "GHSA-g6gw-c38x-mqfc", "GHSA-crvj-82cr-hjcx", "GHSA-hxh3-vqpv-xpqv"],
+    floor: "4.13.16",
+    advisories: [
+      "GHSA-gqvv-2mrq-wpjv",
+      "GHSA-g6gw-c38x-mqfc",
+      "GHSA-crvj-82cr-hjcx",
+      "GHSA-hxh3-vqpv-xpqv",
+      "GHSA-4m76-xfj5-7975",
+      "GHSA-h7mg-cq63-vhpq",
+      "GHSA-3gg2-335m-rxc6",
+      "GHSA-46wx-v44x-9hh2",
+      "GHSA-4h7h-rv7c-7m2v",
+    ],
   },
   {
     name: "ip-address",

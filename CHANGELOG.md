@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.290]
+
+### Changed
+
+- **Native macOS CI validation (#685)**: one hosted Mac job runs the existing
+  Mac-only real-Main/PTY, extended-ACL, and `chflags` checks with unchanged runtime
+  assertions and the locked Pi runtime. Missing prerequisites fail instead of
+  skipping, and the result gates publication. Linux/Windows coverage, product
+  behavior, safety semantics, and developer installations are unchanged. See
+  [development commands and limits](docs/development.md#native-macos-legs-685)
+  for coverage and required-check setup; no repository protections are changed.
+  Hosted PTY/headless evidence is not physical-terminal or live-provider certification.
+
 ## [0.1.0-dev.289]
 
 ### Added

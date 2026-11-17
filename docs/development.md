@@ -10,7 +10,8 @@ there is deliberately no manual publish path — while `session-host-alpha.yml` 
 `workflow_call` plus a targeted `workflow_dispatch` for one commit. Neither
 declares an automatic `pull_request` or `push` trigger, so neither starts a
 second automatic matrix or publish path beside CI; CI's publish job needs the
-session-host matrix, and its eight verification legs therefore gate publication.
+session-host matrix and the native macOS job, and its nine verification legs
+therefore gate publication.
 Those reuse and dependency contracts are pinned by the source-level workflow
 contract tests (`tests/ci-workflow.test.ts`,
 `tests/session-host-windows-workflow.test.ts`); which required contexts a called
@@ -96,6 +97,14 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   unsatisfiable; updating protection first blocks the PR. This documentation
   states the requirement — neither the workflow change nor this page changes the
   live ruleset.
+  The native macOS job contributes one further stable required context,
+  **macOS native validation (Node 24)** (Node 24.22.3 — the same patched Node 24
+  floor as the Linux full suite and the Windows shell job, so a floor bump inside
+  the line never renames it). Requiring that context is an operator action in the
+  live branch ruleset, coordinated in one window like the migration above: this
+  change adds no ruleset change, and neither the workflow nor this page can change
+  live branch settings. The job itself runs unconditionally on every enforced
+  trigger path and gates publication through the publisher's `needs` either way.
 - **TypeScript and type definitions** arrive as ordinary `devDependencies` via
   `npm install`; the runtime dependencies (including Playwright, undici, and the
   HTML/PDF parsing stack) are ordinary npm packages.
@@ -202,10 +211,11 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   type `docs/` in the workspace field, press Ctrl+C once, then Enter — the empty
   value is rejected with the unique "Workspace must be a non-empty string."
   notice, and reopening shows no prefill.
-- **`python3` is not needed by the test suite**: DDGS interactions are mocked.
-  In the runtime, Python is used only by `WebSearch` — launch-time venv
-  creation/validation via `scripts/ensure-ddgs.sh` plus one Python process per
-  search (`src/web/network.ts`).
+- **`python3`** is required by the native macOS Main tests for their kernel
+  process-exit observer (see [Native macOS legs](#native-macos-legs-685)). DDGS
+  interactions are mocked in the suite. In the runtime, Python is used only by
+  `WebSearch` — launch-time venv creation/validation via `scripts/ensure-ddgs.sh`
+  plus one Python process per search (`src/web/network.ts`).
 
 In a working checkout, compile with `npm run build:test` and then run `npm run
 test:run`: that covers the process, Git, filesystem, and end-to-end tiers before
@@ -234,6 +244,92 @@ The focused shipped-config tests (`tests/example-configs.test.ts`) normalize the
 standalone example configs and the runnable JSON blocks in the documentation through the
 production strict validator and check intended reviewer selections/resolution and worker
 routes using hermetic fixtures, without invoking providers or reviewer/executor commands.
+
+### Native macOS legs (#685)
+
+Some existing legs are macOS-only by construction and therefore skip in the
+existing Linux/Windows jobs: the real-native-Main / real-PTY / real-Pi legs (the shared
+`tests/helpers/session-host-native-main-harness.ts` and its Saved-conversation
+variant skip any non-darwin host before their other gates), the real
+extended-ACL proofs in `tests/session-host-storage-protection.test.ts` and
+`tests/session-host-peer-state-permissions.test.ts`, and the three
+`chflags uchg`/`nouchg` transient-`EPERM` legs in
+`tests/temp-file-cleanup.test.ts`. CI now runs exactly those existing compiled
+cases on a native hosted macOS runner in one job, `macos-native`, reported as
+**macOS native validation (Node 24)**. It preserves the existing runtime
+assertions and changes no product behavior or live machine configuration.
+
+The job reuses the existing commands, assertions, and prerequisites: the exact
+locked `@earendil-works/pi-coding-agent@1.5.2` runtime from
+`scripts/ci/pi-ui-runtime/` installed into runner temp (the same canonical
+manifest and convention as the Linux full suite — never a second version
+manifest), the exported `PI_REVIEW_GATE_INSTALLED_AGENT`,
+`PI_REVIEW_GATE_INSTALLED_PI_BIN`, and `PI_REVIEW_GATE_EXPECT_PI_VERSION` pins,
+and `npm run build:test`. It provisions no Chromium, no `fd`, no agent-core
+fixture, and no candidate build (the harness compiles its own candidate into
+per-case scratch), and it runs no full or broad tier. Before any case runs it
+fails closed on a prerequisite check: an actual Darwin host, a `python3` whose
+kqueue can register `EVFILT_PROC`/`NOTE_EXIT` (the owned-PID exit observer is
+spawned as bare `python3` from `PATH`), `/usr/bin/vim`, and `chmod` plus
+`chflags`. Each real-Main test step sets `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` (the
+Saved-conversation steps also set `PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST=1`,
+which no other workflow sets), so a missing pin, Node floor, or PTY dependency is
+a hard failure rather than the harnesses' ordinary local skip; the filesystem
+steps need no Pi host and rely on that prerequisite gate instead. The non-darwin
+platform skips themselves stay exactly as written, which is what keeps the Linux
+and Windows legs skipping honestly. `PI_REVIEW_GATE_RUNTIME_ROLE` and
+`PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG` stay unset, as in every other job.
+
+After `npm ci` and `npm run build:test` on a macOS host at its floor, the same
+commands run locally (each leg keeps its own unchanged 8-minute internal bound).
+Locally a missing prerequisite skips that leg; export
+`PI_REVIEW_GATE_REQUIRE_PI_HOST=1` (and
+`PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST=1` for the Saved files) to make it
+fail, which is what CI always does:
+
+```sh
+node --test --test-concurrency=1 \
+  dist-test/tests/session-host-native-main.test.js \
+  dist-test/tests/session-host-native-main-lifecycle.test.js \
+  dist-test/tests/session-host-native-main-notice.test.js \
+  dist-test/tests/session-host-native-main-framing.test.js
+
+PI_REVIEW_GATE_REQUIRE_PI_HOST=1 PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST=1 \
+  node --test --test-concurrency=1 \
+  dist-test/tests/session-host-native-saved-main.test.js \
+  dist-test/tests/session-host-native-resume-tasks.test.js
+
+node --test --test-concurrency=1 \
+  dist-test/tests/session-host-native-cli-main-pty.test.js \
+  dist-test/tests/session-host-native-images.test.js \
+  dist-test/tests/session-host-native-external-editor.test.js \
+  dist-test/tests/session-host-native-background-counts.test.js
+
+node --test --test-concurrency=1 --test-name-pattern='\(macOS\):' \
+  dist-test/tests/session-host-storage-protection.test.js \
+  dist-test/tests/session-host-peer-state-permissions.test.js
+
+node --test --test-concurrency=1 \
+  --test-name-pattern='^(?:retries transient EPERM until the handle is released, then deletes|fails with the original error when the contention persists past the budget|does not fail a passing body over transient contention)$' \
+  dist-test/tests/temp-file-cleanup.test.js
+```
+
+With the installed-Pi pins exported, those five commands execute the 14
+macOS-only real-Main/PTY legs and the 17 native filesystem legs (10 real
+extended-ACL proofs in storage protection, 4 in peer-state permissions, and 3
+`chflags` contention legs). The ACL selector is deliberately narrower than a bare
+`macOS`: it selects the `(macOS):`-marked real-ACL cases only, and leaves the
+pure `macOS ACL fixture comparison: …` cases — which already run on every host in
+the Linux full suite — out of it. The `chflags` selector is anchored to the three
+exact case names for the same reason.
+
+**Evidence limits, stated honestly:** this runs on a GitHub-hosted virtual macOS
+runner under a hosted PTY, so it provides evidence of the hosted PTY/headless behavior of
+those existing legs on native macOS only. It is not a physical-terminal,
+live-provider-CLI, live-model, or cross-machine certification, and it changes no
+existing manual check. A Linux or Windows run of these files is a skip, never
+native evidence; the workflow contract tests (`tests/ci-workflow.test.ts`) pin the
+job's shape, gates, and selection, not any case's pass status.
 
 ### Human subtask action notices (#215)
 

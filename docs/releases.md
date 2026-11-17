@@ -49,8 +49,9 @@ else fails closed before any write:
   matrix runs the exact per-line Node security floors 22.23.5, 24.22.3, and 26.13.1
   (see [Node.js security floors](getting-started.md#nodejs-security-floors)).
   The full suite and the Windows shell job run on Node 24.22.3, and the Windows
-  launcher job runs on Node 22.23.5. Both Windows jobs gate publication, as does
-  the full suite. Each required-check name comes from a stable per-major label
+  launcher job runs on Node 22.23.5. Both Windows jobs, the native macOS job
+  (**macOS native validation (Node 24)**), and the full suite gate publication.
+  Each required-check name comes from a stable per-major label
   that the matrix pairs explicitly with that line's exact pinned runtime, so
   raising a line's patch or minor floor changes only the pin and keeps every
   required context name — and therefore the ruleset — unchanged, while
@@ -67,13 +68,14 @@ else fails closed before any write:
   skips publication when any dependency failed or was skipped. There is no
   `workflow_run` privilege chain, no custom PAT, and no GitHub App; the only
   write permission anywhere is `contents: write` on the single publish job.
-  Eight verification legs sit upstream of that guard in total. The dependency is
+  Nine verification legs sit upstream of that guard in total. The dependency is
   enforced by keeping every automatic verification path unconditional (no
-  job-level `if:` on the matrix or its caller, no `continue-on-error`, no
-  `always()`/`failure()`/`cancelled()` override) rather than by counting
-  required contexts: GitHub's required-status-check configuration itself does
-  not reject a skipped or neutral conclusion, and the merge gate is exact-head
-  while publication is re-validated against the exact merged commit.
+  job-level `if:` on the matrix, its caller, or the native macOS job, no
+  `continue-on-error`, no `always()`/`failure()`/`cancelled()` override) rather
+  than by counting required contexts: GitHub's required-status-check
+  configuration itself does not reject a skipped or neutral conclusion, and the
+  merge gate is exact-head while publication is re-validated against the exact
+  merged commit.
 - The target SHA is the exact `merge_commit_sha` of a merged pull request
   against `main` of this repository. The commit-to-pull-request association
   endpoint returns simplified items without the detailed merge flag, so every

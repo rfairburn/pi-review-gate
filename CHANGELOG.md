@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.292]
+## [0.1.0-dev.293]
 
 ### Fixed
 
@@ -49,6 +49,21 @@ dates.
   retention behaviour are unchanged. Headless-terminal evidence only — not
   physical-terminal or cross-platform certification. See
   [development docs](docs/development.md#tool-row-background-continuity-across-a-rows-resets-677).
+
+## [0.1.0-dev.292]
+
+### Changed
+
+- **Routine dependency refresh (#665)**: two transitively hoisted production
+  resolutions are refreshed in `package-lock.json` alone — `hono` 4.13.13 → 4.13.19
+  and `@hono/node-server` 2.1.1 → 2.1.9, each at or above the first release outside the
+  published advisory ranges that covered the previous locked copies. Ordinary npm
+  resolution only: no manifest range, override, engine, or dependency-graph change, so
+  `package.json` stays untouched, the resolved package set and its counts are unchanged,
+  and both releases remain inside the ranges their parent packages declare and the
+  supported Node floors. A clean install of the refreshed lock reports no known
+  vulnerabilities, and the offline advisory-floor guard in the test suite carries the
+  raised floors so a fallback to an affected release fails closed.
 
 ## [0.1.0-dev.291]
 

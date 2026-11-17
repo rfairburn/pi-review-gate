@@ -29,6 +29,7 @@ import {
   readNativeCodexRpcEndpoint,
   type NativeCodexRpcFailureCode,
 } from "../src/session-host/native-codex-rpc";
+import { MAX_NATIVE_SESSION_NAME_LENGTH } from "../src/session-host/protocol";
 import {
   FAKE_MARKER,
   FakeCodexAppServer,
@@ -269,6 +270,21 @@ test("correlates responses, and drops late or unknown ids without adopting them"
         { method: "thread/started", row: { threadId: "child-late", parentThreadId: ROOT, status: { kind: "idle", activeFlags: [] } } },
       ], "only allowlisted notifications are decoded, and only their allowlisted fields");
       assert.deepEqual(failures, []);
+
+      // A rename reaches a NON-SUBSCRIBING observer as its thread id ALONE. The
+      // provider may or may not include the new name in the frame; either way this
+      // host keeps no copy of it, because the authoritative title is what the next
+      // root read reports.
+      server.broadcast("thread/name/updated", { threadId: ROOT, threadName: `${FAKE_MARKER} renamed` });
+      server.broadcast("thread/name/updated", { threadId: "child-late" });
+      server.broadcast("thread/name/updated", { threadName: `${FAKE_MARKER} orphan` });
+      await settle();
+      assert.deepEqual(notifications.slice(2), [
+        { method: "thread/name/updated", threadId: ROOT },
+        { method: "thread/name/updated", threadId: "child-late" },
+      ], "a name edge decodes to its thread id only, and one with no thread id is nothing");
+      assert.equal(JSON.stringify(notifications).includes(FAKE_MARKER), false,
+        "the provider's rename text never crosses this edge");
 
       const row = await transport.readThread(ROOT);
       assert.deepEqual(row, { threadId: ROOT, parentThreadId: null, status: { kind: "idle", activeFlags: [] } });
@@ -799,6 +815,16 @@ test("decoders keep ids, status enums, flags, and cursors and drop the rest", ()
 
   assert.deepEqual(decodeNativeCodexNotification("thread/deleted", { threadId: "t", extra: FAKE_MARKER }),
     { method: "thread/deleted", threadId: "t" });
+  // A rename edge is a refresh hint, not a value: the thread id is all it decodes,
+  // whether the provider sent a name, sent `null`, or omitted the field entirely
+  // (which is how a CLEARED name is serialized).
+  assert.deepEqual(decodeNativeCodexNotification("thread/name/updated", { threadId: "t", threadName: "Renamed" }),
+    { method: "thread/name/updated", threadId: "t" });
+  assert.deepEqual(decodeNativeCodexNotification("thread/name/updated", { threadId: "t", threadName: null }),
+    { method: "thread/name/updated", threadId: "t" });
+  assert.deepEqual(decodeNativeCodexNotification("thread/name/updated", { threadId: "t" }),
+    { method: "thread/name/updated", threadId: "t" });
+  assert.equal(decodeNativeCodexNotification("thread/name/updated", { threadName: "no thread id" }), null);
   assert.equal(decodeNativeCodexNotification("thread/status/changed", { threadId: "t" }), null);
   assert.equal(decodeNativeCodexNotification("turn/started", { threadId: "t" }), null);
 });
@@ -850,21 +876,71 @@ test("the workspace-comparing decode keeps the row closed and drops the provider
   assert.deepEqual(read, {
     row: { threadId: ROOT, parentThreadId: null, status: { kind: "notLoaded", activeFlags: [] } },
     workspaceMatches: false,
+    // No `name` on the wire is the provider positively reporting no title.
+    title: null,
   });
   const text = JSON.stringify(read);
   assert.equal(text.includes("/definitely"), false, "the provider cwd never leaves the decode edge");
-  assert.equal(text.includes(FAKE_MARKER), false);
+  assert.equal(text.includes(FAKE_MARKER), false, "a path or preview never leaves the decode edge");
   // An unreadable row stays unreadable rather than becoming a workspace verdict.
   assert.equal(decodeNativeCodexThreadReadInWorkspace({ thread: { ...wire.thread, status: { type: "unheardOf" } } }, "/owned/workspace"), null);
   assert.equal(decodeNativeCodexThreadReadInWorkspace("nope", "/owned/workspace"), null);
+});
+
+test("the root read carries ONLY the provider's own title field, and refuses rather than clip it", () => {
+  const base = { id: ROOT, parentThreadId: null, status: { type: "idle" }, cwd: "/owned/workspace" };
+  const decode = (thread: Record<string, unknown>) => decodeNativeCodexThreadReadInWorkspace({ thread }, "/owned/workspace");
+
+  assert.equal(decode({ ...base, name: "Ship the release notes" })?.title, "Ship the release notes",
+    "the provider's user-facing title is the one provider string this read carries");
+  assert.equal(decode({ ...base, name: null })?.title, null, "an explicit null is the provider saying it has no title");
+  assert.equal("title" in (decode({ ...base }) ?? {}), true, "an absent name is still a positive no-title answer");
+
+  for (const unusable of [
+    "", " ", "  padded  ", "line\nbreak", "tab\there", `x\u0000y`, "u2028\u2028",
+    "a".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 1), 42, true, {}, [], { toString: () => "object" },
+  ]) {
+    const read = decode({ ...base, name: unusable });
+    assert.ok(read);
+    assert.equal("title" in read, false, `${JSON.stringify(unusable)} is refused, never clipped or coerced`);
+  }
+
+  // The operator's manual caption bound is NOT this bound: a Codex thread name longer
+  // than a caption is ordinary display text, and it decodes whole. Only what the
+  // published label cannot carry at all is refused.
+  const longerThanACaption = "Investigating the census read that raced the boundary " + "generation".repeat(6);
+  assert.ok(longerThanACaption.length > 80, "the fixture really is over the manual caption bound");
+  assert.equal(decode({ ...base, name: longerThanACaption })?.title, longerThanACaption);
+  assert.equal(decode({ ...base, name: "a".repeat(MAX_NATIVE_SESSION_NAME_LENGTH) })?.title,
+    "a".repeat(MAX_NATIVE_SESSION_NAME_LENGTH), "the published-label bound itself is inclusive");
+
+  // Every other human-readable field the provider row carries stays dropped.
+  const read = decode({
+    ...base,
+    name: "Real title",
+    preview: `${FAKE_MARKER} preview`,
+    path: `${FAKE_MARKER}/rollout.jsonl`,
+    agentNickname: `${FAKE_MARKER}-nickname`,
+    model: "gpt-something",
+  });
+  assert.equal(read?.title, "Real title");
+  const text = JSON.stringify(read);
+  assert.equal(text.includes(FAKE_MARKER), false, "preview, path, and nickname never ride the root read");
+
+  // A census row is unchanged: the title rides ONLY the workspace-comparing read.
+  assert.deepEqual(decodeNativeCodexThreadRow({ ...base, name: "Real title" }), {
+    threadId: ROOT,
+    parentThreadId: null,
+    status: { kind: "idle", activeFlags: [] },
+  }, "a descendant census row still decodes to identity, parent, and status alone");
 });
 
 test("readThreadInWorkspace is the same read-only thread/read and returns only a closed verdict", async () => {
   await withWorkspaceDirs(async ({ real, alias, other }) => {
     await withUnixTransport({
       threads: [
-        { id: ROOT, parentThreadId: null, status: { type: "idle" }, sourceKind: "cli", cwd: alias },
-        { id: "child-1", parentThreadId: ROOT, status: { type: "idle" }, sourceKind: "subAgentThreadSpawn", cwd: other },
+        { id: ROOT, parentThreadId: null, status: { type: "idle" }, sourceKind: "cli", cwd: alias, name: null },
+        { id: "child-1", parentThreadId: ROOT, status: { type: "idle" }, sourceKind: "subAgentThreadSpawn", cwd: other, name: null },
       ],
       loadedIds: ["child-1"],
     }, async (server, socketPath) => {
@@ -875,6 +951,7 @@ test("readThreadInWorkspace is the same read-only thread/read and returns only a
       assert.deepEqual(matched, {
         row: { threadId: ROOT, parentThreadId: null, status: { kind: "notLoaded", activeFlags: [] } },
         workspaceMatches: true,
+        title: null,
       }, "a saved thread that is not loaded is an ordinary cold row");
       const elsewhere = await transport.readThreadInWorkspace("child-1", real);
       assert.equal(elsewhere?.workspaceMatches, false);

@@ -15,6 +15,74 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.289]
+
+### Added
+
+- **Native rows titled by their own provider (#690)**: a live Claude Code or Codex
+  sidebar row can now show the **actual conversation title the provider itself uses**,
+  instead of only `Claude` / `Codex`. The order is fixed and never depends on which
+  arrived first: **a caption you set with `E`, then the provider's own conversation
+  title, then the provider label**. Each provider is read from a source it already had
+  for that row — Claude from the one transcript file that run's own hooks named (its
+  custom title, or the title the provider generated, with a custom title outranking a
+  generated one), and Codex from the same private root-thread read that already
+  corroborates the row's workspace (the thread's user-facing name). Nothing is
+  generated, guessed, or taken from a prompt, a summary, a first line, or the rendered
+  screen, and the host never renames or writes anything back to a provider.
+  A provider title is **ephemeral**: it is not stored with the row's remembered slot,
+  does not come back as a name after a restart, and never travels to a peer as a new
+  field — it rides the row's one existing label. When the row's conversation is
+  replaced (`/new`, `/clear`, or a resume to another conversation) or the proof of which
+  conversation the row runs is lost, the title is withdrawn with it rather than naming
+  the row after a conversation it no longer runs, and a stale, retired, or foreign
+  observation cannot rename a row. Naming a row with `E` opts out permanently: your
+  caption survives every later provider rename **and** every conversation reset, and it
+  is remembered under the same durability rules as before (live-only, and said so, when
+  the store cannot be written) — including a caption equal to the text the row was
+  already showing, which still counts as your edit. A provider title this host cannot
+  display at all (over 256 characters, or carrying control characters or a line break)
+  is refused whole and never clipped, so the row keeps what it showed. That
+  256-character limit is the bound a row's published name already travels under
+  everywhere else in this host, including a peer's roster decode — deliberately **not**
+  the 80-character limit on a caption you type, which is an input bound with no claim on
+  text the host merely displays. A long provider title is therefore shown, not silently
+  discarded, while typed captions keep their shorter rule. Pi rows, the roster document
+  shape, and every rename path are unchanged.
+  Native validation limits, stated honestly: the Codex read path and its rename edge
+  were exercised against the host's own private synthetic Codex 0.169.0 backend
+  (a non-subscribing observer connection received `thread/name/updated` after a
+  controlled rename on a second connection, and a later root read reported the new
+  name), which is RPC evidence only — no live TUI or `--remote` session, physical
+  terminal, account, transcript durability, or provider-generated Codex title was
+  validated. The Claude title fields are read according to the pinned
+  `@anthropic-ai/claude-agent-sdk` 0.3.233 summary fold and the provider's current
+  session documentation, and the Claude evidence is source-level too: the shipped tests
+  drive synthetic transcripts this suite writes, and no live Claude session, TUI,
+  physical terminal, or account was validated for this change. A title the provider
+  recorded **before** this host started watching a conversation is read as well: once a
+  run positively proves which conversation it is, one metadata-only read of the
+  transcript that run itself named hydrates the row's title, so an existing or resumed
+  conversation needs no new `/rename` and no new prompt — and because that read touches
+  title fields and nothing else, the older prompts, tool rows, turn endings, and counts
+  in the same file are still never replayed. No poller, watcher, session catalog, or
+  extra connection is added for a title. After the proof of which conversation a row
+  runs is lost and then re-established for the same conversation, the same fresh read
+  restores the title with no new title record. Where that one read cannot be trusted —
+  an unreadable or replaced file, a corrupt row inside its window, or only a generated
+  title reached while the file's earlier records stayed unread, where an older custom
+  title could still be waiting — the row keeps your caption or the provider label rather
+  than guessing. To check any of this by hand, use the owned inactive stage in
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md#trying-one-in-an-owned-inactive-stage):
+  name a conversation **inside Claude** with its own `/rename` and watch the row take
+  it, then quit the host and start it again in that same stage and confirm the restored
+  **uncaptioned** row shows that provider title again with no further `/rename`; on a
+  **different** row, press `E` and type a caption of your own, and confirm your caption
+  wins and keeps winning through every later rename, every conversation reset, and a
+  restart — a captioned row never visibly reverts to the provider title. That walkthrough
+  is a live observation of your own provider, account, and terminal, and it is not what
+  the automated evidence above covers.
+
 ## [0.1.0-dev.288]
 
 ### Added

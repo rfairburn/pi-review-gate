@@ -100,6 +100,54 @@ boundaries; [Development](development.md) owns verification commands.
   or an earlier write failed — the live row is still captioned, and the host says so:
   the name applies to this session only and will not return after a restart. It never
   reuses an earlier one-time roster warning as if it described this naming.
+  Naming is also permanent in one direction: a caption you gave survives every later
+  provider title change **and** every conversation reset on that row, and no provider
+  title can move the row again. That includes a caption equal to the text the row was
+  already showing — the host records the intent, not just the difference.
+- A live native row can also be titled by **its own provider**, when this host's
+  observer positively read the provider's actual conversation title. Precedence is
+  fixed: **your caption, then the provider's own title, then the provider label**
+  (`Claude` or `Codex`). It is the provider's own name for the conversation and never
+  text this host generated, guessed, or lifted from a prompt, a summary, a first line,
+  or the screen:
+
+  - **Claude Code**: the conversation's custom title (what `/rename` or `--name` sets),
+    or the title the provider generated for it. Both are read from the one transcript
+    file the provider itself named for that run, and a custom title outranks a
+    generated one, exactly as the provider's own session-summary fold ranks those two
+    fields. A title the provider recorded **before** this host started watching that
+    transcript is read too: once the run positively proves which conversation it is,
+    the observer takes one metadata-only look at the transcript that run itself named
+    and shows the title already recorded there, so an existing or resumed conversation
+    needs no new `/rename` and no new prompt. That look reads title fields and nothing
+    else — the older prompts, tool rows, turn endings, and counts in the same file stay
+    un-replayed — and no poller, watcher, history catalog, or extra connection is added
+    for a title. If that one look cannot be trusted (the file is unreadable or was
+    replaced, a row inside its read window is corrupt, or the only title it reached was
+    a generated one while the file's earlier records stayed unread, where an older
+    custom title could still be waiting), the row keeps your caption or the provider
+    label rather than guessing.
+  - **Codex**: the thread's user-facing name (what `/rename` sets), read from the same
+    private root-thread read that already corroborates the row's workspace. An unnamed
+    thread is answered honestly as having no title, so the row keeps its provider
+    label; Codex documents no automatic titling.
+
+  A provider title is **ephemeral**: it is never stored with the row's remembered slot,
+  never restored as a name after a restart, and never sent back to the provider — this
+  host renames nothing. When the row's conversation is replaced (a `/new`, `/clear`, or
+  a resume to another conversation) or the proof of which conversation the row runs is
+  lost, the title goes with it instead of naming the row after a conversation it no
+  longer runs. A provider title this host cannot display at all — one over 256
+  characters, or carrying control characters or a line break — is refused whole and
+  never clipped, and the row simply keeps what it showed. That 256-character limit is
+  the bound a row's name already travels under everywhere else in this host, including
+  what a peer's roster accepts; it is **not** the 80-character limit that applies to a
+  caption you type, which has no claim on text the host merely displays. So a long
+  provider title is shown rather than silently dropped, while your own typed caption
+  keeps its shorter input rule. A title change is noticed on the paths the observer
+  already has: the
+  one watched Claude transcript, and the owned Codex read refreshed by the provider's own
+  rename edge. There is no polling and no extra connection for a title.
 - A native target is either the built-in default for that backend or an explicit
   shared [`externalAgents`](configuration.md#the-externalagents-catalog) entry —
   its `command`, base `args`, and base `env`. The `review` and `execution` role
@@ -766,15 +814,15 @@ below names the gaps that survive any observer.
 | Sidebar field | Claude Code row | Codex CLI row |
 | --- | --- | --- |
 | Lifecycle and exit code | Real: the host owns the child process | Real: the host owns the child process |
-| Conversation name | Unknown: never scraped | Unknown: never scraped |
+| Conversation name | Observed when this row's observer read its own bound transcript — including the one metadata-only read that picks up a title the provider recorded before this host started watching: the conversation's custom title, else the title the provider generated for it (custom outranks generated); `unknown` before any such read, after an observation gap, and for a conversation this host never proved | Observed when the row's own private backend read named it: that thread's user-facing name; a thread the provider reports with no name is honestly titled by its provider label, and the field stays `unknown` before that read or after a gap |
 | Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary, and a positively observed running turn stands through an unproven `Stop` boundary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: on the owned lane, that backend's own live status for the row's thread once its fresh candidate is proved; on the hook and rollout lane, running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
 | Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes it; on the owned lane, `pending` from the provider's own waiting-for-approval or waiting-for-user-input flag on the row's thread or from that thread's own unanswered asynchronous question, `none` only when both are positively clear, and `unknown` after an input-metadata gap or an own ordinary prompt that may have dropped a held question, until fresh evidence resolves it — this host never answers it, and it is never an inferred value |
 | Background task count | Live membership of this run — exact while its own coverage holds, and a keyed launch or completion edge **updates** that exact number rather than making it unknown; the distinct union of this run's non-shell members and its live agent identities, so an empty in-flight census beside one still-live agent displays `1`, not `0`; a last-reported root `Stop` total stands only while the ledger holds no exact set and no live agent needs reconciling, and any membership edge clears it; `unknown` only for a genuine coverage hole — per category when attributable — a scope change, or a hook-lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's census of this row's own active native sub-agents, while a positively observed empty census displays `0` |
 | Background shell count | Live membership from the same source and lifetime as the task figure — updated by the same keyed edges, cleared the same way when it is a last-reported total, and withdrawn only by a genuine hole (per category when attributable), a scope change, or a lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's complete background-terminal census for the bound root and its proven descendants, while a positively observed empty census displays `0` |
 | Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn, attributed only to the bound root; empty when nothing was observed or after a withdrawal |
 | Row caption the operator can set with `E` | Yes: a host-side name of this host's row, never a provider conversation name | Yes: the same host-side caption |
-| Roster title of a live row | The operator's caption, else `<Provider>` | The operator's caption, else `<Provider>` |
-| Roster title of a remembered row after a host restart | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)` | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)` |
+| Roster title of a live row | The operator's caption, else the observed provider conversation title, else `<Provider>` | The operator's caption, else the observed provider conversation title, else `<Provider>` |
+| Roster title of a remembered row after a host restart | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)`. An observed provider title is ephemeral and is never remembered, so a restored row starts from its caption or provider label, and on an uncaptioned Claude row the provider's title comes back from the transcript that run itself names once its conversation is proved — no new rename is needed, and a caption you typed keeps winning over it | Restored: the operator's caption, else `<Provider>`; not restorable: `<caption or Provider> (unavailable)`. An observed provider title is ephemeral and is never remembered, so a restored row starts from its caption or provider label and, on an uncaptioned row, shows the provider's title again once its own run reports one |
 | Idle-only stop | Confirmation required, always | Confirmation required, always |
 | Provider conversation rename, saved-conversation open, exited-row resume | Unavailable: Pi APIs | Unavailable: Pi APIs |
 
@@ -1144,6 +1192,27 @@ What to expect, and what this does and does not prove:
   because that Codex row's fresh candidate is not yet proved, and — where the operator configured hooks
   of their own — the provider's own hook review-and-trust prompt, which this host never
   answers or bypasses for you.
+- To check a row's **title** by hand, in that same stage, use the provider's own naming
+  and this host's own `E`. Do the two checks below on **two different rows**: a caption
+  you typed permanently outranks the provider's title on the row it belongs to, so one
+  row cannot show you both outcomes.
+  - **The provider's own title, on an uncaptioned row.** Start a Claude row, name the
+    conversation **inside the provider** with its `/rename`, and confirm the sidebar row
+    takes that name. Then quit the host and start it again in the same stage: the restored
+    row reads `Claude` at first, and once that run proves which conversation it is, the
+    provider's own title returns **without** any new `/rename` — it is read from the
+    transcript that run itself names, and never remembered as a name.
+  - **Your caption, on a captioned row.** Press `E` on a row and type a caption of your
+    own: it outranks the provider's title at once, and it survives every later `/rename`
+    on that conversation **and** a conversation reset on that row, including a caption
+    equal to the text the row was already showing. Restart the host on that same row and
+    it comes back under your caption — a captioned row never visibly reverts to the
+    provider's title, on a restart or at any other time.
+
+  A row that stays on `Claude` is the honest outcome when the observer never proved the
+  conversation or never reached its transcript, not a fallback name; and this host never
+  renames anything inside the provider, so `/rename` in that walkthrough is always your
+  own action in the provider.
 - **No automated approvals.** Never try a provider's permission-bypass or
   approval-disabling flag to make a tryout easier; a configured target that names
   one is refused by design, and that refusal is the behavior under test.
@@ -1163,9 +1232,15 @@ What to expect, and what this does and does not prove:
   row accepted — so the clipboard change alone does not tell the two apart; a
   terminal, multiplexer, or permission that declines clipboard writes simply
   discards the request.
-- This stage proves startup, row ownership, input routing, resize, and exit on your
-  machine. It does not certify the provider's own rendering, mouse, image, resume,
-  approval, or platform behavior, and it is not Windows runtime evidence.
+- This stage proves startup, row ownership, input routing, resize, exit, and — if you
+  did the title walkthrough above — a real provider rename reaching your own row on your
+  own terminal. It does not certify the provider's own rendering, mouse, image, resume,
+  approval, or platform behavior, and it is not Windows runtime evidence. The automated
+  evidence behind this page is narrower still and different in kind: the Claude title
+  and status paths are tested against synthetic transcripts this suite writes, and the
+  Codex paths against this host's own private backend, so those tests cover no live
+  Claude or Codex session, no account, no TUI, no physical terminal, and no
+  provider-generated title.
 
 This page documents the procedure only: it claims no completed run of it, and the
 observations it lists are what to check, not reported results.
@@ -1222,3 +1297,13 @@ support.
   persisted tool items), and the `-c` / `hooks.SessionStart` configuration layer.
   Those are code readings against pinned versions, not observed provider behavior,
   and they carry the same moves-independently caveat as the clipboard findings above.
+- The two Claude conversation-title fields behind
+  [What a sidebar row shows](#what-a-sidebar-row-shows) — the custom title a conversation
+  carries and the title the provider generated for it, the rule that the custom title
+  outranks the generated one, and the fact that neither is a prompt, a summary, or a
+  first line — were read in the session-summary fold of the
+  [`@anthropic-ai/claude-agent-sdk`](https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk)
+  version this repository locks, together with the provider's own
+  [session management](https://code.claude.com/docs/en/sessions) page for what `/rename`
+  does. That is a pinned source reading, not observed provider behavior, and it carries
+  the same moves-independently caveat as the items above.

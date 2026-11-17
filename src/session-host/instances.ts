@@ -57,6 +57,7 @@ import {
 	hasCompleteSessionIdle,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
 	isValidNativeSessionId,
+	isValidNativeDisplayName,
 	isValidNativeSessionFile,
 	isValidRenameName,
 	type SessionHostNativeSession,
@@ -823,10 +824,11 @@ export interface NativeInstanceView {
 	/**
 	 * The row's display label, in the shape every presentation of this host (and
 	 * the roster projection built from it) already transmits. For a native CLI row
-	 * this is the stable provider label until the operator captions the row; for a
-	 * Pi row it is the observed native conversation name. It is never a provider
-	 * conversation identity, never observed child output, and never something the
-	 * provider was told.
+	 * this is its EFFECTIVE caption: the operator's caption when they gave one, else
+	 * the provider's own actual conversation title when this row's source positively
+	 * proved one, else the stable provider label. For a Pi row it is the observed
+	 * native conversation name. It is never a provider conversation identity, never
+	 * observed child output, and never something the provider was told.
 	 */
 	readonly label: string;
 	readonly workspace: string;
@@ -1214,6 +1216,25 @@ export interface NativeStatusObserverContext {
 	 * was accepted.
 	 */
 	readonly emitConversationIdentity?: (conversationId: string | null) => boolean;
+	/**
+	 * Owner-private TITLE channel (issue #690), separate from
+	 * {@linkcode NativeStatusObserverContext.emit} and from
+	 * {@linkcode NativeStatusObserverContext.emitConversationIdentity}: report one
+	 * actual provider conversation title the source positively read for one exact
+	 * conversation it already proved and this owner accepted, or an explicit `null`
+	 * when that conversation positively has no title any more. It is never a prompt,
+	 * a summary, a first line, terminal text, or anything the host invented.
+	 *
+	 * The manager accepts it only under the same exact run fences as
+	 * {@linkcode NativeStatusObserverContext.emitConversationIdentity}, and only for
+	 * the conversation this row currently has proved and live: a title for another,
+	 * unproved, or superseded conversation is refused. It is refused outright once the
+	 * operator captioned the row, because their caption outranks any provider title.
+	 * The accepted value is EPHEMERAL: it is never persisted, never becomes the
+	 * roster's remembered display name, and is withdrawn when the conversation it was
+	 * proved for is rebound or lost. `true` means the title was accepted.
+	 */
+	readonly emitConversationTitle?: (conversationId: string, title: string | null) => boolean;
 }
 
 /**
@@ -1368,10 +1389,13 @@ interface ManagedInstance {
 	/**
 	 * The row's display label. A Pi row's label is the last authenticated native
 	 * conversation name (or a placeholder until one is observed). A native CLI
-	 * row's label is the stable provider label until the operator captions the row
-	 * through {@linkcode InstanceManager.setNativeDisplayName}, which replaces this
-	 * one field: there is no second name field, so every surface that already
-	 * transmits `label` carries the caption without any new identity.
+	 * row's label is the EFFECTIVE caption of that row: the operator's caption when
+	 * they gave one, else the one actual provider conversation title this row's own
+	 * source positively proved, else the stable provider label. The two contributing
+	 * values are kept apart privately (see {@linkcode ManagedInstance.nativeCaption}
+	 * and {@linkcode ManagedInstance.nativeConversationTitle}); this stays the ONE
+	 * published field, so every surface that already transmits `label` carries the
+	 * caption, a provider title, or the default without any new field or identity.
 	 */
 	label: string;
 	nativeSession: SessionHostNativeSession | null;
@@ -1415,6 +1439,27 @@ interface ManagedInstance {
 	 * then can an explicit `null` withdraw it.
 	 */
 	nativeConversationLive?: boolean;
+	/**
+	 * Native CLI rows only: the operator's own caption for this row, present from the
+	 * moment one is EXPLICITLY accepted — before any comparison with the text the row
+	 * already shows, so manual intent is a stored fact and never something inferred
+	 * from a string match. While it is present it outranks any provider title and no
+	 * automatic title can be accepted for the row.
+	 *
+	 * This is the durable half of the row's name: the host core remembers it as the
+	 * slot's display name. It is never written to a provider, never a conversation
+	 * rename, and never derived from provider text.
+	 */
+	nativeCaption?: string;
+	/**
+	 * Native CLI rows only: the one actual provider conversation title this row's own
+	 * live source positively proved for its CURRENT proved conversation. EPHEMERAL by
+	 * contract: never persisted, never the roster's remembered display name, never
+	 * sent back to the provider, and withdrawn the moment the conversation it
+	 * describes is rebound or lost. Absent means nothing was observed, which is not a
+	 * claim that the provider has no title.
+	 */
+	nativeConversationTitle?: string;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
@@ -2875,8 +2920,16 @@ export class InstanceManager {
 	 * one. The value is validated against the shared native display-name rule
 	 * before anything changes, so an empty, oversized, or control-bearing value
 	 * updates nothing. A settled row is captioned too — the caption belongs to the
-	 * row, not to the live process — and the row's stable provider label stays in
-	 * charge until a name is actually set.
+	 * row, not to the live process.
+	 *
+	 * Precedence is data, never arrival order or a string comparison: this caption,
+	 * then a provider title this row's own source proved, then the stable provider
+	 * label. Capturing a caption therefore also ends any automatic provider title on
+	 * that row: nothing the provider supplied can move the row's text again. The
+	 * closed result stays `set | unchanged | no-row | not-native | invalid-name`, and
+	 * `unchanged` means only that the TEXT was already equal — the caption is still
+	 * established, which is what makes captioning a row with its own provider label a
+	 * real, durable opt-out.
 	 */
 	setNativeDisplayName(id: string, name: string): NativeDisplayNameResult {
 		if (this.#disposed || this.#stopping) return "no-row";
@@ -2884,6 +2937,12 @@ export class InstanceManager {
 		if (record === undefined) return "no-row";
 		if (!isNativeCliBackend(record.backend)) return "not-native";
 		if (!isNativeDisplayName(name)) return "invalid-name";
+		// Manual intent is recorded FIRST, before any comparison with the text the row
+		// currently shows. The equality shortcut may then skip only the text write and
+		// the publish — never the caption: a caption that happens to equal the provider
+		// default, or an automatic provider title the row had acquired, is still the
+		// operator taking the row over, and it still latches.
+		record.nativeCaption = name;
 		if (record.label === name) return "unchanged";
 		record.label = name;
 		this.#safeChanged(record.id);
@@ -3140,8 +3199,9 @@ export class InstanceManager {
 		const nativeCliTarget = options?.nativeCliTarget === undefined
 			? undefined
 			: validateNativeCliTarget(options.nativeCliTarget);
-		// A native CLI row has no observable native conversation name, so it carries a
-		// stable provider label instead of a name that never arrives.
+		// A native CLI row starts from its stable provider label: a provider's own
+		// conversation title, like an operator's caption, is only ever known once the
+		// row exists, so nothing here waits for a name or invents one.
 		const label = options?.label === undefined
 			? (isNativeCliBackend(backend) ? sessionBackendDisplayLabel(backend) : "(session starting)")
 			: validateLabel(options.label);
@@ -3221,6 +3281,10 @@ export class InstanceManager {
 						: { nativeResumeConversationId, nativeConversationId: nativeResumeConversationId }),
 					nativeConversationConfirmed: false,
 					nativeConversationLive: false,
+					// An explicit initial label on a native row is a CONFIGURED caption
+					// (a remembered slot restores exactly this way), so it latches manual
+					// intent from the start and no automatic provider title can displace it.
+					...(options.label === undefined ? {} : { nativeCaption: label }),
 				}
 				: {}),
 			busy: null,
@@ -4402,6 +4466,9 @@ export class InstanceManager {
 		// never confirmed its restore keeps the admitted id for retry instead.
 		if (record.nativeConversationLive === true) {
 			record.nativeConversationLive = false;
+			// The proved conversation is no longer something this generation can
+			// attribute a title to, so its automatic title goes with it.
+			this.#withdrawNativeConversationTitle(record);
 			delete record.nativeConversationId;
 		}
 		// Retiring the generation is part of the accepted invalidation, not a later step:
@@ -4504,6 +4571,8 @@ export class InstanceManager {
 					: { resumeConversationId: record.nativeResumeConversationId }),
 				emitConversationIdentity: (conversationId) =>
 					this.#emitNativeConversationIdentity(record, run, conversationId),
+				emitConversationTitle: (conversationId, title) =>
+					this.#emitNativeConversationTitle(record, run, conversationId, title),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -4694,6 +4763,9 @@ export class InstanceManager {
 			if (record.nativeConversationId === undefined) {
 				return true;
 			}
+			// The conversation this title was proved for is gone, so the title goes
+			// with it; the publish below carries the row's new effective text.
+			this.#withdrawNativeConversationTitle(record);
 			delete record.nativeConversationId;
 			this.#safeChanged(record.id);
 			return true;
@@ -4710,8 +4782,94 @@ export class InstanceManager {
 		if (record.nativeConversationId === conversationId) {
 			return true;
 		}
+		// A genuine rebind to another conversation: whatever title the previous one
+		// carried describes a conversation this row no longer runs, and carrying it
+		// over would name this row after a foreign conversation.
+		this.#withdrawNativeConversationTitle(record);
 		record.nativeConversationId = conversationId;
 		this.#safeChanged(record.id);
+		return true;
+	}
+
+	/**
+	 * Drop this row's automatic provider title, if it holds one, and let the row's
+	 * effective text fall back to what it was before the provider spoke. An operator
+	 * caption owns the label outright, so only the stored title is dropped there.
+	 * Returns whether the row's published label changed.
+	 */
+	#withdrawNativeConversationTitle(record: ManagedInstance): boolean {
+		if (record.nativeConversationTitle === undefined) return false;
+		delete record.nativeConversationTitle;
+		if (record.nativeCaption !== undefined) return false;
+		const provider = sessionBackendDisplayLabel(record.backend ?? "pi");
+		if (record.label === provider) return false;
+		record.label = provider;
+		return true;
+	}
+
+	/**
+	 * The ONLY write path for one row's automatic provider conversation TITLE
+	 * (issue #690). It is fenced exactly like
+	 * {@linkcode #emitNativeConversationIdentity} — the current record and run, an
+	 * activated capture, that capture's own live PTY handle, process incarnation, and
+	 * observer generation, on an unexited, un-stopping, undisposed row — and never
+	 * queues, retries, or replays.
+	 *
+	 * On top of those fences a title belongs to ONE conversation: it is accepted only
+	 * for the exact id this row currently has proved and holds live, so a late,
+	 * stale-generation, cross-row, or foreign-conversation title can never name this
+	 * row. Once the operator captioned the row, every automatic title is refused: a
+	 * caption outranks the provider, and no provider string moves a captioned row.
+	 *
+	 * A title must satisfy the host's canonical PUBLISHED-LABEL bound — the one a Pi
+	 * row's observed native name and a peer's roster label already satisfy, so an
+	 * accepted title always travels out unchanged — and never the narrower manual-caption
+	 * input bound, which is an operator-typed limit with no claim on text the host merely
+	 * displays. An unusable title is refused whole, never clipped, so nothing silently
+	 * rewrites provider text. `null` withdraws a title
+	 * that is currently held and changes nothing otherwise. The accepted value is
+	 * ephemeral: it lands only in the row's effective label, never in the roster's
+	 * remembered display name, and never travels to a provider.
+	 */
+	#emitNativeConversationTitle(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		conversationId: string,
+		title: string | null,
+	): boolean {
+		if (run.retired || !run.activated || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		// Attribution first: a title is only ever about the conversation this row has
+		// positively proved and still holds live.
+		if (!isNativeConversationId(conversationId)
+			|| record.nativeConversationId !== conversationId
+			|| record.nativeConversationLive !== true) {
+			return false;
+		}
+		// The operator's caption outranks any provider title, for as long as it stands.
+		if (record.nativeCaption !== undefined) return false;
+		if (title === null) {
+			if (record.nativeConversationTitle === undefined) return false;
+			const changed = this.#withdrawNativeConversationTitle(record);
+			if (changed) this.#safeChanged(record.id);
+			return true;
+		}
+		if (!isValidNativeDisplayName(title)) return false;
+		if (record.nativeConversationTitle === title) return true;
+		record.nativeConversationTitle = title;
+		if (record.label !== title) {
+			record.label = title;
+			this.#safeChanged(record.id);
+		}
 		return true;
 	}
 

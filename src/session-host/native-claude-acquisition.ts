@@ -273,6 +273,46 @@
  *    rows, scope ends, and lane losses replace or withdraw it exactly as for a
  *    fresh run. A refused, missing, or foreign proof mints nothing.
  *
+ * 10. The conversation's TITLE is its own fact, on its own read (issue #690). A
+ *     provider title is read from the same ONE positively bound root transcript,
+ *     under the same root fence every other transcript source passes, and it moves
+ *     no status axis. Status and title are different facts, and the prior-history
+ *     floor exists only for the first of them: an existing or restored
+ *     conversation's already-recorded title must not have to wait for a fresh
+ *     `/rename` or for a new title row, so ONE metadata-only read of the bound
+ *     file hydrates it — reading nothing but the provider's own title fields,
+ *     publishing no snapshot, arming no read, retiring nothing, and leaving the
+ *     status floor exactly where it was, so no older activity, count, or terminal
+ *     witness replays. It is armed only on boundaries that already exist (a proved
+ *     conversation identity, a scan floor re-established for this scope), never on
+ *     a timer, a poll, or a watcher, and it is deduplicated per bound file identity
+ *     and root session. The provider's own fold takes the LAST title row of each
+ *     kind in the file and ranks a custom title over a generated one, so a window
+ *     that does not reach the file's first record can still prove the file's LAST
+ *     CUSTOM title (nothing after it went unread) but can never prove the generated
+ *     one, and a read that found only a generated title over an unread head
+ *     publishes nothing rather than outranking a custom title it never saw. That
+ *     ceiling is a property of the LEDGER, not of one read: while no read has
+ *     established what the file's last custom row is — including the case where a
+ *     whole-file read found none — a generated title is not publishable from ANY
+ *     source, so an incremental append cannot outrank a custom title still sitting in
+ *     an unread head. Every title commit, hydration or incremental, is applied by the
+ *     BYTE OFFSET of the row it came from inside one file identity, so a whole-file
+ *     read that lands late can never roll back a rename a watched read already
+ *     consumed. A malformed or oversized row in the window, a replaced file, or any
+ *     other gap publishes nothing — unknown, never a guess — and no retry is invented
+ *     for it: the next real boundary can try again. The result is committed only while
+ *     the title lane's own scope epoch is still the epoch the read started under AND
+ *     this controller is still bound to the same file, the same root session, and the
+ *     same proved conversation AND that file is still the same file at least as large
+ *     as the bytes read — so a read that finishes after a reset, a rebind, a lane gap,
+ *     or a replacement or truncation of the file names nothing, even when the
+ *     conversation and the path match again by then; the epoch moves where the
+ *     transcript lane loses standing outright, and never for an ordinary newer turn,
+ *     which says nothing about a title. A title is offered only for an identity the
+ *     owner accepted, and a manual caption still outranks every provider title
+ *     forever.
+ *
  * Failures withdraw, per lane. A missing/unreadable/replaced/truncated
  * transcript, a malformed or oversized record inside the scanned window, a window
  * too small to cover the barrier, or a watcher error retires the in-flight
@@ -329,7 +369,8 @@ import {
   type NativeJsonlTailFailureReason,
 } from "./native-jsonl-tail";
 import type { NativeHookBackgroundCounts, NativeHookEvent, NativeHookFailure } from "./native-hook-protocol";
-import type { NativeCliBackend } from "./session-backend";
+import { isValidNativeDisplayName } from "./protocol";
+import { type NativeCliBackend } from "./session-backend";
 import type { NativeStatusObservation, NativeStatusSupportMap } from "./native-status";
 
 /**
@@ -434,6 +475,16 @@ export interface NativeClaudeAcquisitionOptions {
    * activation); `true` or no value means accepted. It is never a status value.
    */
   readonly onConversationIdentity?: (conversationId: string | null) => boolean | void;
+  /**
+   * Owner-private TITLE channel: one actual conversation title this run's own ROOT
+   * transcript rows positively named for the exact conversation identity the owner
+   * already accepted from {@linkcode NativeClaudeAcquisitionOptions.onConversationIdentity}
+   * — a provider custom title or a provider-generated title, never a prompt, a
+   * summary, a first line, or terminal text. `false` means the owner refused it (not
+   * this conversation, no live proof, or the operator captioned the row); `true` or
+   * no value means accepted. It is never a status value and never carries a path.
+   */
+  readonly onConversationTitle?: (conversationId: string, title: string) => boolean | void;
 }
 
 /** One file watch this controller owns. `close` is idempotent by contract. */
@@ -544,6 +595,23 @@ interface WindowScan {
    * result body, answer, error text, or role prose crosses.
    */
   readonly questionClosures: readonly string[];
+  /**
+   * The last provider CUSTOM title and the last provider-GENERATED title a ROOT
+   * row of THIS window named for this run's bound conversation, in file order, or
+   * null when this window named none of that kind. These are the provider's own
+   * title fields and nothing else: no prompt, summary, first line, preview, or
+   * rendered terminal text is ever read for a title, and a field that is present
+   * but unusable is simply not carried (never clipped into a guess).
+   */
+  readonly customTitle: string | null;
+  readonly aiTitle: string | null;
+  /**
+   * Byte offset of the record each title above came from, or -1 when that kind was
+   * not named. Position is what makes two reads of one file orderable: a title from
+   * an older row can never roll back a title already taken from a newer one.
+   */
+  readonly customTitleOffset: number;
+  readonly aiTitleOffset: number;
 }
 
 /** One live watcher plus the generation that attached it. */
@@ -566,6 +634,49 @@ interface FreshStartProbe {
   readonly identity: NativeJsonlFileIdentity | null;
   /** True when the bound path was absent: nothing could have been recorded in it. */
   readonly absent: boolean;
+}
+
+/**
+ * One armed metadata-only title read: the ONE bound file, the identity it was
+ * sized under, and the exact scope its result may ever be attributed to. Like the
+ * fresh-start probe it carries no record text and no path beyond the single bound
+ * file this controller already holds.
+ */
+interface TitleMetadataRead {
+  readonly path: string;
+  readonly identity: NativeJsonlFileIdentity;
+  /** The bound root session every title row in this read is fenced against. */
+  readonly sessionId: string;
+  /** The proved conversation this read's result may name, and no other. */
+  readonly conversationId: string;
+  /** The (path, file identity, root session) this read was armed for. */
+  readonly key: string;
+  /**
+   * The title lane's scope epoch at arming. A read may commit only while that epoch
+   * is STILL the epoch it started under: comparing bound values alone would be
+   * satisfied again by a boundary that happened DURING the read — a lane loss and
+   * its same-conversation recovery, or a reset away and back to the same
+   * conversation — and metadata captured before that boundary would publish as
+   * though it had been read after it.
+   */
+  readonly scope: number;
+}
+
+/**
+ * One title commit, from one read of one file: the file it came from, whether that
+ * read covered the WHOLE file, and each title kind together with the byte offset of
+ * the row it was read from.
+ */
+interface TitleFacts {
+  readonly identity: NativeJsonlFileIdentity;
+  /**
+   * True only when this read covered the file from its first record to its last
+   * byte. That is what proves a conversation has NO custom title; a window that
+   * starts later can prove a custom title EXISTS, but never that one is absent.
+   */
+  readonly wholeFile: boolean;
+  readonly custom: { readonly value: string; readonly offset: number } | null;
+  readonly ai: { readonly value: string; readonly offset: number } | null;
 }
 
 /** Hook kinds that may establish this run's own root scope, mirroring the reducer. */
@@ -687,6 +798,7 @@ export class NativeClaudeAcquisitionController {
   /** Owner-selected workspace for identity proof, or null (nothing provable). */
   readonly #workspace: string | null;
   readonly #onConversationIdentity: ((conversationId: string | null) => boolean | void) | undefined;
+  readonly #onConversationTitle: ((conversationId: string, title: string) => boolean | void) | undefined;
   /** True for a run launched to resume one exact conversation. Never changes. */
   readonly #restoring: boolean;
   /** The exact UUID a restored run must prove, or null when none can be. */
@@ -721,6 +833,63 @@ export class NativeClaudeAcquisitionController {
   #reportedIdentity: string | null = null;
   /** True while the current candidate was refused and may be offered once more. */
   #identityOfferPending = false;
+  /**
+   * The last provider CUSTOM title this run's own ROOT rows named for the CURRENT
+   * binding, and the last provider-GENERATED title they named — kept apart, in
+   * file order, last-wins, exactly as the provider's own summary fold ranks them:
+   * a custom title outranks any generated one. Null means that kind was never
+   * named for this binding, which is unknown, not a claim of none.
+   */
+  #customTitle: string | null = null;
+  #aiTitle: string | null = null;
+  /** The title value the owner last accepted, or undefined when none was offered. */
+  #reportedTitle: string | undefined;
+  /**
+   * The (bound path, file identity, bound root session) one metadata-only title
+   * read already covered for the CURRENT binding, so the same bytes of the same
+   * file are never re-read for the same scope. It is set when a read is armed, and
+   * cleared when this binding ends, when the proved conversation is withdrawn, and
+   * when an armed read came back with nothing — a gap is unknown, not a completed
+   * read, and the next real boundary is allowed to try once more. Nothing times it
+   * out, polls for it, or watches for it.
+   */
+  #titleHydratedKey: string | null = null;
+  /** One in-flight metadata-only title read, or null. */
+  #titleRead: TitleMetadataRead | null = null;
+  /** True when a hydration was asked for while one was already in flight. */
+  #titleReadAgain = false;
+  /**
+   * The title lane's own scope epoch. It moves ONLY where this controller loses
+   * standing on the transcript lane outright — a new scope or file, a lost read, an
+   * explicit withdrawal, a hook-lane loss, or the end of the run — and never because
+   * a newer turn arrived, which says nothing about a conversation's title. An armed
+   * title read commits only under the epoch it was armed in, so metadata captured
+   * before one of those boundaries can never publish after it, even when the
+   * conversation, the path, and the session all match again afterwards.
+   */
+  #titleScope = 0;
+  /**
+   * True once some read has established what this file's LAST custom-title row is,
+   * including the case where the whole file was covered and no such row exists.
+   * While it is false, a provider-GENERATED title cannot be published at all: an
+   * unread head could still hold a custom title, and the provider's own fold ranks
+   * custom over generated, so choosing the generated one would be a guess about a
+   * field this host never read.
+   */
+  #customTitleCeilingKnown = false;
+  /**
+   * The file the held title facts came from, and the offset of the last row of each
+   * kind applied from it (-1 when that kind was never applied). Offsets are only
+   * comparable inside one file identity, so the identity travels with them, and a
+   * later title read of the same file can never roll the row back to an older row's
+   * title.
+   */
+  #titleSource: {
+    readonly dev: number;
+    readonly ino: number;
+    customOffset: number;
+    aiOffset: number;
+  } | null = null;
 
   readonly #reducer = new NativeClaudeStatusReducer();
   /** This run's live background membership census. Never published as ownership. */
@@ -867,6 +1036,9 @@ export class NativeClaudeAcquisitionController {
     this.#workspace = typeof options.workspace === "string" && options.workspace !== "" ? options.workspace : null;
     this.#onConversationIdentity = typeof options.onConversationIdentity === "function"
       ? options.onConversationIdentity
+      : undefined;
+    this.#onConversationTitle = typeof options.onConversationTitle === "function"
+      ? options.onConversationTitle
       : undefined;
     this.#restoring = options.resumeConversationId !== undefined;
     this.#restoreExpected = isNativeConversationId(options.resumeConversationId)
@@ -1320,6 +1492,14 @@ export class NativeClaudeAcquisitionController {
     this.#settledChildRequests.clear();
     this.#sessionId = null;
     this.#transcriptPath = null;
+    this.#customTitle = null;
+    this.#aiTitle = null;
+    this.#reportedTitle = undefined;
+    this.#titleHydratedKey = null;
+    this.#titleRead = null;
+    this.#titleReadAgain = false;
+    this.#customTitleCeilingKnown = false;
+    this.#titleSource = null;
   }
 
   // --- conversation identity -----------------------------------------------
@@ -1366,6 +1546,21 @@ export class NativeClaudeAcquisitionController {
       this.#identityOfferPending = false;
       if (this.#reportedIdentity === null) return;
       this.#reportedIdentity = null;
+      // The conversation this TITLE was delivered for is no longer current, so the
+      // delivered-title ledger goes with it: without this, a title the provider
+      // records again after the gap is suppressed by its own equality with what was
+      // delivered before the gap, and the row would sit at its provider label for the
+      // rest of the run. The metadata read BEFORE the gap is not fresh evidence about
+      // the conversation AFTER it, so it goes too — only a later read of this scope
+      // can arm a title again, and a gap is never papered over with cached text.
+      this.#reportedTitle = undefined;
+      this.#customTitle = null;
+      this.#aiTitle = null;
+      // And the read that produced it is no longer the last word either: the next
+      // proof of THIS conversation is allowed one fresh metadata read of the file
+      // that is bound now, which is what restores a title that was already recorded
+      // before the gap without waiting for the provider to write another title row.
+      this.#titleHydratedKey = null;
       this.#offerIdentity(null);
       return;
     }
@@ -1373,9 +1568,18 @@ export class NativeClaudeAcquisitionController {
       this.#identityOfferPending = false;
       return;
     }
+    // A proved conversation is the boundary that says which conversation the bound
+    // file belongs to, so it is where a title that file already holds can be read
+    // for it — whether or not this owner has accepted the identity yet, since a
+    // title read before acceptance is this conversation's fact and becomes
+    // reportable the moment it is.
+    this.#syncTitleHydration();
     if (this.#offerIdentity(target)) {
       this.#reportedIdentity = target;
       this.#identityOfferPending = false;
+      // A title read before the owner accepted this conversation is this
+      // conversation's fact; it becomes reportable the moment it is accepted.
+      this.#syncTitle();
     } else {
       this.#identityOfferPending = true;
     }
@@ -1389,6 +1593,229 @@ export class NativeClaudeAcquisitionController {
     } catch {
       // The owner's channel is contained: a throw is a refusal, nothing more.
       return false;
+    }
+  }
+
+  /**
+   * Bring the owner's view of this conversation's TITLE in line with what this
+   * run's own ROOT rows named for it. Nothing is offered until the owner accepted
+   * an identity for this binding, because a title without a proved conversation
+   * could only ever be associated with whatever row the owner happened to look at;
+   * and nothing is offered when no title row was ever read, which is unknown, not
+   * "no title". A value the owner already accepted is never sent twice, and a
+   * refused one is retried by the next window that carries it — never by a timer.
+   */
+  #syncTitle(): void {
+    if (this.#disposed) return;
+    const report = this.#onConversationTitle;
+    if (report === undefined) return;
+    const conversationId = this.#reportedIdentity;
+    if (conversationId === null) return;
+    // A custom title outranks a generated one, exactly as the provider's own fold
+    // ranks them. A generated one is publishable only once some read has established
+    // what this file's last custom row is (including "there is none"): while that is
+    // unknown, a custom title this host never read could still outrank it.
+    const target = this.#customTitle
+      ?? (this.#customTitleCeilingKnown ? this.#aiTitle : null);
+    if (target === null || target === this.#reportedTitle) return;
+    try {
+      if (report(conversationId, target) !== false) this.#reportedTitle = target;
+    } catch {
+      // The owner's channel is contained: a throw is a refusal, nothing more.
+    }
+  }
+
+  /**
+   * Arm the ONE metadata-only read of the bound transcript that can hydrate a
+   * provider title this scope has never seen — the title of an EXISTING or
+   * RESUMED conversation, which the prior-history status floor deliberately never
+   * reads and which must not have to wait for a fresh `/rename`. It is armed on the
+   * boundaries that already exist and nowhere else: never a timer, a poll, a
+   * watcher, or a second source. Nothing here reads, arms, retires, or publishes a
+   * status fact, and the scan floor stays exactly where it was.
+   *
+   * It needs the two things a title can be attributed to and nothing more: the ONE
+   * transcript path the provider itself named for this run's root scope, and this
+   * run's own positively proved conversation. Without either, a title row would be
+   * a string with no owner, so nothing is read.
+   */
+  #syncTitleHydration(): void {
+    if (this.#disposed) return;
+    const path = this.#transcriptPath;
+    const sessionId = this.#sessionId;
+    const conversationId = this.#boundIdentity;
+    if (path === null || sessionId === null || conversationId === null || this.#identitySuspended) return;
+    const stat = this.#statBound();
+    // Nothing readable behind the binding: unknown, never a guess, and no retry is
+    // scheduled for it. The boundary that makes this file readable arms this again.
+    if ("gap" in stat) return;
+    const identity: NativeJsonlFileIdentity = { dev: stat.stats.dev, ino: stat.stats.ino };
+    const key = `${path}\u0000${identity.dev}:${identity.ino}\u0000${sessionId}`;
+    // This exact file, for this exact conversation, is already accounted for: the
+    // request is satisfied and must NOT queue another pass over the same bytes.
+    if (this.#titleHydratedKey === key) return;
+    if (this.#titleRead !== null) {
+      // Asked about something genuinely different while one is in flight: the request
+      // is for whatever is current when that read lands, so it is drained then rather
+      // than dropped.
+      this.#titleReadAgain = true;
+      return;
+    }
+    const read: TitleMetadataRead = {
+      path,
+      identity,
+      sessionId,
+      conversationId,
+      key,
+      scope: this.#titleScope,
+    };
+    this.#titleHydratedKey = key;
+    this.#titleRead = read;
+    void this.#readTitleMetadata(read);
+  }
+
+  /**
+   * Commit title facts from one read of one file, in the only order that is honest
+   * about a JSONL file: by the byte offset of the row they came from, inside one
+   * file identity. A title read that started earlier and lands later can therefore
+   * never roll the row back to an older row's title, which is what lets the
+   * whole-file hydration read and the watched incremental reads run concurrently —
+   * and lets the incremental read that already consumed a rename keep it.
+   *
+   * A custom title found anywhere in a window that reaches the end of the file IS
+   * that file's last custom row, and a window that starts at byte 0 says the file
+   * holds none; either establishes the ceiling a generated title needs. Nothing here
+   * re-reads, arms, retires, or publishes a status fact.
+   */
+  #applyTitleFacts(facts: TitleFacts): void {
+    const held = this.#titleSource;
+    const source = held !== null && held.dev === facts.identity.dev && held.ino === facts.identity.ino
+      ? held
+      // A different file behind this binding is a different source: its rows are
+      // neither older nor newer than the old file's, so its own offsets start here.
+      : { dev: facts.identity.dev, ino: facts.identity.ino, customOffset: -1, aiOffset: -1 };
+    if (facts.custom !== null && facts.custom.offset >= source.customOffset) {
+      this.#customTitle = facts.custom.value;
+      source.customOffset = facts.custom.offset;
+    }
+    if (facts.ai !== null && facts.ai.offset >= source.aiOffset) {
+      this.#aiTitle = facts.ai.value;
+      source.aiOffset = facts.ai.offset;
+    }
+    this.#titleSource = source;
+    if (facts.custom !== null || facts.wholeFile) this.#customTitleCeilingKnown = true;
+  }
+
+  /**
+   * Read ONLY the provider's own title fields out of the bound transcript, and
+   * commit them only under the full title fence: the scope epoch this read was armed
+   * in, the same bound path, root session, and proved conversation, and the same file
+   * still behind that path with at least the bytes this read consumed. Every record in
+   * the window is parsed before anything is committed, and only `customTitle` /
+   * `aiTitle` are ever read: no prompt, summary, first line, preview, or rendered text
+   * becomes a title, and no status axis, cursor, arm, watcher, or snapshot is touched.
+   *
+   * Coverage is decided by what the provider's own fold actually claims. It takes the
+   * LAST title row of each kind in the file and ranks a custom title over a generated
+   * one, and a bounded window always reaches the end of the file — so a custom row
+   * inside this window IS the file's last custom row, while a generated row could
+   * still be outranked by a custom title sitting in the unread head. A window that
+   * starts past byte 0 therefore hydrates a custom title and nothing else; only a
+   * window that covers the file end to end can settle the generated kind. A malformed
+   * or oversized row, a replaced file, or any other read failure publishes nothing.
+   */
+  async #readTitleMetadata(read: TitleMetadataRead): Promise<void> {
+    let custom: { value: string; offset: number } | null = null;
+    let ai: { value: string; offset: number } | null = null;
+    let wholeFile = false;
+    let readEnd = 0;
+    let usable = false;
+    try {
+      const result = await readNativeJsonlTail({
+        path: read.path,
+        from: 0,
+        maxBytes: this.#maxTailBytes,
+        maxLineBytes: this.#maxLineBytes,
+        expectIdentity: read.identity,
+      });
+      if (result.ok && result.oversizedLines === 0) {
+        let malformed = 0;
+        // Every whole record in the window, in file order, starts exactly here. The
+        // window's own start is NOT that offset: when the bounded window cut a record
+        // in half, the tail reader discarded that leading partial, and its bytes still
+        // count inside `scannedTo`. Deriving the position from the bytes actually
+        // returned is the same arithmetic the watched read uses, and an offset is only
+        // meaningful when it is the row's real position in this file.
+        let recordOffset = result.scannedTo - result.records.reduce(
+          (bytes, record) => bytes + Buffer.byteLength(record, "utf8") + 1,
+          0,
+        );
+        for (const record of result.records) {
+          const recordStart = recordOffset;
+          recordOffset += Buffer.byteLength(record, "utf8") + 1;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(record);
+          } catch {
+            malformed += 1;
+            continue;
+          }
+          if (!isRecord(parsed)) {
+            malformed += 1;
+            continue;
+          }
+          const title = readRootConversationTitle(parsed, read.sessionId);
+          if (title === null) continue;
+          if (title.kind === "custom") custom = { value: title.value, offset: recordStart };
+          else ai = { value: title.value, offset: recordStart };
+        }
+        wholeFile = result.windowStart === 0
+          && !result.skippedBefore
+          && !result.droppedLeadingPartial
+          && !result.trailingPartial;
+        usable = malformed === 0 && (wholeFile || custom !== null);
+        readEnd = result.scannedTo;
+      }
+    } catch {
+      usable = false;
+    }
+    if (this.#titleRead === read) this.#titleRead = null;
+    // The fence is the title lane's own scope epoch PLUS the current binding. The
+    // epoch is what a comparison of bound values cannot express on its own: a lane
+    // loss followed by this conversation's own recovery, or a reset away to another
+    // conversation and back, leaves every value below matching again while the read
+    // in hand is still metadata from before that boundary. A newer turn's
+    // terminal-witness retirement deliberately does NOT move the epoch: a title is
+    // not a fact about a turn.
+    let stale = this.#disposed
+      || this.#titleScope !== read.scope
+      || this.#transcriptPath !== read.path
+      || this.#sessionId !== read.sessionId
+      || this.#boundIdentity !== read.conversationId
+      || this.#identitySuspended;
+    if (!stale && usable) {
+      // Revalidate the file behind the read before committing it. The tail reader
+      // verified the identity it OPENED and never looks at the path again, so a
+      // replacement or a truncation that happened while this read was in flight is
+      // invisible to it — and bytes that no longer exist behind the bound path can
+      // never be this row's evidence.
+      const now = this.#statBound();
+      stale = "gap" in now
+        || now.stats.dev !== read.identity.dev
+        || now.stats.ino !== read.identity.ino
+        || now.stats.size < readEnd;
+    }
+    if (!stale && usable) {
+      this.#applyTitleFacts({ identity: read.identity, wholeFile, custom, ai });
+      this.#syncTitle();
+    } else if (this.#titleHydratedKey === read.key) {
+      // Nothing was learned, so this read is not a completed look at this file.
+      // The next real boundary may take one; nothing schedules it.
+      this.#titleHydratedKey = null;
+    }
+    if (this.#titleReadAgain) {
+      this.#titleReadAgain = false;
+      this.#syncTitleHydration();
     }
   }
 
@@ -1497,6 +1924,15 @@ export class NativeClaudeAcquisitionController {
     this.#childLanes.clear();
     this.#sessionId = sessionId;
     this.#transcriptPath = transcriptPath;
+    // A title belongs to the conversation this boundary replaces. Its rows may even
+    // live in another file, and carrying the old string into the new scope would
+    // name this row after a conversation it no longer runs. The read-once ledger,
+    // the custom-title ceiling, and the offset ledger went with the retired lane
+    // above, so nothing here is inherited.
+    this.#customTitle = null;
+    this.#aiTitle = null;
+    this.#reportedTitle = undefined;
+    this.#titleSource = null;
   }
 
   /**
@@ -1541,6 +1977,18 @@ export class NativeClaudeAcquisitionController {
       this.#cursor = null;
       this.#identity = null;
       this.#foregroundFloor = 0;
+      // The TITLE lane loses standing here too, and only here: an ordinary newer-turn
+      // retirement keeps it, because a title is not a fact about a turn. Every armed
+      // title read is fenced on this epoch, and the read-once deduplication and the
+      // custom-title ceiling are facts about the coverage this retire ended.
+      this.#titleScope += 1;
+      this.#titleHydratedKey = null;
+      this.#customTitleCeilingKnown = false;
+      // The byte-offset ledger is a fact about THIS file's coverage too. Retiring the
+      // title values while keeping their offsets would let stale positions reject the
+      // very next read of the same conversation — and a transcript rewritten during
+      // the gap can legitimately carry its current title at a SMALLER offset.
+      this.#titleSource = null;
     }
     this.#terminalAccepted = false;
     this.#readyPublished = false;
@@ -2199,6 +2647,13 @@ export class NativeClaudeAcquisitionController {
     let corroborated = probe.absent;
     let scannedTo: number | null = null;
     let readIdentity: NativeJsonlFileIdentity | null = null;
+    // What this one whole-file read saw is held HERE, not in the controller, until
+    // the read is proven still to describe the current scope. A title written
+    // straight into the ledger would outlive a rebind that happened while the read
+    // was in flight, and a later sync could name the new conversation with the old
+    // conversation's title.
+    let freshCustomTitle: { value: string; offset: number } | null = null;
+    let freshAiTitle: { value: string; offset: number } | null = null;
     if (!probe.absent) {
       try {
         const result = await readNativeJsonlTail({
@@ -2219,6 +2674,28 @@ export class NativeClaudeAcquisitionController {
           && result.oversizedLines === 0) {
           const seen = scanForPrerecordedWork(result.records);
           corroborated = seen.malformed === 0 && seen.conversationRows === 0;
+          // This is the ONE read of this file that sees its very first records, so
+          // it is also where a title the provider wrote at the start of a brand-new
+          // conversation is picked up. Only the provider's own two title fields are
+          // read, under the same root fence as every later window.
+          if (corroborated) {
+            let recordOffset = 0;
+            for (const record of result.records) {
+              const recordStart = recordOffset;
+              recordOffset += Buffer.byteLength(record, "utf8") + 1;
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(record);
+              } catch {
+                continue;
+              }
+              if (!isRecord(parsed)) continue;
+              const title = readRootConversationTitle(parsed, probe.sessionId);
+              if (title === null) continue;
+              if (title.kind === "custom") freshCustomTitle = { value: title.value, offset: recordStart };
+              else freshAiTitle = { value: title.value, offset: recordStart };
+            }
+          }
           scannedTo = result.scannedTo;
           readIdentity = result.identity;
         }
@@ -2245,6 +2722,21 @@ export class NativeClaudeAcquisitionController {
     // the ledger's known-empty set, so a run observed from outside keeps these
     // corroborated zeros until its first complete membership snapshot.
     this.#snapshotCounts = { tasks: 0, shells: 0 };
+    // Only now, with the probe, the generation, and the reducer's own fresh-start
+    // confirmation all still agreeing that this read describes the current scope, do
+    // its titles become this scope's facts. A read that finished after a rebind or an
+    // invalidation returned above and left the ledger exactly as the boundary left it.
+    // This read covered the file from byte 0, so it also establishes the custom-title
+    // ceiling a generated title needs, and its rows are applied by position like every
+    // other title source.
+    if ((freshCustomTitle !== null || freshAiTitle !== null) && readIdentity !== null) {
+      this.#applyTitleFacts({
+        identity: readIdentity,
+        wholeFile: true,
+        custom: freshCustomTitle,
+        ai: freshAiTitle,
+      });
+    }
     // This read consumed the entire file, so the monitor's floor starts here and
     // the first row of any later turn is still seen.
     if (scannedTo !== null && readIdentity !== null) {
@@ -2252,6 +2744,7 @@ export class NativeClaudeAcquisitionController {
       this.#identity = readIdentity;
       this.#transcriptSeenPath = this.#transcriptPath;
     }
+    this.#syncTitle();
     this.#syncWatcher();
     this.#emit();
   }
@@ -2301,6 +2794,12 @@ export class NativeClaudeAcquisitionController {
     this.#cursor = appeared ? 0 : stat.stats.size;
     this.#identity = { dev: stat.stats.dev, ino: stat.stats.ino };
     this.#transcriptSeenPath = this.#transcriptPath;
+    // The status floor went up over whatever this file already held, which is
+    // exactly why the title gets its own look: those older rows are never read for
+    // a status fact, and a conversation that already has a provider title must not
+    // wait for a new one. Deduplicated per file identity and root session, so this
+    // boundary costs at most one metadata read.
+    this.#syncTitleHydration();
     return true;
   }
 
@@ -2478,6 +2977,13 @@ export class NativeClaudeAcquisitionController {
     // before the await.
     let windowRecords: readonly string[] = [];
     let windowStart = 0;
+    /**
+     * Whether this window covered the file from its first record to its last byte.
+     * Only such a window can prove the file holds NO custom title; a later window can
+     * still prove one EXISTS, and until either happens a generated title stays
+     * unpublished rather than outranking a custom title nobody read.
+     */
+    let wholeFileCoverage = false;
     // The size observed under the SAME handle that produced this window, trailing
     // partial record included: what a committed window proves, it proves at this
     // size.
@@ -2506,6 +3012,10 @@ export class NativeClaudeAcquisitionController {
           (bytes, record) => bytes + Buffer.byteLength(record, "utf8") + 1,
           0,
         );
+        wholeFileCoverage = result.windowStart === 0
+          && !result.skippedBefore
+          && !result.droppedLeadingPartial
+          && !result.trailingPartial;
         scan = this.#scanRecords(
           result.records,
           armedFor !== null,
@@ -2555,6 +3065,24 @@ export class NativeClaudeAcquisitionController {
             windowStart,
           );
         }
+        // The provider's own title rows are an independent fact about THIS
+        // conversation: they move no status axis, retire no read, and contradict no
+        // count. Each kind is remembered separately so a custom title keeps
+        // outranking a generated one across windows, exactly as the provider's own
+        // fold ranks them within a file — and each is applied by the offset of the row
+        // it came from, so a whole-file hydration read that lands later than this
+        // window can never roll a rename this window already consumed back to an
+        // older row's title.
+        this.#applyTitleFacts({
+          identity: readIdentity,
+          wholeFile: wholeFileCoverage,
+          custom: scan.customTitle === null
+            ? null
+            : { value: scan.customTitle, offset: scan.customTitleOffset },
+          ai: scan.aiTitle === null
+            ? null
+            : { value: scan.aiTitle, offset: scan.aiTitleOffset },
+        });
         // A persisted `tool_result` for a request this reducer holds open is that
         // request's own terminal evidence — the shape a declined, cancelled, or
         // answered question leaves when no `Post*` hook ever arrived. It is
@@ -2709,6 +3237,7 @@ export class NativeClaudeAcquisitionController {
     // append is the event that reaches it. No watcher, timer, or poll is added: one
     // bounded read per existing lane, on a read that already happened.
     this.#readOwnedChildLanes();
+    this.#syncTitle();
     this.#syncWatcher();
     this.#emit();
   }
@@ -2763,6 +3292,10 @@ export class NativeClaudeAcquisitionController {
     let foregroundWorkAfterCandidate = false;
     const candidates: NativeClaudeTerminalRecord[] = [];
     const questionClosures: string[] = [];
+    let customTitle: string | null = null;
+    let aiTitle: string | null = null;
+    let customTitleOffset = -1;
+    let aiTitleOffset = -1;
     for (const [index, record] of records.entries()) {
       // Whole lines, in order: this row starts here and the next starts after it.
       const recordStart = recordOffset;
@@ -2810,6 +3343,20 @@ export class NativeClaudeAcquisitionController {
           // the evidence that ends it. Keeping both is safe because settling a
           // member is monotone — the second application is a no-op.
           settlements.push({ id: membership.settle, offset: recordStart });
+        }
+      }
+      // The provider's own title fields, from the SAME root fence every other
+      // transcript source passes: a child's, a sidechain's, or another
+      // conversation's title row is that conversation's fact and can never name
+      // this run. Last row of each kind wins, as in the provider's own fold.
+      const title = readRootConversationTitle(parsed, sessionId);
+      if (title !== null) {
+        if (title.kind === "custom") {
+          customTitle = title.value;
+          customTitleOffset = recordStart;
+        } else {
+          aiTitle = title.value;
+          aiTitleOffset = recordStart;
         }
       }
       const rootRow = classifyRootTurnRow(parsed, sessionId);
@@ -2874,6 +3421,10 @@ export class NativeClaudeAcquisitionController {
       firstCandidateIndex,
       foregroundWorkAfterCandidate,
       questionClosures,
+      customTitle,
+      aiTitle,
+      customTitleOffset,
+      aiTitleOffset,
     };
   }
 
@@ -3160,6 +3711,39 @@ function isRootMembershipRow(parsed: Record<string, unknown>, boundSessionId: st
   const rowSession = readToken(parsed.sessionId) ?? readToken(parsed.session_id);
   if (rowSession === null) return true;
   return boundSessionId !== null && rowSession === boundSessionId;
+}
+
+/**
+ * The one ROOT conversation-title fact a persisted row positively states, or null
+ * when the row names none: the provider's own CUSTOM title (what the operator named
+ * the conversation inside the provider) and the provider-GENERATED title, which are
+ * the only two fields the provider's own summary fold treats as actual titles.
+ * Nothing else is ever read for a title — no prompt, no summary, no first line, no
+ * preview, no rendered terminal text — because those carry conversation content, and
+ * this host displays no provider content it did not positively identify as a title.
+ *
+ * The row passes the same root fence every other transcript source passes, so a
+ * child's, a sidechain's, or another conversation's title row can never name this
+ * run. A field that is present but is not usable display text — measured against the
+ * host's canonical published-label bound, never the operator's narrower manual-caption
+ * input bound, because this is text the host neither invented nor could edit — is
+ * refused outright: never clipped and never rewritten into something else, which
+ * leaves the row's title exactly as this controller last had it.
+ */
+function readRootConversationTitle(
+  parsed: Record<string, unknown>,
+  boundSessionId: string | null,
+): { readonly kind: "custom" | "ai"; readonly value: string } | null {
+  if (!isRootMembershipRow(parsed, boundSessionId)) return null;
+  const custom = parsed.customTitle;
+  if (typeof custom === "string") {
+    return isValidNativeDisplayName(custom) ? { kind: "custom", value: custom } : null;
+  }
+  const generated = parsed.aiTitle;
+  if (typeof generated === "string") {
+    return isValidNativeDisplayName(generated) ? { kind: "ai", value: generated } : null;
+  }
+  return null;
 }
 
 /**

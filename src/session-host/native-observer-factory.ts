@@ -16,20 +16,25 @@ import type { NativeStatusObservation } from "./native-status";
  * Owner-only construction context; no provider conversation is created here.
  *
  * The optional owner-private fields are exactly the manager's own context
- * (issue #277): the row's canonical workspace, the exact admitted restoration
- * UUID this run must still prove, and the separate identity channel. They are
+ * (issue #277, and the #690 title channel): the row's canonical workspace, the
+ * exact admitted restoration UUID this run must still prove, the separate identity
+ * channel, and the separate ephemeral conversation-title channel. They are
  * forwarded only to the source that consumes them; none of them is ever folded
  * into a {@link NativeStatusObservation}.
  */
 export type NativeObserverFactoryContext = Pick<NativeClaudeAcquisitionOptions, "rowId" | "backend"> & {
   readonly emit: (observation: NativeStatusObservation) => void;
-} & Pick<NativeStatusObserverContext, "workspace" | "resumeConversationId" | "emitConversationIdentity">;
+} & Pick<
+  NativeStatusObserverContext,
+  "workspace" | "resumeConversationId" | "emitConversationIdentity" | "emitConversationTitle"
+>;
 
-/** The owner-private identity inputs one consuming source receives, absent fields omitted. */
+/** The owner-private identity and title inputs one consuming source receives, absent fields omitted. */
 function identityOptions(context: NativeObserverFactoryContext): {
   readonly workspace?: string;
   readonly resumeConversationId?: string;
   readonly onConversationIdentity?: (conversationId: string | null) => boolean;
+  readonly onConversationTitle?: (conversationId: string, title: string | null) => boolean;
 } {
   return {
     ...(context.workspace === undefined ? {} : { workspace: context.workspace }),
@@ -37,6 +42,9 @@ function identityOptions(context: NativeObserverFactoryContext): {
     ...(context.emitConversationIdentity === undefined
       ? {}
       : { onConversationIdentity: context.emitConversationIdentity }),
+    ...(context.emitConversationTitle === undefined
+      ? {}
+      : { onConversationTitle: context.emitConversationTitle }),
   };
 }
 

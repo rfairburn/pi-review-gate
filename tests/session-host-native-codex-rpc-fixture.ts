@@ -357,7 +357,10 @@ export class FakeCodexAppServer {
       agentNickname: `${marker}-nickname`,
       agentRole: null,
       gitInfo: null,
-      name: thread.name ?? `${marker} title`,
+      // A thread with NO user-facing title is ordinary (a fresh thread reports its
+      // `name` present with a null value), so an explicit null in a fixture stays
+      // null instead of silently becoming the marker-bearing default.
+      name: thread.name === undefined ? `${marker} title` : thread.name,
       turns: [],
     };
   }

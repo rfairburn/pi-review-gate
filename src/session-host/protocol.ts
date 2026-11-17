@@ -407,7 +407,23 @@ export function isValidRenameName(value: unknown): value is string {
     && !/[\x00-\x1f\x7f\u0080-\u009f\u2028\u2029]/.test(value);
 }
 
-function isValidDisplayName(value: unknown): value is string {
+/**
+ * The canonical DISPLAY NAME rule for one hosted row's published label (issue #690).
+ *
+ * This is the bound a name that ARRIVES AT the host from elsewhere already satisfies:
+ * a Pi row's `nativeSession.name`, and therefore the label a roster peer's decoder
+ * accepts (`MAX_REMOTE_LABEL_CHARS` is this very bound). A value is refused whole —
+ * never clipped, trimmed, or otherwise coerced — unless it is non-empty, exactly
+ * trimmed, at most {@linkcode MAX_NATIVE_SESSION_NAME_LENGTH} code points and four
+ * times that in UTF-8 bytes, and free of C0/C1 controls, DEL, and line or paragraph
+ * separators.
+ *
+ * It is deliberately NOT the operator's manual caption rule, which is a narrower
+ * input bound of its own: an observed provider conversation title is display text the
+ * host neither invented nor can edit, so it is measured against the label it must
+ * survive travelling in, not against what a rename prompt would accept.
+ */
+export function isValidNativeDisplayName(value: unknown): value is string {
   return typeof value === "string"
     && value.trim().length > 0
     && value.trim() === value
@@ -421,7 +437,7 @@ function parseNativeSession(value: unknown): SessionHostNativeSession | undefine
     || !isValidNativeSessionId(value.sessionId)
     || !Number.isSafeInteger(value.epoch)
     || (value.epoch as number) < 1
-    || !isValidDisplayName(value.name)) return undefined;
+    || !isValidNativeDisplayName(value.name)) return undefined;
   const currentFile = value.currentFile;
   return {
     sessionId: value.sessionId,

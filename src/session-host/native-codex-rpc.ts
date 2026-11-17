@@ -59,6 +59,17 @@
  * messages are never placed in a returned value, a callback argument, or an
  * error message. Failures cross the boundary as closed codes only.
  *
+ * The ONE deliberate exception on the read side is the user-facing TITLE of the
+ * thread a workspace-comparing {@linkcode NativeCodexRpcTransport.readThreadInWorkspace}
+ * was asked about (issue #690): that one field is the provider's own name for the
+ * conversation, and this host displays it on the row that read it. It is decoded
+ * under the host's canonical published-label bound — the same bound a Pi row's
+ * observed native name and a roster peer's label already satisfy, deliberately not
+ * the operator's narrower manual-caption input bound — and an unusable title is
+ * refused whole, never clipped. It is carried only on that root read — never on a
+ * descendant census row — and it never travels back out: the host never writes a
+ * provider title.
+ *
  * The one deliberate exception is a CALLER-SUPPLIED workspace comparison: a
  * `thread/read` made through {@linkcode NativeCodexRpcTransport.readThreadInWorkspace}
  * compares the provider's own `cwd` for that one thread against the exact
@@ -73,6 +84,7 @@ import net from "node:net";
 import path from "node:path";
 import WebSocket from "ws";
 import { isRecord } from "../record-guard";
+import { isValidNativeDisplayName } from "./protocol";
 
 /* ------------------------------------------------------------------ bounds */
 
@@ -143,6 +155,12 @@ export const NATIVE_CODEX_RPC_NOTIFICATION_METHODS: readonly string[] = Object.f
   "thread/deleted",
   "thread/archived",
   "thread/closed",
+  // A title edge carries NO title here: it says only that one thread's user-facing
+  // name changed, and the authoritative value comes from the next root read. That
+  // keeps the host's one read-only rule intact — `thread/name/set` stays in the
+  // never-send list above, so this connection can hear a rename and re-read it, but
+  // can never cause one.
+  "thread/name/updated",
 ]);
 
 /** The closed set of census requests this transport will ever send. */
@@ -385,7 +403,10 @@ export interface NativeCodexServerRequestSignal {
 export type NativeCodexRpcNotification =
   | { readonly method: "thread/status/changed"; readonly threadId: string; readonly status: NativeCodexThreadStatus }
   | { readonly method: "thread/started"; readonly row: NativeCodexThreadRow }
-  | { readonly method: "thread/deleted" | "thread/archived" | "thread/closed"; readonly threadId: string };
+  | {
+    readonly method: "thread/deleted" | "thread/archived" | "thread/closed" | "thread/name/updated";
+    readonly threadId: string;
+  };
 
 /* -------------------------------------------------------------- decoding */
 
@@ -451,6 +472,22 @@ export interface NativeCodexThreadWorkspaceRead {
    * caller's expected workspace. A missing, unusable, or different cwd is false.
    */
   readonly workspaceMatches: boolean;
+  /**
+   * The provider's own user-facing title for this thread, decoded from its `name`
+   * field alone — never from `preview`, `agentNickname`, a path, or any other text
+   * the row carries.
+   *
+   * - a string: the actual title, already satisfying this host's canonical
+   *   published-label bound (an unusable title is never clipped into one, and the
+   *   operator's narrower manual-caption input bound never narrows it).
+   * - `null`: the provider positively reports NO title — the `name` key is `null`, or
+   *   the key is missing entirely, which is also what a freshly started thread looks
+   *   like before one is set.
+   * - absent from THIS decoded read: the provider's `name` was present but this host
+   *   could not read it as one bounded single line, which is UNKNOWN — never a
+   *   "no title", and never a guess.
+   */
+  readonly title?: string | null;
 }
 
 /**
@@ -495,7 +532,21 @@ export function decodeNativeCodexThreadReadInWorkspace(
   const nested = isRecord(result.thread) ? result.thread : result;
   const row = decodeNativeCodexThreadRow(nested);
   if (row === null) return null;
-  return { row, workspaceMatches: nativeCodexWorkspaceMatches(nested.cwd, expectedWorkspace) };
+  const rawTitle = nested.name;
+  // `undefined` stays UNKNOWN (a `name` field this host could not read); `null` is
+  // the provider positively saying it has no title. A present-but-unusable name
+  // leaves the field ABSENT rather than clipped: refusing to display a provider
+  // string this host cannot read as one bounded single line is not the same claim
+  // as "the provider has no title".
+  const title: string | null | undefined
+    = rawTitle === undefined || rawTitle === null
+      ? null
+      : isValidNativeDisplayName(rawTitle) ? rawTitle : undefined;
+  return {
+    row,
+    workspaceMatches: nativeCodexWorkspaceMatches(nested.cwd, expectedWorkspace),
+    ...(title === undefined ? {} : { title }),
+  };
 }
 
 /** Decodes one `thread/loaded/list` page. */
@@ -562,7 +613,12 @@ export function decodeNativeCodexNotification(
     }
     case "thread/deleted":
     case "thread/archived":
-    case "thread/closed": {
+    case "thread/closed":
+    // A rename edge is decoded to its thread id ALONE. The provider's own
+    // notification may omit a cleared name entirely, and an edge that tried to carry
+    // the new title would be a second, unsynced copy of a value the root read already
+    // owns — so nothing but "something changed for this thread" crosses here.
+    case "thread/name/updated": {
       const threadId = readBoundedText(params.threadId, NATIVE_CODEX_RPC_MAX_ID_CHARS);
       if (threadId === null) return null;
       return { method, threadId };

@@ -751,6 +751,34 @@ test("a native row is titled by its provider and stays honestly unknown", () => 
   assert.ok(piText.includes("bg tasks 0 | shells 0"), piText);
 });
 
+test("a native row shows its automatic provider title, and an unavailable row still says so", () => {
+  // The effective-label states (issue #690) all draw through the ONE existing
+  // card-title path: the row's label, with the availability suffix where it applies.
+  const longTitle = `census ${"investigation".repeat(5)}`;
+  const harness = rosterWith([
+    { ...NATIVE_ITEM, label: "Investigate the flaky census" },
+    { ...NATIVE_ITEM, id: "native-2", backend: "codex", label: "Codex" },
+    { ...NATIVE_ITEM, id: "native-3", label: longTitle },
+    {
+      ...NATIVE_ITEM,
+      id: "native-4",
+      label: "Captioned row",
+      lifecycle: "error",
+      hasLiveProcess: false,
+      unavailable: true,
+    },
+  ]);
+  const text = rosterText(harness, 48, 40);
+  assert.ok(text.includes("Investigate the flaky census"), text);
+  assert.ok(text.includes("Codex"), "a row with no title still shows its provider");
+  assert.ok(text.includes("Captioned row (unavailable)"), text);
+  // A long provider title stays inside the card's own existing width handling: the
+  // frame still renders, the title is drawn from its start, and the row never gains a
+  // second card-title line.
+  assert.ok(text.includes("census investigation"), text);
+  assert.equal(text.split("\n").filter((line) => line.trim().startsWith("census")).length, 1, text);
+});
+
 /** The real Claude acquisition declaration: every category is reportable. */
 const CLAUDE_SUPPORT = {
   agent: "supported",

@@ -930,6 +930,8 @@ interface IdentityHarness {
   readonly observations: NativeStatusObservation[];
   /** Every identity report, accepted or not, in order. */
   readonly identities: Array<string | null>;
+  /** Every title report, accepted or not, in order. */
+  readonly titles: Array<{ readonly conversationId: string; readonly title: string | null }>;
   readonly consumer: NativeStatusObserver;
   deliverCap(facts?: NativeCodexTuiRootFactsSource): void;
   latest(): NativeStatusObservation;
@@ -944,6 +946,8 @@ async function startIdentityHarness(options: {
   readonly workspace?: string;
   /** Owner acceptance for each identity report; defaults to accepting. */
   readonly accept?: (conversationId: string | null) => boolean;
+  /** Owner acceptance for each title report; defaults to accepting. */
+  readonly acceptTitle?: (conversationId: string, title: string | null) => boolean;
 }): Promise<IdentityHarness> {
   const server = new FakeCodexAppServer({
     threads: options.threads,
@@ -958,6 +962,7 @@ async function startIdentityHarness(options: {
   );
   const observations: NativeStatusObservation[] = [];
   const identities: Array<string | null> = [];
+  const titles: Array<{ readonly conversationId: string; readonly title: string | null }> = [];
   const emit = (observation: NativeStatusObservation): void => {
     observations.push(observation);
   };
@@ -972,12 +977,17 @@ async function startIdentityHarness(options: {
       identities.push(conversationId);
       return options.accept === undefined ? true : options.accept(conversationId);
     },
+    onConversationTitle: (conversationId, title) => {
+      titles.push({ conversationId, title });
+      return options.acceptTitle === undefined ? true : options.acceptTitle(conversationId, title);
+    },
   });
   return {
     server,
     facts,
     observations,
     identities,
+    titles,
     consumer,
     deliverCap: (override) => consumer.observeOwnedCodexBackend?.(makeSource(port, override ?? facts)),
     latest: () => observations[observations.length - 1] as NativeStatusObservation,
@@ -1542,6 +1552,133 @@ test("a stream end with no accepted identity is never a hold and never a null", 
       unsubscribe();
     } finally {
       await refused.close();
+    }
+  }
+});
+
+/* ================================= provider conversation TITLE (issue #690) */
+
+test("the accepted root's actual title is reported once, after its identity, and never on an observation", async () => {
+  const h = await startIdentityHarness({
+    threads: [{ ...restoredThread(WORKSPACE), name: "Investigate the flaky census" }],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    await until(() => h.identities.length === 1, "the identity");
+    await until(() => h.titles.length === 1, "the title from the same validated root read");
+    assert.deepEqual(h.identities, [RESTORED]);
+    assert.deepEqual(h.titles, [{ conversationId: RESTORED, title: "Investigate the flaky census" }]);
+    assert.equal(JSON.stringify(h.observations).includes("Investigate the flaky census"), false,
+      "a title never rides a status observation");
+
+    // A later census of the same root restates nothing new.
+    h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: idleStatus });
+    await settle(150);
+    assert.equal(h.titles.length, 1, "an unchanged title is never republished");
+
+    // The provider's own rename reaches this consumer only as a new read value.
+    h.server.setThread({ ...restoredThread(WORKSPACE), name: "Investigate the flaky census, take two" });
+    h.server.broadcast("thread/name/updated", { threadId: RESTORED, threadName: "Investigate the flaky census, take two" });
+    await until(() => h.titles.length === 2, "the renamed title from the next root read");
+    assert.deepEqual(h.titles[1], {
+      conversationId: RESTORED,
+      title: "Investigate the flaky census, take two",
+    });
+    assert.deepEqual(h.identities, [RESTORED], "a rename is not a new identity");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a root that positively reports no title says so, and a refused identity receives no title at all", async () => {
+  const titled = await startIdentityHarness({
+    threads: [{ ...restoredThread(WORKSPACE), name: null }],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+  });
+  try {
+    titled.deliverCap();
+    restoredCandidate(titled.facts);
+    await until(() => titled.titles.length === 1, "the positive no-title answer");
+    assert.deepEqual(titled.titles, [{ conversationId: RESTORED, title: null }]);
+  } finally {
+    await titled.close();
+  }
+
+  const refused = await startIdentityHarness({
+    threads: [{ ...restoredThread(WORKSPACE), name: "Never shown" }],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+    accept: () => false,
+  });
+  try {
+    refused.deliverCap();
+    restoredCandidate(refused.facts);
+    await until(() => refused.identities.length >= 1, "a refused identity report");
+    await settle(150);
+    assert.deepEqual(refused.titles, [], "a title without an accepted conversation is never offered");
+  } finally {
+    await refused.close();
+  }
+});
+
+test("a refused title is retried by the next validated root read, never by a timer of its own", async () => {
+  let accept = false;
+  const h = await startIdentityHarness({
+    threads: [{ ...restoredThread(WORKSPACE), name: "First offer" }],
+    loadedIds: [RESTORED],
+    resume: RESTORED,
+    workspace: WORKSPACE,
+    acceptTitle: () => accept,
+  });
+  try {
+    h.deliverCap();
+    restoredCandidate(h.facts);
+    await until(() => h.titles.length === 1, "the first offer");
+    await settle(150);
+    assert.equal(h.titles.length, 1, "a refused title is not retried while nothing new arrives");
+
+    accept = true;
+    h.server.broadcast("thread/status/changed", { threadId: RESTORED, status: idleStatus });
+    await until(() => h.titles.length === 2, "the next validated read retries it");
+    assert.deepEqual(h.titles[1], { conversationId: RESTORED, title: "First offer" });
+  } finally {
+    await h.close();
+  }
+});
+
+test("retirement reports no title, and nothing can follow it", async () => {
+  for (const retire of ["invalidate", "dispose"] as const) {
+    const h = await startIdentityHarness({
+      threads: [{ ...restoredThread(WORKSPACE), name: "Before retirement" }],
+      loadedIds: [RESTORED],
+      resume: RESTORED,
+      workspace: WORKSPACE,
+    });
+    try {
+      h.deliverCap();
+      restoredCandidate(h.facts);
+      await until(() => h.titles.length === 1, `${retire}: the title`);
+      const titlesBefore = h.titles.length;
+      const identitiesBefore = h.identities.length;
+      if (retire === "invalidate") h.consumer.invalidate?.();
+      else h.consumer.dispose();
+      await settle(150);
+      assert.equal(h.titles.length, titlesBefore, `${retire}: retirement never reports a title`);
+      assert.equal(h.identities.length, identitiesBefore, `${retire}: retirement never clears the saved identity`);
+
+      h.server.setThread({ ...restoredThread(WORKSPACE), name: "After retirement" });
+      h.server.broadcast("thread/name/updated", { threadId: RESTORED, threadName: "After retirement" });
+      await settle(150);
+      assert.equal(h.titles.length, titlesBefore, `${retire}: no callback follows retirement`);
+    } finally {
+      await h.close();
     }
   }
 });

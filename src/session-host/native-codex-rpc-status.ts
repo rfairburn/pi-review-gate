@@ -389,6 +389,18 @@ export interface NativeCodexRpcStatusObserverOptions {
    * `expectedWorkspace`.
    */
   readonly onRootContradicted?: () => void;
+  /**
+   * Called with the ACTUAL user-facing title the SAME validated root read reported
+   * for the bound root (issue #690), under exactly the fences that make
+   * {@linkcode NativeCodexRpcStatusObserverOptions.onRootValidated} fire — a matched
+   * workspace, the bound root's own row, the current connection and generation.
+   *
+   * `null` means the provider positively reported no title. A title the observer
+   * could not read, and a read that never validated the root, call nothing: unknown
+   * is never presented as "no title". It carries no status, no path, and no other
+   * provider text, and it is never called without `expectedWorkspace`.
+   */
+  readonly onRootTitle?: (title: string | null) => void;
   /** One complete, de-duplicated snapshot. */
   readonly onObservation: (observation: NativeStatusObservation) => void;
   /** Closed diagnostic codes only. */
@@ -537,6 +549,7 @@ export class NativeCodexRpcStatusObserver {
   readonly #expectedWorkspace: string | undefined;
   readonly #onRootValidated: (() => void) | undefined;
   readonly #onRootContradicted: (() => void) | undefined;
+  readonly #onRootTitle: ((title: string | null) => void) | undefined;
   /**
    * True once the census's own root read positively matched the expected
    * workspace on the CURRENT connection and binding. Cleared by any
@@ -612,6 +625,7 @@ export class NativeCodexRpcStatusObserver {
     this.#onRootContradicted = typeof options.onRootContradicted === "function"
       ? options.onRootContradicted
       : undefined;
+    this.#onRootTitle = typeof options.onRootTitle === "function" ? options.onRootTitle : undefined;
     this.#limits = normalizeLimits(options.limits);
     this.#scheduler = options.scheduler ?? REAL_SCHEDULER;
     this.#onObservation = options.onObservation;
@@ -1014,6 +1028,16 @@ export class NativeCodexRpcStatusObserver {
         }
         return;
       }
+      case "thread/name/updated": {
+        // A rename moves NO status axis: this publishes nothing, invents nothing, and
+        // clears nothing on its own. For the bound root it is only an invalidation
+        // hint that the next ordinary coalesced census re-reads — the authoritative
+        // title always comes from that root read, never from this edge — and outside
+        // the bound root it is not this row's evidence at all, exactly like every
+        // other unrelated broadcast. No poller and no extra request are added.
+        if (notification.threadId === this.#rootThreadId) this.#requestRefresh();
+        return;
+      }
       case "thread/deleted":
       case "thread/archived":
       case "thread/closed": {
@@ -1260,6 +1284,11 @@ export class NativeCodexRpcStatusObserver {
         const expectedWorkspace = this.#expectedWorkspace;
         let rootRow: NativeCodexThreadRow | null;
         let workspaceVerdict: "match" | "contrary" | "unread" = "unread";
+        // The title rides the SAME read that validates the root: no second request,
+        // no second socket, no separate authority. `undefined` means this host could
+        // not read the provider's title field; `null` means the provider says there
+        // is none.
+        let rootTitle: string | null | undefined;
         if (expectedWorkspace === undefined) {
           rootRow = await transport.readThread(rootThreadId);
         } else {
@@ -1269,6 +1298,7 @@ export class NativeCodexRpcStatusObserver {
           rootRow = read?.row ?? null;
           if (read !== null) {
             workspaceVerdict = read.row.threadId === rootThreadId && read.workspaceMatches ? "match" : "contrary";
+            rootTitle = read.title;
           }
         }
         if (stale()) return;
@@ -1309,6 +1339,16 @@ export class NativeCodexRpcStatusObserver {
             // is checked again before the census continues.
             try {
               this.#onRootValidated();
+            } catch {
+              // A caller's throw cannot corrupt this census.
+            }
+            if (stale()) return;
+          }
+          if (workspaceVerdict === "match" && rootTitle !== undefined && this.#onRootTitle !== undefined) {
+            // The title of a root this census positively matched, from this
+            // census's own read, under the same fences and the same re-check.
+            try {
+              this.#onRootTitle(rootTitle);
             } catch {
               // A caller's throw cannot corrupt this census.
             }

@@ -67,16 +67,23 @@ export function isNativeCliBackend(value: unknown): value is NativeCliBackend {
 export const MAX_NATIVE_DISPLAY_NAME_CHARS = 80;
 
 /**
- * The one native ROW DISPLAY NAME rule the whole host shares: a non-empty,
- * bounded, single-line value with no control characters.
+ * The one MANUAL CAPTION rule the whole host shares: a non-empty, bounded,
+ * single-line value with no control characters.
  *
- * This is deliberately NOT a conversation name. A native row has no observable
- * provider conversation name, so this is only a host-side caption the operator
- * chose for one sidebar row: it is never sent to the provider, never typed into
- * the child, never compared with, defaulted from, or stored as a Pi native
- * session identity, and it never renames anything outside this host's own row
- * presentation. Neither the sidebar nor the manager keeps its own copy of this
- * bound or its character class.
+ * This is the rule for text an OPERATOR typed: the caption they chose for one sidebar
+ * row (durable, remembered on the row's slot). It is deliberately NOT a conversation
+ * rename, and it is NOT the rule for a provider's own conversation title — an observed
+ * provider title is display text this host neither invented nor could edit, so it is
+ * measured against the canonical published-label bound it must survive travelling in
+ * ({@linkcode isValidNativeDisplayName} in the status protocol, the bound a Pi row's
+ * observed native name already satisfies), never against this input bound. Making the
+ * narrower manual bound out to be a provider limit would silently discard valid
+ * provider titles.
+ *
+ * Neither kind is ever sent to the provider, typed into the child, compared with,
+ * defaulted from, or stored as a Pi native session identity, and neither renames
+ * anything outside this host's own row presentation. Neither the sidebar nor the
+ * manager keeps its own copy of this bound or its character class.
  */
 export function isNativeDisplayName(value: unknown): value is string {
   return typeof value === "string"

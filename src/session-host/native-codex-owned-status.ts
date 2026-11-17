@@ -224,6 +224,15 @@ export interface OwnedNativeCodexStatusObserverOptions {
    * retirement, and never with a path or any other value.
    */
   readonly onConversationIdentity?: (conversationId: string | null) => boolean;
+  /**
+   * Owner-private TITLE channel (issue #690): one ACTUAL user-facing title the
+   * consumer's own validated root read reported for the exact conversation identity
+   * this owner already accepted, or an explicit `null` when that read positively
+   * reported no title. It is reported ONLY for an accepted identity, never before
+   * one, never after retirement, and never with a path, a preview, or any other
+   * provider text. Returns whether the owner accepted it.
+   */
+  readonly onConversationTitle?: (conversationId: string, title: string | null) => boolean;
 }
 
 /**
@@ -261,6 +270,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   /** The exact restored UUID B; undefined in fresh mode or when unusable. */
   readonly #restoreConversationId: string | undefined;
   readonly #onConversationIdentity: ((conversationId: string | null) => boolean) | undefined;
+  readonly #onConversationTitle: ((conversationId: string, title: string | null) => boolean) | undefined;
   /**
    * The root whose provider cwd the CURRENT observer positively matched to the
    * workspace. Evidence retained across a refused report so the next validated
@@ -269,6 +279,13 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   #validatedRootId: string | undefined;
   /** The identity the owner last ACCEPTED from this consumer. */
   #acceptedIdentity: string | undefined;
+  /**
+   * The title the owner last ACCEPTED, and only for
+   * {@linkcode OwnedNativeCodexStatusConsumer.#acceptedIdentity}. Dedupe state: a
+   * new accepted identity resets it, so a title proved for one conversation can
+   * never be reported as another conversation's.
+   */
+  #acceptedTitle: string | null | undefined;
   /**
    * True while status is withdrawn because the adopted TUI connection's stream
    * ended (`client-closed` or `backend-closed`) and an accepted identity is
@@ -324,6 +341,9 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       : undefined;
     this.#onConversationIdentity = typeof options.onConversationIdentity === "function"
       ? options.onConversationIdentity
+      : undefined;
+    this.#onConversationTitle = typeof options.onConversationTitle === "function"
+      ? options.onConversationTitle
       : undefined;
   }
 
@@ -569,6 +589,12 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
               onRootContradicted: () => {
                 this.#onRootContradicted(rootThreadId, epoch);
               },
+              // The SAME validated read that proves the identity also carries the
+              // root's actual title: no second read, no second socket, and no
+              // separate freshness path.
+              onRootTitle: (title) => {
+                this.#onRootTitle(rootThreadId, epoch, title);
+              },
             }),
         ...(this.#scheduler === undefined ? {} : { scheduler: this.#scheduler }),
         ...(this.#limits === undefined ? {} : { limits: this.#limits }),
@@ -615,7 +641,33 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#validatedRootId = undefined;
     if (this.#acceptedIdentity === undefined) return;
     this.#acceptedIdentity = undefined;
+    this.#acceptedTitle = undefined;
     this.#reportIdentityLoss();
+  }
+
+  /**
+   * The CURRENT observer's own validated root read reported the bound root's actual
+   * user-facing title, or positively reported that it has none, under every observer
+   * fence. A title is only ever about a conversation this owner already accepted, so
+   * nothing is reported before that proof and nothing is reported for a root this
+   * consumer never adopted. Unknown — a title the read could not carry — reports
+   * nothing at all, which is never the same claim as "no title".
+   */
+  #onRootTitle(rootThreadId: string, epoch: number, title: string | null): void {
+    if (this.#disposed || this.#retired || this.#withdrawn || epoch !== this.#epoch) return;
+    if (this.#rpc === undefined || this.#boundRootThreadId !== rootThreadId) return;
+    const accepted = this.#acceptedIdentity;
+    if (accepted === undefined || accepted !== rootThreadId) return;
+    const report = this.#onConversationTitle;
+    if (report === undefined) return;
+    if (this.#acceptedTitle === title) return;
+    let applied = false;
+    try {
+      applied = report(accepted, title) === true;
+    } catch {
+      applied = false;
+    }
+    if (applied) this.#acceptedTitle = title;
   }
 
   /**
@@ -643,6 +695,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#detachFacts();
     if (this.#acceptedIdentity === undefined) return;
     this.#acceptedIdentity = undefined;
+    this.#acceptedTitle = undefined;
     this.#reportIdentityLoss();
   }
 
@@ -662,7 +715,12 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     } catch {
       accepted = false;
     }
-    if (accepted) this.#acceptedIdentity = conversationId;
+    if (accepted) {
+      // A different accepted conversation is a different subject: the title this
+      // consumer last reported describes the previous one and is not carried over.
+      if (this.#acceptedIdentity !== conversationId) this.#acceptedTitle = undefined;
+      this.#acceptedIdentity = conversationId;
+    }
   }
 
   /**
@@ -751,6 +809,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       this.#heldConnectionId = this.#boundConnectionId;
     } else {
       this.#acceptedIdentity = undefined;
+      this.#acceptedTitle = undefined;
     }
     this.#validatedRootId = undefined;
     this.#currentTool = undefined;
@@ -794,6 +853,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#epoch += 1;
     // Retirement ends an identity-only hold silently: the saved identity stays.
     this.#closeHold = false;
+    this.#acceptedTitle = undefined;
     this.#closeRpc();
     this.#detachFacts();
     const legacy = this.#legacy;
@@ -813,6 +873,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     this.#retired = true;
     this.#epoch += 1;
     this.#closeHold = false;
+    this.#acceptedTitle = undefined;
     this.#closeRpc();
     this.#detachFacts();
     const legacy = this.#legacy;

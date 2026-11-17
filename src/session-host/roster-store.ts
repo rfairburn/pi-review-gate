@@ -180,12 +180,14 @@ export interface RosterEntry {
    * The operator's own host-side DISPLAY NAME of a native CLI row, keyed to this
    * stable slot.
    *
-   * This is a caption this host chose for its own row, NOT a conversation name:
-   * a native slot has no observable provider conversation NAME, so a remembered
-   * native slot restores this text as its row caption and nothing else. It is
-   * never a provider identity, never sent to a provider, and never itself a
-   * session, a resume target, or an auto-start. A Pi slot never carries it (a
-   * Pi row's name is the observed `name` above).
+   * This is a caption this host chose for its own row, NOT a conversation name: it
+   * is what the operator typed (or restored), and nothing else. A live row may also
+   * be titled by the provider's own actual conversation title, but that title is
+   * EPHEMERAL and is deliberately never stored here — a remembered native slot
+   * restores this text as its row caption and nothing else. It is never a provider
+   * identity, never sent to a provider, and never itself a session, a resume target,
+   * or an auto-start. A Pi slot never carries it (a Pi row's name is the observed
+   * `name` above).
    */
   readonly displayName?: string;
   /** Last observed native persistence evidence for this binding. */

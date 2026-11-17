@@ -89,6 +89,42 @@ test("a negotiated declaration round-trips through the strict decoder", () => {
   assert.equal(decoded?.activeShells, null);
 });
 
+test("an automatic provider title publishes on the existing label field, with no new protocol", () => {
+  // The three states a native row's effective label can be in (issue #690): the
+  // provider default, an automatic provider title, and an operator caption. They are
+  // the SAME field, so the published row — negotiated or not — has the same keys.
+  const providerDefault = toRemoteSessionMetadata(ownerView());
+  const automatic = toRemoteSessionMetadata(ownerView({ label: "Investigate the flaky census" }));
+  const captioned = toRemoteSessionMetadata(ownerView({ label: "Fleet work" }));
+
+  assert.deepEqual(Object.keys(automatic).sort(), Object.keys(providerDefault).sort(),
+    "a provider title adds no field to the published row");
+  assert.deepEqual(Object.keys(captioned).sort(), Object.keys(providerDefault).sort(),
+    "and neither does a caption");
+  assert.equal(automatic.label, "Investigate the flaky census");
+  assert.deepEqual(parseRemoteSessionMetadata(jsonRoundTrip(automatic)), automatic,
+    "the existing strict decoder accepts the titled row unchanged");
+
+  // A provider title longer than the operator's own caption bound is publishable text:
+  // it travels on the label a peer already accepts, whole and unclipped, and the
+  // existing strict decoder round-trips it. This is exactly why the manual caption's
+  // narrower input bound could not be reused as the title bound.
+  const longTitle = "Investigating the census read that raced the " + "generation".repeat(8) + " boundary";
+  assert.ok(longTitle.length > 80, "the fixture really is over the manual caption bound");
+  const titled = toRemoteSessionMetadata(ownerView({ label: longTitle }));
+  assert.deepEqual(Object.keys(titled).sort(), Object.keys(providerDefault).sort());
+  assert.deepEqual(parseRemoteSessionMetadata(jsonRoundTrip(titled)), titled,
+    "a peer's decoder accepts a long provider title on the existing label field");
+  assert.equal(titled.label, longTitle, "and nothing about it is clipped on the way out");
+
+  // A peer that tried to widen the row with a separate title field is refused, not
+  // accommodated — the label stays the only name a peer ever receives.
+  assert.equal(parseRemoteSessionMetadata({
+    ...jsonRoundTrip(automatic),
+    conversationTitle: "Investigate the flaky census",
+  }), null);
+});
+
 test("a legacy row without the field decodes unchanged, and an unknown key still fails closed", () => {
   const legacy = toRemoteSessionMetadata(ownerView());
   const decoded = parseRemoteSessionMetadata(jsonRoundTrip(legacy));

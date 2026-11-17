@@ -64,6 +64,7 @@ import {
   type NativeClaudeWatchHandlers,
 } from "../src/session-host/native-claude-acquisition";
 import type { NativeStatusObservation } from "../src/session-host/native-status";
+import { MAX_NATIVE_SESSION_NAME_LENGTH } from "../src/session-host/protocol";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const OTHER_SESSION = "22222222-2222-4222-8222-222222222222";
@@ -104,6 +105,7 @@ async function createHarness(options: {
   workspace?: string;
   resumeConversationId?: string;
   onConversationIdentity?: (conversationId: string | null) => boolean | void;
+  onConversationTitle?: (conversationId: string, title: string) => boolean | void;
 } = {}): Promise<Harness> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prg-native-claude-acq-"));
   dirs.push(dir);
@@ -126,6 +128,7 @@ async function createHarness(options: {
     ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
     ...(options.resumeConversationId === undefined ? {} : { resumeConversationId: options.resumeConversationId }),
     ...(options.onConversationIdentity === undefined ? {} : { onConversationIdentity: options.onConversationIdentity }),
+    ...(options.onConversationTitle === undefined ? {} : { onConversationTitle: options.onConversationTitle }),
   });
   const bind = options.bindTranscript !== false;
   return {
@@ -6611,4 +6614,905 @@ test("shutdown: another root adopted without its own SessionStart after an ordin
   c.hook("PreToolUse", { session_id: OTHER_SESSION, agent_id: "agent-1", tool_name: "Bash", tool_use_id: "t-1" });
   c.controller.dispose();
   assert.deepEqual(child.calls, [SESSION]);
+});
+
+/* ---------------------------------- provider conversation TITLE (issue #690) */
+
+interface TitleRecorder {
+  readonly calls: { readonly conversationId: string; readonly title: string }[];
+  accept: boolean;
+  readonly report: (conversationId: string, title: string) => boolean;
+}
+
+/** The owner's private title channel: records every report, accepts on demand. */
+function titleRecorder(accept = true): TitleRecorder {
+  const recorder: TitleRecorder = {
+    calls: [],
+    accept,
+    report: (conversationId, title) => {
+      recorder.calls.push({ conversationId, title });
+      return recorder.accept;
+    },
+  };
+  return recorder;
+}
+
+/**
+ * One persisted title row, in the shape the provider records its own title claim:
+ * the title is a top-level field of the row, and the row's `type` is not what makes
+ * it a title — only the two title fields themselves are ever read. `customTitle` is
+ * the title the operator gave the conversation inside the provider, `aiTitle` the one
+ * the provider generated for it.
+ */
+function titleRow(field: "customTitle" | "aiTitle", title: unknown, extra: Record<string, unknown> = {}): string {
+  return jsonRow({
+    type: "system",
+    subtype: field === "customTitle" ? "custom-title" : "ai-title",
+    sessionId: SESSION,
+    uuid: `title-row-${field}`,
+    timestamp: "2026-01-01T00:02:00.000Z",
+    [field]: title,
+    ...extra,
+  });
+}
+
+/**
+ * A host-owned run whose exact root conversation is proved and whose transcript lane
+ * is live (the launch baseline keeps counts published, which is what keeps the one
+ * watcher armed). This is the ordinary shape of a row this host started.
+ */
+async function titledHarness(workspace: string, identity: IdentityRecorder, titles: TitleRecorder, seed?: string): Promise<Harness> {
+  const h = await createHarness({
+    workspace,
+    ...(seed === undefined ? {} : { seed }),
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(30);
+  assert.deepEqual(identity.calls, [SESSION], "the fixture's identity is proved");
+  return h;
+}
+
+test("title: a root custom title this run's own transcript names is reported once for the proved conversation, and a rename updates it", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identity, titles);
+  assert.equal(titles.calls.length, 0, "nothing is claimed before the provider names a title");
+
+  await h.append(titleRow("customTitle", "Ship the release notes"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Ship the release notes" }]);
+
+  // The same row read again (a re-scan, a duplicate append) never re-reports.
+  await h.append(titleRow("customTitle", "Ship the release notes"));
+  await settle();
+  assert.equal(titles.calls.length, 1, "an unchanged title is never published twice");
+
+  // The provider's own rename is a new fact about the SAME conversation.
+  await h.append(titleRow("customTitle", "Ship the release notes, take two"));
+  await settle();
+  assert.deepEqual(titles.calls.map((call) => call.title), [
+    "Ship the release notes",
+    "Ship the release notes, take two",
+  ]);
+
+  // A title is never a status value: nothing about the row's foreground, counts, or
+  // activity changed, and the text never reaches an observation.
+  assert.equal(JSON.stringify(h.snapshots).includes("release notes"), false,
+    "the title travels on its own channel, never inside a status snapshot");
+  h.controller.dispose();
+});
+
+test("title: a provider-generated title is reported, and a custom title outranks it as the provider's own fold ranks them", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  await h.append(titleRow("aiTitle", "Debug flaky session host tests"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Debug flaky session host tests" }]);
+
+  // A custom title outranks the generated one, whenever either arrived.
+  await h.append(titleRow("customTitle", "Named by hand"));
+  await settle();
+  assert.deepEqual(titles.calls.at(-1), { conversationId: SESSION, title: "Named by hand" });
+
+  // A LATER generated title does not outrank a custom title the provider still
+  // reports: the fold ranks custom over generated, not newest over newest.
+  await h.append(titleRow("aiTitle", "A newer generated title"));
+  await settle();
+  assert.equal(titles.calls.length, 2, "the custom title still stands");
+  h.controller.dispose();
+});
+
+test("title: nothing is invented — prompts, summaries, first lines, and previews are never titles", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  await h.append(jsonRow({
+    type: "system",
+    subtype: "summary",
+    sessionId: SESSION,
+    summary: "a summary line that is not a title",
+    lastPrompt: "the last prompt, which is not a title either",
+    firstPrompt: "the first prompt, never a title",
+    preview: "a preview, never a title",
+    uuid: "not-a-title-row",
+    timestamp: "2026-01-01T00:03:00.000Z",
+  }));
+  await h.append(rootUserRow());
+  await h.append(summaryRow());
+  await settle();
+  assert.equal(titles.calls.length, 0, "the two title fields are the only source, and neither is present");
+  h.controller.dispose();
+});
+
+test("title: a sidechain, agent-scoped, or other-conversation title row can never name this run", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  await h.append(titleRow("customTitle", "A child agent's title", { agentId: "agent-1" }));
+  await h.append(titleRow("customTitle", "A sidechain's title", { isSidechain: true }));
+  await h.append(titleRow("customTitle", "Another conversation's title", { sessionId: OTHER_SESSION }));
+  await h.append(titleRow("aiTitle", "Another conversation's generated title", { sessionId: OTHER_SESSION }));
+  await settle();
+  assert.equal(titles.calls.length, 0, "no foreign title is attributed to this row's conversation");
+  h.controller.dispose();
+});
+
+test("title: an unusable title is refused whole, never clipped, and a later valid one still lands", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  for (const unusable of ["", "   ", "padded ", "two\nlines", "a\ttab", `nul\u0000`,
+    "a".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 1), 42, true, {}, []]) {
+    await h.append(titleRow("customTitle", unusable));
+    await h.append(titleRow("aiTitle", unusable));
+  }
+  await settle();
+  assert.equal(titles.calls.length, 0, "a provider string this host cannot display is refused, never clipped or coerced");
+
+  await h.append(titleRow("customTitle", "A title that fits the rule"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "A title that fits the rule" }]);
+  h.controller.dispose();
+});
+
+test("title: nothing is offered before the owner accepted a conversation identity", async () => {
+  const titles = titleRecorder();
+  // No workspace: the conversation can never be proved, so nothing can be attributed.
+  const h = await createHarness({ onConversationTitle: titles.report });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup" });
+  await h.append(titleRow("customTitle", "An unattributable title"));
+  await settle();
+  assert.equal(titles.calls.length, 0, "a title with no proved conversation is never reported");
+  h.controller.dispose();
+});
+
+test("title: a refused report is retried by a later window, never by a timer of its own", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder(false);
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  await h.append(titleRow("customTitle", "Offered and refused"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Offered and refused" }]);
+  await settle(120);
+  assert.equal(titles.calls.length, 1, "a refused title is not retried while nothing new arrives");
+
+  titles.accept = true;
+  await h.append(titleRow("customTitle", "Offered and accepted"));
+  await settle();
+  assert.deepEqual(titles.calls.map((call) => call.title), ["Offered and refused", "Offered and accepted"],
+    "the next window carrying the title is what retries it");
+  h.controller.dispose();
+});
+
+test("title: a genuine conversation rebind withdraws the title, and the old conversation's rows can never name the new one", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identity, titles);
+
+  await h.append(titleRow("customTitle", "First conversation"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "First conversation" }]);
+
+  // The provider replaces the conversation in the live process.
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  await settle();
+  assert.deepEqual(identity.calls, [SESSION, OTHER_SESSION]);
+  assert.equal(titles.calls.length, 1, "the previous conversation's title is never re-offered for the new one");
+
+  // The new conversation's own row names its own title.
+  await h.append(titleRow("customTitle", "Second conversation", { sessionId: OTHER_SESSION }));
+  await settle();
+  assert.deepEqual(titles.calls.at(-1), { conversationId: OTHER_SESSION, title: "Second conversation" });
+
+  // A late row of the PREVIOUS conversation cannot move the new one's title.
+  await h.append(titleRow("customTitle", "Stale first conversation"));
+  await settle();
+  assert.equal(titles.calls.length, 2, "a foreign conversation's row is not this row's evidence");
+  h.controller.dispose();
+});
+
+test("title: a title the provider recorded before this host started watching hydrates for the proved conversation while its prior status rows still never replay", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  // A synthetic transcript of a conversation that already happened — model rows, a
+  // tool row, the provider's own title, and a completed turn's summary — every byte
+  // of it written before this host ever opened the file.
+  const h = await createHarness({
+    workspace,
+    seed: priorHistory()
+      + rootAssistantToolUseRow()
+      + titleRow("customTitle", "Already named by the provider")
+      + rootAssistantTextRow()
+      + summaryRow(),
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  await settle(30);
+  assert.equal(titles.calls.length, 0, "nothing is claimed before this run proves which conversation it runs");
+
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(30);
+  assert.deepEqual(identity.calls, [SESSION], "the fixture's identity is proved");
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Already named by the provider" }],
+    "the title already in the one bound transcript reaches the row: no new title record, no prompt, no rename");
+
+  // The read that produced it is metadata-only. The status floor still sits past
+  // every prior row, so none of them closed a turn, moved a count, named a tool, or
+  // published anything.
+  const snapshotsAfterProof = h.snapshots.length;
+  const state = h.latest();
+  assert.deepEqual([state.busy, state.pendingInput, state.activeTasks, state.activeShells],
+    [false, false, 0, 0], "the row states exactly the host's own launch baseline");
+  await settle(150);
+  assert.equal(h.snapshots.length, snapshotsAfterProof, "the title read publishes no status snapshot at all");
+  assert.deepEqual(h.gaps, [], "reading the title metadata is not a source gap");
+  assert.equal(h.snapshots.some((s) => s.busy === true || s.busy === null), false,
+    "no prior prompt or turn boundary was replayed into the foreground");
+  assert.equal(h.snapshots.some((s) => s.activity.includes("Bash")), false,
+    "no prior tool row was replayed into activity");
+  assert.equal(h.snapshots.some((s) => s.activeTasks !== 0 || s.activeShells !== 0), false,
+    "no prior row moved a published count");
+  assert.equal(JSON.stringify(h.snapshots).includes("Already named by the provider"), false,
+    "the title travels on its own channel, never inside a status snapshot");
+
+  // A rename of the SAME conversation is still noticed afterwards, on the watched file.
+  await h.append(titleRow("customTitle", "Renamed after the host started watching"));
+  await settle();
+  assert.deepEqual(titles.calls.at(-1), { conversationId: SESSION, title: "Renamed after the host started watching" });
+  h.controller.dispose();
+});
+
+test("title: an existing custom title outranks a generated title the provider recorded after it", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  // The file's own order: the operator's custom title first, a generated title
+  // recorded later. The provider's fold ranks custom over generated, and this host
+  // reads that ranking, not an arrival order of its own.
+  const h = await titledHarness(workspace, identityRecorder(), titles,
+    priorHistory()
+    + titleRow("customTitle", "Named by the operator")
+    + titleRow("aiTitle", "Generated after the custom title"));
+  await settle(120);
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Named by the operator" }]);
+
+  await h.append(titleRow("aiTitle", "A newer generated title"));
+  await settle();
+  assert.equal(titles.calls.length, 1, "a later generated row still does not outrank the existing custom title");
+  h.controller.dispose();
+});
+
+test("title: a resumed conversation's already-recorded title reaches the row on its own resume proof, with no prior status replay", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await restoredHarness(workspace, identity, {
+    seed: priorHistory()
+      + rootAssistantToolUseRow()
+      + titleRow("aiTitle", "Restored conversation")
+      + summaryRow(),
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  await settle(60);
+  assert.deepEqual(identity.calls, [], "a restored run proves nothing before its own resume");
+  assert.equal(titles.calls.length, 0, "and claims no title for a conversation it has not proved");
+
+  h.hook("SessionStart", { source: "resume", cwd: workspace });
+  await settle(150);
+  assert.deepEqual(identity.calls, [SESSION], "the exact expected conversation is proved");
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Restored conversation" }],
+    "the restored row shows the title that conversation already has, without a new title row");
+  assert.equal(h.snapshots.some((s) => s.busy === true || s.busy === null), false,
+    "the resumed conversation's older rows replay no foreground state");
+  assert.equal(h.snapshots.some((s) => s.activity.includes("Bash")), false, "or its older tool activity");
+  h.controller.dispose();
+});
+
+test("title: a hydration read that finishes after the conversation was replaced names nothing", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await createHarness({
+    createEmpty: true,
+    workspace,
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  await h.append(titleRow("customTitle", "Conversation A's recorded title"));
+
+  // Arm A's metadata read...
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  // ...and replace the conversation in the SAME synchronous stretch, before that
+  // read's continuation can run. The read of A is still in flight.
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  await settle(150);
+
+  assert.ok(identity.calls.includes(OTHER_SESSION),
+    `the run is now proved to be conversation B: ${JSON.stringify(identity.calls)}`);
+  assert.equal(titles.calls.length, 0,
+    "A's late read cannot name B, and B's own read refuses A's rows by their own session");
+
+  // B's own recorded title still lands, which proves the lane is alive rather than
+  // merely silent.
+  await h.append(titleRow("customTitle", "Conversation B's recorded title", { sessionId: OTHER_SESSION }));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: OTHER_SESSION, title: "Conversation B's recorded title" }]);
+  h.controller.dispose();
+});
+
+test("title: hydration never guesses — a recorded foreign or unusable title publishes nothing", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles,
+    priorHistory()
+    + titleRow("customTitle", "A child agent's title", { agentId: "agent-1" })
+    + titleRow("customTitle", "A sidechain's title", { isSidechain: true })
+    + titleRow("customTitle", "Another conversation's title", { sessionId: OTHER_SESSION })
+    + titleRow("aiTitle", "Another conversation's generated title", { sessionId: OTHER_SESSION })
+    + titleRow("customTitle", "   ")
+    + titleRow("aiTitle", "padded ")
+    + titleRow("customTitle", "two\nlines")
+    + titleRow("aiTitle", "a".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 1))
+    + jsonRow({
+      type: "system",
+      subtype: "summary",
+      sessionId: SESSION,
+      summary: "a summary line that is not a title",
+      lastPrompt: "the last prompt, which is not a title either",
+      firstPrompt: "the first prompt, never a title",
+      uuid: "not-a-title-row",
+    }));
+  await settle(150);
+  assert.equal(titles.calls.length, 0,
+    "a foreign, sidechain, agent-scoped, unusable, or non-title row is never turned into this row's title");
+  h.controller.dispose();
+});
+
+test("title: a bound transcript that is not there yet is not guessed at, and a missing file claims nothing", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await createHarness({
+    createEmpty: true,
+    workspace,
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(150);
+  assert.deepEqual(identity.calls, [SESSION], "the conversation is proved even with no file yet");
+  assert.equal(titles.calls.length, 0, "an absent source states no title, and nothing is invented for it");
+  assert.deepEqual(h.gaps, [], "a root JSONL the provider has not created is not reported as a gap");
+  h.controller.dispose();
+});
+
+test("title: a window that cannot reach the file's first record hydrates a last custom title and never a generated one", async () => {
+  const workspace = await makeWorkspace();
+  const filler = jsonRow({
+    type: "system",
+    subtype: "keep-alive",
+    uuid: "filler-row-1",
+    padding: "x".repeat(512),
+  });
+  // Small enough that the one bounded window cannot start at byte 0.
+  const seedHead = priorHistory() + filler + filler;
+
+  // Only a GENERATED title in the window, with the file's CUSTOM title sitting in the
+  // unread head: this read proves nothing, and the custom-title ceiling it leaves
+  // unknown also stops a LATER generated append from outranking that custom title.
+  const generatedOnly = titleRecorder();
+  const g = await createHarness({
+    workspace,
+    seed: titleRow("customTitle", "A custom title no window reached") + seedHead
+      + titleRow("aiTitle", "A generated title in the tail window"),
+    maxTailBytes: 600,
+    onConversationIdentity: identityRecorder().report,
+    onConversationTitle: generatedOnly.report,
+  });
+  g.controller.observeOwnedStartup();
+  g.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(150);
+  assert.equal(generatedOnly.calls.length, 0,
+    "a generated title read over an unread head is not proof, and nothing is guessed");
+
+  await g.append(titleRow("aiTitle", "A generated title appended afterwards"));
+  await settle();
+  assert.equal(generatedOnly.calls.length, 0,
+    "an incremental generated row cannot outrank a custom title this host never read");
+  g.controller.dispose();
+
+  // A CUSTOM title in the window is proof on its own terms: the window reaches the
+  // end of the file, so nothing after it went unread, and a custom title outranks
+  // anything the unread head could hold.
+  const customFound = titleRecorder();
+  const c = await createHarness({
+    workspace,
+    seed: seedHead + titleRow("customTitle", "The file's last custom title"),
+    maxTailBytes: 600,
+    onConversationIdentity: identityRecorder().report,
+    onConversationTitle: customFound.report,
+  });
+  c.controller.observeOwnedStartup();
+  c.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(150);
+  assert.deepEqual(customFound.calls, [{ conversationId: SESSION, title: "The file's last custom title" }],
+    "the last custom row in the file is inside any window that reaches the end of the file");
+  c.controller.dispose();
+});
+
+/**
+ * A host-owned run with a proved conversation whose ONE title hydration read is
+ * parked just before it commits, with every transcript read driven by the test rather
+ * than by a real file watch. The FIRST open of the bound transcript is that parked
+ * title read (the identity proof arms it before anything else can open the file), so
+ * a test can hold it across a lane loss, a reset, a replacement, a truncation, or a
+ * newer rename, and then let it land.
+ */
+async function parkedTitleHarness(seed: string, maxTailBytes?: number): Promise<{
+  readonly h: Harness;
+  readonly workspace: string;
+  readonly titles: TitleRecorder;
+  readonly received: NativeClaudeWatchHandlers[];
+  readonly first: ObservedOpen;
+  readonly opens: ReturnType<typeof observeOpens>;
+}> {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({
+    workspace,
+    seed,
+    ...(maxTailBytes === undefined ? {} : { maxTailBytes }),
+    watchFile: manualWatch(received),
+    onConversationIdentity: identityRecorder().report,
+    onConversationTitle: titles.report,
+  });
+  const opens = observeOpens([h.transcript]);
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  const [first] = opens.of(h.transcript);
+  assert.ok(first !== undefined, "the identity proof armed a title read");
+  // The identity proof arms the title read BEFORE this run's ordinary monitoring read
+  // of the same file is issued, so the parked FIRST open is the hydration read. Every
+  // test below is self-checking on that: an un-parked hydration read would already
+  // have published the seed's title by the time it asserts.
+  return { h, workspace, titles, received, first, opens };
+}
+
+test("title: a hydration read that lands after a hook-lane loss publishes nothing, and only the same conversation's own recovery reads again", async () => {
+  const f = await parkedTitleHarness(priorHistory() + titleRow("customTitle", "The name recorded before the gap"));
+  try {
+    // The authenticated lane fails while that read is in flight. This source can no
+    // longer state which conversation the row runs, and metadata captured BEFORE that
+    // boundary is not evidence about anything after it — even though the conversation,
+    // the path, and the session all match again the moment the gap closes.
+    f.h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+    f.first.release();
+    await settle(150);
+    assert.equal(f.titles.calls.length, 0, "the read parked before the gap publishes nothing when it lands after it");
+
+    // This run's own admitted ROOT hook names the SAME conversation again. That is a
+    // fresh boundary, and it takes a fresh read of the file bound now.
+    f.h.hook("UserPromptSubmit", { prompt_id: "after-the-gap" });
+    await settle(150);
+    assert.deepEqual(f.titles.calls, [{ conversationId: SESSION, title: "The name recorded before the gap" }],
+      "the title returns from a read taken AFTER the recovery, never from the parked one");
+  } finally {
+    f.opens.restore();
+    f.h.controller.dispose();
+  }
+});
+
+test("title: a rename consumed before a hook-lane gap is recovered from a bounded window that starts inside a record, with no new title row", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const filler = jsonRow({
+    type: "system",
+    subtype: "keep-alive",
+    uuid: "filler-row-5",
+    padding: "z".repeat(400),
+  });
+  // Deliberately larger than the ONE bounded window this host may read, so the read
+  // recovery takes cannot start on a record boundary: the window cuts a row in half,
+  // and the discarded leading partial's bytes still count inside what the reader
+  // actually consumed. A title's position must therefore be derived from the records
+  // returned, exactly as the watched read derives it, or the same row would be given
+  // two different positions in the same file.
+  const h = await createHarness({
+    workspace,
+    seed: priorHistory() + filler + filler + filler + filler,
+    maxTailBytes: 600,
+    onConversationIdentity: identityRecorder().report,
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(60);
+  assert.equal(titles.calls.length, 0, "nothing is named before the provider names anything");
+
+  // The provider renames this conversation and this host's watched read consumes that
+  // row, so the row's name reaches the sidebar row.
+  await h.append(titleRow("customTitle", "Renamed before the gap"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Renamed before the gap" }]);
+
+  // The authenticated lane fails and this run's own ROOT hook proves the SAME
+  // conversation again, with NO new title row anywhere: recovery takes one fresh
+  // metadata read of the bound file and must re-find the custom row that is still the
+  // file's last one, rather than rejecting it over a position that no longer applies.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  await settle(60);
+  h.hook("UserPromptSubmit", { prompt_id: "after-the-gap" });
+  await settle();
+  assert.deepEqual(titles.calls, [
+    { conversationId: SESSION, title: "Renamed before the gap" },
+    { conversationId: SESSION, title: "Renamed before the gap" },
+  ], "the same conversation is titled again by a fresh bounded read, with no new append");
+  h.controller.dispose();
+});
+
+test("title: a transcript rewritten at smaller offsets during a hook-lane gap is retitled by recovery, not rejected by positions from before the gap", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const filler = jsonRow({
+    type: "system",
+    subtype: "keep-alive",
+    uuid: "filler-row-6",
+    padding: "w".repeat(400),
+  });
+  const h = await createHarness({
+    workspace,
+    seed: priorHistory() + filler + filler + filler + filler,
+    maxTailBytes: 600,
+    onConversationIdentity: identityRecorder().report,
+    onConversationTitle: titles.report,
+  });
+  h.controller.observeOwnedStartup();
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle(60);
+  await h.append(titleRow("customTitle", "Renamed deep in a long transcript"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Renamed deep in a long transcript" }]);
+
+  h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  await settle(60);
+
+  // The provider rewrites THIS transcript — the same file behind the same path — and
+  // this conversation's current custom title now sits far earlier in it.
+  const before = await fs.stat(h.transcript);
+  await fs.writeFile(h.transcript,
+    priorHistory() + titleRow("customTitle", "Rewritten while the lane was dark"), "utf8");
+  const after = await fs.stat(h.transcript);
+  assert.equal(after.ino, before.ino, "the same file behind the same path, rewritten smaller");
+  assert.ok(after.size < before.size, "and its title row now starts at a smaller offset");
+
+  // Recovery of the SAME conversation takes one fresh read of the file as it is now.
+  // Positions that belonged to the file before the gap cannot outweigh it: the row is
+  // named by the transcript that exists, at the position it exists at.
+  h.hook("UserPromptSubmit", { prompt_id: "after-the-gap" });
+  await settle();
+  assert.deepEqual(titles.calls.at(-1), { conversationId: SESSION, title: "Rewritten while the lane was dark" },
+    "recovery accepts the fresh title at its new, smaller position");
+  assert.equal(titles.calls.length, 2, JSON.stringify(titles.calls));
+  h.controller.dispose();
+});
+
+test("title: a hydration read that lands after the conversation was replaced and then restored names nothing from before those resets", async () => {
+  const f = await parkedTitleHarness(priorHistory() + titleRow("customTitle", "Conversation A's recorded title"));
+  try {
+    // Conversation B replaces A while A's read is parked. B's own read of the same
+    // file refuses A's rows by their own session, so nothing is claimed.
+    f.h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: f.workspace });
+    await settle(150);
+    assert.equal(f.titles.calls.length, 0, "A's parked read cannot name B");
+
+    // A is proved again in this same process: a new boundary, a new read.
+    f.h.hook("SessionStart", { source: "startup", session_id: SESSION, cwd: f.workspace });
+    f.first.release();
+    await settle(150);
+    assert.deepEqual(f.titles.calls, [{ conversationId: SESSION, title: "Conversation A's recorded title" }],
+      "A's own new proof reads A's title afresh; the parked read contributed nothing");
+  } finally {
+    f.opens.restore();
+    f.h.controller.dispose();
+  }
+});
+
+test("title: a file replaced or truncated behind an in-flight hydration read publishes nothing", async () => {
+  // A replacement: the bound PATH still exists and still names this run, but the file
+  // behind it is gone. The tail reader verified the identity it OPENED and never looks
+  // at the path again, so only a revalidation at commit can catch this.
+  const replaced = await parkedTitleHarness(priorHistory() + titleRow("customTitle", "The first file's title"));
+  try {
+    const elsewhere = path.join(replaced.h.dir, "replacement.jsonl");
+    await fs.writeFile(elsewhere,
+      priorHistory() + titleRow("customTitle", "A different file's title"), "utf8");
+    await fs.rename(elsewhere, replaced.h.transcript);
+    replaced.first.release();
+    await settle(150);
+    assert.equal(replaced.titles.calls.length, 0,
+      "bytes read from a file that is no longer behind the bound path name nothing");
+  } finally {
+    replaced.opens.restore();
+    replaced.h.controller.dispose();
+  }
+
+  // A truncation: the same inode, but the bytes this read took are no longer there.
+  const truncated = await parkedTitleHarness(priorHistory() + titleRow("customTitle", "A title in the truncated file"));
+  try {
+    await fs.truncate(truncated.h.transcript, 0);
+    truncated.first.release();
+    await settle(150);
+    assert.equal(truncated.titles.calls.length, 0,
+      "bytes the file no longer holds are not evidence, and nothing is claimed");
+  } finally {
+    truncated.opens.restore();
+    truncated.h.controller.dispose();
+  }
+});
+
+test("title: a generated title appended while initial coverage is still pending never outranks a custom title in the unread head", async () => {
+  const filler = jsonRow({
+    type: "system",
+    subtype: "keep-alive",
+    uuid: "filler-row-2",
+    padding: "y".repeat(512),
+  });
+  const f = await parkedTitleHarness(
+    titleRow("customTitle", "A custom title no window reached") + priorHistory() + filler
+    + titleRow("aiTitle", "A generated title in the tail window"),
+    600,
+  );
+  try {
+    // The rename of the STATUS lane's own read runs while the title read is still
+    // parked, so an incremental generated row lands FIRST. The provider ranks a custom
+    // title over a generated one, and this host has not established what this file's
+    // last custom row is, so the generated row stays unpublished rather than becoming
+    // the row's name.
+    await f.h.append(titleRow("aiTitle", "A generated title appended during the pending read"));
+    readNow(f.received);
+    // The watched read is issued for real (a busy lane defers it, it does not drop
+    // it), and it completes: only then does "nothing was published" mean anything.
+    await waitFor(() => f.opens.of(f.h.transcript).length >= 3, "the watched read of the appended row was issued");
+    await committed(f.opens.of(f.h.transcript).filter((read) => read !== f.first));
+    await settle(150);
+    assert.equal(f.titles.calls.length, 0, "no generated title is published while custom-title coverage is pending");
+
+    // The parked read lands: its window cannot reach the custom title either, so it
+    // establishes nothing and the row still keeps its provider label.
+    f.first.release();
+    await settle(150);
+    assert.equal(f.titles.calls.length, 0, "and the pending read did not quietly settle the ceiling either");
+  } finally {
+    f.opens.restore();
+    f.h.controller.dispose();
+  }
+});
+
+test("title: a whole-file title read that lands after a newer rename was consumed never rolls the title back", async () => {
+  const f = await parkedTitleHarness(priorHistory() + titleRow("customTitle", "The name recorded first"));
+  try {
+    // The watched read consumes a rename while the whole-file title read is parked.
+    await f.h.append(titleRow("customTitle", "Renamed while the title read was in flight"));
+    readNow(f.received);
+    await waitFor(() => f.titles.calls.length > 0, "the rename reaches the row on its own read");
+    assert.deepEqual(f.titles.calls, [{ conversationId: SESSION, title: "Renamed while the title read was in flight" }],
+      "the rename reaches the row on its own read");
+
+    // The parked read lands now. It saw only the older row, and that row sits at a
+    // lower offset in the same file, so it cannot roll the row back — and the cursor
+    // has already consumed the rename, so a rollback would be permanent.
+    f.first.release();
+    await settle(200);
+    assert.deepEqual(f.titles.calls, [{ conversationId: SESSION, title: "Renamed while the title read was in flight" }],
+      "an older row's title never overwrites a newer one this host already applied");
+  } finally {
+    f.opens.restore();
+    f.h.controller.dispose();
+  }
+});
+
+test("title: a brand-new conversation's first records are read once from the start, and its first title lands", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await createHarness({
+    createEmpty: true,
+    workspace,
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  // The provider writes the title row as part of starting the conversation, before
+  // the fresh-start corroboration read runs.
+  await h.append(titleRow("customTitle", "Named at creation"));
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  await settle();
+  assert.deepEqual(identity.calls, [SESSION]);
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Named at creation" }],
+    "the one whole-file read this scope makes also sees its title");
+  h.controller.dispose();
+});
+
+test("title: a title row moves no status axis and never reaches an observation", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+  const before = { ...h.latest() };
+
+  await h.append(titleRow("customTitle", "Silent to the status lane"));
+  await h.append(titleRow("aiTitle", "Also silent"));
+  await settle();
+  assert.deepEqual(titles.calls.map((call) => call.title), ["Silent to the status lane"]);
+  const after = h.latest();
+  assert.equal(after.busy, before.busy);
+  assert.equal(after.pendingInput, before.pendingInput);
+  assert.equal(after.activeTasks, before.activeTasks);
+  assert.equal(after.activeShells, before.activeShells);
+  assert.deepEqual(after.activity, before.activity);
+  assert.equal(JSON.stringify(h.snapshots).includes("Silent to the status lane"), false);
+  h.controller.dispose();
+});
+
+test("title: a whole-file read that finishes after the conversation was rebound names nothing", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await createHarness({
+    createEmpty: true,
+    workspace,
+    onConversationIdentity: identity.report,
+    onConversationTitle: titles.report,
+  });
+  await h.append(titleRow("customTitle", "The first conversation's title"));
+
+  // Start the one whole-file read of conversation A...
+  h.hook("SessionStart", { source: "startup", cwd: workspace });
+  // ...and replace the conversation in the SAME synchronous stretch, before that
+  // read's continuation can run. The read of A is still in flight.
+  h.hook("SessionStart", { source: "clear", session_id: OTHER_SESSION, cwd: workspace });
+  await settle(120);
+
+  assert.ok(identity.calls.includes(OTHER_SESSION),
+    `the run is now proved to be conversation B: ${JSON.stringify(identity.calls)}`);
+  assert.equal(titles.calls.length, 0,
+    "A's late read cannot leave its title in the ledger for B to publish");
+
+  // B's own title still lands normally, which proves the lane is alive rather than
+  // merely silent.
+  await h.append(titleRow("customTitle", "The second conversation's title", { sessionId: OTHER_SESSION }));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: OTHER_SESSION, title: "The second conversation's title" }]);
+  h.controller.dispose();
+});
+
+test("title: an identity gap is closed by a fresh read of the bound transcript, not by a new title row", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identity, titles);
+
+  await h.append(titleRow("customTitle", "Ship the release notes"));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: "Ship the release notes" }]);
+
+  // The authenticated hook lane fails. This source can no longer state which
+  // conversation the row runs, so it reports the loss — and the owner withdraws the
+  // title with the identity it was proved for.
+  h.controller.acceptFailure({ backend: "claude", reason: "input-timeout" });
+  await settle();
+  assert.deepEqual(identity.calls.at(-1), null, "the gap is reported as identity loss");
+  assert.equal(titles.calls.length, 1, "nothing about the title is claimed while nothing is proved");
+
+  // The provider renames this SAME conversation while this host's lane is dark, and
+  // nothing is read or claimed for it: with no proved conversation there is nothing
+  // a title could be attributed to.
+  await h.append(titleRow("customTitle", "Renamed while the lane was dark"));
+  await settle(120);
+  assert.equal(titles.calls.length, 1, "still nothing is claimed while nothing is proved");
+
+  // This run's own admitted ROOT hook names the SAME conversation again: the gap
+  // closed. Recovery takes one FRESH metadata read of the transcript this scope is
+  // bound to now — the text cached before the gap was thrown away with the identity,
+  // and it is not what arrives, which is what makes this a new observation of the
+  // current source rather than a replay. No new title row is needed for the row to
+  // be titled again.
+  h.hook("UserPromptSubmit", { prompt_id: "after-the-gap" });
+  await settle();
+  assert.deepEqual(identity.calls.at(-1), SESSION, "the same conversation is proved again");
+  assert.deepEqual(titles.calls.at(-1), { conversationId: SESSION, title: "Renamed while the lane was dark" },
+    "the title reacquired after the gap comes from a fresh read of the bound file");
+  assert.equal(titles.calls.length, 2, JSON.stringify(titles.calls));
+
+  // A later row repeating that same title restates a fact this host already has.
+  // (The gap closed the one watcher, exactly as it closes every other transcript
+  // claim; this run's own published counts arm it again, as they always do.)
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await settle();
+  await h.append(titleRow("customTitle", "Renamed while the lane was dark"));
+  await settle();
+  assert.equal(titles.calls.length, 2, "an unchanged title is never published twice");
+  h.controller.dispose();
+});
+
+test("title: a provider title longer than the operator's caption bound is read and reported whole", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder();
+  const h = await titledHarness(workspace, identityRecorder(), titles);
+
+  // The operator's own caption bound is not a provider limit and must not silently
+  // discard a title this host can publish: this text is far over the caption bound
+  // and well inside the published-label bound a row's label actually travels under.
+  const long = "Investigating the census read that raced the " + "generation".repeat(8) + " boundary";
+  assert.ok(long.length > 80, "the fixture really is over the manual caption bound");
+  assert.ok(Array.from(long).length <= MAX_NATIVE_SESSION_NAME_LENGTH);
+
+  await h.append(titleRow("customTitle", long));
+  await settle();
+  assert.deepEqual(titles.calls, [{ conversationId: SESSION, title: long }],
+    "a valid provider title is never discarded, clipped, or truncated for its length");
+
+  // What the published label cannot carry at all is still refused whole.
+  await h.append(titleRow("customTitle", "z".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 1)));
+  await settle();
+  assert.equal(titles.calls.length, 1, "an unpublishable title is refused, never clipped into one");
+
+  const atTheBound = String.fromCodePoint(0xe9).repeat(MAX_NATIVE_SESSION_NAME_LENGTH);
+  await h.append(titleRow("customTitle", atTheBound));
+  await settle();
+  assert.deepEqual(titles.calls.at(-1), { conversationId: SESSION, title: atTheBound },
+    "the bound is measured the way the published label measures it, in code points");
+  h.controller.dispose();
+});
+
+test("title: a captioned row keeps its caption — a refused hydrated title is offered on real source events and never on a timer", async () => {
+  const workspace = await makeWorkspace();
+  const titles = titleRecorder(false);
+  const h = await titledHarness(workspace, identityRecorder(), titles,
+    priorHistory() + titleRow("customTitle", "A title this row no longer shows"));
+  await settle(150);
+  const offered = titles.calls.length;
+  assert.ok(offered > 0, "the recorded title reaches the owner, which is where a caption is honored");
+  assert.ok(titles.calls.every((call) => call.title === "A title this row no longer shows"
+    && call.conversationId === SESSION), JSON.stringify(titles.calls));
+  // Every offer came from a read of this run's own source. With no new source event
+  // there is nothing to retry, so the row simply keeps the caption its owner chose.
+  await settle(250);
+  assert.equal(titles.calls.length, offered,
+    "a refused title is never re-offered on a timer of its own, so a captioned row keeps its caption");
+  h.controller.dispose();
 });

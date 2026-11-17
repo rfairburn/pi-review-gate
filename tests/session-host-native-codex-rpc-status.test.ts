@@ -1694,3 +1694,150 @@ test("a positive root contradiction after validation is reported; an unreadable 
     await h.close();
   }
 });
+
+/* --------------------------------- provider conversation TITLE (issue #690) */
+
+test("the validated root read reports its actual title, once per census, and nothing else carries it", async () => {
+  const titles: (string | null)[] = [];
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootTitle: (title) => {
+      titles.push(title);
+    },
+  });
+  try {
+    assert.equal(titles.length, 1, "one title per census that validated the root");
+    assert.equal(typeof titles[0], "string", "the fixture root carries a provider title");
+    assert.equal((titles[0] as string).length <= 80, true, "the host's own row-name bound is what a title must satisfy");
+
+    // A second census re-reads and restates the same title; the status card is not
+    // republished for a title, and no new connection or request method appears.
+    const before = h.observations.length;
+    h.observer.refresh();
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(titles.length, 2, "the title travels with each validated root read");
+    assert.equal(titles[1], titles[0]);
+    assert.equal(h.observations.length, before, "a title is not a status publication");
+    assert.equal(h.server.connectionCount, 1, "the title rides the observer's own single connection");
+    const surfaced = JSON.stringify(h.observations);
+    assert.equal(surfaced.includes(titles[0] as string), false, "a title never rides a status observation");
+    assert.equal(surfaced.includes("/owned/worktree"), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a root that reports no title is a positive none, while an unvalidated root reports nothing at all", async () => {
+  const titled = POPULATION.map((row) => (row.id === ROOT ? { ...row, name: null } : row));
+  const seen: (string | null)[] = [];
+  const matched = await startHarness({ threads: titled }, {
+    expectedWorkspace: "/owned/worktree",
+    onRootTitle: (title) => {
+      seen.push(title);
+    },
+  });
+  try {
+    assert.deepEqual(seen, [null], "the provider positively saying it has no title is not unknown");
+    assert.equal(matched.latest().busy, false, "the ordinary card is unchanged by a titleless root");
+  } finally {
+    await matched.close();
+  }
+
+  // A root the census never validated — wrong workspace, or an unreadable read —
+  // reports NO title, which is never the same claim as "no title".
+  const elsewhere: (string | null)[] = [];
+  const wrongWorkspace = await startHarness({}, {
+    expectedWorkspace: "/owned/elsewhere",
+    onRootTitle: (title) => {
+      elsewhere.push(title);
+    },
+  });
+  try {
+    assert.deepEqual(elsewhere, [], "a contrary root is never a source of this row's title");
+  } finally {
+    await wrongWorkspace.close();
+  }
+
+  const unread: (string | null)[] = [];
+  const unreadableRoot = await startHarness({ unreadableThreadIds: [ROOT] }, {
+    expectedWorkspace: "/owned/worktree",
+    onRootTitle: (title) => {
+      unread.push(title);
+    },
+  });
+  try {
+    assert.deepEqual(unread, [], "a read that failed claims nothing, not even an absence");
+  } finally {
+    await unreadableRoot.close();
+  }
+});
+
+test("a rename edge re-runs the ordinary coalesced census, and the new title comes from the root read alone", async () => {
+  const titles: (string | null)[] = [];
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootTitle: (title) => {
+      titles.push(title);
+    },
+  });
+  try {
+    const initial = titles[0];
+    assert.equal(typeof initial, "string");
+    const readsBefore = h.requests("thread/read");
+
+    // The provider renames the bound root and emits its own edge. The observer sends
+    // nothing back and asks nothing new: the next ordinary census re-reads the root.
+    h.server.setThread({ ...POPULATION[0]!, name: "Renamed by the operator" });
+    h.server.broadcast("thread/name/updated", { threadId: ROOT, threadName: "Renamed by the operator" });
+    await h.scheduler.advance(500);
+    await h.quiet();
+
+    assert.equal(h.requests("thread/read"), readsBefore + 1, "the edge is one coalesced refresh, not a new request path");
+    assert.deepEqual(titles.slice(1), ["Renamed by the operator"], "the title comes from the root read, not the edge");
+    assert.equal(JSON.stringify(h.observations).includes("Renamed by the operator"), false,
+      "a title never rides a status observation");
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    }, "a rename moves no status axis");
+
+    // A cleared name is a positive none on the next read.
+    const cleared = h.requests("thread/read");
+    h.server.setThread({ ...POPULATION[0]!, name: null });
+    h.server.broadcast("thread/name/updated", { threadId: ROOT });
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(h.requests("thread/read"), cleared + 1);
+    assert.deepEqual(titles.slice(2), [null]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a rename edge outside the bound root is not this row's evidence: no refresh, no title", async () => {
+  const titles: (string | null)[] = [];
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onRootTitle: (title) => {
+      titles.push(title);
+    },
+  });
+  try {
+    const readsBefore = h.requests("thread/read");
+    const observationsBefore = h.observations.length;
+    h.server.broadcast("thread/name/updated", { threadId: CHILD_ACTIVE, threadName: "Another thread's name" });
+    h.server.broadcast("thread/name/updated", { threadId: UNRELATED_ROOT, threadName: "Someone else's name" });
+    await h.scheduler.advance(500);
+    await h.quiet();
+    assert.equal(h.requests("thread/read"), readsBefore, "an unrelated rename never churns this row's census");
+    assert.equal(h.observations.length, observationsBefore, "and publishes nothing");
+    assert.equal(titles.length, 1, "the initial title only");
+    assert.equal(JSON.stringify(h.observations).includes("Another thread"), false);
+  } finally {
+    await h.close();
+  }
+});

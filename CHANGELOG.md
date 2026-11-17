@@ -40,14 +40,23 @@ dates.
   setting sequences are left alone so a row's own colours win, reset-free rows
   stay byte-identical, and a theme without the accessor — or one whose lookup
   throws or returns a non-string — renders exactly as before. This covers every
-  custom tool-result registration; the previously observed affected families are
-  the five `Shell*` tools (both triggers), `ApplyPatch`, `tool_search`, and
-  `Subtasks*` expanded rows. Web/browser families that display control characters
-  instead of emitting them, the native host renderers, the host's renderer-less
-  fallback, custom notification messages, layout, wrapping, copy/selection, and
-  all execution, authorization, audit, scheduling, model-facing payload, and
-  retention behaviour are unchanged. Headless-terminal evidence only — not
-  physical-terminal or cross-platform certification. See
+  custom tool-result registration — the five `Shell*` tools (both triggers),
+  `ApplyPatch`, `tool_search`, and `Subtasks*` expanded rows — and the same seam
+  wherever else a tool row is painted, repaired with that one rule: the native
+  `write` card's own call and failed-result rows on the host's default shell
+  (its call rows reprint the submitted `content` argument, and its result rows
+  the tool's own error text, both verbatim), and the rows the gate paints for a
+  tool that draws its own shell, such as an annotated native `edit` error.
+  `write`'s native renderer and its incremental highlighting reuse are kept, and
+  an unannotated native self-shell card keeps the host's own unpainted
+  presentation. The other native host renderers (`read`, `grep`, `find`, `ls`,
+  `bash`/`powershell`), web/browser families that display control characters
+  instead of emitting them, the host's renderer-less fallback, custom
+  notification messages, layout, wrapping, copy/selection, and all execution,
+  authorization, audit, scheduling, model-facing payload, and retention
+  behaviour are unchanged. Headless-terminal evidence only, on the built-in
+  `dark` 256-colour theme — not physical-terminal, truecolour, light-theme,
+  Windows-terminal, or cross-platform certification. See
   [development docs](docs/development.md#tool-row-background-continuity-across-a-rows-resets-677).
 
 ## [0.1.0-dev.292]

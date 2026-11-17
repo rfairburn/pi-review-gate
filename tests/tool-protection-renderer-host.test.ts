@@ -186,6 +186,18 @@ if (!host) {
       createShellRenderers(prompt: string): Record<string, unknown>;
     }).createShellRenderers("$"),
   };
+  // The installed write renderers (`core/tools/renderers/write.js`), spread into
+  // a definition the same way the shipped write tool does. `write` declares no
+  // `renderShell`, so the host's own `Box` frames it — and unlike the shell
+  // renderers it never runs retained text through `stripAnsi`, which is why it
+  // is the native card #677 has to repair.
+  const nativeWriteRenderers = h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "write.js")) as {
+    writeRenderers: {
+      renderCall(args: unknown, theme: unknown, context: unknown): unknown;
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): unknown;
+    };
+  };
+  const nativeWriteDefinition = { name: "write", ...nativeWriteRenderers.writeRenderers };
   // The host's own custom-entry component (an installed internal module, read the
   // same way as the edit renderers above): it is what wraps the gate's entry
   // renderer in a real transcript row.
@@ -2701,6 +2713,504 @@ if (!host) {
       assertContinuousBackground(lines, theme.getBgAnsi("toolSuccessBg"), 1, `native bash width ${width}`);
       assertFitsWidth(lines, width, `native bash width ${width}`);
     }
+  });
+
+  // ── #677: the native write card's own rows keep the themed background ────
+  //
+  // `write` is the host renderer whose rows carry this seam on the host's own
+  // default shell: `formatWriteCall` reprints the submitted `content` argument
+  // with carriage-return normalization only, and `formatWriteResult` emits the
+  // failed result's own text verbatim, so a full or background reset inside
+  // either region cancels the host `Box`'s single background span for the rest
+  // of the row. The repair is the shared rule applied at the gate's renderer
+  // seam, so every case below runs the production resolver against the real host
+  // row and compares with the same host row WITHOUT the decoration: the native
+  // renderer, its wrapping, its highlighting, its colours, and its glyphs have
+  // to come through untouched, and only the theme's own bare background open may
+  // differ. No write is executed and no file is written by these fixtures.
+
+  const WRITE_CONTENT_RESET = [
+    `first line ${LONG_SHELL_TEXT}`,
+    `second line with a full reset \x1b[0m and more retained text ${LONG_SHELL_TEXT}`,
+    `third line with a background reset \x1b[49m and more retained text ${LONG_SHELL_TEXT}`,
+    `last short line \x1b[0m`,
+  ].join("\n");
+  const WRITE_CONTENT_CLEAN = [
+    `first line ${LONG_SHELL_TEXT}`,
+    `second line with no escape at all ${LONG_SHELL_TEXT}`,
+    "last short line",
+  ].join("\n");
+  const WRITE_ERROR_RESET = `write refused ${LONG_SHELL_TEXT} \x1b[0m tail after a full reset ${LONG_SHELL_TEXT}`;
+  const WRITE_ERROR_CLEAN = `write refused ${LONG_SHELL_TEXT} tail with no escape at all`;
+  const RESET_BEARING_EDIT_ERROR = `edit refused ${LONG_SHELL_TEXT} \x1b[0m tail after a full reset ${LONG_SHELL_TEXT}`;
+  const RESET_FREE_EDIT_ERROR = `edit refused ${LONG_SHELL_TEXT} tail with no escape at all`;
+
+  type WriteRowState = "pending-call" | "pending-partial" | "success" | "error";
+  const writeBgToken = (state: WriteRowState): string =>
+    state === "success" ? "toolSuccessBg" : state === "error" ? "toolErrorBg" : "toolPendingBg";
+
+  /** One real host `write` row, rendered once at `width`. */
+  function writeCardLines(
+    definition: unknown,
+    args: Record<string, unknown>,
+    state: WriteRowState,
+    width: number,
+    expanded: boolean,
+    errorText: string,
+  ): string[] {
+    const component = new h.agent.ToolExecutionComponent("write", "write-677", args, {}, definition, ui, "/work");
+    component.setArgsComplete();
+    if (state !== "pending-call") {
+      component.updateResult(state === "error"
+        ? { content: [{ type: "text", text: errorText }], details: undefined, isError: true }
+        : { content: [{ type: "text", text: "Successfully wrote /work/fixture.txt" }], details: undefined, isError: false },
+      state === "pending-partial");
+    }
+    component.setExpanded(expanded);
+    return component.render(width);
+  }
+
+  const countOf = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  /**
+   * The decorated card is one continuous themed band to the card edge, cell by
+   * cell, with nothing painted past it; the only difference from the undecorated
+   * native card is an inserted copy of the theme's own bare background open.
+   */
+  async function assertWriteCardRepaired(
+    decorated: string[],
+    native: string[],
+    width: number,
+    backgroundAnsi: string,
+    label: string,
+  ): Promise<void> {
+    assert.equal(decorated.length, native.length, `${label}: the repair changed the number of card rows`);
+    const stripOpen = (line: string): string => line.split(backgroundAnsi).join("");
+    for (const [index, line] of decorated.entries()) {
+      assert.equal(stripOpen(line), stripOpen(native[index]!),
+        `${label}: card row ${index + 1} differs from the native row by more than the re-opened background`);
+      assert.equal(stripAnsi(line), stripAnsi(native[index]!),
+        `${label}: card row ${index + 1} changed its displayed text`);
+    }
+    assertFitsWidth(decorated, width, label);
+    const cells = await cardCells(decorated, width + 1);
+    const expected = packedColor(backgroundAnsi, "bg");
+    for (const [index, cellRow] of cells.entries()) {
+      if (index === 0) continue; // the host's own blank row above the card
+      for (let column = 0; column < width; column += 1) {
+        assert.ok(cellRow[column]!.bgMode !== 0,
+          `${label}: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+        assert.ok(cellHasColor(cellRow[column]!, "bg", expected),
+          `${label}: cell ${column} of card row ${index + 1} is not painted with the themed row background`);
+      }
+      // Not merely "not the theme colour": the column past the card carries no
+      // background at all, so a re-open can never paint outside the card.
+      assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past the card carries a background`);
+    }
+    const pastCard = await cardCells([...decorated, ""], width);
+    assert.ok(pastCard.at(-1)!.every((cell) => cell.bgMode === 0), `${label}: a row outside the card is painted`);
+  }
+
+  /** Ordinary-background cells INSIDE the card only: the guard column past the
+   *  card is intentionally unpainted and never counts as a hole. */
+  async function cardHoles(lines: string[], width: number): Promise<number> {
+    const cells = await cardCells(lines, width + 1);
+    return cells.slice(1).flatMap((row) => row.slice(0, width)).filter((cell) => cell.bgMode === 0).length;
+  }
+
+  test("real host: a native write card keeps the themed background across its own resets (#677)", async () => {
+    const pi = fakePiHost();
+    // Debug Off keeps this matrix on the native presentation alone: the gate
+    // draws no audit rows, so the decorated card and the native card have to
+    // agree row for row apart from the re-opened background.
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult && typeof (decoratedWrite as { renderCall?: unknown }).renderCall === "function",
+      "the production resolver decorated the native write call and result renderers");
+    assert.equal((decoratedWrite as { renderShell?: unknown }).renderShell, undefined,
+      "the decoration keeps the write definition on the host's default shell");
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+            const args = { file_path: `/work/fixture.${extension}`, content: WRITE_CONTENT_RESET };
+            const label = `native write .${extension} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, state, width, expanded, WRITE_ERROR_RESET);
+            const native = writeCardLines(nativeWriteDefinition, args, state, width, expanded, WRITE_ERROR_RESET);
+            // The trigger: the undecorated native card really does lose its
+            // background, so this case would not pass vacuously. Only the card's
+            // own columns count — the guard column is unpainted by design.
+            const nativeHoles = await cardHoles(native, width);
+            assert.ok(nativeHoles > 0,
+              `${label}: the undecorated native write card no longer loses its background (the case would pass vacuously)`);
+            await assertWriteCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+            // Nothing is stripped or normalized: the retained resets still reach
+            // the terminal, in both the call rows and (for a failed result) the
+            // result rows.
+            const joined = decorated.join("");
+            const nativeJoined = native.join("");
+            assert.ok(countOf(joined, "\x1b[0m") > 0
+              && countOf(joined, "\x1b[0m") === countOf(nativeJoined, "\x1b[0m"),
+            `${label}: a retained full reset was stripped or duplicated`);
+            assert.equal(countOf(joined, "\x1b[49m"), countOf(nativeJoined, "\x1b[49m"),
+              `${label}: a retained background reset was stripped or duplicated`);
+            if (state === "error") {
+              assert.ok(stripAnsi(joined).includes("tail after a full reset"),
+                `${label}: the failed result text was lost`);
+            }
+            const header = decorated.find((line) => stripAnsi(line).includes("write"));
+            assert.ok(header, `${label}: the card no longer names its tool`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: each native write region loses its own background before the repair (#677)", async () => {
+    // The call region and the result region are repaired independently, so each
+    // is witnessed on its own: a reset only in the submitted `content` argument,
+    // a reset only in the failed result's text, and neither. Each dirty case
+    // differs from the clean baseline in ONE region while the other region's
+    // text is byte-identical, and a hole can only come from a reset inside its
+    // own row, so the holes a dirty case adds belong to the region it changed.
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult, "the production resolver decorated the native write renderers");
+    const cases = [
+      { label: "clean call + clean error", content: WRITE_CONTENT_CLEAN, errorText: WRITE_ERROR_CLEAN, dirty: false },
+      { label: "dirty call + clean error", content: WRITE_CONTENT_RESET, errorText: WRITE_ERROR_CLEAN, dirty: true },
+      { label: "clean call + dirty error", content: WRITE_CONTENT_CLEAN, errorText: WRITE_ERROR_RESET, dirty: true },
+    ];
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const one of cases) {
+            const args = { file_path: `/work/fixture.${extension}`, content: one.content };
+            const label = `native write .${extension} ${one.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, "error", width, expanded, one.errorText);
+            const native = writeCardLines(nativeWriteDefinition, args, "error", width, expanded, one.errorText);
+            const holes = await cardHoles(native, width);
+            if (one.dirty) {
+              assert.ok(holes > 0,
+                `${label}: this region no longer loses its background on its own (the case would pass vacuously)`);
+            } else {
+              assert.equal(holes, 0, `${label}: the reset-free baseline card lost its background`);
+            }
+            await assertWriteCardRepaired(decorated, native, width, theme.getBgAnsi("toolErrorBg"), label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native write card is byte-identical with the decoration (#677 control)", async () => {
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult, "the production resolver decorated the native write renderers");
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const args = { file_path: `/work/fixture.${extension}`, content: WRITE_CONTENT_CLEAN };
+            const label = `clean native write .${extension} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, state, width, expanded, WRITE_ERROR_CLEAN);
+            const native = writeCardLines(nativeWriteDefinition, args, state, width, expanded, WRITE_ERROR_CLEAN);
+            // Byte-for-byte: a card with no background-clearing reset inside a
+            // row gains no escape of any kind, so the repair is provably inert.
+            assert.deepEqual(decorated, native, `${label}: a reset-free native write card was rewritten`);
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: the fixture gained a reset`);
+            const backgroundAnsi: string = theme.getBgAnsi(writeBgToken(state));
+            // One open per painted row, exactly what the host's own `Box` emits.
+            for (const line of decorated.slice(1)) {
+              assert.ok(line.includes(backgroundAnsi), `${label}: a card row lost the themed row background`);
+              assert.equal(countOf(line, backgroundAnsi), 1, `${label}: a row gained a background re-open`);
+            }
+            await assertWriteCardRepaired(decorated, native, width, backgroundAnsi, label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: the decorated native write card keeps the native renderer's own component and cache (#677)", async () => {
+    // The repair wraps what the host receives, so the native renderer must keep
+    // receiving its OWN component as `context.lastComponent`: `write`'s call
+    // renderer writes its incremental highlighting cache onto that component and
+    // calls `setText` on it, neither of which the wrapper carries. The call
+    // region and the result region share one per-row `state`, so they must also
+    // keep separate slots.
+    const passes: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+    const nativeRenderers = nativeWriteRenderers.writeRenderers;
+    const spyDefinition = {
+      name: "write",
+      ...nativeWriteRenderers.writeRenderers,
+      renderCall(args: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderCall(args, spyTheme, spyContext);
+        passes.push({ region: "call", lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent, returned });
+        return returned;
+      },
+      renderResult(spyResult: unknown, options: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderResult(spyResult, options, spyTheme, spyContext);
+        passes.push({ region: "result", lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent, returned });
+        return returned;
+      },
+    };
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => spyDefinition);
+    assert.ok(decoratedWrite?.renderResult && typeof (decoratedWrite as { renderCall?: unknown }).renderCall === "function",
+      "the production resolver decorated the spied native write renderers");
+    const args = { file_path: "/work/fixture.js", content: "const alpha = 1;\n" };
+    const component = new h.agent.ToolExecutionComponent("write", "write-677-cache", args, {}, { ...spyDefinition, ...decoratedWrite }, ui, "/work");
+    // A streaming call: this is the pass where the native renderer keeps an
+    // incremental highlighting cache, so it is the one a handed-back wrapper
+    // would break.
+    component.render(40);
+    const callPasses = (): Array<{ lastComponent: unknown; returned: unknown }> => passes.filter((one) => one.region === "call");
+    assert.equal(callPasses()[0]!.lastComponent, undefined, "the first call pass hands the native renderer no previous component");
+    const callComponent = callPasses()[0]!.returned as Record<string, unknown>;
+    assert.equal(typeof callComponent.setText, "function", "the native call renderer returned its own Text component");
+    // A streamed argument delta, then an unchanged redraw, then both expansion
+    // toggles, then a settled result: the native component is reused every time.
+    (component as unknown as { updateArgs(next: unknown): void }).updateArgs({ file_path: "/work/fixture.js", content: "const alpha = 1;\nconst beta = 2;\n" });
+    component.render(40);
+    const cache = (callComponent as { cache?: { highlightedLines?: string[] } }).cache;
+    assert.ok(cache && Array.isArray(cache.highlightedLines) && cache.highlightedLines.length > 0,
+      "the native incremental highlighting cache survived the decoration");
+    component.render(40);
+    assert.equal((callComponent as { cache?: unknown }).cache, cache,
+      "the native highlighting cache object was rebuilt across redraws");
+    component.setExpanded(true);
+    component.render(40);
+    component.setExpanded(false);
+    component.render(40);
+    // Settling the call is the host's own transition (its renderer stops
+    // maintaining the incremental cache for a complete call); the reused
+    // component and the result region's separate slot still hold.
+    component.setArgsComplete();
+    component.updateResult({ content: [{ type: "text", text: WRITE_ERROR_RESET }], details: undefined, isError: true }, false);
+    component.render(40);
+    // Expansion re-runs both regions, so the result region's own component has
+    // to be reused there exactly as the call region's is here.
+    component.setExpanded(true);
+    component.render(40);
+    component.setExpanded(false);
+    component.render(40);
+    for (const [index, pass] of callPasses().slice(1).entries()) {
+      assert.equal(pass.lastComponent, callComponent,
+        `call pass ${index + 2}: the native renderer was handed something other than its own component, breaking its incremental reuse`);
+    }
+    const resultPasses = passes.filter((one) => one.region === "result");
+    assert.ok(resultPasses.length >= 2, "the result region rendered after the settled result");
+    assert.equal(resultPasses[0]!.lastComponent, undefined, "the first result pass hands the native renderer no previous component");
+    const resultComponent = resultPasses[0]!.returned;
+    for (const [index, pass] of resultPasses.entries()) {
+      assert.notEqual(pass.lastComponent, callComponent,
+        `result pass ${index + 1}: the result region was handed the call region's component (the two share one row state)`);
+      if (index > 0) {
+        assert.equal(pass.lastComponent, resultComponent,
+          `result pass ${index + 1}: the native result renderer was handed something other than its own component`);
+      }
+    }    // The repair still holds on every redraw, including the settled error card.
+    const decorated = component.render(40);
+    const cells = await cardCells(decorated, 41);
+    for (const [index, cellRow] of cells.entries()) {
+      if (index === 0) continue;
+      for (let column = 0; column < 40; column += 1) {
+        assert.ok(cellRow[column]!.bgMode !== 0,
+          `write redraw: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+      }
+      assert.equal(cellRow[40]!.bgMode, 0, "write redraw: the guard column past the card carries a background");
+    }
+  });
+
+  test("real host: a state-less write context keeps the native write component unwrapped (#677)", () => {
+    // A lightweight host context with no per-row `state` has nowhere to remember
+    // the native component, so BOTH regions have to keep handing the native
+    // renderer its own component: the write call renderer writes its
+    // highlighting cache onto it and calls `setText` on it, and the result
+    // renderer calls `setText` (a failed result) or `clear` (no output) on
+    // whatever `context.lastComponent` holds. Neither method exists on the
+    // background wrapper, so wrapping without a slot would push the host onto
+    // its own fallback renderer instead of the native presentation.
+    const observed: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+    const nativeRenderers = nativeWriteRenderers.writeRenderers;
+    const spyDefinition = {
+      name: "write",
+      ...nativeWriteRenderers.writeRenderers,
+      renderCall(args: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderCall(args, spyTheme, spyContext);
+        observed.push({
+          region: "call",
+          lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent,
+          returned,
+        });
+        return returned;
+      },
+      renderResult(spyResult: unknown, options: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderResult(spyResult, options, spyTheme, spyContext);
+        observed.push({
+          region: "result",
+          lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent,
+          returned,
+        });
+        return returned;
+      },
+    };
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decorated = (pi.pi.__rendererResolver as RendererResolver)("write", () => spyDefinition) as unknown as {
+      renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+    };
+    assert.ok(typeof decorated.renderResult === "function" && typeof decorated.renderCall === "function",
+      "the production resolver decorated the spied native write renderers");
+    const args = { file_path: "/work/fixture.js", content: "const alpha = 1;\n" };
+    // No `state` key anywhere, and a call id this gate has no provenance for, so
+    // the decoration has neither a per-row slot nor an annotation of its own.
+    const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      toolCallId: "write-stateless",
+      args,
+      cwd: "/work",
+      ui: {},
+      argsComplete: true,
+      isPartial: false,
+      expanded: false,
+      isError: false,
+      outputPad: 1,
+      ...over,
+    });
+    const passes = (region: "call" | "result") => observed.filter((one) => one.region === region);
+
+    // Two consecutive call passes, the second handed the first component back.
+    const firstCall = decorated.renderCall(args, nativeTheme, context({ isPartial: true, argsComplete: false }));
+    decorated.renderCall(args, nativeTheme, context({ isPartial: true, argsComplete: false, lastComponent: firstCall }));
+    assert.equal(passes("call")[1]!.lastComponent, firstCall,
+      "the state-less call pass was handed the component the previous pass returned");
+    assert.equal(passes("call")[1]!.returned, firstCall,
+      "the state-less call fallback returned the native component itself, not the background wrapper");
+    assert.equal(typeof firstCall.setText, "function",
+      "the reused call component is the native Text the call renderer writes its text and cache onto");
+
+    // Two consecutive failed-result renders.
+    const errorResult = { content: [{ type: "text", text: WRITE_ERROR_RESET }], details: undefined };
+    const firstError = decorated.renderResult(errorResult, { expanded: false, isPartial: false }, nativeTheme, context({ isError: true }));
+    const secondError = decorated.renderResult(errorResult, { expanded: false, isPartial: false }, nativeTheme, context({ isError: true, lastComponent: firstError }));
+    assert.equal(passes("result")[0]!.lastComponent, undefined, "the first state-less result pass hands the native renderer no previous component");
+    assert.equal(passes("result")[1]!.lastComponent, firstError,
+      "the state-less result pass was handed the component the previous result pass returned, not the background wrapper");
+    assert.equal(passes("result")[1]!.returned, firstError,
+      "the state-less result fallback returned the native component itself, not the background wrapper");
+    assert.equal(secondError, firstError, "the failed result reuses one native component across renders");
+    assert.equal(typeof firstError.setText, "function",
+      "the reused failed-result component is the native Text the error path calls setText on");
+
+    // Two consecutive success renders: the no-output path calls `clear()`.
+    const successResult = { content: [{ type: "text", text: "Successfully wrote /work/fixture.txt" }], details: undefined };
+    const firstSuccess = decorated.renderResult(successResult, { expanded: false, isPartial: false }, nativeTheme, context());
+    decorated.renderResult(successResult, { expanded: false, isPartial: false }, nativeTheme, context({ lastComponent: firstSuccess }));
+    assert.equal(passes("result").at(-1)!.lastComponent, firstSuccess,
+      "the second state-less success pass was handed the same native component");
+    assert.equal(typeof firstSuccess.clear, "function",
+      "the reused empty-output component is the native Container the result path calls clear on");
+
+    // And the state-less fallback really is the unchanged native presentation:
+    // nothing gained a theme background of its own.
+    const errorBg = theme.getBgAnsi("toolErrorBg");
+    assert.ok(!secondError.render(38).join("").includes(errorBg),
+      "the state-less fallback painted a row background the native renderer does not emit");
+  });
+
+  test("real host: a gate-painted annotated edit error keeps its background across a retained reset (#677)", async () => {
+    // A self-shell row is painted by this gate, not by the host's `Box`, so the
+    // same seam lives in `paintAnnotationRow`: a reset surviving inside a body
+    // row cancels the gate's own background span for the rest of the row. Only
+    // annotated rows are affected — an unannotated native edit keeps the host's
+    // own unpainted presentation, which this change does not touch.
+    await withEditFixture(async (cwd) => {
+      await withInstalledHostWidths(async () => {
+        const errorBgAnsi = theme.getBgAnsi("toolErrorBg");
+        const errorBg = packedColor(errorBgAnsi, "bg");
+        const errorFg = packedColor(theme.getFgAnsi("error"), "fg");
+        for (const fixture of [
+          { label: "reset-bearing", text: RESET_BEARING_EDIT_ERROR, inserted: true },
+          { label: "reset-free", text: RESET_FREE_EDIT_ERROR, inserted: false },
+        ]) {
+          for (const width of [40, 80]) {
+            for (const expanded of [false, true]) {
+              const pi = fakePiHost();
+              const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd, config: protectionConfig({ debug: true }) });
+              coordinator.registerHooks(pi.pi);
+              assert.equal(await coordinator.admitToolCall(callArgs("edit-677-error", "edit", EDIT_ARGS)), undefined);
+              const event = resultEvent("edit-677-error", "edit", [{ type: "text", text: fixture.text }], { isError: true, details: {} });
+              assert.deepEqual(await pi.emit("tool_result", event), [],
+                "a PASS adds no audit text to a native error result either");
+              const decorated = (pi.pi.__rendererResolver as RendererResolver)("edit", () => nativeEditDefinition);
+              assert.ok(decorated?.renderResult, "the production resolver decorated the native edit renderers");
+              const component = new h.agent.ToolExecutionComponent(
+                "edit", "edit-677-error", EDIT_ARGS, {}, { ...nativeEditDefinition, ...decorated }, ui, cwd,
+              );
+              component.setArgsComplete();
+              component.updateResult(event, false);
+              let lines = await renderWithPreview(component, width);
+              if (expanded) {
+                component.setExpanded(true);
+                lines = component.render(width);
+              }
+              const label = `annotated edit error ${fixture.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+              const cells = await cardCells(lines, width + 1);
+              for (const [index, cellRow] of cells.entries()) {
+                if (index === 0) continue; // the host's own blank row above the card
+                for (let column = 0; column < width; column += 1) {
+                  assert.ok(cellRow[column]!.bgMode !== 0,
+                    `${label}: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+                }
+                assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past the card carries a background`);
+              }
+              const auditStart = lines.findIndex((line) => stripAnsi(line).includes("Tool protection: PASS"));
+              assert.ok(auditStart > 0, `${label}: the gate's own audit row is drawn`);
+              assertFitsWidth(lines, width, label);
+              if (fixture.inserted) {
+                const joined = lines.join("");
+                assert.ok(joined.includes("\x1b[0m"),
+                  `${label}: the fixture no longer renders a retained reset (the case would pass vacuously)`);
+                const seam = lines
+                  .map((line, index) => ({ line, index }))
+                  .filter((one) => stripAnsi(one.line).includes("tail after a full reset"));
+                assert.ok(seam.length > 0, `${label}: the reset-bearing error text was not rendered`);
+                for (const one of seam) {
+                  for (let column = 0; column < width; column += 1) {
+                    assert.ok(cellHasColor(cells[one.index]![column]!, "bg", errorBg),
+                      `${label}: cell ${column} of the reset-bearing card row ${one.index + 1} is not on the error row background`);
+                  }
+                  // The row keeps its own foreground through the reset.
+                  assert.ok(cells[one.index]!.some((cell) => cell.chars.length > 0 && cell.chars !== " "
+                    && cellHasColor(cell, "fg", errorFg)),
+                  `${label}: the reset-bearing row lost its error foreground`);
+                }
+              } else {
+                // Reset-free control: every gate-painted row keeps exactly the
+                // one open and one close the paint itself emits — the repair
+                // inserted nothing anywhere.
+                for (const line of lines.slice(auditStart)) {
+                  assert.ok(!line.includes("\x1b[0m") && !line.includes("\x1b[49m\x1b[49m"),
+                    `${label}: the reset-free fixture gained a reset`);
+                  assert.equal(countOf(line, errorBgAnsi), 1, `${label}: a gate-painted row gained a background re-open`);
+                  assert.equal(countOf(line, "\x1b[49m"), 1, `${label}: a gate-painted row gained a background close`);
+                }
+              }
+            }
+          }
+        }
+      });
+    });
   });
 
 }

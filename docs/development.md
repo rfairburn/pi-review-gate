@@ -1553,8 +1553,43 @@ left alone so a row's own colours are never overridden; a row without a reset
 is returned byte-for-byte unchanged; and a theme without the accessor — or one
 whose lookup throws or returns a non-string — renders exactly as before. This
 is tool-row presentation only: the generic presentation core, the extension's
-own custom-message rows, native host renderers, and the host's renderer-less
-fallback are untouched.
+own custom-message rows, and the host's renderer-less fallback are untouched.
+
+Two further surfaces draw tool rows and therefore own the same seam. They reuse
+the rule rather than restating it — `reopenRowBackground`,
+`toolRowBackgroundAnsi`, `toolRowBackgroundToken`, `toolCallRowBackgroundToken`,
+and `withReopenedRowBackground` are exported from `src/tool-result-expansion.ts`
+for exactly this — and both live in `src/tool-protection/coordinator.ts`:
+
+- **The native `write` card, in both of its regions**, repaired at the gate's
+  existing `pi.registerToolRenderer` seam. `write` is the host renderer that
+  keeps text verbatim on the host's own default shell: `formatWriteCall`
+  reprints the submitted `content` argument after carriage-return normalization
+  only, and `formatWriteResult` emits the failed result's own text as returned,
+  so a reset surviving in either region cancels the host `Box`'s span. The
+  decoration wraps the component the native renderer returned and re-opens that
+  row's own background on its physical rows, before the host's `Box` pads and
+  paints them — the native renderer is not replaced, and no second padding or
+  background layer is added. The repair is gated to `write` on the host's
+  default shell: extension-owned custom renderers already get the rule at the
+  shared adapter, and a self-shell row is painted by the decoration itself (the
+  next bullet). Because the native call renderer reuses `context.lastComponent`
+  for its incremental highlighting cache and writes that cache onto its own
+  component, the decoration keeps the native component in its own per-row slot
+  and hands that back on every pass — never its wrapper. The call region and the
+  result region share one `state` object per tool row, so they own separate
+  slots; without a usable per-row slot the row keeps the native presentation
+  unchanged.
+- **A gate-painted self-shell row** (`paintAnnotationRow`). A tool that draws
+  its own shell (`renderShell: "self"` — the native `edit` tool) gets no host
+  framing, so the gate paints every row it emits with the row's own background;
+  a reset surviving inside a body row cancelled that span to the card edge. The
+  intended background is now re-opened inside the row, before that row's own
+  background close, so nothing is re-opened after the card's final close and
+  nothing paints outside the card. Only rows this decoration paints change: an
+  unannotated native self-shell card keeps the host's own intentionally
+  unpainted presentation, and self-shell layout, padding, and execution are
+  unchanged.
 
 Presentation audit, run through the real installed Pi host and the pinned
 `@xterm/headless` terminal with the built-in `dark` theme, reading every cell
@@ -1562,9 +1597,12 @@ of every card row at widths 40 and 80, collapsed and expanded
 (`tests/tool-protection-renderer-host.test.ts`, plus the registered-renderer
 checks in `tests/tool-result-expansion.test.ts` and
 `tests/background-shell-result-view.test.ts`). The three row states — success,
-error, and pending — are walked for the five `Shell*` tools; the other audited
-families are witnessed in the single state their fixture produces
-(`ApplyPatch` error, `tool_search` and `SubtasksInspect` success):
+error, and pending — are walked for the five `Shell*` tools, and all four host
+row states a native `write` card reaches (a streaming call with no result yet, a
+partial result, a settled success, a settled error) are walked for it; the other
+audited families are witnessed in the single state their fixture produces
+(`ApplyPatch` error, `tool_search` and `SubtasksInspect` success, an annotated
+`edit` error):
 
 - **Affected before the change, repaired:** the five `Shell*` tools across all
   three row states (both reset triggers, and reset sequences combined with a
@@ -1582,7 +1620,33 @@ families are witnessed in the single state their fixture produces
   the `Shell*` rows and at the adapter level. Each affected case showed cells
   from the reset to the card edge falling back to the terminal background; each
   now keeps the themed band to the edge, with the retained foreground — and a
-  retained sequence that sets its own background — unchanged.
+  retained sequence that sets its own background — unchanged. Also affected
+  before the change, repaired, and witnessed on the real host row through the
+  production resolver:
+  - native `write`, in both regions of its card and all four row states, for
+    both branches of its call rendering — the plain-text branch (`.txt`) and the
+    syntax-highlighted branch (`.js`) — at widths 40 and 80, collapsed and
+    expanded, with a `\x1b[0m` and a `\x1b[49m` in the submitted `content`
+    argument and a `\x1b[0m` in the failed result's text, and with each region's
+    trigger witnessed on its own (a reset only in `content`, a reset only in the
+    failed result's text, and neither). The decorated card
+    agrees with the undecorated native card row for row apart from the theme's
+    own bare background open (so no glyph, foreground, wrap, or renderer-cache
+    change slipped in); a reset-free write card is byte-identical with and
+    without the decoration; and the native renderer is handed its own component,
+    with the same incremental highlighting cache object, and never the call
+    region's component for the result region — across a streamed argument delta,
+    unchanged redraws, both expansion toggles, and a settled result. A host
+    context with no per-row `state` keeps both regions unwrapped, and that is
+    witnessed too: the native renderer is handed its own component again on the
+    next pass and can still call `setText` (a failed result) or `clear` (no
+    output) on it.
+  - the gate-painted rows of an annotated native `edit` error card (a self-shell
+    row) at widths 40 and 80, collapsed and expanded, with a reset in the tool's
+    own error text; the reset-free annotated card keeps exactly one background
+    open and one close per gate-painted row, showing the re-open is inert there.
+    The unannotated native `edit` card's unpainted body is the host's own
+    presentation and is deliberately not changed.
 - **Unaffected, witnessed on the real host row:** native `bash`. The same
   reset-bearing text that cut a `Shell*` card apart leaves a native `bash` card
   continuous, because the host's shell renderer takes retained output through
@@ -1601,11 +1665,7 @@ families are witnessed in the single state their fixture produces
 - **Unaffected, reasoned from the pinned host source rather than executed:**
   native `read`, `grep`, `find`, and `ls` take retained output through the
   host's shared `getTextOutput` (`core/tools/render-utils.js`), which runs
-  `stripAnsi` on every text block before painting; `write` has no
-  retained-output region at all — its result rows carry only the host's own
-  status line or the call's failure text (its call rows reprint the submitted
-  `content` argument with carriage-return normalization only, which is native
-  host presentation outside this repair's boundary); `powershell` shares
+  `stripAnsi` on every text block before painting; `powershell` shares
   `bash`'s renderer family (`core/tools/renderers/index.js` builds both from
   `createShellRenderers`, differing only in the prompt they display); and the
   renderer-less registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,

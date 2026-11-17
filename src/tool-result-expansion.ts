@@ -239,11 +239,21 @@ export function toolRowBackgroundToken(
   return "toolSuccessBg";
 }
 
-/** The live theme's bare background sequence for this row's token, or undefined
- *  when the theme cannot answer: no accessor (a fake or older theme), a throwing
- *  lookup, or a non-string value. Callers then leave the rendered rows exactly
- *  as they are rather than guessing a colour. */
-function rowBackgroundAnsi(theme: unknown, result: unknown, options: unknown, context: unknown): string | undefined {
+/** The background token the host paints a tool row's CALL region with: pending
+ *  while the call itself is still streaming (`context.isPartial` is the call
+ *  region's own streaming signal — the call renderer is handed no options
+ *  object), and otherwise exactly the shared result-row decision: error for a
+ *  failed result already recorded on the row, success otherwise. */
+export function toolCallRowBackgroundToken(context: unknown): ToolRowBackgroundToken {
+  if (isRecord(context) && context.isPartial === true) return "toolPendingBg";
+  return toolRowBackgroundToken(undefined, undefined, context);
+}
+
+/** The live theme's bare background sequence for one row-background token, or
+ *  undefined when the theme cannot answer: no accessor (a fake or older theme),
+ *  a throwing lookup, or a non-string value. Callers then leave the rendered
+ *  rows exactly as they are rather than guessing a colour. */
+export function toolRowBackgroundAnsi(theme: unknown, token: ToolRowBackgroundToken): string | undefined {
   if (!isRecord(theme)) return undefined;
   try {
     // Reading the property itself can throw: a host proxy or a theme object
@@ -253,19 +263,32 @@ function rowBackgroundAnsi(theme: unknown, result: unknown, options: unknown, co
     if (typeof getter !== "function") return undefined;
     // The host theme reads instance state, and host proxies hand out the raw
     // method: keep the theme object as the receiver.
-    const ansi = (getter as (token: string) => unknown).call(theme, toolRowBackgroundToken(result, options, context));
+    const ansi = (getter as (token: string) => unknown).call(theme, token);
     return typeof ansi === "string" ? ansi : undefined;
   } catch {
     return undefined;
   }
 }
 
+/** The live theme's bare background sequence for the row state this render call
+ *  is presenting. */
+function rowBackgroundAnsi(theme: unknown, result: unknown, options: unknown, context: unknown): string | undefined {
+  return toolRowBackgroundAnsi(theme, toolRowBackgroundToken(result, options, context));
+}
+
 /** Wrap a rendered tool-row component so every row it emits reopens the row
  *  background after a reset. Width, padding, wrapping, glyphs, foregrounds,
  *  invalidation, and the component's own interaction surface are untouched;
  *  only zero-width escapes are inserted. The host's own Box still closes the
- *  completed padded row, so nothing is painted outside the card. */
-function withReopenedRowBackground<T>(component: T, backgroundAnsi: string): T {
+ *  completed padded row, so nothing is painted outside the card.
+ *
+ *  Exported for the one other surface that draws tool rows and therefore owns
+ *  the same seam (#677): the gate's renderer decoration in
+ *  `./tool-protection/coordinator`, which repairs the rows a native host
+ *  renderer emits. A caller keeps the renderer's own component as
+ *  `context.lastComponent` — this wrapper carries no renderer state, so handing
+ *  it back would break a native renderer's incremental cache. */
+export function withReopenedRowBackground<T>(component: T, backgroundAnsi: string): T {
   const inner = component as {
     render(width: number): string[];
     invalidate?(): void;
@@ -312,9 +335,14 @@ function withReopenedRowBackground<T>(component: T, backgroundAnsi: string): T {
  * No key handler is registered and nothing is fetched, rerun, or read from
  * disk by this mechanism.
  *
- * The adapter is also the single shared boundary for tool-row background
- * continuity (#677): after the shared core selects the component, every row it
- * emits gets the live theme's bare background OPEN sequence
+ * The adapter is also the shared boundary for extension-owned tool-row
+ * background continuity (#677) — `reopenRowBackground`,
+ * `toolRowBackgroundAnsi`, `toolRowBackgroundToken`,
+ * `toolCallRowBackgroundToken`, and `withReopenedRowBackground` are exported so
+ * the one other surface that draws tool rows (the gate's renderer decoration in
+ * `./tool-protection/coordinator`) applies the same rule to the native host rows
+ * it draws instead of restating it. After the shared core selects the component,
+ * every row it emits gets the live theme's bare background OPEN sequence
  * (`theme.getBgAnsi(token)` for that row's own pending/error/success state)
  * inserted directly after each background-clearing reset — a full reset
  * (`\x1b[0m`) or a background reset (`\x1b[49m`) — including a reset at the very

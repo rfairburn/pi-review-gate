@@ -10,6 +10,7 @@ import type { ChangelogModule, Eligibility, PackagingModule, PublishModule, Publ
 const common = loadReleaseModule<{
   REPOSITORY: string;
   sha256Buffer(buffer: Buffer): string;
+  describeReleaseTransport(error: unknown): string | null;
   createApi(options: { fetchImpl: unknown; token: string; repository: string }): unknown;
 }>("common.cjs");
 const packaging = loadReleaseModule<PackagingModule>("packaging.cjs");
@@ -233,6 +234,10 @@ class MockGithub {
   private createPostSeen = false;
   // The next POST /releases conflicts even though no release exists yet.
   conflictWithoutRelease = false;
+  // Optional transport-failure injection: return a rejection value to fail the
+  // matching fetch at the transport boundary. Unset for every existing test; the
+  // transport-attribution tests use it to kill one specific request.
+  rejectRequest: ((request: RecordedRequest) => unknown) | undefined = undefined;
 
   // Behavioral model of the GitHub draft-identity detachment CONFIRMED by a
   // live API probe (issue #13; public release run 33971009517): a PATCH to an
@@ -262,6 +267,8 @@ class MockGithub {
   }): Promise<{ status: number; text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }> {
     const method = init?.method ?? "GET";
     this.requests.push({ method, url, body: typeof init?.body === "string" ? init.body : undefined });
+    const injectedRejection = this.rejectRequest?.({ method, url, body: typeof init?.body === "string" ? init.body : undefined });
+    if (injectedRejection !== undefined) throw injectedRejection;
     const parsed = new URL(url);
     const body = init?.body;
     const bodyJson = (): Record<string, unknown> => JSON.parse(String(body ?? "{}"));
@@ -1839,6 +1846,99 @@ test("a failing artifact build never publishes: the owned draft stays resumable"
       "no publication PATCH may happen after a failed artifact build",
     );
     assert.equal(github.assetContents.size, 0, "no assets may be uploaded for a failed build");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+// --- Transport attribution of the two draft PATCHes -------------------------
+// The identity write and the publication write are the same API method, so the
+// only thing that can tell them apart is the label their call sites attach.
+// These tests kill exactly one of the two PATCHes at the transport boundary.
+
+const TRANSPORT_SENTINEL = "ghp_SENTINEL_plaintext_token_0123456789";
+const TRANSPORT_SENTINEL_URL = "https://objects.githubusercontent.com/private/asset.zip?token=SENTINEL-signed-redirect";
+
+function fetchFailure(): TypeError {
+  const cause = new Error(`connect ECONNRESET secret-host.internal ${TRANSPORT_SENTINEL_URL}`);
+  (cause as Error & { code?: string }).code = "ECONNRESET";
+  return new TypeError(`fetch failed ${TRANSPORT_SENTINEL}`, { cause });
+}
+
+function isReleasePatch(request: RecordedRequest): boolean {
+  return request.method === "PATCH" && /\/releases\/\d+$/.test(new URL(request.url).pathname);
+}
+
+test("a transport failure on the identity PATCH is attributed to update-draft-identity and blocks every later write", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  const rejection = fetchFailure();
+  github.rejectRequest = (request) => (isReleasePatch(request) ? rejection : undefined);
+  try {
+    let caught: unknown;
+    try {
+      await publishWith(repo, github);
+      assert.fail("the injected transport failure must reject the publication");
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal(caught, rejection, "the original rejection reaches the caller unchanged");
+    const diagnostics = common.describeReleaseTransport(caught);
+    assert.equal(diagnostics, "release diagnostics: op=update-draft-identity boundary=request transport=TypeError<ECONNRESET");
+    assert.ok(!String(diagnostics).includes(TRANSPORT_SENTINEL) && !String(diagnostics).includes(TRANSPORT_SENTINEL_URL), "no planted secret reaches the diagnostics line");
+    // Fail-closed state: the owned draft survives, nothing was uploaded, and the
+    // release was never published.
+    const draft = github.releaseByTag("b2");
+    assert.ok(draft, "the owned draft created before the failure stays resumable");
+    assert.equal(draft.draft, true, "a transport failure never publishes");
+    assert.deepEqual(draft.assets, [], "no asset upload happens after the identity write failed");
+    assert.equal(
+      github.countRequests((request) => request.method === "POST" && request.url.includes("/assets")),
+      0,
+      "no asset upload was even attempted",
+    );
+    assert.equal(
+      github.countRequests((request) => isReleasePatch(request) && (request.body ?? "").includes('"draft":false')),
+      0,
+      "no publication PATCH after the identity write failed",
+    );
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+test("a transport failure on the publication PATCH is attributed to publish-release, distinct from the identity write", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  const rejection = fetchFailure();
+  // Only the publication write (draft:false) dies; everything before it runs.
+  github.rejectRequest = (request) => (isReleasePatch(request) && (request.body ?? "").includes('"draft":false') ? rejection : undefined);
+  try {
+    let caught: unknown;
+    try {
+      await publishWith(repo, github);
+      assert.fail("the injected transport failure must reject the publication");
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal(caught, rejection, "the original rejection reaches the caller unchanged");
+    assert.equal(
+      common.describeReleaseTransport(caught),
+      "release diagnostics: op=publish-release boundary=request transport=TypeError<ECONNRESET",
+    );
+    assert.equal(
+      github.countRequests((request) => isReleasePatch(request) && (request.body ?? "").includes('"draft":true')),
+      1,
+      "the identity write itself carried the other label and succeeded",
+    );
+    const draft = github.releaseByTag("b2");
+    assert.ok(draft);
+    assert.equal(draft.draft, true, "a failed publication leaves the release a draft");
+    assert.deepEqual(
+      draft.assets.map((asset) => asset.name).sort(),
+      publish.expectedAssetNames(publish.tarballFilenameFor("0.1.0-dev.2"), 2).sort(),
+      "all six verified assets are present on the still-draft release",
+    );
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }

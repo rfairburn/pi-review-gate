@@ -371,6 +371,37 @@ If a draft remains incomplete, a re-run of the same SHA resumes it after identit
 validation; if the failure was a fail-closed identity, integrity, or permission error,
 resolve the underlying condition (or recover manually at the same exact SHA) and re-run.
 
+### Transport failure attribution
+
+A publisher step that dies at the network used to report only
+`release failed closed: fetch failed`, because Node reports every failed fetch with
+that one message. The release API client now attributes such a rejection to the
+operation that made it — the draft identity write and the final publication PATCH are
+labelled apart — and to one of two boundaries: sending the request, or reading the
+response body. The publisher CLI then prints its static headline plus at most one
+additional line:
+
+```text
+release failed closed: fetch failed
+release diagnostics: op=update-draft-identity boundary=request transport=TypeError<ECONNRESET
+```
+
+Every field is a fixed literal drawn from a closed allowlist: the operation, the
+boundary, and the underlying error name or code (socket and DNS codes such as
+`ECONNRESET` or `ENOTFOUND`, undici codes such as `UND_ERR_SOCKET`, TLS trust codes,
+and similar). A cause chain that cannot be classified reports the static
+`unclassified`, and a chain is only walked to a fixed depth. Nothing derived from the
+failure itself is ever printed — no message, stack, URL or query value (including a
+signed asset-redirect URL), header, body, hostname, address, path, environment value,
+or raw error object — so the line stays safe for public logs even when the underlying
+error carries hostile or secret-shaped content. A transport rejection that is not an
+error object at all — a bare string, for example — is attributed the same way with the
+static `unclassified` transport, and its text is never printed either.
+
+This is reporting only. The original failure propagates unchanged, the publication
+still fails closed, no request is retried, and every failure that is not a fetch or
+response-body failure keeps its existing single-line reporting.
+
 ### Annotated tag failures
 
 The builder only manages lightweight `b<N>` tags: the ref must point directly to

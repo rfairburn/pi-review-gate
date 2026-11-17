@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.291]
+
+### Changed
+
+- **Publisher transport failure attribution (#694)**: a publication that dies at the
+  network no longer reports only `release failed closed: fetch failed`. The release API
+  client now attributes a fetch or response-body rejection to the operation that made
+  it — the draft identity write and the final publication PATCH are labelled apart —
+  and to one of two boundaries (sending the request, or reading the response body), and
+  the publisher CLI prints its static headline plus at most one
+  `release diagnostics: op=… boundary=… transport=…` line. Every field is a fixed
+  literal from a closed allowlist (socket, DNS, undici, and TLS error codes; an
+  unclassifiable cause chain reports `unclassified`), and nothing derived from the
+  failure itself is printed — no message, stack, URL or query value, header, body,
+  hostname, path, or environment value — so the line stays safe for public logs even
+  when the underlying failure carries hostile or secret-shaped content, or is not an
+  error object at all. The original
+  failure propagates unchanged and publication still fails closed: no retry, timeout,
+  gate, signing, six-asset, immutability, or workflow change, and failures that are not
+  fetch or response-body failures keep their existing single-line reporting.
+
 ## [0.1.0-dev.290]
 
 ### Changed

@@ -23,10 +23,12 @@ const {
   BASELINE_SHA,
   HEX40,
   POLICY_ADOPTION_ANCHOR,
+  RELEASE_TRANSPORT_OPERATIONS,
   REPOSITORY,
   ReleaseError,
   assertReleaseEventContext,
   createApi,
+  describeReleaseTransport,
   git,
   sha256Buffer,
 } = require("./common.cjs");
@@ -755,7 +757,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       draft: true,
       prerelease: true,
       body: releaseBody(eligibility, build.provenance, notesBlock),
-    });
+    }, RELEASE_TRANSPORT_OPERATIONS.updateDraftIdentity);
     const refreshed = await api.getRelease(release.id);
     if (!refreshed) throw new ReleaseError("draft release became unreadable after identity write");
     if (!isOwnedDraft(refreshed, eligibility)) {
@@ -778,7 +780,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
       prerelease: true,
       make_latest: "false",
       body: releaseBody(eligibility, build.provenance, notesBlock),
-    });
+    }, RELEASE_TRANSPORT_OPERATIONS.publishRelease);
     const published = await api.getRelease(release.id);
     if (!published) throw new ReleaseError("release became unreadable after publication");
     await assertTagRefMatches({ api, tag: eligibility.tag, target: eligibility.target });
@@ -834,6 +836,13 @@ module.exports = {
 // Re-exported for the CLI entry point and tests.
 module.exports.summarizeGITHUBOutput = summarizeGITHUBOutput;
 
+// Static headline for a fetch or response-body failure. Node reports every
+// failed fetch with the single message `fetch failed`, and the message of an
+// attributed rejection is whatever the transport (or, in a test, an injected
+// stub) put there — so for these failures the CLI prints this fixed line and
+// never the error's own text.
+const TRANSPORT_FAILURE_HEADLINE = "release failed closed: fetch failed";
+
 if (require.main === module) {
   publishRelease({
     env: process.env,
@@ -850,7 +859,19 @@ if (require.main === module) {
       process.stdout.write(`release ${summary.outcome}: ${summary.tag} (${summary.version}) from ${summary.target}\n`);
     })
     .catch((error) => {
-      process.stderr.write(`release failed closed: ${error instanceof Error ? error.message : String(error)}\n`);
+      // An attributed transport or response-body failure prints the static
+      // headline plus at most one bounded diagnostics line built only from
+      // closed literals (operation, boundary, allowlisted underlying code) — no
+      // message, stack, URL, query, header, body, path, environment value, raw
+      // error text, or bare rejection value that is not even an Error object.
+      // Every failure that never crossed a fetch boundary keeps its existing
+      // reporting.
+      const diagnostics = describeReleaseTransport(error);
+      if (diagnostics) {
+        process.stderr.write(`${TRANSPORT_FAILURE_HEADLINE}\n${diagnostics}\n`);
+      } else {
+        process.stderr.write(`release failed closed: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
       process.exit(1);
     });
 }

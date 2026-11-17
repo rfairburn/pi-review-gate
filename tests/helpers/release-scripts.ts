@@ -31,6 +31,10 @@ export interface ReleaseCommon {
   REPOSITORY: string;
   TAG_PREFIX: string;
   MAIN_REF: string;
+  // Closed static labels for transport attribution of a failed fetch.
+  RELEASE_TRANSPORT_OPERATIONS: Record<string, string>;
+  RELEASE_TRANSPORT_BOUNDARIES: { request: string; responseBody: string };
+  describeReleaseTransport(error: unknown): string | null;
   assertReleaseEventContext(env: Record<string, string | undefined>): { target: string; repository: string; ref: string };
   createApi(options: { fetchImpl: FetchLike; token?: string; repository: string }): ReleaseApi;
   git(args: string[], options: { repoRoot: string }): string;
@@ -57,7 +61,9 @@ export interface ReleaseApi {
   // Authenticated listing that includes drafts; bounded pagination.
   listReleases(options?: { perPage?: number; maxPages?: number }): Promise<Array<Record<string, unknown>>>;
   createRelease(body: Record<string, unknown>): Promise<ApiResult>;
-  updateRelease(releaseId: number, body: Record<string, unknown>): Promise<ApiResult>;
+  // `transportOperation` is an optional closed RELEASE_TRANSPORT_OPERATIONS
+  // label distinguishing the draft identity write from the publication write.
+  updateRelease(releaseId: number, body: Record<string, unknown>, transportOperation?: string): Promise<ApiResult>;
   getRelease(releaseId: number): Promise<Record<string, unknown> | null>;
   getCommitPullRequests(sha: string, options?: { perPage?: number; maxPages?: number }): Promise<PullRequestFixture[]>;
   // Detailed record; 404 resolves to null.

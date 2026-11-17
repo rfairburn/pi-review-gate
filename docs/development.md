@@ -1558,31 +1558,59 @@ fallback are untouched.
 
 Presentation audit, run through the real installed Pi host and the pinned
 `@xterm/headless` terminal with the built-in `dark` theme, reading every cell
-of every card row at widths 40 and 80, collapsed and expanded, and across
-success, error, and pending row states
+of every card row at widths 40 and 80, collapsed and expanded
 (`tests/tool-protection-renderer-host.test.ts`, plus the registered-renderer
 checks in `tests/tool-result-expansion.test.ts` and
-`tests/background-shell-result-view.test.ts`):
+`tests/background-shell-result-view.test.ts`). The three row states — success,
+error, and pending — are walked for the five `Shell*` tools; the other audited
+families are witnessed in the single state their fixture produces
+(`ApplyPatch` error, `tool_search` and `SubtasksInspect` success):
 
-- **Affected before the change, repaired:** the five `Shell*` tools (both
-  reset triggers, and reset sequences combined with a foreground such as
-  `\x1b[0;31m` or the colon-form `\x1b[0;38:2::255:0:0m`), `ApplyPatch` (the
-  retained diff and the partial-failure diagnostic), `tool_search` (the
-  expanded outcome and raw query), and `Subtasks*` expanded detail rows. Each
-  showed cells from the reset to the card edge falling back to the terminal
-  background; each now keeps the themed band to the edge, with the retained
-  foreground — and a retained sequence that sets its own background, zero-padded
-  or colon-form — unchanged.
-- **Unaffected, witnessed with the same reset-bearing content:** the 21
-  interactive `Browser*` tools and the three acquisition/search tools
-  (`WebFetch`, `BrowserExtract`, `WebSearch`) display retained control
-  characters through `visibleTerminalText` (`src/tool-result-text.ts`), so no
-  reset is emitted into a row; native `bash` and `powershell` (one shared
-  renderer family) and native `read`, `write`, `grep`, `find`, and `ls` strip
-  SGR from retained output before painting; and the renderer-less
-  registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,
-  `YouShouldKnow`) render through the host's own fallback, which also strips
-  SGR.
+- **Affected before the change, repaired:** the five `Shell*` tools across all
+  three row states (both reset triggers, and reset sequences combined with a
+  foreground — `\x1b[0;38;5;196m` and the colon-form `\x1b[0;38:2::255:0:0m`
+  in the host rows — and a reset combined with the row's own background in the
+  indexed, zero-padded, and colon forms); `ApplyPatch` in the error state (the
+  retained diff and the partial-failure diagnostic); `tool_search` in the
+  success state (the expanded outcome and raw query); and `SubtasksInspect`,
+  the witnessed member of the `Subtasks*` family, in the success state with
+  expanded detail rows. The pending `Shell*` case renders the family's short
+  status line, which carries no reset, so it is witnessed as a row that keeps
+  the pending band unchanged rather than as a repair. The other families'
+  fixtures carry a plain `\x1b[0m` and `\x1b[49m`; the combined-attribute and
+  own-background shapes (including the simpler `\x1b[0;31m`) are asserted on
+  the `Shell*` rows and at the adapter level. Each affected case showed cells
+  from the reset to the card edge falling back to the terminal background; each
+  now keeps the themed band to the edge, with the retained foreground — and a
+  retained sequence that sets its own background — unchanged.
+- **Unaffected, witnessed on the real host row:** native `bash`. The same
+  reset-bearing text that cut a `Shell*` card apart leaves a native `bash` card
+  continuous, because the host's shell renderer takes retained output through
+  its own `getTextOutput` (`core/tools/render-utils.js`), which runs `stripAnsi`
+  before painting.
+- **Unaffected, evidenced by the families' own control-notation tests rather
+  than by this audit:** the 21 interactive `Browser*` tools and the three
+  acquisition/search tools (`WebFetch`, `BrowserExtract`, `WebSearch`) display
+  retained control characters through `visibleTerminalText`
+  (`src/tool-result-text.ts`), so no live reset is ever emitted into one of
+  their rows. Those tests feed real escape bytes in and assert they come back
+  as visible `\u001b`-shaped notation, never as an executed sequence
+  (`tests/tool-result-text.test.ts`, `tests/web-result-renderer.test.ts`,
+  `tests/web-acquisition-renderer.test.ts`, `tests/web-search-renderer.test.ts`,
+  `tests/browser-render-registration.test.ts`).
+- **Unaffected, reasoned from the pinned host source rather than executed:**
+  native `read`, `grep`, `find`, and `ls` take retained output through the
+  host's shared `getTextOutput` (`core/tools/render-utils.js`), which runs
+  `stripAnsi` on every text block before painting; `write` has no
+  retained-output region at all — its result rows carry only the host's own
+  status line or the call's failure text (its call rows reprint the submitted
+  `content` argument with carriage-return normalization only, which is native
+  host presentation outside this repair's boundary); `powershell` shares
+  `bash`'s renderer family (`core/tools/renderers/index.js` builds both from
+  `createShellRenderers`, differing only in the prompt they display); and the
+  renderer-less registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,
+  `YouShouldKnow`) register no `renderResult` and render through the host's
+  `createResultFallback`, which uses that same stripping `getTextOutput`.
 - **A separate defect, found and deliberately not changed here:** the Subtasks
   expanded detail view wraps its own retained lines with a plain-text wrap
   (`wrapByDisplayCells` in `src/execution/subtask-result-expanded.ts`) that

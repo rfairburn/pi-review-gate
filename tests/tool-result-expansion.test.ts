@@ -852,6 +852,26 @@ test("toolRowBackgroundToken follows the host's tool-row state", () => {
   assert.equal(toolRowBackgroundToken(undefined, undefined, undefined), "toolSuccessBg");
 });
 
+test("a partial row with a reset reopens the pending token, never the success or error one", () => {
+  const render = expandableResult(
+    () => textComponent([`streaming ${RESET_TEXT}`]),
+    () => textComponent([`streaming ${RESET_TEXT}`]),
+  );
+  const options = { expanded: false, isPartial: true };
+  const before = renderAt(render({}, options, noBgTheme, {}), 200);
+  // The trigger: the partial row really does carry a background-clearing reset,
+  // so this case cannot pass vacuously.
+  assert.ok(/\x1b\[(?:0+m|49m)/.test(before.join("")), "the partial fixture carries no background-clearing reset");
+  const after = renderAt(render({}, options, bgTheme, {}), 200);
+  assertReopened(after, BG_OPEN.toolPendingBg, "partial row");
+  assertOnlyOpensInserted(before, after, BG_OPEN.toolPendingBg, "partial row");
+  // The other two tokens belong to non-partial rows: a partial render must not
+  // paint a row the host is still drawing as pending.
+  const joined = after.join("");
+  assert.ok(!joined.includes(BG_OPEN.toolSuccessBg), "a partial row reopened the success token");
+  assert.ok(!joined.includes(BG_OPEN.toolErrorBg), "a partial row reopened the error token");
+});
+
 test("the shared adapter keeps both wiring-audit markers on the registered callback", () => {
   const render = expandableResult(() => textComponent(["row"]), () => textComponent(["detail"]));
   assert.equal(isExpandableResult(render), true);

@@ -1306,11 +1306,14 @@ describe("row background continuity across a tool row's resets (#677)", () => {
     }
   });
 
-  it("a registered streaming Shell card reopens the pending token", () => {
+  it("a registered streaming Shell card carries no reset, so the repair inserts nothing", () => {
     const tools = registeredShellTools();
-    // The family's own pending card is a short status line with no reset, so
-    // nothing is inserted there; a partial row that does carry one reopens the
-    // PENDING token rather than the success one.
+    // The family's own pending card is one short status line built from
+    // `theme.fg`, so it carries no background-clearing reset at all: the
+    // adapter has nothing to re-open after, the rows come back byte-for-byte
+    // as the family rendered them, and no background open of any token is
+    // added. Which token a partial row re-opens when it DOES carry a reset is
+    // the adapter's decision, asserted in tests/tool-result-expansion.test.ts.
     const pending = tools.ShellLog.renderResult(
       shellLogFixture([`${LONG} \x1b[0m ${LONG}`]), { expanded: false, isPartial: true }, themed, {},
     ) as { render(w: number): string[] };

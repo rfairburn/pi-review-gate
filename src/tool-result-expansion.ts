@@ -134,12 +134,9 @@ function parameterCode(part: string): number | undefined {
  *  `38`/`48`/`58` take `5;n` (one more parameter) or `2;r;g;b` (three more),
  *  with the mode read numerically so `48;05;0` consumes its payload exactly
  *  like `48;5;0`. Consuming the payload is what stops the zero components of
- *  `38;2;0;0;0` from being read as a full reset; the rarer CMYK form
- *  (`38;2;c;m;y;k`) leaves one extra numeric parameter, which can only ever
- *  be read as a further attribute, and re-opening the row's own theme
- *  background there is a visual no-op. A colon-form colour (`48:2::0:0:0`)
- *  keeps its payload inside one top-level parameter and consumes nothing beyond
- *  itself. */
+ *  `38;2;0;0;0` from being read as a full reset. A colon-form colour
+ *  (`48:2::0:0:0`) keeps its payload inside one top-level parameter and consumes
+ *  nothing beyond itself. */
 function extendedColorEnd(parts: string[], start: number): number {
   // A colon-form colour carries its whole payload inside this one parameter
   // (`38:2::255:0:0`), so the next parameter is another top-level attribute and

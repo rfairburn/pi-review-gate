@@ -2384,8 +2384,12 @@ if (!host) {
             const cells = await cardCells(lines, width + 1);
             for (const [index, cellRow] of cells.entries()) {
               if (index === 0) continue;
-              assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
-                `${label}: the guard column past the card is painted`);
+              // Not merely "not the theme colour": the column past the card
+              // carries NO background at all, so nothing the repaired row
+              // holds — the theme re-open or a retained own-background
+              // sequence — paints outside the card.
+              assert.equal(cellRow[width]!.bgMode, 0,
+                `${label}: the guard column past the card carries a background`);
             }
             const pastCard = await cardCells([...lines, ""], width);
             const afterCard = pastCard.at(-1)!;
@@ -2613,8 +2617,10 @@ if (!host) {
           const cells = await cardCells(lines, width + 1);
           for (const [index, cellRow] of cells.entries()) {
             if (index === 0) continue;
-            assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
-              `${label}: the guard column past the card is painted`);
+            // No background of any colour — the theme re-open or a retained
+            // own-background sequence — may reach the column past the card.
+            assert.equal(cellRow[width]!.bgMode, 0,
+              `${label}: the guard column past the card carries a background`);
           }
         }
       }
@@ -2660,8 +2666,10 @@ if (!host) {
               assert.ok(cellRow[column]!.bgMode !== 0,
                 `${label}: cell ${column} of card row ${index + 2} has no background — an ordinary terminal-background hole inside the card`);
             }
-            assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
-              `${label}: the guard column past the card is painted`);
+            // The row's own background stops at the card edge too: the guard
+            // column keeps no background of any colour.
+            assert.equal(cellRow[width]!.bgMode, 0,
+              `${label}: the guard column past the card carries a background`);
           }
           const flat = card.flat();
           assert.ok(flat.some((cell) => cellHasColor(cell, "bg", form.expected)),

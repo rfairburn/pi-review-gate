@@ -272,6 +272,20 @@ export type PeerUiCommand =
 	/** Owner-side policy: expose remote saved-history deletion to paired viewers. */
 	| { readonly type: "peer-remote-history-delete"; readonly enabled: boolean }
 	| { readonly type: "peer-add"; readonly label: string; readonly host: string; readonly port: string }
+	/**
+	 * Change one saved destination's address only. `expectedHost` and
+	 * `expectedPort` are the exact saved endpoint the edit form was drawn with:
+	 * a destination removed, replaced, or re-addressed while the form was open
+	 * is a stale target and is refused rather than retargeted. The port, label,
+	 * id, and remembered key never move.
+	 */
+	| {
+		readonly type: "peer-edit-host";
+		readonly hostId: string;
+		readonly expectedHost: string;
+		readonly expectedPort: number;
+		readonly host: string;
+	}
 	| { readonly type: "peer-connect"; readonly hostId: string }
 	| { readonly type: "peer-disconnect"; readonly hostId: string }
 	| { readonly type: "peer-remove"; readonly hostId: string }

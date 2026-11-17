@@ -653,17 +653,18 @@ function callerReleaseConditions(): void {
 function callerRunsOnlyAfterAllRequiredChecks(): void {
   const source = readWorkflow();
   const release = releaseJobBlock();
-  assert.match(release, /needs: \[verify, full-tests, windows-launcher, windows-shell, windows-session-host\]/,
-    "the publisher must need Linux verification, both native Windows check jobs, and the native session-host alpha matrix");
+  assert.match(release, /needs: \[verify, full-tests, windows-launcher, windows-shell, windows-session-host, macos-native\]/,
+    "the publisher must need Linux verification, both native Windows check jobs, the native session-host alpha matrix, and the native macOS job");
   assert.match(source, /^  verify:$/m);
   assert.match(source, /^  full-tests:$/m);
   assert.match(source, /^  windows-shell:$/m);
+  assert.match(source, /^  macos-native:$/m);
   // GitHub evaluates a needed job as failure when it fails OR is skipped; the
   // implicit success() guard therefore blocks the publisher in both cases, but
   // only as long as the condition is not overridden.
   assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)/,
     "overriding the implicit success() guard would let failed or skipped checks publish");
-  for (const neededJob of ["verify", "full-tests", "windows-launcher", "windows-shell", "windows-session-host"]) {
+  for (const neededJob of ["verify", "full-tests", "windows-launcher", "windows-shell", "windows-session-host", "macos-native"]) {
     const job = blockOf(source, neededJob, 2);
     assert.doesNotMatch(job, /continue-on-error/,
       `a continue-on-error step or job in ${neededJob} would convert failure into success upstream of the publisher`);
@@ -1077,7 +1078,7 @@ test("ci calls the session-host alpha matrix as an unconditional read-only reusa
     "the verification caller must carry no publish path");
 });
 
-test("publication depends on all eight verification legs and the Windows matrix still runs once", () => {
+test("publication depends on all nine verification legs and the Windows matrix still runs once", () => {
   const source = readWorkflow();
   const alpha = readSessionHostWorkflow();
   const alphaOn = alpha.slice(alpha.indexOf("\non:"));
@@ -1090,18 +1091,19 @@ test("publication depends on all eight verification legs and the Windows matrix 
   assert.match(alphaOn, /^  workflow_dispatch:$/m,
     "the targeted single-commit host run must remain available");
 
-  // Eight real verification legs gate publication: three Verify floors, the full
-  // suite, the two native Windows jobs, and the matrix's two Node lines.
+  // Nine real verification legs gate publication: three Verify floors, the full
+  // suite, the two native Windows jobs, the native macOS job, and the matrix's
+  // two Node lines.
   const verifyRows = matrixRows(blockOf(source, "verify", 2));
   assert.deepEqual(verifyRows.map((row) => row.version), ["22.23.5", "24.22.3", "26.13.1"],
     "three Verify legs at the exact patched floors");
   const alphaRows = matrixRows(blockOf(alpha, "windows-acceptance", 2));
   assert.deepEqual(alphaRows.map((row) => row.version), ["22.23.5", "24.22.3"],
     "the matrix contributes exactly two native legs");
-  assert.equal(verifyRows.length + 1 + 2 + alphaRows.length, 8,
-    "verify legs + full suite + two native Windows jobs + two native session-host legs = eight verification legs");
+  assert.equal(verifyRows.length + 1 + 2 + 1 + alphaRows.length, 9,
+    "verify legs + full suite + two native Windows jobs + one native macOS job + two native session-host legs = nine verification legs");
   const release = releaseJobBlock();
-  for (const needed of ["verify", "full-tests", "windows-launcher", "windows-shell", SESSION_HOST_CALLER_JOB]) {
+  for (const needed of ["verify", "full-tests", "windows-launcher", "windows-shell", SESSION_HOST_CALLER_JOB, MACOS_JOB]) {
     assert.ok(release.includes(needed), `the publisher must still need ${needed}`);
   }
   // No duplicated full suite or Windows matrix inside the callee: it runs its
@@ -1110,6 +1112,8 @@ test("publication depends on all eight verification legs and the Windows matrix 
     "the called matrix must stay focused; the full suite stays in full-tests");
   assert.equal((source.match(/runs-on: windows-latest/g) ?? []).length, 2,
     "ci.yml itself keeps exactly two automatic Windows jobs; the third native matrix arrives only through the callee");
+  assert.equal((source.match(/runs-on: macos-latest/g) ?? []).length, 1,
+    "ci.yml keeps exactly one native macOS job: the native legs are never duplicated across jobs");
 });
 
 test("matrix keeps its fail-closed prerequisites, pins, and deadlines while reused", () => {
@@ -1677,3 +1681,295 @@ for (const [jobId, stepName] of [
     assert.match(job, /run: npm run build:test/, `${jobId} must compile the suites it runs`);
   });
 }
+
+// --- Native macOS validation job (issue #685) ------------------------------
+// The real-native-Main / real-PTY / real-Pi legs and the real extended-ACL and
+// `chflags` legs skip on non-darwin hosts in the existing Linux/Windows jobs.
+// These contracts pin the ONE native macOS job that runs exactly
+// those existing compiled cases: unconditional single-leg execution on a hosted
+// macOS runner, a fail-closed prerequisite gate, the canonical locked Pi runtime
+// and its exported pins, step-scoped required-host gates, exact whole-file and
+// exact anchored selection with no silently skipped intended coverage, no
+// duplicated broad tier, and an unchanged publication trust boundary. They are
+// source-level contracts only: they prove nothing about a live macOS run, the
+// live ruleset, or any case's actual pass status — only a real native run does.
+
+const MACOS_JOB = "macos-native";
+const MACOS_CHECK_NAME = "macOS native validation (Node 24)";
+const MACOS_PREREQ_STEP = "Verify macOS native prerequisites";
+
+/** The steps carrying the 14 existing macOS-only real-Main/PTY legs. */
+const MACOS_NATIVE_MAIN_STEPS: [string, string[]][] = [
+  ["Native Main lifecycle family (real PTY, real Pi)", [
+    "session-host-native-main",
+    "session-host-native-main-lifecycle",
+    "session-host-native-main-notice",
+    "session-host-native-main-framing",
+  ]],
+  ["Native Saved conversations and resume (real PTY, real Pi)", [
+    "session-host-native-saved-main",
+    "session-host-native-resume-tasks",
+  ]],
+  ["Native CLI, image, external-editor, and background-count legs (real PTY, real Pi)", [
+    "session-host-native-cli-main-pty",
+    "session-host-native-images",
+    "session-host-native-external-editor",
+    "session-host-native-background-counts",
+  ]],
+];
+
+const MACOS_ACL_STEP = "Native extended-ACL storage and peer-state proofs";
+const MACOS_CHFLAGS_STEP = "Native chflags temp-file cleanup legs";
+
+/** The step's folded `run: >-` value as one command line. */
+function foldedRunOf(stepBlock: string): string {
+  const match = withoutComments(stepBlock).match(/^        run: >-\n((?:          .*\n?)+)/m);
+  assert.ok(match, "the step must carry a folded-scalar run value");
+  return flattened(match[1]);
+}
+
+/** The single `--test-name-pattern='…'` argument of a step, unquoted. */
+function namePatternOf(stepBlock: string): string {
+  const matches = withoutComments(stepBlock).match(/--test-name-pattern='([^']*)'/g) ?? [];
+  assert.equal(matches.length, 1, "the step must carry exactly one --test-name-pattern argument");
+  return matches[0].slice("--test-name-pattern='".length, -1);
+}
+
+/** Every top-level `test("…")` title in a compiled test file's source. */
+function topLevelTitlesOf(testSourcePath: string): string[] {
+  return [...readFileSync(testSourcePath, "utf8").matchAll(/^test\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
+}
+
+/** Every `it("…")` title in a compiled test file's source (Node matches these by their own name). */
+function itTitlesOf(testSourcePath: string): string[] {
+  return [...readFileSync(testSourcePath, "utf8").matchAll(/^\s*it\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
+}
+
+function macosJobBlock(): string {
+  return blockOf(readWorkflow(), MACOS_JOB, 2);
+}
+
+test("the native macOS job is a single unconditional leg on a real macOS runner", () => {
+  const source = readWorkflow();
+  assert.match(source, new RegExp(`^  ${MACOS_JOB}:$`, "m"),
+    "the job id must stay stable for the publisher's needs list");
+  const job = macosJobBlock();
+  assert.match(job, new RegExp(`^    name: ${escapeRegExp(MACOS_CHECK_NAME)}$`, "m"),
+    "the check name keeps the stable per-major Node label and never embeds a pinned patch version");
+  assert.match(job, /^    runs-on: macos-latest$/m,
+    "the native legs need a genuinely native macOS runner: a Linux runner would skip them silently");
+  assert.match(job, /^          node-version: 24\.22\.3$/m,
+    "the job selects the exact patched Node 24 security floor already pinned elsewhere in CI");
+  assert.match(job, /^    timeout-minutes: 45$/m, "the job carries an active finite cap");
+  // Unconditional and single-legged: an `if:` here would be a way to skip the
+  // native legs out of the publisher's dependency set, and a matrix would
+  // duplicate every native leg under qualified context names.
+  assert.doesNotMatch(job, /^    (if|needs|matrix|continue-on-error|secrets):/m,
+    "the native job must stay unconditional, single-legged, secret-free, and never tolerate a failure");
+  assert.equal(jobPermissions(job), null,
+    "the native job inherits the workflow's read-only permission; it must not declare its own");
+  assert.doesNotMatch(job, /gh (release|pr merge|workflow run|repo deploy)|npm publish|uses: \.\/\.github\/workflows\/release\.yml/,
+    "the native verification job carries no publish path");
+  assert.doesNotMatch(withoutComments(job), /PI_REVIEW_GATE_RUNTIME_ROLE|PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG/,
+    "the delegated role/catalog markers stay unset: the real native Main harness rejects them outright");
+  // The job-level env is the Chromium skip only; the required-host gates are
+  // step-scoped (asserted below), matching every other job in this file.
+  const jobEnv = job.match(/^    env:\n((?:      .*\n?)*)/m);
+  assert.ok(jobEnv, "the job presets the Chromium provisioning skip");
+  assert.equal(flattened(jobEnv[1]), 'PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"',
+    "the native legs need no browser, and the required-host gates must not be preset job-wide");
+  assert.doesNotMatch(job, /npx playwright|apt-get|brew |choco |sudo /,
+    "the native job installs no browser and changes no runner machine configuration");
+});
+
+test("the native macOS job fails closed on its platform, kqueue, Vim, and filesystem prerequisites", () => {
+  const job = macosJobBlock();
+  const step = stepOf(job, MACOS_PREREQ_STEP);
+  const run = stepRunOf(step);
+  // Each missing prerequisite fails the job at provisioning instead of surfacing
+  // mid-suite: the harnesses spawn bare `python3` from PATH with no interpreter
+  // pin, and the Ctrl+G leg checks /usr/bin/vim itself.
+  assert.match(run, /test "\$\(uname -s\)" = "Darwin"/, "the runner must actually be Darwin");
+  assert.match(run, /command -v python3 >\/dev\/null/, "the owned-PID exit observer needs python3 on PATH");
+  assert.match(run, /select\.kqueue\(\)/, "the observer needs a real kqueue");
+  assert.match(run, /KQ_FILTER_PROC/, "the observer registers a process filter");
+  assert.match(run, /KQ_NOTE_EXIT/, "the observer registers the kernel exit note");
+  assert.match(run, /test -x \/usr\/bin\/vim/, "the real Ctrl+G external-editor leg needs real Vim");
+  assert.match(run, /command -v chmod >\/dev\/null/, "the ACL legs need chmod");
+  assert.match(run, /test -x \/usr\/bin\/chflags/, "the transient-EPERM legs need chflags");
+  // No tolerated failure anywhere in the gate.
+  assert.doesNotMatch(step, /^        (if|continue-on-error):/m, "the prerequisite gate is unconditional");
+  assert.doesNotMatch(run, /\|\| *true|\|\| *exit 0|:-|skip/i,
+    "a missing prerequisite must fail the step; it can never be tolerated or skipped");
+  // The gate precedes everything that depends on it.
+  assert.ok(job.indexOf(`- name: ${MACOS_PREREQ_STEP}`) < job.indexOf("run: npm run build:test"),
+    "prerequisites must be verified before the test bundle is built and the legs run");
+});
+
+test("the native macOS job reuses the canonical locked Pi runtime and exports only its pins", () => {
+  const job = macosJobBlock();
+  assert.match(job, /rm -rf "\$RUNNER_TEMP\/pi-ui-runtime"/,
+    "the runtime must be freshly installed into a clean runner-temp directory");
+  assert.match(job, /cp scripts\/ci\/pi-ui-runtime\/package\.json scripts\/ci\/pi-ui-runtime\/package-lock\.json "\$RUNNER_TEMP\/pi-ui-runtime\/"/,
+    "the runtime must install from the one canonical locked manifest, never a restated second manifest");
+  assert.match(job, /npm ci --no-audit --no-fund/,
+    "the runtime install must be lockfile-exact, never a global, ambient, or range-resolving install");
+  assert.doesNotMatch(withoutComments(job), /npm (?:view|install|i) @earendil-works|npm init|package\.json.*EOF|cat > /,
+    "the job may not author an ad-hoc manifest or resolve a floating Pi version");
+  const expectedVersion = readPiUiRuntimeManifest().dependencies?.["@earendil-works/pi-coding-agent"];
+  assert.ok(expectedVersion, "the canonical Pi UI runtime manifest must pin a version");
+  assert.match(job, new RegExp(`PI_REVIEW_GATE_EXPECT_PI_VERSION=${escapeRegExp(expectedVersion)}" >> "\\$GITHUB_ENV"`),
+    "the exported version pin must come from the canonical manifest's exact Pi release, not a second literal list");
+  assert.match(job, /PI_REVIEW_GATE_INSTALLED_AGENT=\$RUNNER_TEMP\/pi-ui-runtime\/node_modules\/@earendil-works\/pi-coding-agent/,
+    "the native harness must be pointed at the locked runtime's exact package root");
+  assert.match(job, /PI_REVIEW_GATE_INSTALLED_PI_BIN=\$RUNNER_TEMP\/pi-ui-runtime\/node_modules\/\.bin/,
+    "the bin pin must be npm's actual installed bin directory: the harness rejects any other directory");
+  // The shared harness compiles its own candidate into per-case scratch, so a
+  // second candidate build here would be pure duplication.
+  assert.doesNotMatch(withoutComments(job), /PI_REVIEW_GATE_CANDIDATE_ENTRY|npx tsc|review-gate-candidate/,
+    "the harness compiles its own candidate: the job must not duplicate that build");
+  assert.doesNotMatch(withoutComments(job), /pi-agent-runtime|fd-find|command -v fd/,
+    "the agent-core fixture and the fd picker belong to the Linux full suite, not this job");
+});
+
+test("the native macOS job runs every existing real-Main suite in bounded serial steps that cannot silently skip", () => {
+  const job = macosJobBlock();
+  assert.match(job, /run: npm run build:test/, "the job compiles the suites it runs");
+  const seenSuites: string[] = [];
+  for (const [stepName, suites] of MACOS_NATIVE_MAIN_STEPS) {
+    const step = stepOf(job, stepName);
+    const command = foldedRunOf(step);
+    assert.match(command, /^node --test --test-concurrency=1\b/,
+      `${stepName} must run its suites serialized, as the documented native commands do`);
+    assert.deepEqual(command.replace(/^node --test --test-concurrency=1 /, "").split(" "),
+      suites.map((suite) => `dist-test/tests/${suite}.test.js`),
+      `${stepName} must execute exactly these whole compiled suites, in order, with no extra target`);
+    for (const suite of suites) {
+      assert.ok(existsSync(join(projectRoot, "tests", `${suite}.test.ts`)),
+        `${suite} must exist as a test source for the step to compile`);
+      seenSuites.push(suite);
+    }
+    // Required-host gating is what turns the harnesses' ordinary local skip into
+    // a hard failure on this host; without it a missing pin would stay green.
+    const env = stepEnvOf(step);
+    assert.match(env, /PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"/,
+      `${stepName} must fail rather than skip a missing Pi host, bin, version, Node floor, or PTY dependency`);
+    if (suites.includes("session-host-native-saved-main")) {
+      assert.match(env, /PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST: "1"/,
+        `${stepName} must set the Saved-conversation gate: without it those legs still skip silently on macOS`);
+    } else {
+      assert.doesNotMatch(env, /PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST/,
+        "the Saved gate belongs only to the steps that run the Saved harness");
+    }
+    assert.notEqual(env.trim(), "", `${stepName} declares its required-host env`);
+    assert.doesNotMatch(env.replace(/PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"|PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST: "1"/g, "").trim(),
+      /\S/, "the native test steps add no configuration beyond the required-host gates");
+    assert.match(step, /^        timeout-minutes: \d+$/m, `${stepName} carries its own finite cap`);
+    assert.doesNotMatch(step, /^        (if|continue-on-error):/m, `${stepName} stays unconditional and unforgiving`);
+    assert.doesNotMatch(command, /--test-name-pattern|--test-only|--test-timeout|skip/,
+      `${stepName} selects whole suites and never relaxes a per-test bound`);
+    assert.doesNotMatch(command, /--model|API_KEY|OPENAI|ANTHROPIC|provider/i,
+      "the native legs add no provider or model call");
+  }
+  assert.equal(new Set(seenSuites).size, seenSuites.length, "no native suite runs twice in the job");
+  // The platform skips themselves stay exactly as written: they are what keeps
+  // the Linux and Windows legs skipping honestly instead of pretending.
+  const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-main-harness.ts"), "utf8");
+  assert.match(harness, /if \(process\.platform !== "darwin"\) \{\n\s*t\.skip\(/,
+    "the harness's non-darwin platform skip must stay untouched: the fail-closed behavior comes only from the required-host gate");
+  const savedHarness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-saved-main-harness.ts"), "utf8");
+  assert.match(savedHarness, /PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST === "1"/,
+    "the Saved harness keeps its own mandatory gate that the job's Saved step satisfies");
+});
+
+test("the native macOS filesystem tier selects the real ACL and chflags cases and nothing else", () => {
+  const job = macosJobBlock();
+
+  // The real extended-ACL proofs: 10 in session-host-storage-protection, 4 in
+  // session-host-peer-state-permissions. The selector is deliberately narrower
+  // than a bare "macOS" so the pure fixture-comparison cases — which already run
+  // on every host in the Linux full suite — are not re-run here.
+  const aclStep = stepOf(job, MACOS_ACL_STEP);
+  const aclCommand = foldedRunOf(aclStep);
+  assert.match(aclCommand, /^node --test --test-concurrency=1 --test-name-pattern=/,
+    "the ACL tier runs serialized and selects by name");
+  const aclPattern = new RegExp(namePatternOf(aclStep));
+  const aclFiles = [...aclCommand.matchAll(/dist-test\/tests\/([\w.-]+)\.test\.js/g)].map((m) => m[1]);
+  assert.deepEqual(aclFiles, ["session-host-storage-protection", "session-host-peer-state-permissions"],
+    "the ACL tier runs exactly the two files carrying the real ACL fixtures");
+  let aclTotal = 0;
+  for (const file of aclFiles) {
+    const titles = topLevelTitlesOf(join(projectRoot, "tests", `${file}.test.ts`));
+    const selected = titles.filter((title) => aclPattern.test(title));
+    assert.ok(selected.length >= 4, `${file} must contribute real-ACL cases to the native ACL tier`);
+    aclTotal += selected.length;
+    for (const title of titles) {
+      if (title.startsWith("macOS ACL fixture comparison")) {
+        assert.ok(!aclPattern.test(title),
+          `${title} is a pure fixture comparison already proven on every host: the selector must exclude it`);
+      }
+    }
+  }
+  assert.equal(aclTotal, 14, "the native ACL tier selects exactly the 14 real extended-ACL cases");
+  assert.match(aclStep, /^        timeout-minutes: \d+$/m, "the ACL tier carries its own finite cap");
+  assert.doesNotMatch(aclStep, /^        (if|continue-on-error):/m, "the ACL tier stays unconditional and unforgiving");
+
+  // The three chflags transient-EPERM legs, selected by their exact anchored
+  // names so no other case in the file is re-run on this host.
+  const chflagsStep = stepOf(job, MACOS_CHFLAGS_STEP);
+  const chflagsCommand = foldedRunOf(chflagsStep);
+  assert.deepEqual([...chflagsCommand.matchAll(/dist-test\/tests\/([\w.-]+)\.test\.js/g)].map((m) => m[1]),
+    ["temp-file-cleanup"], "the chflags tier runs exactly the one file carrying those legs");
+  const chflagsPattern = new RegExp(namePatternOf(chflagsStep));
+  const chflagsTitles = itTitlesOf(join(projectRoot, "tests", "temp-file-cleanup.test.ts"));
+  const chflagsSelected = chflagsTitles.filter((title) => chflagsPattern.test(title));
+  assert.deepEqual(chflagsSelected, [
+    "retries transient EPERM until the handle is released, then deletes",
+    "fails with the original error when the contention persists past the budget",
+    "does not fail a passing body over transient contention",
+  ], "the chflags tier selects exactly the three existing macOS-only legs, in file order");
+  assert.equal(chflagsSelected.length, 3, "no chflags leg may be dropped or duplicated by the selector");
+  assert.ok(chflagsSelected.length < chflagsTitles.length,
+    "the selector must stay narrower than the whole file: the other legs are not macOS-only");
+  assert.match(chflagsStep, /^        timeout-minutes: \d+$/m, "the chflags tier carries its own finite cap");
+  assert.doesNotMatch(chflagsStep, /^        (if|continue-on-error):/m, "the chflags tier stays unconditional and unforgiving");
+});
+
+test("the native macOS job duplicates no broad tier and leaves the publication boundary unchanged", () => {
+  const job = macosJobBlock();
+  const clean = withoutComments(job);
+  // Every executed command in the job, from whichever scalar style it is written
+  // in, so a folded or block run body cannot hide a duplicated broad tier.
+  const commands = stepsOf(clean).filter((step) => /^        run:/m.test(step)).map((step) => {
+    const folded = step.match(/^        run: >-\n((?:          .*\n?)+)/m);
+    if (folded) return flattened(folded[1]);
+    const block = step.match(/^        run: \|\n((?:          .*\n?)*)/m);
+    if (block) return flattened(block[1]);
+    const inline = step.match(/^        run: (.+)$/m);
+    assert.ok(inline, "a run step must carry an inline, folded, or block scalar run value");
+    return flattened(inline[1]);
+  });
+  assert.ok(commands.length >= 8, "the native job's every executed command must be enumerated here");
+  for (const command of commands) {
+    assert.doesNotMatch(command, /npm (?:run )?test(?![\w:-])/, `unsafe full-suite command: ${command}`);
+    assert.doesNotMatch(command, /npm run build(?![\w:-])/, `the native job must never rebuild the live dist: ${command}`);
+    for (const tier of ["npm run test:run", "npm run test:fast", "npm run test:package", "npm run test:integration",
+      "npm run test:execution", "npm run test:serial", "npm run check:static"]) {
+      assert.ok(!command.includes(tier), `${tier} already runs in its dedicated job: the native job stays focused`);
+    }
+    assert.doesNotMatch(command, /dist-test\/tests\/\*\.test\.js/, "the native job never runs a globbed suite");
+  }
+  // The publisher gains one dependency and nothing else: same event/ref/
+  // repository condition, same implicit success() guard, same secret allowlist.
+  const release = releaseJobBlock();
+  assert.equal(flattened(releaseJobCondition()), RELEASE_IF,
+    "adding the native macOS dependency must not touch the publisher's trust boundary");
+  assert.doesNotMatch(release, /always\(\)|failure\(\)|cancelled\(\)|!cancelled\(\)/,
+    "overriding the implicit success() guard would let a failed or skipped native leg publish");
+  assert.equal((readWorkflow().match(/^    secrets:$/gm) ?? []).length, 1,
+    "the release caller job remains the only job that passes secrets");
+  assert.doesNotMatch(readWorkflow(), /secrets:\s*inherit/, "the native job adds no secret surface");
+  // A new required context must not shadow an existing one.
+  assert.doesNotMatch(MACOS_CHECK_NAME, /Verify|Full suite|Windows launcher|Windows shell|Session host|Publish/,
+    "the native macOS check name must stay distinct from every existing required-check name");
+});

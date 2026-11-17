@@ -15,6 +15,37 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.293]
+
+### Added
+
+- **Editing a saved destination's address (#688)**: each saved destination in the
+  Network pane now draws its own **Edit address** row, matching the Android
+  destination-address edit. Enter or a left-click on that written row opens the
+  destination's address menu, which names the destination and its endpoint and
+  states that the name, port, history, and remembered key stay fixed; its one
+  editable row prefills the saved address (no port or name editing exists here),
+  Escape abandons the edit with no command and no connection, and one
+  **Save address and reconnect** action validates the address, saves it, and then
+  makes a single ordinary explicit Connect to the new address with the same
+  approvals any other explicit Connect needs. The edit itself moves nothing else:
+  it never clears, rotates, or re-pairs the remembered server key, and a server
+  identity that changed along with the address is still refused with the existing
+  terminal key-changed report and prompts for nothing new. It also never sets or
+  clears a saved Disconnect suppression — the explicit Connect it then makes
+  clears one exactly as any other explicit Connect always has. A saved change
+  retires the old endpoint's in-flight attempt, owned retry timer, channel, and
+  displayed content through the existing tracked retirement, so a late completion
+  of the old connection cannot reappear and only the new address is dialled
+  afterwards. The command carries the exact endpoint the drawn form replaced, so a
+  destination removed, re-added, or re-addressed while the form was open is refused
+  as stale and saves nothing, and a refused save changes nothing on disk or in
+  memory and reconnects nothing. Auto reconnect, the listen endpoint, other
+  destinations, hosting, trust storage, and the persisted settings document shape
+  are unchanged — no new persisted field exists — and after a host restart the
+  ordinary automatic-recovery rules apply to the saved address. Shared desktop
+  sidebar behavior on Windows, macOS, and Linux; no Android change.
+
 ## [0.1.0-dev.292]
 
 ### Changed

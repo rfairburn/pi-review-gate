@@ -1063,6 +1063,263 @@ test("an arrival while the Add menu or its field editor is open keeps alert, foc
   assert.deepEqual(harness.commands(), [], "nothing was approved, denied, or added on the way out");
 });
 
+// ---------------------------------------------------------------------------
+// Saved destination address edit (#688): one deliberate Save address and reconnect
+// ---------------------------------------------------------------------------
+
+/** One saved destination with a distinct address and port, for address-edit tests. */
+const EDITABLE_HOST = makeHost({ id: "studio", label: "studio", host: "10.0.0.5", port: 8443 });
+
+/** Opens the address edit through the destination's own drawn Edit address row. */
+function openAddressEdit(harness: Harness): void {
+  focusPeerEntry(harness, "Edit address");
+  harness.send(ENTER);
+  const menu = peerPaneText(harness);
+  assert.ok(menu.some((line) => line.includes("Save address and reconnect (enter to save)")),
+    "the destination's address edit opened its own menu");
+  assert.deepEqual(harness.commands(), [], "opening the address edit sends nothing");
+  harness.baseline = harness.actions.length;
+}
+
+test("every saved destination draws its own Edit address row", () => {
+  const harness = makeHarness(makeSnapshot({
+    hosts: [
+      EDITABLE_HOST,
+      makeHost({ id: "lab", label: "lab", host: "10.0.0.9", port: 9000 }),
+    ],
+  }));
+  openNetworkPane(harness);
+  const text = peerPaneText(harness, 70, 40);
+  assert.equal(text.filter((line) => line.includes("Edit address (enter to edit)")).length, 2,
+    "each destination carries exactly one drawn edit entry");
+  assert.deepEqual(harness.commands(), [], "drawing the rows sends nothing");
+});
+
+test("a destination's Edit address row opens its address edit prefilled, with the fixed port named", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+
+  focusPeerEntry(harness, "Edit address");
+  harness.send(ENTER);
+  const menu = peerPaneText(harness);
+  assert.equal(harness.controller.focus, "form", "the edit stays in the same form-pane route");
+  assert.ok(menu.some((line) => line.trim() === "Edit address"), "the menu names itself");
+  assert.ok(menu.some((line) => line.includes("studio 10.0.0.5:8443")),
+    "the menu names the one destination it acts on, with its endpoint");
+  assert.ok(peerPaneFlat(harness).replace(/\s+/g, " ").includes("name, port, history, and remembered key stay fixed"),
+    "what the edit preserves is stated on the menu itself");
+  assert.ok(menu.some((line) => line.includes("Address: 10.0.0.5 (enter to edit)")),
+    "the address field is prefilled with the saved address");
+  assert.ok(menu.some((line) => line.includes("Save address and reconnect (enter to save)")),
+    "the menu's final action states the whole gesture");
+  assert.ok(!menu.some((line) => line.includes("Hosting:")), "the menu replaces the network rows");
+  assert.ok(!menu.some((line) => line.includes("Port: ")), "the fixed port is never an editable row");
+  assert.ok(!menu.some((line) => line.includes("Name: ")), "the label is never an editable row");
+  assert.deepEqual(harness.commands(), [], "opening and reading the edit sends nothing");
+
+  // Up/Down reach both rows, and the keyboard action keys are not offered here.
+  focusPeerEntry(harness, "Save address and reconnect");
+  harness.send(UP);
+  assert.ok(peerHighlighted(harness).includes("Address:"));
+  harness.send("c");
+  harness.send("x");
+  harness.send("r");
+  assert.deepEqual(harness.commands(), [], "host-action keys do nothing inside the address edit");
+});
+
+test("the address edit emits exactly one Save address and reconnect carrying the drawn endpoint", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+  openAddressEdit(harness);
+
+  focusPeerEntry(harness, "Address:");
+  harness.send(ENTER);
+  assertLabeledInputRow(harness.controller.renderForm(70, 26), 70, 26, "> Address: ", "10.0.0.5");
+  assert.ok(peerPaneFlat(harness).includes("Only the address changes"),
+    "the editor states that only the address changes");
+  assert.deepEqual(harness.commands(), [], "opening the address editor sends nothing");
+
+  harness.send("\x15");
+  submitField(harness, "10.9.9.9");
+  assert.equal(harness.controller.focus, "form", "a saved address returns to the edit menu");
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.9.9.9 (enter to edit)")));
+  assert.deepEqual(harness.commands(), [], "a stored address draft emits no command");
+
+  focusPeerEntry(harness, "Save address and reconnect");
+  harness.send(ENTER);
+  assert.deepEqual(harness.commands(), [{
+    type: "peer-edit-host",
+    hostId: "studio",
+    expectedHost: "10.0.0.5",
+    expectedPort: 8443,
+    host: "10.9.9.9",
+  }], "one deliberate action emits the new address and the endpoint the form was drawn with");
+  const back = peerPaneText(harness);
+  assert.ok(back.some((line) => line.trim() === "Network"), "the save returns to the network pane");
+  assert.ok((back.find((line) => line.startsWith("> ")) ?? "").includes("Edit address"),
+    "the highlight returns to the Edit address row the operator came from");
+});
+
+test("an invalid address is refused locally, and Escape cancels the edit with no command", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+  openAddressEdit(harness);
+
+  // An unusable address keeps the editor open and never reaches the draft.
+  focusPeerEntry(harness, "Address:");
+  harness.send(ENTER);
+  harness.send("10.0.0. 9");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("Destination address cannot contain whitespace"));
+  assert.equal(harness.controller.focus, "form", "an invalid address stays in its editor");
+  harness.send(ESC);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.5 (enter to edit)")),
+    "a rejected value never reaches the draft");
+
+  // An empty address is refused inside the editor itself, so the draft can
+  // never be emptied for the Save action to send.
+  focusPeerEntry(harness, "Address:");
+  harness.send(ENTER);
+  harness.send("\x15");
+  harness.send(ENTER);
+  assert.ok(peerPaneFlat(harness).includes("Destination address is required"));
+  assert.equal(harness.controller.focus, "form", "an empty address stays in its editor");
+  assert.deepEqual(harness.commands(), [], "an empty address sends nothing");
+  harness.send(ESC);
+
+  // Escape from the menu cancels the whole edit: no command, no reconnect.
+  focusPeerEntry(harness, "Address:");
+  harness.send(ENTER);
+  harness.send("\x15");
+  submitField(harness, "10.9.9.9");
+  assert.deepEqual(harness.commands(), []);
+  harness.send(ESC);
+  const network = peerPaneText(harness);
+  assert.ok(network.some((line) => line.trim() === "Network"), "Escape leaves the address edit");
+  assert.ok(network.some((line) => line.includes("10.0.0.5:8443")),
+    "the destination row still shows the saved address the edit never changed");
+  assert.deepEqual(harness.commands(), [], "cancelling the address edit emits nothing");
+
+  // A later visit re-prefills from the saved destination, not the abandoned draft.
+  focusPeerEntry(harness, "Edit address");
+  harness.send(ENTER);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.5 (enter to edit)")),
+    "the cancelled draft is discarded and the saved address prefills again");
+  assert.deepEqual(harness.commands(), []);
+});
+
+test("the whole address edit is reachable and acts under the pointer from the Network pane", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+
+  // Enter the editor straight from Network through the destination's drawn row.
+  assert.equal(
+    harness.controller.activatePeerAt(1, peerRowOf(harness, "Edit address (enter to edit)"), 70, 26),
+    true,
+  );
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.5 (enter to edit)")),
+    "the press opened that destination's address edit");
+  assert.deepEqual(harness.commands(), [], "opening the edit with a press sends nothing");
+  harness.baseline = harness.actions.length;
+
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Address: 10.0.0.5"), 70, 26), true);
+  assertLabeledInputRow(harness.controller.renderForm(70, 26), 70, 26, "> Address: ", "10.0.0.5");
+  assert.deepEqual(harness.commands(), [], "opening the editor with a press sends nothing");
+  harness.send(ESC);
+  peerPaneText(harness);
+
+  assert.equal(
+    harness.controller.activatePeerAt(1, peerRowOf(harness, "Save address and reconnect"), 70, 26),
+    true,
+  );
+  assert.deepEqual(harness.commands(), [{
+    type: "peer-edit-host",
+    hostId: "studio",
+    expectedHost: "10.0.0.5",
+    expectedPort: 8443,
+    host: "10.0.0.5",
+  }], "the drawn Save row performs exactly the same single action as Enter");
+  const back = peerPaneText(harness);
+  assert.ok(back.some((line) => line.trim() === "Network"), "the save returns to the network pane");
+  assert.ok((back.find((line) => line.startsWith("> ")) ?? "").includes("Edit address"),
+    "the highlight returns to the Edit address row the operator came from");
+});
+
+test("a pointer-only cancel leaves the saved address and emits nothing", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+
+  assert.equal(
+    harness.controller.activatePeerAt(1, peerRowOf(harness, "Edit address (enter to edit)"), 70, 26),
+    true,
+  );
+  harness.baseline = harness.actions.length;
+  assert.equal(harness.controller.activatePeerAt(1, peerRowOf(harness, "Address: 10.0.0.5"), 70, 26), true);
+  // Replace the value entirely, then cancel out of both the field and the menu.
+  harness.send("\x15");
+  harness.send("10.9.9.9");
+  harness.send(ESC);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.5 (enter to edit)")),
+    "cancelling the field never stored the typed address");
+  harness.send(ESC);
+  const network = peerPaneText(harness);
+  assert.ok(network.some((line) => line.trim() === "Network"), "cancelling leaves the address edit");
+  assert.ok(network.some((line) => line.includes("10.0.0.5:8443")),
+    "the destination row still shows the address the cancel never changed");
+  assert.deepEqual(harness.commands(), [], "a pointer-only cancel emits nothing at all");
+});
+
+test("a captured Edit address press cannot outlive the endpoint it was drawn for", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+  const editRow = peerRowOf(harness, "Edit address (enter to edit)");
+  const written = harness.controller.captureMousePresentation();
+
+  // The saved destination is re-addressed behind the written frame.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    revision: 2,
+    hosts: [{ ...EDITABLE_HOST, host: "10.0.0.6" }],
+  }));
+  peerPaneText(harness);
+  assert.equal(written.activatePeerAt(1, editRow, 70, 26), false,
+    "a press captured for the old endpoint refuses rather than editing the new one");
+  assert.deepEqual(harness.commands(), [], "the refused press sent nothing");
+
+  // The freshly drawn row still opens the edit for the destination it now names.
+  assert.equal(
+    harness.controller.activatePeerAt(1, peerRowOf(harness, "Edit address (enter to edit)"), 70, 26),
+    true,
+  );
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.6 (enter to edit)")),
+    "the current row edits the destination it was drawn for");
+  assert.deepEqual(harness.commands(), []);
+});
+
+test("leaving the address edit emits nothing and holds no save authority", () => {
+  const harness = makeHarness(makeSnapshot({ hosts: [EDITABLE_HOST] }));
+  openNetworkPane(harness);
+  openAddressEdit(harness);
+
+  // The saved destination changes underneath the open edit, then the operator
+  // leaves the menu: nothing is emitted, and no stale edit survives.
+  harness.controller.setPeerUiSnapshot(makeSnapshot({
+    hosts: [{ ...EDITABLE_HOST, host: "10.0.0.6" }],
+  }));
+  peerPaneText(harness);
+  harness.send(ESC);
+  assert.deepEqual(harness.commands(), [], "leaving the address edit emits nothing");
+  const network = peerPaneText(harness);
+  assert.ok(network.some((line) => line.trim() === "Network"), "the network rows are back");
+  assert.ok(network.some((line) => line.includes("10.0.0.6:8443")), "the pane shows the destination's live address");
+  assert.ok(!network.some((line) => line.includes("Save address and reconnect")), "the edit menu is closed");
+
+  // A fresh edit re-prefills from the live destination, never the abandoned one.
+  focusPeerEntry(harness, "Edit address");
+  harness.send(ENTER);
+  assert.ok(peerPaneText(harness).some((line) => line.includes("Address: 10.0.0.6 (enter to edit)")));
+  assert.deepEqual(harness.commands(), [], "reopening the edit still sends nothing");
+});
+
 test("per-host connect, disconnect, remove-confirmation and revoke-confirmation emit commands", () => {
   const host = makeHost({
     id: "studio",
@@ -1107,8 +1364,8 @@ test("per-host connect, disconnect, remove-confirmation and revoke-confirmation 
   // Receiving revocation is independent and separately confirmed.
   harness.baseline = harness.actions.length;
   peerPaneText(harness);
-  // Rows: 9 controls, host, remote row, then the trusted peer.
-  movePeerRow(harness, 2);
+  // Rows: 9 controls, host, its Edit address row, remote row, then the trusted peer.
+  movePeerRow(harness, 3);
   harness.send("v");
   assert.equal(harness.controller.focus, "confirm");
   const revokeView = confirmText(harness);
@@ -1162,7 +1419,7 @@ test("remote host rows stay honest metadata and never emit a local session actio
   // changes nothing else.
   const focusBefore = harness.controller.focus;
   const selectedBefore = harness.controller.selectedId;
-  movePeerRow(harness, 10, 40); // host, then the first remote row
+  movePeerRow(harness, 11, 40); // host, its Edit address row, then the first remote row
   harness.send(ENTER);
   const after = peerPaneText(harness, 140, 40).join("\n");
   assert.ok(after.includes("Remote session metadata only"));

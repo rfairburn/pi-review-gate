@@ -38,6 +38,13 @@ import path from "node:path";
 import test from "node:test";
 import { Terminal } from "@xterm/headless";
 import { DEFAULT_CONFIG, type ReviewGateConfig } from "../src/config";
+import registerBackgroundShell, { reapAll } from "../src/background-shell";
+import { shellResultDetails } from "../src/background-shell/result-view";
+import { APPLY_PATCH_TOOL_NAME, registerApplyPatchTool } from "../src/apply-patch/tool";
+import { DeferredToolManager } from "../src/deferred-tools";
+import { EXECUTION_TOOL_NAMES, ExecutionToolManager } from "../src/execution/tool";
+import { normalizeConfig } from "../src/config";
+import { createState } from "../src/state";
 import { createToolProtectionCoordinator } from "../src/tool-protection/coordinator";
 import { setNativeExpansionHost } from "../src/presentation-hints";
 import {
@@ -126,7 +133,10 @@ const SKIP_REASON =
  * is not rendered, so it must not count toward the row width).
  */
 function stripAnsi(text: string): string {
-  return text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+  // CSI parameters may carry colon sub-parameters (`\x1b[0;38:2::255:0:0m`),
+  // which the terminal, the host width guard, and the Shell family's own wrap
+  // all treat as zero-width; the helper has to measure the same way.
+  return text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;:]*[a-zA-Z]/g, "");
 }
 
 if (!host) {
@@ -2204,6 +2214,485 @@ if (!host) {
           `the root status row appears once, and only with debug On (debug ${debug})`);
       }
     });
+  });
+
+
+  // ── #677: Shell family rows keep the themed background across resets ────
+  //
+  // The reported #677 shape is a Shell card whose own row content carries a
+  // full reset: the host pads the row and paints it with ONE background span,
+  // so the reset cancels that span for the rest of the row and the card's own
+  // right padding falls back to the terminal background. Both Shell triggers
+  // are witnessed here through the REAL registrations and the REAL host row:
+  // the family's wrap closing a continued styled row, and retained child
+  // output that already carries resets (mid-row and at the end of a short
+  // row). The repair may only re-open the live theme's background after the
+  // reset: same glyphs, same rows, same foregrounds, nothing painted past the
+  // card.
+
+  /** The five Shell registrations, taken from the production registrar. */
+  function registerShellTools(): Record<string, Record<string, unknown>> {
+    const tools: Record<string, Record<string, unknown>> = {};
+    registerBackgroundShell({
+      registerTool: (tool: Record<string, unknown>) => {
+        tools[String(tool.name)] = tool;
+      },
+      on: () => ({}),
+      sendMessage: () => ({}),
+    } as never);
+    return tools;
+  }
+
+  const RESET_BEARING_DIFF = "retained diff context alpha beta gamma delta epsilon zeta eta theta iota kappa lambda \x1b[0m tail after a full reset mu nu xi omicron pi rho";
+  const RESET_BEARING_BG_RESET = "retained context with a background reset \x1b[49m and more retained text alpha beta gamma delta epsilon";
+  const LONG_SHELL_TEXT = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon";
+  const RETAINED_RESET_MID = `retained output ${LONG_SHELL_TEXT} \x1b[0m continues after a full reset ${LONG_SHELL_TEXT}`;
+  const RETAINED_RESET_TRAILING = "short retained line \x1b[0m";
+  const RETAINED_BG_RESET = `retained line with a background reset \x1b[49m and more ${LONG_SHELL_TEXT}`;
+  const RETAINED_COLOURED = `\x1b[38;5;208mkept foreground ${LONG_SHELL_TEXT}\x1b[39m tail`;
+  // A reset combined with a foreground in ONE sequence: the background is
+  // still unset at the end of it, while the red foreground must survive.
+  const RETAINED_RESET_PLUS_FG = `reset then red ${LONG_SHELL_TEXT} \x1b[0;38;5;196m red after a reset ${LONG_SHELL_TEXT}`;
+  // The same with a colon-form (sub-parameter) foreground: the sequence has to
+  // be inspected despite its colons, and the truecolour red must survive.
+  const RETAINED_RESET_PLUS_COLON_FG = `reset then colon red ${LONG_SHELL_TEXT} \x1b[0;38:2::255:0:0m colon red after a reset ${LONG_SHELL_TEXT}`;
+  // The colon-form (sub-parameter) foreground of a combined reset is asserted
+  // in the dedicated own-background test below, which loops over the indexed,
+  // zero-padded, and colon forms of a reset combined with a background.
+
+  function shellLogCard(bodyLines: string[]): Record<string, unknown> {
+    return {
+      content: [{ type: "text", text: `job1 "view" running\n\`\`\`\n${bodyLines.join("\n")}\n\`\`\`` }],
+      isError: false,
+      details: shellResultDetails("ShellLog", {
+        id: "job1", label: "view", status: "running",
+        totalLines: bodyLines.length, droppedLines: 0, from: 0, nextOffset: bodyLines.length,
+        requestOffset: 0, requestLimit: bodyLines.length,
+      }),
+    };
+  }
+
+  /** The shell-family fixtures that carry a reset into the card: one per
+   *  registered tool, each long enough to wrap at both tested widths. */
+  function shellResetFixtures(): Array<{ tool: string; result: Record<string, unknown> }> {
+    return [
+      {
+        tool: "ShellStart",
+        result: {
+          content: [{ type: "text", text: `Started "view" as job1 (pid 1234); currently running.` }],
+          isError: false,
+          details: shellResultDetails("ShellStart", {
+            event: "started", id: "job1", label: LONG_SHELL_TEXT,
+            command: `echo ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT}`,
+            state: "running", pid: 1234, startedAt: 1_700_000_000_000, watching: "exit",
+          }),
+        },
+      },
+      {
+        tool: "ShellList",
+        result: {
+          content: [{ type: "text", text: `1 background job(s):\n  job1 "${LONG_SHELL_TEXT}" running (pid 1234)` }],
+          isError: false,
+          details: shellResultDetails("ShellList", {
+            jobs: [{
+              id: "job1", label: LONG_SHELL_TEXT, status: "running", pid: 1234,
+              command: `sleep ${LONG_SHELL_TEXT}`, watching: "exit",
+              totalLines: 3, droppedCount: 0, elapsedMs: 5000, lastOutputAgoMs: 1000,
+            }],
+          }),
+        },
+      },
+      // The asserted retained lines sit at the END of the returned range: the
+      // collapsed card truthfully shows the tail of that range, so a line in
+      // the middle is legitimately omitted there (and asserted expanded only).
+      { tool: "ShellLog", result: shellLogCard([RETAINED_RESET_MID, RETAINED_RESET_TRAILING, RETAINED_BG_RESET, RETAINED_RESET_PLUS_FG, RETAINED_RESET_PLUS_COLON_FG, RETAINED_COLOURED]) },
+      {
+        tool: "ShellSend",
+        result: {
+          content: [{ type: "text", text: `Sent 40 bytes to job1 stdin (delivery confirmed).` }],
+          isError: false,
+          details: shellResultDetails("ShellSend", {
+            event: "stdin-write", id: "job1", label: LONG_SHELL_TEXT, bytes: 40, delivery: "confirmed",
+          }),
+        },
+      },
+      {
+        tool: "ShellStop",
+        result: {
+          content: [{ type: "text", text: "Stopping 2 job(s)." }],
+          isError: false,
+          details: shellResultDetails("ShellStop", {
+            target: "all", count: 2, outcome: "stopping",
+            targets: [{ id: "job1", label: LONG_SHELL_TEXT }, { id: "job2", label: `two ${LONG_SHELL_TEXT}` }],
+          }),
+        },
+      },
+    ];
+  }
+
+  /** One real host row around a registered Shell renderer. */
+  function shellHostRow(tool: string, renderResult: unknown, result: unknown, isPartial = false) {
+    const component = new h.agent.ToolExecutionComponent(
+      tool, `${tool}-call`, {}, {}, { name: tool, renderResult }, ui, "/work",
+    );
+    component.setArgsComplete();
+    component.updateResult(result, isPartial);
+    return component;
+  }
+
+  const shellBgToken = (isPartial: boolean, isError: boolean): string =>
+    isPartial ? "toolPendingBg" : isError ? "toolErrorBg" : "toolSuccessBg";
+
+  test("real host: registered Shell rows keep the themed background across every reset (#677)", async () => {
+    const shellTools = registerShellTools();
+    for (const fixture of shellResetFixtures()) {
+      const renderResult = shellTools[fixture.tool]!.renderResult;
+      assert.ok(renderResult, `${fixture.tool} registers a result renderer`);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error", "pending"] as const) {
+            const isPartial = state === "pending";
+            // The host's own row state: a failed result paints the error
+            // background, a partial result the pending one. (The legacy
+            // `result.isError` fallback the renderers keep is covered in
+            // tests/background-shell-result-view.test.ts.)
+            const result = state === "error" ? { ...fixture.result, isError: true } : fixture.result;
+            const row = shellHostRow(fixture.tool, renderResult, result, isPartial);
+            row.setExpanded(expanded);
+            const lines = row.render(width);
+            const label = `${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            // The trigger itself: unless the card really carries a reset, this
+            // case would pass vacuously. (A pending card renders only a short
+            // status line, so it cannot carry one.)
+            if (!isPartial) {
+              assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+                `${label}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+            }
+
+            // The card is one continuous themed band, measured CELL BY CELL in
+            // the pinned headless VT: every cell of every card row — text,
+            // gap, and the host's own padding to the right of the last glyph —
+            // carries the live theme's row background. (The string-level
+            // `assertContinuousBackground` cannot see this seam: a row keeps
+            // its opening sequence even after a reset cancels it.)
+            const backgroundAnsi = theme.getBgAnsi(shellBgToken(isPartial, state !== "success"));
+            await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+            assertFitsWidth(lines, width, label);
+
+            // Nothing is painted outside the card: the guard column and the
+            // first row after the card keep the terminal's own background.
+            const cells = await cardCells(lines, width + 1);
+            for (const [index, cellRow] of cells.entries()) {
+              if (index === 0) continue;
+              assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
+                `${label}: the guard column past the card is painted`);
+            }
+            const pastCard = await cardCells([...lines, ""], width);
+            const afterCard = pastCard.at(-1)!;
+            assert.ok(afterCard.every((cell) => cell.bgMode === 0),
+              `${label}: a row outside the card is painted`);
+
+            // The reset itself survives (nothing is stripped or normalized),
+            // and the retained text and the family's own foreground stay.
+            const joined = lines.join("\n");
+            if (fixture.tool === "ShellLog" && state === "success") {
+              // Nothing is stripped or normalized: a retained reset still
+              // reaches the row, and the retained text is still shown.
+              const clearsBackground = /\x1b\[(?:0+m|49m)/.test(joined);
+              // The family's wrap breaks on cell boundaries and the host pads
+              // every row, so compare the displayed characters with styling,
+              // padding, and line breaks removed: nothing may be dropped.
+              const flatten = (text: string): string => stripAnsi(text).replace(/\s+/g, "");
+              const displayed = flatten(lines.join(""));
+              assert.ok(clearsBackground, `${label}: the retained reset was removed`);
+              if (expanded) {
+                // Expansion renders the complete returned range.
+                for (const text of [RETAINED_RESET_MID, RETAINED_RESET_TRAILING, RETAINED_BG_RESET, RETAINED_COLOURED]) {
+                  const wanted = flatten(text);
+                  assert.ok(wanted.length > 0 && displayed.includes(wanted),
+                    `${label}: retained text ${JSON.stringify(stripAnsi(text).trim())} was lost`);
+                }
+              } else {
+                // Collapsed keeps the truthful bounded tail of the returned
+                // range and says how many earlier lines it omitted.
+                assert.ok(joined.includes("earlier returned line"), `${label}: the collapsed tail note was lost`);
+              }
+              const kept = packedColor("\x1b[38;5;208m", "fg");
+              const keptCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", kept)).length;
+              assert.ok(keptCells > 0, `${label}: retained foreground was not kept`);
+              // A reset combined with a foreground keeps that foreground while
+              // the row background is re-opened, and a reset combined with its
+              // own background keeps that background.
+              if (expanded) {
+                // The combined reset+foreground lines are asserted where the
+                // complete returned range is rendered; the collapsed card
+                // truthfully shows only the tail of that range.
+                const redFg = packedColor("\x1b[38;5;196m", "fg");
+                const redCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", redFg)).length;
+                assert.ok(redCells > 0, `${label}: the foreground of a combined reset sequence was not kept`);
+                // The colon-form (sub-parameter) truecolour red of
+                // `\x1b[0;38:2::255:0:0m` survives as the same RGB colour.
+                const colonRedFg: PackedColor = { kind: "rgb", value: 0xff0000 };
+                const colonRedCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", colonRedFg)).length;
+                assert.ok(colonRedCells > 0, `${label}: the colon-form foreground of a combined reset sequence was not kept`);
+              }
+            }
+            const header = lines.find((line) => stripAnsi(line).includes(fixture.tool));
+            assert.ok(header, `${label}: the card still names its tool`);
+          }
+        }
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: a wrapped Shell row reopens the background after the wrap's own reset (#677)", async () => {
+    const shellTools = registerShellTools();
+    // A themed line long enough to wrap: the family's wrap closes every
+    // continued styled row with a full reset of its own, which is the second
+    // way the reported card loses its background.
+    const result = {
+      content: [{ type: "text", text: `Started "view" as job1 (pid 1234); currently running.` }],
+      isError: false,
+      details: shellResultDetails("ShellStart", {
+        event: "started", id: "job1", label: "view",
+        command: `echo ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT}`,
+        state: "running", pid: 1234, startedAt: 1_700_000_000_000, watching: "exit, silence 10m",
+      }),
+    };
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        const row = shellHostRow("ShellStart", shellTools.ShellStart!.renderResult, result);
+        row.setExpanded(expanded);
+        const lines = row.render(width);
+        const label = `wrapped ShellStart ${expanded ? "expanded" : "collapsed"} width ${width}`;
+        const backgroundAnsi = theme.getBgAnsi("toolSuccessBg");
+        // The trigger itself: the wrap really did close a row with a reset.
+        assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+          `${label}: the fixture no longer produces the wrap's own reset (the case would pass vacuously)`);
+        // Every cell of every row still reaches the card edge painted with the
+        // themed background (cell-level, through the pinned headless VT).
+        await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+        assertFitsWidth(lines, width, label);
+        const cells = await cardCells(lines, width);
+        const glyphText = cells.map((cellRow) => rowGlyphs(cellRow).replace(/\s+$/, "")).join("\n");
+        assert.ok(glyphText.includes("alpha beta gamma"), `${label}: the wrapped glyphs changed`);
+        assert.ok(!glyphText.includes("\x1b"), `${label}: an escape leaked into the buffer glyphs`);
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: other custom tool families keep the themed background across retained resets (#677)", async () => {
+    // The same seam is not Shell-specific: every custom tool-result row goes
+    // through the shared adapter, and retained content in these families keeps
+    // its live SGR (unlike the web families, which display control characters
+    // through visibleTerminalText, and the native renderers/fallback, which
+    // strip SGR before painting). Each case below is witnessed through the real
+    // host row and the real registrations.
+    const cases: Array<{ label: string; tool: string; renderResult: unknown; result: Record<string, unknown>; token: string }> = [];
+
+    // ApplyPatch: the partial-failure diagnostic and the retained final diff
+    // are rendered unfiltered.
+    {
+      const tools: Array<Record<string, any>> = [];
+      registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
+      const applyPatch = tools.find((candidate) => candidate.name === APPLY_PATCH_TOOL_NAME)!;
+      assert.ok(applyPatch, "ApplyPatch was not registered");
+      cases.push({
+        label: "ApplyPatch failure",
+        tool: APPLY_PATCH_TOOL_NAME,
+        renderResult: applyPatch.renderResult,
+        result: {
+          content: [{ type: "text", text: `ApplyPatch partial failure ${RESET_BEARING_DIFF}` }],
+          isError: true,
+          details: { requestedDiff: `${RESET_BEARING_DIFF}\n${RESET_BEARING_BG_RESET}`, finalDiff: `${RESET_BEARING_DIFF}\n${RESET_BEARING_BG_RESET}` },
+        },
+        token: "toolErrorBg",
+      });
+    }
+
+    // tool_search: the expanded view renders the raw query and outcome.
+    {
+      const deferredTools: Array<Record<string, any>> = [];
+      new DeferredToolManager({
+        registerTool: (tool: Record<string, any>) => { deferredTools.push(tool); },
+        getActiveTools: () => [],
+        getAllTools: () => [],
+        setActiveTools: () => {},
+      } as never).register();
+      const search = deferredTools.find((candidate) => candidate.name === "tool_search")!;
+      assert.ok(search, "tool_search was not registered");
+      cases.push({
+        label: "tool_search expanded",
+        tool: "tool_search",
+        renderResult: search.renderResult,
+        result: {
+          content: [{ type: "text", text: `Discovery ${RESET_BEARING_DIFF}` }],
+          details: {
+            query: `${RESET_BEARING_DIFF} ${RESET_BEARING_BG_RESET}`,
+            activated: ["BrowserClick"], alreadyActive: [], refused: [], omitted: 0,
+          },
+        },
+        token: "toolSuccessBg",
+      });
+    }
+
+    // Subtasks*: the expanded detail view renders retained task records.
+    {
+      const executionTools: Array<Record<string, any>> = [];
+      const pi: Record<string, any> = {
+        registerTool(tool: Record<string, any>) { executionTools.push(tool); },
+        registerCommand(_name: string, _options: unknown) {},
+        setToolActive() {},
+        getActiveTools: () => [...Object.values(EXECUTION_TOOL_NAMES), "read", "bash"],
+      };
+      new ExecutionToolManager({
+        pi,
+        config: normalizeConfig({
+          enabled: true,
+          review: { activeReviewers: [] },
+          externalAgents: {
+            synthetic: {
+              adapter: "run-as-binary",
+              command: process.execPath,
+              execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+            },
+          },
+          execution: {
+            workerResources: { default: { selection: { source: "external", id: "synthetic" }, maxConcurrent: 4 } },
+            routes: { execute: [{ resourceId: "default" }], research: [] },
+          },
+        }),
+        state: createState(),
+        cwd: () => process.cwd(),
+        notify: () => {},
+      }).sync();
+      const inspect = executionTools.find((candidate) => candidate.name === "SubtasksInspect")!;
+      assert.ok(inspect, "SubtasksInspect was not registered");
+      cases.push({
+        label: "SubtasksInspect expanded",
+        tool: "SubtasksInspect",
+        renderResult: inspect.renderResult,
+        result: {
+          // The family's expanded detail view wraps its own retained lines
+          // with a plain-text wrap (src/execution/subtask-result-expanded.ts
+          // `wrapByDisplayCells`). These fixtures keep each retained value on
+          // one row, which is what proves the SHARED adapter reaches this
+          // family. A reset that lands ON a wrap boundary there is split by
+          // that plain-text wrap (`\x1b[` / `49m` on two rows) — a separate
+          // escape-splitting defect in that wrap, not the reset seam, and out
+          // of this change's boundary.
+          content: [{ type: "text", text: `inspect: outcome \x1b[0m after a full reset` }],
+          details: {
+            action: "inspect",
+            tasks: [{
+              taskId: "task-a", state: "running",
+              definition: { title: `work alpha \x1b[0m after a full reset` },
+              summary: "outcome beta \x1b[49m after a background reset",
+            }],
+          },
+        },
+        token: "toolSuccessBg",
+      });
+    }
+
+    for (const one of cases) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          const row = shellHostRow(one.tool, one.renderResult, one.result);
+          row.setExpanded(expanded);
+          const lines = row.render(width);
+          const label = `${one.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          // The trigger: the card really carries a background-clearing reset.
+          assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+            `${label}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+          const backgroundAnsi = theme.getBgAnsi(one.token);
+          await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+          assertFitsWidth(lines, width, label);
+          const cells = await cardCells(lines, width + 1);
+          for (const [index, cellRow] of cells.entries()) {
+            if (index === 0) continue;
+            assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
+              `${label}: the guard column past the card is painted`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a retained background combined with a reset keeps its own colour and still paints the row (#677)", async () => {
+    // Each form below resets and then sets the row's OWN background in one
+    // sequence. The theme re-open must not override that colour, while the rest
+    // of the card keeps the themed background and nothing is left unpainted
+    // inside the card. The zero-padded and colon forms are the ones a purely
+    // string comparison of the extended-colour mode gets wrong.
+    const shellTools = registerShellTools();
+    const forms: Array<{ label: string; sequence: string; expected: PackedColor }> = [
+      { label: "indexed", sequence: "\x1b[0;48;5;22m", expected: packedColor("\x1b[48;5;22m", "bg") },
+      { label: "zero-padded indexed", sequence: "\x1b[0;48;05;0m", expected: { kind: "palette", value: 0 } },
+      { label: "colon truecolour", sequence: "\x1b[0;48:2::0:0:0m", expected: { kind: "rgb", value: 0x000000 } },
+      // A colon colour carries its payload inside one parameter, so the `2`
+      // (dim) after it is another attribute and the `41` after that still sets
+      // the row's own background (SGR 41 is palette entry 1 in the VT).
+      { label: "colon foreground followed by dim and background", sequence: "\x1b[0;38:2::255:0:0;2;41m", expected: { kind: "palette", value: 1 } },
+    ];
+    for (const form of forms) {
+      const ownRow = `reset then own background ${LONG_SHELL_TEXT} ${form.sequence} kept background ${LONG_SHELL_TEXT}`;
+      const result = shellLogCard([
+        `plain retained row ${LONG_SHELL_TEXT}`,
+        `another plain retained row ${LONG_SHELL_TEXT}`,
+        ownRow,
+      ]);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          const row = shellHostRow("ShellLog", shellTools.ShellLog!.renderResult, result);
+          row.setExpanded(expanded);
+          const lines = row.render(width);
+          const label = `${form.label} own-background ShellLog ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          assert.ok(lines.join("").includes(form.sequence),
+            `${label}: the fixture no longer carries a reset combined with its own background`);
+          const backgroundAnsi = theme.getBgAnsi("toolSuccessBg");
+          const cells = await cardCells(lines, width + 1);
+          const card = cells.slice(1);
+          for (const [index, cellRow] of card.entries()) {
+            for (let column = 0; column < width; column += 1) {
+              assert.ok(cellRow[column]!.bgMode !== 0,
+                `${label}: cell ${column} of card row ${index + 2} has no background — an ordinary terminal-background hole inside the card`);
+            }
+            assert.ok(!cellHasColor(cellRow[width]!, "bg", packedColor(backgroundAnsi, "bg")),
+              `${label}: the guard column past the card is painted`);
+          }
+          const flat = card.flat();
+          assert.ok(flat.some((cell) => cellHasColor(cell, "bg", form.expected)),
+            `${label}: the row's own combined background was overridden by the theme re-open`);
+          assert.ok(flat.some((cell) => cellHasColor(cell, "bg", packedColor(backgroundAnsi, "bg"))),
+            `${label}: the rest of the card lost the themed row background`);
+        }
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: native bash keeps its own background across reset-bearing output (#677 control)", () => {
+    // The native shell renderers (shared by bash and powershell) strip SGR
+    // from retained output before painting, so no reset can reach the Box row:
+    // the same reset-bearing text that cut a Shell card apart leaves a native
+    // bash card continuous.
+    for (const width of [40, 80]) {
+      const component = new h.agent.ToolExecutionComponent(
+        "bash", "bash-677", { command: "printf ..." }, {}, nativeBashDefinition, ui, "/work",
+      );
+      component.setArgsComplete();
+      component.updateResult({
+        content: [{ type: "text", text: `${RETAINED_RESET_MID}\n${RETAINED_RESET_TRAILING}\n${RETAINED_BG_RESET}` }],
+        details: undefined,
+        isError: false,
+      }, false);
+      const lines = component.render(width);
+      assertContinuousBackground(lines, theme.getBgAnsi("toolSuccessBg"), 1, `native bash width ${width}`);
+      assertFitsWidth(lines, width, `native bash width ${width}`);
+    }
   });
 
 }

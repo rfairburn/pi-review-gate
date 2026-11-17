@@ -1508,6 +1508,94 @@ callbacks. The shared inventory also exercises registered web, discovery, shell,
 subtask, and patch tools through expansion and re-collapse with their real
 renderers.
 
+#### Tool-row background continuity across a row's resets (#677)
+
+The host frames a tool card in its own `Box`: it pads a rendered row to the
+full width and then paints that whole padded row with ONE background span
+(pi-tui `Box.applyBg` → `theme.bg(token, padded)`), where the token follows the
+host's row state — `toolPendingBg` while the call is partial, `toolErrorBg` for
+a failed result, `toolSuccessBg` otherwise. A full reset (`\x1b[0m`) or
+background reset (`\x1b[49m`) that survives inside a row therefore cancels that
+span for the rest of the row, and the card's own right padding falls back to the
+terminal's background. An extension row can carry such a reset in two ways: its
+own width wrap closing a continued styled row (for example `wrapToWidth` in
+`src/background-shell/result-view.ts`), and retained output that already
+contains resets — a diff, a discovery outcome, a subtask record, or shell
+output.
+
+The repair lives at the single shared tool-result boundary,
+`src/tool-result-expansion.ts`, so every custom tool-result registration gets
+it: after the shared presentation core selects the component, each row it emits
+has the live theme's bare background OPEN sequence (`theme.getBgAnsi(token)`
+for that row's own state) inserted directly after each background-clearing
+reset, including a reset at the very end of a row so the host's following
+padding stays painted. Which sequences clear the background is decided by
+walking the sequence's own parameters, so a reset combined with other
+attributes is judged by what the sequence ends up doing: `\x1b[0;31m` clears
+the background and keeps a red foreground (the background is re-opened, the red
+survives), while `\x1b[0;41m` or `\x1b[0;48;2;0;0;0m` set their own background
+after the reset and are left completely alone, and the zero components of an
+extended-colour payload (`\x1b[38;5;0m`, `\x1b[38;2;0;0;0m`, `\x1b[58;5;0m`) are
+never mistaken for a reset. Parameters are read the way a terminal reads them:
+a zero-padded mode (`\x1b[48;05;0m`) is the same mode as `48;5;0`, and
+colon-form sub-parameters are recognised, so `\x1b[0;38:2::255:0:0m` re-opens
+the background under its retained truecolour red while
+`\x1b[0;48:2::0:0:0m` keeps its own background. Inverse video is tracked
+separately from the background, as state carried across the sequences of one
+rendered row: a row still under inverse video (`\x1b[0;7;49m`, or `\x1b[7m` in an
+earlier sequence and `\x1b[49m` in the next) is left alone there, because what a
+cell paints is the foreground colour, and the background is re-opened only where
+the row turns inverse back off (`\x1b[0;7;27m`, or `\x1b[0;7m` … `\x1b[27m` in a
+later sequence). Nothing is removed, reordered, or normalized; no
+background close is added (the host's `Box` still ends the completed padded
+row, so nothing is painted outside the card); attribute-setting sequences are
+left alone so a row's own colours are never overridden; a row without a reset
+is returned byte-for-byte unchanged; and a theme without the accessor — or one
+whose lookup throws or returns a non-string — renders exactly as before. This
+is tool-row presentation only: the generic presentation core, the extension's
+own custom-message rows, native host renderers, and the host's renderer-less
+fallback are untouched.
+
+Presentation audit, run through the real installed Pi host and the pinned
+`@xterm/headless` terminal with the built-in `dark` theme, reading every cell
+of every card row at widths 40 and 80, collapsed and expanded, and across
+success, error, and pending row states
+(`tests/tool-protection-renderer-host.test.ts`, plus the registered-renderer
+checks in `tests/tool-result-expansion.test.ts` and
+`tests/background-shell-result-view.test.ts`):
+
+- **Affected before the change, repaired:** the five `Shell*` tools (both
+  reset triggers, and reset sequences combined with a foreground such as
+  `\x1b[0;31m` or the colon-form `\x1b[0;38:2::255:0:0m`), `ApplyPatch` (the
+  retained diff and the partial-failure diagnostic), `tool_search` (the
+  expanded outcome and raw query), and `Subtasks*` expanded detail rows. Each
+  showed cells from the reset to the card edge falling back to the terminal
+  background; each now keeps the themed band to the edge, with the retained
+  foreground — and a retained sequence that sets its own background, zero-padded
+  or colon-form — unchanged.
+- **Unaffected, witnessed with the same reset-bearing content:** the 21
+  interactive `Browser*` tools and the three acquisition/search tools
+  (`WebFetch`, `BrowserExtract`, `WebSearch`) display retained control
+  characters through `visibleTerminalText` (`src/tool-result-text.ts`), so no
+  reset is emitted into a row; native `bash` and `powershell` (one shared
+  renderer family) and native `read`, `write`, `grep`, `find`, and `ls` strip
+  SGR from retained output before painting; and the renderer-less
+  registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,
+  `YouShouldKnow`) render through the host's own fallback, which also strips
+  SGR.
+- **A separate defect, found and deliberately not changed here:** the Subtasks
+  expanded detail view wraps its own retained lines with a plain-text wrap
+  (`wrapByDisplayCells` in `src/execution/subtask-result-expanded.ts`) that
+  counts code points, so a retained escape sequence landing on a wrap boundary
+  is split across two rows. That is escape-splitting inside a wrap, not the
+  reset seam, and fixing it would change that family's wrapping behaviour.
+
+Evidence limits: headless VT with the built-in `dark` 256-colour theme only —
+no PTY, physical-terminal, truecolour, light-theme, or Windows-terminal
+certification, and the originally reported screenshot environment was never
+replayed. `powershell` shares `bash`'s renderer family and was reasoned from
+that shared source rather than executed (no PowerShell on the audit host).
+
 ### Automatic notification compaction (#92)
 
 The same shared core delivers a compact, expandable presentation for the

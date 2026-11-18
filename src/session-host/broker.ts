@@ -35,6 +35,24 @@
  * read consumes only that verified file inode; the namespace is removed only
  * when its own identity still matches and it is empty.
  *
+ * Routed SessionSpawn (optional `host`/`kind` selectors) is a separate
+ * `spawn_routed_request` frame family. A registration advertises it in its
+ * bootstrap (`spawnRouting`) only when the caller installed
+ * `onRoutedSpawnRequest`; a routed request is delivered only to that handler
+ * and is otherwise refused with a definite `failed` before any payload read.
+ * The legacy Pi-only `onSpawnRequest` never receives a routed request.
+ *
+ * Read-only SessionHosts discovery (issue #493) is advertised in the bootstrap
+ * (`sessionHosts`) only when the caller installed BOTH `onSessionHostsRequest`
+ * and `onRoutedSpawnRequest`. An authenticated `hosts_request` invokes that
+ * handler once (bounded concurrency and deadline, abortable), validates its
+ * snapshot with the shared canonical validator, and replies with ordered
+ * token-authenticated `hosts_result` pages, or one `unavailable` page when the
+ * handler throws, times out, or returns anything malformed. The broker keeps
+ * no snapshot cache, registry, or second authority: every reply comes from the
+ * handler's current answer. A request never launches, connects, pairs, or
+ * probes anything on the broker's own behalf.
+ *
  * A separate native-only one-shot family (see ./native-hook-protocol) lets
  * provider command hooks report closed lifecycle metadata on the same local
  * listener. A native source is registered before its provider child spawns and
@@ -111,9 +129,16 @@ import { isAbsolute, join } from "node:path";
 import {
   ACTIVITY_CENSUS_CAPABILITY,
   INPUT_ORIGIN_FRAMING_MODE,
+  SESSION_SPAWN_ROUTING_MODE,
+  SESSION_HOSTS_DISCOVERY_MODE,
+  encodeSessionHostsResultFrames,
+  hasSessionSpawnRouting,
+  type LegacySessionSpawnInput,
   type SessionHostActivityRequest,
   type SessionHostActivityResult,
   type SessionHostBootstrap,
+  type SessionHostHostsRequest,
+  type SessionHostsSnapshot,
   type SessionHostHello,
   type SessionHostNativeSession,
   type SessionHostRenameAck,
@@ -179,8 +204,49 @@ export interface StatusBrokerStatusHandlers {
    * first connection of a fresh registration.
    */
   onReconnect?: () => void;
-  /** Optional host-side operation invoked only by a valid request on this registration's authenticated connection. */
-  onSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+  /**
+   * Optional legacy own-host Pi spawn operation, invoked only by a valid
+   * request on this registration's authenticated connection. It receives
+   * exactly the three legacy fields; a request carrying `host` or `kind` is
+   * never delivered here (it goes to {@link onRoutedSpawnRequest} or is
+   * refused), so a Pi-only handler can never silently ignore a selector.
+   */
+  onSpawnRequest?: (request: LegacySessionSpawnInput) => Promise<SessionSpawnOutcome>;
+  /**
+   * Optional routed spawn operation. Supplying it is the registration's actual
+   * routed-spawn support: only then does the bootstrap advertise
+   * `spawnRouting`, letting the reporter send `spawn_routed_request`. It is
+   * invoked only for a valid routed request (at least one of `host`/`kind`
+   * present) and receives the exact {@link SessionSpawnInput}, selectors
+   * unchanged. It must honor the selectors or settle without launching (never
+   * a local Pi fallback), and must return `unknown` whenever a launch may have
+   * happened but was not confirmed. Legacy requests never reach it.
+   */
+  onRoutedSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+  /**
+   * Optional read-only SessionHosts discovery source for this registration's
+   * own child. Supplying it together with {@link onRoutedSpawnRequest} is the
+   * registration's actual inspection capability: only then does the bootstrap
+   * advertise `sessionHosts`. It must answer from the host's existing owning
+   * launch probe (`ownKinds`, the caller's own host) and existing paired-peer
+   * projection (`hosts`, exact saved destination ids eligible for selection);
+   * it must not connect, pair, regrant, spawn, or probe the requester's
+   * workspace. Any throw, rejection, deadline expiry, or malformed snapshot is
+   * reported to the child as unavailable; the signal aborts on deadline,
+   * disconnect, release, or disposal.
+   */
+  onSessionHostsRequest?: (request: SessionHostsRequestContext) => Promise<SessionHostsSnapshot> | SessionHostsSnapshot;
+}
+
+/** Context passed to {@link StatusBrokerStatusHandlers.onSessionHostsRequest}; carries no user data. */
+export interface SessionHostsRequestContext {
+  /** Aborted when the broker stops waiting (deadline, disconnect, release, disposal). */
+  readonly signal: AbortSignal;
+}
+
+/** True when a handler set carries the actual discovery capability the bootstrap may advertise. */
+export function hasSessionHostsDiscoveryHandlers(handlers: StatusBrokerStatusHandlers): boolean {
+  return typeof handlers.onSessionHostsRequest === "function" && typeof handlers.onRoutedSpawnRequest === "function";
 }
 
 /**
@@ -352,11 +418,15 @@ const RENAME_TIMEOUT_MS = 5000;
 const SHUTDOWN_TIMEOUT_MS = 5000;
 const ACTIVITY_TIMEOUT_MS = 5000;
 const SPAWN_TIMEOUT_MS = 60_000;
+/** Broker-side deadline for one discovery answer; below the reporter's own caller deadline. */
+const HOSTS_TIMEOUT_MS = 5000;
 const WINDOWS_PIPE_LISTEN_TIMEOUT_MS = 5000;
 const WINDOWS_PIPE_CLOSE_TIMEOUT_MS = 5000;
 const MAX_PENDING_RENAMES = 4;
 const MAX_PENDING_SHUTDOWNS = 1;
 const MAX_PENDING_SPAWNS = 2;
+const MAX_PENDING_HOSTS_REQUESTS = 2;
+const MAX_COMPLETED_HOSTS_REQUEST_IDS = 64;
 const MAX_PENDING_CONTROL_FRAMES = 4;
 const MAX_COMPLETED_RENAME_IDS = 64;
 const MAX_COMPLETED_SHUTDOWN_IDS = 64;
@@ -431,6 +501,10 @@ interface RegistrationRecord {
   completedShutdownIds: Set<string>;
   pendingSpawns: Map<string, PendingSpawn>;
   completedSpawns: Map<string, CompletedSpawn>;
+  /** In-flight read-only discovery requests, keyed by request id. */
+  pendingHosts: Map<string, PendingHostsRequest>;
+  /** Bounded recently answered request ids; a reused id is a protocol violation. */
+  completedHostsRequestIds: Set<string>;
   pendingActivity: PendingActivity | undefined;
   /** One bounded follow-up is admitted when a caller coalesces onto an in-flight request. */
   activityFollowUp: boolean;
@@ -479,6 +553,13 @@ interface PendingSpawn {
   timer: NodeJS.Timeout;
   /** True once the exact payload was verified and consumed by a successful read. */
   consumed: boolean;
+}
+
+interface PendingHostsRequest {
+  readonly requestId: string;
+  readonly connection: ConnectionState;
+  readonly controller: AbortController;
+  readonly timer: NodeJS.Timeout;
 }
 
 interface PendingActivity {
@@ -644,6 +725,7 @@ let createServerForTests: (() => Server) | undefined;
 let windowsPipeListenTimeoutForTests: number | undefined;
 let windowsPipeCloseTimeoutForTests: number | undefined;
 let spawnTimeoutMsForTests: number | undefined;
+let hostsTimeoutMsForTests: number | undefined;
 let activityTimeoutMsForTests: number | undefined;
 let nativeHookDeliveryLimitForTests: number | undefined;
 
@@ -667,6 +749,9 @@ export const __test = Object.freeze({
   },
   setSpawnTimeoutForTests(timeoutMs: number | undefined): void {
     spawnTimeoutMsForTests = timeoutMs;
+  },
+  setHostsTimeoutForTests(timeoutMs: number | undefined): void {
+    hostsTimeoutMsForTests = timeoutMs;
   },
   setActivityTimeoutForTests(timeoutMs: number | undefined): void {
     activityTimeoutMsForTests = timeoutMs;
@@ -997,6 +1082,8 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       completedShutdownIds: new Set(),
       pendingSpawns: new Map(),
       completedSpawns: new Map(),
+      pendingHosts: new Map(),
+      completedHostsRequestIds: new Set(),
       pendingActivity: undefined,
       activityFollowUp: false,
       activityCensusSupported: false,
@@ -1019,6 +1106,14 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       // one-shot bootstrap before any child exists, and nothing mutates this
       // object (or its token/secret fields) after validation.
       ...(inputOriginFraming ? { inputOriginFraming: INPUT_ORIGIN_FRAMING_MODE } : {}),
+      // Routed-spawn support is advertised only from an actually installed
+      // routed handler; a host that forwards only the legacy handler (or none)
+      // keeps the legacy bootstrap, and its reporter refuses selectors locally.
+      ...(typeof handlers.onRoutedSpawnRequest === "function" ? { spawnRouting: SESSION_SPAWN_ROUTING_MODE } : {}),
+      // Discovery is advertised only from an actually installed discovery
+      // handler on a routed-spawn registration; otherwise the child exposes no
+      // SessionHosts inspection at all.
+      ...(hasSessionHostsDiscoveryHandlers(handlers) ? { sessionHosts: SESSION_HOSTS_DISCOVERY_MODE } : {}),
     };
     return {
       bootstrap,
@@ -1424,6 +1519,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
   #failPendingRenames(record: RegistrationRecord, connection: ConnectionState, status: "disconnected"): void {
     connection.renameWriteQueue.length = 0;
     this.#failPendingActivity(record, connection);
+    this.#abandonHostsRequests(record, connection);
     for (const pending of [...record.pendingRenames.values()]) {
       if (pending.connection === connection) {
         this.#settleRename(record, pending, {
@@ -1467,6 +1563,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         });
       }
       for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
+      this.#abandonHostsRequests(record);
       this.#removePayloadNamespace(record);
       record.active = undefined;
     }
@@ -1836,8 +1933,10 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       this.#onShutdownAck(conn, message);
     } else if (message.type === "activity_result") {
       this.#onActivityResult(conn, message);
-    } else if (message.type === "spawn_request") {
+    } else if (message.type === "spawn_request" || message.type === "spawn_routed_request") {
       this.#onSpawnRequest(conn, message);
+    } else if (message.type === "hosts_request") {
+      this.#onHostsRequest(conn, message);
     } else {
       this.#destroyConnection(conn); // Reporters may only issue the explicitly admitted SessionSpawn request.
     }
@@ -2123,11 +2222,14 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     // diagnostic.
     const fingerprint = createHash("sha256")
       .update(JSON.stringify([
+        request.type,
         request.workspace,
         request.title,
         request.payload.name,
         request.payload.size,
         request.payload.sha256,
+        request.host ?? null,
+        request.kind ?? null,
       ]), "utf8")
       .digest("hex");
     const completed = record.completedSpawns.get(request.requestId);
@@ -2180,8 +2282,26 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     };
     record.pendingSpawns.set(request.requestId, operation);
 
-    const onSpawnRequest = record.handlers.onSpawnRequest;
-    if (typeof onSpawnRequest !== "function") {
+    // A routed request is delivered only to the routed handler; the legacy
+    // Pi-only handler never sees it. Without a routed handler the request is
+    // refused before any payload read, so no child can be launched. Each
+    // handler receives exactly the input shape it accepts, values unchanged.
+    const legacyHandler = record.handlers.onSpawnRequest;
+    const routedHandler = record.handlers.onRoutedSpawnRequest;
+    const invokeHost: ((prompt: string) => Promise<SessionSpawnOutcome>) | undefined = hasSessionSpawnRouting(request)
+      ? typeof routedHandler === "function"
+        ? (prompt) => routedHandler({
+          workspace: request.workspace,
+          title: request.title,
+          prompt,
+          ...(request.host === undefined ? {} : { host: request.host }),
+          ...(request.kind === undefined ? {} : { kind: request.kind }),
+        })
+        : undefined
+      : typeof legacyHandler === "function"
+        ? (prompt) => legacyHandler({ workspace: request.workspace, title: request.title, prompt })
+        : undefined;
+    if (invokeHost === undefined) {
       this.#settleSpawn(record, operation, "failed");
       return;
     }
@@ -2217,11 +2337,6 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         if (record.released || this.#disposed) this.#removePayloadNamespace(record);
         return;
       }
-      const input: SessionSpawnInput = {
-        workspace: request.workspace,
-        title: request.title,
-        prompt,
-      };
       // Re-check immediately before invoking the host callback: a release or
       // timeout may have settled this operation after the read completed.
       void Promise.resolve().then(async () => {
@@ -2232,13 +2347,124 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         }
         let outcome: SessionSpawnOutcome;
         try {
-          outcome = await onSpawnRequest(input);
+          outcome = await invokeHost(prompt);
         } catch {
           outcome = "unknown";
         }
         this.#settleSpawn(record, operation, isSpawnOutcome(outcome) ? outcome : "unknown");
       });
     })();
+  }
+
+  /**
+   * One authenticated read-only discovery request. Never launches, connects,
+   * pairs, or probes anything itself: it asks the installed handler once and
+   * relays a validated canonical snapshot (or `unavailable`) as ordered pages.
+   */
+  #onHostsRequest(conn: ConnectionState, request: SessionHostHostsRequest): void {
+    const record = conn.registration;
+    if (!record || !conn.authed || conn.superseded || conn.destroyed || record.released || record.active !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!timingSafeTextEqual(request.instanceId, record.instanceId)
+      || !timingSafeTextEqual(request.generation, this.generation)
+      || !timingSafeTextEqual(request.token, record.token)) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    // A reused request id is never coalesced or replayed: it is a protocol violation.
+    if (record.pendingHosts.has(request.requestId) || record.completedHostsRequestIds.has(request.requestId)) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const handler = record.handlers.onSessionHostsRequest;
+    if (!hasSessionHostsDiscoveryHandlers(record.handlers) || typeof handler !== "function"
+      || record.pendingHosts.size >= MAX_PENDING_HOSTS_REQUESTS) {
+      // Not advertised or over the bound: a definite read-only "unavailable".
+      this.#rememberHostsRequest(record, request.requestId);
+      this.#sendHostsResult(record, conn, request.requestId, undefined);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      const current = record.pendingHosts.get(request.requestId);
+      if (current) this.#settleHostsRequest(record, current, undefined);
+    }, hostsTimeoutMsForTests ?? HOSTS_TIMEOUT_MS);
+    timer.unref?.();
+    const pending: PendingHostsRequest = { requestId: request.requestId, connection: conn, controller, timer };
+    record.pendingHosts.set(request.requestId, pending);
+    void (async () => {
+      let snapshot: unknown;
+      try {
+        snapshot = await handler({ signal: controller.signal });
+      } catch {
+        snapshot = undefined;
+      }
+      this.#settleHostsRequest(record, pending, snapshot);
+    })();
+  }
+
+  #rememberHostsRequest(record: RegistrationRecord, requestId: string): void {
+    record.completedHostsRequestIds.add(requestId);
+    while (record.completedHostsRequestIds.size > MAX_COMPLETED_HOSTS_REQUEST_IDS) {
+      const oldest = record.completedHostsRequestIds.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      record.completedHostsRequestIds.delete(oldest);
+    }
+  }
+
+  #settleHostsRequest(record: RegistrationRecord, pending: PendingHostsRequest, snapshot: unknown): void {
+    if (record.pendingHosts.get(pending.requestId) !== pending) return;
+    record.pendingHosts.delete(pending.requestId);
+    clearTimeout(pending.timer);
+    pending.controller.abort();
+    this.#rememberHostsRequest(record, pending.requestId);
+    this.#sendHostsResult(record, pending.connection, pending.requestId, snapshot);
+  }
+
+  /** Stops waiting without replying: the connection (or registration) is already gone. */
+  #abandonHostsRequests(record: RegistrationRecord, connection?: ConnectionState): void {
+    for (const pending of [...record.pendingHosts.values()]) {
+      if (connection !== undefined && pending.connection !== connection) continue;
+      record.pendingHosts.delete(pending.requestId);
+      clearTimeout(pending.timer);
+      pending.controller.abort();
+      this.#rememberHostsRequest(record, pending.requestId);
+    }
+  }
+
+  /**
+   * Writes one complete ordered reply directly (bounded by the page bound and
+   * the per-registration concurrency bound), never through the four-frame
+   * control queue that could otherwise split or refuse a multi-page reply.
+   * A missing or invalid snapshot becomes one `unavailable` page.
+   */
+  #sendHostsResult(
+    record: RegistrationRecord,
+    connection: ConnectionState,
+    requestId: string,
+    snapshot: unknown,
+  ): void {
+    if (connection.destroyed || connection.superseded || !connection.authed
+      || record.released || this.#disposed || record.active !== connection) return;
+    let batch: string;
+    try {
+      batch = encodeSessionHostsResultFrames({
+        instanceId: record.instanceId,
+        generation: this.generation,
+        token: record.token,
+        requestId,
+      }, snapshot).join("");
+    } catch {
+      this.#destroyConnection(connection);
+      return;
+    }
+    try {
+      connection.socket.write(batch);
+    } catch {
+      this.#destroyConnection(connection);
+    }
   }
 
   #rememberSpawnResult(
@@ -2605,6 +2831,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       });
     }
     for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
+    this.#abandonHostsRequests(record);
     this.#removePayloadNamespace(record);
     record.active = undefined;
     this.#registrations.delete(record.instanceId);

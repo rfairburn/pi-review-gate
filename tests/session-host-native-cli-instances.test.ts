@@ -702,7 +702,14 @@ test("unsupported Pi inputs, an unknown backend, and a host without a provider a
   try {
     const refusals: CreateInstanceOptions[] = [
       { workspace: harness.workspace, backend: "claude", savedSession: admission },
-      { workspace: harness.workspace, backend: "claude", initialRequest: { title: "t", prompt: "do the thing" } },
+      // A native startup request is admitted since #493 (see the native spawn tests),
+      // but never combined with a resume or a separate caption.
+      {
+        workspace: harness.workspace, backend: "claude", nativeCliTarget: "claude",
+        nativeResumeConversationId: "0190a5c8-2b4e-7f00-8a00-000000000001",
+        initialRequest: { title: "t", prompt: "do the thing" },
+      },
+      { workspace: harness.workspace, backend: "codex", label: "caption", initialRequest: { title: "t", prompt: "do the thing" } },
       { workspace: harness.workspace, backend: "codex", profile: join(harness.root, "legacy-profile") },
       { workspace: harness.workspace, backend: "kittens" as never },
       { workspace: harness.workspace, backend: "" as never },

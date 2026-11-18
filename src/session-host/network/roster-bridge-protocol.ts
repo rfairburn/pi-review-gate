@@ -163,6 +163,10 @@ export const ROSTER_BRIDGE_CLOSE_CAPABILITY = "roster-close-v1";
  * this declaration alone.
  */
 export const ROSTER_BRIDGE_CREATE_CAPABILITY = "roster-create-v1";
+/** Exact, fragmented prompted launches. Never implies blank or native New support. */
+export const ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY = "roster-session-spawn-v1";
+/** Raw bytes per fragment; the encoded frame is also checked against channel bounds. */
+export const SESSION_SPAWN_FRAGMENT_BYTES = 16 * 1024;
 /**
  * Optional capability for the Saved catalog exchange. It states that the owner
  * really holds a Saved catalog view factory AND a live delete-policy callback;
@@ -249,6 +253,25 @@ export const ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY = "roster-native-name-v1";
  */
 export const ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY = "roster-native-status-v1";
 /**
+ * Optional capability DESCRIBING how the owner's native target catalog
+ * ({@link ROSTER_BRIDGE_NATIVE_CAPABILITY}) is produced (#493). It depends on that
+ * lane: an owner acknowledges it only beside the native lane, and a viewer treats an
+ * acknowledgement without the native lane as a protocol violation.
+ *
+ * Acknowledged, it states that the owner explicitly declared that its ONE native
+ * target provider performs a fresh read-only launch probe for every catalog read, so
+ * each `snapshot_end` catalog lists the targets that probe found launchable when that
+ * snapshot was published. Unacknowledged (absent, a legacy owner, or an owner that
+ * did not declare probing), the catalog is configuration-only and its availability is
+ * UNKNOWN — never assumed launchable and never assumed unavailable.
+ *
+ * It is a description of the catalog and nothing else: it adds no frame, no field,
+ * no target or kind state, no grant, and no permission. The owner still re-reads and
+ * re-proves its own live catalog before every native create, exactly as it does
+ * without this capability.
+ */
+export const ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY = "roster-native-availability-v1";
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -256,12 +279,14 @@ export const ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY = "roster-native-status-v1";
 export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Object.freeze([
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -827,7 +852,25 @@ export type RosterBridgeSavedFrame =
   | RosterBridgeSavedDeleteResultFrame
   | RosterBridgeSavedPolicyFrame;
 
+/** A single streaming create occupies the existing create slot from begin to result.
+ * The JSON payload is the exact OwnerSessionSpawnRequest, not an argv or paste.
+ * Bytes and SHA-256 bind the whole payload; ordered chunks are never dispatched
+ * until the matching end. No total prompt-size policy is imposed here.
+ */
+export type RosterBridgeSessionSpawnFrame =
+  | { readonly type: "spawn_begin"; readonly requestId: string; readonly hostRunId: string;
+      readonly sequence: number; readonly bytes: number; readonly sha256: string }
+  | { readonly type: "spawn_chunk"; readonly requestId: string; readonly index: number; readonly data: string }
+  | { readonly type: "spawn_end"; readonly requestId: string; readonly chunks: number };
+export interface RosterBridgeSessionSpawnResultFrame {
+  readonly type: "spawn_result";
+  readonly requestId: string;
+  readonly outcome: OwnerCreateFacts;
+}
+
 export type RosterBridgeFrame =
+  | RosterBridgeSessionSpawnFrame
+  | RosterBridgeSessionSpawnResultFrame
   | RosterBridgeHelloFrame
   | RosterBridgeHelloAckFrame
   | RosterBridgeSubscribeFrame
@@ -850,6 +893,10 @@ export type RosterBridgeFrame =
   | RosterBridgeErrorFrame;
 
 const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
+  spawn_begin: new Set(["type", "requestId", "hostRunId", "sequence", "bytes", "sha256"]),
+  spawn_chunk: new Set(["type", "requestId", "index", "data"]),
+  spawn_end: new Set(["type", "requestId", "chunks"]),
+  spawn_result: new Set(["type", "requestId", "outcome"]),
   hello: new Set(["type", "service", "major", "minor", "capabilities"]),
   hello_ack: new Set(["type", "service", "major", "minor", "capabilities"]),
   subscribe: new Set(["type", "subscriptionId"]),
@@ -893,6 +940,10 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
 });
 
 const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
+  spawn_begin: new Set(["requestId", "hostRunId", "sequence", "bytes", "sha256"]),
+  spawn_chunk: new Set(["requestId", "index", "data"]),
+  spawn_end: new Set(["requestId", "chunks"]),
+  spawn_result: new Set(["requestId", "outcome"]),
   hello: new Set(["service", "major", "minor", "capabilities"]),
   hello_ack: new Set(["service", "major", "minor", "capabilities"]),
   subscribe: new Set(["subscriptionId"]),
@@ -1408,8 +1459,44 @@ function buildSavedFrame(type: string, record: Record<string, unknown>, bounds: 
   }
 }
 
+function readSessionSpawnFrame(
+  value: object,
+  bounds: RosterBridgeBounds,
+): RosterBridgeSessionSpawnFrame {
+  const record = value as Record<string, unknown>;
+  const requestId = readIdentifier(record.requestId, bounds.maxIdentifierBytes);
+  switch (record.type) {
+    case "spawn_begin": {
+      const sha256 = record.sha256;
+      if (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/.test(sha256)) fail("bad_frame");
+      return Object.freeze({ type: "spawn_begin", requestId,
+        hostRunId: readIdentifier(record.hostRunId, bounds.maxIdentifierBytes),
+        sequence: readInteger(record.sequence, 1, Number.MAX_SAFE_INTEGER),
+        bytes: readInteger(record.bytes, 1, Number.MAX_SAFE_INTEGER), sha256 });
+    }
+    case "spawn_chunk": {
+      const data = record.data;
+      if (typeof data !== "string" || data.length === 0
+        || data.length > Math.ceil(SESSION_SPAWN_FRAGMENT_BYTES / 3) * 4
+        || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) fail("bad_frame");
+      const bytes = Buffer.from(data, "base64");
+      if (bytes.length > SESSION_SPAWN_FRAGMENT_BYTES || bytes.toString("base64") !== data) fail("bad_frame");
+      return Object.freeze({ type: "spawn_chunk", requestId,
+        index: readInteger(record.index, 0, Number.MAX_SAFE_INTEGER), data });
+    }
+    case "spawn_end":
+      return Object.freeze({ type: "spawn_end", requestId,
+        chunks: readInteger(record.chunks, 1, Number.MAX_SAFE_INTEGER) });
+    default: return fail("bad_frame");
+  }
+}
+
 function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): RosterBridgeFrame {
   switch (frame.type) {
+    case "spawn_begin":
+    case "spawn_chunk":
+    case "spawn_end":
+      return readSessionSpawnFrame(frame, bounds);
     case "hello":
     case "hello_ack": {
       readService(frame.service);
@@ -1480,6 +1567,7 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
       return frame;
     }
+    case "spawn_result":
     case "create_result": {
       readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
       if (!isOwnerCreateFacts(frame.outcome)) fail("invalid_frame");
@@ -1628,6 +1716,10 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
     if (!Object.prototype.hasOwnProperty.call(record, key)) fail("bad_frame");
   }
   switch (type) {
+    case "spawn_begin":
+    case "spawn_chunk":
+    case "spawn_end":
+      return readSessionSpawnFrame(record, bounds);
     case "hello":
     case "hello_ack": {
       return Object.freeze({
@@ -1711,6 +1803,7 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
         sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
       });
     }
+    case "spawn_result":
     case "create_result": {
       const outcome = ownField(record, "outcome");
       // The fact boundary is closed: one fixed kind, and for `started` exactly the
@@ -1929,6 +2022,12 @@ export function reviewRosterBridgeHelloAck(
   if (ack.minor > ROSTER_BRIDGE_MINOR) return { ok: false, code: "protocol_violation" };
   for (const capability of ack.capabilities) {
     if (!offered.capabilities.includes(capability)) return { ok: false, code: "protocol_violation" };
+  }
+  // Availability only describes the native lane's catalog, so it can never be
+  // acknowledged on its own: that would describe a catalog that cannot exist here.
+  if (ack.capabilities.includes(ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY)
+    && !ack.capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY)) {
+    return { ok: false, code: "protocol_violation" };
   }
   return Object.freeze({ ok: true, minor: ack.minor, capabilities: Object.freeze([...ack.capabilities]) });
 }

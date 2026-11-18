@@ -77,9 +77,15 @@ object RosterProtocol {
         if (!hello.capabilities.contains(RosterWire.REQUIRED_CAPABILITY)) {
             return RosterNegotiation.Refused(RosterWireErrorCode.MISSING_CAPABILITY)
         }
-        val negotiated = hello.capabilities.filter { capability ->
+        val known = hello.capabilities.filter { capability ->
             capability != RosterWire.REQUIRED_CAPABILITY &&
                 RosterWire.KNOWN_OPTIONAL_CAPABILITIES.contains(capability)
+        }
+        // A dependent description is never negotiated without the lane it describes.
+        val negotiated = if (RosterWire.dependenciesHold(known)) {
+            known
+        } else {
+            known.filter { it != RosterWire.NATIVE_AVAILABILITY_CAPABILITY }
         }
         return RosterNegotiation.Accepted(
             major = RosterWire.MAJOR,
@@ -107,6 +113,11 @@ object RosterProtocol {
             if (!offeredCapabilities.contains(capability)) {
                 return RosterAckVerdict.Refused(RosterWireErrorCode.PROTOCOL_VIOLATION)
             }
+        }
+        // Native availability only describes the native lane's catalog, so an
+        // acknowledgement of it alone describes a catalog that cannot exist here.
+        if (!RosterWire.dependenciesHold(ack.capabilities)) {
+            return RosterAckVerdict.Refused(RosterWireErrorCode.PROTOCOL_VIOLATION)
         }
         return RosterAckVerdict.Accepted(minor = ack.minor, capabilities = ack.capabilities)
     }

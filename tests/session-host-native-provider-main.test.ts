@@ -12,7 +12,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SidebarNativeCliTarget } from "../src/session-host/sidebar";
+import {
+  SidebarController,
+  type SidebarAction,
+  type SidebarNativeCliTarget,
+} from "../src/session-host/sidebar";
 import {
   createHarness,
   nextTurn,
@@ -64,9 +68,11 @@ function recordingHosting(calls: LaunchCall[]) {
   });
 }
 
-/** Open the New form, choose the nth native provider choice, and submit. */
-function submitNativeNew(harness: ReturnType<typeof createHarness>, workspace: string, cycles: number): void {
+/** Open the New form, let its fresh probe settle, choose the nth native provider choice, and submit. */
+async function submitNativeNew(harness: ReturnType<typeof createHarness>, workspace: string, cycles: number): Promise<void> {
   harness.terminal.emitInput(ENTER); // the selected New session row
+  // Native choices exist only after this form's fresh launch probe settles.
+  await nextTurn();
   harness.terminal.emitInput("\x15"); // replace any retained draft
   // The New form draws Host, then Provider, then Workspace: one Shift+Tab from
   // the workspace field lands on the Provider line drawn directly above it.
@@ -133,7 +139,7 @@ test("the New form's provider choice reaches the owned create as backend plus ta
   const harness = createHarness({}, { nativeCliHosting: recordingHosting(calls) });
   const manager: FakeManager = await ready(harness);
 
-  submitNativeNew(harness, "/native/claude/workspace", 1);
+  await submitNativeNew(harness, "/native/claude/workspace", 1);
   await nextTurn();
   assert.deepEqual(manager.createOptions.at(-1), {
     workspace: "/native/claude/workspace",
@@ -148,20 +154,21 @@ test("the New form's provider choice reaches the owned create as backend plus ta
   const roster = plain(harness.writer.frames.at(-1)?.frame);
   assert.match(roster, /Claude/, "the roster card names the provider honestly");
   assert.match(roster, /agent unknown \| input unknown/, "and its telemetry stays unknown, never idle");
-  assert.deepEqual(calls, [], "the synthetic manager owns the row; only the host's launcher can be called by a real create");
+  assert.ok(calls.length > 0 && calls.every((call) => call.workspace === process.cwd()),
+    "the synthetic manager owns the row; the host's launcher saw only pure probes at the startup cwd");
 });
 
-test("a configured target selection carries its exact id and a later New still defaults to Pi", async () => {
+test("a default target selection carries its exact id and a later New still defaults to Pi", async () => {
   const calls: LaunchCall[] = [];
   const harness = createHarness({}, { nativeCliHosting: recordingHosting(calls) });
   const manager: FakeManager = await ready(harness);
 
-  submitNativeNew(harness, "/srv/box", 3); // Pi -> claude -> codex -> external:review-box
+  await submitNativeNew(harness, "/srv/box", 2); // Pi -> claude -> codex
   await nextTurn();
   assert.deepEqual(manager.createOptions.at(-1), {
     workspace: "/srv/box",
     backend: "codex",
-    nativeCliTarget: "external:review-box",
+    nativeCliTarget: "codex",
   });
 
   // Back to the roster and open New again: the provider resets to Pi.
@@ -170,6 +177,7 @@ test("a configured target selection carries its exact id and a later New still d
   harness.terminal.emitInput(DOWN); // first row -> Saved conversations
   harness.terminal.emitInput(DOWN); // -> New session
   harness.terminal.emitInput(ENTER);
+  await nextTurn();
   await nextTurn();
   assert.match(plain(harness.writer.frames.at(-1)?.frame), /Provider: \[ Pi \]/,
     "a native choice is never remembered as the next form's default");
@@ -180,4 +188,45 @@ test("a configured target selection carries its exact id and a later New still d
   await nextTurn();
   assert.deepEqual(manager.createOptions.at(-1), { workspace: "/plain/second" },
     "the following create is the ordinary Pi create with no provider fields");
+});
+
+test("a configured named worker profile is never a local NEW choice and a forged one is refused (#493)", async () => {
+  const calls: LaunchCall[] = [];
+  let dispatch: ((action: SidebarAction) => void) | undefined;
+  let offered: readonly SidebarNativeCliTarget[] | undefined;
+  let fresh: boolean | undefined;
+  const harness = createHarness({}, {
+    nativeCliHosting: recordingHosting(calls),
+    createSidebar: (sidebarOptions) => {
+      dispatch = sidebarOptions?.onAction;
+      offered = sidebarOptions?.nativeCliTargets;
+      fresh = sidebarOptions?.freshNativeTargets;
+      return new SidebarController(sidebarOptions);
+    },
+  });
+  const manager: FakeManager = await ready(harness);
+  // No static list reaches the New form at all: it only ever offers what the
+  // fresh probe found, and the probe covers only the defaults-only projection.
+  assert.equal(offered, undefined, "no unprobed static native choice is handed to the sidebar");
+  assert.equal(fresh, true, "the New form asks Main for fresh native choices");
+
+  // Pi -> claude -> codex -> back to Pi: no third native choice exists.
+  await submitNativeNew(harness, "/srv/box", 3);
+  assert.deepEqual([...new Set(calls.map((call) => call.targetId))].sort(), ["claude", "codex"],
+    "the probe asks the launcher about the Claude and Codex default targets only");
+  await nextTurn();
+  assert.deepEqual(manager.createOptions.at(-1), { workspace: "/srv/box" },
+    "the bounded cycle wraps to Pi; the named profile is never a choice");
+  const plainFrame = plain(harness.writer.frames.at(-1)?.frame);
+  assert.doesNotMatch(plainFrame, /review-box/);
+
+  // A forged local create naming the profile is refused at the host's NEW gate:
+  // no create, no default target, no other backend, and no Pi fallback.
+  const before = manager.createOptions.length;
+  assert.ok(dispatch !== undefined);
+  dispatch({ type: "create", requestId: 9001, workspace: "/srv/forged", backend: "codex", nativeCliTarget: "external:review-box" });
+  await nextTurn();
+  await nextTurn();
+  assert.equal(manager.createOptions.length, before, "the forged NEW request never reaches the manager");
+  assert.ok(calls.every((call) => call.targetId !== "external:review-box"), "and never reaches the launcher");
 });

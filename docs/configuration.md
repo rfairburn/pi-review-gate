@@ -485,6 +485,13 @@ command failures remain errors. Other adapters retain their existing executable
 validation. Pi-scoped internal models are never copied into the external
 catalog.
 
+These definitions configure delegated review and execution workers only. The
+session host's interactive Claude Code and Codex CLI sessions — New, a paired
+owner's create, `SessionSpawn`, and restart restoration — always use that provider's
+built-in default command in its normal native setup, never an `externalAgents`
+definition, and offering those sessions changes nothing in this catalog (see
+[Native Claude Code and Codex sessions](native-sidebar-agents.md#what-shipped)).
+
 Only the canonical keyed object form is accepted. The former legacy array form
 (entries carrying their own `id`) is no longer imported or converted; see
 [Removed legacy array catalogs](#removed-legacy-array-catalogs) for the behavior

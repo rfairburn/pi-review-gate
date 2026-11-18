@@ -52,6 +52,7 @@ import {
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { SESSION_SPAWN_TOOL_NAME } from "../session-host/spawn-tool";
+import { SESSION_HOSTS_TOOL_NAME } from "../session-host/hosts-tool";
 
 /** Per-call batch bound, independent of worker concurrency and group admission. */
 const MAX_TASKS_PER_SUBMISSION = 128;
@@ -1192,9 +1193,10 @@ export class ExecutionToolManager {
       : (kind === "inplace"
         ? allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME && !tool.startsWith("Subtasks"))
         : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME)))
-      // The hosted parent may have SessionSpawn, but it is never part of any
-      // delegated executor ceiling, including execute/in-place catalogs.
-      .filter((tool) => tool !== SESSION_SPAWN_TOOL_NAME)
+      // The hosted parent may have SessionSpawn/SessionHosts, but neither is
+      // ever part of any delegated executor ceiling, including execute/in-place
+      // catalogs: both depend on the parent's own authenticated host capability.
+      .filter((tool) => tool !== SESSION_SPAWN_TOOL_NAME && tool !== SESSION_HOSTS_TOOL_NAME)
       // Issue #434: executor-only denials apply to every NEW execute/in-place
       // ceiling, after the role/ceiling filters and never to research.
       .filter((tool) => kind === "research" || !executorDenied.has(tool));

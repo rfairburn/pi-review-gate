@@ -57,6 +57,7 @@ class ClientProjection {
                     rosterSlot = capability(roster, roster?.supportsRosterSlot),
                     native = capability(roster, roster?.supportsNative),
                     nativeName = capability(roster, roster?.supportsNativeName),
+                    nativeAvailability = capability(roster, roster?.supportsNativeAvailability),
                 ),
                 // A catalog is offered only with the CURRENT snapshot it committed
                 // with. Retained/STALE rows never carry a selectable provider.
@@ -115,6 +116,10 @@ class OperationCorrelation<T : Any>(private val capacity: Int = 128) {
             early.keys.removeAll { it.hostId == hostId && it.channelGeneration == generation }
         } else admitting[key] = left
     }
+    /** True while any operation on this exact host channel is admitting or awaiting settlement. */
+    fun inFlight(hostId: HostId, generation: Long): Boolean =
+        (admitting[hostId to generation] ?: 0) > 0 ||
+            accepted.keys.any { it.hostId == hostId && it.channelGeneration == generation }
     fun settle(key: OperationKey, event: RosterClientEvent.OperationSettled): Pair<T, RosterClientEvent.OperationSettled>? {
         accepted.remove(key)?.let { return it to event }
         if ((admitting[key.hostId to key.channelGeneration] ?: 0) > 0) {

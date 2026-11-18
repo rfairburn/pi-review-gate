@@ -5,12 +5,18 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { externalAgentCatalog, normalizeConfig, type ReviewGateConfig } from "../src/config";
+import {
+  isNativeCliNewSessionTarget,
+  nativeCliRestoreTargetId,
+  projectNativeCliNewSessionTargets,
+} from "../src/session-host/session-backend";
 import {
   NATIVE_CLI_DEFAULT_TARGET_IDS,
   NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
   NativeCodexOwnedProfileUnsupportedError,
   createNativeCliLauncher,
+  listNativeCliNewSessionTargets,
   listNativeCliTargets,
   type NativeCliLaunchDescriptor,
   type NativeCodexOwnedLaunchPlan,
@@ -88,6 +94,77 @@ test("the default targets are exactly claude and codex, and configured shared CL
       "claude", "codex", "external:__proto__", "external:constructor",
     ]);
     assert.deepEqual(listNativeCliTargets({} as ReviewGateConfig).map((target) => target.id), ["claude", "codex"]);
+  });
+});
+
+test("NEW-session choices are only the backend defaults while the configured worker catalog stays intact (#493)", async () => {
+  await fixture(async (_root, bin) => {
+    const config = configWith({
+      "review-codex": {
+        adapter: "codex-cli",
+        command: join(bin, "codex"),
+        args: ["--profile", "work"],
+        env: { CODEX_HOME: "/operator/.codex-work" },
+        reasoningEffort: "high",
+        review: { model: "gpt-review", reasoningEffort: "xhigh", args: ["--search"] },
+        execution: { model: "gpt-exec", reasoningEffort: "low", protocol: "pi-review-executor-jsonl-v1" },
+      },
+      "worker-claude": {
+        adapter: "claude-cli",
+        command: join(bin, "claude"),
+        model: "claude-shared",
+        review: { model: "claude-review", reasoningEffort: "max" },
+      },
+    });
+    const catalogBefore = JSON.stringify(externalAgentCatalog(config));
+    const configBefore = JSON.stringify(config);
+
+    const choices = listNativeCliNewSessionTargets(config);
+    assert.deepEqual(choices, [
+      { id: "claude", backend: "claude", label: "Claude Code (default)" },
+      { id: "codex", backend: "codex", label: "Codex CLI (default)" },
+    ], "a NEW session offers exactly the two backend defaults with their unchanged labels");
+    assert.ok(Object.isFrozen(choices));
+    // The launcher's full configured identity list is unchanged.
+    assert.deepEqual(listNativeCliTargets(config).map((target) => target.id), [
+      "claude", "codex", "external:review-codex", "external:worker-claude",
+    ]);
+    // The NEW choice list is the projection of that same list, not a registry.
+    assert.deepEqual(projectNativeCliNewSessionTargets(listNativeCliTargets(config)), choices);
+    // Deriving choices never touches the review/execution catalog, models,
+    // reasoning, args, or env.
+    assert.equal(JSON.stringify(externalAgentCatalog(config)), catalogBefore);
+    assert.equal(JSON.stringify(config), configBefore);
+    const reviewCodex = externalAgentCatalog(config).find((agent) => agent.id === "review-codex");
+    assert.equal(reviewCodex?.reasoningEffort, "high");
+    assert.equal(reviewCodex?.review?.model, "gpt-review");
+    assert.equal(reviewCodex?.review?.reasoningEffort, "xhigh");
+    assert.equal(reviewCodex?.execution?.model, "gpt-exec");
+    assert.equal(reviewCodex?.execution?.reasoningEffort, "low");
+    assert.deepEqual(reviewCodex?.args, ["--profile", "work"]);
+
+    assert.equal(isNativeCliNewSessionTarget("claude", "claude"), true);
+    assert.equal(isNativeCliNewSessionTarget("codex", "codex"), true);
+    assert.equal(isNativeCliNewSessionTarget("codex", "claude"), false, "a default id under the other backend is not a choice");
+    assert.equal(isNativeCliNewSessionTarget("claude", "external:worker-claude"), false);
+    assert.equal(isNativeCliNewSessionTarget("pi", "claude"), false);
+    assert.equal(isNativeCliNewSessionTarget("codex", undefined), false);
+    // Restoration maps a remembered id to its backend default (#493): the default
+    // itself, or any legacy `external:<id>` — configured or not — and nothing else.
+    assert.equal(nativeCliRestoreTargetId("claude", "claude"), "claude");
+    assert.equal(nativeCliRestoreTargetId("codex", "codex"), "codex");
+    assert.equal(nativeCliRestoreTargetId("claude", "external:worker-claude"), "claude");
+    assert.equal(nativeCliRestoreTargetId("codex", "external:review-codex"), "codex");
+    assert.equal(nativeCliRestoreTargetId("codex", "external:never-configured"), "codex");
+    assert.equal(nativeCliRestoreTargetId("codex", "claude"), undefined, "another backend's default is not mapped");
+    assert.equal(nativeCliRestoreTargetId("codex", "external:"), undefined, "a bare prefix names no worker");
+    assert.equal(nativeCliRestoreTargetId("claude", "retired-target"), undefined);
+    assert.equal(nativeCliRestoreTargetId("claude", "external:bad\nid"), undefined, "a malformed id is never mapped");
+    assert.equal(nativeCliRestoreTargetId("pi", "external:worker-claude"), undefined);
+    assert.equal(nativeCliRestoreTargetId("claude", undefined), undefined);
+    assert.equal(JSON.stringify(externalAgentCatalog(config)), catalogBefore, "mapping reads no configuration");
+    // An empty configuration still offers both defaults.
+    assert.deepEqual(listNativeCliNewSessionTargets({} as ReviewGateConfig).map((target) => target.id), ["claude", "codex"]);
   });
 });
 
@@ -1491,5 +1568,101 @@ test("the owned Windows renders re-compose both children from literal tokens thr
     } finally {
       helperModule.resolveTrustedWindowsCmd = shipped;
     }
+  });
+});
+
+// --- SessionSpawn startup request composition (issue #493). ---
+
+const STARTUP_INSTRUCTION = "Please read the entire file at the JSON-quoted path \"/tmp/prg-native-prompt-x/p-1.json\", then do it.";
+
+test("a Claude startup request adds the exact attached --name title and the instruction after a terminator", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "claude"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const title = "--dangerous looking  title with ünicode, \"quotes\" and a long tail ".padEnd(900, "t");
+    const environment: NodeJS.ProcessEnv = { PATH: bin, HOME: "/operator/home" };
+    const descriptor = await createNativeCliLauncher(configWith({}), { platform: "darwin" })("claude", {
+      workspace, env: environment, targetId: "claude",
+      initialPrompt: { instruction: STARTUP_INSTRUCTION, title },
+    });
+    assert.deepEqual(descriptor.args, [`--name=${title}`, "--", STARTUP_INSTRUCTION],
+      "the exact title rides one attached option; the instruction is the single prompt operand");
+    assert.equal(descriptor.cwd, workspace);
+    assert.ok(!Object.values(descriptor.env).some((value) => value?.includes(STARTUP_INSTRUCTION) || value?.includes(title)),
+      "neither the instruction nor the title reaches the child environment");
+    assert.equal(environment.PWD, undefined, "the caller's environment is never mutated");
+    // Without a startup request the descriptor is byte-identical to the bare launch.
+    const bare = await createNativeCliLauncher(configWith({}), { platform: "darwin" })("claude", { workspace, env: environment });
+    assert.deepEqual(bare.args, []);
+  });
+});
+
+test("a Codex startup request keeps --no-daemon, appends the terminated instruction, and refuses a title argument", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const launcher = createNativeCliLauncher(configWith({}), { platform: "darwin" });
+    const codex = await launcher("codex", { workspace, env: { PATH: bin }, initialPrompt: { instruction: STARTUP_INSTRUCTION } });
+    assert.deepEqual(codex.args, ["--no-daemon", "--", STARTUP_INSTRUCTION]);
+    await assert.rejects(
+      () => launcher("codex", { workspace, env: { PATH: bin }, initialPrompt: { instruction: STARTUP_INSTRUCTION, title: "T" } }),
+      /no native title option/u,
+      "Codex has no title flag: the title is never silently dropped or invented as an argument",
+    );
+  });
+});
+
+test("an owned Codex startup request reaches the TUI render only, after the remote connection and a terminator", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const descriptor = await createNativeCliLauncher(configWith({}), { platform: "darwin", ownedCodexBackend: true })("codex", {
+      workspace, env: { PATH: bin }, targetId: "codex", initialPrompt: { instruction: STARTUP_INSTRUCTION },
+    });
+    const plan = ownedPlanOf(descriptor);
+    const tui = plan.renderTui(ownedConnection(plan.backendEnv));
+    assert.deepEqual(tui.args, [...ownedConnectionArgs(), "--", STARTUP_INSTRUCTION],
+      "the owned TUI keeps its existing relay connection and gains only the terminated instruction");
+    assert.deepEqual(plan.renderTui(ownedConnection(plan.backendEnv)).args, tui.args, "rendering is repeatable");
+    const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+    assert.ok(!backend.args.includes(STARTUP_INSTRUCTION) && !backend.args.includes("--"),
+      "the app-server backend never receives the startup operand");
+  });
+});
+
+test("a startup request is refused for a configured worker profile, a restore, or an unsafe instruction", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "claude"));
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const launcher = createNativeCliLauncher(configWith({
+      worker: { adapter: "claude-cli", command: join(bin, "claude"), review: {} },
+    }), { platform: "darwin" });
+    await assert.rejects(
+      () => launcher("claude", { workspace, env: { PATH: bin }, targetId: "external:worker", initialPrompt: { instruction: STARTUP_INSTRUCTION } }),
+      /not its backend's default target/u,
+      "a SessionSpawn startup never selects an external worker target",
+    );
+    await assert.rejects(
+      () => launcher("claude", {
+        workspace, env: { PATH: bin }, targetId: "claude",
+        resumeConversationId: "0190a5c8-2b4e-7f00-8a00-000000000001",
+        initialPrompt: { instruction: STARTUP_INSTRUCTION },
+      }),
+      /cannot be combined with a conversation restore/u,
+    );
+    for (const instruction of ["", "-p evil", "/slash command", "@/etc/passwd", "line\nbreak", " x"]) {
+      const error = await launcher("claude", { workspace, env: { PATH: bin }, initialPrompt: { instruction } }).then(
+        () => undefined, (caught: unknown) => caught as Error);
+      assert.ok(error instanceof Error, `${JSON.stringify(instruction)} is refused`);
+      assert.ok(instruction === "" || !error.message.includes(instruction), "a refusal never echoes the instruction");
+    }
+    const titled = await launcher("claude", { workspace, env: { PATH: bin }, initialPrompt: { instruction: STARTUP_INSTRUCTION, title: "bad\ntitle" } })
+      .then(() => undefined, (caught: unknown) => caught as Error);
+    assert.ok(titled instanceof Error && !titled.message.includes("bad"), "a control-bearing title is refused without echo");
   });
 });

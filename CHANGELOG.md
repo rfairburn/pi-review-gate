@@ -15,6 +15,111 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.296]
+
+### Added
+
+- **SessionSpawn host and kind selection, and SessionHosts discovery (#493)**: a
+  hosted Pi child's `SessionSpawn` accepts two optional selectors when its host
+  advertises routed spawning. `kind` is `pi`, `claude`, or `codex` and defaults to
+  Pi. `host` is the exact id of one existing paired saved destination, matched
+  exactly as supplied with no trimming, case folding, label lookup, or local alias;
+  omitting it starts the child on the caller's own host, never on the host a sidebar
+  currently selects or views. A legacy workspace/title/prompt call is unchanged, and
+  a session without routed spawning refuses selectors rather than dropping them. The
+  workspace is validated on the destination only, the title and prompt content are
+  kept exactly, and the child starts in the background without requesting attention
+  or changing focus, selection, or sidebar visibility. A paired request travels on
+  the existing roster channel under the optional `roster-session-spawn-v1`
+  capability and needs the destination's existing pinned identity, current
+  directional grant, and a live connection; the owner revalidates the workspace and
+  kind against its own current catalog. Nothing falls back to the caller's host, to
+  Pi, or to a worker profile, and nothing connects, pairs, regrants, or retries.
+  `started` confirms launch only, never prompt processing or completion, and an
+  uncertain submitted request is `unknown`, never a claim that no child exists. A new
+  read-only `SessionHosts` tool with a static empty schema returns
+  `{ ownKinds, hosts: [{ id, kinds }] }` from the host's existing launch probe and
+  paired-destination projection: `ownKinds` is the caller's own host, and each `id`
+  is the raw exact paired id to pass as `host`. It is descriptive only — not a
+  grant or launch receipt, and an observation can race the spawn's own
+  validation. Standalone sessions, delegated executors, and native Claude Code and
+  Codex callers get neither selector nor discovery tool. See
+  [Session host](docs/session-host-alpha.md#starting-and-owning-sessions).
+- **Native availability description (#493)**: the optional
+  `roster-native-availability-v1` roster capability, acknowledged only beside the
+  native lane, states that an owner's native catalog comes from a fresh read-only
+  launch probe at each publication. A legacy configuration-only catalog has unknown
+  availability: it is never presented as launchable, current clients offer no
+  unverified native choice for that owner, and its existing Pi create is offered
+  only where supported. A fresher view comes only from the existing roster
+  resync/resubscribe, never an automatic connect, and busy, disconnected, or stale
+  destinations are withheld or refused truthfully with no Pi or native fallback.
+  Android may retain its last complete probed choices when a busy channel cannot
+  refresh; the owner still revalidates creation.
+  The capability adds no frame, field, grant, or permission. See
+  [Remote native create and host row name](docs/session-host-alpha.md#remote-native-create-and-host-row-name).
+
+### Changed
+
+- **Native session choices are the three kinds in each destination's normal setup
+  (#493)**: every application New session — local and paired-host creation in the
+  terminal sidebar, and paired-host creation in Android — chooses only among Pi,
+  Claude Code, and Codex CLI, filtered by the destination's current availability.
+  A native kind always
+  launches that backend's built-in default command with the provider's own normal
+  configuration. Configured `externalAgents` worker profiles are no longer offered
+  or admitted as session choices (an older owner that still advertises them keeps
+  them on the wire, but no current client offers them), while their adapters,
+  commands, environment, arguments, models, and reasoning settings keep configuring
+  delegated review and execution exactly as before. See
+  [Native Claude Code and Codex sessions](docs/native-sidebar-agents.md#what-shipped).
+- **Remembered legacy native targets restore as the base provider (#493)**: a
+  remembered native row whose target was a configured worker entry
+  (`external:<id>`) now restores with its backend's built-in default — a Claude row
+  as base Claude Code, a Codex row as base Codex CLI — instead of reproducing that
+  entry's command, arguments, and environment, and it is no longer unavailable merely
+  because the entry was removed. This is a deliberate compatibility change, not a
+  fallback: the exact provider conversation UUID, recorded workspace, caption,
+  roster order, restoration proof, and native permissions are preserved, and a row
+  is never resumed as a fresh conversation or a different kind. No bulk deletion
+  or migration of settings is performed; normal row persistence records the chosen
+  base target, and worker configuration is unchanged.
+  See
+  [Restart restoration of native rows](docs/native-sidebar-agents.md#restart-restoration-of-native-rows).
+- **File-backed initial request and titles for native SessionSpawn children
+  (#493)**: a native `SessionSpawn` child remains a genuine interactive TUI rather
+  than a headless review or execution worker. It receives one short generated
+  plain-word instruction as its single prompt operand
+  after `--`, asking it to read every page of a private host-owned temporary file,
+  decode its JSON array of string fragments (one per line), concatenate them with no
+  separators, and carry out the result. The original prompt is staged losslessly
+  and never travels in argv or the environment, and no total prompt cap is added;
+  the line framing is not an input limit. The provider's first message is therefore
+  the instruction, not the verbatim prompt, and its normal file-read, trust,
+  approval, context, and resource behavior applies — no PTY paste, automatic
+  approval, permission, model, or reasoning override, or headless substitute. The
+  file stays leased until the row's PTY and any owned Codex backend have settled,
+  including trust waits and failed launches; cleanup is identity-, size-, digest-,
+  and ancestry-checked and preserves unknown, modified, replaced, or foreign
+  entries. It is plaintext for the same user, not a sandbox or secure erasure, and
+  promises no new Windows ACL; a later resume history that names the path does not
+  mean the file was kept. Claude Code receives the exact title as `--name=<title>`;
+  Codex CLI stores the full title as the row's host caption, restored after a
+  restart and never sent as a provider rename, accepting the full 1024-byte
+  `SessionSpawn` title bound without trimming or clipping while the manual
+  80-character caption rule is unchanged. A long caption is shown on cards and peer
+  labels as a visibly ellipsized display projection, not a second stored caption.
+  An older build limited to trimmed 80-character captions may reject an entire
+  roster containing a longer or untrimmed startup caption; automatic downgrade
+  conversion is not provided.
+  A Pi child's staged-payload delivery to Pi's native API is unchanged. Component
+  tests and isolated Linux real-PTY probes with genuine Claude Code 2.1.327 and
+  Codex CLI 0.169.0 against a loopback mock endpoint observed the exact generated
+  instruction only; real-model reading or completion, cross-machine, physical
+  terminal, macOS, and Windows behavior are not qualified. See
+  [Session host](docs/session-host-alpha.md#starting-and-owning-sessions) and
+  [Security model](docs/security-model.md#session-host-status-ipc).
+
 ## [0.1.0-dev.295]
 
 ### Tests

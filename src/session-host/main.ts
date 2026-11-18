@@ -6,7 +6,7 @@ import { isAbsolute, join } from "node:path";
 import type { Writable } from "node:stream";
 import { ProcessTerminal, matchesKey } from "pi-session-host-tui";
 
-import { createStatusBroker, type NativeHookStatusBroker, type StatusBroker } from "./broker";
+import { createStatusBroker, type NativeHookStatusBroker, type SessionHostsRequestContext, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type HostPaneRect, type RenderedSidebar } from "./compositor";
 import { chooseExitedRestart } from "./exited-restart";
 import {
@@ -66,6 +66,7 @@ import {
   type OwnerCreateFacts,
   type OwnerCreateRequest,
   type OwnerNativeCreateRequest,
+  type OwnerSessionSpawnRequest,
   type PeerCoordinatorWithCreate,
   type PeerCreateController,
   type PeerCreateResult,
@@ -109,7 +110,14 @@ import type {
   PeerUiHost,
   PeerUiSnapshot,
 } from "./peer-ui-protocol";
-import { isValidNativeSessionId } from "./protocol";
+import {
+  isValidNativeSessionId,
+  type SessionHostsEntry,
+  type SessionHostsSnapshot,
+  type SessionSpawnInput,
+  type SessionSpawnOutcome,
+} from "./protocol";
+import { isNativeCaption, projectNativeCaptionLabel } from "./native-caption";
 import {
   readRemoteInputModes,
   readRemoteNativeIoSource,
@@ -205,6 +213,7 @@ import {
   type SidebarMainOwnerKey,
   type SidebarMousePresentation,
   type SidebarNativeCliTarget,
+  type SidebarNativeRefreshResult,
   type SidebarRemoteCloseRow,
   type SidebarRemoteEditRow,
   type SidebarRemoteNativeEditRow,
@@ -214,15 +223,20 @@ import {
 import type { TerminalFrame, TerminalInputModes, TerminalMouseReportingRequest } from "./terminal-surface";
 import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
-import { createNativeCliLauncher, listNativeCliTargets } from "./native-cli-launch";
+import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
 import { isNativeConversationId } from "./native-conversation";
 import {
+  NATIVE_CLI_DEFAULT_TARGET_IDS,
+  SESSION_BACKENDS,
   isNativeCliBackend,
+  isNativeCliNewSessionTarget,
   isNativeCliTargetId,
   isNativeDisplayName,
+  nativeCliRestoreTargetId,
+  projectNativeCliNewSessionTargets,
   sessionBackendDisplayLabel,
   type NativeCliBackend,
   type SessionBackend,
@@ -917,14 +931,20 @@ interface MainDependencies {
   };
   readonly createManager: (options: InstanceManagerOptions) => OwningHostManager;
   /**
-   * Native interactive CLI hosting (issue #277): the provider targets the New
-   * form offers and the launcher this host's manager calls for a native row.
-   * Production derives BOTH from the ONE already-normalized review-gate
+   * Native interactive CLI hosting (issue #277): this host's configured native
+   * target identities and the launcher this host's manager calls for a native
+   * row. Production derives BOTH from the ONE already-normalized review-gate
    * configuration through the existing config load/resolution path — no second
    * parser, no new setting, and no config, command, argument, or environment
    * value is ever logged. A host with no usable hosting offers no target and
    * injects no launcher: the New form then draws no Provider line, every
    * creation stays the ordinary Pi launch, and a native request cannot exist.
+   *
+   * Production supplies only the Claude and Codex default targets (#493), and
+   * every native session surface — the local New form, the owner's advertised
+   * catalog, owner native create admission, and remembered-row restoration —
+   * reads them through `projectNativeCliNewSessionTargets`, so a named external
+   * worker profile is never a native session target here.
    */
   readonly nativeCliHosting: (env: NodeJS.ProcessEnv) => {
     readonly targets: readonly SidebarNativeCliTarget[];
@@ -1434,6 +1454,14 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
         onDisconnect: handlers.onDisconnect,
         ...(handlers.onReconnect ? { onReconnect: handlers.onReconnect } : {}),
         ...(handlers.onSpawnRequest ? { onSpawnRequest: handlers.onSpawnRequest } : {}),
+        // Forwarded only when the manager installed it, so the broker advertises
+        // routed SessionSpawn in a bootstrap only when this host really routes.
+        ...(handlers.onRoutedSpawnRequest ? { onRoutedSpawnRequest: handlers.onRoutedSpawnRequest } : {}),
+        // Forwarded only beside routed spawn, exactly as the manager installed it,
+        // so the broker advertises SessionHosts only when this host really answers.
+        ...(handlers.onRoutedSpawnRequest && handlers.onSessionHostsRequest
+          ? { onSessionHostsRequest: handlers.onSessionHostsRequest }
+          : {}),
       }, options);
       // Keep the broker's exact registration closures and their auth/tuple fences.
       return registration satisfies InstanceStatusRegistration;
@@ -1506,7 +1534,8 @@ function productionDependencies(): MainDependencies {
     nativeCliHosting: (env) => {
       const config = loadConfig(env).config;
       return {
-        targets: listNativeCliTargets(config),
+        // The native session choices: the backend defaults only (#493).
+        targets: listNativeCliNewSessionTargets(config),
         launch: createNativeCliLauncher(config, { ownedCodexBackend: OWNED_NATIVE_CODEX_BACKEND }),
       };
     },
@@ -1603,7 +1632,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * offer and the launcher the manager calls for a native row. A failure here
    * is not fatal and never reaches the child or the transcript — it simply means
    * this host offers no native session at all, so the New form keeps its exact
-   * pre-native layout and every creation stays the ordinary Pi launch.
+   * pre-native layout and every creation stays the ordinary Pi launch. Every
+   * reader goes through `projectNativeCliNewSessionTargets` (#493), so even an
+   * injected list can never surface a named external worker profile.
    */
   let nativeCliTargets: readonly SidebarNativeCliTarget[] = [];
   let nativeCliLaunch: NativeCliLaunch | undefined;
@@ -2508,6 +2539,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // path: the owner's own provider decides, and only a peer that negotiated
         // the optional capability can ever reach it.
         createOwnedSession,
+        // The owner-side prompted SessionSpawn provider (issue #493) on the same one
+        // create core; only a peer that negotiated the optional capability can reach
+        // it, and a native kind is still authorized only by this host's own catalog.
+        spawnOwnedSession,
         // The owner-side NATIVE create provider and this host's live advertised
         // target catalog are handed over together, and ONLY when this host really
         // has native launch support. With no real launcher neither option is
@@ -2517,9 +2552,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // native New action uses (`hostService.startSession` with the operator's
         // chosen backend and target id), so no second manager, config, discovery
         // system, selected row, viewer, or launch path is added.
+        //
+        // The catalog reader IS the one fresh read-only launch probe below, so this
+        // owner explicitly declares `nativeCliAvailability`: every advertised or
+        // re-proved catalog is what that probe found launchable at the moment of
+        // the read, and nothing in Main keeps a second written availability list.
         ...(nativeCliLaunch === undefined ? {} : {
           nativeCreateOwnedSession: createNativeOwnedSession,
-          nativeCliTargets: advertisedNativeCliTargets,
+          nativeCliTargets: probeNativeCliTargets,
+          nativeCliAvailability: true,
         }),
         // Rename uses this same host's existing verified native-name operation.
         renameOwnedSession,
@@ -3399,8 +3440,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // bare caption, so the label stays one caption and nothing else.
       label: nativeBackend === undefined
         ? (name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)")
-        : (record.displayName !== undefined && record.displayName.trim().length > 0
-          ? record.displayName
+        : (record.displayName !== undefined && isNativeCaption(record.displayName)
+          ? projectNativeCaptionLabel(record.displayName)
           : sessionBackendDisplayLabel(nativeBackend)),
       workspace: record.workspace ?? "",
       agentDir: "",
@@ -3526,7 +3567,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * identity is never wiped by a missing read. When the row answers without a
    * conversation id, the previously remembered id was positively withdrawn and
    * is forgotten rather than kept stale. Nothing here touches the Pi `sessionId`,
-   * name, or persistence fields, or the operator's caption.
+   * name, or persistence fields. A row's own stored caption is copied to the
+   * slot's display name exactly when the manager reports one, so a Codex startup
+   * title survives a restart like an operator caption; a row without one leaves
+   * the remembered display name alone.
    */
   function syncNativeRestartIdentity(record: RosterRecord, rowId: string): void {
     const owner = manager;
@@ -3534,6 +3578,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const identity = owner.readNativeConversationIdentity(rowId);
     if (identity === undefined) return;
     if (isNativeCliTargetId(identity.targetId)) record.nativeTargetId = identity.targetId;
+    // The row's own stored caption (an operator caption or a Codex startup title)
+    // is the slot's remembered display name. An uncaptioned row changes nothing.
+    if (identity.caption !== undefined && isNativeCaption(identity.caption)) record.displayName = identity.caption;
     if (identity.conversationId !== undefined && isNativeConversationId(identity.conversationId)) {
       record.nativeConversationId = identity.conversationId;
     } else {
@@ -3818,7 +3865,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           ? { sessionId: record.sessionId } : {}),
         ...(record.workspace !== undefined && isValidRosterWorkspace(record.workspace) ? { workspace: record.workspace } : {}),
         ...(record.name !== undefined && isValidRosterName(record.name) ? { name: record.name } : {}),
-        ...(record.displayName !== undefined && isNativeDisplayName(record.displayName)
+        ...(record.displayName !== undefined && isNativeCaption(record.displayName)
           ? { displayName: record.displayName } : {}),
         ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
         ...(record.backend === undefined ? {} : { backend: record.backend }),
@@ -3954,12 +4001,15 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
    * through a new exact branded admission as a NEW independently owned child in
    * the conversation's recorded workspace. Every remembered native entry (#277)
    * is restarted only when it remembers one exact provider conversation UUID and
-   * its exact launch target, that target is still in this host's CURRENT
-   * configured catalog for the same backend, and its recorded workspace still
-   * exists: it then becomes a NEW independently owned child asked to resume
-   * exactly that conversation, which its own run must still prove. Nothing is
-   * adopted, guessed, or substituted; an entry that cannot be restarted stays
-   * visible as a bounded error row and never starts a fresh session.
+   * a launch target id that maps to its backend's default target (#493: the
+   * default itself, or a legacy `external:<id>` worker target, which is
+   * deliberately restored as base Claude or base Codex without consulting that
+   * entry), that default is in this host's CURRENT offered catalog, and its
+   * recorded workspace still exists: it then becomes a NEW independently owned
+   * child asked to resume exactly that conversation, which its own run must still
+   * prove. No conversation is adopted or guessed; an entry that cannot be
+   * restarted stays visible as a bounded error row and never starts a fresh
+   * session.
    */
   async function restorePersistedRoster(): Promise<void> {
     const handle = hostState;
@@ -4014,15 +4064,19 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       let reason = "This conversation is unavailable";
       const entrySessionId = entry.sessionId;
       // A remembered native row (#277) is restarted only from its OWN remembered
-      // exact conversation UUID and exact launch target, re-proved against this
-      // host's CURRENT configured catalog and its recorded workspace. There is no
-      // provider file search, no newest-session adoption, no default target, and
-      // no Pi lookup; anything missing or refused stays a bounded unavailable
-      // placeholder and is never served as a Pi session or a fresh conversation.
+      // exact conversation UUID and its recorded workspace, with the launch target
+      // its remembered target id maps to (#493): its backend's default target —
+      // a remembered legacy `external:<id>` worker target deliberately restores
+      // as base Claude or base Codex, with no lookup of that old entry — re-proved
+      // against this host's CURRENT offered catalog. There is no provider file
+      // search, no newest-session adoption, and no Pi lookup; anything missing or
+      // refused stays a bounded unavailable placeholder and is never served as a
+      // Pi session or a fresh conversation.
       if (isNativeCliBackend(entry.backend)) {
         const provider = sessionBackendDisplayLabel(entry.backend);
         const conversationId = entry.nativeConversationId;
         const targetId = entry.nativeTargetId;
+        const restoreTargetId = nativeCliRestoreTargetId(entry.backend, targetId);
         const workspace = canonicalExistingDirectory(entry.workspace);
         if (conversationId === undefined || !isNativeConversationId(conversationId)) {
           reason = `This remembered ${provider} session has no known conversation; it was not restarted`;
@@ -4030,7 +4084,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           reason = `This remembered ${provider} session has no known launch target; it was not restarted`;
         } else if (nativeCliLaunch === undefined) {
           reason = `This host cannot start ${provider} sessions; this conversation was not restarted`;
-        } else if (findRemoteNativeCliTarget(advertisedNativeCliTargets(), entry.backend, targetId) === null) {
+        } else if (restoreTargetId === undefined
+          || findRemoteNativeCliTarget(definedNativeCliTargets(), entry.backend, restoreTargetId) === null) {
           reason = `This conversation's ${provider} launch target is no longer configured; it was not restarted`;
         } else if (workspace === undefined) {
           reason = "This conversation's recorded workspace is unavailable; it was not restarted";
@@ -4038,10 +4093,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           createOptions = {
             workspace,
             backend: entry.backend,
-            // Always explicit: a resume never falls back to a backend default.
-            nativeCliTarget: targetId,
+            // Always explicit. The default target is the deliberate #493 mapping
+            // of the remembered id, never a fallback for a missing identity.
+            nativeCliTarget: restoreTargetId,
             nativeResumeConversationId: conversationId,
-            ...(isNativeDisplayName(entry.displayName) ? { label: entry.displayName } : {}),
+            ...(isNativeCaption(entry.displayName) ? { label: entry.displayName } : {}),
           };
         }
         return { entry, createOptions, reason };
@@ -5539,8 +5595,69 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     return task;
   }
 
+  /**
+   * Answer one New-form fresh-native request (#493) for exactly the Host choice
+   * it was made under. Local: the ONE fresh launch probe at this host's startup
+   * cwd (the workspace field is not consulted until submit). Remote: the
+   * destination's existing bounded catalog refresh, after which the sidebar reads
+   * that destination's CURRENT probed projection for the run the refresh observed.
+   * A legacy, busy, failed, or missing refresh is `unavailable`, so no unverified
+   * native choice is offered and nothing falls back. The sidebar ignores a late
+   * answer for a closed form, another Host, or a superseded request; nothing here
+   * selects, focuses, connects, retries, or changes visibility.
+   */
+  function refreshNewFormNativeTargets(refreshId: number, hostId: string | undefined): void {
+    const target = sidebar;
+    if (target === undefined || shutdownRequested) return;
+    const settle = (result: SidebarNativeRefreshResult): void => {
+      if (shutdownRequested || sidebar !== target) return;
+      let accepted = false;
+      try {
+        accepted = target.settleNewFormNativeRefresh(refreshId, result);
+      } catch {
+        accepted = false;
+      }
+      if (!accepted) return;
+      reconcileLayout(true);
+      scheduleRedraw();
+    };
+    if (hostId === undefined) {
+      void probeNativeCliTargets().then(
+        (targets) => settle({ kind: "local", targets }),
+        () => settle({ kind: "unavailable" }),
+      );
+      return;
+    }
+    const controller = ownerCreateController();
+    const refresh = controller?.refreshNativeTargets;
+    if (controller === undefined || typeof refresh !== "function") {
+      settle({ kind: "unavailable" });
+      return;
+    }
+    void Promise.resolve()
+      .then(() => refresh.call(controller, hostId))
+      .then(
+        (result) => settle(result?.kind === "refreshed" && typeof result.hostRunId === "string"
+          ? { kind: "remote", hostRunId: result.hostRunId }
+          : { kind: "unavailable" }),
+        () => settle({ kind: "unavailable" }),
+      );
+  }
+
   function launchCreate(action: Extract<SidebarAction, { type: "create" }>): void {
     if (!manager || shutdownRequested || !negotiationReady) return;
+    // The host's NEW provider gate (#493): a NEW native session names only its
+    // backend's default target. A named external worker profile — even one this
+    // host still has configured for review or execution — is refused here before
+    // any create, never served by a default target, the other backend, or a Pi
+    // create. An absent target keeps the manager's own backend default, exactly
+    // as before.
+    if (action.backend !== undefined && action.nativeCliTarget !== undefined
+      && !isNativeCliNewSessionTarget(action.backend, action.nativeCliTarget)) {
+      sidebar?.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
+      scheduleRedraw();
+      return;
+    }
     // The New form's explicit provider choice travels unchanged: the manager
     // validates the backend and target, and the host's injected native launcher
     // owns discovery, argv, and environment. An absent backend is the ordinary
@@ -6352,6 +6469,42 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     request: OwnerCreateRequest,
     stillAuthorized: () => boolean,
   ): Promise<OwnerCreateFacts> {
+    // A blank create has no saved-conversation duplicate fence: the canonical form
+    // text is forwarded verbatim and the manager applies its own existing launch
+    // semantics.
+    return startOwnedCreate(request.hostRunId, stillAuthorized, { workspace: request.workspace });
+  }
+
+  /**
+   * The ONE owner-side create core behind every owner create provider — blank
+   * Create, native Create, and prompted SessionSpawn — so none keeps its own copy
+   * of the run fence, the final re-proof, or the facts classification.
+   *
+   * Order is the contract: teardown and the one manager run are fenced first; the
+   * inventory read before the create must name the EXACT requested run (another
+   * run is refused, an unreadable one unknown); the caller's own `admit` check
+   * (for example the owner's own native catalog) runs next; the transport's
+   * minimal re-proof is checked IMMEDIATELY before the create is invoked — after
+   * every callout above — so a Revoke, a replaced grant, or a retired channel that
+   * landed after admission never starts a child. The create itself is the very
+   * {@link OwningHostService.startSession} seam the local New action uses, which
+   * never selects, activates, or focuses anything.
+   *
+   * The facts never overstate what this host saw. `started` requires the row to be
+   * alive with a live process in THIS run's own post-create inventory. `unconfirmed`
+   * is an addressed create that produced nothing usable (a not-ready or failed
+   * create may have left an error row, which this fact neither removes nor
+   * describes). `refused` is reserved for authority or identity this host
+   * positively established before any create was invoked. A throwing manager, an
+   * interrupted run, an unexpected duplicate, or an unrecognized status is
+   * `unknown` and claims neither a child nor its absence.
+   */
+  async function startOwnedCreate(
+    hostRunId: string,
+    stillAuthorized: () => boolean,
+    createOptions: CreateInstanceOptions,
+    admit: () => boolean = () => true,
+  ): Promise<OwnerCreateFacts> {
     // Fence teardown and the one manager run before anything is read or written.
     if (manager === undefined || shutdownRequested) return { kind: "refused" };
     // An inventory that cannot be observed is unknown, and another owner run is
@@ -6363,10 +6516,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       before = undefined;
     }
     if (before === undefined) return { kind: "unknown" };
-    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
-    // The owner's minimal re-proof is checked IMMEDIATELY before the create is
-    // invoked — after every callout above — so a Revoke, a replaced grant, or a
-    // retired channel that landed after admission never starts a child.
+    if (before.hostRunId !== hostRunId) return { kind: "refused" };
+    let admitted = false;
+    try {
+      admitted = admit() === true;
+    } catch {
+      admitted = false;
+    }
+    if (!admitted) return { kind: "refused" };
     let authorized = false;
     try {
       authorized = stillAuthorized() === true;
@@ -6374,12 +6531,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       authorized = false;
     }
     if (!authorized || shutdownRequested) return { kind: "refused" };
-    // A blank create has no saved-conversation duplicate fence: the canonical form
-    // text is forwarded verbatim and the manager applies its own existing launch
-    // semantics.
     let outcome: StartedSessionOutcome;
     try {
-      outcome = await hostService.startSession({ workspace: request.workspace });
+      outcome = await hostService.startSession(createOptions);
     } catch {
       return { kind: "unknown" };
     }
@@ -6387,8 +6541,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     if (outcome.status === "not-ready" || outcome.status === "failed") {
       return { kind: "unconfirmed" };
     }
-    // `duplicate` is never a saved-duplicate refusal here, because a blank create
-    // has no duplicate fence at all; an interrupted run and any unrecognized status
+    // `duplicate` is never a saved-duplicate refusal here, because no owner create
+    // has a duplicate fence at all; an interrupted run and any unrecognized status
     // are equally unobservable.
     if (outcome.status !== "started") return { kind: "unknown" };
     // `started` requires this exact run's own post-create inventory to report the
@@ -6403,7 +6557,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       after = undefined;
     }
     if (after === undefined) return { kind: "unknown" };
-    if (after.hostRunId !== request.hostRunId) return { kind: "unknown" };
+    if (after.hostRunId !== hostRunId) return { kind: "unknown" };
     const row = after.rows.find((candidate) => candidate.id === outcome.id);
     if (row === undefined || row.lifecycle !== "alive" || row.hasLiveProcess !== true) {
       return { kind: "unconfirmed" };
@@ -6412,18 +6566,78 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
   }
 
   /**
-   * This host's live native target catalog for the roster bridge.
+   * This host's native session DEFINITIONS (#493): the native session view of
+   * the ONE already-resolved configuration list — exactly the Claude and Codex
+   * default targets, never a named external worker profile. It is a static
+   * definition, not an availability observation: it says which targets this
+   * host's launcher was built for, never that their executables exist right now.
    *
-   * It reads the ONE already-resolved list this host's own New form offers, so the
-   * bridge can state and re-prove exactly which targets exist right now without a
-   * second configuration or discovery system. A host with no real native launch
-   * support has no provider at all (the option is never supplied), and a host whose
-   * manager is gone or whose teardown began reports an empty catalog, which the
-   * bridge treats as "nothing may be launched" rather than as a default.
+   * It is what remembered-row restoration maps onto (the actual launcher still
+   * resolves the executable at that launch), what the fresh probe below probes,
+   * and the synchronous last-instant definition re-proof of an owner create. A
+   * host with no real native launch support, no manager, or a teardown in
+   * progress defines nothing, which every caller treats as "nothing may be
+   * launched" rather than as a default.
    */
-  function advertisedNativeCliTargets(): readonly RemoteNativeCliTarget[] {
+  function definedNativeCliTargets(): readonly RemoteNativeCliTarget[] {
     if (nativeCliLaunch === undefined || shutdownRequested || manager === undefined) return [];
-    return nativeCliTargets;
+    return projectNativeCliNewSessionTargets(nativeCliTargets);
+  }
+
+  /**
+   * The ONE fresh read-only native launch probe of this host (#493).
+   *
+   * For each defined native session target it asks the ACTUAL configured
+   * launcher — the very function the manager calls for a native row — to
+   * prepare that target's pure launch descriptor against this host's startup
+   * working directory and a clone of the normal child environment, with no
+   * status hook, no startup request, and no restoration: the launcher's own
+   * command resolution, canonicalization, and argument/platform guards decide.
+   * Such a descriptor stages nothing (no hook artifact, no owned backend, no
+   * child), so the probe creates no process, file, setting, or registry entry;
+   * the descriptor is discarded. A target whose preparation throws (most often
+   * an executable that is not installed) is simply not available now.
+   *
+   * There is no second command detector, no version check, no cache, and no
+   * timer: every caller gets a fresh answer, and the answer is an observation
+   * for this moment only. Each actual launch re-resolves its executable against
+   * its own workspace again, so the probe never authorizes a launch by itself.
+   * A host whose manager is gone or whose teardown began reports nothing.
+   *
+   * This one function feeds the owner's advertised catalog and native create
+   * admission (through the coordinator), the owner's prompted native spawn,
+   * this host's own routed native SessionSpawn, SessionHosts `ownKinds`, and the
+   * local New form's native choices.
+   */
+  async function probeNativeCliTargets(): Promise<readonly RemoteNativeCliTarget[]> {
+    const launch = nativeCliLaunch;
+    const definitions = definedNativeCliTargets();
+    if (launch === undefined || definitions.length === 0) return Object.freeze([]);
+    const probed = await Promise.all(definitions.map(async (target) => {
+      try {
+        await launch(target.backend, {
+          workspace: snapshot.startupCwd,
+          env: { ...snapshot.env },
+          targetId: target.id,
+        });
+        return target;
+      } catch {
+        return undefined;
+      }
+    }));
+    // Teardown that began during the probe withdraws every answer.
+    if (shutdownRequested || manager === undefined || nativeCliLaunch !== launch) return Object.freeze([]);
+    return Object.freeze(probed.filter((target): target is RemoteNativeCliTarget => target !== undefined));
+  }
+
+  /** True only when one fresh probe finds this backend's default target launchable now. */
+  async function nativeKindAvailableNow(kind: NativeCliBackend): Promise<boolean> {
+    try {
+      const probed = await probeNativeCliTargets();
+      return findRemoteNativeCliTarget(probed, kind, NATIVE_CLI_DEFAULT_TARGET_IDS[kind]) !== null;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -6451,64 +6665,377 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     request: OwnerNativeCreateRequest,
     stillAuthorized: () => boolean,
   ): Promise<OwnerCreateFacts> {
-    // Fence teardown, the one manager run, and real native launch support.
-    if (manager === undefined || shutdownRequested || nativeCliLaunch === undefined) {
-      return { kind: "refused" };
-    }
-    let before: OwningHostInventorySnapshot | undefined;
-    try {
-      before = hostService.readInventorySnapshot();
-    } catch {
-      before = undefined;
-    }
-    if (before === undefined) return { kind: "unknown" };
-    if (before.hostRunId !== request.hostRunId) return { kind: "refused" };
+    // Fence real native launch support before anything is read.
+    if (nativeCliLaunch === undefined) return { kind: "refused" };
     // This owner's OWN current catalog is the only thing that can authorize the
-    // target. A miss is a positive pre-invocation establishment, so `refused`.
-    if (findRemoteNativeCliTarget(advertisedNativeCliTargets(), request.backend, request.targetId) === null) {
-      return { kind: "refused" };
+    // target. A miss is a positive pre-invocation establishment, so `refused`. The
+    // canonical form text is forwarded verbatim: the owner's own launcher applies
+    // its existing home/cwd resolution for ITS machine.
+    return startOwnedCreate(request.hostRunId, stillAuthorized, {
+      workspace: request.workspace,
+      backend: request.backend,
+      nativeCliTarget: request.targetId,
+    }, () => findRemoteNativeCliTarget(definedNativeCliTargets(), request.backend, request.targetId) !== null);
+  }
+
+  /**
+   * The ONE owner-side prompted SessionSpawn provider (issue #493): a paired
+   * requester asked THIS host to launch one `pi`, `claude`, or `codex` child with
+   * an exact workspace, title, and initial prompt in this exact run.
+   *
+   * It is the same create as everything else here — {@link startOwnedCreate} over
+   * the local New seam — with the one existing initial-request option. `pi` is the
+   * ordinary Pi startup request. A native kind maps ONLY to this owner's own
+   * default target for that backend, and only while this owner's own catalog
+   * advertises it; anything else is refused before a create, never served by
+   * another backend, a configured worker profile, or a Pi fallback. The workspace
+   * is interpreted and validated HERE by this host's own launch path; nothing
+   * about the requester's filesystem is consulted. Background only: nothing is
+   * selected, activated, or focused, and a `started` fact is a launch, never
+   * prompt completion.
+   */
+  async function spawnOwnedSession(
+    request: OwnerSessionSpawnRequest,
+    stillAuthorized: () => boolean,
+  ): Promise<OwnerCreateFacts> {
+    const kind = request.kind;
+    const initialRequest = { title: request.title, prompt: request.prompt };
+    if (kind === "pi") {
+      return startOwnedCreate(request.hostRunId, stillAuthorized, { workspace: request.workspace, initialRequest });
     }
-    let authorized = false;
+    if (!isNativeCliBackend(kind) || nativeCliLaunch === undefined) return { kind: "refused" };
+    const targetId = NATIVE_CLI_DEFAULT_TARGET_IDS[kind];
+    // The prompted lane has no catalog read in the transport, so the one fresh
+    // probe is consulted here: a kind whose default target is not launchable now
+    // is refused before any create, never served by another backend or Pi.
+    if (!await nativeKindAvailableNow(kind)) return { kind: "refused" };
+    return startOwnedCreate(request.hostRunId, stillAuthorized, {
+      workspace: request.workspace,
+      backend: kind,
+      nativeCliTarget: targetId,
+      initialRequest,
+    }, () => findRemoteNativeCliTarget(definedNativeCliTargets(), kind, targetId) !== null);
+  }
+
+  // --- Requester-side routed SessionSpawn (issue #493). ---
+
+  /**
+   * The ONE routed SessionSpawn handler for a child of THIS host. The broker
+   * delivers only routed requests here (`host` and/or `kind` present); the legacy
+   * three-field request keeps its unchanged own-host Pi route.
+   *
+   * An omitted `host` means the requesting child's OWN host — this one — whatever
+   * any viewer currently displays; the `kind` then goes through the same local
+   * spawn admission as the legacy request. A present `host` names exactly one
+   * existing paired destination by its saved-destination id; there is no local
+   * alias, name or label lookup, default, or substitution, and an unknown,
+   * unavailable, unsupported, or unauthorized destination settles without any
+   * local launch, connection, pairing, grant, or retry.
+   */
+  async function routeSpawnRequest(
+    parentInstanceId: string,
+    request: SessionSpawnInput,
+    parentStillCurrent: () => boolean,
+  ): Promise<SessionSpawnOutcome> {
+    if (shutdownRequested) return "failed";
+    if (request.host === undefined) {
+      // An own-host native kind is admitted only while the one fresh probe finds
+      // that backend's default target launchable; otherwise nothing is created
+      // (the launch itself still re-resolves the executable). Pi is unchanged.
+      if (isNativeCliBackend(request.kind)) {
+        if (!await nativeKindAvailableNow(request.kind)) return "failed";
+        if (shutdownRequested || !proveCurrent(parentStillCurrent)) return "failed";
+      }
+      return hostService.spawnRequestedChild(parentInstanceId, request);
+    }
+    return spawnOnPairedHost(request.host, request, parentStillCurrent);
+  }
+
+  /** Contained re-read of one manager-supplied parent proof. */
+  function proveCurrent(proof: () => boolean): boolean {
     try {
-      authorized = stillAuthorized() === true;
+      return proof() === true;
     } catch {
-      authorized = false;
+      return false;
     }
-    if (!authorized || shutdownRequested) return { kind: "refused" };
-    // The canonical form text is forwarded verbatim: the owner's own launcher
-    // applies its existing home/cwd resolution for ITS machine.
-    let outcome: StartedSessionOutcome;
+  }
+
+  /**
+   * Submit one routed SessionSpawn to an existing paired owner through the ONE
+   * coordinator's Create controller. The destination's current owner run is
+   * resolved once, from this host's own current observation of that exact
+   * destination id, and the coordinator re-proves it, the pin, the identity, and
+   * the negotiated capability at its write boundary. The parent registration is
+   * re-proved inside that same boundary, so a parent that exited, was stopped, or
+   * lost its registration never submits. Nothing is retried; a throw after the
+   * handoff is `unknown`.
+   */
+  async function spawnOnPairedHost(
+    hostId: string,
+    request: SessionSpawnInput,
+    parentStillCurrent: () => boolean,
+  ): Promise<SessionSpawnOutcome> {
+    const controller = ownerCreateController();
+    if (controller === undefined || typeof controller.spawnSession !== "function") return "failed";
+    let supported = false;
     try {
-      outcome = await hostService.startSession({
+      supported = controller.supportsSessionSpawn?.(hostId) === true;
+    } catch {
+      supported = false;
+    }
+    if (!supported) return "failed";
+    const destination = peerUiSnapshot?.hosts?.find((candidate) => candidate.id === hostId);
+    const hostRunId = destination?.roster.hostRunId;
+    if (destination === undefined || typeof hostRunId !== "string" || hostRunId.length === 0) return "failed";
+    const stillCurrent = (): boolean => {
+      if (shutdownRequested) return false;
+      try {
+        return parentStillCurrent() === true;
+      } catch {
+        return false;
+      }
+    };
+    if (!stillCurrent()) return "failed";
+    let result: PeerCreateResult;
+    try {
+      result = await controller.spawnSession({
+        hostId,
+        hostRunId,
+        kind: request.kind ?? "pi",
         workspace: request.workspace,
-        backend: request.backend,
-        nativeCliTarget: request.targetId,
-      });
+        title: request.title,
+        prompt: request.prompt,
+      }, { stillCurrent });
     } catch {
-      return { kind: "unknown" };
+      return "unknown";
     }
-    if (outcome.status === "not-ready" || outcome.status === "failed") {
-      return { kind: "unconfirmed" };
+    return sessionSpawnOutcomeOfPeerResult(result);
+  }
+
+  // --- Requester-side read-only SessionHosts discovery (issue #493). ---
+
+  /** One inspection that cannot complete: the broker reports it as unavailable, never as an empty listing. */
+  function sessionHostsUnavailable(): Error {
+    return new Error("session-host: SessionHosts inspection is unavailable");
+  }
+
+  /** Settle with `operation`, or reject as soon as the broker stops waiting. */
+  function untilAborted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(sessionHostsUnavailable());
+    return new Promise<T>((resolve, reject) => {
+      const abort = (): void => reject(sessionHostsUnavailable());
+      signal.addEventListener("abort", abort, { once: true });
+      operation.then(
+        (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+        (error: unknown) => { signal.removeEventListener("abort", abort); reject(error); },
+      );
+    });
+  }
+
+  /** Canonical closed kind list in display order. */
+  function canonicalSessionKinds(kinds: ReadonlySet<SessionBackend>): readonly SessionBackend[] {
+    return Object.freeze(SESSION_BACKENDS.filter((kind) => kinds.has(kind)));
+  }
+
+  /**
+   * The ONE read-only SessionHosts answer for a child of THIS host.
+   *
+   * `ownKinds` describes the caller's OWN host — this one, whatever any viewer
+   * currently displays — and comes from the same facts its own SessionSpawn uses:
+   * Pi while this host's one manager is open and not tearing down, plus each
+   * native backend whose default target the one fresh launch probe finds
+   * launchable now. `hosts` lists the existing paired destination ids a routed
+   * SessionSpawn could currently address (negotiated SessionSpawn on a connected
+   * destination with a current owner run), each with the kinds observed for it:
+   * Pi from that negotiated support, and native kinds ONLY from a fresh owner
+   * probe — the destination's existing bounded catalog refresh, then its current
+   * probed projection. A legacy or non-probing owner contributes no native kind.
+   *
+   * Ids are the raw saved-destination ids, unchanged. Nothing here connects,
+   * pairs, regrants, retries, spawns, selects, focuses, or changes visibility,
+   * and nothing about the requester's workspace is consulted. A parent that is
+   * no longer current, a teardown, an unreadable network state, a busy or failed
+   * owner refresh, or a broker that stopped waiting makes the WHOLE inspection
+   * unavailable: a partial answer is never reported as complete, and a refresh
+   * that could not run is never reported as fresh availability or as absence.
+   * A destination that is positively no longer addressable is simply not listed.
+   * The snapshot is descriptive only; every spawn is revalidated at its
+   * destination.
+   */
+  async function inspectSessionHosts(
+    _parentInstanceId: string,
+    context: SessionHostsRequestContext,
+    parentStillCurrent: () => boolean,
+  ): Promise<SessionHostsSnapshot> {
+    const signal = context.signal;
+    const stillCurrent = (): boolean => !shutdownRequested && !signal.aborted && proveCurrent(parentStillCurrent);
+    if (!stillCurrent()) throw sessionHostsUnavailable();
+    const [ownKinds, observations] = await untilAborted(Promise.all([ownSessionKinds(), pairedSessionHosts()]), signal);
+    if (!stillCurrent()) throw sessionHostsUnavailable();
+    // The final boundary: every paired observation is re-proved synchronously
+    // against the CURRENT coordinator view, after all waiting is over and with no
+    // await before the return, so a destination that disconnected, changed run,
+    // or changed its native description while another wait was pending is never
+    // reported with its earlier kinds.
+    const hosts = confirmPairedObservations(observations);
+    return Object.freeze({ ownKinds, hosts });
+  }
+
+  /**
+   * One paired destination's observation, with the facts it was derived from so
+   * the final boundary can re-prove them.
+   */
+  interface PairedHostObservation {
+    readonly entry: SessionHostsEntry;
+    readonly hostRunId: string;
+    readonly nativeIdentity: string;
+  }
+
+  /** Identity of everything the reported kinds depend on in one destination's native description. */
+  function pairedNativeIdentity(host: PeerUiHost | undefined): string {
+    const native = host?.nativeCli;
+    return JSON.stringify([
+      native?.supported ?? null,
+      native?.availability ?? null,
+      projectNativeCliNewSessionTargets(native?.targets ?? []).map((target) => [target.backend, target.id]),
+    ]);
+  }
+
+  /**
+   * Re-prove every observation against the current view: a destination that is
+   * positively no longer addressable is omitted; one still addressable whose run
+   * or native description moved makes the whole inspection unavailable.
+   */
+  function confirmPairedObservations(observations: readonly PairedHostObservation[]): readonly SessionHostsEntry[] {
+    if (observations.length === 0) return Object.freeze([]);
+    const coordinator = peerCoordinator;
+    const controller = ownerCreateController();
+    if (coordinator === undefined || controller === undefined) throw sessionHostsUnavailable();
+    const current = readPeerSnapshotForDiscovery(coordinator);
+    const confirmed: SessionHostsEntry[] = [];
+    for (const observation of observations) {
+      const host = (current.hosts ?? []).find((candidate) => candidate.id === observation.entry.id);
+      if (!sessionSpawnHostAddressable(controller, host)) continue;
+      if (host?.roster.hostRunId !== observation.hostRunId
+        || pairedNativeIdentity(host) !== observation.nativeIdentity) throw sessionHostsUnavailable();
+      confirmed.push(observation.entry);
     }
-    if (outcome.status !== "started") return { kind: "unknown" };
-    // The same authoritative post-create observation as the Pi create: `started`
-    // requires THIS run's own inventory to report the row alive with a live
-    // process. An unreadable or foreign-run inventory cannot establish that nothing
-    // came up, so it stays `unknown`; an observable absent, starting, errored, or
-    // exited row is `unconfirmed`.
-    let after: OwningHostInventorySnapshot | undefined;
+    return Object.freeze(confirmed);
+  }
+
+  /** The caller's own host: Pi from the open manager, native kinds from one fresh probe. */
+  async function ownSessionKinds(): Promise<readonly SessionBackend[]> {
+    if (manager === undefined || shutdownRequested) throw sessionHostsUnavailable();
+    const probed = await probeNativeCliTargets();
+    if (manager === undefined || shutdownRequested) throw sessionHostsUnavailable();
+    const kinds = new Set<SessionBackend>(["pi"]);
+    for (const target of probed) {
+      if (isNativeCliNewSessionTarget(target.backend, target.id)) kinds.add(target.backend);
+    }
+    return canonicalSessionKinds(kinds);
+  }
+
+  /** True while one destination is addressable by a routed SessionSpawn right now. */
+  function sessionSpawnHostAddressable(controller: PeerCreateController, host: PeerUiHost | undefined): boolean {
+    if (host === undefined || host.state !== "connected" || host.roster.state !== "current") return false;
+    const hostRunId = host.roster.hostRunId;
+    if (typeof hostRunId !== "string" || hostRunId.length === 0) return false;
     try {
-      after = hostService.readInventorySnapshot();
+      return typeof controller.spawnSession === "function" && controller.supportsSessionSpawn?.(host.id) === true;
     } catch {
-      after = undefined;
+      return false;
     }
-    if (after === undefined) return { kind: "unknown" };
-    if (after.hostRunId !== request.hostRunId) return { kind: "unknown" };
-    const row = after.rows.find((candidate) => candidate.id === outcome.id);
-    if (row === undefined || row.lifecycle !== "alive" || row.hasLiveProcess !== true) {
-      return { kind: "unconfirmed" };
+  }
+
+  /** The live coordinator view; an unreadable view is an unavailable inspection. */
+  function readPeerSnapshotForDiscovery(coordinator: MainPeerCoordinator): PeerUiSnapshot {
+    try {
+      return coordinator.read();
+    } catch {
+      throw sessionHostsUnavailable();
     }
-    return { kind: "started", hostRunId: after.hostRunId, rowId: outcome.id };
+  }
+
+  /** Every addressable paired destination with its freshly observed kinds. */
+  async function pairedSessionHosts(): Promise<readonly PairedHostObservation[]> {
+    const coordinator = peerCoordinator;
+    const controller = ownerCreateController();
+    // A host with no paired network, or one whose coordinator has no prompted
+    // spawn lane, has no destination a routed SessionSpawn could address.
+    if (coordinator === undefined || controller === undefined || typeof controller.spawnSession !== "function") {
+      return Object.freeze([]);
+    }
+    const current = readPeerSnapshotForDiscovery(coordinator);
+    if (current.status === "loading") throw sessionHostsUnavailable();
+    const addressable = (current.hosts ?? []).filter((host) => sessionSpawnHostAddressable(controller, host));
+    const entries = await Promise.all(addressable.map((host) => pairedHostKinds(coordinator, controller, host.id)));
+    return Object.freeze(entries.filter((entry): entry is PairedHostObservation => entry !== undefined));
+  }
+
+  /**
+   * One destination's kinds, or undefined when it is positively no longer
+   * addressable. Throws (unavailable) whenever a fresh observation could not be
+   * established for a destination that may still be addressable.
+   */
+  async function pairedHostKinds(
+    coordinator: MainPeerCoordinator,
+    controller: PeerCreateController,
+    hostId: string,
+  ): Promise<PairedHostObservation | undefined> {
+    const findHost = (): PeerUiHost | undefined =>
+      (readPeerSnapshotForDiscovery(coordinator).hosts ?? []).find((candidate) => candidate.id === hostId);
+    const before = findHost();
+    if (!sessionSpawnHostAddressable(controller, before)) return undefined;
+    const kinds = new Set<SessionBackend>(["pi"]);
+    let observed: PeerUiHost | undefined = before;
+    const native = before?.nativeCli;
+    // Only an owner that negotiated native AVAILABILITY can describe launchable
+    // native kinds; a configuration-only (legacy) catalog stays unverified and is
+    // never listed as available.
+    if (native?.supported === true && native.availability === "probed") {
+      if (typeof controller.refreshNativeTargets !== "function") throw sessionHostsUnavailable();
+      let refreshed: Awaited<ReturnType<NonNullable<PeerCreateController["refreshNativeTargets"]>>>;
+      try {
+        refreshed = await controller.refreshNativeTargets(hostId);
+      } catch {
+        throw sessionHostsUnavailable();
+      }
+      if (refreshed.kind === "not-sent" && refreshed.reason === "target-unavailable") return undefined;
+      if (refreshed.kind !== "refreshed") throw sessionHostsUnavailable();
+      const after = findHost();
+      if (!sessionSpawnHostAddressable(controller, after)) return undefined;
+      if (after?.roster.hostRunId !== refreshed.hostRunId) throw sessionHostsUnavailable();
+      const fresh = after.nativeCli;
+      if (fresh?.supported !== true || fresh.availability !== "probed") throw sessionHostsUnavailable();
+      for (const target of projectNativeCliNewSessionTargets(fresh.targets)) kinds.add(target.backend);
+      observed = after;
+    }
+    const hostRunId = observed?.roster.hostRunId;
+    if (typeof hostRunId !== "string" || hostRunId.length === 0) return undefined;
+    return Object.freeze({
+      entry: Object.freeze({ id: hostId, kinds: canonicalSessionKinds(kinds) }),
+      hostRunId,
+      nativeIdentity: pairedNativeIdentity(observed),
+    });
+  }
+
+  /**
+   * The bounded SessionSpawn outcome of one paired result. Only a positive
+   * owner `started` is `started`. Only proof that nothing was created is
+   * `failed`: a positively not-sent request, or an owner refusal established
+   * before any create. Everything else — an owner `unconfirmed` (a starting or
+   * errored row may still run), an owner `unknown`, an unrecognized fact, or an
+   * unobservable transport result — is `unknown`, never a claim of no effect.
+   */
+  function sessionSpawnOutcomeOfPeerResult(result: unknown): SessionSpawnOutcome {
+    if (typeof result !== "object" || result === null) return "unknown";
+    const settled = result as PeerCreateResult;
+    if (settled.kind === "not-sent") return "failed";
+    if (settled.kind !== "owner-result") return "unknown";
+    const facts = isOwnerCreateFacts(settled.facts) ? settled.facts : undefined;
+    if (facts?.kind === "started") return "started";
+    if (facts?.kind === "refused") return "failed";
+    return "unknown";
   }
 
   // --- The ONE native naming core, shared by the local Edit form and a remote owner request. ---
@@ -7624,6 +8151,15 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       scheduleRedraw();
       return;
     }
+    if (native && !isNativeCliNewSessionTarget(action.backend, action.targetId)) {
+      // A NEW native session names only the owner's backend default target (#493):
+      // a named external worker profile an older owner may still advertise is
+      // refused here, never sent and never answered by a Pi create.
+      activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_UNSUPPORTED_MESSAGE);
+      reconcileLayout(true);
+      scheduleRedraw();
+      return;
+    }
     if (native && typeof controller.createNativeSession !== "function") {
       // This side's coordinator never learned the native lane. The request is
       // refused here and NEVER answered by a Pi create on the same destination.
@@ -8349,6 +8885,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
 
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
+    // A fresh-native refresh is a read-only consequence of opening the New form or
+    // changing its Host, not a deliberate action of its own: it never invalidates
+    // a pending automatic activation, selects, focuses, or changes visibility.
+    if (action.type === "new-form-native-refresh") {
+      refreshNewFormNativeTargets(action.refreshId, action.hostId);
+      return;
+    }
     // Any deliberate user action invalidates a pending automatic activation.
     deliberateActionGeneration += 1;
     switch (action.type) {
@@ -9383,9 +9926,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         return createNativeSavedQueryInput(activeSessionSetup.nativeAgentDir);
       },
       initialVisible: true,
-      // The native provider targets this host can actually offer in the New
-      // form's Provider line (empty means: draw no Provider line at all).
-      nativeCliTargets,
+      // No static native choice is handed over (#493): every New form starts with
+      // none and asks for a fresh observation — this host's one launch probe for
+      // Local, or an owner refresh for a remote destination — so the Provider line
+      // only ever offers what was found launchable for that form's Host choice.
+      freshNativeTargets: true,
       onAction: handleSidebarAction,
       // The sidebar's read-only view of this host's ONE canonical mixed order
       // (#477): the current runtime identities of the cards it is drawing, in
@@ -9443,6 +9988,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // service. This path never completes a sidebar form and never activates
       // the created row; manager onChange only refreshes the roster.
       onSpawnRequest: (parentInstanceId, request) => hostService.spawnRequestedChild(parentInstanceId, request),
+      // Routed requests (`host`/`kind`) go to the one routed handler; installing it
+      // is what makes each child's bootstrap advertise routed SessionSpawn.
+      onRoutedSpawnRequest: routeSpawnRequest,
+      // Read-only SessionHosts discovery for the same children. Installed beside
+      // the routed handler, it is what makes each child's bootstrap advertise the
+      // SessionHosts tool; the parent proof is the manager's own registration fact.
+      onSessionHostsRequest: inspectSessionHosts,
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
       // The host-injected native interactive launcher (issue #277). A row whose
       // backend is Claude or Codex launches through it with the provider's own

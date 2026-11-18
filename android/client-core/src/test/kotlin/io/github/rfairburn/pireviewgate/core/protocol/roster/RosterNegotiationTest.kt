@@ -164,6 +164,48 @@ class RosterNegotiationTest {
     }
 
     @Test
+    fun `native availability is acknowledged only beside the native lane it describes`() {
+        assertEquals("roster-native-availability-v1", RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+        val offered = listOf(
+            RosterWire.REQUIRED_CAPABILITY,
+            RosterWire.NATIVE_CAPABILITY,
+            RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+        )
+        fun ack(vararg capabilities: String) = RosterFrame.HelloAck(
+            RosterWire.SERVICE, RosterWire.MAJOR, RosterWire.MINOR, listOf(RosterWire.REQUIRED_CAPABILITY, *capabilities),
+        )
+        assertEquals(
+            RosterAckVerdict.Accepted(RosterWire.MINOR, ack(
+                RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+            ).capabilities),
+            RosterProtocol.reviewHelloAck(
+                ack(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY), offered,
+            ),
+        )
+        // A legacy owner that acknowledges only the native lane stays accepted.
+        assertTrue(RosterProtocol.reviewHelloAck(ack(RosterWire.NATIVE_CAPABILITY), offered) is RosterAckVerdict.Accepted)
+        // A description of a catalog that cannot exist on this channel is a violation.
+        assertEquals(
+            RosterAckVerdict.Refused(RosterWireErrorCode.PROTOCOL_VIOLATION),
+            RosterProtocol.reviewHelloAck(ack(RosterWire.NATIVE_AVAILABILITY_CAPABILITY), offered),
+        )
+        // The owner side never negotiates the description without the lane.
+        fun hello(vararg capabilities: String) = RosterFrame.Hello(
+            RosterWire.SERVICE, RosterWire.MAJOR, RosterWire.MINOR, listOf(RosterWire.REQUIRED_CAPABILITY, *capabilities),
+        )
+        assertEquals(
+            listOf(RosterWire.CLOSE_CAPABILITY),
+            (RosterProtocol.negotiateHello(hello(RosterWire.CLOSE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY))
+                as RosterNegotiation.Accepted).capabilities,
+        )
+        assertEquals(
+            listOf(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY),
+            (RosterProtocol.negotiateHello(hello(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY))
+                as RosterNegotiation.Accepted).capabilities,
+        )
+    }
+
+    @Test
     fun `the optional capabilities are exactly the ones this lane knows`() {
         assertEquals(
             listOf(
@@ -174,6 +216,7 @@ class RosterNegotiationTest {
                 RosterWire.ROSTER_SLOT_CAPABILITY,
                 RosterWire.NATIVE_CAPABILITY,
                 RosterWire.NATIVE_NAME_CAPABILITY,
+                RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
             ),
             RosterWire.KNOWN_OPTIONAL_CAPABILITIES,
         )

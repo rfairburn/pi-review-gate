@@ -1297,10 +1297,10 @@ test("codemode absent from the parent ceiling never enters delegated catalogs (#
   }
 });
 
-test("SessionSpawn is excluded from delegated executor catalogs even when active in the parent", async () => {
+test("SessionSpawn and SessionHosts are excluded from delegated executor catalogs even when active in the parent", async () => {
   const { tools, manager } = harness({
     deferredPiTools: false,
-    activeTools: ["read", "bash", "SessionSpawn", ...executionToolNames],
+    activeTools: ["read", "bash", "SessionSpawn", "SessionHosts", ...executionToolNames],
   });
   const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   try {
@@ -1318,6 +1318,8 @@ test("SessionSpawn is excluded from delegated executor catalogs even when active
     };
     assert.equal(catalog.allowedToolCatalog.includes("SessionSpawn"), false);
     assert.equal(catalog.initialActiveTools.includes("SessionSpawn"), false);
+    assert.equal(catalog.allowedToolCatalog.includes("SessionHosts"), false);
+    assert.equal(catalog.initialActiveTools.includes("SessionHosts"), false);
   } finally {
     await manager.shutdown();
     await manager.detach();

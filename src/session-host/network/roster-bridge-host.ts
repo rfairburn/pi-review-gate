@@ -84,7 +84,7 @@
  * authorization.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, type Hash } from "node:crypto";
 import type {
   OwningHostInventorySnapshot,
   OwningHostInventoryWatch,
@@ -102,10 +102,12 @@ import {
   isOwnerCreateFacts,
   type OwnerCreateFacts,
   type OwnerCreateHandler,
+  type OwnerSessionSpawnHandler,
+  isOwnerSessionSpawnRequest,
   type OwnerCreateRequest,
   copyRemoteNativeCliTargets,
   findRemoteNativeCliTarget,
-  type OwnerNativeCliTargetProvider,
+  type OwnerNativeCliTargetSource,
   type OwnerNativeCreateHandler,
   type OwnerNativeCreateRequest,
   type RemoteNativeCliTarget,
@@ -140,6 +142,9 @@ import type { NativeCliBackend } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
+  type RosterBridgeSessionSpawnFrame,
+  ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
@@ -248,6 +253,9 @@ export interface RosterBridgeHostOptions {
    * handed a minimal re-proof for its own last-instant check.
    */
   readonly createOwnedSession?: OwnerCreateHandler;
+  /** Optional exact prompted launch provider on the SAME create lane. Main owns
+   * launcher selection/delivery and must explicitly refuse unsupported launches. */
+  readonly spawnOwnedSession?: OwnerSessionSpawnHandler;
   /** Optional verified native rename provider; absence never acknowledges support. */
   readonly renameOwnedSession?: OwnerRenameHandler;
   /**
@@ -272,8 +280,28 @@ export interface RosterBridgeHostOptions {
    * called to resolve or launch anything — only to state, and to re-prove, exactly
    * which owner targets exist right now. A throw or a malformed entry is a refusal
    * to advertise, never a partial catalog.
+   *
+   * It may answer synchronously or with a promise. An asynchronous answer is
+   * awaited within the existing deadline of the operation it serves (the snapshot
+   * start deadline for a publication, the create result deadline for a native
+   * create), and the binding, subscription, run, and grant are re-proved after it
+   * settles, so a late answer can never commit a snapshot for a retired scope or
+   * launch a target for a replaced run.
    */
-  readonly nativeCliTargets?: OwnerNativeCliTargetProvider;
+  readonly nativeCliTargets?: OwnerNativeCliTargetSource;
+  /**
+   * The owner's explicit declaration that {@link RosterBridgeHostOptions.nativeCliTargets}
+   * performs a FRESH read-only launch probe on every read (#493). Only `true`
+   * acknowledges {@link ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY}, and only beside
+   * the native lane. Absent or `false` keeps the catalog configuration-only, which a
+   * viewer describes as unknown availability.
+   *
+   * It is a description of the provider, never a permission, a grant, a target
+   * state, or a reason to skip any re-proof; it changes nothing about which
+   * targets are read, launched, or refused. `true` without the native pair, or any
+   * non-boolean value, is refused at construction.
+   */
+  readonly nativeCliAvailability?: boolean;
   /**
    * The owner's ONE host-side ROW NAME provider for its native rows, supplied by
    * Main, which already owns the only manager label, stable-slot caption, and
@@ -323,7 +351,9 @@ interface SavedProviders {
  */
 interface NativeProviders {
   readonly create: OwnerNativeCreateHandler;
-  readonly targets: OwnerNativeCliTargetProvider;
+  readonly targets: OwnerNativeCliTargetSource;
+  /** The owner's explicit fresh-probe declaration; description only. */
+  readonly probesAvailability: boolean;
 }
 
 /** One attached channel. Stopping it ends metadata delivery and nothing else. */
@@ -409,7 +439,7 @@ interface InFlightTransfer {
 interface InFlightCreate {
   readonly requestId: string;
   readonly hostRunId: string;
-  readonly resultType: "create_result" | "create_native_result";
+  readonly resultType: "create_result" | "create_native_result" | "spawn_result";
   /** Native only: the exact owner-advertised backend and target id this names. */
   readonly descriptor: { readonly backend: NativeCliBackend; readonly targetId: string } | null;
 }
@@ -456,6 +486,16 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * that scalar neither cancels the earlier child nor drops its fixed result.
    */
   #inflightCreate: InFlightCreate | null = null;
+  /** Only incomplete assembly is timed out; accepted provider work is never cancelled. */
+  #spawnAssembly: {
+    readonly inflight: InFlightCreate;
+    readonly bytes: number;
+    readonly sha256: string;
+    readonly hash: Hash;
+    readonly parts: Buffer[];
+    received: number;
+    timer: NodeJS.Timeout;
+  } | null = null;
   #createSequence = 0;
   /** One operation and one anti-replay admission high-water, never a queue. */
   #inflightRename: { readonly requestId: string } | null = null;
@@ -515,8 +555,24 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #installUnavailable = false;
   #subscriptionRun: string | null = null;
   #subscriptionId: string | null = null;
+  /**
+   * Owner-local lifetime number of the live subscription: advanced when one is
+   * installed AND when one retires, so two subscriptions of the same run (or a
+   * viewer that reuses a subscription id) are never the same lifetime. A native
+   * create is fenced to the exact lifetime that admitted it. A scalar, not a history.
+   */
+  #subscriptionGeneration = 0;
   #watch: OwningHostInventoryWatch | null = null;
   #transfer: InFlightTransfer | null = null;
+  /**
+   * The ONE snapshot whose native catalog is being read asynchronously, scoped to
+   * the subscription and run it was started for. While it exists no other roster
+   * transfer starts (newer observations wait as the single newest-wins pending
+   * snapshot), and retiring the subscription clears it, so a probe that settles
+   * afterwards can never commit a snapshot for a scope this binding left. It is a
+   * marker for one read in progress, never a catalog cache.
+   */
+  #preparing: { readonly subscriptionId: string; readonly hostRunId: string } | null = null;
   #pending: OwningHostInventorySnapshot | null = null;
   #sending = false;
   #publishedRun: string | null = null;
@@ -614,6 +670,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "close_request":
         this.#onCloseRequest(frame);
         return;
+      case "spawn_begin":
+      case "spawn_chunk":
+      case "spawn_end":
+        this.#onSessionSpawnFrame(frame);
+        return;
       case "create_request":
         this.#onCreateRequest(frame);
         return;
@@ -670,6 +731,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       if (capability === ROSTER_BRIDGE_CLOSE_CAPABILITY) {
         return typeof this.#options.closeOwnedSession === "function";
       }
+      if (capability === ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY) {
+        return typeof this.#options.spawnOwnedSession === "function";
+      }
       if (capability === ROSTER_BRIDGE_CREATE_CAPABILITY) {
         return typeof this.#options.createOwnedSession === "function";
       }
@@ -680,6 +744,15 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         // never widens anything, and acknowledging the lane states no authority,
         // no available target, and no permission for this peer.
         return this.#native !== null;
+      }
+      if (capability === ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY) {
+        // Description of the native catalog only, so it exists only beside that
+        // lane on this very channel, and only when the owner explicitly declared
+        // that its provider freshly probes launchability. It never authorizes a
+        // target and never relaxes the per-create re-read and re-proof.
+        return this.#native !== null
+          && this.#native.probesAvailability
+          && decision.capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY);
       }
       if (capability === ROSTER_BRIDGE_RENAME_CAPABILITY) {
         return typeof this.#options.renameOwnedSession === "function";
@@ -781,6 +854,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     }
     this.#watch = watch;
     this.#subscriptionId = subscriptionId;
+    this.#subscriptionGeneration += 1;
     this.#subscriptionRun = watch.snapshot.hostRunId;
     this.#state = "subscribed";
     this.#publishedRun = null;
@@ -1069,7 +1143,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     }
     // A binding that retired inside the authorizer's own callout can no longer
     // write a result at all; one that is merely unauthorized reports the refusal.
-    const authorized = inflight.resultType === "create_native_result"
+    const authorized = inflight.resultType === "create_native_result" || inflight.resultType === "spawn_result"
       // The native lane also re-proves its own exact run: a reply about a run this
       // channel no longer subscribes to is not this request's answer.
       ? this.#nativeCreateStillAuthorized(inflight.hostRunId)
@@ -1100,11 +1174,106 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * a lane-crossing answer would be a claim this side cannot support.
    */
   #writeCreateResult(
-    resultType: "create_result" | "create_native_result",
+    resultType: "create_result" | "create_native_result" | "spawn_result",
     requestId: string,
     facts: OwnerCreateFacts,
   ): void {
     this.#writeResult({ type: resultType, requestId, outcome: facts }, "create_reply_dropped");
+  }
+
+  // ------------------------------------------------------- prompted create
+
+  #discardSpawnAssembly(): void {
+    if (this.#spawnAssembly === null) return;
+    clearTimeout(this.#spawnAssembly.timer);
+    this.#spawnAssembly = null;
+  }
+
+  #onSessionSpawnFrame(frame: RosterBridgeSessionSpawnFrame): void {
+    if (this.#state === "finished") return;
+    const handler = this.#options.spawnOwnedSession;
+    if (handler === undefined || !this.#capabilities.includes(ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY)) {
+      this.#violation(); return;
+    }
+    if (!this.#createStillAuthorized()) {
+      if (this.#spawnAssembly?.inflight === this.#inflightCreate) this.#inflightCreate = null;
+      this.#discardSpawnAssembly();
+      // No reply can establish an unauthorized outcome.
+      return;
+    }
+    if (frame.type === "spawn_begin") {
+      // Never answer an active request's replay with a no-effect claim. A second
+      // begin during assembly (including changed metadata) invalidates that stream.
+      // Already accepted owner work remains its own lifecycle, never cancelled.
+      if (this.#inflightCreate?.requestId === frame.requestId) {
+        if (this.#spawnAssembly !== null) { this.#discardSpawnAssembly(); this.#violation(); }
+        return;
+      }
+      if (frame.sequence <= this.#createSequence) {
+        this.#writeCreateResult("spawn_result", frame.requestId, { kind: "refused" }); return;
+      }
+      this.#createSequence = frame.sequence;
+      if (!this.#nativeCreateStillAuthorized(frame.hostRunId)) return;
+      if (this.#inflightCreate !== null) {
+        this.#writeCreateResult("spawn_result", frame.requestId, { kind: "refused" }); return;
+      }
+      const inflight: InFlightCreate = { requestId: frame.requestId, hostRunId: frame.hostRunId,
+        resultType: "spawn_result", descriptor: null };
+      this.#inflightCreate = inflight;
+      const timer = setTimeout(() => {
+        if (this.#spawnAssembly?.inflight !== inflight) return;
+        this.#discardSpawnAssembly();
+        if (this.#inflightCreate === inflight) this.#inflightCreate = null;
+        // Incomplete submission is unknown; never invoke, retry, or fabricate a result.
+      }, this.#bounds.createResultTimeoutMs);
+      timer.unref();
+      this.#spawnAssembly = { inflight, bytes: frame.bytes, sha256: frame.sha256,
+        hash: createHash("sha256"), parts: [], received: 0, timer };
+      return;
+    }
+    const assembly = this.#spawnAssembly;
+    if (assembly === null || assembly.inflight.requestId !== frame.requestId) {
+      this.#violation(); return;
+    }
+    const inflight = assembly.inflight;
+    if (!this.#nativeCreateStillAuthorized(inflight.hostRunId)) {
+      this.#discardSpawnAssembly();
+      if (this.#inflightCreate === inflight) this.#inflightCreate = null;
+      return;
+    }
+    if (frame.type === "spawn_chunk") {
+      const part = Buffer.from(frame.data, "base64");
+      if (frame.index !== assembly.parts.length || part.length > assembly.bytes - assembly.received) {
+        this.#discardSpawnAssembly(); this.#violation(); return;
+      }
+      assembly.received += part.length;
+      assembly.hash.update(part);
+      assembly.parts.push(part);
+      return;
+    }
+    this.#discardSpawnAssembly();
+    if (frame.chunks !== assembly.parts.length || assembly.received !== assembly.bytes
+      || assembly.hash.digest("hex") !== assembly.sha256) {
+      this.#violation(); return;
+    }
+    let value: unknown;
+    try {
+      // Fatal UTF-8 decoding avoids replacing corrupt bytes with a different prompt.
+      value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(assembly.parts)));
+    } catch { this.#violation(); return; }
+    if (!isOwnerSessionSpawnRequest(value) || value.hostRunId !== inflight.hostRunId) {
+      this.#violation(); return;
+    }
+    const request = Object.freeze({ ...value });
+    const stillAuthorized = (): boolean => this.#nativeCreateStillAuthorized(request.hostRunId);
+    this.#diagnostic("create_accepted");
+    void Promise.resolve().then(() => {
+      if (!stillAuthorized()) { this.#completeCreate(inflight, { kind: "unknown" }, false); return; }
+      return handler(request, stillAuthorized).then(
+        facts => this.#completeCreate(inflight, isOwnerCreateFacts(facts) ? facts : { kind: "unknown" }, true),
+        () => this.#completeCreate(inflight, { kind: "unknown" }, true),
+      );
+    }).catch(() => this.#completeCreate(inflight, { kind: "unknown" }, false));
   }
 
   // ---------------------------------------------------------- native create
@@ -1118,10 +1287,17 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * Read and validate the owner's OWN current advertised native target catalog.
    *
    * `null` means this owner cannot represent its native targets right now: no
-   * provider, a throw from the owner's own reader, a non-array, an over-long
-   * catalog beyond the frame-derived loop guard, or one malformed entry. That is a
+   * provider, a throw or rejection from the owner's own reader, a non-array, an
+   * over-long catalog beyond the frame-derived loop guard, one malformed entry, or
+   * an asynchronous answer that did not settle within `deadlineMs`. That is a
    * coherent refusal, never a partial, empty, or best-effort catalog, and nothing
    * is cached from a previous read.
+   *
+   * A synchronous provider answers synchronously (the original configuration-only
+   * shape, byte-for-byte unchanged in timing); an asynchronous one yields a promise
+   * that never rejects. The deadline is the caller's EXISTING operation deadline,
+   * never a new tunable, and a late settlement after it is simply ignored. Every
+   * caller re-proves its own scope after awaiting the promise.
    *
    * The guard is the existing complete-frame byte bound expressed as an entry
    * count, never the per-page row bound: this catalog describes the owner's own
@@ -1129,16 +1305,43 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * how many targets it may advertise. Whether the catalog can actually be carried
    * is settled by the encoded `snapshot_end` frame.
    */
-  #advertisedNativeTargets(): readonly RemoteNativeCliTarget[] | null {
+  #readNativeTargets(
+    deadlineMs: number,
+  ): readonly RemoteNativeCliTarget[] | null | Promise<readonly RemoteNativeCliTarget[] | null> {
     const native = this.#native;
     if (native === null) return null;
+    const maxEntries = rosterBridgeNativeCatalogMaxEntries(this.#bounds);
     let value: unknown;
+    let then: unknown;
     try {
       value = native.targets();
+      then = typeof value === "object" && value !== null && !Array.isArray(value)
+        ? (value as { then?: unknown }).then
+        : undefined;
     } catch {
       return null;
     }
-    return copyRemoteNativeCliTargets(value, rosterBridgeNativeCatalogMaxEntries(this.#bounds));
+    if (typeof then !== "function") return copyRemoteNativeCliTargets(value, maxEntries);
+    const thenable = value as PromiseLike<unknown>;
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (catalog: readonly RemoteNativeCliTarget[] | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(catalog);
+      };
+      const timer = setTimeout(() => finish(null), deadlineMs);
+      timer.unref?.();
+      try {
+        Promise.resolve(thenable).then(
+          (resolved) => finish(copyRemoteNativeCliTargets(resolved, maxEntries)),
+          () => finish(null),
+        );
+      } catch {
+        finish(null);
+      }
+    });
   }
 
   /**
@@ -1166,6 +1369,19 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   }
 
   /**
+   * The native create's pre-invocation re-proof: everything
+   * {@link #nativeCreateStillAuthorized} proves, plus the EXACT subscription
+   * lifetime that admitted the request, checked before and after the authorizer
+   * callout. A probe that settles after its subscription was replaced — even by a
+   * new subscription to the same run — never reaches the provider.
+   */
+  #nativeCreateStillInLifetime(hostRunId: string, generation: number): boolean {
+    if (this.#subscriptionGeneration !== generation) return false;
+    if (!this.#nativeCreateStillAuthorized(hostRunId)) return false;
+    return this.#subscriptionGeneration === generation;
+  }
+
+  /**
    * Answer one native create request with the owner's ONE native provider, or not
    * at all.
    *
@@ -1189,10 +1405,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * owed, and a second, competing `refused` on the same correlation would claim
    * nothing was created while the provider may still be creating it.
    *
-   * Inside the detached continuation the authorization, the exact run, and the
-   * exact advertised descriptor are each proved again — and proved AGAIN after the
-   * owner's catalog callout, immediately before the provider is invoked — so a
-   * target withdrawn, a grant revoked, or a run replaced after admission never
+   * Inside the detached continuation the authorization and the exact run are
+   * proved again, the owner's catalog is read ONCE (awaiting a fresh probe within
+   * the existing create deadline when the provider is asynchronous), and the
+   * authorization, run, and exact advertised descriptor are proved AGAIN after that
+   * callout, immediately before the provider is invoked — so a target withdrawn, a
+   * grant revoked, or a run replaced after admission or during the probe never
    * launches.
    */
   #onNativeCreateRequest(frame: RosterBridgeNativeCreateRequestFrame): void {
@@ -1252,22 +1470,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // happens BEFORE every target-dependent refusal, so a target that is unavailable
     // now and available later cannot turn the same consumed attempt into a launch.
     this.#createSequence = frame.sequence;
-    // The owner's own current catalog is the only thing that can authorize this
-    // target. A requester's configured id, a label match, or a backend-only match
-    // is never enough, and a catalog this owner cannot read is a refusal.
-    const advertised = this.#advertisedNativeTargets();
-    if (!this.#nativeCreateStillAuthorized(frame.hostRunId)) {
-      // The owner's catalog reader is arbitrary owner code: re-prove the binding,
-      // the grant, and the exact run after that callout, before any write.
-      this.#diagnostic("create_refused");
-      return;
-    }
-    if (advertised === null
-      || findRemoteNativeCliTarget(advertised, frame.backend, frame.targetId) === null) {
-      this.#diagnostic("create_refused");
-      this.#writeCreateResult("create_native_result", frame.requestId, { kind: "refused" });
-      return;
-    }
+    // The owner's own catalog is read ONCE per create, immediately before the
+    // provider would be invoked (below), so a fresh launch probe is awaited exactly
+    // once and its answer is the one the launch decision acts on. The one in-flight
+    // slot is reserved first, so a probe in progress is never run beside another
+    // create and a replay of this frame is ignored rather than answered twice.
     if (this.#inflightCreate !== null) {
       // One create per channel, across both lanes. A second is refused, never
       // queued, evicted, retargeted, or run beside the first.
@@ -1281,6 +1488,10 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       targetId: frame.targetId,
     });
     const descriptor = Object.freeze({ backend: frame.backend, targetId: frame.targetId });
+    // The exact subscription lifetime that admitted this request (live: the run
+    // check above required a subscription). Unsubscribing and subscribing again to
+    // the SAME run — through any viewer implementation — ends that lifetime.
+    const generation = this.#subscriptionGeneration;
     const inflight: InFlightCreate = {
       requestId: frame.requestId,
       hostRunId: frame.hostRunId,
@@ -1288,32 +1499,48 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       descriptor,
     };
     this.#inflightCreate = inflight;
-    this.#diagnostic("create_accepted");
-    const stillAuthorized = (): boolean => this.#nativeCreateStillAuthorized(request.hostRunId);
+    // The provider's own re-proof carries the same lifetime fence, so Main's
+    // last-instant check also refuses a request whose subscription was replaced.
+    const stillAuthorized = (): boolean => this.#nativeCreateStillInLifetime(request.hostRunId, generation);
     void Promise.resolve()
-      .then(() => {
-        // Re-proved inside the detached continuation, immediately before the call:
+      .then(async () => {
+        // Re-proved inside the detached continuation, before the catalog callout:
         // a Revoke, a replacement, a run change, or a teardown that landed while
-        // this was queued means the provider is never reached.
+        // this was queued means neither the catalog nor the provider is reached.
         if (!stillAuthorized()) {
           this.#completeCreate(inflight, { kind: "unknown" }, false);
           return;
         }
-        // The exact advertised descriptor, proved again against the owner's live
-        // catalog right here. A withdrawal after admission is a positive
-        // pre-invocation establishment, so `refused` is truthful and nothing ran.
-        const current = this.#advertisedNativeTargets();
+        // The owner's own current catalog is the only thing that can authorize this
+        // target: a requester's configured id, a label match, or a backend-only
+        // match is never enough. A synchronous reader answers at once; a fresh probe
+        // is awaited within the existing create deadline. A catalog this owner
+        // cannot read, a probe that did not settle in time, or a target it no
+        // longer lists is a positive pre-invocation establishment, so `refused` is
+        // truthful and nothing ran.
+        const read = this.#readNativeTargets(this.#bounds.createResultTimeoutMs);
+        const current = read instanceof Promise ? await read : read;
+        // A teardown that abandoned this request while the probe ran owns nothing
+        // more here: no result, no provider call.
+        if (this.#inflightCreate !== inflight) return;
+        // The catalog read is arbitrary owner code (and possibly an await): it may
+        // revoke this peer's grant, retire this binding, or replace the owner run
+        // while still returning a catalog that names the requested target. Those
+        // facts are re-proved before the catalog is even consulted.
+        if (!stillAuthorized()) {
+          this.#diagnostic("create_refused");
+          this.#completeCreate(inflight, { kind: "unknown" }, false);
+          return;
+        }
         if (current === null || findRemoteNativeCliTarget(current, descriptor.backend, descriptor.targetId) === null) {
           this.#diagnostic("create_refused");
           this.#completeCreate(inflight, { kind: "refused" }, true);
           return;
         }
-        // The final catalog read is itself an arbitrary owner callout: it may revoke
-        // this peer's grant, retire this binding, or replace the owner run while
-        // still returning a catalog that names the requested target. Every one of
-        // those facts is therefore re-proved AFTER it, as the last thing checked
-        // before the provider is invoked, so a provider never runs for a request the
-        // owner no longer authorizes, on a run it no longer observes.
+        this.#diagnostic("create_accepted");
+        // Re-proved once more as the very last thing before the provider, in the
+        // same synchronous turn as its invocation, so a provider never runs for a
+        // request the owner no longer authorizes, on a run it no longer observes.
         if (!stillAuthorized()) {
           this.#diagnostic("create_refused");
           this.#completeCreate(inflight, { kind: "unknown" }, false);
@@ -2221,7 +2448,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #drain(): void {
     if (this.#sending) return;
     if (this.#state === "finished" || this.#fenced) return;
-    if (this.#state === "subscribed" && this.#transfer === null) {
+    if (this.#state === "subscribed" && this.#transfer === null && this.#preparing === null) {
       const pending = this.#pending;
       if (pending !== null) {
         this.#pending = null;
@@ -2235,10 +2462,82 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   }
 
   #beginTransfer(snapshot: OwningHostInventorySnapshot): void {
-    if (this.#state !== "subscribed" || this.#transfer !== null) return;
+    if (this.#state !== "subscribed") return;
+    if (this.#transfer !== null) return;
+    if (this.#preparing !== null) {
+      // A catalog read is in progress for this subscription: keep the newer
+      // observation as the single newest-wins pending snapshot instead of losing it.
+      if (this.#pending === null || snapshot.revision > this.#pending.revision) this.#pending = snapshot;
+      return;
+    }
     const subscriptionId = this.#subscriptionId;
     if (subscriptionId === null) return;
-    let rows: RemoteSessionMetadata[];
+    const rows = this.#projectRows(snapshot);
+    if (rows === null) return;
+    // A negotiated native lane owes this viewer a truthful catalog beside its
+    // rows. An unreadable or unrepresentable one refuses THIS snapshot whole
+    // through the existing terminal path rather than publishing rows with no
+    // catalog, an empty catalog, or a clipped one; the viewer then honestly marks
+    // its observation not current. With the lane unnegotiated nothing is read.
+    if (!this.#nativeNegotiated()) {
+      this.#buildTransfer(subscriptionId, snapshot, rows, null);
+      return;
+    }
+    const read = this.#readNativeTargets(this.#bounds.snapshotStartTimeoutMs);
+    if (!(read instanceof Promise)) {
+      this.#buildTransfer(subscriptionId, snapshot, rows, read);
+      return;
+    }
+    // An asynchronous (fresh-probe) catalog: the one send slot stays free for
+    // Saved work, no other roster transfer starts, and the probe's answer commits
+    // only if this exact subscription and run are still live when it settles.
+    const preparing = Object.freeze({ subscriptionId, hostRunId: snapshot.hostRunId });
+    this.#preparing = preparing;
+    void read.then((catalog) => this.#completePreparedTransfer(preparing, snapshot, rows, catalog));
+  }
+
+  /**
+   * Commit one asynchronously read catalog, or nothing. The scope is re-proved
+   * first: a retired, replaced, or fenced subscription (the retirement already
+   * cleared the marker), or another run, commits nothing. A newer observation of
+   * the SAME run that arrived during the probe is published in place of the older
+   * one (newest-wins), with the catalog this probe just produced; the grant is
+   * re-proved by the pump before every frame, exactly as for any transfer.
+   */
+  #completePreparedTransfer(
+    preparing: { readonly subscriptionId: string; readonly hostRunId: string },
+    snapshot: OwningHostInventorySnapshot,
+    rows: RemoteSessionMetadata[],
+    catalog: readonly RemoteNativeCliTarget[] | null,
+  ): void {
+    if (this.#preparing !== preparing) return;
+    this.#preparing = null;
+    if (this.#state !== "subscribed"
+      || this.#fenced
+      || this.#subscriptionId !== preparing.subscriptionId
+      || this.#subscriptionRun !== preparing.hostRunId
+      || snapshot.hostRunId !== preparing.hostRunId) {
+      this.#drain();
+      return;
+    }
+    let source = snapshot;
+    let sourceRows: RemoteSessionMetadata[] | null = rows;
+    const newer = this.#pending;
+    if (newer !== null && newer.hostRunId === preparing.hostRunId && newer.revision > snapshot.revision) {
+      this.#pending = null;
+      source = newer;
+      sourceRows = this.#projectRows(newer);
+      if (sourceRows === null) return;
+    }
+    this.#buildTransfer(preparing.subscriptionId, source, sourceRows, catalog, true);
+    this.#drain();
+  }
+
+  /**
+   * Project one owner snapshot onto the wire DTO, or terminate the subscription
+   * through the existing path and answer `null`.
+   */
+  #projectRows(snapshot: OwningHostInventorySnapshot): RemoteSessionMetadata[] | null {
     try {
       // The DTO allowlist is the only way onto the wire: no spread of the owner
       // view, so no agent directory, current file, or other private field.
@@ -2253,22 +2552,29 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // and it is copied exactly: a row whose observer declared nothing omits the
       // field, so a viewer keeps its unchanged unknown rendering for that row.
       const carryStatusSupport = this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY);
-      rows = snapshot.rows.map((row) => toRemoteSessionMetadata(
+      return snapshot.rows.map((row) => toRemoteSessionMetadata(
         row,
         { rosterSlotId: carryRosterSlots, backend: carryBackend, statusSupport: carryStatusSupport },
       ));
     } catch (error) {
       this.#terminateSubscription(isRemoteSessionMetadataError(error) ? "row_unrepresentable" : "bad_frame", "snapshot_failed");
-      return;
+      return null;
     }
-    // A negotiated native lane owes this viewer a truthful catalog beside its
-    // rows. An unreadable or unrepresentable one refuses THIS snapshot whole
-    // through the existing terminal path rather than publishing rows with no
-    // catalog, an empty catalog, or a clipped one; the viewer then honestly marks
-    // its observation not current. With the lane unnegotiated nothing is read.
+  }
+
+  /**
+   * Build the one in-flight transfer from projected rows and, on a negotiated
+   * native lane, the catalog read for it (`null` there refuses the snapshot whole).
+   */
+  #buildTransfer(
+    subscriptionId: string,
+    snapshot: OwningHostInventorySnapshot,
+    rows: RemoteSessionMetadata[],
+    catalog: readonly RemoteNativeCliTarget[] | null,
+    nativeRead = this.#nativeNegotiated(),
+  ): void {
     let nativeCliTargets: readonly RemoteNativeCliTarget[] | null = null;
-    if (this.#nativeNegotiated()) {
-      const catalog = this.#advertisedNativeTargets();
+    if (nativeRead) {
       if (catalog === null) {
         this.#terminateSubscription("row_unrepresentable", "snapshot_failed");
         return;
@@ -2407,6 +2713,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   /** End the subscription, cancel queued transfers, and retire the source watch once. */
   #retireSubscription(): void {
     this.#transfer = null;
+    // A catalog read in progress belongs to this subscription only: whatever it
+    // answers later is never committed for a later scope.
+    this.#preparing = null;
     this.#pending = null;
     this.#subscriptionRun = null;
     const watch = this.#watch;
@@ -2414,6 +2723,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // explicit subscription installs a new watch with its own retirement.
     this.#watch = null;
     this.#subscriptionId = null;
+    this.#subscriptionGeneration += 1;
     if (watch !== null) {
       try {
         watch.unsubscribe();
@@ -2485,6 +2795,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // Create bookkeeping is network-delivery bookkeeping only, for the same
       // reason: an accepted create keeps running under Main's launch lifecycle, and
       // its result is dropped rather than claimed after this binding is gone.
+      this.#discardSpawnAssembly();
       this.#inflightCreate = null;
       this.#inflightRename = null;
       // Saved bookkeeping is network-delivery bookkeeping too: a pending resume or
@@ -2607,6 +2918,9 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
     // No implicit policy: without an explicit authorizer no metadata is written.
     throw new TypeError("roster metadata host requires an explicit peer authorizer");
   }
+  if (options.spawnOwnedSession !== undefined && typeof options.spawnOwnedSession !== "function") {
+    throw new TypeError("roster metadata host requires a callable prompted spawn provider");
+  }
   if (options.renameOwnedSession !== undefined && typeof options.renameOwnedSession !== "function") {
     throw new TypeError("roster metadata host requires a callable rename provider");
   }
@@ -2630,12 +2944,23 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
   // rather than defaulted, so a host can never acknowledge a lane it cannot honour.
   const nativeCreate = options.nativeCreateOwnedSession;
   const nativeTargets = options.nativeCliTargets;
+  const nativeAvailability = options.nativeCliAvailability;
+  if (nativeAvailability !== undefined && typeof nativeAvailability !== "boolean") {
+    throw new TypeError("roster metadata host requires a boolean native availability declaration");
+  }
   let native: NativeProviders | null = null;
   if (nativeCreate !== undefined || nativeTargets !== undefined) {
     if (typeof nativeCreate !== "function" || typeof nativeTargets !== "function") {
       throw new TypeError("roster metadata host requires a native create provider and an explicit target catalog together");
     }
-    native = Object.freeze({ create: nativeCreate, targets: nativeTargets });
+    native = Object.freeze({
+      create: nativeCreate,
+      targets: nativeTargets,
+      probesAvailability: nativeAvailability === true,
+    });
+  } else if (nativeAvailability === true) {
+    // A probing declaration describes a provider; without one it describes nothing.
+    throw new TypeError("roster metadata host native availability requires the native provider pair");
   }
   const bounds = resolveRosterBridgeBounds(options.bounds);
   const bindings = new Set<OwnerBinding>();

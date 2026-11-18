@@ -2199,9 +2199,10 @@ test("two visible rows naming the same durable slot refuse an ambiguous placemen
 // implementations against a fresh temporary agent directory.
 // ---------------------------------------------------------------------------
 
-/** Submit the New form with the first native provider choice selected. */
-function submitNativeNew(harness: Harness, workspace: string, cycles = 1): void {
+/** Submit the New form with the first native provider choice selected, once its fresh probe settled. */
+async function submitNativeNew(harness: Harness, workspace: string, cycles = 1): Promise<void> {
   harness.terminal.emitInput(ENTER); // New session
+  await nextTurn(); // native choices exist only after this form's fresh launch probe
   harness.terminal.emitInput("\x15"); // clear any retained draft
   // The New form draws Host, then Provider, then Workspace: one Shift+Tab from
   // the workspace field lands on the Provider line drawn directly above it.
@@ -2244,13 +2245,19 @@ test("a native New row is launched through the host's provider, remembered by ba
     assert.ok(first.sidebar?.items.every((item) => item.backend === undefined),
       "no row exists yet, so no provider identity is displayed");
 
-    submitNativeNew(first, workspace);
+    await submitNativeNew(first, workspace);
     await nextTurn();
     assert.deepEqual(manager.createOptions.at(-1), {
       workspace: realpathSync(workspace),
       backend: "claude",
       nativeCliTarget: "claude",
     }, "the explicit provider choice reaches the owned create unchanged");
+    // The New form's fresh probe asks the same launcher for pure descriptors at the
+    // host startup cwd; only the deliberate create launches in the workspace.
+    const probeCalls = launchCalls.filter((call) => call.workspace === process.cwd());
+    assert.ok(probeCalls.length > 0 && probeCalls.every((call) => call.targetId === "claude"),
+      "the probe covers only the default target, never the named worker profile");
+    launchCalls.splice(0, launchCalls.length, ...launchCalls.filter((call) => call.workspace !== process.cwd()));
     assert.deepEqual(launchCalls, [{
       backend: "claude",
       workspace: realpathSync(workspace),
@@ -2286,7 +2293,8 @@ test("a native New row is launched through the host's provider, remembered by ba
       "a roster of only remembered native slots never scans Pi saved conversations");
     assert.equal(secondManager.createCallCount, 0,
       "restoration starts neither a Pi session nor a fresh native conversation");
-    assert.deepEqual(launchCalls.length, 1, "no native launch happens during restoration");
+    assert.deepEqual(launchCalls.filter((call) => call.workspace !== process.cwd()).length, 1,
+      "no native launch happens during restoration");
     const placeholder = second.sidebar?.items.find((item) => item.id === "roster-error:row-1");
     assert.ok(placeholder, "the remembered native slot stays visible as a bounded placeholder row");
     assert.equal(placeholder?.unavailable, true);
@@ -2326,6 +2334,7 @@ test("an ordinary Pi New submission still persists no backend field and restores
   const workspace = join(root, "ws");
   mkdirSync(workspace);
   const launchCalls: string[] = [];
+  const probeCalls: string[] = [];
   // The same catalog guard must NOT skip a roster that holds a Pi slot.
   let catalogCalls = 0;
   const countPiCatalog = async (): Promise<SavedSessionCatalog> => {
@@ -2334,8 +2343,9 @@ test("an ordinary Pi New submission still persists no backend field and restores
   };
   const hosting: MainTestDependencies["nativeCliHosting"] = () => ({
     targets: [{ id: "claude", backend: "claude", label: "Claude Code (default)" }],
-    launch: async (backend) => {
-      launchCalls.push(backend);
+    launch: async (backend, request) => {
+      // The New form's fresh probe is a pure descriptor at the startup cwd, never a launch.
+      (request.workspace === process.cwd() ? probeCalls : launchCalls).push(backend);
       return { file: "/synthetic/claude", args: [], env: {}, cwd: workspace };
     },
   });
@@ -2439,7 +2449,7 @@ test("naming a native row captions its card, persists on its own slot, and retur
   try {
     const first = createHarness(agentDir, async () => emptyCatalog(agentDir), {}, { nativeCliHosting: hosting });
     const manager = await ready(first);
-    submitNativeNew(first, workspace);
+    await submitNativeNew(first, workspace);
     await nextTurn();
     const rowId = manager.views.at(-1)?.id;
     assert.ok(rowId);
@@ -2535,7 +2545,7 @@ test("naming a native row after an earlier save failure reports the new caption 
   try {
     const first = createHarness(agentDir, async () => emptyCatalog(agentDir), {}, { nativeCliHosting: hosting });
     const manager = await ready(first);
-    submitNativeNew(first, workspace);
+    await submitNativeNew(first, workspace);
     await nextTurn();
     const rowId = manager.views.at(-1)?.id;
     assert.ok(rowId);
@@ -2590,11 +2600,16 @@ const CODEX_UUID = "8e7d6c5b-4a39-4281-b7c6-d5e4f3a2b1c0";
 const LATER_UUID = "0f1e2d3c-4b5a-4968-8776-655443322110";
 
 /** A host offering the default Claude target and one custom Codex target. */
+/**
+ * The production hosting shape (#493): only the two backend default targets are
+ * offered, so a remembered legacy `external:<id>` slot is never resolved against
+ * a configured worker entry.
+ */
 function restoreHosting(): MainTestDependencies["nativeCliHosting"] {
   return () => ({
     targets: [
       { id: "claude", backend: "claude", label: "Claude Code (default)" },
-      { id: "external:review-box", backend: "codex", label: "review-box (Codex CLI)" },
+      { id: "codex", backend: "codex", label: "Codex CLI (default)" },
     ],
     launch: async (_backend, request) => ({ file: "/synthetic/native", args: [], env: { ...request.env }, cwd: request.workspace }),
   });
@@ -2631,8 +2646,10 @@ test("a restart resumes every remembered native conversation exactly, beside Pi,
     slotId: "slot-claude", workspace: realpathSync(wsClaude), displayName: "Fleet work", backend: "claude",
     nativeTargetId: "claude", nativeConversationId: CLAUDE_UUID,
   };
+  // A legacy remembered worker target that is no longer configured anywhere:
+  // it deliberately restores with base Codex (#493).
   const codexEntry: RosterEntry = {
-    slotId: "slot-codex", workspace: realpathSync(wsCodex), backend: "codex",
+    slotId: "slot-codex", workspace: realpathSync(wsCodex), displayName: "Review box", backend: "codex",
     nativeTargetId: "external:review-box", nativeConversationId: CODEX_UUID,
   };
   try {
@@ -2665,14 +2682,14 @@ test("a restart resumes every remembered native conversation exactly, beside Pi,
         nativeResumeConversationId: CLAUDE_UUID, label: "Fleet work",
       },
       {
-        workspace: realpathSync(wsCodex), backend: "codex", nativeCliTarget: "external:review-box",
-        nativeResumeConversationId: CODEX_UUID,
+        workspace: realpathSync(wsCodex), backend: "codex", nativeCliTarget: "codex",
+        nativeResumeConversationId: CODEX_UUID, label: "Review box",
       },
-    ], "each native slot is resumed in remembered order with its exact id, explicit target, workspace, and caption");
+    ], "each native slot is resumed in remembered order with its exact id, workspace, and caption; a legacy worker target restores with its backend default");
     assert.deepEqual(manager.nativeLaunchRequests.map((request) => [request.backend, request.targetId, request.resumeConversationId]), [
       ["claude", "claude", CLAUDE_UUID],
-      ["codex", "external:review-box", CODEX_UUID],
-    ], "the host launcher receives only the remembered target and the private resume intent");
+      ["codex", "codex", CODEX_UUID],
+    ], "the host launcher receives only the backend default target and the private resume intent");
 
     assert.equal(harness.sidebar?.activeMainOwnerID, "row-2", "the remembered active native entry is restored by its slot");
     const claudeItem = harness.sidebar?.items.find((item) => item.id === "row-2");
@@ -2689,7 +2706,8 @@ test("a restart resumes every remembered native conversation exactly, beside Pi,
     assert.equal(persisted.activeSlotId, "slot-claude");
     const slots = rememberedSlots(persisted);
     assert.deepEqual(slots[1], claudeEntry, "the still-unproved admitted id, target, and caption are kept for a later retry");
-    assert.deepEqual(slots[2], codexEntry);
+    assert.deepEqual(slots[2], { ...codexEntry, nativeTargetId: "codex" },
+      "the restored row's normal observed identity records its backend default; id, workspace, and caption are exact");
     assert.equal(slots[0]?.nativeTargetId, undefined, "a Pi slot never carries native restart fields");
     assert.equal(slots[0]?.nativeConversationId, undefined);
     const raw = readFileSync(rosterStorePath(agentDir), "utf8");
@@ -2698,7 +2716,73 @@ test("a restart resumes every remembered native conversation exactly, beside Pi,
     assert.equal(await quit(harness), 0);
     const afterQuit = rememberedSlots(loadedRoster(agentDir));
     assert.deepEqual(afterQuit[1], claudeEntry, "quitting before proof neither forgets nor falsely proves the id");
-    assert.deepEqual(afterQuit[2], codexEntry);
+    assert.deepEqual(afterQuit[2], { ...codexEntry, nativeTargetId: "codex" });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a remembered legacy worker target restores with its backend default, exactly resuming its conversation (#493)", async () => {
+  const root = makeRoot("native-restore-legacy");
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir);
+  const wsA = join(root, "ws-a");
+  const wsB = join(root, "ws-b");
+  const wsC = join(root, "ws-c");
+  for (const workspace of [wsA, wsB, wsC]) mkdirSync(workspace);
+  const entries: RosterEntry[] = [
+    // A Claude worker profile that no longer exists in any configuration.
+    { slotId: "slot-legacy-claude", workspace: realpathSync(wsA), displayName: "Old reviewer", backend: "claude",
+      nativeTargetId: "external:retired-worker", nativeConversationId: CLAUDE_UUID },
+    // A default row stays a default row.
+    { slotId: "slot-default-claude", workspace: realpathSync(wsB), backend: "claude",
+      nativeTargetId: "claude", nativeConversationId: LATER_UUID },
+    // A Codex worker profile id, likewise never offered by this host.
+    { slotId: "slot-legacy-codex", workspace: realpathSync(wsC), displayName: "Old builder", backend: "codex",
+      nativeTargetId: "external:builder", nativeConversationId: CODEX_UUID },
+    // A bare prefix names no worker id at all: unmapped, refused, never defaulted.
+    { slotId: "slot-bare-prefix", workspace: realpathSync(wsC), backend: "codex",
+      nativeTargetId: "external:", nativeConversationId: CODEX_UUID },
+  ];
+  try {
+    writeRosterStore(agentDir, { version: ROSTER_STORE_VERSION, entries, activeSlotId: "slot-legacy-codex" });
+    const harness = createHarness(agentDir, async () => emptyCatalog(agentDir), {}, { nativeCliHosting: restoreHosting() });
+    const manager = await readyWith(harness, () => undefined);
+
+    assert.deepEqual(manager.createOptions, [
+      {
+        workspace: realpathSync(wsA), backend: "claude", nativeCliTarget: "claude",
+        nativeResumeConversationId: CLAUDE_UUID, label: "Old reviewer",
+      },
+      {
+        workspace: realpathSync(wsB), backend: "claude", nativeCliTarget: "claude",
+        nativeResumeConversationId: LATER_UUID,
+      },
+      {
+        workspace: realpathSync(wsC), backend: "codex", nativeCliTarget: "codex",
+        nativeResumeConversationId: CODEX_UUID, label: "Old builder",
+      },
+    ], "legacy worker targets restore as base Claude/Codex in remembered order with the exact conversation, workspace, and caption");
+    assert.deepEqual(manager.nativeLaunchRequests.map((request) => [request.backend, request.targetId, request.resumeConversationId]), [
+      ["claude", "claude", CLAUDE_UUID],
+      ["claude", "claude", LATER_UUID],
+      ["codex", "codex", CODEX_UUID],
+    ], "the launcher only ever sees a backend default target plus the exact resume intent");
+    assert.equal(JSON.stringify(manager.nativeLaunchRequests).includes("external:"), false,
+      "no worker profile identity reaches the launcher");
+    assert.match(harness.sidebar?.items.find((item) => item.id === "roster-error:slot-bare-prefix")?.activity.join(" ") ?? "",
+      /Codex launch target is no longer configured/, "an unmappable identity is refused, never started fresh");
+    assert.equal(harness.sidebar?.activeMainOwnerID, "row-3", "the remembered active legacy slot is restored by its slot");
+    assert.deepEqual(harness.sidebar?.items.find((item) => item.id === "row-1")?.label, "Old reviewer");
+
+    const slots = rememberedSlots(loadedRoster(agentDir));
+    assert.deepEqual(slots.map((entry) => entry.slotId),
+      ["slot-legacy-claude", "slot-default-claude", "slot-legacy-codex", "slot-bare-prefix"], "the remembered order is unchanged");
+    assert.deepEqual(slots.map((entry) => entry.nativeConversationId), [CLAUDE_UUID, LATER_UUID, CODEX_UUID, CODEX_UUID],
+      "every exact conversation id is kept");
+    assert.deepEqual(slots.map((entry) => entry.nativeTargetId), ["claude", "claude", "codex", "external:"],
+      "a restored row's normal observed identity records its backend default; an unrestored slot is untouched");
+    assert.equal(await quit(harness), 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2771,7 +2855,8 @@ test("a native slot without a verifiable id, target, workspace, or native hostin
   const entries: RosterEntry[] = [
     { slotId: "slot-old", workspace: ws, backend: "claude", nativeTargetId: "claude" },
     { slotId: "slot-no-target", workspace: ws, backend: "claude", nativeConversationId: CLAUDE_UUID },
-    { slotId: "slot-unconfigured", workspace: ws, backend: "claude", nativeTargetId: "external:retired", nativeConversationId: CLAUDE_UUID },
+    // A well-formed id no host ever produced maps to no restorable target (#493).
+    { slotId: "slot-unconfigured", workspace: ws, backend: "claude", nativeTargetId: "retired-target", nativeConversationId: CLAUDE_UUID },
     { slotId: "slot-other-backend", workspace: ws, backend: "codex", nativeTargetId: "claude", nativeConversationId: CODEX_UUID },
     { slotId: "slot-gone", workspace: canonicalGone, backend: "codex", nativeTargetId: "external:review-box", nativeConversationId: CODEX_UUID },
   ];
@@ -2848,7 +2933,12 @@ test("a resume refused before spawn or exited before proof is an unavailable rea
     assert.equal(draining?.hasLiveProcess, true);
     assert.equal(manager.closeExitedCalls, 0, "nothing is closed automatically");
     assert.equal(manager.views.length, 3, "no row is dropped");
-    assert.deepEqual(rememberedSlots(loadedRoster(agentDir)), entries, "every retry identity and caption is kept");
+    // The legacy slot-b target restored as base Codex (#493), so its normal
+    // observed identity now records that default; every conversation id and
+    // caption is kept for a retry.
+    assert.deepEqual(rememberedSlots(loadedRoster(agentDir)),
+      entries.map((entry) => (entry.slotId === "slot-b" ? { ...entry, nativeTargetId: "codex" } : entry)),
+      "every retry identity and caption is kept");
 
     // A deliberate Delete acts on the real row through the existing removal path.
     harness.terminal.emitInput(UP); // New session -> Saved conversations

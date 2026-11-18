@@ -3,6 +3,8 @@ package io.github.rfairburn.pireviewgate.core.client.ui
 import io.github.rfairburn.pireviewgate.core.client.roster.NativeCatalogScope
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeCliNewSessionTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNewSessionTarget
 
 /**
  * One exact provider choice in the create form.
@@ -30,11 +32,13 @@ public sealed interface CreateProviderChoice {
 /**
  * Host-scoped create-provider selection.
  *
- * Options come only from the selected owner's committed catalog, and a native
- * choice is admissible only while that exact host, run, backend, id, and label are
- * still advertised. A changed catalog, a replaced owner run, or a different host
- * invalidates a native choice; it is never silently replaced by Pi. Choosing Pi is
- * always an explicit operator choice (or the fresh-form default).
+ * Options come only from the selected owner's committed catalog, and only from its
+ * NEW-session targets — a backend's default target, never a named external worker
+ * profile (#493). A native choice is admissible only while that exact host, run,
+ * backend, id, and label are still advertised. A changed catalog, a replaced owner
+ * run, or a different host invalidates a native choice; it is never silently
+ * replaced by Pi. Choosing Pi is always an explicit operator choice (or the
+ * fresh-form default).
  */
 public object CreateProviderSelection {
 
@@ -43,7 +47,8 @@ public object CreateProviderSelection {
         add(CreateProviderChoice.Pi)
         val scope = owner?.nativeCatalogScope
         if (owner?.nativeCreateEligible == true && scope != null) {
-            owner.nativeTargets.forEach { add(choiceOf(it, scope)) }
+            // NEW-session targets only (#493): never a named external worker profile.
+            owner.nativeTargets.filter { it.isNewSessionTarget }.forEach { add(choiceOf(it, scope)) }
         }
     }
 
@@ -75,7 +80,10 @@ public object CreateProviderSelection {
         null -> false
         CreateProviderChoice.Pi -> owner?.createEligible == true
         is CreateProviderChoice.Native ->
-            owner?.nativeCreateEligible == true &&
+            // The controller's submit gate: a named external worker profile is refused
+            // even if some caller froze it as a choice (#493); nothing falls back to Pi.
+            isNativeCliNewSessionTarget(choice.backend, choice.targetId) &&
+                owner?.nativeCreateEligible == true &&
                 owner.nativeCatalogScope == choice.catalogScope &&
                 owner.nativeTargets.any { target ->
                     target.backend == choice.backend &&

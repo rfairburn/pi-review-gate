@@ -608,6 +608,7 @@ internal class RuntimeHarness(
         runId: String = RUN_ID,
         revision: Long = 1L,
         pageSize: Int = 2,
+        nativeCliTargets: List<io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget>? = null,
     ) {
         val subscription = subscriptionIdOf(channel)
         val chunks = rows.chunked(pageSize)
@@ -639,6 +640,7 @@ internal class RuntimeHarness(
                 transferId = "transfer-$revision",
                 revision = revision,
                 totalRows = rows.size.toLong(),
+                nativeCliTargets = nativeCliTargets,
             ),
         )
         settle()

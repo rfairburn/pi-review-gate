@@ -24,6 +24,7 @@ import activate, {
   SESSION_HOST_STICKY_STATE_KEY,
 } from "../src/session-host/reporter";
 import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY } from "../src/session-host/spawn-capability";
+import { encodeSessionHostsResultFrames, type SessionHostsSnapshot } from "../src/session-host/protocol";
 import {
   readSessionHostPayload,
 } from "../src/session-host/payload";
@@ -992,6 +993,7 @@ describe("session-host reporter status frames", () => {
       reconnectDelayMs?: number;
       maxReconnectAttempts?: number;
       spawnTimeoutMs?: number;
+      hostsTimeoutMs?: number;
       connectSocket?: (socketPath: string) => net.Socket;
       onSocket?: (socket: net.Socket) => void;
     };
@@ -1220,6 +1222,262 @@ describe("session-host reporter status frames", () => {
     assert.equal(await outcome, "unknown");
     assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("refuses host/kind locally against a host that did not advertise routed spawn: nothing staged or sent", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({ server });
+    assert.equal(Object.hasOwn(bootstrap, "spawnRouting"), false, "a legacy/not-yet-integrated host bootstrap");
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    assert.equal(capability.routing, false, "the capability mirrors the host-issued bootstrap marker");
+    const payloadDir = bootstrap.payloadDir as string;
+    for (const selectors of [{ kind: "pi" as const }, { kind: "codex" as const }, { host: "laptop" }, { host: "laptop", kind: "claude" as const }]) {
+      assert.equal(await capability.spawn({ workspace: "/existing", title: "Child", prompt: "Start.", ...selectors }), "failed",
+        "a definite refusal: the request was never sent");
+    }
+    assert.deepEqual(readdirSync(payloadDir), [], "no prompt was staged for a refused routed request");
+    assert.equal(server.frames.some((frame) => frame.message.type === "spawn_request" || frame.message.type === "spawn_routed_request"), false,
+      "selectors are never sent to (and so never dropped by) an older broker, and never degraded to a local Pi request");
+
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Legacy prompt." });
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    assert.equal(Object.hasOwn(request.message, "host"), false, "the legacy call gains no defaulted host");
+    assert.equal(Object.hasOwn(request.message, "kind"), false, "the legacy call gains no defaulted kind");
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.message.requestId,
+      outcome: "started",
+    } as never));
+    assert.equal(await pending, "started");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("sends exact selectors and an exact >128 KiB staged prompt only in the advertised routed family; disconnect is unknown without retry", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({
+      server,
+      bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1 }),
+      reporterOptions: { reconnectDelayMs: 5 },
+    });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    assert.equal(capability.routing, true);
+    const prompt = [
+      "BEGIN routed prompt",
+      "--host other --kind pi --session /tmp/not-an-option",
+      "Unicode 日本語 — café — 🚀 and a lone surrogate \ud800 kept exactly",
+      "MIDDLE line\r\n".repeat(12_000),
+      "END routed prompt",
+      "",
+    ].join("\n");
+    assert.ok(Buffer.byteLength(prompt, "utf8") > 128 * 1024);
+    const host = "Büro laptop (2)";
+    const pending = capability.spawn({ workspace: "/existing exact workspace", title: "Routed child", prompt, host, kind: "claude" });
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_routed_request");
+    assert.equal(request.message.host, host);
+    assert.equal(request.message.kind, "claude");
+    assert.equal(request.message.workspace, "/existing exact workspace");
+    assert.equal(request.message.title, "Routed child");
+    assert.equal(Object.hasOwn(request.message, "prompt"), false, "the prompt still travels only through the staged payload");
+    const stagedText = await readSessionHostPayload(bootstrap.payloadDir as string, request.message.payload as never);
+    assert.equal(JSON.parse(stagedText), prompt, "the staged payload carries the exact prompt");
+
+    const beforeDisconnect = server.frames.length - 1;
+    server.destroyClients();
+    assert.equal(await pending, "unknown", "a disconnect after the write cannot claim the child was not created");
+    await server.waitForFrame((frame) => frame.message.type === "hello", 3_000, beforeDisconnect);
+    await sleep(20);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_routed_request").length, 1,
+      "the routed request is never replayed after reconnect");
+    assert.equal(server.frames.some((frame) => frame.message.type === "spawn_request"), false,
+      "a routed request is never re-sent as a legacy own-host Pi request");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("returns unknown after post-send cancellation of a routed request and never retries", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({
+      server,
+      bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1 }),
+    });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const controller = new AbortController();
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Start.", kind: "pi" }, controller.signal);
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_routed_request");
+    assert.equal(request.message.kind, "pi", "an explicit kind pi stays an explicit routed selector");
+    controller.abort();
+    assert.equal(await pending, "unknown");
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.message.requestId,
+      outcome: "started",
+    } as never));
+    await sleep(20);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_routed_request").length, 1);
+
+    // The legacy call on a routing-capable host keeps the legacy family.
+    const legacy = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Legacy." });
+    const legacyRequest = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    assert.equal(Object.hasOwn(legacyRequest.message, "kind"), false);
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: legacyRequest.message.requestId,
+      outcome: "failed",
+    } as never));
+    assert.equal(await legacy, "failed");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("exposes SessionHosts inspection only when the host bootstrap advertised discovery with routing", async () => {
+    const server = await startTestServer();
+    const { testPi } = await startSession({ server, bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1 }) });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    assert.equal(capability.routing, true);
+    assert.equal(capability.inspectHosts, undefined, "routing alone never implies an inspection capability");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("reassembles a complete authenticated multi-page SessionHosts snapshot from one read-only request", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({
+      server,
+      bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1, sessionHosts: 1 }),
+    });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability?.inspectHosts);
+    const snapshot: SessionHostsSnapshot = {
+      ownKinds: ["pi", "claude", "codex"],
+      hosts: Array.from({ length: 64 }, (_, index) => ({
+        id: `${String(index).padStart(2, "0")} ${"\udc00".repeat(120)} ${"日".repeat(4)}`,
+        kinds: index % 2 === 0 ? ["pi", "codex"] as const : ["claude"] as const,
+      })),
+    };
+    const pending = capability.inspectHosts();
+    const request = await server.waitForFrame((frame) => frame.message.type === "hosts_request");
+    assert.deepEqual(Object.keys(request.message).sort(), ["generation", "instanceId", "requestId", "token", "type", "version"],
+      "the read-only request carries no prompt, title, workspace, or path");
+    assert.equal(request.message.token, bootstrap.token);
+    const frames = encodeSessionHostsResultFrames({
+      instanceId: bootstrap.instanceId as string,
+      generation: bootstrap.generation as string,
+      token: bootstrap.token as string,
+      requestId: request.message.requestId as string,
+    }, snapshot);
+    assert.ok(frames.length > 1);
+    // Deliver pages separately: nothing completes before the final page.
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    for (const frame of frames.slice(0, -1)) server.sendToClients(frame);
+    await sleep(20);
+    assert.equal(settled, false, "an incomplete page sequence is never reported");
+    server.sendToClients(frames[frames.length - 1]!);
+    assert.deepEqual(await pending, { outcome: "complete", snapshot });
+    assert.equal(server.frames.filter((frame) => frame.message.type === "hosts_request").length, 1);
+    assert.equal(server.frames.some((frame) => String(frame.message.type).startsWith("spawn")), false, "discovery never spawns");
+    assert.deepEqual(readdirSync(bootstrap.payloadDir as string), [], "discovery stages nothing");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("reports malformed, unauthenticated, timed-out, cancelled, and disconnected SessionHosts inspections as unavailable without retry", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({
+      server,
+      bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1, sessionHosts: 1 }),
+      reporterOptions: { hostsTimeoutMs: 40, reconnectDelayMs: 5 },
+    });
+    let hello = await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability?.inspectHosts);
+    const pagesFor = (requestId: unknown, snapshot: unknown, token = bootstrap.token as string) => encodeSessionHostsResultFrames({
+      instanceId: bootstrap.instanceId as string,
+      generation: bootstrap.generation as string,
+      token,
+      requestId: requestId as string,
+    }, snapshot);
+    const nextRequest = async () => {
+      const after = server.frames.length - 1;
+      return server.waitForFrame((frame) => frame.message.type === "hosts_request", 3_000, after);
+    };
+    const reconnect = async () => {
+      const after = server.frames.indexOf(hello);
+      hello = await server.waitForFrame((frame) => frame.message.type === "hello", 3_000, after);
+      await sleep(10);
+    };
+
+    // Host-declared unavailable.
+    let pending = capability.inspectHosts();
+    let request = await nextRequest();
+    server.sendToClients(pagesFor(request.message.requestId, undefined).join(""));
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "host-unavailable" });
+
+    // Timeout: unavailable; late pages are ignored and nothing is retried.
+    pending = capability.inspectHosts();
+    request = await nextRequest();
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "timeout" });
+    server.sendToClients(pagesFor(request.message.requestId, { ownKinds: ["pi"], hosts: [] }).join(""));
+    await sleep(20);
+    assert.equal(server.liveClients(), 1, "a late page for a settled request is ignored");
+
+    // Cancellation.
+    const controller = new AbortController();
+    pending = capability.inspectHosts(controller.signal);
+    await nextRequest();
+    controller.abort();
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "cancelled" });
+
+    // Out-of-order pages are a protocol violation: never partial.
+    const large = {
+      ownKinds: ["pi"],
+      hosts: Array.from({ length: 64 }, (_, index) => ({ id: `${index}${"\udc00".repeat(120)}`, kinds: ["pi"] })),
+    };
+    pending = capability.inspectHosts();
+    request = await nextRequest();
+    const reordered = pagesFor(request.message.requestId, large);
+    assert.ok(reordered.length > 1);
+    server.sendToClients(reordered[1]!);
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "protocol" });
+    await reconnect();
+
+    // A page signed with the wrong token closes the connection: unavailable.
+    pending = capability.inspectHosts();
+    request = await nextRequest();
+    server.sendToClients(pagesFor(request.message.requestId, { ownKinds: ["pi"], hosts: [] }, "f".repeat(64)).join(""));
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "disconnected" });
+    await reconnect();
+
+    // Disconnect mid-sequence.
+    pending = capability.inspectHosts();
+    request = await nextRequest();
+    server.sendToClients(pagesFor(request.message.requestId, large)[0]!);
+    await sleep(10);
+    server.destroyClients();
+    assert.deepEqual(await pending, { outcome: "unavailable", reason: "disconnected" });
+    await reconnect();
+    const requests = server.frames.filter((frame) => frame.message.type === "hosts_request").length;
+    await sleep(30);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "hosts_request").length, requests,
+      "reconnect never replays an inspection");
+    assert.equal(server.frames.some((frame) => String(frame.message.type).startsWith("spawn")), false);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+    assert.deepEqual(await capability.inspectHosts(), { outcome: "unavailable", reason: "not-connected" },
+      "a retired reporter never reconnects to inspect");
   });
 
   it("sends hello with the token, then an initial Ready status", async () => {
@@ -4501,6 +4759,8 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/pi.js", source: join(__dirname, "..", "src/pi.js") },
         { relative: "src/record-guard.js", source: join(__dirname, "..", "src/record-guard.js") },
         { relative: "src/session-host/protocol.js", source: join(__dirname, "..", "src/session-host/protocol.js") },
+        { relative: "src/session-host/session-backend.js", source: join(__dirname, "..", "src/session-host/session-backend.js") },
+        { relative: "src/session-host/peer-destination-id.js", source: join(__dirname, "..", "src/session-host/peer-destination-id.js") },
         { relative: "src/session-host/reporter.js", source: join(__dirname, "..", "src/session-host/reporter.js") },
         { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },
         { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },

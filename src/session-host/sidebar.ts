@@ -201,6 +201,7 @@ import {
   isNativeDisplayName,
   isSessionBackend,
   MAX_NATIVE_DISPLAY_NAME_CHARS,
+  projectNativeCliNewSessionTargets,
   sessionBackendDisplayLabel,
   type NativeCliBackend,
   type SessionBackend,
@@ -656,6 +657,15 @@ export type SidebarAction =
     }
   | { readonly type: "visibility"; readonly visible: boolean }
   /**
+   * Ask Main for one FRESH native launch observation for the open New form's
+   * current Host choice (only with {@link SidebarControllerOptions.freshNativeTargets}).
+   * Emitted when a New form opens and on every ACTUAL Host change; absent
+   * `hostId` means this host (Local). It is a read-only refresh request: it
+   * selects, submits, connects, and focuses nothing, and Main answers only
+   * through {@link SidebarController.settleNewFormNativeRefresh} with the same id.
+   */
+  | { readonly type: "new-form-native-refresh"; readonly refreshId: number; readonly hostId?: string }
+  /**
    * Network sidebar actions are exactly the parent-owned `PeerUiAction` DTOs.
    * Consent decisions travel only as `peer-consent` with the written
    * `renderToken`; Main independently rechecks them, and this module never
@@ -760,6 +770,20 @@ export interface SidebarNativeCliTarget {
   readonly label: string;
 }
 
+/**
+ * Main's answer to one `new-form-native-refresh` request.
+ *
+ * - `local`: this host's freshly probed native targets (Local Host choice only).
+ * - `remote`: the destination completed a fresh owner observation of `hostRunId`;
+ *   the choices are then read from its CURRENT probed projection.
+ * - `unavailable`: no fresh observation exists (a busy, failed, unsupported, or
+ *   legacy owner, or no probe). No native choice is offered; nothing falls back.
+ */
+export type SidebarNativeRefreshResult =
+  | { readonly kind: "local"; readonly targets: readonly SidebarNativeCliTarget[] }
+  | { readonly kind: "remote"; readonly hostRunId: string }
+  | { readonly kind: "unavailable" };
+
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
   readonly toggleKey?: string;
@@ -789,6 +813,18 @@ export interface SidebarControllerOptions {
    * ordinary Pi create, and a native request therefore cannot be made.
    */
   readonly nativeCliTargets?: readonly SidebarNativeCliTarget[];
+  /**
+   * Main-owned FRESH native choices (#493). When true, every New form starts with
+   * NO native choice: opening it, and every actual Host change, emits one
+   * `new-form-native-refresh` action, and native choices appear only after Main
+   * settles THAT request for THAT Host choice — this host's freshly probed
+   * targets for Local, or a completed owner refresh of the exact observed run for
+   * a remote destination whose owner negotiated availability. A legacy
+   * (availability-unknown) owner then offers no native choice. Absent/false keeps
+   * the supplied static `nativeCliTargets` and the remote catalog as before.
+   * Display only: Main and every destination still re-prove each create.
+   */
+  readonly freshNativeTargets?: boolean;
   /** Optional Main-owned factory; production supplies current native keybindings and external-editor ownership. */
   readonly createTextField?: (options: SidebarFieldFactoryOptions) => SidebarFieldFactoryResult;
   /** Main supplies native global keybindings and owns the safe Input manager bridge. */
@@ -1635,7 +1671,9 @@ function nativeProviderScopeIdentityOf(
     host.roster?.hostRunId ?? null,
     host.fingerprint,
     host.nativeCli?.supported ?? null,
+    host.nativeCli?.availability ?? null,
     (host.nativeCli?.targets ?? []).map((target) => [target.backend, target.id, target.label]),
+    host.createSupported ?? null,
   ]);
 }
 
@@ -1646,6 +1684,10 @@ function nativeProviderScopeIdentityOf(
  * duplicated id keeps only its first occurrence, so one drawn choice never
  * names two targets. The id rule is the manager's shared one, so the New form
  * never draws a provider choice that could only ever fail to start.
+ *
+ * Main supplies only its NEW-session projection here (#493: backend default
+ * targets, never a named external worker profile) and refuses any other target
+ * at its local New gate; this sanitizer stays the generic shape rule.
  */
 function normalizeNativeCliTargets(value: unknown): readonly SidebarNativeCliTarget[] {
   if (!Array.isArray(value)) return [];
@@ -2448,6 +2490,8 @@ const NEW_FORM_HOST_PREFIX = "Host: ";
 const NEW_FORM_PROVIDER_PREFIX = "Provider: ";
 /** The drawn label of the default provider choice. */
 const NEW_FORM_PI_PROVIDER_LABEL = "Pi";
+/** Drawn when the current choice (Pi) is not offered by the chosen Host. */
+const NEW_FORM_UNOFFERED_PROVIDER_LABEL = "choose";
 /** Native-session card heights: title, status, background (+2 activity). */
 const CARD_COLLAPSED_ROWS = 3;
 const CARD_EXPANDED_ROWS = 5;
@@ -3462,11 +3506,18 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const nativeSupported = displayBoolean(nativeValue?.supported);
   let nativeCli: PeerUiHostNativeCli | undefined;
   if (nativeValue !== undefined && nativeSupported !== undefined) {
+    const availability = nativeValue.availability === "probed" || nativeValue.availability === "unknown"
+      ? nativeValue.availability
+      : undefined;
     nativeCli = {
       supported: nativeSupported,
       targets: nativeSupported ? normalizeNativeCliTargets(nativeValue.targets) : [],
+      // Kept only as one of its two closed values; anything else is absent (unknown).
+      ...(availability === undefined ? {} : { availability }),
     };
   }
+  // Optional descriptive blank Pi create support; absent or malformed stays absent.
+  const createSupported = displayBoolean(source.createSupported);
   // Optional descriptive HOST ROW NAME support of the SEPARATE native lane. Absent
   // or malformed means NOT supported; nothing is ever inferred from the roster.
   const nativeNameSupported = displayBoolean(source.nativeNameSupported);
@@ -3506,6 +3557,7 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
     },
     ...(saved === undefined ? {} : { saved }),
     ...(renameSupported === undefined ? {} : { renameSupported }),
+    ...(createSupported === undefined ? {} : { createSupported }),
     ...(nativeCli === undefined ? {} : { nativeCli }),
     ...(nativeNameSupported === undefined ? {} : { nativeNameSupported }),
   };
@@ -3874,9 +3926,18 @@ export class SidebarController {
   /**
    * The native provider targets Main supplied for this host, already sanitized.
    * An empty list means this host offers no native session at all, so the New
-   * form draws no Provider line.
+   * form draws no Provider line. With fresh native targets this is only the
+   * display projection of the latest settled probe for the open Local form; it
+   * is never an availability authority.
    */
-  private readonly nativeCliTargets: readonly SidebarNativeCliTarget[];
+  private nativeCliTargets: readonly SidebarNativeCliTarget[];
+  /** Main-owned fresh native choices; see {@link SidebarControllerOptions.freshNativeTargets}. */
+  private readonly freshNativeTargets: boolean;
+  private newFormNativeRefreshSequence = 0;
+  /** The one outstanding fresh-native request for the open New form's Host choice. */
+  private newFormNativeRefreshPending: { readonly refreshId: number; readonly hostKey: string } | undefined;
+  /** The settled fresh observation native choices may be offered from, bound to its Host choice. */
+  private newFormNativeFresh: { readonly hostKey: string; readonly hostRunId: string | null } | undefined;
   /** The Host line the last complete New-form render drew, or undefined. */
   private formHostDisplay: DisplayedFormHostRow | undefined;
   private formProviderDisplay: DisplayedFormProviderRow | undefined;
@@ -4172,6 +4233,7 @@ export class SidebarController {
     this._visible = options.initialVisible ?? true;
     this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
     this.nativeCliTargets = normalizeNativeCliTargets(options.nativeCliTargets);
+    this.freshNativeTargets = options.freshNativeTargets === true;
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
     this.now = options.now ?? (() => Date.now());
@@ -9564,6 +9626,52 @@ export class SidebarController {
     if (wasRemote) this.workspaceDraft = "";
     this._focus = "form";
     this.createFormField(this.workspaceDraft);
+    this.requestNewFormNativeRefresh();
+  }
+
+  /**
+   * Start one fresh native observation for the open New form's CURRENT Host
+   * choice (fresh mode only). Any earlier observation is forgotten first, so no
+   * native choice is offered until THIS request settles; Pi and the workspace
+   * field, its focus, and its draft are untouched.
+   */
+  private requestNewFormNativeRefresh(): void {
+    if (!this.freshNativeTargets || this.formKind !== "new") return;
+    this.newFormNativeFresh = undefined;
+    if (this.newFormHost.kind === "local") this.nativeCliTargets = Object.freeze([]);
+    const refreshId = ++this.newFormNativeRefreshSequence;
+    const hostKey = this.newFormHostKey();
+    this.newFormNativeRefreshPending = { refreshId, hostKey };
+    const chosen = this.newFormHost;
+    this.emit({
+      type: "new-form-native-refresh",
+      refreshId,
+      ...(chosen.kind === "remote" ? { hostId: chosen.hostId } : {}),
+    });
+  }
+
+  /**
+   * Main's answer to one `new-form-native-refresh`. Accepted only for the exact
+   * outstanding request of the still-open New form whose Host choice is unchanged;
+   * a late answer for a closed form, another Host, or a superseded request changes
+   * nothing. Accepting it never selects a provider, moves focus, or submits: Pi
+   * stays the default, and a native choice still needs an explicit selection.
+   */
+  settleNewFormNativeRefresh(refreshId: number, result: SidebarNativeRefreshResult): boolean {
+    const pending = this.newFormNativeRefreshPending;
+    if (!this.freshNativeTargets || pending === undefined || pending.refreshId !== refreshId
+      || this.formKind !== "new" || pending.hostKey !== this.newFormHostKey()) return false;
+    this.newFormNativeRefreshPending = undefined;
+    const chosen = this.newFormHost;
+    if (result?.kind === "local" && chosen.kind === "local") {
+      this.nativeCliTargets = normalizeNativeCliTargets(result.targets);
+      this.newFormNativeFresh = { hostKey: pending.hostKey, hostRunId: null };
+    } else if (result?.kind === "remote" && chosen.kind === "remote"
+      && typeof result.hostRunId === "string" && result.hostRunId.length > 0) {
+      this.newFormNativeFresh = { hostKey: pending.hostKey, hostRunId: result.hostRunId };
+    }
+    this.onInvalidate?.();
+    return true;
   }
 
   // --- New form Host line: Local by default, one host-owned selection. ---
@@ -9676,6 +9784,7 @@ export class SidebarController {
         : this.newFormProviderLabelFor(previousProvider);
       this.formError = `${chosenLabel} is not available on ${this.currentNewFormHostLabel()}; the provider is Pi again`;
     }
+    this.requestNewFormNativeRefresh();
   }
 
   /** The bounded label one provider choice was drawn with, for an honest notice. */
@@ -9771,8 +9880,10 @@ export class SidebarController {
   /**
    * The native targets the CURRENT Host choice can honestly offer.
    *
-   * Local is this host's own configured list, exactly as before. A remote
-   * destination contributes ONLY its own current advertised catalog: a connected
+   * Local is the NEW-session list Main supplied for this host. A remote
+   * destination contributes ONLY the NEW-session view of its own current
+   * advertised catalog (#493: an older owner may still advertise named external
+   * worker profiles, and none is ever a NEW choice here): a connected
    * destination whose coordinator reports `nativeCli.supported` AND whose roster
    * observation is CURRENT. A disconnected, stale, reconnecting, older, or
    * native-less owner contributes nothing, so its own configured targets can never
@@ -9780,14 +9891,40 @@ export class SidebarController {
    */
   private newFormNativeTargets(): readonly SidebarNativeCliTarget[] {
     const chosen = this.newFormHost;
-    if (chosen.kind === "local") return this.nativeCliTargets;
+    if (chosen.kind === "local") {
+      if (!this.freshNativeTargets) return this.nativeCliTargets;
+      // Fresh mode: only the probe settled for THIS open Local form.
+      return this.newFormNativeFresh?.hostKey === this.newFormHostKey() ? this.nativeCliTargets : [];
+    }
     const host = (this.peerUiSnapshot?.hosts ?? [])
       .find((candidate) => candidate.id === chosen.hostId);
     if (host === undefined || host.state !== "connected") return [];
     if (host.roster.state !== "current") return [];
     const native = host.nativeCli;
     if (native === undefined || native.supported !== true) return [];
-    return native.targets;
+    if (this.freshNativeTargets) {
+      // Fresh mode: an owner that did not negotiate availability offers no
+      // unverified native choice, and a probed owner's choices are offered only
+      // after THIS form's refresh completed for the exact run still observed.
+      if (native.availability !== "probed") return [];
+      const fresh = this.newFormNativeFresh;
+      if (fresh === undefined || fresh.hostKey !== this.newFormHostKey()
+        || fresh.hostRunId === null || fresh.hostRunId !== host.roster.hostRunId) return [];
+    }
+    return projectNativeCliNewSessionTargets(native.targets);
+  }
+
+  /**
+   * True while the CURRENT Host choice can be offered the ordinary Pi create:
+   * always for Local (Main still fences its own manager), and for a remote
+   * destination unless its coordinator positively reports that the owner did not
+   * negotiate the blank create. Never a fallback for a withdrawn native choice.
+   */
+  private newFormPiOffered(): boolean {
+    const chosen = this.newFormHost;
+    if (chosen.kind === "local") return true;
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === chosen.hostId);
+    return host?.createSupported !== false;
   }
 
   /** The exact owner run the CURRENT Host choice names, or null. */
@@ -9804,7 +9941,7 @@ export class SidebarController {
    * a reconnect or run replacement never leaves a stale owner choice selectable.
    */
   private newFormProviderChoiceCurrent(): boolean {
-    if (this.newFormProvider.backend === "pi") return true;
+    if (this.newFormProvider.backend === "pi") return this.newFormPiOffered();
     if (this.newFormProviderScope === undefined) return false;
     // Latched, not re-compared: the scope this choice was made under has to be the
     // scope that has been continuously in effect ever since. Equal present values
@@ -9833,7 +9970,9 @@ export class SidebarController {
    * target is offered — and a target belonging to the other destination never is.
    */
   private newFormProviderOptions(): NewFormProviderOption[] {
-    const options: NewFormProviderOption[] = [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }];
+    const options: NewFormProviderOption[] = this.newFormPiOffered()
+      ? [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }]
+      : [];
     for (const target of this.newFormNativeTargets()) {
       options.push({ backend: target.backend, targetId: target.id, label: target.label });
     }
@@ -9859,7 +9998,12 @@ export class SidebarController {
   private currentNewFormProviderLabel(): string {
     const key = this.newFormProviderKey();
     const option = this.newFormProviderOptions().find((candidate) => newFormProviderOptionKey(candidate) === key);
-    return option === undefined ? NEW_FORM_PI_PROVIDER_LABEL : option.label;
+    if (option !== undefined) return option.label;
+    // A choice this Host does not offer is never drawn as though it were one (an
+    // owner that cannot create Pi): the operator is asked to choose explicitly.
+    return this.newFormProvider.backend === "pi" && !this.newFormPiOffered()
+      ? NEW_FORM_UNOFFERED_PROVIDER_LABEL
+      : NEW_FORM_PI_PROVIDER_LABEL;
   }
 
   /**
@@ -9890,7 +10034,10 @@ export class SidebarController {
   private cycleNewFormProvider(direction: 1 | -1): void {
     if (!this.newFormProviderAvailable() || this.pendingCreate !== undefined) return;
     const options = this.newFormProviderOptions();
-    if (options.length < 2) return;
+    // A single offered choice is still explicitly selectable: when Pi is not
+    // offered (the owner cannot create it), the sole native target must be
+    // reachable by the operator's own gesture. Reselecting it is a no-op.
+    if (options.length === 0) return;
     const key = this.newFormProviderKey();
     const index = options.findIndex((option) => newFormProviderOptionKey(option) === key);
     const next = index < 0
@@ -10980,6 +11127,13 @@ export class SidebarController {
       // states the conflict and emits nothing, rather than quietly relaunching it
       // somewhere else or quietly turning it into Pi.
       this.formError = NATIVE_PROVIDER_SCOPE_CHANGED_NOTICE;
+      this.onInvalidate?.();
+      return;
+    }
+    if (providerBackend === "pi" && !this.newFormPiOffered()) {
+      // The owner did not negotiate the blank Pi create: nothing is sent, and the
+      // request is never turned into a native or local create.
+      this.formError = `${this.currentNewFormHostLabel()} cannot start a Pi session; choose Local or another provider`;
       this.onInvalidate?.();
       return;
     }

@@ -20,8 +20,8 @@ keeps every process.
 
 The host's own sessions are Pi sessions, and it can also host a real full native
 interactive **Claude Code** or **Codex CLI** session as its own sidebar row beside
-them. Pi stays the default: every New-session form opens on Pi, and a native row is
-always an explicit local choice. A hosted row is the operator's own CLI as an
+them. Pi stays the default: every New-session form opens on Pi, a `SessionSpawn`
+call without `kind` starts Pi, and a native row is always an explicit choice. A hosted row is the operator's own CLI as an
 ordinary PTY child: the host owns its process, and anything the provider's own
 surfaces do not state stays unknown. How a native row
 starts, what its row may honestly display, and a safe owned staging tryout are owned
@@ -567,12 +567,22 @@ line, and one **Host** line, drawn in that order from top to bottom as **Host**,
 **Provider**, then the field; there is no separate host display-label field. The
 Provider line names **Pi** every time the form opens, so a native
 **Claude Code**/**Codex CLI** row is always a deliberate choice (see
-[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). Its
-offered choices belong to the destination currently selected on the **Host** line:
-a Local choice offers this host's own targets, a remote choice offers only that
-owner's advertised targets, and an explicit native choice is never reinterpreted
-for another destination or a replaced owner run — it is dropped and stated, never
-quietly turned into Pi. `Shift+Tab`
+[Native Claude Code and Codex rows](#native-claude-code-and-codex-rows)). The
+only choices are the three session kinds **Pi**, **Claude Code**, and **Codex
+CLI** — the same on the terminal sidebar and in the
+[Android application](#android-application). A native choice is the
+destination's normal native setup for that kind (the provider's built-in default
+command), never a configured `externalAgents` worker profile, and the offered
+choices belong to the destination currently selected on the **Host** line and are
+filtered by its current availability: a Local choice offers only the kinds this
+host's own launch probe finds startable, and a remote choice offers only what that
+owner's freshly probed catalog reports (see
+[Remote native create and host row name](#remote-native-create-and-host-row-name)).
+An offered choice is an observation, not a grant: the destination still
+revalidates it at submission, and a kind that became unavailable in between is
+refused. An explicit native choice is never reinterpreted for another destination
+or a replaced owner run — it is dropped and stated, never quietly turned into Pi.
+`Shift+Tab`
 moves **Workspace** → **Provider** → **Host** — or **Workspace** → **Host** directly
 when no Provider line is drawn — and `Tab` steps back down through **Provider** to
 **Workspace**; `Up`/`Down` cycle the displayed choice on the focused line; a click
@@ -590,51 +600,137 @@ choice is never carried forward, an actual Host change clears the Workspace
 value, and choosing the same Host again is a no-op, so no per-host history is
 kept. Choosing one already-connected saved destination makes Workspace plain
 bounded text for that owner's filesystem and submits a single create request to
-that owner, which creates one blank native child in its own run with no initial
-prompt (see
+that owner, which creates one blank child of the chosen kind in its own run with no
+initial prompt (see
 [Owner Create transport foundation](#owner-create-transport-foundation)). That
 Host choice is not a Network destination action: it adds no destination,
 connection, pin, or grant.
 
 An authenticated top-level session-host child with the review-gate reporter also
-exposes `SessionSpawn`; delegated executor children do not. It remains a native,
-owner-bound tool: the child is created in its own hosting process through the
-same owner service, without adding a network `SessionSpawn` RPC. The optional
-owner-create exchange later in this page is a separate operation. `SessionSpawn`
-requires exactly an existing workspace, title, and nonempty prompt. It creates a
-fresh native Pi process and conversation in that workspace, without creating a
-worktree, clone, or branch. Native settings and compatible inherited launch
-options remain shared, but the parent's conversation name and startup
-message/file inputs are not inherited. The supplied title is forwarded unchanged
-to Pi's native session-name API; Pi applies its own persistence semantics,
-including trimming surrounding whitespace on the pinned 1.5.2 runtime. The host
-does not crop or shorten titles to fit the sidebar, and titles longer than the
-recommendation remain stored in full after Pi's native normalization. The prompt
-is handed unchanged to Pi's public user-message API with prompt-template
+exposes `SessionSpawn`; delegated executor children, standalone sessions, and
+native Claude Code/Codex rows do not. `SessionSpawn` requires an existing
+workspace, a title, and a nonempty prompt. When the child's host advertises routed
+spawning, it also accepts two optional selectors:
+
+- `kind` — `pi`, `claude`, or `codex`. Omitting it starts a Pi child.
+- `host` — the exact id of one existing paired saved destination, passed exactly as
+  supplied: no trimming, case folding, name or label lookup, and no local alias.
+  Omitting it starts the child on the caller's **own** host — the host that owns the
+  calling child — never on the host currently selected or viewed in a sidebar, even
+  while the caller is being watched from another machine.
+
+A legacy call with only the workspace, title, and prompt behaves exactly as before:
+one fresh Pi child on the caller's own host. In a session whose host does not
+advertise routed spawning, the schema shows only those three fields, and a call
+that names `host` or `kind` is refused with nothing started rather than having the
+selectors dropped.
+
+The same child also exposes the read-only `SessionHosts` tool when its host
+supplies the matching inspection capability. It takes no arguments and returns one
+structured snapshot `{ ownKinds, hosts }`: `ownKinds` lists the session kinds the
+caller's own host currently observes as startable (the host an omitted `host`
+selects), and `hosts` lists each existing paired destination eligible for
+selection as `{ id, kinds }`, with the id given raw and exact — including opaque
+Unicode or whitespace — for use unchanged as `host`. Both views come from the host's
+existing launch probe and paired-destination projection; there is no static host
+roster, profile list, or dynamic schema enum. The snapshot is descriptive only: it
+is not a grant or a launch receipt. It does not start sessions, connect, pair, or
+change trust or settings, but it may refresh an existing owner's metadata
+subscription. An observation can race the validation the actual spawn performs,
+so a listed host or kind can still be refused. An inspection that cannot complete is an error
+result saying nothing is known, never an empty listing.
+
+`SessionSpawn` never falls back. A selected host that is unknown, disconnected,
+stale, busy, unsupported, or not currently authorized, a kind the destination cannot
+start now, and a workspace the destination's own launch path refuses are refused
+or reported `unknown` when the launch outcome cannot be confirmed. The request is
+never served by the caller's own host, by a Pi child in place of a native kind,
+or by a configured worker profile, and nothing connects,
+pairs, renews a grant, or retries automatically. A paired request travels over that
+destination's existing authenticated roster channel under the optional
+`roster-session-spawn-v1` capability. It requires the destination's existing
+pinned identity, a current directional grant for this host on that owner, and a
+live current connection; the owner interprets and validates the workspace on its
+own filesystem, re-proves the kind against its own current catalog, and launches
+through the same create path as its own local New. A native kind always means that
+destination's built-in default for the backend — the same normal native setup the
+New form offers — never an `externalAgents` worker definition.
+
+For every kind, the new child is a fresh process and conversation in the
+validated workspace, without creating a worktree, clone, or branch. The title and
+prompt content are kept exactly as supplied. The child is added in the background:
+its row appears without requesting attention or changing the selected row, focus,
+active Main owner, or sidebar visibility. A `started` result confirms that the
+child launched, not that its prompt was read, processed, or completed. When a
+request may have been submitted but its result is uncertain — a timeout, a
+cancellation, a lost reply, or a launch that errored after it already owned a
+process — the outcome is `unknown`: the child may or may not exist, and the result
+never claims its absence. Inspect the sidebar before retrying; the tool never
+retries automatically.
+
+**A Pi child** keeps its existing behavior. Native settings and compatible
+inherited launch options remain shared, but the parent's conversation name and
+startup message/file inputs are not inherited. The supplied title is forwarded
+unchanged to Pi's native session-name API; Pi applies its own persistence
+semantics, including trimming surrounding whitespace on the pinned 1.5.2 runtime.
+The host does not crop or shorten titles to fit the sidebar, and titles longer than
+the recommendation remain stored in full after Pi's native normalization. The
+prompt is handed unchanged to Pi's public user-message API with prompt-template
 expansion disabled, so leading `@`, `/`, and option-like text are prompt content
 rather than CLI inputs. It is dispatched only after review-gate session
 initialization has established checkpoint scope and deferred-tool authorization,
-and is recorded in the review request context before the turn starts. The child
-is added in the background: its row appears without changing the selected row,
-focus, active Main owner, or sidebar visibility. A successful result confirms
-process launch only, not prompt processing or completion.
+and is recorded in the review request context before the turn starts.
 
 There is no fixed initial-prompt character or byte ceiling and no prompt-length
-setting. Long handoffs use the same tool arguments as short prompts; callers do
-not need to shorten the text or ask the child to load a file. The host transfers
-the complete exact text automatically through private temporary payload files,
-keeping both authenticated control frames and the child's startup environment
-small. Payloads are checked for exact size, integrity, and file identity before
-consumption; nothing is truncated, summarized, or substituted. Empty or
-NUL-containing prompts remain invalid. Existing title and workspace safety
+setting for any kind. Long handoffs use the same tool arguments as short prompts;
+callers do not need to shorten the text or ask the child to load a file. For a Pi
+child the host transfers the complete exact text automatically through private
+temporary payload files, keeping both authenticated control frames and the child's
+startup environment small. Payloads are checked for exact size, integrity, and file
+identity before consumption; nothing is truncated, summarized, or substituted.
+Empty or NUL-containing prompts remain invalid. Existing title and workspace safety
 bounds are unchanged. This is not an unlimited-resource guarantee: filesystem,
-memory, native Pi, and model-context limits still apply. A transfer or initial
-delivery failure is reported rather than treated as complete delivery. An
-uncertain launch may already have created a child: inspect the sidebar before
-retrying; the tool never automatically retries. Longer context grants no
-additional tool or role authority. See
+memory, native Pi, provider, and model-context limits still apply. A transfer or
+initial delivery failure is reported rather than treated as complete delivery.
+Longer context grants no additional tool or role authority. See
 [Security model](security-model.md#session-host-status-ipc) for
 temporary-payload privacy and ownership boundaries.
+
+**A Claude Code or Codex CLI child** is the provider's genuine interactive TUI,
+started exactly like a New-form native row, without substituting the project's
+headless print, `exec`, SDK, or worker RPC routes. Its initial request uses the
+file-backed startup path: the host stages the exact original prompt losslessly in a private
+temporary file it owns — one JSON array of string fragments, one fragment per line
+— and passes the TUI one short generated plain-word instruction as the single
+prompt operand after `--`. That instruction asks the provider to read every page of
+the file, decode the fragments, concatenate them in order with no separators, and
+carry out the result as the user's request. The original prompt never travels in
+argv or the environment, and no new total prompt cap is introduced: the
+one-fragment-per-line framing exists so a paging file reader can reach every line,
+not as an input-length limit. The provider's first user message is therefore the
+generated instruction, not the verbatim prompt. The provider reads the file through
+its own normal file-read, trust, approval, context, and resource behavior: nothing
+is pasted into the PTY, nothing is approved automatically, and no permission,
+model, reasoning, or headless-worker setting is added or substituted. The prompt
+file stays leased until the row's PTY — and, for a Codex row, its owned backend and
+relay — have actually settled, including while the provider waits at a trust
+prompt and after a failed launch that still owns resources. Cleanup then removes
+only the exact unchanged file and its empty private directory after rechecking
+identity, size, digest, and ancestry; an unknown, modified, replaced, or foreign
+entry is preserved. Once the row has settled the file is gone, so a later provider
+resume whose history still names that path does not mean the file was kept.
+
+Titles follow each provider's normal handling. Claude Code receives the exact title
+as its documented `--name=<title>` option and persists it as its own session name.
+Codex CLI has no native title option, so the full supplied title becomes the row's
+host-side caption — the same caption `E` sets, stored with the row's remembered
+slot and restored after a restart — and is never sent to Codex as a conversation
+rename. A startup caption accepts the full `SessionSpawn` title bound of 1024 UTF-8
+bytes without trimming or clipping; the manual `E` rule (one trimmed line of at
+most 80 characters) is unchanged. Where a sidebar card or a paired viewer's row
+label cannot show a long caption, it shows a bounded display projection that is
+visibly ellipsized; that projection is not a second stored caption, and the full
+caption is what is kept and restored.
 
 The tool's title-width suggestion is a host-computed snapshot of the sidebar
 title area in the visible layout when that reporter child was launched; it is
@@ -840,10 +936,13 @@ A native row is deliberately a plain provider child rather than a Pi child:
   separate native observation family; anything the host has not observed stays
   `unknown`, never idle and never zero
   ([Native Claude Code and Codex sessions](native-sidebar-agents.md#native-status-observation)).
-- Its command, base arguments, and base environment come from the built-in default
-  for that backend or from an explicit shared
-  [`externalAgents`](configuration.md#the-externalagents-catalog) entry — never from
-  the `review`/`execution` role overlays, their models, or their reasoning. The
+- Its command is the built-in default for that backend (`claude` or `codex`), with
+  that provider's own normal configuration — the normal native setup, never a
+  configured [`externalAgents`](configuration.md#the-externalagents-catalog) worker
+  definition, its `review`/`execution` role overlays, models, reasoning, arguments,
+  or environment. Those worker definitions, adapters, commands, environment,
+  arguments, models, and reasoning settings keep configuring delegated review and
+  execution exactly as before; they are simply not New-session choices. The
   command is located by the same discovery the settings availability probe uses, and
   a missing binary or a configured argument that names a headless or service mode, an
   approval, sandbox, or hook-trust bypass, an existing-session attach, or a
@@ -872,17 +971,19 @@ A native row is deliberately a plain provider child rather than a Pi child:
 - It carries no review gate, no tool protection, and none of the subtask
   capture/review/landing guarantees, and it is never presented as a review-gate-managed
   worker.
-- Native rows are created by **this host** and by **one connected owner that
-  advertises its own native targets**. Locally, the Provider line offers this
-  host's configured targets. When the **Host** line names a connected destination,
-  the same line offers only that owner's advertised catalog — never this host's own
-  configured ids, and never a blend — and submitting sends one native owner-create
-  request instead of a Pi one (see
+- Native rows are created by **this host**, by **one connected owner that
+  advertises its own native kinds**, and by `SessionSpawn` with `kind` `claude` or
+  `codex` (see [Starting and owning sessions](#starting-and-owning-sessions)).
+  Locally, the Provider line offers the Claude Code and Codex CLI kinds this host's
+  launch probe finds startable. When the **Host** line names a connected
+  destination, the same line offers only what that owner advertises — never this
+  host's own choices, and never a blend — and submitting sends one native
+  owner-create request instead of a Pi one (see
   [Remote native create and host row name](#remote-native-create-and-host-row-name)).
-  An owner that advertises nothing draws no Provider line at all and keeps its
-  ordinary Pi-only behavior. `SessionSpawn`, the Saved picker, and the standalone
-  launchers keep creating Pi sessions unchanged, and a native row contributes
-  nothing to the saved-conversation censuses. An authorized remote viewer **can**
+  An owner that offers no native kind draws no Provider line at all and keeps its
+  ordinary Pi-only behavior. The Saved picker and the standalone launchers keep
+  creating Pi sessions unchanged, and a native row contributes nothing to the
+  saved-conversation censuses. An authorized remote viewer **can**
   type into a native row: the owner hands that viewer's keys, canonical mouse
   packets, and whole pastes to the row's PTY raw under the negotiated
   `native-input-cli-v1` capability, exactly as its own Main types them (see
@@ -894,14 +995,19 @@ A native row is deliberately a plain provider child rather than a Pi child:
   the optional `native-copy-cli-v1` capability — or drops it (the
   **Hosted provider text copy** part of
   [Native input and copy](#native-input-and-copy)).
-- Each new session selects its native target again: the chosen target id, its
-  executable, arguments, and environment are not persisted, so a later form cannot
-  silently reuse them.
-- A remembered native row keeps its own backend and workspace and returns as a
-  truthful **unavailable placeholder** titled `<caption or Provider> (unavailable)`,
-  where the title carries the operator's caption when one was set and the provider
-  label otherwise — it is never restarted as a Pi row and never bound to an arbitrary
-  recent provider conversation. Rename, saved-conversation open, and exited-row resume are unavailable
+- Each new session selects its native kind again: the chosen kind's executable,
+  arguments, and environment are not persisted, so a later form cannot silently
+  reuse them.
+- A remembered native row keeps its own backend, workspace, and caption and is
+  restored at host startup when its exact provider conversation can be verified;
+  a row remembered with a legacy configured worker target restores as that
+  backend's normal native setup (see
+  [Restart restoration of native rows](native-sidebar-agents.md#restart-restoration-of-native-rows)).
+  A row that cannot be restored returns as a truthful **unavailable placeholder**
+  titled `<caption or Provider> (unavailable)`, where the title carries the row's
+  caption when one was set and the provider label otherwise — it is never
+  restarted as a Pi row and never bound to an arbitrary recent provider
+  conversation. Rename, saved-conversation open, and exited-row resume are unavailable
   for a native row, because they are Pi APIs; resume happens in-pane through the
   provider's own control.
 
@@ -923,7 +1029,7 @@ process or status store. This ownership belongs to one host process on one
 machine. A paired viewer on another machine may see a projection of this
 manager's roster metadata, display one deliberately selected row's native
 viewport, forward native input to it and receive its copies, ask this owner to
-close or create a session, and browse, resume, or delete this owner's saved
+close or create a session (including one prompted `SessionSpawn` child), and browse, resume, or delete this owner's saved
 conversations (see
 [Network sidebar](#network-sidebar-hosting-pairing-and-remote-metadata),
 [Selected native viewport](#selected-native-viewport-interim-display-scope), and
@@ -975,8 +1081,11 @@ text-copy bridge that normal production Main enables by default, with a
 per-viewer off setting (see [Native input and copy](#native-input-and-copy)),
 and the roster lane carries the optional owner Saved catalog exchange (see
 [Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner)).
-`SessionSpawn` is unchanged: it remains the native, owner-bound tool inside a
-hosted child and is not a network request. Human handoff remains unimplemented.
+The roster lane also carries the optional `roster-session-spawn-v1` exchange that a
+hosted child's `SessionSpawn` uses when it names a paired `host` (see
+[Starting and owning sessions](#starting-and-owning-sessions)); a call that omits
+`host` stays on the caller's own host and is not a network request. Human handoff
+remains unimplemented.
 Native client-only mobile implementations can use this trust model; ordinary
 browser WebSockets do not expose self-signed certificate pinning and are not
 claimed supported.
@@ -1253,8 +1362,9 @@ ask one connected destination's owner for one blank child, as described under
 Saved picker can browse, resume, and delete one connected owner's saved
 conversations, as described under
 [Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner).
-`SessionSpawn` remains the native, owner-bound tool described above, and human
-handoff remains unimplemented. Close uses the highlighted remote row and its
+`SessionSpawn` stays on the calling child's own host unless it names an exact
+paired `host` (see [Starting and owning sessions](#starting-and-owning-sessions)),
+and human handoff remains unimplemented. Close uses the highlighted remote row and its
 owner, independently of the displayed stream. Host shutdown closes only
 this host's owned local network resources and waits for that local settlement;
 an unconfirmed close is reported and retains agent-directory ownership. It never
@@ -1537,8 +1647,9 @@ New-form Host choice can create one blank child through the owner-routed Create
 capability described below, and the Saved picker can reach one connected owner's
 saved conversations (see
 [Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner)).
-`SessionSpawn` remains the native, owner-bound tool described above rather than
-a network request, and human handoff is not implemented. The owner-routed Close
+`SessionSpawn` reaches another owner only when it names that exact paired
+`host` (see [Starting and owning sessions](#starting-and-owning-sessions)), and
+human handoff is not implemented. The owner-routed Close
 controls are described below. Authenticated local and SSH clipboard copying,
 ordinary standalone Pi, and local host input are unchanged: nothing is broadcast,
 a remote copy reaches only its initiating viewer, raw PTY OSC 52 stays denied on
@@ -1660,9 +1771,10 @@ newer form is left untouched. Every refusal or uncertainty is reported as a
 brief, non-modal, fixed notice that carries no payload, path, exception text,
 retry, or automatic re-send. Local New, Close, Quit, saved history, hosting
 settings, Auto, the editable listen default, and protected identity/pin
-persistence are unchanged. `SessionSpawn` is not replaced: it stays the native,
-owner-bound tool described above. Remote New does not add or require a network
-`SessionSpawn` RPC.
+persistence are unchanged. Remote New neither uses nor requires the separate
+prompted `roster-session-spawn-v1` exchange that `SessionSpawn` uses for a paired
+`host` (see [Starting and owning sessions](#starting-and-owning-sessions)); that
+exchange never implies blank or native New support.
 
 ### Remote native create and host row name
 
@@ -1675,10 +1787,15 @@ pre-native wire schema exactly as before, and neither lane adds a listener, queu
 replay cache, registry, permission kind, or stored state.
 
 **Starting a native row on an owner.** The New form's **Provider** line is scoped to
-the destination selected on the **Host** line. A Local choice offers this host's own
-configured targets; a remote choice offers only the catalog that owner advertises,
-with its own labels and ids, and this host's configured ids are never merged in or
-substituted. The choice is part of the written form the writer actually committed:
+the destination selected on the **Host** line. A Local choice offers the native
+kinds this host's own launch probe finds startable; a remote choice offers only the
+catalog that owner advertises, with its own labels and ids, and this host's own
+choices are never merged in or substituted. Either way the only native choices are
+each backend's default target — the Claude Code or Codex CLI kind in that host's
+normal native setup. An older owner may still advertise configured `externalAgents`
+worker profiles in its catalog; those entries are kept on the wire but are never
+offered or admitted as New-session choices, and an owner advertising only such
+profiles offers the Pi-only form. The choice is part of the written form the writer actually committed:
 submission requires that exact frame — its host identity, owner run, canonical
 workspace, pane geometry, and the drawn provider identity — and one request receipt
 consumed before dispatch. The request then names the exact owner run, that one
@@ -1694,6 +1811,25 @@ refused rather than quietly reinterpreted as a Local id of the same name or as P
 An owner that advertises no target draws no Provider line and keeps its ordinary
 Pi-only path, and a remote destination whose channel never negotiated the native
 lane reports one fixed unsupported notice and sends nothing.
+
+**Native availability.** A separate optional `roster-native-availability-v1`
+capability, acknowledged only beside `roster-native-v1`, describes how the owner's
+catalog is produced: the owner declares that each published catalog comes from a
+fresh read-only launch probe on that owner, so it lists the kinds actually found
+startable when the snapshot was published. Without it — a legacy owner, or one that
+does not probe — the catalog is configuration-only and its availability is
+**unknown**: it is never presented as launchable, and a current client offers no
+unverified native choice for that owner, while that owner's existing Pi create is
+offered only when the owner supports it. The capability adds no frame, field,
+grant, or permission, and the owner still re-reads and re-proves its own live
+catalog before every native create or prompted `SessionSpawn`. A fresher view of
+the selected owner comes only from the existing roster resync and resubscribe on
+the current connection, never from an automatic connect; while that destination is
+busy, disconnected, or stale its choices are withheld or the request is refused
+truthfully, with no Pi or native fallback. The terminal New form withholds native
+choices until its refresh settles. If an Android refresh cannot start because the
+channel is busy, Android may still show the last complete probed catalog; that is
+an observation, not a promise of admission, and the owner revalidates any create.
 
 **Naming one of the owner's native rows.** A native row's host-side name is a
 different operation from renaming a Pi conversation, and the two never share a
@@ -1870,6 +2006,21 @@ host, backend, or protocol behavior. Its device and runtime acceptance is
 incomplete: real-host Saved full-catalog, search, resume, network, and lifecycle
 acceptance is not established, and no full parity with the desktop sidebar or
 daily-use certification is claimed. It includes the Saved delete refresh above.
+
+**New session.** The Android New-session form is a first-class peer of the
+terminal sidebar's New form and follows the same rules. Its provider choices are
+only **Pi**, **Claude Code**, and **Codex CLI**, scoped to the selected connected
+owner: Pi, which reaches that owner only when it supports its existing create,
+and a native kind only while that owner's current catalog was produced by a fresh launch probe
+(`roster-native-availability-v1`) and lists that kind as that owner's normal native
+setup. A configuration-only catalog has unknown availability and offers no native
+choice, and a configured worker profile an older owner still advertises is never
+offered or submitted. A changed catalog, a replaced owner run, a reconnect, or a
+different host invalidates an earlier native choice; it is refused, never silently
+turned into Pi. A fresher catalog comes only from the existing roster resync on the
+current connection, never from an automatic connect, and the owner still
+revalidates every request. See
+[Remote native create and host row name](#remote-native-create-and-host-row-name).
 
 **Open terminal.** A roster revision alone does not retire the session card's
 committed Open terminal action. Its first tap can start the existing opening

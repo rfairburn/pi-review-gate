@@ -50,6 +50,9 @@ class ClientApplicationController private constructor(
         it.setTerminalInputCoverage(false)
     }
     private val projection = ClientProjection()
+    // One-shot native-availability refresh of the owner a New form selects (#493):
+    // the existing resync plus its matching re-subscribe, fenced to one channel.
+    private val createRefresh = CreateOwnerRefresh(runtime, scope)
     private val state = MutableStateFlow(ClientUiState())
     val ui = state.asStateFlow()
     private val notice = MutableStateFlow<String?>(null)
@@ -204,6 +207,8 @@ class ClientApplicationController private constructor(
     }
 
     private fun consume(event: ClientRuntimeEvent) {
+        // Only that helper's own retirements are followed up, on their own channel.
+        createRefresh.observe(event)
         when (event) {
             is ClientRuntimeEvent.Roster -> {
                 when (val rosterEvent = event.event) {
@@ -792,6 +797,22 @@ class ClientApplicationController private constructor(
         report("Terminal opening")
     }
     private fun generation(host: HostId): Long? = registry.snapshot.value.hosts.firstOrNull { it.hostId == host }?.generation
+
+    /**
+     * Ask for the one-shot availability refresh of [host], fenced to the channel this
+     * controller adopted for it and to every in-flight fact only this controller sees.
+     */
+    private fun requestCreateRefresh(host: HostId) {
+        val fact = registry.snapshot.value.hosts.firstOrNull { it.hostId == host }
+        val gen = fact?.generation?.takeIf {
+            fact.phase == HostConnectionPhase.CONNECTED && registry.snapshot.value.foreground &&
+                channels[host]?.generation == it
+        }
+        val busy = gen == null || operations.inFlight(host, gen) ||
+            submittedCreate?.hostId == host || createdActivation?.hostId == host ||
+            navigation.wanted()?.target?.hostId == host || savedDeletion != null
+        createRefresh.request(state.value.hostState(host), gen, busy)
+    }
     private fun currentRun(host: HostId): String? = runtime.hostState(host)?.roster?.projection?.takeIf {
         it.state == RosterProjectionState.CURRENT
     }?.hostRunId
@@ -929,6 +950,12 @@ class ClientApplicationController private constructor(
                 dialogs = dialogs.copy(createSession = form.copy(selectedHostId = intent.hostId, provider = provider,
                     proof = proof(listOf("create", intent.hostId, form.workspaceDraft, CreateProviderSelection.key(provider),
                         ++proofGeneration), UiProofScreen.SESSION_CREATE, intent.hostId, currentRun(intent.hostId))))
+                // A newly selected destination gets one fresh native-availability
+                // observation through the existing resync/re-subscribe. Reselecting the
+                // same owner keeps its observation (and its exact provider choice). It
+                // never connects anything, and the refreshed catalog reaches this form
+                // only through the ordinary projection and reconcile in refresh().
+                if (form.selectedHostId != intent.hostId) requestCreateRefresh(intent.hostId)
             }
             is ClientIntent.SelectCreateProvider -> dialogs.createSession?.let { form ->
                 if (form.proof in busyForms) return

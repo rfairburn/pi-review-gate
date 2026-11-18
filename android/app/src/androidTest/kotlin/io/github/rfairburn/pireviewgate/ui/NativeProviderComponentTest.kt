@@ -30,8 +30,8 @@ class NativeProviderComponentTest {
 
     private val hostId = NativeUiFixtures.hostA
     private val run = NativeUiFixtures.RUN_A
-    private val claude = NativeCliTarget("claude-default", NativeCliBackend.CLAUDE, "Claude default")
-    private val codex = NativeCliTarget("codex-review", NativeCliBackend.CODEX, "Codex review")
+    private val claude = NativeCliTarget("claude", NativeCliBackend.CLAUDE, "Claude default")
+    private val codex = NativeCliTarget("codex", NativeCliBackend.CODEX, "Codex review")
     private val scope = NativeCatalogScope(run, 1L, 1L)
 
     private fun nativeRow() = SessionUiState(
@@ -51,6 +51,7 @@ class NativeProviderComponentTest {
             RosterWire.CREATE_CAPABILITY,
             RosterWire.NATIVE_CAPABILITY,
             RosterWire.NATIVE_NAME_CAPABILITY,
+            RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
         ), 1),
         nativeCliTargets = listOf(claude, codex),
         nativeCatalogScope = scope,
@@ -94,11 +95,56 @@ class NativeProviderComponentTest {
             val captured = fixture.intents.single { it.intent is ClientIntent.SelectCreateProvider }
             assertEquals(
                 ClientIntent.SelectCreateProvider(CreateProviderChoice.Native(
-                    NativeCliBackend.CODEX, "codex-review", "Codex review", scope,
+                    NativeCliBackend.CODEX, "codex", "Codex review", scope,
                 )),
                 captured.intent,
             )
         }
+    }
+
+    @Test fun legacyOwnerWithUnknownNativeAvailabilityKeepsThePiOnlyForm() {
+        // The same advertised catalog, but the owner never described it as a fresh
+        // launch probe: its native availability is unknown, so nothing native is offered.
+        val legacy = host().copy(capabilities = HostCapabilities.fromAcknowledged(listOf(
+            RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_NAME_CAPABILITY,
+        ), 1))
+        val owner = OwnerChoice.of(legacy)
+        val formProof = proof()
+        val state = ClientUiState(
+            hostStates = listOf(legacy),
+            dialogs = ClientDialogs(createSession = CreateSessionDialog(
+                owners = listOf(owner), selectedHostId = hostId,
+                provider = CreateProviderChoice.Pi, workspaceDraft = "/synthetic/work", proof = formProof,
+            )),
+        )
+        val fixture = NativeUiFixture(state)
+        show(fixture)
+        waitProof(formProof)
+        compose.onAllNodesWithText("Choose provider").assertCountEquals(0)
+        compose.onAllNodesWithText("Claude default · Claude").assertCountEquals(0)
+        compose.onAllNodesWithText("Codex review · Codex").assertCountEquals(0)
+        // Pi stays the default on the owner's own create capability.
+        dialogControl("Create session").assertIsEnabled()
+    }
+
+    @Test fun claudeOnlyAvailabilityOffersPiAndClaudeOnly() {
+        val claudeOnly = host().copy(nativeCliTargets = listOf(claude))
+        val owner = OwnerChoice.of(claudeOnly)
+        val formProof = proof()
+        val state = ClientUiState(
+            hostStates = listOf(claudeOnly),
+            dialogs = ClientDialogs(createSession = CreateSessionDialog(
+                owners = listOf(owner), selectedHostId = hostId,
+                provider = CreateProviderChoice.Pi, proof = formProof,
+            )),
+        )
+        val fixture = NativeUiFixture(state)
+        show(fixture)
+        waitProof(formProof)
+        dialogControl("Choose provider").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Claude default · Claude").assertIsDisplayed()
+        compose.onAllNodesWithText("Codex review · Codex").assertCountEquals(0)
     }
 
     @Test fun staleNativeChoiceShowsChooseAgainAndNeverSilentlyBecomesPi() {

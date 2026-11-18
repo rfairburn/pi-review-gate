@@ -25,11 +25,11 @@ import { performance } from "node:perf_hooks";
 
 import { MAX_NATIVE_SESSION_NAME_LENGTH, isValidNativeSessionId } from "./protocol";
 import { isNativeConversationId } from "./native-conversation";
+import { isNativeCaption } from "./native-caption";
 import {
   isNativeCliBackend,
   isNativeCliTargetId,
   isSessionBackend,
-  isNativeDisplayName,
   type SessionBackend,
 } from "./session-backend";
 
@@ -400,10 +400,12 @@ export function parseStoredRoster(value: unknown): StoredRoster | undefined {
     if (entry.sessionId !== undefined && !isValidNativeSessionId(entry.sessionId)) return undefined;
     if (entry.workspace !== undefined && !isValidRosterWorkspace(entry.workspace)) return undefined;
     if (entry.name !== undefined && !isValidRosterName(entry.name)) return undefined;
-    // A remembered host-side row caption follows the shared native display-name
-    // rule, not the provider conversation-name rule: an unbounded or
-    // control-bearing caption is a malformed document, never a truncated guess.
-    if (entry.displayName !== undefined && !isNativeDisplayName(entry.displayName)) return undefined;
+    // A remembered host-side row caption follows the shared native caption rule
+    // (an operator caption, or a Codex SessionSpawn startup title under the same
+    // bound the request was admitted with), not the provider conversation-name
+    // rule: an unbounded or control-bearing caption is a malformed document,
+    // never a truncated guess.
+    if (entry.displayName !== undefined && !isNativeCaption(entry.displayName)) return undefined;
     if (entry.persistence !== undefined && !isPersistence(entry.persistence)) return undefined;
     // The closed backend set only: an unknown provider identity is a malformed
     // document, never a value normalized to Pi or to the first known backend.

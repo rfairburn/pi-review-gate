@@ -32,6 +32,7 @@ import {
 } from "../src/session-host/network/peer-coordinator";
 import type {
 	OwnerCreateFacts,
+	OwnerSessionSpawnRequest,
 	OwnerNativeCreateRequest,
 	RemoteNativeCliTarget,
 } from "../src/session-host/network/peer-create";
@@ -42,6 +43,8 @@ import type {
 	PeerRenameController,
 } from "../src/session-host/network/peer-rename";
 import type { PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
+import type { PeerByteChannel } from "../src/session-host/network/channel";
+import { decodeRosterBridgeFrame } from "../src/session-host/network/roster-bridge-protocol";
 import { createPosixTestPolicy } from "./session-host-network-peer-state-fixtures";
 import {
 	consentsOf,
@@ -78,9 +81,12 @@ async function start(
 		readonly inventory: FakeInventory;
 		readonly nativeCreateOwnedSession?: PeerCoordinatorOptions["nativeCreateOwnedSession"];
 		readonly nativeCliTargets?: PeerCoordinatorOptions["nativeCliTargets"];
+		readonly nativeCliAvailability?: boolean;
 		readonly renameNativeOwnedSession?: PeerCoordinatorOptions["renameNativeOwnedSession"];
 		readonly renameOwnedSession?: PeerCoordinatorOptions["renameOwnedSession"];
 		readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"];
+		readonly spawnOwnedSession?: PeerCoordinatorOptions["spawnOwnedSession"];
+		readonly wrapClientChannel?: PeerCoordinatorTestHooks["wrapClientChannel"];
 	},
 ): Promise<Started> {
 	const log = createSnapshotLog();
@@ -89,12 +95,16 @@ async function start(
 		inventory: options.inventory,
 		onChange: log.onChange,
 		onIncomingConsentArrival: log.onArrival,
-		testHooks: hooks(),
+		testHooks: options.wrapClientChannel === undefined
+			? hooks()
+			: { ...hooks(), wrapClientChannel: options.wrapClientChannel },
 		...(options.createOwnedSession === undefined ? {} : { createOwnedSession: options.createOwnedSession }),
+		...(options.spawnOwnedSession === undefined ? {} : { spawnOwnedSession: options.spawnOwnedSession }),
 		...(options.nativeCreateOwnedSession === undefined
 			? {}
 			: { nativeCreateOwnedSession: options.nativeCreateOwnedSession }),
 		...(options.nativeCliTargets === undefined ? {} : { nativeCliTargets: options.nativeCliTargets }),
+		...(options.nativeCliAvailability === undefined ? {} : { nativeCliAvailability: options.nativeCliAvailability }),
 		...(options.renameNativeOwnedSession === undefined
 			? {}
 			: { renameNativeOwnedSession: options.renameNativeOwnedSession }),
@@ -183,11 +193,16 @@ async function pair(
 		readonly native?: boolean;
 		/** With `native`, omit the host-name provider while keeping the create pair. */
 		readonly nameLane?: boolean;
-		readonly targets?: () => readonly RemoteNativeCliTarget[];
+		readonly targets?: PeerCoordinatorOptions["nativeCliTargets"];
+		/** With `native`, the owner's explicit fresh-probe declaration. */
+		readonly availability?: boolean;
 		readonly create?: (request: OwnerNativeCreateRequest, stillAuthorized: () => boolean) => Promise<OwnerCreateFacts>;
 		readonly rename?: (request: OwnerNativeRenameRequest, stillAuthorized: () => boolean) => Promise<OwnerNativeRenameFacts>;
 		readonly renamePi?: PeerCoordinatorOptions["renameOwnedSession"];
 		readonly createPi?: PeerCoordinatorOptions["createOwnedSession"];
+		readonly spawn?: PeerCoordinatorOptions["spawnOwnedSession"];
+		/** Fixture-only wrapper for the REQUESTER's outgoing metadata channel. */
+		readonly requesterWrap?: PeerCoordinatorTestHooks["wrapClientChannel"];
 	} = {},
 ): Promise<Pair> {
 	const ownerFixture = createOwnedAgentDir(t);
@@ -201,6 +216,7 @@ async function pair(
 	const owner = await start(t, {
 		agentDir: ownerFixture.agentDir,
 		inventory: ownerInventory,
+		...(ownerOptions.spawn === undefined ? {} : { spawnOwnedSession: ownerOptions.spawn }),
 		// The Pi provider is always present, so the Pi create lane stays live and
 		// any native refusal can be shown NOT to fall through to it.
 		createOwnedSession: ownerOptions.createPi ?? (async (request) => {
@@ -216,6 +232,7 @@ async function pair(
 		...(ownerOptions.native === true
 			? {
 				nativeCliTargets: ownerOptions.targets ?? (() => [CLAUDE_TARGET, CODEX_TARGET, SHARED_TARGET]),
+				...(ownerOptions.availability === undefined ? {} : { nativeCliAvailability: ownerOptions.availability }),
 				nativeCreateOwnedSession: ownerOptions.create ?? (async (request, stillAuthorized) => {
 					nativeCalls.push(request);
 					guards.push(stillAuthorized());
@@ -239,6 +256,7 @@ async function pair(
 	const requester = await start(t, {
 		agentDir: requesterFixture.agentDir,
 		inventory: createFakeInventory(),
+		...(ownerOptions.requesterWrap === undefined ? {} : { wrapClientChannel: ownerOptions.requesterWrap }),
 	});
 	const hostId = await addDestination(requester, "Owner host", port as number);
 	await connectWithApprovals(requester, owner, hostId);
@@ -249,6 +267,46 @@ async function pair(
 }
 
 const STILL_CURRENT = Object.freeze({ stillCurrent: (): boolean => true });
+
+test("prompted launch reuses the paired coordinator with exact kind/payload and required fences", async t => {
+	const calls: OwnerSessionSpawnRequest[] = [];
+	const p = await pair(t, [], { spawn: async (request, guard) => {
+		assert.equal(guard(), true); calls.push(request);
+		return { kind: "started", hostRunId: request.hostRunId, rowId: "spawned" };
+	} });
+	const controller = p.requester.coordinator.ownerCreate;
+	assert.equal(controller.supportsSessionSpawn?.(p.hostId), true);
+	const base = { hostId: p.hostId, hostRunId: p.hostRunId, workspace: " /destination/only/宇宙 ",
+		title: "Exact title", prompt: "/literal\n@file\n--flag\n😀".repeat(10000) };
+	for (const kind of ["pi", "claude", "codex"] as const) {
+		assert.deepEqual(await controller.spawnSession?.({ ...base, kind }, STILL_CURRENT), {
+			kind: "owner-result", facts: { kind: "started", hostRunId: p.hostRunId, rowId: "spawned" },
+		});
+	}
+	assert.deepEqual(calls, ["pi", "claude", "codex"].map(kind => ({ ...base, kind, hostId: undefined }))
+		.map(({ hostId: _hostId, ...request }) => request));
+	assert.equal(p.piCalls.length, 0);
+	assert.equal(p.nativeCalls.length, 0);
+	assert.equal(p.requester.coordinator.content.readContent().state, "none");
+	assert.deepEqual(hostOf(p.requester.coordinator.read(), p.hostId).roster.rows, []);
+	assert.deepEqual(await controller.spawnSession?.({ ...base, kind: "pi", hostRunId: "replaced-run" }, STILL_CURRENT),
+		{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await controller.spawnSession?.({ ...base, kind: "pi" }, { stillCurrent: () => false }),
+		{ kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await controller.spawnSession?.({ ...base, kind: "pi" }, {} as never),
+		{ kind: "not-sent", reason: "invalid-request" });
+	assert.equal(calls.length, 3);
+});
+
+test("prompted launch never uses blank create on an old paired owner", async t => {
+	const p = await pair(t, []);
+	const controller = p.requester.coordinator.ownerCreate;
+	assert.equal(controller.supportsSessionSpawn?.(p.hostId), false);
+	assert.deepEqual(await controller.spawnSession?.({ hostId: p.hostId, hostRunId: p.hostRunId,
+		kind: "codex", workspace: "/destination", title: "Title", prompt: "Exact prompt" }, STILL_CURRENT),
+		{ kind: "not-sent", reason: "capability-unsupported" });
+	assert.equal(p.piCalls.length, 0);
+});
 
 /** The one native host-name method this coordinator's controller must expose. */
 function nativeRename(
@@ -274,6 +332,8 @@ test("a connected owner advertises its default and explicit shared targets, and 
 	const host = hostOf(p.requester.coordinator.read(), p.hostId);
 	assert.deepEqual(host.nativeCli, {
 		supported: true,
+		// A synchronous, configuration-only owner never claims probed availability.
+		availability: "unknown",
 		targets: [CLAUDE_TARGET, CODEX_TARGET, SHARED_TARGET],
 	}, "the two defaults plus the owner's explicit shared entry, in the owner's order");
 	assert.deepEqual(host.roster.rows?.map((row) => [row.id, row.backend ?? "<absent>"]), [
@@ -300,7 +360,7 @@ function findTarget(targets: readonly RemoteNativeCliTarget[], id: string): Remo
 test("a legacy owner with no native pair is described unsupported and offers no target", async (t) => {
 	const p = await pair(t, [rowView("claude-row", { backend: "claude" })], { native: false });
 	const host = hostOf(p.requester.coordinator.read(), p.hostId);
-	assert.deepEqual(host.nativeCli, { supported: false, targets: [] });
+	assert.deepEqual(host.nativeCli, { supported: false, targets: [], availability: "unknown" });
 	// The unnegotiated row keeps the pre-native shape: no backend key at all.
 	assert.equal(Object.prototype.hasOwnProperty.call(host.roster.rows?.[0] ?? {}, "backend"), false);
 	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
@@ -407,7 +467,7 @@ test("a disconnected destination loses its catalog and cannot be addressed nativ
 	await p.requester.coordinator.perform({ type: "peer-disconnect", hostId: p.hostId });
 	const host = hostOf(p.requester.coordinator.read(), p.hostId);
 	assert.equal(host.state, "disconnected");
-	assert.deepEqual(host.nativeCli, { supported: false, targets: [] },
+	assert.deepEqual(host.nativeCli, { supported: false, targets: [], availability: "unknown" },
 		"a lost run's target list never survives as a selectable choice");
 	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
 		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/owner/child", backend: "claude", targetId: "claude" },
@@ -481,7 +541,7 @@ test("a native create never names a run the destination no longer observes", asy
 	), { kind: "not-sent", reason: "target-unavailable" });
 	assert.deepEqual(p.nativeCalls, [], "no native frame is submitted for a run this side no longer observes");
 	// The newly adopted run's own catalog is what the fresh observation carries.
-	assert.deepEqual(adopted.nativeCli, { supported: true, targets: [CLAUDE_TARGET, CODEX_TARGET, SHARED_TARGET] });
+	assert.deepEqual(adopted.nativeCli, { supported: true, targets: [CLAUDE_TARGET, CODEX_TARGET, SHARED_TARGET], availability: "unknown" });
 });
 
 test("a half native pair is refused at construction rather than defaulted", () => {
@@ -542,7 +602,7 @@ test("the owner's native name lane is described on the peer DTO, and a legacy ow
   const legacyHost = hostOf(legacy.requester.log.latest(), legacy.hostId);
   assert.notEqual(legacyHost.nativeNameSupported, true,
     "a provider-less owner is never described as name-capable");
-  assert.deepEqual(legacyHost.nativeCli, { supported: false, targets: [] });
+  assert.deepEqual(legacyHost.nativeCli, { supported: false, targets: [], availability: "unknown" });
 });
 
 test("a host name reaches the owner's provider once with the exact fields and re-proof", async (t) => {
@@ -642,4 +702,281 @@ test("a host name whose caller proof or row moves mid-flight is never reported a
   if (result.kind === "not-sent") {
     assert.equal(result.reason, "target-unavailable");
   }
+});
+
+// ------------------------------------------------- native availability (#493)
+
+async function pollUntil(predicate: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 2000 && !predicate(); attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(predicate(), `timed out waiting for ${message}`);
+}
+
+/** The one refresh method this coordinator's controller must expose. */
+function refresh(side: Started): (hostId: string) => ReturnType<NonNullable<Started["coordinator"]["ownerCreate"]["refreshNativeTargets"]>> {
+	const slot = side.coordinator.ownerCreate.refreshNativeTargets;
+	assert.equal(typeof slot, "function", "the create controller exposes the native catalog refresh");
+	return slot as (hostId: string) => ReturnType<NonNullable<Started["coordinator"]["ownerCreate"]["refreshNativeTargets"]>>;
+}
+
+test("a probing owner is described as probed and an explicit refresh lands only in the roster observation", async (t) => {
+	let catalog: readonly RemoteNativeCliTarget[] = [CLAUDE_TARGET, CODEX_TARGET];
+	let reads = 0;
+	const spawned: OwnerSessionSpawnRequest[] = [];
+	const p = await pair(t, [], {
+		native: true,
+		availability: true,
+		targets: async () => {
+			reads += 1;
+			return catalog;
+		},
+		spawn: async (request) => {
+			spawned.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "spawned" };
+		},
+	});
+	const before = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.deepEqual(before.nativeCli, { supported: true, targets: [CLAUDE_TARGET, CODEX_TARGET], availability: "probed" });
+	const readsBefore = reads;
+	catalog = [CODEX_TARGET];
+	const refreshed = await refresh(p.requester)(p.hostId);
+	assert.deepEqual(refreshed, { kind: "refreshed", hostRunId: p.hostRunId });
+	assert.equal(reads, readsBefore + 1, "one fresh probe for the one resubscription; nothing polls");
+	const after = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.deepEqual(after.nativeCli, { supported: true, targets: [CODEX_TARGET], availability: "probed" },
+		"the refreshed catalog is read from the ordinary roster observation");
+	assert.equal(after.state, "connected");
+	// The shared create/spawn lane is unaffected once the refresh settled.
+	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
+		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/owner/child", backend: "codex", targetId: "codex" },
+		STILL_CURRENT,
+	), { kind: "owner-result", facts: { kind: "started", hostRunId: p.hostRunId, rowId: "native-codex" } });
+	// A target the owner's fresh probe withdrew is refused before submission.
+	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
+		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/owner/child", backend: "claude", targetId: "claude" },
+		STILL_CURRENT,
+	), { kind: "not-sent", reason: "invalid-request" });
+	assert.deepEqual(await p.requester.coordinator.ownerCreate.spawnSession?.({
+		hostId: p.hostId, hostRunId: p.hostRunId, kind: "pi", workspace: "/srv/owner", title: "Title", prompt: "Exact prompt",
+	}, STILL_CURRENT), { kind: "owner-result", facts: { kind: "started", hostRunId: p.hostRunId, rowId: "spawned" } });
+	assert.equal(spawned.length, 1);
+	assert.equal(p.nativeCalls.length, 1);
+	assert.deepEqual(p.piCalls, []);
+});
+
+test("a configuration-only owner stays unknown and is never refreshed as if probed", async (t) => {
+	const p = await pair(t, [], { native: true });
+	assert.equal(hostOf(p.requester.coordinator.read(), p.hostId).nativeCli?.availability, "unknown");
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "not-sent", reason: "capability-unsupported" });
+	const legacy = await pair(t, []);
+	assert.deepEqual(await refresh(legacy.requester)(legacy.hostId), { kind: "not-sent", reason: "capability-unsupported" });
+	assert.deepEqual(hostOf(legacy.requester.coordinator.read(), legacy.hostId).nativeCli,
+		{ supported: false, targets: [], availability: "unknown" });
+});
+
+test("a refresh refuses while a create is in flight, and creates refuse while a refresh is", async (t) => {
+	let releaseCreate: ((facts: OwnerCreateFacts) => void) | null = null;
+	let holdProbe: ((targets: readonly RemoteNativeCliTarget[]) => void) | null = null;
+	let reads = 0;
+	const p = await pair(t, [], {
+		native: true,
+		availability: true,
+		targets: () => {
+			reads += 1;
+			// The create's own probe answers at once; a later publication probe is held.
+			if (reads === 3) return new Promise((resolve) => { holdProbe = resolve; });
+			return [CLAUDE_TARGET];
+		},
+		create: (request) => new Promise((resolve) => {
+			p.nativeCalls.push(request);
+			releaseCreate = resolve;
+		}),
+	});
+	assert.equal(reads, 1);
+	const controller = p.requester.coordinator.ownerCreate;
+	const creating = controller.createNativeSession!(
+		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/a", backend: "claude", targetId: "claude" },
+		STILL_CURRENT,
+	);
+	await pollUntil(() => releaseCreate !== null, "the owner provider holds the create");
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "not-sent", reason: "busy" },
+		"a refresh never retires the subscription a create is answered on");
+	(releaseCreate as unknown as (facts: OwnerCreateFacts) => void)(
+		{ kind: "started", hostRunId: p.hostRunId, rowId: "native-1" });
+	assert.deepEqual(await creating,
+		{ kind: "owner-result", facts: { kind: "started", hostRunId: p.hostRunId, rowId: "native-1" } });
+	assert.equal(reads, 2);
+	const refreshing = refresh(p.requester)(p.hostId);
+	await pollUntil(() => holdProbe !== null, "the refresh's publication probe is outstanding");
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "not-sent", reason: "busy" }, "one refresh at a time");
+	const target = { hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/b" };
+	assert.deepEqual(await controller.createSession(target, STILL_CURRENT), { kind: "not-sent", reason: "busy" });
+	assert.deepEqual(await controller.createNativeSession!({ ...target, backend: "claude", targetId: "claude" }, STILL_CURRENT),
+		{ kind: "not-sent", reason: "busy" });
+	assert.deepEqual(await controller.spawnSession!({ ...target, kind: "pi", title: "T", prompt: "P" }, STILL_CURRENT),
+		{ kind: "not-sent", reason: "busy" });
+	(holdProbe as unknown as (targets: readonly RemoteNativeCliTarget[]) => void)([CLAUDE_TARGET]);
+	assert.deepEqual(await refreshing, { kind: "refreshed", hostRunId: p.hostRunId });
+	assert.equal(p.nativeCalls.length, 1, "nothing was queued or replayed behind the refresh");
+	assert.deepEqual(p.piCalls, []);
+});
+
+test("a refresh never connects, pairs, retries, or falls back for a destination without a live channel", async (t) => {
+	const p = await pair(t, [], { native: true, availability: true });
+	const ask = refresh(p.requester);
+	assert.deepEqual(await ask("no-such-destination"), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(await ask("" as string), { kind: "not-sent", reason: "invalid-request" });
+	await p.requester.coordinator.perform({ type: "peer-disconnect", hostId: p.hostId });
+	assert.deepEqual(await ask(p.hostId), { kind: "not-sent", reason: "target-unavailable" });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	const host = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.equal(host.state, "disconnected", "no connection attempt was started on its behalf");
+	assert.deepEqual(host.nativeCli, { supported: false, targets: [], availability: "unknown" });
+});
+
+test("a failed refresh probe is reported truthfully and leaves no usable catalog", async (t) => {
+	let reads = 0;
+	const p = await pair(t, [], {
+		native: true,
+		availability: true,
+		targets: async () => {
+			reads += 1;
+			if (reads > 1) throw new Error("probe unavailable");
+			return [CLAUDE_TARGET];
+		},
+	});
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "failed" });
+	const host = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.equal(host.state, "connected", "the channel stays; nothing reconnects or retries");
+	assert.notEqual(host.roster.state, "current");
+	assert.deepEqual(host.nativeCli, { supported: false, targets: [], availability: "unknown" });
+	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
+		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/a", backend: "claude", targetId: "claude" },
+		STILL_CURRENT,
+	), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(p.nativeCalls, []);
+});
+
+test("a probing declaration without the native pair, or a non-boolean one, is refused at construction", (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const base = {
+		agentDir: fixture.agentDir,
+		inventory: createFakeInventory(),
+		onChange: () => undefined,
+		onIncomingConsentArrival: () => undefined,
+		testHooks: hooks(),
+	};
+	assert.throws(() => createPeerCoordinator({ ...base, nativeCliAvailability: true }),
+		(error: unknown) => error instanceof TypeError);
+	assert.throws(() => createPeerCoordinator({
+		...base,
+		nativeCreateOwnedSession: async () => ({ kind: "refused" }),
+		nativeCliTargets: () => [],
+		nativeCliAvailability: 1 as never,
+	}), (error: unknown) => error instanceof TypeError);
+});
+
+/**
+ * Fixture-only requester channel that, once armed, withholds incoming roster
+ * transfer frames and owner errors and then delivers them ALL synchronously in one
+ * batch — exactly what one received socket chunk can do — so a refresh's first
+ * fresh snapshot and whatever superseded it are both handled before the refresh's
+ * own continuation resumes. Control frames (acks) always pass, so no retirement
+ * waits on a held frame.
+ */
+function batchingWrap(): {
+	readonly wrap: (channel: PeerByteChannel) => PeerByteChannel;
+	arm(onFirstEnd: () => void, ready: (types: readonly string[]) => boolean): void;
+} {
+	let armed: { onFirstEnd: () => void; ready: (types: readonly string[]) => boolean; sawEnd: boolean } | null = null;
+	const held: Array<{ handler: (bytes: Buffer) => void; bytes: Buffer; type: string }> = [];
+	const HELD = new Set(["snapshot_begin", "snapshot_page", "snapshot_end", "error"]);
+	return {
+		arm(onFirstEnd, ready) {
+			armed = { onFirstEnd, ready, sawEnd: false };
+		},
+		wrap(inner) {
+			return {
+				get peerKey() { return inner.peerKey; },
+				get lane() { return inner.lane; },
+				get label() { return inner.label; },
+				get bufferedAmount() { return inner.bufferedAmount; },
+				get closed() { return inner.closed; },
+				send: (bytes) => inner.send(bytes),
+				close: () => inner.close(),
+				onMessage(handler) {
+					return inner.onMessage((bytes) => {
+						let type = "";
+						try {
+							type = decodeRosterBridgeFrame(bytes).type;
+						} catch {
+							type = "";
+						}
+						const current = armed;
+						if (current === null || !HELD.has(type)) {
+							handler(bytes);
+							return;
+						}
+						held.push({ handler, bytes, type });
+						if (type === "snapshot_end" && !current.sawEnd) {
+							current.sawEnd = true;
+							current.onFirstEnd();
+						}
+						if (!current.ready(held.map((entry) => entry.type))) return;
+						armed = null;
+						// One synchronous batch: no microtask runs between these deliveries.
+						for (const entry of held.splice(0)) entry.handler(entry.bytes);
+					});
+				},
+			};
+		},
+	};
+}
+
+test("a refresh whose first fresh snapshot is superseded in the same batch reports the newer observation", async (t) => {
+	let catalog: readonly RemoteNativeCliTarget[] = [CLAUDE_TARGET];
+	const batch = batchingWrap();
+	const p = await pair(t, [], {
+		native: true,
+		availability: true,
+		targets: async () => catalog,
+		requesterWrap: batch.wrap,
+	});
+	batch.arm(() => {
+		// The owner publishes a NEWER snapshot with a newer probed catalog right after
+		// the refresh's first one, before the requester has handled either.
+		catalog = [CODEX_TARGET];
+		p.owner.inventory.setRows([rowView("later-row")]);
+	}, (types) => types.filter((type) => type === "snapshot_end").length === 2);
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "refreshed", hostRunId: p.hostRunId });
+	const host = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.deepEqual(host.nativeCli, { supported: true, targets: [CODEX_TARGET], availability: "probed" },
+		"the refresh never replays its older first snapshot over the newer observation");
+	assert.deepEqual(host.roster.rows?.map((row) => row.id), ["later-row"]);
+});
+
+test("a refresh whose first fresh snapshot is followed by a terminal owner error reports failure and stays not current", async (t) => {
+	const batch = batchingWrap();
+	const p = await pair(t, [], {
+		native: true,
+		availability: true,
+		targets: async () => [CLAUDE_TARGET],
+		requesterWrap: batch.wrap,
+	});
+	batch.arm(() => {
+		// The owner run is replaced right after the first fresh snapshot: the owner
+		// ends that subscription with a terminal error in the same batch.
+		p.owner.inventory.setRun("replacement-run");
+		p.owner.inventory.setRows([]);
+	}, (types) => types.includes("snapshot_end") && types.includes("error"));
+	assert.deepEqual(await refresh(p.requester)(p.hostId), { kind: "failed" });
+	const host = hostOf(p.requester.coordinator.read(), p.hostId);
+	assert.notEqual(host.roster.state, "current", "the old first snapshot is never republished as current");
+	assert.deepEqual(host.nativeCli, { supported: false, targets: [], availability: "unknown" });
+	assert.deepEqual(await p.requester.coordinator.ownerCreate.createNativeSession?.(
+		{ hostId: p.hostId, hostRunId: p.hostRunId, workspace: "/srv/a", backend: "claude", targetId: "claude" },
+		STILL_CURRENT,
+	), { kind: "not-sent", reason: "target-unavailable" });
+	assert.deepEqual(p.nativeCalls, []);
 });

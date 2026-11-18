@@ -99,6 +99,15 @@
  * local row, selection, or focus change anywhere on this path; a requester's own
  * configured native targets are never addressed, merged, or defaulted.
  *
+ * Native AVAILABILITY (#493) is one more description on that lane, not state: an
+ * owner whose Main declared `nativeCliAvailability` (a provider that freshly probes
+ * launchability on each read) acknowledges it beside the native lane, and each
+ * destination DTO then says `availability: "probed"`; every other owner's catalog is
+ * `unknown`. The one explicit `refreshNativeTargets` request is the existing viewer
+ * resync on an already-connected, availability-negotiated destination with no
+ * owner request outstanding — never a connect, pair, retry, or poll — and its
+ * result lands only in the ordinary roster observation.
+ *
  * Native input and text copies for that selected stream exist only with explicit
  * `nativeIo` callbacks (the production Main supplies them by default). Without
  * them this coordinator is exactly the previous display-only one: no native
@@ -206,13 +215,18 @@ import {
 	copyRemoteNativeCliTargets,
 	findRemoteNativeCliTarget,
 	type OwnerCreateHandler,
-	type OwnerNativeCliTargetProvider,
+	type OwnerSessionSpawnHandler,
+	type OwnerSessionSpawnRequest,
+	type PeerSpawnTarget,
+	isOwnerSessionSpawnRequest,
+	type OwnerNativeCliTargetSource,
 	type OwnerNativeCreateHandler,
 	type PeerCreateController,
 	type PeerCreateOptions,
 	type PeerCreateResult,
 	type PeerCreateTarget,
 	type PeerNativeCreateTarget,
+	type PeerNativeTargetsRefreshResult,
 	type PeerCoordinatorWithCreate,
 	type RemoteNativeCliTarget,
 } from "./peer-create";
@@ -287,6 +301,8 @@ import { isValidNativeSessionId, isValidRenameName } from "../protocol";
 import {
 	isRosterBridgeIdentifier,
 	ROSTER_BRIDGE_CREATE_CAPABILITY,
+	ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
+	ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
@@ -500,6 +516,8 @@ export interface PeerCoordinatorOptions {
 	 * today.
 	 */
 	readonly createOwnedSession?: OwnerCreateHandler;
+	/** Main's optional exact prompted launcher; absent means no negotiated support. */
+	readonly spawnOwnedSession?: OwnerSessionSpawnHandler;
 	/**
 	 * The host's ONE owner-side rename provider, supplied by Main, which already owns
 	 * the only manager, the only verified native-name seam, and the only roster.
@@ -535,8 +553,22 @@ export interface PeerCoordinatorOptions {
 	 * it to resolve or launch anything — it exists so the owner can state, and
 	 * re-prove, exactly which of ITS targets exist right now. A requester's own
 	 * configured native targets are never merged in, substituted, or defaulted.
+	 *
+	 * It may answer synchronously (configuration only) or with a promise (a fresh
+	 * read-only launch probe); the owner bridge awaits it within its existing
+	 * deadlines and re-proves every scope fact afterwards.
 	 */
-	readonly nativeCliTargets?: OwnerNativeCliTargetProvider;
+	readonly nativeCliTargets?: OwnerNativeCliTargetSource;
+	/**
+	 * OWNER side: the explicit declaration that {@link PeerCoordinatorOptions.nativeCliTargets}
+	 * performs a FRESH read-only launch probe on every read (#493). Only `true`, and
+	 * only together with the native pair, lets the owner bridge acknowledge native
+	 * availability; absent or `false` keeps the catalog configuration-only (unknown
+	 * availability to requesters). It is a description, never a permission or grant,
+	 * and it changes no admission or re-proof. A non-boolean value, or `true`
+	 * without the native pair, is refused at construction.
+	 */
+	readonly nativeCliAvailability?: boolean;
 	/**
 	 * The host's ONE owner-side native HOST ROW NAME provider, supplied by Main,
 	 * which already owns the only manager label, stable-slot caption, and roster
@@ -721,6 +753,13 @@ interface DestinationRuntime {
 	viewer: RosterBridgeViewer | null;
 	channel: PeerByteChannel | null;
 	epoch: number;
+	/**
+	 * Marker for the ONE native catalog refresh (an explicit resync of the current
+	 * viewer) in flight on this destination, or null. It holds no catalog: the
+	 * roster observation stays the only requester-side truth. While it is set no
+	 * create of any lane is submitted here, and no second refresh starts.
+	 */
+	nativeRefresh: object | null;
 }
 
 interface PendingConsent {
@@ -1591,6 +1630,8 @@ class OwnedPeerCoordinator implements
 	 * connection. The caller's own written-form proof is REQUIRED for every request.
 	 */
 	readonly #ownerCreateController: PeerCreateController = {
+		supportsSessionSpawn: (hostId) => this.#runtime.get(hostId)?.viewer?.supportsSessionSpawn === true,
+		spawnSession: (target, options) => this.#spawnSession(target, options),
 		createSession: (target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> =>
 			this.#createSession(target, options),
 		// The native lane is one extra method on the SAME controller, sharing the
@@ -1599,6 +1640,10 @@ class OwnedPeerCoordinator implements
 		// an older fake controller simply finds the method absent.
 		createNativeSession: (target: PeerNativeCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> =>
 			this.#createNativeSession(target, options),
+		// One explicit resync of the destination's existing viewer; never a connect,
+		// pair, retry, poll, or catalog store.
+		refreshNativeTargets: (hostId: string): Promise<PeerNativeTargetsRefreshResult> =>
+			this.#refreshNativeTargets(hostId),
 	};
 	/**
 	 * The ONE owner-routed rename controller: a property of this coordinator rather
@@ -1923,6 +1968,8 @@ class OwnedPeerCoordinator implements
 				...(this.#options.closeOwnedSession === undefined
 					? {}
 					: { closeOwnedSession: this.#options.closeOwnedSession }),
+				...(this.#options.spawnOwnedSession === undefined
+					? {} : { spawnOwnedSession: this.#options.spawnOwnedSession }),
 				...(this.#options.createOwnedSession === undefined
 					? {}
 					: { createOwnedSession: this.#options.createOwnedSession }),
@@ -1942,6 +1989,9 @@ class OwnedPeerCoordinator implements
 					: {
 						nativeCreateOwnedSession: this.#options.nativeCreateOwnedSession,
 						nativeCliTargets: this.#options.nativeCliTargets,
+						// The owner's explicit fresh-probe declaration rides with the pair it
+						// describes, and only as an exact `true`; nothing else claims probing.
+						...(this.#options.nativeCliAvailability === true ? { nativeCliAvailability: true } : {}),
 					}),
 				// The native HOST ROW NAME provider is handed over exactly like the other
 				// owner providers: never wrapped, never called here, and passed only when the
@@ -2718,6 +2768,7 @@ class OwnedPeerCoordinator implements
 			viewer: null,
 			channel: null,
 			epoch: 0,
+			nativeRefresh: null,
 		};
 		this.#runtime.set(destination.id, runtime);
 		return runtime;
@@ -3200,6 +3251,11 @@ class OwnedPeerCoordinator implements
 					// an owner without one keeps its exact previous capability set and this
 					// viewer sees the unchanged legacy snapshot shape.
 					ROSTER_BRIDGE_NATIVE_CAPABILITY,
+					// Native AVAILABILITY is a description of that catalog, offered because
+					// this side can tell a freshly probed catalog from a configuration-only
+					// one. An owner acknowledges it only beside the native lane and only when
+					// it explicitly declared fresh probing; it grants nothing either way.
+					ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
 					// The SEPARATE native HOST ROW NAME lane is offered on its own, for the
 					// same reason Rename is: this implementation knows that exchange and holds
 					// the controller. It is a statement about THIS side only — an owner
@@ -3214,8 +3270,8 @@ class OwnedPeerCoordinator implements
 					// owner that never declares anything keeps sending the exact rows it sent before.
 					ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
 					...(this.#savedViewer
-						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY]
-						: [ROSTER_BRIDGE_CREATE_CAPABILITY]),
+						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]
+						: [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]),
 				],
 				onProjection: (projection) => this.#onProjection(runtime, epoch, projection),
 				...(this.#savedViewer
@@ -3405,9 +3461,20 @@ class OwnedPeerCoordinator implements
 	 * is reported `unknown` rather than retargeted, and nothing is created, selected,
 	 * or focused locally.
 	 */
-	async #createSession(target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> {
+	async #spawnSession(target: PeerSpawnTarget, options: PeerCreateOptions): Promise<PeerCreateResult> {
+		if (!isRecord(target)) return { kind: "not-sent", reason: "invalid-request" };
+		const { hostId, ...payload } = target;
+		if (typeof hostId !== "string" || hostId.length === 0 || !isOwnerSessionSpawnRequest(payload)) {
+			return { kind: "not-sent", reason: "invalid-request" };
+		}
+		return this.#createSession({ hostId, hostRunId: payload.hostRunId, workspace: payload.workspace }, options,
+			Object.freeze(payload));
+	}
+
+	async #createSession(target: PeerCreateTarget, options: PeerCreateOptions,
+		spawnRequest?: OwnerSessionSpawnRequest): Promise<PeerCreateResult> {
 		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
-		const request = normalizeCreateTarget(target);
+		const request = spawnRequest === undefined ? normalizeCreateTarget(target) : target;
 		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
 		// The caller's last-instant proof is required, not optional: without a real
 		// written form/run/workspace fence nothing may be submitted at all.
@@ -3418,6 +3485,9 @@ class OwnedPeerCoordinator implements
 		const callerStillCurrent = proof.stillCurrent;
 		const runtime = this.#runtime.get(request.hostId);
 		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		// A native catalog refresh is retiring and replacing this destination's
+		// subscription right now: nothing is submitted beside it or queued behind it.
+		if (runtime.nativeRefresh !== null) return { kind: "not-sent", reason: "busy" };
 		const viewer = runtime.viewer;
 		const metadata = runtime.channel;
 		const client = runtime.client;
@@ -3447,10 +3517,15 @@ class OwnedPeerCoordinator implements
 			return { kind: "not-sent", reason: "target-unavailable" };
 		}
 		// The owner never acknowledged create support for this channel: no frame exists.
-		if (!viewer.supportsCreate) return { kind: "not-sent", reason: "capability-unsupported" };
+		if (spawnRequest === undefined ? !viewer.supportsCreate
+			: viewer.supportsSessionSpawn !== true || typeof viewer.spawnSession !== "function") {
+			return { kind: "not-sent", reason: "capability-unsupported" };
+		}
 		const destinationEpoch = runtime.epoch;
-		const result = await viewer.createSession(
-			{ hostRunId: request.hostRunId, workspace: request.workspace },
+		const submit = (sendOptions: { readonly stillCurrent: () => boolean }) => spawnRequest === undefined
+			? viewer.createSession({ hostRunId: request.hostRunId, workspace: request.workspace }, sendOptions)
+			: viewer.spawnSession!(spawnRequest, sendOptions);
+		const result = await submit(
 			{
 				stillCurrent: () => {
 					let callerOwns = false;
@@ -3470,9 +3545,10 @@ class OwnedPeerCoordinator implements
 		);
 		// A positively-not-sent answer stays true regardless of any later change.
 		if (result.kind === "not-sent") return result;
-		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
-			// The request may already have been submitted, so nothing here can claim it
-			// never happened; an answer from a replaced destination is not this one's.
+		if (spawnRequest === undefined
+			? !this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)
+			: !this.#createFenceHolds(runtime, viewer, metadata, client, destinationEpoch, request.hostRunId)) {
+			// Submitted work is never replayed or attributed to a replacement run.
 			return { kind: "unknown" };
 		}
 		return result;
@@ -3516,6 +3592,9 @@ class OwnedPeerCoordinator implements
 		const callerStillCurrent = proof.stillCurrent;
 		const runtime = this.#runtime.get(request.hostId);
 		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		// A native catalog refresh is retiring and replacing this destination's
+		// subscription right now: nothing is submitted beside it or queued behind it.
+		if (runtime.nativeRefresh !== null) return { kind: "not-sent", reason: "busy" };
 		const viewer = runtime.viewer;
 		const metadata = runtime.channel;
 		const client = runtime.client;
@@ -3664,6 +3743,117 @@ class OwnedPeerCoordinator implements
 	): boolean {
 		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
 		return isOwnerCreateRunStillCurrent(runtime.roster.hostRunId, hostRunId);
+	}
+
+	/**
+	 * Ask one destination's EXISTING connected viewer for a fresh, complete roster
+	 * observation so its owner re-reads (re-probes) its native catalog now (#493).
+	 *
+	 * It is the viewer's existing explicit resync — retire the one subscription, wait
+	 * for its acknowledgement, subscribe afresh, await its first complete snapshot —
+	 * bounded by that viewer's existing stop-acknowledgement, snapshot-start, and
+	 * transfer deadlines. It never connects, pairs, retries, polls, or falls back, and
+	 * it stores nothing: the committed snapshot becomes this destination's ordinary
+	 * roster observation, which `PeerUiHost.nativeCli` already reads.
+	 *
+	 * Admission requires a connected destination whose remembered pin equals the key
+	 * the live metadata channel proved and whose borrowed client still proves this
+	 * side's identity, an owner that negotiated BOTH the native lane and native
+	 * availability on that channel, no other refresh in flight, and no owner request
+	 * outstanding on the viewer (a create of either lane or a prompted spawn above
+	 * all: the owner answers it only on the subscription it was made under). While a
+	 * refresh runs, every create on this destination is refused `busy`.
+	 *
+	 * After the await every borrowed fact is re-proved — runtime, viewer, channel,
+	 * client, destination epoch, pin, identity, and the negotiated description. The
+	 * resync's returned snapshot is never replayed over the observation: the viewer's
+	 * LIVE projection must still be current on that same fresh subscription and must
+	 * match what the ordinary projection listener already committed, so a newer
+	 * snapshot or a terminal owner error that landed first is what stays published.
+	 */
+	async #refreshNativeTargets(hostId: unknown): Promise<PeerNativeTargetsRefreshResult> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		if (typeof hostId !== "string" || hostId.length === 0) return { kind: "not-sent", reason: "invalid-request" };
+		const runtime = this.#runtime.get(hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		if (runtime.state !== "connected" || viewer === null || metadata === null || client === null) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		const destinationEpoch = runtime.epoch;
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		let eligible = false;
+		let outstanding: unknown;
+		try {
+			eligible = viewer.supportsNative === true
+				&& viewer.supportsNativeAvailability === true
+				&& typeof viewer.resync === "function";
+			outstanding = viewer.ownerRequestInFlight;
+		} catch {
+			return { kind: "not-sent", reason: "not-ready" };
+		}
+		// A configuration-only (legacy) catalog is never refreshed as if it were
+		// probed, and a viewer that cannot state its outstanding work is not resynced.
+		if (!eligible) return { kind: "not-sent", reason: "capability-unsupported" };
+		if (typeof outstanding !== "boolean") return { kind: "not-sent", reason: "not-ready" };
+		if (runtime.nativeRefresh !== null || outstanding) return { kind: "not-sent", reason: "busy" };
+		const token = {};
+		runtime.nativeRefresh = token;
+		let projection: RosterBridgeProjection | null = null;
+		try {
+			projection = await viewer.resync();
+		} catch {
+			projection = null;
+		} finally {
+			if (runtime.nativeRefresh === token) runtime.nativeRefresh = null;
+		}
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) {
+			// The destination was replaced, lost, re-pinned, or closed meanwhile: its
+			// own lifecycle already describes it, and nothing here speaks for it.
+			return { kind: "failed" };
+		}
+		if (projection === null) {
+			// The connection exists but its metadata view is not current; it is never
+			// replaced by a fabricated empty roster, and nothing is retried here.
+			runtime.message = HOST_MESSAGE.metadataUnavailable;
+			this.#emit();
+			return { kind: "failed" };
+		}
+		// The returned first snapshot is NEVER replayed: by the time this continuation
+		// runs, the same viewer may already have committed a newer snapshot or an owner
+		// error, and the ordinary projection listener has already applied it to this
+		// destination's observation. Only the LIVE projection of the SAME fresh
+		// subscription, as already committed here, can be reported.
+		let live: RosterBridgeProjection;
+		try {
+			const supported = viewer.supportsNative === true && viewer.supportsNativeAvailability === true;
+			live = viewer.projection;
+			if (!supported) return { kind: "failed" };
+		} catch {
+			return { kind: "failed" };
+		}
+		const roster = runtime.roster;
+		if (live.state !== "current"
+			|| live.subscriptionId === null
+			|| live.subscriptionId !== projection.subscriptionId
+			|| live.hostRunId === null
+			|| roster.state !== "current"
+			|| roster.rows === null
+			|| roster.hostRunId !== live.hostRunId
+			|| roster.nativeCliTargets === null) {
+			return { kind: "failed" };
+		}
+		// A complete fresh observation retires an earlier refresh's own unavailability
+		// notice; any other message belongs to its own lifecycle and is left alone.
+		if (runtime.message === HOST_MESSAGE.metadataUnavailable) {
+			runtime.message = null;
+			this.#emit();
+		}
+		return { kind: "refreshed", hostRunId: live.hostRunId };
 	}
 
 	// ------------------------------------------------------------ owner rename
@@ -6072,6 +6262,8 @@ class OwnedPeerCoordinator implements
 			// Read live from the ONE current metadata viewer: no stored mirror, cached
 			// capability list, or per-destination rename state exists here.
 			renameSupported: this.#renameHostSupport(runtime),
+			// The owner's negotiated blank Pi create, read live from the same viewer.
+			createSupported: this.#createHostSupport(runtime),
 			// Descriptive native-lane facts, also read live from the current viewer and
 			// this destination's current complete observation. Always present on this
 			// coordinator's own DTO (an absent field would be an older coordinator), and
@@ -6100,6 +6292,24 @@ class OwnedPeerCoordinator implements
 		if (runtime.client === null) return false;
 		try {
 			return runtime.viewer.supportsNativeName === true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Descriptive blank Pi create capability for one destination; never authority.
+	 * True only while this destination is connected over a live metadata viewer whose
+	 * owner acknowledged the optional create capability, with a live channel and
+	 * borrowed client. Like rename it does NOT require a current roster run: the New
+	 * form separately requires the exact observed run, and the owner re-proves it.
+	 */
+	#createHostSupport(runtime: DestinationRuntime | undefined): boolean {
+		if (runtime === undefined || this.#closed || this.#tearingDown) return false;
+		if (runtime.state !== "connected" || runtime.viewer === null || runtime.channel === null) return false;
+		if (runtime.client === null) return false;
+		try {
+			return runtime.viewer.supportsCreate === true;
 		} catch {
 			return false;
 		}
@@ -6181,7 +6391,11 @@ class OwnedPeerCoordinator implements
 	 * from it.
 	 */
 	#nativeHostFacts(runtime: DestinationRuntime | undefined): PeerUiHost["nativeCli"] {
-		const unavailable = Object.freeze({ supported: false, targets: Object.freeze([]) as readonly RemoteNativeCliTarget[] });
+		const unavailable = Object.freeze({
+			supported: false,
+			targets: Object.freeze([]) as readonly RemoteNativeCliTarget[],
+			availability: "unknown" as const,
+		});
 		if (runtime === undefined || this.#closed || this.#tearingDown) return unavailable;
 		const viewer = runtime.viewer;
 		const channel = runtime.channel;
@@ -6201,7 +6415,17 @@ class OwnedPeerCoordinator implements
 		if (roster.state !== "current" || roster.rows === null || roster.hostRunId === null) return unavailable;
 		const targets = copyNativeTargets(roster.nativeCliTargets);
 		if (targets === null) return unavailable;
-		return Object.freeze({ supported: true, targets });
+		// How the catalog was produced, read live from the same viewer: `probed` only
+		// when this owner negotiated availability beside the native lane on THIS
+		// channel. A legacy or configuration-only owner is `unknown`, never assumed
+		// launchable. Description only, never per-target state or authority.
+		let probed = false;
+		try {
+			probed = viewer.supportsNativeAvailability === true;
+		} catch {
+			probed = false;
+		}
+		return Object.freeze({ supported: true, targets, availability: probed ? "probed" as const : "unknown" as const });
 	}
 
 	#consentSnapshot(entry: PendingConsent): PeerUiConsent {
@@ -6344,6 +6568,9 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		// support this host cannot honour.
 		throw new TypeError("peer coordinator close provider is invalid");
 	}
+	if (options.spawnOwnedSession !== undefined && typeof options.spawnOwnedSession !== "function") {
+		throw new TypeError("peer coordinator requires a callable prompted spawn provider");
+	}
 	if (options.createOwnedSession !== undefined && typeof options.createOwnedSession !== "function") {
 		// The same rule for the rowless create provider: no implicit support this host
 		// cannot honour.
@@ -6371,6 +6598,16 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 	if (nativeCreateProvider !== undefined || nativeTargetProvider !== undefined) {
 		if (typeof nativeCreateProvider !== "function" || typeof nativeTargetProvider !== "function") {
 			throw new TypeError("peer coordinator native create provider and target catalog are required together");
+		}
+	}
+	if (options.nativeCliAvailability !== undefined) {
+		// A real boolean or absent; and a probing declaration describes a provider, so
+		// without the native pair it would describe nothing and is refused.
+		if (typeof options.nativeCliAvailability !== "boolean") {
+			throw new TypeError("peer coordinator native availability declaration is invalid");
+		}
+		if (options.nativeCliAvailability && nativeCreateProvider === undefined) {
+			throw new TypeError("peer coordinator native availability requires the native create provider and target catalog");
 		}
 	}
 	if (options.savedCatalogViewFactory !== undefined && typeof options.savedCatalogViewFactory !== "function") {

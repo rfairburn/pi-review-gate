@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 
 import {
   MAX_SESSION_HOST_PAYLOAD_DIR_BYTES,
+  MAX_SESSION_SPAWN_HOST_BYTES,
   MAX_SESSION_SPAWN_TITLE_BYTES,
   MAX_SESSION_SPAWN_WORKSPACE_BYTES,
   decodeFrame,
@@ -12,6 +13,9 @@ import {
   parseSessionHostPayloadRef,
   parseSpawnAck,
   parseSpawnRequest,
+  hasSessionSpawnRouting,
+  isValidSessionSpawnHost,
+  SESSION_SPAWN_ROUTING_MODE,
   type SessionHostSpawnRequest,
 } from "../src/session-host/protocol";
 
@@ -96,6 +100,72 @@ describe("session-host SessionSpawn wire protocol", () => {
     assert.equal(parseBootstrap({ ...base, payloadDir: "/tmp/\0payload" }), undefined);
     assert.equal(parseBootstrap({ ...base, payloadDir: `/${"x".repeat(MAX_SESSION_HOST_PAYLOAD_DIR_BYTES)}` }), undefined);
     assert.ok(parseBootstrap(base), "absence is admitted for status-only legacy bootstraps");
+  });
+
+  it("carries exact routing selectors only in the distinct routed request family", () => {
+    const host = "Büro laptop (2) — 日本";
+    const routed = request({ type: "spawn_routed_request", host, kind: "claude" });
+    assert.deepEqual(parseSpawnRequest(routed), routed);
+    assert.deepEqual(decodeFrame(encodeFrame(routed)), routed, "selectors round-trip byte-exact through the wire");
+    for (const selectors of [{ host }, { kind: "pi" as const }, { kind: "codex" as const }]) {
+      const only = request({ type: "spawn_routed_request", ...selectors });
+      assert.deepEqual(parseSpawnRequest(only), only, "either selector alone is a routed request; kind pi is kept explicit");
+      assert.equal(hasSessionSpawnRouting(only), true);
+    }
+    const legacy = request();
+    assert.equal(hasSessionSpawnRouting(legacy), false);
+    assert.equal(Object.hasOwn(parseSpawnRequest(legacy)!, "host"), false, "the legacy frame gains no default selector");
+    assert.equal(Object.hasOwn(parseSpawnRequest(legacy)!, "kind"), false, "the legacy frame gains no default selector");
+
+    // The frame family is fixed by the selectors; a mismatch is never repaired.
+    assert.equal(parseSpawnRequest({ ...legacy, kind: "pi" }), undefined,
+      "a legacy frame can never smuggle a selector an older broker would drop");
+    assert.equal(parseSpawnRequest({ ...legacy, host }), undefined);
+    assert.equal(parseSpawnRequest({ ...legacy, type: "spawn_routed_request" }), undefined,
+      "a routed frame must carry at least one selector");
+    assert.equal(parseSpawnRequest({ ...legacy, type: "spawn_routed_request", host: undefined }), undefined,
+      "a present-but-undefined selector key is malformed, not absent");
+    assert.equal(decodeFrame(`${JSON.stringify({ ...legacy, host })}\n`), undefined);
+  });
+
+  it("rejects unknown backends and unsafe or over-bound host selectors without rewriting padded saved ids", () => {
+    const valid = request({ type: "spawn_routed_request", host: "laptop" });
+    for (const kind of ["Pi", "PI", "gemini", "", " pi", 1, null, true]) {
+      assert.equal(parseSpawnRequest({ ...valid, kind }), undefined, `kind ${JSON.stringify(kind)} is refused`);
+    }
+    // The selector is the saved paired-destination id contract: at most 128
+    // UTF-16 code units, matched raw, padding included; bytes derive from it.
+    for (const atBound of ["h".repeat(128), "日".repeat(128), " ", " laptop", "laptop "]) {
+      assert.ok(Buffer.byteLength(atBound, "utf8") <= MAX_SESSION_SPAWN_HOST_BYTES);
+      assert.equal(isValidSessionSpawnHost(atBound), true);
+      assert.equal(parseSpawnRequest({ ...valid, host: atBound })?.host, atBound);
+    }
+    for (const host of [
+      "", "lap\ntop", "lap\ttop", "lap\u0000top", "lap\u0085top", "lap\u2028top",
+      "h".repeat(129),
+      "é".repeat(129),
+      42, null,
+    ]) {
+      assert.equal(isValidSessionSpawnHost(host), false, `host ${JSON.stringify(host)} is refused`);
+      assert.equal(parseSpawnRequest({ ...valid, host }), undefined, `host ${JSON.stringify(host)} is refused on the wire`);
+    }
+  });
+
+  it("admits the routed-spawn bootstrap marker only as the closed mode version", () => {
+    const base = {
+      version: 1 as const,
+      socketPath: `\\\\.\\pipe\\prg-st-${"a".repeat(32)}`,
+      token: "a".repeat(64),
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      payloadDir: "/tmp/prg-pl-payload",
+    };
+    assert.equal(parseBootstrap(base)?.spawnRouting, undefined, "absence is the legacy own-host Pi bootstrap");
+    assert.equal(parseBootstrap({ ...base, spawnRouting: SESSION_SPAWN_ROUTING_MODE })?.spawnRouting, 1);
+    for (const spawnRouting of [0, 2, true, "1", null]) {
+      assert.equal(parseBootstrap({ ...base, spawnRouting }), undefined,
+        `marker ${JSON.stringify(spawnRouting)} rejects the whole bootstrap rather than degrading`);
+    }
   });
 
   it("validates strict single-segment payload names and digests without reading a file", () => {

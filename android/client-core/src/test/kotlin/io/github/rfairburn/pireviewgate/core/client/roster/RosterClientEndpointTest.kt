@@ -45,6 +45,29 @@ internal class RosterClientEndpointTest {
     }
 
     @Test
+    fun `native availability is assumed only beside the native lane it describes`() {
+        val described = RosterClientHarness()
+        described.start()
+        described.acknowledgeHandshake(listOf(
+            RosterWire.REQUIRED_CAPABILITY, RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+        ))
+        assertEquals(RosterClientPhase.READY, described.endpoint.state().phase)
+        assertTrue(described.endpoint.state().supportsNativeAvailability)
+
+        val legacy = RosterClientHarness()
+        legacy.start()
+        legacy.acknowledgeHandshake(listOf(RosterWire.REQUIRED_CAPABILITY, RosterWire.NATIVE_CAPABILITY))
+        assertTrue(legacy.endpoint.state().supportsNative)
+        assertFalse(legacy.endpoint.state().supportsNativeAvailability)
+
+        val orphan = RosterClientHarness()
+        orphan.start()
+        orphan.acknowledgeHandshake(listOf(RosterWire.REQUIRED_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY))
+        assertEquals(RosterClientPhase.FAILED, orphan.endpoint.state().phase)
+        assertFalse(orphan.endpoint.state().supportsNativeAvailability)
+    }
+
+    @Test
     fun `an acknowledgement narrows what this side may assume and never widens it`() {
         val harness = RosterClientHarness()
         harness.start()

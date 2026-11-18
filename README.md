@@ -67,10 +67,15 @@ told.
   (activity only, never an error state), a remote card's owner hostname uses
   Pi's cyan, and the active conversation remains marked while browsing the
   sidebar ([Session host](docs/session-host-alpha.md)). Beside those rows the host
-  can also start an explicit, local-only **Claude Code** or **Codex CLI** row: a real
-  interactive provider session over the same owned PTY surfaces, with its own
-  sidebar card that reports only what the host owns and leaves provider activity
-  honestly unknown ([Native Claude Code and Codex sessions](docs/native-sidebar-agents.md)).
+  can also start an explicit **Claude Code** or **Codex CLI** row: a real
+  interactive provider session in that host's normal native setup, over the same
+  owned PTY surfaces, with its own sidebar card that reports only what the host
+  owns and leaves provider activity honestly unknown
+  ([Native Claude Code and Codex sessions](docs/native-sidebar-agents.md)). New
+  sessions — from the terminal sidebar, the Android application, or a hosted Pi
+  child's `SessionSpawn` on its own or an exact paired host — choose among Pi,
+  Claude Code, and Codex CLI as currently available on the destination; configured
+  external review/execution workers are not session choices and are unchanged.
 - **Android application** — a native Pi Review Gate app for Android 13 (API 33)
   and newer that connects directly to a session host with hosting turned on,
   showing that host's roster, session cards, Saved picker, and terminal; nothing
@@ -209,8 +214,8 @@ terminal, one left sidebar roster of your sessions, and the review gate plus the
 same shared configuration in every Pi session the host starts. Each Pi sidebar row is
 an ordinary native Pi session with its own workspace, conversation, and
 lifecycle. The host can also start a real interactive Claude Code or Codex CLI row
-beside them, chosen explicitly on the New-session form, which still defaults to Pi; a
-native row keeps the provider's own configuration and carries no review gate, tool
+beside them, chosen explicitly on the New-session form (which still defaults to Pi) or
+by `SessionSpawn` with an explicit `kind`; a native row keeps the provider's own configuration and carries no review gate, tool
 protection, or subtask capture/review/landing guarantee
 ([Native Claude Code and Codex sessions](docs/native-sidebar-agents.md)). This is the
 documented recommendation for how to launch the gate, not a different review setup,

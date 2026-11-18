@@ -101,6 +101,37 @@ class NativeCreateControllerComponentTest {
         assertEquals(CreateProviderChoice.Pi, start.ui.value.dialogs.createSession?.provider)
     }
 
+    @Test fun legacyOwnerUnknownAvailabilityOffersNoNativeChoiceAndUnadoptedChannelIsNeverRefreshed() {
+        val start = start()
+        compose.runOnIdle { start.intent(ClientIntent.RequestSessionCreate) }
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostD)) }
+        val legacyForm = requireNotNull(start.ui.value.dialogs.createSession)
+        // Its catalog is configuration-only (availability unknown), so only Pi is offered,
+        // and Pi stays the fresh-form default on the owner's own create capability.
+        assertEquals(listOf(CreateProviderChoice.Pi), legacyForm.providerOptions)
+        assertEquals(CreateProviderChoice.Pi, legacyForm.provider)
+        assertTrue(legacyForm.selectedOwner?.createEligible == true)
+        assertFalse(legacyForm.selectedOwner?.nativeCreateEligible == true)
+
+        // A described-availability owner offers its native kind; leaving it for the
+        // legacy owner invalidates that choice to "choose again", never Pi.
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostA)) }
+        val native = requireNotNull(start.ui.value.dialogs.createSession)
+            .providerOptions.filterIsInstance<CreateProviderChoice.Native>().single()
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateProvider(native)) }
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostD)) }
+        assertNull(start.ui.value.dialogs.createSession?.provider)
+        assertEquals(listOf(CreateProviderChoice.Pi), start.ui.value.dialogs.createSession?.providerOptions)
+
+        // This scenario adopted no channel, so the refresh fence never reaches a lane:
+        // selecting owners neither connects nor retires anything.
+        val field = ClientApplicationController::class.java.getDeclaredField("createRefresh")
+        field.isAccessible = true
+        val refresh = field.get(start) as io.github.rfairburn.pireviewgate.core.client.application.CreateOwnerRefresh
+        assertFalse(refresh.isRefreshing(ObservedState.hostA))
+        assertFalse(refresh.isRefreshing(ObservedState.hostD))
+    }
+
     private fun start(): ClientApplicationController {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val settings = AndroidClientStorage.settingsStore(context)
@@ -182,12 +213,24 @@ class NativeCreateControllerComponentTest {
         val hostA = HostId.parse("native-controller-a")
         val hostB = HostId.parse("native-controller-b")
         val hostC = HostId.parse("native-controller-c")
+        /** A legacy owner: native lane and catalog, but no described availability (#493). */
+        val hostD = HostId.parse("native-controller-d")
         val runA = "11111111-1111-4111-8111-111111111111"
         val runB = "22222222-2222-4222-8222-222222222222"
         val runC = "33333333-3333-4333-8333-333333333333"
-        val target = NativeCliTarget("claude-default", NativeCliBackend.CLAUDE, "Claude default")
+        val runD = "44444444-4444-4444-8444-444444444444"
+        val target = NativeCliTarget("claude", NativeCliBackend.CLAUDE, "Claude default")
         val scopeA = NativeCatalogScope(runA, 1L, 1L)
         val scopeB = NativeCatalogScope(runB, 1L, 1L)
+        val scopeD = NativeCatalogScope(runD, 1L, 1L)
+        val availability = listOf(
+            RosterWire.CLOSE_CAPABILITY,
+            RosterWire.CREATE_CAPABILITY,
+            RosterWire.NATIVE_CAPABILITY,
+            RosterWire.NATIVE_NAME_CAPABILITY,
+            RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+        )
+        val legacy = availability - RosterWire.NATIVE_AVAILABILITY_CAPABILITY
 
         fun registry() = ConnectionRegistrySnapshot(
             generation = 1,
@@ -197,7 +240,7 @@ class NativeCreateControllerComponentTest {
             viewerRemoteInputEnabled = false,
             identity = DeviceIdentityObservation.NeverInitialized,
             storage = StorageObservation(StorageHandleState(available = true), StorageHandleState(available = true)),
-            hosts = listOf(hostA, hostB, hostC).mapIndexed { index, hostId ->
+            hosts = listOf(hostA, hostB, hostC, hostD).mapIndexed { index, hostId ->
                 HostConnectionSnapshot(
                     hostId, Endpoint("native-controller-$index.invalid", 8443), "Native owner $index",
                     HostConnectionPhase.CONNECTED, HostConnectionReason.NONE,
@@ -219,6 +262,9 @@ class NativeCreateControllerComponentTest {
                 )),
                 // Pi-only: it holds create but advertises no native catalog.
                 HostRuntimeState(hostC, 1, HostLanePhase.ATTACHED, roster(hostC, runC, null, emptyList())),
+                HostRuntimeState(hostD, 1, HostLanePhase.ATTACHED, roster(
+                    hostD, runD, scopeD, listOf(target), capabilities = legacy,
+                )),
             ),
             selection = null,
             pendingSelection = null,
@@ -236,6 +282,7 @@ class NativeCreateControllerComponentTest {
             run: String,
             scope: NativeCatalogScope?,
             targets: List<NativeCliTarget>,
+            capabilities: List<String> = availability,
         ): RosterClientState = RosterClientState(
             hostId = hostId.value,
             generation = 1,
@@ -259,12 +306,7 @@ class NativeCreateControllerComponentTest {
             ),
             subscriptionId = "synthetic-native-$run",
             subscriptionRunId = run,
-            capabilities = listOf(
-                RosterWire.CLOSE_CAPABILITY,
-                RosterWire.CREATE_CAPABILITY,
-                RosterWire.NATIVE_CAPABILITY,
-                RosterWire.NATIVE_NAME_CAPABILITY,
-            ),
+            capabilities = capabilities,
             savedPolicy = null,
             savedOwnership = null,
             pending = emptyList(),

@@ -77,8 +77,16 @@ import {
   isValidNativeSessionFile,
   isValidRenameName,
   hasCompleteSessionIdle,
+  hasSessionSpawnRouting,
   parseBootstrap,
+  parseHostsRequest,
   parseSpawnRequest,
+  SESSION_HOSTS_DISCOVERY_MODE,
+  SESSION_SPAWN_ROUTING_MODE,
+  SessionHostsResultAssembler,
+  type SessionHostHostsResult,
+  type SessionHostsInspection,
+  type SessionHostsUnavailableReason,
   sanitizeActivityLine,
   type SessionHostBootstrap,
   type SessionHostActivityRequest,
@@ -244,6 +252,10 @@ const MAX_RECENT_SHUTDOWN_REQUEST_IDS = 64;
 const MAX_CONCURRENT_SPAWN_REQUESTS = 2;
 const MAX_RECENT_SPAWN_REQUEST_IDS = 64;
 const MAX_CONCURRENT_ACTIVITY_REQUESTS = 2;
+const MAX_CONCURRENT_HOSTS_REQUESTS = 2;
+const MAX_RECENT_HOSTS_REQUEST_IDS = 64;
+/** Caller deadline for one read-only discovery answer; above the broker's own deadline. */
+const DEFAULT_SESSION_HOSTS_TIMEOUT_MS = 10_000;
 const MAX_RECENT_ACTIVITY_REQUEST_IDS = 64;
 
 export interface SessionHostReporterOptions {
@@ -257,6 +269,8 @@ export interface SessionHostReporterOptions {
   connectSocket?: (socketPath: string) => net.Socket;
   /** Test seam: bounded caller wait for SessionSpawn. Production default is 65 seconds. */
   spawnTimeoutMs?: number;
+  /** Test seam: bounded caller wait for SessionHosts inspection. Production default is 10 seconds. */
+  hostsTimeoutMs?: number;
 }
 
 interface StickyState {
@@ -602,6 +616,16 @@ interface ReporterHandle {
   spawnCapability?: SessionHostSpawnCapability;
 }
 
+interface PendingHostsCall {
+  readonly socket: net.Socket;
+  readonly generation: number;
+  readonly assembler: SessionHostsResultAssembler;
+  readonly resolve: (inspection: SessionHostsInspection) => void;
+  readonly timer: NodeJS.Timeout;
+  readonly signal?: AbortSignal;
+  readonly abortListener?: () => void;
+}
+
 interface PendingSpawnCall {
   readonly socket: net.Socket;
   readonly generation: number;
@@ -691,6 +715,8 @@ function createReporter(
   const recentActivityRequestIds = new Set<string>();
   const pendingSpawnCalls = new Map<string, PendingSpawnCall>();
   const recentSpawnRequestIds = new Set<string>();
+  const pendingHostsCalls = new Map<string, PendingHostsCall>();
+  const recentHostsRequestIds = new Set<string>();
   const recentShutdownRequests = new Map<string, {
     expectedSessionId: string;
     expectedSessionEpoch: number;
@@ -967,14 +993,21 @@ function createReporter(
       return Promise.resolve("failed");
     }
 
-    let fields: { workspace: unknown; title: unknown; prompt: unknown };
+    let fields: { workspace: unknown; title: unknown; prompt: unknown; host: unknown; kind: unknown };
     try {
       const raw = input as unknown as Record<string, unknown>;
-      fields = { workspace: raw.workspace, title: raw.title, prompt: raw.prompt };
+      fields = { workspace: raw.workspace, title: raw.title, prompt: raw.prompt, host: raw.host, kind: raw.kind };
     } catch {
       return Promise.resolve("failed");
     }
     if (typeof fields.prompt !== "string" || fields.prompt.length === 0 || fields.prompt.includes("\0")) {
+      return Promise.resolve("failed");
+    }
+    const routed = hasSessionSpawnRouting(fields);
+    if (routed && bootstrap.spawnRouting !== SESSION_SPAWN_ROUTING_MODE) {
+      // The host registration did not advertise routed-spawn support (an older
+      // or not-yet-integrated host). Never send selectors it could drop, and
+      // never degrade to a legacy own-host Pi request: definitely not sent.
       return Promise.resolve("failed");
     }
     let staged: StagedSessionHostPayload;
@@ -988,7 +1021,7 @@ function createReporter(
     const requestId = randomUUID();
     const requestCandidate: unknown = {
       version: 1,
-      type: "spawn_request",
+      type: routed ? "spawn_routed_request" : "spawn_request",
       instanceId: bootstrap.instanceId,
       generation: bootstrap.generation,
       token: bootstrap.token,
@@ -996,6 +1029,8 @@ function createReporter(
       workspace: fields.workspace,
       title: fields.title,
       payload: staged.descriptor,
+      ...(fields.host === undefined ? {} : { host: fields.host }),
+      ...(fields.kind === undefined ? {} : { kind: fields.kind }),
     };
     const validated = parseSpawnRequest(requestCandidate);
     if (!validated) {
@@ -1055,6 +1090,135 @@ function createReporter(
     });
   };
 
+  const hostsUnavailable = (reason: SessionHostsUnavailableReason): SessionHostsInspection =>
+    Object.freeze({ outcome: "unavailable", reason });
+
+  const settleHostsCall = (requestId: string, pending: PendingHostsCall, inspection: SessionHostsInspection): boolean => {
+    if (pendingHostsCalls.get(requestId) !== pending) return false;
+    pendingHostsCalls.delete(requestId);
+    clearTimeout(pending.timer);
+    if (pending.signal && pending.abortListener) pending.signal.removeEventListener("abort", pending.abortListener);
+    recentHostsRequestIds.delete(requestId);
+    recentHostsRequestIds.add(requestId);
+    while (recentHostsRequestIds.size > MAX_RECENT_HOSTS_REQUEST_IDS) {
+      const oldest = recentHostsRequestIds.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      recentHostsRequestIds.delete(oldest);
+    }
+    try {
+      pending.resolve(inspection);
+    } catch {
+      // A cancelled/stale model callback cannot affect the transport.
+    }
+    return true;
+  };
+
+  const settleHostsCallsForConnection = (candidate: net.Socket, generation: number | undefined): void => {
+    for (const [requestId, pending] of [...pendingHostsCalls]) {
+      if (pending.socket === candidate && (generation === undefined || pending.generation === generation)) {
+        settleHostsCall(requestId, pending, hostsUnavailable("disconnected"));
+      }
+    }
+  };
+
+  /**
+   * One read-only SessionHosts inspection on the current authenticated
+   * connection. Never connects, reconnects, launches, or retries; any timeout,
+   * cancellation, disconnect, or malformed reply is "unavailable", which is
+   * never a claim that no hosts exist.
+   */
+  const requestSessionHosts = (signal?: AbortSignal): Promise<SessionHostsInspection> => {
+    if (signal?.aborted) return Promise.resolve(hostsUnavailable("cancelled"));
+    if (bootstrap.sessionHosts !== SESSION_HOSTS_DISCOVERY_MODE || bootstrap.spawnRouting !== SESSION_SPAWN_ROUTING_MODE) {
+      return Promise.resolve(hostsUnavailable("host-unavailable"));
+    }
+    if (shutdownRequested || !active || connecting || !socket || socket.destroyed) {
+      return Promise.resolve(hostsUnavailable("not-connected"));
+    }
+    if (pendingHostsCalls.size >= MAX_CONCURRENT_HOSTS_REQUESTS) return Promise.resolve(hostsUnavailable("busy"));
+    const requestId = randomUUID();
+    const request = parseHostsRequest({
+      version: 1,
+      type: "hosts_request",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: bootstrap.token,
+      requestId,
+    });
+    if (!request) return Promise.resolve(hostsUnavailable("protocol"));
+    let frame: string;
+    try {
+      frame = encodeFrame(request);
+    } catch {
+      return Promise.resolve(hostsUnavailable("protocol"));
+    }
+    const candidate = socket;
+    const generation = sessionGeneration;
+    return new Promise<SessionHostsInspection>((resolve) => {
+      let pending!: PendingHostsCall;
+      const timer = setTimeout(
+        () => settleHostsCall(requestId, pending, hostsUnavailable("timeout")),
+        Math.max(0, options.hostsTimeoutMs ?? DEFAULT_SESSION_HOSTS_TIMEOUT_MS),
+      );
+      timer.unref?.();
+      const abortListener = signal ? () => settleHostsCall(requestId, pending, hostsUnavailable("cancelled")) : undefined;
+      pending = {
+        socket: candidate,
+        generation,
+        assembler: new SessionHostsResultAssembler(requestId),
+        resolve,
+        timer,
+        ...(signal ? { signal } : {}),
+        ...(abortListener ? { abortListener } : {}),
+      };
+      pendingHostsCalls.set(requestId, pending);
+      if (signal && abortListener) signal.addEventListener("abort", abortListener, { once: true });
+      if (signal?.aborted) {
+        settleHostsCall(requestId, pending, hostsUnavailable("cancelled"));
+        return;
+      }
+      if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket || candidate.destroyed) {
+        settleHostsCall(requestId, pending, hostsUnavailable("not-connected"));
+        return;
+      }
+      if (!tryWriteFrame(frame)) settleHostsCall(requestId, pending, hostsUnavailable("disconnected"));
+    });
+  };
+
+  /** Routes one authenticated discovery page; false means the connection was closed for a protocol violation. */
+  const processHostsResult = (candidate: net.Socket, generation: number, page: SessionHostHostsResult): boolean => {
+    if (page.instanceId !== bootstrap.instanceId || page.generation !== bootstrap.generation
+      || !tokenMatches(page.token, bootstrap.token)) {
+      candidate.destroy();
+      return false;
+    }
+    const pending = pendingHostsCalls.get(page.requestId);
+    if (!pending) {
+      if (recentHostsRequestIds.has(page.requestId)) return true; // Late page after timeout/cancellation.
+      candidate.destroy();
+      return false;
+    }
+    if (pending.socket !== candidate || pending.generation !== generation) {
+      settleHostsCall(page.requestId, pending, hostsUnavailable("protocol"));
+      candidate.destroy();
+      return false;
+    }
+    const step = pending.assembler.accept(page);
+    if (step.status === "pending") return true;
+    if (step.status === "complete") {
+      settleHostsCall(page.requestId, pending, Object.freeze({ outcome: "complete", snapshot: step.snapshot }));
+      return true;
+    }
+    if (step.status === "unavailable") {
+      settleHostsCall(page.requestId, pending, hostsUnavailable("host-unavailable"));
+      return true;
+    }
+    // Out-of-order, inconsistent, duplicate, or over-bound pages: never partial.
+    settleHostsCall(page.requestId, pending, hostsUnavailable("protocol"));
+    candidate.destroy();
+    return false;
+  };
+
   const flushQueuedRenameAcks = (candidate: net.Socket, generation: number): boolean => {
     if (!active || generation !== sessionGeneration || candidate !== socket) return false;
     while (renameAckQueue.length > 0) {
@@ -1082,6 +1246,7 @@ function createReporter(
     if (socket) {
       const stale = socket;
       settleSpawnCallsForConnection(stale, undefined, "unknown");
+      settleHostsCallsForConnection(stale, undefined);
       socket = undefined;
       stale.removeAllListeners();
       try {
@@ -1196,6 +1361,7 @@ function createReporter(
       candidate.setTimeout(0);
       if (candidate !== socket) return;
       settleSpawnCallsForConnection(candidate, generation, "unknown");
+      settleHostsCallsForConnection(candidate, generation);
       socket = undefined;
       connecting = false;
       drainPending = false;
@@ -2180,6 +2346,9 @@ function createReporter(
       settleSpawnCall(message.requestId, pending, message.outcome);
       return !candidate.destroyed;
     }
+    if (message.type === "hosts_result") {
+      return processHostsResult(candidate, generation, message) && !candidate.destroyed;
+    }
     if (message.type !== "rename_request" && message.type !== "shutdown_request"
       && message.type !== "activity_request") {
       candidate.destroy(); // No status or peer-originated control frame is accepted from the broker.
@@ -2343,6 +2512,14 @@ function createReporter(
       // 0 is deliberately invalid: without a host-issued visible-layout budget
       // the model-visible tool must not invent a constant width recommendation.
       titleColumns: titleColumns ?? 0,
+      // Derived only from the immutable host-issued bootstrap marker; the same
+      // marker gates requestSessionSpawn, so the two can never disagree.
+      routing: bootstrap.spawnRouting === SESSION_SPAWN_ROUTING_MODE,
+      // Read-only discovery exists only when the host advertised an actual
+      // inspection handler (which the protocol admits only with routing).
+      ...(bootstrap.sessionHosts === SESSION_HOSTS_DISCOVERY_MODE && bootstrap.spawnRouting === SESSION_SPAWN_ROUTING_MODE
+        ? { inspectHosts: requestSessionHosts }
+        : {}),
     });
 
   const teardown = (): void => {

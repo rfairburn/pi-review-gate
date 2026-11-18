@@ -96,9 +96,17 @@
  * bypass each other's ordering. A target the owner never advertised is refused
  * before submission, and no outcome ever creates, selects, focuses, or defaults a
  * local row.
+ *
+ * The optional native AVAILABILITY description ({@link
+ * ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY}) only says how that catalog was
+ * produced: acknowledged beside the native lane, each committed catalog is the
+ * owner's fresh launch probe at publication; otherwise it is configuration-only
+ * with unknown availability. It adds no frame, field, store, or poll here — a
+ * fresher catalog is earned only by the existing explicit {@link
+ * RosterBridgeViewer.resync} — and it never relaxes any create admission check.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PeerByteChannel } from "./channel";
 import type { PeerKey } from "./identity";
 import type { OwnerCloseRequest, PeerCloseResult } from "./peer-close";
@@ -106,6 +114,8 @@ import {
   isOwnerCreateWorkspace,
   findRemoteNativeCliTarget,
   type OwnerCreateRequest,
+  type OwnerSessionSpawnRequest,
+  isOwnerSessionSpawnRequest,
   type OwnerNativeCreateRequest,
   type PeerCreateResult,
   type RemoteNativeCliTarget,
@@ -139,6 +149,10 @@ import { isNativeCliBackend, isNativeCliTargetId } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
+  SESSION_SPAWN_FRAGMENT_BYTES,
+  type RosterBridgeSessionSpawnResultFrame,
+  ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
@@ -346,6 +360,23 @@ export interface RosterBridgeViewer {
    * published in a complete snapshot this side still holds as current.
    */
   readonly supportsNative: boolean;
+  /**
+   * True only when this owner acknowledged native AVAILABILITY beside the native
+   * lane: its catalog comes from a fresh read-only launch probe per snapshot.
+   * False means a configuration-only catalog whose availability is unknown.
+   * Descriptive only — never a grant, never per-target state. Optional so older or
+   * fake viewers stay representable; absence means unknown.
+   */
+  readonly supportsNativeAvailability?: boolean;
+  /**
+   * True while ANY owner request this viewer submitted (a create of either lane or
+   * a prompted spawn, a close, a rename of either lane, or a Saved operation) is
+   * still outstanding. A caller that would retire this subscription (an explicit
+   * resync) must not do so while it is true: the owner answers several of those
+   * requests only on the subscription they were made under. Descriptive only;
+   * optional so older or fake viewers stay representable.
+   */
+  readonly ownerRequestInFlight?: boolean;
   readonly supportsRename: boolean;
   renameSession(request: OwnerRenameRequest, options?: PeerRenameOptions): Promise<PeerRenameResult>;
   /**
@@ -404,6 +435,11 @@ export interface RosterBridgeViewer {
    */
   createSession(
     request: OwnerCreateRequest,
+    options?: { readonly stillCurrent?: () => boolean },
+  ): Promise<PeerCreateResult>;
+  readonly supportsSessionSpawn?: boolean;
+  spawnSession?(
+    request: OwnerSessionSpawnRequest,
     options?: { readonly stillCurrent?: () => boolean },
   ): Promise<PeerCreateResult>;
   /**
@@ -466,7 +502,7 @@ interface PendingCreate {
   readonly requestId: string;
   readonly hostRunId: string;
   readonly sequence: number;
-  readonly resultType: "create_result" | "create_native_result";
+  readonly resultType: "create_result" | "create_native_result" | "spawn_result";
   readonly settle: (result: PeerCreateResult) => void;
   timer: NodeJS.Timeout | null;
 }
@@ -829,12 +865,31 @@ class ViewerBinding implements RosterBridgeViewer {
     return this.#capabilities.includes(ROSTER_BRIDGE_CLOSE_CAPABILITY);
   }
 
+  get supportsSessionSpawn(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY);
+  }
+
   get supportsCreate(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY);
   }
 
   get supportsNative(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY);
+  }
+
+  get supportsNativeAvailability(): boolean {
+    // The acknowledgement review already refuses availability without the native
+    // lane; both are read again so this can never describe a missing catalog.
+    return this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY)
+      && this.#capabilities.includes(ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY);
+  }
+
+  get ownerRequestInFlight(): boolean {
+    return this.#pendingCreate !== null
+      || this.#pendingCloses.size > 0
+      || this.#pendingRename !== null
+      || this.#pendingNativeRename !== null
+      || this.#pendingSaved !== null;
   }
 
   get supportsRename(): boolean {
@@ -1118,12 +1173,81 @@ class ViewerBinding implements RosterBridgeViewer {
     return outcome.promise;
   }
 
-  /**
-   * True only while this side holds a CURRENT complete observation of the exact
-   * owner run the request names, and that observation advertised this exact
-   * backend and target id. A stale or never-completed observation, another run, a
-   * withdrawn catalog, or a target the owner never offered is no authorization to
-   * ask, and nothing here substitutes a default or reinterprets a requester-side id.
+  /** Stream one fragment at a time through the existing ordered control writer.
+   * There is no queued batch, retry, cancellation, filesystem access, or fallback.
+   * Once ANY frame was handed off, even a later local refusal is unknown.
+   */
+  spawnSession(
+    request: OwnerSessionSpawnRequest,
+    options: { readonly stillCurrent?: () => boolean } = {},
+  ): Promise<PeerCreateResult> {
+    const refusal = this.#createRefusal();
+    if (refusal !== null) return Promise.resolve(refusal);
+    if (!this.supportsSessionSpawn) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    // Capture exact immutable values before validation and the first async boundary.
+    const captured = Object.freeze({ ...request });
+    if (!isOwnerSessionSpawnRequest(captured)) return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    const runCurrent = (): boolean => this.#projection.state === "current"
+      && this.#projection.hostRunId === captured.hostRunId;
+    if (!runCurrent()) return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
+    if (this.#pendingCreate !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    if (this.#createSequence >= Number.MAX_SAFE_INTEGER) return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    let payload: Buffer;
+    try { payload = Buffer.from(JSON.stringify(captured), "utf8"); }
+    catch { return Promise.resolve({ kind: "not-sent", reason: "invalid-request" }); }
+    const outcome = deferred<PeerCreateResult>();
+    const pending: PendingCreate = {
+      requestId: randomUUID(), hostRunId: captured.hostRunId,
+      sequence: ++this.#createSequence, resultType: "spawn_result",
+      settle: result => outcome.resolve(result), timer: null,
+    };
+    this.#pendingCreate = pending;
+    pending.timer = this.#arm(null, this.#bounds.createResultTimeoutMs, () => {
+      pending.timer = null;
+      this.#settleCreate(pending, { kind: "unknown" });
+    });
+    const sendLifetimeCurrent = (): boolean => this.#pendingCreate === pending && !this.#stopRequested
+      && this.#state !== "detached" && this.#state !== "failed";
+    const gate: ViewerSendGate = () => {
+      if (!sendLifetimeCurrent()) return { allow: false, reason: "not-ready" };
+      try {
+        if (options.stillCurrent !== undefined && options.stillCurrent() !== true) {
+          return { allow: false, reason: "target-unavailable" };
+        }
+      } catch { return { allow: false, reason: "target-unavailable" }; }
+      // The arbitrary caller proof may synchronously stop this viewer and settle
+      // the request while its projection still names the old current run.
+      if (!sendLifetimeCurrent()) return { allow: false, reason: "not-ready" };
+      return runCurrent() ? { allow: true } : { allow: false, reason: "target-unavailable" };
+    };
+    void (async () => {
+      let sent = false;
+      const send = async (frame: RosterBridgeFrame): Promise<boolean> => {
+        const written = await this.#queueSend(frame, gate);
+        if (written.ok) { sent = true; return true; }
+        if (sent || written.sent) this.#settleCreate(pending, { kind: "unknown" });
+        else this.#settleCreate(pending, { kind: "not-sent", reason: written.reason });
+        return false;
+      };
+      if (!await send({ type: "spawn_begin", requestId: pending.requestId,
+        hostRunId: captured.hostRunId, sequence: pending.sequence,
+        bytes: payload.length, sha256: createHash("sha256").update(payload).digest("hex") })) return;
+      // Respect smaller negotiated frame bounds too. Base64 has a 4/3 expansion;
+      // leave ample room for the fixed envelope, never truncate payload data.
+      const size = Math.min(SESSION_SPAWN_FRAGMENT_BYTES, Math.floor((this.#bounds.maxFrameBytes - 512) * 3 / 4));
+      if (size < 1) { this.#settleCreate(pending, { kind: "unknown" }); return; }
+      let chunks = 0;
+      for (let offset = 0; offset < payload.length; offset += size) {
+        if (!await send({ type: "spawn_chunk", requestId: pending.requestId, index: chunks++,
+          data: payload.subarray(offset, offset + size).toString("base64") })) return;
+      }
+      await send({ type: "spawn_end", requestId: pending.requestId, chunks });
+    })().catch(() => this.#settleCreate(pending, { kind: "unknown" }));
+    return outcome.promise;
+  }
+
+  /** True only for a CURRENT complete observation of the exact run and target.
+   * No stale catalog, substituted backend, or requester-side id is authority.
    */
   #nativeTargetAdvertised(request: OwnerNativeCreateRequest): boolean {
     const projection = this.#projection;
@@ -1236,7 +1360,7 @@ class ViewerBinding implements RosterBridgeViewer {
    * that names another owner run can never be reported as a result of this request.
    */
   #onCreateResult(
-    frame: RosterBridgeCreateResultFrame | RosterBridgeNativeCreateResultFrame,
+    frame: RosterBridgeCreateResultFrame | RosterBridgeNativeCreateResultFrame | RosterBridgeSessionSpawnResultFrame,
   ): void {
     const pending = this.#pendingCreate;
     if (pending === null || pending.requestId !== frame.requestId) return;
@@ -1247,6 +1371,10 @@ class ViewerBinding implements RosterBridgeViewer {
       return;
     }
     const facts = frame.outcome;
+    if (frame.type === "spawn_result" && (this.#projection.state !== "current"
+      || this.#projection.hostRunId !== pending.hostRunId)) {
+      this.#settleCreate(pending, { kind: "unknown" }); return;
+    }
     if (facts.kind === "started" && facts.hostRunId !== pending.hostRunId) {
       // The request named one exact run; an answer about another run establishes
       // nothing about this one.
@@ -2167,6 +2295,10 @@ class ViewerBinding implements RosterBridgeViewer {
         return;
       case "close_result":
         this.#onCloseResult(frame);
+        return;
+      case "spawn_result":
+        if (!this.supportsSessionSpawn) { this.#protocolFailure(); return; }
+        this.#onCreateResult(frame);
         return;
       case "create_result":
         this.#onCreateResult(frame);

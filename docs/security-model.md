@@ -103,11 +103,29 @@ data for inspection; this is not secure erasure. On Windows requested POSIX
 modes do not establish privacy beyond inherited OS ACLs; no custom ACL is
 installed.
 
-The prompt is not copied into status snapshots or status/sidebar diagnostics. It is
-delivered to the new child's ordinary native Pi conversation, while the supplied title
-appears through that conversation's normal native name/sidebar display. Temporary
-payloads contain plaintext and are not a same-user sandbox: other processes with the
-user's authority can access them. This distinction adds no encryption, confidentiality
+The prompt is not copied into status snapshots or status/sidebar diagnostics. For a
+Pi child it is delivered to the new child's ordinary native Pi conversation, while the
+supplied title appears through that conversation's normal native name/sidebar display.
+
+For a Claude Code or Codex CLI child, the owning host stages the exact prompt as a
+JSON array of string fragments in one exclusively created file (requested mode
+`0600`) inside a fresh private temporary directory it owns (requested mode `0700`)
+outside any workspace, and passes the provider only a short generated plain-word
+instruction to read and carry out that file. The prompt never appears in argv or the
+environment. A temporary path that could give the instruction option, slash-command,
+file-reference, or multi-line structure is refused before the prompt is written. The
+provider reads the file through its own normal file-read, trust, and approval
+behavior; nothing is approved automatically and no permission, model, or reasoning
+setting is added. The file is leased until the row's PTY and, for Codex, its owned
+backend and relay have settled; cleanup then removes only the exact unchanged file
+and the empty owned directory after rechecking identity, size, digest, and ancestry,
+and preserves unknown, modified, replaced, or foreign entries. The plaintext,
+no-secure-erasure, and Windows-mode limits described in this section apply to it as
+well; no new Windows ACL is promised. After cleanup the file no
+longer exists, even if the provider's history still names its path.
+
+Temporary payloads contain plaintext and are not a same-user sandbox: other
+processes with the user's authority can access them. This distinction adds no encryption, confidentiality
 in transit, or new Windows ACL guarantee. Launch confirmation is not a receipt for
 prompt execution or task completion; uncertain outcomes are never retried automatically.
 
@@ -211,8 +229,8 @@ reported settled until each of them proves its own actual end.
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for
 explicit pairing, remote session rows, one deliberately selected row's native
-viewport with native input and copy, owner-routed Close, Create, and Rename, and
-one chosen owner's saved conversations. Every operation is performed by the
+viewport with native input and copy, owner-routed Close, Create, Rename, and
+prompted `SessionSpawn`, and one chosen owner's saved conversations. Every operation is performed by the
 owning host on its own children and files. Ordinary Pi sessions and the
 standalone review-gate launchers are unchanged and start no peer listener or
 client. This optional surface carries no readiness certification: it does not
@@ -307,14 +325,30 @@ for or claims a remote receipt or remote work outcome.
 
 The roster lane is a projection of the owner's roster. By itself it grants no
 control. Control exists only through the separately negotiated native I/O bridge
-and the owner-routed Close, Create, Rename, and Saved operations described
-below, each re-authorized and performed by the owner. Roster rows carry bounded
+and the owner-routed Close, Create, Rename, prompted `SessionSpawn`, and Saved
+operations described below, each re-authorized and performed by the owner. Roster rows carry bounded
 display facts, including the exact owner-side workspace path, and never the
 native current-file guard, agent/account directories, configuration, providers,
 credentials, prompts, transcripts, question text, terminal/output bytes, or
 image data. A lost projection is stale or unavailable, never idle or zero. A row
 the owner hosts as a native provider session projects the same bounded display
 facts, and an unobserved field stays unknown.
+
+A hosted child's `SessionSpawn` that names an exact paired `host` travels on the
+same roster lane under the optional `roster-session-spawn-v1` capability. It
+requires that destination's existing pinned identity, a current directional grant
+for the requester on that owner, and a live current connection; it never connects,
+pairs, requests or renews a grant, or retries. The owner re-authorizes the request,
+validates the workspace on its own filesystem, and admits a native kind only from
+its own current catalog, with no fallback to another host, kind, or configured
+worker profile. The prompt crosses the authenticated channel as exact bounded
+fragments and is not projected into roster rows, status, or diagnostics. An
+uncertain outcome is `unknown` and never claims that no child exists. The
+read-only `SessionHosts` listing of paired destination ids and observed kinds is
+descriptive only: it is not a grant, a pairing, or a launch receipt, and every
+spawn is validated again. The optional `roster-native-availability-v1` capability
+only describes whether an owner's native catalog came from a fresh launch probe; it
+grants nothing, and a catalog without it has unknown availability.
 
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app`
@@ -376,8 +410,9 @@ public hooks, and the first session update closes it permanently. The owner's
 registration closes it at the first accepted status, disconnect, or exit. A
 startup source has no native session field and its own token domain. Pi's trust
 decision and persistence are unchanged, nothing is trusted automatically, and
-copy is unsupported until a real conversation exists. A network `SessionSpawn`
-and human handoff remain unimplemented. Close remains owner-routed from the
+copy is unsupported until a real conversation exists. A paired-host
+`SessionSpawn` uses the roster lane described above, not this content lane, and
+human handoff remains unimplemented. Close remains owner-routed from the
 requesting sidebar's actually written highlighted row, as described below.
 
 The optional `native-input-cli-v1` capability, which also depends on

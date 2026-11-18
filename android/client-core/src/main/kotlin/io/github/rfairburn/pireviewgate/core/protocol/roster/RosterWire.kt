@@ -61,6 +61,21 @@ object RosterWire {
     const val NATIVE_NAME_CAPABILITY: String = "roster-native-name-v1"
 
     /**
+     * Optional capability DESCRIBING how the owner's [NATIVE_CAPABILITY] catalog is
+     * produced (#493). It depends on that lane: an acknowledgement carrying it without
+     * [NATIVE_CAPABILITY] is a protocol violation.
+     *
+     * Acknowledged, each `snapshot_end` catalog is the owner's fresh read-only launch
+     * probe at publication, so its targets are the ones observed launchable then.
+     * Unacknowledged (absent or a legacy owner), the catalog is configuration-only and
+     * its availability is UNKNOWN: never assumed launchable and never assumed
+     * unavailable. It adds no frame, field, target, or kind state, and it grants
+     * nothing: the owner still re-reads and re-proves its own live catalog before
+     * every native create.
+     */
+    const val NATIVE_AVAILABILITY_CAPABILITY: String = "roster-native-availability-v1"
+
+    /**
      * Optional capabilities this implementation knows. An identifier offered by a
      * peer is recorded only when it appears here and is otherwise ignored; an
      * acknowledgement additionally narrows to what the owner can really honour.
@@ -73,7 +88,16 @@ object RosterWire {
         ROSTER_SLOT_CAPABILITY,
         NATIVE_CAPABILITY,
         NATIVE_NAME_CAPABILITY,
+        NATIVE_AVAILABILITY_CAPABILITY,
     )
+
+    /**
+     * True when [capabilities] respect every optional-capability dependency: the
+     * native availability description exists only beside the native lane it
+     * describes.
+     */
+    fun dependenciesHold(capabilities: Collection<String>): Boolean =
+        !capabilities.contains(NATIVE_AVAILABILITY_CAPABILITY) || capabilities.contains(NATIVE_CAPABILITY)
 
     /** One metadata subscription per channel; not configurable. */
     const val MAX_SUBSCRIPTIONS_PER_CHANNEL: Int = 1

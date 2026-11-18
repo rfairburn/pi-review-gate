@@ -1,10 +1,10 @@
 /**
- * Pure owner-side session Create contracts (rowless owner-create phase).
+ * Owner-side session Create contracts, including optional exact prompted spawn.
  *
  * Importing this file allocates nothing, starts nothing, reads nothing, and
- * grants nothing: it declares the one request shape an owner host answers, the
+ * grants nothing: it declares the rowless requests an owner host answers, the
  * fixed facts it may report back, the fixed result a requester may see, and the
- * one workspace field rule shared by the wire and by the requester. There is no
+ * field validation shared by the wire and by the requester. There is no
  * frame, codec, timer, store, queue, retry, deduplication fence, or permission
  * type here, and no capability is granted by any of these types: the
  * authoritative create stays where the only manager, the only run identity, and
@@ -16,9 +16,10 @@
  *
  * - One request names THIS owner's current run and the canonical workspace text
  *   a caller is creating a child in. Both are opaque to this contract; nothing
- *   here carries a payload, an error, a path decision, a signal, a native
- *   conversation tuple, a selected stream, a viewer, or any other private fact
- *   about the row, its conversation, or its host.
+ *   in blank New carries a prompt payload, an error, a path decision, a signal,
+ *   a native conversation tuple, a selected stream, a viewer, or any other private fact
+ *   about the row, its conversation, or its host. The separately negotiated
+ *   prompted variant adds exact title/prompt/kind data, never startup options.
  * - A create is ROWLESS: no row id, roster row, display badge, native session
  *   tuple, epoch, input mode, or viewer is needed to ask. An owner whose current
  *   roster is empty is a perfectly valid first target, and no saved-duplicate
@@ -49,12 +50,54 @@
  */
 
 import type { PeerCoordinator } from "../peer-ui-protocol";
+import type { SessionSpawnInput } from "../protocol";
+import { parseSessionSpawnInput } from "../spawn-tool";
 import type { NativeCliTarget } from "../native-cli-launch";
 import {
 	isNativeCliBackend,
 	isNativeCliTargetId,
+	isSessionBackend,
+	type SessionBackend,
 	type NativeCliBackend,
 } from "../session-backend";
+
+/**
+ * Exact prompted launch data on the wire: the canonical local {@link SessionSpawnInput}
+ * workspace/title/prompt triple (its model-facing `host` selector is never carried —
+ * the owner IS the host), plus the exact owner run and a REQUIRED backend kind.
+ * The key set stays closed at exactly these five, enforced by
+ * {@link isOwnerSessionSpawnRequest}.
+ */
+export type OwnerSessionSpawnRequest = Readonly<
+	Omit<SessionSpawnInput, "host" | "kind"> & { hostRunId: string; kind: SessionBackend }
+>;
+
+/** The requester's spawn target: the wire request plus only its local destination handle. */
+export type PeerSpawnTarget = OwnerSessionSpawnRequest & { readonly hostId: string };
+
+/** Main implements Pi and native delivery through its supported launcher, never substitutes.
+ * This transport carries the exact request. Check the guard
+ * immediately before starting; requester disappearance does not cancel accepted work.
+ */
+export type OwnerSessionSpawnHandler = (
+	request: OwnerSessionSpawnRequest,
+	stillAuthorized: OwnerCreateAuthorizationGuard,
+) => Promise<OwnerCreateFacts>;
+
+/** Share the exact local prompt/title/workspace validation, not its IPC schema. */
+export function isOwnerSessionSpawnRequest(value: unknown): value is OwnerSessionSpawnRequest {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.length !== 5 || !["hostRunId", "kind", "workspace", "title", "prompt"].every(key => keys.includes(key))
+		|| !isFactIdentifier(record.hostRunId) || !isSessionBackend(record.kind)) return false;
+	try {
+		parseSessionSpawnInput({ workspace: record.workspace, title: record.title, prompt: record.prompt });
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 /** One owner-routed create of one blank child in exactly one owner run. */
 export interface OwnerCreateRequest {
@@ -305,6 +348,10 @@ export interface PeerCreateOptions {
  * destination's existing connected metadata channel and verified peer facts.
  */
 export interface PeerCreateController {
+	/** Negotiated transport support only; admission still re-proves all authority. */
+	supportsSessionSpawn?(hostId: string): boolean;
+	/** Exact prompted launch on the same one-in-flight owner-create lane. No fallback. */
+	spawnSession?(target: PeerSpawnTarget, options: PeerCreateOptions): Promise<PeerCreateResult>;
 	createSession(target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult>;
 	/**
 	 * Ask the same owner to create one NATIVE child in exactly one of its runs,
@@ -324,7 +371,62 @@ export interface PeerCreateController {
 		target: PeerNativeCreateTarget,
 		options: PeerCreateOptions,
 	): Promise<PeerCreateResult>;
+	/**
+	 * Ask the destination's EXISTING connected metadata viewer for one fresh,
+	 * complete roster observation, so its owner re-reads (and, when it negotiated
+	 * native availability, re-probes) its native catalog now.
+	 *
+	 * Optional so an older or fake controller stays representable; its absence is
+	 * never answered by a connect, a pair, a retry, or a cached catalog. It is the
+	 * existing explicit resync of that one subscription — no new frame, store,
+	 * poll, or registry — and the refreshed facts land ONLY in the destination's
+	 * existing roster observation (`PeerUiHost.nativeCli`), which stays the one
+	 * requester-side truth. See {@link PeerNativeTargetsRefreshResult}.
+	 */
+	refreshNativeTargets?(hostId: string): Promise<PeerNativeTargetsRefreshResult>;
 }
+
+/**
+ * Fixed reasons a native catalog refresh was positively NEVER started: no
+ * resubscribe was requested and the current observation is untouched.
+ *
+ * - `capability-unsupported`: the owner did not negotiate BOTH the native lane
+ *   and native availability on the current channel (a legacy, configuration-only
+ *   catalog is never refreshed as though it were probed).
+ * - `not-ready`: this coordinator is closing, or the viewer cannot state whether
+ *   owner work is outstanding.
+ * - `invalid-request`: the destination handle could not be represented.
+ * - `target-unavailable`: no current connected destination with its exact pin and
+ *   identity; nothing connects, pairs, or retries on its behalf.
+ * - `busy`: a create/spawn (or other owner request) or another refresh is in
+ *   flight on that destination; nothing was queued.
+ */
+export type PeerNativeTargetsRefreshNotSentReason =
+	| "capability-unsupported"
+	| "not-ready"
+	| "invalid-request"
+	| "target-unavailable"
+	| "busy";
+
+/**
+ * The one fixed result of a native catalog refresh.
+ *
+ * - `refreshed`: a fresh subscription on the same channel, destination epoch,
+ *   pin, and identity completed one complete authoritative snapshot, and that
+ *   snapshot is now the destination's current roster observation. `hostRunId`
+ *   names the run it observed, which MAY differ from an earlier one (a fresh
+ *   subscription is the boundary at which another owner run may be adopted), so a
+ *   caller re-proves its own run before asking anything of it. The targets
+ *   themselves are read from the observation, never from this result.
+ * - `not-sent`: positively nothing was requested.
+ * - `failed`: a resubscribe was requested and no complete fresh observation could
+ *   be committed for the same destination facts (deadline, refusal, loss, or a
+ *   replacement). The observation is then not current; nothing is retried.
+ */
+export type PeerNativeTargetsRefreshResult =
+	| { readonly kind: "refreshed"; readonly hostRunId: string }
+	| { readonly kind: "not-sent"; readonly reason: PeerNativeTargetsRefreshNotSentReason }
+	| { readonly kind: "failed" };
 
 /**
  * The production coordinator interface for a host that also answers Create:
@@ -477,16 +579,25 @@ export interface OwnerNativeCreateRequest {
  * The owner's ONE live native target catalog reader.
  *
  * It is read at the moments that matter — when a snapshot is about to be
- * published, when a native create is admitted, and again immediately before the
- * create provider is invoked — so a withdrawn or replaced target is never
- * launched from a stale description. It is a read of the owner's own already
- * authoritative configuration, never a second catalog: this transport stores no
- * copy of it, refreshes it on no timer, and never resolves, expands, or launches
- * anything itself. A throw, a non-array, or one malformed entry means "this
- * owner cannot represent its native targets right now", which is a refusal, not
- * a partial offer.
+ * published, and immediately before a native create provider is invoked — so a
+ * withdrawn or replaced target is never launched from a stale description. It is
+ * a read of the owner's own already authoritative configuration (or, for an owner
+ * that declared `nativeCliAvailability`, of a fresh read-only launch probe over
+ * it), never a second catalog: this transport stores no copy of it, refreshes it on
+ * no timer, and never resolves, expands, or launches anything itself. A throw, a
+ * rejection, a non-array, or one malformed entry means "this owner cannot represent
+ * its native targets right now", which is a refusal, not a partial offer.
+ *
+ * It may answer synchronously (the original configuration-only shape, still fully
+ * representable) or asynchronously (a fresh probe). An asynchronous answer is
+ * awaited within the transport's existing deadline for the operation it serves, and
+ * every identity, grant, run, subscription, and lifetime fact is re-proved AFTER
+ * the await: a probe that settles for a retired subscription, a replaced run, a
+ * revoked peer, or a finished binding commits nothing and launches nothing.
  */
-export type OwnerNativeCliTargetProvider = () => readonly RemoteNativeCliTarget[];
+export type OwnerNativeCliTargetSource = () =>
+	| readonly RemoteNativeCliTarget[]
+	| PromiseLike<readonly RemoteNativeCliTarget[]>;
 
 /**
  * The ONE owner-side native create provider: one request naming one exact

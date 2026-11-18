@@ -3,6 +3,7 @@ package io.github.rfairburn.pireviewgate.core.client.ui
 import io.github.rfairburn.pireviewgate.core.client.roster.NativeCatalogScope
 import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNewSessionTarget
 import io.github.rfairburn.pireviewgate.core.protocol.roster.OwnerSavedEntry
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedDeleteRefusalReason
 import io.github.rfairburn.pireviewgate.core.protocol.roster.SavedWindowRefusalReason
@@ -29,13 +30,17 @@ public data class OwnerChoice(
     /** Exact owner run the current catalog belongs to, or `null` when not current. */
     public val hostRunId: String? = null,
     /**
-     * The native targets committed with that owner's CURRENT snapshot. Empty means
-     * this owner offers no native target now; it is never filled from another host.
+     * The NEW-session native targets committed with that owner's CURRENT snapshot:
+     * only backend default targets, never a named external worker profile an older
+     * owner may still advertise (#493) — and only from an owner whose catalog is a
+     * described fresh availability probe ([HostUiState.canCreateNativeSession]).
+     * Empty means no native target is offered now (none launchable, or availability
+     * unknown on a legacy owner); it is never filled from another host.
      */
     public val nativeTargets: List<NativeCliTarget> = emptyList(),
     /** The exact catalog observation lifetime [nativeTargets] belongs to. */
     public val nativeCatalogScope: NativeCatalogScope? = null,
-    /** True only when this owner can take a native create now. */
+    /** True only when this owner can take a native create now with a NEW-session target. */
     public val nativeCreateEligible: Boolean = false,
 ) {
     public companion object {
@@ -46,6 +51,14 @@ public data class OwnerChoice(
          */
         public fun of(host: HostUiState): OwnerChoice {
             val currentRun = host.roster?.takeIf { it.freshness == RosterFreshness.CURRENT }?.hostRunId
+            // Only the NEW-session view of the advertised catalog (#493); an owner
+            // whose catalog holds no NEW-session target offers no native choice.
+            val newSessionTargets = if (host.canCreateNativeSession) {
+                host.nativeCliTargets.orEmpty().filter { it.isNewSessionTarget }
+            } else {
+                emptyList()
+            }
+            val nativeEligible = newSessionTargets.isNotEmpty()
             return OwnerChoice(
                 hostId = host.host.id,
                 label = host.host.label.value,
@@ -53,9 +66,9 @@ public data class OwnerChoice(
                 connection = host.connection,
                 createEligible = host.canCreateSession,
                 hostRunId = currentRun,
-                nativeTargets = if (host.canCreateNativeSession) host.nativeCliTargets.orEmpty() else emptyList(),
-                nativeCatalogScope = if (host.canCreateNativeSession) host.nativeCatalogScope else null,
-                nativeCreateEligible = host.canCreateNativeSession,
+                nativeTargets = newSessionTargets,
+                nativeCatalogScope = if (nativeEligible) host.nativeCatalogScope else null,
+                nativeCreateEligible = nativeEligible,
             )
         }
     }

@@ -3189,8 +3189,13 @@ if (process.platform === "win32") {
    * in this process's `PSModulePath`, the legacy inherited environment shows that
    * location to the child as a closed category, while the environment production
    * itself built for its query child (captured from the producer, not re-derived
-   * here) makes Windows PowerShell rebuild a path with the native location and no
-   * PowerShell 7 location. Stubbed CIM again; no module directory is inspected.
+   * here) carries no inherited `PSModulePath` key, so Windows PowerShell rebuilds a
+   * path that contains its native module location. The rebuilt path may also hold
+   * user- or machine-scope entries (Microsoft documents that the rebuild can include
+   * a user-scope `PSModulePath`, which may legitimately name PowerShell 7 locations),
+   * so the absence of every PowerShell 7 location is NOT asserted, and the native
+   * location is not claimed to be the only entry. Stubbed CIM again; no module
+   * directory is inspected.
    */
   test("the producer's query environment lets the real host rebuild its own module path", async () => {
     if (!existsSync(powershellHost)) {
@@ -3210,10 +3215,14 @@ if (process.platform === "win32") {
       const captured = await withProcessEnv({ PSModulePath: syntheticModulePath }, async () => {
         const legacy: NodeJS.ProcessEnv = { ...process.env };
         const query = fakeQuery({ kind: "output", output: VALID_EVIDENCE });
+        const parentUnchanged = processEnvSnapshot();
         const result = await verifyWithMockedQuery(query);
         const call = query.calls[0]!;
         return {
           result, calls: query.calls.length, script: call.args[4]!, legacy, producer: call.options.env,
+          parentUnchanged: parentUnchanged(),
+          legacyModulePathKeys: countModulePathKeys(legacy),
+          producerModulePathKeys: countModulePathKeys(call.options.env),
           producerShape: queryOptionsShape(call.options),
           difference: queryEnvironmentDifference(call.options.env, process.env),
           expected: expectedEnvironmentDifference(process.env),
@@ -3224,6 +3233,9 @@ if (process.platform === "win32") {
       assert.deepEqual(captured.producerShape, PRODUCTION_OPTIONS_SHAPE, "the producer supplied its own environment copy");
       assert.deepEqual(captured.difference, captured.expected,
         "on the real host the producer's copy keeps every other key and value and drops only PSModulePath");
+      assert.deepEqual(captured.parentUnchanged, { sameKeys: true, sameValues: true }, "the producer never modifies this process's environment");
+      assert.equal(captured.legacyModulePathKeys, 1, "the legacy control still inherits the PSModulePath key");
+      assert.equal(captured.producerModulePathKeys, 0, "the producer's child environment carries no inherited PSModulePath key");
       const outcome = instrumentWindowsLineageCausalScript(captured.script, "ungated");
       assert.ok(outcome.instrumented);
       if (!outcome.instrumented) return;
@@ -3244,8 +3256,8 @@ if (process.platform === "win32") {
       }
       assert.equal(bits.legacy?.[1], "1", `an inherited PowerShell 7 location is visible to the legacy child: ${bits.legacy}`);
       assert.equal(bits.producer?.[0], "1", `the removed variable is rebuilt by the child: ${bits.producer}`);
-      assert.equal(bits.producer?.[1], "0", `the rebuilt path has no PowerShell 7 location: ${bits.producer}`);
       assert.equal(bits.producer?.[2], "1", `the rebuilt path has the native module location: ${bits.producer}`);
+      assert.equal(runs.producer.stdout, runs.legacy.stdout, "the proof bytes are identical under both environments");
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

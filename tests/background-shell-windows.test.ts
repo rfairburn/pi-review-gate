@@ -31,12 +31,13 @@ import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { basename, dirname, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { runWithTempCleanup } from "./helpers/temp-file-cleanup";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
+import { ownershipVerdict } from "../src/background-shell/ownership";
 import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import { probePwshPrerequisite } from "./helpers/pwsh-prerequisite";
@@ -918,15 +919,26 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // Fail-closed ownership establishment: a marker path that is an existing
   // directory can never receive the record, so the watchdog's handshake fails.
   // The wrapper must abort BEFORE the user command runs — no unprotected
-  // execution, and no clean success. (When the watchdog dies after assigning
-  // the root, KILL_ON_JOB_CLOSE may kill the wrapper itself; either way the
-  // command never ran and the exit is not a clean 0.)
+  // execution — and the job must never read as complete: with the root gone
+  // and the marker still an unreadable directory, the production verdict is
+  // `unverifiable` and readiness stays blocked.
   //
-  // Diagnosis only (Refs #404): one native run observed exit 0 here. Before the
-  // assertions, one fixed-label line records the wrapper's exit status and the
-  // allowlisted abort stage names it reached, so a failing run can distinguish
-  // the wrapper's own fail-closed exit from an external kill. It never prints
-  // output, errors, environment, or paths, and it changes no assertion.
+  // The wrapper's exit status alone is NOT the success signal, so it is not
+  // asserted as "nonzero". Two outcomes are evidenced natively (Refs #404) and
+  // are the only ones accepted: 1 is the wrapper's own `__pi_review_fail` exit
+  // (native run printed stage=record-unreadable); 0 is a TERMINATION outcome,
+  // not clean completion — when the watchdog dies after assigning the root, the
+  // kernel's KILL_ON_JOB_CLOSE ends the wrapper, and the controlled native
+  // Job Object probe below observed exactly that exit status 0 after closing
+  // the only kill-on-close handle. That probe shows 0 is a possible
+  // termination outcome; it does not establish the exact cause of the
+  // historical exit-0 run here. Either way, the guards below — canary absent,
+  // marker unreadable, verdict `unverifiable`, readiness blocked — must hold;
+  // any other exit status or signal fails.
+  //
+  // Diagnosis only: before the assertions, one fixed-label line records the
+  // wrapper's exit status and the allowlisted abort stage names it reached. It
+  // never prints output, errors, environment, or paths, and decides nothing.
   it("fails closed before running the command when ownership cannot be established", SKIP, async (t) => {
     const markerDir = mkdtempSync(join(tmpdir(), "pi-review-owner-fail-"));
     await runWithTempCleanup([markerDir], { recursive: true }, async () => {
@@ -940,6 +952,8 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       const executable = resolveWindowsPowerShell();
       const spawnedAt = Date.now();
       const child = spawn(executable, [...POWERSHELL_ARGS, wrapped], { windowsHide: true });
+      // The exact owned root: the directly spawned wrapper's own pid.
+      const rootPid = child.pid;
       let out = "";
       const stderrCapture = boundedCapture();
       let exitObservedMs: number | null = null;
@@ -955,7 +969,44 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       ));
       expect(exited, "wrapper exited").toBe(true);
       expect(out).not.toContain("OWNERFAIL-CANARY");
-      expect(child.exitCode === 0, "no clean exit without established ownership").toBe(false);
+      expect(typeof rootPid === "number" && rootPid > 0, "owned root pid").toBe(true);
+      // Only the natively evidenced outcomes: 1 (wrapper fail-closed exit) or
+      // 0 (kill-on-close termination), never a signal or any other status.
+      expect(child.signalCode, "no signal termination").toBe(null);
+      expect(
+        child.exitCode === 1 || child.exitCode === 0,
+        `exit status ${diagnosticExitCode(child.exitCode)} is an evidenced ownership-failure outcome (1 or 0)`,
+      ).toBe(true);
+
+      // Whatever the exit status, ownership evidence stays unreadable: the
+      // marker is still a directory, so no record (not even `0 failed`) exists.
+      expect(statSync(markerDir).isDirectory(), "marker path is still an unreadable directory").toBe(true);
+      // Root exit observed on the exact ChildProcess -> rootAlive=false. The
+      // production verdict for missing evidence is `unverifiable`, never `clear`.
+      expect(ownershipVerdict(markerDir, false, pidAlive), "production ownership verdict").toBe("unverifiable");
+
+      // The production readiness tracker, fed fixture metadata for THIS wrapper
+      // (its real pid and the real marker path) through its public structured
+      // input — this fixture is a directly spawned wrapper, not a registered
+      // ShellStart job. On Windows the snapshot must keep it in `running`.
+      const readiness = new BackgroundProcessReadiness();
+      const tracked = readiness.observeToolResult("ShellStart", {
+        details: {
+          kind: "pi-review-bg-shell",
+          event: "started",
+          id: "owner-fail-fixture",
+          label: "owner-fail-fixture",
+          pid: rootPid,
+          ownershipMarker: markerDir,
+        },
+      });
+      expect(tracked?.pid === rootPid && tracked?.ownershipMarker === markerDir, "tracks the fixture's own pid and marker").toBe(true);
+      const snapshot = readiness.snapshot();
+      expect(
+        snapshot.running.map((p) => [p.pid, p.ownershipMarker]),
+        "readiness stays blocked on unverifiable ownership even after the root exited",
+      ).toEqual([[rootPid, markerDir]]);
+      expect(snapshot.unverifiable, "tracked as a structured job, not as unparseable output").toEqual([]);
     });
   });
   // Paths with spaces and apostrophes must survive BOTH quoting layers: the

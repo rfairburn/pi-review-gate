@@ -31,11 +31,13 @@ dates.
 
 ### Changed
 
-- **Native Windows ownership evidence (Refs #404)**: the ownership-failure
-  regression reports bounded exit and allowlisted failure-stage facts, and an
-  owned Job Object fixture is added to measure the kernel's kill-on-close exit
-  outcome. This diagnostic work does not establish a cause or change the original
-  canary or exit-status assertions or production behavior.
+- **Native Windows ownership regression (Refs #404)**: an owned Job Object
+  fixture demonstrates that kill-on-close can report exit code zero. The
+  blocked-marker regression accepts only the demonstrated zero/one termination
+  outcomes and checks the real safety contract: the command did not run,
+  ownership remains unverifiable, and readiness stays blocked. Bounded exit/stage
+  diagnostics remain; deadlines and production behavior are unchanged. The exact
+  path behind the historical failure is not established.
 
 ## [0.1.0-dev.294]
 

@@ -4,8 +4,11 @@ import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { loadReleaseModule, projectRoot } from "./helpers/release-scripts";
-import type { ChangelogModule, Eligibility, PackagingModule, PublishModule, PublishSummary } from "./helpers/release-scripts";
+import { withLoopbackServer } from "./helpers/release-loopback";
+import type { LoopbackHandler, LoopbackStats } from "./helpers/release-loopback";
+import type { ChangelogModule, Eligibility, FetchLike, PackagingModule, PublishModule, PublishSummary } from "./helpers/release-scripts";
 
 const common = loadReleaseModule<{
   REPOSITORY: string;
@@ -238,6 +241,8 @@ class MockGithub {
   // matching fetch at the transport boundary. Unset for every existing test; the
   // transport-attribution tests use it to kill one specific request.
   rejectRequest: ((request: RecordedRequest) => unknown) | undefined = undefined;
+  // Optional read-only observer invoked as each request is issued.
+  onRequest: ((request: RecordedRequest) => void) | undefined = undefined;
 
   // Behavioral model of the GitHub draft-identity detachment CONFIRMED by a
   // live API probe (issue #13; public release run 33971009517): a PATCH to an
@@ -267,6 +272,7 @@ class MockGithub {
   }): Promise<{ status: number; text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }> {
     const method = init?.method ?? "GET";
     this.requests.push({ method, url, body: typeof init?.body === "string" ? init.body : undefined });
+    this.onRequest?.(this.requests[this.requests.length - 1]);
     const injectedRejection = this.rejectRequest?.({ method, url, body: typeof init?.body === "string" ? init.body : undefined });
     if (injectedRejection !== undefined) throw injectedRejection;
     const parsed = new URL(url);
@@ -546,6 +552,7 @@ function publishWith(repo: SyntheticRepo, github: MockGithub, overrides: {
   legacyVerifyOnly?: boolean;
   inspectOnly?: boolean;
   androidRun?: typeof androidRun;
+  fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 } = {}): Promise<PublishSummary> {
   const eligible = overrides.eligible ?? true;
   // List-shaped association + detailed record, as the real endpoints return.
@@ -562,7 +569,8 @@ function publishWith(repo: SyntheticRepo, github: MockGithub, overrides: {
     legacyVerifyOnly: overrides.legacyVerifyOnly,
     inspectOnly: overrides.inspectOnly,
     androidRun: overrides.androidRun ?? androidRun,
-    fetchImpl: github.fetch.bind(github),
+    // A native-fetch override (owned loopback) is structurally the same client contract.
+    fetchImpl: (overrides.fetchImpl as FetchLike | undefined) ?? github.fetch.bind(github),
     projectRoot: repo.root,
     baseline: repo.baseline,
     // Default: the target IS the adoption anchor, i.e. a legacy build — this
@@ -1939,6 +1947,135 @@ test("a transport failure on the publication PATCH is attributed to publish-rele
       publish.expectedAssetNames(publish.tarballFilenameFor("0.1.0-dev.2"), 2).sort(),
       "all six verified assets are present on the still-draft release",
     );
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+// --- Transport phase boundary in the actual producer (issue #708) ----------
+//
+// The publisher's artifact build and APK checks are synchronous; the first
+// request after them is the draft identity PATCH. These tests drive the real
+// publishRelease orchestration (no production test hook) and prove the
+// boundary sits exactly between that synchronous work and the PATCH.
+
+function isIdentityPatch(request: RecordedRequest): boolean {
+  return isReleasePatch(request) && (request.body ?? "").includes('"draft":true');
+}
+
+test("the identity PATCH waits one full event-loop turn after the synchronous artifact and APK checks", async () => {
+  const repo = makeRepo();
+  const github = new MockGithub();
+  // A two-step setImmediate chain armed at the end of each synchronous step:
+  // its second step can only have run if at least one full event-loop turn
+  // (two check phases with a poll phase between them) elapsed since that step.
+  // Re-armed on every APK tool call, so the last arming marks the end of the
+  // last synchronous APK check before the PATCH.
+  let witness = { origin: "none", first: false, second: false };
+  const arm = (origin: string) => {
+    const current = { origin, first: false, second: false };
+    witness = current;
+    setImmediate(() => {
+      current.first = true;
+      setImmediate(() => {
+        current.second = true;
+      });
+    });
+  };
+  let apkChecks = 0;
+  let built = false;
+  let atPatch: { origin: string; first: boolean; second: boolean; built: boolean; apkChecks: number; previousIsCreate: boolean } | undefined;
+  github.onRequest = (request) => {
+    if (atPatch || !isIdentityPatch(request)) return;
+    const previous = github.requests[github.requests.length - 2];
+    atPatch = { ...witness, built, apkChecks, previousIsCreate: previous.method === "POST" && new URL(previous.url).pathname === "/repos/rfairburn/pi-review-gate/releases" };
+  };
+  try {
+    const summary = await publishWith(repo, github, {
+      buildArtifacts: (options) => {
+        built = true;
+        arm("artifacts");
+        return Promise.resolve(fakeBuildArtifacts(options.eligibility));
+      },
+      androidRun: (file, args) => {
+        // Only the pre-PATCH loadAssets checks count; later verification
+        // calls happen after the PATCH was already observed.
+        if (!atPatch) {
+          apkChecks += 1;
+          arm("apk");
+        }
+        return androidRun(file, args);
+      },
+    });
+    assert.equal(summary.outcome, "published");
+    assert.ok(atPatch, "the identity PATCH was issued");
+    assert.equal(atPatch.built, true, "the artifact build ran before the identity PATCH");
+    assert.ok(atPatch.apkChecks > 0, "the synchronous APK checks ran before the identity PATCH");
+    assert.equal(atPatch.origin, "apk", "the last synchronous step before the PATCH was an APK check");
+    assert.equal(atPatch.first, true, "the PATCH did not run in the same phase as the synchronous work");
+    assert.equal(atPatch.second, true, "one full event-loop turn elapsed between the APK checks and the identity PATCH");
+    assert.equal(atPatch.previousIsCreate, true, "no request was added between draft creation and the identity PATCH");
+    assert.equal(github.countRequests(isIdentityPatch), 1, "exactly one identity PATCH");
+  } finally {
+    rmSync(repo.root, { recursive: true, force: true });
+  }
+});
+
+// Serves the stateful mock through the owned native-HTTP loopback server, so
+// the real producer runs over Node's built-in fetch and connection pool.
+function loopbackMockHandler(github: MockGithub): LoopbackHandler {
+  return async (request) => {
+    const hasBody = request.method !== "GET" && request.method !== "DELETE" && request.body.length > 0;
+    const body = hasBody ? (request.contentType.startsWith("application/json") ? request.body.toString("utf8") : request.body) : undefined;
+    const response = await github.fetch(request.url, { method: request.method, body });
+    return { status: response.status, body: Buffer.from(await response.arrayBuffer()) };
+  };
+}
+
+test("native loopback: a peer close during the producer's synchronous artifact work does not break the identity PATCH", async () => {
+  const repo = makeRepo();
+  const reference = new MockGithub();
+  const github = new MockGithub();
+  try {
+    // In-memory reference run of the same scenario: the native run must issue
+    // exactly the same requests with the same payloads.
+    const expected = await publishWith(repo, reference);
+    assert.equal(expected.outcome, "published");
+    const native = await withLoopbackServer(loopbackMockHandler(github), async (server) => {
+      let ack: LoopbackStats | undefined;
+      let summary: PublishSummary | undefined;
+      let failure: string | null | undefined;
+      try {
+        summary = await publishWith(repo, github, {
+          fetchImpl: server.fetchImpl,
+          buildArtifacts: (options) => {
+            // Inside the producer's synchronous artifact window: the event
+            // loop is blocked while the peer closes every idle pooled
+            // connection and witnesses each close.
+            ack = server.controlSync("close-idle");
+            return Promise.resolve(fakeBuildArtifacts(options.eligibility));
+          },
+        });
+      } catch (error) {
+        failure = common.describeReleaseTransport(error);
+      }
+      const after = await server.controlAsync("stats");
+      return { ack, outcome: summary?.outcome, failed: failure !== undefined, failure: failure ?? null, after };
+    });
+    assert.ok(native.ack, "the close interlude ran inside the artifact build");
+    const ack = native.ack as LoopbackStats;
+    assert.ok(ack.closed >= 1, `inconclusive — no idle pooled connection was closed during the artifact build (closed=${ack.closed})`);
+    assert.equal(ack.open, 0, "every pooled connection was closed and witnessed closed");
+    assert.equal(ack.patches, 0, "no PATCH before the artifact build");
+    assert.equal(native.failed, false, `the publication did not fail (${native.failure ?? "no transport line"})`);
+    assert.equal(native.outcome, "published");
+    assert.ok(native.after.connections > ack.connections, "the identity PATCH opened a fresh connection");
+    assert.equal(github.countRequests(isIdentityPatch), 1, "exactly one identity PATCH reached the server");
+    assert.equal(native.after.patches, 2, "the server received exactly the identity and publication PATCHes");
+    assert.equal(native.after.requests, github.requests.length, "every request reached the server once");
+    // Boolean-only comparison: a mismatch must never print request URLs or bodies.
+    assert.equal(github.requests.length, reference.requests.length, "the native run issued as many requests as the reference");
+    assert.equal(isDeepStrictEqual(github.requests, reference.requests), true, "request order, methods, URLs and payloads are unchanged");
   } finally {
     rmSync(repo.root, { recursive: true, force: true });
   }

@@ -498,6 +498,17 @@ export function frameWaitFailure(stage: string, metadata: FrameWaitMetadata, ter
   const parts = [
     `revision=${metadata.frameRevision}`,
     `after=${metadata.after}`,
+    ...launcherEvidenceParts(metadata),
+  ];
+  return new Error(`${stage}: bounded frame wait failed (${parts.join(", ")})`);
+}
+
+/**
+ * The shared fixed exit/abort/journal-witness parts of a launcher wait
+ * diagnostic: numeric and boolean status only, never journal or terminal text.
+ */
+function launcherEvidenceParts(metadata: Omit<FrameWaitMetadata, "frameRevision" | "after">): string[] {
+  const parts = [
     `exit=${metadata.exitObserved}`,
     `aborted=${metadata.aborted}`,
   ];
@@ -517,7 +528,74 @@ export function frameWaitFailure(stage: string, metadata: FrameWaitMetadata, ter
       parts.push(`summaryUnexited=${diagnosticNumber(metadata.summaryUnexitedSpawns)}`);
     }
   }
-  return new Error(`${stage}: bounded frame wait failed (${parts.join(", ")})`);
+  return parts;
+}
+
+/**
+ * The fixed native observer record types a journal-wait diagnostic may count by
+ * name. Any other type is folded into one count, so a record's own type string
+ * never reaches the message.
+ */
+export const NATIVE_JOURNAL_DIAGNOSTIC_TYPES = [
+  "session_start",
+  "native_session_name",
+  "session_shutdown",
+  "agent_start",
+  "agent_settled",
+  "tool_call",
+  "resize",
+] as const;
+export type NativeJournalDiagnosticType = (typeof NATIVE_JOURNAL_DIAGNOSTIC_TYPES)[number];
+
+/** The fixed outcome of a failed native journal wait; never free-form text. */
+export type NativeJournalWaitOutcome = "deadline exceeded" | "bounded event predicate failed" | "wait failed";
+
+/**
+ * Fixed metadata for a bounded native-journal wait failure. It reuses the frame
+ * wait's exit/abort/launcher-journal witnesses and adds counts only: how many
+ * observer records exist in total, per allowlisted type, and of other types, and
+ * how many public PTY spawn/exit records the launcher preload journaled. An
+ * unreadable observer journal is reported as such (`nativeReadable: false`) and
+ * an absent count means that evidence was unavailable, never guessed. No record
+ * field value (cwd, session id or file, name, PID, prompt, argument, environment
+ * value, or path) is ever carried.
+ */
+export interface NativeJournalWaitMetadata extends Omit<FrameWaitMetadata, "after"> {
+  readonly nativeReadable: boolean;
+  readonly nativeRecords?: number;
+  readonly nativeTypeCounts?: Readonly<Record<NativeJournalDiagnosticType, number>>;
+  readonly nativeOtherRecords?: number;
+  readonly ptySpawns?: number;
+  readonly ptyExits?: number;
+}
+
+/**
+ * Build a bounded native-journal wait diagnostic. The message keeps the
+ * original `${stage}: ${outcome}` prefix so the failure reads exactly as the
+ * unchanged wait reported it, followed by fixed numeric/boolean evidence only.
+ */
+export function nativeJournalWaitFailure(stage: string, outcome: NativeJournalWaitOutcome, metadata: NativeJournalWaitMetadata): Error {
+  const parts = [`revision=${metadata.frameRevision}`, ...launcherEvidenceParts(metadata)];
+  if (!metadata.nativeReadable) {
+    parts.push("native=unreadable");
+  } else {
+    parts.push(`native=${diagnosticNumber(metadata.nativeRecords)}`);
+    for (const type of NATIVE_JOURNAL_DIAGNOSTIC_TYPES) {
+      parts.push(`${type}=${diagnosticNumber(metadata.nativeTypeCounts?.[type])}`);
+    }
+    parts.push(`otherTypes=${diagnosticNumber(metadata.nativeOtherRecords)}`);
+  }
+  if (metadata.ptySpawns !== undefined) parts.push(`ptySpawns=${diagnosticNumber(metadata.ptySpawns)}`);
+  if (metadata.ptyExits !== undefined) parts.push(`ptyExits=${diagnosticNumber(metadata.ptyExits)}`);
+  return new Error(`${stage}: ${outcome} (bounded journal evidence: ${parts.join(", ")})`);
+}
+
+/** Classify a native journal wait rejection into its fixed outcome token. */
+function nativeJournalWaitOutcome(error: unknown): NativeJournalWaitOutcome {
+  if (!(error instanceof Error)) return "wait failed";
+  if (error.message.endsWith(": deadline exceeded")) return "deadline exceeded";
+  if (error.message.endsWith(": bounded event predicate failed")) return "bounded event predicate failed";
+  return "wait failed";
 }
 
 /**
@@ -984,9 +1062,63 @@ export class LauncherPtyDriver {
     return evidence;
   }
 
+  /**
+   * Durable observer-journal readiness. The native observer appends each
+   * record once, and its only live trigger is an `fs.watch` notification that
+   * can be coalesced or never delivered, so this uses the shared bounded
+   * `waitForRecheck`: the unchanged predicate, the single original absolute
+   * deadline, the leg abort signal, and `notify()` as the fast path, plus the
+   * shared bounded re-evaluation that never resets or extends that deadline.
+   * Cancellation by the leg deadline is rethrown verbatim; any other failure
+   * keeps its original `${stage}: ${outcome}` prefix with bounded,
+   * transcript-free journal evidence appended.
+   */
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, stage: string, timeoutMs = LAUNCHER_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, stage, this.deadline.signal);
+    const signal = this.deadline.signal;
+    await this.journalSignal.waitForRecheck(() => predicate(this.records()), timeoutMs, stage, signal).catch((error: unknown) => {
+      if (error instanceof Error && /leg deadline|cancelled before completion/.test(error.message)) throw error;
+      throw nativeJournalWaitFailure(stage, nativeJournalWaitOutcome(error), this.nativeWaitFailureEvidence(signal));
+    });
     return this.records();
+  }
+
+  /**
+   * Bounded, transcript-free evidence for one native-journal wait failure: the
+   * same exit/abort/launcher-journal witnesses as a frame-wait failure plus
+   * record counts only. A journal that cannot be read leaves its counts
+   * unreported (or the observer journal explicitly `unreadable`) rather than
+   * claiming they are zero.
+   */
+  private nativeWaitFailureEvidence(signal: AbortSignal): NativeJournalWaitMetadata {
+    const { after: _after, ...base } = this.waitFailureEvidence(-1, signal);
+    void _after;
+    const evidence: { -readonly [K in keyof NativeJournalWaitMetadata]: NativeJournalWaitMetadata[K] } = { ...base, nativeReadable: false };
+    try {
+      const records = this.records();
+      const counts = Object.fromEntries(NATIVE_JOURNAL_DIAGNOSTIC_TYPES.map((type) => [type, 0])) as Record<NativeJournalDiagnosticType, number>;
+      let other = 0;
+      for (const record of records) {
+        const type = (NATIVE_JOURNAL_DIAGNOSTIC_TYPES as readonly unknown[]).includes(record.type)
+          ? record.type as NativeJournalDiagnosticType
+          : undefined;
+        if (type === undefined) other += 1;
+        else counts[type] += 1;
+      }
+      evidence.nativeReadable = true;
+      evidence.nativeRecords = records.length;
+      evidence.nativeTypeCounts = counts;
+      evidence.nativeOtherRecords = other;
+    } catch {
+      // Unreadable: reported as such, never as an empty journal.
+    }
+    try {
+      const ptyRecords = this.ptyRecords();
+      evidence.ptySpawns = ptyRecords.filter((record) => record.type === "pty_spawn").length;
+      evidence.ptyExits = ptyRecords.filter((record) => record.type === "pty_exit").length;
+    } catch {
+      // Unreadable: the PTY counts stay unreported.
+    }
+    return evidence;
   }
 
   async waitForPty(predicate: (records: PtyJournalRecord[]) => boolean, stage: string, timeoutMs = LAUNCHER_EVENT_TIMEOUT_MS): Promise<PtyJournalRecord[]> {

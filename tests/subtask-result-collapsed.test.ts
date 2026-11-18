@@ -14,9 +14,6 @@
  * `expandableResult` wrapper, so these cards must never contain their own hint.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { after, before, test } from "node:test";
 import { normalizeConfig } from "../src/config";
 import { renderSubtaskResultCollapsed } from "../src/execution/subtask-result-collapsed";
@@ -100,10 +97,9 @@ function harness() {
   return { tools, manager };
 }
 
-const state: { manager?: ExecutionToolManager; tools: Array<Record<string, any>>; root?: string } = { tools: [] };
+const state: { manager?: ExecutionToolManager; tools: Array<Record<string, any>> } = { tools: [] };
 
 before(async () => {
-  state.root = await mkdir(join(tmpdir(), "subtask-collapsed-"), { recursive: true }).then(() => join(tmpdir(), "subtask-collapsed-"));
   const harness_ = harness();
   state.manager = harness_.manager;
   state.tools = harness_.tools;
@@ -111,7 +107,6 @@ before(async () => {
 
 after(async () => {
   if (state.manager) await state.manager.shutdown();
-  await rm(join(tmpdir(), "subtask-collapsed-"), { recursive: true, force: true });
 });
 
 function execute(name: string): ExecuteTool {

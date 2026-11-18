@@ -150,6 +150,7 @@ import {
   processIsAlive,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
+import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import { waitForDurableReadyLeaf } from "./helpers/change-signal";
 import { hasFullWidthNativeEditorRule } from "./helpers/session-host-native-saved-main-harness";
 import {
@@ -411,6 +412,261 @@ function cardCounts(text: string, label: string): CardCounts | undefined {
 /** True only for the honest task count the acceptance tolerates: known 0 or unknown. */
 function honestTaskCount(counts: CardCounts): boolean {
   return counts.tasks === null || counts.tasks === 0;
+}
+
+/**
+ * Issue #697 failure-only diagnostics for the post-ShellList known-zero shell
+ * assertion. Instrumentation only: the assertion itself is the original strict
+ * `assert.equal(cardCounts(sample, ROW_LABEL)?.shells, 0, message)` over ONE
+ * canonical frame sample, with the same extraction, actual, and expected. Only
+ * when that exact comparison fails is a bounded fact line appended to the
+ * original message, built from the same sample with the canonical roster
+ * helpers. It never reads another frame, waits, or flushes, never carries raw
+ * sidebar/native/activity/footer text or exception text, and any diagnostic
+ * failure degrades to a fixed `unavailable` label instead of replacing the
+ * original assertion failure.
+ */
+const SHELL_SAMPLE_MESSAGE_MAX_CHARS = 1024;
+const SHELL_SAMPLE_ROW_TOKEN_LIMIT = 16;
+const SHELL_SAMPLE_UNAVAILABLE = "unavailable";
+
+/** Existing public driver counters captured before the list prompt. */
+interface ShellSampleCounters {
+  readonly frameRevision: number;
+  readonly outputRevision: number;
+}
+
+/** Passive existing driver facts read in the same synchronous tick as the sample. */
+interface ShellSampleObservation extends ShellSampleCounters {
+  readonly redrawState: string;
+  readonly exited: boolean;
+}
+
+/** A safely bounded numeric fact; anything else is a fixed label. */
+function boundedSampleNumber(value: unknown): string {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return "?";
+  if (value < 0) return "neg";
+  return value > 999_999 ? ">999999" : String(value);
+}
+
+/** A signed bounded delta between two counter readings. */
+function boundedSampleDelta(observed: unknown, baseline: unknown): string {
+  if (typeof observed !== "number" || typeof baseline !== "number"
+    || !Number.isSafeInteger(observed) || !Number.isSafeInteger(baseline)) return "?";
+  const delta = observed - baseline;
+  if (delta < 0) return "neg";
+  return delta > 999_999 ? "+>999999" : `+${delta}`;
+}
+
+/**
+ * Fixed row-shape token for one SGR-stripped sidebar pane row (never its text):
+ * `_` blank, `H` roster header, `a` activity-indented, `S`/`U` selected or
+ * unselected marker rows suffixed `b` (count row this test's own pattern reads),
+ * `g` (other `bg tasks` row), or `m` (other marker row), `L` a row whose
+ * rendered title matches the label, and `t` any other unindented text.
+ */
+function sidebarRowShapeToken(line: string, label: string): string {
+  const trimmed = line.trimEnd();
+  if (trimmed.length === 0) return "_";
+  if (/^\s*Sessions \(\d+\)\s*$/u.test(line)) return "H";
+  if (line.startsWith("    ")) return "a";
+  const marker = line.startsWith("> ") ? "S" : line.startsWith("  ") ? "U" : undefined;
+  if (marker !== undefined) {
+    const body = trimmed.slice(2);
+    if (BACKGROUND_PATTERN.test(body)) return `${marker}b`;
+    return `${marker}${body.startsWith("bg tasks ") ? "g" : "m"}`;
+  }
+  return renderedTitleMatches(trimmed, label) ? "L" : "t";
+}
+
+/** Up to SHELL_SAMPLE_ROW_TOKEN_LIMIT run-length row-shape tokens from the roster header on. */
+function sidebarRowShapeTokens(text: string, label: string): string {
+  const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
+  const offset = /^\s*Sessions \(\d+\)\s*$/u.test(pane[0] ?? "") ? 0 : 1;
+  const runs: Array<{ token: string; count: number }> = [];
+  for (const line of pane.slice(offset)) {
+    const token = sidebarRowShapeToken(line, label);
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.token === token) last.count += 1;
+    else runs.push({ token, count: 1 });
+  }
+  const shown = runs.slice(0, SHELL_SAMPLE_ROW_TOKEN_LIMIT)
+    .map((run) => (run.count > 1 ? `${run.token}*${boundedSampleNumber(run.count)}` : run.token));
+  const more = runs.length > SHELL_SAMPLE_ROW_TOKEN_LIMIT ? `,+${boundedSampleNumber(runs.length - SHELL_SAMPLE_ROW_TOKEN_LIMIT)}` : "";
+  return `[${shown.join(",")}${more}]`;
+}
+
+/** Fixed classification of one sample, using the same canonical extraction as the assertion. */
+function shellSampleFacts(text: string, label: string): string {
+  const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
+  const cards = rosterCards(text, SIDEBAR_COLUMNS);
+  const matches = cards.filter((card) => renderedTitleMatches(card.title, label));
+  const counts = cardCounts(text, label);
+  let outcome: string;
+  let bgRow = "none";
+  if (!parsed.complete) outcome = "incomplete";
+  else if (matches.length === 0) outcome = "missing";
+  else if (matches.length > 1) outcome = "duplicate";
+  else if (counts === undefined) {
+    outcome = "unparseable-bg";
+    const background = matches[0]!.background;
+    bgRow = background.endsWith("...") ? "clipped" : background.includes("N/A") ? "N/A" : "other";
+  } else if (counts.shells === null) outcome = "shells-unknown";
+  else if (counts.shells !== 0) outcome = "nonzero";
+  else outcome = "known-zero";
+  const shells = counts === undefined ? "undefined" : counts.shells === null ? "unknown" : boundedSampleNumber(counts.shells);
+  return `outcome=${outcome} bgRow=${bgRow} shells=${shells} roster=${parsed.complete ? "complete" : "incomplete"}`
+    + ` headerValid=${parsed.count !== undefined} count=${parsed.count === undefined ? "none" : boundedSampleNumber(parsed.count)}`
+    + ` entryEnd=${boundedSampleNumber(parsed.entryEnd)} cards=${boundedSampleNumber(cards.length)}`
+    + ` titleMatches=${boundedSampleNumber(matches.length)}`;
+}
+
+/** Same-sample passive counter facts; a throwing or malformed read is a fixed label. */
+function shellSampleCounterFacts(baseline: ShellSampleCounters, observe: () => ShellSampleObservation): string {
+  let observed: ShellSampleObservation;
+  try { observed = observe(); } catch { return `counters=${SHELL_SAMPLE_UNAVAILABLE}`; }
+  const redraw = observed.redrawState === "clear" || observed.redrawState === "held" || observed.redrawState === "unavailable"
+    ? observed.redrawState : "?";
+  return `frameRev=${boundedSampleNumber(observed.frameRevision)}(${boundedSampleDelta(observed.frameRevision, baseline.frameRevision)})`
+    + ` outputRev=${boundedSampleNumber(observed.outputRevision)}(${boundedSampleDelta(observed.outputRevision, baseline.outputRevision)})`
+    + ` redraw=${redraw} exited=${observed.exited === true ? "true" : observed.exited === false ? "false" : "?"}`;
+}
+
+/** Original message plus the bounded failure-only diagnostic, never longer than the cap. */
+function withShellSampleDiagnostic(
+  message: string,
+  text: string,
+  label: string,
+  baseline: ShellSampleCounters,
+  observe: () => ShellSampleObservation,
+): string {
+  const section = (build: () => string, name: string): string => {
+    try { return build(); } catch { return `${name}=${SHELL_SAMPLE_UNAVAILABLE}`; }
+  };
+  const diagnostic = `[#697 single-sample diagnostic] ${section(() => shellSampleFacts(text, label), "facts")}`
+    + ` ${section(() => shellSampleCounterFacts(baseline, observe), "counters")}`
+    + ` rows=${section(() => sidebarRowShapeTokens(text, label), "rows")}`;
+  const budget = SHELL_SAMPLE_MESSAGE_MAX_CHARS - message.length - 1;
+  if (budget <= 0) return message;
+  return `${message} ${diagnostic.length <= budget ? diagnostic : diagnostic.slice(0, budget)}`;
+}
+
+/**
+ * The original strict known-zero assertion over one already-taken canonical
+ * sample. `observe` is invoked only on failure, synchronously before the
+ * assertion throws, so its passive counters belong to the same sample.
+ */
+function assertKnownZeroShellSample(
+  sample: string,
+  message: string,
+  baseline: ShellSampleCounters,
+  observe: () => ShellSampleObservation,
+): void {
+  const shells = cardCounts(sample, ROW_LABEL)?.shells;
+  assert.equal(shells, 0, Object.is(shells, 0)
+    ? message
+    : withShellSampleDiagnostic(message, sample, ROW_LABEL, baseline, observe));
+}
+
+/**
+ * Issue #697 test-observation fence for the post-ShellList strict assertion.
+ *
+ * A deterministic real-TerminalSurface control in this file shows that one
+ * outer frame can be read between an erased status row and its redraw suffix
+ * (complete 0 -> incomplete/no extractable card -> complete 0). That control is
+ * SYNTHETIC mechanism evidence only: it is not a native reproduction and not
+ * proof of the historical CI failure's cause.
+ *
+ * The fence waits ONCE, through the driver's existing event-driven frame wait
+ * and its unchanged single EVENT_TIMEOUT_MS deadline, for a structurally
+ * complete post-list observation: the scripted list turn's response marker plus
+ * a canonical `parseRosterFrame(...).complete` roster. Readiness never depends
+ * on the shell or task count, the owned card's multiplicity, or count
+ * extraction, so a complete response-bearing frame with a nonzero, unknown,
+ * N/A, clipped, missing, or duplicate owned card is the captured snapshot and
+ * reaches the ORIGINAL strict known-zero assertion, which fails even if a later
+ * frame would show 0. The eligible text and its passive counters are captured
+ * inside the predicate (the same synchronous tick) and never re-sampled after
+ * the await. A deadline, owned PTY exit, or predicate failure fails closed with
+ * a bounded fixed-label message; the driver's raw frame/exception text is
+ * deliberately dropped.
+ */
+const POST_LIST_RESPONSE_MARKER = "probe service listed";
+const POST_LIST_FENCE_DESCRIPTION =
+  "the list turn renders a complete response-bearing roster frame before the strict known-zero shell assertion";
+
+/** The existing driver capabilities the fence uses; nothing else is read. */
+interface PostListFrameSource {
+  /** The driver's own event-driven frame wait with its default single deadline. */
+  waitFrame(predicate: (text: string) => boolean, description: string): Promise<void>;
+  /** Passive owned outer PTY exit fact. */
+  exited(): boolean;
+  /** Passive diagnostic counters, read only inside the predicate for an eligible frame. */
+  observe(): ShellSampleObservation;
+}
+
+/** The one eligible snapshot: its text and its same-tick passive counters. */
+interface PostListFrame {
+  readonly text: string;
+  readonly observe: () => ShellSampleObservation;
+}
+
+/** Structural post-list readiness only: response marker plus a canonical complete roster. */
+function postListFrameEligible(text: string): boolean {
+  return text.includes(POST_LIST_RESPONSE_MARKER) && parseRosterFrame(text, SIDEBAR_COLUMNS).complete;
+}
+
+/** Bounded fixed-label fence failure context from the last evaluated frame only. */
+function postListFenceFailure(reason: string, evaluations: number, last: string | undefined): string {
+  const section = (build: () => string, name: string): string => {
+    try { return build(); } catch { return `${name}=${SHELL_SAMPLE_UNAVAILABLE}`; }
+  };
+  const lastFacts = last === undefined
+    ? "last=none"
+    : `marker=${section(() => (last.includes(POST_LIST_RESPONSE_MARKER) ? "present" : "absent"), "marker")}`
+      + ` ${section(() => shellSampleFacts(last, ROW_LABEL), "facts")}`
+      + ` rows=${section(() => sidebarRowShapeTokens(last, ROW_LABEL), "rows")}`;
+  const message = `${POST_LIST_FENCE_DESCRIPTION}: no eligible frame [#697 post-list fence] reason=${reason}`
+    + ` evaluations=${boundedSampleNumber(evaluations)} ${lastFacts}`;
+  return message.length <= SHELL_SAMPLE_MESSAGE_MAX_CHARS ? message : message.slice(0, SHELL_SAMPLE_MESSAGE_MAX_CHARS);
+}
+
+async function awaitCompletePostListFrame(source: PostListFrameSource): Promise<PostListFrame> {
+  let eligible: PostListFrame | undefined;
+  let evaluations = 0;
+  let last: string | undefined;
+  let predicateFailed = false;
+  try {
+    await source.waitFrame((text) => {
+      if (eligible !== undefined) return true; // the first eligible snapshot is never replaced
+      evaluations += 1;
+      last = text;
+      try {
+        if (source.exited() || !postListFrameEligible(text)) return false;
+      } catch (error) {
+        predicateFailed = true;
+        throw error; // the shared wait core turns this into its own generic failure
+      }
+      let observation: ShellSampleObservation | undefined;
+      try { observation = source.observe(); } catch { observation = undefined; }
+      eligible = {
+        text,
+        observe: () => {
+          if (observation === undefined) throw new Error(SHELL_SAMPLE_UNAVAILABLE);
+          return observation;
+        },
+      };
+      return true;
+    }, POST_LIST_FENCE_DESCRIPTION);
+  } catch {
+    // The driver's rejection carries the raw full frame; it is never forwarded.
+    let exited: boolean | undefined;
+    try { exited = source.exited(); } catch { exited = undefined; }
+    const reason = exited === true ? "exited" : predicateFailed ? "predicate-error" : exited === false ? "not-ready" : "unavailable";
+    throw new Error(postListFenceFailure(reason, evaluations, last));
+  }
+  if (eligible === undefined) throw new Error(postListFenceFailure("unresolved", evaluations, last));
+  return eligible;
 }
 
 /** The sidebar pane footer text after a complete roster extent; undefined when incomplete. */
@@ -1110,6 +1366,11 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
       && hasFullWidthNativeEditorRule(text, OUTER_COLS - SIDEBAR_COLUMNS - 1) && text.includes("probe service stop requested"),
       "the stop turn restores the complete native editor before the list prompt");
     const beforeList = settledCount();
+    // #697 diagnostics only: passive existing counters before the list prompt.
+    const listPromptBaseline: ShellSampleCounters = {
+      frameRevision: driver.frameRevision,
+      outputRevision: driver.outputRevision,
+    };
     await driver.writeAndWait(PROMPT_LIST, (text) => text.includes(PROMPT_LIST),
       "the list prompt is typed into the real native editor");
     await driver.writeKeys(KEYS.enter, "the list prompt is submitted to the real native child");
@@ -1122,8 +1383,26 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     }), "the public ShellList result reports the exact job as done");
     assert.ok(toolCallCount("ShellList") >= 1,
       "the real native child dispatched the public ShellList tool call that corroborated the exact job");
-    assert.equal(cardCounts(driver.currentText(), ROW_LABEL)?.shells, 0,
-      "the row's known zero shell count is unchanged after the corroborating ShellList");
+    // #697 observation fence (see awaitCompletePostListFrame): one bounded
+    // event-driven wait for a structurally complete response-bearing frame,
+    // independent of any count. That one captured snapshot (and its same-tick
+    // counters) serves both the unchanged strict assertion and, only on its
+    // failure, the bounded diagnostic; the frame is never re-sampled here. The
+    // synthetic split-row control motivates this fence; it does not establish
+    // the historical cause.
+    const listFrame = await awaitCompletePostListFrame({
+      waitFrame: (predicate, description) => driver.waitFrame(predicate, description),
+      exited: () => driver.exitEvent !== undefined,
+      observe: () => ({
+        frameRevision: driver.frameRevision,
+        outputRevision: driver.outputRevision,
+        redrawState: driver.surface.redrawState(),
+        exited: driver.exitEvent !== undefined,
+      }),
+    });
+    assertKnownZeroShellSample(listFrame.text,
+      "the row's known zero shell count is unchanged after the corroborating ShellList",
+      listPromptBaseline, listFrame.observe);
     // Completion-side preparation cleanup is asserted only after the public
     // ShellList `done` settlement for the exact job, which the extension
     // reports only once that job's own settlement finished: the publisher has
@@ -1941,6 +2220,578 @@ test("scenario frame witnesses reject partial and mixed footers", () => {
   assert.equal(sidebarOwnedFrame(frame("Session host", mainFooter), "BGT"), false,
     "a stale host header is never the active child's owner header");
   assert.equal(activatedRowFrame(frame("Session host", mainFooter)), false);
+});
+
+/** Synthetic #697 controls: the exact original assertion message and comparison. */
+const SHELL_SAMPLE_MESSAGE = "the row's known zero shell count is unchanged after the corroborating ShellList";
+const SHELL_SAMPLE_CARD = ["BGT", "> agent idle | input none", "  bg tasks 0 | shells 0", "", ""] as const;
+const SHELL_SAMPLE_ACTIONS = ["  Saved conversations", "  New session", "  Quit host"] as const;
+const SHELL_SAMPLE_FOOTER = ["F8 toggle | enter open | esc hide", "q quit"] as const;
+
+/** The same composed-frame builder pattern as the footer witness test above. */
+function shellSampleFrame(rows: readonly string[], native: readonly string[] = [], header = "BGT"): string {
+  return [header, ...rows.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}│${native[index] ?? (index === 0 ? "Welcome" : "")}`)]
+    .join("\n");
+}
+
+function shellSampleRows(card: readonly string[] = SHELL_SAMPLE_CARD, count = 1, extra: readonly string[] = []): string[] {
+  return [` Sessions (${count}) `, ...card, ...SHELL_SAMPLE_ACTIONS, ...SHELL_SAMPLE_FOOTER, ...extra];
+}
+
+function withShellRow(row: string): string[] {
+  return [SHELL_SAMPLE_CARD[0], SHELL_SAMPLE_CARD[1], row, SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]];
+}
+
+/**
+ * Node's own strict-equality rendering appended after a custom message (for
+ * example `\n\n3 !== 0\n`); it depends only on actual/expected, so the
+ * instrumented failure must end with the exact same tail.
+ */
+function originalShellFailureTail(original: assert.AssertionError): string {
+  assert.ok(original.message.startsWith(SHELL_SAMPLE_MESSAGE), "the original failure starts with its literal message");
+  return original.message.slice(SHELL_SAMPLE_MESSAGE.length);
+}
+
+/** What the ORIGINAL un-instrumented assertion throws (or undefined when it passes). */
+function originalShellAssertionError(sample: string): assert.AssertionError | undefined {
+  try {
+    assert.equal(cardCounts(sample, ROW_LABEL)?.shells, 0, SHELL_SAMPLE_MESSAGE);
+    return undefined;
+  } catch (error) {
+    assert.ok(error instanceof assert.AssertionError, "the original assertion fails only as an AssertionError");
+    return error;
+  }
+}
+
+const SYNTHETIC_BASELINE: ShellSampleCounters = { frameRevision: 100, outputRevision: 40 };
+const syntheticObservation = (): ShellSampleObservation =>
+  ({ frameRevision: 112, outputRevision: 47, redrawState: "clear", exited: false });
+
+/**
+ * Runs the instrumented assertion and proves it fails exactly as the original:
+ * same error class, code, operator, actual, and expected, with the original
+ * message as an unmodified prefix and the whole message within the cap.
+ */
+function instrumentedShellFailure(sample: string, observe = syntheticObservation): string {
+  const original = originalShellAssertionError(sample);
+  assert.ok(original, "the synthetic sample fails the original strict assertion");
+  const tail = originalShellFailureTail(original);
+  let observedCalls = 0;
+  let instrumented: unknown;
+  try {
+    assertKnownZeroShellSample(sample, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, () => { observedCalls += 1; return observe(); });
+  } catch (error) {
+    instrumented = error;
+  }
+  assert.ok(instrumented instanceof assert.AssertionError, "the instrumented assertion still throws the original AssertionError kind");
+  assert.equal(instrumented.code, original.code);
+  assert.equal(instrumented.operator, original.operator);
+  assert.ok(Object.is(instrumented.actual, original.actual), "the instrumented failure keeps the exact original actual value");
+  assert.ok(Object.is(instrumented.expected, original.expected), "the instrumented failure keeps the exact original expected value");
+  assert.equal(instrumented.generatedMessage, false);
+  assert.equal(observedCalls, 1, "same-sample counters are read exactly once, on failure");
+  assert.ok(instrumented.message.endsWith(tail), "Node's own actual/expected rendering is unchanged after the message");
+  const reported = instrumented.message.slice(0, instrumented.message.length - tail.length);
+  assert.ok(reported.startsWith(`${SHELL_SAMPLE_MESSAGE} [#697 single-sample diagnostic] `),
+    "the original message is preserved verbatim before the diagnostic");
+  assert.ok(reported.length <= SHELL_SAMPLE_MESSAGE_MAX_CHARS, "the supplied assertion message stays within its cap");
+  assert.equal(reported.includes("BGT"), false, "no raw sidebar title text is copied into the diagnostic");
+  return reported.slice(SHELL_SAMPLE_MESSAGE.length + 1);
+}
+
+test("#697 single-sample shell diagnostics keep the strict assertion and classify one sample", () => {
+  // Pass: the complete known-zero sample passes both forms, and the failure-only
+  // diagnostic (including its counter observation) is never built.
+  const passing = shellSampleFrame(shellSampleRows());
+  assert.equal(originalShellAssertionError(passing), undefined, "the canonical complete known-zero sample passes the original assertion");
+  assert.doesNotThrow(() => assertKnownZeroShellSample(passing, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, () => {
+    throw new Error("same-sample counters must not be read on a passing sample");
+  }));
+  assert.match(shellSampleFacts(passing, ROW_LABEL), /^outcome=known-zero bgRow=none shells=0 roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=1$/u);
+
+  // Nonzero known count: actual is the observed number.
+  const nonzero = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 3"))));
+  assert.match(nonzero, /outcome=nonzero bgRow=none shells=3 roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=1 /u);
+  assert.match(nonzero, / frameRev=112\(\+12\) outputRev=47\(\+7\) redraw=clear exited=false /u);
+  assert.match(nonzero, / rows=\[H,L,Sm,Ub,_\*2,Um\*3,t\*2\]$/u);
+
+  // Unknown count maps to null, distinct from an undefined extraction.
+  const unknown = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells unknown"))));
+  assert.match(unknown, /outcome=shells-unknown bgRow=none shells=unknown roster=complete /u);
+
+  // Incomplete: an erased status row leaves no complete roster (undefined extraction).
+  const erased = instrumentedShellFailure(shellSampleFrame(shellSampleRows(
+    [SHELL_SAMPLE_CARD[0], "", SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]]),
+  ));
+  assert.match(erased, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=0 cards=0 titleMatches=0 /u);
+  assert.match(erased, / rows=\[H,L,_,Ub,_\*2,Um\*3,t\*2\]$/u);
+
+  // Missing title: a complete roster without the owned label.
+  const missing = instrumentedShellFailure(shellSampleFrame(shellSampleRows(
+    ["Other", SHELL_SAMPLE_CARD[1], SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]]),
+  ));
+  assert.match(missing, /outcome=missing bgRow=none shells=undefined roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=0 /u);
+
+  // Duplicate title: two complete cards both match the owned label.
+  const duplicateCard = [...SHELL_SAMPLE_CARD, "BGT", "  agent idle | input none", "  bg tasks 0 | shells 0", "", ""];
+  const duplicateSample = shellSampleFrame(shellSampleRows(duplicateCard, 2));
+  assert.equal(parseRosterFrame(duplicateSample, SIDEBAR_COLUMNS).complete, true, "the duplicate control is a complete two-card roster");
+  const duplicate = instrumentedShellFailure(duplicateSample);
+  assert.match(duplicate, /outcome=duplicate bgRow=none shells=undefined roster=complete headerValid=true count=2 entryEnd=13 cards=2 titleMatches=2 /u);
+
+  // N/A count row: complete for the shared parser, unreadable for this test's own pattern.
+  const notApplicableSample = shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells N/A")));
+  assert.equal(parseRosterFrame(notApplicableSample, SIDEBAR_COLUMNS).complete, true);
+  assert.match(instrumentedShellFailure(notApplicableSample), /outcome=unparseable-bg bgRow=N\/A shells=undefined roster=complete /u);
+
+  // Clipped count row: the renderer's exact width-2 ellipsis form.
+  const clippedRow = "  bg tasks 1234567890123 | shell...";
+  assert.equal(clippedRow.length, SIDEBAR_COLUMNS, "the clipped control fills the exact pane width");
+  const clippedSample = shellSampleFrame(shellSampleRows(withShellRow(clippedRow)));
+  assert.equal(parseRosterFrame(clippedSample, SIDEBAR_COLUMNS).complete, true);
+  const clipped = instrumentedShellFailure(clippedSample);
+  assert.match(clipped, /outcome=unparseable-bg bgRow=clipped shells=undefined roster=complete /u);
+  assert.match(clipped, / rows=\[H,L,Sm,Ug,/u);
+
+  // A not-applicable TASK cell is equally unreadable to this test's own pattern
+  // (the shared grammar admits only unknown/digits/N/A or clipping, so the
+  // `other` label is a defensive fallback for any future admitted form).
+  const tasksNotApplicable = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks N/A | shells 0"))));
+  assert.match(tasksNotApplicable, /outcome=unparseable-bg bgRow=N\/A shells=undefined roster=complete /u);
+});
+
+test("#697 shell diagnostics stay bounded, private, and never replace the original failure", () => {
+  const SENTINELS = ["PRIVATE-SENTINEL", "/Users/", "sess-0123", "TOKEN="] as const;
+  const privateNative = "PRIVATE-SENTINEL /Users/someone/.secret sess-0123 TOKEN=abc";
+  // A complete nonzero roster whose native pane, outer header, activity rows,
+  // and footer/notice rows all carry sentinels: only shapes and facts escape.
+  const privateCard = [SHELL_SAMPLE_CARD[0], "> agent idle | input none", "  bg tasks 0 | shells 4",
+    "    PRIVATE-SENTINEL activity", "    sess-0123"];
+  const completeRows = shellSampleRows(privateCard, 1, ["PRIVATE-SENTINEL footer /Users/x", "/Users/someone/private"])
+    .map((row) => (row === "q quit" ? "q quit PRIVATE-SENTINEL" : row));
+  const completePrivate = shellSampleFrame(completeRows, completeRows.map(() => privateNative), "PRIVATE-SENTINEL header");
+  assert.equal(parseRosterFrame(completePrivate, SIDEBAR_COLUMNS).complete, true, "the private control is a complete roster");
+  const completeMessage = instrumentedShellFailure(completePrivate);
+  assert.match(completeMessage, /outcome=nonzero bgRow=none shells=4 roster=complete /u);
+  assert.match(completeMessage, / rows=\[H,L,Sm,Ub,a\*2,Um\*3,t\*4\]$/u);
+
+  // Unknown marker-shaped sidebar rows after the action tail make the roster
+  // incomplete; they are reported only as shape tokens.
+  const unknownRows = shellSampleRows(privateCard, 1, ["  PRIVATE-SENTINEL unknown", "> TOKEN=abc sess-0123"]);
+  const incompletePrivate = shellSampleFrame(unknownRows, unknownRows.map(() => privateNative), "PRIVATE-SENTINEL header");
+  const incompleteMessage = instrumentedShellFailure(incompletePrivate);
+  assert.match(incompleteMessage, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=8 /u);
+  assert.match(incompleteMessage, / rows=\[H,L,Sm,Ub,a\*2,Um\*3,t\*2,Um,Sm\]$/u);
+  for (const message of [completeMessage, incompleteMessage]) {
+    for (const sentinel of SENTINELS) {
+      assert.equal(message.includes(sentinel), false, `no private sentinel ${sentinel} reaches the diagnostic`);
+    }
+  }
+
+  // A throwing passive counter read degrades to a fixed label without its text.
+  const throwingObserve = (): ShellSampleObservation => { throw new Error("PRIVATE-SENTINEL /Users/someone sess-0123"); };
+  const unavailable = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 2"))), throwingObserve);
+  assert.match(unavailable, / counters=unavailable rows=/u);
+  for (const sentinel of SENTINELS) assert.equal(unavailable.includes(sentinel), false);
+
+  // A throwing baseline/counter fact is equally contained, never a replacement error.
+  const hostileBaseline = { get frameRevision(): number { throw new Error("PRIVATE-SENTINEL"); }, outputRevision: 1 };
+  const hostileSample = shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 2")));
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, SHELL_SAMPLE_MESSAGE, hostileBaseline, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.actual === 2 && error.expected === 0
+      && error.message.includes(" counters=unavailable ") && !error.message.includes("PRIVATE-SENTINEL"));
+
+  // Malformed/huge observed facts are bounded labels, not echoed values.
+  const malformed = instrumentedShellFailure(hostileSample, () => ({
+    frameRevision: Number.MAX_SAFE_INTEGER, outputRevision: -5, redrawState: "PRIVATE-SENTINEL", exited: "yes" as unknown as boolean,
+  }));
+  assert.match(malformed, / frameRev=>999999\(\+>999999\) outputRev=neg\(neg\) redraw=\? exited=\? /u);
+
+  // Huge counts and header counts stay bounded; the extraction's actual stays exact.
+  const huge = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 999999999999"))));
+  assert.match(huge, /outcome=nonzero bgRow=none shells=>999999 /u);
+  const hugeHeader = instrumentedShellFailure(shellSampleFrame(shellSampleRows(SHELL_SAMPLE_CARD, 99_999_999)));
+  assert.match(hugeHeader, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=>999999 /u);
+
+  // At most 16 row-shape tokens, with a bounded overflow count.
+  const manyShapes = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? "x" : ""));
+  const capped = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 5"), 1, manyShapes)));
+  const rowsPart = /rows=\[([^\]]*)\]$/u.exec(capped);
+  assert.ok(rowsPart, "the row-shape token list is present");
+  const tokens = rowsPart[1]!.split(",");
+  assert.equal(tokens.length, SHELL_SAMPLE_ROW_TOKEN_LIMIT + 1, "sixteen tokens plus one bounded overflow marker");
+  assert.match(tokens[tokens.length - 1]!, /^\+\d+$/u);
+
+  // The whole message never exceeds the cap; an over-long original is kept verbatim.
+  const hostileTail = originalShellFailureTail(originalShellAssertionError(hostileSample)!);
+  const longMessage = "m".repeat(SHELL_SAMPLE_MESSAGE_MAX_CHARS + 10);
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, longMessage, SYNTHETIC_BASELINE, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.message === `${longMessage}${hostileTail}`);
+  const nearCap = "m".repeat(SHELL_SAMPLE_MESSAGE_MAX_CHARS - 40);
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, nearCap, SYNTHETIC_BASELINE, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.message.endsWith(hostileTail)
+      && error.message.length - hostileTail.length === SHELL_SAMPLE_MESSAGE_MAX_CHARS
+      && error.message.startsWith(`${nearCap} [#697`));
+});
+
+test("SYNTHETIC mechanism evidence (not a native or historical reproduction): a real TerminalSurface split-row redraw", async () => {
+  // Deterministic in-process control only: the real TerminalSurface parser is
+  // fed a complete synthetic roster, then an erase-row chunk, then the redraw
+  // suffix, and the same instrumented assertion classifies each single sample.
+  const cols = SIDEBAR_COLUMNS + 1 + 20;
+  const surface = new TerminalSurface(cols, 16);
+  try {
+    let writes = 0;
+    const write = async (chunk: string): Promise<void> => {
+      surface.write(chunk);
+      writes += 1;
+      await surface.flush();
+    };
+    const sampleOf = (): string => surface.frame().lines.map(stripGeneratedSgr).join("\n");
+    const observe = (): ShellSampleObservation =>
+      ({ frameRevision: writes, outputRevision: writes, redrawState: surface.redrawState(), exited: false });
+    const baseline: ShellSampleCounters = { frameRevision: 0, outputRevision: 0 };
+    const rows = shellSampleRows();
+    await write(`\x1b[H\x1b[2J${shellSampleFrame(rows).split("\n").join("\r\n")}`);
+    const complete = sampleOf();
+    assert.doesNotThrow(() => assertKnownZeroShellSample(complete, SHELL_SAMPLE_MESSAGE, baseline, () => {
+      throw new Error("no counters are read for a passing synthetic sample");
+    }), "the complete synthetic roster passes the strict assertion");
+
+    // Erase-row chunk: the status row (terminal row 4) is cleared before its redraw.
+    await write("\x1b[4;1H\x1b[2K");
+    const split = sampleOf();
+    assert.equal(cardCounts(split, ROW_LABEL), undefined, "the split sample has no extractable card counts");
+    let splitMessage = "";
+    assert.throws(() => assertKnownZeroShellSample(split, SHELL_SAMPLE_MESSAGE, baseline, observe), (error: unknown) => {
+      if (!(error instanceof assert.AssertionError) || error.actual !== undefined || error.expected !== 0) return false;
+      splitMessage = error.message;
+      return true;
+    });
+    assert.match(splitMessage, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=0 cards=0 titleMatches=0 /u);
+    assert.match(splitMessage, / frameRev=2\(\+2\) outputRev=2\(\+2\) redraw=clear exited=false rows=\[H,L,_,Ub,/u);
+
+    // Redraw suffix: the row is repainted and the same assertion recovers.
+    await write(`\x1b[4;1H${rows[2]!.padEnd(SIDEBAR_COLUMNS)}│`);
+    const recovered = sampleOf();
+    assert.doesNotThrow(() => assertKnownZeroShellSample(recovered, SHELL_SAMPLE_MESSAGE, baseline, () => {
+      throw new Error("no counters are read once the synthetic redraw recovers");
+    }), "the redrawn synthetic roster passes the strict assertion again");
+
+    // Fenced replay over the same real parser: the stale complete 0 without the
+    // list response marker is not readiness, the erased-row repaint that already
+    // carries the marker still waits, and the redraw suffix yields the one
+    // captured snapshot. Still synthetic mechanism evidence only.
+    const frames = new ChangeSignal();
+    let fenceWaits = 0;
+    const fenced = trackSettlement(awaitCompletePostListFrame({
+      waitFrame: (predicate, description) => {
+        fenceWaits += 1;
+        return frames.waitFor(() => predicate(sampleOf()), EVENT_TIMEOUT_MS, description);
+      },
+      exited: () => false,
+      observe,
+    }));
+    await flushEvents();
+    assert.equal(fenced.state, "pending", "a stale complete known-zero frame without the response marker is not readiness");
+    await write("\x1b[4;1H\x1b[2K");
+    frames.notify();
+    await write(`\x1b[2;${SIDEBAR_COLUMNS + 2}H${POST_LIST_RESPONSE_MARKER}`);
+    const splitWithMarker = sampleOf();
+    assert.ok(splitWithMarker.includes(POST_LIST_RESPONSE_MARKER), "the marker is on screen while the status row is erased");
+    assert.equal(parseRosterFrame(splitWithMarker, SIDEBAR_COLUMNS).complete, false);
+    frames.notify();
+    await flushEvents();
+    assert.equal(fenced.state, "pending", "an incomplete response-bearing repaint waits for its redraw suffix");
+    await write(`\x1b[4;1H${rows[2]!.padEnd(SIDEBAR_COLUMNS)}│`);
+    const redrawn = sampleOf();
+    frames.notify();
+    await flushEvents();
+    assert.equal(fenced.state, "resolved");
+    const ready = fenced.value!;
+    assert.equal(ready.text, redrawn, "the fence captures the exact complete response-bearing frame");
+    // A later erase changes the live surface; the captured snapshot does not move.
+    await write("\x1b[4;1H\x1b[2K");
+    frames.notify();
+    assert.equal(cardCounts(sampleOf(), ROW_LABEL), undefined, "the live surface is incomplete again");
+    assert.doesNotThrow(() => assertKnownZeroShellSample(ready.text, SHELL_SAMPLE_MESSAGE, baseline, ready.observe),
+      "the strict assertion reads only the captured snapshot");
+    assert.equal(fenceWaits, 1, "one bounded wait, never re-armed");
+    assert.equal(frames.pendingWaiterCount, 0);
+  } finally {
+    surface.dispose();
+  }
+});
+
+/** Observable settlement of one fence promise for deterministic synthetic controls. */
+interface TrackedSettlement<T> {
+  state: "pending" | "resolved" | "rejected";
+  value?: T;
+  error?: unknown;
+}
+
+function trackSettlement<T>(promise: Promise<T>): TrackedSettlement<T> {
+  const tracked: TrackedSettlement<T> = { state: "pending" };
+  promise.then(
+    (value) => { tracked.state = "resolved"; tracked.value = value; },
+    (error: unknown) => { tracked.state = "rejected"; tracked.error = error; },
+  );
+  return tracked;
+}
+
+/** Drains pending promise reactions through one real (never mocked) macrotask turn. */
+function flushEvents(): Promise<void> {
+  return new Promise<void>((resolve) => { setImmediate(resolve); });
+}
+
+/**
+ * Synthetic stand-in for the native driver's frame wait: the real shared
+ * ChangeSignal core with MainPtyDriver.waitFrame's default single
+ * EVENT_TIMEOUT_MS deadline, its owned-exit refusal, and its rejection that
+ * carries the RAW current frame (which the fence must never forward).
+ */
+class SyntheticPostListFrames {
+  readonly signal = new ChangeSignal();
+  readonly waitArgumentCounts: number[] = [];
+  text: string;
+  ownedExit = false;
+  frameRevision = SYNTHETIC_BASELINE.frameRevision;
+  outputRevision = SYNTHETIC_BASELINE.outputRevision;
+
+  constructor(text = "") {
+    this.text = text;
+  }
+
+  show(text: string): void {
+    this.text = text;
+    this.frameRevision += 1;
+    this.outputRevision += 1;
+    this.signal.notify();
+  }
+
+  exit(): void {
+    this.ownedExit = true;
+    this.signal.notify();
+  }
+
+  source(overrides: Partial<PostListFrameSource> = {}): PostListFrameSource {
+    return {
+      waitFrame: (...args: Parameters<PostListFrameSource["waitFrame"]>) => {
+        this.waitArgumentCounts.push(args.length);
+        const [predicate, description] = args;
+        return this.signal.waitFor(() => {
+          if (this.ownedExit && !predicate(this.text)) {
+            throw new Error("owned outer Main PTY exited before the expected frame was observed");
+          }
+          return predicate(this.text);
+        }, EVENT_TIMEOUT_MS, description).catch((error: unknown) => {
+          throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}`
+            + `\nActual owned Main frame:\n${this.text}`);
+        });
+      },
+      exited: () => this.ownedExit,
+      observe: () => ({
+        frameRevision: this.frameRevision,
+        outputRevision: this.outputRevision,
+        redrawState: "clear",
+        exited: this.ownedExit,
+      }),
+      ...overrides,
+    };
+  }
+}
+
+/** The existing synthetic roster rows with the list response marker in the native pane. */
+function markedShellFrame(rows: readonly string[], native: readonly string[] = [POST_LIST_RESPONSE_MARKER]): string {
+  return shellSampleFrame(rows, native);
+}
+
+const ERASED_STATUS_CARD = [SHELL_SAMPLE_CARD[0], "", SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]] as const;
+
+/** A bounded fence failure: fixed labels only, no raw frame, marker, title, or driver text. */
+function assertBoundedFenceFailure(error: unknown, reason: string, forbidden: readonly string[] = []): string {
+  assert.ok(error instanceof Error && !(error instanceof assert.AssertionError), "the fence fails closed with its own error");
+  const message = error.message;
+  assert.ok(message.startsWith(`${POST_LIST_FENCE_DESCRIPTION}: no eligible frame [#697 post-list fence] reason=${reason} `),
+    `the fence failure names reason=${reason}`);
+  assert.ok(message.length <= SHELL_SAMPLE_MESSAGE_MAX_CHARS, "the fence failure stays within the diagnostic cap");
+  for (const raw of ["Actual owned Main frame", "owned outer Main PTY exited", "deadline exceeded", "bounded event predicate failed",
+    POST_LIST_RESPONSE_MARKER, "BGT", "Welcome", ...forbidden]) {
+    assert.equal(message.includes(raw), false, `the fence failure never forwards raw text (${raw.slice(0, 24)})`);
+  }
+  return message;
+}
+
+test("#697 post-list fence: an incomplete response-bearing repaint recovers to the one complete snapshot it captures", async () => {
+  const staleZero = shellSampleFrame(shellSampleRows());
+  assert.equal(originalShellAssertionError(staleZero), undefined,
+    "the stale response-absent frame would pass the count assertion, so only the marker withholds readiness");
+  const frames = new SyntheticPostListFrames(staleZero);
+  const fenced = trackSettlement(awaitCompletePostListFrame(frames.source()));
+  await flushEvents();
+  assert.equal(fenced.state, "pending", "a stale complete known 0 without the list response is not readiness");
+
+  frames.show(markedShellFrame(shellSampleRows(ERASED_STATUS_CARD)));
+  await flushEvents();
+  assert.equal(fenced.state, "pending", "an incomplete response-bearing repaint waits");
+
+  const zeroMarked = markedShellFrame(shellSampleRows());
+  frames.show(zeroMarked);
+  await flushEvents();
+  assert.equal(fenced.state, "resolved");
+  const ready = fenced.value!;
+  assert.equal(ready.text, zeroMarked);
+
+  // The live frame changes after readiness; nothing re-samples it.
+  frames.show(markedShellFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 3"))));
+  assert.equal(ready.text, zeroMarked, "the captured snapshot is not re-sampled after the await");
+  assert.doesNotThrow(() => assertKnownZeroShellSample(ready.text, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, () => {
+    throw new Error("counters are read only on failure");
+  }));
+  assert.deepEqual(ready.observe(), { frameRevision: 102, outputRevision: 42, redrawState: "clear", exited: false },
+    "the counters belong to the captured frame's own tick, not the later frame");
+  assert.deepEqual(frames.waitArgumentCounts, [2], "exactly one wait with the driver's default single deadline");
+  assert.equal(frames.signal.pendingWaiterCount, 0);
+});
+
+test("#697 post-list fence: complete incorrect owned states reach the strict assertion and a later zero cannot cure them", async () => {
+  const duplicateCard = [...SHELL_SAMPLE_CARD, "BGT", "  agent idle | input none", "  bg tasks 0 | shells 0", "", ""];
+  const cases: ReadonlyArray<{ name: string; frame: string; outcome: RegExp }> = [
+    { name: "nonzero", frame: markedShellFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 3"))),
+      outcome: /^\[#697 single-sample diagnostic\] outcome=nonzero bgRow=none shells=3 roster=complete /u },
+    { name: "unknown", frame: markedShellFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells unknown"))),
+      outcome: /outcome=shells-unknown bgRow=none shells=unknown roster=complete /u },
+    { name: "missing", frame: markedShellFrame(shellSampleRows(
+      ["Other", SHELL_SAMPLE_CARD[1], SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]])),
+      outcome: /outcome=missing bgRow=none shells=undefined roster=complete /u },
+    { name: "duplicate", frame: markedShellFrame(shellSampleRows(duplicateCard, 2)),
+      outcome: /outcome=duplicate bgRow=none shells=undefined roster=complete headerValid=true count=2 /u },
+    { name: "N/A", frame: markedShellFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells N/A"))),
+      outcome: /outcome=unparseable-bg bgRow=N\/A shells=undefined roster=complete /u },
+    { name: "clipped", frame: markedShellFrame(shellSampleRows(withShellRow("  bg tasks 1234567890123 | shell..."))),
+      outcome: /outcome=unparseable-bg bgRow=clipped shells=undefined roster=complete /u },
+  ];
+  const zeroMarked = markedShellFrame(shellSampleRows());
+  for (const { name, frame, outcome } of cases) {
+    assert.equal(parseRosterFrame(frame, SIDEBAR_COLUMNS).complete, true, `${name}: the control is a complete roster`);
+    const frames = new SyntheticPostListFrames(markedShellFrame(shellSampleRows(ERASED_STATUS_CARD)));
+    const fenced = trackSettlement(awaitCompletePostListFrame(frames.source()));
+    await flushEvents();
+    assert.equal(fenced.state, "pending", `${name}: the incomplete repaint waits`);
+    frames.show(frame);
+    await flushEvents();
+    assert.equal(fenced.state, "resolved", `${name}: a complete response-bearing frame is ready regardless of its count`);
+    // A later known-zero frame arrives; it cannot replace the captured snapshot.
+    frames.show(zeroMarked);
+    assert.equal(frames.frameRevision, 102, `${name}: the live frame really advanced to the later zero`);
+    assert.equal(originalShellAssertionError(frames.text), undefined, `${name}: the later live frame would have passed`);
+    const ready = fenced.value!;
+    assert.equal(ready.text, frame, `${name}: the incorrect complete snapshot is the one asserted`);
+    const diagnostic = instrumentedShellFailure(ready.text, ready.observe);
+    assert.match(diagnostic, outcome, `${name}: the original strict assertion fails with its classification`);
+    assert.match(diagnostic, / frameRev=101\(\+1\) outputRev=41\(\+1\) redraw=clear exited=false /u,
+      `${name}: the diagnostic counters belong to the captured tick, not the later zero frame`);
+    assert.deepEqual(frames.waitArgumentCounts, [2], `${name}: one wait, never retried toward a desired count`);
+  }
+
+  // An already-complete incorrect frame is ready on the very first evaluation.
+  const immediate = new SyntheticPostListFrames(cases[0]!.frame);
+  const ready = await awaitCompletePostListFrame(immediate.source());
+  assert.equal(ready.text, cases[0]!.frame);
+  assert.throws(() => assertKnownZeroShellSample(ready.text, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, ready.observe),
+    (error: unknown) => error instanceof assert.AssertionError && error.actual === 3 && error.expected === 0);
+
+  // A throwing counter read on an eligible frame degrades to the fixed label only.
+  const throwingObserve = new SyntheticPostListFrames(cases[0]!.frame);
+  const degraded = await awaitCompletePostListFrame(throwingObserve.source({
+    observe: () => { throw new Error("PRIVATE-SENTINEL /Users/someone"); },
+  }));
+  const degradedDiagnostic = instrumentedShellFailure(degraded.text, degraded.observe);
+  assert.match(degradedDiagnostic, / counters=unavailable rows=/u);
+  assert.equal(degradedDiagnostic.includes("PRIVATE-SENTINEL"), false);
+});
+
+test("#697 post-list fence: never-complete, stale, and no-output observations fail closed at the single unchanged deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    // No output at all: the empty frame is never eligible.
+    const silent = new SyntheticPostListFrames();
+    const silentFence = trackSettlement(awaitCompletePostListFrame(silent.source()));
+    t.mock.timers.tick(EVENT_TIMEOUT_MS - 1);
+    await flushEvents();
+    assert.equal(silentFence.state, "pending", "no early failure before the single deadline");
+    t.mock.timers.tick(1);
+    await flushEvents();
+    assert.equal(silentFence.state, "rejected", "the unchanged single deadline fails closed");
+    assert.match(assertBoundedFenceFailure(silentFence.error, "not-ready"),
+      /reason=not-ready evaluations=1 marker=absent outcome=incomplete /u);
+
+    // A stream of stale response-absent known zeros and incomplete response-bearing
+    // repaints: notifications keep arriving, yet the deadline is never re-armed.
+    const staleZero = shellSampleFrame(shellSampleRows());
+    const incompleteMarked = markedShellFrame(shellSampleRows(ERASED_STATUS_CARD));
+    const churn = new SyntheticPostListFrames(staleZero);
+    const churnFence = trackSettlement(awaitCompletePostListFrame(churn.source()));
+    for (let step = 0; step < 6; step += 1) {
+      t.mock.timers.tick(Math.floor((EVENT_TIMEOUT_MS - 1) / 6));
+      churn.show(step % 2 === 0 ? incompleteMarked : staleZero);
+    }
+    t.mock.timers.tick(EVENT_TIMEOUT_MS - 1 - 6 * Math.floor((EVENT_TIMEOUT_MS - 1) / 6));
+    churn.show(incompleteMarked);
+    await flushEvents();
+    assert.equal(churnFence.state, "pending", "frames before the deadline neither satisfy nor extend the wait");
+    t.mock.timers.tick(1);
+    await flushEvents();
+    assert.equal(churnFence.state, "rejected", "the deadline from the one original wait expires on schedule");
+    assert.match(assertBoundedFenceFailure(churnFence.error, "not-ready"),
+      /reason=not-ready evaluations=8 marker=present outcome=incomplete bgRow=none shells=undefined roster=incomplete /u);
+    assert.deepEqual(churn.waitArgumentCounts, [2], "exactly one wait: no retry, no re-armed or longer deadline");
+    assert.equal(churn.signal.pendingWaiterCount, 0);
+
+    // A later complete zero after the deadline cannot resurrect the failed fence.
+    churn.show(markedShellFrame(shellSampleRows()));
+    await flushEvents();
+    assert.equal(churnFence.state, "rejected");
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("#697 post-list fence: owned exit and predicate failure fail closed with bounded private-safe evidence", async () => {
+  const SENTINELS = ["PRIVATE-SENTINEL", "/Users/", "sess-0123", "TOKEN="] as const;
+  const privateNative = `${POST_LIST_RESPONSE_MARKER} PRIVATE-SENTINEL /Users/someone sess-0123 TOKEN=abc`;
+  const privateRows = shellSampleRows(ERASED_STATUS_CARD);
+  const privateIncomplete = shellSampleFrame(privateRows, privateRows.map(() => privateNative), "PRIVATE-SENTINEL header");
+
+  // Owned exit while waiting on an incomplete repaint.
+  const exiting = new SyntheticPostListFrames(privateIncomplete);
+  const exitingFence = trackSettlement(awaitCompletePostListFrame(exiting.source()));
+  await flushEvents();
+  assert.equal(exitingFence.state, "pending");
+  exiting.exit();
+  await flushEvents();
+  assert.equal(exitingFence.state, "rejected");
+  assert.match(assertBoundedFenceFailure(exitingFence.error, "exited", SENTINELS),
+    /reason=exited evaluations=\d+ marker=present outcome=incomplete /u);
+
+  // An exited PTY never yields readiness, even over an otherwise eligible frame.
+  const exitedEligible = new SyntheticPostListFrames(markedShellFrame(shellSampleRows()));
+  exitedEligible.ownedExit = true;
+  await assert.rejects(awaitCompletePostListFrame(exitedEligible.source()), (error: unknown) => {
+    assertBoundedFenceFailure(error, "exited");
+    return true;
+  });
+
+  // A throwing predicate input becomes the shared core's generic failure, then
+  // this bounded label; neither the thrown text nor the frame escapes.
+  const hostile = new SyntheticPostListFrames(privateIncomplete);
+  await assert.rejects(awaitCompletePostListFrame(hostile.source({
+    exited: () => { throw new Error("PRIVATE-SENTINEL /Users/someone TOKEN=abc"); },
+  })), (error: unknown) => {
+    assertBoundedFenceFailure(error, "predicate-error", SENTINELS);
+    return true;
+  });
+  assert.equal(hostile.signal.pendingWaiterCount, 0);
 });
 
 test("the job fixture path contract refuses unsafe service directories before mutation", () => {

@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.295]
+
+### Tests
+
+- **Native macOS shell-count observation (#697)**: wait for a structurally
+  complete rendered `ShellList` response before checking the owned row's shell
+  count, rather than sampling a partial terminal repaint. Readiness does not
+  depend on a zero count: complete incorrect or unextractable results still
+  fail the strict assertion. Bounded failure-only extraction diagnostics and
+  synthetic split-redraw controls retain evidence without raw terminal text.
+  Runtime behavior, count parsing, and existing deadlines are unchanged. This
+  addresses a demonstrated test-observation hazard, not an attribution of the
+  historical CI failure.
+
 ## [0.1.0-dev.294]
 
 ### Fixed

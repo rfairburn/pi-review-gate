@@ -15,6 +15,57 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.294]
+
+### Fixed
+
+- **Themed tool-card background across resets (#677)**: a coloured tool card no
+  longer cuts itself apart. The host pads a tool row and paints the whole padded
+  row with one background span, so a full reset (`\x1b[0m`) or background reset
+  (`\x1b[49m`) surviving inside a rendered row cancelled that span for the rest
+  of the row and the card's own right padding fell back to the terminal
+  background — visible as a default-background band after wrapped rows and after
+  retained output that already carried resets. The shared tool-result boundary
+  (`src/tool-result-expansion.ts`) now re-opens the live theme's background
+  (`theme.getBgAnsi` for the row's own pending/error/success state) directly
+  after each reset that leaves the background unset — including a reset
+  combined with foreground attributes (`\x1b[0;31m`, `\x1b[0;38:2::255:0:0m`) and
+  a reset at the end of a row — while a sequence that sets its own background
+  after the reset (`\x1b[0;41m`, `\x1b[0;48;2;0;0;0m`, `\x1b[0;48:2::0:0:0m`) is
+  left alone, extended-colour modes are read numerically (`\x1b[48;05;0m` is
+  `\x1b[48;5;0m`), and the zero components of an extended-colour payload are
+  never read as a reset. Nothing is stripped or
+  reordered, no reset is removed, no
+  background close is added (the host still ends the padded row), attribute-
+  setting sequences are left alone so a row's own colours win, reset-free rows
+  stay byte-identical, and a theme without the accessor — or one whose lookup
+  throws or returns a non-string — renders exactly as before. This covers every
+  custom tool-result registration — the five `Shell*` tools (both triggers),
+  `ApplyPatch`, `tool_search`, and `Subtasks*` expanded rows — and the same seam
+  wherever else a tool row is painted, repaired with that one rule: the host
+  builtin tool cards' CALL rows on the host's default shell (`bash`,
+  `powershell`, `read`, `write`, `grep`, `find`, and `ls` each reprint a
+  submitted `command`, path, `pattern`, `glob`, or `content`, and a reset
+  surviving in one of those arguments cut the card from that point to its edge),
+  the native `write` failed-result rows (the one builtin result region that
+  prints the tool's own error text verbatim), the native `edit` self-shell
+  header (re-opened inside the background span that renderer's own theme
+  callback opens, with that callback's own pending/error token, so nothing is
+  painted past the card), and the rows the gate paints for a tool that draws its
+  own shell, such as an annotated native `edit` error. The native renderers and
+  `write`'s incremental highlighting reuse are kept, each native renderer keeps
+  receiving its own component, and an unannotated native self-shell body keeps
+  the host's own unpainted presentation. The builtin result rows other than
+  `write`'s need no repair and get none — the host strips SGR from retained
+  output before painting those — and the web/browser families that display
+  control characters instead of emitting them, the host's renderer-less
+  fallback, custom notification messages, layout, wrapping, copy/selection, and
+  all execution, authorization, audit, scheduling, model-facing payload, and
+  retention behaviour are unchanged. Headless-terminal evidence only, on the
+  built-in `dark` 256-colour theme — not physical-terminal, truecolour,
+  light-theme, Windows-terminal, or cross-platform certification. See
+  [development docs](docs/development.md#tool-row-background-continuity-across-a-rows-resets-677).
+
 ## [0.1.0-dev.293]
 
 ### Added

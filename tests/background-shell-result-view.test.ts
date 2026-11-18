@@ -18,6 +18,7 @@
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
+import { isExpandableResult } from "../src/tool-result-expansion";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import {
   TRUNCATION_MARKER,
@@ -1109,5 +1110,262 @@ describe("bounded lifecycle variants of the production renderers", () => {
       tool: "ShellLog",
       id: "job1",
     });
+  });
+});
+// ── Row background continuity across a tool row's resets (#677) ──
+//
+// The host paints a tool card's Box row with ONE background span applied AFTER
+// it pads the row to the full width, so a full reset (`\x1b[0m`) or background
+// reset (`\x1b[49m`) surviving inside a rendered row cancels that span for the
+// rest of the row — including the card's own right padding. Both Shell triggers
+// are exercised through the REGISTERED renderers, i.e. through the shared
+// tool-result adapter in src/tool-result-expansion.ts where the repair lives:
+// the family's own wrap closing a continued styled row, and retained child
+// output that already carries resets. Adapter-level behaviour (the insertion
+// rule, token resolution, degradation, and component forwarding) is covered in
+// tests/tool-result-expansion.test.ts; real-host cell coverage is in
+// tests/tool-protection-renderer-host.test.ts.
+
+/** The three row-background tokens, with a distinct bare open each so a test
+ *  can tell which token a row reopened with. */
+const BG_OPEN: Record<string, string> = {
+  toolPendingBg: "\x1b[48;5;24m",
+  toolSuccessBg: "\x1b[48;5;22m",
+  toolErrorBg: "\x1b[48;5;52m",
+};
+
+/** A theme shaped like the installed host's: `fg` emits real SGR (so the
+ *  family's wrap re-applies and closes styles exactly as it does live), and
+ *  `getBgAnsi` returns the bare opening sequence for a background token. */
+type ThemedShellResultViewTheme = ShellResultViewTheme & {
+  getBgAnsi(token: string): string;
+};
+
+const themed: ThemedShellResultViewTheme = {
+  bold: (text) => `\x1b[1m${text}\x1b[22m`,
+  fg: (_color, text) => `\x1b[38;5;145m${text}\x1b[39m`,
+  getBgAnsi: (token) => BG_OPEN[token]!,
+};
+
+/** The same theme WITHOUT the background accessor: the degradation case. */
+const themedNoBg: ShellResultViewTheme = {
+  bold: themed.bold,
+  fg: themed.fg,
+};
+
+/** Long enough to wrap at width 40 and at width 80 in a Box row. */
+const LONG = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+
+/** Retained child output that already carries its own resets: one mid-row and
+ *  one at the very end of a short row. */
+const RETAINED_RESET_MID = `retained output ${LONG} \x1b[0m continues after a full reset ${LONG}`;
+const RETAINED_RESET_TRAILING = `short retained line \x1b[0m`;
+const RETAINED_BG_RESET = `retained line with a background reset \x1b[49m and more text ${LONG}`;
+
+/** Render through the REGISTERED entrypoint with a given theme. */
+function renderRegisteredWith(
+  tool: any,
+  result: unknown,
+  options: { expanded?: boolean; isPartial?: boolean },
+  renderTheme: ShellResultViewTheme,
+  width: number,
+  context?: unknown,
+): string[] {
+  return (tool.renderResult(result, options, renderTheme, context) as { render(w: number): string[] })
+    .render(width) as string[];
+}
+
+/** Every background-clearing reset in a row is immediately followed by the
+ *  row's background open (including a reset at the very end of the row). */
+function assertReopenedAfterEveryReset(lines: string[], backgroundAnsi: string, label: string): void {
+  for (const [index, line] of lines.entries()) {
+    for (const reset of ["\x1b[0m", "\x1b[m", "\x1b[49m"]) {
+      let at = line.indexOf(reset);
+      while (at !== -1) {
+        expect(line.slice(at + reset.length, at + reset.length + backgroundAnsi.length),
+          `${label}: row ${index + 1} does not reopen the themed row background after ${JSON.stringify(reset)}`)
+          .toBe(backgroundAnsi);
+        at = line.indexOf(reset, at + reset.length);
+      }
+    }
+  }
+}
+
+/** The repaired rows are the original rows plus nothing but the background
+ *  opens: deleting every inserted open restores each row byte-for-byte. */
+function assertOnlyBackgroundOpensInserted(before: string[], after: string[], backgroundAnsi: string, label: string): void {
+  expect(after.length, `${label}: the number of rendered rows changed`).toBe(before.length);
+  for (const [index, repaired] of after.entries()) {
+    expect(repaired.split(backgroundAnsi).join(""), `${label}: row ${index + 1} changed beyond the inserted background open`)
+      .toBe(before[index]!);
+  }
+}
+
+function shellLogFixture(bodyLines: string[]): Record<string, any> {
+  return {
+    content: [{ type: "text", text: `job1 "view" running\n\`\`\`\n${bodyLines.join("\n")}\n\`\`\`` }],
+    isError: false,
+    details: shellResultDetails("ShellLog", {
+      id: "job1", label: "view", status: "running",
+      totalLines: bodyLines.length, droppedLines: 0, from: 0, nextOffset: bodyLines.length,
+      requestOffset: 0, requestLimit: bodyLines.length,
+    }),
+  };
+}
+
+function registeredShellTools(): Record<string, any> {
+  return wire().tools;
+}
+
+describe("row background continuity across a tool row's resets (#677)", () => {
+  it("registered Shell renderers reopen the themed row background at narrow and normal widths", () => {
+    const tools = registeredShellTools();
+    const fixtures: Array<[string, unknown, unknown?]> = [
+      ["ShellStart", {
+        content: [{ type: "text", text: `Started "view" as job1 (pid 1234); currently running.` }],
+        isError: false,
+        details: shellResultDetails("ShellStart", {
+          event: "started", id: "job1", label: LONG, command: `echo ${LONG} ${LONG}`,
+          state: "running", pid: 1234, startedAt: 1_700_000_000_000, watching: "exit",
+        }),
+      }, { args: { command: `echo ${LONG} ${LONG}` } }],
+      ["ShellList", {
+        content: [{ type: "text", text: `1 background job(s):\n  job1 "${LONG}" running (pid 1234)` }],
+        isError: false,
+        details: shellResultDetails("ShellList", {
+          jobs: [{
+            id: "job1", label: LONG, status: "running", pid: 1234, command: `sleep ${LONG}`,
+            watching: "exit", totalLines: 3, droppedCount: 0, elapsedMs: 5000, lastOutputAgoMs: 1000,
+          }],
+        }),
+      }],
+      ["ShellLog", shellLogFixture([RETAINED_RESET_MID, RETAINED_RESET_TRAILING, RETAINED_BG_RESET])],
+      ["ShellSend", {
+        content: [{ type: "text", text: `Sent 40 bytes to job1 stdin (delivery confirmed).` }],
+        isError: false,
+        details: shellResultDetails("ShellSend", {
+          event: "stdin-write", id: "job1", label: LONG, bytes: 40, delivery: "confirmed",
+        }),
+      }, { args: { text: `${LONG} \x1b[0m ${LONG}` } }],
+      ["ShellStop", {
+        content: [{ type: "text", text: "Stopping 2 job(s)." }],
+        isError: false,
+        details: shellResultDetails("ShellStop", {
+          target: "all", count: 2, outcome: "stopping",
+          targets: [{ id: "job1", label: LONG }, { id: "job2", label: `two ${LONG}` }],
+        }),
+      }],
+    ];
+
+    for (const [name, result, context] of fixtures) {
+      const tool = tools[name]!;
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          const label = `${name} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          const before = renderRegisteredWith(tool, result, { expanded, isPartial: false }, themedNoBg, width, context);
+          const after = renderRegisteredWith(tool, result, { expanded, isPartial: false }, themed, width, context);
+          const bg = BG_OPEN.toolSuccessBg;
+          // The trigger itself: without a reset in the card this case would
+          // pass vacuously.
+          expect(/\x1b\[(?:0+m|49m)/.test(before.join("")), `${label}: the fixture carries no background-clearing reset`)
+            .toBe(true);
+          assertReopenedAfterEveryReset(after, bg, label);
+          assertOnlyBackgroundOpensInserted(before, after, bg, label);
+          // The repair adds no background close of its own: the host's Box
+          // still owns the single close that ends the padded row.
+          for (const [index, line] of after.entries()) {
+            const closesBefore = (before[index]!.match(/\x1b\[49m/g) ?? []).length;
+            const closesAfter = (line.match(/\x1b\[49m/g) ?? []).length;
+            expect(closesAfter, `${label}: row ${index + 1} gained a background close`)
+              .toBe(closesBefore);
+          }
+        }
+      }
+    }
+  });
+
+  it("registered error and legacy-error cards reopen the error token, success the success token", () => {
+    const tools = registeredShellTools();
+    const result = shellLogFixture([`${LONG} \x1b[0m ${LONG}`]);
+    const failed = { ...result, isError: true };
+    const cases: Array<[string, unknown, Record<string, unknown>, string]> = [
+      ["context error", result, { isError: true }, BG_OPEN.toolErrorBg],
+      ["legacy error", failed, { isError: false }, BG_OPEN.toolErrorBg],
+      ["success", result, { isError: false }, BG_OPEN.toolSuccessBg],
+    ];
+    for (const [label, card, context, backgroundAnsi] of cases) {
+      for (const expanded of [false, true]) {
+        const component = tools.ShellLog.renderResult(
+          card, { expanded, isPartial: false }, themed, context,
+        ) as { render(w: number): string[] };
+        const lines = component.render(80);
+        const caseLabel = `ShellLog ${label} ${expanded ? "expanded" : "collapsed"}`;
+        assertReopenedAfterEveryReset(lines, backgroundAnsi, caseLabel);
+        expect(lines.join(""), `${caseLabel} uses the wrong background token`).toContain(backgroundAnsi);
+      }
+    }
+  });
+
+  it("a registered streaming Shell card carries no reset, so the repair inserts nothing", () => {
+    const tools = registeredShellTools();
+    // The family's own pending card is one short status line built from
+    // `theme.fg`, so it carries no background-clearing reset at all: the
+    // adapter has nothing to re-open after, the rows come back byte-for-byte
+    // as the family rendered them, and no background open of any token is
+    // added. Which token a partial row re-opens when it DOES carry a reset is
+    // the adapter's decision, asserted in tests/tool-result-expansion.test.ts.
+    const pending = tools.ShellLog.renderResult(
+      shellLogFixture([`${LONG} \x1b[0m ${LONG}`]), { expanded: false, isPartial: true }, themed, {},
+    ) as { render(w: number): string[] };
+    const pendingLines = pending.render(80);
+    expect(pendingLines.join("")).not.toContain("\x1b[0m");
+    expect(pendingLines.join("")).not.toContain(BG_OPEN.toolPendingBg);
+    expect(pendingLines.join("")).not.toContain(BG_OPEN.toolSuccessBg);
+  });
+
+  it("a theme without the accessor, or one that cannot answer, keeps the previous rows", () => {
+    const tools = registeredShellTools();
+    const result = shellLogFixture([RETAINED_RESET_MID, RETAINED_RESET_TRAILING]);
+    const baseline = renderRegisteredWith(tools.ShellLog, result, { expanded: true }, themedNoBg, 80);
+    // The reset is still there in the degraded output (nothing is stripped).
+    expect(baseline.join("\n")).toContain("\x1b[0m");
+
+    const throwing: ThemedShellResultViewTheme = {
+      ...themed,
+      getBgAnsi: () => {
+        throw new Error("unknown theme color");
+      },
+    };
+    expect(renderRegisteredWith(tools.ShellLog, result, { expanded: true }, throwing, 80)).toEqual(baseline);
+
+    const nonString: ThemedShellResultViewTheme = { ...themed, getBgAnsi: () => undefined as unknown as string };
+    expect(renderRegisteredWith(tools.ShellLog, result, { expanded: true }, nonString, 80)).toEqual(baseline);
+  });
+
+  it("reset-free Shell cards stay byte-identical with the background accessor", () => {
+    const tools = registeredShellTools();
+    const result = {
+      content: [{ type: "text", text: "No background jobs." }],
+      isError: false,
+      details: shellResultDetails("ShellList", { jobs: [] }),
+    };
+    for (const expanded of [false, true]) {
+      const before = renderRegisteredWith(tools.ShellList, result, { expanded }, themedNoBg, 80);
+      const after = renderRegisteredWith(tools.ShellList, result, { expanded }, themed, 80);
+      expect(after, `ShellList ${expanded ? "expanded" : "collapsed"} changed without any reset present`).toEqual(before);
+      expect(after.join("")).not.toContain(BG_OPEN.toolSuccessBg);
+    }
+  });
+
+  it("the repair mutates no result, options, or context value", () => {
+    const tools = registeredShellTools();
+    const result = shellLogFixture([RETAINED_RESET_MID]);
+    const options = Object.freeze({ expanded: true, isPartial: false });
+    const context = Object.freeze({ args: Object.freeze({ id: "job1" }), isError: false });
+    const resultCopy = JSON.parse(JSON.stringify(result));
+    expect(() => renderRegisteredWith(tools.ShellLog, result, options, themed, 80, context)).not.toThrow();
+    expect(result).toEqual(resultCopy);
+    expect(options).toEqual({ expanded: true, isPartial: false });
+    expect(context).toEqual({ args: { id: "job1" }, isError: false });
   });
 });

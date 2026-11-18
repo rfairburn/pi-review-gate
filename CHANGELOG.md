@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.297]
+
+### Changed
+
+- **Native Windows lineage causal experiment (Refs #446; partial, not a fix)**:
+  the native genuine-descendant/unrelated-PID proof now runs as one fixed
+  two-arm experiment. Each arm has its own freshly owned root, descendant and
+  unrelated process. The control query inherits the test environment. The
+  treatment differs only in getting a child-only environment copy without
+  `PSModulePath`. Passive Windows PowerShell command-lookup hooks and a child
+  clock record when the first `Get-CimInstance` lookup starts and resolves. A
+  bounded stdin gate releases both positive lookups together, inside the
+  unchanged 5-second deadline. A gate, hook or setup failure marks the
+  experiment invalid instead of being read as a CIM timeout. The production
+  query, script, deadline, output bound and acceptance rules are unchanged, as
+  are the original assertions and owned cleanup. Hook support on the installed
+  Windows PowerShell 5.1 is checked by stubbed-CIM controls on the native
+  runner. The cause of the historical timeout is not yet established, and no
+  correction is claimed.
+
 ## [0.1.0-dev.296]
 
 ### Fixed

@@ -527,7 +527,9 @@ private fun CreateSessionDialogView(
                     Text(
                         text = stringResource(
                             R.string.create_provider_field,
-                            providerText(provider),
+                            // A Pi default this owner cannot create (native-only) is
+                            // drawn as "no provider chosen", never as a chosen Pi.
+                            providerText(dialog.shownProvider),
                         ),
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.weight(1f),

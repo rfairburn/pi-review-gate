@@ -98,6 +98,13 @@ public data class CreateSessionDialog(
     /** Providers this owner may be addressed with right now, in Host -> Provider order. */
     public val providerOptions: List<CreateProviderChoice>
         get() = CreateProviderSelection.options(selectedOwner)
+
+    /**
+     * The provider the form draws as chosen: [provider], except that a Pi default the
+     * selected owner cannot create is drawn as no choice (see [CreateProviderSelection.shown]).
+     */
+    public val shownProvider: CreateProviderChoice?
+        get() = CreateProviderSelection.shown(selectedOwner, provider)
 }
 
 /** Rename one row, fenced to the native conversation tuple frozen in [target]. */

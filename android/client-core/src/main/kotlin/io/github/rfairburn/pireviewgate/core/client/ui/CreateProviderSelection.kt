@@ -38,13 +38,18 @@ public sealed interface CreateProviderChoice {
  * backend, id, and label are still advertised. A changed catalog, a replaced owner
  * run, or a different host invalidates a native choice; it is never silently
  * replaced by Pi. Choosing Pi is always an explicit operator choice (or the
- * fresh-form default).
+ * fresh-form default), and Pi is offered only to an owner that can create it now:
+ * a native-only owner offers just its native kinds and draws no Pi choice.
  */
 public object CreateProviderSelection {
 
-    /** Every provider that owner may be addressed with right now, in display order. */
+    /**
+     * Every provider that owner may be addressed with right now, in display order.
+     * Pi leads only while the owner itself can create Pi; nothing is offered for an
+     * owner the form has not chosen.
+     */
     public fun options(owner: OwnerChoice?): List<CreateProviderChoice> = buildList {
-        add(CreateProviderChoice.Pi)
+        if (owner?.createEligible == true) add(CreateProviderChoice.Pi)
         val scope = owner?.nativeCatalogScope
         if (owner?.nativeCreateEligible == true && scope != null) {
             // NEW-session targets only (#493): never a named external worker profile.
@@ -74,6 +79,18 @@ public object CreateProviderSelection {
         catalogScope: NativeCatalogScope,
     ): CreateProviderChoice.Native =
         CreateProviderChoice.Native(target.backend, target.id, target.label, catalogScope)
+
+    /**
+     * The choice the form draws as current for [owner].
+     *
+     * The fresh-form Pi default is never drawn as chosen on an owner that cannot
+     * create Pi (a native-only owner): it is drawn as the existing "no provider
+     * chosen" state so the operator explicitly picks one of the offered kinds. This
+     * is presentation only — the form's choice is not rewritten, nothing else is
+     * selected on the operator's behalf, and [admits] still refuses that Pi.
+     */
+    public fun shown(owner: OwnerChoice?, choice: CreateProviderChoice?): CreateProviderChoice? =
+        if (choice == CreateProviderChoice.Pi && owner != null && !owner.createEligible) null else choice
 
     /** True only when [choice] is exactly admissible for [owner] now. */
     public fun admits(owner: OwnerChoice?, choice: CreateProviderChoice?): Boolean = when (choice) {

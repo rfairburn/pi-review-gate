@@ -214,7 +214,7 @@ class CreateProviderSelectionTest {
     }
 
     @Test
-    fun `options come only from the selected owner's catalog and Pi is always the default`() {
+    fun `options come only from the selected owner's catalog and Pi leads for a Pi-capable owner`() {
         val a = owner()
         val b = owner(host = hostB, targets = listOf(NativeCliTarget("codex", NativeCliBackend.CODEX, "Other")))
         assertEquals(
@@ -233,7 +233,82 @@ class CreateProviderSelectionTest {
         )
         // An owner with no catalog keeps the Pi-only form.
         assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(a.copy(nativeTargets = emptyList())))
-        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(null))
+        // Nothing is offered before an owner is chosen.
+        assertEquals(emptyList(), CreateProviderSelection.options(null))
+    }
+
+    @Test
+    fun `a native-only owner offers only its advertised native kinds and never Pi`() {
+        // Native lanes with a described catalog, but no Pi create capability.
+        val nativeOnlyCaps = listOf(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+        val both = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(claude, codex)))
+        assertEquals(false, both.createEligible)
+        assertEquals(true, both.nativeCreateEligible)
+        assertEquals(
+            listOf(CreateProviderSelection.choiceOf(claude, scope), CreateProviderSelection.choiceOf(codex, scope)),
+            CreateProviderSelection.options(both),
+        )
+        // The sole advertised kind is still offered for an explicit choice.
+        val claudeOnly = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(claude)))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(claude, scope)), CreateProviderSelection.options(claudeOnly))
+        assertEquals(true, CreateProviderSelection.admits(claudeOnly, CreateProviderSelection.choiceOf(claude, scope)))
+        val codexOnly = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(codex)))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(codex, scope)), CreateProviderSelection.options(codexOnly))
+        // Pi is neither offered nor admitted, so a held Pi can never be submitted.
+        assertEquals(false, CreateProviderSelection.admits(both, CreateProviderChoice.Pi))
+        // A direct native-only owner (no catalog) offers nothing at all.
+        assertEquals(emptyList(), CreateProviderSelection.options(owner(createEligible = false, nativeEligible = false)))
+    }
+
+    @Test
+    fun `a native-only owner draws the fresh Pi default as no provider chosen`() {
+        val nativeOnly = owner(createEligible = false, targets = listOf(claude, codex))
+        val claudeChoice = CreateProviderSelection.choiceOf(claude, scope)
+        // The fresh-form Pi default is drawn as the existing "no provider chosen" state,
+        // never as a chosen Pi and never as a native kind picked on the operator's behalf.
+        assertNull(CreateProviderSelection.shown(nativeOnly, CreateProviderChoice.Pi))
+        assertNull(CreateProviderSelection.shown(nativeOnly, null))
+        // An explicit, admissible native choice is drawn exactly.
+        assertEquals(claudeChoice, CreateProviderSelection.shown(nativeOnly, claudeChoice))
+        val form = CreateSessionDialog(
+            owners = listOf(nativeOnly), selectedHostId = hostA, proof = MutableUiActionProof(
+                UiActionTargetToken(UiProofScreen.SESSION_CREATE, hostA, hostRunId = "run-1", generation = 1),
+            ),
+        )
+        // The form's own default is unchanged; only what it draws differs.
+        assertEquals(CreateProviderChoice.Pi, form.provider)
+        assertNull(form.shownProvider)
+        assertEquals(listOf(claudeChoice, CreateProviderSelection.choiceOf(codex, scope)), form.providerOptions)
+        assertEquals(claudeChoice, form.copy(provider = claudeChoice).shownProvider)
+        // No owner chosen yet: the default is untouched (no provider line is drawn).
+        assertEquals(CreateProviderChoice.Pi, form.copy(selectedHostId = null).shownProvider)
+    }
+
+    @Test
+    fun `an owner that can create Pi keeps the Pi default drawn and offered first`() {
+        val piCapable = owner()
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.shown(piCapable, CreateProviderChoice.Pi))
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.options(piCapable).first())
+        val piOnly = owner(nativeEligible = false)
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.shown(piOnly, CreateProviderChoice.Pi))
+        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(piOnly))
+        // A stale native choice stays "choose again" on any owner.
+        assertNull(CreateProviderSelection.shown(piCapable, null))
+    }
+
+    @Test
+    fun `a native-only owner's withdrawn choice asks to choose again and never offers Pi`() {
+        val before = owner(createEligible = false, targets = listOf(claude, codex))
+        val chosen = CreateProviderSelection.choiceOf(claude, scope)
+        assertEquals(chosen, CreateProviderSelection.reconcile(before, before, chosen))
+        val refreshed = owner(createEligible = false, targets = listOf(codex), catalogScope = scope.copy(epoch = 2L))
+        val reconciled = CreateProviderSelection.reconcile(before, refreshed, chosen)
+        assertNull(reconciled)
+        assertNull(CreateProviderSelection.shown(refreshed, reconciled))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(codex, refreshed.nativeCatalogScope!!)),
+            CreateProviderSelection.options(refreshed))
+        // Moving to another owner after a native choice is "choose again", never Pi.
+        assertNull(CreateProviderSelection.afterOwnerChange(chosen))
     }
 
     @Test

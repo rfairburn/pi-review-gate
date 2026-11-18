@@ -132,6 +132,50 @@ class NativeCreateControllerComponentTest {
         assertFalse(refresh.isRefreshing(ObservedState.hostD))
     }
 
+    @Test fun nativeOnlyOwnerOffersNoPiAndPiCapableOwnersKeepThePiDefault() {
+        val start = start()
+        compose.runOnIdle { start.intent(ClientIntent.RequestSessionCreate) }
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostE)) }
+        val form = requireNotNull(start.ui.value.dialogs.createSession)
+        assertFalse(form.selectedOwner?.createEligible == true)
+        assertTrue(form.selectedOwner?.nativeCreateEligible == true)
+        val claude = CreateProviderSelection.choiceOf(ObservedState.target, ObservedState.scopeE)
+        val codex = CreateProviderSelection.choiceOf(ObservedState.codex, ObservedState.scopeE)
+        // Only the owner's advertised native kinds; the unsupported Pi default is drawn
+        // as "no provider chosen" and nothing is selected on the operator's behalf.
+        assertEquals(listOf(claude, codex), form.providerOptions)
+        assertNull(form.shownProvider)
+
+        // Neither an explicit Pi selection nor a submit of the held default is admitted.
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateProvider(CreateProviderChoice.Pi)) }
+        assertEquals(CreateProviderChoice.Pi, start.ui.value.dialogs.createSession?.provider)
+        assertNull(start.ui.value.dialogs.createSession?.shownProvider)
+        val held = requireNotNull(start.ui.value.dialogs.createSession)
+        compose.runOnIdle {
+            start.intent(ClientIntent.SubmitSessionCreate(ObservedState.hostE, held.workspaceDraft, held.proof,
+                CreateProviderChoice.Pi))
+        }
+        val submitted = ClientApplicationController::class.java.getDeclaredField("submittedCreate")
+        submitted.isAccessible = true
+        assertNull(submitted.get(start))
+
+        // The operator explicitly chooses one offered native kind.
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateProvider(codex)) }
+        assertEquals(codex, start.ui.value.dialogs.createSession?.provider)
+        assertEquals(codex, start.ui.value.dialogs.createSession?.shownProvider)
+
+        // A fresh form still defaults to Pi on Pi-capable owners, including after
+        // passing through the native-only owner.
+        compose.runOnIdle { start.intent(ClientIntent.DismissDialog(ClientDialogKind.CREATE_SESSION)) }
+        compose.runOnIdle { start.intent(ClientIntent.RequestSessionCreate) }
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostE)) }
+        assertNull(start.ui.value.dialogs.createSession?.shownProvider)
+        compose.runOnIdle { start.intent(ClientIntent.SelectCreateOwner(ObservedState.hostA)) }
+        assertEquals(CreateProviderChoice.Pi, start.ui.value.dialogs.createSession?.provider)
+        assertEquals(CreateProviderChoice.Pi, start.ui.value.dialogs.createSession?.shownProvider)
+        assertEquals(CreateProviderChoice.Pi, start.ui.value.dialogs.createSession?.providerOptions?.first())
+    }
+
     private fun start(): ClientApplicationController {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val settings = AndroidClientStorage.settingsStore(context)
@@ -215,14 +259,19 @@ class NativeCreateControllerComponentTest {
         val hostC = HostId.parse("native-controller-c")
         /** A legacy owner: native lane and catalog, but no described availability (#493). */
         val hostD = HostId.parse("native-controller-d")
+        /** A native-only owner: described native catalog, but no Pi create capability. */
+        val hostE = HostId.parse("native-controller-e")
         val runA = "11111111-1111-4111-8111-111111111111"
         val runB = "22222222-2222-4222-8222-222222222222"
         val runC = "33333333-3333-4333-8333-333333333333"
         val runD = "44444444-4444-4444-8444-444444444444"
+        val runE = "55555555-5555-4555-8555-555555555555"
         val target = NativeCliTarget("claude", NativeCliBackend.CLAUDE, "Claude default")
+        val codex = NativeCliTarget("codex", NativeCliBackend.CODEX, "Codex default")
         val scopeA = NativeCatalogScope(runA, 1L, 1L)
         val scopeB = NativeCatalogScope(runB, 1L, 1L)
         val scopeD = NativeCatalogScope(runD, 1L, 1L)
+        val scopeE = NativeCatalogScope(runE, 1L, 1L)
         val availability = listOf(
             RosterWire.CLOSE_CAPABILITY,
             RosterWire.CREATE_CAPABILITY,
@@ -231,6 +280,7 @@ class NativeCreateControllerComponentTest {
             RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
         )
         val legacy = availability - RosterWire.NATIVE_AVAILABILITY_CAPABILITY
+        val nativeOnly = availability - RosterWire.CREATE_CAPABILITY
 
         fun registry() = ConnectionRegistrySnapshot(
             generation = 1,
@@ -240,7 +290,7 @@ class NativeCreateControllerComponentTest {
             viewerRemoteInputEnabled = false,
             identity = DeviceIdentityObservation.NeverInitialized,
             storage = StorageObservation(StorageHandleState(available = true), StorageHandleState(available = true)),
-            hosts = listOf(hostA, hostB, hostC, hostD).mapIndexed { index, hostId ->
+            hosts = listOf(hostA, hostB, hostC, hostD, hostE).mapIndexed { index, hostId ->
                 HostConnectionSnapshot(
                     hostId, Endpoint("native-controller-$index.invalid", 8443), "Native owner $index",
                     HostConnectionPhase.CONNECTED, HostConnectionReason.NONE,
@@ -264,6 +314,9 @@ class NativeCreateControllerComponentTest {
                 HostRuntimeState(hostC, 1, HostLanePhase.ATTACHED, roster(hostC, runC, null, emptyList())),
                 HostRuntimeState(hostD, 1, HostLanePhase.ATTACHED, roster(
                     hostD, runD, scopeD, listOf(target), capabilities = legacy,
+                )),
+                HostRuntimeState(hostE, 1, HostLanePhase.ATTACHED, roster(
+                    hostE, runE, scopeE, listOf(target, codex), capabilities = nativeOnly,
                 )),
             ),
             selection = null,

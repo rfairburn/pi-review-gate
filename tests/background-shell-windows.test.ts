@@ -29,7 +29,7 @@
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import childProcess, { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { basename, dirname, join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1357,8 +1357,19 @@ async function runGuardSelfTest(executable: string): Promise<GuardSelfTestOutcom
   const closeSeen = new Promise<void>((resolve) => {
     child.once("close", () => { closed = true; resolve(); });
   });
+  // The error listener stays attached for the child's whole lifetime: a
+  // started process can report more than one runtime error (including one
+  // from child.kill below), and a consumed one-shot listener would let the
+  // next become an unhandled 'error' that skips the awaited settlement.
+  // Only the FIRST error classifies the outcome and settles this race.
+  let errorSeen = false;
   const spawnError = new Promise<void>((resolve) => {
-    child.once("error", () => { spawnFailed = child.pid === undefined; resolve(); });
+    child.on("error", () => {
+      if (errorSeen) return;
+      errorSeen = true;
+      spawnFailed = child.pid === undefined;
+      resolve();
+    });
   });
   child.stdout!.on("data", (d: Buffer) => { stdout.push(d); });
   child.stderr!.on("data", (d: Buffer) => { stderrBytes += d.length; });
@@ -1550,6 +1561,44 @@ describe("watchdog root identity guard fixture: diagnostics privacy and lifetime
       message = String((err as Error).message);
     }
     expect(message).toBe("guard self-test PowerShell could not be started");
+  });
+
+  it("handles repeated runtime errors and still returns only after positive exit and close", async (t) => {
+    // The helper's own spawn call is redirected to a REAL Node child that
+    // exits at once (no PowerShell needed). Node emits 'spawn' before 'exit'
+    // and 'close', so the two runtime errors (carrying hostile text) raised
+    // synchronously in the spawn callback always precede settlement.
+    const realSpawn = childProcess.spawn;
+    let child: ChildProcess | undefined;
+    let unhandled = false;
+    let exitObserved = false;
+    let closeObserved = false;
+    t.mock.method(childProcess, "spawn", ((_file: string, _args: readonly string[], options: childProcess.SpawnOptions) => {
+      const spawned = realSpawn(process.execPath, ["-e", "void 0"], options);
+      child = spawned;
+      spawned.once("exit", () => { exitObserved = true; });
+      spawned.once("close", () => { closeObserved = true; });
+      spawned.once("spawn", () => {
+        for (const n of [1, 2]) {
+          try {
+            spawned.emit("error", new Error(`SECRET runtime error ${n} C:\\Users\\SECRET`));
+          } catch {
+            unhandled = true; // an 'error' with no listener throws from emit
+          }
+        }
+      });
+      return spawned;
+    }) as unknown as typeof childProcess.spawn);
+
+    const outcome = await runGuardSelfTest("SECRET-pwsh.exe");
+    expect(child !== undefined, "the helper spawned through the redirected spawn").toBe(true);
+    expect(unhandled, "every runtime error reached a listener").toBe(false);
+    expect(exitObserved && closeObserved, "returned only after positive exit and close").toBe(true);
+    expect(child!.listenerCount("error") > 0, "error listener retained after settlement").toBe(true);
+    expect(outcome.exit).toBe("0");
+    expect(outcome.signal).toBe("none");
+    const summary = describeGuardOutcome(outcome);
+    for (const secret of [...SECRETS, String(child!.pid)]) expect(summary, "summary stays closed").not.toContain(secret);
   });
 });
 

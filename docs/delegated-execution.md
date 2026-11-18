@@ -1298,7 +1298,13 @@ a Windows host, `ShellStart` fails with a clear error before starting any job.
 Windows commands use Pi's non-interactive, profile-free PowerShell invocation
 and best-effort UTF-8 console-output initialization. Before the user command
 runs, a watchdog of the same PowerShell edition establishes a Windows Job Object
-with kill-on-close protection. The watchdog holds ownership even if the original
+with kill-on-close protection. Before assigning the root shell to that job, the
+watchdog opens the root process once and checks the creation time read through
+that same handle against the root's captured creation identity; it assigns that
+handle only on an exact match and closes it on every path, so a process that
+reused the root PID is never adopted. An unknown, unreadable, or mismatched
+identity is refused before the running handshake is written, and the user
+command does not run. The watchdog holds ownership even if the original
 shell exits before its descendants; `ShellStop`, session shutdown, and host
 disappearance terminate the owned job rather than targeting a potentially reused
 shell PID. If ownership cannot be established, the user command does not run.

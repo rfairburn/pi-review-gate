@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.295]
+
+### Fixed
+
+- **Deterministic CI fixtures (#702; Refs #689)**: failover-label tests hold their
+  synthetic successor until a real watch observes its active identity, and the
+  broad generation-cleanup regression uses an already-expired test budget rather
+  than assuming a minimum filesystem runtime. Production behavior, deadlines and
+  the original acceptance assertions are unchanged.
+- **Invocation-owned renderer fixtures (Refs #354)**: remove an unused shared
+  temporary directory and dispose the expanded-render fixture's actual unique
+  directory, including partial setup and shutdown failures, without deleting
+  foreign fixtures. Broader suite-wide fixture cleanup remains open.
+
 ## [0.1.0-dev.294]
 
 ### Fixed

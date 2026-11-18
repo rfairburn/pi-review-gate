@@ -174,14 +174,23 @@ interface EvidenceFixture {
   root: string;
   inspect: ExecuteTool;
   inspectTool: Record<string, any>;
-  manager: ExecutionToolManager;
 }
 
 let evidence: EvidenceFixture | undefined;
+let disposeEvidence: (() => Promise<void>) | undefined;
 const renderedFamilies = new Set<string>();
 
 before(async () => {
   const base = await mkdtemp(join(tmpdir(), "subtask-expanded-"));
+  let manager: ExecutionToolManager | undefined;
+  // Capture ownership immediately, before any later setup operation can fail.
+  disposeEvidence = async () => {
+    try {
+      if (manager) await manager.shutdown();
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  };
   const sourceRoot = join(base, "source");
   await mkdir(sourceRoot, { recursive: true });
 
@@ -305,17 +314,18 @@ before(async () => {
   };
   await writeGroupSnapshot(resolvedEmptyGroupRoot, serializeGroupSnapshot(emptyGroup, new Map()));
 
-  const { tools, manager } = harness({ cwd: () => sourceRoot });
+  const fixture = harness({ cwd: () => sourceRoot });
+  manager = fixture.manager;
+  const { tools } = fixture;
   const controller = (manager as unknown as { controller: { restore: (value: unknown) => Promise<void> } }).controller;
   await controller.restore({ waveRoots: [], bundles: [], groupRoots: [resolvedGroupRoot, resolvedEmptyGroupRoot] });
   const inspectTool = tools.find((candidate) => candidate.name === "SubtasksInspect")!;
   assert.ok(inspectTool, "SubtasksInspect must be registered");
-  evidence = { root: base, inspect: inspectTool.execute as ExecuteTool, inspectTool, manager };
+  evidence = { root: base, inspect: inspectTool.execute as ExecuteTool, inspectTool };
 });
 
 after(async () => {
-  if (evidence) await evidence.manager.shutdown();
-  await rm(join(tmpdir(), "subtask-expanded-"), { recursive: true, force: true });
+  await disposeEvidence?.();
 });
 
 async function runInspect(params: Record<string, unknown>): Promise<Record<string, any>> {

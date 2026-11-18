@@ -374,8 +374,11 @@ test("active widget and watch labels follow the failover successor during execut
     await initGitRepo(root);
     // Deterministic fake executor: waits for stdin end, records the invocation
     // (turn/operation/session), optionally fails mapped turns, and writes
-    // worker-output.txt only on mapped turns.
-    const fakeSource = (capture: string, failTurns: number[], contents: Record<string, string>) => [
+    // worker-output.txt only on mapped turns. With a release path it holds
+    // the recorded invocation active until the test writes that file (the
+    // owned successor handshake below); the bounded wait is an orphan guard
+    // for hard process kills only.
+    const fakeSource = (capture: string, failTurns: number[], contents: Record<string, string>, release?: string) => [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
       "process.stdin.on('end',()=>{",
@@ -383,19 +386,26 @@ test("active widget and watch labels follow the failover successor during execut
       "const sessionId=process.env.PI_REVIEW_EXECUTOR_SESSION_ID;",
       `fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify({turn,operation:process.env.PI_REVIEW_EXECUTOR_OPERATION,sessionId})+'\\n');`,
       `if(${JSON.stringify(failTurns)}.includes(turn)){console.log(JSON.stringify({type:'session',sessionId}));process.exit(3);}`,
+      "const finish=()=>{",
       `const content=${JSON.stringify(contents)}[String(turn)];`,
       "if(content!==undefined)fs.writeFileSync('worker-output.txt',content);",
       "console.log(JSON.stringify({type:'session',sessionId}));",
       "console.log(JSON.stringify({type:'assistant',text:'turn complete'}));",
+      "};",
+      `const release=${JSON.stringify(release ?? null)};`,
+      "if(release===null){finish();return;}",
+      "const deadline=Date.now()+30000;",
+      "const timer=setInterval(()=>{if(fs.existsSync(release)||Date.now()>deadline){clearInterval(timer);finish();}},10);",
       "});",
     ].join("\n");
 
     const captureA = join(root, "invocations-a.jsonl");
     const captureB = join(root, "invocations-b.jsonl");
+    const releaseB = join(root, "release-b.txt");
     const execA = join(root, "exec-a.cjs");
     const execB = join(root, "exec-b.cjs");
     await writeFile(execA, fakeSource(captureA, [2], { 1: "v1\n" }), "utf8");
-    await writeFile(execB, fakeSource(captureB, [], { 3: "v2\n" }), "utf8");
+    await writeFile(execB, fakeSource(captureB, [], { 3: "v2\n" }, releaseB), "utf8");
     await chmod(execA, 0o755);
     await chmod(execB, 0o755);
 
@@ -475,6 +485,19 @@ review: { activeReviewers: [
     // One-shot watch checkpoints: arm the first, then re-arm after each
     // delivery so the sequence spans the whole run, including the
     // post-failover turns. The loop also doubles as the wait for settlement.
+    //
+    // Owned successor handshake: the successor fake records its invocation
+    // and then holds it active. Once that record exists, the delivered
+    // checkpoint count is the baseline; any checkpoint at or past the next
+    // index was inspected by a watch armed after the successor was already
+    // running (one watch is armed at a time). The successor is released only
+    // after such a real checkpoint shows its label, so the active-label
+    // observation no longer depends on an uncoordinated short active window.
+    const watchCheckpoints = () => contents.filter((content) => content.startsWith("[pi-review-subtask-watch]"));
+    const successorCheckpointLabel = /failover-task · (running|correcting|reviewing) · exec-b-effective/;
+    const releaseSuccessor = () => writeFile(releaseB, "released\n", "utf8");
+    let successorBaseline: number | undefined;
+    let successorReleased = false;
     try {
       controller.watch(started.executionId, 100);
     } catch {
@@ -494,11 +517,27 @@ review: { activeReviewers: [
           break;
         }
       }
+      if (!successorReleased) {
+        if (successorBaseline === undefined && await access(captureB).then(() => true, () => false)) {
+          successorBaseline = watchCheckpoints().length;
+        }
+        if (successorBaseline !== undefined && watchCheckpoints().slice(successorBaseline + 1).some((content) => successorCheckpointLabel.test(content))) {
+          await releaseSuccessor();
+          successorReleased = true;
+        }
+      }
       const settled = controller.inspect(started.executionId).tasks.every((task) => task.state === "landed");
       if (settled) break;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
     }
+    // Bounded fail-closed path: if the loop bound elapsed without that
+    // observation, release anyway so the owned successor can finish; the
+    // checkpoint assertions below then fail on the missing observation.
+    if (!successorReleased) await releaseSuccessor();
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 60_000);
+    // The fallback release above only settles owned resources; it is not an
+    // observation. Require that an eligible checkpoint saw the active successor.
+    assert.ok(successorReleased, "successor was not observed by an eligible watch checkpoint before release");
 
     // The failover really happened: res-a served turn 1, failed on the
     // correction turn, and res-b served the successor turns.
@@ -529,7 +568,7 @@ review: { activeReviewers: [
     // after that relabels the task with the original executor.
     const checkpoints = contents.filter((content) => content.startsWith("[pi-review-subtask-watch]"));
     assert.ok(checkpoints.length > 0, "expected at least one delivered watch checkpoint");
-    const successorCheckpoints = checkpoints.filter((content) => /failover-task · (running|correcting|reviewing) · exec-b-effective/.test(content));
+    const successorCheckpoints = checkpoints.filter((content) => successorCheckpointLabel.test(content));
     assert.ok(successorCheckpoints.length > 0,
       `no watch checkpoint showed the successor's effective model while active: ${JSON.stringify(checkpoints)}`);
     const firstSuccessorCheckpoint = checkpoints.indexOf(successorCheckpoints[0]!);
@@ -538,6 +577,9 @@ review: { activeReviewers: [
       `a watch checkpoint after failover still showed the original executor: ${JSON.stringify(checkpoints)}`,
     );
   } finally {
+    // Release any still-held successor so failure cleanup cannot hang behind
+    // it; shutdown's abort (and process-tree termination) is the backstop.
+    await writeFile(join(root, "release-b.txt"), "released\n", "utf8").catch(() => undefined);
     await controller?.shutdown().catch(() => undefined);
     await controller?.detach().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
@@ -549,7 +591,9 @@ test("failover to a model-less external executor clears the predecessor's model 
   let controller: BackgroundExecutionController | undefined;
   try {
     await initGitRepo(root);
-    const fakeSource = (capture: string, failTurns: number[], contents: Record<string, string>) => [
+    // Same fake and owned successor handshake as the effective-model
+    // failover fixture above.
+    const fakeSource = (capture: string, failTurns: number[], contents: Record<string, string>, release?: string) => [
       "#!/usr/bin/env node",
       "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
       "process.stdin.on('end',()=>{",
@@ -557,19 +601,26 @@ test("failover to a model-less external executor clears the predecessor's model 
       "const sessionId=process.env.PI_REVIEW_EXECUTOR_SESSION_ID;",
       `fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify({turn,operation:process.env.PI_REVIEW_EXECUTOR_OPERATION,sessionId})+'\\n');`,
       `if(${JSON.stringify(failTurns)}.includes(turn)){console.log(JSON.stringify({type:'session',sessionId}));process.exit(3);}`,
+      "const finish=()=>{",
       `const content=${JSON.stringify(contents)}[String(turn)];`,
       "if(content!==undefined)fs.writeFileSync('worker-output.txt',content);",
       "console.log(JSON.stringify({type:'session',sessionId}));",
       "console.log(JSON.stringify({type:'assistant',text:'turn complete'}));",
+      "};",
+      `const release=${JSON.stringify(release ?? null)};`,
+      "if(release===null){finish();return;}",
+      "const deadline=Date.now()+30000;",
+      "const timer=setInterval(()=>{if(fs.existsSync(release)||Date.now()>deadline){clearInterval(timer);finish();}},10);",
       "});",
     ].join("\n");
 
     const captureA = join(root, "invocations-a.jsonl");
     const captureB = join(root, "invocations-b.jsonl");
+    const releaseB = join(root, "release-b.txt");
     const execA = join(root, "exec-a.cjs");
     const execB = join(root, "exec-b.cjs");
     await writeFile(execA, fakeSource(captureA, [2], { 1: "v1\n" }), "utf8");
-    await writeFile(execB, fakeSource(captureB, [], { 3: "v2\n" }), "utf8");
+    await writeFile(execB, fakeSource(captureB, [], { 3: "v2\n" }, releaseB), "utf8");
     await chmod(execA, 0o755);
     await chmod(execB, 0o755);
 
@@ -646,6 +697,14 @@ review: { activeReviewers: [
       { title: "modelless-task", instructions: "make the change", acceptanceCriteria: ["done"] },
     ]);
 
+    // Owned successor handshake (see the effective-model failover fixture):
+    // release the held model-less successor only after a checkpoint inspected
+    // while it was already running shows its own identity.
+    const watchCheckpoints = () => contents.filter((content) => content.startsWith("[pi-review-subtask-watch]"));
+    const successorCheckpointLabel = /modelless-task · (running|correcting|reviewing) · exec-b\b/;
+    const releaseSuccessor = () => writeFile(releaseB, "released\n", "utf8");
+    let successorBaseline: number | undefined;
+    let successorReleased = false;
     try {
       controller.watch(started.executionId, 100);
     } catch {
@@ -664,11 +723,26 @@ review: { activeReviewers: [
           break;
         }
       }
+      if (!successorReleased) {
+        if (successorBaseline === undefined && await access(captureB).then(() => true, () => false)) {
+          successorBaseline = watchCheckpoints().length;
+        }
+        if (successorBaseline !== undefined && watchCheckpoints().slice(successorBaseline + 1).some((content) => successorCheckpointLabel.test(content))) {
+          await releaseSuccessor();
+          successorReleased = true;
+        }
+      }
       const settled = controller.inspect(started.executionId).tasks.every((task) => task.state === "landed");
       if (settled) break;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
     }
+    // Bounded fail-closed path: release anyway; the assertions below then
+    // fail on the missing active observation.
+    if (!successorReleased) await releaseSuccessor();
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 60_000);
+    // The fallback release above only settles owned resources; it is not an
+    // observation. Require that an eligible checkpoint saw the active successor.
+    assert.ok(successorReleased, "successor was not observed by an eligible watch checkpoint before release");
 
     // The failover really happened.
     const invocationsA = (await readFile(captureA, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
@@ -697,7 +771,7 @@ review: { activeReviewers: [
     // Same guarantee for the watch checkpoints.
     const checkpoints = contents.filter((content) => content.startsWith("[pi-review-subtask-watch]"));
     assert.ok(checkpoints.length > 0, "expected at least one delivered watch checkpoint");
-    const successorCheckpoints = checkpoints.filter((content) => /modelless-task · (running|correcting|reviewing) · exec-b\b/.test(content));
+    const successorCheckpoints = checkpoints.filter((content) => successorCheckpointLabel.test(content));
     assert.ok(successorCheckpoints.length > 0,
       `no watch checkpoint showed the model-less successor's own identity: ${JSON.stringify(checkpoints)}`);
     const firstSuccessorCheckpoint = checkpoints.indexOf(successorCheckpoints[0]!);
@@ -706,6 +780,8 @@ review: { activeReviewers: [
       `a watch checkpoint after failover still showed the predecessor's model: ${JSON.stringify(checkpoints)}`,
     );
   } finally {
+    // Release any still-held successor so failure cleanup cannot hang behind it.
+    await writeFile(join(root, "release-b.txt"), "released\n", "utf8").catch(() => undefined);
     await controller?.shutdown().catch(() => undefined);
     await controller?.detach().catch(() => undefined);
     await rm(root, { recursive: true, force: true });

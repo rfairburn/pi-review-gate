@@ -1791,17 +1791,28 @@ export class ToolProtectionCoordinator {
         // row of its children, including these, so the decoration must not add
         // a second padding or background layer.
         const selfShell = base.renderShell === "self";
-        // #677: the native `write` tool is the host renderer whose own rows carry
-        // this seam. Its call rows reprint the submitted `content` argument with
-        // carriage-return normalization only (`formatWriteCall`), and its failed
-        // result body is the tool's error text verbatim (`formatWriteResult`), so
-        // a full or background reset inside either region cancels the host
-        // `Box`'s single background span for the rest of the row. Scoped to
-        // `write` on the host's default shell: every extension-owned custom
-        // renderer already gets the rule at the shared adapter, and a self-shell
-        // row is painted by this decoration (see `paintAnnotationRow`).
-        const nativeWriteRows = toolName === "write" && !selfShell;
-        const baseRenderCall = nativeWriteRows && typeof base.renderCall === "function"
+        // #677: the host's own rows carry this seam wherever a renderer reprints
+        // a submitted argument. On the host's default shell those are the builtin
+        // call families in `NATIVE_CALL_ARG_REGION_TOOLS`: the repair wraps the
+        // component the native call renderer returned and re-opens that row's own
+        // background on its physical rows, before the host's `Box` pads and paints
+        // them. A self-shell renderer owns its own background span, so its rows
+        // cannot be wrapped from outside — wrapping after the renderer's own
+        // background close would paint past the card — and the same rule is
+        // applied inside the renderer's own semantic background callback instead.
+        // Scoped to the host's builtin renderers either way: every extension-owned
+        // custom renderer already gets the rule at the shared adapter, and a
+        // self-shell row the decoration itself paints is handled by
+        // `paintAnnotationRow`.
+        const nativeCallRows = !selfShell && NATIVE_CALL_ARG_REGION_TOOLS.has(toolName);
+        const nativeSelfShellRows = selfShell && NATIVE_SELF_SHELL_TOOLS.has(toolName);
+        // The result BODY is a separate question from the call region: of the
+        // builtin families only `write` emits a result row verbatim
+        // (`formatWriteResult`); the others take retained output through the
+        // host's stripping `getTextOutput`, so their result rows never carry a
+        // live reset in the first place.
+        const nativeWriteResultRows = toolName === "write" && !selfShell;
+        const baseRenderCall = (nativeCallRows || nativeSelfShellRows) && typeof base.renderCall === "function"
           ? base.renderCall.bind(base) as (...callArgs: any[]) => unknown
           : undefined;
         return {
@@ -1812,20 +1823,29 @@ export class ToolProtectionCoordinator {
             // no second background layer, no replacement of the native renderer.
             renderCall: (...callArgs: any[]): unknown => {
               const context = callArgs[2];
+              if (nativeSelfShellRows) {
+                // No component wrapper on this path: the renderer reuses the
+                // component it returned as its own backgrounded `Box`, so the
+                // value handed back to the host has to stay the native component
+                // (and needs no per-row slot). The re-open travels with the
+                // theme, inside the background callback that owns the span.
+                return baseRenderCall!(callArgs[0], withReopenedToolBackground(callArgs[1]), context);
+              }
               const state = isRecord(context) && isRecord(context.state)
                 ? context.state as Record<string | symbol, unknown>
                 : undefined;
-              // The native call renderer reuses `context.lastComponent` and
-              // writes its highlighting cache onto that component, so it has to
-              // receive its own component and never this wrapper. Without a
-              // per-row slot there is nowhere safe to keep it, so the row keeps
-              // the native presentation exactly as it was before this repair.
+              // The native call renderer reuses `context.lastComponent` and —
+              // for `write` — writes its incremental highlighting cache onto that
+              // component, so it has to receive its own component and never this
+              // wrapper. Without a per-row slot there is nowhere safe to keep it,
+              // so the row keeps the native presentation exactly as it was before
+              // this repair.
               if (state === undefined) return baseRenderCall!(...callArgs);
               const component = baseRenderCall(callArgs[0], callArgs[1], {
                 ...context,
-                lastComponent: state[NATIVE_WRITE_CALL_INNER],
+                lastComponent: state[NATIVE_CALL_INNER],
               });
-              state[NATIVE_WRITE_CALL_INNER] = component;
+              state[NATIVE_CALL_INNER] = component;
               return reopenNativeRows(component, callArgs[1], toolCallRowBackgroundToken(context));
             },
           }),
@@ -1854,6 +1874,14 @@ export class ToolProtectionCoordinator {
               if (state !== undefined && baseArgs.length >= 3) {
                 baseArgs[2] = { ...context, lastComponent: state[ANNOTATION_DISPLAY_INNER] };
               }
+              if (nativeSelfShellRows && baseArgs.length >= 2) {
+                // The native self-shell result path rebuilds its own header `Box`
+                // with the theme it is handed, so the background re-open has to
+                // travel with that theme too — otherwise a settled result rebuilds
+                // the header without the repair. The decoration's own rows still
+                // style themselves from the untouched theme in `callArgs[2]`.
+                baseArgs[1] = withReopenedToolBackground(baseArgs[1]);
+              }
               const component = baseRender(annotation ? annotation.view : result, ...baseArgs);
               if (state !== undefined) state[ANNOTATION_DISPLAY_INNER] = component;
               // The same #677 seam on the result side. The renderer keeps its own
@@ -1864,7 +1892,7 @@ export class ToolProtectionCoordinator {
               // to the native renderer as `context.lastComponent` on the next
               // pass, and the native write renderer calls `setText`/`clear` on it,
               // so a state-less context keeps the native component unchanged.
-              const drawn = nativeWriteRows && state !== undefined
+              const drawn = nativeWriteResultRows && state !== undefined
                 ? reopenNativeRows(component, callArgs[2], toolRowBackgroundToken(result, callArgs[1], context))
                 : component;
               if (!annotation || !isRecord(drawn) || typeof drawn.render !== "function") return drawn;
@@ -2360,11 +2388,45 @@ const ANNOTATION_DISPLAY_PROVENANCE = Symbol("pi-review-gate.annotation-display-
  * Per-row slot holding the native call renderer's own component, for the same
  * reason {@link ANNOTATION_DISPLAY_INNER} exists on the result side (#677): the
  * wrapper that re-opens the row background carries no renderer state, and the
- * native write call renderer reuses `context.lastComponent` while writing its
- * highlighting cache onto that component. The call region and the result region
- * share one `state` object per tool row, so they own separate slots.
+ * native call renderers reuse `context.lastComponent` — `write` also writes its
+ * incremental highlighting cache onto that component. The call region and the
+ * result region share one `state` object per tool row, so they own separate
+ * slots.
  */
-const NATIVE_WRITE_CALL_INNER = Symbol("pi-review-gate.native-write-call-inner");
+const NATIVE_CALL_INNER = Symbol("pi-review-gate.native-call-inner");
+
+/**
+ * The host builtin renderers whose CALL rows reprint a submitted argument
+ * verbatim on the host's default shell, so a reset surviving inside that
+ * argument cancels the host `Box`'s single background span for the rest of the
+ * row (#677). Each entry is the host's own renderer and the argument it
+ * reprints: `bash` and `powershell` share `createShellRenderers` and reprint
+ * `command` (`formatShellCall`); `read`, `ls`, and `write` reprint their path
+ * through `renderToolPath`, and `write` also reprints `content`
+ * (`formatWriteCall`); `grep` reprints `pattern`, `path`, and `glob`
+ * (`formatGrepCall`); `find` reprints `pattern` and `path`
+ * (`formatFindCall`). Extension-owned registrations are deliberately absent:
+ * they already get the rule at the shared adapter in
+ * `./tool-result-expansion`.
+ */
+const NATIVE_CALL_ARG_REGION_TOOLS = new Set([
+  "bash",
+  "powershell",
+  "read",
+  "write",
+  "grep",
+  "find",
+  "ls",
+]);
+
+/**
+ * The host builtin that draws its own shell (`renderShell: "self"`) and paints
+ * its own header rows through the theme's semantic tool-background callback
+ * (`getEditHeaderBg` → `theme.bg(token, paddedRow)`) rather than through the
+ * host `Box` (#677). Its CALL rows reprint the submitted path, so the same
+ * seam lives inside the renderer's own background span.
+ */
+const NATIVE_SELF_SHELL_TOOLS = new Set(["edit"]);
 
 /** The structural component shape this decoration wraps or replaces. */
 interface AnnotationDisplayComponent {
@@ -2391,20 +2453,70 @@ function stashedDisplayProvenance(
 
 /**
  * Re-open the host's row background on the physical rows a native host renderer
- * emitted (#677). The native write renderer keeps the submitted `content`
- * argument verbatim in its call rows and the failed result's own text verbatim,
- * so a reset inside that text cancels the host `Box`'s single background span
- * for the rest of the row — the same seam the extension families hit, one layer
- * below the shared adapter, which is why the shared rule is reused here rather
- * than the row being repainted. Only the rendered rows are touched, and only
- * zero-width opens are inserted. A non-renderable value, or a theme that cannot
- * supply this row's own background, is returned exactly as it came.
+ * emitted (#677). The host's builtin call renderers reprint a submitted
+ * argument — a shell `command`, a `pattern`, `glob`, or `path`, or the
+ * submitted `content` — with normalization only, so a reset inside that text
+ * cancels the host `Box`'s single background span for the rest of the row: the
+ * same seam the extension families hit, one layer below the shared adapter,
+ * which is why the shared rule is reused here rather than the row being
+ * repainted. Only the rendered rows are touched, and only zero-width opens are
+ * inserted. A non-renderable value, or a theme that cannot supply this row's
+ * own background, is returned exactly as it came.
  */
 function reopenNativeRows(component: unknown, theme: unknown, token: ToolRowBackgroundToken): unknown {
   if (!isRecord(component) || typeof component.render !== "function") return component;
   const backgroundAnsi = toolRowBackgroundAnsi(theme, token);
   if (backgroundAnsi === undefined) return component;
   return withReopenedRowBackground(component, backgroundAnsi);
+}
+
+/**
+ * A view of the live theme whose `bg` re-opens, inside the text it is handed,
+ * the background it is about to paint (#677). This is the seam for a native
+ * renderer that paints its own rows through the theme's semantic tool
+ * background callback instead of through the host `Box`: the callback is the
+ * last place that still owns the row's own background token, and the re-open
+ * lands inside the span that callback opens — never after the renderer's own
+ * background close, which would paint outside the card. The theme's own `bg`
+ * still produces the span, and every other accessor is handed back bound to
+ * the original theme, so the original method receivers, its instance state, and
+ * every foreground, glyph, and layout decision are untouched. A token the
+ * theme cannot answer leaves the text exactly as it came.
+ */
+function withReopenedToolBackground(theme: unknown): unknown {
+  if (!isRecord(theme) || typeof theme.bg !== "function") return theme;
+  const original = theme as { bg(token: string, text: string): unknown } & Record<string | symbol, unknown>;
+  const bound = new Map<PropertyKey, unknown>();
+  const bg = (token: string, text: string): unknown => {
+    // Re-open the background this very callback is about to paint, from the
+    // token the renderer chose — the native edit header's own
+    // pending/error/success state, never a row state guessed by this
+    // decoration. The shared accessor only reads `theme.getBgAnsi(token)`, so a
+    // token the theme cannot answer leaves the text untouched (and the theme's
+    // own `bg` still behaves exactly as it did for it).
+    const open = toolRowBackgroundAnsi(original, token as ToolRowBackgroundToken);
+    return original.bg(token, open === undefined ? text : reopenRowBackground(text, open));
+  };
+  try {
+    return new Proxy(original, {
+      get(target, property) {
+        if (property === "bg") return bg;
+        // Read through the original theme, and hand back its own method bound to
+        // the original theme, so the renderer never observes a different
+        // receiver or a different theme object from its own.
+        const value = Reflect.get(target, property, target);
+        if (typeof value !== "function") return value;
+        const cached = bound.get(property);
+        if (cached !== undefined) return cached;
+        const method = value.bind(target);
+        bound.set(property, method);
+        return method;
+      },
+    });
+  } catch {
+    // A host theme this environment cannot wrap keeps its own presentation.
+    return theme;
+  }
 }
 
 /**

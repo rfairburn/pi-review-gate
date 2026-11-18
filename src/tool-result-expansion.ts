@@ -287,7 +287,10 @@ function rowBackgroundAnsi(theme: unknown, result: unknown, options: unknown, co
  *  `./tool-protection/coordinator`, which repairs the rows a native host
  *  renderer emits. A caller keeps the renderer's own component as
  *  `context.lastComponent` — this wrapper carries no renderer state, so handing
- *  it back would break a native renderer's incremental cache. */
+ *  it back would break a native renderer's incremental cache. For the record,
+ *  the extension's own delegates do not read `context.lastComponent` at all
+ *  today; the constraint is one the native host renderers impose, not a new
+ *  requirement this gate places on extension tools. */
 export function withReopenedRowBackground<T>(component: T, backgroundAnsi: string): T {
   const inner = component as {
     render(width: number): string[];
@@ -354,7 +357,6 @@ export function withReopenedRowBackground<T>(component: T, backgroundAnsi: strin
  * returns a non-string — renders exactly as before. Tool-row presentation only:
  * the generic presentation core and custom-message rows are untouched.
  */
-
 export function expandableResult<TTheme, TContext>(
   collapsedRenderer: ToolResultRenderer<TTheme, TContext>,
   expandedRenderer?: ToolResultRenderer<TTheme, TContext>,

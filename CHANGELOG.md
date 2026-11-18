@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.293]
+## [0.1.0-dev.294]
 
 ### Fixed
 
@@ -42,22 +42,60 @@ dates.
   throws or returns a non-string — renders exactly as before. This covers every
   custom tool-result registration — the five `Shell*` tools (both triggers),
   `ApplyPatch`, `tool_search`, and `Subtasks*` expanded rows — and the same seam
-  wherever else a tool row is painted, repaired with that one rule: the native
-  `write` card's own call and failed-result rows on the host's default shell
-  (its call rows reprint the submitted `content` argument, and its result rows
-  the tool's own error text, both verbatim), and the rows the gate paints for a
-  tool that draws its own shell, such as an annotated native `edit` error.
-  `write`'s native renderer and its incremental highlighting reuse are kept, and
-  an unannotated native self-shell card keeps the host's own unpainted
-  presentation. The other native host renderers (`read`, `grep`, `find`, `ls`,
-  `bash`/`powershell`), web/browser families that display control characters
-  instead of emitting them, the host's renderer-less fallback, custom
-  notification messages, layout, wrapping, copy/selection, and all execution,
-  authorization, audit, scheduling, model-facing payload, and retention
-  behaviour are unchanged. Headless-terminal evidence only, on the built-in
-  `dark` 256-colour theme — not physical-terminal, truecolour, light-theme,
-  Windows-terminal, or cross-platform certification. See
+  wherever else a tool row is painted, repaired with that one rule: the host
+  builtin tool cards' CALL rows on the host's default shell (`bash`,
+  `powershell`, `read`, `write`, `grep`, `find`, and `ls` each reprint a
+  submitted `command`, path, `pattern`, `glob`, or `content`, and a reset
+  surviving in one of those arguments cut the card from that point to its edge),
+  the native `write` failed-result rows (the one builtin result region that
+  prints the tool's own error text verbatim), the native `edit` self-shell
+  header (re-opened inside the background span that renderer's own theme
+  callback opens, with that callback's own pending/error token, so nothing is
+  painted past the card), and the rows the gate paints for a tool that draws its
+  own shell, such as an annotated native `edit` error. The native renderers and
+  `write`'s incremental highlighting reuse are kept, each native renderer keeps
+  receiving its own component, and an unannotated native self-shell body keeps
+  the host's own unpainted presentation. The builtin result rows other than
+  `write`'s need no repair and get none — the host strips SGR from retained
+  output before painting those — and the web/browser families that display
+  control characters instead of emitting them, the host's renderer-less
+  fallback, custom notification messages, layout, wrapping, copy/selection, and
+  all execution, authorization, audit, scheduling, model-facing payload, and
+  retention behaviour are unchanged. Headless-terminal evidence only, on the
+  built-in `dark` 256-colour theme — not physical-terminal, truecolour,
+  light-theme, Windows-terminal, or cross-platform certification. See
   [development docs](docs/development.md#tool-row-background-continuity-across-a-rows-resets-677).
+
+## [0.1.0-dev.293]
+
+### Added
+
+- **Editing a saved destination's address (#688)**: each saved destination in the
+  Network pane now draws its own **Edit address** row, matching the Android
+  destination-address edit. Enter or a left-click on that written row opens the
+  destination's address menu, which names the destination and its endpoint and
+  states that the name, port, history, and remembered key stay fixed; its one
+  editable row prefills the saved address (no port or name editing exists here),
+  Escape abandons the edit with no command and no connection, and one
+  **Save address and reconnect** action validates the address, saves it, and then
+  makes a single ordinary explicit Connect to the new address with the same
+  approvals any other explicit Connect needs. The edit itself moves nothing else:
+  it never clears, rotates, or re-pairs the remembered server key, and a server
+  identity that changed along with the address is still refused with the existing
+  terminal key-changed report and prompts for nothing new. It also never sets or
+  clears a saved Disconnect suppression — the explicit Connect it then makes
+  clears one exactly as any other explicit Connect always has. A saved change
+  retires the old endpoint's in-flight attempt, owned retry timer, channel, and
+  displayed content through the existing tracked retirement, so a late completion
+  of the old connection cannot reappear and only the new address is dialled
+  afterwards. The command carries the exact endpoint the drawn form replaced, so a
+  destination removed, re-added, or re-addressed while the form was open is refused
+  as stale and saves nothing, and a refused save changes nothing on disk or in
+  memory and reconnects nothing. Auto reconnect, the listen endpoint, other
+  destinations, hosting, trust storage, and the persisted settings document shape
+  are unchanged — no new persisted field exists — and after a host restart the
+  ordinary automatic-recovery rules apply to the saved address. Shared desktop
+  sidebar behavior on Windows, macOS, and Linux; no Android change.
 
 ## [0.1.0-dev.292]
 

@@ -180,11 +180,42 @@ if (!host) {
   // `createShellRenderers(config.prompt)` with the bash prompt "$" and declares
   // no `renderShell`, so the host's own `Box` (padding plus row background)
   // frames this family — the other half of the #547 card shape.
-  const nativeBashDefinition = {
-    name: "bash",
-    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "bash.js")) as {
-      createShellRenderers(prompt: string): Record<string, unknown>;
-    }).createShellRenderers("$"),
+  const { createShellRenderers } = h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "bash.js")) as {
+    createShellRenderers(prompt: string): Record<string, unknown>;
+  };
+  const nativeBashDefinition = { name: "bash", ...createShellRenderers("$") };
+  // `powershell` is the same installed factory with the host's powershell prompt
+  // (`renderers/index.js` builds both builtins from `createShellRenderers`, and
+  // `tools/powershell.js` spreads them the same way `tools/bash.js` does). This
+  // is the real powershell presentation exercised headlessly through that shared
+  // factory — no PowerShell process is started anywhere in this file.
+  const nativePowershellDefinition = { name: "powershell", ...createShellRenderers("PS>") };
+  // The remaining installed builtin renderers, spread into definitions the same
+  // way the shipped tools do. None declares `renderShell`, so the host's `Box`
+  // frames all of them.
+  const nativeReadDefinition = {
+    name: "read",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "read.js")) as {
+      readRenderers: Record<string, unknown>;
+    }).readRenderers,
+  };
+  const nativeGrepDefinition = {
+    name: "grep",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "grep.js")) as {
+      grepRenderers: Record<string, unknown>;
+    }).grepRenderers,
+  };
+  const nativeFindDefinition = {
+    name: "find",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "find.js")) as {
+      findRenderers: Record<string, unknown>;
+    }).findRenderers,
+  };
+  const nativeLsDefinition = {
+    name: "ls",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "ls.js")) as {
+      lsRenderers: Record<string, unknown>;
+    }).lsRenderers,
   };
   // The installed write renderers (`core/tools/renderers/write.js`), spread into
   // a definition the same way the shipped write tool does. `write` declares no
@@ -2777,7 +2808,7 @@ if (!host) {
    * cell, with nothing painted past it; the only difference from the undecorated
    * native card is an inserted copy of the theme's own bare background open.
    */
-  async function assertWriteCardRepaired(
+  async function assertNativeCardRepaired(
     decorated: string[],
     native: string[],
     width: number,
@@ -2844,7 +2875,7 @@ if (!host) {
             const nativeHoles = await cardHoles(native, width);
             assert.ok(nativeHoles > 0,
               `${label}: the undecorated native write card no longer loses its background (the case would pass vacuously)`);
-            await assertWriteCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
             // Nothing is stripped or normalized: the retained resets still reach
             // the terminal, in both the call rows and (for a failed result) the
             // result rows.
@@ -2899,7 +2930,7 @@ if (!host) {
             } else {
               assert.equal(holes, 0, `${label}: the reset-free baseline card lost its background`);
             }
-            await assertWriteCardRepaired(decorated, native, width, theme.getBgAnsi("toolErrorBg"), label);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi("toolErrorBg"), label);
           }
         }
       }
@@ -2930,7 +2961,7 @@ if (!host) {
               assert.ok(line.includes(backgroundAnsi), `${label}: a card row lost the themed row background`);
               assert.equal(countOf(line, backgroundAnsi), 1, `${label}: a row gained a background re-open`);
             }
-            await assertWriteCardRepaired(decorated, native, width, backgroundAnsi, label);
+            await assertNativeCardRepaired(decorated, native, width, backgroundAnsi, label);
           }
         }
       }
@@ -3126,6 +3157,522 @@ if (!host) {
     const errorBg = theme.getBgAnsi("toolErrorBg");
     assert.ok(!secondError.render(38).join("").includes(errorBg),
       "the state-less fallback painted a row background the native renderer does not emit");
+  });
+
+  // ── #677: the native builtin CALL regions keep the themed background ─────
+  //
+  // `write` is not the only host renderer whose own rows carry this seam. Every
+  // default-shell builtin CALL region reprints a submitted argument: the shell
+  // family (`formatShellCall`) reprints `command`, `renderToolPath` reprints the
+  // path of `read`, `ls`, and `write`, `formatGrepCall` reprints `pattern`,
+  // `path`, and `glob`, and `formatFindCall` reprints `pattern` and `path`. A
+  // full or background reset inside one of those arguments therefore cancels the
+  // host `Box`'s single background span for the rest of the CALL row, exactly as
+  // `write`'s submitted `content` does.
+  //
+  // The RESULT regions of those families are a different story, and they are not
+  // repaired: `read`, `grep`, `find`, `ls`, and the shell family take retained
+  // output through the host's own `getTextOutput` (`core/tools/render-utils.js`),
+  // which runs `stripAnsi` before painting, so no live reset ever reaches their
+  // rows. Both halves of that distinction are witnessed below — the CALL seam
+  // with a reset carried in the ARGUMENT, and the unaffected RESULT rows with a
+  // reset carried in the retained output.
+  //
+  // Nothing here executes a native tool. These are renderer fixtures only: no
+  // shell is started, no file is read, written, or searched, and `powershell` is
+  // exercised through the host's shared shell factory — the same installed
+  // `createShellRenderers` the shipped powershell tool spreads, with the host's
+  // powershell prompt — not through PowerShell.
+
+  const CALL_RESET = `reset in the argument \x1b[0m and after it ${LONG_SHELL_TEXT}`;
+  const CALL_BG_RESET = `background reset in the argument \x1b[49m and after it ${LONG_SHELL_TEXT}`;
+  const CALL_CLEAN = `no escape in the argument at all ${LONG_SHELL_TEXT}`;
+  /** Path-only edit arguments: no `edits` and no old/new text, so the host's
+   *  `getRenderablePreviewInput` returns null and `computeEditsDiff` is never
+   *  reached — these fixtures touch no file. */
+  const EDIT_CLEAN_ARGS = { path: `/work/${CALL_CLEAN}.txt` };
+  const RESULT_RESET = `retained output ${LONG_SHELL_TEXT} \x1b[0m after a full reset ${LONG_SHELL_TEXT}`;
+  const RESULT_CLEAN = `retained output ${LONG_SHELL_TEXT} with no escape at all`;
+
+  /** The displayed glyphs of a card, with styling, padding, and line breaks
+   *  removed: a wrap may split a phrase across rows, so a substring check has to
+   *  be made against the same flattening of the fixture. */
+  const flattenRows = (lines: string[]): string => stripAnsi(lines.join("")).replace(/\s+/g, "");
+  const flattenText = (text: string): string => stripAnsi(text).replace(/\s+/g, "");
+
+  /** One host builtin whose CALL rows reprint these arguments. */
+  const nativeCallFixtures: Array<{
+    tool: string;
+    definition: Record<string, unknown>;
+    /** Every argument value the host reprints, each carrying a reset. */
+    dirtyArgs: Record<string, unknown>;
+    /** The same arguments with no escape anywhere. */
+    cleanArgs: Record<string, unknown>;
+  }> = [
+    { tool: "bash", definition: nativeBashDefinition, dirtyArgs: { command: `printf ${CALL_RESET} ${CALL_BG_RESET}` }, cleanArgs: { command: `printf ${CALL_CLEAN}` } },
+    { tool: "powershell", definition: nativePowershellDefinition, dirtyArgs: { command: `Write-Output ${CALL_RESET} ${CALL_BG_RESET}` }, cleanArgs: { command: `Write-Output ${CALL_CLEAN}` } },
+    { tool: "read", definition: nativeReadDefinition, dirtyArgs: { file_path: `/work/${CALL_RESET}.txt`, offset: 1, limit: 10 }, cleanArgs: { file_path: `/work/${CALL_CLEAN}.txt` } },
+    {
+      tool: "grep",
+      definition: nativeGrepDefinition,
+      dirtyArgs: { pattern: CALL_RESET, path: `/work/${CALL_BG_RESET}`, glob: `*${CALL_RESET}.ts`, limit: 5 },
+      cleanArgs: { pattern: CALL_CLEAN, path: `/work/${CALL_CLEAN}`, glob: `*${CALL_CLEAN}.ts` },
+    },
+    {
+      tool: "find",
+      definition: nativeFindDefinition,
+      dirtyArgs: { pattern: CALL_BG_RESET, path: `/work/${CALL_RESET}`, limit: 5 },
+      cleanArgs: { pattern: CALL_CLEAN, path: `/work/${CALL_CLEAN}` },
+    },
+    { tool: "ls", definition: nativeLsDefinition, dirtyArgs: { path: `/work/${CALL_RESET}`, limit: 20 }, cleanArgs: { path: `/work/${CALL_CLEAN}` } },
+  ];
+
+  /** One real host row for a native builtin, rendered once at `width`. */
+  function nativeCardLines(
+    toolName: string,
+    definition: unknown,
+    args: Record<string, unknown>,
+    state: WriteRowState,
+    width: number,
+    expanded: boolean,
+    resultText: string,
+  ): string[] {
+    const component = new h.agent.ToolExecutionComponent(toolName, `${toolName}-677-call`, args, {}, definition, ui, "/work");
+    component.setArgsComplete();
+    if (state !== "pending-call") {
+      component.updateResult({
+        content: [{ type: "text", text: resultText }],
+        details: undefined,
+        isError: state === "error",
+      }, state === "pending-partial");
+    }
+    component.setExpanded(expanded);
+    return component.render(width);
+  }
+
+  /** The production resolver, with the gate's row decoration installed. */
+  function decoratedNativeDefinition(toolName: string, definition: Record<string, unknown>) {
+    const pi = fakePiHost();
+    // Debug Off keeps these matrices on the native presentation alone: the gate
+    // draws no audit rows, so the decorated card and the native card have to
+    // agree row for row apart from the re-opened background.
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decorated = (pi.pi.__rendererResolver as RendererResolver)(toolName, () => definition);
+    assert.ok(typeof (decorated as { renderCall?: unknown }).renderCall === "function",
+      `the production resolver decorated the native ${toolName} call renderer`);
+    return { ...definition, ...decorated };
+  }
+
+  test("real host: every native builtin call argument that the host reprints loses its own background before the repair (#677)", async () => {
+    // The trigger, per argument: a reset carried in one reprinted argument, with
+    // every other argument reset-free, cuts the undecorated card from that point
+    // to the card edge. A hole can only come from a reset inside its own row, so
+    // the holes this adds belong to the argument that changed.
+    for (const fixture of nativeCallFixtures) {
+      const native = fixture.definition;
+      // Only the string arguments the host reprints carry a reset; the numeric
+      // ones (`offset`, `limit`) are printed as numbers and have no seam.
+      const reprinted = Object.entries(fixture.dirtyArgs)
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].includes("\x1b"));
+      // One case per reprinted argument, alone: every other argument stays
+      // reset-free, so the holes this adds belong to that argument. The clean
+      // baseline is the control, and the all-dirty case is the whole card.
+      const cases: Array<{ label: string; args: Record<string, unknown>; wanted: string[] }> = reprinted
+        .map(([key, value]) => ({
+          label: `only ${key} dirty`,
+          args: { ...fixture.cleanArgs, [key]: value },
+          wanted: [flattenText(value)],
+        }));
+      cases.push({ label: "clean", args: fixture.cleanArgs, wanted: [flattenText(CALL_CLEAN)] });
+      cases.push({
+        label: "every argument dirty",
+        args: fixture.dirtyArgs,
+        wanted: reprinted.map(([, value]) => flattenText(value)),
+      });
+      for (const one of cases) {
+        for (const width of [40, 80]) {
+          const lines = nativeCardLines(fixture.tool, native, one.args, "pending-call", width, false, RESULT_CLEAN);
+          const name = `${fixture.tool} ${one.label} width ${width}`;
+          const flat = flattenRows(lines);
+          // The trigger: the reprinted argument really reached the row, and the
+          // dirty variants really carry a background-clearing reset there.
+          assert.ok(one.wanted.every((text) => flat.includes(text)),
+            `${name}: the fixture's argument text was not rendered (the case would pass vacuously)`);
+          const holes = await cardHoles(lines, width);
+          if (one.label === "clean") {
+            assert.equal(holes, 0, `${name}: the reset-free native card lost its background`);
+          } else {
+            assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+              `${name}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+            assert.ok(holes > 0,
+              `${name}: the undecorated native card no longer loses its background (the case would pass vacuously)`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: every native builtin call region keeps the themed background across a reset-bearing argument (#677)", async () => {
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+            const label = `${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.dirtyArgs, state, width, expanded, RESULT_CLEAN);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.dirtyArgs, state, width, expanded, RESULT_CLEAN);
+            // The trigger: the undecorated native card really does lose its
+            // background, so this case would not pass vacuously.
+            const nativeHoles = await cardHoles(native, width);
+            assert.ok(nativeHoles > 0,
+              `${label}: the undecorated native card no longer loses its background (the case would pass vacuously)`);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+            // Nothing is stripped or normalized: the retained resets still reach
+            // the terminal, in the call rows.
+            const joined = decorated.join("");
+            const nativeJoined = native.join("");
+            assert.equal(countOf(joined, "\x1b[0m"), countOf(nativeJoined, "\x1b[0m"),
+              `${label}: a retained full reset was stripped or duplicated`);
+            assert.equal(countOf(joined, "\x1b[49m"), countOf(nativeJoined, "\x1b[49m"),
+              `${label}: a retained background reset was stripped or duplicated`);
+            const flat = flattenRows(decorated);
+            for (const [, value] of Object.entries(fixture.dirtyArgs)) {
+              if (typeof value !== "string" || !value.includes("\x1b")) continue;
+              assert.ok(flat.includes(flattenText(value)),
+                `${label}: the reprinted argument text ${JSON.stringify(stripAnsi(value).slice(0, 32))} was lost`);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native builtin call card is byte-identical with the decoration (#677 control)", async () => {
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const label = `clean native ${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.cleanArgs, state, width, expanded, RESULT_CLEAN);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.cleanArgs, state, width, expanded, RESULT_CLEAN);
+            // Byte-for-byte: a card with no background-clearing reset inside a
+            // row gains no escape of any kind, so the repair is provably inert.
+            assert.deepEqual(decorated, native, `${label}: a reset-free native card was rewritten`);
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: the fixture gained a reset`);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset in a builtin family's retained output never reaches its rows (#677 result control)", async () => {
+    // The other half of the CALL/RESULT classification, witnessed rather than
+    // inferred: these families take retained output through the host's own
+    // `getTextOutput`, which strips SGR before painting, so the same reset that
+    // cut a CALL row apart never becomes a live sequence in a result row. The
+    // decoration therefore changes nothing on these cards — no repair was
+    // applied where none is needed.
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const label = `${fixture.tool} retained-output reset ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.cleanArgs, state, width, expanded, RESULT_RESET);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.cleanArgs, state, width, expanded, RESULT_RESET);
+            assert.deepEqual(decorated, native, `${label}: the decoration changed a card whose rows carry no live reset`);
+            assert.equal(await cardHoles(native, width), 0, `${label}: the host's own stripping no longer keeps the card continuous`);
+            // The reset was stripped on the way in, not hidden by the repair.
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: a live reset reached the row`);
+            const shown = stripAnsi(decorated.join(""));
+            if (expanded) {
+              assert.ok(shown.includes("after a full reset"), `${label}: the retained output was dropped`);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: the decorated native builtin call rows keep the native renderer's own component (#677)", async () => {
+    // Generalizing the repair must not cost any family its own reuse: each of
+    // these renderers takes `context.lastComponent` and writes its text onto it,
+    // so handing back the background wrapper would push the host onto its
+    // fallback renderer. The call region and the result region share one per-row
+    // `state`, so they also have to keep separate slots.
+    for (const fixture of nativeCallFixtures) {
+      const passes: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+      const nativeCall = (fixture.definition.renderCall as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const nativeResult = (fixture.definition.renderResult as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const spy = {
+        ...fixture.definition,
+        renderCall: (...a: unknown[]): unknown => {
+          const returned = nativeCall(...a);
+          passes.push({ region: "call", lastComponent: (a[2] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+        renderResult: (...a: unknown[]): unknown => {
+          const returned = nativeResult(...a);
+          passes.push({ region: "result", lastComponent: (a[3] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+      };
+      const withRepair = decoratedNativeDefinition(fixture.tool, spy);
+      const component = new h.agent.ToolExecutionComponent(
+        fixture.tool, `${fixture.tool}-677-reuse`, fixture.cleanArgs, {}, withRepair, ui, "/work",
+      );
+      component.render(40);
+      const callPasses = () => passes.filter((one) => one.region === "call");
+      assert.equal(callPasses()[0]!.lastComponent, undefined, `${fixture.tool}: the first call pass hands the native renderer no previous component`);
+      const callComponent = callPasses()[0]!.returned;
+      assert.equal(typeof (callComponent as { setText?: unknown }).setText, "function",
+        `${fixture.tool}: the native call renderer returned its own Text component`);
+      // A streamed argument delta, an unchanged redraw, both expansion toggles,
+      // and a settled result: the native component is reused every time.
+      (component as unknown as { updateArgs(next: unknown): void }).updateArgs({ ...fixture.cleanArgs, extra: 1 });
+      component.render(40);
+      component.render(40);
+      component.setArgsComplete();
+      component.updateResult({ content: [{ type: "text", text: RESULT_CLEAN }], details: undefined, isError: false }, false);
+      component.render(40);
+      component.setExpanded(true);
+      component.render(40);
+      component.setExpanded(false);
+      component.render(40);
+      for (const [index, pass] of callPasses().slice(1).entries()) {
+        assert.equal(pass.lastComponent, callComponent,
+          `${fixture.tool} call pass ${index + 2}: the native renderer was handed something other than its own component`);
+      }
+      const resultPasses = passes.filter((one) => one.region === "result");
+      assert.ok(resultPasses.length >= 2, `${fixture.tool}: the result region rendered after the settled result`);
+      for (const [index, pass] of resultPasses.entries()) {
+        assert.notEqual(pass.lastComponent, callComponent,
+          `${fixture.tool} result pass ${index + 1}: the result region was handed the call region's component`);
+      }
+      const resultComponent = resultPasses[0]!.returned;
+      for (const [index, pass] of resultPasses.slice(1).entries()) {
+        assert.equal(pass.lastComponent, resultComponent,
+          `${fixture.tool} result pass ${index + 2}: the native result renderer was handed something other than its own component`);
+      }
+      // And the repair still holds on every redraw, including the settled card.
+      const lines = component.render(40);
+      const cells = await cardCells(lines, 41);
+      for (const [index, cellRow] of cells.entries()) {
+        if (index === 0) continue;
+        for (let column = 0; column < 40; column += 1) {
+          assert.ok(cellRow[column]!.bgMode !== 0,
+            `${fixture.tool} redraw: cell ${column} of card row ${index + 1} has no background`);
+        }
+        assert.equal(cellRow[40]!.bgMode, 0, `${fixture.tool} redraw: the guard column past the card carries a background`);
+      }
+    }
+  });
+
+  test("real host: a state-less native call context keeps the native builtin component unwrapped (#677)", () => {
+    // A lightweight host context with no per-row `state` has nowhere to remember
+    // the native component, so the call region has to keep handing the native
+    // renderer its own component: these renderers call `setText` on whatever
+    // `context.lastComponent` holds, and that method does not exist on the
+    // background wrapper.
+    for (const fixture of nativeCallFixtures) {
+      const observed: Array<{ lastComponent: unknown; returned: unknown }> = [];
+      const nativeCall = (fixture.definition.renderCall as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const spy = {
+        ...fixture.definition,
+        renderCall: (...a: unknown[]): unknown => {
+          const returned = nativeCall(...a);
+          observed.push({ lastComponent: (a[2] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+      };
+      const decorated = decoratedNativeDefinition(fixture.tool, spy) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+      };
+      const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+        toolCallId: `${fixture.tool}-stateless`,
+        args: fixture.cleanArgs,
+        cwd: "/work",
+        ui: {},
+        argsComplete: true,
+        isPartial: true,
+        expanded: false,
+        isError: false,
+        outputPad: 1,
+        ...over,
+      });
+      const first = decorated.renderCall(fixture.cleanArgs, nativeTheme, context());
+      decorated.renderCall(fixture.cleanArgs, nativeTheme, context({ lastComponent: first }));
+      assert.equal(observed[1]!.lastComponent, first,
+        `${fixture.tool}: the state-less call pass was handed the component the previous pass returned`);
+      assert.equal(observed[1]!.returned, first,
+        `${fixture.tool}: the state-less call fallback returned the native component itself, not the background wrapper`);
+      assert.equal(typeof first.setText, "function", `${fixture.tool}: the reused call component is the native Text the renderer writes onto`);
+      // And the state-less fallback really is the unchanged native presentation:
+      // nothing gained a theme background of its own.
+      const pendingBg = theme.getBgAnsi("toolPendingBg");
+      assert.ok(!first.render(38).join("").includes(pendingBg),
+        `${fixture.tool}: the state-less fallback painted a row background the native renderer does not emit`);
+    }
+  });
+
+  test("real host: a native edit self-shell header keeps its own background across a reset-bearing path (#677)", async () => {
+    // The native `edit` tool draws its own shell, so its header rows are painted
+    // by the renderer's own `Box` (`getEditHeaderBg` → `theme.bg(token, row)`),
+    // not by the host's `Box`. Wrapping that component from outside would insert
+    // the re-open after the renderer's own background close and paint past the
+    // card, so the repair happens inside the callback that owns the span, using
+    // the token that callback chose — which is the header's own pending or error
+    // state, not the host row's state. The fixtures are path-only, which is what
+    // keeps the host out of `computeEditsDiff`: no file is read or written here.
+    const args = { path: `/work/${CALL_RESET}.txt` };
+    const withRepair = decoratedNativeDefinition("edit", nativeEditDefinition);
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+          const label = `native edit self-shell header ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          const native = nativeCardLines("edit", nativeEditDefinition, args, state, width, expanded, RESULT_CLEAN);
+          const decorated = nativeCardLines("edit", withRepair, args, state, width, expanded, RESULT_CLEAN);
+          assert.equal(decorated.length, native.length, `${label}: the repair changed the number of card rows`);
+          // The header row, and the background its own callback opened with —
+          // read out of the undecorated row rather than guessed from the state.
+          const headerIndex = native.findIndex((line) => stripAnsi(line).includes("edit"));
+          assert.ok(headerIndex > 0, `${label}: the card draws its native header row`);
+          const headerOpen = /\x1b\[48;\d+(?:;\d+)*m/.exec(native[headerIndex]!)?.[0];
+          assert.ok(headerOpen, `${label}: the native header row opens a background of its own`);
+          // The trigger: the undecorated header row loses its own background.
+          const nativeCells = await cardCells(native, width + 1);
+          assert.ok(nativeCells[headerIndex]!.slice(0, width).some((cell) => cell.bgMode === 0),
+            `${label}: the undecorated native header row no longer loses its background (the case would pass vacuously)`);
+          const decoratedCells = await cardCells(decorated, width + 1);
+          const expected = packedColor(headerOpen, "bg");
+          for (let column = 0; column < width; column += 1) {
+            const cell = decoratedCells[headerIndex]![column]!;
+            assert.ok(cell.bgMode !== 0, `${label}: cell ${column} of the header row has no background`);
+            assert.ok(cellHasColor(cell, "bg", expected),
+              `${label}: cell ${column} of the header row is not painted with the background the header's own callback opened`);
+          }
+          // Nothing is painted outside the card, and every row keeps its own
+          // background close: only zero-width opens were inserted.
+          for (const [index, cellRow] of decoratedCells.entries()) {
+            assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past card row ${index + 1} carries a background`);
+          }
+          for (const [index, line] of decorated.entries()) {
+            assert.equal(stripAnsi(line), stripAnsi(native[index]!), `${label}: card row ${index + 1} changed its displayed text`);
+            assert.equal(countOf(line, "\x1b[49m"), countOf(native[index]!, "\x1b[49m"),
+              `${label}: card row ${index + 1} gained or lost a background close`);
+            if (line === native[index]) continue;
+            assert.ok(/\x1b\[(?:0+m|49m)/.test(native[index]!), `${label}: row ${index + 1} changed without carrying a reset`);
+            assert.ok(native[index]!.includes(headerOpen!),
+              `${label}: row ${index + 1} changed outside the native header's own background span`);
+          }
+          // The unannotated body is the host's own presentation and is not
+          // repainted: with no audit rows, every row outside the header's own
+          // span is byte-identical, reset-bearing output included.
+          const bodyNative = native.slice(headerIndex + 1).filter((line) => !line.includes(headerOpen!));
+          const bodyDecorated = decorated.slice(headerIndex + 1).filter((line) => !line.includes(headerOpen!));
+          assert.deepEqual(bodyDecorated, bodyNative, `${label}: the unannotated self-shell body was repainted`);
+          if (state === "error") {
+            // The failed result's own text is still shown — and the body stays
+            // the host's own unpainted presentation, byte-for-byte.
+            assert.ok(flattenRows(decorated).includes(flattenText(RESULT_CLEAN)),
+              `${label}: the failed result text was lost`);
+            assert.ok(bodyNative.length > 0 && bodyNative.every((line) => !line.includes("\x1b[48;")),
+              `${label}: the unannotated self-shell body was not the unpainted presentation this repair must leave alone`);
+          }
+          // A path-only fixture never computes a diff preview, so no file is
+          // touched and no diff row is drawn.
+          assert.ok(!stripAnsi(decorated.join("\n")).split("\n").some((row) => /^[-+]\d/.test(row.trim())),
+            `${label}: a path-only edit fixture drew a diff preview`);
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native edit self-shell header is byte-identical with the decoration (#677 control)", async () => {
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        for (const state of ["pending-call", "success", "error"] as WriteRowState[]) {
+          const label = `clean native edit self-shell header ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          const withRepair = decoratedNativeDefinition("edit", nativeEditDefinition);
+          const native = nativeCardLines("edit", nativeEditDefinition, EDIT_CLEAN_ARGS, state, width, expanded, RESULT_CLEAN);
+          const decorated = nativeCardLines("edit", withRepair, EDIT_CLEAN_ARGS, state, width, expanded, RESULT_CLEAN);
+          assert.deepEqual(decorated, native, `${label}: a reset-free self-shell header was rewritten`);
+        }
+      }
+    }
+  });
+
+  test("real host: a theme that cannot supply the row background leaves the native call rows unchanged (#677 fallback)", () => {
+    // Both new seams share one fallback: when the theme cannot answer what its
+    // own background looks like, the row is rendered exactly as the native
+    // renderer draws it — no guessed colour, and nothing thrown into the host's
+    // render path (which would push the row onto the host's fallback renderer).
+    const styledTheme = nativeTheme as unknown as {
+      fg(token: string, text: string): string;
+      bg(token: string, text: string): string;
+      bold(text: string): string;
+    };
+    const brokenBgTheme = {
+      fg: (token: string, text: string): string => styledTheme.fg(token, text),
+      bg: (token: string, text: string): string => styledTheme.bg(token, text),
+      bold: (text: string): string => styledTheme.bold(text),
+      getBgAnsi: (): string => { throw new Error("this theme has no background tokens"); },
+    };
+    const noBgTheme = {
+      fg: (token: string, text: string): string => styledTheme.fg(token, text),
+      bold: (text: string): string => styledTheme.bold(text),
+    };
+    const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      toolCallId: "native-677-broken-theme",
+      cwd: "/work",
+      ui: {},
+      argsComplete: true,
+      isPartial: true,
+      expanded: false,
+      isError: false,
+      outputPad: 1,
+      state: {},
+      ...over,
+    });
+    for (const [themeCase, themeLike] of [["getBgAnsi throws", brokenBgTheme], ["no bg accessor", noBgTheme]] as const) {
+      // The default-shell path: the wrapper is skipped, the native component is
+      // handed to the host unchanged.
+      const bash = decoratedNativeDefinition("bash", nativeBashDefinition) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+      };
+      const nativeBashCall = (nativeBashDefinition as Record<string, unknown>).renderCall as unknown as (
+        args: unknown, theme: unknown, context: unknown,
+      ) => { render(width: number): string[] };
+      const bashArgs = { command: `printf ${CALL_RESET}` };
+      const bashContext = context(bashArgs);
+      assert.deepEqual(
+        bash.renderCall(bashArgs, themeLike, bashContext).render(40),
+        nativeBashCall(bashArgs, themeLike, context(bashArgs)).render(40),
+        `${themeCase}: the decorated default-shell call rows differ from the native rows`,
+      );
+      if (typeof (themeLike as { bg?: unknown }).bg !== "function") {
+        // A theme with no `bg` at all is not something the native self-shell
+        // renderer can draw on its own, so there is nothing to compare here.
+        continue;
+      }
+      // The self-shell path: the theme view is inert, so the renderer's own
+      // header `Box` paints exactly the span it always painted.
+      const edit = decoratedNativeDefinition("edit", nativeEditDefinition) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+      };
+      const nativeEditCall = (nativeEditDefinition as Record<string, unknown>).renderCall as unknown as (
+        args: unknown, theme: unknown, context: unknown,
+      ) => { render(width: number): string[] };
+      const editArgs = { path: `/work/${CALL_RESET}.txt` };
+      assert.deepEqual(
+        edit.renderCall(editArgs, themeLike, context(editArgs)).render(40),
+        nativeEditCall(editArgs, themeLike, context(editArgs)).render(40),
+        `${themeCase}: the decorated self-shell header differs from the native header`,
+      );
+    }
   });
 
   test("real host: a gate-painted annotated edit error keeps its background across a retained reset (#677)", async () => {

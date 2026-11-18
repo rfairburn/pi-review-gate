@@ -1555,31 +1555,62 @@ whose lookup throws or returns a non-string — renders exactly as before. This
 is tool-row presentation only: the generic presentation core, the extension's
 own custom-message rows, and the host's renderer-less fallback are untouched.
 
-Two further surfaces draw tool rows and therefore own the same seam. They reuse
-the rule rather than restating it — `reopenRowBackground`,
+The gate's renderer decoration owns the same seam in four more places. They
+reuse the rule rather than restating it — `reopenRowBackground`,
 `toolRowBackgroundAnsi`, `toolRowBackgroundToken`, `toolCallRowBackgroundToken`,
 and `withReopenedRowBackground` are exported from `src/tool-result-expansion.ts`
-for exactly this — and both live in `src/tool-protection/coordinator.ts`:
+for exactly this — and all four live in `src/tool-protection/coordinator.ts`:
 
-- **The native `write` card, in both of its regions**, repaired at the gate's
-  existing `pi.registerToolRenderer` seam. `write` is the host renderer that
-  keeps text verbatim on the host's own default shell: `formatWriteCall`
-  reprints the submitted `content` argument after carriage-return normalization
-  only, and `formatWriteResult` emits the failed result's own text as returned,
-  so a reset surviving in either region cancels the host `Box`'s span. The
-  decoration wraps the component the native renderer returned and re-opens that
-  row's own background on its physical rows, before the host's `Box` pads and
-  paints them — the native renderer is not replaced, and no second padding or
-  background layer is added. The repair is gated to `write` on the host's
-  default shell: extension-owned custom renderers already get the rule at the
-  shared adapter, and a self-shell row is painted by the decoration itself (the
-  next bullet). Because the native call renderer reuses `context.lastComponent`
-  for its incremental highlighting cache and writes that cache onto its own
-  component, the decoration keeps the native component in its own per-row slot
-  and hands that back on every pass — never its wrapper. The call region and the
-  result region share one `state` object per tool row, so they own separate
-  slots; without a usable per-row slot the row keeps the native presentation
-  unchanged.
+- **The native builtin call rows on the host's default shell**, repaired at the
+  gate's existing `pi.registerToolRenderer` seam. Every host builtin call
+  renderer reprints a submitted argument, and none of them sanitizes it: the
+  shell family reprints `command` (`formatShellCall`), `renderToolPath` reprints
+  the path of `read`, `ls`, and `write`, `formatGrepCall` reprints `pattern`,
+  `path`, and `glob`, `formatFindCall` reprints `pattern` and `path`, and
+  `formatWriteCall` additionally reprints the submitted `content` after
+  carriage-return normalization only. A full or background reset surviving
+  inside one of those arguments therefore cancels the host `Box`'s single
+  background span for the rest of the call row. The decoration wraps the
+  component the native renderer returned and re-opens that row's own background
+  on its physical rows, before the host's `Box` pads and paints them — the
+  native renderer is not replaced, and no second padding or background layer is
+  added. The repair is scoped to those builtin families on the host's default
+  shell: extension-owned custom renderers already get the rule at the shared
+  adapter, and a self-shell row is painted either by the renderer's own
+  background callback or by the decoration itself (the next two bullets).
+  Because these native call renderers reuse `context.lastComponent` — `write`
+  also writes its incremental highlighting cache onto that component — the
+  decoration keeps the native component in its own per-row slot and hands that
+  back on every pass, never its wrapper. The call region and the result region
+  share one `state` object per tool row, so they own separate slots; without a
+  usable per-row slot the row keeps the native presentation unchanged.
+- **The native `write` failed-result body**, the one builtin result region that
+  emits text verbatim: `formatWriteResult` prints the tool's own error text as
+  returned, so the same rule is applied to the component the native result
+  renderer returned. The other builtins are not wrapped there — `read`, `grep`,
+  `find`, `ls`, and the shell family take retained output through the host's own
+  `getTextOutput`, which runs `stripAnsi` before painting, so their result rows
+  never carry a live reset (witnessed below, not assumed).
+- **A self-shell row the native renderer paints itself** — the native `edit`
+  header. A tool with `renderShell: "self"` draws its own framing, and `edit`
+  paints its header rows through the theme's semantic tool-background callback
+  (`getEditHeaderBg` → `theme.bg(token, paddedRow)`) rather than through the
+  host's `Box`. Wrapping that component from outside would insert the re-open
+  after the renderer's own background close and paint past the card, so the same
+  rule is applied one level in: the decoration hands the renderer a view of the
+  live theme whose `bg` re-opens, inside the text it is passed, the background
+  that same callback is about to paint, using the token the renderer chose — the
+  header's own pending or error state, not the host row's state — and then
+  delegates to the original theme's `bg` with the original theme as receiver.
+  Every other accessor is the original theme's own method bound to the original
+  theme, so the native component, the returned header `Box`, `outputPad`, the
+  preview cache and renderer state, and every foreground, glyph, and layout
+  decision are untouched, and the re-open never lands after the row's own
+  background close. A token the theme cannot answer leaves the text alone.
+  On both native paths, a theme whose bare-background lookup is missing or
+  throws renders the rows exactly as the native renderer draws them — no guessed
+  colour, and nothing thrown into the host's render path, which would push the
+  row onto the host's own fallback renderer.
 - **A gate-painted self-shell row** (`paintAnnotationRow`). A tool that draws
   its own shell (`renderShell: "self"` — the native `edit` tool) gets no host
   framing, so the gate paints every row it emits with the row's own background;
@@ -1598,9 +1629,10 @@ of every card row at widths 40 and 80, collapsed and expanded
 checks in `tests/tool-result-expansion.test.ts` and
 `tests/background-shell-result-view.test.ts`). The three row states — success,
 error, and pending — are walked for the five `Shell*` tools, and all four host
-row states a native `write` card reaches (a streaming call with no result yet, a
-partial result, a settled success, a settled error) are walked for it; the other
-audited families are witnessed in the single state their fixture produces
+row states a native card reaches (a streaming call with no result yet, a
+partial result, a settled success, a settled error) are walked for every native
+builtin card and for the native `edit` self-shell header; the other audited
+families are witnessed in the single state their fixture produces
 (`ApplyPatch` error, `tool_search` and `SubtasksInspect` success, an annotated
 `edit` error):
 
@@ -1647,11 +1679,45 @@ audited families are witnessed in the single state their fixture produces
     open and one close per gate-painted row, showing the re-open is inert there.
     The unannotated native `edit` card's unpainted body is the host's own
     presentation and is deliberately not changed.
-- **Unaffected, witnessed on the real host row:** native `bash`. The same
-  reset-bearing text that cut a `Shell*` card apart leaves a native `bash` card
-  continuous, because the host's shell renderer takes retained output through
-  its own `getTextOutput` (`core/tools/render-utils.js`), which runs `stripAnsi`
-  before painting.
+  - the CALL region of the other host builtins on the default shell — `bash`,
+    `powershell`, `read`, `grep`, `find`, and `ls` — at widths 40 and 80,
+    collapsed and expanded, in all four row states, with a `\x1b[0m` and a
+    `\x1b[49m` carried in the arguments the host reprints (`command`; the path;
+    `pattern`, `path`, and `glob`) rather than in the tool's output. Each
+    reprinted argument is witnessed on its own: with every other argument
+    reset-free, a reset in that one argument adds the holes, and the reset-free
+    baseline card has none. As for `write`, the decorated card agrees with the
+    undecorated native card row for row apart from the theme's own bare
+    background open, so no glyph, foreground, wrap, or renderer reuse changed;
+    a reset-free builtin card is byte-identical with and without the decoration;
+    and each family's native renderer keeps receiving its own component — across
+    a streamed argument delta, unchanged redraws, both expansion toggles, and a
+    settled result — with the result region's slot kept separate from the call
+    region's. A host context with no per-row `state` keeps those rows unwrapped
+    and hands the native component back on the next pass.
+  - the native `edit` self-shell header, with path-only arguments (no `edits`
+    and no old/new text, which is what keeps the host out of `computeEditsDiff`
+    and off the file system), at widths 40 and 80, collapsed and expanded, in
+    all four row states. The expected background is read out of the undecorated
+    header row — the token that row's own background callback opened with —
+    rather than assumed from the host row's state, and the decorated header is
+    then painted with that token to the card edge. Every card row keeps its own
+    background close, the guard column past the card carries no background at
+    all, only rows that already carried a reset inside that span differ at all,
+    and every row outside it — including the deliberately unpainted unannotated
+    failure body — is byte-identical. A reset-free path is byte-identical with
+    and without the decoration, and a theme whose background lookup is missing
+    or throws leaves both native paths byte-identical to the undecorated host
+    rows.
+- **Unaffected, witnessed on the real host row:** the RESULT rows of `read`,
+  `grep`, `find`, `ls`, `bash`, and `powershell`. Feeding the same reset-bearing
+  text through the tool's output instead of its arguments leaves these cards
+  continuous with no repair at all — the host's own `getTextOutput`
+  (`core/tools/render-utils.js`) runs `stripAnsi` before painting — and the
+  decorated card is byte-identical to the undecorated one, so no repair was
+  applied where none is needed. That is the CALL/RESULT boundary this section
+  keeps, witnessed rather than inferred; `write` is the builtin on the other
+  side of it, and its failed-result body is repaired above.
 - **Unaffected, evidenced by the families' own control-notation tests rather
   than by this audit:** the 21 interactive `Browser*` tools and the three
   acquisition/search tools (`WebFetch`, `BrowserExtract`, `WebSearch`) display
@@ -1663,14 +1729,11 @@ audited families are witnessed in the single state their fixture produces
   `tests/web-acquisition-renderer.test.ts`, `tests/web-search-renderer.test.ts`,
   `tests/browser-render-registration.test.ts`).
 - **Unaffected, reasoned from the pinned host source rather than executed:**
-  native `read`, `grep`, `find`, and `ls` take retained output through the
-  host's shared `getTextOutput` (`core/tools/render-utils.js`), which runs
-  `stripAnsi` on every text block before painting; `powershell` shares
-  `bash`'s renderer family (`core/tools/renderers/index.js` builds both from
-  `createShellRenderers`, differing only in the prompt they display); and the
-  renderer-less registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,
+  the renderer-less registrations (`GitRead`, `SessionSpawn`, `AskUserQuestion`,
   `YouShouldKnow`) register no `renderResult` and render through the host's
-  `createResultFallback`, which uses that same stripping `getTextOutput`.
+  `createResultFallback`, which uses that same stripping `getTextOutput`. Their
+  presentation with an audit row is witnessed above; a reset-bearing retained
+  output through that fallback is not.
 - **A separate defect, found and deliberately not changed here:** the Subtasks
   expanded detail view wraps its own retained lines with a plain-text wrap
   (`wrapByDisplayCells` in `src/execution/subtask-result-expanded.ts`) that
@@ -1681,8 +1744,10 @@ audited families are witnessed in the single state their fixture produces
 Evidence limits: headless VT with the built-in `dark` 256-colour theme only —
 no PTY, physical-terminal, truecolour, light-theme, or Windows-terminal
 certification, and the originally reported screenshot environment was never
-replayed. `powershell` shares `bash`'s renderer family and was reasoned from
-that shared source rather than executed (no PowerShell on the audit host).
+replayed. `powershell` is exercised headlessly through the host's own shared
+shell factory (`createShellRenderers` with the powershell prompt, the same call
+the shipped tool spreads), not by running PowerShell; no shell, file read, file
+write, or search is executed anywhere in this audit.
 
 ### Automatic notification compaction (#92)
 

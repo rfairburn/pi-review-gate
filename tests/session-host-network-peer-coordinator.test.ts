@@ -116,6 +116,26 @@ async function bindHost(t: TestContext, agentDir: string, port: number | 0, extr
 	return side;
 }
 
+/** The same explicit Enable on one exact bind address, for same-port fixtures. */
+async function bindHostAt(
+	t: TestContext,
+	agentDir: string,
+	host: string,
+	port: number,
+	extra: Partial<PeerCoordinatorTestHooks> = {},
+): Promise<StartedCoordinator> {
+	const side = await startCoordinator(t, { agentDir, testHooks: hooks(extra) });
+	await side.coordinator.perform({
+		type: "peer-listener",
+		enabled: true,
+		host,
+		port: String(port),
+	});
+	const state = side.coordinator.read().listener;
+	assert.equal(state.state, "listening", `the fixture could not bind ${host}:${port}`);
+	return side;
+}
+
 /** Only the two facts a connect/observe helper needs; every fixture side has them. */
 type CoordinatorSide = Pick<StartedCoordinator, "coordinator" | "log">;
 
@@ -839,6 +859,460 @@ test("a changed host key is terminal, is never overwritten, and re-confirms only
 	const newHostId = await addDestination(reopened, "B laptop", port);
 	await connectWithApprovals(reopened, replacement, newHostId);
 	await waitConnected(reopened, "the deliberately re-confirmed destination");
+});
+
+// ---------------------------------------------------------------------------
+// Saved destination address edit (#688): save the new address, retire the old
+// endpoint, and reconnect it explicitly once.
+// ---------------------------------------------------------------------------
+
+test("an address edit retires the live old endpoint and never dials it again", async (t) => {
+	const clientFixture = createOwnedAgentDir(t);
+	const ownerFixture = createOwnedAgentDir(t);
+	const port = await reserveLoopbackPort(t);
+	// The owner STAYS reachable at the old address, so any successful connection
+	// after the edit would prove the old endpoint was dialed. It is not.
+	const owner = await bindHostAt(t, ownerFixture.agentDir, "127.0.0.1", port);
+	const oldChannel = controlledChannel();
+	let wrapped = 0;
+	const client = await startCoordinator(t, {
+		agentDir: clientFixture.agentDir,
+		testHooks: hooks({
+			wrapClientChannel: (channel) => {
+				wrapped += 1;
+				return wrapped === 1 ? oldChannel.hook(channel) : channel;
+			},
+		}),
+	});
+	const hostId = await addDestination(client, "B laptop", port);
+	await connectWithApprovals(client, owner, hostId);
+	const connected = await waitConnected(client, "the initial connection at the old address");
+	const pin = connected.hosts?.[0]?.fingerprint;
+	assert.ok(pin);
+	const arrivalsBefore = owner.log.arrivals.length;
+
+	// Nothing listens at the new address, so the reconnect can only fail — and
+	// only after the old endpoint's own resources were retired.
+	await client.coordinator.perform({
+		type: "peer-edit-host",
+		hostId,
+		expectedHost: "127.0.0.1",
+		expectedPort: port,
+		host: "127.0.0.2",
+	});
+	const retired = await Promise.race([
+		oldChannel.closeStarted.then(() => "closed" as const),
+		delay(5_000).then(() => "timeout" as const),
+	]);
+	oldChannel.resolveClose();
+	assert.equal(retired, "closed", "the edit retires the old endpoint's owned channel");
+	await client.log.waitFor(
+		(snapshot) => snapshot.hosts?.[0]?.state === "disconnected",
+		"the refused explicit reconnect at the new address",
+	);
+	const after = client.coordinator.read();
+	assert.equal(after.hosts?.[0]?.host, "127.0.0.2", "the new address is adopted once it is saved");
+	assert.equal(after.hosts?.[0]?.port, port, "the port never moves");
+	assert.equal(after.hosts?.[0]?.label, "B laptop");
+	assert.equal(after.hosts?.[0]?.fingerprint, pin, "the remembered key belongs to the destination");
+	assert.equal(after.hosts?.[0]?.previouslyConnected, true, "connection history is preserved");
+	assert.notEqual(after.hosts?.[0]?.roster.state, "current",
+		"the retired destination's roster is no longer current");
+	assert.equal(owner.log.arrivals.length, arrivalsBefore, "the old address is never dialed again");
+});
+
+test("a saved address edit reaches the new address through one normal explicit Connect", async (t) => {
+	const clientFixture = createOwnedAgentDir(t);
+	const ownerFixture = createOwnedAgentDir(t);
+	const port = await reserveLoopbackPort(t);
+	// Only the new address is reachable; the saved one is not.
+	const owner = await bindHostAt(t, ownerFixture.agentDir, "127.0.0.2", port);
+	const client = await startCoordinator(t, { agentDir: clientFixture.agentDir, testHooks: hooks() });
+	const hostId = await addDestination(client, "B laptop", port);
+	assert.equal(client.coordinator.read().hosts?.[0]?.host, "127.0.0.1");
+
+	const editing = client.coordinator.perform({
+		type: "peer-edit-host",
+		hostId,
+		expectedHost: "127.0.0.1",
+		expectedPort: port,
+		host: "127.0.0.2",
+	});
+	// The gesture's reconnect is the ordinary explicit Connect path: it asks for
+	// the local first-use key and the owner's approval like any other Connect.
+	const withKey = await client.log.waitFor(
+		(snapshot) => consentsOf(snapshot, "server-key").length > 0,
+		"the local first-use server-key consent of the reconnect",
+	);
+	const keyConsent = consentsOf(withKey, "server-key")[0];
+	assert.ok(keyConsent);
+	assert.equal(client.coordinator.decideConsent(keyConsent.id, "approve"), true);
+	const withIncoming = await owner.log.waitFor(
+		(snapshot) => consentsOf(snapshot, "incoming").length > 0,
+		"the receiving pairing consent of the reconnect",
+	);
+	const incoming = consentsOf(withIncoming, "incoming")[0];
+	assert.ok(incoming);
+	assert.equal(owner.coordinator.decideConsent(incoming.id, "approve"), true);
+	await editing;
+
+	const moved = await waitConnected(client, "the explicit reconnect reaches the new address");
+	assert.equal(moved.hosts?.[0]?.host, "127.0.0.2");
+	assert.equal(moved.hosts?.[0]?.port, port);
+	assert.ok(moved.hosts?.[0]?.fingerprint, "the new address's key is confirmed once, by the Connect");
+	const persisted = readPreferencesJson(clientFixture).destinations as Record<string, unknown>[];
+	assert.equal(persisted[0]?.host, "127.0.0.2", "the new address is what persists");
+});
+
+test("an address edit preserves the port, flags, other destinations, and hosting across a reopen", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	const studio = await addDestination(side, "studio mac", 7001);
+	const laptop = await addDestination(side, "laptop", 7002);
+	assert.notEqual(studio, laptop);
+	await side.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: "0" });
+	await side.coordinator.perform({ type: "peer-bell", enabled: false });
+	await side.coordinator.perform({ type: "peer-auto-reconnect", enabled: true });
+	// A persisted Disconnect suppression is one of the facts the edit must keep.
+	await side.coordinator.perform({ type: "peer-disconnect", hostId: laptop });
+
+	await side.coordinator.perform({
+		type: "peer-edit-host",
+		hostId: studio,
+		expectedHost: "127.0.0.1",
+		expectedPort: 7001,
+		host: "studio.internal",
+	});
+	const saved = side.coordinator.read();
+	const moved = saved.hosts?.find((host) => host.id === studio);
+	assert.ok(moved);
+	assert.equal(moved.host, "studio.internal");
+	assert.equal(moved.port, 7001, "the port is preserved by the edit");
+	assert.equal(moved.label, "studio mac", "the label is preserved by the edit");
+	assert.equal(moved.reconnectSuppressed, false, "the edit neither sets nor clears suppression");
+	const kept = saved.hosts?.find((host) => host.id === laptop);
+	assert.ok(kept);
+	assert.deepEqual(
+		[kept.host, kept.port, kept.label, kept.reconnectSuppressed, kept.previouslyConnected],
+		["127.0.0.1", 7002, "laptop", true, false],
+		"the other destination is untouched, including its saved suppression",
+	);
+	assert.equal(saved.settings?.hostingEnabled, true);
+	assert.equal(saved.settings?.bellEnabled, false);
+	assert.equal(saved.settings?.autoReconnect, true);
+	assert.equal(saved.listener.state, "listening");
+
+	await side.coordinator.close();
+	const reopened = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	const persisted = reopened.coordinator.read();
+	const reopenedMoved = persisted.hosts?.find((host) => host.id === studio);
+	assert.ok(reopenedMoved);
+	assert.deepEqual(
+		[reopenedMoved.host, reopenedMoved.port, reopenedMoved.label, reopenedMoved.reconnectSuppressed],
+		["studio.internal", 7001, "studio mac", false],
+		"the edit round-trips through a fresh handle with only the address changed",
+	);
+	const reopenedKept = persisted.hosts?.find((host) => host.id === laptop);
+	assert.deepEqual(
+		[reopenedKept?.host, reopenedKept?.port, reopenedKept?.label, reopenedKept?.reconnectSuppressed],
+		["127.0.0.1", 7002, "laptop", true],
+	);
+	assert.equal(persisted.settings?.hostingEnabled, true);
+	assert.equal(persisted.listener.state, "listening", "the listener keeps its saved hosting intent");
+});
+
+test("an address edit refuses an invalid address, an unknown destination, and a stale drawn endpoint", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	const hostId = await addDestination(side, "B laptop", 7000);
+	const unchanged = (): void => {
+		const host = side.coordinator.read().hosts?.[0];
+		assert.ok(host);
+		assert.deepEqual([host.host, host.port, host.label], ["127.0.0.1", 7000, "B laptop"]);
+	};
+
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: 7000, host: "   ",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /explicit destination address/);
+	unchanged();
+
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: 7000, host: "bad host",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /explicit destination address/);
+	unchanged();
+
+	await side.coordinator.perform({
+		type: "peer-edit-host",
+		hostId: "removed-destination",
+		expectedHost: "127.0.0.1",
+		expectedPort: 7000,
+		host: "studio.internal",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /no longer available/);
+	unchanged();
+
+	// The form was drawn against one exact endpoint: a destination re-addressed
+	// or re-portedit meanwhile is stale, and its CURRENT endpoint is not overwritten.
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "10.0.0.9", expectedPort: 7000, host: "studio.internal",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /changed while its address was being edited/);
+	unchanged();
+
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: 7001, host: "studio.internal",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /changed while its address was being edited/);
+	unchanged();
+
+	// A destination removed while the form was open is unknown, not re-created.
+	await side.coordinator.perform({ type: "peer-remove", hostId });
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: 7000, host: "studio.internal",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /no longer available/);
+	assert.deepEqual(side.coordinator.read().hosts, []);
+});
+
+test("a refused address save changes nothing on disk or in memory and reconnects nothing", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const policy = createPosixTestPolicy();
+	const side = await startCoordinator(t, {
+		agentDir: fixture.agentDir,
+		testHooks: { preferencesPermissions: policy, peerStatePermissions: createPosixTestPolicy() },
+	});
+	const hostId = await addDestination(side, "B laptop", 7000);
+	const onDisk = readPreferencesJson(fixture).destinations as Record<string, unknown>[];
+	assert.equal(onDisk[0]?.host, "127.0.0.1");
+
+	policy.fail = (call) => call.operation === "protectCreatedFile";
+	await side.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: 7000, host: "studio.internal",
+	});
+	assert.match(side.coordinator.read().notice ?? "", /could not be saved/);
+	assert.equal(side.coordinator.read().hosts?.[0]?.host, "127.0.0.1",
+		"an unsaved address is never adopted in this session");
+	assert.equal((readPreferencesJson(fixture).destinations as Record<string, unknown>[])[0]?.host, "127.0.0.1",
+		"the saved document still names the old address");
+	assert.equal(side.coordinator.read().hosts?.[0]?.state, "disconnected",
+		"a refused save reconnects nothing");
+});
+
+test("an unchanged address persists nothing and still performs the deliberate explicit Connect", async (t) => {
+	const clientFixture = createOwnedAgentDir(t);
+	const ownerFixture = createOwnedAgentDir(t);
+	const b = await bindHost(t, ownerFixture.agentDir, 0);
+	const port = b.coordinator.read().listener.port as number;
+	const client = await startCoordinator(t, { agentDir: clientFixture.agentDir, testHooks: hooks() });
+	const hostId = await addDestination(client, "B laptop", port);
+
+	// The deliberate gesture is not awaited first: its reconnect is an ordinary
+	// explicit Connect, and both approvals have to be made while it runs.
+	const editing = client.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: port, host: "127.0.0.1",
+	});
+	// The address is the same, so nothing is rewritten and nothing of an old
+	// endpoint is retired; the deliberate gesture is still an explicit Connect.
+	const withKey = await client.log.waitFor(
+		(snapshot) => consentsOf(snapshot, "server-key").length > 0,
+		"the local first-use server-key consent",
+	);
+	const keyConsent = consentsOf(withKey, "server-key")[0];
+	assert.ok(keyConsent);
+	assert.equal(client.coordinator.decideConsent(keyConsent.id, "approve"), true);
+	const withIncoming = await b.log.waitFor(
+		(snapshot) => consentsOf(snapshot, "incoming").length > 0,
+		"the receiving pairing consent",
+	);
+	const incoming = consentsOf(withIncoming, "incoming")[0];
+	assert.ok(incoming);
+	assert.equal(b.coordinator.decideConsent(incoming.id, "approve"), true);
+	await editing;
+
+	const connected = await waitConnected(client, "the unchanged-address Connect");
+	assert.equal(connected.hosts?.[0]?.host, "127.0.0.1");
+	assert.equal(connected.hosts?.[0]?.port, port);
+	const persisted = readPreferencesJson(clientFixture).destinations as Record<string, unknown>[];
+	assert.equal(persisted[0]?.host, "127.0.0.1", "the unchanged address is not rewritten");
+});
+
+test("a changed server identity at the new address is refused with the existing terminal report", async (t) => {
+	const clientFixture = createOwnedAgentDir(t);
+	const ownerFixture = createOwnedAgentDir(t);
+	const port = await reserveLoopbackPort(t);
+	const owner = await bindHostAt(t, ownerFixture.agentDir, "127.0.0.1", port);
+	const client = await startCoordinator(t, { agentDir: clientFixture.agentDir, testHooks: hooks() });
+	const hostId = await addDestination(client, "B laptop", port);
+	await connectWithApprovals(client, owner, hostId);
+	const connected = await waitConnected(client, "the initial connection");
+	const pin = connected.hosts?.[0]?.fingerprint;
+	assert.ok(pin);
+	// The old locator is released and a DIFFERENT host identity takes the same
+	// port at the new address.
+	await owner.coordinator.perform({ type: "peer-listener", enabled: false, host: "", port: "" });
+	const replacementFixture = createOwnedAgentDir(t);
+	const replacement = await bindHostAt(t, replacementFixture.agentDir, "127.0.0.2", port);
+	const arrivalsBefore = replacement.log.arrivals.length;
+	const consentMark = client.log.snapshots.length;
+
+	await client.coordinator.perform({
+		type: "peer-edit-host", hostId, expectedHost: "127.0.0.1", expectedPort: port, host: "127.0.0.2",
+	});
+	const failed = await client.log.waitFor(
+		(snapshot) => snapshot.hosts?.[0]?.state === "error",
+		"the changed-key terminal state at the new address",
+	);
+	assert.equal(failed.hosts?.[0]?.host, "127.0.0.2", "the address itself is still saved");
+	assert.match(failed.hosts?.[0]?.message ?? "", /key changed/);
+	assert.equal(failed.hosts?.[0]?.fingerprint, pin, "the pin is never replaced by the new identity");
+	expectNoConsentRecorded(client, consentMark);
+	assert.equal(replacement.log.arrivals.length, arrivalsBefore, "no re-pair prompt is offered for the edit");
+	assert.deepEqual(replacement.coordinator.read().trustedPeers, []);
+});
+
+test("an address edit to the same server identity reconnects with the remembered pin and no new approval", async (t) => {
+	const clientFixture = createOwnedAgentDir(t);
+	const ownerFixture = createOwnedAgentDir(t);
+	const port = await reserveLoopbackPort(t);
+	const ownPort = await reserveLoopbackPort(t);
+	const owner = await bindHostAt(t, ownerFixture.agentDir, "127.0.0.1", port);
+	const client = await startCoordinator(t, { agentDir: clientFixture.agentDir, testHooks: hooks() });
+	// This side's own hosting and one unrelated destination are the configuration
+	// the deliberate gesture must leave exactly as it found them.
+	await client.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.1", port: String(ownPort) });
+	const studio = await addDestination(client, "studio mac", 7001);
+	const hostId = await addDestination(client, "B laptop", port);
+	await connectWithApprovals(client, owner, hostId);
+	const paired = await client.log.waitFor(
+		(snapshot) => snapshot.hosts?.find((host) => host.id === hostId)?.state === "connected"
+			&& snapshot.hosts.find((host) => host.id === hostId)?.roster.state === "current",
+		"the initial paired connection at the old address",
+	);
+	const before = paired.hosts?.find((host) => host.id === hostId);
+	assert.ok(before);
+	const pin = before.fingerprint;
+	assert.ok(pin, "pairing remembered this destination's server key");
+	const clientIdentity = client.coordinator.read().identityFingerprint;
+	const ownerIdentity = owner.coordinator.read().identityFingerprint;
+	const ownerTrustBefore = owner.coordinator.read().trustedPeers;
+	assert.ok(ownerTrustBefore);
+	assert.equal(ownerTrustBefore.length, 1, "the pairing left exactly one receiving association");
+
+	// A deliberate Disconnect is one of the saved facts the address save keeps;
+	// only the ordinary explicit Connect that follows may clear it.
+	await client.coordinator.perform({ type: "peer-disconnect", hostId });
+	await client.coordinator.perform({ type: "peer-disconnect", hostId: studio });
+	const suppressed = client.coordinator.read();
+	assert.equal(suppressed.hosts?.find((host) => host.id === hostId)?.reconnectSuppressed, true);
+	assert.equal(suppressed.hosts?.find((host) => host.id === hostId)?.previouslyConnected, true);
+
+	const preferencesBefore = readPreferencesJson(clientFixture).destinations as Record<string, unknown>[];
+
+	// A form drawn against an endpoint this destination no longer has is refused
+	// before anything is written, retired, or dialed — the saved suppression and
+	// the saved old address both stay in memory AND on disk, and the deliberately
+	// disconnected destination is still disconnected even though A still listens.
+	await client.coordinator.perform({
+		type: "peer-edit-host",
+		hostId,
+		expectedHost: "10.0.0.9",
+		expectedPort: port,
+		host: "127.0.0.2",
+	});
+	const refused = client.coordinator.read();
+	assert.match(refused.notice ?? "", /changed while its address was being edited/);
+	const refusedHost = refused.hosts?.find((host) => host.id === hostId);
+	assert.deepEqual(
+		[refusedHost?.host, refusedHost?.port, refusedHost?.reconnectSuppressed, refusedHost?.previouslyConnected, refusedHost?.state],
+		["127.0.0.1", port, true, true, "disconnected"],
+		"a refused stale edit keeps the saved address and suppression and reconnects nothing",
+	);
+	assert.deepEqual(
+		readPreferencesJson(clientFixture).destinations,
+		preferencesBefore,
+		"the refused stale edit persists nothing: A and both saved suppressions are still what the document names",
+	);
+	const clientStateBefore = readFileSync(clientFixture.statePath, "utf8");
+	const ownerStateBefore = readFileSync(ownerFixture.statePath, "utf8");
+	const clientMark = client.log.snapshots.length;
+	const ownerMark = owner.log.snapshots.length;
+	const ownerArrivalsBefore = owner.log.arrivals.length;
+
+	// The SAME owner coordinator moves its listener to the new address on the same
+	// port: its identity, its receiving association, and the remembered pin all
+	// stay exactly as they are.
+	await owner.coordinator.perform({ type: "peer-listener", enabled: false, host: "", port: "" });
+	await owner.coordinator.perform({ type: "peer-listener", enabled: true, host: "127.0.0.2", port: String(port) });
+	const relocated = owner.coordinator.read();
+	assert.equal(relocated.listener.state, "listening");
+	assert.equal(relocated.identityFingerprint, ownerIdentity, "moving the listener never regenerates the identity");
+	assert.deepEqual(relocated.trustedPeers, ownerTrustBefore, "the receiving association is untouched");
+
+	// One sidebar Save-address gesture: B is saved, then reached by the ordinary
+	// explicit Connect path — which needs no approval for a remembered pin.
+	await client.coordinator.perform({
+		type: "peer-edit-host",
+		hostId,
+		expectedHost: "127.0.0.1",
+		expectedPort: port,
+		host: "127.0.0.2",
+	});
+	const moved = await client.log.waitFor(
+		(snapshot) => snapshot.hosts?.find((host) => host.id === hostId)?.state === "connected"
+			&& snapshot.hosts.find((host) => host.id === hostId)?.roster.state === "current",
+		"the reconnect reaches the new address on the remembered key",
+	);
+	expectNoConsentRecorded(client, clientMark);
+	expectNoConsentRecorded(owner, ownerMark);
+	assert.equal(owner.log.arrivals.length, ownerArrivalsBefore, "the remembered pin never rings the arrival bell again");
+	const movedHost = moved.hosts?.find((host) => host.id === hostId);
+	assert.ok(movedHost);
+	assert.deepEqual(
+		[movedHost.id, movedHost.label, movedHost.host, movedHost.port, movedHost.fingerprint, movedHost.previouslyConnected],
+		[hostId, "B laptop", "127.0.0.2", port, pin, true],
+		"only the address moved: id, label, port, remembered pin, and connection history are unchanged",
+	);
+	assert.equal(movedHost.reconnectSuppressed, false,
+		"the accompanying explicit Connect re-arms the destination exactly like any other explicit Connect");
+
+	const after = client.coordinator.read();
+	assert.equal(after.identityFingerprint, clientIdentity, "the gesture never regenerates this side's identity");
+	assert.equal(after.settings?.hostingEnabled, true);
+	assert.deepEqual([after.listener.state, after.listener.host, after.listener.port], ["listening", "127.0.0.1", ownPort],
+		"this side's own listener keeps serving the same address");
+	const kept = after.hosts?.find((host) => host.id === studio);
+	assert.deepEqual(
+		[kept?.host, kept?.port, kept?.label, kept?.reconnectSuppressed, kept?.previouslyConnected],
+		["127.0.0.1", 7001, "studio mac", true, false],
+		"the unrelated destination is untouched, including its saved suppression",
+	);
+
+	// Canonical data: the trust document — including this side's remembered server
+	// key slot — is never rewritten, and the saved destination record moves its
+	// address and nothing else beyond the ordinary Connect's own re-arm.
+	assert.equal(readFileSync(clientFixture.statePath, "utf8"), clientStateBefore,
+		"no trust record, grant, or remembered key is written by the move");
+	assert.equal(readFileSync(ownerFixture.statePath, "utf8"), ownerStateBefore,
+		"the owner's canonical trust document is not rewritten by the move");
+	const preferencesAfter = readPreferencesJson(clientFixture).destinations as Record<string, unknown>[];
+	assert.deepEqual(
+		preferencesAfter.find((entry) => entry.id === hostId),
+		{
+			...preferencesBefore.find((entry) => entry.id === hostId) as Record<string, unknown>,
+			host: "127.0.0.2",
+			// The saved re-arm is the ordinary explicit Connect's own persisted fact,
+			// never a fact the address save writes about anything else.
+			reconnectSuppressed: false,
+		},
+		"the saved destination record changes its address, plus the re-arm the ordinary explicit Connect always persists",
+	);
+	assert.deepEqual(
+		preferencesAfter.find((entry) => entry.id === studio),
+		preferencesBefore.find((entry) => entry.id === studio),
+		"the unrelated saved destination is the same record",
+	);
 });
 
 test("pending consent handles are cancelled on close and never replaced in place", async (t) => {

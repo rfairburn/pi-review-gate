@@ -1148,7 +1148,11 @@ changed key, missing initialized trust, or unsafe/corrupt store fails closed: it
 is reported with a fixed reason and is never re-paired, rotated, or overwritten.
 Only an unsafe-permission refusal can be offered the explicit, confirmed
 [permission repair](#repairing-network-storage-permissions), and an explicit
-Connect does not replace a changed remembered key. Independently verify the
+Connect does not replace a changed remembered key. Editing a saved destination's
+address keeps that same remembered key: the destination is the same destination,
+so the next explicit Connect must prove the same exact key at the new address, and
+a server identity that changed along with the address is refused with that same
+fixed terminal report. Independently verify the
 intended identity before choosing to Remove and re-add a destination to confirm
 a new key. Receiving approval is directional: A approving B lets B connect to A
 and does not grant A access to B.
@@ -1181,11 +1185,35 @@ local draft value in any order: the editor shows only the chosen field and the
 other two drafts stay on the menu; Enter saves that field and returns to the
 menu, Escape abandons only that edit, and the destination is sent only by the
 menu's single Add destination action, which validates all three values first and
-then returns to the Network pane; leaving the menu sends nothing. A single
-left-click on a row the pane actually drew performs that row's ordinary Enter
-action once through the same activation path — it selects a destination, opens a
-field or the Add menu, or opens a pending request's review — and it decides
-nothing that Enter would not. A press whose drawn row, pane geometry, or
+then returns to the Network pane; leaving the menu sends nothing.
+Each saved destination also draws its own **Edit address** row, so Enter or a
+left-click on that written row opens the destination's address menu. The menu
+names that one destination and its endpoint and states that the name, port,
+history, and remembered key stay fixed. Its single editable row prefills the
+saved address — there is no port or name editing here — Enter saves the new
+address locally and returns to the menu, and Escape abandons only that edit,
+changing nothing and connecting nothing. The menu's one **Save address and
+reconnect** action is a single deliberate gesture: it validates the address,
+saves it, then makes one ordinary explicit Connect to the new address, with the
+same approvals any other explicit Connect needs. Nothing else is inferred: the
+edit itself never clears, rotates, or re-pairs the remembered server key, and a
+server identity that changed with the address is still refused with the existing
+terminal key-changed report and prompts for nothing new. The edit also never
+sets or clears a saved Disconnect suppression; the explicit Connect it then makes
+behaves exactly as any other explicit Connect, so that suppression is cleared by
+the Connect, as it always has been, and the edit alone never writes one. A saved
+change retires the old endpoint's in-flight attempt, owned retry timer, channel,
+and displayed content, so a late completion of the old connection cannot
+reappear, and the new address is the only one dialled afterwards. The edit never
+changes the Auto setting, and after a host restart the ordinary
+automatic-recovery rules apply to the saved address unchanged. An edit whose
+destination was removed, re-added, or re-addressed since its row or menu was
+drawn is refused as stale: nothing is saved and nothing is connected.
+A single left-click on a row the pane actually drew performs that row's ordinary
+Enter action once through the same activation path — it selects a destination,
+opens a destination's Edit address row, opens a field or the Add menu, or opens
+a pending request's review — and it decides nothing that Enter would not. A
+press whose drawn row, pane geometry, or
 displayed state has since changed is refused instead of retargeted, and
 releases, drags, and non-left buttons activate nothing and are never forwarded
 to a native child. Removing a destination forgets only this side's saved

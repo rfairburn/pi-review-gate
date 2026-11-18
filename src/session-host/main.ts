@@ -8410,6 +8410,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       case "peer-viewer-native-input":
       case "peer-remote-history-delete":
       case "peer-add":
+      case "peer-edit-host":
       case "peer-connect":
       case "peer-disconnect":
       case "peer-remove":

@@ -92,6 +92,32 @@ export interface WindowsLineageQueryOptions {
   encoding: "utf8";
   maxBuffer: number;
   windowsHide: boolean;
+  /** The query child's own environment, built by {@link windowsLineageQueryEnvironment}. */
+  env: NodeJS.ProcessEnv;
+}
+
+/**
+ * The query child's environment: a NEW copy of `parentEnv` without any key that
+ * equals `PSModulePath` case-insensitively, so the fixed System32 Windows
+ * PowerShell 5.1 host rebuilds its own native module path instead of inheriting
+ * one composed for another PowerShell edition (for example a PowerShell 7 parent
+ * of this Node process). Microsoft documents removing `PSModulePath` when an
+ * intermediate process launches Windows PowerShell for exactly this reason.
+ *
+ * Every other key and value (`PATH`, `WinPSModulePath`, `PSModulePathX`,
+ * `SystemRoot`, ...) is copied unchanged, and `parentEnv` itself is never
+ * modified. As a bounded compatibility choice the internal query therefore no
+ * longer honours an ambient custom `PSModulePath`; it adds no module import,
+ * warmup, command lookup, host selection, or configuration, and it changes
+ * nothing about what the proof accepts. This is the one canonical factory:
+ * diagnostics observe its output rather than re-deriving it.
+ */
+export function windowsLineageQueryEnvironment(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  // `Object.fromEntries` defines own data properties, so even an own `__proto__`
+  // key is copied as a key rather than through the `Object.prototype` setter.
+  return Object.fromEntries(
+    Object.entries(parentEnv).filter(([key]) => key.toLowerCase() !== "psmodulepath"),
+  );
 }
 
 export type WindowsLineageQueryExecutor = (
@@ -143,7 +169,10 @@ const productionQueryExecutor: WindowsLineageQueryExecutor = (file, args, option
  * contains only process IDs and creation-time ticks; the local validator checks
  * snapshot stability and rejects a parent created after its child, preventing a
  * recycled ancestor PID from satisfying proof. Exactly one bounded query child
- * runs per verification: no retry, cache, or polling.
+ * runs per verification: no retry, cache, or polling. That child receives a copy
+ * of this process's environment without `PSModulePath`
+ * ({@link windowsLineageQueryEnvironment}); this process's environment is never
+ * changed.
  *
  * The two PIDs this verification already knows before querying anything — the
  * candidate and the owned root — are observed in the script's single initial
@@ -229,7 +258,12 @@ async function runBoundedLineageQuery(
         child = execute(
           powershell,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-          { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
+          {
+            encoding: "utf8",
+            maxBuffer: MAX_QUERY_OUTPUT_BYTES,
+            windowsHide: true,
+            env: windowsLineageQueryEnvironment(process.env),
+          },
           (error, stdout) => {
             if (witness.timedOut) {
               // A timeout this module positively witnessed is final. Evidence

@@ -980,7 +980,11 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
 
       // Whatever the exit status, ownership evidence stays unreadable: the
       // marker is still a directory, so no record (not even `0 failed`) exists.
-      expect(statSync(markerDir).isDirectory(), "marker path is still an unreadable directory").toBe(true);
+      let markerIsDirectory = false;
+      try { markerIsDirectory = statSync(markerDir).isDirectory(); } catch {
+        // Fail the fixed-label assertion below without exposing a filesystem path.
+      }
+      expect(markerIsDirectory, "marker path is still an unreadable directory").toBe(true);
       // Root exit observed on the exact ChildProcess -> rootAlive=false. The
       // production verdict for missing evidence is `unverifiable`, never `clear`.
       expect(ownershipVerdict(markerDir, false, pidAlive), "production ownership verdict").toBe("unverifiable");
@@ -1002,11 +1006,12 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       });
       expect(tracked?.pid === rootPid && tracked?.ownershipMarker === markerDir, "tracks the fixture's own pid and marker").toBe(true);
       const snapshot = readiness.snapshot();
+      const retained = snapshot.running[0];
       expect(
-        snapshot.running.map((p) => [p.pid, p.ownershipMarker]),
+        snapshot.running.length === 1 && retained?.pid === rootPid && retained?.ownershipMarker === markerDir,
         "readiness stays blocked on unverifiable ownership even after the root exited",
-      ).toEqual([[rootPid, markerDir]]);
-      expect(snapshot.unverifiable, "tracked as a structured job, not as unparseable output").toEqual([]);
+      ).toBe(true);
+      expect(snapshot.unverifiable.length, "tracked as a structured job, not as unparseable output").toBe(0);
     });
   });
   // Paths with spaces and apostrophes must survive BOTH quoting layers: the

@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.297]
+
+### Fixed
+
+- **Publisher transport phase boundary (#708)**: after the synchronous artifact
+  build and APK checks, the publisher awaits one full event-loop turn (two
+  `setImmediate` phase yields) before the draft identity PATCH, so a pooled
+  connection closed during that blocking work is not reused for the PATCH.
+  There is no timed sleep, retry, extra request, or deadline change, and request
+  order, payloads and every publication gate are unchanged. Owned loopback
+  native-HTTP regressions cover the stale-socket failure without the boundary
+  and the single fresh-connection PATCH with it.
+
 ## [0.1.0-dev.296]
 
 ### Fixed

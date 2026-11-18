@@ -402,6 +402,15 @@ This is reporting only. The original failure propagates unchanged, the publicati
 still fails closed, no request is retried, and every failure that is not a fetch or
 response-body failure keeps its existing single-line reporting.
 
+The artifact build and the APK checks block the event loop synchronously, so a pooled
+connection that the server closes in the meantime is not yet marked closed when that
+work ends. Before the draft identity PATCH, which is the first request after that work,
+the publisher therefore awaits one full event-loop turn (two `setImmediate` phase
+yields): pending connection closures are processed first, and the PATCH goes out over
+a live or fresh connection rather than a stale socket. This adds no timed sleep, retry,
+request, or deadline; request order and payloads are unchanged, and a PATCH that
+genuinely fails still fails closed with the attribution above.
+
 ### Annotated tag failures
 
 The builder only manages lightweight `b<N>` tags: the ref must point directly to

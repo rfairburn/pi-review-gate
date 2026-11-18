@@ -14,7 +14,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { NODE_OPTIONS_RESTORE_ENV, restoreNodeOptions } from "../src/session-host/bootstrap-preload";
 import activate, {
   beginSessionHostRestore,
@@ -24,7 +24,7 @@ import activate, {
   SESSION_HOST_STICKY_STATE_KEY,
 } from "../src/session-host/reporter";
 import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY } from "../src/session-host/spawn-capability";
-import { encodeSessionHostsResultFrames, type SessionHostsSnapshot } from "../src/session-host/protocol";
+import { encodeSessionHostsResultFrames, type SessionHostsInspection, type SessionHostsSnapshot } from "../src/session-host/protocol";
 import {
   readSessionHostPayload,
 } from "../src/session-host/payload";
@@ -1397,38 +1397,106 @@ describe("session-host reporter status frames", () => {
 
   it("reports malformed, unauthenticated, timed-out, cancelled, and disconnected SessionHosts inspections as unavailable without retry", async () => {
     const server = await startTestServer();
+    const hostsTimeoutMs = 40;
+    let reporterSocket: net.Socket | undefined;
     const { testPi, bootstrap } = await startSession({
       server,
       bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1, sessionHosts: 1 }),
-      reporterOptions: { hostsTimeoutMs: 40, reconnectDelayMs: 5 },
+      reporterOptions: { hostsTimeoutMs, reconnectDelayMs: 5, onSocket: (candidate) => { reporterSocket = candidate; } },
     });
     let hello = await server.waitForFrame((frame) => frame.message.type === "hello");
     const capability = getSessionHostSpawnCapability();
     assert.ok(capability?.inspectHosts);
+    const inspectHosts = (signal?: AbortSignal) => capability.inspectHosts!(signal);
     const pagesFor = (requestId: unknown, snapshot: unknown, token = bootstrap.token as string) => encodeSessionHostsResultFrames({
       instanceId: bootstrap.instanceId as string,
       generation: bootstrap.generation as string,
       token,
       requestId: requestId as string,
     }, snapshot);
+    // The fixture observation budget shared by every wait in this test.
+    const observationBudgetMs = 3_000;
     const nextRequest = async () => {
       const after = server.frames.length - 1;
-      return server.waitForFrame((frame) => frame.message.type === "hosts_request", 3_000, after);
+      return server.waitForFrame((frame) => frame.message.type === "hosts_request", observationBudgetMs, after);
     };
     const reconnect = async () => {
       const after = server.frames.indexOf(hello);
-      hello = await server.waitForFrame((frame) => frame.message.type === "hello", 3_000, after);
+      hello = await server.waitForFrame((frame) => frame.message.type === "hello", observationBudgetMs, after);
       await sleep(10);
+    };
+    // Outer test guard only, not a product deadline: an expected outcome or
+    // data event that never arrives fails within the same observation budget
+    // instead of hanging the test. The guard timer is armed after any held
+    // setTimeout mock is restored, and is always cleared.
+    const observed = async <T>(event: Promise<T>, what: string, onExpire?: () => void): Promise<T> => {
+      let guard: NodeJS.Timeout | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        guard = setTimeout(() => {
+          onExpire?.();
+          reject(new Error(`no ${what} within ${observationBudgetMs}ms`));
+        }, observationBudgetMs);
+      });
+      try {
+        return await Promise.race([event, expired]);
+      } finally {
+        clearTimeout(guard);
+      }
+    };
+    // Only the explicit timeout scenario below runs on the real short caller
+    // deadline. Every other lifecycle scenario starts its inspection with that
+    // one deadline held by the test instead of armed on the event loop, so its
+    // exact outcome is ordered by its own event (reply, abort, close) rather
+    // than by racing the deliberately tiny deadline against transport and
+    // timer granularity. The held deadline is fired only after the outcome
+    // is observed, and must not change it.
+    const inspectWithHeldDeadline = (signal?: AbortSignal) => {
+      const held = mock.method(globalThis, "setTimeout", ((..._args: unknown[]) =>
+        ({ ref() { return this; }, unref() { return this; }, hasRef: () => false })) as never);
+      let pending: Promise<SessionHostsInspection>;
+      try {
+        pending = inspectHosts(signal);
+      } finally {
+        held.mock.restore();
+      }
+      assert.equal(held.mock.callCount(), 1, "the inspection arms exactly one caller deadline");
+      const [deadline, delay] = held.mock.calls[0]!.arguments as unknown as [() => void, number];
+      assert.equal(delay, hostsTimeoutMs, "the held timer is the configured SessionHosts caller deadline");
+      return { pending, fireDeadline: () => deadline() };
+    };
+    // Resolves once the reporter socket has delivered exactly these bytes to
+    // its listeners. The reporter's own 'data' listener was registered at
+    // connect, before this one, so it has already processed them.
+    // Bounded by the observation guard; its test-only listener is removed on
+    // delivery and on expiry alike.
+    const reporterReceived = (bytes: number): Promise<void> => {
+      const candidate = reporterSocket;
+      assert.ok(candidate && !candidate.destroyed);
+      let onData: ((chunk: Buffer) => void) | undefined;
+      const received = new Promise<void>((resolve) => {
+        let seen = 0;
+        onData = (chunk: Buffer) => {
+          seen += chunk.length;
+          if (seen < bytes) return;
+          candidate.off("data", onData!);
+          resolve();
+        };
+        candidate.on("data", onData);
+      });
+      return observed(received, `reporter delivery of ${bytes} bytes`, () => candidate.off("data", onData!));
     };
 
     // Host-declared unavailable.
-    let pending = capability.inspectHosts();
+    let held = inspectWithHeldDeadline();
     let request = await nextRequest();
     server.sendToClients(pagesFor(request.message.requestId, undefined).join(""));
-    assert.deepEqual(await pending, { outcome: "unavailable", reason: "host-unavailable" });
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "host-unavailable" });
+    held.fireDeadline();
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "host-unavailable" });
 
     // Timeout: unavailable; late pages are ignored and nothing is retried.
-    pending = capability.inspectHosts();
+    // This is the only scenario on the real (deliberately short) deadline.
+    let pending = inspectHosts();
     request = await nextRequest();
     assert.deepEqual(await pending, { outcome: "unavailable", reason: "timeout" });
     server.sendToClients(pagesFor(request.message.requestId, { ownKinds: ["pi"], hosts: [] }).join(""));
@@ -1437,38 +1505,50 @@ describe("session-host reporter status frames", () => {
 
     // Cancellation.
     const controller = new AbortController();
-    pending = capability.inspectHosts(controller.signal);
+    held = inspectWithHeldDeadline(controller.signal);
     await nextRequest();
     controller.abort();
-    assert.deepEqual(await pending, { outcome: "unavailable", reason: "cancelled" });
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "cancelled" });
+    held.fireDeadline();
 
     // Out-of-order pages are a protocol violation: never partial.
     const large = {
       ownKinds: ["pi"],
       hosts: Array.from({ length: 64 }, (_, index) => ({ id: `${index}${"\udc00".repeat(120)}`, kinds: ["pi"] })),
     };
-    pending = capability.inspectHosts();
+    held = inspectWithHeldDeadline();
     request = await nextRequest();
     const reordered = pagesFor(request.message.requestId, large);
     assert.ok(reordered.length > 1);
     server.sendToClients(reordered[1]!);
-    assert.deepEqual(await pending, { outcome: "unavailable", reason: "protocol" });
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "protocol" });
+    held.fireDeadline();
     await reconnect();
 
     // A page signed with the wrong token closes the connection: unavailable.
-    pending = capability.inspectHosts();
+    held = inspectWithHeldDeadline();
     request = await nextRequest();
     server.sendToClients(pagesFor(request.message.requestId, { ownKinds: ["pi"], hosts: [] }, "f".repeat(64)).join(""));
-    assert.deepEqual(await pending, { outcome: "unavailable", reason: "disconnected" });
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "disconnected" });
+    held.fireDeadline();
     await reconnect();
 
-    // Disconnect mid-sequence.
-    pending = capability.inspectHosts();
+    // Disconnect mid-sequence: the first page is accepted, never reported as
+    // a partial snapshot, and the remote close settles the call as
+    // disconnected before its deadline is ever allowed to fire.
+    held = inspectWithHeldDeadline();
     request = await nextRequest();
-    server.sendToClients(pagesFor(request.message.requestId, large)[0]!);
-    await sleep(10);
+    let settled = false;
+    void held.pending.then(() => { settled = true; });
+    const firstPage = pagesFor(request.message.requestId, large)[0]!;
+    const firstPageReceived = reporterReceived(Buffer.byteLength(firstPage));
+    server.sendToClients(firstPage);
+    await firstPageReceived;
+    assert.equal(settled, false, "an accepted first page alone is never reported");
     server.destroyClients();
-    assert.deepEqual(await pending, { outcome: "unavailable", reason: "disconnected" });
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "disconnected" });
+    held.fireDeadline();
+    assert.deepEqual(await observed(held.pending, "held-deadline outcome"), { outcome: "unavailable", reason: "disconnected" });
     await reconnect();
     const requests = server.frames.filter((frame) => frame.message.type === "hosts_request").length;
     await sleep(30);

@@ -36,6 +36,7 @@ import {
   type WindowsLineageQueryExecutor,
   type WindowsLineageQueryOptions,
   type WindowsLineageVerification,
+  windowsLineageQueryEnvironment,
 } from "../../src/execution/windows-process-lineage";
 
 /** The only text a script-side marker line may carry after this prefix. */
@@ -283,7 +284,22 @@ function isProductionDelegation(file: string, args: readonly string[], options: 
   return options.encoding === "utf8"
     && options.maxBuffer === MAX_QUERY_OUTPUT_BYTES
     && options.windowsHide === true
-    && !("timeout" in options);
+    && !("timeout" in options)
+    && isProductionQueryEnvironment(options.env);
+}
+
+/**
+ * The received environment is exactly what the canonical production factory builds
+ * from this process's environment right now: same keys, same values. Only a
+ * boolean leaves this check — never a key list or a value.
+ */
+function isProductionQueryEnvironment(env: unknown): boolean {
+  if (typeof env !== "object" || env === null || env === process.env) return false;
+  const received = env as NodeJS.ProcessEnv;
+  const expected = windowsLineageQueryEnvironment(process.env);
+  const receivedKeys = Object.keys(received);
+  return receivedKeys.length === Object.keys(expected).length
+    && receivedKeys.every((key) => Object.hasOwn(expected, key) && expected[key] === received[key]);
 }
 
 export interface WindowsLineagePhaseProbe {

@@ -626,7 +626,12 @@ function psLiteral(value: string): string {
  *   records the parent's AND its own StartTime ticks and fails closed (exit 1,
  *   command never runs) when it cannot; the watchdog then treats the parent as
  *   gone unless the pid exists AND its creation time still matches, so a reused
- *   pid cannot keep the job alive.
+ *   pid cannot keep the job alive. The same root identity also guards the
+ *   initial job assignment: the watchdog opens the root pid ONCE, reads that
+ *   handle's creation time, and assigns exactly that handle only when it
+ *   matches the captured ticks (closing the handle on every path), so a pid
+ *   reused before the watchdog runs can never be adopted into the job — a
+ *   mismatch or unreadable identity aborts before the running record.
  * - The user command runs in a child scope (`& { ... }`) so assignments in the
  *   command cannot leak into wrapper state (the Bash version uses a subshell
  *   for the same reason).
@@ -682,8 +687,33 @@ export function wrapWithPowerShellWatchdog(
     `[Console]::SetOut([System.IO.StreamWriter]::Null); [Console]::SetError([System.IO.StreamWriter]::Null); ` +
     `$mk = __PI_MARKER__; $st = __PI_STOP__; ` +
     // kernel32 job-object surface, compiled in-process (Add-Type works on both
-    // PowerShell editions; no external dependency).
-    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobApi { [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,String n); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e); [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a,bool b,int p); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); }' } catch { exit 1 }; ` +
+    // PowerShell editions; no external dependency). The class text stays ONE
+    // line of C# 5 (Windows PowerShell 5.1 compiles it) inside a single-quoted
+    // PowerShell string, so it carries no apostrophes and no __PI_ tokens.
+    //
+    // Root assignment is identity-guarded through ONE native handle (#705):
+    // AssignOwnedRoot opens the root pid once, delegates to
+    // AssignRootIfIdentity, and closes that handle in `finally` on every path.
+    // AssignRootIfIdentity is the single guard: it reads the creation time
+    // through the SAME handle (GetProcessTimes), converts it exactly as .NET
+    // Process.StartTime does (DateTime.FromFileTime(...).Ticks — the format the
+    // wrapper captured), and only on an exact match calls
+    // AssignProcessToJobObject with that handle. A handle stays bound to the
+    // process object it opened, so a pid reused between the wrapper's identity
+    // capture and this open can never be adopted into the job: its creation
+    // time differs and the guard refuses. An unreadable creation time, an
+    // out-of-range value, or a zero handle also refuses — fail closed.
+    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobApi { ` +
+    `[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,String n); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e); ` +
+    `[DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a,bool b,int p); ` +
+    `[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool GetProcessTimes(IntPtr h,out long c,out long x,out long k,out long u); ` +
+    `public static bool AssignRootIfIdentity(IntPtr j,IntPtr h,long t) { if (h == IntPtr.Zero) { return false; } long c; long x; long k; long u; if (!GetProcessTimes(h,out c,out x,out k,out u)) { return false; } long s; try { s = DateTime.FromFileTime(c).Ticks; } catch { return false; } if (s != t) { return false; } return AssignProcessToJobObject(j,h); } ` +
+    `public static bool AssignOwnedRoot(IntPtr j,int pid,long t) { IntPtr h = OpenProcess(0x1FFFFF,false,pid); if (h == IntPtr.Zero) { return false; } try { return AssignRootIfIdentity(j,h,t); } finally { CloseHandle(h); } } ` +
+    `}' } catch { exit 1 }; ` +
     // JOB_OBJECT_LIMIT_DIE_ON_CLOSE (0x2000): when the last handle to the job
     // closes, the kernel terminates every member. The watchdog holds that only
     // handle, so a dead watchdog can never leave owned work behind.
@@ -702,11 +732,13 @@ export function wrapWithPowerShellWatchdog(
     // Job-accounting query used to verify the job is EMPTY before release.
     `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobQuery { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,IntPtr b,uint n,IntPtr r); }' -ErrorAction Stop } catch { exit 1 }; ` +
     // Assign THIS shell (root pid substituted at runtime — never a bare parent
-    // pid that could be ours) to the job. Existing children (the watchdog)
-    // stay OUT of the job on purpose: it must survive its own termination path.
-    `$rp = [PiReviewBgJobApi]::OpenProcess(0x1FFFFF, $false, __PI_ROOT__); if ($rp -eq [IntPtr]::Zero) { exit 1 }; ` +
-    `if (-not [PiReviewBgJobApi]::AssignProcessToJobObject($job, $rp)) { exit 1 }; ` +
-    `[void][PiReviewBgJobApi]::CloseHandle($rp); ` +
+    // pid that could be ours) to the job, guarded by the root's captured
+    // creation-time identity through the same opened handle (#705). Existing
+    // children (the watchdog) stay OUT of the job on purpose: it must survive
+    // its own termination path. Fail-closed exception boundary: a refused
+    // guard (false) and a thrown method call both leave $assigned false and
+    // exit BEFORE the running record, so the wrapper never runs the command.
+    `$assigned = $false; try { $assigned = [PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__) } catch {}; if (-not $assigned) { exit 1 }; ` +
     // Handshake record: written only now that ownership is established.
     `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch { exit 1 }; ` +
     `while ($true) { Start-Sleep -Seconds ${pollSeconds}; ` +

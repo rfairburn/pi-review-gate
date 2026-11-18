@@ -1064,7 +1064,17 @@ receipt, the parent authenticates the existing child/session/generation
 signature and then verifies through bounded native process ancestry evidence
 that the reported live PID descends from the still-owned command root. The query
 rechecks process creation times and parent links and requires each parent to
-predate its child, rejecting recycled PIDs. That verified PID is bound for exact
+predate its child, rejecting recycled PIDs. The one query child is the fixed
+System32 Windows PowerShell 5.1 host, launched with its own copy of the parent
+environment that omits every case-insensitive `PSModulePath` key, so the host
+rebuilds its native module path instead of inheriting one composed for another
+PowerShell edition (Microsoft recommends removing `PSModulePath` when an
+intermediate process launches Windows PowerShell). The parent environment and
+every other variable are unchanged; as a bounded compatibility choice, the
+internal query does not honour an ambient custom `PSModulePath`. On a native
+runner this corrected a measured binding of `Get-CimInstance` to a `CimCmdlets`
+module outside the native system modules; it is not an established cause of the
+historical lineage timeout. That verified PID is bound for exact
 equality on later receipts; the receipt wire schema and HMAC identity remain
 unchanged. When that verification refuses, the existing settlement refusal is
 kept verbatim and one fixed sanitized stage code is appended

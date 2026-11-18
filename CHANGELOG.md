@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.297]
+## [0.1.0-dev.300]
 
 ### Added
 
@@ -124,6 +124,80 @@ dates.
   terminal, macOS, and Windows behavior are not qualified. See
   [Session host](docs/session-host-alpha.md#starting-and-owning-sessions) and
   [Security model](docs/security-model.md#session-host-status-ipc).
+
+## [0.1.0-dev.299]
+
+### Fixed
+
+- **Windows lineage query uses the native Windows PowerShell module path
+  (Refs #446; the historical timeout cause is still unproven)**: the bounded
+  descendant-proof query child now gets its own copy of the parent environment
+  with every case-insensitive `PSModulePath` key removed. The fixed System32
+  Windows PowerShell 5.1 host then rebuilds its own native module path instead
+  of inheriting one composed for another PowerShell edition. Microsoft
+  recommends removing `PSModulePath` when an intermediate process launches
+  Windows PowerShell. On a native Windows runner, a `pwsh` -> Node -> Windows
+  PowerShell chain that inherited `PSModulePath` resolved `Get-CimInstance` from
+  a `CimCmdlets` module outside the native system modules. The cleared
+  environment resolved the native one. Both proofs verified quickly in that run,
+  so the original 5-second timeout was not reproduced. This removes a proven
+  module-binding mismatch but establishes no timeout cause and closes no issue.
+  The parent environment, `PATH`, `WinPSModulePath`, and every other variable
+  are unchanged. So are the host, arguments, 5-second deadline, 4KiB bound,
+  single query child, CIM requests, and acceptance rules. As a bounded
+  compatibility choice, the internal query no longer honours an ambient custom
+  `PSModulePath`.
+
+### Changed
+
+- **Native Windows lineage causal experiment (Refs #446; diagnosis)**: the
+  native genuine-descendant/unrelated-PID proof runs as one fixed two-arm
+  experiment. Each arm has its own freshly owned root, descendant and unrelated
+  process. In version 2 the corrected arm launches the environment production
+  itself builds, forwarded unchanged. The legacy control deliberately overrides
+  it with the original parent environment, reproducing the query child from
+  before the correction. Passive Windows PowerShell command-lookup hooks and a
+  child clock record when the first `Get-CimInstance` lookup starts and which
+  module it resolves to. A bounded stdin gate releases both positive lookups
+  together, inside the unchanged 5-second deadline. A gate, hook, setup, or
+  environment-handoff failure marks the experiment invalid instead of being read
+  as a CIM timeout. Apart from the passive instrumentation and the legacy
+  control's environment override, the experiment runs the production query
+  with its deadline, output bound and acceptance rules; the original assertions
+  and owned cleanup are kept. Hook support
+  on the installed Windows PowerShell 5.1 is checked by stubbed-CIM controls on
+  the native runner.
+
+## [0.1.0-dev.298]
+
+### Fixed
+
+- **Windows background-shell root assignment is identity-guarded (#705)**: the
+  `ShellStart` Windows watchdog now verifies the root shell's captured creation
+  identity before assigning it to the Windows Job Object. It opens the root
+  process once, reads that handle's creation time (`GetProcessTimes`, converted
+  with `DateTime.FromFileTime(...).Ticks` to match the wrapper's existing .NET
+  `StartTime.Ticks` capture), and calls `AssignProcessToJobObject` with that
+  same handle only on an exact match, so a process that reused the root PID is
+  never adopted into the job. An unknown or unreadable creation time, an
+  out-of-range value, a mismatch, a failed open, or a thrown call fails closed:
+  the watchdog exits before writing the running record and the user command
+  never runs. The handle is retained through assignment and closed on every
+  path. The PowerShell 5.1 fallback and `pwsh.exe` preference, record formats,
+  liveness, stop, settlement, and deadlines are unchanged.
+
+## [0.1.0-dev.297]
+
+### Fixed
+
+- **Publisher transport phase boundary (#708)**: after the synchronous artifact
+  build and APK checks, the publisher awaits one full event-loop turn (two
+  `setImmediate` phase yields) before the draft identity PATCH, so a pooled
+  connection closed during that blocking work is not reused for the PATCH.
+  There is no timed sleep, retry, extra request, or deadline change, and request
+  order, payloads and every publication gate are unchanged. Owned loopback
+  native-HTTP regressions cover the stale-socket failure without the boundary
+  and the single fresh-connection PATCH with it.
 
 ## [0.1.0-dev.296]
 

@@ -29,7 +29,7 @@
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import childProcess, { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { basename, dirname, join } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1101,6 +1101,504 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
 
   it("keeps readiness blocked across watchdog polls until a descendant finishes naturally (Windows PowerShell 5.1)", SKIP, async () => {
     await withWindowsPowerShell51(runNaturalCompletion);
+  });
+});
+// ── Root identity guard before job assignment (#705) ─────────────────────
+//
+// The watchdog assigns the shell root to its job only after the root's
+// captured creation identity matches through the SAME opened handle. These
+// controls drive the producer's actual Add-Type class (extracted verbatim from
+// wrapWithPowerShellWatchdog — the guard algorithm is never copied here) in a
+// directly owned PowerShell process that targets ONLY ITSELF while it runs, so
+// no foreign or reusable pid is ever opened, assigned, or killed. Every job is
+// a fresh plain job object WITHOUT kill limits: membership is observable with
+// IsProcessInJob and closing the handles never terminates anything. Output is
+// fixed witness names with booleans/edition only — no paths, pids, ticks, raw
+// stderr, environment, or command text.
+
+/** The producer's one-line kernel32 class text, exactly as embedded in the
+ *  watchdog's single-quoted Add-Type string (apostrophe-free by construction). */
+function producerJobApiClass(): string {
+  const script = wrapWithPowerShellWatchdog("Write-Output unused", process.pid, 1, {
+    markerPath: "unused.job",
+    stopPath: "unused.stop",
+  });
+  const match = script.match(/Add-Type -TypeDefinition '([^']*public static class PiReviewBgJobApi \{[^']*)'/);
+  if (!match) throw new Error("producer PiReviewBgJobApi class text not found in wrapWithPowerShellWatchdog output");
+  return match[1];
+}
+
+/** Ordered witness names and the exact value each control must produce.
+ *  Order matters: both stale negatives and the unreadable-identity control
+ *  run BEFORE the matching positive, and the raw assignment that proves the
+ *  query-denied handle was assignable runs after it. */
+const GUARD_EXPECTED: ReadonlyArray<readonly [string, string]> = [
+  ["stale-plus.guard", "False"],
+  ["stale-plus.member", "False"],
+  ["stale-minus.guard", "False"],
+  ["stale-minus.member", "False"],
+  ["denied.times", "False"],
+  ["denied.guard", "False"],
+  ["denied.member", "False"],
+  ["zero.guard", "False"],
+  ["zero.member", "False"],
+  ["match.guard", "True"],
+  ["match.member", "True"],
+  ["denied.raw-assign", "True"],
+  ["denied.raw-member", "True"],
+  ["stale-plus.member-after", "False"],
+  ["stale-minus.member-after", "False"],
+  ["denied.member-after", "False"],
+  ["zero.member-after", "False"],
+  ["done", "True"],
+];
+const GUARD_BOOL_KEYS = new Set<string>(GUARD_EXPECTED.map(([k]) => k));
+const GUARD_WITNESS_KEYS = new Set<string>([...GUARD_BOOL_KEYS, "edition", "major", "failed-stage"]);
+/** stdout cap in BYTES (16 KiB). Exceeding it fails native verification. */
+const GUARD_STDOUT_CAP = 16 * 1024;
+/** The value every unrecognized input normalizes to. It never equals an
+ *  expected control value, so it can only fail an assertion. */
+const GUARD_OTHER = "other";
+
+/** Byte-bounded stdout capture: keeps at most `cap` bytes and records
+ *  whether anything beyond the cap arrived. */
+function createBoundedByteSink(cap: number) {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let truncated = false;
+  return {
+    push(chunk: Buffer): void {
+      const room = cap - bytes;
+      if (chunk.length > room) {
+        if (room > 0) chunks.push(chunk.subarray(0, room));
+        bytes = cap;
+        truncated = true;
+        return;
+      }
+      chunks.push(chunk);
+      bytes += chunk.length;
+    },
+    get bytes(): number { return bytes; },
+    get truncated(): boolean { return truncated; },
+    text(): string { return Buffer.concat(chunks).toString("utf8"); },
+  };
+}
+
+/** Helper stage names, derived from the generated script itself (its
+ *  `$stage = '...'` assignments): the single stage vocabulary definition. */
+function guardStageVocabulary(): ReadonlySet<string> {
+  const script = guardSelfTestScript(producerJobApiClass());
+  return new Set([...script.matchAll(/\$stage = '([a-z-]+)'/g)].map((m) => m[1]));
+}
+
+/** The ONE canonical normalizer for a recognized witness: a closed value
+ *  set per key (True/False controls, Desktop/Core edition, a bounded major
+ *  version, known stage names). Everything else becomes GUARD_OTHER — never
+ *  a valid expected value. */
+function normalizeGuardWitness(key: string, raw: string, stages: ReadonlySet<string>): string {
+  if (GUARD_BOOL_KEYS.has(key)) return raw === "True" || raw === "False" ? raw : GUARD_OTHER;
+  if (key === "edition") return raw === "Desktop" || raw === "Core" ? raw : GUARD_OTHER;
+  if (key === "major") return /^[1-9][0-9]?$/.test(raw) ? raw : GUARD_OTHER;
+  if (key === "failed-stage") return stages.has(raw) ? raw : GUARD_OTHER;
+  return GUARD_OTHER;
+}
+
+function guardSelfTestScript(cls: string): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$stage = 'setup'",
+    "function Witness($name, $value) { Write-Output ('PIW ' + $name + '=' + [string][bool]$value) }",
+    "try {",
+    `Add-Type -TypeDefinition '${cls}'`,
+    // Test-only observation surface (membership + pseudo-handle); the guard
+    // itself comes exclusively from the producer class above.
+    "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobGuardProbe { [DllImport(\"kernel32.dll\")] public static extern IntPtr GetCurrentProcess(); [DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool IsProcessInJob(IntPtr p,IntPtr j,out bool r); }'",
+    "Write-Output ('PIW edition=' + $PSVersionTable.PSEdition)",
+    "Write-Output ('PIW major=' + $PSVersionTable.PSVersion.Major)",
+    "$self = [PiReviewBgJobGuardProbe]::GetCurrentProcess()",
+    // The exact identity format production captures for the root.
+    "$ticks = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.Ticks",
+    "function New-FreshJob { $j = [PiReviewBgJobApi]::CreateJobObjectW([IntPtr]::Zero, $null); if ($j -eq [IntPtr]::Zero) { throw 'fresh-job' }; return $j }",
+    "function Test-Member($j) { $r = $false; if (-not [PiReviewBgJobGuardProbe]::IsProcessInJob($self, $j, [ref]$r)) { throw 'membership' }; return $r }",
+    "$stage = 'stale-plus'",
+    "$jPlus = New-FreshJob",
+    "Witness 'stale-plus.guard' ([PiReviewBgJobApi]::AssignOwnedRoot($jPlus, $PID, $ticks + 1))",
+    "Witness 'stale-plus.member' (Test-Member $jPlus)",
+    "$stage = 'stale-minus'",
+    "$jMinus = New-FreshJob",
+    "Witness 'stale-minus.guard' ([PiReviewBgJobApi]::AssignOwnedRoot($jMinus, $PID, $ticks - 1))",
+    "Witness 'stale-minus.member' (Test-Member $jMinus)",
+    // Unreadable identity: TERMINATE|SET_QUOTA (0x0101) is enough to assign
+    // but grants no query right, so GetProcessTimes must fail on it.
+    "$stage = 'denied'",
+    "$denied = [PiReviewBgJobApi]::OpenProcess(0x0101, $false, $PID)",
+    "if ($denied -eq [IntPtr]::Zero) { throw 'denied-open' }",
+    "$c = [long]0; $x = [long]0; $k = [long]0; $u = [long]0",
+    "Witness 'denied.times' ([PiReviewBgJobApi]::GetProcessTimes($denied, [ref]$c, [ref]$x, [ref]$k, [ref]$u))",
+    "$jDenied = New-FreshJob",
+    "Witness 'denied.guard' ([PiReviewBgJobApi]::AssignRootIfIdentity($jDenied, $denied, $ticks))",
+    "Witness 'denied.member' (Test-Member $jDenied)",
+    "$stage = 'zero'",
+    "$jZero = New-FreshJob",
+    "Witness 'zero.guard' ([PiReviewBgJobApi]::AssignRootIfIdentity($jZero, [IntPtr]::Zero, $ticks))",
+    "Witness 'zero.member' (Test-Member $jZero)",
+    "$stage = 'match'",
+    "$jMatch = New-FreshJob",
+    "Witness 'match.guard' ([PiReviewBgJobApi]::AssignOwnedRoot($jMatch, $PID, $ticks))",
+    "Witness 'match.member' (Test-Member $jMatch)",
+    "$stage = 'raw-assign'",
+    "$jRaw = New-FreshJob",
+    "Witness 'denied.raw-assign' ([PiReviewBgJobApi]::AssignProcessToJobObject($jRaw, $denied))",
+    "Witness 'denied.raw-member' (Test-Member $jRaw)",
+    "$stage = 'after'",
+    "Witness 'stale-plus.member-after' (Test-Member $jPlus)",
+    "Witness 'stale-minus.member-after' (Test-Member $jMinus)",
+    "Witness 'denied.member-after' (Test-Member $jDenied)",
+    "Witness 'zero.member-after' (Test-Member $jZero)",
+    "$stage = 'release'",
+    "foreach ($h in @($denied, $jPlus, $jMinus, $jDenied, $jZero, $jMatch, $jRaw)) { [void][PiReviewBgJobApi]::CloseHandle($h) }",
+    "Witness 'done' $true",
+    "exit 0",
+    "} catch {",
+    "Write-Output ('PIW failed-stage=' + $stage)",
+    "exit 3",
+    "}",
+  ].join("\n");
+}
+
+/** What the owned process produced, before normalization. Never printed or
+ *  asserted on directly. */
+interface GuardSelfTestRaw {
+  exitCode: number | null;
+  signal: string | null;
+  stdout: string;
+  stdoutTruncated: boolean;
+  stderrBytes: number;
+}
+
+/** Normalized outcome: every field comes from a closed vocabulary, so both
+ *  assertions and diagnostics only ever see allowlisted names and values. */
+interface GuardSelfTestOutcome {
+  exit: string;
+  signal: string;
+  witnesses: Array<[string, string]>;
+  stdoutTruncated: boolean;
+  stderrBytes: string;
+}
+
+const GUARD_STDERR_REPORT_CAP = 65_536;
+/** Closed signal vocabulary: the signals Node can report for a Windows child
+ *  (ChildProcess.kill and console control events). Anything else is 'other'. */
+const GUARD_KNOWN_SIGNALS = new Set<string>(["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGBREAK"]);
+
+function normalizeGuardOutcome(raw: GuardSelfTestRaw, stages: ReadonlySet<string>): GuardSelfTestOutcome {
+  const witnesses: Array<[string, string]> = [];
+  for (const line of raw.stdout.split(/\r?\n/)) {
+    const m = line.trim().match(/^PIW ([a-z.-]{1,40})=(.*)$/);
+    // Only allowlisted names are kept; their values are normalized at once
+    // and the raw value is never retained.
+    if (m && GUARD_WITNESS_KEYS.has(m[1])) witnesses.push([m[1], normalizeGuardWitness(m[1], m[2], stages)]);
+  }
+  const code = raw.exitCode;
+  const exit = code === null
+    ? "none"
+    : Number.isInteger(code) && code >= -2_147_483_648 && code <= 4_294_967_295 ? String(code) : GUARD_OTHER;
+  const signal = raw.signal === null ? "none" : GUARD_KNOWN_SIGNALS.has(raw.signal) ? raw.signal : GUARD_OTHER;
+  const n = raw.stderrBytes;
+  const stderrBytes = !Number.isInteger(n) || n < 0
+    ? GUARD_OTHER
+    : n > GUARD_STDERR_REPORT_CAP ? `${GUARD_STDERR_REPORT_CAP}+` : String(n);
+  return { exit, signal, witnesses, stdoutTruncated: raw.stdoutTruncated === true, stderrBytes };
+}
+
+/** Fixed-vocabulary summary for assertion messages: normalized fields only —
+ *  never raw output, paths, pids, ticks, error or signal text. */
+function describeGuardOutcome(outcome: GuardSelfTestOutcome): string {
+  const witnesses = outcome.witnesses.map(([k, v]) => `${k}=${v}`).join(", ");
+  return `exit=${outcome.exit} signal=${outcome.signal} stdoutTruncated=${outcome.stdoutTruncated} ` +
+    `stderrBytes=${outcome.stderrBytes} witnesses=[${witnesses}]`;
+}
+
+/** Race `work` against a deadline whose timer is always cleared once the
+ *  race finishes, so a settled control never keeps the test process alive
+ *  until the unused deadline would have fired. */
+async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | "timeout"> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), ms); });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Run the self-targeting guard controls in ONE directly owned PowerShell
+ *  process and return only after that exact ChildProcess has positively
+ *  emitted BOTH `exit` and `close`. On timeout or any setup failure the
+ *  process is stopped through its own ChildProcess handle (never a bare pid)
+ *  and settlement is still awaited; failing to observe it fails the test. */
+async function runGuardSelfTest(executable: string): Promise<GuardSelfTestOutcome> {
+  const encoded = Buffer.from(guardSelfTestScript(producerJobApiClass()), "utf16le").toString("base64");
+  const child = spawn(
+    executable,
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+    { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let exited = false;
+  let closed = false;
+  let spawnFailed = false;
+  let exitCode: number | null = null;
+  let signal: NodeJS.Signals | null = null;
+  const stdout = createBoundedByteSink(GUARD_STDOUT_CAP);
+  let stderrBytes = 0;
+  const exitSeen = new Promise<void>((resolve) => {
+    child.once("exit", (code, sig) => { exited = true; exitCode = code; signal = sig; resolve(); });
+  });
+  const closeSeen = new Promise<void>((resolve) => {
+    child.once("close", () => { closed = true; resolve(); });
+  });
+  // The error listener stays attached for the child's whole lifetime: a
+  // started process can report more than one runtime error (including one
+  // from child.kill below), and a consumed one-shot listener would let the
+  // next become an unhandled 'error' that skips the awaited settlement.
+  // Only the FIRST error classifies the outcome and settles this race.
+  let errorSeen = false;
+  const spawnError = new Promise<void>((resolve) => {
+    child.on("error", () => {
+      if (errorSeen) return;
+      errorSeen = true;
+      spawnFailed = child.pid === undefined;
+      resolve();
+    });
+  });
+  child.stdout!.on("data", (d: Buffer) => { stdout.push(d); });
+  child.stderr!.on("data", (d: Buffer) => { stderrBytes += d.length; });
+  const settled = Promise.all([exitSeen, closeSeen]).then(() => "settled" as const);
+  let timedOut = false;
+  try {
+    const first = await withDeadline(Promise.race([settled, spawnError.then(() => "error" as const)]), 120_000);
+    if (first === "error" && !spawnFailed) {
+      // A runtime error on a started process: it still must settle.
+      timedOut = (await withDeadline(settled, 60_000)) === "timeout";
+    } else {
+      timedOut = first === "timeout";
+    }
+  } finally {
+    if (spawnFailed) {
+      // No process was ever created (no pid), so no `exit` is expected — but
+      // the ChildProcess still emits `close` once its stdio is torn down.
+      // Await that positive close within a finite bound.
+      if ((await withDeadline(closeSeen, 30_000)) === "timeout") {
+        throw new Error("guard self-test PowerShell could not be started, and its stdio did not close");
+      }
+    } else if (!(exited && closed)) {
+      child.kill();
+      if ((await withDeadline(settled, 30_000)) === "timeout") {
+        throw new Error(`guard self-test process did not settle (exit=${exited} close=${closed}) after being stopped`);
+      }
+    }
+  }
+  if (spawnFailed) throw new Error("guard self-test PowerShell could not be started");
+  const outcome = normalizeGuardOutcome(
+    { exitCode, signal, stdout: stdout.text(), stdoutTruncated: stdout.truncated, stderrBytes },
+    guardStageVocabulary(),
+  );
+  if (timedOut) throw new Error(`guard self-test timed out before settling: ${describeGuardOutcome(outcome)}`);
+  return outcome;
+}
+
+/** Every native control must hold; there is no fallback or partial pass.
+ *  Assertions see normalized values only, so no raw value can reach an
+ *  assertion message or its actual/expected fields. */
+function checkGuardControls(outcome: GuardSelfTestOutcome, edition: "Desktop" | "Core"): void {
+  const summary = describeGuardOutcome(outcome);
+  // Truncated output fails even when every required record is in the prefix.
+  expect(outcome.stdoutTruncated, `stdout within the byte cap; ${summary}`).toBe(false);
+  const editionWitness = outcome.witnesses.find(([k]) => k === "edition")?.[1];
+  const major = Number(outcome.witnesses.find(([k]) => k === "major")?.[1]);
+  expect(editionWitness, `edition witness; ${summary}`).toBe(edition);
+  expect(edition === "Desktop" ? major === 5 : major >= 7, `edition major version; ${summary}`).toBe(true);
+  expect(outcome.witnesses.some(([k]) => k === "failed-stage"), `no failed stage; ${summary}`).toBe(false);
+  expect(outcome.exit, `self-test exit; ${summary}`).toBe("0");
+  const controls = outcome.witnesses.filter(([k]) => k !== "edition" && k !== "major");
+  expect(controls, `ordered native guard controls; ${summary}`).toEqual(GUARD_EXPECTED.map(([k, v]) => [k, v]));
+}
+
+async function expectGuardControls(executable: string, edition: "Desktop" | "Core"): Promise<void> {
+  checkGuardControls(await runGuardSelfTest(executable), edition);
+}
+
+describe("ShellStart on native Windows: watchdog root identity guard (#705)", () => {
+  it("assigns only a root whose creation identity matches through the same handle (Windows PowerShell 5.1)", SKIP, async () => {
+    await withWindowsPowerShell51((powershellExe) => expectGuardControls(powershellExe, "Desktop"));
+  });
+
+  it("assigns only a root whose creation identity matches through the same handle (PowerShell 7)", SKIP, async (t) => {
+    // Optional prerequisite, resolved by ONE lookup whose verified path is
+    // the executable used: absence skips truthfully; a failed, timed-out, or
+    // malformed lookup fails with a fixed message instead (its reason can
+    // carry paths or raw error text, so it is not echoed).
+    const prereq = probePwshPrerequisite();
+    if (prereq.kind === "absent") {
+      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
+      return;
+    }
+    if (prereq.kind === "error") {
+      throw new Error("pwsh prerequisite lookup failed (stage pwsh-lookup): presence was neither verified nor ruled out");
+    }
+    await expectGuardControls(prereq.path, "Core");
+  });
+});
+
+// Cross-platform controls for the native guard fixture's privacy and
+// lifetime handling (no PowerShell needed; these run on every platform).
+describe("watchdog root identity guard fixture: diagnostics privacy and lifetime (#705)", () => {
+  const stages = guardStageVocabulary();
+  const SECRETS = ["SECRET", "C:\\Users", "sk-", "123456", "TTTTTTTTTT", "1000000000000", "/tmp/"];
+
+  function expectedRecords(): string[] {
+    return ["PIW edition=Desktop", "PIW major=5", ...GUARD_EXPECTED.map(([k, v]) => `PIW ${k}=${v}`)];
+  }
+
+  function messageOf(fn: () => void): string {
+    try {
+      fn();
+    } catch (err) {
+      return String((err as Error).message);
+    }
+    throw new Error("expected the guard controls check to fail");
+  }
+
+  it("derives the stage vocabulary from the generated helper script", () => {
+    for (const stage of ["setup", "stale-plus", "denied", "match", "raw-assign", "after", "release"]) {
+      expect(stages.has(stage), stage).toBe(true);
+    }
+  });
+
+  it("passes only the exact closed vocabulary and fails once stdout was truncated", () => {
+    const raw = { exitCode: 0, signal: null, stdout: expectedRecords().join("\r\n"), stdoutTruncated: false, stderrBytes: 0 };
+    expect(() => checkGuardControls(normalizeGuardOutcome(raw, stages), "Desktop")).not.toThrow();
+    // Every required record is present in the kept prefix, yet truncation fails.
+    expect(() => checkGuardControls(normalizeGuardOutcome({ ...raw, stdoutTruncated: true }, stages), "Desktop")).toThrow();
+  });
+
+  it("normalizes path-, token-bearing, oversized, and unknown values to 'other' without printing them", () => {
+    const hostile = [
+      "C:\\Users\\SECRET-USER\\AppData\\x",
+      "True; sk-SECRETTOKEN",
+      "true",
+      "TRUE",
+      "False/tmp/SECRET",
+      "T".repeat(5_000),
+      "1",
+      "",
+    ];
+    const lines = [
+      "PIW edition=Desktop\\SECRET",
+      "PIW major=123456",
+      "PIW failed-stage=SECRET-STAGE",
+      "PIW secret-key=SECRET",
+      "raw SECRET output line C:\\Users\\SECRET",
+      ...GUARD_EXPECTED.map(([k], i) => `PIW ${k}=${hostile[i % hostile.length]}`),
+    ];
+    const outcome = normalizeGuardOutcome(
+      { exitCode: 1e13, signal: "SIGSECRET/tmp/x", stdout: lines.join("\n"), stdoutTruncated: false, stderrBytes: 1e12 },
+      stages,
+    );
+    // Every recognized value collapsed to 'other'; the unknown key is dropped.
+    expect(outcome.witnesses.length, "only allowlisted names kept").toBe(GUARD_EXPECTED.length + 3);
+    for (const [key, value] of outcome.witnesses) expect(value, key).toBe(GUARD_OTHER);
+    expect(outcome.exit).toBe(GUARD_OTHER);
+    expect(outcome.signal).toBe(GUARD_OTHER);
+    expect(outcome.stderrBytes).toBe(`${GUARD_STDERR_REPORT_CAP}+`);
+    const summary = describeGuardOutcome(outcome);
+    for (const secret of SECRETS) expect(summary, `summary omits ${secret}`).not.toContain(secret);
+    expect(summary.length < 2_000, "summary stays bounded").toBe(true);
+    // Hostile values can never satisfy the expected controls, and the
+    // failure message is equally free of them.
+    const failure = messageOf(() => checkGuardControls(outcome, "Desktop"));
+    for (const secret of SECRETS) expect(failure, `failure omits ${secret}`).not.toContain(secret);
+  });
+
+  it("reports only allowlisted signal names, never unknown well-formed ones", () => {
+    const records = expectedRecords().join("\n");
+    const unknown = normalizeGuardOutcome({ exitCode: null, signal: "SIGSECRET", stdout: records, stdoutTruncated: false, stderrBytes: 0 }, stages);
+    expect(unknown.signal).toBe(GUARD_OTHER);
+    expect(describeGuardOutcome(unknown)).not.toContain("SIGSECRET");
+    const failure = messageOf(() => checkGuardControls(unknown, "Desktop"));
+    expect(failure).not.toContain("SIGSECRET");
+    const known = normalizeGuardOutcome({ exitCode: null, signal: "SIGTERM", stdout: "", stdoutTruncated: false, stderrBytes: 0 }, stages);
+    expect(known.signal).toBe("SIGTERM");
+  });
+
+  it("keeps known stage names and reports unknown ones as 'other'", () => {
+    const known = normalizeGuardOutcome({ exitCode: 3, signal: null, stdout: "PIW failed-stage=denied", stdoutTruncated: false, stderrBytes: 0 }, stages);
+    expect(known.witnesses).toEqual([["failed-stage", "denied"]]);
+    const unknown = normalizeGuardOutcome({ exitCode: 3, signal: null, stdout: "PIW failed-stage=den1ed", stdoutTruncated: false, stderrBytes: 0 }, stages);
+    expect(unknown.witnesses).toEqual([["failed-stage", GUARD_OTHER]]);
+  });
+
+  it("caps stdout by bytes, not UTF-16 code units", () => {
+    const sink = createBoundedByteSink(GUARD_STDOUT_CAP);
+    sink.push(Buffer.alloc(GUARD_STDOUT_CAP, 0x41));
+    expect(sink.truncated, "exactly the cap is not truncated").toBe(false);
+    sink.push(Buffer.from([0x41]));
+    expect(sink.truncated, "one byte past the cap truncates").toBe(true);
+    expect(sink.bytes).toBe(GUARD_STDOUT_CAP);
+    // Two-byte characters: well under the cap in code units, over it in bytes.
+    const wide = createBoundedByteSink(GUARD_STDOUT_CAP);
+    wide.push(Buffer.from("é".repeat(GUARD_STDOUT_CAP / 2 + 1), "utf8"));
+    expect(wide.truncated, "multi-byte overflow truncates").toBe(true);
+    expect(Buffer.byteLength(wide.text(), "utf8") <= GUARD_STDOUT_CAP, "kept prefix within the byte cap").toBe(true);
+  });
+
+  it("awaits close and fails with a fixed message when the helper cannot be started", async () => {
+    const missing = join(tmpdir(), `pi-review-705-missing-${process.pid}-${Date.now()}`, "SECRET-pwsh.exe");
+    let message = "";
+    try {
+      await runGuardSelfTest(missing);
+    } catch (err) {
+      message = String((err as Error).message);
+    }
+    expect(message).toBe("guard self-test PowerShell could not be started");
+  });
+
+  it("handles repeated runtime errors and still returns only after positive exit and close", async (t) => {
+    // The helper's own spawn call is redirected to a REAL Node child that
+    // exits at once (no PowerShell needed). Node emits 'spawn' before 'exit'
+    // and 'close', so the two runtime errors (carrying hostile text) raised
+    // synchronously in the spawn callback always precede settlement.
+    const realSpawn = childProcess.spawn;
+    let child: ChildProcess | undefined;
+    let unhandled = false;
+    let exitObserved = false;
+    let closeObserved = false;
+    t.mock.method(childProcess, "spawn", ((_file: string, _args: readonly string[], options: childProcess.SpawnOptions) => {
+      const spawned = realSpawn(process.execPath, ["-e", "void 0"], options);
+      child = spawned;
+      spawned.once("exit", () => { exitObserved = true; });
+      spawned.once("close", () => { closeObserved = true; });
+      spawned.once("spawn", () => {
+        for (const n of [1, 2]) {
+          try {
+            spawned.emit("error", new Error(`SECRET runtime error ${n} C:\\Users\\SECRET`));
+          } catch {
+            unhandled = true; // an 'error' with no listener throws from emit
+          }
+        }
+      });
+      return spawned;
+    }) as unknown as typeof childProcess.spawn);
+
+    const outcome = await runGuardSelfTest("SECRET-pwsh.exe");
+    expect(child !== undefined, "the helper spawned through the redirected spawn").toBe(true);
+    expect(unhandled, "every runtime error reached a listener").toBe(false);
+    expect(exitObserved && closeObserved, "returned only after positive exit and close").toBe(true);
+    expect(child!.listenerCount("error") > 0, "error listener retained after settlement").toBe(true);
+    expect(outcome.exit).toBe("0");
+    expect(outcome.signal).toBe("none");
+    const summary = describeGuardOutcome(outcome);
+    for (const secret of [...SECRETS, String(child!.pid)]) expect(summary, "summary stays closed").not.toContain(secret);
   });
 });
 

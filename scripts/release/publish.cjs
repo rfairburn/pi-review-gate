@@ -19,6 +19,8 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+// Promise form of setImmediate: each await resumes in a check phase.
+const { setImmediate: nextCheckPhase } = require("node:timers/promises");
 const {
   BASELINE_SHA,
   HEX40,
@@ -614,6 +616,29 @@ function deriveReleaseNotes({ projectRoot, repoRoot, eligibility, policyAnchor }
 }
 
 // ---------------------------------------------------------------------------
+// Transport phase boundary
+// ---------------------------------------------------------------------------
+
+// The artifact build and the APK checks are synchronous and block the event
+// loop for a long time. A pooled keep-alive connection that the peer closes
+// (or that expires) during that window is not marked closed until pending
+// socket I/O is processed, so a request sent straight from that continuation
+// can be written to the stale socket and fail before the server ever sees it.
+// Awaiting one full event-loop turn first lets the pool process the closure
+// and open a fresh connection. Two check-phase yields are needed because the
+// continuation may already be running in any phase: the first yield only
+// leaves the current phase; the second resumes in the next turn's check
+// phase, after a complete poll phase has handled pending I/O. This is not a
+// timed sleep, retry, deadline, or extra request: a request that genuinely
+// fails still fails closed with its original error.
+async function awaitTransportPhaseBoundary() {
+  // Phase yield 1 — leave the current phase (resumes in a check phase).
+  await nextCheckPhase();
+  // Phase yield 2 — complete the turn: resumes only after the next poll phase.
+  await nextCheckPhase();
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
@@ -745,6 +770,9 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
     }
     const androidAssets = android.loadAssets({ directory: env.ANDROID_RELEASE_DIR, eligibility, env, run: androidRun });
     build.assets.push(...androidAssets);
+    // The synchronous artifact and APK work above is done; process pending
+    // transport events before the first request that follows it.
+    await awaitTransportPhaseBoundary();
     await api.updateRelease(release.id, {
       // Re-assert the bound tag and source on EVERY draft mutation: a live
       // API probe (issue #13) confirmed that a draft PATCH omitting tag_name
@@ -814,6 +842,7 @@ async function publishRelease({ env, fetchImpl, projectRoot, scratchRoot, buildA
 module.exports = {
   PRODUCER_CONTRACT,
   assertTagRefMatches,
+  awaitTransportPhaseBoundary,
   bodyWithoutNotes,
   changelogPolicyAdopted,
   deriveReleaseNotes,

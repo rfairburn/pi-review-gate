@@ -29,6 +29,14 @@ dates.
   directory, including partial setup and shutdown failures, without deleting
   foreign fixtures. Broader suite-wide fixture cleanup remains open.
 
+### Changed
+
+- **Native Windows ownership evidence (Refs #404)**: the ownership-failure
+  regression reports bounded exit and allowlisted failure-stage facts, and an
+  owned Job Object fixture is added to measure the kernel's kill-on-close exit
+  outcome. This diagnostic work does not establish a cause or change the original
+  canary or exit-status assertions or production behavior.
+
 ## [0.1.0-dev.294]
 
 ### Fixed

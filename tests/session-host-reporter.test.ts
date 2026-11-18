@@ -1366,6 +1366,8 @@ describe("session-host reporter status frames", () => {
       ownKinds: ["pi", "claude", "codex"],
       hosts: Array.from({ length: 64 }, (_, index) => ({
         id: `${String(index).padStart(2, "0")} ${"\udc00".repeat(120)} ${"日".repeat(4)}`,
+        // Exact saved labels survive: legal 64-byte labels, one repeated descriptive label.
+        label: index % 16 === 0 ? "ai-inference-machine" : `Host ${String(index).padStart(2, "0")} (lab)-${"y".repeat(50)}`,
         kinds: index % 2 === 0 ? ["pi", "codex"] as const : ["claude"] as const,
       })),
     };
@@ -1392,6 +1394,26 @@ describe("session-host reporter status frames", () => {
     assert.equal(server.frames.filter((frame) => frame.message.type === "hosts_request").length, 1);
     assert.equal(server.frames.some((frame) => String(frame.message.type).startsWith("spawn")), false, "discovery never spawns");
     assert.deepEqual(readdirSync(bootstrap.payloadDir as string), [], "discovery stages nothing");
+
+    // A hand-built page whose host entry lacks its required label fails the
+    // shared wire decoder: the connection closes and nothing partial is reported.
+    const unlabeledPending = capability.inspectHosts();
+    const unlabeledRequest = await server.waitForFrame((frame) => frame.message.type === "hosts_request", undefined, server.frames.indexOf(request));
+    assert.notEqual(unlabeledRequest.message.requestId, request.message.requestId, "a fresh request, never a replay");
+    const unlabeled = JSON.parse(encodeSessionHostsResultFrames({
+      instanceId: bootstrap.instanceId as string,
+      generation: bootstrap.generation as string,
+      token: bootstrap.token as string,
+      requestId: unlabeledRequest.message.requestId as string,
+    }, { ownKinds: ["pi"], hosts: [{ id: "example-peer-id", label: "ai-inference-machine", kinds: ["pi"] }] })[0]!) as {
+      outcome: string;
+      hosts: Array<Record<string, unknown>>;
+    };
+    assert.equal(unlabeled.outcome, "complete");
+    delete unlabeled.hosts[0]!.label;
+    server.sendToClients(`${JSON.stringify(unlabeled)}\n`);
+    assert.deepEqual(await unlabeledPending, { outcome: "unavailable", reason: "disconnected" },
+      "a missing label is malformed, never a partial or id-substituted listing");
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
@@ -1514,7 +1536,7 @@ describe("session-host reporter status frames", () => {
     // Out-of-order pages are a protocol violation: never partial.
     const large = {
       ownKinds: ["pi"],
-      hosts: Array.from({ length: 64 }, (_, index) => ({ id: `${index}${"\udc00".repeat(120)}`, kinds: ["pi"] })),
+      hosts: Array.from({ length: 64 }, (_, index) => ({ id: `${index}${"\udc00".repeat(120)}`, label: "x".repeat(64), kinds: ["pi"] })),
     };
     held = inspectWithHeldDeadline();
     request = await nextRequest();
@@ -4841,6 +4863,7 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/session-host/protocol.js", source: join(__dirname, "..", "src/session-host/protocol.js") },
         { relative: "src/session-host/session-backend.js", source: join(__dirname, "..", "src/session-host/session-backend.js") },
         { relative: "src/session-host/peer-destination-id.js", source: join(__dirname, "..", "src/session-host/peer-destination-id.js") },
+        { relative: "src/session-host/network/protocol.js", source: join(__dirname, "..", "src/session-host/network/protocol.js") },
         { relative: "src/session-host/reporter.js", source: join(__dirname, "..", "src/session-host/reporter.js") },
         { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },
         { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },

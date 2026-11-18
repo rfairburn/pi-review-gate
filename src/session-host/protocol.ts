@@ -31,8 +31,10 @@
  * the host answers with one or more bounded, token-authenticated, ordered
  * `hosts_result` pages that the reporter reassembles into one complete
  * validated SessionHosts snapshot or reports as unavailable, never partial.
- * Discovery frames carry only closed backend names and existing opaque saved
- * destination ids: no prompt, title, workspace, path, or profile data.
+ * Discovery frames carry only closed backend names, existing opaque saved
+ * destination ids, and each destination's existing saved friendly label (display
+ * metadata, never identity or authority): no prompt, title, workspace, path,
+ * address, or profile data.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
  * transcripts, or credentials. Owned-work counts are opaque numbers only.
@@ -57,6 +59,7 @@ import {
   isValidPeerDestinationId,
 } from "./peer-destination-id";
 import { SESSION_BACKENDS, isSessionBackend, type SessionBackend } from "./session-backend";
+import { DEFAULT_PEER_TRANSPORT_BOUNDS, isValidPeerLabel } from "./network/protocol";
 
 export const HOST_BOOTSTRAP_ENV = "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP";
 
@@ -444,6 +447,13 @@ export type SessionSpawnOutcome = SessionHostSpawnAck["outcome"];
 export interface SessionHostsEntry {
   /** Exact existing opaque saved destination id; never an invented local alias. */
   readonly id: string;
+  /**
+   * The destination's existing saved friendly label, exactly as stored and
+   * bounded by the existing peer label contract ({@link isValidPeerLabel}).
+   * Descriptive only: labels may repeat across destinations and are never
+   * accepted as a SessionSpawn `host` selector.
+   */
+  readonly label: string;
   /** Current kind observations for that destination, canonical order, no duplicates. */
   readonly kinds: readonly SessionBackend[];
 }
@@ -988,6 +998,9 @@ export function parseSpawnAck(value: unknown): SessionHostSpawnAck | undefined {
 const WORST_HOSTS_ENTRY_BYTES = Buffer.byteLength(JSON.stringify({
   // An unpaired surrogate is the costliest admitted code unit once JSON-escaped (6 bytes).
   id: "\ud800".repeat(MAX_PEER_DESTINATION_ID_CHARS),
+  // The existing label alphabet needs no JSON escaping, so the longest admitted
+  // label costs exactly its existing byte bound.
+  label: "x".repeat(DEFAULT_PEER_TRANSPORT_BOUNDS.maxLabelBytes),
   kinds: SESSION_BACKENDS,
 }), "utf8") + 1;
 
@@ -1038,13 +1051,17 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
-/** Closed `{ id, kinds }` entry with an existing saved-destination id shape. */
+/**
+ * Closed `{ id, label, kinds }` entry with an existing saved-destination id
+ * shape and an existing saved-label shape. The label is required and kept
+ * exactly; it is never compared, deduplicated, or used as identity.
+ */
 function parseSessionHostsEntry(value: unknown, requireCanonical: boolean): SessionHostsEntry | undefined {
-  if (!isRecord(value) || !hasExactKeys(value, ["id", "kinds"])) return undefined;
-  if (!isValidPeerDestinationId(value.id)) return undefined;
+  if (!isRecord(value) || !hasExactKeys(value, ["id", "label", "kinds"])) return undefined;
+  if (!isValidPeerDestinationId(value.id) || !isValidPeerLabel(value.label)) return undefined;
   const kinds = parseSessionHostKinds(value.kinds, requireCanonical);
   if (!kinds) return undefined;
-  return { id: value.id, kinds };
+  return { id: value.id, label: value.label, kinds };
 }
 
 function parseSessionHostsEntries(
@@ -1067,9 +1084,10 @@ function parseSessionHostsEntries(
 /**
  * The one canonical SessionHosts snapshot validator. Admits exactly
  * `{ ownKinds, hosts }` with closed kind lists (duplicates refused, order
- * canonicalized), closed `{ id, kinds }` entries whose ids satisfy the existing
- * saved-destination contract, unique ids, and at most the existing saved
- * destination bound. Returns a fresh frozen canonical copy, or undefined.
+ * canonicalized), closed `{ id, label, kinds }` entries whose ids satisfy the
+ * existing saved-destination contract and whose labels satisfy the existing
+ * saved-label contract, unique ids (labels may repeat), and at most the
+ * existing saved destination bound. Returns a fresh frozen canonical copy, or undefined.
  */
 export function parseSessionHostsSnapshot(value: unknown): SessionHostsSnapshot | undefined {
   if (!isRecord(value) || !hasExactKeys(value, ["ownKinds", "hosts"])) return undefined;
@@ -1078,7 +1096,11 @@ export function parseSessionHostsSnapshot(value: unknown): SessionHostsSnapshot 
   if (!ownKinds || !hosts) return undefined;
   return Object.freeze({
     ownKinds: Object.freeze(ownKinds),
-    hosts: Object.freeze(hosts.map((entry) => Object.freeze({ id: entry.id, kinds: Object.freeze([...entry.kinds]) }))),
+    hosts: Object.freeze(hosts.map((entry) => Object.freeze({
+      id: entry.id,
+      label: entry.label,
+      kinds: Object.freeze([...entry.kinds]),
+    }))),
   });
 }
 

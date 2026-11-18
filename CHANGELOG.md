@@ -38,9 +38,14 @@ dates.
   `started` confirms launch only, never prompt processing or completion, and an
   uncertain submitted request is `unknown`, never a claim that no child exists. A new
   read-only `SessionHosts` tool with a static empty schema returns
-  `{ ownKinds, hosts: [{ id, kinds }] }` from the host's existing launch probe and
-  paired-destination projection: `ownKinds` is the caller's own host, and each `id`
-  is the raw exact paired id to pass as `host`. It is descriptive only — not a
+  `{ ownKinds, hosts: [{ id, label, kinds }] }` from the host's existing launch
+  probe and paired-destination projection: `ownKinds` is the caller's own host, each
+  `id` is the raw exact paired id to pass as `host`, and each `label` is that
+  destination's existing saved friendly name (for example
+  `{ "id": "example-peer-id", "label": "ai-inference-machine", "kinds": ["pi"] }`),
+  so a caller can recognize the host a user named without reading configuration.
+  Labels follow the existing saved-label bounds, may repeat, and are never accepted
+  as `host`; no address is exposed. It is descriptive only — not a
   grant or launch receipt, and an observation can race the spawn's own
   validation. Standalone sessions, delegated executors, and native Claude Code and
   Codex callers get neither selector nor discovery tool. See

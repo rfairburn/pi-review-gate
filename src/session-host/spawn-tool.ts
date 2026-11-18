@@ -81,7 +81,7 @@ export const SESSION_SPAWN_ROUTED_PROMPT_DELIVERY =
 
 /** Static SessionHosts pointer used only when the actual inspection capability exists. */
 export const SESSION_SPAWN_DISCOVERY_GUIDANCE =
-  "Omit host for this session's own host; omit kind for Pi. Use SessionHosts for paired host ids and current kind observations.";
+  "Omit host for this session's own host; omit kind for Pi. Use SessionHosts for paired host ids, their saved friendly labels, and current kind observations; pass the listed id, not the label, as host.";
 
 export function sessionSpawnToolSchema(
   titleColumns: number,

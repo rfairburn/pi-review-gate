@@ -544,8 +544,8 @@ test("SessionHosts reports this host and each probing paired owner with all thre
     const snapshot = await inspect(manager, parent);
     assert.deepEqual(snapshot, {
       ownKinds: ["pi", "claude", "codex"],
-      hosts: [{ id: exactId, kinds: ["pi", "claude", "codex"] }],
-    }, "own kinds come from the fresh probe; the paired id is exact and its kinds come from a fresh owner refresh");
+      hosts: [{ id: exactId, label: "Lab Beta", kinds: ["pi", "claude", "codex"] }],
+    }, "own kinds come from the fresh probe; the paired id is exact, its saved label is carried unchanged, and its kinds come from a fresh owner refresh");
     assert.deepEqual(peer.refreshes, [exactId], "only the addressable probing owner is refreshed, by its exact id");
     assert.equal(manager.createOptions.length, createsBefore, "discovery never spawns");
     assert.deepEqual(peer.spawns, []);
@@ -571,7 +571,7 @@ test("SessionHosts keeps the caller's own Pi while viewing B and lists a legacy 
     await activateRemoteRosterRow(harness, "Lab Beta");
     assert.equal(harness.sidebar!.activeMainOwnerKey?.kind, "remote", "the viewer is displaying host B");
     const snapshot = await inspect(manager, parent);
-    assert.deepEqual(snapshot, { ownKinds: ["pi"], hosts: [{ id: "lab-b", kinds: ["pi"] }] },
+    assert.deepEqual(snapshot, { ownKinds: ["pi"], hosts: [{ id: "lab-b", label: "Lab Beta", kinds: ["pi"] }] },
       "a host without native launch support owns Pi only; the legacy owner's configuration-only catalog is not availability");
     assert.deepEqual(peer.refreshes, [], "a non-probing owner is never refreshed as though it were probed");
   } finally {
@@ -734,10 +734,60 @@ test("SessionHosts re-proves every paired observation at its final boundary, aft
     for (let step = 0; step < 3; step += 1) await nextTurn();
     peer.publish({ hosts: [hostA, { ...hostB, state: "disconnected" } as PeerUiHost] });
     held.release();
-    assert.deepEqual((await pending).hosts, [{ id: "lab-a", kinds: ["pi", "claude", "codex"] }],
+    assert.deepEqual((await pending).hosts, [{ id: "lab-a", label: "Lab Alpha", kinds: ["pi", "claude", "codex"] }],
       "a destination that disconnected meanwhile is not listed");
+
+    // B completes, then only its saved display label changes while A is
+    // pending: a label is not authority, so this is no refusal, and the final
+    // boundary reports the CURRENT projection's label for the same id.
+    peer.publish({ hosts: [hostA, hostB] });
+    held = holdA();
+    pending = inspect(manager, parent);
+    for (let step = 0; step < 3; step += 1) await nextTurn();
+    peer.publish({ hosts: [hostA, probedHost("lab-b", "Lab Beta renamed", "run-b")] });
+    held.release();
+    assert.deepEqual((await pending).hosts, [
+      { id: "lab-a", label: "Lab Alpha", kinds: ["pi", "claude", "codex"] },
+      { id: "lab-b", label: "Lab Beta renamed", kinds: ["pi", "claude", "codex"] },
+    ], "the label is the current destination projection's label after every wait");
     assert.deepEqual(peer.spawns, []);
     assert.deepEqual(peer.commands, []);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("SessionHosts shows each destination's saved label beside its id so a named host maps to the id SessionSpawn needs", async (t) => {
+  // Synthetic ids and labels only. Two distinct destinations share one label:
+  // labels are descriptive and may repeat; ids stay distinct and authoritative.
+  const hosts = [
+    probedHost("example-peer-id", "ai-inference-machine", "run-b"),
+    { ...remotePeerHost({ id: "example-peer-id-2", label: "ai-inference-machine", hostRunId: "run-b", rows: [] }), createSupported: true },
+  ] as unknown as PeerUiSnapshot["hosts"];
+  const { harness, peer, manager } = await discoveryHarness(t, hosts);
+  try {
+    peer.supported = new Set(["example-peer-id", "example-peer-id-2"]);
+    peer.refreshResults.set("example-peer-id", { kind: "refreshed", hostRunId: "run-b" });
+    const parent = await localParent(harness, manager);
+    const snapshot = await inspect(manager, parent);
+    assert.deepEqual(snapshot.hosts, [
+      { id: "example-peer-id", label: "ai-inference-machine", kinds: ["pi", "claude", "codex"] },
+      { id: "example-peer-id-2", label: "ai-inference-machine", kinds: ["pi"] },
+    ], "the exact saved label rides beside each distinct id; duplicate labels are preserved, not merged");
+    assert.doesNotMatch(JSON.stringify(snapshot), /10\.0\.0\.5|8443/, "no endpoint address or port is exposed");
+    assert.deepEqual(peer.commands, [], "discovery reads the live projection only: no connect, pair, or retry");
+
+    // The caller recognizes the named host by label and passes its listed id unchanged.
+    const named = snapshot.hosts.find((entry) => entry.kinds.includes("claude") && entry.label === "ai-inference-machine")!;
+    assert.equal(await routed(manager)(parent, { workspace: "/w", title: "t", prompt: "p", host: named.id }, () => true), "started");
+    assert.deepEqual(peer.spawns.map((target) => target.hostId), ["example-peer-id"], "SessionSpawn routes by the exact id");
+
+    // A label is never a host selector: no alias resolution and no fallback.
+    const createsBefore = manager.createOptions.length;
+    assert.equal(await routed(manager)(parent, { workspace: "/w", title: "t", prompt: "p", host: "ai-inference-machine" }, () => true),
+      "failed", "a label passed as host is refused, not resolved");
+    assert.equal(peer.spawns.length, 1, "nothing is sent for a label");
+    assert.equal(manager.createOptions.length, createsBefore, "and nothing is launched locally instead");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

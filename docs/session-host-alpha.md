@@ -630,8 +630,24 @@ supplies the matching inspection capability. It takes no arguments and returns o
 structured snapshot `{ ownKinds, hosts }`: `ownKinds` lists the session kinds the
 caller's own host currently observes as startable (the host an omitted `host`
 selects), and `hosts` lists each existing paired destination eligible for
-selection as `{ id, kinds }`, with the id given raw and exact — including opaque
-Unicode or whitespace — for use unchanged as `host`. Both views come from the host's
+selection as `{ id, label, kinds }`, with the id given raw and exact — including
+opaque Unicode or whitespace — for use unchanged as `host`. The `label` is that
+destination's existing saved friendly name, exactly as shown for the destination
+locally, so a request such as "start it on ai-inference-machine" can be matched to
+the listed id without reading configuration:
+
+```json
+{
+  "ownKinds": ["pi", "codex"],
+  "hosts": [
+    { "id": "example-peer-id", "label": "ai-inference-machine", "kinds": ["pi", "claude", "codex"] }
+  ]
+}
+```
+
+A label is display metadata within the existing saved-label bounds, not identity:
+two destinations may share one, and `SessionSpawn` never accepts a label as
+`host` or resolves one to an id. No network address is listed. Both views come from the host's
 existing launch probe and paired-destination projection; there is no static host
 roster, profile list, or dynamic schema enum. The snapshot is descriptive only: it
 is not a grant or a launch receipt. It does not start sessions, connect, pair, or

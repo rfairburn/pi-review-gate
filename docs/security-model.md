@@ -344,9 +344,10 @@ its own current catalog, with no fallback to another host, kind, or configured
 worker profile. The prompt crosses the authenticated channel as exact bounded
 fragments and is not projected into roster rows, status, or diagnostics. An
 uncertain outcome is `unknown` and never claims that no child exists. The
-read-only `SessionHosts` listing of paired destination ids and observed kinds is
-descriptive only: it is not a grant, a pairing, or a launch receipt, and every
-spawn is validated again. The optional `roster-native-availability-v1` capability
+read-only `SessionHosts` listing of paired destination ids, their existing saved
+friendly labels, and observed kinds is descriptive only (a label is never identity
+or a selector, and no address is listed): it is not a grant, a pairing, or a
+launch receipt, and every spawn is validated again. The optional `roster-native-availability-v1` capability
 only describes whether an owner's native catalog came from a fresh launch probe; it
 grants nothing, and a catalog without it has unknown availability.
 

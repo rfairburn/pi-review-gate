@@ -6851,9 +6851,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
    * probe — the destination's existing bounded catalog refresh, then its current
    * probed projection. A legacy or non-probing owner contributes no native kind.
    *
-   * Ids are the raw saved-destination ids, unchanged. Nothing here connects,
-   * pairs, regrants, retries, spawns, selects, focuses, or changes visibility,
-   * and nothing about the requester's workspace is consulted. A parent that is
+   * Ids are the raw saved-destination ids, unchanged, and each label is that
+   * destination's existing saved friendly label from the same projection —
+   * display metadata only, never identity, a selector, or authority. Nothing
+   * here connects, pairs, regrants, retries, spawns, selects, focuses, or
+   * changes visibility, and nothing about the requester's workspace is
+   * consulted. A parent that is
    * no longer current, a teardown, an unreadable network state, a busy or failed
    * owner refresh, or a broker that stopped waiting makes the WHOLE inspection
    * unavailable: a partial answer is never reported as complete, and a refresh
@@ -6876,7 +6879,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // against the CURRENT coordinator view, after all waiting is over and with no
     // await before the return, so a destination that disconnected, changed run,
     // or changed its native description while another wait was pending is never
-    // reported with its earlier kinds.
+    // reported with its earlier kinds. Each label is read from that same current
+    // projection; a label change alone is display metadata, not a refusal.
     const hosts = confirmPairedObservations(observations);
     return Object.freeze({ ownKinds, hosts });
   }
@@ -6915,10 +6919,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     const confirmed: SessionHostsEntry[] = [];
     for (const observation of observations) {
       const host = (current.hosts ?? []).find((candidate) => candidate.id === observation.entry.id);
-      if (!sessionSpawnHostAddressable(controller, host)) continue;
-      if (host?.roster.hostRunId !== observation.hostRunId
+      if (host === undefined || !sessionSpawnHostAddressable(controller, host)) continue;
+      if (host.roster.hostRunId !== observation.hostRunId
         || pairedNativeIdentity(host) !== observation.nativeIdentity) throw sessionHostsUnavailable();
-      confirmed.push(observation.entry);
+      // The CURRENT saved label for the same id. A malformed label fails the
+      // shared snapshot validator downstream (unavailable), never a substitute.
+      confirmed.push(Object.freeze({ id: observation.entry.id, label: host.label, kinds: observation.entry.kinds }));
     }
     return Object.freeze(confirmed);
   }
@@ -7011,9 +7017,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       observed = after;
     }
     const hostRunId = observed?.roster.hostRunId;
-    if (typeof hostRunId !== "string" || hostRunId.length === 0) return undefined;
+    if (observed === undefined || typeof hostRunId !== "string" || hostRunId.length === 0) return undefined;
     return Object.freeze({
-      entry: Object.freeze({ id: hostId, kinds: canonicalSessionKinds(kinds) }),
+      entry: Object.freeze({ id: hostId, label: observed.label, kinds: canonicalSessionKinds(kinds) }),
       hostRunId,
       nativeIdentity: pairedNativeIdentity(observed),
     });

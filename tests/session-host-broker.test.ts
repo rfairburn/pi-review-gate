@@ -2752,6 +2752,8 @@ function maxHostsSnapshot(): SessionHostsSnapshot {
     ownKinds: ["pi", "claude", "codex"],
     hosts: Array.from({ length: 64 }, (_, index) => ({
       id: `${String(index).padStart(2, "0")}${index % 2 === 0 ? "\udc00".repeat(126) : "日".repeat(125) + " "}`,
+      // Legal 64-byte saved labels; every eighth repeats one descriptive label.
+      label: index % 8 === 0 ? "ai-inference-machine" : `host ${String(index).padStart(2, "0")} ${"x".repeat(56)}`,
       kinds: index % 3 === 0 ? ["pi", "claude", "codex"] as const : index % 3 === 1 ? ["claude"] as const : ["codex"] as const,
     })),
   };
@@ -2794,7 +2796,7 @@ test("SessionHosts discovery is advertised only with installed discovery and rou
   await disposeBroker(broker);
 });
 
-test("SessionHosts returns a complete authenticated multi-frame snapshot of 64 long Unicode ids without spawning", async () => {
+test("SessionHosts returns a complete authenticated multi-frame snapshot of 64 long Unicode ids and max labels without spawning", async () => {
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   const snapshot = maxHostsSnapshot();
   const calls = { spawn: 0, hosts: 0 };
@@ -2834,19 +2836,20 @@ test("SessionHosts reports unavailable for throwing, malformed, or late handlers
   brokerTest.setHostsTimeoutForTests(30);
   try {
     const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
-    let mode: "throw" | "malformed" | "hang" = "throw";
+    let mode: "throw" | "malformed" | "unlabeled" | "hang" = "throw";
     const signals: AbortSignal[] = [];
     const calls = { spawn: 0 };
     const registration = broker.register(INSTANCE_A, discoveryHandlers(({ signal }) => {
       signals.push(signal);
       if (mode === "throw") throw new Error("projection unavailable");
-      if (mode === "malformed") return { ownKinds: ["pi"], hosts: [{ id: "a", kinds: ["pi"] }, { id: "a", kinds: [] }] } as never;
+      if (mode === "malformed") return { ownKinds: ["pi"], hosts: [{ id: "a", label: "A", kinds: ["pi"] }, { id: "a", label: "A", kinds: [] }] } as never;
+      if (mode === "unlabeled") return { ownKinds: ["pi"], hosts: [{ id: "a", kinds: ["pi"] }] } as never;
       return new Promise<never>(() => undefined);
     }, calls));
     const client = await connectClient(broker.socketPath);
     const raw = collectRawFrames(client);
     client.write(encodeFrame(helloFrame(registration.bootstrap) as never));
-    for (const [index, next] of (["throw", "malformed", "hang"] as const).entries()) {
+    for (const [index, next] of (["throw", "malformed", "unlabeled", "hang"] as const).entries()) {
       mode = next;
       client.write(hostsRequestFrame(registration.bootstrap, `cccccccc-0000-4000-8000-00000000000${index}`));
       await waitFor(() => raw.frames.length === index + 1);
@@ -2854,7 +2857,7 @@ test("SessionHosts reports unavailable for throwing, malformed, or late handlers
       assert.equal(page.outcome, "unavailable", `${next} handler is reported unavailable, never as an empty listing`);
       assert.equal(Object.hasOwn(page, "hosts"), false);
     }
-    assert.equal(signals[2]!.aborted, true, "the deadline aborts the handler signal");
+    assert.equal(signals[3]!.aborted, true, "the deadline aborts the handler signal");
 
     // Reusing a request id is a protocol violation.
     await expectClientClose(client, () => client.write(hostsRequestFrame(registration.bootstrap, "cccccccc-0000-4000-8000-000000000000")));

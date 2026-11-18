@@ -296,7 +296,7 @@ test("SessionHosts discovery is forwarded only beside routed spawn and refuses a
       onRoutedSpawnRequest: async () => "failed",
       onSessionHostsRequest: async (parent, context, current) => {
         received.push({ parent, current, signal: context.signal });
-        return { ownKinds: ["pi", "codex"], hosts: [{ id: " Lab B ", kinds: ["pi"] }] };
+        return { ownKinds: ["pi", "codex"], hosts: [{ id: " Lab B ", label: "Lab B", kinds: ["pi"] }] };
       },
     },
   });
@@ -305,7 +305,7 @@ test("SessionHosts discovery is forwarded only beside routed spawn and refuses a
   assert.equal(typeof handlers?.onSessionHostsRequest, "function");
   const signal = new AbortController().signal;
   assert.deepEqual(await handlers!.onSessionHostsRequest!({ signal }),
-    { ownKinds: ["pi", "codex"], hosts: [{ id: " Lab B ", kinds: ["pi"] }] },
+    { ownKinds: ["pi", "codex"], hosts: [{ id: " Lab B ", label: "Lab B", kinds: ["pi"] }] },
     "the host's snapshot is relayed unchanged, raw ids included");
   assert.equal(received.length, 1);
   assert.equal(received[0]!.parent, parentId, "the parent id comes from the registration");

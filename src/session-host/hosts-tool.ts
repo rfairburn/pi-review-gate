@@ -7,10 +7,13 @@
  * and native Claude/Codex callers have no such capability and never see it.
  *
  * The tool takes no arguments (static `{}` schema) and returns the canonical
- * structured snapshot `{ ownKinds, hosts }`: `ownKinds` describes the caller's
- * own host (selected by omitting SessionSpawn `host`), and `hosts` lists the
- * existing paired destination ids eligible for selection, each with its current
- * kind observations. The listing is descriptive: it is not a permission grant
+ * structured snapshot `{ ownKinds, hosts: [{ id, label, kinds }] }`: `ownKinds`
+ * describes the caller's own host (selected by omitting SessionSpawn `host`),
+ * and `hosts` lists the existing paired destination ids eligible for selection,
+ * each with that destination's existing saved friendly label and its current
+ * kind observations. The label is display metadata so a model can recognize the
+ * destination a user named; only the id is ever passed as SessionSpawn `host`,
+ * and labels may repeat. The listing is descriptive: it is not a permission grant
  * or launch receipt, it has no dynamic roster/schema enum, and the tool never
  * connects, pairs, regrants, creates a session, or validates a requested child
  * workspace. It may refresh an existing metadata subscription. An inspection
@@ -23,6 +26,7 @@ import {
   type SessionHostsUnavailableReason,
 } from "./protocol";
 import { MAX_PEER_DESTINATIONS, MAX_PEER_DESTINATION_ID_CHARS } from "./peer-destination-id";
+import { DEFAULT_PEER_TRANSPORT_BOUNDS } from "./network/protocol";
 import { SESSION_BACKENDS } from "./session-backend";
 import { hasSessionHostsInspection, type SessionHostSpawnCapability } from "./spawn-capability";
 import { isRecord } from "../record-guard";
@@ -63,13 +67,20 @@ export function sessionHostsOutputSchema(): Record<string, unknown> {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["id", "kinds"],
+          required: ["id", "label", "kinds"],
           properties: {
             id: {
               type: "string",
               minLength: 1,
               maxLength: MAX_PEER_DESTINATION_ID_CHARS,
               description: "Exact paired host id to pass unchanged as SessionSpawn host (no trimming or case changes).",
+            },
+            label: {
+              type: "string",
+              minLength: 1,
+              // Byte bound of the existing saved-label contract, whose alphabet is single-byte ASCII.
+              maxLength: DEFAULT_PEER_TRANSPORT_BOUNDS.maxLabelBytes,
+              description: "That host's existing saved friendly name, for recognizing which host the user means. Descriptive only and not necessarily unique; never pass it as SessionSpawn host — pass the id.",
             },
             kinds: kindsSchema("Session kinds currently observed for that host."),
           },
@@ -100,10 +111,14 @@ const UNAVAILABLE_TEXT: Readonly<Record<SessionHostsUnavailableReason, string>> 
 
 /** Model-facing complete result: text plus identical structured data. */
 export function sessionHostsResult(snapshot: SessionHostsSnapshot): Record<string, unknown> {
-  const data = { ownKinds: [...snapshot.ownKinds], hosts: snapshot.hosts.map((entry) => ({ id: entry.id, kinds: [...entry.kinds] })) };
+  const data = {
+    ownKinds: [...snapshot.ownKinds],
+    hosts: snapshot.hosts.map((entry) => ({ id: entry.id, label: entry.label, kinds: [...entry.kinds] })),
+  };
   const text = "Session host snapshot (descriptive only; not a permission grant or launch receipt). "
     + "ownKinds is this session's own host, used when SessionSpawn host is omitted; "
-    + "hosts are paired host ids to pass exactly as SessionSpawn host. "
+    + "each hosts entry is a paired host whose id is passed exactly as SessionSpawn host, "
+    + "with its saved friendly label for recognition only (labels may repeat and are never a host value). "
     + JSON.stringify(data);
   return { content: [{ type: "text", text }], details: data, structuredContent: data };
 }
@@ -122,12 +137,12 @@ export function registerSessionHostsTool(
     annotations: { readOnlyHint: true, destructiveHint: false },
     description:
       "Read-only snapshot of where SessionSpawn can start a child: ownKinds lists the session kinds currently observed on this session's own host (used when SessionSpawn host is omitted), "
-      + "and hosts lists existing paired host ids with their currently observed kinds. "
+      + "and hosts lists existing paired host ids with their saved friendly labels and currently observed kinds. "
       + "The snapshot is descriptive, not a permission grant or launch receipt. It does not start sessions, connect, pair, or change trust or settings; it may refresh an existing owner's metadata subscription.",
     promptSnippet:
-      "Use SessionHosts to list paired host ids and current session-kind observations before choosing SessionSpawn host or kind.",
+      "Use SessionHosts to list paired host ids, their saved friendly labels, and current session-kind observations before choosing SessionSpawn host or kind.",
     promptGuidelines: [
-      "Use SessionHosts when you need a paired host id or the current kind observations for SessionSpawn. Pass a listed id exactly as SessionSpawn host; omit host for this session's own host.",
+      "Use SessionHosts when you need a paired host id or the current kind observations for SessionSpawn. A listed label helps recognize the host the user named; pass that host's listed id exactly as SessionSpawn host, never the label. Omit host for this session's own host.",
       "SessionHosts is descriptive only: a listed host or kind can still be refused by SessionSpawn, and an unavailable SessionHosts result means nothing is known, not that no hosts exist.",
     ],
     parameters: sessionHostsToolSchema(),

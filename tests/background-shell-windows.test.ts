@@ -29,13 +29,15 @@
  */
 import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { basename, dirname, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { runWithTempCleanup } from "./helpers/temp-file-cleanup";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
+import { ownershipVerdict } from "../src/background-shell/ownership";
 import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import { probePwshPrerequisite } from "./helpers/pwsh-prerequisite";
@@ -255,6 +257,296 @@ async function withPath(pathValue: string | null, fn: () => Promise<void>): Prom
   } finally {
     process.env.PATH = original;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded #404 diagnostics. Test-only and diagnosis only: these helpers never
+// print captured output, error text, environment, commands, pids, or paths —
+// only fixed labels, allowlisted names, and clamped integers — and they never
+// decide an assertion.
+
+/** Keep at most `limit` leading bytes of a stream for scanning, noting truncation. */
+function boundedCapture(limit = 16_384) {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let truncated = false;
+  return {
+    push: (data: Buffer | string): void => {
+      const bytes = typeof data === "string" ? Buffer.from(data) : data;
+      const take = bytes.subarray(0, Math.max(0, limit - size));
+      if (take.length < bytes.length) truncated = true;
+      if (take.length > 0) {
+        chunks.push(Buffer.from(take));
+        size += take.length;
+      }
+    },
+    text: (): string => Buffer.concat(chunks).toString("utf8"),
+    truncated: (): boolean => truncated,
+  };
+}
+
+type BoundedCapture = ReturnType<typeof boundedCapture>;
+
+const clampCount = (n: number): number => Math.min(Math.max(0, n), 99);
+
+function diagnosticExitCode(code: number | null): string {
+  if (code === null) return "null";
+  return Number.isSafeInteger(code) ? String(code) : "other";
+}
+
+function diagnosticSignal(signal: NodeJS.Signals | null): string {
+  if (signal === null) return "null";
+  return /^SIG[A-Z0-9]{1,12}$/.test(signal) ? signal : "other";
+}
+
+/** The abort stage names the generated wrapper can report, read from the
+ *  wrapper text itself so this allowlist cannot drift from production. */
+function wrapperFailureStages(wrapped: string): Set<string> {
+  const stages = new Set<string>();
+  for (const match of wrapped.matchAll(/__pi_review_fail '([a-z][a-z-]{0,39})'/g)) stages.add(match[1]);
+  return stages;
+}
+
+/** One fixed-label line for the ownership-failure case: exit status, which
+ *  allowlisted abort stages the wrapper reported on stderr (an unknown stage
+ *  is counted, never printed), whether stdio had closed — the line is taken at
+ *  exit, so with `stdioClosed=false` an empty stage list is not proof that no
+ *  abort line was written — and when the exit was observed. */
+function formatOwnershipFailureDiagnostic(
+  exited: boolean,
+  exitCode: number | null,
+  signalCode: NodeJS.Signals | null,
+  wrapped: string,
+  stderr: BoundedCapture,
+  stdioClosed: boolean,
+  exitObservedMs: number | null,
+): string {
+  const allowlist = wrapperFailureStages(wrapped);
+  const stages: string[] = [];
+  let abortLines = 0;
+  let unrecognized = 0;
+  for (const match of stderr.text().matchAll(/\(stage '([^'\r\n]{0,64})'\)/g)) {
+    abortLines += 1;
+    if (!allowlist.has(match[1])) unrecognized += 1;
+    else if (!stages.includes(match[1])) stages.push(match[1]);
+  }
+  return [
+    "issue404 ownership-failure:",
+    `exited=${exited}`,
+    `exitCode=${diagnosticExitCode(exitCode)}`,
+    `signalCode=${diagnosticSignal(signalCode)}`,
+    `stages=${stages.length > 0 ? stages.join(",") : "none"}`,
+    `abortLines=${clampCount(abortLines)}`,
+    `unrecognizedStages=${clampCount(unrecognized)}`,
+    `stderrTruncated=${stderr.truncated()}`,
+    `stdioClosed=${stdioClosed}`,
+    `stageAllowlist=${clampCount(allowlist.size)}`,
+    `exitObservedMs=${exitObservedMs === null ? "null" : Math.min(Math.max(0, Math.round(exitObservedMs)), 999_999)}`,
+  ].join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// #404 Job Object close experiment (test-only diagnosis, not product code).
+// Node directly spawns a synthetic child that does not exit on its own (stdin
+// stays open) and a tiny PowerShell owner. Retaining the ChildProcess object
+// does NOT pin the child's pid (an unexpected exit lets the OS reuse it), so
+// the owner's OpenProcess(pid) is only trusted through a post-open liveness
+// handshake: the owner opens and RETAINS a process handle, reports OPENED, and
+// waits; only then does Node send a fresh one-shot challenge over the ORIGINAL
+// child's private stdin, and only that child's matching reply on its private
+// stdout — proof it was still alive after the handle was opened, so the handle
+// is its incarnation — lets Node send ASSIGN. The owner keeps that handle
+// through AssignProcessToJobObject and the IsProcessInJob proof, holds the ONLY
+// handle to a KILL_ON_JOB_CLOSE job, and on an explicit CLOSE command closes
+// it. The test records the kernel's actual exit status for the child without
+// assuming it. Nothing is ever killed by pid; cleanup goes only through the two
+// directly spawned ChildProcess objects and requires observed exit + close.
+
+const JOB_CLOSE_OWNER_STAGES = new Set([
+  "add-type", "create-job", "set-limit", "open-child", "assign-command", "assign", "in-job", "close-command", "close-job",
+]);
+
+/** The owner script. Win32 surface is limited to the approved fixture calls. */
+function jobCloseOwnerScript(childPid: number): string {
+  if (!Number.isSafeInteger(childPid) || childPid <= 0) throw new Error("job-close fixture: invalid child pid");
+  const api = "[Pi404JobCloseFixture]";
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "function Fail($stage) { try { [Console]::Out.WriteLine('JOBCLOSE-OWNER-FAIL ' + $stage); [Console]::Out.Flush() } catch {}; exit 2 }",
+    "try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class Pi404JobCloseFixture { " +
+      "[DllImport(\"kernel32.dll\",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,string n); " +
+      "[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); " +
+      "[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern IntPtr OpenProcess(uint a,bool i,int p); " +
+      "[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); " +
+      "[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool IsProcessInJob(IntPtr p,IntPtr j,out bool r); " +
+      "[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool CloseHandle(IntPtr h); }' } catch { Fail 'add-type' }",
+    `$job = ${api}::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { Fail 'create-job' }`,
+    // JobObjectExtendedLimitInformation (9): LimitFlags at offset 16 =
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000); struct 144 bytes (112 on 32-bit).
+    "$size = 144; if ([IntPtr]::Size -eq 4) { $size = 112 }",
+    "$pin = [Runtime.InteropServices.GCHandle]::Alloc((New-Object byte[] $size), [Runtime.InteropServices.GCHandleType]::Pinned)",
+    `try { [Runtime.InteropServices.Marshal]::WriteInt32($pin.AddrOfPinnedObject(), 16, 0x2000); $limited = ${api}::SetInformationJobObject($job, 9, $pin.AddrOfPinnedObject(), $size) } finally { $pin.Free() }`,
+    "if (-not $limited) { Fail 'set-limit' }",
+    // PROCESS_SET_QUOTA | PROCESS_TERMINATE (assign) | PROCESS_QUERY_LIMITED_INFORMATION (IsProcessInJob).
+    `$child = ${api}::OpenProcess(0x1101, $false, ${childPid}); if ($child -eq [IntPtr]::Zero) { Fail 'open-child' }`,
+    // Retain $child; assignment waits for Node's post-open child liveness proof.
+    "[Console]::Out.WriteLine('JOBCLOSE-OWNER-OPENED'); [Console]::Out.Flush()",
+    "if ([Console]::In.ReadLine() -ne 'ASSIGN') { Fail 'assign-command' }",
+    `if (-not ${api}::AssignProcessToJobObject($job, $child)) { Fail 'assign' }`,
+    "$inJob = $false",
+    `if (-not ${api}::IsProcessInJob($child, $job, [ref]$inJob)) { Fail 'in-job' }`,
+    "if (-not $inJob) { Fail 'in-job' }",
+    `[void]${api}::CloseHandle($child)`,
+    "[Console]::Out.WriteLine('JOBCLOSE-OWNER-ASSIGNED'); [Console]::Out.Flush()",
+    "if ([Console]::In.ReadLine() -ne 'CLOSE') { Fail 'close-command' }",
+    `if (-not ${api}::CloseHandle($job)) { Fail 'close-job' }`,
+    "[Console]::Out.WriteLine('JOBCLOSE-OWNER-CLOSED'); [Console]::Out.Flush()",
+    "exit 0",
+  ].join("\n");
+}
+
+/** One directly spawned process with its observed lifecycle. Settled means
+ *  positive evidence: `close` observed AND either `exit` observed or the spawn
+ *  failed without ever creating a process. */
+interface OwnedProcess {
+  proc: ChildProcess;
+  stdout: BoundedCapture;
+  exit: { code: number | null; signal: NodeJS.Signals | null; afterClose: boolean } | null;
+  closed: boolean;
+  spawnFailed: boolean;
+}
+
+const ownedSettled = (p: OwnedProcess): boolean => p.closed && (p.exit !== null || (p.spawnFailed && p.proc.pid === undefined));
+
+/** Event-driven bounded wait: re-checks `pred` on every lifecycle/output change
+ *  and resolves false when the bound elapses (never treated as settlement). */
+function changeNotifier() {
+  let waiters: Array<() => void> = [];
+  return {
+    notify(): void {
+      const current = waiters;
+      waiters = [];
+      for (const w of current) w();
+    },
+    wait(pred: () => boolean, ms: number): Promise<boolean> {
+      return new Promise((resolve) => {
+        if (pred()) { resolve(true); return; }
+        const check = (): void => { if (pred()) finish(true); else waiters.push(check); };
+        const timer = setTimeout(() => finish(false), ms);
+        function finish(value: boolean): void {
+          clearTimeout(timer);
+          waiters = waiters.filter((w) => w !== check);
+          resolve(value);
+        }
+        waiters.push(check);
+      });
+    },
+  };
+}
+
+type ChangeNotifier = ReturnType<typeof changeNotifier>;
+
+function observeOwned(proc: ChildProcess, notifier: ChangeNotifier, closeSent: () => boolean): OwnedProcess {
+  const owned: OwnedProcess = { proc, stdout: boundedCapture(), exit: null, closed: false, spawnFailed: false };
+  proc.once("exit", (code, signal) => { owned.exit = { code, signal, afterClose: closeSent() }; notifier.notify(); });
+  proc.once("close", () => { owned.closed = true; notifier.notify(); });
+  proc.on("error", () => { if (proc.pid === undefined) owned.spawnFailed = true; notifier.notify(); });
+  proc.stdin?.on("error", () => { /* a dead peer's pipe; lifecycle is judged by exit/close */ });
+  proc.stdout?.on("data", (d) => { owned.stdout.push(d); notifier.notify(); });
+  proc.stderr?.resume();
+  return owned;
+}
+
+const hasWitness = (p: OwnedProcess | undefined, token: string): boolean =>
+  p !== undefined && new RegExp(`^${token}\\r?$`, "m").test(p.stdout.text());
+
+const isLive = (p: OwnedProcess | undefined): p is OwnedProcess => p !== undefined && p.exit === null && !p.closed;
+
+/** The synthetic child: stays alive on its open stdin and answers exactly one
+ *  `JOBCLOSE-CHALLENGE <hex>` line on its private stdout. */
+const JOB_CLOSE_CHILD_SOURCE =
+  "let b='',r=0;process.stdin.setEncoding('utf8');process.stdin.on('data',d=>{b+=d;" +
+  "const m=/^JOBCLOSE-CHALLENGE ([0-9a-f]{32})\\r?$/m.exec(b);" +
+  "if(m&&!r){r=1;process.stdout.write('JOBCLOSE-CHILD-ALIVE '+m[1]+'\\n')}});" +
+  "process.stdout.write('JOBCLOSE-CHILD-READY\\n')";
+
+/** Ordered fixed phase labels plus the one-shot challenge (never printed). */
+interface JobCloseHandshake {
+  phases: string[];
+  challenge: string | null;
+  settledAfterClose: boolean;
+}
+
+/** Send the fresh one-shot challenge to the ORIGINAL child's stdin, but only
+ *  once the owner has reported OPENED (its process handle is already held) and
+ *  both processes are still live. Refuses otherwise. */
+function sendChildChallenge(h: JobCloseHandshake, child: OwnedProcess | undefined, owner: OwnedProcess | undefined): boolean {
+  if (h.challenge !== null || !hasWitness(owner, "JOBCLOSE-OWNER-OPENED") || !isLive(child) || !isLive(owner)) return false;
+  h.challenge = randomBytes(16).toString("hex");
+  h.phases.push("challenge-sent");
+  child.proc.stdin!.write(`JOBCLOSE-CHALLENGE ${h.challenge}\n`);
+  return true;
+}
+
+/** Assignment gate: the owner reported OPENED before the challenge went out,
+ *  the original child answered THIS challenge, and neither process has exited.
+ *  Any missing or mismatched step forbids ASSIGN. */
+function jobCloseAssignmentAllowed(h: JobCloseHandshake, child: OwnedProcess | undefined, owner: OwnedProcess | undefined): boolean {
+  const opened = h.phases.indexOf("owner-opened");
+  const challenged = h.phases.indexOf("challenge-sent");
+  return h.challenge !== null && opened >= 0 && challenged > opened && !h.phases.includes("assign-sent")
+    && hasWitness(child, `JOBCLOSE-CHILD-ALIVE ${h.challenge}`) && isLive(child) && isLive(owner);
+}
+
+/** Request termination of every unsettled process through its own directly
+ *  spawned ChildProcess object (never a pid lookup), then require positive
+ *  exit + close evidence within a finite bound. Returns the fixed labels whose
+ *  settlement could NOT be confirmed. */
+async function settleOwnedProcesses(
+  owned: Array<[label: string, process: OwnedProcess]>,
+  notifier: ChangeNotifier,
+  ms: number,
+): Promise<string[]> {
+  for (const [, p] of owned) {
+    if (ownedSettled(p)) continue;
+    try { p.proc.stdin?.destroy(); } catch { /* judged by exit/close below */ }
+    try { p.proc.kill(); } catch { /* judged by exit/close below */ }
+  }
+  await notifier.wait(() => owned.every(([, p]) => ownedSettled(p)), ms);
+  return owned.filter(([, p]) => !ownedSettled(p)).map(([label]) => label);
+}
+
+const JOB_CLOSE_PHASES = [
+  "child-ready", "owner-opened", "challenge-sent", "child-alive", "assign-sent", "owner-assigned", "close-sent",
+];
+
+/** One fixed-label line: allowlisted phases, an allowlisted owner failure
+ *  stage (an unknown one prints as `other`), and clamped numeric exit
+ *  outcomes. The challenge value and raw output are never printed. */
+function formatJobCloseDiagnostic(
+  child: OwnedProcess | undefined,
+  owner: OwnedProcess | undefined,
+  h: JobCloseHandshake,
+): string {
+  const stageMatch = owner?.stdout.text().match(/^JOBCLOSE-OWNER-FAIL ([^\r\n]{0,32})\r?$/m);
+  const stage = stageMatch ? (JOB_CLOSE_OWNER_STAGES.has(stageMatch[1]) ? stageMatch[1] : "other") : "none";
+  const phases = h.phases.slice(0, 16).map((phase) => (JOB_CLOSE_PHASES.includes(phase) ? phase : "other"));
+  const outcome = (label: string, p: OwnedProcess | undefined): string[] => [
+    `${label}Exited=${p?.exit != null}`,
+    `${label}ExitCode=${p?.exit ? diagnosticExitCode(p.exit.code) : "null"}`,
+    `${label}Signal=${p?.exit ? diagnosticSignal(p.exit.signal) : "null"}`,
+    `${label}ExitAfterClose=${p?.exit ? p.exit.afterClose : "null"}`,
+    `${label}Closed=${p?.closed ?? false}`,
+  ];
+  return [
+    "issue404 job-close:",
+    `phases=${phases.length > 0 ? phases.join(",") : "none"}`,
+    `ownerFailStage=${stage}`,
+    `ownerCloseWitness=${hasWitness(owner, "JOBCLOSE-OWNER-CLOSED")}`,
+    `settledAfterClose=${h.settledAfterClose}`,
+    ...outcome("child", child),
+    ...outcome("owner", owner),
+  ].join(" ");
 }
 
 afterEach(() => {
@@ -627,10 +919,27 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // Fail-closed ownership establishment: a marker path that is an existing
   // directory can never receive the record, so the watchdog's handshake fails.
   // The wrapper must abort BEFORE the user command runs — no unprotected
-  // execution, and no clean success. (When the watchdog dies after assigning
-  // the root, KILL_ON_JOB_CLOSE may kill the wrapper itself; either way the
-  // command never ran and the exit is not a clean 0.)
-  it("fails closed before running the command when ownership cannot be established", SKIP, async () => {
+  // execution — and the job must never read as complete: with the root gone
+  // and the marker still an unreadable directory, the production verdict is
+  // `unverifiable` and readiness stays blocked.
+  //
+  // The wrapper's exit status alone is NOT the success signal, so it is not
+  // asserted as "nonzero". Two outcomes are evidenced natively (Refs #404) and
+  // are the only ones accepted: 1 is the wrapper's own `__pi_review_fail` exit
+  // (native run printed stage=record-unreadable); 0 is a TERMINATION outcome,
+  // not clean completion — when the watchdog dies after assigning the root, the
+  // kernel's KILL_ON_JOB_CLOSE ends the wrapper, and the controlled native
+  // Job Object probe below observed exactly that exit status 0 after closing
+  // the only kill-on-close handle. That probe shows 0 is a possible
+  // termination outcome; it does not establish the exact cause of the
+  // historical exit-0 run here. Either way, the guards below — canary absent,
+  // marker unreadable, verdict `unverifiable`, readiness blocked — must hold;
+  // any other exit status or signal fails.
+  //
+  // Diagnosis only: before the assertions, one fixed-label line records the
+  // wrapper's exit status and the allowlisted abort stage names it reached. It
+  // never prints output, errors, environment, or paths, and decides nothing.
+  it("fails closed before running the command when ownership cannot be established", SKIP, async (t) => {
     const markerDir = mkdtempSync(join(tmpdir(), "pi-review-owner-fail-"));
     await runWithTempCleanup([markerDir], { recursive: true }, async () => {
       const wrapped = wrapWithPowerShellWatchdog(
@@ -641,13 +950,68 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
         5_000,
       );
       const executable = resolveWindowsPowerShell();
+      const spawnedAt = Date.now();
       const child = spawn(executable, [...POWERSHELL_ARGS, wrapped], { windowsHide: true });
+      // The exact owned root: the directly spawned wrapper's own pid.
+      const rootPid = child.pid;
       let out = "";
+      const stderrCapture = boundedCapture();
+      let exitObservedMs: number | null = null;
+      let stdioClosed = false;
+      child.once("exit", () => { exitObservedMs = Date.now() - spawnedAt; });
+      child.once("close", () => { stdioClosed = true; });
       child.stdout!.on("data", (d) => { out += d.toString(); });
       child.stderr!.on("data", (d) => { out += d.toString(); });
-      expect(await until(() => child.exitCode !== null || child.signalCode !== null, 30_000), "wrapper exited").toBe(true);
+      child.stderr!.on("data", stderrCapture.push);
+      const exited = await until(() => child.exitCode !== null || child.signalCode !== null, 30_000);
+      t.diagnostic(formatOwnershipFailureDiagnostic(
+        exited, child.exitCode, child.signalCode, wrapped, stderrCapture, stdioClosed, exitObservedMs,
+      ));
+      expect(exited, "wrapper exited").toBe(true);
       expect(out).not.toContain("OWNERFAIL-CANARY");
-      expect(child.exitCode === 0, "no clean exit without established ownership").toBe(false);
+      expect(typeof rootPid === "number" && rootPid > 0, "owned root pid").toBe(true);
+      // Only the natively evidenced outcomes: 1 (wrapper fail-closed exit) or
+      // 0 (kill-on-close termination), never a signal or any other status.
+      expect(child.signalCode, "no signal termination").toBe(null);
+      expect(
+        child.exitCode === 1 || child.exitCode === 0,
+        `exit status ${diagnosticExitCode(child.exitCode)} is an evidenced ownership-failure outcome (1 or 0)`,
+      ).toBe(true);
+
+      // Whatever the exit status, ownership evidence stays unreadable: the
+      // marker is still a directory, so no record (not even `0 failed`) exists.
+      let markerIsDirectory = false;
+      try { markerIsDirectory = statSync(markerDir).isDirectory(); } catch {
+        // Fail the fixed-label assertion below without exposing a filesystem path.
+      }
+      expect(markerIsDirectory, "marker path is still an unreadable directory").toBe(true);
+      // Root exit observed on the exact ChildProcess -> rootAlive=false. The
+      // production verdict for missing evidence is `unverifiable`, never `clear`.
+      expect(ownershipVerdict(markerDir, false, pidAlive), "production ownership verdict").toBe("unverifiable");
+
+      // The production readiness tracker, fed fixture metadata for THIS wrapper
+      // (its real pid and the real marker path) through its public structured
+      // input — this fixture is a directly spawned wrapper, not a registered
+      // ShellStart job. On Windows the snapshot must keep it in `running`.
+      const readiness = new BackgroundProcessReadiness();
+      const tracked = readiness.observeToolResult("ShellStart", {
+        details: {
+          kind: "pi-review-bg-shell",
+          event: "started",
+          id: "owner-fail-fixture",
+          label: "owner-fail-fixture",
+          pid: rootPid,
+          ownershipMarker: markerDir,
+        },
+      });
+      expect(tracked?.pid === rootPid && tracked?.ownershipMarker === markerDir, "tracks the fixture's own pid and marker").toBe(true);
+      const snapshot = readiness.snapshot();
+      const retained = snapshot.running[0];
+      expect(
+        snapshot.running.length === 1 && retained?.pid === rootPid && retained?.ownershipMarker === markerDir,
+        "readiness stays blocked on unverifiable ownership even after the root exited",
+      ).toBe(true);
+      expect(snapshot.unverifiable.length, "tracked as a structured job, not as unparseable output").toBe(0);
     });
   });
   // Paths with spaces and apostrophes must survive BOTH quoting layers: the
@@ -737,6 +1101,167 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
 
   it("keeps readiness blocked across watchdog polls until a descendant finishes naturally (Windows PowerShell 5.1)", SKIP, async () => {
     await withWindowsPowerShell51(runNaturalCompletion);
+  });
+});
+
+describe("native Windows Job Object kill-on-close outcome (Refs #404)", () => {
+  const fakeOwned = (stdout: string, exit: OwnedProcess["exit"] = null, closed = exit !== null): OwnedProcess => {
+    const capture = boundedCapture();
+    capture.push(stdout);
+    const writes: string[] = [];
+    const proc = { stdin: { write: (text: string) => { writes.push(text); return true; } }, writes } as unknown as ChildProcess;
+    return { proc, stdout: capture, exit, closed, spawnFailed: false };
+  };
+
+  // Cross-platform controls for the experiment's own pieces: the diagnostic
+  // line stays fixed-label/allowlisted, and the owner script carries only the
+  // approved Win32 surface (no pid-targeted or job-terminate kill path).
+  it("keeps the job-close diagnostic allowlisted and the owner fixture kill-free", () => {
+    const hostile = fakeOwned("JOBCLOSE-OWNER-FAIL C:\\Users\\secret token=abc\r\nraw error text\n", {
+      code: Number.NaN, signal: "not-a-signal" as NodeJS.Signals, afterClose: false,
+    });
+    const handshake: JobCloseHandshake = { phases: ["child-ready", "C:\\Users\\secret"], challenge: "f".repeat(32), settledAfterClose: false };
+    const line = formatJobCloseDiagnostic(fakeOwned("noise\n", { code: 1, signal: null, afterClose: true }), hostile, handshake);
+    expect(/^issue404 job-close:( [A-Za-z]+=[A-Za-z0-9,-]+)+$/.test(line), line).toBe(true);
+    expect(line).toContain("phases=child-ready,other");
+    expect(line).toContain("ownerFailStage=other");
+    expect(line).toContain("ownerExitCode=other");
+    expect(line).toContain("ownerSignal=other");
+    expect(line).toContain("childExitCode=1");
+    expect(/secret|token|raw|Users|ffff/.test(line), "no raw output or challenge").toBe(false);
+    const known = formatJobCloseDiagnostic(undefined, fakeOwned("JOBCLOSE-OWNER-FAIL in-job\r\n"), { phases: [], challenge: null, settledAfterClose: false });
+    expect(known).toContain("ownerFailStage=in-job");
+    expect(known).toContain("phases=none");
+    expect(known).toContain("childExited=false");
+
+    const script = jobCloseOwnerScript(4242);
+    for (const api of ["CreateJobObjectW", "SetInformationJobObject", "OpenProcess", "AssignProcessToJobObject", "IsProcessInJob", "CloseHandle", "0x2000"]) {
+      expect(script, api).toContain(api);
+    }
+    expect(/TerminateJobObject|TerminateProcess|Stop-Process|taskkill|\.Kill\(/i.test(script), "no kill path").toBe(false);
+    for (const stage of script.matchAll(/Fail '([a-z-]+)'/g)) {
+      expect(JOB_CLOSE_OWNER_STAGES.has(stage[1]), `stage ${stage[1]} allowlisted`).toBe(true);
+    }
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(() => jobCloseOwnerScript(bad), `pid ${bad}`).toThrow();
+    }
+  });
+
+  // No assignment before post-open child proof, structurally and in the gate.
+  it("forbids assignment until the original child answers a challenge sent after the owner opened its handle", () => {
+    // Owner script order: open + retain handle -> OPENED -> wait for ASSIGN ->
+    // assign -> IsProcessInJob -> only then release the process handle.
+    const script = jobCloseOwnerScript(4242);
+    const at = (needle: string): number => {
+      const index = script.indexOf(needle);
+      expect(index >= 0, `owner script contains ${needle}`).toBe(true);
+      return index;
+    };
+    const order = [
+      at("::OpenProcess("), at("JOBCLOSE-OWNER-OPENED"), at("-ne 'ASSIGN'"), at("::AssignProcessToJobObject("),
+      at("::IsProcessInJob("), at("::CloseHandle($child)"), at("JOBCLOSE-OWNER-ASSIGNED"),
+    ];
+    expect(order.every((index, i) => i === 0 || index > order[i - 1]), "owner handshake order").toBe(true);
+    expect(script.split("::AssignProcessToJobObject(").length - 1, "single assignment site").toBe(1);
+    expect(script.split("::CloseHandle($child)").length - 1, "single process-handle release").toBe(1);
+
+    const exited = { code: 1, signal: null, afterClose: false };
+    const fresh = (): JobCloseHandshake => ({ phases: ["child-ready"], challenge: null, settledAfterClose: false });
+    // Challenge refused before OPENED, and while either process is not live.
+    const early = fresh();
+    expect(sendChildChallenge(early, fakeOwned("JOBCLOSE-CHILD-READY\n"), fakeOwned("")), "no challenge before OPENED").toBe(false);
+    expect(early.challenge, "no challenge recorded").toBe(null);
+    expect(sendChildChallenge(fresh(), fakeOwned("", exited), fakeOwned("JOBCLOSE-OWNER-OPENED\n")), "dead child").toBe(false);
+    expect(sendChildChallenge(fresh(), fakeOwned(""), fakeOwned("JOBCLOSE-OWNER-OPENED\n", exited)), "dead owner").toBe(false);
+
+    // Proper order: OPENED, then one fresh challenge over the child's stdin.
+    const h = fresh();
+    const child = fakeOwned("JOBCLOSE-CHILD-READY\n");
+    const owner = fakeOwned("JOBCLOSE-OWNER-OPENED\n");
+    h.phases.push("owner-opened");
+    expect(jobCloseAssignmentAllowed(h, child, owner), "no assignment before the challenge").toBe(false);
+    expect(sendChildChallenge(h, child, owner), "challenge sent after OPENED").toBe(true);
+    expect(sendChildChallenge(h, child, owner), "challenge is one-shot").toBe(false);
+    expect(/^[0-9a-f]{32}$/.test(h.challenge ?? ""), "fresh hex challenge").toBe(true);
+    expect((child.proc as unknown as { writes: string[] }).writes).toEqual([`JOBCLOSE-CHALLENGE ${h.challenge}\n`]);
+    expect(jobCloseAssignmentAllowed(h, child, owner), "no assignment without the child's reply").toBe(false);
+    child.stdout.push(`JOBCLOSE-CHILD-ALIVE ${"0".repeat(32)}\n`);
+    expect(jobCloseAssignmentAllowed(h, child, owner), "a reply to another challenge does not count").toBe(false);
+    child.stdout.push(`JOBCLOSE-CHILD-ALIVE ${h.challenge}\n`);
+    expect(jobCloseAssignmentAllowed(h, child, owner), "assignment allowed after post-open proof").toBe(true);
+    // ...but never once either process has exited or closed, never twice, and
+    // never when the challenge was not ordered after OPENED.
+    expect(jobCloseAssignmentAllowed(h, { ...child, exit: exited }, owner), "child exited").toBe(false);
+    expect(jobCloseAssignmentAllowed(h, { ...child, closed: true }, owner), "child closed").toBe(false);
+    expect(jobCloseAssignmentAllowed(h, child, { ...owner, exit: exited }), "owner exited").toBe(false);
+    expect(jobCloseAssignmentAllowed({ ...h, phases: [...h.phases, "assign-sent"] }, child, owner), "one-shot assign").toBe(false);
+    expect(jobCloseAssignmentAllowed({ ...h, phases: ["child-ready", "challenge-sent", "owner-opened"] }, child, owner), "challenge before OPENED").toBe(false);
+  });
+
+  // The kernel outcome itself. Assertions cover the handshake and that both
+  // processes actually exit and close after the controlled closure; the
+  // child's exit status is RECORDED (diagnostic), never assumed.
+  it("records the child's actual exit status when the owner closes the only kill-on-close job handle", SKIP, async (t) => {
+    const notifier = changeNotifier();
+    const h: JobCloseHandshake = { phases: [], challenge: null, settledAfterClose: false };
+    const closeSent = (): boolean => h.phases.includes("close-sent");
+    let child: OwnedProcess | undefined;
+    let owner: OwnedProcess | undefined;
+    let bodyError: unknown;
+    try {
+      child = observeOwned(spawn(process.execPath, ["-e", JOB_CLOSE_CHILD_SOURCE], { windowsHide: true }), notifier, closeSent);
+      const c = child;
+      await notifier.wait(() => hasWitness(c, "JOBCLOSE-CHILD-READY") || !isLive(c), 30_000);
+      if (hasWitness(c, "JOBCLOSE-CHILD-READY") && isLive(c)) {
+        h.phases.push("child-ready");
+        const script = jobCloseOwnerScript(c.proc.pid!);
+        owner = observeOwned(
+          spawn(resolveWindowsPowerShell(), [
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64"),
+          ], { windowsHide: true }),
+          notifier, closeSent,
+        );
+        const o = owner;
+        await notifier.wait(() => hasWitness(o, "JOBCLOSE-OWNER-OPENED") || !isLive(o) || !isLive(c), 90_000);
+        if (hasWitness(o, "JOBCLOSE-OWNER-OPENED")) h.phases.push("owner-opened");
+        if (sendChildChallenge(h, c, o)) {
+          const reply = `JOBCLOSE-CHILD-ALIVE ${h.challenge}`;
+          await notifier.wait(() => hasWitness(c, reply) || !isLive(c) || !isLive(o), 30_000);
+          if (hasWitness(c, reply)) h.phases.push("child-alive");
+        }
+        if (jobCloseAssignmentAllowed(h, c, o)) {
+          h.phases.push("assign-sent");
+          o.proc.stdin!.write("ASSIGN\n");
+          await notifier.wait(() => hasWitness(o, "JOBCLOSE-OWNER-ASSIGNED") || !isLive(o) || !isLive(c), 30_000);
+          if (hasWitness(o, "JOBCLOSE-OWNER-ASSIGNED")) h.phases.push("owner-assigned");
+          if (hasWitness(o, "JOBCLOSE-OWNER-ASSIGNED") && isLive(o) && isLive(c)) {
+            h.phases.push("close-sent");
+            o.proc.stdin!.write("CLOSE\n");
+            h.settledAfterClose = await notifier.wait(() => ownedSettled(c) && ownedSettled(o), 30_000);
+          }
+        }
+      }
+      t.diagnostic(formatJobCloseDiagnostic(child, owner, h));
+      expect(h.phases, "assignment only after post-open child proof, then controlled closure").toEqual(JOB_CLOSE_PHASES);
+      expect(child.exit !== null && !child.exit.afterClose, "no child exit before the controlled job closure").toBe(false);
+      expect(h.settledAfterClose, "child and owner exit + close observed after closure (a timeout is not settlement)").toBe(true);
+      expect(hasWitness(owner, "JOBCLOSE-OWNER-CLOSED"), "owner closed its only job handle").toBe(true);
+      expect(owner!.exit?.code === 0 && owner!.exit.signal === null, "owner exited normally").toBe(true);
+      expect(child.exit?.afterClose === true && typeof child.exit.code === "number", "child exit status recorded").toBe(true);
+    } catch (err) {
+      bodyError = err;
+    }
+    const owned: Array<[string, OwnedProcess]> = [];
+    if (owner) owned.push(["owner", owner]);
+    if (child) owned.push(["child", child]);
+    const unconfirmed = await settleOwnedProcesses(owned, notifier, 30_000);
+    if (unconfirmed.length > 0) {
+      const message = `issue404 job-close cleanup unconfirmed: ${unconfirmed.join(",")} bodyFailed=${bodyError !== undefined}`;
+      t.diagnostic(message);
+      throw new Error(message, { cause: bodyError });
+    }
+    if (bodyError !== undefined) throw bodyError;
   });
 });
 

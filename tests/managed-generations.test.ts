@@ -1971,7 +1971,11 @@ test("a broad directory-only generation is deleted progressively instead of coll
   seedLegacy(f.builds, ["b", "c", "d", "e", "f"]);
   const before = countEntries(broad);
   assert.ok(before > 1400, `the fixture is really broad: ${before} entries`);
-  const bounded = admitStage(f, { cleanupBudgetMs: 25 });
+  // A zero budget is already expired when the pass starts, so the stop no longer
+  // depends on filesystem speed (a fast filesystem may legitimately finish this
+  // finite tree inside a small positive budget). The exhausted pass must still
+  // prove positive progress, deleting at least one real entry before it stops part-way.
+  const bounded = admitStage(f, { cleanupBudgetMs: 0 });
   assert.ok(existsSync(bounded.root));
   bounded.generation.release();
   assert.ok(existsSync(broad), "a short bounded pass stops part-way");

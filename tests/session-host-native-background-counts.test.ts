@@ -150,6 +150,7 @@ import {
   processIsAlive,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
+import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import { waitForDurableReadyLeaf } from "./helpers/change-signal";
 import { hasFullWidthNativeEditorRule } from "./helpers/session-host-native-saved-main-harness";
 import {
@@ -411,6 +412,160 @@ function cardCounts(text: string, label: string): CardCounts | undefined {
 /** True only for the honest task count the acceptance tolerates: known 0 or unknown. */
 function honestTaskCount(counts: CardCounts): boolean {
   return counts.tasks === null || counts.tasks === 0;
+}
+
+/**
+ * Issue #697 failure-only diagnostics for the post-ShellList known-zero shell
+ * assertion. Instrumentation only: the assertion itself is the original strict
+ * `assert.equal(cardCounts(sample, ROW_LABEL)?.shells, 0, message)` over ONE
+ * canonical frame sample, with the same extraction, actual, and expected. Only
+ * when that exact comparison fails is a bounded fact line appended to the
+ * original message, built from the same sample with the canonical roster
+ * helpers. It never reads another frame, waits, or flushes, never carries raw
+ * sidebar/native/activity/footer text or exception text, and any diagnostic
+ * failure degrades to a fixed `unavailable` label instead of replacing the
+ * original assertion failure.
+ */
+const SHELL_SAMPLE_MESSAGE_MAX_CHARS = 1024;
+const SHELL_SAMPLE_ROW_TOKEN_LIMIT = 16;
+const SHELL_SAMPLE_UNAVAILABLE = "unavailable";
+
+/** Existing public driver counters captured before the list prompt. */
+interface ShellSampleCounters {
+  readonly frameRevision: number;
+  readonly outputRevision: number;
+}
+
+/** Passive existing driver facts read in the same synchronous tick as the sample. */
+interface ShellSampleObservation extends ShellSampleCounters {
+  readonly redrawState: string;
+  readonly exited: boolean;
+}
+
+/** A safely bounded numeric fact; anything else is a fixed label. */
+function boundedSampleNumber(value: unknown): string {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return "?";
+  if (value < 0) return "neg";
+  return value > 999_999 ? ">999999" : String(value);
+}
+
+/** A signed bounded delta between two counter readings. */
+function boundedSampleDelta(observed: unknown, baseline: unknown): string {
+  if (typeof observed !== "number" || typeof baseline !== "number"
+    || !Number.isSafeInteger(observed) || !Number.isSafeInteger(baseline)) return "?";
+  const delta = observed - baseline;
+  if (delta < 0) return "neg";
+  return delta > 999_999 ? "+>999999" : `+${delta}`;
+}
+
+/**
+ * Fixed row-shape token for one SGR-stripped sidebar pane row (never its text):
+ * `_` blank, `H` roster header, `a` activity-indented, `S`/`U` selected or
+ * unselected marker rows suffixed `b` (count row this test's own pattern reads),
+ * `g` (other `bg tasks` row), or `m` (other marker row), `L` a row whose
+ * rendered title matches the label, and `t` any other unindented text.
+ */
+function sidebarRowShapeToken(line: string, label: string): string {
+  const trimmed = line.trimEnd();
+  if (trimmed.length === 0) return "_";
+  if (/^\s*Sessions \(\d+\)\s*$/u.test(line)) return "H";
+  if (line.startsWith("    ")) return "a";
+  const marker = line.startsWith("> ") ? "S" : line.startsWith("  ") ? "U" : undefined;
+  if (marker !== undefined) {
+    const body = trimmed.slice(2);
+    if (BACKGROUND_PATTERN.test(body)) return `${marker}b`;
+    return `${marker}${body.startsWith("bg tasks ") ? "g" : "m"}`;
+  }
+  return renderedTitleMatches(trimmed, label) ? "L" : "t";
+}
+
+/** Up to SHELL_SAMPLE_ROW_TOKEN_LIMIT run-length row-shape tokens from the roster header on. */
+function sidebarRowShapeTokens(text: string, label: string): string {
+  const pane = sidebarPaneLines(text, SIDEBAR_COLUMNS);
+  const offset = /^\s*Sessions \(\d+\)\s*$/u.test(pane[0] ?? "") ? 0 : 1;
+  const runs: Array<{ token: string; count: number }> = [];
+  for (const line of pane.slice(offset)) {
+    const token = sidebarRowShapeToken(line, label);
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.token === token) last.count += 1;
+    else runs.push({ token, count: 1 });
+  }
+  const shown = runs.slice(0, SHELL_SAMPLE_ROW_TOKEN_LIMIT)
+    .map((run) => (run.count > 1 ? `${run.token}*${boundedSampleNumber(run.count)}` : run.token));
+  const more = runs.length > SHELL_SAMPLE_ROW_TOKEN_LIMIT ? `,+${boundedSampleNumber(runs.length - SHELL_SAMPLE_ROW_TOKEN_LIMIT)}` : "";
+  return `[${shown.join(",")}${more}]`;
+}
+
+/** Fixed classification of one sample, using the same canonical extraction as the assertion. */
+function shellSampleFacts(text: string, label: string): string {
+  const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
+  const cards = rosterCards(text, SIDEBAR_COLUMNS);
+  const matches = cards.filter((card) => renderedTitleMatches(card.title, label));
+  const counts = cardCounts(text, label);
+  let outcome: string;
+  let bgRow = "none";
+  if (!parsed.complete) outcome = "incomplete";
+  else if (matches.length === 0) outcome = "missing";
+  else if (matches.length > 1) outcome = "duplicate";
+  else if (counts === undefined) {
+    outcome = "unparseable-bg";
+    const background = matches[0]!.background;
+    bgRow = background.endsWith("...") ? "clipped" : background.includes("N/A") ? "N/A" : "other";
+  } else if (counts.shells === null) outcome = "shells-unknown";
+  else if (counts.shells !== 0) outcome = "nonzero";
+  else outcome = "known-zero";
+  const shells = counts === undefined ? "undefined" : counts.shells === null ? "unknown" : boundedSampleNumber(counts.shells);
+  return `outcome=${outcome} bgRow=${bgRow} shells=${shells} roster=${parsed.complete ? "complete" : "incomplete"}`
+    + ` headerValid=${parsed.count !== undefined} count=${parsed.count === undefined ? "none" : boundedSampleNumber(parsed.count)}`
+    + ` entryEnd=${boundedSampleNumber(parsed.entryEnd)} cards=${boundedSampleNumber(cards.length)}`
+    + ` titleMatches=${boundedSampleNumber(matches.length)}`;
+}
+
+/** Same-sample passive counter facts; a throwing or malformed read is a fixed label. */
+function shellSampleCounterFacts(baseline: ShellSampleCounters, observe: () => ShellSampleObservation): string {
+  let observed: ShellSampleObservation;
+  try { observed = observe(); } catch { return `counters=${SHELL_SAMPLE_UNAVAILABLE}`; }
+  const redraw = observed.redrawState === "clear" || observed.redrawState === "held" || observed.redrawState === "unavailable"
+    ? observed.redrawState : "?";
+  return `frameRev=${boundedSampleNumber(observed.frameRevision)}(${boundedSampleDelta(observed.frameRevision, baseline.frameRevision)})`
+    + ` outputRev=${boundedSampleNumber(observed.outputRevision)}(${boundedSampleDelta(observed.outputRevision, baseline.outputRevision)})`
+    + ` redraw=${redraw} exited=${observed.exited === true ? "true" : observed.exited === false ? "false" : "?"}`;
+}
+
+/** Original message plus the bounded failure-only diagnostic, never longer than the cap. */
+function withShellSampleDiagnostic(
+  message: string,
+  text: string,
+  label: string,
+  baseline: ShellSampleCounters,
+  observe: () => ShellSampleObservation,
+): string {
+  const section = (build: () => string, name: string): string => {
+    try { return build(); } catch { return `${name}=${SHELL_SAMPLE_UNAVAILABLE}`; }
+  };
+  const diagnostic = `[#697 single-sample diagnostic] ${section(() => shellSampleFacts(text, label), "facts")}`
+    + ` ${section(() => shellSampleCounterFacts(baseline, observe), "counters")}`
+    + ` rows=${section(() => sidebarRowShapeTokens(text, label), "rows")}`;
+  const budget = SHELL_SAMPLE_MESSAGE_MAX_CHARS - message.length - 1;
+  if (budget <= 0) return message;
+  return `${message} ${diagnostic.length <= budget ? diagnostic : diagnostic.slice(0, budget)}`;
+}
+
+/**
+ * The original strict known-zero assertion over one already-taken canonical
+ * sample. `observe` is invoked only on failure, synchronously before the
+ * assertion throws, so its passive counters belong to the same sample.
+ */
+function assertKnownZeroShellSample(
+  sample: string,
+  message: string,
+  baseline: ShellSampleCounters,
+  observe: () => ShellSampleObservation,
+): void {
+  const shells = cardCounts(sample, ROW_LABEL)?.shells;
+  assert.equal(shells, 0, Object.is(shells, 0)
+    ? message
+    : withShellSampleDiagnostic(message, sample, ROW_LABEL, baseline, observe));
 }
 
 /** The sidebar pane footer text after a complete roster extent; undefined when incomplete. */
@@ -1110,6 +1265,11 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
       && hasFullWidthNativeEditorRule(text, OUTER_COLS - SIDEBAR_COLUMNS - 1) && text.includes("probe service stop requested"),
       "the stop turn restores the complete native editor before the list prompt");
     const beforeList = settledCount();
+    // #697 diagnostics only: passive existing counters before the list prompt.
+    const listPromptBaseline: ShellSampleCounters = {
+      frameRevision: driver.frameRevision,
+      outputRevision: driver.outputRevision,
+    };
     await driver.writeAndWait(PROMPT_LIST, (text) => text.includes(PROMPT_LIST),
       "the list prompt is typed into the real native editor");
     await driver.writeKeys(KEYS.enter, "the list prompt is submitted to the real native child");
@@ -1122,8 +1282,17 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     }), "the public ShellList result reports the exact job as done");
     assert.ok(toolCallCount("ShellList") >= 1,
       "the real native child dispatched the public ShellList tool call that corroborated the exact job");
-    assert.equal(cardCounts(driver.currentText(), ROW_LABEL)?.shells, 0,
-      "the row's known zero shell count is unchanged after the corroborating ShellList");
+    // One canonical sample serves both the unchanged strict assertion and, only
+    // on its failure, the bounded #697 diagnostic (same synchronous tick).
+    const listSample = driver.currentText();
+    assertKnownZeroShellSample(listSample,
+      "the row's known zero shell count is unchanged after the corroborating ShellList",
+      listPromptBaseline, () => ({
+        frameRevision: driver.frameRevision,
+        outputRevision: driver.outputRevision,
+        redrawState: driver.surface.redrawState(),
+        exited: driver.exitEvent !== undefined,
+      }));
     // Completion-side preparation cleanup is asserted only after the public
     // ShellList `done` settlement for the exact job, which the extension
     // reports only once that job's own settlement finished: the publisher has
@@ -1941,6 +2110,266 @@ test("scenario frame witnesses reject partial and mixed footers", () => {
   assert.equal(sidebarOwnedFrame(frame("Session host", mainFooter), "BGT"), false,
     "a stale host header is never the active child's owner header");
   assert.equal(activatedRowFrame(frame("Session host", mainFooter)), false);
+});
+
+/** Synthetic #697 controls: the exact original assertion message and comparison. */
+const SHELL_SAMPLE_MESSAGE = "the row's known zero shell count is unchanged after the corroborating ShellList";
+const SHELL_SAMPLE_CARD = ["BGT", "> agent idle | input none", "  bg tasks 0 | shells 0", "", ""] as const;
+const SHELL_SAMPLE_ACTIONS = ["  Saved conversations", "  New session", "  Quit host"] as const;
+const SHELL_SAMPLE_FOOTER = ["F8 toggle | enter open | esc hide", "q quit"] as const;
+
+/** The same composed-frame builder pattern as the footer witness test above. */
+function shellSampleFrame(rows: readonly string[], native: readonly string[] = [], header = "BGT"): string {
+  return [header, ...rows.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}│${native[index] ?? (index === 0 ? "Welcome" : "")}`)]
+    .join("\n");
+}
+
+function shellSampleRows(card: readonly string[] = SHELL_SAMPLE_CARD, count = 1, extra: readonly string[] = []): string[] {
+  return [` Sessions (${count}) `, ...card, ...SHELL_SAMPLE_ACTIONS, ...SHELL_SAMPLE_FOOTER, ...extra];
+}
+
+function withShellRow(row: string): string[] {
+  return [SHELL_SAMPLE_CARD[0], SHELL_SAMPLE_CARD[1], row, SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]];
+}
+
+/**
+ * Node's own strict-equality rendering appended after a custom message (for
+ * example `\n\n3 !== 0\n`); it depends only on actual/expected, so the
+ * instrumented failure must end with the exact same tail.
+ */
+function originalShellFailureTail(original: assert.AssertionError): string {
+  assert.ok(original.message.startsWith(SHELL_SAMPLE_MESSAGE), "the original failure starts with its literal message");
+  return original.message.slice(SHELL_SAMPLE_MESSAGE.length);
+}
+
+/** What the ORIGINAL un-instrumented assertion throws (or undefined when it passes). */
+function originalShellAssertionError(sample: string): assert.AssertionError | undefined {
+  try {
+    assert.equal(cardCounts(sample, ROW_LABEL)?.shells, 0, SHELL_SAMPLE_MESSAGE);
+    return undefined;
+  } catch (error) {
+    assert.ok(error instanceof assert.AssertionError, "the original assertion fails only as an AssertionError");
+    return error;
+  }
+}
+
+const SYNTHETIC_BASELINE: ShellSampleCounters = { frameRevision: 100, outputRevision: 40 };
+const syntheticObservation = (): ShellSampleObservation =>
+  ({ frameRevision: 112, outputRevision: 47, redrawState: "clear", exited: false });
+
+/**
+ * Runs the instrumented assertion and proves it fails exactly as the original:
+ * same error class, code, operator, actual, and expected, with the original
+ * message as an unmodified prefix and the whole message within the cap.
+ */
+function instrumentedShellFailure(sample: string, observe = syntheticObservation): string {
+  const original = originalShellAssertionError(sample);
+  assert.ok(original, "the synthetic sample fails the original strict assertion");
+  const tail = originalShellFailureTail(original);
+  let observedCalls = 0;
+  let instrumented: unknown;
+  try {
+    assertKnownZeroShellSample(sample, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, () => { observedCalls += 1; return observe(); });
+  } catch (error) {
+    instrumented = error;
+  }
+  assert.ok(instrumented instanceof assert.AssertionError, "the instrumented assertion still throws the original AssertionError kind");
+  assert.equal(instrumented.code, original.code);
+  assert.equal(instrumented.operator, original.operator);
+  assert.ok(Object.is(instrumented.actual, original.actual), "the instrumented failure keeps the exact original actual value");
+  assert.ok(Object.is(instrumented.expected, original.expected), "the instrumented failure keeps the exact original expected value");
+  assert.equal(instrumented.generatedMessage, false);
+  assert.equal(observedCalls, 1, "same-sample counters are read exactly once, on failure");
+  assert.ok(instrumented.message.endsWith(tail), "Node's own actual/expected rendering is unchanged after the message");
+  const reported = instrumented.message.slice(0, instrumented.message.length - tail.length);
+  assert.ok(reported.startsWith(`${SHELL_SAMPLE_MESSAGE} [#697 single-sample diagnostic] `),
+    "the original message is preserved verbatim before the diagnostic");
+  assert.ok(reported.length <= SHELL_SAMPLE_MESSAGE_MAX_CHARS, "the supplied assertion message stays within its cap");
+  assert.equal(reported.includes("BGT"), false, "no raw sidebar title text is copied into the diagnostic");
+  return reported.slice(SHELL_SAMPLE_MESSAGE.length + 1);
+}
+
+test("#697 single-sample shell diagnostics keep the strict assertion and classify one sample", () => {
+  // Pass: the complete known-zero sample passes both forms, and the failure-only
+  // diagnostic (including its counter observation) is never built.
+  const passing = shellSampleFrame(shellSampleRows());
+  assert.equal(originalShellAssertionError(passing), undefined, "the canonical complete known-zero sample passes the original assertion");
+  assert.doesNotThrow(() => assertKnownZeroShellSample(passing, SHELL_SAMPLE_MESSAGE, SYNTHETIC_BASELINE, () => {
+    throw new Error("same-sample counters must not be read on a passing sample");
+  }));
+  assert.match(shellSampleFacts(passing, ROW_LABEL), /^outcome=known-zero bgRow=none shells=0 roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=1$/u);
+
+  // Nonzero known count: actual is the observed number.
+  const nonzero = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 3"))));
+  assert.match(nonzero, /outcome=nonzero bgRow=none shells=3 roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=1 /u);
+  assert.match(nonzero, / frameRev=112\(\+12\) outputRev=47\(\+7\) redraw=clear exited=false /u);
+  assert.match(nonzero, / rows=\[H,L,Sm,Ub,_\*2,Um\*3,t\*2\]$/u);
+
+  // Unknown count maps to null, distinct from an undefined extraction.
+  const unknown = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells unknown"))));
+  assert.match(unknown, /outcome=shells-unknown bgRow=none shells=unknown roster=complete /u);
+
+  // Incomplete: an erased status row leaves no complete roster (undefined extraction).
+  const erased = instrumentedShellFailure(shellSampleFrame(shellSampleRows(
+    [SHELL_SAMPLE_CARD[0], "", SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]]),
+  ));
+  assert.match(erased, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=0 cards=0 titleMatches=0 /u);
+  assert.match(erased, / rows=\[H,L,_,Ub,_\*2,Um\*3,t\*2\]$/u);
+
+  // Missing title: a complete roster without the owned label.
+  const missing = instrumentedShellFailure(shellSampleFrame(shellSampleRows(
+    ["Other", SHELL_SAMPLE_CARD[1], SHELL_SAMPLE_CARD[2], SHELL_SAMPLE_CARD[3], SHELL_SAMPLE_CARD[4]]),
+  ));
+  assert.match(missing, /outcome=missing bgRow=none shells=undefined roster=complete headerValid=true count=1 entryEnd=8 cards=1 titleMatches=0 /u);
+
+  // Duplicate title: two complete cards both match the owned label.
+  const duplicateCard = [...SHELL_SAMPLE_CARD, "BGT", "  agent idle | input none", "  bg tasks 0 | shells 0", "", ""];
+  const duplicateSample = shellSampleFrame(shellSampleRows(duplicateCard, 2));
+  assert.equal(parseRosterFrame(duplicateSample, SIDEBAR_COLUMNS).complete, true, "the duplicate control is a complete two-card roster");
+  const duplicate = instrumentedShellFailure(duplicateSample);
+  assert.match(duplicate, /outcome=duplicate bgRow=none shells=undefined roster=complete headerValid=true count=2 entryEnd=13 cards=2 titleMatches=2 /u);
+
+  // N/A count row: complete for the shared parser, unreadable for this test's own pattern.
+  const notApplicableSample = shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells N/A")));
+  assert.equal(parseRosterFrame(notApplicableSample, SIDEBAR_COLUMNS).complete, true);
+  assert.match(instrumentedShellFailure(notApplicableSample), /outcome=unparseable-bg bgRow=N\/A shells=undefined roster=complete /u);
+
+  // Clipped count row: the renderer's exact width-2 ellipsis form.
+  const clippedRow = "  bg tasks 1234567890123 | shell...";
+  assert.equal(clippedRow.length, SIDEBAR_COLUMNS, "the clipped control fills the exact pane width");
+  const clippedSample = shellSampleFrame(shellSampleRows(withShellRow(clippedRow)));
+  assert.equal(parseRosterFrame(clippedSample, SIDEBAR_COLUMNS).complete, true);
+  const clipped = instrumentedShellFailure(clippedSample);
+  assert.match(clipped, /outcome=unparseable-bg bgRow=clipped shells=undefined roster=complete /u);
+  assert.match(clipped, / rows=\[H,L,Sm,Ug,/u);
+
+  // A not-applicable TASK cell is equally unreadable to this test's own pattern
+  // (the shared grammar admits only unknown/digits/N/A or clipping, so the
+  // `other` label is a defensive fallback for any future admitted form).
+  const tasksNotApplicable = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks N/A | shells 0"))));
+  assert.match(tasksNotApplicable, /outcome=unparseable-bg bgRow=N\/A shells=undefined roster=complete /u);
+});
+
+test("#697 shell diagnostics stay bounded, private, and never replace the original failure", () => {
+  const SENTINELS = ["PRIVATE-SENTINEL", "/Users/", "sess-0123", "TOKEN="] as const;
+  const privateNative = "PRIVATE-SENTINEL /Users/someone/.secret sess-0123 TOKEN=abc";
+  // A complete nonzero roster whose native pane, outer header, activity rows,
+  // and footer/notice rows all carry sentinels: only shapes and facts escape.
+  const privateCard = [SHELL_SAMPLE_CARD[0], "> agent idle | input none", "  bg tasks 0 | shells 4",
+    "    PRIVATE-SENTINEL activity", "    sess-0123"];
+  const completeRows = shellSampleRows(privateCard, 1, ["PRIVATE-SENTINEL footer /Users/x", "/Users/someone/private"])
+    .map((row) => (row === "q quit" ? "q quit PRIVATE-SENTINEL" : row));
+  const completePrivate = shellSampleFrame(completeRows, completeRows.map(() => privateNative), "PRIVATE-SENTINEL header");
+  assert.equal(parseRosterFrame(completePrivate, SIDEBAR_COLUMNS).complete, true, "the private control is a complete roster");
+  const completeMessage = instrumentedShellFailure(completePrivate);
+  assert.match(completeMessage, /outcome=nonzero bgRow=none shells=4 roster=complete /u);
+  assert.match(completeMessage, / rows=\[H,L,Sm,Ub,a\*2,Um\*3,t\*4\]$/u);
+
+  // Unknown marker-shaped sidebar rows after the action tail make the roster
+  // incomplete; they are reported only as shape tokens.
+  const unknownRows = shellSampleRows(privateCard, 1, ["  PRIVATE-SENTINEL unknown", "> TOKEN=abc sess-0123"]);
+  const incompletePrivate = shellSampleFrame(unknownRows, unknownRows.map(() => privateNative), "PRIVATE-SENTINEL header");
+  const incompleteMessage = instrumentedShellFailure(incompletePrivate);
+  assert.match(incompleteMessage, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=8 /u);
+  assert.match(incompleteMessage, / rows=\[H,L,Sm,Ub,a\*2,Um\*3,t\*2,Um,Sm\]$/u);
+  for (const message of [completeMessage, incompleteMessage]) {
+    for (const sentinel of SENTINELS) {
+      assert.equal(message.includes(sentinel), false, `no private sentinel ${sentinel} reaches the diagnostic`);
+    }
+  }
+
+  // A throwing passive counter read degrades to a fixed label without its text.
+  const throwingObserve = (): ShellSampleObservation => { throw new Error("PRIVATE-SENTINEL /Users/someone sess-0123"); };
+  const unavailable = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 2"))), throwingObserve);
+  assert.match(unavailable, / counters=unavailable rows=/u);
+  for (const sentinel of SENTINELS) assert.equal(unavailable.includes(sentinel), false);
+
+  // A throwing baseline/counter fact is equally contained, never a replacement error.
+  const hostileBaseline = { get frameRevision(): number { throw new Error("PRIVATE-SENTINEL"); }, outputRevision: 1 };
+  const hostileSample = shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 2")));
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, SHELL_SAMPLE_MESSAGE, hostileBaseline, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.actual === 2 && error.expected === 0
+      && error.message.includes(" counters=unavailable ") && !error.message.includes("PRIVATE-SENTINEL"));
+
+  // Malformed/huge observed facts are bounded labels, not echoed values.
+  const malformed = instrumentedShellFailure(hostileSample, () => ({
+    frameRevision: Number.MAX_SAFE_INTEGER, outputRevision: -5, redrawState: "PRIVATE-SENTINEL", exited: "yes" as unknown as boolean,
+  }));
+  assert.match(malformed, / frameRev=>999999\(\+>999999\) outputRev=neg\(neg\) redraw=\? exited=\? /u);
+
+  // Huge counts and header counts stay bounded; the extraction's actual stays exact.
+  const huge = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 999999999999"))));
+  assert.match(huge, /outcome=nonzero bgRow=none shells=>999999 /u);
+  const hugeHeader = instrumentedShellFailure(shellSampleFrame(shellSampleRows(SHELL_SAMPLE_CARD, 99_999_999)));
+  assert.match(hugeHeader, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=>999999 /u);
+
+  // At most 16 row-shape tokens, with a bounded overflow count.
+  const manyShapes = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? "x" : ""));
+  const capped = instrumentedShellFailure(shellSampleFrame(shellSampleRows(withShellRow("  bg tasks 0 | shells 5"), 1, manyShapes)));
+  const rowsPart = /rows=\[([^\]]*)\]$/u.exec(capped);
+  assert.ok(rowsPart, "the row-shape token list is present");
+  const tokens = rowsPart[1]!.split(",");
+  assert.equal(tokens.length, SHELL_SAMPLE_ROW_TOKEN_LIMIT + 1, "sixteen tokens plus one bounded overflow marker");
+  assert.match(tokens[tokens.length - 1]!, /^\+\d+$/u);
+
+  // The whole message never exceeds the cap; an over-long original is kept verbatim.
+  const hostileTail = originalShellFailureTail(originalShellAssertionError(hostileSample)!);
+  const longMessage = "m".repeat(SHELL_SAMPLE_MESSAGE_MAX_CHARS + 10);
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, longMessage, SYNTHETIC_BASELINE, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.message === `${longMessage}${hostileTail}`);
+  const nearCap = "m".repeat(SHELL_SAMPLE_MESSAGE_MAX_CHARS - 40);
+  assert.throws(() => assertKnownZeroShellSample(hostileSample, nearCap, SYNTHETIC_BASELINE, syntheticObservation),
+    (error: unknown) => error instanceof assert.AssertionError && error.message.endsWith(hostileTail)
+      && error.message.length - hostileTail.length === SHELL_SAMPLE_MESSAGE_MAX_CHARS
+      && error.message.startsWith(`${nearCap} [#697`));
+});
+
+test("SYNTHETIC mechanism evidence (not a native or historical reproduction): a real TerminalSurface split-row redraw", async () => {
+  // Deterministic in-process control only: the real TerminalSurface parser is
+  // fed a complete synthetic roster, then an erase-row chunk, then the redraw
+  // suffix, and the same instrumented assertion classifies each single sample.
+  const cols = SIDEBAR_COLUMNS + 1 + 20;
+  const surface = new TerminalSurface(cols, 16);
+  try {
+    let writes = 0;
+    const write = async (chunk: string): Promise<void> => {
+      surface.write(chunk);
+      writes += 1;
+      await surface.flush();
+    };
+    const sampleOf = (): string => surface.frame().lines.map(stripGeneratedSgr).join("\n");
+    const observe = (): ShellSampleObservation =>
+      ({ frameRevision: writes, outputRevision: writes, redrawState: surface.redrawState(), exited: false });
+    const baseline: ShellSampleCounters = { frameRevision: 0, outputRevision: 0 };
+    const rows = shellSampleRows();
+    await write(`\x1b[H\x1b[2J${shellSampleFrame(rows).split("\n").join("\r\n")}`);
+    const complete = sampleOf();
+    assert.doesNotThrow(() => assertKnownZeroShellSample(complete, SHELL_SAMPLE_MESSAGE, baseline, () => {
+      throw new Error("no counters are read for a passing synthetic sample");
+    }), "the complete synthetic roster passes the strict assertion");
+
+    // Erase-row chunk: the status row (terminal row 4) is cleared before its redraw.
+    await write("\x1b[4;1H\x1b[2K");
+    const split = sampleOf();
+    assert.equal(cardCounts(split, ROW_LABEL), undefined, "the split sample has no extractable card counts");
+    let splitMessage = "";
+    assert.throws(() => assertKnownZeroShellSample(split, SHELL_SAMPLE_MESSAGE, baseline, observe), (error: unknown) => {
+      if (!(error instanceof assert.AssertionError) || error.actual !== undefined || error.expected !== 0) return false;
+      splitMessage = error.message;
+      return true;
+    });
+    assert.match(splitMessage, /outcome=incomplete bgRow=none shells=undefined roster=incomplete headerValid=true count=1 entryEnd=0 cards=0 titleMatches=0 /u);
+    assert.match(splitMessage, / frameRev=2\(\+2\) outputRev=2\(\+2\) redraw=clear exited=false rows=\[H,L,_,Ub,/u);
+
+    // Redraw suffix: the row is repainted and the same assertion recovers.
+    await write(`\x1b[4;1H${rows[2]!.padEnd(SIDEBAR_COLUMNS)}│`);
+    const recovered = sampleOf();
+    assert.doesNotThrow(() => assertKnownZeroShellSample(recovered, SHELL_SAMPLE_MESSAGE, baseline, () => {
+      throw new Error("no counters are read once the synthetic redraw recovers");
+    }), "the redrawn synthetic roster passes the strict assertion again");
+  } finally {
+    surface.dispose();
+  }
 });
 
 test("the job fixture path contract refuses unsafe service directories before mutation", () => {

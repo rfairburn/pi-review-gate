@@ -38,6 +38,13 @@ import path from "node:path";
 import test from "node:test";
 import { Terminal } from "@xterm/headless";
 import { DEFAULT_CONFIG, type ReviewGateConfig } from "../src/config";
+import registerBackgroundShell, { reapAll } from "../src/background-shell";
+import { shellResultDetails } from "../src/background-shell/result-view";
+import { APPLY_PATCH_TOOL_NAME, registerApplyPatchTool } from "../src/apply-patch/tool";
+import { DeferredToolManager } from "../src/deferred-tools";
+import { EXECUTION_TOOL_NAMES, ExecutionToolManager } from "../src/execution/tool";
+import { normalizeConfig } from "../src/config";
+import { createState } from "../src/state";
 import { createToolProtectionCoordinator } from "../src/tool-protection/coordinator";
 import { setNativeExpansionHost } from "../src/presentation-hints";
 import {
@@ -126,7 +133,10 @@ const SKIP_REASON =
  * is not rendered, so it must not count toward the row width).
  */
 function stripAnsi(text: string): string {
-  return text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+  // CSI parameters may carry colon sub-parameters (`\x1b[0;38:2::255:0:0m`),
+  // which the terminal, the host width guard, and the Shell family's own wrap
+  // all treat as zero-width; the helper has to measure the same way.
+  return text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;:]*[a-zA-Z]/g, "");
 }
 
 if (!host) {
@@ -170,12 +180,55 @@ if (!host) {
   // `createShellRenderers(config.prompt)` with the bash prompt "$" and declares
   // no `renderShell`, so the host's own `Box` (padding plus row background)
   // frames this family — the other half of the #547 card shape.
-  const nativeBashDefinition = {
-    name: "bash",
-    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "bash.js")) as {
-      createShellRenderers(prompt: string): Record<string, unknown>;
-    }).createShellRenderers("$"),
+  const { createShellRenderers } = h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "bash.js")) as {
+    createShellRenderers(prompt: string): Record<string, unknown>;
   };
+  const nativeBashDefinition = { name: "bash", ...createShellRenderers("$") };
+  // `powershell` is the same installed factory with the host's powershell prompt
+  // (`renderers/index.js` builds both builtins from `createShellRenderers`, and
+  // `tools/powershell.js` spreads them the same way `tools/bash.js` does). This
+  // is the real powershell presentation exercised headlessly through that shared
+  // factory — no PowerShell process is started anywhere in this file.
+  const nativePowershellDefinition = { name: "powershell", ...createShellRenderers("PS>") };
+  // The remaining installed builtin renderers, spread into definitions the same
+  // way the shipped tools do. None declares `renderShell`, so the host's `Box`
+  // frames all of them.
+  const nativeReadDefinition = {
+    name: "read",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "read.js")) as {
+      readRenderers: Record<string, unknown>;
+    }).readRenderers,
+  };
+  const nativeGrepDefinition = {
+    name: "grep",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "grep.js")) as {
+      grepRenderers: Record<string, unknown>;
+    }).grepRenderers,
+  };
+  const nativeFindDefinition = {
+    name: "find",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "find.js")) as {
+      findRenderers: Record<string, unknown>;
+    }).findRenderers,
+  };
+  const nativeLsDefinition = {
+    name: "ls",
+    ...(h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "ls.js")) as {
+      lsRenderers: Record<string, unknown>;
+    }).lsRenderers,
+  };
+  // The installed write renderers (`core/tools/renderers/write.js`), spread into
+  // a definition the same way the shipped write tool does. `write` declares no
+  // `renderShell`, so the host's own `Box` frames it — and unlike the shell
+  // renderers it never runs retained text through `stripAnsi`, which is why it
+  // is the native card #677 has to repair.
+  const nativeWriteRenderers = h.req(path.join(h.agentDir, "dist", "core", "tools", "renderers", "write.js")) as {
+    writeRenderers: {
+      renderCall(args: unknown, theme: unknown, context: unknown): unknown;
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): unknown;
+    };
+  };
+  const nativeWriteDefinition = { name: "write", ...nativeWriteRenderers.writeRenderers };
   // The host's own custom-entry component (an installed internal module, read the
   // same way as the edit renderers above): it is what wraps the gate's entry
   // renderer in a real transcript row.
@@ -2203,6 +2256,1507 @@ if (!host) {
         assert.equal(combined.split("Tool protection: PASS — the auditor approved this codemode call").length - 1, debug ? 1 : 0,
           `the root status row appears once, and only with debug On (debug ${debug})`);
       }
+    });
+  });
+
+
+  // ── #677: Shell family rows keep the themed background across resets ────
+  //
+  // The reported #677 shape is a Shell card whose own row content carries a
+  // full reset: the host pads the row and paints it with ONE background span,
+  // so the reset cancels that span for the rest of the row and the card's own
+  // right padding falls back to the terminal background. Both Shell triggers
+  // are witnessed here through the REAL registrations and the REAL host row:
+  // the family's wrap closing a continued styled row, and retained child
+  // output that already carries resets (mid-row and at the end of a short
+  // row). The repair may only re-open the live theme's background after the
+  // reset: same glyphs, same rows, same foregrounds, nothing painted past the
+  // card.
+
+  /** The five Shell registrations, taken from the production registrar. */
+  function registerShellTools(): Record<string, Record<string, unknown>> {
+    const tools: Record<string, Record<string, unknown>> = {};
+    registerBackgroundShell({
+      registerTool: (tool: Record<string, unknown>) => {
+        tools[String(tool.name)] = tool;
+      },
+      on: () => ({}),
+      sendMessage: () => ({}),
+    } as never);
+    return tools;
+  }
+
+  const RESET_BEARING_DIFF = "retained diff context alpha beta gamma delta epsilon zeta eta theta iota kappa lambda \x1b[0m tail after a full reset mu nu xi omicron pi rho";
+  const RESET_BEARING_BG_RESET = "retained context with a background reset \x1b[49m and more retained text alpha beta gamma delta epsilon";
+  const LONG_SHELL_TEXT = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon";
+  const RETAINED_RESET_MID = `retained output ${LONG_SHELL_TEXT} \x1b[0m continues after a full reset ${LONG_SHELL_TEXT}`;
+  const RETAINED_RESET_TRAILING = "short retained line \x1b[0m";
+  const RETAINED_BG_RESET = `retained line with a background reset \x1b[49m and more ${LONG_SHELL_TEXT}`;
+  const RETAINED_COLOURED = `\x1b[38;5;208mkept foreground ${LONG_SHELL_TEXT}\x1b[39m tail`;
+  // A reset combined with a foreground in ONE sequence: the background is
+  // still unset at the end of it, while the red foreground must survive.
+  const RETAINED_RESET_PLUS_FG = `reset then red ${LONG_SHELL_TEXT} \x1b[0;38;5;196m red after a reset ${LONG_SHELL_TEXT}`;
+  // The same with a colon-form (sub-parameter) foreground: the sequence has to
+  // be inspected despite its colons, and the truecolour red must survive.
+  const RETAINED_RESET_PLUS_COLON_FG = `reset then colon red ${LONG_SHELL_TEXT} \x1b[0;38:2::255:0:0m colon red after a reset ${LONG_SHELL_TEXT}`;
+  // The colon-form (sub-parameter) foreground of a combined reset is asserted
+  // in the dedicated own-background test below, which loops over the indexed,
+  // zero-padded, and colon forms of a reset combined with a background.
+
+  function shellLogCard(bodyLines: string[]): Record<string, unknown> {
+    return {
+      content: [{ type: "text", text: `job1 "view" running\n\`\`\`\n${bodyLines.join("\n")}\n\`\`\`` }],
+      isError: false,
+      details: shellResultDetails("ShellLog", {
+        id: "job1", label: "view", status: "running",
+        totalLines: bodyLines.length, droppedLines: 0, from: 0, nextOffset: bodyLines.length,
+        requestOffset: 0, requestLimit: bodyLines.length,
+      }),
+    };
+  }
+
+  /** The shell-family fixtures that carry a reset into the card: one per
+   *  registered tool, each long enough to wrap at both tested widths. */
+  function shellResetFixtures(): Array<{ tool: string; result: Record<string, unknown> }> {
+    return [
+      {
+        tool: "ShellStart",
+        result: {
+          content: [{ type: "text", text: `Started "view" as job1 (pid 1234); currently running.` }],
+          isError: false,
+          details: shellResultDetails("ShellStart", {
+            event: "started", id: "job1", label: LONG_SHELL_TEXT,
+            command: `echo ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT}`,
+            state: "running", pid: 1234, startedAt: 1_700_000_000_000, watching: "exit",
+          }),
+        },
+      },
+      {
+        tool: "ShellList",
+        result: {
+          content: [{ type: "text", text: `1 background job(s):\n  job1 "${LONG_SHELL_TEXT}" running (pid 1234)` }],
+          isError: false,
+          details: shellResultDetails("ShellList", {
+            jobs: [{
+              id: "job1", label: LONG_SHELL_TEXT, status: "running", pid: 1234,
+              command: `sleep ${LONG_SHELL_TEXT}`, watching: "exit",
+              totalLines: 3, droppedCount: 0, elapsedMs: 5000, lastOutputAgoMs: 1000,
+            }],
+          }),
+        },
+      },
+      // The asserted retained lines sit at the END of the returned range: the
+      // collapsed card truthfully shows the tail of that range, so a line in
+      // the middle is legitimately omitted there (and asserted expanded only).
+      { tool: "ShellLog", result: shellLogCard([RETAINED_RESET_MID, RETAINED_RESET_TRAILING, RETAINED_BG_RESET, RETAINED_RESET_PLUS_FG, RETAINED_RESET_PLUS_COLON_FG, RETAINED_COLOURED]) },
+      {
+        tool: "ShellSend",
+        result: {
+          content: [{ type: "text", text: `Sent 40 bytes to job1 stdin (delivery confirmed).` }],
+          isError: false,
+          details: shellResultDetails("ShellSend", {
+            event: "stdin-write", id: "job1", label: LONG_SHELL_TEXT, bytes: 40, delivery: "confirmed",
+          }),
+        },
+      },
+      {
+        tool: "ShellStop",
+        result: {
+          content: [{ type: "text", text: "Stopping 2 job(s)." }],
+          isError: false,
+          details: shellResultDetails("ShellStop", {
+            target: "all", count: 2, outcome: "stopping",
+            targets: [{ id: "job1", label: LONG_SHELL_TEXT }, { id: "job2", label: `two ${LONG_SHELL_TEXT}` }],
+          }),
+        },
+      },
+    ];
+  }
+
+  /** One real host row around a registered Shell renderer. */
+  function shellHostRow(tool: string, renderResult: unknown, result: unknown, isPartial = false) {
+    const component = new h.agent.ToolExecutionComponent(
+      tool, `${tool}-call`, {}, {}, { name: tool, renderResult }, ui, "/work",
+    );
+    component.setArgsComplete();
+    component.updateResult(result, isPartial);
+    return component;
+  }
+
+  const shellBgToken = (isPartial: boolean, isError: boolean): string =>
+    isPartial ? "toolPendingBg" : isError ? "toolErrorBg" : "toolSuccessBg";
+
+  test("real host: registered Shell rows keep the themed background across every reset (#677)", async () => {
+    const shellTools = registerShellTools();
+    for (const fixture of shellResetFixtures()) {
+      const renderResult = shellTools[fixture.tool]!.renderResult;
+      assert.ok(renderResult, `${fixture.tool} registers a result renderer`);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error", "pending"] as const) {
+            const isPartial = state === "pending";
+            // The host's own row state: a failed result paints the error
+            // background, a partial result the pending one. (The legacy
+            // `result.isError` fallback the renderers keep is covered in
+            // tests/background-shell-result-view.test.ts.)
+            const result = state === "error" ? { ...fixture.result, isError: true } : fixture.result;
+            const row = shellHostRow(fixture.tool, renderResult, result, isPartial);
+            row.setExpanded(expanded);
+            const lines = row.render(width);
+            const label = `${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            // The trigger itself: unless the card really carries a reset, this
+            // case would pass vacuously. (A pending card renders only a short
+            // status line, so it cannot carry one.)
+            if (!isPartial) {
+              assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+                `${label}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+            }
+
+            // The card is one continuous themed band, measured CELL BY CELL in
+            // the pinned headless VT: every cell of every card row — text,
+            // gap, and the host's own padding to the right of the last glyph —
+            // carries the live theme's row background. (The string-level
+            // `assertContinuousBackground` cannot see this seam: a row keeps
+            // its opening sequence even after a reset cancels it.)
+            const backgroundAnsi = theme.getBgAnsi(shellBgToken(isPartial, state !== "success"));
+            await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+            assertFitsWidth(lines, width, label);
+
+            // Nothing is painted outside the card: the guard column and the
+            // first row after the card keep the terminal's own background.
+            const cells = await cardCells(lines, width + 1);
+            for (const [index, cellRow] of cells.entries()) {
+              if (index === 0) continue;
+              // Not merely "not the theme colour": the column past the card
+              // carries NO background at all, so nothing the repaired row
+              // holds — the theme re-open or a retained own-background
+              // sequence — paints outside the card.
+              assert.equal(cellRow[width]!.bgMode, 0,
+                `${label}: the guard column past the card carries a background`);
+            }
+            const pastCard = await cardCells([...lines, ""], width);
+            const afterCard = pastCard.at(-1)!;
+            assert.ok(afterCard.every((cell) => cell.bgMode === 0),
+              `${label}: a row outside the card is painted`);
+
+            // The reset itself survives (nothing is stripped or normalized),
+            // and the retained text and the family's own foreground stay.
+            const joined = lines.join("\n");
+            if (fixture.tool === "ShellLog" && state === "success") {
+              // Nothing is stripped or normalized: a retained reset still
+              // reaches the row, and the retained text is still shown.
+              const clearsBackground = /\x1b\[(?:0+m|49m)/.test(joined);
+              // The family's wrap breaks on cell boundaries and the host pads
+              // every row, so compare the displayed characters with styling,
+              // padding, and line breaks removed: nothing may be dropped.
+              const flatten = (text: string): string => stripAnsi(text).replace(/\s+/g, "");
+              const displayed = flatten(lines.join(""));
+              assert.ok(clearsBackground, `${label}: the retained reset was removed`);
+              if (expanded) {
+                // Expansion renders the complete returned range.
+                for (const text of [RETAINED_RESET_MID, RETAINED_RESET_TRAILING, RETAINED_BG_RESET, RETAINED_COLOURED]) {
+                  const wanted = flatten(text);
+                  assert.ok(wanted.length > 0 && displayed.includes(wanted),
+                    `${label}: retained text ${JSON.stringify(stripAnsi(text).trim())} was lost`);
+                }
+              } else {
+                // Collapsed keeps the truthful bounded tail of the returned
+                // range and says how many earlier lines it omitted.
+                assert.ok(joined.includes("earlier returned line"), `${label}: the collapsed tail note was lost`);
+              }
+              const kept = packedColor("\x1b[38;5;208m", "fg");
+              const keptCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", kept)).length;
+              assert.ok(keptCells > 0, `${label}: retained foreground was not kept`);
+              // A reset combined with a foreground keeps that foreground while
+              // the row background is re-opened, and a reset combined with its
+              // own background keeps that background.
+              if (expanded) {
+                // The combined reset+foreground lines are asserted where the
+                // complete returned range is rendered; the collapsed card
+                // truthfully shows only the tail of that range.
+                const redFg = packedColor("\x1b[38;5;196m", "fg");
+                const redCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", redFg)).length;
+                assert.ok(redCells > 0, `${label}: the foreground of a combined reset sequence was not kept`);
+                // The colon-form (sub-parameter) truecolour red of
+                // `\x1b[0;38:2::255:0:0m` survives as the same RGB colour.
+                const colonRedFg: PackedColor = { kind: "rgb", value: 0xff0000 };
+                const colonRedCells = cells.slice(1).flat().filter((cell) => cellHasColor(cell, "fg", colonRedFg)).length;
+                assert.ok(colonRedCells > 0, `${label}: the colon-form foreground of a combined reset sequence was not kept`);
+              }
+            }
+            const header = lines.find((line) => stripAnsi(line).includes(fixture.tool));
+            assert.ok(header, `${label}: the card still names its tool`);
+          }
+        }
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: a wrapped Shell row reopens the background after the wrap's own reset (#677)", async () => {
+    const shellTools = registerShellTools();
+    // A themed line long enough to wrap: the family's wrap closes every
+    // continued styled row with a full reset of its own, which is the second
+    // way the reported card loses its background.
+    const result = {
+      content: [{ type: "text", text: `Started "view" as job1 (pid 1234); currently running.` }],
+      isError: false,
+      details: shellResultDetails("ShellStart", {
+        event: "started", id: "job1", label: "view",
+        command: `echo ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT} ${LONG_SHELL_TEXT}`,
+        state: "running", pid: 1234, startedAt: 1_700_000_000_000, watching: "exit, silence 10m",
+      }),
+    };
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        const row = shellHostRow("ShellStart", shellTools.ShellStart!.renderResult, result);
+        row.setExpanded(expanded);
+        const lines = row.render(width);
+        const label = `wrapped ShellStart ${expanded ? "expanded" : "collapsed"} width ${width}`;
+        const backgroundAnsi = theme.getBgAnsi("toolSuccessBg");
+        // The trigger itself: the wrap really did close a row with a reset.
+        assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+          `${label}: the fixture no longer produces the wrap's own reset (the case would pass vacuously)`);
+        // Every cell of every row still reaches the card edge painted with the
+        // themed background (cell-level, through the pinned headless VT).
+        await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+        assertFitsWidth(lines, width, label);
+        const cells = await cardCells(lines, width);
+        const glyphText = cells.map((cellRow) => rowGlyphs(cellRow).replace(/\s+$/, "")).join("\n");
+        assert.ok(glyphText.includes("alpha beta gamma"), `${label}: the wrapped glyphs changed`);
+        assert.ok(!glyphText.includes("\x1b"), `${label}: an escape leaked into the buffer glyphs`);
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: other custom tool families keep the themed background across retained resets (#677)", async () => {
+    // The same seam is not Shell-specific: every custom tool-result row goes
+    // through the shared adapter, and retained content in these families keeps
+    // its live SGR (unlike the web families, which display control characters
+    // through visibleTerminalText, and the native renderers/fallback, which
+    // strip SGR before painting). Each case below is witnessed through the real
+    // host row and the real registrations.
+    const cases: Array<{ label: string; tool: string; renderResult: unknown; result: Record<string, unknown>; token: string }> = [];
+
+    // ApplyPatch: the partial-failure diagnostic and the retained final diff
+    // are rendered unfiltered.
+    {
+      const tools: Array<Record<string, any>> = [];
+      registerApplyPatchTool({ registerTool: (tool: Record<string, any>) => { tools.push(tool); } });
+      const applyPatch = tools.find((candidate) => candidate.name === APPLY_PATCH_TOOL_NAME)!;
+      assert.ok(applyPatch, "ApplyPatch was not registered");
+      cases.push({
+        label: "ApplyPatch failure",
+        tool: APPLY_PATCH_TOOL_NAME,
+        renderResult: applyPatch.renderResult,
+        result: {
+          content: [{ type: "text", text: `ApplyPatch partial failure ${RESET_BEARING_DIFF}` }],
+          isError: true,
+          details: { requestedDiff: `${RESET_BEARING_DIFF}\n${RESET_BEARING_BG_RESET}`, finalDiff: `${RESET_BEARING_DIFF}\n${RESET_BEARING_BG_RESET}` },
+        },
+        token: "toolErrorBg",
+      });
+    }
+
+    // tool_search: the expanded view renders the raw query and outcome.
+    {
+      const deferredTools: Array<Record<string, any>> = [];
+      new DeferredToolManager({
+        registerTool: (tool: Record<string, any>) => { deferredTools.push(tool); },
+        getActiveTools: () => [],
+        getAllTools: () => [],
+        setActiveTools: () => {},
+      } as never).register();
+      const search = deferredTools.find((candidate) => candidate.name === "tool_search")!;
+      assert.ok(search, "tool_search was not registered");
+      cases.push({
+        label: "tool_search expanded",
+        tool: "tool_search",
+        renderResult: search.renderResult,
+        result: {
+          content: [{ type: "text", text: `Discovery ${RESET_BEARING_DIFF}` }],
+          details: {
+            query: `${RESET_BEARING_DIFF} ${RESET_BEARING_BG_RESET}`,
+            activated: ["BrowserClick"], alreadyActive: [], refused: [], omitted: 0,
+          },
+        },
+        token: "toolSuccessBg",
+      });
+    }
+
+    // Subtasks*: the expanded detail view renders retained task records.
+    {
+      const executionTools: Array<Record<string, any>> = [];
+      const pi: Record<string, any> = {
+        registerTool(tool: Record<string, any>) { executionTools.push(tool); },
+        registerCommand(_name: string, _options: unknown) {},
+        setToolActive() {},
+        getActiveTools: () => [...Object.values(EXECUTION_TOOL_NAMES), "read", "bash"],
+      };
+      new ExecutionToolManager({
+        pi,
+        config: normalizeConfig({
+          enabled: true,
+          review: { activeReviewers: [] },
+          externalAgents: {
+            synthetic: {
+              adapter: "run-as-binary",
+              command: process.execPath,
+              execution: { protocol: "pi-review-executor-jsonl-v1" as const },
+            },
+          },
+          execution: {
+            workerResources: { default: { selection: { source: "external", id: "synthetic" }, maxConcurrent: 4 } },
+            routes: { execute: [{ resourceId: "default" }], research: [] },
+          },
+        }),
+        state: createState(),
+        cwd: () => process.cwd(),
+        notify: () => {},
+      }).sync();
+      const inspect = executionTools.find((candidate) => candidate.name === "SubtasksInspect")!;
+      assert.ok(inspect, "SubtasksInspect was not registered");
+      cases.push({
+        label: "SubtasksInspect expanded",
+        tool: "SubtasksInspect",
+        renderResult: inspect.renderResult,
+        result: {
+          // The family's expanded detail view wraps its own retained lines
+          // with a plain-text wrap (src/execution/subtask-result-expanded.ts
+          // `wrapByDisplayCells`). These fixtures keep each retained value on
+          // one row, which is what proves the SHARED adapter reaches this
+          // family. A reset that lands ON a wrap boundary there is split by
+          // that plain-text wrap (`\x1b[` / `49m` on two rows) — a separate
+          // escape-splitting defect in that wrap, not the reset seam, and out
+          // of this change's boundary.
+          content: [{ type: "text", text: `inspect: outcome \x1b[0m after a full reset` }],
+          details: {
+            action: "inspect",
+            tasks: [{
+              taskId: "task-a", state: "running",
+              definition: { title: `work alpha \x1b[0m after a full reset` },
+              summary: "outcome beta \x1b[49m after a background reset",
+            }],
+          },
+        },
+        token: "toolSuccessBg",
+      });
+    }
+
+    for (const one of cases) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          const row = shellHostRow(one.tool, one.renderResult, one.result);
+          row.setExpanded(expanded);
+          const lines = row.render(width);
+          const label = `${one.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          // The trigger: the card really carries a background-clearing reset.
+          assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+            `${label}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+          const backgroundAnsi = theme.getBgAnsi(one.token);
+          await assertEveryCardCellBackground(lines, width, backgroundAnsi, label);
+          assertFitsWidth(lines, width, label);
+          const cells = await cardCells(lines, width + 1);
+          for (const [index, cellRow] of cells.entries()) {
+            if (index === 0) continue;
+            // No background of any colour — the theme re-open or a retained
+            // own-background sequence — may reach the column past the card.
+            assert.equal(cellRow[width]!.bgMode, 0,
+              `${label}: the guard column past the card carries a background`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a retained background combined with a reset keeps its own colour and still paints the row (#677)", async () => {
+    // Each form below resets and then sets the row's OWN background in one
+    // sequence. The theme re-open must not override that colour, while the rest
+    // of the card keeps the themed background and nothing is left unpainted
+    // inside the card. The zero-padded and colon forms are the ones a purely
+    // string comparison of the extended-colour mode gets wrong.
+    const shellTools = registerShellTools();
+    const forms: Array<{ label: string; sequence: string; expected: PackedColor }> = [
+      { label: "indexed", sequence: "\x1b[0;48;5;22m", expected: packedColor("\x1b[48;5;22m", "bg") },
+      { label: "zero-padded indexed", sequence: "\x1b[0;48;05;0m", expected: { kind: "palette", value: 0 } },
+      { label: "colon truecolour", sequence: "\x1b[0;48:2::0:0:0m", expected: { kind: "rgb", value: 0x000000 } },
+      // A colon colour carries its payload inside one parameter, so the `2`
+      // (dim) after it is another attribute and the `41` after that still sets
+      // the row's own background (SGR 41 is palette entry 1 in the VT).
+      { label: "colon foreground followed by dim and background", sequence: "\x1b[0;38:2::255:0:0;2;41m", expected: { kind: "palette", value: 1 } },
+    ];
+    for (const form of forms) {
+      const ownRow = `reset then own background ${LONG_SHELL_TEXT} ${form.sequence} kept background ${LONG_SHELL_TEXT}`;
+      const result = shellLogCard([
+        `plain retained row ${LONG_SHELL_TEXT}`,
+        `another plain retained row ${LONG_SHELL_TEXT}`,
+        ownRow,
+      ]);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          const row = shellHostRow("ShellLog", shellTools.ShellLog!.renderResult, result);
+          row.setExpanded(expanded);
+          const lines = row.render(width);
+          const label = `${form.label} own-background ShellLog ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          assert.ok(lines.join("").includes(form.sequence),
+            `${label}: the fixture no longer carries a reset combined with its own background`);
+          const backgroundAnsi = theme.getBgAnsi("toolSuccessBg");
+          const cells = await cardCells(lines, width + 1);
+          const card = cells.slice(1);
+          for (const [index, cellRow] of card.entries()) {
+            for (let column = 0; column < width; column += 1) {
+              assert.ok(cellRow[column]!.bgMode !== 0,
+                `${label}: cell ${column} of card row ${index + 2} has no background — an ordinary terminal-background hole inside the card`);
+            }
+            // The row's own background stops at the card edge too: the guard
+            // column keeps no background of any colour.
+            assert.equal(cellRow[width]!.bgMode, 0,
+              `${label}: the guard column past the card carries a background`);
+          }
+          const flat = card.flat();
+          assert.ok(flat.some((cell) => cellHasColor(cell, "bg", form.expected)),
+            `${label}: the row's own combined background was overridden by the theme re-open`);
+          assert.ok(flat.some((cell) => cellHasColor(cell, "bg", packedColor(backgroundAnsi, "bg"))),
+            `${label}: the rest of the card lost the themed row background`);
+        }
+      }
+    }
+    reapAll();
+  });
+
+  test("real host: native bash keeps its own background across reset-bearing output (#677 control)", () => {
+    // The native shell renderers (shared by bash and powershell) strip SGR
+    // from retained output before painting, so no reset can reach the Box row:
+    // the same reset-bearing text that cut a Shell card apart leaves a native
+    // bash card continuous.
+    for (const width of [40, 80]) {
+      const component = new h.agent.ToolExecutionComponent(
+        "bash", "bash-677", { command: "printf ..." }, {}, nativeBashDefinition, ui, "/work",
+      );
+      component.setArgsComplete();
+      component.updateResult({
+        content: [{ type: "text", text: `${RETAINED_RESET_MID}\n${RETAINED_RESET_TRAILING}\n${RETAINED_BG_RESET}` }],
+        details: undefined,
+        isError: false,
+      }, false);
+      const lines = component.render(width);
+      assertContinuousBackground(lines, theme.getBgAnsi("toolSuccessBg"), 1, `native bash width ${width}`);
+      assertFitsWidth(lines, width, `native bash width ${width}`);
+    }
+  });
+
+  // ── #677: the native write card's own rows keep the themed background ────
+  //
+  // `write` is the host renderer whose rows carry this seam on the host's own
+  // default shell: `formatWriteCall` reprints the submitted `content` argument
+  // with carriage-return normalization only, and `formatWriteResult` emits the
+  // failed result's own text verbatim, so a full or background reset inside
+  // either region cancels the host `Box`'s single background span for the rest
+  // of the row. The repair is the shared rule applied at the gate's renderer
+  // seam, so every case below runs the production resolver against the real host
+  // row and compares with the same host row WITHOUT the decoration: the native
+  // renderer, its wrapping, its highlighting, its colours, and its glyphs have
+  // to come through untouched, and only the theme's own bare background open may
+  // differ. No write is executed and no file is written by these fixtures.
+
+  const WRITE_CONTENT_RESET = [
+    `first line ${LONG_SHELL_TEXT}`,
+    `second line with a full reset \x1b[0m and more retained text ${LONG_SHELL_TEXT}`,
+    `third line with a background reset \x1b[49m and more retained text ${LONG_SHELL_TEXT}`,
+    `last short line \x1b[0m`,
+  ].join("\n");
+  const WRITE_CONTENT_CLEAN = [
+    `first line ${LONG_SHELL_TEXT}`,
+    `second line with no escape at all ${LONG_SHELL_TEXT}`,
+    "last short line",
+  ].join("\n");
+  const WRITE_ERROR_RESET = `write refused ${LONG_SHELL_TEXT} \x1b[0m tail after a full reset ${LONG_SHELL_TEXT}`;
+  const WRITE_ERROR_CLEAN = `write refused ${LONG_SHELL_TEXT} tail with no escape at all`;
+  const RESET_BEARING_EDIT_ERROR = `edit refused ${LONG_SHELL_TEXT} \x1b[0m tail after a full reset ${LONG_SHELL_TEXT}`;
+  const RESET_FREE_EDIT_ERROR = `edit refused ${LONG_SHELL_TEXT} tail with no escape at all`;
+
+  type WriteRowState = "pending-call" | "pending-partial" | "success" | "error";
+  const writeBgToken = (state: WriteRowState): string =>
+    state === "success" ? "toolSuccessBg" : state === "error" ? "toolErrorBg" : "toolPendingBg";
+
+  /** One real host `write` row, rendered once at `width`. */
+  function writeCardLines(
+    definition: unknown,
+    args: Record<string, unknown>,
+    state: WriteRowState,
+    width: number,
+    expanded: boolean,
+    errorText: string,
+  ): string[] {
+    const component = new h.agent.ToolExecutionComponent("write", "write-677", args, {}, definition, ui, "/work");
+    component.setArgsComplete();
+    if (state !== "pending-call") {
+      component.updateResult(state === "error"
+        ? { content: [{ type: "text", text: errorText }], details: undefined, isError: true }
+        : { content: [{ type: "text", text: "Successfully wrote /work/fixture.txt" }], details: undefined, isError: false },
+      state === "pending-partial");
+    }
+    component.setExpanded(expanded);
+    return component.render(width);
+  }
+
+  const countOf = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  /**
+   * The decorated card is one continuous themed band to the card edge, cell by
+   * cell, with nothing painted past it; the only difference from the undecorated
+   * native card is an inserted copy of the theme's own bare background open.
+   */
+  async function assertNativeCardRepaired(
+    decorated: string[],
+    native: string[],
+    width: number,
+    backgroundAnsi: string,
+    label: string,
+  ): Promise<void> {
+    assert.equal(decorated.length, native.length, `${label}: the repair changed the number of card rows`);
+    const stripOpen = (line: string): string => line.split(backgroundAnsi).join("");
+    for (const [index, line] of decorated.entries()) {
+      assert.equal(stripOpen(line), stripOpen(native[index]!),
+        `${label}: card row ${index + 1} differs from the native row by more than the re-opened background`);
+      assert.equal(stripAnsi(line), stripAnsi(native[index]!),
+        `${label}: card row ${index + 1} changed its displayed text`);
+    }
+    assertFitsWidth(decorated, width, label);
+    const cells = await cardCells(decorated, width + 1);
+    const expected = packedColor(backgroundAnsi, "bg");
+    for (const [index, cellRow] of cells.entries()) {
+      if (index === 0) continue; // the host's own blank row above the card
+      for (let column = 0; column < width; column += 1) {
+        assert.ok(cellRow[column]!.bgMode !== 0,
+          `${label}: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+        assert.ok(cellHasColor(cellRow[column]!, "bg", expected),
+          `${label}: cell ${column} of card row ${index + 1} is not painted with the themed row background`);
+      }
+      // Not merely "not the theme colour": the column past the card carries no
+      // background at all, so a re-open can never paint outside the card.
+      assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past the card carries a background`);
+    }
+    const pastCard = await cardCells([...decorated, ""], width);
+    assert.ok(pastCard.at(-1)!.every((cell) => cell.bgMode === 0), `${label}: a row outside the card is painted`);
+  }
+
+  /** Ordinary-background cells INSIDE the card only: the guard column past the
+   *  card is intentionally unpainted and never counts as a hole. */
+  async function cardHoles(lines: string[], width: number): Promise<number> {
+    const cells = await cardCells(lines, width + 1);
+    return cells.slice(1).flatMap((row) => row.slice(0, width)).filter((cell) => cell.bgMode === 0).length;
+  }
+
+  test("real host: a native write card keeps the themed background across its own resets (#677)", async () => {
+    const pi = fakePiHost();
+    // Debug Off keeps this matrix on the native presentation alone: the gate
+    // draws no audit rows, so the decorated card and the native card have to
+    // agree row for row apart from the re-opened background.
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult && typeof (decoratedWrite as { renderCall?: unknown }).renderCall === "function",
+      "the production resolver decorated the native write call and result renderers");
+    assert.equal((decoratedWrite as { renderShell?: unknown }).renderShell, undefined,
+      "the decoration keeps the write definition on the host's default shell");
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+            const args = { file_path: `/work/fixture.${extension}`, content: WRITE_CONTENT_RESET };
+            const label = `native write .${extension} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, state, width, expanded, WRITE_ERROR_RESET);
+            const native = writeCardLines(nativeWriteDefinition, args, state, width, expanded, WRITE_ERROR_RESET);
+            // The trigger: the undecorated native card really does lose its
+            // background, so this case would not pass vacuously. Only the card's
+            // own columns count — the guard column is unpainted by design.
+            const nativeHoles = await cardHoles(native, width);
+            assert.ok(nativeHoles > 0,
+              `${label}: the undecorated native write card no longer loses its background (the case would pass vacuously)`);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+            // Nothing is stripped or normalized: the retained resets still reach
+            // the terminal, in both the call rows and (for a failed result) the
+            // result rows.
+            const joined = decorated.join("");
+            const nativeJoined = native.join("");
+            assert.ok(countOf(joined, "\x1b[0m") > 0
+              && countOf(joined, "\x1b[0m") === countOf(nativeJoined, "\x1b[0m"),
+            `${label}: a retained full reset was stripped or duplicated`);
+            assert.equal(countOf(joined, "\x1b[49m"), countOf(nativeJoined, "\x1b[49m"),
+              `${label}: a retained background reset was stripped or duplicated`);
+            if (state === "error") {
+              assert.ok(stripAnsi(joined).includes("tail after a full reset"),
+                `${label}: the failed result text was lost`);
+            }
+            const header = decorated.find((line) => stripAnsi(line).includes("write"));
+            assert.ok(header, `${label}: the card no longer names its tool`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: each native write region loses its own background before the repair (#677)", async () => {
+    // The call region and the result region are repaired independently, so each
+    // is witnessed on its own: a reset only in the submitted `content` argument,
+    // a reset only in the failed result's text, and neither. Each dirty case
+    // differs from the clean baseline in ONE region while the other region's
+    // text is byte-identical, and a hole can only come from a reset inside its
+    // own row, so the holes a dirty case adds belong to the region it changed.
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult, "the production resolver decorated the native write renderers");
+    const cases = [
+      { label: "clean call + clean error", content: WRITE_CONTENT_CLEAN, errorText: WRITE_ERROR_CLEAN, dirty: false },
+      { label: "dirty call + clean error", content: WRITE_CONTENT_RESET, errorText: WRITE_ERROR_CLEAN, dirty: true },
+      { label: "clean call + dirty error", content: WRITE_CONTENT_CLEAN, errorText: WRITE_ERROR_RESET, dirty: true },
+    ];
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const one of cases) {
+            const args = { file_path: `/work/fixture.${extension}`, content: one.content };
+            const label = `native write .${extension} ${one.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, "error", width, expanded, one.errorText);
+            const native = writeCardLines(nativeWriteDefinition, args, "error", width, expanded, one.errorText);
+            const holes = await cardHoles(native, width);
+            if (one.dirty) {
+              assert.ok(holes > 0,
+                `${label}: this region no longer loses its background on its own (the case would pass vacuously)`);
+            } else {
+              assert.equal(holes, 0, `${label}: the reset-free baseline card lost its background`);
+            }
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi("toolErrorBg"), label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native write card is byte-identical with the decoration (#677 control)", async () => {
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => nativeWriteDefinition);
+    assert.ok(decoratedWrite?.renderResult, "the production resolver decorated the native write renderers");
+    for (const extension of ["txt", "js"] as const) {
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const args = { file_path: `/work/fixture.${extension}`, content: WRITE_CONTENT_CLEAN };
+            const label = `clean native write .${extension} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const decorated = writeCardLines({ ...nativeWriteDefinition, ...decoratedWrite }, args, state, width, expanded, WRITE_ERROR_CLEAN);
+            const native = writeCardLines(nativeWriteDefinition, args, state, width, expanded, WRITE_ERROR_CLEAN);
+            // Byte-for-byte: a card with no background-clearing reset inside a
+            // row gains no escape of any kind, so the repair is provably inert.
+            assert.deepEqual(decorated, native, `${label}: a reset-free native write card was rewritten`);
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: the fixture gained a reset`);
+            const backgroundAnsi: string = theme.getBgAnsi(writeBgToken(state));
+            // One open per painted row, exactly what the host's own `Box` emits.
+            for (const line of decorated.slice(1)) {
+              assert.ok(line.includes(backgroundAnsi), `${label}: a card row lost the themed row background`);
+              assert.equal(countOf(line, backgroundAnsi), 1, `${label}: a row gained a background re-open`);
+            }
+            await assertNativeCardRepaired(decorated, native, width, backgroundAnsi, label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: the decorated native write card keeps the native renderer's own component and cache (#677)", async () => {
+    // The repair wraps what the host receives, so the native renderer must keep
+    // receiving its OWN component as `context.lastComponent`: `write`'s call
+    // renderer writes its incremental highlighting cache onto that component and
+    // calls `setText` on it, neither of which the wrapper carries. The call
+    // region and the result region share one per-row `state`, so they must also
+    // keep separate slots.
+    const passes: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+    const nativeRenderers = nativeWriteRenderers.writeRenderers;
+    const spyDefinition = {
+      name: "write",
+      ...nativeWriteRenderers.writeRenderers,
+      renderCall(args: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderCall(args, spyTheme, spyContext);
+        passes.push({ region: "call", lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent, returned });
+        return returned;
+      },
+      renderResult(spyResult: unknown, options: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderResult(spyResult, options, spyTheme, spyContext);
+        passes.push({ region: "result", lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent, returned });
+        return returned;
+      },
+    };
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decoratedWrite = (pi.pi.__rendererResolver as RendererResolver)("write", () => spyDefinition);
+    assert.ok(decoratedWrite?.renderResult && typeof (decoratedWrite as { renderCall?: unknown }).renderCall === "function",
+      "the production resolver decorated the spied native write renderers");
+    const args = { file_path: "/work/fixture.js", content: "const alpha = 1;\n" };
+    const component = new h.agent.ToolExecutionComponent("write", "write-677-cache", args, {}, { ...spyDefinition, ...decoratedWrite }, ui, "/work");
+    // A streaming call: this is the pass where the native renderer keeps an
+    // incremental highlighting cache, so it is the one a handed-back wrapper
+    // would break.
+    component.render(40);
+    const callPasses = (): Array<{ lastComponent: unknown; returned: unknown }> => passes.filter((one) => one.region === "call");
+    assert.equal(callPasses()[0]!.lastComponent, undefined, "the first call pass hands the native renderer no previous component");
+    const callComponent = callPasses()[0]!.returned as Record<string, unknown>;
+    assert.equal(typeof callComponent.setText, "function", "the native call renderer returned its own Text component");
+    // A streamed argument delta, then an unchanged redraw, then both expansion
+    // toggles, then a settled result: the native component is reused every time.
+    (component as unknown as { updateArgs(next: unknown): void }).updateArgs({ file_path: "/work/fixture.js", content: "const alpha = 1;\nconst beta = 2;\n" });
+    component.render(40);
+    const cache = (callComponent as { cache?: { highlightedLines?: string[] } }).cache;
+    assert.ok(cache && Array.isArray(cache.highlightedLines) && cache.highlightedLines.length > 0,
+      "the native incremental highlighting cache survived the decoration");
+    component.render(40);
+    assert.equal((callComponent as { cache?: unknown }).cache, cache,
+      "the native highlighting cache object was rebuilt across redraws");
+    component.setExpanded(true);
+    component.render(40);
+    component.setExpanded(false);
+    component.render(40);
+    // Settling the call is the host's own transition (its renderer stops
+    // maintaining the incremental cache for a complete call); the reused
+    // component and the result region's separate slot still hold.
+    component.setArgsComplete();
+    component.updateResult({ content: [{ type: "text", text: WRITE_ERROR_RESET }], details: undefined, isError: true }, false);
+    component.render(40);
+    // Expansion re-runs both regions, so the result region's own component has
+    // to be reused there exactly as the call region's is here.
+    component.setExpanded(true);
+    component.render(40);
+    component.setExpanded(false);
+    component.render(40);
+    for (const [index, pass] of callPasses().slice(1).entries()) {
+      assert.equal(pass.lastComponent, callComponent,
+        `call pass ${index + 2}: the native renderer was handed something other than its own component, breaking its incremental reuse`);
+    }
+    const resultPasses = passes.filter((one) => one.region === "result");
+    assert.ok(resultPasses.length >= 2, "the result region rendered after the settled result");
+    assert.equal(resultPasses[0]!.lastComponent, undefined, "the first result pass hands the native renderer no previous component");
+    const resultComponent = resultPasses[0]!.returned;
+    for (const [index, pass] of resultPasses.entries()) {
+      assert.notEqual(pass.lastComponent, callComponent,
+        `result pass ${index + 1}: the result region was handed the call region's component (the two share one row state)`);
+      if (index > 0) {
+        assert.equal(pass.lastComponent, resultComponent,
+          `result pass ${index + 1}: the native result renderer was handed something other than its own component`);
+      }
+    }    // The repair still holds on every redraw, including the settled error card.
+    const decorated = component.render(40);
+    const cells = await cardCells(decorated, 41);
+    for (const [index, cellRow] of cells.entries()) {
+      if (index === 0) continue;
+      for (let column = 0; column < 40; column += 1) {
+        assert.ok(cellRow[column]!.bgMode !== 0,
+          `write redraw: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+      }
+      assert.equal(cellRow[40]!.bgMode, 0, "write redraw: the guard column past the card carries a background");
+    }
+  });
+
+  test("real host: a state-less write context keeps the native write component unwrapped (#677)", () => {
+    // A lightweight host context with no per-row `state` has nowhere to remember
+    // the native component, so BOTH regions have to keep handing the native
+    // renderer its own component: the write call renderer writes its
+    // highlighting cache onto it and calls `setText` on it, and the result
+    // renderer calls `setText` (a failed result) or `clear` (no output) on
+    // whatever `context.lastComponent` holds. Neither method exists on the
+    // background wrapper, so wrapping without a slot would push the host onto
+    // its own fallback renderer instead of the native presentation.
+    const observed: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+    const nativeRenderers = nativeWriteRenderers.writeRenderers;
+    const spyDefinition = {
+      name: "write",
+      ...nativeWriteRenderers.writeRenderers,
+      renderCall(args: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderCall(args, spyTheme, spyContext);
+        observed.push({
+          region: "call",
+          lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent,
+          returned,
+        });
+        return returned;
+      },
+      renderResult(spyResult: unknown, options: unknown, spyTheme: unknown, spyContext: unknown): unknown {
+        const returned = nativeRenderers.renderResult(spyResult, options, spyTheme, spyContext);
+        observed.push({
+          region: "result",
+          lastComponent: (spyContext as { lastComponent?: unknown }).lastComponent,
+          returned,
+        });
+        return returned;
+      },
+    };
+    const pi = fakePiHost();
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decorated = (pi.pi.__rendererResolver as RendererResolver)("write", () => spyDefinition) as unknown as {
+      renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+      renderResult(result: unknown, options: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+    };
+    assert.ok(typeof decorated.renderResult === "function" && typeof decorated.renderCall === "function",
+      "the production resolver decorated the spied native write renderers");
+    const args = { file_path: "/work/fixture.js", content: "const alpha = 1;\n" };
+    // No `state` key anywhere, and a call id this gate has no provenance for, so
+    // the decoration has neither a per-row slot nor an annotation of its own.
+    const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      toolCallId: "write-stateless",
+      args,
+      cwd: "/work",
+      ui: {},
+      argsComplete: true,
+      isPartial: false,
+      expanded: false,
+      isError: false,
+      outputPad: 1,
+      ...over,
+    });
+    const passes = (region: "call" | "result") => observed.filter((one) => one.region === region);
+
+    // Two consecutive call passes, the second handed the first component back.
+    const firstCall = decorated.renderCall(args, nativeTheme, context({ isPartial: true, argsComplete: false }));
+    decorated.renderCall(args, nativeTheme, context({ isPartial: true, argsComplete: false, lastComponent: firstCall }));
+    assert.equal(passes("call")[1]!.lastComponent, firstCall,
+      "the state-less call pass was handed the component the previous pass returned");
+    assert.equal(passes("call")[1]!.returned, firstCall,
+      "the state-less call fallback returned the native component itself, not the background wrapper");
+    assert.equal(typeof firstCall.setText, "function",
+      "the reused call component is the native Text the call renderer writes its text and cache onto");
+
+    // Two consecutive failed-result renders.
+    const errorResult = { content: [{ type: "text", text: WRITE_ERROR_RESET }], details: undefined };
+    const firstError = decorated.renderResult(errorResult, { expanded: false, isPartial: false }, nativeTheme, context({ isError: true }));
+    const secondError = decorated.renderResult(errorResult, { expanded: false, isPartial: false }, nativeTheme, context({ isError: true, lastComponent: firstError }));
+    assert.equal(passes("result")[0]!.lastComponent, undefined, "the first state-less result pass hands the native renderer no previous component");
+    assert.equal(passes("result")[1]!.lastComponent, firstError,
+      "the state-less result pass was handed the component the previous result pass returned, not the background wrapper");
+    assert.equal(passes("result")[1]!.returned, firstError,
+      "the state-less result fallback returned the native component itself, not the background wrapper");
+    assert.equal(secondError, firstError, "the failed result reuses one native component across renders");
+    assert.equal(typeof firstError.setText, "function",
+      "the reused failed-result component is the native Text the error path calls setText on");
+
+    // Two consecutive success renders: the no-output path calls `clear()`.
+    const successResult = { content: [{ type: "text", text: "Successfully wrote /work/fixture.txt" }], details: undefined };
+    const firstSuccess = decorated.renderResult(successResult, { expanded: false, isPartial: false }, nativeTheme, context());
+    decorated.renderResult(successResult, { expanded: false, isPartial: false }, nativeTheme, context({ lastComponent: firstSuccess }));
+    assert.equal(passes("result").at(-1)!.lastComponent, firstSuccess,
+      "the second state-less success pass was handed the same native component");
+    assert.equal(typeof firstSuccess.clear, "function",
+      "the reused empty-output component is the native Container the result path calls clear on");
+
+    // And the state-less fallback really is the unchanged native presentation:
+    // nothing gained a theme background of its own.
+    const errorBg = theme.getBgAnsi("toolErrorBg");
+    assert.ok(!secondError.render(38).join("").includes(errorBg),
+      "the state-less fallback painted a row background the native renderer does not emit");
+  });
+
+  // ── #677: the native builtin CALL regions keep the themed background ─────
+  //
+  // `write` is not the only host renderer whose own rows carry this seam. Every
+  // default-shell builtin CALL region reprints a submitted argument: the shell
+  // family (`formatShellCall`) reprints `command`, `renderToolPath` reprints the
+  // path of `read`, `ls`, and `write`, `formatGrepCall` reprints `pattern`,
+  // `path`, and `glob`, and `formatFindCall` reprints `pattern` and `path`. A
+  // full or background reset inside one of those arguments therefore cancels the
+  // host `Box`'s single background span for the rest of the CALL row, exactly as
+  // `write`'s submitted `content` does.
+  //
+  // The RESULT regions of those families are a different story, and they are not
+  // repaired: `read`, `grep`, `find`, `ls`, and the shell family take retained
+  // output through the host's own `getTextOutput` (`core/tools/render-utils.js`),
+  // which runs `stripAnsi` before painting, so no live reset ever reaches their
+  // rows. Both halves of that distinction are witnessed below — the CALL seam
+  // with a reset carried in the ARGUMENT, and the unaffected RESULT rows with a
+  // reset carried in the retained output.
+  //
+  // Nothing here executes a native tool. These are renderer fixtures only: no
+  // shell is started, no file is read, written, or searched, and `powershell` is
+  // exercised through the host's shared shell factory — the same installed
+  // `createShellRenderers` the shipped powershell tool spreads, with the host's
+  // powershell prompt — not through PowerShell.
+
+  const CALL_RESET = `reset in the argument \x1b[0m and after it ${LONG_SHELL_TEXT}`;
+  const CALL_BG_RESET = `background reset in the argument \x1b[49m and after it ${LONG_SHELL_TEXT}`;
+  const CALL_CLEAN = `no escape in the argument at all ${LONG_SHELL_TEXT}`;
+  /** Path-only edit arguments: no `edits` and no old/new text, so the host's
+   *  `getRenderablePreviewInput` returns null and `computeEditsDiff` is never
+   *  reached — these fixtures touch no file. */
+  const EDIT_CLEAN_ARGS = { path: `/work/${CALL_CLEAN}.txt` };
+  const RESULT_RESET = `retained output ${LONG_SHELL_TEXT} \x1b[0m after a full reset ${LONG_SHELL_TEXT}`;
+  const RESULT_CLEAN = `retained output ${LONG_SHELL_TEXT} with no escape at all`;
+
+  /** The displayed glyphs of a card, with styling, padding, and line breaks
+   *  removed: a wrap may split a phrase across rows, so a substring check has to
+   *  be made against the same flattening of the fixture. */
+  const flattenRows = (lines: string[]): string => stripAnsi(lines.join("")).replace(/\s+/g, "");
+  const flattenText = (text: string): string => stripAnsi(text).replace(/\s+/g, "");
+
+  /** One host builtin whose CALL rows reprint these arguments. */
+  const nativeCallFixtures: Array<{
+    tool: string;
+    definition: Record<string, unknown>;
+    /** Every argument value the host reprints, each carrying a reset. */
+    dirtyArgs: Record<string, unknown>;
+    /** The same arguments with no escape anywhere. */
+    cleanArgs: Record<string, unknown>;
+  }> = [
+    { tool: "bash", definition: nativeBashDefinition, dirtyArgs: { command: `printf ${CALL_RESET} ${CALL_BG_RESET}` }, cleanArgs: { command: `printf ${CALL_CLEAN}` } },
+    { tool: "powershell", definition: nativePowershellDefinition, dirtyArgs: { command: `Write-Output ${CALL_RESET} ${CALL_BG_RESET}` }, cleanArgs: { command: `Write-Output ${CALL_CLEAN}` } },
+    { tool: "read", definition: nativeReadDefinition, dirtyArgs: { file_path: `/work/${CALL_RESET}.txt`, offset: 1, limit: 10 }, cleanArgs: { file_path: `/work/${CALL_CLEAN}.txt` } },
+    {
+      tool: "grep",
+      definition: nativeGrepDefinition,
+      dirtyArgs: { pattern: CALL_RESET, path: `/work/${CALL_BG_RESET}`, glob: `*${CALL_RESET}.ts`, limit: 5 },
+      cleanArgs: { pattern: CALL_CLEAN, path: `/work/${CALL_CLEAN}`, glob: `*${CALL_CLEAN}.ts` },
+    },
+    {
+      tool: "find",
+      definition: nativeFindDefinition,
+      dirtyArgs: { pattern: CALL_BG_RESET, path: `/work/${CALL_RESET}`, limit: 5 },
+      cleanArgs: { pattern: CALL_CLEAN, path: `/work/${CALL_CLEAN}` },
+    },
+    { tool: "ls", definition: nativeLsDefinition, dirtyArgs: { path: `/work/${CALL_RESET}`, limit: 20 }, cleanArgs: { path: `/work/${CALL_CLEAN}` } },
+  ];
+
+  /** One real host row for a native builtin, rendered once at `width`. */
+  function nativeCardLines(
+    toolName: string,
+    definition: unknown,
+    args: Record<string, unknown>,
+    state: WriteRowState,
+    width: number,
+    expanded: boolean,
+    resultText: string,
+  ): string[] {
+    const component = new h.agent.ToolExecutionComponent(toolName, `${toolName}-677-call`, args, {}, definition, ui, "/work");
+    component.setArgsComplete();
+    if (state !== "pending-call") {
+      component.updateResult({
+        content: [{ type: "text", text: resultText }],
+        details: undefined,
+        isError: state === "error",
+      }, state === "pending-partial");
+    }
+    component.setExpanded(expanded);
+    return component.render(width);
+  }
+
+  /** The production resolver, with the gate's row decoration installed. */
+  function decoratedNativeDefinition(toolName: string, definition: Record<string, unknown>) {
+    const pi = fakePiHost();
+    // Debug Off keeps these matrices on the native presentation alone: the gate
+    // draws no audit rows, so the decorated card and the native card have to
+    // agree row for row apart from the re-opened background.
+    const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd: "/work", config: protectionConfig({ debug: false }) });
+    coordinator.registerHooks(pi.pi);
+    const decorated = (pi.pi.__rendererResolver as RendererResolver)(toolName, () => definition);
+    assert.ok(typeof (decorated as { renderCall?: unknown }).renderCall === "function",
+      `the production resolver decorated the native ${toolName} call renderer`);
+    return { ...definition, ...decorated };
+  }
+
+  test("real host: every native builtin call argument that the host reprints loses its own background before the repair (#677)", async () => {
+    // The trigger, per argument: a reset carried in one reprinted argument, with
+    // every other argument reset-free, cuts the undecorated card from that point
+    // to the card edge. A hole can only come from a reset inside its own row, so
+    // the holes this adds belong to the argument that changed.
+    for (const fixture of nativeCallFixtures) {
+      const native = fixture.definition;
+      // Only the string arguments the host reprints carry a reset; the numeric
+      // ones (`offset`, `limit`) are printed as numbers and have no seam.
+      const reprinted = Object.entries(fixture.dirtyArgs)
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].includes("\x1b"));
+      // One case per reprinted argument, alone: every other argument stays
+      // reset-free, so the holes this adds belong to that argument. The clean
+      // baseline is the control, and the all-dirty case is the whole card.
+      const cases: Array<{ label: string; args: Record<string, unknown>; wanted: string[] }> = reprinted
+        .map(([key, value]) => ({
+          label: `only ${key} dirty`,
+          args: { ...fixture.cleanArgs, [key]: value },
+          wanted: [flattenText(value)],
+        }));
+      cases.push({ label: "clean", args: fixture.cleanArgs, wanted: [flattenText(CALL_CLEAN)] });
+      cases.push({
+        label: "every argument dirty",
+        args: fixture.dirtyArgs,
+        wanted: reprinted.map(([, value]) => flattenText(value)),
+      });
+      for (const one of cases) {
+        for (const width of [40, 80]) {
+          const lines = nativeCardLines(fixture.tool, native, one.args, "pending-call", width, false, RESULT_CLEAN);
+          const name = `${fixture.tool} ${one.label} width ${width}`;
+          const flat = flattenRows(lines);
+          // The trigger: the reprinted argument really reached the row, and the
+          // dirty variants really carry a background-clearing reset there.
+          assert.ok(one.wanted.every((text) => flat.includes(text)),
+            `${name}: the fixture's argument text was not rendered (the case would pass vacuously)`);
+          const holes = await cardHoles(lines, width);
+          if (one.label === "clean") {
+            assert.equal(holes, 0, `${name}: the reset-free native card lost its background`);
+          } else {
+            assert.ok(/\x1b\[(?:0+m|49m)/.test(lines.join("")),
+              `${name}: the fixture no longer produces a background-clearing reset (the case would pass vacuously)`);
+            assert.ok(holes > 0,
+              `${name}: the undecorated native card no longer loses its background (the case would pass vacuously)`);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: every native builtin call region keeps the themed background across a reset-bearing argument (#677)", async () => {
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+            const label = `${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.dirtyArgs, state, width, expanded, RESULT_CLEAN);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.dirtyArgs, state, width, expanded, RESULT_CLEAN);
+            // The trigger: the undecorated native card really does lose its
+            // background, so this case would not pass vacuously.
+            const nativeHoles = await cardHoles(native, width);
+            assert.ok(nativeHoles > 0,
+              `${label}: the undecorated native card no longer loses its background (the case would pass vacuously)`);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+            // Nothing is stripped or normalized: the retained resets still reach
+            // the terminal, in the call rows.
+            const joined = decorated.join("");
+            const nativeJoined = native.join("");
+            assert.equal(countOf(joined, "\x1b[0m"), countOf(nativeJoined, "\x1b[0m"),
+              `${label}: a retained full reset was stripped or duplicated`);
+            assert.equal(countOf(joined, "\x1b[49m"), countOf(nativeJoined, "\x1b[49m"),
+              `${label}: a retained background reset was stripped or duplicated`);
+            const flat = flattenRows(decorated);
+            for (const [, value] of Object.entries(fixture.dirtyArgs)) {
+              if (typeof value !== "string" || !value.includes("\x1b")) continue;
+              assert.ok(flat.includes(flattenText(value)),
+                `${label}: the reprinted argument text ${JSON.stringify(stripAnsi(value).slice(0, 32))} was lost`);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native builtin call card is byte-identical with the decoration (#677 control)", async () => {
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const label = `clean native ${fixture.tool} ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.cleanArgs, state, width, expanded, RESULT_CLEAN);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.cleanArgs, state, width, expanded, RESULT_CLEAN);
+            // Byte-for-byte: a card with no background-clearing reset inside a
+            // row gains no escape of any kind, so the repair is provably inert.
+            assert.deepEqual(decorated, native, `${label}: a reset-free native card was rewritten`);
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: the fixture gained a reset`);
+            await assertNativeCardRepaired(decorated, native, width, theme.getBgAnsi(writeBgToken(state)), label);
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: a reset in a builtin family's retained output never reaches its rows (#677 result control)", async () => {
+    // The other half of the CALL/RESULT classification, witnessed rather than
+    // inferred: these families take retained output through the host's own
+    // `getTextOutput`, which strips SGR before painting, so the same reset that
+    // cut a CALL row apart never becomes a live sequence in a result row. The
+    // decoration therefore changes nothing on these cards — no repair was
+    // applied where none is needed.
+    for (const fixture of nativeCallFixtures) {
+      const withRepair = decoratedNativeDefinition(fixture.tool, fixture.definition);
+      for (const width of [40, 80]) {
+        for (const expanded of [false, true]) {
+          for (const state of ["success", "error"] as WriteRowState[]) {
+            const label = `${fixture.tool} retained-output reset ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+            const native = nativeCardLines(fixture.tool, fixture.definition, fixture.cleanArgs, state, width, expanded, RESULT_RESET);
+            const decorated = nativeCardLines(fixture.tool, withRepair, fixture.cleanArgs, state, width, expanded, RESULT_RESET);
+            assert.deepEqual(decorated, native, `${label}: the decoration changed a card whose rows carry no live reset`);
+            assert.equal(await cardHoles(native, width), 0, `${label}: the host's own stripping no longer keeps the card continuous`);
+            // The reset was stripped on the way in, not hidden by the repair.
+            assert.ok(!decorated.join("").includes("\x1b[0m"), `${label}: a live reset reached the row`);
+            const shown = stripAnsi(decorated.join(""));
+            if (expanded) {
+              assert.ok(shown.includes("after a full reset"), `${label}: the retained output was dropped`);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("real host: the decorated native builtin call rows keep the native renderer's own component (#677)", async () => {
+    // Generalizing the repair must not cost any family its own reuse: each of
+    // these renderers takes `context.lastComponent` and writes its text onto it,
+    // so handing back the background wrapper would push the host onto its
+    // fallback renderer. The call region and the result region share one per-row
+    // `state`, so they also have to keep separate slots.
+    for (const fixture of nativeCallFixtures) {
+      const passes: Array<{ region: "call" | "result"; lastComponent: unknown; returned: unknown }> = [];
+      const nativeCall = (fixture.definition.renderCall as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const nativeResult = (fixture.definition.renderResult as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const spy = {
+        ...fixture.definition,
+        renderCall: (...a: unknown[]): unknown => {
+          const returned = nativeCall(...a);
+          passes.push({ region: "call", lastComponent: (a[2] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+        renderResult: (...a: unknown[]): unknown => {
+          const returned = nativeResult(...a);
+          passes.push({ region: "result", lastComponent: (a[3] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+      };
+      const withRepair = decoratedNativeDefinition(fixture.tool, spy);
+      const component = new h.agent.ToolExecutionComponent(
+        fixture.tool, `${fixture.tool}-677-reuse`, fixture.cleanArgs, {}, withRepair, ui, "/work",
+      );
+      component.render(40);
+      const callPasses = () => passes.filter((one) => one.region === "call");
+      assert.equal(callPasses()[0]!.lastComponent, undefined, `${fixture.tool}: the first call pass hands the native renderer no previous component`);
+      const callComponent = callPasses()[0]!.returned;
+      assert.equal(typeof (callComponent as { setText?: unknown }).setText, "function",
+        `${fixture.tool}: the native call renderer returned its own Text component`);
+      // A streamed argument delta, an unchanged redraw, both expansion toggles,
+      // and a settled result: the native component is reused every time.
+      (component as unknown as { updateArgs(next: unknown): void }).updateArgs({ ...fixture.cleanArgs, extra: 1 });
+      component.render(40);
+      component.render(40);
+      component.setArgsComplete();
+      component.updateResult({ content: [{ type: "text", text: RESULT_CLEAN }], details: undefined, isError: false }, false);
+      component.render(40);
+      component.setExpanded(true);
+      component.render(40);
+      component.setExpanded(false);
+      component.render(40);
+      for (const [index, pass] of callPasses().slice(1).entries()) {
+        assert.equal(pass.lastComponent, callComponent,
+          `${fixture.tool} call pass ${index + 2}: the native renderer was handed something other than its own component`);
+      }
+      const resultPasses = passes.filter((one) => one.region === "result");
+      assert.ok(resultPasses.length >= 2, `${fixture.tool}: the result region rendered after the settled result`);
+      for (const [index, pass] of resultPasses.entries()) {
+        assert.notEqual(pass.lastComponent, callComponent,
+          `${fixture.tool} result pass ${index + 1}: the result region was handed the call region's component`);
+      }
+      const resultComponent = resultPasses[0]!.returned;
+      for (const [index, pass] of resultPasses.slice(1).entries()) {
+        assert.equal(pass.lastComponent, resultComponent,
+          `${fixture.tool} result pass ${index + 2}: the native result renderer was handed something other than its own component`);
+      }
+      // And the repair still holds on every redraw, including the settled card.
+      const lines = component.render(40);
+      const cells = await cardCells(lines, 41);
+      for (const [index, cellRow] of cells.entries()) {
+        if (index === 0) continue;
+        for (let column = 0; column < 40; column += 1) {
+          assert.ok(cellRow[column]!.bgMode !== 0,
+            `${fixture.tool} redraw: cell ${column} of card row ${index + 1} has no background`);
+        }
+        assert.equal(cellRow[40]!.bgMode, 0, `${fixture.tool} redraw: the guard column past the card carries a background`);
+      }
+    }
+  });
+
+  test("real host: a state-less native call context keeps the native builtin component unwrapped (#677)", () => {
+    // A lightweight host context with no per-row `state` has nowhere to remember
+    // the native component, so the call region has to keep handing the native
+    // renderer its own component: these renderers call `setText` on whatever
+    // `context.lastComponent` holds, and that method does not exist on the
+    // background wrapper.
+    for (const fixture of nativeCallFixtures) {
+      const observed: Array<{ lastComponent: unknown; returned: unknown }> = [];
+      const nativeCall = (fixture.definition.renderCall as (...a: unknown[]) => unknown).bind(fixture.definition);
+      const spy = {
+        ...fixture.definition,
+        renderCall: (...a: unknown[]): unknown => {
+          const returned = nativeCall(...a);
+          observed.push({ lastComponent: (a[2] as { lastComponent?: unknown }).lastComponent, returned });
+          return returned;
+        },
+      };
+      const decorated = decoratedNativeDefinition(fixture.tool, spy) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] } & Record<string, unknown>;
+      };
+      const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+        toolCallId: `${fixture.tool}-stateless`,
+        args: fixture.cleanArgs,
+        cwd: "/work",
+        ui: {},
+        argsComplete: true,
+        isPartial: true,
+        expanded: false,
+        isError: false,
+        outputPad: 1,
+        ...over,
+      });
+      const first = decorated.renderCall(fixture.cleanArgs, nativeTheme, context());
+      decorated.renderCall(fixture.cleanArgs, nativeTheme, context({ lastComponent: first }));
+      assert.equal(observed[1]!.lastComponent, first,
+        `${fixture.tool}: the state-less call pass was handed the component the previous pass returned`);
+      assert.equal(observed[1]!.returned, first,
+        `${fixture.tool}: the state-less call fallback returned the native component itself, not the background wrapper`);
+      assert.equal(typeof first.setText, "function", `${fixture.tool}: the reused call component is the native Text the renderer writes onto`);
+      // And the state-less fallback really is the unchanged native presentation:
+      // nothing gained a theme background of its own.
+      const pendingBg = theme.getBgAnsi("toolPendingBg");
+      assert.ok(!first.render(38).join("").includes(pendingBg),
+        `${fixture.tool}: the state-less fallback painted a row background the native renderer does not emit`);
+    }
+  });
+
+  test("real host: a native edit self-shell header keeps its own background across a reset-bearing path (#677)", async () => {
+    // The native `edit` tool draws its own shell, so its header rows are painted
+    // by the renderer's own `Box` (`getEditHeaderBg` → `theme.bg(token, row)`),
+    // not by the host's `Box`. Wrapping that component from outside would insert
+    // the re-open after the renderer's own background close and paint past the
+    // card, so the repair happens inside the callback that owns the span, using
+    // the token that callback chose — which is the header's own pending or error
+    // state, not the host row's state. The fixtures are path-only, which is what
+    // keeps the host out of `computeEditsDiff`: no file is read or written here.
+    const args = { path: `/work/${CALL_RESET}.txt` };
+    const withRepair = decoratedNativeDefinition("edit", nativeEditDefinition);
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        for (const state of ["pending-call", "pending-partial", "success", "error"] as WriteRowState[]) {
+          const label = `native edit self-shell header ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          const native = nativeCardLines("edit", nativeEditDefinition, args, state, width, expanded, RESULT_CLEAN);
+          const decorated = nativeCardLines("edit", withRepair, args, state, width, expanded, RESULT_CLEAN);
+          assert.equal(decorated.length, native.length, `${label}: the repair changed the number of card rows`);
+          // The header row, and the background its own callback opened with —
+          // read out of the undecorated row rather than guessed from the state.
+          const headerIndex = native.findIndex((line) => stripAnsi(line).includes("edit"));
+          assert.ok(headerIndex > 0, `${label}: the card draws its native header row`);
+          const headerOpen = /\x1b\[48;\d+(?:;\d+)*m/.exec(native[headerIndex]!)?.[0];
+          assert.ok(headerOpen, `${label}: the native header row opens a background of its own`);
+          // The trigger: the undecorated header row loses its own background.
+          const nativeCells = await cardCells(native, width + 1);
+          assert.ok(nativeCells[headerIndex]!.slice(0, width).some((cell) => cell.bgMode === 0),
+            `${label}: the undecorated native header row no longer loses its background (the case would pass vacuously)`);
+          const decoratedCells = await cardCells(decorated, width + 1);
+          const expected = packedColor(headerOpen, "bg");
+          for (let column = 0; column < width; column += 1) {
+            const cell = decoratedCells[headerIndex]![column]!;
+            assert.ok(cell.bgMode !== 0, `${label}: cell ${column} of the header row has no background`);
+            assert.ok(cellHasColor(cell, "bg", expected),
+              `${label}: cell ${column} of the header row is not painted with the background the header's own callback opened`);
+          }
+          // Nothing is painted outside the card, and every row keeps its own
+          // background close: only zero-width opens were inserted.
+          for (const [index, cellRow] of decoratedCells.entries()) {
+            assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past card row ${index + 1} carries a background`);
+          }
+          for (const [index, line] of decorated.entries()) {
+            assert.equal(stripAnsi(line), stripAnsi(native[index]!), `${label}: card row ${index + 1} changed its displayed text`);
+            assert.equal(countOf(line, "\x1b[49m"), countOf(native[index]!, "\x1b[49m"),
+              `${label}: card row ${index + 1} gained or lost a background close`);
+            if (line === native[index]) continue;
+            assert.ok(/\x1b\[(?:0+m|49m)/.test(native[index]!), `${label}: row ${index + 1} changed without carrying a reset`);
+            assert.ok(native[index]!.includes(headerOpen!),
+              `${label}: row ${index + 1} changed outside the native header's own background span`);
+          }
+          // The unannotated body is the host's own presentation and is not
+          // repainted: with no audit rows, every row outside the header's own
+          // span is byte-identical, reset-bearing output included.
+          const bodyNative = native.slice(headerIndex + 1).filter((line) => !line.includes(headerOpen!));
+          const bodyDecorated = decorated.slice(headerIndex + 1).filter((line) => !line.includes(headerOpen!));
+          assert.deepEqual(bodyDecorated, bodyNative, `${label}: the unannotated self-shell body was repainted`);
+          if (state === "error") {
+            // The failed result's own text is still shown — and the body stays
+            // the host's own unpainted presentation, byte-for-byte.
+            assert.ok(flattenRows(decorated).includes(flattenText(RESULT_CLEAN)),
+              `${label}: the failed result text was lost`);
+            assert.ok(bodyNative.length > 0 && bodyNative.every((line) => !line.includes("\x1b[48;")),
+              `${label}: the unannotated self-shell body was not the unpainted presentation this repair must leave alone`);
+          }
+          // A path-only fixture never computes a diff preview, so no file is
+          // touched and no diff row is drawn.
+          assert.ok(!stripAnsi(decorated.join("\n")).split("\n").some((row) => /^[-+]\d/.test(row.trim())),
+            `${label}: a path-only edit fixture drew a diff preview`);
+        }
+      }
+    }
+  });
+
+  test("real host: a reset-free native edit self-shell header is byte-identical with the decoration (#677 control)", async () => {
+    for (const width of [40, 80]) {
+      for (const expanded of [false, true]) {
+        for (const state of ["pending-call", "success", "error"] as WriteRowState[]) {
+          const label = `clean native edit self-shell header ${state} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+          const withRepair = decoratedNativeDefinition("edit", nativeEditDefinition);
+          const native = nativeCardLines("edit", nativeEditDefinition, EDIT_CLEAN_ARGS, state, width, expanded, RESULT_CLEAN);
+          const decorated = nativeCardLines("edit", withRepair, EDIT_CLEAN_ARGS, state, width, expanded, RESULT_CLEAN);
+          assert.deepEqual(decorated, native, `${label}: a reset-free self-shell header was rewritten`);
+        }
+      }
+    }
+  });
+
+  test("real host: a theme that cannot supply the row background leaves the native call rows unchanged (#677 fallback)", () => {
+    // Both new seams share one fallback: when the theme cannot answer what its
+    // own background looks like, the row is rendered exactly as the native
+    // renderer draws it — no guessed colour, and nothing thrown into the host's
+    // render path (which would push the row onto the host's fallback renderer).
+    const styledTheme = nativeTheme as unknown as {
+      fg(token: string, text: string): string;
+      bg(token: string, text: string): string;
+      bold(text: string): string;
+    };
+    const brokenBgTheme = {
+      fg: (token: string, text: string): string => styledTheme.fg(token, text),
+      bg: (token: string, text: string): string => styledTheme.bg(token, text),
+      bold: (text: string): string => styledTheme.bold(text),
+      getBgAnsi: (): string => { throw new Error("this theme has no background tokens"); },
+    };
+    const noBgTheme = {
+      fg: (token: string, text: string): string => styledTheme.fg(token, text),
+      bold: (text: string): string => styledTheme.bold(text),
+    };
+    const context = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      toolCallId: "native-677-broken-theme",
+      cwd: "/work",
+      ui: {},
+      argsComplete: true,
+      isPartial: true,
+      expanded: false,
+      isError: false,
+      outputPad: 1,
+      state: {},
+      ...over,
+    });
+    for (const [themeCase, themeLike] of [["getBgAnsi throws", brokenBgTheme], ["no bg accessor", noBgTheme]] as const) {
+      // The default-shell path: the wrapper is skipped, the native component is
+      // handed to the host unchanged.
+      const bash = decoratedNativeDefinition("bash", nativeBashDefinition) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+      };
+      const nativeBashCall = (nativeBashDefinition as Record<string, unknown>).renderCall as unknown as (
+        args: unknown, theme: unknown, context: unknown,
+      ) => { render(width: number): string[] };
+      const bashArgs = { command: `printf ${CALL_RESET}` };
+      const bashContext = context(bashArgs);
+      assert.deepEqual(
+        bash.renderCall(bashArgs, themeLike, bashContext).render(40),
+        nativeBashCall(bashArgs, themeLike, context(bashArgs)).render(40),
+        `${themeCase}: the decorated default-shell call rows differ from the native rows`,
+      );
+      if (typeof (themeLike as { bg?: unknown }).bg !== "function") {
+        // A theme with no `bg` at all is not something the native self-shell
+        // renderer can draw on its own, so there is nothing to compare here.
+        continue;
+      }
+      // The self-shell path: the theme view is inert, so the renderer's own
+      // header `Box` paints exactly the span it always painted.
+      const edit = decoratedNativeDefinition("edit", nativeEditDefinition) as unknown as {
+        renderCall(args: unknown, theme: unknown, context: unknown): { render(width: number): string[] };
+      };
+      const nativeEditCall = (nativeEditDefinition as Record<string, unknown>).renderCall as unknown as (
+        args: unknown, theme: unknown, context: unknown,
+      ) => { render(width: number): string[] };
+      const editArgs = { path: `/work/${CALL_RESET}.txt` };
+      assert.deepEqual(
+        edit.renderCall(editArgs, themeLike, context(editArgs)).render(40),
+        nativeEditCall(editArgs, themeLike, context(editArgs)).render(40),
+        `${themeCase}: the decorated self-shell header differs from the native header`,
+      );
+    }
+  });
+
+  test("real host: a gate-painted annotated edit error keeps its background across a retained reset (#677)", async () => {
+    // A self-shell row is painted by this gate, not by the host's `Box`, so the
+    // same seam lives in `paintAnnotationRow`: a reset surviving inside a body
+    // row cancels the gate's own background span for the rest of the row. Only
+    // annotated rows are affected — an unannotated native edit keeps the host's
+    // own unpainted presentation, which this change does not touch.
+    await withEditFixture(async (cwd) => {
+      await withInstalledHostWidths(async () => {
+        const errorBgAnsi = theme.getBgAnsi("toolErrorBg");
+        const errorBg = packedColor(errorBgAnsi, "bg");
+        const errorFg = packedColor(theme.getFgAnsi("error"), "fg");
+        for (const fixture of [
+          { label: "reset-bearing", text: RESET_BEARING_EDIT_ERROR, inserted: true },
+          { label: "reset-free", text: RESET_FREE_EDIT_ERROR, inserted: false },
+        ]) {
+          for (const width of [40, 80]) {
+            for (const expanded of [false, true]) {
+              const pi = fakePiHost();
+              const { coordinator } = coordinatorFor([PASS_WITH_REASON], { cwd, config: protectionConfig({ debug: true }) });
+              coordinator.registerHooks(pi.pi);
+              assert.equal(await coordinator.admitToolCall(callArgs("edit-677-error", "edit", EDIT_ARGS)), undefined);
+              const event = resultEvent("edit-677-error", "edit", [{ type: "text", text: fixture.text }], { isError: true, details: {} });
+              assert.deepEqual(await pi.emit("tool_result", event), [],
+                "a PASS adds no audit text to a native error result either");
+              const decorated = (pi.pi.__rendererResolver as RendererResolver)("edit", () => nativeEditDefinition);
+              assert.ok(decorated?.renderResult, "the production resolver decorated the native edit renderers");
+              const component = new h.agent.ToolExecutionComponent(
+                "edit", "edit-677-error", EDIT_ARGS, {}, { ...nativeEditDefinition, ...decorated }, ui, cwd,
+              );
+              component.setArgsComplete();
+              component.updateResult(event, false);
+              let lines = await renderWithPreview(component, width);
+              if (expanded) {
+                component.setExpanded(true);
+                lines = component.render(width);
+              }
+              const label = `annotated edit error ${fixture.label} ${expanded ? "expanded" : "collapsed"} width ${width}`;
+              const cells = await cardCells(lines, width + 1);
+              for (const [index, cellRow] of cells.entries()) {
+                if (index === 0) continue; // the host's own blank row above the card
+                for (let column = 0; column < width; column += 1) {
+                  assert.ok(cellRow[column]!.bgMode !== 0,
+                    `${label}: cell ${column} of card row ${index + 1} has no background — an ordinary terminal-background hole inside the card`);
+                }
+                assert.equal(cellRow[width]!.bgMode, 0, `${label}: the guard column past the card carries a background`);
+              }
+              const auditStart = lines.findIndex((line) => stripAnsi(line).includes("Tool protection: PASS"));
+              assert.ok(auditStart > 0, `${label}: the gate's own audit row is drawn`);
+              assertFitsWidth(lines, width, label);
+              if (fixture.inserted) {
+                const joined = lines.join("");
+                assert.ok(joined.includes("\x1b[0m"),
+                  `${label}: the fixture no longer renders a retained reset (the case would pass vacuously)`);
+                const seam = lines
+                  .map((line, index) => ({ line, index }))
+                  .filter((one) => stripAnsi(one.line).includes("tail after a full reset"));
+                assert.ok(seam.length > 0, `${label}: the reset-bearing error text was not rendered`);
+                for (const one of seam) {
+                  for (let column = 0; column < width; column += 1) {
+                    assert.ok(cellHasColor(cells[one.index]![column]!, "bg", errorBg),
+                      `${label}: cell ${column} of the reset-bearing card row ${one.index + 1} is not on the error row background`);
+                  }
+                  // The row keeps its own foreground through the reset.
+                  assert.ok(cells[one.index]!.some((cell) => cell.chars.length > 0 && cell.chars !== " "
+                    && cellHasColor(cell, "fg", errorFg)),
+                  `${label}: the reset-bearing row lost its error foreground`);
+                }
+              } else {
+                // Reset-free control: every gate-painted row keeps exactly the
+                // one open and one close the paint itself emits — the repair
+                // inserted nothing anywhere.
+                for (const line of lines.slice(auditStart)) {
+                  assert.ok(!line.includes("\x1b[0m") && !line.includes("\x1b[49m\x1b[49m"),
+                    `${label}: the reset-free fixture gained a reset`);
+                  assert.equal(countOf(line, errorBgAnsi), 1, `${label}: a gate-painted row gained a background re-open`);
+                  assert.equal(countOf(line, "\x1b[49m"), 1, `${label}: a gate-painted row gained a background close`);
+                }
+              }
+            }
+          }
+        }
+      });
     });
   });
 

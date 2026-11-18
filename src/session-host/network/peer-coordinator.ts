@@ -395,8 +395,10 @@ const NOTICE = Object.freeze({
 	actionFailed: "The network action could not be completed.",
 	invalidBind: "Enter an explicit bind address and port.",
 	invalidDestination: "Enter a name, host, and port for the destination.",
+	invalidAddress: "Enter an explicit destination address.",
 	tooManyDestinations: "No more destinations can be saved.",
 	unknownDestination: "That saved destination is no longer available.",
+	staleDestination: "That saved destination changed while its address was being edited; nothing was changed.",
 	unknownPeer: "That peer receiving permission is no longer available.",
 	removeUnsaved: "Removal could not be saved.",
 	pinNotCleared: "The saved host key could not be cleared.",
@@ -1823,6 +1825,9 @@ class OwnedPeerCoordinator implements
 					return;
 				case "peer-add":
 					this.#commandAdd(command);
+					return;
+				case "peer-edit-host":
+					await this.#commandEditHost(command);
 					return;
 				case "peer-connect":
 					await this.#commandConnect(command);
@@ -5333,6 +5338,80 @@ class OwnedPeerCoordinator implements
 		}
 		this.#runtimeFor(destination);
 		this.#emit();
+	}
+
+	/**
+	 * Change one saved destination's address and reconnect it explicitly — the one
+	 * deliberate gesture its edit form's Save action drew. Only the address moves:
+	 * the destination keeps its id, label, port, connection history, saved
+	 * suppression flag, and remembered server key, so no trust record is written,
+	 * cleared, or re-paired here.
+	 *
+	 * The drawn form names the exact endpoint it replaces. A destination that was
+	 * removed, re-added, or re-addressed in the meantime is a stale target and is
+	 * refused: nothing is written, retired, or dialed. A refused save changes
+	 * nothing at all — no apply, no retirement, no reconnect.
+	 *
+	 * A saved change retires the old endpoint's live resources (in-flight attempt,
+	 * owned retry timer, channel, viewer, content selection, and in-flight
+	 * consents) through the same tracked retirement Disconnect and Remove use, so
+	 * a late completion of the old attempt can never republish itself against the
+	 * new address. B is then reached by the ordinary explicit Connect path, which
+	 * alone may clear a saved suppression and alone may prompt for a key: a server
+	 * identity that changed with the address still refuses with the existing
+	 * terminal key-changed report and prompts for nothing new.
+	 */
+	async #commandEditHost(command: Record<string, unknown>): Promise<void> {
+		const hostId = command.hostId;
+		const hostText = command.host;
+		const expectedHost = command.expectedHost;
+		const expectedPort = command.expectedPort;
+		if (typeof hostId !== "string" || typeof hostText !== "string"
+			|| typeof expectedHost !== "string" || typeof expectedPort !== "number") {
+			this.#transientNotice = NOTICE.invalidRequest;
+			this.#emit();
+			return;
+		}
+		const host = hostText.trim();
+		if (!isValidPeerEndpointHost(host)) {
+			this.#transientNotice = NOTICE.invalidAddress;
+			this.#emit();
+			return;
+		}
+		const destination = this.#destination(hostId);
+		if (destination === undefined) {
+			this.#transientNotice = NOTICE.unknownDestination;
+			this.#emit();
+			return;
+		}
+		if (destination.host !== expectedHost || destination.port !== expectedPort) {
+			this.#transientNotice = NOTICE.staleDestination;
+			this.#emit();
+			return;
+		}
+		if (destination.host === host) {
+			// Nothing is persisted and no old endpoint exists to retire, exactly as
+			// on Android; the deliberate gesture is still an explicit Connect.
+			await this.#commandConnect({ hostId });
+			return;
+		}
+		const preferences = this.#preferences;
+		if (preferences === null) {
+			this.#transientNotice = NOTICE.preferencesUnavailable;
+			this.#emit();
+			return;
+		}
+		const next: PeerPreferences = {
+			...preferences,
+			destinations: preferences.destinations.map((entry) => (
+				entry.id === hostId ? { ...entry, host } : entry
+			)),
+		};
+		// Write-before-publish with no apply-on-failure: a refused save leaves both
+		// the document and this session's view of it naming A, and reconnects nothing.
+		if (!this.#savePreferences(next)) return;
+		this.#cancelActivity(hostId, null);
+		await this.#commandConnect({ hostId });
 	}
 
 	async #commandConnect(command: Record<string, unknown>): Promise<void> {

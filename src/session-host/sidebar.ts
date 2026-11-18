@@ -1909,7 +1909,9 @@ type PeerActionRowKind =
   | "edit-add-label"
   | "edit-add-host"
   | "edit-add-port"
-  | "apply-add";
+  | "apply-add"
+  | "edit-host-address"
+  | "apply-edit-host";
 
 /** Selectable network-panel rows; remote rows are a separate typed kind. */
 type PeerPaneRow =
@@ -1919,6 +1921,8 @@ type PeerPaneRow =
       readonly intent: PeerPaneRowIntent;
     }
   | { readonly kind: "host"; readonly key: string; readonly host: PeerUiHost }
+  /** Drawn per-destination entry into that one destination's address edit. */
+  | { readonly kind: "edit-host"; readonly key: string; readonly host: PeerUiHost }
   | { readonly kind: "trusted"; readonly key: string; readonly peer: PeerUiTrustedPeer }
   | { readonly kind: "consent"; readonly key: string; readonly consent: PeerUiConsent }
   | {
@@ -1934,7 +1938,7 @@ type PeerPaneRow =
  * One bounded network field editor: an explicit listen value, or exactly one
  * part of the local Add-destination draft. A purpose never edits two fields.
  */
-type PeerFieldPurpose = "bind-host" | "bind-port" | "add-label" | "add-host" | "add-port";
+type PeerFieldPurpose = "bind-host" | "bind-port" | "add-label" | "add-host" | "add-port" | "edit-host";
 
 /** Which Add-destination part a purpose edits; undefined for a listen field. */
 function peerAddFieldOf(purpose: PeerFieldPurpose): "label" | "host" | "port" | undefined {
@@ -2084,6 +2088,11 @@ function peerPaneRowIdentity(row: PeerPaneRow): readonly unknown[] {
       return [row.key, row.kind, row.host.id, row.host.state, row.host.roster.state,
         row.host.roster.rows === null ? null : row.host.roster.rows.length,
         row.host.reconnectSuppressed, row.host.previouslyConnected];
+    // The drawn Edit address row names exactly one destination endpoint, so a
+    // destination removed or re-addressed behind the written frame can never be
+    // retargeted by a press that was captured for it.
+    case "edit-host":
+      return [row.key, row.kind, row.host.id, row.host.host, row.host.port];
     case "trusted":
       return [row.key, row.kind, row.peer.id, row.peer.hasInboundGrant];
     case "consent":
@@ -3738,6 +3747,22 @@ export class SidebarController {
   private peerAddDraft = { label: "", host: "", port: "" };
   /** True while the Add-destination field menu replaces the network rows. */
   private peerAddMenuOpen = false;
+  /**
+   * Frozen destination whose address is being edited, captured from the row the
+   * operator activated: its id plus the exact saved endpoint the form drew. A
+   * later snapshot never retargets it, and the emitted command carries that
+   * endpoint so the coordinator can refuse a destination that changed meanwhile.
+   */
+  private peerEditTarget: {
+    readonly hostId: string;
+    readonly label: string;
+    readonly host: string;
+    readonly port: number;
+  } | undefined;
+  /** Unsaved address draft for the open destination edit; address only. */
+  private peerEditHostDraft = "";
+  /** True while the destination address-edit menu replaces the network rows. */
+  private peerEditMenuOpen = false;
   private peerFieldTarget: { readonly purpose: PeerFieldPurpose } | undefined;
   /** Frozen destination-removal target; later snapshots never retarget it. */
   private peerRemoveTarget: { readonly hostId: string; readonly label: string; readonly endpoint: string } | undefined;
@@ -5461,6 +5486,9 @@ export class SidebarController {
     this.peerPaneNotice = undefined;
     this.peerFieldTarget = undefined;
     this.peerAddMenuOpen = false;
+    this.peerEditMenuOpen = false;
+    this.peerEditTarget = undefined;
+    this.peerEditHostDraft = "";
     this.peerConfirmDisplayed = false;
     this.peerRemoveTarget = undefined;
     this.peerRevokeTarget = undefined;
@@ -6694,6 +6722,7 @@ export class SidebarController {
         return true;
       case "peer":
         if (this.peerAddMenuOpen) this.closePeerAddMenu();
+        if (this.peerEditMenuOpen) this.closePeerEditMenu();
         this.closePeerPane();
         this._focus = "sidebar";
         this.onInvalidate?.();
@@ -6703,6 +6732,7 @@ export class SidebarController {
         // containing pane closes after it, so nothing stays open underneath.
         this.closePeerFieldForm();
         if (this.peerAddMenuOpen) this.closePeerAddMenu();
+        if (this.peerEditMenuOpen) this.closePeerEditMenu();
         this.closePeerPane();
         this._focus = "sidebar";
         this.onInvalidate?.();
@@ -12192,6 +12222,16 @@ export class SidebarController {
         return [kind, add.host];
       case "edit-add-port":
         return [kind, add.port];
+      // The address-edit rows carry the frozen destination endpoint the form
+      // drew, so a captured frame can only ever emit the edit it displayed.
+      case "edit-host-address":
+        return [kind, this.peerEditHostDraft];
+      case "apply-edit-host": {
+        const target = this.peerEditTarget;
+        return target === undefined
+          ? [kind, null]
+          : [kind, target.hostId, target.host, target.port, this.peerEditHostDraft];
+      }
     }
   }
 
@@ -12201,6 +12241,13 @@ export class SidebarController {
     // and one explicit Add action, reachable in any order like the Listen rows.
     if (this.peerAddMenuOpen) {
       return (["edit-add-label", "edit-add-host", "edit-add-port", "apply-add"] as const)
+        .map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
+    }
+    // The address edit is its own field menu on one frozen destination: the
+    // address field and the single Save address and reconnect action. The port
+    // is displayed as fixed and is never an editable row.
+    if (this.peerEditMenuOpen) {
+      return (["edit-host-address", "apply-edit-host"] as const)
         .map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) }));
     }
     const rows: PeerPaneRow[] = [];
@@ -12223,6 +12270,9 @@ export class SidebarController {
     if (snapshot === undefined) return rows;
     for (const host of snapshot.hosts ?? []) {
       rows.push({ key: `host:${host.id}`, kind: "host", host });
+      // Each destination carries its own drawn Edit address row, so the whole
+      // edit is reachable by Enter and by an ordinary press on that written row.
+      rows.push({ key: `edit-host:${host.id}`, kind: "edit-host", host });
       const rosterRows = host.roster.rows;
       // rows === null is "no complete observation": never fabricate empty rows.
       if (rosterRows === null) continue;
@@ -12348,6 +12398,8 @@ export class SidebarController {
         return "Repair Network storage permissions... (enter to review)";
       case "add-host":
         return "Add destination";
+      case "edit-host":
+        return "Edit address (enter to edit)";
       case "edit-add-label":
         return `Name: ${this.peerAddDraft.label.length > 0 ? sanitizeBounded(this.peerAddDraft.label, PEER_LABEL_MAX_CODEPOINTS) : "(not set)"} (enter to edit)`;
       case "edit-add-host":
@@ -12356,6 +12408,10 @@ export class SidebarController {
         return `Port: ${this.peerAddDraft.port.length > 0 ? sanitizeBounded(this.peerAddDraft.port, 16) : "(not set)"} (enter to edit)`;
       case "apply-add":
         return "Add destination (enter to add)";
+      case "edit-host-address":
+        return `Address: ${this.peerEditHostDraft.length > 0 ? sanitizeBounded(this.peerEditHostDraft, PEER_ADDRESS_MAX_CODEPOINTS) : "(not set)"} (enter to edit)`;
+      case "apply-edit-host":
+        return "Save address and reconnect (enter to save)";
       case "host": {
         const host = row.host;
         const endpoint = `${peerBracketHost(host.host)}:${host.port}`;
@@ -12414,18 +12470,28 @@ export class SidebarController {
     const snapshot = this.peerUiSnapshot;
     if (snapshot === undefined) return this.renderTooSmall(cols, rows);
     const addMenu = this.peerAddMenuOpen;
-    const header = addMenu ? " Add destination " : " Network ";
+    const editMenu = this.peerEditMenuOpen && !addMenu;
+    const header = addMenu
+      ? " Add destination "
+      : editMenu
+        ? " Edit address "
+        : " Network ";
     const statusLines = wrapHintLines(this.peerStatusSegments(snapshot), cols);
     const identityLines = wrapBoundedField(this.peerIdentityText(snapshot), cols, 2);
     // Sanitized storage why/mitigation lines: fixed text from closed facts only.
-    const storageLines = addMenu || snapshot.storage === undefined || snapshot.storage === null
+    const storageLines = addMenu || editMenu || snapshot.storage === undefined || snapshot.storage === null
       ? []
       : wrapSentenceLines(describePeerUiStorage(snapshot.storage), cols) ?? [];
+    // The edit menu always names the one destination it acts on, with its fixed
+    // port, so the operator can never be unsure which endpoint the edit replaces.
+    const editIdentityLines = editMenu
+      ? wrapHintLines([this.peerEditIdentityText()], cols)
+      : ([] as string[]);
     const notices = [snapshot.notice, this.peerPaneError, this.peerPaneNotice]
       .filter((message): message is string => typeof message === "string" && message.trim().length > 0)
       .map((message) => `! ${sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS)}`);
     const noticeLines = notices.length === 0 ? [] : wrapHintLines(notices, cols) ?? [];
-    const footerLines = wrapHintLines(addMenu
+    const footerLines = wrapHintLines(addMenu || editMenu
       ? [
         `${this.toggleLabel} toggle`,
         "up/down select",
@@ -12442,9 +12508,11 @@ export class SidebarController {
         "v revoke",
         "esc back",
       ], cols);
-    if (statusLines === undefined || footerLines === undefined) return this.renderTooSmall(cols, rows);
+    if (statusLines === undefined || footerLines === undefined || editIdentityLines === undefined) {
+      return this.renderTooSmall(cols, rows);
+    }
     const fixedRows = 1 + statusLines.length + identityLines.length + storageLines.length + noticeLines.length
-      + footerLines.length;
+      + editIdentityLines.length + footerLines.length;
     const listRows = rows - fixedRows;
     if (listRows < 1) return this.renderTooSmall(cols, rows);
     const paneRows = this.buildPeerPaneRows();
@@ -12458,6 +12526,7 @@ export class SidebarController {
     for (const line of identityLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
     for (const line of storageLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
     for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
+    for (const line of editIdentityLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
     const drawn: DisplayedPeerRow[] = [];
     for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
       const row = paneRows[index];
@@ -12515,6 +12584,12 @@ export class SidebarController {
         this.closePeerAddMenu();
         return;
       }
+      if (this.peerEditMenuOpen) {
+        // Escape cancels the address edit the same way: the destination keeps
+        // its saved address, no command is emitted, and no reconnect happens.
+        this.closePeerEditMenu();
+        return;
+      }
       this.closePeerPane();
       if (this.settingsPaneReturn) {
         // Entered from the grouped Settings menu, so Back returns THROUGH that
@@ -12534,10 +12609,10 @@ export class SidebarController {
     }
     if (isKeyRepeat(data)) return;
     const printable = printableOf(data);
-    // The Add-destination menu shows no destination or permission row, so the
-    // host-action keys are not offered there and do nothing; Enter, Up/Down,
-    // and Escape are its whole navigation surface.
-    if (this.peerAddMenuOpen) return;
+    // The Add-destination and address-edit menus show no destination or
+    // permission row, so the host-action keys are not offered there and do
+    // nothing; Enter, Up/Down, and Escape are their whole navigation surface.
+    if (this.peerAddMenuOpen || this.peerEditMenuOpen) return;
     if (printable === "c" || printable === "C") {
       this.requestPeerConnect();
       return;
@@ -12672,6 +12747,12 @@ export class SidebarController {
       case "apply-add":
         this.requestPeerAdd();
         return;
+      case "edit-host-address":
+        this.openPeerFieldForm("edit-host");
+        return;
+      case "apply-edit-host":
+        this.requestPeerEditHost();
+        return;
       case "host": {
         const label = sanitizeBounded(row.host.label, PEER_LABEL_MAX_CODEPOINTS);
         this.peerPaneError = undefined;
@@ -12679,6 +12760,12 @@ export class SidebarController {
         this.onInvalidate?.();
         return;
       }
+      case "edit-host":
+        // The row carries the destination it was drawn for, so the frozen edit
+        // target is the row the operator activated, never whatever is
+        // highlighted now.
+        this.openPeerEditMenu(row.host);
+        return;
       case "trusted": {
         const label = sanitizeBounded(row.peer.label, PEER_LABEL_MAX_CODEPOINTS);
         const grant = row.peer.hasInboundGrant ? "" : " (no grant observed)";
@@ -12925,6 +13012,9 @@ export class SidebarController {
     this.formKind = undefined;
     this.peerFieldTarget = undefined;
     this.peerAddMenuOpen = false;
+    this.peerEditMenuOpen = false;
+    this.peerEditTarget = undefined;
+    this.peerEditHostDraft = "";
     this.peerDisplay = undefined;
     this.peerPaneError = undefined;
     this.peerPaneNotice = undefined;
@@ -12955,6 +13045,84 @@ export class SidebarController {
     this.peerPaneError = undefined;
     this.peerSelectedKey = "add-host";
     this.onInvalidate?.();
+  }
+
+  /** The one line that names the destination an open address edit acts on. */
+  private peerEditIdentityText(): string {
+    const target = this.peerEditTarget;
+    if (target === undefined) return "No destination is selected for an address edit";
+    const label = sanitizeBounded(target.label, PEER_LABEL_MAX_CODEPOINTS);
+    const endpoint = `${peerBracketHost(target.host)}:${target.port}`;
+    return `${label} ${endpoint} — name, port, history, and remembered key stay fixed`;
+  }
+
+  /**
+   * Opens the address edit for one destination row the operator actually
+   * activated. Opening it sends nothing: the destination's saved address
+   * prefills the one editable field, and the change is emitted only by the
+   * menu's single Save address and reconnect action.
+   */
+  private openPeerEditMenu(host: PeerUiHost): void {
+    this.peerEditTarget = Object.freeze({
+      hostId: host.id,
+      label: sanitizeBounded(host.label, PEER_LABEL_MAX_CODEPOINTS),
+      host: host.host,
+      port: host.port,
+    });
+    this.peerEditHostDraft = host.host;
+    this.peerEditMenuOpen = true;
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = undefined;
+    this.peerSelectedKey = "edit-host-address";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Leaves the address edit. Cancelling and saving both return here: the
+   * destination keeps whatever address the coordinator actually holds, the
+   * local draft is discarded, and this path never emits a command.
+   */
+  private closePeerEditMenu(): void {
+    const hostId = this.peerEditTarget?.hostId;
+    this.peerEditMenuOpen = false;
+    this.peerEditTarget = undefined;
+    this.peerEditHostDraft = "";
+    this.peerPaneError = undefined;
+    this.peerSelectedKey = hostId === undefined ? "add-host" : `edit-host:${hostId}`;
+    this.onInvalidate?.();
+  }
+
+  /**
+   * The one Save address and reconnect action: validate the drawn address with
+   * the existing host field rule, then emit exactly one command carrying the
+   * frozen endpoint the form was drawn with, so a destination that was removed,
+   * replaced, or re-addressed while the form was open cannot be retargeted. An
+   * invalid or missing address is refused locally and sends nothing.
+   */
+  private requestPeerEditHost(): void {
+    const target = this.peerEditTarget;
+    if (target === undefined) {
+      this.peerPaneError = "Select a destination to edit its address";
+      this.onInvalidate?.();
+      return;
+    }
+    const host = this.peerEditHostDraft;
+    const error = peerHostFieldError(host, "Destination address");
+    if (error !== undefined) {
+      this.peerPaneError = error;
+      this.onInvalidate?.();
+      return;
+    }
+    this.peerPaneError = undefined;
+    this.peerPaneNotice = `Address change requested for ${target.label}; the coordinator saves it and reconnects`;
+    this.closePeerEditMenu();
+    this.emit({
+      type: "peer-edit-host",
+      hostId: target.hostId,
+      expectedHost: target.host,
+      expectedPort: target.port,
+      host,
+    });
   }
 
   /**
@@ -13009,6 +13177,8 @@ export class SidebarController {
         return this.peerAddDraft.host;
       case "add-port":
         return this.peerAddDraft.port;
+      case "edit-host":
+        return this.peerEditHostDraft;
     }
   }
 
@@ -13052,7 +13222,24 @@ export class SidebarController {
       return;
     }
     const addField = peerAddFieldOf(purpose);
-    if (addField === undefined) return;
+    if (addField === undefined) {
+      if (purpose !== "edit-host") return;
+      const addressError = peerHostFieldError(value, "Destination address");
+      if (addressError !== undefined) {
+        // The field keeps its own text and the fixed local data-shape message;
+        // an unusable address is never stored in the draft and nothing is sent.
+        this.formError = addressError;
+        this.createFormField(value);
+        return;
+      }
+      this.peerEditHostDraft = value;
+      this.peerPaneNotice = "Address updated locally; choose Save address and reconnect";
+      this.peerPaneError = undefined;
+      // The edit returns to its menu: the change is sent only by that menu's
+      // single Save action.
+      this.closePeerFieldForm();
+      return;
+    }
     const error = addField === "label"
       ? peerLabelFieldError(value)
       : addField === "host"
@@ -13082,14 +13269,22 @@ export class SidebarController {
     const purpose = target?.purpose;
     if (target === undefined || field === undefined || purpose === undefined) return this.renderTooSmall(cols, rows);
     const addField = peerAddFieldOf(purpose);
-    const header = addField === undefined ? " Network settings " : " Add destination ";
+    const editingAddress = purpose === "edit-host";
+    const header = editingAddress
+      ? " Edit address "
+      : addField === undefined
+        ? " Network settings "
+        : " Add destination ";
     const activeLabel = purpose === "bind-host"
       ? "Listen address"
       : purpose === "bind-port"
         ? "Listen port"
-        : peerAddFieldLabel(addField ?? "label");
-    const contextLines = wrapHintLines([
-      addField !== undefined
+        : editingAddress
+          ? "Address"
+          : peerAddFieldLabel(addField ?? "label");
+    const contextLines = wrapHintLines([editingAddress
+      ? `${this.peerEditIdentityText()}. Only the address changes; saving it saves the new address and reconnects explicitly, and a changed server key is still refused.`
+      : addField !== undefined
         ? "The destination is display data; the coordinator validates and saves it."
         : "Address and port are separate fields. \"*\" asks for one dual-stack listener (IPv4 and IPv6); \"0.0.0.0\" is IPv4 only. New hosts start with Hosting off. Edits stay local until Apply or Enable; no other address or port is substituted.",
     ], cols);
@@ -13169,6 +13364,11 @@ export class SidebarController {
     // A hidden pane also holds no Add-destination menu: reopening Network shows
     // the network rows, and an unseen menu can never authorize an Add.
     this.peerAddMenuOpen = false;
+    // Nor an address edit: a menu the operator can no longer see can never
+    // authorize a save-and-reconnect, and its local draft is discarded.
+    this.peerEditMenuOpen = false;
+    this.peerEditTarget = undefined;
+    this.peerEditHostDraft = "";
     // Nor does it hold a Settings submenu, a Theme pane, or the grouping's
     // return routing: none of them may authorize anything off-screen.
     this.settingsDisplay = undefined;

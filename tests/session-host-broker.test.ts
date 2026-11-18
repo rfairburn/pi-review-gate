@@ -2056,7 +2056,10 @@ function collectReplies(client: net.Socket): Record<string, unknown>[] {
   return replies;
 }
 
-test("routed SessionSpawn without an installed routed handler is refused before any read and never reaches the Pi-only handler", async () => {
+test("routed SessionSpawn without an installed routed handler is refused before any read and never reaches the Pi-only handler", async (t) => {
+  // Exercise Windows-style linked ownership on every platform.
+  payloadTest.setOwnershipPinForTests(false);
+  t.after(() => payloadTest.setOwnershipPinForTests(undefined));
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   let legacyCalls = 0;
   const registration = broker.register(INSTANCE_A, {
@@ -2067,6 +2070,8 @@ test("routed SessionSpawn without an installed routed handler is refused before 
   assert.equal(Object.hasOwn(registration.bootstrap, "spawnRouting"), false,
     "a registration without a routed handler keeps the legacy bootstrap");
   const payloadDir = registration.bootstrap.payloadDir as string;
+  const routedStage = stageSessionHostPayload(payloadDir, JSON.stringify("Routed prompt."));
+  stagedPayloadOwnership.push(routedStage);
   const client = await connectClient(broker.socketPath);
   const replies = collectReplies(client);
   const routed = {
@@ -2078,7 +2083,7 @@ test("routed SessionSpawn without an installed routed handler is refused before 
     requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     workspace: "/existing workspace",
     title: "Routed child",
-    payload: spawnPayload(registration.bootstrap, "Routed prompt."),
+    payload: routedStage.descriptor,
     kind: "codex",
   };
   client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(routed as never));
@@ -2086,12 +2091,18 @@ test("routed SessionSpawn without an installed routed handler is refused before 
   assert.equal(replies[0]!.type, "spawn_result");
   assert.equal(replies[0]!.requestId, routed.requestId);
   assert.equal(replies[0]!.outcome, "failed", "a definite refusal: no host operation was invoked");
-  await waitFor(() => fs.readdirSync(payloadDir).length === 0);
+  // The broker consumes its verified payload name, not the producer's Windows
+  // continuity pin. A definite refusal lets the producer release its own lease.
+  await waitFor(() => !fs.existsSync(path.join(payloadDir, routed.payload.name)));
+  routedStage.discard();
+  assert.deepEqual(fs.readdirSync(payloadDir), []);
   assert.equal(legacyCalls, 0, "the selector is never dropped to launch a local Pi child");
 
   // A legacy-family frame smuggling a selector is malformed: the connection
   // closes and still nothing is invoked.
   const smuggledStage = stageSessionHostPayload(payloadDir, JSON.stringify("Smuggled prompt."));
+  stagedPayloadOwnership.push(smuggledStage);
+  const smuggledEntries = fs.readdirSync(payloadDir).sort();
   const smuggled = {
     ...routed,
     type: "spawn_request",
@@ -2101,12 +2112,16 @@ test("routed SessionSpawn without an installed routed handler is refused before 
   await expectClientClose(client, () => client.write(`${JSON.stringify(smuggled)}\n`));
   assert.equal(legacyCalls, 0);
   // The broker never accepted that frame, so the sender still owns its file.
-  assert.equal(fs.readdirSync(payloadDir).length, 1, "a malformed frame is never read or consumed");
+  assert.deepEqual(fs.readdirSync(payloadDir).sort(), smuggledEntries,
+    "a malformed frame preserves the payload and every producer-owned continuity entry");
+  assert.equal(fs.readFileSync(path.join(payloadDir, smuggled.payload.name), "utf8"), JSON.stringify("Smuggled prompt."));
   smuggledStage.discard();
 
   // The unchanged three-field legacy request still reaches the Pi-only handler.
   const next = await connectClient(broker.socketPath);
   const nextReplies = collectReplies(next);
+  const legacyStage = stageSessionHostPayload(payloadDir, JSON.stringify("Legacy prompt."));
+  stagedPayloadOwnership.push(legacyStage);
   const legacy = {
     version: 1,
     type: "spawn_request",
@@ -2116,12 +2131,15 @@ test("routed SessionSpawn without an installed routed handler is refused before 
     requestId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
     workspace: "/existing workspace",
     title: "Legacy child",
-    payload: spawnPayload(registration.bootstrap, "Legacy prompt."),
+    payload: legacyStage.descriptor,
   };
   next.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(legacy as never));
   await waitFor(() => nextReplies.length === 1);
   assert.equal(nextReplies[0]!.outcome, "started");
   assert.equal(legacyCalls, 1);
+  await waitFor(() => !fs.existsSync(path.join(payloadDir, legacy.payload.name)));
+  legacyStage.discard();
+  assert.deepEqual(fs.readdirSync(payloadDir), [], "all producer leases are released before broker disposal");
   await disposeBroker(broker);
 });
 

@@ -24,6 +24,7 @@ import {
   isVerifiedWindowsAncestryEvidence,
   isWindowsLineageRefusalReason,
   verifyWindowsProcessLineage,
+  windowsLineageQueryEnvironment,
   type WindowsLineageQueryChild,
   type WindowsLineageQueryExecutor,
   type WindowsLineageQueryOptions,
@@ -45,9 +46,11 @@ import {
   WINDOWS_LINEAGE_CAUSAL_MAX_ADDED_LINES,
   WINDOWS_LINEAGE_CAUSAL_MAX_FRAME_BYTES,
   WINDOWS_LINEAGE_CAUSAL_SUMMARY_MAX_CHARS,
+  WINDOWS_LINEAGE_CAUSAL_VERSION,
   assessWindowsLineageCausalExperiment,
   assessWindowsLineageCausalLedger,
   classifyModulePathCategories,
+  countModulePathKeys,
   createWindowsLineageCausalLedger,
   createWindowsLineageCausalProbe,
   createWindowsLineageReleaseGate,
@@ -56,7 +59,6 @@ import {
   instrumentWindowsLineageCausalScript,
   nativeWindowsModulesDir,
   parseWindowsLineageCausalFrame,
-  withoutPSModulePath,
   type WindowsLineageCausalArm,
   type WindowsLineageCausalChild,
   type WindowsLineageCausalLauncher,
@@ -265,11 +267,11 @@ function flushAsync(): Promise<void> {
 async function captureLineageScript(
   ownedRoot: ChildProcess = fakeOwnedRoot(),
   candidatePid: number = CANDIDATE_PID,
-): Promise<{ script: string; result: Awaited<ReturnType<typeof verifyWithMockedQuery>> }> {
+): Promise<{ script: string; options: WindowsLineageQueryOptions; result: Awaited<ReturnType<typeof verifyWithMockedQuery>> }> {
   const query = fakeQuery({ kind: "output", output: VALID_EVIDENCE });
   const result = await withSystemRoot("/fake-windows", () => verifyWithMockedQuery(query, ownedRoot, candidatePid));
   assert.equal(query.calls.length, 1, "batching the initial lookup never adds a query child or a retry");
-  return { script: query.calls[0].args[4], result };
+  return { script: query.calls[0].args[4], options: query.calls[0].options, result };
 }
 
 /** Every index at which `needle` occurs in `haystack`. */
@@ -324,6 +326,119 @@ async function withSystemRoot<T>(value: string | undefined, fn: () => Promise<T>
   }
 }
 
+/**
+ * Temporarily set (string) or delete (undefined) keys of this process's
+ * environment, restoring every touched key afterwards. On Windows the process
+ * environment is case-insensitive, so case aliases collapse onto one key there;
+ * assertions built on this helper count keys instead of assuming the aliases stay
+ * distinct.
+ */
+async function withProcessEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const saved = Object.keys(patch).map((key) => [key, Object.hasOwn(process.env, key), process.env[key]] as const);
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key] of [...saved].reverse()) delete process.env[key];
+    for (const [key, had, value] of saved) if (had) process.env[key] = value;
+  }
+}
+
+/** Synthetic environment entries; only these allowlisted names are ever named in a failure. */
+const SYNTHETIC_ENV_PATCH: Record<string, string> = {
+  PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+  psmodulepath: "alias-lower",
+  PSMODULEPATH: "alias-upper",
+  WinPSModulePath: "keep-winps",
+  PSModulePathX: "keep-suffix",
+  PRG_L446_ENV_SENTINEL: "keep-sentinel",
+};
+
+/** The parent's actual key spellings (Windows keeps one spelling per name) that a failure may name. */
+function allowlistedEnvKeys(parentEnv: NodeJS.ProcessEnv): string[] {
+  const names = ["path", "systemroot", "winpsmodulepath", "psmodulepathx", "prg_l446_env_sentinel"];
+  return Object.keys(parentEnv).filter((key) => names.includes(key.toLowerCase()));
+}
+
+/**
+ * Compare a query child's environment with the specification (every key of
+ * `parentEnv` except case-insensitive `PSModulePath`, values identical, nothing
+ * added) using counts and booleans only, so a failing assertion can never print an
+ * environment value or an unexpected key name.
+ */
+function queryEnvironmentDifference(env: unknown, parentEnv: NodeJS.ProcessEnv): {
+  isObject: boolean;
+  isParent: boolean;
+  modulePathKeys: number;
+  missing: number;
+  changed: number;
+  extra: number;
+  allowlisted: Record<string, boolean>;
+} {
+  const isObject = typeof env === "object" && env !== null;
+  const received = (isObject ? env : {}) as NodeJS.ProcessEnv;
+  const isModulePathKey = (key: string): boolean => key.toLowerCase() === "psmodulepath";
+  const retained = Object.keys(parentEnv).filter((key) => !isModulePathKey(key));
+  const allowlisted: Record<string, boolean> = {};
+  for (const key of allowlistedEnvKeys(parentEnv)) {
+    allowlisted[key] = Object.hasOwn(received, key) && received[key] === parentEnv[key];
+  }
+  return {
+    isObject,
+    isParent: env === parentEnv,
+    modulePathKeys: Object.keys(received).filter(isModulePathKey).length,
+    missing: retained.filter((key) => !Object.hasOwn(received, key)).length,
+    changed: retained.filter((key) => Object.hasOwn(received, key) && received[key] !== parentEnv[key]).length,
+    extra: Object.keys(received).filter((key) => !Object.hasOwn(parentEnv, key)).length,
+    allowlisted,
+  };
+}
+
+/** The exact difference a correct producer leaves: none, apart from the removed keys. */
+function expectedEnvironmentDifference(parentEnv: NodeJS.ProcessEnv): ReturnType<typeof queryEnvironmentDifference> {
+  const allowlisted: Record<string, boolean> = {};
+  for (const key of allowlistedEnvKeys(parentEnv)) allowlisted[key] = true;
+  return { isObject: true, isParent: false, modulePathKeys: 0, missing: 0, changed: 0, extra: 0, allowlisted };
+}
+
+/** Allowlisted shape of the query options: fixed keys and values plus env booleans/counts, never env content. */
+function queryOptionsShape(options: WindowsLineageQueryOptions): Record<string, unknown> {
+  return {
+    keys: Object.keys(options).sort(),
+    encoding: options.encoding,
+    maxBuffer: options.maxBuffer,
+    windowsHide: options.windowsHide,
+    envIsObject: typeof options.env === "object" && options.env !== null,
+    envIsProcessEnv: options.env === process.env,
+    envModulePathKeys: countModulePathKeys(options.env),
+  };
+}
+
+const PRODUCTION_OPTIONS_SHAPE = {
+  keys: ["encoding", "env", "maxBuffer", "windowsHide"],
+  encoding: "utf8",
+  maxBuffer: MAX_QUERY_OUTPUT_BYTES,
+  windowsHide: true,
+  envIsObject: true,
+  envIsProcessEnv: false,
+  envModulePathKeys: 0,
+};
+
+/** A boolean-only snapshot comparison of this process's environment. */
+function processEnvSnapshot(): () => { sameKeys: boolean; sameValues: boolean } {
+  const before = new Map(Object.entries(process.env));
+  return () => {
+    const after = Object.entries(process.env);
+    return {
+      sameKeys: after.length === before.size && after.every(([key]) => before.has(key)),
+      sameValues: after.every(([key, value]) => before.get(key) === value),
+    };
+  };
+}
+
 async function writeSignedReceipt(
   bootstrap: PiSettlementBootstrap,
   pid: number,
@@ -370,8 +485,8 @@ test("the original acceptance conditions are unchanged and report no refusal sta
   assert.equal(query.calls.length, 1, "exactly one bounded query child runs, never a retry");
   assert.equal(query.calls[0].file, join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
   assert.deepEqual(query.calls[0].args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-  assert.deepEqual(query.calls[0].options, { encoding: "utf8", maxBuffer: 4096, windowsHide: true },
-    "the query keeps its 4KiB output bound and stays hidden");
+  assert.deepEqual(queryOptionsShape(query.calls[0].options), { ...PRODUCTION_OPTIONS_SHAPE, maxBuffer: 4096 },
+    "the query keeps its 4KiB output bound, stays hidden, and gets its own environment copy");
   assert.ok(!("timeout" in query.calls[0].options),
     "the verifier owns the deadline callback, so timeout evidence is positively witnessed");
   const script = query.calls[0].args[4];
@@ -381,6 +496,68 @@ test("the original acceptance conditions are unchanged and report no refusal sta
     "the bounded query still inspects no command lines, paths, or shim contents");
   assert.equal(isVerifiedWindowsAncestryEvidence(VALID_EVIDENCE, CANDIDATE_PID, OWNED_ROOT_PID), true,
     "the boolean acceptance view agrees with the typed result");
+});
+
+test("the query child gets production's environment copy without any PSModulePath key and nothing else changes", async () => {
+  await withProcessEnv(SYNTHETIC_ENV_PATCH, async () => {
+    const parentAliases = countModulePathKeys(process.env);
+    assert.ok(parentAliases >= 1, "the parent environment carries at least one PSModulePath key for this case");
+    const query = fakeQuery({ kind: "output", output: VALID_EVIDENCE });
+    const outcome = await withSystemRoot("/fake-windows", async () => {
+      const unchanged = processEnvSnapshot();
+      const result = await verifyWithMockedQuery(query);
+      // Compared while the same parent environment (including SystemRoot) is in effect.
+      return { result, difference: queryEnvironmentDifference(query.calls[0]?.options.env, process.env),
+        expected: expectedEnvironmentDifference(process.env), unchanged: unchanged() };
+    });
+    assert.deepEqual(outcome.result, { verified: true }, "the corrected environment changes no acceptance decision");
+    assert.equal(query.calls.length, 1, "still exactly one bounded query child, never a retry or warmup");
+    assert.deepEqual(outcome.difference, outcome.expected,
+      "the child env is a new copy: every case-insensitive PSModulePath key removed, every other key and value kept, nothing added");
+    assert.deepEqual(outcome.unchanged, { sameKeys: true, sameValues: true }, "this process's environment is never modified");
+    assert.equal(countModulePathKeys(process.env), parentAliases, "the parent keeps every PSModulePath key it had");
+    assert.deepEqual(queryOptionsShape(query.calls[0]!.options), PRODUCTION_OPTIONS_SHAPE,
+      "the host options are unchanged apart from the environment copy");
+    assert.deepEqual(query.calls[0]!.args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+      "the same fixed host arguments: no module import or command lookup is added");
+    assert.ok(!/Import-Module|Get-Command|Get-Module/.test(query.calls[0]!.args[4]!), "the script adds no module import or lookup");
+  });
+});
+
+test("the canonical query environment factory removes only case-insensitive PSModulePath keys from a new copy", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PSModulePath: "a", psmodulepath: "b", PSMODULEPATH: "c", PsModulePath: "d",
+    PATH: "C:\\bin", WinPSModulePath: "keep", PSModulePathX: "keep", XPSModulePath: "keep", SystemRoot: "C:\\Windows", EMPTY: "",
+  };
+  const before = { ...parent };
+  const child = windowsLineageQueryEnvironment(parent);
+  assert.deepEqual(parent, before, "the parent environment object is never modified");
+  assert.notEqual(child, parent, "the copy is a new object");
+  assert.deepEqual(Object.keys(child).sort(), ["EMPTY", "PATH", "PSModulePathX", "SystemRoot", "WinPSModulePath", "XPSModulePath"],
+    "every case alias of PSModulePath is removed and no look-alike key is");
+  assert.ok(Object.keys(child).every((key) => child[key] === parent[key]), "every retained value is copied unchanged");
+  assert.notEqual(windowsLineageQueryEnvironment(parent), child, "each call builds its own copy");
+});
+
+test("the canonical query environment factory keeps an own __proto__ key as an ordinary key", () => {
+  // Built without object-literal prototype syntax, so `__proto__` is a real own key.
+  const parent = Object.fromEntries([
+    ["PATH", "C:\\bin"], ["__proto__", "own-proto-value"], ["PSModulePath", "removed"], ["SystemRoot", "C:\\Windows"],
+  ]) as NodeJS.ProcessEnv;
+  Object.defineProperty(parent, "Ordinary", { value: "ordinary-value", enumerable: true, writable: true, configurable: true });
+  const parentKeysBefore = Object.keys(parent).join("\u0000");
+  const child = windowsLineageQueryEnvironment(parent);
+  const ownValue = (env: object, key: string): unknown => Object.getOwnPropertyDescriptor(env, key)?.value;
+  assert.deepEqual({
+    protoKept: Object.hasOwn(child, "__proto__") && ownValue(child, "__proto__") === ownValue(parent, "__proto__"),
+    prototypeUnchanged: Object.getPrototypeOf(child) === Object.prototype,
+    othersKept: ["PATH", "SystemRoot", "Ordinary"].every((key) => Object.hasOwn(child, key) && ownValue(child, key) === ownValue(parent, key)),
+    targetRemoved: !Object.hasOwn(child, "PSModulePath"),
+    keyCount: Object.keys(child).length,
+    parentUnchanged: Object.keys(parent).join("\u0000") === parentKeysBefore && Object.hasOwn(parent, "PSModulePath"),
+  }, {
+    protoKept: true, prototypeUnchanged: true, othersKept: true, targetRemoved: true, keyCount: 4, parentUnchanged: true,
+  }, "an own __proto__ key and every ordinary key survive the copy; only PSModulePath is removed");
 });
 
 test("the initial lookup batches exactly the two known PIDs and saves one CIM round trip", async () => {
@@ -1131,8 +1308,8 @@ test("the phase probe observes one native query without changing its proof or le
   assert.equal(seen[0].args.length, 5, "only the script argument may be substituted");
   assert.deepEqual(seen[0].args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
     "the production argument vector is passed through unchanged");
-  assert.deepEqual(seen[0].options, { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
-    "the 4KiB per-stream bound, encoding, and hidden window are passed through untouched");
+  assert.deepEqual(queryOptionsShape(seen[0].options), PRODUCTION_OPTIONS_SHAPE,
+    "the 4KiB per-stream bound, encoding, hidden window, and production environment copy are passed through untouched");
   assert.ok(!("timeout" in seen[0].options), "the probe never takes over the owned 5s deadline");
   assert.ok(seen[0].args[4].includes("PRG-LINEAGE-PHASE:snapshot-start"), "the script argument is the instrumented copy");
 
@@ -1204,7 +1381,7 @@ test("a query child that never notifies spawn leaves no spawn evidence behind", 
   });
   probe.execute(join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'proof'"],
-    { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
+    { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true, env: windowsLineageQueryEnvironment(process.env) },
     () => undefined);
 
   const started = probe.diagnostic("spawn-failure", { verified: false, reason: "query-spawn-failed" });
@@ -1331,17 +1508,14 @@ function acceptedFrames(ack: "ok" | "ungated", lookupClass = "native-cim"): stri
 
 const ARMS = WINDOWS_LINEAGE_CAUSAL_ARMS;
 
-test("the treatment removes only PSModulePath keys from a child-only copy and reports closed categories", () => {
+test("module-path observation reports closed categories and counts keys without copying any environment", () => {
   const parent: NodeJS.ProcessEnv = {
     PSModulePath: SYNTHETIC_MODULE_PATH, psmodulepath: "dup", PSMODULEPATH: "dup2",
     PATH: "C:\\bin", WinPSModulePath: "keep", PSModulePathX: "keep", SystemRoot: "C:\\Windows",
   };
-  const before = { ...parent };
-  const child = withoutPSModulePath(parent);
-  assert.deepEqual(parent, before, "the parent environment object is never modified");
-  assert.notEqual(child, parent, "the treatment is a new object");
-  assert.deepEqual(Object.keys(child).sort(), ["PATH", "PSModulePathX", "SystemRoot", "WinPSModulePath"],
-    "every case-insensitive PSModulePath key is removed and nothing else is");
+  assert.equal(countModulePathKeys(parent), 3, "every case alias is counted");
+  assert.equal(countModulePathKeys(windowsLineageQueryEnvironment(parent)), 0, "the production copy has none left");
+  assert.equal(countModulePathKeys(undefined), 0);
 
   const native = nativeWindowsModulesDir("C:\\Windows");
   assert.equal(classifyModulePathCategories(SYNTHETIC_MODULE_PATH, native), "1111",
@@ -1606,10 +1780,16 @@ test("the release gate opens only after both arms are ready and fails as invalid
   assert.equal(unknown.record().reason, "unknown-party");
 });
 
-test("the two-arm experiment changes only the treatment child's environment and releases both positives together", async () => {
+test("the corrected arm launches the producer's own environment and the legacy control overrides it", async () => {
+  await withProcessEnv(SYNTHETIC_ENV_PATCH, () => twoArmExperimentCase());
+});
+
+async function twoArmExperimentCase(): Promise<void> {
+  // The legacy control's override source; the corrected arm never sees it.
   const parentEnv: NodeJS.ProcessEnv = { SystemRoot: "C:\\Windows", PSModulePath: SYNTHETIC_MODULE_PATH, psmodulepath: "dup", PATH: "C:\\bin" };
   const parentBefore = { ...parentEnv };
-  const processModulePath = process.env.PSModulePath;
+  const processUnchanged = processEnvSnapshot();
+  const processModulePathKeys = countModulePathKeys(process.env);
   const timer = manualSchedule();
   let clock = 0;
   const gate = createWindowsLineageReleaseGate({ parties: ARMS, now: () => clock, schedule: timer.schedule });
@@ -1631,13 +1811,20 @@ test("the two-arm experiment changes only the treatment child's environment and 
     assert.ok(!("timeout" in launched.options), "the probe never takes over the owned 5s deadline");
   }
   assert.equal(control.args[4], treated.args[4], "both arms run byte-identical scripts");
-  assert.deepEqual(control.options, { encoding: "utf8", maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true },
-    "the control arm passes production's options object through and inherits the environment");
-  const { env, ...treatedRest } = treated.options;
-  assert.deepEqual(treatedRest, control.options, "the treatment differs from the control only by its env copy");
-  assert.deepEqual(env, { SystemRoot: "C:\\Windows", PATH: "C:\\bin" }, "the treatment env is the parent copy minus PSModulePath keys");
-  assert.deepEqual(parentEnv, parentBefore, "the parent environment is never modified");
-  assert.equal(process.env.PSModulePath, processModulePath, "this process's environment is never modified");
+  // The corrected arm launches exactly the environment the producer built from this
+  // process's environment: compared against the specification, not re-derived here,
+  // so a producer that dropped the correction (or changed any other key) fails.
+  assert.deepEqual(queryOptionsShape(treated.options), PRODUCTION_OPTIONS_SHAPE,
+    "the corrected arm forwards production's options object, environment copy included");
+  assert.deepEqual(queryEnvironmentDifference(treated.options.env, process.env), expectedEnvironmentDifference(process.env),
+    "the corrected arm's env is production's copy: no PSModulePath alias, every other key and value kept");
+  assert.ok(control.options.env === parentEnv, "the legacy control explicitly overrides the env with the original parent environment");
+  assert.equal(countModulePathKeys(control.options.env), 2, "the legacy control still carries the parent's PSModulePath keys");
+  const { env: controlEnv, ...controlRest } = control.options;
+  const { env: treatedEnv, ...treatedRest } = treated.options;
+  assert.ok(controlEnv !== treatedEnv, "the arms launch different environment objects");
+  assert.deepEqual(controlRest, treatedRest, "the arms differ only in their environment");
+  assert.deepEqual(parentEnv, parentBefore, "the override source is never modified");
 
   control.child.emit("spawn");
   treated.child.emit("spawn");
@@ -1661,6 +1848,9 @@ test("the two-arm experiment changes only the treatment child's environment and 
   }
   assert.deepEqual(await proving, [{ verified: true }, { verified: true }],
     "the forwarded callback keeps each production acceptance decision intact");
+  // Compared once the test's own SystemRoot override has been restored.
+  assert.deepEqual(processUnchanged(), { sameKeys: true, sameValues: true }, "this process's environment is never modified");
+  assert.equal(countModulePathKeys(process.env), processModulePathKeys, "this process keeps every PSModulePath key it had");
   assert.deepEqual(await Promise.all(positives.map((probe) => probe.whenClosed())), [true, true],
     "each probe witnessed its actual query child's close");
   positives.forEach((probe) => probe.dispose());
@@ -1696,25 +1886,33 @@ test("the two-arm experiment changes only the treatment child's environment and 
   ];
   assert.deepEqual(assessWindowsLineageCausalExperiment({ gate: gate.record(), records }), { valid: true });
   const [controlRecord, treatedRecord] = records as [WindowsLineageCausalRecord, WindowsLineageCausalRecord];
-  assert.equal(controlRecord.treatment, "inherited-env");
-  assert.equal(treatedRecord.treatment, "psmodulepath-removed");
+  assert.equal(controlRecord.treatment, "legacy-inherited-override");
+  assert.equal(treatedRecord.treatment, "producer-env");
   assert.equal(controlRecord.parentModulePath, "1111", "the parent categories are closed bits computed in memory");
+  for (const record of records) {
+    const legacy = record.arm === "inherited";
+    assert.equal(record.producerEnv, true, `${record.arm}: the producer supplied its own environment copy`);
+    assert.equal(record.launchModulePath, legacy ? "1111" : "0000", `${record.arm}: launched module-path categories`);
+    assert.equal(record.launchModulePathKeys, legacy ? 2 : 0, `${record.arm}: launched PSModulePath key count`);
+  }
   assert.equal(controlRecord.gateWaitMs, 22, "the introduced gate wait is recorded separately for the first-ready arm");
   assert.equal(treatedRecord.gateWaitMs, 0);
 
   for (const record of records) {
     const line = formatWindowsLineageCausalRecord(record);
     assert.ok(line.length <= WINDOWS_LINEAGE_CAUSAL_SUMMARY_MAX_CHARS, `bounded: ${line.length}`);
-    assert.match(line, /^prg-l446 v=1 experiment=l446-psmodulepath-differential arm=(?:inherited|child-scoped) role=(?:positive|negative) /);
+    assert.match(line, /^prg-l446 v=2 experiment=l446-psmodulepath-differential arm=(?:inherited|child-scoped) role=(?:positive|negative) treatment=(?:legacy-inherited-override|producer-env) /);
     assert.ok(!line.includes("delegation="), "the experiment never claims production delegation");
     for (const forbidden of ["vic", "C:\\", "Program Files", "67890", "4321", "999", "Get-CimInstance", "PRG-L446", "PSModulePath", "G\n"]) {
       assert.ok(!line.includes(forbidden), `the summary carries no ${JSON.stringify(forbidden)}: ${line}`);
     }
-    assert.match(line, /instrument=ok calls=1 callbacks=1 exit=true close=true stdinFailed=false parentPsmp=1111 childPsmp=1010/);
+    assert.match(line, record.arm === "inherited"
+      ? /instrument=ok calls=1 callbacks=1 exit=true close=true stdinFailed=false parentPsmp=1111 producerEnv=true launchPsmp=1111 launchPsmpKeys=2 childPsmp=1010/
+      : /instrument=ok calls=1 callbacks=1 exit=true close=true stdinFailed=false parentPsmp=1111 producerEnv=true launchPsmp=0000 launchPsmpKeys=0 childPsmp=1010/);
   }
   assert.match(formatWindowsLineageCausalRecord(controlRecord),
     /lookup=native-cim lookups=1-1-0 ack=ok gateWaitMs=22 .*events=\[child-spawn@0,stderr-first@0,psmp@0\/c1:1010,hooks-installed@0\/c2,initial-query-start@0\/c3,lookup-ready@0\/c4,release-sent@22,lookup-released@22\/c9:ok,lookup-complete@22\/c40:native-cim,/);
-});
+}
 
 test("an invalid gate or a lost party makes the experiment invalid and never pretends a timeout", async () => {
   const timer = manualSchedule();
@@ -1743,7 +1941,7 @@ test("an invalid gate or a lost party makes the experiment invalid and never pre
   const results = await proving;
   const negatives = ARMS.map((arm) => ({
     ...probes[0]!.record({ verified: false, reason: "chain-parent-absent" }),
-    arm, role: "negative" as const, gate: "ungated" as const, treatment: arm === "inherited" ? "inherited-env" as const : "psmodulepath-removed" as const,
+    arm, role: "negative" as const, gate: "ungated" as const, treatment: arm === "inherited" ? "legacy-inherited-override" as const : "producer-env" as const,
     releaseAck: "ungated",
   }));
   const validity = assessWindowsLineageCausalExperiment({
@@ -1772,6 +1970,38 @@ test("an invalid gate or a lost party makes the experiment invalid and never pre
   const unstarted = createWindowsLineageCausalProbe({ arm: "inherited", role: "negative", gate: "ungated" });
   assert.equal(await unstarted.whenClosed(), false, "a probe that never launched reports no closure instead of waiting forever");
   assert.equal(unstarted.record({ verified: false, reason: "preflight-not-win32" }).instrument, "not-started");
+});
+
+test("the corrected arm never normalizes: a producer that omitted the correction is launched as-is and reported", async () => {
+  const { script } = await captureLineageScript();
+  const file = join("/fake-windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script];
+  const base = { encoding: "utf8" as const, maxBuffer: MAX_QUERY_OUTPUT_BYTES, windowsHide: true };
+  const brokenProducers: Array<{ name: string; options: WindowsLineageQueryOptions; reason: string; keys: number }> = [
+    // A producer that forwarded the parent's module path unchanged.
+    { name: "env kept PSModulePath", options: { ...base, env: { SystemRoot: "C:\\Windows", PSModulePath: SYNTHETIC_MODULE_PATH } },
+      reason: "child-scoped-negative-launch-env-module-path", keys: 1 },
+    // A case alias the producer failed to remove.
+    { name: "env kept a case alias", options: { ...base, env: { SystemRoot: "C:\\Windows", psmodulepath: "alias" } },
+      reason: "child-scoped-negative-launch-env-module-path", keys: 1 },
+    // A producer that dropped the env option entirely (the child would inherit).
+    { name: "env omitted", options: base as WindowsLineageQueryOptions, reason: "child-scoped-negative-producer-env-missing", keys: -1 },
+  ];
+  for (const broken of brokenProducers) {
+    const fake = fakeCausalLauncher();
+    const probe = createWindowsLineageCausalProbe({
+      arm: "child-scoped", role: "negative", gate: "ungated", parentEnv: { SystemRoot: "C:\\Windows" }, launch: fake.launch,
+    });
+    probe.execute(file, args, broken.options, () => undefined);
+    assert.equal(fake.children.length, 1, `${broken.name}: one launch`);
+    assert.ok(fake.children[0]!.options === broken.options, `${broken.name}: the corrected arm forwards the producer's options object verbatim`);
+    const record = probe.record({ verified: false, reason: "chain-parent-absent" });
+    if (broken.keys >= 0) assert.equal(record.launchModulePathKeys, broken.keys, `${broken.name}: the leaked key is counted`);
+    const validity = assessWindowsLineageCausalExperiment({ gate: { status: "released", parties: 2, registered: 2, ready: 2, boundMs: 1_000, waitMs: 1 }, records: [record] });
+    assert.ok(!validity.valid && validity.reasons.includes(broken.reason), `${broken.name}: ${validity.valid ? "valid" : validity.reasons.join(",")}`);
+    assert.ok(!formatWindowsLineageCausalRecord(record).includes("alias") && !formatWindowsLineageCausalRecord(record).includes("C:\\"),
+      `${broken.name}: no environment value reaches the summary`);
+  }
 });
 
 test("the probe finalizes its ledger at the actual close, so a truncated last frame invalidates the experiment", async () => {
@@ -1820,6 +2050,9 @@ test("the causal summary cannot exceed its bound or report an unvalidated value"
     closeWitnessed: true,
     stdinFailed: false,
     parentModulePath: SYNTHETIC_MODULE_PATH,
+    producerEnv: FAKE_SECRET as unknown as boolean,
+    launchModulePath: FAKE_PRIVATE_PATH,
+    launchModulePathKeys: -3,
     childModulePath: "10101",
     lookupClass: FAKE_PRIVATE_PATH,
     lookupCounts: FAKE_SECRET,
@@ -1841,17 +2074,18 @@ test("the causal summary cannot exceed its bound or report an unvalidated value"
     assert.ok(!line.includes(forbidden), `no unvalidated ${JSON.stringify(forbidden)}: ${line}`);
   }
   assert.match(line, /arm=\? role=positive treatment=\? gate=matched result=unknown instrument=ok calls=\?/);
-  assert.match(line, /parentPsmp=\? childPsmp=\? lookup=\? lookups=\? ack=\? gateWaitMs=\? /);
+  assert.match(line, /parentPsmp=\? producerEnv=false launchPsmp=\? launchPsmpKeys=\? childPsmp=\? lookup=\? lookups=\? ack=\? gateWaitMs=\? /);
   assert.ok(!line.includes("cim-elsewhere") && !line.includes("@1,"), "a duplicated event record never replaces the canonical first one");
   const longest: Record<string, string> = {
     psmp: "1111", "lookup-released": "ungated", "lookup-complete": "cim-elsewhere", "initial-query-end": "9-9-9",
     "prelude-error": "hooks", "hook-error": "post",
   };
   const widest = formatWindowsLineageCausalRecord({
-    arm: "child-scoped", role: "negative", gate: "ungated", treatment: "psmodulepath-removed",
+    arm: "child-scoped", role: "negative", gate: "ungated", treatment: "producer-env",
     result: { verified: false, reason: "evidence-creation-order-invalid" }, elapsedMs: 2 ** 31 - 1, calls: 2 ** 31 - 1,
     callbacks: 2 ** 31 - 1, instrument: "hooks-unconfirmed", exitWitnessed: false, closeWitnessed: false, stdinFailed: true,
-    parentModulePath: "1111", childModulePath: "1111", lookupClass: "cim-elsewhere", lookupCounts: "9-9-9", releaseAck: "ungated",
+    parentModulePath: "1111", producerEnv: false, launchModulePath: "1111", launchModulePathKeys: 9,
+    childModulePath: "1111", lookupClass: "cim-elsewhere", lookupCounts: "9-9-9", releaseAck: "ungated",
     gateWaitMs: 2 ** 31 - 1, malformed: 999, unrecognized: 999, duplicates: 999, scanTruncated: true,
     events: WINDOWS_LINEAGE_CAUSAL_EVENT_ORDER.map((event) => ({
       event, parentMs: 2 ** 31 - 1, childMs: 9_999_999, ...(longest[event] === undefined ? {} : { token: longest[event] }), count: 999,
@@ -2502,9 +2736,15 @@ if (process.platform === "win32") {
    * validated ready before any query starts, and exactly two production
    * verifications (one genuine positive, then one unrelated negative), each with
    * the production executable, arguments, 5s owned deadline, 4KiB bound, one query
-   * child, initial identity, fresh snapshot, and final root-liveness check. The
-   * `inherited` arm is the original control; the `child-scoped` arm differs ONLY
-   * by giving its query child an environment copy without `PSModulePath`.
+   * child, initial identity, fresh snapshot, and final root-liveness check.
+   * Version 2: the `child-scoped` arm launches the environment the production
+   * producer itself now builds (a copy without `PSModulePath`), forwarded verbatim;
+   * the `inherited` arm is the LEGACY CONTROL that overrides that environment with
+   * the original parent environment, reproducing the pre-correction query child.
+   * Version 1 of this case (before the correction) showed the inherited child
+   * binding a `CimCmdlets` outside the native system modules and the cleared child
+   * binding the native one, with both arms fast; that is a module-binding
+   * counterexample, not the cause of the historical timeout.
    *
    * Both positives are the first real CIM operations of this case. Their first
    * outer `Get-CimInstance` pre-lookup waits for one release token that the gate
@@ -2515,7 +2755,7 @@ if (process.platform === "win32") {
    * observed, one child each, closure witnessed) is asserted separately, and an
    * invalid experiment is reported as invalid, never as a CIM timeout. Fixed
    * diagnostic lines are printed before any assertion so they survive failure.
-   * This is diagnosis: no production code or deadline changes here.
+   * The experiment changes no production code, deadline, or acceptance rule.
    */
   test("native Windows lineage proof accepts a real descendant and refuses an unrelated PID", async (t) => {
     const fixtures: NativeLineageFixture[] = [];
@@ -2589,7 +2829,7 @@ if (process.platform === "win32") {
       }
 
       const validity = assessWindowsLineageCausalExperiment({ gate: gate.record(), records });
-      t.diagnostic(`prg-l446-validity v=1 valid=${validity.valid} reasons=[${validity.valid ? "" : validity.reasons.join(",")}]`);
+      t.diagnostic(`prg-l446-validity v=${WINDOWS_LINEAGE_CAUSAL_VERSION} valid=${validity.valid} reasons=[${validity.valid ? "" : validity.reasons.join(",")}]`);
 
       for (const [index, fixture] of fixtures.entries()) {
         check(() => assert.deepEqual(positives[index], { verified: true },
@@ -2944,47 +3184,68 @@ if (process.platform === "win32") {
   });
 
   /**
-   * The treatment's only lever, checked on the real host with synthetic values: a
-   * PowerShell 7-style module location inherited from the parent is visible to the
-   * child as a closed category, and the child-only copy without `PSModulePath`
-   * makes Windows PowerShell rebuild a path with the native location and no
+   * The correction's only lever, checked on the real host with synthetic values
+   * and the ACTUAL producer environment: with a PowerShell 7-style module location
+   * in this process's `PSModulePath`, the legacy inherited environment shows that
+   * location to the child as a closed category, while the environment production
+   * itself built for its query child (captured from the producer, not re-derived
+   * here) makes Windows PowerShell rebuild a path with the native location and no
    * PowerShell 7 location. Stubbed CIM again; no module directory is inspected.
    */
-  test("the child-scoped environment copy lets the real host rebuild its own module path", async () => {
+  test("the producer's query environment lets the real host rebuild its own module path", async () => {
     if (!existsSync(powershellHost)) {
-      throw new Error("the win32 suite must be able to locate Windows PowerShell to validate the environment treatment");
+      throw new Error("the win32 suite must be able to locate Windows PowerShell to validate the environment correction");
     }
-    const { script } = await captureLineageScript();
-    const outcome = instrumentWindowsLineageCausalScript(script, "ungated");
-    assert.ok(outcome.instrumented);
-    if (!outcome.instrumented) return;
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "";
     const scratch = await mkdtemp(join(tmpdir(), "prg-l446-psmp-"));
     try {
-      const inherited = withoutPSModulePath(process.env);
-      inherited.PSModulePath = [
+      const syntheticModulePath = [
         join(scratch, "PowerShell", "7", "Modules"),
         join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
       ].join(";");
+      // Windows environment names are case-insensitive, so this replaces the one
+      // existing PSModulePath entry for the duration of the capture only. The real
+      // SystemRoot stays in effect, so the producer's copy differs from the legacy
+      // environment only by the correction itself.
+      const captured = await withProcessEnv({ PSModulePath: syntheticModulePath }, async () => {
+        const legacy: NodeJS.ProcessEnv = { ...process.env };
+        const query = fakeQuery({ kind: "output", output: VALID_EVIDENCE });
+        const result = await verifyWithMockedQuery(query);
+        const call = query.calls[0]!;
+        return {
+          result, calls: query.calls.length, script: call.args[4]!, legacy, producer: call.options.env,
+          producerShape: queryOptionsShape(call.options),
+          difference: queryEnvironmentDifference(call.options.env, process.env),
+          expected: expectedEnvironmentDifference(process.env),
+        };
+      });
+      assert.deepEqual(captured.result, { verified: true });
+      assert.equal(captured.calls, 1, "one producer call, no retry");
+      assert.deepEqual(captured.producerShape, PRODUCTION_OPTIONS_SHAPE, "the producer supplied its own environment copy");
+      assert.deepEqual(captured.difference, captured.expected,
+        "on the real host the producer's copy keeps every other key and value and drops only PSModulePath");
+      const outcome = instrumentWindowsLineageCausalScript(captured.script, "ungated");
+      assert.ok(outcome.instrumented);
+      if (!outcome.instrumented) return;
       const responses = [[CANDIDATE_DIRECT, ROOT_RECORD], [CANDIDATE_DIRECT, ROOT_RECORD]];
       const runs = {
-        inherited: await runEmittedLineageScript(outcome.script, responses, { env: inherited }),
-        removed: await runEmittedLineageScript(outcome.script, responses, { env: withoutPSModulePath(inherited) }),
+        legacy: await runEmittedLineageScript(outcome.script, responses, { env: captured.legacy }),
+        producer: await runEmittedLineageScript(outcome.script, responses, { env: captured.producer }),
       };
       const bits: Record<string, string | undefined> = {};
       for (const [arm, run] of Object.entries(runs)) {
         const verdict = classifyWindowsAncestryEvidence(run.stdout, CANDIDATE_PID, OWNED_ROOT_PID);
-        assert.deepEqual(verdict, { verified: true }, `${arm}: the stubbed proof is unchanged by the environment treatment`);
+        assert.deepEqual(verdict, { verified: true }, `${arm}: the stubbed proof is unchanged by the environment`);
         const ledger = createWindowsLineageCausalLedger();
         ledger.scan(`${run.stderr}\n`, 0);
         ledger.finish();
         assert.equal(assessWindowsLineageCausalLedger(ledger, "ungated"), "ok", `${arm}: the instrument is coherent`);
         bits[arm] = ledger.events.get("psmp")?.token;
       }
-      assert.equal(bits.inherited?.[1], "1", `an inherited PowerShell 7 location is visible to the child: ${bits.inherited}`);
-      assert.equal(bits.removed?.[0], "1", `the removed variable is rebuilt by the child: ${bits.removed}`);
-      assert.equal(bits.removed?.[1], "0", `the rebuilt path has no PowerShell 7 location: ${bits.removed}`);
-      assert.equal(bits.removed?.[2], "1", `the rebuilt path has the native module location: ${bits.removed}`);
+      assert.equal(bits.legacy?.[1], "1", `an inherited PowerShell 7 location is visible to the legacy child: ${bits.legacy}`);
+      assert.equal(bits.producer?.[0], "1", `the removed variable is rebuilt by the child: ${bits.producer}`);
+      assert.equal(bits.producer?.[1], "0", `the rebuilt path has no PowerShell 7 location: ${bits.producer}`);
+      assert.equal(bits.producer?.[2], "1", `the rebuilt path has the native module location: ${bits.producer}`);
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

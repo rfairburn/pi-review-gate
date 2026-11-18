@@ -17,23 +17,46 @@ dates.
 
 ## [0.1.0-dev.297]
 
+### Fixed
+
+- **Windows lineage query uses the native Windows PowerShell module path
+  (Refs #446; the historical timeout cause is still unproven)**: the bounded
+  descendant-proof query child now gets its own copy of the parent environment
+  with every case-insensitive `PSModulePath` key removed. The fixed System32
+  Windows PowerShell 5.1 host then rebuilds its own native module path instead
+  of inheriting one composed for another PowerShell edition. Microsoft
+  recommends removing `PSModulePath` when an intermediate process launches
+  Windows PowerShell. On a native Windows runner, a `pwsh` -> Node -> Windows
+  PowerShell chain that inherited `PSModulePath` resolved `Get-CimInstance` from
+  a `CimCmdlets` module outside the native system modules. The cleared
+  environment resolved the native one. Both proofs verified quickly in that run,
+  so the original 5-second timeout was not reproduced. This removes a proven
+  module-binding mismatch but establishes no timeout cause and closes no issue.
+  The parent environment, `PATH`, `WinPSModulePath`, and every other variable
+  are unchanged. So are the host, arguments, 5-second deadline, 4KiB bound,
+  single query child, CIM requests, and acceptance rules. As a bounded
+  compatibility choice, the internal query no longer honours an ambient custom
+  `PSModulePath`.
+
 ### Changed
 
-- **Native Windows lineage causal experiment (Refs #446; partial, not a fix)**:
-  the native genuine-descendant/unrelated-PID proof now runs as one fixed
-  two-arm experiment. Each arm has its own freshly owned root, descendant and
-  unrelated process. The control query inherits the test environment. The
-  treatment differs only in getting a child-only environment copy without
-  `PSModulePath`. Passive Windows PowerShell command-lookup hooks and a child
-  clock record when the first `Get-CimInstance` lookup starts and resolves. A
-  bounded stdin gate releases both positive lookups together, inside the
-  unchanged 5-second deadline. A gate, hook or setup failure marks the
-  experiment invalid instead of being read as a CIM timeout. The production
-  query, script, deadline, output bound and acceptance rules are unchanged, as
-  are the original assertions and owned cleanup. Hook support on the installed
-  Windows PowerShell 5.1 is checked by stubbed-CIM controls on the native
-  runner. The cause of the historical timeout is not yet established, and no
-  correction is claimed.
+- **Native Windows lineage causal experiment (Refs #446; diagnosis)**: the
+  native genuine-descendant/unrelated-PID proof runs as one fixed two-arm
+  experiment. Each arm has its own freshly owned root, descendant and unrelated
+  process. In version 2 the corrected arm launches the environment production
+  itself builds, forwarded unchanged. The legacy control deliberately overrides
+  it with the original parent environment, reproducing the query child from
+  before the correction. Passive Windows PowerShell command-lookup hooks and a
+  child clock record when the first `Get-CimInstance` lookup starts and which
+  module it resolves to. A bounded stdin gate releases both positive lookups
+  together, inside the unchanged 5-second deadline. A gate, hook, setup, or
+  environment-handoff failure marks the experiment invalid instead of being read
+  as a CIM timeout. Apart from the passive instrumentation and the legacy
+  control's environment override, the experiment runs the production query
+  with its deadline, output bound and acceptance rules; the original assertions
+  and owned cleanup are kept. Hook support
+  on the installed Windows PowerShell 5.1 is checked by stubbed-CIM controls on
+  the native runner.
 
 ## [0.1.0-dev.296]
 

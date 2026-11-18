@@ -1,20 +1,29 @@
 /**
  * Test-only #446 causal experiment for the native Windows lineage proof
- * (Refs #446: a partial causal phase, not a fix).
+ * (Refs #446: diagnosis plus verification of the module-binding correction; the
+ * historical timeout's cause is still unproven).
  *
  * One required Windows run timed out on the genuine-descendant proof after the
  * script entered its initial CIM request and before that request returned. The
  * existing marker-only phase probe (`windows-lineage-phase-diagnostics.ts`) can
  * only bracket that whole statement. This helper runs ONE fixed two-arm
- * experiment on the same production verifier:
+ * experiment on the same production verifier.
  *
- * - `inherited` is the control arm: the query child is launched exactly as
- *   production launches it, inheriting this process's environment.
- * - `child-scoped` is the treatment arm: the ONLY difference is that the query
- *   child's environment is a copy of this process's environment with every
- *   case-insensitive `PSModulePath` key removed, so Windows PowerShell 5.1
- *   rebuilds its own default module path. The parent environment is never
- *   changed.
+ * Version 1 compared an inherited environment against a test-side copy without
+ * `PSModulePath`. Its native run showed the inherited child binding
+ * `Get-CimInstance` to a `CimCmdlets` module outside the native Windows
+ * PowerShell 5.1 system modules (`cim-elsewhere`) and the cleared child binding
+ * the native one (`native-cim`), with both arms fast. Production now builds that
+ * copy itself ({@link windowsLineageQueryEnvironment}), so version 2 is:
+ *
+ * - `inherited` is the LEGACY CONTROL: it overrides the producer's environment
+ *   with the original parent environment (`parentEnv`, default `process.env`),
+ *   reproducing what the query child received before the correction. It is a
+ *   deliberate override, never production delegation.
+ * - `child-scoped` is the CORRECTED arm: it forwards the producer's query options
+ *   verbatim, including the environment production actually built. The probe
+ *   applies no normalization of its own, so a producer that dropped the
+ *   correction would launch this arm with `PSModulePath` and be reported.
  *
  * Both arms run the same production-emitted script with the same added passive
  * instrument: a child-local `Stopwatch` and the public
@@ -36,8 +45,9 @@
  * never evidence of the historical timeout.
  *
  * Status vocabulary is deliberately separate from the marker-only probe: this is
- * not production delegation (the script, and for one arm the environment, differ),
- * so it never reports `delegation=production`. Output is one bounded line of
+ * not production delegation (the script differs for both arms, and the legacy
+ * control's environment is overridden), so it never reports
+ * `delegation=production`; the `treatment=` token names which environment ran. Output is one bounded line of
  * closed-vocabulary tokens and bounded integers: no PID, path, environment value,
  * command, script, error text, CommandInfo, or module inventory. Hook availability
  * and non-interference on the installed Windows PowerShell 5.1 are NOT assumed:
@@ -58,13 +68,14 @@ import {
 } from "../../src/execution/windows-process-lineage";
 
 export const WINDOWS_LINEAGE_CAUSAL_EXPERIMENT = "l446-psmodulepath-differential";
-export const WINDOWS_LINEAGE_CAUSAL_VERSION = 1;
+export const WINDOWS_LINEAGE_CAUSAL_VERSION = 2;
 export const WINDOWS_LINEAGE_CAUSAL_FRAME_PREFIX = "PRG-L446:";
 /** The one fixed release token a gated child accepts (followed by a newline). */
 export const WINDOWS_LINEAGE_CAUSAL_RELEASE_TOKEN = "G";
 /** Gate bound, counted from the first ready report; well inside the 5s query deadline. */
 export const WINDOWS_LINEAGE_CAUSAL_GATE_BOUND_MS = 1_000;
-export const WINDOWS_LINEAGE_CAUSAL_SUMMARY_MAX_CHARS = 1_200;
+/** Grew by exactly the three bounded environment fields version 2 added (51 chars at their widest). */
+export const WINDOWS_LINEAGE_CAUSAL_SUMMARY_MAX_CHARS = 1_251;
 /** The literal command name the passive delegates observe. */
 export const WINDOWS_LINEAGE_CAUSAL_TARGET_COMMAND = "Get-CimInstance";
 
@@ -74,29 +85,29 @@ export const WINDOWS_LINEAGE_CAUSAL_ROLES = ["positive", "negative"] as const;
 export type WindowsLineageCausalRole = (typeof WINDOWS_LINEAGE_CAUSAL_ROLES)[number];
 /** `matched`: the pre-lookup waits for the release token. `ungated`: observation only. */
 export type WindowsLineageCausalGateMode = "matched" | "ungated";
-export type WindowsLineageCausalTreatment = "inherited-env" | "psmodulepath-removed";
+export const WINDOWS_LINEAGE_CAUSAL_TREATMENTS = ["legacy-inherited-override", "producer-env"] as const;
+export type WindowsLineageCausalTreatment = (typeof WINDOWS_LINEAGE_CAUSAL_TREATMENTS)[number];
 
 const TREATMENT_BY_ARM: Readonly<Record<WindowsLineageCausalArm, WindowsLineageCausalTreatment>> = {
-  inherited: "inherited-env",
-  "child-scoped": "psmodulepath-removed",
+  inherited: "legacy-inherited-override",
+  "child-scoped": "producer-env",
 };
 
 // ---------------------------------------------------------------------------
-// Child environment treatment and closed module-path categories
+// Closed module-path categories (observation only; production owns the env copy)
 // ---------------------------------------------------------------------------
 
 /**
- * A NEW environment object equal to `env` minus every key that equals
- * `PSModulePath` case-insensitively. `env` itself is never modified, and no other
- * key (`PATH`, `WinPSModulePath`, `PSModulePathX`, ...) is touched.
+ * How many keys of `env` name `PSModulePath` case-insensitively, saturating at 9.
+ * This only COUNTS; the environment copy itself comes from production.
  */
-export function withoutPSModulePath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const copy: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toLowerCase() === "psmodulepath") continue;
-    copy[key] = value;
-  }
-  return copy;
+export function countModulePathKeys(env: NodeJS.ProcessEnv | undefined): number {
+  if (env === undefined || env === null || typeof env !== "object") return 0;
+  return Math.min(9, Object.keys(env).filter((key) => key.toLowerCase() === "psmodulepath").length);
+}
+
+function modulePathValue(env: NodeJS.ProcessEnv): string | undefined {
+  return Object.entries(env).find(([key]) => key.toLowerCase() === "psmodulepath")?.[1];
 }
 
 /**
@@ -805,9 +816,8 @@ export interface WindowsLineageCausalChild extends WindowsLineageQueryChild {
   once(event: "spawn" | "exit" | "close", listener: () => void): unknown;
 }
 
-export interface WindowsLineageCausalLaunchOptions extends WindowsLineageQueryOptions {
-  env?: NodeJS.ProcessEnv;
-}
+/** Exactly the production query options; the legacy control only replaces `env`. */
+export type WindowsLineageCausalLaunchOptions = WindowsLineageQueryOptions;
 
 export type WindowsLineageCausalLauncher = (
   file: string,
@@ -825,9 +835,12 @@ export interface WindowsLineageCausalProbeOptions {
   gate: WindowsLineageCausalGateMode;
   /** Required for `matched`; ignored for `ungated`. */
   releaseGate?: WindowsLineageReleaseGate;
-  /** The environment the control inherits and the treatment copies. Default: `process.env`. */
+  /**
+   * The original parent environment: classified for `parentPsmp`, and the legacy
+   * control's override. Default: `process.env`. The corrected arm never uses it.
+   */
   parentEnv?: NodeJS.ProcessEnv;
-  /** Default: execFile, exactly as production launches the query child. */
+  /** Default: execFile, as production launches the query child. */
   launch?: WindowsLineageCausalLauncher;
   now?: () => number;
 }
@@ -846,6 +859,12 @@ export interface WindowsLineageCausalRecord {
   closeWitnessed: boolean;
   stdinFailed: boolean;
   parentModulePath: string;
+  /** The producer handed this probe an environment object distinct from `parentEnv`. */
+  producerEnv: boolean;
+  /** Closed categories of the environment actually launched (`0000`: no `PSModulePath`). */
+  launchModulePath: string;
+  /** Case-insensitive `PSModulePath` keys in the environment actually launched (saturating). */
+  launchModulePathKeys: number;
   childModulePath: string;
   lookupClass: string;
   lookupCounts: string;
@@ -875,11 +894,12 @@ export interface WindowsLineageCausalProbe {
  *
  * Exactly one query child per probe: a second `execute` throws synchronously
  * (production maps that to its fixed spawn stage) and starts nothing. The
- * production executable, the four leading arguments, and the options object are
- * passed through; the script argument is the instrumented copy (or the untouched
- * original when instrumentation fails closed), and only the `child-scoped` arm
- * adds an `env` copy without `PSModulePath`. The completion callback is forwarded
- * verbatim; everything else is a listener.
+ * production executable and the four leading arguments are passed through; the
+ * script argument is the instrumented copy (or the untouched original when
+ * instrumentation fails closed). The corrected `child-scoped` arm forwards the
+ * producer's options object verbatim, environment included; only the legacy
+ * `inherited` control replaces its `env` with the original parent environment.
+ * The completion callback is forwarded verbatim; everything else is a listener.
  */
 export function createWindowsLineageCausalProbe(options: WindowsLineageCausalProbeOptions): WindowsLineageCausalProbe {
   const { arm, role, gate } = options;
@@ -892,6 +912,9 @@ export function createWindowsLineageCausalProbe(options: WindowsLineageCausalPro
   let calls = 0;
   let scriptStatus: WindowsLineageCausalInstrumentStatus | undefined;
   let parentModulePath = "?";
+  let producerEnv = false;
+  let launchModulePath = "?";
+  let launchModulePathKeys = 0;
   let stdinFailed = false;
   let stdinEnded = false;
   let child: WindowsLineageCausalChild | undefined;
@@ -926,17 +949,23 @@ export function createWindowsLineageCausalProbe(options: WindowsLineageCausalPro
     }
     calls = 1;
     startedAt = now();
-    parentModulePath = classifyModulePathCategories(
-      Object.entries(parentEnv).find(([key]) => key.toLowerCase() === "psmodulepath")?.[1],
-      nativeWindowsModulesDir(parentEnv.SystemRoot ?? parentEnv.WINDIR),
-    );
+    const nativeModules = nativeWindowsModulesDir(parentEnv.SystemRoot ?? parentEnv.WINDIR);
+    parentModulePath = classifyModulePathCategories(modulePathValue(parentEnv), nativeModules);
     const script = typeof args[4] === "string" ? args[4] : undefined;
     const outcome = script === undefined ? undefined : instrumentWindowsLineageCausalScript(script, gate);
     scriptStatus = outcome === undefined ? "unexpected-script" : outcome.instrumented ? undefined : outcome.reason;
     const launchArgs = outcome?.instrumented === true ? args.map((arg, index) => (index === 4 ? outcome.script : arg)) : args;
-    const launchOptions: WindowsLineageCausalLaunchOptions = treatment === "psmodulepath-removed"
-      ? { ...queryOptions, env: withoutPSModulePath(parentEnv) }
+    const supplied = (queryOptions as { env?: unknown }).env;
+    producerEnv = typeof supplied === "object" && supplied !== null && supplied !== parentEnv;
+    // The legacy control is an explicit override back to the original parent
+    // environment; the corrected arm launches exactly what the producer built.
+    const launchOptions: WindowsLineageCausalLaunchOptions = treatment === "legacy-inherited-override"
+      ? { ...queryOptions, env: parentEnv }
       : queryOptions;
+    // An options object without `env` makes the child inherit this process's environment.
+    const launchedEnv = launchOptions.env ?? process.env;
+    launchModulePath = classifyModulePathCategories(modulePathValue(launchedEnv), nativeModules);
+    launchModulePathKeys = countModulePathKeys(launchedEnv);
     let launched: WindowsLineageCausalChild;
     try {
       launched = launch(file, launchArgs, launchOptions, (error, stdout, stderr) => {
@@ -1006,6 +1035,9 @@ export function createWindowsLineageCausalProbe(options: WindowsLineageCausalPro
       closeWitnessed: ledger.events.has("child-close"),
       stdinFailed,
       parentModulePath,
+      producerEnv,
+      launchModulePath,
+      launchModulePathKeys,
       childModulePath: ledger.events.get("psmp")?.token ?? "?",
       lookupClass: ledger.events.get("lookup-complete")?.token ?? "none",
       lookupCounts: ledger.events.get("initial-query-end")?.token ?? "none",
@@ -1066,7 +1098,7 @@ export function formatWindowsLineageCausalRecord(record: WindowsLineageCausalRec
     `experiment=${WINDOWS_LINEAGE_CAUSAL_EXPERIMENT}`,
     `arm=${oneOf(record.arm, WINDOWS_LINEAGE_CAUSAL_ARMS)}`,
     `role=${oneOf(record.role, WINDOWS_LINEAGE_CAUSAL_ROLES)}`,
-    `treatment=${oneOf(record.treatment, ["inherited-env", "psmodulepath-removed"])}`,
+    `treatment=${oneOf(record.treatment, WINDOWS_LINEAGE_CAUSAL_TREATMENTS)}`,
     `gate=${oneOf(record.gate, ["matched", "ungated"])}`,
     `result=${resultToken(record.result)}`,
     `instrument=${oneOf(record.instrument, WINDOWS_LINEAGE_CAUSAL_INSTRUMENT_STATUSES)}`,
@@ -1076,6 +1108,9 @@ export function formatWindowsLineageCausalRecord(record: WindowsLineageCausalRec
     `close=${record.closeWitnessed === true}`,
     `stdinFailed=${record.stdinFailed === true}`,
     `parentPsmp=${MODULE_PATH_BITS.test(String(record.parentModulePath)) ? record.parentModulePath : "?"}`,
+    `producerEnv=${record.producerEnv === true}`,
+    `launchPsmp=${MODULE_PATH_BITS.test(String(record.launchModulePath)) ? record.launchModulePath : "?"}`,
+    `launchPsmpKeys=${boundedInteger(record.launchModulePathKeys)}`,
     `childPsmp=${MODULE_PATH_BITS.test(String(record.childModulePath)) ? record.childModulePath : "?"}`,
     `lookup=${oneOf(record.lookupClass, [...WINDOWS_LINEAGE_CAUSAL_LOOKUP_CLASSES, "none"])}`,
     `lookups=${record.lookupCounts === "none" || COUNTS_TOKEN.test(String(record.lookupCounts)) ? record.lookupCounts : "?"}`,
@@ -1140,6 +1175,11 @@ export function assessWindowsLineageCausalExperiment(input: {
       }
       const record = matching[0]!;
       if (record.treatment !== TREATMENT_BY_ARM[arm]) reasons.push(`${id}-treatment-mismatch`);
+      // Both arms must have received the producer's own environment; the corrected
+      // arm must have launched it without any PSModulePath key. The legacy control
+      // is checked only for having been an override, never for what it inherited.
+      if (record.producerEnv !== true) reasons.push(`${id}-producer-env-missing`);
+      if (arm === "child-scoped" && record.launchModulePathKeys !== 0) reasons.push(`${id}-launch-env-module-path`);
       const expectedGate: WindowsLineageCausalGateMode = role === "positive" ? "matched" : "ungated";
       if (record.gate !== expectedGate) reasons.push(`${id}-gate-mode-mismatch`);
       if (record.calls !== 1) reasons.push(`${id}-calls-not-one`);

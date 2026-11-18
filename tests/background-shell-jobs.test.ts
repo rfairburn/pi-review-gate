@@ -510,15 +510,19 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(wrapped).toContain("$size = 144; if ([IntPtr]::Size -eq 4) { $size = 112 }");
     expect(wrapped).toContain("WriteInt32($lim.AddrOfPinnedObject(), 16, 0x2000)");
     expect(wrapped).toContain("SetInformationJobObject($job, 9, $lim.AddrOfPinnedObject(), $size)");
-    // The root is assigned from this shell's read-only $PID at runtime.
+    // The root is assigned from this shell's read-only $PID at runtime, through
+    // the identity-guarded owned-root method (full access mask unchanged).
     expect(wrapped).toContain(".Replace('__PI_ROOT__', [string]$PID)");
-    expect(wrapped).toContain("OpenProcess(0x1FFFFF, $false, __PI_ROOT__)");
+    expect(wrapped).toContain("[PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__)");
+    expect(wrapped).toContain("OpenProcess(0x1FFFFF,false,pid)");
   });
 
   it("writes the running record only AFTER the job object exists and the root is assigned", () => {
-    const assign = wrapped.indexOf("AssignProcessToJobObject($job, $rp)");
+    const assign = wrapped.indexOf("[PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__)");
+    const refused = wrapped.indexOf("if (-not $assigned) { exit 1 }");
     const firstRunning = wrapped.indexOf('Set-Content -LiteralPath $mk -Value "$PID running"');
-    expect(assign !== -1 && firstRunning !== -1 && assign < firstRunning).toBe(true);
+    expect(assign !== -1 && refused !== -1 && firstRunning !== -1).toBe(true);
+    expect(assign < refused && refused < firstRunning).toBe(true);
   });
 
   it("waits for the ownership handshake before running the command (fail closed)", () => {
@@ -614,6 +618,128 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(wrapped).not.toContain("??");
     // The PS7 ternary would read `cond -f truepart -t falsepart`; guard its shape.
     expect(/\S+ -f \S+/.test(wrapped)).toBe(false);
+  });
+});
+
+/** The producer's one-line kernel32 class text, exactly as embedded in the
+ *  watchdog's single-quoted Add-Type string (apostrophe-free by construction). */
+function producerJobApiClass(script: string): string {
+  const match = script.match(/Add-Type -TypeDefinition '([^']*public static class PiReviewBgJobApi \{[^']*)'/);
+  if (!match) throw new Error("PiReviewBgJobApi class text not found in the wrapper");
+  return match[1];
+}
+
+/** Brace-matched body of the ONE C# method declared by `signature`. */
+function csharpMethodBody(cls: string, signature: string): string {
+  const start = cls.indexOf(signature);
+  if (start === -1 || cls.indexOf(signature, start + 1) !== -1) {
+    throw new Error(`expected exactly one declaration: ${signature}`);
+  }
+  const open = cls.indexOf("{", start + signature.length);
+  let depth = 0;
+  for (let i = open; i < cls.length; i++) {
+    if (cls[i] === "{") depth++;
+    if (cls[i] === "}" && --depth === 0) return cls.slice(open, i + 1);
+  }
+  throw new Error(`unterminated method body: ${signature}`);
+}
+
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+describe("wrapWithPowerShellWatchdog root identity guard (Windows, #705)", () => {
+  const COMMAND = "Write-Output hi; exit 0";
+  const wrapped = wrapWithPowerShellWatchdog(COMMAND, 4242, 5, {
+    markerPath: "C:\\pi-review-bg\\guard.job",
+    stopPath: "C:\\pi-review-bg\\guard.stop",
+  });
+  const hereStart = wrapped.indexOf("$__pi_review_watchdog_command = @'");
+  const hereEnd = wrapped.indexOf("\n'@", hereStart);
+  const watchdog = wrapped.slice(hereStart, hereEnd);
+  const cls = producerJobApiClass(watchdog);
+  const CORE_SIGNATURE = "public static bool AssignRootIfIdentity(IntPtr j,IntPtr h,long t)";
+  const OWNED_SIGNATURE = "public static bool AssignOwnedRoot(IntPtr j,int pid,long t)";
+  const core = csharpMethodBody(cls, CORE_SIGNATURE);
+  const owned = csharpMethodBody(cls, OWNED_SIGNATURE);
+
+  it("validates creation identity through the handle before the sole job assignment", () => {
+    const steps = [
+      "if (h == IntPtr.Zero) { return false; }",
+      "if (!GetProcessTimes(h,out c,out x,out k,out u)) { return false; }",
+      "try { s = DateTime.FromFileTime(c).Ticks; } catch { return false; }",
+      "if (s != t) { return false; }",
+      "return AssignProcessToJobObject(j,h); }",
+    ];
+    let previous = -1;
+    for (const step of steps) {
+      const at = core.indexOf(step);
+      expect(at > previous, `core step in order: ${step}`).toBe(true);
+      previous = at;
+    }
+    // The query and the assignment use the SAME handle parameter, and the
+    // assignment is the core's last statement, reached only past every check.
+    expect(occurrences(core, "AssignProcessToJobObject("), "one assignment in the core").toBe(1);
+    expect(core.endsWith("return AssignProcessToJobObject(j,h); }"), "assignment is the final step").toBe(true);
+    expect(occurrences(core, "OpenProcess("), "the core never opens its own handle").toBe(0);
+    // The core is the ONLY assignment call site in the class: removing the
+    // extern declaration and the core body leaves no other call.
+    const rest = cls
+      .replace("public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);", "")
+      .replace(core, "");
+    expect(rest).not.toContain("AssignProcessToJobObject(");
+  });
+
+  it("opens the root once, delegates to the guard, and closes the same handle in finally", () => {
+    expect(occurrences(owned, "OpenProcess("), "one open").toBe(1);
+    const open = owned.indexOf("IntPtr h = OpenProcess(0x1FFFFF,false,pid);");
+    const zero = owned.indexOf("if (h == IntPtr.Zero) { return false; }");
+    const guarded = owned.indexOf("try { return AssignRootIfIdentity(j,h,t); } finally { CloseHandle(h); }");
+    expect(open !== -1 && open < zero && zero < guarded, "open, zero check, then guarded delegation").toBe(true);
+    expect(occurrences(owned, "CloseHandle("), "one release").toBe(1);
+    // Delegation only: the owned method neither re-implements nor bypasses
+    // the guard.
+    expect(owned).not.toContain("GetProcessTimes(");
+    expect(owned).not.toContain("AssignProcessToJobObject(");
+    // Within the class, the guard core is reached only through the owned method.
+    expect(occurrences(cls, "AssignRootIfIdentity("), "core declared once, called once").toBe(2);
+  });
+
+  it("invokes only the owned guard from the watchdog and exits on refusal or exception before the running record", () => {
+    const boundary =
+      "$assigned = $false; try { $assigned = [PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__) } catch {}; if (-not $assigned) { exit 1 }; ";
+    expect(occurrences(watchdog, boundary), "fail-closed exception boundary").toBe(1);
+    const at = watchdog.indexOf(boundary);
+    const configured = watchdog.indexOf("if (-not $configured) { exit 1 }");
+    const firstRunning = watchdog.indexOf('Set-Content -LiteralPath $mk -Value "$PID running"');
+    expect(configured !== -1 && configured < at, "job configured before the guarded assignment").toBe(true);
+    expect(at + boundary.length <= firstRunning, "refusal exits before the running record").toBe(true);
+    // No raw open/assign sequence or direct guard-core call outside the class.
+    const script = watchdog.replace(cls, "");
+    expect(occurrences(script, "[PiReviewBgJobApi]::AssignOwnedRoot("), "single production call").toBe(1);
+    for (const raw of ["::AssignProcessToJobObject(", "::OpenProcess(", "::AssignRootIfIdentity(", "::GetProcessTimes(", "::CloseHandle("]) {
+      expect(script, raw).not.toContain(raw);
+    }
+  });
+
+  it("reuses the single captured root identity without new representations", () => {
+    const tokens = new Set(wrapped.match(/__PI_[A-Z]+(?:_[A-Z]+)*__/g) ?? []);
+    expect([...tokens].sort()).toEqual(["__PI_MARKER__", "__PI_ROOT_TICKS__", "__PI_ROOT__", "__PI_STOP__", "__PI_TICKS__"]);
+    expect(occurrences(wrapped, "$__pi_review_root_ticks = "), "root identity captured once").toBe(1);
+    expect(occurrences(wrapped, ".Replace('__PI_ROOT_TICKS__', [string]$__pi_review_root_ticks)"), "substituted once").toBe(1);
+    // The assignment guard and the later root-liveness check consume the
+    // same token; nothing else does.
+    expect(occurrences(watchdog, "__PI_ROOT_TICKS__"), "guard + liveness").toBe(2);
+    expect(watchdog).toContain("$rt.StartTime.Ticks -eq __PI_ROOT_TICKS__");
+  });
+
+  it("keeps the class C# 5 / Windows PowerShell 5.1 compatible and token-free", () => {
+    expect(cls.includes("\n"), "one line").toBe(false);
+    expect(cls).not.toContain("__PI_");
+    for (const modern of ["=>", "?.", "??", "$\"", "out var", "nameof", "is not"]) {
+      expect(cls, modern).not.toContain(modern);
+    }
+    expect(cls).toContain("[DllImport(\"kernel32.dll\",SetLastError=true)] public static extern bool GetProcessTimes(IntPtr h,out long c,out long x,out long k,out long u);");
   });
 });
 

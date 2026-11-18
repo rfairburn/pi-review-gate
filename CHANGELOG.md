@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.297]
+## [0.1.0-dev.299]
 
 ### Fixed
 
@@ -57,6 +57,37 @@ dates.
   and owned cleanup are kept. Hook support
   on the installed Windows PowerShell 5.1 is checked by stubbed-CIM controls on
   the native runner.
+
+## [0.1.0-dev.298]
+
+### Fixed
+
+- **Windows background-shell root assignment is identity-guarded (#705)**: the
+  `ShellStart` Windows watchdog now verifies the root shell's captured creation
+  identity before assigning it to the Windows Job Object. It opens the root
+  process once, reads that handle's creation time (`GetProcessTimes`, converted
+  with `DateTime.FromFileTime(...).Ticks` to match the wrapper's existing .NET
+  `StartTime.Ticks` capture), and calls `AssignProcessToJobObject` with that
+  same handle only on an exact match, so a process that reused the root PID is
+  never adopted into the job. An unknown or unreadable creation time, an
+  out-of-range value, a mismatch, a failed open, or a thrown call fails closed:
+  the watchdog exits before writing the running record and the user command
+  never runs. The handle is retained through assignment and closed on every
+  path. The PowerShell 5.1 fallback and `pwsh.exe` preference, record formats,
+  liveness, stop, settlement, and deadlines are unchanged.
+
+## [0.1.0-dev.297]
+
+### Fixed
+
+- **Publisher transport phase boundary (#708)**: after the synchronous artifact
+  build and APK checks, the publisher awaits one full event-loop turn (two
+  `setImmediate` phase yields) before the draft identity PATCH, so a pooled
+  connection closed during that blocking work is not reused for the PATCH.
+  There is no timed sleep, retry, extra request, or deadline change, and request
+  order, payloads and every publication gate are unchanged. Owned loopback
+  native-HTTP regressions cover the stale-socket failure without the boundary
+  and the single fresh-connection PATCH with it.
 
 ## [0.1.0-dev.296]
 

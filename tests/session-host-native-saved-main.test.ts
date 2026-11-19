@@ -54,6 +54,7 @@ import {
   sidebarRosterHidden,
   validateSharedRuntimeEnvironment,
   waitForJsonl,
+  workspaceOnlyNewCompletionFrame,
   workspaceOnlyNewFrame,
   type ConversationBinding,
   type JournalSnapshot,
@@ -291,7 +292,7 @@ async function submitWorkspaceOnlyNew(
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the canonical workspace prefix is typed through Pi's real native Editor");
   const basename = workspace.slice(workspace.lastIndexOf(sep) + 1);
-  await driver.waitFrame((text) => workspaceOnlyNewFrame(text) && text.includes(basename),
+  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
     "the native filesystem provider displays the owned workspace completion", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix,
     "the bordered New field contains the literal typed prefix before accepting completion");

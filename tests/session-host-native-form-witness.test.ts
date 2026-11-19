@@ -451,6 +451,20 @@ test("completion witness accepts the captured native frame the New-open witness 
   assert.equal(workspaceOnlyNewFrame(captured), false);
 });
 
+test("completion witness recognizes the macOS saved and resume workspace suggestion shapes", () => {
+  for (const stem of ["saved-main-workspace", "resume-workspace"]) {
+    const draft = `/private/tmp/owned-native-fixture/${stem}-`;
+    const suggestion = `${stem}-abcdef/`;
+    const frame = formHostFrame(localNewFormCompletionRows([`${EDITOR_GUTTER}→ ${suggestion}`], draft));
+    assert.equal(workspaceOnlyNewCompletionFrame(frame, { draft, suggestion }), true,
+      `${stem}: the exact draft and selected owned folder are a completion frame`);
+    assert.equal(workspaceOnlyNewFrame(frame), false,
+      `${stem}: the open-form witness is not used while the menu is displayed`);
+    assert.equal(workspaceOnlyNewCompletionFrame(frame, { draft: `${draft}x`, suggestion }), false);
+    assert.equal(workspaceOnlyNewCompletionFrame(frame, { draft, suggestion: `${stem}-other/` }), false);
+  }
+});
+
 test("completion witness accepts the synthetic geometry with focused Host and default Provider line", () => {
   assert.equal(completionAccepted(localNewFormCompletionRows()), true);
   const hostFocused = localNewFormCompletionRows().map((line, index) => index === 1 ? "> Host: [ Local ]" : line);

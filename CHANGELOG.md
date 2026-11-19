@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.300]
+
+### Changed
+
+- **Android release jobs use the patched Temurin JDK 21.0.13.1+2 (Refs #712)**:
+  the unsigned builder, the protected signer, and the publisher now provision
+  Eclipse Temurin JDK 21.0.13.1+2 instead of 21.0.9+10. Each `actions/setup-java`
+  step quotes `21.0.13+100000002.0.LTS`, the exact semver Adoptium publishes for
+  the `jdk-21.0.13.1+2` GA release, because the pinned action cannot resolve the
+  four-component canonical label. Release provenance records the canonical
+  `21.0.13.1+2` label. The action pin, Java 21 major, vendor, signing isolation,
+  exact-source identity checks, six-asset verification, and release immutability
+  are unchanged.
+
 ## [0.1.0-dev.299]
 
 ### Fixed

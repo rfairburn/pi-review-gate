@@ -8,7 +8,7 @@ const { REPOSITORY, ReleaseError, assertReleaseEventContext, git, sha256Buffer }
 
 const APPLICATION_ID = "io.github.rfairburn.pireviewgate";
 const SCHEMA = "pi-review-gate-android-provenance/1";
-const TOOLCHAIN = Object.freeze({ gradle: "9.6.1", agp: "9.3.1", kotlin: "2.4.21", jdk: "21.0.9+10", commandLineTools: "22.0", compileSdk: 37, buildTools: "37.0.0" });
+const TOOLCHAIN = Object.freeze({ gradle: "9.6.1", agp: "9.3.1", kotlin: "2.4.21", jdk: "21.0.13.1+2", commandLineTools: "22.0", compileSdk: 37, buildTools: "37.0.0" });
 function fail(message, code) {
   const error = new ReleaseError(`Android release: ${message}`);
   if (code) error.signFailureCode = code;

@@ -1601,11 +1601,12 @@ test("Windows shell and the reusable release builder select the exact patched No
 });
 
 test("Android release jobs select the pinned Temurin JDK with the exact vendor selector", () => {
-  // actions/setup-java resolves a requested version that carries build metadata with
-  // semver.compareBuild, so the canonical `21.0.9+10` label is never satisfied by the
-  // vendor's `21.0.9+10.0.LTS` release and the cold job fails before any build. Every
-  // setup-java step must quote the full vendor selector for that same JDK build; this
-  // is a source-level contract, not proof of an installed tool.
+  // The pinned actions/setup-java rejects the four-component canonical `21.0.13.1+2`
+  // label and resolves a requested version that carries build metadata with
+  // semver.compareBuild. Adoptium's official metadata for jdk-21.0.13.1+2 publishes
+  // that same build as semver `21.0.13+100000002.0.LTS`, so every setup-java step must
+  // quote exactly that vendor selector; this is a source-level contract, not proof of
+  // an installed tool.
   const source = withoutComments(readReleaseWorkflow());
   const steps = setupJavaSteps(source);
   assert.equal(steps.length, 3, "the builder, signer, and publisher each provision the pinned JDK");
@@ -1613,11 +1614,11 @@ test("Android release jobs select the pinned Temurin JDK with the exact vendor s
     assert.match(step, /^\s*- uses: actions\/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5\.0\.0$/m,
       "the JDK provisioner stays on its independently verified immutable pin");
     assert.match(step, /^\s*distribution: temurin$/m);
-    assert.match(step, /^\s*java-version: '21\.0\.9\+10\.0\.LTS'$/m,
+    assert.match(step, /^\s*java-version: '21\.0\.13\+100000002\.0\.LTS'$/m,
       "the selector must stay quoted so YAML keeps the vendor build metadata intact");
   }
-  assert.doesNotMatch(source, /java-version:\s*'21\.0\.9\+10'/,
-    "the unsatisfiable short label must not return anywhere in the release builder");
+  assert.doesNotMatch(source, /java-version:\s*'?21\.0\.13\.1\+2'?\s*$/m,
+    "the unsatisfiable canonical label must not be used as a selector anywhere in the release builder");
   assert.doesNotMatch(source, /java-version:\s*'?(?:latest|openjdk|21(?:\.x|\.\*)?)'?,?\s*$/im,
     "no floating major, wildcard, or latest JDK selection may replace the pinned build");
 });

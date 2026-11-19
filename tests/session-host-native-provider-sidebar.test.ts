@@ -487,6 +487,46 @@ test("a target the owner withdrew is refused instead of silently becoming Pi", (
     JSON.stringify(drawn));
 });
 
+test("an older owner's advertised named worker profile is never a remote NEW choice (#493)", () => {
+  const { harness } = newForm({ nativeCliTargets: TARGETS });
+  harness.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [
+    { id: "external:workhorse", backend: "codex", label: "workhorse (Codex CLI)" },
+    { id: "claude", backend: "claude", label: "Claude (owner)" },
+  ])]));
+  void paneTexts(harness);
+  harness.send(SHIFT_TAB); // Provider line
+  harness.send(SHIFT_TAB); // Host line
+  harness.send(DOWN); // -> Lab Alpha
+  harness.send(TAB); // Host -> Provider
+  // The remote cycle is Pi plus the owner's default target only.
+  for (const expected of ["Claude (owner)", "Pi", "Claude (owner)"]) {
+    harness.send(DOWN);
+    assert.ok(paneTexts(harness).some((line) => line.startsWith(`> Provider: [ ${expected} ]`)),
+      JSON.stringify(paneTexts(harness)));
+  }
+  assert.equal(paneTexts(harness).join("\n").includes("workhorse"), false,
+    "the named profile is never drawn");
+
+  // An owner advertising ONLY named profiles draws the exact Pi-only form and
+  // submits the ordinary Pi remote create.
+  const pi = newForm({ nativeCliTargets: TARGETS }).harness;
+  pi.controller.setPeerUiSnapshot(peerSnapshot([peerHostNative("lab-a", "Lab Alpha", [
+    { id: "external:workhorse", backend: "codex", label: "workhorse (Codex CLI)" },
+  ])]));
+  void paneTexts(pi);
+  pi.send(SHIFT_TAB); // Provider line
+  pi.send(SHIFT_TAB); // Host line
+  pi.send(DOWN); // -> Lab Alpha
+  pi.send(TAB); // no Provider line is drawn, so the ring reaches Workspace
+  pi.baseline = pi.actions.length;
+  pi.send("/srv/app");
+  settleNewForm(pi);
+  pi.send(ENTER);
+  const drawn = paneTexts(pi);
+  assert.equal(drawn.some((line) => line.includes("Provider:")), false, JSON.stringify(drawn));
+  assert.deepEqual(pi.focusedActions().map((action) => action.type), ["create-on-peer"]);
+});
+
 /**
  * Select one owner destination and the native target it advertises, then fill the
  * workspace. Leaves the form open with the native choice held.
@@ -953,4 +993,79 @@ test("a target the manager would refuse is dropped at the exact shared bound", (
   assert.equal(drawn.includes("one over"), false, "an id past the bound would fail create, so it is never drawn");
   assert.equal(drawn.includes("c1 control"), false, "a C1 control character is not a target id");
   assert.equal(drawn.includes("del control"), false, "DEL is not a target id");
+});
+
+test("fresh native choices: a New form offers none until its own refresh settles, and stale answers change nothing (#493)", () => {
+  const { harness, texts } = newForm({ freshNativeTargets: true, nativeCliTargets: TARGETS });
+  const refreshes = harness.actions.filter((action) => action.type === "new-form-native-refresh");
+  assert.equal(refreshes.length, 1, "opening the New form asks Main for one fresh observation");
+  const first = refreshes[0] as Extract<SidebarAction, { type: "new-form-native-refresh" }>;
+  assert.equal(first.hostId, undefined, "the form opens on Local");
+  assert.ok(!texts.join("\n").includes("Provider:"), "no unprobed static target is drawn before the probe settles");
+  assert.equal(harness.controller.focus, "form", "the workspace field keeps its initial focus");
+
+  assert.equal(harness.controller.settleNewFormNativeRefresh(first.refreshId + 1, { kind: "local", targets: TARGETS }), false,
+    "an answer for another request is ignored");
+  assert.equal(harness.controller.settleNewFormNativeRefresh(first.refreshId, { kind: "remote", hostRunId: "run" }), true,
+    "the outstanding request is consumed");
+  assert.ok(!paneTexts(harness).join("\n").includes("Provider:"), "a remote-shaped answer offers nothing for Local");
+  assert.equal(harness.controller.settleNewFormNativeRefresh(first.refreshId, { kind: "local", targets: TARGETS }), false,
+    "a request settles at most once");
+
+  // Reopen: a fresh request; its local answer offers exactly the probed targets with Pi first.
+  harness.send(ESC); // cancel the form back to the visible roster
+  assert.equal(harness.controller.focus, "sidebar");
+  void harness.controller.render(40, 20); // the roster must be drawn before a row key acts
+  harness.send(ENTER); // reopen New
+  assert.equal(harness.controller.focus, "form");
+  const second = harness.actions.filter((action) => action.type === "new-form-native-refresh").at(-1) as
+    Extract<SidebarAction, { type: "new-form-native-refresh" }>;
+  assert.ok(second.refreshId > first.refreshId);
+  assert.equal(harness.controller.settleNewFormNativeRefresh(second.refreshId, { kind: "local", targets: [TARGETS[1]!] }), true);
+  const drawn = paneTexts(harness).join("\n");
+  assert.match(drawn, /Provider: \[ Pi \]/, "Pi stays the default once a native choice appears");
+  assert.equal(harness.controller.focus, "form", "settling moves no focus");
+  assert.deepEqual(harness.actions.filter((action) => action.type === "create" || action.type === "select"), [],
+    "settling submits and selects nothing");
+
+  // A late answer for a closed form is ignored.
+  harness.send(ESC);
+  assert.equal(harness.controller.settleNewFormNativeRefresh(second.refreshId, { kind: "local", targets: TARGETS }), false);
+});
+
+test("an owner that cannot create Pi still lets the operator select and submit its sole native target by key or click", () => {
+  const sole = [{ id: "claude", backend: "claude" as const, label: "Claude (owner)" }];
+  const noPi = (): PeerUiHost => ({ ...peerHostNative("lab-a", "Lab Alpha", sole), createSupported: false });
+  for (const gesture of ["key", "click"] as const) {
+    const { harness } = newForm();
+    harness.controller.setPeerUiSnapshot(peerSnapshot([noPi()]));
+    void paneTexts(harness);
+    harness.send(SHIFT_TAB); // Host line (Local draws no Provider line)
+    harness.send(DOWN); // -> Lab Alpha
+    const drawn = paneTexts(harness);
+    const providerRow = drawn.findIndex((line) => line.includes("Provider: [ choose ]"));
+    assert.ok(providerRow >= 0, `an unoffered Pi is never drawn as the choice: ${JSON.stringify(drawn)}`);
+    assert.ok(!drawn.some((line) => line.includes("Provider: [ Pi ]")));
+    if (gesture === "key") {
+      harness.send(TAB); // Host -> Provider
+      harness.send(DOWN); // the sole native target
+    } else {
+      const shown = harness.controller.captureMousePresentation();
+      assert.equal(shown.activateFormProviderAt?.(14, providerRow, 48, 14), true, "a press on the drawn value selects");
+    }
+    assert.ok(paneTexts(harness).some((line) => line.includes("Provider: [ Claude (owner) ]")),
+      `${gesture}: the sole native provider is selectable`);
+    // Back to the workspace field: Tab leaves the focused Provider line; after a
+    // value click the Host line still owns the keys, and Escape leaves it.
+    harness.send(gesture === "key" ? TAB : ESC);
+    harness.send("/srv/app");
+    settleNewForm(harness);
+    harness.baseline = harness.actions.length;
+    harness.send(ENTER);
+    const actions = harness.focusedActions();
+    assert.deepEqual(actions.map((action) => action.type), ["create-native-on-peer"], `${gesture}: ${JSON.stringify(actions)}`);
+    const submitted = actions[0] as Extract<SidebarAction, { type: "create-native-on-peer" }>;
+    assert.deepEqual([submitted.hostId, submitted.backend, submitted.targetId, submitted.workspace],
+      ["lab-a", "claude", "claude", "/srv/app"]);
+  }
 });

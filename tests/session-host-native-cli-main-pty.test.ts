@@ -13,8 +13,9 @@
  *    Provider control (Shift+Tab to Host, Shift+Tab to Provider, arrow-cycled,
  *    Tab back to Workspace, submitted), which carries the operator's explicit
  *    choice through the production sidebar action, host create options, manager,
- *    and `createNativeCliLauncher` into a real PTY child. The claude-backed row
- *    is the configured interactive child alone. The codex-backed row is the
+ *    and `createNativeCliLauncher` into a real PTY child. Both rows are the
+ *    built-in DEFAULT targets — the only native choices a New session offers
+ *    (#493) — and the claude-backed row is that default's interactive child alone. The codex-backed row is the
  *    production owned pair: one private `app-server` backend child on plain
  *    stdio pipes (NOT a terminal), and only after that backend reports its own
  *    loopback endpoint, the interactive TUI child in this row's real PTY; and
@@ -31,10 +32,15 @@
  *    They are NOT Claude Code and NOT the Codex CLI. Nothing here proves a real
  *    provider TUI's rendering, prompts, key handling, trust dialogs, or
  *    telemetry, and nothing reads or writes any provider's real configuration,
- *    credentials, keychain, clipboard, or conversations. Each fixture's
- *    configured shared `env` overrides `PATH` to one owned empty directory, so
- *    no real provider binary is reachable from a hosted child, and this test
- *    never submits a built-in default target at all.
+ *    credentials, keychain, clipboard, or conversations. Each default target
+ *    resolves its bare `claude` / `codex` command through the host's own PATH,
+ *    whose FIRST entry is a fixture-owned directory holding exactly two shims
+ *    that exec this test's Node interpreter on the recording script, so the
+ *    default launch reaches the synthetic program and never a real provider
+ *    binary later on PATH. The authored configuration also carries two
+ *    external worker profiles pointing at the same fixture with their own
+ *    `PATH`/target-id overlay; they are never offered as New choices, and every
+ *    child's own environment proves no such overlay reached it.
  * - The owned Codex backend stand-in is deliberately minimal and hermetic: it
  *    validates the lease's capability-token digest against the bearer its
  *    client presents, prints the ONE readiness banner grammar the production
@@ -131,13 +137,13 @@
  * claim.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, sep } from "node:path";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import test from "node:test";
 
 import { normalizeConfig } from "../src/config";
 import { SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
-import { listNativeCliTargets } from "../src/session-host/native-cli-launch";
+import { listNativeCliNewSessionTargets, listNativeCliTargets } from "../src/session-host/native-cli-launch";
 import { NATIVE_CODEX_BACKEND_AUTH_ENV_PREFIX } from "../src/session-host/native-codex-backend";
 import {
   CLAUDE_NATIVE_HOOK_EVENTS,
@@ -197,9 +203,13 @@ import {
 const SHIFT_TAB = "\x1b[Z";
 const TAB = "\t";
 
-/** The configured synthetic target ids, in the alphabetical catalog order the New form cycles. */
-const CLAUDE_TARGET = "scla";
-const CODEX_TARGET = "scod";
+/**
+ * The synthetic fixture tags: the journal key and the `FX <tag>` pane prefix of
+ * each provider fixture, and also the ids of the two configured external worker
+ * profiles the New form must never offer (#493).
+ */
+const CLAUDE_TAG = "scla";
+const CODEX_TAG = "scod";
 /** The outer geometry the displayed row's pane has at the wide 120x50 layout. */
 const PANE_COLS = OUTER_COLS - SIDEBAR_COLUMNS - 1;
 const PANE_ROWS = OUTER_ROWS - 1;
@@ -207,12 +217,17 @@ const PANE_ROWS = OUTER_ROWS - 1;
 const RESIZED_OUTER = { cols: 100, rows: 30 } as const;
 const RESIZED_PANE = { cols: RESIZED_OUTER.cols - SIDEBAR_COLUMNS - 1, rows: RESIZED_OUTER.rows - 1 } as const;
 
-/** The provider choices the New form offers, in cycle order, for the authored configuration. */
+/** The provider choices the New form offers, in cycle order: the two defaults only (#493). */
 const OFFERED_TARGETS = [
   { id: "claude", backend: "claude", label: "Claude Code (default)" },
   { id: "codex", backend: "codex", label: "Codex CLI (default)" },
-  { id: `external:${CLAUDE_TARGET}`, backend: "claude", label: `${CLAUDE_TARGET} (Claude Code)` },
-  { id: `external:${CODEX_TARGET}`, backend: "codex", label: `${CODEX_TARGET} (Codex CLI)` },
+] as const;
+
+/** The launcher's full configured identity list, worker profiles included, which is never offered whole. */
+const CONFIGURED_TARGETS = [
+  ...OFFERED_TARGETS,
+  { id: `external:${CLAUDE_TAG}`, backend: "claude", label: `${CLAUDE_TAG} (Claude Code)` },
+  { id: `external:${CODEX_TAG}`, backend: "codex", label: `${CODEX_TAG} (Codex CLI)` },
 ] as const;
 
 /** One synthetic provider question is answered; nothing real is ever answered. */
@@ -618,7 +633,7 @@ function isInteractiveTuiStart(record: FixtureRecord): boolean {
   return record.type === "hello" && record.role === "tui" && record.tty === true;
 }
 
-/** The configured synthetic target's unchanged base argv prefix. */
+/** The provider shim's unchanged base argv prefix: the recording script, then its fixture tag. */
 function configuredArgvPrefixMatches(
   argv: readonly string[] | undefined,
   fixtureScript: string,
@@ -628,7 +643,7 @@ function configuredArgvPrefixMatches(
 }
 
 /**
- * The owned Codex TUI's exact lease-issued argv shape: the configured base argv
+ * The owned Codex TUI's exact lease-issued argv shape: the shim's base argv
  * unchanged, then ONLY the relay's `--remote` endpoint and the name of the
  * child-only auth variable. No generated hook flag, no daemon-isolating flag,
  * and no secret token appears anywhere in it.
@@ -653,7 +668,7 @@ function assertCodexOwnedTuiArgv(
   tag: string,
 ): void {
   assert.ok(codexOwnedTuiArgvMatches(argv, fixtureScript, tag),
-    "the owned Codex TUI receives exactly the unchanged configured base argv, then the lease's "
+    "the owned Codex TUI receives exactly the unchanged shim base argv, then the lease's "
     + `private --remote/--remote-auth-token-env tokens, and nothing else: ${JSON.stringify(argv)}`);
   for (const forbidden of ["--no-daemon", "--settings", "-c"]) {
     assert.ok(!(argv ?? []).includes(forbidden),
@@ -865,11 +880,13 @@ async function activateHighlightedOnSettledFrame(driver: MainPtyDriver, caption:
 /**
  * Author the fixture-owned review-gate configuration the host discovers.
  *
- * Both targets share the shape the product documents for a configured external
- * agent: `command` is this test process's own Node interpreter and the shared
- * `args` are the owned recording script, so a hosted "provider" is never a real
- * provider binary; each target's shared `env` overlay is what the child actually
- * searches (`PATH` is one owned empty directory) and where it journals.
+ * It carries two external worker profiles in the shape the product documents
+ * for a configured external agent: `command` is this test process's own Node
+ * interpreter and the shared `args` are the owned recording script, with a
+ * shared `env` overlay naming one owned empty `PATH` and the profile's own
+ * `external:<tag>` target id. Since #493 such a profile is never a New choice;
+ * if the host ever launched one anyway, the child's own journal would report
+ * that overlay, which every row's assertions below refuse.
  */
 function writeNativeAgentConfig(
   agentDir: string,
@@ -894,11 +911,43 @@ function writeNativeAgentConfig(
     review: { activeReviewers: [] },
     execution: { workerResources: {}, routes: { execute: [], research: [] } },
     externalAgents: {
-      [CLAUDE_TARGET]: target(CLAUDE_TARGET, "claude-cli"),
-      [CODEX_TARGET]: target(CODEX_TARGET, "codex-cli"),
+      [CLAUDE_TAG]: target(CLAUDE_TAG, "claude-cli"),
+      [CODEX_TAG]: target(CODEX_TAG, "codex-cli"),
     },
   };
   writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify(config, undefined, 2), { mode: 0o600 });
+}
+
+/** Quote one value for a POSIX `sh` script as a single literal word. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Write the fixture-owned `claude` and `codex` shims a DEFAULT target resolves
+ * to. Each one sets only its own fixture tag and journal, then `exec`s this
+ * test's Node interpreter on the recording script with the launcher's argv
+ * appended unchanged, so the provider process keeps the shim's PID, PTY, and
+ * stdio, and its argv is exactly `[script, tag, ...launcher argv]`.
+ */
+function writeProviderShims(
+  binDir: string,
+  fixtureScript: string,
+  journals: Readonly<Record<string, string>>,
+): void {
+  const shims: Readonly<Record<string, string>> = { claude: CLAUDE_TAG, codex: CODEX_TAG };
+  for (const [command, tag] of Object.entries(shims)) {
+    const file = join(binDir, command);
+    writeFileSync(file, [
+      "#!/bin/sh",
+      `PRG_SYNTH_TAG=${shellQuote(tag)}`,
+      `PRG_SYNTH_JOURNAL=${shellQuote(journals[tag]!)}`,
+      "export PRG_SYNTH_TAG PRG_SYNTH_JOURNAL",
+      `exec ${shellQuote(process.execPath)} ${shellQuote(fixtureScript)} ${shellQuote(tag)} "$@"`,
+      "",
+    ].join("\n"), { mode: 0o700 });
+    chmodSync(file, 0o700);
+  }
 }
 
 /**
@@ -989,7 +1038,7 @@ function claudeObserverFlags(
 ): readonly string[] {
   const generated = argv.slice(2);
   assert.equal(generated.length, 2,
-    `the claude-backed child receives exactly the configured base argv plus the two generated --settings tokens and nothing else; its own argv was ${JSON.stringify(argv)}`);
+    `the claude-backed child receives exactly the shim's base argv plus the two generated --settings tokens and nothing else; its own argv was ${JSON.stringify(argv)}`);
   assert.equal(generated[0], "--settings",
     "the claude route is the single hook-only --settings layer, because the configured argv carries no --settings of its own");
   const settingsPath = generated[1] ?? "";
@@ -998,7 +1047,7 @@ function claudeObserverFlags(
 }
 
 /**
- * The Claude TUI is the configured interactive child plus exactly the one
+ * The Claude TUI is the default target's interactive child plus exactly the one
  * generated hook-only `--settings` pair: the unchanged base argv, then those two
  * tokens, and nothing else. Used as a non-throwing fresh-start witness so a
  * partial or unexpected record can never stand in for the launched child.
@@ -1057,8 +1106,8 @@ async function focusProviderLine(driver: MainPtyDriver): Promise<void> {
 
 /**
  * Cycle the Provider line one real Down at a time and witness every drawn
- * choice by its exact drawn value, including the two built-in defaults this
- * scenario deliberately passes over without ever submitting them.
+ * choice by its exact drawn value; reaching the last default also proves the
+ * cycle wraps straight back to Pi.
  */
 async function cycleProviderTo(driver: MainPtyDriver, steps: number): Promise<string> {
   for (let step = 1; step <= steps; step += 1) {
@@ -1067,6 +1116,19 @@ async function cycleProviderTo(driver: MainPtyDriver, steps: number): Promise<st
     driver.pty.write(KEYS.down);
     await driver.waitFrame((text) => providerValue(providerRow(text)) === expected,
     `the Provider line cycles to the offered choice ${expected}`, after);
+  }
+  if (steps === OFFERED_TARGETS.length) {
+    // The last default is the last native choice: one more Down wraps to Pi, so
+    // no configured worker profile is ever drawn (#493), and Up returns to it.
+    const last = `[ ${OFFERED_TARGETS[steps - 1]!.label} ]`;
+    const afterWrap = driver.frameRevision;
+    driver.pty.write(KEYS.down);
+    await driver.waitFrame((text) => providerValue(providerRow(text)) === PI_PROVIDER_VALUE,
+      "one Down past the last default wraps the Provider line to Pi: no worker profile choice exists", afterWrap);
+    const afterBack = driver.frameRevision;
+    driver.pty.write(KEYS.up);
+    await driver.waitFrame((text) => providerValue(providerRow(text)) === last,
+      `Up returns the Provider line to ${last}`, afterBack);
   }
   return providerValue(providerRow(driver.currentText()));
 }
@@ -1151,9 +1213,13 @@ async function createNativeFixtureSession(options: {
   readonly tag: string;
   readonly journalFile: string;
   readonly fixtureScript: string;
-  readonly ownedBin: string;
+  /** The host's own PATH, which a default target's child inherits unchanged. */
+  readonly hostPath: string;
   readonly scratchHome: string;
   readonly cycles: number;
+  /** The default target id this row must launch, and its drawn label. */
+  readonly targetId: string;
+  readonly label: string;
   /** True only for the production owned-Codex split: one backend plus one TUI. */
   readonly ownedCodex: boolean;
   /** Non-throwing positive witness for this target's exact interactive-TUI argv. */
@@ -1165,10 +1231,8 @@ async function createNativeFixtureSession(options: {
   await openNewForm(driver);
   await focusProviderLine(driver);
   const drawnChoice = await cycleProviderTo(driver, options.cycles);
-  assert.ok(drawnChoice.includes(`[ ${tag}`),
-    `the focused Provider line names the configured target ${tag}; drawn value was ${drawnChoice}`);
-  assert.ok(!drawnChoice.includes("default)"),
-    "the submitted choice is the configured target, never a built-in default",);
+  assert.equal(drawnChoice, `[ ${options.label} ]`,
+    `the focused Provider line names the default target ${options.targetId}; drawn value was ${drawnChoice}`);
   await submitWorkspace(driver, workspace, journalFile, options.tuiArgvMatches);
 
   const records = await untilNativeLaunch(driver, journalFile,
@@ -1206,8 +1270,8 @@ async function createNativeFixtureSession(options: {
 
   assert.equal(hello.role, "tui",
     "the fixture positively labeled the PTY child from its OWN actual invocation mode, not from a journal position or a new PID");
-  assert.equal(hello.target, `external:${tag}`,
-    "the child's own environment names the exact configured target id the Provider line selected");
+  assert.equal(hello.target, "absent",
+    "a default target carries no configured environment overlay: no worker profile's target id reached the child");
   assert.equal(hello.tty, true, "the real interactive child reports a real terminal of its own");
   assert.equal(hello.stdinTty, true, "the interactive child's own stdin is that same real terminal");
   assert.deepEqual([hello.cols, hello.rows], [PANE_COLS, PANE_ROWS],
@@ -1226,10 +1290,10 @@ async function createNativeFixtureSession(options: {
     options.ownedCodex
       ? "the child-only environment really carries a value for that name; the witness records presence only"
       : "a non-owned claude launch receives no owned Codex auth variable value");
-  assert.equal(hello.path, options.ownedBin,
-    "the configured shared environment makes one owned empty directory the only PATH the child can search");
+  assert.equal(hello.path, options.hostPath,
+    "the default target's child inherits the host's own PATH unchanged, never a worker profile's PATH overlay");
   assert.equal(hello.execPath !== undefined && realpath(hello.execPath) === realpath(process.execPath), true,
-    "the hosted child is this test's own Node interpreter, never a real provider binary");
+    "the hosted child is the fixture shim's exec of this test's own Node interpreter, never a real provider binary");
   assert.equal(hello.home, options.scratchHome, "the child's HOME stays the fixture's owned home");
   assert.equal(hello.boot, "absent", "no session-host bootstrap token reaches a provider child");
   assert.equal(hello.runtimeRole, "absent", "no delegated runtime-role authorization reaches a provider child");
@@ -1253,14 +1317,14 @@ async function createNativeFixtureSession(options: {
       options.fixtureScript, tag,
       "app-server", "--listen", "ws://127.0.0.1:0",
       "--ws-auth", "capability-token", "--ws-token-sha256", "<redacted>",
-    ], "the owned backend receives exactly the configured base argv and the lease's closed app-server capability-token control argv; the private digest is redacted from the witness, never copied");
+    ], "the owned backend receives exactly the shim's base argv and the lease's closed app-server capability-token control argv; the private digest is redacted from the witness, never copied");
     assert.equal(backend.hello.hook, "absent",
       "the owned backend receives no generated hook marker either");
     assert.equal(backend.hello.boot, "absent", "no session-host bootstrap token reaches the backend");
     assert.equal(backend.hello.runtimeRole, "absent", "no delegated runtime-role authorization reaches the backend");
-    assert.equal(backend.hello.target, `external:${tag}`);
+    assert.equal(backend.hello.target, "absent", "no worker profile overlay reaches the backend either");
     assert.equal(backend.hello.cwd, workspace, "the owned backend runs in the same selected workspace");
-    assert.equal(backend.hello.path, options.ownedBin, "the backend sees the same configured PATH the operator set");
+    assert.equal(backend.hello.path, options.hostPath, "the backend inherits the same host PATH as its TUI");
     assert.equal(backend.hello.home, options.scratchHome, "the backend sees the same owned HOME the operator set");
     // NEGATIVE CONTROL: a backend start is a fresh PID with a fresh hello, yet
     // it can never satisfy the interactive fresh-start witness this file uses.
@@ -1290,7 +1354,7 @@ async function createNativeFixtureSession(options: {
       "the private capability-token digest is never copied into the witness journal");
   }
 
-  return { targetId: `external:${tag}`, tag, journalFile, workspace, pid, hello, watcher, ...(backend === undefined ? {} : { backend }) };
+  return { targetId: options.targetId, tag, journalFile, workspace, pid, hello, watcher, ...(backend === undefined ? {} : { backend }) };
 }
 
 function realpath(path: string): string {
@@ -1368,27 +1432,34 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
   const workspaceCodex = makeWorkspace(scratch, "workspace-codex-fixture");
 
   // The fixture tree is owned by this file: the recording script, one journal
-  // per target, and the empty directory a hosted child sees as its whole PATH.
+  // per fixture, the two provider shims a default target resolves to, and the
+  // empty directory the never-offered worker profiles name as their PATH.
   const fixtureDir = join(scratch, "native-fixture");
   mkdirSync(fixtureDir, { mode: 0o700 });
   const fixtureScript = join(fixtureDir, "synthetic-cli.cjs");
   writeFileSync(fixtureScript, SYNTHETIC_CLI_SOURCE, { mode: 0o600 });
   const ownedBin = join(fixtureDir, "owned-empty-bin");
   mkdirSync(ownedBin, { mode: 0o700 });
+  const providerBin = join(fixtureDir, "provider-bin");
+  mkdirSync(providerBin, { mode: 0o700 });
   const journals: Record<string, string> = {
-    [CLAUDE_TARGET]: join(fixtureDir, `${CLAUDE_TARGET}.jsonl`),
-    [CODEX_TARGET]: join(fixtureDir, `${CODEX_TARGET}.jsonl`),
+    [CLAUDE_TAG]: join(fixtureDir, `${CLAUDE_TAG}.jsonl`),
+    [CODEX_TAG]: join(fixtureDir, `${CODEX_TAG}.jsonl`),
   };
   for (const file of Object.values(journals)) writeFileSync(file, "", { mode: 0o600 });
+  writeProviderShims(providerBin, fixtureScript, journals);
 
   // One ordinary shared native agent root, then this scenario's configured
-  // targets in it. The host discovers exactly this file, so the New form's
-  // offered choices and the launcher's resolution come from one configuration.
+  // worker profiles in it. The host discovers exactly this file; its New form
+  // offers only the two defaults, while the launcher's configured identity list
+  // still carries the profiles untouched.
   const nativeAgentDir = makeNativeAgentRoot(scratch);
   writeNativeAgentConfig(nativeAgentDir, fixtureScript, ownedBin, journals);
   const authoredConfig = normalizeConfig(JSON.parse(readFileSync(join(nativeAgentDir, "review-gate.json"), "utf8")) as never);
-  assert.deepEqual(listNativeCliTargets(authoredConfig), OFFERED_TARGETS,
-    "the authored configuration offers Pi's two built-in defaults plus the two owned synthetic targets, in the order the New form cycles them");
+  assert.deepEqual(listNativeCliNewSessionTargets(authoredConfig), OFFERED_TARGETS,
+    "the authored configuration offers exactly Pi's two built-in defaults, in the order the New form cycles them");
+  assert.deepEqual(listNativeCliTargets(authoredConfig), CONFIGURED_TARGETS,
+    "the configured worker profiles stay in the launcher's identity list, untouched, yet are never offered");
 
   const observerFile = join(scratch, "observer", "native-main.jsonl");
   const editorLog = createEditorLog(scratch);
@@ -1399,6 +1470,11 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
 
   const scratchHome = join(scratch, "home");
   const startEnv = makeRuntimeEnvironment(scratch, runtime, editor, observerFile, editorLog, "", nativeAgentDir);
+  // The fixture's provider shims come FIRST on the host's PATH, so a default
+  // target's bare `claude` / `codex` resolves to them and never to a real
+  // provider binary that may share a later directory (such as Node's own).
+  const hostPath = `${providerBin}${delimiter}${startEnv.PATH ?? ""}`;
+  startEnv.PATH = hostPath;
   assert.deepEqual(Object.keys(startEnv).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name)), [],
     "the synthetic native child environment contains no external credentials");
   const args = [...REQUIRED_PI_ARGS, "--extension", OBSERVER_FIXTURE];
@@ -1441,28 +1517,30 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
   assert.equal(processIsAlive(piSession.record.pid), true, "the real Pi child is live");
 
   // --- Two native provider rows through the actual New form Provider control. ---
-  // The claude-backed fixture is cycled past Pi and both built-in defaults. Its
-  // armed launch adds exactly one hook-only `--settings` layer, because the
-  // configured argv carries none of its own; the file it points at is read and
-  // validated here, while the row is still live.
+  // The claude-backed fixture is the default Claude target, one Down past Pi.
+  // Its armed launch adds exactly one hook-only `--settings` layer, because the
+  // default target carries no argv of its own; the file it points at is read
+  // and validated here, while the row is still live.
   const claudeFixture = await createNativeFixtureSession({
     driver,
     workspace: workspaceClaude,
-    tag: CLAUDE_TARGET,
-    journalFile: journals[CLAUDE_TARGET]!,
+    tag: CLAUDE_TAG,
+    journalFile: journals[CLAUDE_TAG]!,
     fixtureScript,
-    ownedBin,
+    hostPath,
     scratchHome,
-    cycles: 3,
+    cycles: 1,
+    targetId: OFFERED_TARGETS[0].id,
+    label: OFFERED_TARGETS[0].label,
     ownedCodex: false,
-    tuiArgvMatches: (argv) => claudeTuiArgvMatches(argv, fixtureScript, CLAUDE_TARGET, ownedTmpRoot),
+    tuiArgvMatches: (argv) => claudeTuiArgvMatches(argv, fixtureScript, CLAUDE_TAG, ownedTmpRoot),
     assertTuiArgv: (argv) => assert.deepEqual(argv,
-      [fixtureScript, CLAUDE_TARGET, ...claudeObserverFlags(argv ?? [], { ownedTmpRoot, entrypoints: hookEntrypoints })],
-      "the claude-backed child sees exactly the configured base argv plus this launch's own generated hook-only --settings pair, in order"),
+      [fixtureScript, CLAUDE_TAG, ...claudeObserverFlags(argv ?? [], { ownedTmpRoot, entrypoints: hookEntrypoints })],
+      "the claude-backed child sees exactly the shim's base argv plus this launch's own generated hook-only --settings pair, in order"),
   });
   await driver.waitFrame((text) => headerNamesOwner(text, "Claude")
-    && nativePaneText(text).includes(`FX ${CLAUDE_TARGET} HELLO pid=${claudeFixture.pid}`)
-    && nativePaneText(text).includes(`FX ${CLAUDE_TARGET} QUESTION`),
+    && nativePaneText(text).includes(`FX ${CLAUDE_TAG} HELLO pid=${claudeFixture.pid}`)
+    && nativePaneText(text).includes(`FX ${CLAUDE_TAG} QUESTION`),
   "the real host displays the created native row's own terminal output under its own header");
   const claudeCard = cardFor(driver.currentText(), "Claude");
   assert.ok(claudeCard, "the native row draws its own roster card");
@@ -1483,27 +1561,29 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
   assert.ok(!`${claudeCard.status} ${claudeCard.background}`.includes(NATIVE_STATUS_NOT_APPLICABLE_TEXT),
     "a route that can report every category never gains a not-applicable claim");
 
-  // The codex-backed fixture is the production OWNED pair. The operator's
-  // configured args and environment reach both children unchanged, but this
-  // host's own hook preparation is declined for the owned launch: the TUI gets
-  // no generated hook flag and no opt-in marker, and the backend gets neither
+  // The codex-backed fixture is the default Codex target as the production
+  // OWNED pair; reaching it also proves the cycle then wraps to Pi. This host's
+  // own hook preparation is declined for the owned launch: the TUI gets no
+  // generated hook flag and no opt-in marker, and the backend gets neither
   // either. Its only extra TUI tokens are the lease's private remote flags.
   const codexFixture = await createNativeFixtureSession({
     driver,
     workspace: workspaceCodex,
-    tag: CODEX_TARGET,
-    journalFile: journals[CODEX_TARGET]!,
+    tag: CODEX_TAG,
+    journalFile: journals[CODEX_TAG]!,
     fixtureScript,
-    ownedBin,
+    hostPath,
     scratchHome,
-    cycles: 4,
+    cycles: 2,
+    targetId: OFFERED_TARGETS[1].id,
+    label: OFFERED_TARGETS[1].label,
     ownedCodex: true,
-    tuiArgvMatches: (argv) => codexOwnedTuiArgvMatches(argv, fixtureScript, CODEX_TARGET),
-    assertTuiArgv: (argv) => assertCodexOwnedTuiArgv(argv, fixtureScript, CODEX_TARGET),
+    tuiArgvMatches: (argv) => codexOwnedTuiArgvMatches(argv, fixtureScript, CODEX_TAG),
+    assertTuiArgv: (argv) => assertCodexOwnedTuiArgv(argv, fixtureScript, CODEX_TAG),
   });
   assert.ok(codexFixture.backend, "the owned Codex row reports both of its actual processes");
   await driver.waitFrame((text) => headerNamesOwner(text, "Codex")
-    && nativePaneText(text).includes(`FX ${CODEX_TARGET} HELLO pid=${codexFixture.pid}`),
+    && nativePaneText(text).includes(`FX ${CODEX_TAG} HELLO pid=${codexFixture.pid}`),
   "the second native row becomes the displayed owner under its own header");
   const codexCard = cardFor(driver.currentText(), "Codex");
   assert.ok(codexCard);
@@ -1554,10 +1634,10 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
   }
 
   // --- Addressed input: only the displayed row's real child is answered. ---
-  await driver.waitFrame((text) => nativePaneText(text).includes(`FX ${CODEX_TARGET} QUESTION`),
+  await driver.waitFrame((text) => nativePaneText(text).includes(`FX ${CODEX_TAG} QUESTION`),
     "the displayed native row shows its own synthetic question");
   const claudeInputBeforeAnswer = countOf(readJournal(claudeFixture.journalFile), "input");
-  await driver.writeAndWait(`${ANSWER}\r`, (text) => nativePaneText(text).includes(`FX ${CODEX_TARGET} CONFIRMED`),
+  await driver.writeAndWait(`${ANSWER}\r`, (text) => nativePaneText(text).includes(`FX ${CODEX_TAG} CONFIRMED`),
     "the synthetic prompt answer reaches the displayed native child and is echoed by that child alone");
   await untilJournal(codexFixture.journalFile,
     (records) => records.some((record) => record.type === "input" && record.line === ANSWER),
@@ -1571,11 +1651,11 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
   await driver.ensureSidebarFocus();
   await stepRosterTo(driver, "Claude");
   await activateHighlighted(driver, "Claude",
-    (text) => nativePaneText(text).includes(`FX ${CLAUDE_TARGET} HELLO pid=${claudeFixture.pid}`)
-      && nativePaneText(text).includes(`FX ${CLAUDE_TARGET} QUESTION`));
+    (text) => nativePaneText(text).includes(`FX ${CLAUDE_TAG} HELLO pid=${claudeFixture.pid}`)
+      && nativePaneText(text).includes(`FX ${CLAUDE_TAG} QUESTION`));
   const codexBeatsBeforeSwitch = lastBeat(readJournal(codexFixture.journalFile));
   const codexInputBeforeSwitch = countOf(readJournal(codexFixture.journalFile), "input");
-  await driver.writeAndWait(`${ANSWER}\r`, (text) => nativePaneText(text).includes(`FX ${CLAUDE_TARGET} CONFIRMED`),
+  await driver.writeAndWait(`${ANSWER}\r`, (text) => nativePaneText(text).includes(`FX ${CLAUDE_TAG} CONFIRMED`),
     "the answer follows the deliberate switch to the other row's real child");
   await untilJournal(claudeFixture.journalFile,
     (records) => records.some((record) => record.type === "input" && record.line === ANSWER),
@@ -1619,7 +1699,7 @@ test("real public Main hosts a real Pi row, a synthetic native CLI fixture, and 
     "restoring the outer size still gives the non-TTY backend no PTY geometry");
 
   // --- One natural fixture exit: the fixture's own farewell, then real settlement. ---
-  await driver.writeAndWait(`${FAREWELL}\r`, (text) => nativePaneText(text).includes(`FX ${CLAUDE_TARGET} FAREWELL`),
+  await driver.writeAndWait(`${FAREWELL}\r`, (text) => nativePaneText(text).includes(`FX ${CLAUDE_TAG} FAREWELL`),
     "the fixture ends its own session when asked in its own terminal");
   await claudeFixture.watcher.waitForExit(EVENT_TIMEOUT_MS);
   assert.equal(claudeFixture.watcher.observedExit, true,

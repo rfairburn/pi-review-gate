@@ -23,7 +23,7 @@
  */
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -76,6 +76,8 @@ import type {
 } from "../src/session-host/native-hook-protocol";
 import type { NativeStatusObservation, NativeStatusSupportMap } from "../src/session-host/native-status";
 import type { NativeCodexTuiRootFactsSource } from "../src/session-host/native-codex-tui-root-facts";
+import { decodeNativeInitialPromptFile } from "../src/session-host/native-initial-prompt";
+import { createLocalOwningHostService } from "../src/session-host/owning-host-service";
 
 /** The synthetic bearer, endpoint, and auth name every case shares. */
 const SYNTHETIC_BEARER = "synthetic-observer-bearer-never-public";
@@ -1788,6 +1790,47 @@ test("a Windows batch plan's rendered command line reaches the pinned spawn verb
     assert.deepEqual(pty.spawnDescriptor.args, [], "argv stays empty for a batch child");
     assert.equal(pty.spawnDescriptor.commandLine, plan.batchTui.commandLine, "the literal command line is delivered verbatim");
     harness.settleAll();
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a SessionSpawn whose owned backend readiness is refused before any TUI is unknown, and its prompt file waits for backend settlement (#493)", async () => {
+  const harness = makeHarness("spawn-ready-rejected");
+  try {
+    const service = createLocalOwningHostService({
+      createManager: () => harness.manager,
+      teardownRequested: () => false,
+    });
+    service.openManager({} as Parameters<typeof service.openManager>[0]);
+    const parentId = await harness.manager.create({ workspace: harness.workspace });
+    assert.equal(viewOf(harness.manager, parentId).lifecycle, "alive", "a live Pi parent requests the spawn");
+    const prompt = "exact startup prompt\r\nwith ünicode 😀";
+
+    const outcome = service.spawnRequestedChild(parentId, {
+      workspace: harness.workspace, title: "Spawned Codex", prompt, kind: "codex",
+    });
+    await until(() => harness.factoryRequests.length === 1, "the owned backend exists");
+    const instruction = harness.providerCalls.at(-1)?.initialPrompt?.instruction ?? "";
+    const quoted = /"(?:[^"\\]|\\.)*"/u.exec(instruction);
+    assert.ok(quoted, "the provider received the generated instruction only");
+    const path = JSON.parse(quoted[0]) as string;
+    assert.equal(decodeNativeInitialPromptFile(readFileSync(path, "utf8")), prompt);
+    const lease = lastLease(harness);
+    lease.rejectReady();
+
+    assert.equal(await outcome, "unknown",
+      "an errored launch that still owns its backend is never reported as a started session");
+    const childId = harness.manager.list().find((row) => row.id !== parentId)?.id ?? "";
+    assert.equal(viewOf(harness.manager, childId).lifecycle, "error");
+    assert.equal(viewOf(harness.manager, childId).hasLiveProcess, true, "readiness rejection is not settlement");
+    assert.equal(harness.spawned.length, 1, "only the parent ever had a PTY: no TUI was spawned");
+    assert.equal(harness.factoryRequests.length, 1, "nothing was retried");
+    assert.ok(existsSync(path), "the unsettled backend keeps the owned prompt file");
+
+    lease.settle();
+    await until(() => !existsSync(path), "the backend's own settlement releases the prompt file");
     await harness.manager.dispose();
   } finally {
     rmSync(harness.root, { recursive: true, force: true });

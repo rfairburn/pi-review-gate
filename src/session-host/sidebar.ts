@@ -201,6 +201,7 @@ import {
   isNativeDisplayName,
   isSessionBackend,
   MAX_NATIVE_DISPLAY_NAME_CHARS,
+  projectNativeCliNewSessionTargets,
   sessionBackendDisplayLabel,
   type NativeCliBackend,
   type SessionBackend,
@@ -514,6 +515,13 @@ export type SidebarAction =
    * form's Provider line; an ordinary Pi submission keeps the exact existing
    * `{ requestId, workspace }` shape, and absence means Pi. The target is the
    * unchanged selected target id, never a command, path, or argument.
+   *
+   * `createWorkspace` is present (and only ever `true`) when the operator
+   * deliberately checked "Create missing workspace directory" (#493), and then
+   * ONLY together with the form generation and render token of the written frame
+   * that drew that checked box: Main proves that exact frame before it asks the
+   * manager to create anything. An unchecked submission keeps the exact existing
+   * shape — no flag and no frame ids.
    */
   | {
       readonly type: "create";
@@ -521,6 +529,9 @@ export type SidebarAction =
       readonly workspace: string;
       readonly backend?: NativeCliBackend;
       readonly nativeCliTarget?: string;
+      readonly createWorkspace?: true;
+      readonly formGeneration?: number;
+      readonly renderToken?: number;
     }
   /**
    * One deliberate REMOTE New submission: exactly the destination host, the
@@ -528,6 +539,9 @@ export type SidebarAction =
    * the form held, and the frozen id of the New-form frame the writer actually
    * wrote. It is never a local `create`, never a connect, and Main never
    * re-derives any field of it from a later roster index, label, or selection.
+   * `createWorkspace` is present (only ever `true`) exactly when the written
+   * frame drew a checked "Create missing workspace directory" box (#493); an
+   * unchecked submission keeps the existing shape.
    */
   | {
       readonly type: "create-on-peer";
@@ -537,6 +551,7 @@ export type SidebarAction =
       readonly hostId: string;
       readonly hostRunId: string;
       readonly workspace: string;
+      readonly createWorkspace?: true;
     }
   /**
    * One deliberate REMOTE New submission of a NATIVE session on the explicitly
@@ -545,7 +560,8 @@ export type SidebarAction =
    * verbatim — the owner resolves it against its OWN home and cwd), and the exact
    * OWNER-ADVERTISED backend and target id the Provider line drew. It is never a
    * local `create`, never a Pi create, and never a requester-side configured
-   * target id reinterpreted as the owner's same-named one.
+   * target id reinterpreted as the owner's same-named one. `createWorkspace` has
+   * the same present-only-when-checked meaning as on `create-on-peer`.
    */
   | {
       readonly type: "create-native-on-peer";
@@ -557,6 +573,7 @@ export type SidebarAction =
       readonly workspace: string;
       readonly backend: NativeCliBackend;
       readonly targetId: string;
+      readonly createWorkspace?: true;
     }
   | {
       readonly type: "rename";
@@ -655,6 +672,15 @@ export type SidebarAction =
       readonly theme: SidebarThemeId;
     }
   | { readonly type: "visibility"; readonly visible: boolean }
+  /**
+   * Ask Main for one FRESH native launch observation for the open New form's
+   * current Host choice (only with {@link SidebarControllerOptions.freshNativeTargets}).
+   * Emitted when a New form opens and on every ACTUAL Host change; absent
+   * `hostId` means this host (Local). It is a read-only refresh request: it
+   * selects, submits, connects, and focuses nothing, and Main answers only
+   * through {@link SidebarController.settleNewFormNativeRefresh} with the same id.
+   */
+  | { readonly type: "new-form-native-refresh"; readonly refreshId: number; readonly hostId?: string }
   /**
    * Network sidebar actions are exactly the parent-owned `PeerUiAction` DTOs.
    * Consent decisions travel only as `peer-consent` with the written
@@ -760,6 +786,20 @@ export interface SidebarNativeCliTarget {
   readonly label: string;
 }
 
+/**
+ * Main's answer to one `new-form-native-refresh` request.
+ *
+ * - `local`: this host's freshly probed native targets (Local Host choice only).
+ * - `remote`: the destination completed a fresh owner observation of `hostRunId`;
+ *   the choices are then read from its CURRENT probed projection.
+ * - `unavailable`: no fresh observation exists (a busy, failed, unsupported, or
+ *   legacy owner, or no probe). No native choice is offered; nothing falls back.
+ */
+export type SidebarNativeRefreshResult =
+  | { readonly kind: "local"; readonly targets: readonly SidebarNativeCliTarget[] }
+  | { readonly kind: "remote"; readonly hostRunId: string }
+  | { readonly kind: "unavailable" };
+
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
   readonly toggleKey?: string;
@@ -789,6 +829,18 @@ export interface SidebarControllerOptions {
    * ordinary Pi create, and a native request therefore cannot be made.
    */
   readonly nativeCliTargets?: readonly SidebarNativeCliTarget[];
+  /**
+   * Main-owned FRESH native choices (#493). When true, every New form starts with
+   * NO native choice: opening it, and every actual Host change, emits one
+   * `new-form-native-refresh` action, and native choices appear only after Main
+   * settles THAT request for THAT Host choice — this host's freshly probed
+   * targets for Local, or a completed owner refresh of the exact observed run for
+   * a remote destination whose owner negotiated availability. A legacy
+   * (availability-unknown) owner then offers no native choice. Absent/false keeps
+   * the supplied static `nativeCliTargets` and the remote catalog as before.
+   * Display only: Main and every destination still re-prove each create.
+   */
+  readonly freshNativeTargets?: boolean;
   /** Optional Main-owned factory; production supplies current native keybindings and external-editor ownership. */
   readonly createTextField?: (options: SidebarFieldFactoryOptions) => SidebarFieldFactoryResult;
   /** Main supplies native global keybindings and owns the safe Input manager bridge. */
@@ -940,6 +992,16 @@ export interface SidebarMousePresentation {
    * form that drew no Provider line simply reports no target.
    */
   activateFormProviderAt?(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Activates only the "Create missing workspace directory" checkbox row the
+   * captured New-form render actually drew (#493), with the same written-geometry
+   * rule: a press on the drawn box and label toggles exactly the state that frame
+   * showed, any other column on that drawn row only focuses it, and a different
+   * row, geometry, form generation, drawn state, or support refuses. Optional so
+   * an older presentation stays representable; a form that drew no checkbox
+   * reports no target.
+   */
+  activateFormCreateWorkspaceAt?(column: number, row: number, cols: number, rows: number): boolean;
   /**
    * Begins ONE session-card pointer interaction against the roster this render
    * actually drew. True only when the coordinate is a completely drawn session
@@ -1635,7 +1697,9 @@ function nativeProviderScopeIdentityOf(
     host.roster?.hostRunId ?? null,
     host.fingerprint,
     host.nativeCli?.supported ?? null,
+    host.nativeCli?.availability ?? null,
     (host.nativeCli?.targets ?? []).map((target) => [target.backend, target.id, target.label]),
+    host.createSupported ?? null,
   ]);
 }
 
@@ -1646,6 +1710,10 @@ function nativeProviderScopeIdentityOf(
  * duplicated id keeps only its first occurrence, so one drawn choice never
  * names two targets. The id rule is the manager's shared one, so the New form
  * never draws a provider choice that could only ever fail to start.
+ *
+ * Main supplies only its NEW-session projection here (#493: backend default
+ * targets, never a named external worker profile) and refuses any other target
+ * at its local New gate; this sanitizer stays the generic shape rule.
  */
 function normalizeNativeCliTargets(value: unknown): readonly SidebarNativeCliTarget[] {
   if (!Array.isArray(value)) return [];
@@ -1692,6 +1760,13 @@ interface CreateFormCandidate {
   /** The drawn Provider line's choice identity (`pi`, `backend:targetId`), or
    * undefined when this form drew no Provider line at all. */
   readonly providerKey: string | undefined;
+  /**
+   * The drawn "Create missing workspace directory" checkbox state (#493): `true`
+   * or `false` exactly as this frame showed it, or undefined when this frame drew
+   * no checkbox row at all. Only a frame that DREW a checked box can authorize a
+   * creating submission.
+   */
+  readonly createWorkspace: boolean | undefined;
   /** Pane geometry this candidate was composed at. */
   readonly cols: number;
   readonly rows: number;
@@ -1839,6 +1914,14 @@ export interface SidebarCreateFormPresentation {
    * Absent means a form that drew no Provider line at all.
    */
   readonly providerKey?: string;
+  /**
+   * The drawn "Create missing workspace directory" checkbox state (#493), part of
+   * what the writer committed: `true` only when this frame drew the box checked,
+   * `false` when it drew it unchecked, and absent when it drew no checkbox row. A
+   * submission carrying `createWorkspace: true` is authorized only by a written
+   * frame whose value is `true`, and an unchecked submission never by one.
+   */
+  readonly createWorkspace?: boolean;
   readonly cols: number;
   readonly rows: number;
 }
@@ -1875,6 +1958,25 @@ interface DisplayedFormProviderRow {
   readonly valueStart: number;
   readonly valueEnd: number;
   readonly optionKey: string;
+  readonly formGeneration: number;
+}
+
+/**
+ * The New form's "Create missing workspace directory" checkbox row drawn
+ * completely (#493), with the same written-geometry binding as the Host and
+ * Provider lines. `checked` and `supported` are the exact state the row showed,
+ * so a press can only toggle the state the operator actually saw, for the
+ * destination support the frame actually drew.
+ */
+interface DisplayedFormCreateWorkspaceRow {
+  readonly cols: number;
+  readonly rows: number;
+  readonly row: number;
+  readonly valueStart: number;
+  readonly valueEnd: number;
+  readonly checked: boolean;
+  readonly supported: boolean;
+  readonly hostKey: string;
   readonly formGeneration: number;
 }
 
@@ -2164,6 +2266,7 @@ function mouseAuthorizationKey(
   formProvider: DisplayedFormProviderRow | undefined,
   settings: DisplayedSettingsRows | undefined,
   theme: DisplayedSettingsRows | undefined,
+  formCreateWorkspace?: DisplayedFormCreateWorkspaceRow,
 ): string {
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
@@ -2210,6 +2313,15 @@ function mouseAuthorizationKey(
       formProvider.cols, formProvider.rows, formProvider.row,
       formProvider.valueStart, formProvider.valueEnd,
       formProvider.optionKey, formProvider.formGeneration,
+    ],
+    // The checkbox row is the same kind of written pointer target: its drawn row,
+    // span, checked state, support, and Host belong to this identity, so a toggle
+    // or a capability change needs its own written boundary.
+    formCreateWorkspace: formCreateWorkspace === undefined ? null : [
+      formCreateWorkspace.cols, formCreateWorkspace.rows, formCreateWorkspace.row,
+      formCreateWorkspace.valueStart, formCreateWorkspace.valueEnd,
+      formCreateWorkspace.checked, formCreateWorkspace.supported,
+      formCreateWorkspace.hostKey, formCreateWorkspace.formGeneration,
     ],
     // The grouped Settings submenu and the Theme pane are ordinary written
     // menus: their drawn rows and exact wording belong to this same identity,
@@ -2421,6 +2533,18 @@ export const NATIVE_PROVIDER_SCOPE_CHANGED_NOTICE =
 export const NATIVE_PROVIDER_NOT_DRAWN_NOTICE =
   "No Provider line is drawn here; make the pane taller, then submit again";
 /**
+ * A checked "Create missing workspace directory" box this pane cannot fit was
+ * never drawn, so the writer never committed it (#493): a creating submission
+ * says so instead of riding a frame that showed no checkbox. It is never quietly
+ * submitted as an ordinary (non-creating) request either.
+ */
+export const CREATE_WORKSPACE_NOT_DRAWN_NOTICE =
+  "The Create missing workspace directory box is not drawn here; make the pane taller or uncheck it";
+/** The suffix of a checked box whose selected Host cannot create a workspace. */
+export function createWorkspaceUnsupportedNotice(hostLabel: string): string {
+  return `${hostLabel} cannot create a missing workspace directory; uncheck it or choose another host`;
+}
+/**
  * Fixed, bounded notices for the selected-host Saved picker. Each states only
  * what this side knows locally; none claims an owner outcome, a retry, a
  * reconnect, a cancellation, or a path, and no raw error text is shown.
@@ -2448,6 +2572,12 @@ const NEW_FORM_HOST_PREFIX = "Host: ";
 const NEW_FORM_PROVIDER_PREFIX = "Provider: ";
 /** The drawn label of the default provider choice. */
 const NEW_FORM_PI_PROVIDER_LABEL = "Pi";
+/** Drawn when the current choice (Pi) is not offered by the chosen Host. */
+const NEW_FORM_UNOFFERED_PROVIDER_LABEL = "choose";
+/** The New form's one default-off workspace-creation checkbox (#493). */
+const NEW_FORM_CREATE_WORKSPACE_LABEL = "Create missing workspace directory";
+/** Drawn after a CHECKED box whose selected Host does not support creation. */
+const NEW_FORM_CREATE_WORKSPACE_UNSUPPORTED_SUFFIX = " (unsupported here)";
 /** Native-session card heights: title, status, background (+2 activity). */
 const CARD_COLLAPSED_ROWS = 3;
 const CARD_EXPANDED_ROWS = 5;
@@ -3462,11 +3592,22 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
   const nativeSupported = displayBoolean(nativeValue?.supported);
   let nativeCli: PeerUiHostNativeCli | undefined;
   if (nativeValue !== undefined && nativeSupported !== undefined) {
+    const availability = nativeValue.availability === "probed" || nativeValue.availability === "unknown"
+      ? nativeValue.availability
+      : undefined;
     nativeCli = {
       supported: nativeSupported,
       targets: nativeSupported ? normalizeNativeCliTargets(nativeValue.targets) : [],
+      // Kept only as one of its two closed values; anything else is absent (unknown).
+      ...(availability === undefined ? {} : { availability }),
     };
   }
+  // Optional descriptive blank Pi create support; absent or malformed stays absent.
+  const createSupported = displayBoolean(source.createSupported);
+  // Optional descriptive destination workspace-creation support (#493). Only a
+  // well-formed boolean is kept; absent or malformed stays absent, which every
+  // reader treats as NOT supported.
+  const createWorkspaceSupported = displayBoolean(source.createWorkspaceSupported);
   // Optional descriptive HOST ROW NAME support of the SEPARATE native lane. Absent
   // or malformed means NOT supported; nothing is ever inferred from the roster.
   const nativeNameSupported = displayBoolean(source.nativeNameSupported);
@@ -3506,6 +3647,8 @@ function copyPeerHost(value: unknown): SidebarPeerHost | null {
     },
     ...(saved === undefined ? {} : { saved }),
     ...(renameSupported === undefined ? {} : { renameSupported }),
+    ...(createSupported === undefined ? {} : { createSupported }),
+    ...(createWorkspaceSupported === undefined ? {} : { createWorkspaceSupported }),
     ...(nativeCli === undefined ? {} : { nativeCli }),
     ...(nativeNameSupported === undefined ? {} : { nativeNameSupported }),
   };
@@ -3846,6 +3989,25 @@ export class SidebarController {
    */
   private formProviderRowSuppressed = false;
   /**
+   * The New form's one "Create missing workspace directory" intent (#493). It is
+   * OFF at every form opening, never remembered across forms, and never set by
+   * anything but the operator's own keyboard or pointer gesture on the drawn
+   * checkbox. A Host change keeps it exactly as it was: a checked box on a Host
+   * that cannot honor it stays visible and clearable and refuses submission; it
+   * is never silently cleared and never silently dropped from a request.
+   */
+  private newFormCreateWorkspace = false;
+  /** True only while the checkbox row owns the form's keyboard focus. */
+  private formCreateWorkspaceFocused = false;
+  /**
+   * True only while the last complete New-form render had no row to spare for a
+   * checkbox this form shows. Like the Provider line, an undrawn control never
+   * holds the form's keyboard focus and never authorizes a creating submission.
+   */
+  private formCreateWorkspaceRowSuppressed = false;
+  /** The checkbox row the last complete New-form render drew, or undefined. */
+  private formCreateWorkspaceDisplay: DisplayedFormCreateWorkspaceRow | undefined;
+  /**
    * The New form's one provider choice. It is Pi at EVERY form opening, exactly
    * like the Host line is Local, and a native choice never survives a reopen.
    */
@@ -3874,9 +4036,18 @@ export class SidebarController {
   /**
    * The native provider targets Main supplied for this host, already sanitized.
    * An empty list means this host offers no native session at all, so the New
-   * form draws no Provider line.
+   * form draws no Provider line. With fresh native targets this is only the
+   * display projection of the latest settled probe for the open Local form; it
+   * is never an availability authority.
    */
-  private readonly nativeCliTargets: readonly SidebarNativeCliTarget[];
+  private nativeCliTargets: readonly SidebarNativeCliTarget[];
+  /** Main-owned fresh native choices; see {@link SidebarControllerOptions.freshNativeTargets}. */
+  private readonly freshNativeTargets: boolean;
+  private newFormNativeRefreshSequence = 0;
+  /** The one outstanding fresh-native request for the open New form's Host choice. */
+  private newFormNativeRefreshPending: { readonly refreshId: number; readonly hostKey: string } | undefined;
+  /** The settled fresh observation native choices may be offered from, bound to its Host choice. */
+  private newFormNativeFresh: { readonly hostKey: string; readonly hostRunId: string | null } | undefined;
   /** The Host line the last complete New-form render drew, or undefined. */
   private formHostDisplay: DisplayedFormHostRow | undefined;
   private formProviderDisplay: DisplayedFormProviderRow | undefined;
@@ -4026,6 +4197,13 @@ export class SidebarController {
   private pendingCreate:
     | {
         readonly requestId: number;
+        /**
+         * Present (only ever `true`) when this submission deliberately asked the
+         * destination to create a missing workspace directory (#493), local or
+         * remote. Every last-instant proof compares it with the form's CURRENT
+         * checkbox, so a request can never be re-proved for the other intent.
+         */
+        readonly createWorkspace?: true;
         /** Frozen remote target facts; absent for a local `create`. */
         readonly peer?: {
           readonly formGeneration: number;
@@ -4172,6 +4350,7 @@ export class SidebarController {
     this._visible = options.initialVisible ?? true;
     this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
     this.nativeCliTargets = normalizeNativeCliTargets(options.nativeCliTargets);
+    this.freshNativeTargets = options.freshNativeTargets === true;
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
     this.now = options.now ?? (() => Date.now());
@@ -5390,6 +5569,24 @@ export class SidebarController {
     // ordered write could still pass Main's last-instant proof (which asks whether
     // THIS request still owns the form) and the owner-side catalog check after the
     // target was withdrawn and advertised again. A Pi submission is untouched.
+    // The chosen destination's workspace-creation support (#493) is part of what a
+    // drawn New form committed: the checkbox row appears, disappears, or says
+    // "unsupported" with it. Any observed move retires the drawn receipt, even one
+    // that returns to its earlier value before anything is painted (supported ->
+    // unsupported -> supported), so a frame written under the earlier observation
+    // can never authorize a creating request afterwards.
+    const createWorkspaceSupportChanged = chosenHostId !== undefined
+      && (before?.createWorkspaceSupported === true) !== (after?.createWorkspaceSupported === true);
+    if (createWorkspaceSupportChanged) {
+      this.invalidateFormPanePresentations();
+      const pending = this.pendingCreate;
+      if (pending !== undefined && pending.peer !== undefined && pending.createWorkspace === true) {
+        // A creating request in flight loses its last-instant proof; dispatch may
+        // already have happened, so only uncertainty is claimed. An ordinary
+        // (non-creating) request is untouched.
+        this.failCreateOnPeer(pending.requestId, CREATE_ON_PEER_UNCERTAIN_NOTICE);
+      }
+    }
     if (targetChanged || (nativeScopeChanged && this.newFormProvider.backend !== "pi")) {
       // Comparing present values is not enough: a run or connection that returns
       // to its earlier value (A -> B -> A, or disconnected -> connected) must
@@ -5698,6 +5895,7 @@ export class SidebarController {
     const displayedPeerConsent = this.peerConsentDisplay;
     const displayedFormHost = this.formHostDisplay;
     const displayedFormProvider = this.formProviderDisplay;
+    const displayedFormCreateWorkspace = this.formCreateWorkspaceDisplay;
     const displayedSettingsRows = this.settingsDisplay;
     const displayedThemeRows = this.themeDisplay;
     return Object.freeze({
@@ -5711,6 +5909,7 @@ export class SidebarController {
         displayedFormProvider,
         displayedSettingsRows,
         displayedThemeRows,
+        displayedFormCreateWorkspace,
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       remoteEdit: this.remoteEditRowFrom(displayedRoster),
@@ -5739,6 +5938,8 @@ export class SidebarController {
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows),
       activateFormProviderAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateFormProviderAtFrom(displayedFormProvider, column, row, cols, rows),
+      activateFormCreateWorkspaceAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activateFormCreateWorkspaceAtFrom(displayedFormCreateWorkspace, column, row, cols, rows),
       // Session-card pointer reorder. Each callback stays bound to the roster
       // maps THIS render drew, so Main drives them with the presentation whose
       // frame it actually wrote and no packet can resolve against a newer order.
@@ -5755,6 +5956,7 @@ export class SidebarController {
       activateFormRowAt: (column: number, row: number, cols: number, rows: number): boolean =>
         this.activateFormHostAtFrom(displayedFormHost, column, row, cols, rows)
           || this.activateFormProviderAtFrom(displayedFormProvider, column, row, cols, rows)
+          || this.activateFormCreateWorkspaceAtFrom(displayedFormCreateWorkspace, column, row, cols, rows)
           || (displayedSavedRows !== undefined
             ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
             : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows))
@@ -6808,6 +7010,7 @@ export class SidebarController {
     // on (the same mutual exclusion the keyboard focus ring keeps).
     this.formHostFocused = true;
     this.formProviderFocused = false;
+    this.formCreateWorkspaceFocused = false;
     this.onInvalidate?.();
     return true;
   }
@@ -6842,6 +7045,42 @@ export class SidebarController {
     // cannot disagree.
     this.formProviderFocused = true;
     this.formHostFocused = false;
+    this.formCreateWorkspaceFocused = false;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Activates only the New form's checkbox row that the captured render drew
+   * (#493). The drawn box-and-label span toggles exactly the state that frame
+   * showed; any other column on that drawn row only focuses the control; and a
+   * different row, pane geometry, form generation, Host, drawn checked state, or
+   * drawn support refuses, so a press can never act on a box the operator did not
+   * see or flip the opposite of what was drawn.
+   */
+  private activateFormCreateWorkspaceAtFrom(
+    shown: DisplayedFormCreateWorkspaceRow | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (shown === undefined) return false;
+    if (!this._visible || this._focus !== "form" || this.formKind !== "new"
+      || this.pendingCreate !== undefined || !this.newFormCreateWorkspaceShown()) return false;
+    if (!validHitGeometry(column, row, cols, rows)) return false;
+    if (shown.cols !== cols || shown.rows !== rows || shown.row !== row) return false;
+    if (this.formGeneration !== shown.formGeneration) return false;
+    if (shown.hostKey !== this.newFormHostKey()) return false;
+    if (shown.checked !== this.newFormCreateWorkspace) return false;
+    if (shown.supported !== this.newFormCreateWorkspaceSupported()) return false;
+    if (column >= shown.valueStart && column < shown.valueEnd) {
+      this.toggleNewFormCreateWorkspace();
+      return true;
+    }
+    this.formCreateWorkspaceFocused = true;
+    this.formHostFocused = false;
+    this.formProviderFocused = false;
     this.onInvalidate?.();
     return true;
   }
@@ -7066,8 +7305,10 @@ export class SidebarController {
       // drawn rows may not keep authorizing Enter or a captured press.
       this.settingsDisplay = undefined;
       this.themeDisplay = undefined;
-      // An unshowable New form is not on screen at all.
+      // An unshowable New form is not on screen at all, and neither is its
+      // checkbox: it never keeps the keyboard behind the fallback (#493).
       this.invalidateFormPanePresentations();
+      this.formCreateWorkspaceFocused = false;
       return this.renderTooSmall(cols, rows);
     }
     if (this.peerConsentConfirmationActive) {
@@ -8304,7 +8545,8 @@ export class SidebarController {
       // the operator is not typing in: while one of the New form's host-owned
       // selection controls owns the focus the chunk is consumed instead of
       // reaching the hidden editor.
-      if (this.formKind !== "new" || (!this.formHostFocused && !this.formProviderFocused)) {
+      if (this.formKind !== "new" || (!this.formHostFocused && !this.formProviderFocused
+        && !(this.formCreateWorkspaceFocused && this.newFormCreateWorkspaceDrawn()))) {
         this.formField?.handleInput(data);
       }
       return;
@@ -9561,9 +9803,61 @@ export class SidebarController {
     // render never meets a stale suppression from an earlier, differently sized
     // form.
     this.formProviderRowSuppressed = false;
+    // Workspace creation is OFF at every opening (#493): a box checked on an
+    // earlier form is a request-specific intent, never a remembered default.
+    this.newFormCreateWorkspace = false;
+    this.formCreateWorkspaceFocused = false;
+    this.formCreateWorkspaceRowSuppressed = false;
+    this.formCreateWorkspaceDisplay = undefined;
     if (wasRemote) this.workspaceDraft = "";
     this._focus = "form";
     this.createFormField(this.workspaceDraft);
+    this.requestNewFormNativeRefresh();
+  }
+
+  /**
+   * Start one fresh native observation for the open New form's CURRENT Host
+   * choice (fresh mode only). Any earlier observation is forgotten first, so no
+   * native choice is offered until THIS request settles; Pi and the workspace
+   * field, its focus, and its draft are untouched.
+   */
+  private requestNewFormNativeRefresh(): void {
+    if (!this.freshNativeTargets || this.formKind !== "new") return;
+    this.newFormNativeFresh = undefined;
+    if (this.newFormHost.kind === "local") this.nativeCliTargets = Object.freeze([]);
+    const refreshId = ++this.newFormNativeRefreshSequence;
+    const hostKey = this.newFormHostKey();
+    this.newFormNativeRefreshPending = { refreshId, hostKey };
+    const chosen = this.newFormHost;
+    this.emit({
+      type: "new-form-native-refresh",
+      refreshId,
+      ...(chosen.kind === "remote" ? { hostId: chosen.hostId } : {}),
+    });
+  }
+
+  /**
+   * Main's answer to one `new-form-native-refresh`. Accepted only for the exact
+   * outstanding request of the still-open New form whose Host choice is unchanged;
+   * a late answer for a closed form, another Host, or a superseded request changes
+   * nothing. Accepting it never selects a provider, moves focus, or submits: Pi
+   * stays the default, and a native choice still needs an explicit selection.
+   */
+  settleNewFormNativeRefresh(refreshId: number, result: SidebarNativeRefreshResult): boolean {
+    const pending = this.newFormNativeRefreshPending;
+    if (!this.freshNativeTargets || pending === undefined || pending.refreshId !== refreshId
+      || this.formKind !== "new" || pending.hostKey !== this.newFormHostKey()) return false;
+    this.newFormNativeRefreshPending = undefined;
+    const chosen = this.newFormHost;
+    if (result?.kind === "local" && chosen.kind === "local") {
+      this.nativeCliTargets = normalizeNativeCliTargets(result.targets);
+      this.newFormNativeFresh = { hostKey: pending.hostKey, hostRunId: null };
+    } else if (result?.kind === "remote" && chosen.kind === "remote"
+      && typeof result.hostRunId === "string" && result.hostRunId.length > 0) {
+      this.newFormNativeFresh = { hostKey: pending.hostKey, hostRunId: result.hostRunId };
+    }
+    this.onInvalidate?.();
+    return true;
   }
 
   // --- New form Host line: Local by default, one host-owned selection. ---
@@ -9676,6 +9970,16 @@ export class SidebarController {
         : this.newFormProviderLabelFor(previousProvider);
       this.formError = `${chosenLabel} is not available on ${this.currentNewFormHostLabel()}; the provider is Pi again`;
     }
+    // The checkbox intent is the operator's and survives a Host change exactly as
+    // it was (#493). A checked box the new Host cannot honor is never silently
+    // cleared: it stays drawn and clearable, the form says why it cannot submit,
+    // and submission refuses until the operator unchecks it or picks a Host that
+    // supports creation.
+    if (this.newFormCreateWorkspace && !this.newFormCreateWorkspaceSupported()
+      && this.formError === undefined) {
+      this.formError = createWorkspaceUnsupportedNotice(this.currentNewFormHostLabel());
+    }
+    this.requestNewFormNativeRefresh();
   }
 
   /** The bounded label one provider choice was drawn with, for an honest notice. */
@@ -9736,6 +10040,10 @@ export class SidebarController {
         // layout suppressed is never a stop on the ring.
         this.formHostFocused = false;
         this.formProviderFocused = matchesKey(data, "tab") && this.newFormProviderDrawn();
+        // The ring's backward wrap goes to the BOTTOM of the drawn order: the
+        // workspace-creation checkbox drawn below the workspace editor when this
+        // form draws one (#493), otherwise the workspace editor as before.
+        this.formCreateWorkspaceFocused = matchesShiftTab(data) && this.newFormCreateWorkspaceDrawn();
         this.onInvalidate?.();
       }
       return true;
@@ -9771,8 +10079,10 @@ export class SidebarController {
   /**
    * The native targets the CURRENT Host choice can honestly offer.
    *
-   * Local is this host's own configured list, exactly as before. A remote
-   * destination contributes ONLY its own current advertised catalog: a connected
+   * Local is the NEW-session list Main supplied for this host. A remote
+   * destination contributes ONLY the NEW-session view of its own current
+   * advertised catalog (#493: an older owner may still advertise named external
+   * worker profiles, and none is ever a NEW choice here): a connected
    * destination whose coordinator reports `nativeCli.supported` AND whose roster
    * observation is CURRENT. A disconnected, stale, reconnecting, older, or
    * native-less owner contributes nothing, so its own configured targets can never
@@ -9780,14 +10090,40 @@ export class SidebarController {
    */
   private newFormNativeTargets(): readonly SidebarNativeCliTarget[] {
     const chosen = this.newFormHost;
-    if (chosen.kind === "local") return this.nativeCliTargets;
+    if (chosen.kind === "local") {
+      if (!this.freshNativeTargets) return this.nativeCliTargets;
+      // Fresh mode: only the probe settled for THIS open Local form.
+      return this.newFormNativeFresh?.hostKey === this.newFormHostKey() ? this.nativeCliTargets : [];
+    }
     const host = (this.peerUiSnapshot?.hosts ?? [])
       .find((candidate) => candidate.id === chosen.hostId);
     if (host === undefined || host.state !== "connected") return [];
     if (host.roster.state !== "current") return [];
     const native = host.nativeCli;
     if (native === undefined || native.supported !== true) return [];
-    return native.targets;
+    if (this.freshNativeTargets) {
+      // Fresh mode: an owner that did not negotiate availability offers no
+      // unverified native choice, and a probed owner's choices are offered only
+      // after THIS form's refresh completed for the exact run still observed.
+      if (native.availability !== "probed") return [];
+      const fresh = this.newFormNativeFresh;
+      if (fresh === undefined || fresh.hostKey !== this.newFormHostKey()
+        || fresh.hostRunId === null || fresh.hostRunId !== host.roster.hostRunId) return [];
+    }
+    return projectNativeCliNewSessionTargets(native.targets);
+  }
+
+  /**
+   * True while the CURRENT Host choice can be offered the ordinary Pi create:
+   * always for Local (Main still fences its own manager), and for a remote
+   * destination unless its coordinator positively reports that the owner did not
+   * negotiate the blank create. Never a fallback for a withdrawn native choice.
+   */
+  private newFormPiOffered(): boolean {
+    const chosen = this.newFormHost;
+    if (chosen.kind === "local") return true;
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === chosen.hostId);
+    return host?.createSupported !== false;
   }
 
   /** The exact owner run the CURRENT Host choice names, or null. */
@@ -9804,7 +10140,7 @@ export class SidebarController {
    * a reconnect or run replacement never leaves a stale owner choice selectable.
    */
   private newFormProviderChoiceCurrent(): boolean {
-    if (this.newFormProvider.backend === "pi") return true;
+    if (this.newFormProvider.backend === "pi") return this.newFormPiOffered();
     if (this.newFormProviderScope === undefined) return false;
     // Latched, not re-compared: the scope this choice was made under has to be the
     // scope that has been continuously in effect ever since. Equal present values
@@ -9833,7 +10169,9 @@ export class SidebarController {
    * target is offered — and a target belonging to the other destination never is.
    */
   private newFormProviderOptions(): NewFormProviderOption[] {
-    const options: NewFormProviderOption[] = [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }];
+    const options: NewFormProviderOption[] = this.newFormPiOffered()
+      ? [{ backend: "pi", label: NEW_FORM_PI_PROVIDER_LABEL }]
+      : [];
     for (const target of this.newFormNativeTargets()) {
       options.push({ backend: target.backend, targetId: target.id, label: target.label });
     }
@@ -9859,7 +10197,12 @@ export class SidebarController {
   private currentNewFormProviderLabel(): string {
     const key = this.newFormProviderKey();
     const option = this.newFormProviderOptions().find((candidate) => newFormProviderOptionKey(candidate) === key);
-    return option === undefined ? NEW_FORM_PI_PROVIDER_LABEL : option.label;
+    if (option !== undefined) return option.label;
+    // A choice this Host does not offer is never drawn as though it were one (an
+    // owner that cannot create Pi): the operator is asked to choose explicitly.
+    return this.newFormProvider.backend === "pi" && !this.newFormPiOffered()
+      ? NEW_FORM_UNOFFERED_PROVIDER_LABEL
+      : NEW_FORM_PI_PROVIDER_LABEL;
   }
 
   /**
@@ -9890,7 +10233,10 @@ export class SidebarController {
   private cycleNewFormProvider(direction: 1 | -1): void {
     if (!this.newFormProviderAvailable() || this.pendingCreate !== undefined) return;
     const options = this.newFormProviderOptions();
-    if (options.length < 2) return;
+    // A single offered choice is still explicitly selectable: when Pi is not
+    // offered (the owner cannot create it), the sole native target must be
+    // reachable by the operator's own gesture. Reselecting it is a no-op.
+    if (options.length === 0) return;
     const key = this.newFormProviderKey();
     const index = options.findIndex((option) => newFormProviderOptionKey(option) === key);
     const next = index < 0
@@ -9943,6 +10289,12 @@ export class SidebarController {
    * one, otherwise the Host line, exactly as before the Provider line existed.
    */
   private handleNewFormSelectionKey(data: string): boolean {
+    if (this.formCreateWorkspaceFocused) {
+      if (this.handleNewFormCreateWorkspaceKey(data)) return true;
+      // A released (undrawn or no longer shown) checkbox hands the key on to the
+      // workspace editor, exactly like a suppressed Provider line.
+      if (this.formKind !== "new" || !matchesShiftTab(data)) return false;
+    }
     if (this.formProviderFocused) return this.handleNewFormProviderKey(data);
     if (this.formHostFocused) return this.handleNewFormHostKey(data);
     if (this.formKind !== "new" || !matchesShiftTab(data)) return false;
@@ -9950,6 +10302,89 @@ export class SidebarController {
     if (this.newFormProviderDrawn()) this.formProviderFocused = true;
     else this.formHostFocused = true;
     this.onInvalidate?.();
+    return true;
+  }
+
+  // --- New form workspace-creation checkbox: off by default (#493). ---
+
+  /**
+   * True while the CURRENT Host choice can honor a checked "Create missing
+   * workspace directory" box: always for Local (this host's own manager creates
+   * it), and for a remote destination only while it is connected and its
+   * coordinator positively reports the owner negotiated workspace creation.
+   * Absent or false is NOT supported. Descriptive only, never authority: the
+   * owner re-proves everything per request.
+   */
+  private newFormCreateWorkspaceSupported(): boolean {
+    const chosen = this.newFormHost;
+    if (chosen.kind === "local") return true;
+    const host = (this.peerUiSnapshot?.hosts ?? []).find((candidate) => candidate.id === chosen.hostId);
+    return host !== undefined && host.state === "connected" && host.createWorkspaceSupported === true;
+  }
+
+  /**
+   * True while the New form shows the checkbox: the selected Host supports
+   * creation, OR the operator's box is checked — a checked intent is always
+   * shown, so it can be seen and cleared on a Host that cannot honor it.
+   */
+  private newFormCreateWorkspaceShown(): boolean {
+    return this.formKind === "new" && (this.newFormCreateWorkspace || this.newFormCreateWorkspaceSupported());
+  }
+
+  /** True only while this form actually DRAWS the checkbox row (focus-ring stop). */
+  private newFormCreateWorkspaceDrawn(): boolean {
+    return this.newFormCreateWorkspaceShown() && !this.formCreateWorkspaceRowSuppressed;
+  }
+
+  /**
+   * One deliberate toggle of the checkbox. Only the operator's own gesture on the
+   * drawn control reaches it; the workspace draft, its caret, the Host, and the
+   * provider are untouched, and no action is emitted by a toggle alone. Clearing a
+   * box the Host could not honor also clears the notice that explained it.
+   */
+  private toggleNewFormCreateWorkspace(): void {
+    if (this.formKind !== "new" || this.pendingCreate !== undefined) return;
+    if (!this.newFormCreateWorkspaceShown()) return;
+    const unsupportedNotice = createWorkspaceUnsupportedNotice(this.currentNewFormHostLabel());
+    this.newFormCreateWorkspace = !this.newFormCreateWorkspace;
+    if (!this.newFormCreateWorkspace && this.formError === unsupportedNotice) this.formError = undefined;
+    if (this.formError === CREATE_WORKSPACE_NOT_DRAWN_NOTICE) this.formError = undefined;
+    // An unchecked box on a Host that cannot create is no longer shown at all; a
+    // control that left the screen never keeps the keyboard.
+    if (!this.newFormCreateWorkspaceShown()) this.formCreateWorkspaceFocused = false;
+    this.onInvalidate?.();
+  }
+
+  /**
+   * One key while the checkbox row owns the form's focus. Space toggles it; Tab
+   * wraps forward to the Host line at the top of the drawn order; Shift+Tab or
+   * one fresh Escape steps back up into the workspace editor drawn directly
+   * above; every other press is consumed so it can never edit the workspace
+   * underneath the control the operator is using. A checkbox that is no longer
+   * shown, or that this layout could not draw, never owns the keyboard: the
+   * stale focus is released and the key is routed on to the workspace editor.
+   */
+  private handleNewFormCreateWorkspaceKey(data: string): boolean {
+    if (!this.formCreateWorkspaceFocused) return false;
+    if (!this.newFormCreateWorkspaceDrawn()) {
+      this.formCreateWorkspaceFocused = false;
+      return false;
+    }
+    if (matchesKey(data, "tab") || matchesShiftTab(data)) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+        this.formCreateWorkspaceFocused = false;
+        this.formHostFocused = matchesKey(data, "tab");
+        this.onInvalidate?.();
+      }
+      return true;
+    }
+    if (isKeyRelease(data) || isKeyRepeat(data)) return true;
+    if (matchesKey(data, "escape")) {
+      this.formCreateWorkspaceFocused = false;
+      this.onInvalidate?.();
+      return true;
+    }
+    if (matchesKey(data, "space")) this.toggleNewFormCreateWorkspace();
     return true;
   }
 
@@ -9970,6 +10405,7 @@ export class SidebarController {
       hostRunId: candidate.hostRunId,
       workspace: candidate.workspace,
       providerKey: candidate.providerKey,
+      ...(candidate.createWorkspace === undefined ? {} : { createWorkspace: candidate.createWorkspace }),
       cols: candidate.cols,
       rows: candidate.rows,
     });
@@ -9993,6 +10429,7 @@ export class SidebarController {
     this.createFormCandidate = undefined;
     this.formHostDisplay = undefined;
     this.formProviderDisplay = undefined;
+    this.formCreateWorkspaceDisplay = undefined;
   }
 
   /**
@@ -10024,6 +10461,8 @@ export class SidebarController {
     cols: number,
     rows: number,
     providerDrawn: boolean,
+    createWorkspaceDrawn: boolean | undefined,
+    createWorkspaceSupported: boolean,
   ): void {
     const hostKind = this.newFormHost.kind;
     const hostId = this.newFormHost.kind === "remote" ? this.newFormHost.hostId : "";
@@ -10032,8 +10471,12 @@ export class SidebarController {
     // The drawn Provider choice is part of what the writer committed, so changing
     // it mints a new token that needs its own written receipt.
     const providerKey = providerDrawn ? this.newFormProviderKey() : undefined;
+    // The drawn checkbox state and the support the row showed are committed the
+    // same way (#493): a toggle, an appearing/disappearing row, or a support change
+    // mints a new token that needs its own written receipt.
     const identity = JSON.stringify([
       this.formGeneration, hostKind, hostId, hostRunId, workspace, providerKey, cols, rows,
+      createWorkspaceDrawn ?? null, createWorkspaceSupported,
     ]);
     const previous = this.createFormCandidate;
     if (previous !== undefined && previous.identity === identity) return;
@@ -10046,6 +10489,7 @@ export class SidebarController {
       hostRunId,
       workspace,
       providerKey,
+      createWorkspace: createWorkspaceDrawn,
       cols,
       rows,
       written: false,
@@ -10064,17 +10508,64 @@ export class SidebarController {
     readonly hostId: string;
     readonly hostRunId: string;
     readonly workspace: string;
+    /**
+     * The submitted workspace-creation intent (#493). Absent means an ordinary
+     * request; the form's CURRENT checkbox and the pending request must both say
+     * exactly the same, and a creating request also needs the destination's
+     * support still reported, so nothing is ever re-proved for the other intent.
+     */
+    readonly createWorkspace?: boolean;
   }): boolean {
     if (!this._visible || this._focus !== "form") return false;
     if (this.formKind !== "new") return false;
     const pending = this.pendingCreate;
     if (pending === undefined || pending.requestId !== submission.requestId) return false;
     if (pending.peer === undefined) return false;
+    if (!this.createWorkspaceIntentStillCurrent(pending, submission.createWorkspace === true)) return false;
     if (this.formGeneration !== submission.formGeneration) return false;
     if (this.newFormHost.kind !== "remote" || this.newFormHost.hostId !== submission.hostId) return false;
     const option = this.currentNewFormHostOption();
     if (option === undefined || option.kind !== "remote" || !option.connected) return false;
     if (option.hostRunId !== submission.hostRunId) return false;
+    if (this.workspaceDraft !== submission.workspace) return false;
+    const field = this.formField;
+    return field !== undefined && field.getValue() === submission.workspace;
+  }
+
+  /**
+   * The submitted workspace-creation intent still matches this form exactly: the
+   * pending request, the submitted value, and the form's CURRENT checkbox all
+   * agree, and a creating request's Host still reports support (#493).
+   */
+  private createWorkspaceIntentStillCurrent(
+    pending: { readonly createWorkspace?: true },
+    submitted: boolean,
+  ): boolean {
+    if ((pending.createWorkspace === true) !== submitted) return false;
+    if (this.newFormCreateWorkspace !== submitted) return false;
+    return !submitted || this.newFormCreateWorkspaceSupported();
+  }
+
+  /**
+   * The caller's last-instant proof for one LOCAL New submission that carried a
+   * checked workspace-creation box (#493), evaluated immediately before Main asks
+   * its manager to create anything (including after a create was queued for
+   * negotiation): this EXACT request still owns this still-open Local form, whose
+   * generation, workspace, and checkbox are still the submitted ones.
+   */
+  createStillCurrent(submission: {
+    readonly requestId: number;
+    readonly formGeneration: number;
+    readonly workspace: string;
+    readonly createWorkspace?: boolean;
+  }): boolean {
+    if (!this._visible || this._focus !== "form") return false;
+    if (this.formKind !== "new" || this.newFormHost.kind !== "local") return false;
+    const pending = this.pendingCreate;
+    if (pending === undefined || pending.requestId !== submission.requestId) return false;
+    if (pending.peer !== undefined) return false;
+    if (!this.createWorkspaceIntentStillCurrent(pending, submission.createWorkspace === true)) return false;
+    if (this.formGeneration !== submission.formGeneration) return false;
     if (this.workspaceDraft !== submission.workspace) return false;
     const field = this.formField;
     return field !== undefined && field.getValue() === submission.workspace;
@@ -10983,6 +11474,13 @@ export class SidebarController {
       this.onInvalidate?.();
       return;
     }
+    if (providerBackend === "pi" && !this.newFormPiOffered()) {
+      // The owner did not negotiate the blank Pi create: nothing is sent, and the
+      // request is never turned into a native or local create.
+      this.formError = `${this.currentNewFormHostLabel()} cannot start a Pi session; choose Local or another provider`;
+      this.onInvalidate?.();
+      return;
+    }
     if (providerBackend !== "pi" && this.newFormHostIsRemote()
       && this.newFormNativeTargets().length === 0) {
       // Native provider sessions are only a capability of a host that really offers
@@ -10991,6 +11489,16 @@ export class SidebarController {
       // local one): the form states the conflict and emits nothing.
       this.formError = `${sessionBackendDisplayLabel(providerBackend)} is local only; choose Local or Pi`;
       this.onInvalidate?.();
+      return;
+    }
+    if (this.newFormCreateWorkspace && !this.newFormCreateWorkspaceSupported()) {
+      // A checked "Create missing workspace directory" box the selected Host
+      // cannot honor (#493) is never dropped to make the request fit, and never
+      // silently cleared: nothing is emitted until the operator unchecks it or
+      // chooses a Host that supports creation. The draft is kept for the retry.
+      this.formError = createWorkspaceUnsupportedNotice(this.currentNewFormHostLabel());
+      this.workspaceDraft = submission.value;
+      this.createFormField(submission.value);
       return;
     }
     if (this.newFormHostIsRemote()) {
@@ -11012,8 +11520,39 @@ export class SidebarController {
       return;
     }
     this.workspaceDraft = workspace;
+    // A CHECKED workspace-creation box (#493) is the one Local intent that must
+    // ride the exact written frame that drew it: the candidate this render
+    // captured for the checked Local form, written by Main's actual writer, for
+    // this generation, this Local host, this exact workspace, and the drawn
+    // provider. Anything else refuses here and is never sent as an ordinary
+    // (non-creating) create. An unchecked submission takes the unchanged path.
+    let createWorkspaceFrame: { readonly formGeneration: number; readonly renderToken: number } | undefined;
+    if (this.newFormCreateWorkspace) {
+      const drawn = this.createFormCandidate;
+      if (drawn !== undefined && drawn.createWorkspace === undefined) {
+        this.formError = CREATE_WORKSPACE_NOT_DRAWN_NOTICE;
+        this.createFormField(workspace);
+        return;
+      }
+      const drawnProviderMatches = drawn !== undefined && (drawn.providerKey === undefined
+        ? providerBackend === "pi"
+        : drawn.providerKey === this.newFormProviderKey());
+      if (drawn === undefined || !drawn.written
+        || drawn.formGeneration !== this.formGeneration
+        || drawn.hostKind !== "local"
+        || drawn.workspace !== workspace
+        || drawn.createWorkspace !== true
+        || !drawnProviderMatches) {
+        this.formError = CREATE_ON_PEER_UNWRITTEN_NOTICE;
+        this.createFormField(workspace);
+        return;
+      }
+      createWorkspaceFrame = { formGeneration: drawn.formGeneration, renderToken: drawn.token };
+    }
     const requestId = this.nextRequestId++;
-    this.pendingCreate = { requestId };
+    this.pendingCreate = createWorkspaceFrame === undefined
+      ? { requestId }
+      : { requestId, createWorkspace: true };
     this.formError = undefined;
     // Claim only the exact submit key that fired this submission: its
     // repeat/release must not reach the newly focused native child after a
@@ -11032,6 +11571,13 @@ export class SidebarController {
       ...(providerBackend === "pi" ? {} : { backend: providerBackend }),
       ...(providerBackend === "pi" || providerTargetId === undefined
         ? {} : { nativeCliTarget: providerTargetId }),
+      // The creation intent travels only when checked, and then always with the
+      // written frame that drew it; an unchecked create keeps its exact shape.
+      ...(createWorkspaceFrame === undefined ? {} : {
+        createWorkspace: true as const,
+        formGeneration: createWorkspaceFrame.formGeneration,
+        renderToken: createWorkspaceFrame.renderToken,
+      }),
     });
   }
 
@@ -11077,12 +11623,22 @@ export class SidebarController {
       return;
     }
     const drawn = this.createFormCandidate;
+    const createWorkspace = this.newFormCreateWorkspace;
+    if (createWorkspace && drawn !== undefined && drawn.createWorkspace === undefined) {
+      this.formError = CREATE_WORKSPACE_NOT_DRAWN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
     if (drawn === undefined || !drawn.written
       || drawn.formGeneration !== this.formGeneration
       || drawn.hostKind !== "remote"
       || drawn.hostId !== target.hostId
       || drawn.hostRunId !== target.hostRunId
-      || drawn.workspace !== workspace) {
+      || drawn.workspace !== workspace
+      // The drawn checkbox is part of the written form (#493): a creating
+      // submission needs a frame that drew it CHECKED, and an ordinary one can
+      // never ride a frame that showed it checked.
+      || (drawn.createWorkspace === true) !== createWorkspace) {
       // The exact displayed form is the only thing that may submit: a too-small,
       // covered, queued, held, or since-changed frame sends nothing.
       this.formError = CREATE_ON_PEER_UNWRITTEN_NOTICE;
@@ -11092,6 +11648,7 @@ export class SidebarController {
     const requestId = this.nextRequestId++;
     this.pendingCreate = {
       requestId,
+      ...(createWorkspace ? { createWorkspace: true as const } : {}),
       peer: {
         formGeneration: drawn.formGeneration,
         renderToken: drawn.token,
@@ -11113,6 +11670,7 @@ export class SidebarController {
       hostId: target.hostId,
       hostRunId: target.hostRunId,
       workspace,
+      ...(createWorkspace ? { createWorkspace: true as const } : {}),
     });
   }
 
@@ -11169,6 +11727,12 @@ export class SidebarController {
     }
     const providerKey = newFormProviderOptionKey({ backend, targetId });
     const drawn = this.createFormCandidate;
+    const createWorkspace = this.newFormCreateWorkspace;
+    if (createWorkspace && drawn !== undefined && drawn.createWorkspace === undefined) {
+      this.formError = CREATE_WORKSPACE_NOT_DRAWN_NOTICE;
+      this.createFormField(workspace);
+      return;
+    }
     if (drawn !== undefined && drawn.providerKey === undefined) {
       // This frame drew no Provider line at all — the pane suppressed it, or this
       // owner offers no native target. Either way the operator never saw the
@@ -11184,7 +11748,8 @@ export class SidebarController {
       || drawn.hostId !== target.hostId
       || drawn.hostRunId !== target.hostRunId
       || drawn.workspace !== workspace
-      || drawn.providerKey !== providerKey) {
+      || drawn.providerKey !== providerKey
+      || (drawn.createWorkspace === true) !== createWorkspace) {
       this.formError = CREATE_ON_PEER_UNWRITTEN_NOTICE;
       this.createFormField(workspace);
       return;
@@ -11192,6 +11757,7 @@ export class SidebarController {
     const requestId = this.nextRequestId++;
     this.pendingCreate = {
       requestId,
+      ...(createWorkspace ? { createWorkspace: true as const } : {}),
       peer: {
         formGeneration: drawn.formGeneration,
         renderToken: drawn.token,
@@ -11217,6 +11783,7 @@ export class SidebarController {
       workspace,
       backend,
       targetId,
+      ...(createWorkspace ? { createWorkspace: true as const } : {}),
     });
   }
 
@@ -11243,6 +11810,7 @@ export class SidebarController {
     this.formError = undefined;
     this.formHostFocused = false;
     this.formProviderFocused = false;
+    this.formCreateWorkspaceFocused = false;
     this.invalidateFormPanePresentations();
     if (this._focus !== "form") return; // the request no longer owns the pane
     this._focus = "main";
@@ -11452,6 +12020,7 @@ export class SidebarController {
     this.peerFieldTarget = undefined;
     this.formHostFocused = false;
     this.formProviderFocused = false;
+    this.formCreateWorkspaceFocused = false;
     this.invalidateFormPanePresentations();
     this.disposeFormField();
     this.formKind = undefined;
@@ -14235,6 +14804,18 @@ export class SidebarController {
     return this.entries.some((entry) => entry.kind === "item" || entry.kind === "remote");
   }
 
+  /**
+   * The New/Edit form pane's own too-small fallback. Nothing of the form is on
+   * screen, so no drawn control map, writer-receipt candidate, or checkbox focus
+   * (#493) may survive it: an earlier complete frame can never keep authorizing
+   * a submission or a press, and Space can never toggle a box nobody can see.
+   */
+  private renderFormPaneTooSmall(cols: number, rows: number): { lines: string[] } {
+    this.invalidateFormPanePresentations();
+    this.formCreateWorkspaceFocused = false;
+    return this.renderTooSmall(cols, rows);
+  }
+
   private renderFormPane(
     cols: number,
     rows: number,
@@ -14267,12 +14848,13 @@ export class SidebarController {
       ? []
       : wrapHintLines([`! ${this.formNotice}`], cols);
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols || !this.formField) {
-      return this.renderTooSmall(cols, rows);
+      return this.renderFormPaneTooSmall(cols, rows);
     }
     // Only a COMPLETE render may leave a pointer/activation map behind: a
     // too-small or wrapped-refusal fallback must not keep an earlier New form's
     // Provider row authorizable, nor claim a control the operator cannot see.
     this.formProviderDisplay = undefined;
+    this.formCreateWorkspaceDisplay = undefined;
     // The New form's one Host line takes the single spacer row the form has
     // always reserved below the editor, so the editable body keeps exactly its
     // previous row budget at every geometry; Edit is untouched. The Provider
@@ -14289,16 +14871,16 @@ export class SidebarController {
       ? 1 + 2 + 1 + 1 + noticeLines.length + footerLines.length
       : 1 + hostRows + 1 + noticeLines.length + footerLines.length;
     const fieldRows = rows - fixedRows;
-    if (fieldRows < 1) return this.renderTooSmall(cols, rows);
+    if (fieldRows < 1) return this.renderFormPaneTooSmall(cols, rows);
 
     const prefix = editing ? "> New name: " : "> Workspace: ";
     const prefixWidth = Math.min(visibleWidth(prefix), cols - 1);
     const fieldWidth = Math.max(1, cols - prefixWidth);
     const fieldFrame = this.formField.render(fieldWidth, fieldRows);
-    if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+    if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderFormPaneTooSmall(cols, rows);
     const drawnFieldRows = Math.min(fieldRows, fieldFrame.lines.length);
     const labeledRows = labeledFieldRows(fieldFrame, drawnFieldRows, prefix, prefixWidth, cols);
-    if (labeledRows === undefined) return this.renderTooSmall(cols, rows);
+    if (labeledRows === undefined) return this.renderFormPaneTooSmall(cols, rows);
 
     const lines = [wrapRow(header, cols, this.paint("header"))];
     let hostRow: number | undefined;
@@ -14371,10 +14953,50 @@ export class SidebarController {
       providerValueEnd = providerPrefixWidth + Math.max(1, visibleWidth(providerValue));
       lines.push(wrapRow(`${providerPrefix}${providerValue}`, cols));
     }
+    // The workspace-creation checkbox (#493) is budgeted the same way and never
+    // joins the field's budget either: the native field keeps exactly its rows at
+    // every geometry. It needs ONE free row after the Provider line took its own:
+    // the reserved spacer row when no real status occupies it and the Provider
+    // line did not take it, otherwise one spare filler row. A pane with nothing
+    // left draws no checkbox; the status, the footer, the Provider line, and the
+    // field are never displaced by it.
+    const createWorkspaceShown = newForm && this.newFormCreateWorkspaceShown();
+    const optionalFreeRows = fieldRows - drawnFieldRows + (statusLine === undefined ? 1 : 0);
+    const createWorkspaceRows = createWorkspaceShown && optionalFreeRows - providerRows >= 1 ? 1 : 0;
+    // A checkbox this form shows but this pane cannot fit is a layout suppression:
+    // it never holds the keyboard (released in this same render) and its intent
+    // can never ride a frame that did not draw it. A checkbox that is not shown
+    // at all (an unchecked box on a Host that cannot create) holds nothing either.
+    this.formCreateWorkspaceRowSuppressed = createWorkspaceShown && createWorkspaceRows === 0;
+    if (!createWorkspaceShown || this.formCreateWorkspaceRowSuppressed) this.formCreateWorkspaceFocused = false;
+    const createWorkspaceSupported = newForm && this.newFormCreateWorkspaceSupported();
+    let createWorkspaceRow: number | undefined;
+    let createWorkspaceValueStart = 0;
+    let createWorkspaceValueEnd = 0;
     const fieldTopRow = lines.length;
     lines.push(...labeledRows);
+    if (createWorkspaceRows === 1) {
+      // One fixed checkbox row directly below the workspace field it qualifies, in
+      // the same ordinary marker style, so the drawn order is Header, Host,
+      // Provider, Workspace, checkbox and the keyboard ring follows it. A checked
+      // box the selected Host cannot honor says so on the row itself.
+      const checkboxPrefix = this.formCreateWorkspaceFocused ? "> " : "  ";
+      const checkboxPrefixWidth = Math.min(visibleWidth(checkboxPrefix), cols - 1);
+      const checkboxAvailable = Math.max(1, cols - checkboxPrefixWidth);
+      const checkboxValue = truncateToWidth(
+        `${this.newFormCreateWorkspace ? "[x]" : "[ ]"} ${NEW_FORM_CREATE_WORKSPACE_LABEL}`
+          + (this.newFormCreateWorkspace && !createWorkspaceSupported ? NEW_FORM_CREATE_WORKSPACE_UNSUPPORTED_SUFFIX : ""),
+        checkboxAvailable,
+        "...",
+        true,
+      );
+      createWorkspaceRow = lines.length;
+      createWorkspaceValueStart = checkboxPrefixWidth;
+      createWorkspaceValueEnd = checkboxPrefixWidth + Math.max(1, visibleWidth(checkboxValue));
+      lines.push(wrapRow(`${checkboxPrefix}${checkboxValue}`, cols));
+    }
     if (statusLine !== undefined) lines.push(statusLine);
-    else if (providerRows === 0) lines.push("");
+    else if (providerRows === 0 && createWorkspaceRows === 0) lines.push("");
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols, this.paint("hint")));
@@ -14406,11 +15028,34 @@ export class SidebarController {
         formGeneration: this.formGeneration,
       })
       : undefined;
-    // The written-submit candidate exists only for a REMOTE destination: a
-    // Local submission keeps its exact previous path and needs no receipt, and
-    // it therefore adds no extra writer boundary either.
-    if (newForm && this.newFormHostIsRemote()) {
-      this.captureCreateFormCandidate(this.formField.getValue(), cols, rows, providerRows === 1);
+    // The checkbox row's written geometry, by the same rule.
+    this.formCreateWorkspaceDisplay = newForm && createWorkspaceRow !== undefined
+      ? Object.freeze({
+        cols,
+        rows,
+        row: createWorkspaceRow,
+        valueStart: createWorkspaceValueStart,
+        valueEnd: createWorkspaceValueEnd,
+        checked: this.newFormCreateWorkspace,
+        supported: createWorkspaceSupported,
+        hostKey: this.newFormHostKey(),
+        formGeneration: this.formGeneration,
+      })
+      : undefined;
+    // The written-submit candidate exists for a REMOTE destination, and for a
+    // Local form only while its workspace-creation box is CHECKED (#493): that
+    // intent must ride the exact written frame that drew it. An ordinary
+    // unchecked Local submission keeps its exact previous path, needs no
+    // receipt, and therefore adds no extra writer boundary either.
+    if (newForm && (this.newFormHostIsRemote() || this.newFormCreateWorkspace)) {
+      this.captureCreateFormCandidate(
+        this.formField.getValue(),
+        cols,
+        rows,
+        providerRows === 1,
+        createWorkspaceRow === undefined ? undefined : this.newFormCreateWorkspace,
+        createWorkspaceSupported,
+      );
     } else {
       this.createFormCandidate = undefined;
     }
@@ -14434,7 +15079,9 @@ export class SidebarController {
         ? { column: Math.min(hostValueEnd, cols - 1), row: hostRow }
         : newForm && this.formProviderFocused && providerRow !== undefined
           ? { column: Math.min(providerValueEnd, cols - 1), row: providerRow }
-          : fieldCursor,
+          : newForm && this.formCreateWorkspaceFocused && createWorkspaceRow !== undefined
+            ? { column: Math.min(createWorkspaceValueStart + 1, cols - 1), row: createWorkspaceRow }
+            : fieldCursor,
     };
   }
 

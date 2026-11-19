@@ -1081,6 +1081,26 @@ const NEW_FORM_DEFAULT_PI_PROVIDER_ROW = "Provider: [ Pi ]";
  */
 const PROVIDER_CONTROL_ROW = /^(?:>\s*)?Provider:/u;
 const WORKSPACE_FIELD_LABEL = "> Workspace:";
+/**
+ * The New form's workspace-creation checkbox drawn completely as its default
+ * (#493): unfocused and unchecked. Every New form opens with it off, so a checked,
+ * focused, clipped, truncated, or "unsupported" spelling is never this drawn
+ * default and never evidence of a freshly opened form.
+ */
+const NEW_FORM_DEFAULT_CREATE_WORKSPACE_ROW = "[ ] Create missing workspace directory";
+/**
+ * A right-pane row drawn as the New form's own checkbox control: the optional
+ * focus marker, a drawn box, and the checkbox caption. The labelled Workspace row
+ * never matches, so a draft that merely mentions the caption stays body content.
+ */
+const CREATE_WORKSPACE_CONTROL_ROW = /^(?:>\s*)?\[[^\]]*\]?\s*Create missing/u;
+/**
+ * The rows that may legitimately sit directly below the Editor's bottom rule when
+ * the form drew NO checkbox because the pane had no row to spare for it: the
+ * footer's own first hint row, or a bounded notice/status row. A blank or any
+ * other row there is a partial paint, never the completed form.
+ */
+const NEW_FORM_FOOTER_FIRST_HINT = "enter create";
 /** Below this a run of `─` is a transcript divider or decoration, not the field's own border. */
 const MIN_NATIVE_EDITOR_RULE_COLUMNS = 20;
 
@@ -1108,6 +1128,9 @@ function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): nu
  *                ────────────   Editor top rule (blank gutter above the label)
  *   > Workspace: <draft>        the Editor's own labelled content row
  *                ────────────   Editor bottom rule, same width
+ *     [ ] Create missing workspace directory
+ *                               default-off checkbox (#493), drawn directly
+ *                               below the Editor whenever the pane has the row
  *
  * The Provider line sits between the Host line and the workspace field, so the
  * drawn order is Header, Host, Provider, Workspace; the legacy layout with no
@@ -1121,9 +1144,17 @@ function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): nu
  * or one in place of the drawn default — focused, another provider, clipped —
  * rejects the frame instead of matching around a stale or duplicated control.
  *
+ * The checkbox is surveyed the same way: at most one checkbox control row, and
+ * one is usable only directly below the Editor's bottom rule with the complete
+ * unfocused, unchecked default. A Local form always shows it, so when none is
+ * drawn the row below the bottom rule must be one the pane legitimately puts
+ * there when it had no row to spare (the footer's first hint row or a notice
+ * row); a blank or other row there is the checkbox row not yet painted.
+ *
  * Every actual New-open wait uses this so a partial incremental paint — header,
- * Host line, top rule and labelled row with the bottom rule not yet written —
- * is never mistaken for the open form. A left-roster caption, a lone label, an
+ * Host line, top rule and labelled row with the bottom rule not yet written, or
+ * the bottom rule written and the checkbox row not yet — is never mistaken for
+ * the open form. A left-roster caption, a lone label, an
  * open completion menu, a Main-transcript rule, or the Main transcript itself
  * are never evidence. The body is deliberately not required to be empty: New
  * retains its Local workspace draft across reopens, and the caller decides what
@@ -1131,12 +1162,60 @@ function nativeEditorRuleWidth(row: string | undefined, valueColumn: number): nu
  */
 export function isCompleteLocalNewFormFrame(text: string): boolean {
   const pane = rightPaneText(text).split("\n");
+  const controls = surveyLocalNewFormControls(pane);
+  if (controls === undefined) return false;
+  const { checkboxRow } = controls;
+  return localNewFormEditorCandidates(pane, controls.providerRow).some(({ fieldTopRow }) => {
+    if (checkboxRow !== undefined) {
+      // The pane's single checkbox control, in its drawn slot directly below the
+      // Editor, with the complete unfocused default-off value.
+      return checkboxRow.index === fieldTopRow + 3 && checkboxRow.row === NEW_FORM_DEFAULT_CREATE_WORKSPACE_ROW;
+    }
+    // No checkbox drawn: only the layout that had no row to spare for it, whose
+    // next drawn row is the footer's first hint row or a notice/status row.
+    const next = pane[fieldTopRow + 3]?.trim() ?? "";
+    return next.startsWith(NEW_FORM_FOOTER_FIRST_HINT) || next.startsWith("!");
+  });
+}
+
+interface SurveyedPaneRow {
+  readonly row: string;
+  readonly index: number;
+}
+
+/**
+ * The single Provider and checkbox control rows the form pane draws, in drawn
+ * order, or undefined when either control is drawn more than once.
+ */
+function surveyLocalNewFormControls(pane: readonly string[]):
+  { readonly providerRow?: SurveyedPaneRow; readonly checkboxRow?: SurveyedPaneRow } | undefined {
+  const rows = pane.map((row, index) => ({ row: row.trim(), index }));
   // Every Provider control row the form pane actually draws, in drawn order.
-  const providerRows = pane
-    .map((row, index) => ({ row: row.trim(), index }))
-    .filter((entry) => PROVIDER_CONTROL_ROW.test(entry.row));
-  if (providerRows.length > 1) return false;
-  const providerRow = providerRows[0];
+  const providerRows = rows.filter((entry) => PROVIDER_CONTROL_ROW.test(entry.row));
+  if (providerRows.length > 1) return undefined;
+  // Every workspace-creation checkbox row the form pane draws, in drawn order.
+  const checkboxRows = rows.filter((entry) => CREATE_WORKSPACE_CONTROL_ROW.test(entry.row));
+  if (checkboxRows.length > 1) return undefined;
+  return { providerRow: providerRows[0], checkboxRow: checkboxRows[0] };
+}
+
+interface LocalNewFormEditorGeometry {
+  /** Pane row of the Editor's top rule; the labelled body and bottom rule follow it. */
+  readonly fieldTopRow: number;
+  /** Pane column where the Editor's own content (and anything it renders) begins. */
+  readonly valueColumn: number;
+}
+
+/**
+ * Every drawn Local New-form header whose Host line, optional default Provider
+ * line, and complete equal-width bordered Workspace Editor sit in their drawn
+ * slots. What follows the Editor's bottom rule is left to the caller.
+ */
+function localNewFormEditorCandidates(
+  pane: readonly string[],
+  providerRow: SurveyedPaneRow | undefined,
+): LocalNewFormEditorGeometry[] {
+  const candidates: LocalNewFormEditorGeometry[] = [];
   for (let header = 0; header < pane.length; header += 1) {
     const headerRow: string | undefined = pane[header];
     if (headerRow?.trim() !== NEW_FORM_PANE_HEADER) continue;
@@ -1161,13 +1240,87 @@ export function isCompleteLocalNewFormFrame(text: string): boolean {
     const valueColumn = label + WORKSPACE_FIELD_LABEL.length + 1;
     const top = nativeEditorRuleWidth(pane[fieldTopRow], valueColumn);
     const bottom = nativeEditorRuleWidth(pane[fieldTopRow + 2], valueColumn);
-    if (top !== undefined && top === bottom) return true;
+    if (top === undefined || top !== bottom) continue;
+    candidates.push({ fieldTopRow, valueColumn });
   }
-  return false;
+  return candidates;
 }
 
 export function workspaceOnlyNewFrame(text: string): boolean {
   return isCompleteLocalNewFormFrame(text)
+    && !text.includes("Label:") && !text.includes("Profile:");
+}
+
+/** The exact native workspace autocomplete state a completion wait expects. */
+export interface NewFormWorkspaceCompletion {
+  /** The literal Workspace draft typed through the native Editor, drawn exactly as its body. */
+  readonly draft: string;
+  /**
+   * The one suggestion the filesystem provider must draw, selected: the owned
+   * folder's basename with its trailing slash, never a path or a partial name.
+   */
+  readonly suggestion: string;
+}
+
+/** The pinned SDK SelectList's selected-item marker, drawn before the item value. */
+const NATIVE_COMPLETION_SELECTED_MARKER = "→ ";
+
+/**
+ * Positive witness for the Local New form while the native Editor shows its
+ * filesystem completion for one expected owned folder, exactly as the host draws
+ * it: the form places the checkbox after the Editor's ENTIRE native render, and
+ * the pinned SDK Editor renders its open completion list below its own bottom
+ * rule, indented to the Editor's content column like every other Editor row:
+ *
+ *   New session
+ *     Host: [ Local ]
+ *     Provider: [ Pi ]          optional, in its drawn slot (as the New-open witness)
+ *                ────────────   Editor top rule
+ *   > Workspace: <draft>        the exact typed draft as the Editor body
+ *                ────────────   Editor bottom rule, same width
+ *                → <folder>/    the single selected suggestion at the content column
+ *     [ ] Create missing workspace directory
+ *                               default-off checkbox directly below the list
+ *
+ * This is deliberately separate from the New-open witness, which keeps rejecting
+ * an open completion menu. It is bound to one exact expectation: the draft body,
+ * one selected suggestion row whose value is exactly the expected folder
+ * basename plus slash at the Editor's content column, and the checkbox in the
+ * one row after it. The fixture workspace has exactly one matching folder, so a
+ * second, partial, stale, or unrelated suggestion row, a scroll or no-match row,
+ * a suggestion drawn anywhere else (including the left roster), a missing or
+ * misplaced checkbox, or a checked/focused/clipped checkbox never qualifies.
+ */
+export function isLocalNewFormWorkspaceCompletionFrame(text: string, expected: NewFormWorkspaceCompletion): boolean {
+  const { draft, suggestion } = expected;
+  if (draft === "" || draft !== draft.trim() || /[\r\n]/u.test(draft)) {
+    throw new TypeError("a native workspace completion witness needs the exact non-empty single-line typed draft");
+  }
+  if (!/^[^\s/][^/]*\/$/u.test(suggestion) || suggestion !== suggestion.trim()) {
+    throw new TypeError("a native workspace completion witness needs one folder basename with its trailing slash");
+  }
+  const pane = rightPaneText(text).split("\n");
+  const controls = surveyLocalNewFormControls(pane);
+  if (controls === undefined) return false;
+  const { checkboxRow } = controls;
+  if (checkboxRow === undefined || checkboxRow.row !== NEW_FORM_DEFAULT_CREATE_WORKSPACE_ROW) return false;
+  // The pane draws exactly one completion-list row at all, and the expected
+  // suggestion exactly once: no duplicated, stale, or second list survives.
+  if (pane.filter((row) => row.includes(NATIVE_COMPLETION_SELECTED_MARKER.trim())).length !== 1) return false;
+  if (pane.filter((row) => row.includes(suggestion)).length !== 1) return false;
+  return localNewFormEditorCandidates(pane, controls.providerRow).some(({ fieldTopRow, valueColumn }) => {
+    const labelledRow = pane[fieldTopRow + 1]!;
+    if (labelledRow.slice(valueColumn).trimEnd() !== draft) return false;
+    const completionRow = pane[fieldTopRow + 3];
+    if (completionRow === undefined || completionRow.slice(0, valueColumn).trim() !== "") return false;
+    if (completionRow.slice(valueColumn).trimEnd() !== `${NATIVE_COMPLETION_SELECTED_MARKER}${suggestion}`) return false;
+    return checkboxRow.index === fieldTopRow + 4;
+  });
+}
+
+/** The Workspace-only form (no Label/Profile field) showing the exact expected completion. */
+export function workspaceOnlyNewCompletionFrame(text: string, expected: NewFormWorkspaceCompletion): boolean {
+  return isLocalNewFormWorkspaceCompletionFrame(text, expected)
     && !text.includes("Label:") && !text.includes("Profile:");
 }
 

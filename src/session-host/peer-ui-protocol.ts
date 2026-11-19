@@ -48,6 +48,22 @@ export interface PeerUiHostSaved {
 export interface PeerUiHostNativeCli {
 	readonly supported: boolean;
 	readonly targets: readonly RemoteNativeCliTarget[];
+	/**
+	 * How `targets` were produced, as the owner itself negotiated it (#493).
+	 *
+	 * - `probed`: the owner negotiated native availability on the current channel,
+	 *   declaring that its provider performs a fresh read-only launch probe for each
+	 *   catalog read, so `targets` are what that probe found launchable when the
+	 *   current observation was published.
+	 * - `unknown`: a configuration-only catalog (a legacy or non-probing owner, or
+	 *   no current native observation). It is never read as "launchable" nor as
+	 *   "unavailable".
+	 *
+	 * Absent (an older coordinator or fake) means `unknown`. Like every fact here it
+	 * is descriptive only: it grants nothing, it is not per-target state, and the
+	 * owner re-proves its own live catalog on every request regardless of it.
+	 */
+	readonly availability?: "probed" | "unknown";
 }
 
 export interface PeerUiHost {
@@ -83,6 +99,25 @@ export interface PeerUiHost {
 	readonly saved?: PeerUiHostSaved;
 	/** Current negotiated owner rename support; descriptive only, never authority. */
 	readonly renameSupported?: boolean;
+	/**
+	 * Current negotiated owner support for the ordinary blank Pi create, read live
+	 * from the destination's one connected metadata viewer. Absent (an older
+	 * coordinator or fake) keeps the legacy behavior; `false` means the New form
+	 * never offers a Pi create for this destination. Descriptive only, never
+	 * authority: the owner re-proves its run, grant, and provider on every request.
+	 */
+	readonly createSupported?: boolean;
+	/**
+	 * Optional descriptive destination WORKSPACE CREATION support (#493): the owner
+	 * negotiated `roster-create-workspace-v1` beside at least one creation lane, so
+	 * every create/native/prompted lane it acknowledged honors an opt-in
+	 * `createWorkspace: true` (the owner itself creates the missing directory and
+	 * parents, then launches normally). Absent (an older coordinator or fake) or
+	 * `false` means NOT supported: a UI must not offer creation for this
+	 * destination, and a creation request is never sent to it. Descriptive only —
+	 * never a permission; the owner re-proves everything per request.
+	 */
+	readonly createWorkspaceSupported?: boolean;
 	/**
 	 * Optional native-lane capability and the owner's advertised launch targets.
 	 * Absent (an older coordinator, a fake, or a destination with no current

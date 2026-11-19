@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isNativeCliBackend } from "./session-backend";
+import { NATIVE_CLI_DEFAULT_TARGET_IDS, isNativeCliBackend } from "./session-backend";
 import {
   isValidNativeSessionId,
   type SessionSpawnInput,
@@ -817,10 +817,16 @@ export interface OwningHostService {
    */
   startSession(createOptions: CreateInstanceOptions): Promise<StartedSessionOutcome>;
   /**
-   * Admit and create one background sibling for an authenticated child request.
-   * The parent identity comes from the manager's own registration, never from
-   * model input; the requested workspace, title, and prompt are forwarded
-   * verbatim with no defaults and no retry.
+   * Admit and create one background sibling for an authenticated child request
+   * on THIS host. The parent identity comes from the manager's own registration,
+   * never from model input; the requested workspace, title, and prompt are
+   * forwarded verbatim with no defaults and no retry. An omitted `kind` is the
+   * unchanged legacy Pi create; an explicit native kind launches that backend's
+   * default target only, through the same one manager create. A request naming
+   * a `host` is never served here: routing to another host belongs to the
+   * caller, and this boundary refuses it rather than launching locally. An
+   * exact `createWorkspace: true` is forwarded to that one create, which ensures
+   * the workspace exists on THIS host during its own launch preparation.
    */
   spawnRequestedChild(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
   /**
@@ -1350,6 +1356,10 @@ class LocalOwningHostService implements OwningHostService {
   async spawnRequestedChild(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome> {
     const manager = this.#manager;
     if (manager === undefined || this.dependencies.teardownRequested()) return "failed";
+    // An explicit destination host is never a local launch: nothing is created.
+    if (request.host !== undefined) return "failed";
+    const kind = request.kind;
+    if (kind !== undefined && kind !== "pi" && !isNativeCliBackend(kind)) return "failed";
     let parent: NativeInstanceView | undefined;
     try {
       parent = manager.list().find((view) => view.id === parentInstanceId);
@@ -1360,9 +1370,18 @@ class LocalOwningHostService implements OwningHostService {
 
     let childId: string;
     try {
+      // Omitted or explicit `pi` is exactly the legacy Pi create. A native kind maps
+      // ONLY to that backend's default target: no configured worker profile, no
+      // other backend, and no Pi fallback when that launch cannot start.
       childId = await manager.create({
         workspace: request.workspace,
         initialRequest: { title: request.title, prompt: request.prompt },
+        ...(kind === undefined || kind === "pi"
+          ? {}
+          : { backend: kind, nativeCliTarget: NATIVE_CLI_DEFAULT_TARGET_IDS[kind] }),
+        // Opt-in creation of this host's own workspace, inside the same one create;
+        // absence and `false` keep the exact noncreating create options.
+        ...(request.createWorkspace === true ? { createWorkspace: true } : {}),
       });
     } catch {
       return "failed";
@@ -1377,6 +1396,15 @@ class LocalOwningHostService implements OwningHostService {
       return "unknown";
     }
     if (!child) return "unknown";
+    // An errored launch is never a confirmed start. While it still owns a process —
+    // a child whose wiring failed, or an unsettled owned Codex backend whose
+    // readiness was refused before any TUI existed — or after a child of it already
+    // ran, the request may or may not have been delivered: that is `unknown`, never
+    // `started` and never a definite no-effect `failed`. Only an error row that never
+    // owned a process is `failed`.
+    if (child.lifecycle === "error") {
+      return child.hasLiveProcess === true || child.exitCode !== undefined ? "unknown" : "failed";
+    }
     return child.hasLiveProcess === true || child.exitCode !== undefined ? "started" : "failed";
   }
 

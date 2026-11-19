@@ -371,6 +371,53 @@ IPC, and teardown requires positive owned-process exits before removal. This is
 headless native process/TUI evidence, not physical-terminal focus observation,
 native Windows certification, or a live-provider context-limit test.
 
+### Routed SessionSpawn, SessionHosts, and native session choices (#493)
+
+After `npm run build:test`, the focused checks for the three-kind `SessionSpawn`
+selectors, the `SessionHosts` snapshot, the paired-host spawn exchange, the
+native-availability description, the default-target-only session choices and
+legacy-target restoration, and the native file-backed initial request are:
+
+```sh
+node --test dist-test/tests/session-host-spawn-tool.test.js \
+  dist-test/tests/session-host-spawn-protocol.test.js \
+  dist-test/tests/session-host-hosts-discovery.test.js \
+  dist-test/tests/session-host-spawn-routing-main.test.js \
+  dist-test/tests/session-host-network-roster-bridge-spawn.test.js \
+  dist-test/tests/session-host-network-roster-bridge-native.test.js \
+  dist-test/tests/session-host-network-peer-coordinator-native-create.test.js \
+  dist-test/tests/session-host-native-initial-prompt.test.js \
+  dist-test/tests/session-host-native-spawn-instances.test.js \
+  dist-test/tests/session-host-native-cli-launch.test.js \
+  dist-test/tests/session-host-roster-main.test.js \
+  dist-test/tests/session-host-broker.test.js \
+  dist-test/tests/session-host-reporter.test.js
+```
+
+The Android client's NEW-session provider projection is covered by the
+client-core `CreateProviderSelectionTest` and the related create-controller
+component tests.
+
+These are component and protocol controls: in-memory or loopback channels,
+scripted coordinators, synthetic managers, and synthetic or mocked provider
+children. They do not show a real provider reading the staged prompt file or
+completing a request. To observe a native `SessionSpawn` by hand, use an owned
+inactive stage as described in
+[Trying one in an owned inactive stage](native-sidebar-agents.md#trying-one-in-an-owned-inactive-stage),
+ask a hosted Pi child to call `SessionHosts` and then `SessionSpawn` with
+`kind` `claude` or `codex` and an existing workspace, and watch the new row: the
+provider's first message is the generated read-this-file instruction, not the
+verbatim prompt, and the provider's own file-read and approval prompts are yours
+to answer. Isolated Linux probes with genuine Claude Code 2.1.327 and Codex CLI
+0.169.0 TUIs in a real PTY, against a loopback mock model endpoint, observed the
+exact generated startup instruction; they did not show the full original prompt
+in the first model context, a real model reading or completing the request,
+cross-machine operation, a physical terminal, or macOS or Windows behavior, and
+some probes could load a repository instruction file from an ancestor directory,
+so they are not an isolation certification. Test presence alone does not establish
+a passing run, full-suite/CI success, Android device acceptance, or release
+approval.
+
 ### Fullscreen popup pointer-input verification (#431, #436)
 
 `tests/user-question-mouse-host.test.ts` drives the production shared-popup

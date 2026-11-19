@@ -3,6 +3,8 @@ package io.github.rfairburn.pireviewgate.core.client.ui
 import io.github.rfairburn.pireviewgate.core.client.roster.NativeCatalogScope
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeCliNewSessionTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNewSessionTarget
 
 /**
  * One exact provider choice in the create form.
@@ -30,20 +32,28 @@ public sealed interface CreateProviderChoice {
 /**
  * Host-scoped create-provider selection.
  *
- * Options come only from the selected owner's committed catalog, and a native
- * choice is admissible only while that exact host, run, backend, id, and label are
- * still advertised. A changed catalog, a replaced owner run, or a different host
- * invalidates a native choice; it is never silently replaced by Pi. Choosing Pi is
- * always an explicit operator choice (or the fresh-form default).
+ * Options come only from the selected owner's committed catalog, and only from its
+ * NEW-session targets — a backend's default target, never a named external worker
+ * profile (#493). A native choice is admissible only while that exact host, run,
+ * backend, id, and label are still advertised. A changed catalog, a replaced owner
+ * run, or a different host invalidates a native choice; it is never silently
+ * replaced by Pi. Choosing Pi is always an explicit operator choice (or the
+ * fresh-form default), and Pi is offered only to an owner that can create it now:
+ * a native-only owner offers just its native kinds and draws no Pi choice.
  */
 public object CreateProviderSelection {
 
-    /** Every provider that owner may be addressed with right now, in display order. */
+    /**
+     * Every provider that owner may be addressed with right now, in display order.
+     * Pi leads only while the owner itself can create Pi; nothing is offered for an
+     * owner the form has not chosen.
+     */
     public fun options(owner: OwnerChoice?): List<CreateProviderChoice> = buildList {
-        add(CreateProviderChoice.Pi)
+        if (owner?.createEligible == true) add(CreateProviderChoice.Pi)
         val scope = owner?.nativeCatalogScope
         if (owner?.nativeCreateEligible == true && scope != null) {
-            owner.nativeTargets.forEach { add(choiceOf(it, scope)) }
+            // NEW-session targets only (#493): never a named external worker profile.
+            owner.nativeTargets.filter { it.isNewSessionTarget }.forEach { add(choiceOf(it, scope)) }
         }
     }
 
@@ -70,12 +80,27 @@ public object CreateProviderSelection {
     ): CreateProviderChoice.Native =
         CreateProviderChoice.Native(target.backend, target.id, target.label, catalogScope)
 
+    /**
+     * The choice the form draws as current for [owner].
+     *
+     * The fresh-form Pi default is never drawn as chosen on an owner that cannot
+     * create Pi (a native-only owner): it is drawn as the existing "no provider
+     * chosen" state so the operator explicitly picks one of the offered kinds. This
+     * is presentation only — the form's choice is not rewritten, nothing else is
+     * selected on the operator's behalf, and [admits] still refuses that Pi.
+     */
+    public fun shown(owner: OwnerChoice?, choice: CreateProviderChoice?): CreateProviderChoice? =
+        if (choice == CreateProviderChoice.Pi && owner != null && !owner.createEligible) null else choice
+
     /** True only when [choice] is exactly admissible for [owner] now. */
     public fun admits(owner: OwnerChoice?, choice: CreateProviderChoice?): Boolean = when (choice) {
         null -> false
         CreateProviderChoice.Pi -> owner?.createEligible == true
         is CreateProviderChoice.Native ->
-            owner?.nativeCreateEligible == true &&
+            // The controller's submit gate: a named external worker profile is refused
+            // even if some caller froze it as a choice (#493); nothing falls back to Pi.
+            isNativeCliNewSessionTarget(choice.backend, choice.targetId) &&
+                owner?.nativeCreateEligible == true &&
                 owner.nativeCatalogScope == choice.catalogScope &&
                 owner.nativeTargets.any { target ->
                     target.backend == choice.backend &&

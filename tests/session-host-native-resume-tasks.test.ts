@@ -84,6 +84,7 @@ import {
   sessionFileHasStoredName,
   sidebarRosterHidden,
   waitForJsonl,
+  workspaceOnlyNewCompletionFrame,
   workspaceOnlyNewFrame,
   type ProcessIncarnation,
 } from "./helpers/session-host-native-saved-main-harness";
@@ -466,7 +467,7 @@ async function submitWorkspaceOnlyNew(
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the synthetic workspace path is typed through Pi's real native Editor");
   const workspaceName = workspace.slice(workspace.lastIndexOf(sep) + 1);
-  await driver.waitFrame((text) => workspaceOnlyNewFrame(text) && text.includes(workspaceName),
+  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${workspaceName}/` }),
     "native filesystem completion displays the exact owned workspace", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix);
   const beforeCompletion = driver.snapshot();

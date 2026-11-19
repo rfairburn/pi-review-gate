@@ -77,9 +77,17 @@ object RosterProtocol {
         if (!hello.capabilities.contains(RosterWire.REQUIRED_CAPABILITY)) {
             return RosterNegotiation.Refused(RosterWireErrorCode.MISSING_CAPABILITY)
         }
-        val negotiated = hello.capabilities.filter { capability ->
+        val known = hello.capabilities.filter { capability ->
             capability != RosterWire.REQUIRED_CAPABILITY &&
                 RosterWire.KNOWN_OPTIONAL_CAPABILITIES.contains(capability)
+        }
+        // A dependent capability is never negotiated without the lane it depends on.
+        val negotiated = known.filter { capability ->
+            when (capability) {
+                RosterWire.NATIVE_AVAILABILITY_CAPABILITY -> RosterWire.nativeAvailabilityDependencyHolds(known)
+                RosterWire.CREATE_WORKSPACE_CAPABILITY -> RosterWire.createWorkspaceDependencyHolds(known)
+                else -> true
+            }
         }
         return RosterNegotiation.Accepted(
             major = RosterWire.MAJOR,
@@ -107,6 +115,12 @@ object RosterProtocol {
             if (!offeredCapabilities.contains(capability)) {
                 return RosterAckVerdict.Refused(RosterWireErrorCode.PROTOCOL_VIOLATION)
             }
+        }
+        // Native availability only describes the native lane's catalog, and the
+        // create-workspace flag only rides a create lane, so an acknowledgement of
+        // either without its lane describes something that cannot exist here.
+        if (!RosterWire.dependenciesHold(ack.capabilities)) {
+            return RosterAckVerdict.Refused(RosterWireErrorCode.PROTOCOL_VIOLATION)
         }
         return RosterAckVerdict.Accepted(minor = ack.minor, capabilities = ack.capabilities)
     }
@@ -170,11 +184,13 @@ object RosterProtocol {
                 "outcome" to obj("kind" to q(frame.outcome.wireName)),
             )
             is RosterFrame.CreateRequest -> obj(
-                "type" to q("create_request"),
-                "requestId" to q(encIdentifier(frame.requestId, bounds)),
-                "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
-                "workspace" to q(encWorkspace(frame.workspace)),
-                "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+                listOf(
+                    "type" to q("create_request"),
+                    "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                    "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
+                    "workspace" to q(encWorkspace(frame.workspace)),
+                    "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+                ) + createWorkspaceField(frame.createWorkspace),
             )
             is RosterFrame.CreateResult -> obj(
                 "type" to q("create_result"),
@@ -197,13 +213,15 @@ object RosterProtocol {
                 "outcome" to obj("kind" to q(frame.outcome.wireName)),
             )
             is RosterFrame.NativeCreateRequest -> obj(
-                "type" to q("create_native_request"),
-                "requestId" to q(encIdentifier(frame.requestId, bounds)),
-                "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
-                "workspace" to q(encWorkspace(frame.workspace)),
-                "backend" to q(frame.backend.wireName),
-                "targetId" to q(encNativeTargetId(frame.targetId)),
-                "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+                listOf(
+                    "type" to q("create_native_request"),
+                    "requestId" to q(encIdentifier(frame.requestId, bounds)),
+                    "hostRunId" to q(encIdentifier(frame.hostRunId, bounds)),
+                    "workspace" to q(encWorkspace(frame.workspace)),
+                    "backend" to q(frame.backend.wireName),
+                    "targetId" to q(encNativeTargetId(frame.targetId)),
+                    "sequence" to n(encRange(frame.sequence, 1L, MAX_SAFE_INTEGER)),
+                ) + createWorkspaceField(frame.createWorkspace),
             )
             is RosterFrame.NativeCreateResult -> obj(
                 "type" to q("create_native_result"),
@@ -536,6 +554,13 @@ object RosterProtocol {
     private fun b(value: Boolean): String = if (value) "true" else "false"
 
     /**
+     * The optional create-workspace flag: present only when true, so an unchecked
+     * create stays byte-identical to the legacy frame an older owner already accepts.
+     */
+    private fun createWorkspaceField(createWorkspace: Boolean): List<Pair<String, String>> =
+        if (createWorkspace) listOf("createWorkspace" to b(true)) else emptyList()
+
+    /**
      * True only for a value this protocol can carry as one opaque identifier: a
      * bounded, non-empty, unremarkable token.
      */
@@ -602,13 +627,13 @@ object RosterProtocol {
         put("close_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
         put(
             "create_request",
-            listOf("type", "requestId", "hostRunId", "workspace", "sequence"),
+            listOf("type", "requestId", "hostRunId", "workspace", "sequence", "createWorkspace"),
             listOf("requestId", "hostRunId", "workspace", "sequence"),
         )
         put("create_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
         put(
             "create_native_request",
-            listOf("type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence"),
+            listOf("type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence", "createWorkspace"),
             listOf("requestId", "hostRunId", "workspace", "backend", "targetId", "sequence"),
         )
         put("create_native_result", listOf("type", "requestId", "outcome"), listOf("requestId", "outcome"))
@@ -750,6 +775,7 @@ object RosterProtocol {
                 hostRunId = id("hostRunId"),
                 workspace = readWorkspace(record["workspace"]),
                 sequence = readInteger(record["sequence"], 1L, MAX_SAFE_INTEGER),
+                createWorkspace = readOptionalCreateWorkspace(record),
             )
             "create_result" -> RosterFrame.CreateResult(id("requestId"), readCreateOutcome(record["outcome"], bounds))
             "create_native_request" -> RosterFrame.NativeCreateRequest(
@@ -759,6 +785,7 @@ object RosterProtocol {
                 backend = readNativeCliBackend(record["backend"]),
                 targetId = readNativeCliTargetId(record["targetId"]),
                 sequence = readInteger(record["sequence"], 1L, MAX_SAFE_INTEGER),
+                createWorkspace = readOptionalCreateWorkspace(record),
             )
             "create_native_result" -> RosterFrame.NativeCreateResult(
                 id("requestId"),
@@ -854,6 +881,14 @@ object RosterProtocol {
         if (primitive.isString) fail(RosterFailureCode.BAD_FRAME)
         return primitive.booleanOrNull ?: fail(RosterFailureCode.BAD_FRAME)
     }
+
+    /**
+     * The optional create-workspace flag: absent means false, and a present value
+     * must be a real JSON boolean. `null`, a string, a number, or any other shape is
+     * refused rather than coerced.
+     */
+    private fun readOptionalCreateWorkspace(record: JsonObject): Boolean =
+        if (record.containsKey("createWorkspace")) readBoolean(record["createWorkspace"]) else false
 
     private fun readCapabilities(element: JsonElement?, bounds: RosterBounds): List<String> {
         val array = element as? JsonArray ?: fail(RosterFailureCode.BAD_FRAME)

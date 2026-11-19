@@ -73,11 +73,14 @@ import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
+  ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_NATIVE_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
   ROSTER_BRIDGE_RENAME_CAPABILITY,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
@@ -365,12 +368,15 @@ test("roster-native-v1 is one more optional lane of the same negotiation", () =>
     [
       ROSTER_BRIDGE_CLOSE_CAPABILITY,
       ROSTER_BRIDGE_CREATE_CAPABILITY,
+      ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
       ROSTER_BRIDGE_NATIVE_CAPABILITY,
       ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
       ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
+      ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
       ROSTER_BRIDGE_RENAME_CAPABILITY,
       ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
       ROSTER_BRIDGE_SAVED_CAPABILITY,
+      ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
     ].sort(),
   );
   assert.ok(!ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES.includes(ROSTER_BRIDGE_REQUIRED_CAPABILITY));
@@ -1955,3 +1961,343 @@ test("a host name whose reply never arrives is unknown, never \"not sent\"", asy
 function nameResultsOnOwner(side: Loopback): RosterBridgeFrame[] {
   return side.frames().filter((frame) => frame.type === "rename_native_result");
 }
+
+// ------------------------------------------------- native availability (#493)
+
+const AVAILABILITY_OFFER = [ROSTER_BRIDGE_NATIVE_CAPABILITY, ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY];
+
+/** One controllable async probe per catalog read, in call order. */
+function deferredProbes(): {
+  readonly provider: () => Promise<readonly RemoteNativeCliTarget[]>;
+  readonly calls: number;
+  resolve(index: number, targets: readonly RemoteNativeCliTarget[]): void;
+  reject(index: number): void;
+} {
+  const pending: Array<{ resolve: (value: readonly RemoteNativeCliTarget[]) => void; reject: (error: unknown) => void }> = [];
+  return {
+    provider: () => new Promise((resolve, reject) => { pending.push({ resolve, reject }); }),
+    get calls() { return pending.length; },
+    resolve(index, targets) { pending[index]?.resolve(targets); },
+    reject(index) { pending[index]?.reject(new Error("probe failed")); },
+  };
+}
+
+function snapshotEnds(side: Loopback): Array<Extract<RosterBridgeFrame, { type: "snapshot_end" }>> {
+  return side.frames().filter((frame): frame is Extract<RosterBridgeFrame, { type: "snapshot_end" }> =>
+    frame.type === "snapshot_end");
+}
+
+test("availability depends on the native lane and is acknowledged only with an explicit probing declaration", async () => {
+  assert.equal(ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY, "roster-native-availability-v1");
+  // An acknowledgement that describes a catalog without the lane is a violation.
+  const ack = reviewRosterBridgeHelloAck({
+    type: "hello_ack",
+    service: ROSTER_BRIDGE_SERVICE,
+    major: ROSTER_BRIDGE_MAJOR,
+    minor: ROSTER_BRIDGE_MINOR,
+    capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY],
+  }, { capabilities: [ROSTER_BRIDGE_REQUIRED_CAPABILITY, ...AVAILABILITY_OFFER] });
+  assert.deepEqual(ack, { ok: false, code: "protocol_violation" });
+  const cases: Array<{ label: string; owner: Partial<RosterBridgeHostOptions>; offer: readonly string[]; probed: boolean; native: boolean }> = [
+    { label: "legacy configuration-only owner", owner: nativeOwner().owner, offer: AVAILABILITY_OFFER, probed: false, native: true },
+    { label: "explicit false", owner: { ...nativeOwner().owner, nativeCliAvailability: false }, offer: AVAILABILITY_OFFER, probed: false, native: true },
+    { label: "declared probing owner", owner: { ...nativeOwner().owner, nativeCliAvailability: true }, offer: AVAILABILITY_OFFER, probed: true, native: true },
+    { label: "viewer offered availability without the lane", owner: { ...nativeOwner().owner, nativeCliAvailability: true }, offer: [ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY], probed: false, native: false },
+    { label: "viewer offered only the lane", owner: { ...nativeOwner().owner, nativeCliAvailability: true }, offer: NATIVE_OFFER, probed: false, native: true },
+  ];
+  for (const entry of cases) {
+    const h = harness({ inventory: fixedSource([]), viewerCapabilities: entry.offer, owner: entry.owner });
+    try {
+      await h.viewer.hello;
+      assert.equal(h.viewer.supportsNative, entry.native, entry.label);
+      assert.equal(h.viewer.supportsNativeAvailability, entry.probed, entry.label);
+      const acked = h.ownerSide.frames().find((frame) => frame.type === "hello_ack");
+      assert.ok(acked && acked.type === "hello_ack");
+      assert.equal(acked.capabilities.includes(ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY), entry.probed, entry.label);
+    } finally {
+      await h.stop();
+    }
+  }
+});
+
+test("a probing declaration without the native pair, or a non-boolean one, is refused at construction", () => {
+  const inventory = fixedSource([]);
+  assert.throws(() => createRosterBridgeHost({ inventory, authorizePeer: () => true, nativeCliAvailability: true }),
+    (error: unknown) => error instanceof TypeError);
+  assert.throws(() => createRosterBridgeHost({
+    inventory,
+    authorizePeer: () => true,
+    ...nativeOwner().owner,
+    nativeCliAvailability: "yes" as never,
+  }), (error: unknown) => error instanceof TypeError);
+  // `false` without a pair describes nothing and changes nothing.
+  createRosterBridgeHost({ inventory, authorizePeer: () => true, nativeCliAvailability: false });
+});
+
+test("an async provider's snapshot commits only after its probe, with the probed catalog", async () => {
+  const probes = deferredProbes();
+  const h = harness({
+    inventory: fixedSource([]),
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: { ...nativeOwner().owner, nativeCliTargets: probes.provider, nativeCliAvailability: true },
+  });
+  try {
+    await h.viewer.hello;
+    const subscribed = h.viewer.subscribe();
+    await waitFor(() => probes.calls === 1, "the snapshot awaited one fresh probe");
+    await settle();
+    assert.equal(snapshotEnds(h.ownerSide).length, 0, "nothing is published while the probe is outstanding");
+    assert.equal(h.viewer.projection.state, "empty");
+    probes.resolve(0, [CODEX_TARGET]);
+    const projection = await subscribed;
+    assert.equal(projection.state, "current");
+    assert.deepEqual(projection.nativeCliTargets, [CODEX_TARGET]);
+    assert.equal(probes.calls, 1, "one probe per publication; no polling");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a probe that settles after its subscription was retired never commits the old scope", async () => {
+  const probes = deferredProbes();
+  const h = harness({
+    inventory: fixedSource([]),
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: { ...nativeOwner().owner, nativeCliTargets: probes.provider, nativeCliAvailability: true },
+  });
+  try {
+    await h.viewer.hello;
+    const first = h.viewer.subscribe();
+    first.catch(() => undefined);
+    await waitFor(() => probes.calls === 1, "the first subscription's probe started");
+    const refreshed = h.viewer.resync();
+    await waitFor(() => probes.calls === 2, "the fresh subscription started its own probe");
+    // The retired scope's probe answers LAST-but-first: it must be discarded.
+    probes.resolve(0, [SHARED_TARGET]);
+    await settle();
+    assert.equal(snapshotEnds(h.ownerSide).length, 0, "the retired subscription's probe published nothing");
+    probes.resolve(1, [CLAUDE_TARGET]);
+    const projection = await refreshed;
+    assert.deepEqual(projection.nativeCliTargets, [CLAUDE_TARGET]);
+    const ends = snapshotEnds(h.ownerSide);
+    assert.equal(ends.length, 1);
+    assert.deepEqual(ends[0]?.nativeCliTargets, [CLAUDE_TARGET]);
+    assert.equal(ends[0]?.subscriptionId, projection.subscriptionId);
+    await assert.rejects(first);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a run replaced during an awaited probe commits nothing for either run", async () => {
+  const probes = deferredProbes();
+  const push = pushableSource([]);
+  const h = harness({
+    inventory: push.source,
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: { ...nativeOwner().owner, nativeCliTargets: probes.provider, nativeCliAvailability: true },
+  });
+  try {
+    await h.viewer.hello;
+    const subscribed = h.viewer.subscribe();
+    subscribed.catch(() => undefined);
+    await waitFor(() => probes.calls === 1, "the probe started");
+    push.push([], "owner-run-2");
+    probes.resolve(0, [CLAUDE_TARGET]);
+    await assert.rejects(subscribed);
+    await settle();
+    assert.equal(snapshotEnds(h.ownerSide).length, 0, "no snapshot of the replaced run was committed");
+    assert.notEqual(h.viewer.projection.state, "current");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a newer observation arriving during a probe is published once, with that probe's catalog", async () => {
+  const probes = deferredProbes();
+  const push = pushableSource([]);
+  const h = harness({
+    inventory: push.source,
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: { ...nativeOwner().owner, nativeCliTargets: probes.provider, nativeCliAvailability: true },
+  });
+  try {
+    await h.viewer.hello;
+    const subscribed = h.viewer.subscribe();
+    await waitFor(() => probes.calls === 1, "the probe started");
+    push.push([ownerRow("claude-row", "claude")]);
+    await settle();
+    assert.equal(probes.calls, 1, "a change during the probe waits; it starts no second probe");
+    probes.resolve(0, [CLAUDE_TARGET]);
+    const projection = await subscribed;
+    assert.deepEqual(projection.rows.map((row) => row.id), ["claude-row"], "newest-wins rows");
+    assert.deepEqual(projection.nativeCliTargets, [CLAUDE_TARGET]);
+    assert.equal(snapshotEnds(h.ownerSide).length, 1);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a rejected or malformed async catalog refuses the snapshot whole", async () => {
+  for (const outcome of ["reject", "malformed"] as const) {
+    const probes = deferredProbes();
+    const h = harness({
+      inventory: fixedSource([]),
+      viewerCapabilities: AVAILABILITY_OFFER,
+      owner: { ...nativeOwner().owner, nativeCliTargets: probes.provider, nativeCliAvailability: true },
+    });
+    try {
+      await h.viewer.hello;
+      const subscribed = h.viewer.subscribe();
+      subscribed.catch(() => undefined);
+      await waitFor(() => probes.calls === 1, "the probe started");
+      if (outcome === "reject") probes.reject(0);
+      else probes.resolve(0, [{ ...CLAUDE_TARGET, command: "x" } as never]);
+      await assert.rejects(subscribed, outcome);
+      assert.equal(snapshotEnds(h.ownerSide).length, 0, outcome);
+      assert.equal(h.viewer.projection.nativeCliTargets, null, outcome);
+    } finally {
+      await h.stop();
+    }
+  }
+});
+
+test("a native create awaits a fresh probe and refuses a target withdrawn by it", async () => {
+  const calls: OwnerNativeCreateRequest[] = [];
+  let catalog: readonly RemoteNativeCliTarget[] = [CLAUDE_TARGET, SHARED_TARGET];
+  let reads = 0;
+  const h = harness({
+    inventory: fixedSource([]),
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: {
+      ...nativeOwner({
+        create: async (request) => {
+          calls.push(request);
+          return { kind: "started", hostRunId: request.hostRunId, rowId: "native-1" };
+        },
+      }).owner,
+      nativeCliTargets: async () => {
+        reads += 1;
+        return catalog;
+      },
+      nativeCliAvailability: true,
+    },
+  });
+  try {
+    await h.viewer.hello;
+    await h.viewer.subscribe();
+    assert.equal(reads, 1);
+    // The viewer still holds SHARED_TARGET as current; the owner's fresh probe no
+    // longer lists it, so the owner refuses before its provider is reached.
+    catalog = [CLAUDE_TARGET];
+    assert.deepEqual(await h.viewer.createNativeSession(CREATE_REQUEST),
+      { kind: "owner-result", facts: { kind: "refused" } });
+    assert.equal(reads, 2, "exactly one fresh catalog read per create");
+    assert.deepEqual(calls, []);
+    // The negotiated description is not authority: a target the probe still lists
+    // is launched only through the ordinary create, once.
+    assert.deepEqual(await h.viewer.createNativeSession({ ...CREATE_REQUEST, targetId: "claude" }),
+      { kind: "owner-result", facts: { kind: "started", hostRunId: OWNER_RUN, rowId: "native-1" } });
+    assert.equal(calls.length, 1);
+    assert.equal(reads, 3);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("a grant revoked or a subscription retired during an awaited create probe never launches", async () => {
+  for (const change of ["revoke", "unsubscribe"] as const) {
+    const calls: OwnerNativeCreateRequest[] = [];
+    let authorized = true;
+    let hold: ((targets: readonly RemoteNativeCliTarget[]) => void) | null = null;
+    let reads = 0;
+    const h = harness({
+      inventory: fixedSource([]),
+      viewerCapabilities: AVAILABILITY_OFFER,
+      owner: {
+        ...nativeOwner({
+          create: async (request) => {
+            calls.push(request);
+            return { kind: "started", hostRunId: request.hostRunId, rowId: "unexpected" };
+          },
+        }).owner,
+        authorizePeer: () => authorized,
+        nativeCliTargets: () => {
+          reads += 1;
+          if (reads === 1) return Promise.resolve([SHARED_TARGET]);
+          return new Promise((resolve) => { hold = resolve; });
+        },
+        nativeCliAvailability: true,
+      },
+    });
+    try {
+      await h.viewer.hello;
+      const projection = await h.viewer.subscribe();
+      h.ownerSide.deliver(encodeRosterBridgeFrame(
+        rawNativeRequest({ requestId: `raw-${change}`, hostRunId: OWNER_RUN, sequence: 1 }) as never,
+      ));
+      await waitFor(() => hold !== null, "the create's probe is outstanding");
+      if (change === "revoke") authorized = false;
+      else h.ownerSide.deliver(encodeRosterBridgeFrame({ type: "unsubscribe", subscriptionId: projection.subscriptionId! } as never));
+      await settle();
+      (hold as unknown as (targets: readonly RemoteNativeCliTarget[]) => void)([SHARED_TARGET]);
+      await settle();
+      assert.deepEqual(calls, [], `${change}: the provider is never reached after the awaited probe`);
+      const results = h.ownerSide.frames().filter((frame) => frame.type === "create_native_result");
+      assert.deepEqual(results, [], `${change}: no fabricated result for a scope that ended`);
+    } finally {
+      await h.stop();
+    }
+  }
+});
+
+test("a create probe that settles after its subscription was replaced on the SAME run never launches", async () => {
+  const calls: OwnerNativeCreateRequest[] = [];
+  const guards: boolean[] = [];
+  let hold: ((targets: readonly RemoteNativeCliTarget[]) => void) | null = null;
+  let reads = 0;
+  const h = harness({
+    inventory: fixedSource([]),
+    viewerCapabilities: AVAILABILITY_OFFER,
+    owner: {
+      ...nativeOwner({
+        create: async (request, stillAuthorized) => {
+          calls.push(request);
+          guards.push(stillAuthorized());
+          return { kind: "started", hostRunId: request.hostRunId, rowId: "unexpected" };
+        },
+      }).owner,
+      nativeCliTargets: () => {
+        reads += 1;
+        // The create's own probe (the second read) is held; every publication answers.
+        if (reads === 2) return new Promise((resolve) => { hold = resolve; });
+        return Promise.resolve([SHARED_TARGET]);
+      },
+      nativeCliAvailability: true,
+    },
+  });
+  try {
+    await h.viewer.hello;
+    const first = await h.viewer.subscribe();
+    const creating = h.viewer.createNativeSession(CREATE_REQUEST);
+    await waitFor(() => hold !== null, "the create's probe is outstanding");
+    // A direct viewer resync: unsubscribe, then a fresh subscription to the same run.
+    const replaced = await h.viewer.resync();
+    assert.equal(replaced.hostRunId, first.hostRunId, "the replacement observes the SAME run");
+    assert.notEqual(replaced.subscriptionId, first.subscriptionId);
+    (hold as unknown as (targets: readonly RemoteNativeCliTarget[]) => void)([SHARED_TARGET]);
+    const result = await creating;
+    await settle();
+    assert.deepEqual(calls, [], "a retired subscription's create never reaches the provider");
+    assert.deepEqual(guards, []);
+    assert.deepEqual(result, { kind: "owner-result", facts: { kind: "unknown" } },
+      "the one fixed answer claims nothing, and the in-flight slot is released");
+    // The released slot admits a fresh create on the live subscription.
+    assert.deepEqual(await h.viewer.createNativeSession(CREATE_REQUEST),
+      { kind: "owner-result", facts: { kind: "started", hostRunId: OWNER_RUN, rowId: "unexpected" } });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(guards, [true]);
+  } finally {
+    await h.stop();
+  }
+});

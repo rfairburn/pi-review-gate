@@ -208,6 +208,14 @@ public sealed interface ClientIntent {
      */
     public data class SelectCreateProvider(public val provider: CreateProviderChoice) : ClientIntent
 
+    /**
+     * Check or uncheck the create form's "Create missing workspace directory" choice.
+     *
+     * It changes only the open form's request-specific flag and retires the form's
+     * previous receipt; nothing is created, persisted, or sent by the choice itself.
+     */
+    public data class SetCreateWorkspace(public val createWorkspace: Boolean) : ClientIntent
+
     /** Create one session on one explicitly chosen owner and provider, workspace verbatim. */
     public data class SubmitSessionCreate(
         public val hostId: HostId,
@@ -215,6 +223,8 @@ public sealed interface ClientIntent {
         public val proof: UiActionProof,
         /** Fresh forms default to Pi; an existing caller keeps that exact lane. */
         public val provider: CreateProviderChoice = CreateProviderChoice.Pi,
+        /** The form's create-workspace choice; it must equal the form's own state. */
+        public val createWorkspace: Boolean = false,
     ) : ClientIntent
 
     /** Arm the rename form for one row that reports a native conversation. */

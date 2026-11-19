@@ -148,6 +148,12 @@ export interface PrepareProfileOptions {
   workspace: string;
   /** Legacy-only explicit profile directory. NativeAgentRegistry rejects it. */
   profile?: string;
+  /**
+   * Opt-in workspace creation ({@link WorkspaceDirectoryOptions.createWorkspace}).
+   * It applies to the workspace only: no profile, agent, or config directory is
+   * ever created because of it. Absent or `false` is the noncreating admission.
+   */
+  createWorkspace?: boolean;
 }
 
 /** Structural contract consumed by InstanceManager; production must inject NativeAgentRegistry. */
@@ -213,8 +219,60 @@ export function expandUserPath(input: string, homeDir: string = homedir()): stri
  * those stay the invoking shell's business, exactly as for Pi.
  */
 export function resolveExistingDirectory(input: string, label: string): string {
+  return resolveWorkspaceDirectory(input, label);
+}
+
+/** Workspace-only resolution options; nothing here applies to config or agent directories. */
+export interface WorkspaceDirectoryOptions {
+  /**
+   * Opt-in destination directory creation (issue #493). Only an exact `true`
+   * ensures the resolved directory exists first, with one ordinary recursive
+   * `mkdir` through the filesystem API (never a shell, Git, worktree, or clone).
+   * An existing directory is reused unchanged; the process umask and OS
+   * permissions apply as usual, and no mode, owner, or permission is changed.
+   * Directories it creates are never removed afterwards, even when a later step
+   * of the same launch fails. Absent or `false` is exactly the noncreating
+   * resolution.
+   */
+  readonly createWorkspace?: boolean;
+}
+
+/**
+ * The ONE workspace resolution behind {@link resolveExistingDirectory}, with the
+ * same tilde/relative/canonical meanings. With `createWorkspace: true` the
+ * resolved absolute path is first ensured to exist with a recursive `mkdir`;
+ * the existing stat/directory/realpath checks then decide exactly as before, so
+ * an existing regular file is still "not a directory" and an unreachable path is
+ * still refused on the same error path.
+ */
+export function resolveWorkspaceDirectory(
+  input: string,
+  label: string,
+  options: WorkspaceDirectoryOptions = {},
+): string {
   const expanded = expandUserPath(input);
   const absolute = resolve(expanded);
+  if (options.createWorkspace === true) {
+    try {
+      mkdirSync(absolute, { recursive: true });
+    } catch (error) {
+      // An existing entry (for example a regular file) keeps the ordinary
+      // stat-based refusal below; anything else is a creation failure on the
+      // same thrown workspace error path. Parents created before the failure
+      // are left as ordinary recursive creation leaves them.
+      let present = false;
+      try {
+        statSync(absolute);
+        present = true;
+      } catch {
+        present = false;
+      }
+      if (!present) {
+        const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+        throw new Error(`session-host: ${label} ${absolute} could not be created (${code})`);
+      }
+    }
+  }
   let stats;
   try {
     stats = statSync(absolute);
@@ -498,7 +556,9 @@ export class ProfileRegistry implements ProfilePreparer {
    * returned profile (idempotently) when the instance exits.
    */
   prepare(options: PrepareProfileOptions): PreparedProfile {
-    const workspace = resolveExistingDirectory(options.workspace, "workspace");
+    const workspace = resolveWorkspaceDirectory(options.workspace, "workspace", {
+      createWorkspace: options.createWorkspace === true,
+    });
     const profileInput = options.profile;
     if (profileInput === undefined || profileInput === "") {
       return this.#prepareCreatedProfile(workspace);
@@ -660,7 +720,9 @@ export class NativeAgentRegistry implements ProfilePreparer {
     }
     // The canonical native agent directory (or its `.pi` parent) is an
     // ordinary workspace choice: children keep sharing this same root.
-    const workspace = resolveExistingDirectory(options.workspace, "workspace");
+    const workspace = resolveWorkspaceDirectory(options.workspace, "workspace", {
+      createWorkspace: options.createWorkspace === true,
+    });
 
     ensureNativeReviewGateConfig(this.#agentDir, workspace, this.#env);
 

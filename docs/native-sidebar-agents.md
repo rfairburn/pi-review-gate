@@ -7,9 +7,9 @@ terminal surfaces. It is the published deliverable of
 [#277](https://github.com/rfairburn/pi-review-gate/issues/277): how a native row
 starts, what the host can honestly display about it, and what stays unknown.
 
-Pi stays the default everywhere. Every New-session form still opens on Pi, every
-existing Pi path is unchanged, and a native row is always an explicit local
-choice. A hosted row is the operator's own CLI as an ordinary child: the host
+Pi stays the default everywhere. Every New-session form still opens on Pi, a
+`SessionSpawn` call without `kind` still starts Pi, every existing Pi path is
+unchanged, and a native row is always an explicit choice. A hosted row is the operator's own CLI as an ordinary child: the host
 owns its process, its input, its size, and its exit, and everything else is what
 the provider's own surfaces state. The provider's own startup, authentication,
 model behavior, in-pane approvals and resume, and physical-terminal rendering
@@ -52,9 +52,15 @@ boundaries; [Development](development.md) owns verification commands.
   of its own.
 - Provider selection is the New-session form's **Provider** line, and it
   **defaults to Pi every time the form opens**; choosing a native provider is
-  explicit. The offered choices belong to the destination on the **Host** line: this
-  host's own targets when it names **Local**, and only a connected owner's advertised
-  targets when it names that owner. The **Workspace** field and its initial focus
+  explicit. The only choices are the three session kinds **Pi**, **Claude Code**, and
+  **Codex CLI** — on the terminal sidebar and in the Android application alike — and
+  a native kind always means the destination's normal native setup, never a
+  configured `externalAgents` worker profile. The offered choices belong to the
+  destination on the **Host** line and are filtered by its current availability: the
+  kinds this host's own launch probe finds startable when it names **Local**, and
+  only what a connected owner's freshly probed catalog reports when it names that
+  owner. An offered choice is an observation, not a grant; the destination
+  revalidates it at submission. The **Workspace** field and its initial focus
   behave exactly as before:
   the form still opens on **Workspace**. The lines above it are drawn in the order
   **Host**, then **Provider**, then the field, and the keyboard ring follows that
@@ -73,10 +79,12 @@ boundaries; [Development](development.md) owns verification commands.
   there is refused. It returns on a later render once a row is spare again, for
   example after a resize or once the field stops drawing a completion list.
 - Choosing a native provider for a connected destination needs that owner to advertise
-  native targets and to hold the native owner-create provider. If it does, the form offers
-  only its own catalog and one request starts the row there; if it does not, no Provider
-  line is drawn for that destination and the choice is never carried across destinations or
-  quietly turned into Pi. The product description is
+  native kinds, to hold the native owner-create provider, and to describe its catalog as
+  freshly probed under `roster-native-availability-v1`. If it does, the form offers
+  only its own catalog and one request starts the row there; if it does not — including
+  a legacy owner whose configuration-only catalog has unknown availability — no native
+  choice is offered for that destination, and the choice is never carried across
+  destinations or quietly turned into Pi. The product description is
   [Remote native create and host row name](session-host-alpha.md#remote-native-create-and-host-row-name).
 - The native **Workspace** field accepts exactly the spellings the Pi workspace field
   already accepts, because both go through the host's one existing resolver: a bare
@@ -93,7 +101,12 @@ boundaries; [Development](development.md) owns verification commands.
   child or the provider, never becomes provider conversation identity, and never
   touches the authenticated Pi rename path. A name must be one trimmed line of at most
   80 characters with no control characters; anything else is refused with the row and
-  the draft left exactly as they were. A remembered placeholder is not a live row to
+  the draft left exactly as they were. A Codex row started by `SessionSpawn` gets its
+  full supplied title as this same stored caption at startup, under the `SessionSpawn`
+  title bound (1024 UTF-8 bytes) instead of the manual rule, with no trimming or
+  clipping; a card or peer row label too narrow for it shows a visibly ellipsized
+  display projection, never a second stored caption, and the full caption is what is
+  kept and restored. A remembered placeholder is not a live row to
   caption: its footer advertises no naming affordance, and `E` there refuses truthfully.
   Naming is honest about durability. When this host's roster publication for that
   operation did not take — the store is unreadable, the remembered sequence overflowed,
@@ -148,14 +161,18 @@ boundaries; [Development](development.md) owns verification commands.
   already has: the
   one watched Claude transcript, and the owned Codex read refreshed by the provider's own
   rename edge. There is no polling and no extra connection for a title.
-- A native target is either the built-in default for that backend or an explicit
-  shared [`externalAgents`](configuration.md#the-externalagents-catalog) entry —
-  its `command`, base `args`, and base `env`. The `review` and `execution` role
-  overlays, their models, and their reasoning settings are **never** consulted: a
-  top-level native session is not a delegated execution or review role. Each new
-  session selects its native target again: the chosen target id, its executable,
-  arguments, and environment are never persisted, so a later form cannot silently
-  reuse them.
+- A native session — from the New form, a paired owner, `SessionSpawn`, or restart
+  restoration — always uses the built-in default target for its backend: the
+  `claude` or `codex` command with no host-configured arguments or environment, so
+  the provider runs with its own normal configuration. A configured
+  [`externalAgents`](configuration.md#the-externalagents-catalog) entry is a
+  delegated review/execution worker definition, not a session choice: its adapter,
+  `command`, `args`, `env`, role overlays, models, and reasoning settings are
+  **never** used for a top-level native session, and they keep configuring delegated
+  workers exactly as before. Each new session selects its native kind again: the
+  chosen kind's executable, arguments, and environment are never persisted, so a
+  later form cannot silently reuse them. The argument guards and the named-profile
+  refusal described below remain part of the launcher contract.
 - Command discovery is the shared application-command resolver the settings
   availability probe already uses — one filesystem/`PATH`/`PATHEXT`/case contract,
   so neither surface keeps a second detector. One shared resolver is not an
@@ -228,10 +245,14 @@ boundaries; [Development](development.md) owns verification commands.
   host does not front with its own backend keeps `--no-daemon` as its one host-added
   argument, and an operator who configured that flag themselves keeps it either way.
   `--no-alt-screen` is never added, and no approval, sandbox, or headless flag is
-  ever added. Claude Code adds no arguments of its own. The only other thing ever
-  added is the separately documented per-launch status-observer setup, which changes
-  nothing the operator configured
-  ([Native status observation](#native-status-observation)).
+  ever added. On a New-form or restored row, Claude Code adds no arguments of its own.
+  The only other thing ever added is the separately documented per-launch
+  status-observer setup, which changes nothing the operator configured
+  ([Native status observation](#native-status-observation)), plus, for a fresh
+  `SessionSpawn` child only, that request's startup tokens: Claude Code's
+  `--name=<title>` in option position, and for both providers the generated
+  prompt-file instruction as the single operand after a trailing `--` (see
+  [Starting and owning sessions](session-host-alpha.md#starting-and-owning-sessions)).
 - **A configured Codex target whose arguments choose one of the operator's named
   provider profiles is refused clearly, before any process, socket, or file is
   created.** This host does not route profile-scoped provider configuration into the
@@ -282,10 +303,13 @@ boundaries; [Development](development.md) owns verification commands.
   None of it is scraped from the terminal, none of it is this host's own subtask or
   background-shell registry, and none of it weakens a stop confirmation
   ([Native status observation](#native-status-observation)).
-- Native rows are created by this host, and — over the paired owner lanes — by a
-  connected owner that advertises native targets. `SessionSpawn`, the Saved picker,
-  and the standalone launchers all keep creating Pi sessions and behave exactly as
-  before. A native row has no Pi status registration, so Pi's input framing and its
+- Native rows are created by this host, over the paired owner lanes by a connected
+  owner that advertises native kinds, and by a hosted Pi child's `SessionSpawn` with
+  `kind` `claude` or `codex` on its own host or an exact paired `host` (see
+  [Starting and owning sessions](session-host-alpha.md#starting-and-owning-sessions)
+  for its file-backed initial request and title handling). The Saved picker and the
+  standalone launchers keep creating Pi sessions and behave exactly as before. A
+  native row has no Pi status registration, so Pi's input framing and its
   per-registration encoder do not apply to it. Instead, when both sides negotiated
   the optional `native-input-cli-v1` capability, an authorized and consented viewer's
   keys, canonical mouse packets, and whole pastes are handed to that row's PTY raw,
@@ -314,17 +338,34 @@ unless you already acted during startup. Each restored row is a **new** process 
 host owns, asked to resume exactly one conversation:
 
 - **What is remembered.** For a native row the roster keeps the exact provider
-  conversation UUID the row's own run last proved, and the exact id of the configured
-  launch target it was started with. No executable, argument, environment, or
-  credential is stored. The UUID is the host's private restart identity: it is never a
+  conversation UUID the row's own run last proved, and the id of the launch target it
+  was started with. No executable, argument, environment, or credential is stored. The UUID is the host's private restart identity: it is never a
   Pi conversation id, never shown on a card, and never sent to a paired viewer.
+- **Which target restores it.** A row restores with its backend's built-in default
+  target — the same normal native setup a New session uses. A row remembered with
+  that default restores with it unchanged. A row remembered with a legacy configured
+  worker target (`external:<id>`) is deliberately restored with its **backend's**
+  default: a Claude row as base Claude Code and a Codex row as base Codex CLI. This is
+  a deliberate compatibility change, not a fallback: the old entry's command,
+  arguments, and environment are not looked up or reproduced, and the row is not
+  unavailable merely because that worker entry was since removed. Everything that
+  identifies the row is still exact — the same provider conversation UUID, recorded
+  workspace, caption, roster order, and restoration proof below — and the provider's
+  own native permissions apply. A row is never resumed as a fresh conversation or as
+  a different kind. No bulk deletion or migration of settings is performed; normal
+  row persistence records the selected base target. Worker configuration is not
+  rewritten. Any other remembered id stays refused.
+- **Downgrade compatibility.** A roster containing a Codex startup caption longer
+  than the old 80-character manual limit, or with surrounding whitespace, may be
+  rejected as a whole by an older build that accepts only that narrower rule.
+  Those builds cannot restore such a roster; this change provides no automatic
+  conversion for downgrades.
 - **What is checked before anything starts.** The remembered UUID and target id are
-  both present; that target is still in this host's **current** configuration for the
-  same backend; the recorded workspace still exists; and this host can start native
-  rows at all. The launch then goes through the same configured launcher as New, with
-  the target named explicitly, so a launcher that cannot resume that target exactly
-  (for example a Codex row whose backend this host does not own, or a configured
-  argument set that cannot be combined with a resume) refuses instead of starting a
+  both present; the backend default it maps to is currently offered by this host;
+  the recorded workspace still exists; and this host can start native rows at all.
+  The launch then goes through the same launcher as New, with the target named
+  explicitly, so a launcher that cannot resume that target exactly (for example a
+  Codex row whose backend this host does not own) refuses instead of starting a
   fresh conversation.
 - **What proves it.** The resumed run's own provider must still prove the
   conversation: for Claude Code, that run's own root `SessionStart` resuming exactly
@@ -365,8 +406,9 @@ host owns, asked to resume exactly one conversation:
   actual observations rather than the presence of a prompt alone.
 - **What stays unavailable.** A remembered row with no proved UUID — including every
   row remembered before this restoration existed, which is never retrofitted from
-  provider history, file times, or names — or with a missing or no-longer-configured
-  target, a vanished workspace, or no native hosting, comes back as the unavailable
+  provider history, file times, or names — or with a missing or unmappable target
+  id, a backend default this host does not currently offer, a vanished workspace, or
+  no native hosting, comes back as the unavailable
   placeholder with a bounded reason, and nothing is started for it. A resume refused
   before it started, or one whose provider exited before proving the conversation,
   stays on its real row as `<name> (unavailable)`; that row still owns its resources
@@ -960,8 +1002,7 @@ multiplexer, or a provider path that talks to a clipboard helper directly, can
 bypass the owned PTY emission entirely. Nothing here falls back to polling a
 clipboard.
 
-**One Codex child environment marker.** A hosted Codex child — built-in or an
-explicitly configured target — is given `HERDR_ENV=1`, the one value of an
+**One Codex child environment marker.** A hosted Codex child is given `HERDR_ENV=1`, the one value of an
 undocumented upstream branch (reviewed at the pinned `rust-v0.167.2` tag) under which
 Codex writes that extra terminal copy request to its own controlling terminal, which
 under this host is the row's PTY. It is applied to that one composed **child**
@@ -1033,12 +1074,12 @@ never a guarantee that the owner's clipboard was untouched.
   permission or hook-trust posture
   is overridden
   ([Native status observation](#native-status-observation)).
-- The provider command, base arguments, and shared environment come from the
-  operator's explicit
-  [`externalAgents` catalog](configuration.md#the-externalagents-catalog) entry
-  when one is selected; otherwise the built-in default command is used. The
-  `execution` and `review` role overlays are **not** inherited: a top-level
-  native session is not a delegated execution or review role.
+- The provider command is always the built-in default for the backend, with no
+  host-configured base arguments or environment. An
+  [`externalAgents` catalog](configuration.md#the-externalagents-catalog) entry is
+  never a native session target, and neither its shared settings nor its
+  `execution` and `review` role overlays are inherited: a top-level native session
+  is not a delegated execution or review role.
 - A hosted Codex row's interactive client carries no host-added `--no-daemon`, because
   it attaches to the private app-server backend this host started for that row; a Codex
   launch this host does not front with its own backend keeps `--no-daemon` as its one
@@ -1049,7 +1090,9 @@ never a guarantee that the owner's clipboard was untouched.
   backend or rejects a flag fails rather than being quietly redirected; nothing is
   silently dropped.
   `--no-alt-screen` and any headless or approval flag are not added. Claude Code
-  adds no flags of its own.
+  adds no flags of its own on a New-form or restored row; a fresh `SessionSpawn`
+  child additionally gets Claude Code's `--name=<title>` and, for either provider,
+  the generated prompt-file instruction after a trailing `--`.
 - Configured arguments that override the provider's permission, tool, sandbox, or
   hook-trust posture, or that would start a headless/service mode or attach to an
   existing conversation, or that would change the workspace scope, are a **launch
@@ -1166,9 +1209,12 @@ What to expect, and what this does and does not prove:
   ring; make the terminal taller.
 - To create a native row: press `Shift+Tab` once (**Workspace** → **Provider**),
   use `Up`/`Down` to reach the provider you want, press `Tab` back to
-  **Workspace**, enter an existing directory, and submit. With a connected **Host** line the
-  Provider line offers only that owner's advertised targets, or nothing at all if it
-  advertises none; confirm which of the two you get before submitting.
+  **Workspace**, enter an existing directory, and submit. The Provider line offers
+  only Pi plus the Claude Code and Codex CLI kinds this host's launch probe finds
+  startable, so a provider CLI that is not installed is not offered. With a connected
+  **Host** line it offers only that owner's freshly probed native kinds, or no native
+  choice at all if that owner advertises none or its catalog availability is unknown;
+  confirm which you get before submitting.
 - The provider CLI inherits your normal `HOME`, configuration, and authentication,
   exactly as it would from your own shell. **You do not have to log in, select a
   model, or send a prompt to complete the tryout.** Opening the row, watching the
@@ -1214,15 +1260,14 @@ What to expect, and what this does and does not prove:
   renames anything inside the provider, so `/rename` in that walkthrough is always your
   own action in the provider.
 - **No automated approvals.** Never try a provider's permission-bypass or
-  approval-disabling flag to make a tryout easier; a configured target that names
-  one is refused by design, and that refusal is the behavior under test.
+  approval-disabling flag to make a tryout easier; the host adds none, and the
+  provider's own approval prompts are part of what you observe.
 - Restarting the host in the same stage restores a remembered native row whose own
-  run proved its conversation, through the same configured target, and shows any
-  other remembered native row as `<Provider> (unavailable)`
+  run proved its conversation, through its backend's built-in default target, and
+  shows any other remembered native row as `<Provider> (unavailable)`
   ([Restart restoration of native rows](#restart-restoration-of-native-rows)). Only
-  the target's id is remembered; its executable, arguments, and environment come from
-  the current configuration, and the next New session still asks you to choose a
-  target.
+  the target's id is remembered; no executable, argument, or environment is stored,
+  and the next New session still asks you to choose a kind.
 - If your terminal implements OSC 52 clipboard writes, select and copy text in the
   provider the provider's own way and see whether your connecting terminal's
   clipboard changed. For a hosted Codex row this is exactly what the `HERDR_ENV=1`

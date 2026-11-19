@@ -479,6 +479,11 @@ public class RosterClientEndpoint(
                 ) {
                     return RosterSendRefusal.PROOF_UNAVAILABLE
                 }
+                // A checked Pi create re-proves the same current-run fence it was
+                // admitted under; a retirement or run change while queued refuses it.
+                if (native == null && pending.createWorkspace && !ownerRunCurrent(pending.hostRunId)) {
+                    return RosterSendRefusal.PROOF_UNAVAILABLE
+                }
                 null
             }
 
@@ -701,6 +706,11 @@ public class RosterClientEndpoint(
         if (!snapshot().supportsCreate) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
         }
+        // A checked create-workspace request is never silently downgraded to a plain
+        // create: an owner that did not acknowledge the flag gets nothing at all.
+        if (command.createWorkspace && !snapshot().supportsCreateWorkspace) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
+        }
         if (!isIdentifier(command.hostRunId) || !RosterText.isCreateWorkspace(command.workspace)) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
         }
@@ -708,11 +718,18 @@ public class RosterClientEndpoint(
         if (proof == null ||
             proof.channelGeneration != generation ||
             proof.hostRunId != command.hostRunId ||
-            proof.workspace != command.workspace
+            proof.workspace != command.workspace ||
+            proof.createWorkspace != command.createWorkspace
         ) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
         }
         if (!proofHolds(proof.ui)) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.TARGET_UNAVAILABLE)
+        }
+        // A checked create is fenced to the CURRENT observation of the exact owner run,
+        // exactly as a native create is: a retired, stale, or replaced run never takes
+        // it. An unchecked create keeps its existing legacy admission unchanged.
+        if (command.createWorkspace && !ownerRunCurrent(command.hostRunId)) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.TARGET_UNAVAILABLE)
         }
         if (pendingCreate != null) return refuse(RosterOperationKind.CREATE, RosterNotSentReason.BUSY)
@@ -727,11 +744,12 @@ public class RosterClientEndpoint(
             hostRunId = command.hostRunId,
             sequence = sequence,
             deadlineAt = clock() + bounds.createResultTimeoutMs,
+            createWorkspace = command.createWorkspace,
         )
         armDeadline(RosterDeadlineKind.CREATE_RESULT, requestId, bounds.createResultTimeoutMs)
         events += RosterClientEvent.OperationAccepted(RosterOperationKind.CREATE, requestId, command.hostRunId)
         val sent = send(
-            RosterFrame.CreateRequest(requestId, command.hostRunId, command.workspace, sequence),
+            RosterFrame.CreateRequest(requestId, command.hostRunId, command.workspace, sequence, command.createWorkspace),
             SendPurpose.CREATE,
             requestId,
             proof,
@@ -758,6 +776,9 @@ public class RosterClientEndpoint(
         if (!snapshot().supportsNative) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
         }
+        if (command.createWorkspace && !snapshot().supportsCreateWorkspace) {
+            return refuse(RosterOperationKind.CREATE, RosterNotSentReason.CAPABILITY_UNSUPPORTED)
+        }
         if (!isIdentifier(command.hostRunId) || !RosterText.isCreateWorkspace(command.workspace) ||
             !isNativeCliTargetId(command.targetId)
         ) {
@@ -770,7 +791,8 @@ public class RosterClientEndpoint(
             proof.workspace != command.workspace ||
             proof.backend != command.backend ||
             proof.targetId != command.targetId ||
-            proof.catalogScope.hostRunId != command.hostRunId
+            proof.catalogScope.hostRunId != command.hostRunId ||
+            proof.createWorkspace != command.createWorkspace
         ) {
             return refuse(RosterOperationKind.CREATE, RosterNotSentReason.INVALID_REQUEST)
         }
@@ -785,6 +807,7 @@ public class RosterClientEndpoint(
             backend = command.backend,
             targetId = command.targetId,
             sequence = 1L,
+            createWorkspace = command.createWorkspace,
         )
         try {
             RosterProtocol.encode(probe, bounds)
@@ -816,6 +839,7 @@ public class RosterClientEndpoint(
                 backend = command.backend,
                 targetId = command.targetId,
                 sequence = sequence,
+                createWorkspace = command.createWorkspace,
             ),
             SendPurpose.CREATE,
             requestId,
@@ -1487,15 +1511,18 @@ public class RosterClientEndpoint(
      * replaced catalog is never a match: the request is refused rather than
      * defaulted, retargeted, or retried as Pi.
      */
+    /** True only while this live subscription's CURRENT projection names exactly [hostRunId]. */
+    private fun ownerRunCurrent(hostRunId: String): Boolean =
+        !stopRequested && phase == RosterClientPhase.SUBSCRIBED &&
+            projection.state == RosterProjectionState.CURRENT && projection.hostRunId == hostRunId
+
     private fun nativeCreateTargetCurrent(
         hostRunId: String,
         backend: NativeCliBackend,
         targetId: String,
         catalogScope: NativeCatalogScope,
     ): Boolean {
-        if (stopRequested || phase != RosterClientPhase.SUBSCRIBED) return false
-        if (projection.state != RosterProjectionState.CURRENT) return false
-        if (projection.hostRunId != hostRunId) return false
+        if (!ownerRunCurrent(hostRunId)) return false
         // The exact observation the written form froze: an unchanged catalog on a
         // later roster revision keeps this scope, while any add/remove/relabel/
         // reorder/withdrawal/re-advertisement advances it and refuses the old request.
@@ -2636,6 +2663,8 @@ public class RosterClientEndpoint(
         val deadlineAt: Long,
         /** Non-null only for a native create; the exact advertised pair it named. */
         val native: PendingNativeCreate? = null,
+        /** True for a checked create-workspace request: dispatch re-proves the current run. */
+        val createWorkspace: Boolean = false,
     )
 
     private class PendingNativeCreate(

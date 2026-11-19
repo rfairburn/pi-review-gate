@@ -5,6 +5,8 @@ import io.github.rfairburn.pireviewgate.core.hosts.HostId
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliBackend
 import io.github.rfairburn.pireviewgate.core.protocol.native.NativeCliTarget
 import io.github.rfairburn.pireviewgate.core.protocol.native.SessionBackend
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNativeCliNewSessionTarget
+import io.github.rfairburn.pireviewgate.core.protocol.native.isNewSessionTarget
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteNativeSession
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RemoteSessionMetadata
 import io.github.rfairburn.pireviewgate.core.protocol.roster.RosterLifecycle
@@ -19,8 +21,10 @@ class CreateProviderSelectionTest {
 
     private val hostA = HostId.parse("provider-host-a")
     private val hostB = HostId.parse("provider-host-b")
-    private val claude = NativeCliTarget("claude-default", NativeCliBackend.CLAUDE, "Claude default")
-    private val codex = NativeCliTarget("codex-review", NativeCliBackend.CODEX, "Codex review")
+    private val claude = NativeCliTarget("claude", NativeCliBackend.CLAUDE, "Claude default")
+    private val codex = NativeCliTarget("codex", NativeCliBackend.CODEX, "Codex review")
+    /** A named external worker profile an older owner may still advertise (#493). */
+    private val namedProfile = NativeCliTarget("external:review-box", NativeCliBackend.CODEX, "review-box (Codex CLI)")
     private val scope = NativeCatalogScope("run-1", 1L, 1L)
 
     private fun owner(
@@ -93,7 +97,7 @@ class CreateProviderSelectionTest {
             connection = HostConnectionState.CONNECTED,
             roster = RosterSnapshot(RosterFreshness.CURRENT, "run-1", 3L, emptyList()),
             capabilities = HostCapabilities.fromAcknowledged(
-                listOf(RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY), 1,
+                listOf(RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY), 1,
             ),
             nativeCliTargets = listOf(claude, codex),
             nativeCatalogScope = scope,
@@ -112,10 +116,107 @@ class CreateProviderSelectionTest {
         assertEquals(false, stale.nativeCreateEligible)
     }
 
+    private fun availabilityHost(
+        capabilities: List<String> = listOf(
+            RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+        ),
+        targets: List<NativeCliTarget>? = listOf(claude, codex),
+        connection: HostConnectionState = HostConnectionState.CONNECTED,
+    ): HostUiState = HostUiState(
+        host = io.github.rfairburn.pireviewgate.core.hosts.ConfiguredHost(
+            hostA, io.github.rfairburn.pireviewgate.core.hosts.HostLabel.parse("Owner A"),
+            io.github.rfairburn.pireviewgate.core.hosts.Endpoint("provider-host-a.invalid", 8443),
+        ),
+        connection = connection,
+        roster = RosterSnapshot(RosterFreshness.CURRENT, "run-1", 3L, emptyList()),
+        capabilities = HostCapabilities.fromAcknowledged(capabilities, 1),
+        nativeCliTargets = targets,
+        nativeCatalogScope = targets?.let { scope },
+    )
+
     @Test
-    fun `options come only from the selected owner's catalog and Pi is always the default`() {
+    fun `native availability is a dependent capability projected from the acknowledgement`() {
+        val described = HostCapabilities.fromAcknowledged(
+            listOf(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY), 1,
+        )
+        assertEquals(CapabilityStatus.SUPPORTED, described.nativeAvailability)
+        assertEquals(CapabilityStatus.SUPPORTED, described.statusOf(RosterWire.NATIVE_AVAILABILITY_CAPABILITY))
+        val legacy = HostCapabilities.fromAcknowledged(listOf(RosterWire.NATIVE_CAPABILITY), 1)
+        assertEquals(CapabilityStatus.UNSUPPORTED, legacy.nativeAvailability)
+        // Without the lane it describes, the description is never projected as support.
+        val orphan = HostCapabilities.fromAcknowledged(listOf(RosterWire.NATIVE_AVAILABILITY_CAPABILITY), 1)
+        assertEquals(CapabilityStatus.UNSUPPORTED, orphan.nativeAvailability)
+        assertEquals(CapabilityStatus.UNKNOWN, HostCapabilities.UNKNOWN.statusOf(RosterWire.NATIVE_AVAILABILITY_CAPABILITY))
+    }
+
+    @Test
+    fun `a legacy owner's unknown native availability offers no native choice and keeps Pi`() {
+        // The same catalog, but the owner never described it as a launch probe.
+        val legacy = availabilityHost(capabilities = listOf(RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY))
+        assertEquals(false, legacy.canCreateNativeSession)
+        val choice = OwnerChoice.of(legacy)
+        assertEquals(emptyList<NativeCliTarget>(), choice.nativeTargets)
+        assertNull(choice.nativeCatalogScope)
+        assertEquals(false, choice.nativeCreateEligible)
+        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(choice))
+        assertEquals(true, CreateProviderSelection.admits(choice, CreateProviderChoice.Pi))
+        // A native choice frozen from such an owner is refused, never converted to Pi.
+        assertEquals(false, CreateProviderSelection.admits(choice, CreateProviderSelection.choiceOf(claude, scope)))
+        assertNull(CreateProviderSelection.reconcile(choice, choice, CreateProviderSelection.choiceOf(claude, scope)))
+        // Pi stays offered only on the owner's own current create capability.
+        val noCreate = OwnerChoice.of(availabilityHost(capabilities = listOf(RosterWire.NATIVE_CAPABILITY)))
+        assertEquals(false, noCreate.createEligible)
+        assertEquals(false, CreateProviderSelection.admits(noCreate, CreateProviderChoice.Pi))
+    }
+
+    @Test
+    fun `a described availability catalog offers exactly the advertised default kinds`() {
+        val both = OwnerChoice.of(availabilityHost(targets = listOf(claude, codex)))
+        assertEquals(
+            listOf(CreateProviderChoice.Pi, CreateProviderSelection.choiceOf(claude, scope),
+                CreateProviderSelection.choiceOf(codex, scope)),
+            CreateProviderSelection.options(both),
+        )
+        val claudeOnly = OwnerChoice.of(availabilityHost(targets = listOf(claude)))
+        assertEquals(
+            listOf(CreateProviderChoice.Pi, CreateProviderSelection.choiceOf(claude, scope)),
+            CreateProviderSelection.options(claudeOnly),
+        )
+        assertEquals(false, CreateProviderSelection.admits(claudeOnly, CreateProviderSelection.choiceOf(codex, scope)))
+        val codexOnly = OwnerChoice.of(availabilityHost(targets = listOf(codex)))
+        assertEquals(
+            listOf(CreateProviderChoice.Pi, CreateProviderSelection.choiceOf(codex, scope)),
+            CreateProviderSelection.options(codexOnly),
+        )
+        assertEquals(false, CreateProviderSelection.admits(codexOnly, CreateProviderSelection.choiceOf(claude, scope)))
+        // The probe found nothing launchable: an empty catalog keeps the Pi-only form.
+        val none = OwnerChoice.of(availabilityHost(targets = emptyList()))
+        assertEquals(false, none.nativeCreateEligible)
+        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(none))
+        // A named profile in a described catalog is still never a NEW choice.
+        val profiles = OwnerChoice.of(availabilityHost(targets = listOf(namedProfile, codex)))
+        assertEquals(listOf(codex), profiles.nativeTargets)
+        // A disconnected owner offers nothing native, whatever it last described.
+        val offline = OwnerChoice.of(availabilityHost(connection = HostConnectionState.DISCONNECTED))
+        assertEquals(false, offline.nativeCreateEligible)
+        assertEquals(false, offline.createEligible)
+    }
+
+    @Test
+    fun `a refreshed catalog that withdrew the chosen kind asks to choose again and never selects Pi`() {
+        val before = OwnerChoice.of(availabilityHost(targets = listOf(claude, codex)))
+        val chosen = CreateProviderSelection.choiceOf(claude, scope)
+        val refreshed = OwnerChoice.of(availabilityHost(targets = listOf(codex)))
+            .copy(nativeCatalogScope = scope.copy(epoch = 3L))
+        assertNull(CreateProviderSelection.reconcile(before, refreshed, chosen))
+        // Pi chosen before the refresh stays Pi; nothing switches it either way.
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.reconcile(before, refreshed, CreateProviderChoice.Pi))
+    }
+
+    @Test
+    fun `options come only from the selected owner's catalog and Pi leads for a Pi-capable owner`() {
         val a = owner()
-        val b = owner(host = hostB, targets = listOf(NativeCliTarget("codex-other", NativeCliBackend.CODEX, "Other")))
+        val b = owner(host = hostB, targets = listOf(NativeCliTarget("codex", NativeCliBackend.CODEX, "Other")))
         assertEquals(
             listOf(
                 CreateProviderChoice.Pi,
@@ -126,13 +227,88 @@ class CreateProviderSelectionTest {
         )
         assertEquals(
             listOf(CreateProviderChoice.Pi, CreateProviderChoice.Native(
-                NativeCliBackend.CODEX, "codex-other", "Other", scope,
+                NativeCliBackend.CODEX, "codex", "Other", scope,
             )),
             CreateProviderSelection.options(b),
         )
         // An owner with no catalog keeps the Pi-only form.
         assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(a.copy(nativeTargets = emptyList())))
-        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(null))
+        // Nothing is offered before an owner is chosen.
+        assertEquals(emptyList(), CreateProviderSelection.options(null))
+    }
+
+    @Test
+    fun `a native-only owner offers only its advertised native kinds and never Pi`() {
+        // Native lanes with a described catalog, but no Pi create capability.
+        val nativeOnlyCaps = listOf(RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+        val both = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(claude, codex)))
+        assertEquals(false, both.createEligible)
+        assertEquals(true, both.nativeCreateEligible)
+        assertEquals(
+            listOf(CreateProviderSelection.choiceOf(claude, scope), CreateProviderSelection.choiceOf(codex, scope)),
+            CreateProviderSelection.options(both),
+        )
+        // The sole advertised kind is still offered for an explicit choice.
+        val claudeOnly = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(claude)))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(claude, scope)), CreateProviderSelection.options(claudeOnly))
+        assertEquals(true, CreateProviderSelection.admits(claudeOnly, CreateProviderSelection.choiceOf(claude, scope)))
+        val codexOnly = OwnerChoice.of(availabilityHost(capabilities = nativeOnlyCaps, targets = listOf(codex)))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(codex, scope)), CreateProviderSelection.options(codexOnly))
+        // Pi is neither offered nor admitted, so a held Pi can never be submitted.
+        assertEquals(false, CreateProviderSelection.admits(both, CreateProviderChoice.Pi))
+        // A direct native-only owner (no catalog) offers nothing at all.
+        assertEquals(emptyList(), CreateProviderSelection.options(owner(createEligible = false, nativeEligible = false)))
+    }
+
+    @Test
+    fun `a native-only owner draws the fresh Pi default as no provider chosen`() {
+        val nativeOnly = owner(createEligible = false, targets = listOf(claude, codex))
+        val claudeChoice = CreateProviderSelection.choiceOf(claude, scope)
+        // The fresh-form Pi default is drawn as the existing "no provider chosen" state,
+        // never as a chosen Pi and never as a native kind picked on the operator's behalf.
+        assertNull(CreateProviderSelection.shown(nativeOnly, CreateProviderChoice.Pi))
+        assertNull(CreateProviderSelection.shown(nativeOnly, null))
+        // An explicit, admissible native choice is drawn exactly.
+        assertEquals(claudeChoice, CreateProviderSelection.shown(nativeOnly, claudeChoice))
+        val form = CreateSessionDialog(
+            owners = listOf(nativeOnly), selectedHostId = hostA, proof = MutableUiActionProof(
+                UiActionTargetToken(UiProofScreen.SESSION_CREATE, hostA, hostRunId = "run-1", generation = 1),
+            ),
+        )
+        // The form's own default is unchanged; only what it draws differs.
+        assertEquals(CreateProviderChoice.Pi, form.provider)
+        assertNull(form.shownProvider)
+        assertEquals(listOf(claudeChoice, CreateProviderSelection.choiceOf(codex, scope)), form.providerOptions)
+        assertEquals(claudeChoice, form.copy(provider = claudeChoice).shownProvider)
+        // No owner chosen yet: the default is untouched (no provider line is drawn).
+        assertEquals(CreateProviderChoice.Pi, form.copy(selectedHostId = null).shownProvider)
+    }
+
+    @Test
+    fun `an owner that can create Pi keeps the Pi default drawn and offered first`() {
+        val piCapable = owner()
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.shown(piCapable, CreateProviderChoice.Pi))
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.options(piCapable).first())
+        val piOnly = owner(nativeEligible = false)
+        assertEquals(CreateProviderChoice.Pi, CreateProviderSelection.shown(piOnly, CreateProviderChoice.Pi))
+        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(piOnly))
+        // A stale native choice stays "choose again" on any owner.
+        assertNull(CreateProviderSelection.shown(piCapable, null))
+    }
+
+    @Test
+    fun `a native-only owner's withdrawn choice asks to choose again and never offers Pi`() {
+        val before = owner(createEligible = false, targets = listOf(claude, codex))
+        val chosen = CreateProviderSelection.choiceOf(claude, scope)
+        assertEquals(chosen, CreateProviderSelection.reconcile(before, before, chosen))
+        val refreshed = owner(createEligible = false, targets = listOf(codex), catalogScope = scope.copy(epoch = 2L))
+        val reconciled = CreateProviderSelection.reconcile(before, refreshed, chosen)
+        assertNull(reconciled)
+        assertNull(CreateProviderSelection.shown(refreshed, reconciled))
+        assertEquals(listOf(CreateProviderSelection.choiceOf(codex, refreshed.nativeCatalogScope!!)),
+            CreateProviderSelection.options(refreshed))
+        // Moving to another owner after a native choice is "choose again", never Pi.
+        assertNull(CreateProviderSelection.afterOwnerChange(chosen))
     }
 
     @Test
@@ -187,6 +363,63 @@ class CreateProviderSelectionTest {
         assertEquals(false, CreateProviderSelection.admits(nativeOnly, CreateProviderChoice.Pi))
         assertEquals(true, CreateProviderSelection.admits(nativeOnly, CreateProviderSelection.choiceOf(claude, scope)))
         assertEquals(false, CreateProviderSelection.admits(null, CreateProviderChoice.Pi))
+    }
+
+    @Test
+    fun `only backend default targets are NEW-session choices`() {
+        assertEquals(true, isNativeCliNewSessionTarget(NativeCliBackend.CLAUDE, "claude"))
+        assertEquals(true, isNativeCliNewSessionTarget(NativeCliBackend.CODEX, "codex"))
+        assertEquals(false, isNativeCliNewSessionTarget(NativeCliBackend.CODEX, "claude"))
+        assertEquals(false, isNativeCliNewSessionTarget(NativeCliBackend.CLAUDE, "external:claude"))
+        assertEquals(false, isNativeCliNewSessionTarget(NativeCliBackend.CODEX, "external:review-box"))
+        assertEquals(true, codex.isNewSessionTarget)
+        assertEquals(false, namedProfile.isNewSessionTarget)
+    }
+
+    @Test
+    fun `an older owner's advertised named profile is never offered or admitted for NEW`() {
+        val host = HostUiState(
+            host = io.github.rfairburn.pireviewgate.core.hosts.ConfiguredHost(
+                hostA, io.github.rfairburn.pireviewgate.core.hosts.HostLabel.parse("Owner A"),
+                io.github.rfairburn.pireviewgate.core.hosts.Endpoint("provider-host-a.invalid", 8443),
+            ),
+            connection = HostConnectionState.CONNECTED,
+            roster = RosterSnapshot(RosterFreshness.CURRENT, "run-1", 3L, emptyList()),
+            capabilities = HostCapabilities.fromAcknowledged(
+                listOf(RosterWire.CREATE_CAPABILITY, RosterWire.NATIVE_CAPABILITY, RosterWire.NATIVE_AVAILABILITY_CAPABILITY), 1,
+            ),
+            nativeCliTargets = listOf(claude, namedProfile, codex),
+            nativeCatalogScope = scope,
+        )
+        // The committed wire catalog keeps the legacy entry; only the NEW view drops it.
+        assertEquals(listOf(claude, namedProfile, codex), host.nativeCliTargets)
+        val choice = OwnerChoice.of(host)
+        assertEquals(listOf(claude, codex), choice.nativeTargets)
+        assertEquals(
+            listOf(
+                CreateProviderChoice.Pi,
+                CreateProviderSelection.choiceOf(claude, scope),
+                CreateProviderSelection.choiceOf(codex, scope),
+            ),
+            CreateProviderSelection.options(choice),
+        )
+        // Even a directly constructed owner whose list carries the profile neither
+        // offers nor admits it, so the controller's submit gate refuses it.
+        val direct = owner(targets = listOf(claude, namedProfile))
+        assertEquals(
+            listOf(CreateProviderChoice.Pi, CreateProviderSelection.choiceOf(claude, scope)),
+            CreateProviderSelection.options(direct),
+        )
+        assertEquals(false, CreateProviderSelection.admits(direct, CreateProviderSelection.choiceOf(namedProfile, scope)))
+        assertEquals(false, CreateProviderSelection.admits(choice, CreateProviderSelection.choiceOf(namedProfile, scope)))
+
+        // An owner advertising ONLY named profiles offers the Pi-only form.
+        val namedOnly = OwnerChoice.of(host.copy(nativeCliTargets = listOf(namedProfile)))
+        assertEquals(emptyList<NativeCliTarget>(), namedOnly.nativeTargets)
+        assertEquals(false, namedOnly.nativeCreateEligible)
+        assertNull(namedOnly.nativeCatalogScope)
+        assertEquals(listOf(CreateProviderChoice.Pi), CreateProviderSelection.options(namedOnly))
+        assertEquals(true, CreateProviderSelection.admits(namedOnly, CreateProviderChoice.Pi))
     }
 
     @Test

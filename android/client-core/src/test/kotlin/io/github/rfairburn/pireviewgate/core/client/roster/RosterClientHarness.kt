@@ -29,6 +29,8 @@ internal class RosterClientHarness(
         RosterWire.ROSTER_SLOT_CAPABILITY,
         RosterWire.NATIVE_CAPABILITY,
         RosterWire.NATIVE_NAME_CAPABILITY,
+        RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+        RosterWire.CREATE_WORKSPACE_CAPABILITY,
     ),
     hostId: String = "host-1",
 ) {

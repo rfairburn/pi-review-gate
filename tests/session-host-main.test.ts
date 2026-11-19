@@ -9505,6 +9505,7 @@ class FakePeerCoordinatorWithCreate extends FakePeerCoordinator {
     readonly hostId: string;
     readonly hostRunId: string;
     readonly workspace: string;
+    readonly createWorkspace?: boolean;
   }> = [];
   /** The exact caller proofs Main handed over, retained for later re-evaluation. */
   readonly createOptions: PeerCreateOptions[] = [];
@@ -9516,7 +9517,10 @@ class FakePeerCoordinatorWithCreate extends FakePeerCoordinator {
   createThrows = false;
   /** True while the backend's required last-instant proof still held. */
   readonly createProofs: boolean[] = [];
+  /** The negotiated workspace-creation support this fake controller reports (#493). */
+  createWorkspaceSupported = true;
   readonly ownerCreate: PeerCreateController = {
+    supportsCreateWorkspace: () => this.createWorkspaceSupported,
     createSession: async (target, options) => {
       this.createTargets.push({ ...target });
       this.createOptions.push(options);
@@ -9578,6 +9582,8 @@ async function remoteCreateMainHarness(
     size?: { readonly cols: number; readonly rows: number };
     /** Supply the port when the test needs the coordinator's own observations. */
     content?: FakePeerContentPort;
+    /** Publish the destination's descriptive workspace-creation support (#493). */
+    createWorkspaceSupported?: boolean;
   } = {},
 ): Promise<{
   harness: Harness;
@@ -9594,7 +9600,10 @@ async function remoteCreateMainHarness(
   const size = options.size ?? { cols: 120, rows: 30 };
   started.harness.terminal.setSize(size.cols, size.rows);
   await nextTurn();
-  peer.publish({ hosts: [connectedCreateHost(options.hostRunId === undefined ? "run-a" : options.hostRunId)] as unknown as PeerUiSnapshot["hosts"] });
+  const host = connectedCreateHost(options.hostRunId === undefined ? "run-a" : options.hostRunId);
+  peer.publish({ hosts: [options.createWorkspaceSupported === undefined
+    ? host
+    : { ...host, createWorkspaceSupported: options.createWorkspaceSupported }] as unknown as PeerUiSnapshot["hosts"] });
   await nextTurn();
   await fillRemoteNewForm(started.harness, options.workspace ?? "/srv/owner/project");
   return { harness: started.harness, peer, content, dispatch: started.dispatch };
@@ -9928,6 +9937,257 @@ test("a disconnect and reconnect retires an in-flight remote create the same way
     assert.equal(harness.sidebar!.focus, "form", "no selection follows a retired request");
     assert.deepEqual(content.selections, []);
     assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(UNCERTAIN), true);
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+// --- #493: the New form's checked "Create missing workspace directory" box. ---
+
+const CREATE_WORKSPACE_CHECKED_ROW = "[x] Create missing workspace directory";
+
+/**
+ * From the workspace editor: Shift+Tab to the Host line, Shift+Tab again to wrap
+ * to the checkbox drawn below the editor, Space to check it, and Shift+Tab back up
+ * into the editor — each keystroke's frame written before the next, like Main.
+ */
+async function checkCreateWorkspaceBox(harness: Harness): Promise<void> {
+  for (const key of ["\x1b[Z", "\x1b[Z", " ", "\x1b[Z"]) {
+    harness.terminal.emitInput(key);
+    await nextTurn();
+  }
+  assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(CREATE_WORKSPACE_CHECKED_ROW), true,
+    "the written New form draws the checked box");
+}
+
+/** One connected destination that reports workspace-creation support. */
+function connectedCreatingHost(supported = true): PeerUiHost {
+  return { ...connectedCreateHost(), createWorkspaceSupported: supported } as PeerUiHost;
+}
+
+test("a checked Local New form asks the manager to create the workspace only from its written frame", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  try {
+    harness.terminal.emitInput(ENTER); // New session
+    await nextTurn();
+    await checkCreateWorkspaceBox(harness);
+    harness.terminal.emitInput("/srv/new-workspace");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions, [{ workspace: "/srv/new-workspace", createWorkspace: true }],
+      "the checked intent reaches the one local create, exactly once");
+    assert.equal(harness.sidebar!.focus, "main", "the created child takes Main exactly like an ordinary create");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a checked Local box the writer has not written creates nothing", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  try {
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    harness.terminal.emitInput("/srv/new-workspace");
+    await nextTurn();
+    // Hold the sink BEFORE checking: the operator's screen still shows the box
+    // unchecked, so a creating submission has no written frame to ride.
+    harness.writer.holdWrites = true;
+    for (const key of ["\x1b[Z", "\x1b[Z", " ", "\x1b[Z"]) {
+      harness.terminal.emitInput(key);
+      await nextTurn();
+    }
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions, [], "no create — and never an ordinary create instead");
+    assert.equal(harness.sidebar!.focus, "form");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    const form = harness.sidebar!.renderForm(100, 20).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, " ");
+    assert.equal(form.includes("That New session form is not the displayed form; nothing was sent"), true, form);
+    assert.equal(form.includes(CREATE_WORKSPACE_CHECKED_ROW), true, "the refusal keeps the checked intent");
+    assert.deepEqual(manager.createOptions, []);
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a checked Local create queued for negotiation is re-proved before it may create anything", async () => {
+  // Kept: the queued request still owns its checked form when negotiation settles.
+  {
+    const harness = createHarness();
+    const manager = await started(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await checkCreateWorkspaceBox(harness);
+    harness.terminal.emitInput("/srv/queued");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions, [], "the create waits during initial negotiation");
+    harness.observer.settle(0);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions, [{ workspace: "/srv/queued", createWorkspace: true }]);
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+  // Abandoned: unlike an ordinary queued create, a creating one no longer owned by
+  // its form is never launched, so no unintended directory is created.
+  {
+    const harness = createHarness();
+    const manager = await started(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await checkCreateWorkspaceBox(harness);
+    harness.terminal.emitInput("/srv/abandoned");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    harness.terminal.emitInput(ESC); // abandon the form while its create is still queued
+    await nextTurn();
+    harness.observer.settle(0);
+    await nextTurn();
+    assert.deepEqual(manager.createOptions, [], "an abandoned creating request starts nothing");
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a queued checked Local create never outlives a resize of its written frame's geometry", async () => {
+  for (const scenario of ["too-small", "away-and-back"] as const) {
+    const harness = createHarness();
+    const manager = await started(harness);
+    try {
+      const cols = harness.terminal.columns;
+      const rows = harness.terminal.rows;
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      await checkCreateWorkspaceBox(harness);
+      harness.terminal.emitInput("/srv/queued");
+      await nextTurn();
+      harness.terminal.emitInput(ENTER);
+      await nextTurn();
+      assert.deepEqual(manager.createOptions, [], "the create waits during initial negotiation");
+      if (scenario === "too-small") {
+        // A layout too small to draw the form at all retires the receipt.
+        harness.terminal.setSize(20, 5);
+        await nextTurn();
+      } else {
+        // Resize away and back with nothing repainted in between: the final size
+        // matches, but the physical screen was reflowed.
+        harness.writer.holdWrites = true;
+        harness.terminal.setSize(Math.max(40, cols - 20), rows);
+        await nextTurn();
+        harness.terminal.setSize(cols, rows);
+        await nextTurn();
+      }
+      harness.observer.settle(0);
+      await nextTurn();
+      assert.deepEqual(manager.createOptions, [],
+        `${scenario}: neither a creating nor an ordinary create reaches the manager`);
+    } finally {
+      harness.writer.holdWrites = false;
+      assert.equal(await closeWithSignal(harness), 0);
+    }
+  }
+});
+
+test("a checked remote New form forwards createWorkspace through the one Create controller", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t, { createWorkspaceSupported: true });
+  const manager = harnessManager(harness);
+  try {
+    await checkCreateWorkspaceBox(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [{
+      hostId: "lab-a",
+      hostRunId: "run-a",
+      workspace: "/srv/owner/project",
+      createWorkspace: true,
+    }], "the checked intent is never dropped on the way to the owner");
+    assert.deepEqual(peer.createProofs, [true], "the last-instant proof held for the checked intent");
+    assert.deepEqual(manager.createOptions, [], "no local child, and no local directory, for a remote create");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("an unchecked remote New form to a supporting owner keeps the exact existing target", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t, { createWorkspaceSupported: true });
+  try {
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("[ ] Create missing workspace directory"), true,
+      "a supporting owner draws the default-off box");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [{ hostId: "lab-a", hostRunId: "run-a", workspace: "/srv/owner/project" }]);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a checked remote create whose controller lost creation support sends nothing", async (t) => {
+  const { harness, peer } = await remoteCreateMainHarness(t, { createWorkspaceSupported: true });
+  try {
+    await checkCreateWorkspaceBox(harness);
+    peer.createWorkspaceSupported = false; // the live channel no longer negotiated it
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [], "never sent, and never sent without the intent");
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes(
+      "That destination cannot create a missing workspace directory; nothing was sent"), true);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a forged create intent that differs from the written frame is refused before dispatch", async (t) => {
+  const { harness, peer, dispatch } = await remoteCreateMainHarness(t, { createWorkspaceSupported: true });
+  try {
+    // The written frame drew the box UNCHECKED; a DTO claiming the opposite intent
+    // for that exact frame sends nothing.
+    const written = harness.sidebar!.captureCreateFormPresentation();
+    assert.ok(written !== undefined && written.createWorkspace === false, JSON.stringify(written));
+    dispatch({
+      type: "create-on-peer",
+      requestId: 99,
+      formGeneration: written!.formGeneration,
+      renderToken: written!.renderToken,
+      hostId: "lab-a",
+      hostRunId: "run-a",
+      workspace: "/srv/owner/project",
+      createWorkspace: true,
+    });
+    await nextTurn();
+    assert.deepEqual(peer.createTargets, [], "a forged creating intent never reaches the controller");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a creation-support change retires an in-flight checked remote create even when it returns", async (t) => {
+  const { harness, peer, content } = await remoteCreateMainHarness(t, { createWorkspaceSupported: true });
+  try {
+    await checkCreateWorkspaceBox(harness);
+    let release: (() => void) | undefined;
+    peer.createGate = new Promise<void>((resolve) => { release = resolve; });
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.createProofs, [true]);
+    assert.equal(peer.createOptions[0]!.stillCurrent(), true, "the queued write is current before anything moves");
+    harness.writer.holdWrites = true;
+    peer.publish({ hosts: [connectedCreatingHost(false)] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    peer.publish({ hosts: [connectedCreatingHost(true)] as unknown as PeerUiSnapshot["hosts"] });
+    await nextTurn();
+    assert.equal(peer.createOptions[0]!.stillCurrent(), false,
+      "support that disappears and returns before any paint never revives the queued write's proof");
+    peer.createResult = { kind: "owner-result", facts: { kind: "started", hostRunId: "run-a", rowId: "row-a" } };
+    release?.();
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "form", "no selection follows a retired creating request");
+    assert.deepEqual(content.selections, []);
   } finally {
     harness.writer.holdWrites = false;
     assert.equal(await closeWithSignal(harness), 0);

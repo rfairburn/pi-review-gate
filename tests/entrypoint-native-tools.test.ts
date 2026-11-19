@@ -355,6 +355,7 @@ test("SessionSpawn is reporter-capability-gated for top-level hosted children an
     await activate(standalone.pi);
     await startSession(standalone);
     assert.equal(standalone.definitions.has("SessionSpawn"), false, "ordinary standalone Pi has no host capability");
+    assert.equal(standalone.definitions.has("SessionHosts"), false, "ordinary standalone Pi has no inspection capability");
 
     const capability = { titleColumns: 32, spawn: async () => "started" as const };
     publishSessionHostSpawnCapability(capability);
@@ -364,6 +365,23 @@ test("SessionSpawn is reporter-capability-gated for top-level hosted children an
     await activate(hosted.pi);
     await startSession(hosted);
     assert.equal(hosted.definitions.has("SessionSpawn"), true, "the reporter-published top-level capability registers the tool");
+    assert.equal(hosted.definitions.has("SessionHosts"), false, "a capability without inspection never registers discovery");
+    revokeSessionHostSpawnCapability(capability);
+
+    const inspecting = {
+      titleColumns: 32,
+      routing: true,
+      spawn: async () => "started" as const,
+      inspectHosts: async () => ({ outcome: "complete" as const, snapshot: { ownKinds: ["pi" as const], hosts: [] } }),
+    };
+    publishSessionHostSpawnCapability(inspecting);
+    const inspectingNativeTools = nativeDefinitions();
+    const inspectingHosted = new NativeToolRuntime(cwd, inspectingNativeTools, inspectingNativeTools.map((tool) => tool.name));
+    await activate(inspectingHosted.pi);
+    await startSession(inspectingHosted);
+    assert.equal(inspectingHosted.definitions.has("SessionHosts"), true, "the actual inspection capability registers SessionHosts");
+    assert.match(JSON.stringify(inspectingHosted.definitions.get("SessionSpawn")?.parameters), /Use SessionHosts for paired host ids/);
+    await inspectingHosted.fire("session_shutdown", inspectingHosted.context);
 
     const catalog = createExecutorToolCatalog(["read"], ["read"]);
     const settlement = createPiSettlementBootstrap(cwd, "session-spawn-executor-ceiling");
@@ -375,8 +393,10 @@ test("SessionSpawn is reporter-capability-gated for top-level hosted children an
     await startSession(executor);
     assert.equal(executor.definitions.has("SessionSpawn"), false, "executor role ignores even a process-local capability");
     assert.equal(executor.activeTools().includes("SessionSpawn"), false);
+    assert.equal(executor.definitions.has("SessionHosts"), false, "executor role ignores even a process-local inspection capability");
+    assert.equal(executor.activeTools().includes("SessionHosts"), false);
     await executor.fire("session_shutdown", executor.context);
-    revokeSessionHostSpawnCapability(capability);
+    revokeSessionHostSpawnCapability(inspecting);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

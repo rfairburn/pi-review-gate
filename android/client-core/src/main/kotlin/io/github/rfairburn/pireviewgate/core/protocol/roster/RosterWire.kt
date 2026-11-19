@@ -61,6 +61,38 @@ object RosterWire {
     const val NATIVE_NAME_CAPABILITY: String = "roster-native-name-v1"
 
     /**
+     * Optional capability DESCRIBING how the owner's [NATIVE_CAPABILITY] catalog is
+     * produced (#493). It depends on that lane: an acknowledgement carrying it without
+     * [NATIVE_CAPABILITY] is a protocol violation.
+     *
+     * Acknowledged, each `snapshot_end` catalog is the owner's fresh read-only launch
+     * probe at publication, so its targets are the ones observed launchable then.
+     * Unacknowledged (absent or a legacy owner), the catalog is configuration-only and
+     * its availability is UNKNOWN: never assumed launchable and never assumed
+     * unavailable. It adds no frame, field, target, or kind state, and it grants
+     * nothing: the owner still re-reads and re-proves its own live catalog before
+     * every native create.
+     */
+    const val NATIVE_AVAILABILITY_CAPABILITY: String = "roster-native-availability-v1"
+
+    /**
+     * Optional capability for the request-specific "create missing workspace
+     * directory" flag (#493). Acknowledged, a `create_request` or
+     * `create_native_request` may carry the optional boolean `createWorkspace`; the
+     * owner honours it on every create lane it supports by a plain recursive mkdir
+     * of the requested workspace before launch. It depends on a create lane: an
+     * acknowledgement carrying it without [CREATE_CAPABILITY] or [NATIVE_CAPABILITY]
+     * is a protocol violation.
+     *
+     * It is protocol support only, never a permission or grant. An unchecked request
+     * omits the field, so it is byte-identical to a legacy frame and works on any
+     * owner; a checked request is refused locally, before any write or attempt
+     * number, unless the current owner acknowledged this capability. This side never
+     * creates a directory itself.
+     */
+    const val CREATE_WORKSPACE_CAPABILITY: String = "roster-create-workspace-v1"
+
+    /**
      * Optional capabilities this implementation knows. An identifier offered by a
      * peer is recorded only when it appears here and is otherwise ignored; an
      * acknowledgement additionally narrows to what the owner can really honour.
@@ -73,7 +105,28 @@ object RosterWire {
         ROSTER_SLOT_CAPABILITY,
         NATIVE_CAPABILITY,
         NATIVE_NAME_CAPABILITY,
+        NATIVE_AVAILABILITY_CAPABILITY,
+        CREATE_WORKSPACE_CAPABILITY,
     )
+
+    /**
+     * True when [capabilities] respect every optional-capability dependency: the
+     * native availability description exists only beside the native lane it
+     * describes, and the create-workspace flag exists only beside at least one
+     * create lane (Pi create or native) it can ride on.
+     */
+    fun dependenciesHold(capabilities: Collection<String>): Boolean =
+        nativeAvailabilityDependencyHolds(capabilities) && createWorkspaceDependencyHolds(capabilities)
+
+    /** The native availability description is present only beside the native lane. */
+    fun nativeAvailabilityDependencyHolds(capabilities: Collection<String>): Boolean =
+        !capabilities.contains(NATIVE_AVAILABILITY_CAPABILITY) || capabilities.contains(NATIVE_CAPABILITY)
+
+    /** The create-workspace flag is present only beside a Pi create or native create lane. */
+    fun createWorkspaceDependencyHolds(capabilities: Collection<String>): Boolean =
+        !capabilities.contains(CREATE_WORKSPACE_CAPABILITY) ||
+            capabilities.contains(CREATE_CAPABILITY) ||
+            capabilities.contains(NATIVE_CAPABILITY)
 
     /** One metadata subscription per channel; not configurable. */
     const val MAX_SUBSCRIPTIONS_PER_CHANNEL: Int = 1

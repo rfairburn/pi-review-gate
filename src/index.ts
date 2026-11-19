@@ -74,6 +74,7 @@ import { YOU_SHOULD_KNOW_TOOL_NAME } from "./user-question/notice-tool";
 import { registerSafeMarkdownDisplayTransformer } from "./markdown-safety";
 import { getSessionHostSpawnCapability } from "./session-host/spawn-capability";
 import { registerSessionSpawnTool } from "./session-host/spawn-tool";
+import { registerSessionHostsTool } from "./session-host/hosts-tool";
 import { consumeSessionHostStartupRequest } from "./session-host/startup-request";
 import {
   beginSessionHostRestore,
@@ -265,8 +266,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // child. Register before deferred-tool authorization capture so ordinary
   // native allowlists, deferred discovery, and plan/research visibility keep
   // their existing authority; executor processes never receive this tool.
+  // SessionHosts (read-only discovery) is registered only when that same
+  // capability carries the actual authenticated inspection authority.
   if (!executorRole) {
-    registerSessionSpawnTool(pi, getSessionHostSpawnCapability());
+    const sessionHostCapability = getSessionHostSpawnCapability();
+    registerSessionSpawnTool(pi, sessionHostCapability);
+    registerSessionHostsTool(pi, sessionHostCapability);
   }
 
   if (executorRole) {

@@ -81,6 +81,11 @@ import {
 import { isAbsolute, join } from "node:path";
 
 import { sessionHostStateDir } from "../roster-store";
+import {
+	MAX_PEER_DESTINATIONS,
+	isValidPeerDestinationId as isBoundedDestinationId,
+} from "../peer-destination-id";
+export { MAX_PEER_DESTINATIONS, MAX_PEER_DESTINATION_ID_CHARS } from "../peer-destination-id";
 import type { PeerStatePermissionPolicy } from "./peer-state-permission-policy";
 import { ensureNetworkStateDirectory, type StorageReceipt } from "./peer-storage-base";
 import {
@@ -103,12 +108,6 @@ export const PEER_PREFERENCES_FILENAME = "preferences.json";
 
 /** Bound for the whole published document. */
 export const MAX_PEER_PREFERENCES_FILE_BYTES = 64 * 1024;
-
-/** Bound for saved destinations; larger documents are refused. */
-export const MAX_PEER_DESTINATIONS = 64;
-
-/** Bound for an opaque LOCAL destination id. It never names a path component. */
-export const MAX_PEER_DESTINATION_ID_CHARS = 128;
 
 /** Bound for a saved bind/listen host string. */
 export const MAX_PEER_ENDPOINT_HOST_CHARS = 255;
@@ -232,17 +231,6 @@ function hasOnlyKeys(record: Record<string, unknown>, allowed: readonly string[]
 		if (!allowed.includes(key)) return false;
 	}
 	return true;
-}
-
-function isBoundedDestinationId(value: unknown): value is string {
-	// An opaque local id is data only: it is never used as a path component or a
-	// property key, so names such as `__proto__` are ordinary strings here.
-	return (
-		typeof value === "string"
-		&& value.length > 0
-		&& value.length <= MAX_PEER_DESTINATION_ID_CHARS
-		&& !/[\u0000-\u001f\u007f\u0080-\u009f\u2028\u2029]/.test(value)
-	);
 }
 
 function isSavedPort(value: unknown, allowZero: boolean): value is number {

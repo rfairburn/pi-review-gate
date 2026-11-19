@@ -16,7 +16,7 @@ import type {
   ViewerOpenOptions,
 } from "../src/session-host/instances";
 import { FakeViewerSeam } from "./session-host-viewer-fakes";
-import type { SessionHostNativeSession, SessionSpawnInput } from "../src/session-host/protocol";
+import type { SessionHostNativeSession, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
 import type { SavedSessionCatalog, SavedSessionRow } from "../src/session-host/saved-sessions";
 import {
   createLocalOwningHostService,
@@ -257,6 +257,56 @@ test("an authenticated background child gets the exact workspace, title, and pro
     "the sibling is an independent new row appended after the parent");
   assert.deepEqual(manager.views[0], rowView({ id: "parent-1", workspace: "/parent/workspace" }),
     "the requesting parent row is untouched");
+});
+
+test("a routed kind maps only to its backend default target, and a host selector is never served locally (#493)", async () => {
+  const manager = new SyntheticManager();
+  manager.views = [rowView({ id: "parent-1", workspace: "/parent/workspace" })];
+  const harness = fixture({ manager });
+  const request = spawnRequest();
+
+  assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...request, kind: "pi" }), "started");
+  for (const kind of ["claude", "codex"] as const) {
+    assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...request, kind }), "started");
+  }
+  assert.deepEqual(manager.createOptions, [
+    { workspace: request.workspace, initialRequest: { title: request.title, prompt: request.prompt } },
+    { workspace: request.workspace, initialRequest: { title: request.title, prompt: request.prompt }, backend: "claude", nativeCliTarget: "claude" },
+    { workspace: request.workspace, initialRequest: { title: request.title, prompt: request.prompt }, backend: "codex", nativeCliTarget: "codex" },
+  ], "explicit pi is the legacy create; a native kind names only its default target");
+
+  const before = manager.createOptions.length;
+  assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...request, host: "lab-b" }), "failed");
+  assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...request, host: "lab-b", kind: "codex" }), "failed");
+  assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...request, kind: "gemini" as never }), "failed");
+  assert.equal(manager.createOptions.length, before, "no local child is created for another host or an unknown kind");
+});
+
+test("an errored launch that still owns a process, or whose child already ran, is unknown, never started (#493)", async () => {
+  class ErroredLaunchManager extends SyntheticManager {
+    childView: Partial<NativeInstanceView> = {};
+    override async create(options: CreateInstanceOptions): Promise<string> {
+      this.createOptions.push({ ...options });
+      const id = `child-${this.nextId++}`;
+      this.views.push(rowView({ id, workspace: options.workspace, nativeSession: null, ...this.childView }));
+      return id;
+    }
+  }
+  const cases: readonly (readonly [string, Partial<NativeInstanceView>, SessionSpawnOutcome])[] = [
+    // e.g. an owned Codex backend whose readiness was refused before any TUI existed.
+    ["error row with a live owned process", { lifecycle: "error", hasLiveProcess: true }, "unknown"],
+    ["error row whose child already exited", { lifecycle: "error", hasLiveProcess: false, exitCode: 1 }, "unknown"],
+    ["error row that never owned a process", { lifecycle: "error", hasLiveProcess: false }, "failed"],
+    ["alive row with a live process", { lifecycle: "alive", hasLiveProcess: true }, "started"],
+  ];
+  for (const [name, childView, expected] of cases) {
+    const manager = new ErroredLaunchManager();
+    manager.views = [rowView({ id: "parent-1", workspace: "/parent/workspace" })];
+    manager.childView = childView;
+    const harness = fixture({ manager });
+    assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...spawnRequest(), kind: "codex" }), expected, name);
+    assert.equal(manager.createOptions.length, 1, `${name}: exactly one create, never a retry or fallback`);
+  }
 });
 
 test("a background child is refused for any parent that is not a live alive row", async () => {

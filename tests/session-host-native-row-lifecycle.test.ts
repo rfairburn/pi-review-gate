@@ -73,6 +73,7 @@ import {
   shortBaselineFitsTwentyFourColumns,
   sidebarRosterHidden,
   validateSharedRuntimeEnvironment,
+  workspaceOnlyNewCompletionFrame,
   workspaceOnlyNewFrame,
   type ConversationBinding,
   type JournalSnapshot,
@@ -333,7 +334,10 @@ async function submitWorkspaceOnlyNew(
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the canonical workspace prefix is typed through Pi's real native Editor");
   const basename = workspace.slice(workspace.lastIndexOf(sep) + 1);
-  await driver.waitFrame((text) => workspaceOnlyNewFrame(text) && text.includes(basename),
+  // The open completion list is part of the native Editor render, so the form
+  // draws its checkbox after it; this witness binds the exact typed draft, the
+  // single selected owned-folder suggestion at the Editor column, and that slot.
+  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
     "the native filesystem provider displays the owned workspace completion", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix,
     "the bordered New field contains the literal typed prefix before accepting completion");

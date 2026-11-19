@@ -41,6 +41,8 @@ class AcceptedCreateActivation private constructor(
     val workspace: String,
     /** The exact provider the submitted form chose; native and Pi use different capabilities. */
     val provider: CreateProviderChoice,
+    /** The exact create-workspace choice of the submitted form. */
+    val createWorkspace: Boolean,
     val formProof: UiActionProof,
     val originRoute: ClientRoute,
     private val click: FrozenAction,
@@ -103,10 +105,11 @@ class AcceptedCreateActivation private constructor(
      * Record the actual owner `started` answer for this exact accepted request.
      *
      * Returns the returned run/row only when the form receipt is the same submitted
-     * form and its semantic owner/workspace are unchanged. The controller may then
-     * close that exact form. Any other outcome or correlation cancels permanently; no
-     * other result opens the form or mints a target. Whether navigation is authorized
-     * is kept separate in [mayActivate], so a retired receipt is never recaptured.
+     * form and its semantic owner/workspace/create-workspace choice are unchanged.
+     * The controller may then close that exact form. Any other outcome or correlation
+     * cancels permanently; no other result opens the form or mints a target. Whether
+     * navigation is authorized is kept separate in [mayActivate], so a retired receipt
+     * is never recaptured.
      */
     fun started(event: RosterClientEvent.OperationSettled, form: CreateSessionDialog?): StartedRow? {
         if (!live.get() || returned != null || claimed.get()) return null
@@ -114,7 +117,7 @@ class AcceptedCreateActivation private constructor(
         if (event.kind != RosterOperationKind.CREATE || event.requestId != pending.requestId ||
             event.hostRunId != hostRunId || form == null || form.proof !== formProof ||
             form.selectedHostId != hostId || form.workspaceDraft != workspace ||
-            click.target != formProof.target) {
+            form.createWorkspace != createWorkspace || click.target != formProof.target) {
             cancel()
             return null
         }
@@ -151,10 +154,10 @@ class AcceptedCreateActivation private constructor(
         /**
          * Capture the committed form receipt at the synchronous submit boundary.
          *
-         * The form, selected owner, workspace, and live click must all name the same
-         * create. `originRoute` records where the form was opened so the controller can
-         * cancel a delayed activation after any later explicit navigation; it is never
-         * used to restrict Create to the session list.
+         * The form, selected owner, workspace, create-workspace choice, and live click
+         * must all name the same create. `originRoute` records where the form was
+         * opened so the controller can cancel a delayed activation after any later
+         * explicit navigation; it is never used to restrict Create to the session list.
          */
         fun capture(
             hostId: HostId,
@@ -164,15 +167,17 @@ class AcceptedCreateActivation private constructor(
             form: CreateSessionDialog,
             click: FrozenAction,
             originRoute: ClientRoute,
+            createWorkspace: Boolean = false,
         ): AcceptedCreateActivation? {
             val token = form.proof.target
             if (!click.isStillCurrent() || click.target != token ||
                 token.screen != UiProofScreen.SESSION_CREATE || token.hostId != hostId ||
                 token.hostRunId != hostRunId || token.rowId != null ||
-                form.selectedHostId != hostId || form.workspaceDraft != workspace) return null
+                form.selectedHostId != hostId || form.workspaceDraft != workspace ||
+                form.createWorkspace != createWorkspace) return null
             val provider = form.provider ?: return null
             return AcceptedCreateActivation(hostId, connectionGeneration, hostRunId, workspace, provider,
-                form.proof, originRoute, click)
+                createWorkspace, form.proof, originRoute, click)
         }
     }
 }

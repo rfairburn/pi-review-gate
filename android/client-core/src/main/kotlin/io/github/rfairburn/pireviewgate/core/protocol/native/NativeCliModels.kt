@@ -69,6 +69,17 @@ enum class NativeCliBackend(val wireName: String) {
             CODEX -> SessionBackend.CODEX
         }
 
+    /**
+     * The owner's reserved default launch-target id for this backend: the host's
+     * `NATIVE_CLI_DEFAULT_TARGET_IDS` restated, and the only id a NEW native session
+     * may name (see [isNativeCliNewSessionTarget]).
+     */
+    val defaultTargetId: String
+        get() = when (this) {
+            CLAUDE -> "claude"
+            CODEX -> "codex"
+        }
+
     companion object {
         fun fromWireName(value: String): NativeCliBackend? = entries.firstOrNull { it.wireName == value }
     }
@@ -82,6 +93,21 @@ data class NativeCliTarget(
     /** The owner's own operator-facing label for this target. */
     val label: String,
 )
+
+/**
+ * True only for the one target a NEW native session may launch for [backend]: that
+ * backend's reserved default id (#493), the host's `isNativeCliNewSessionTarget`
+ * restated. A named external worker profile an older owner may still advertise is
+ * never a NEW choice. This governs NEW-session selection only: the wire decoders
+ * keep accepting every well-formed advertised id, and nothing here touches an
+ * existing row's identity.
+ */
+fun isNativeCliNewSessionTarget(backend: NativeCliBackend, targetId: String): Boolean =
+    targetId == backend.defaultTargetId
+
+/** True only when this advertised descriptor is a NEW-session choice. */
+val NativeCliTarget.isNewSessionTarget: Boolean
+    get() = isNativeCliNewSessionTarget(backend, id)
 
 /** Upper bound for one target id, shared by every surface that accepts one. */
 const val MAX_NATIVE_CLI_TARGET_CHARS: Int = 128

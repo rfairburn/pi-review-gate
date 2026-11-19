@@ -21,7 +21,24 @@
  * still carry no tool arguments, prompts, or transcripts. A hosted child may
  * explicitly submit one bounded authenticated SessionSpawn command containing
  * its supplied workspace/title and a reference to its private staged prompt;
- * the host replies only with a bounded launch outcome.
+ * the host replies only with a bounded launch outcome. A request carrying the
+ * optional `host`/`kind` routing selectors travels as a distinct
+ * `spawn_routed_request` frame, sent only when the registration's bootstrap
+ * advertised routed-spawn support (`spawnRouting`), so an older or
+ * not-yet-integrated host can never drop the selectors and launch a local Pi.
+ * A request carrying `createWorkspace: true` also travels as the routed family,
+ * and only when the bootstrap additionally advertised `spawnCreateWorkspace`
+ * (the registration's declared creation support), so an older routed host can
+ * never silently ignore it.
+ * A registration whose bootstrap advertises `sessionHosts` (only together
+ * with `spawnRouting`) also lets the child send one read-only `hosts_request`;
+ * the host answers with one or more bounded, token-authenticated, ordered
+ * `hosts_result` pages that the reporter reassembles into one complete
+ * validated SessionHosts snapshot or reports as unavailable, never partial.
+ * Discovery frames carry only closed backend names, existing opaque saved
+ * destination ids, and each destination's existing saved friendly label (display
+ * metadata, never identity or authority): no prompt, title, workspace, path,
+ * address, or profile data.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
  * transcripts, or credentials. Owned-work counts are opaque numbers only.
@@ -39,6 +56,14 @@
 
 import { isAbsolute, posix as posixPath } from "node:path";
 import { isRecord } from "../record-guard";
+import {
+  MAX_PEER_DESTINATIONS,
+  MAX_PEER_DESTINATION_ID_CHARS,
+  MAX_PEER_DESTINATION_ID_UTF8_BYTES,
+  isValidPeerDestinationId,
+} from "./peer-destination-id";
+import { SESSION_BACKENDS, isSessionBackend, type SessionBackend } from "./session-backend";
+import { DEFAULT_PEER_TRANSPORT_BOUNDS, isValidPeerLabel } from "./network/protocol";
 
 export const HOST_BOOTSTRAP_ENV = "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP";
 
@@ -58,6 +83,13 @@ export const MAX_NATIVE_SESSION_FILE_BYTES = 4096;
 /** SessionSpawn fields have independent transport bounds; sidebar width is not a data limit. */
 export const MAX_SESSION_SPAWN_WORKSPACE_BYTES = 4096;
 export const MAX_SESSION_SPAWN_TITLE_BYTES = MAX_RENAME_NAME_BYTES;
+/**
+ * Optional SessionSpawn host selector transport bound (UTF-8 bytes), derived
+ * from the saved paired-destination id bound so every existing saved id fits;
+ * the value is never clipped. The admitted shape is the saved-id contract
+ * itself ({@link isValidSessionSpawnHost}).
+ */
+export const MAX_SESSION_SPAWN_HOST_BYTES = MAX_PEER_DESTINATION_ID_UTF8_BYTES;
 /** Private staged-payload basenames are bounded, strict, and single-segment. */
 export const MAX_SESSION_PAYLOAD_NAME_BYTES = 64;
 /** Canonical absolute host-owned payload namespace path bound. */
@@ -113,6 +145,35 @@ export interface SessionHostBootstrap {
    * ignores it simply never signals readiness (so the host frames nothing).
    */
   inputOriginFraming?: 1;
+  /**
+   * Closed routed-SessionSpawn support marker. Present (only as mode version 1)
+   * exactly when the host registration installed a routed spawn handler, so a
+   * reporter may submit `spawn_routed_request` frames. Absence means the host
+   * accepts only the legacy three-field own-host Pi request; the reporter then
+   * refuses any request carrying `host` or `kind` before staging or sending
+   * anything. Any other value rejects the whole bootstrap.
+   */
+  spawnRouting?: 1;
+  /**
+   * Closed read-only SessionHosts discovery marker. Present (only as mode
+   * version 1, and only together with {@link spawnRouting}) exactly when the
+   * host registration installed an actual discovery handler, so the reporter
+   * may send `hosts_request` frames and expose the SessionHosts capability.
+   * Absence means no inspection is available; any other value rejects the
+   * whole bootstrap.
+   */
+  sessionHosts?: 1;
+  /**
+   * Closed SessionSpawn workspace-creation support marker (issue #493). Present
+   * (only as mode version 1, and only together with {@link spawnRouting})
+   * exactly when the host registration declared that its routed spawn handler
+   * honors `createWorkspace`, so the reporter may send a routed request carrying
+   * `createWorkspace: true`. Absence means the reporter refuses such a request
+   * before staging or sending anything, so an older routed host can never
+   * silently ignore it. Implementation support only, never a permission. Any
+   * other value rejects the whole bootstrap.
+   */
+  spawnCreateWorkspace?: 1;
 }
 
 /** First wire frame after connecting: authenticates the reporter to the host. */
@@ -316,10 +377,17 @@ export function parseSessionHostPayloadRef(value: unknown): SessionHostPayloadRe
   return { name: value.name, size: value.size as number, sha256: value.sha256 };
 }
 
-/** Explicit child request; the token is checked by the broker and never passed to host/UI callbacks. */
+/**
+ * Explicit child request; the token is checked by the broker and never passed
+ * to host/UI callbacks. The frame type is fixed by the routing selectors: a
+ * request carrying `host` and/or `kind` is a `spawn_routed_request` (a family
+ * older brokers do not decode, so they close the connection instead of
+ * silently dropping the selectors); one carrying neither is the legacy
+ * `spawn_request`. The parser rejects any mismatch.
+ */
 export interface SessionHostSpawnRequest {
   version: 1;
-  type: "spawn_request";
+  type: "spawn_request" | "spawn_routed_request";
   instanceId: string;
   generation: string;
   token: string;
@@ -329,6 +397,16 @@ export interface SessionHostSpawnRequest {
   title: string;
   /** Private staged prompt reference; the exact text is read and verified by the broker. */
   payload: SessionHostPayloadRef;
+  /** Exact optional host selector (routed requests only); absence means the requesting child's own host. */
+  host?: string;
+  /** Exact optional child backend (routed requests only); absence means `pi`. */
+  kind?: SessionBackend;
+  /**
+   * Opt-in destination workspace creation (routed requests only). Carried only as
+   * `true`; absence (or an admitted explicit `false`, which the parser drops) is
+   * the noncreating request exactly.
+   */
+  createWorkspace?: true;
 }
 
 /** Host acknowledgement is about launch, never model completion or prompt processing. */
@@ -341,18 +419,152 @@ export interface SessionHostSpawnAck {
   outcome: "started" | "failed" | "unknown";
 }
 
-/** Non-wire input passed from the broker to the owning host registration. */
+/**
+ * The one SessionSpawn input representation: model tool -> reporter
+ * capability -> broker -> owning host handler. Every value is carried exactly
+ * as supplied. `host` and `kind` are optional routing selectors: absent `host`
+ * means the requesting child's own host (never the host currently selected or
+ * viewed in any UI), and absent `kind` means `pi`. A present selector is never
+ * dropped or defaulted away: it is honored by a routed handler or refused.
+ */
 export interface SessionSpawnInput {
   workspace: string;
   title: string;
   prompt: string;
+  host?: string;
+  kind?: SessionBackend;
+  /**
+   * Opt-in destination workspace creation (issue #493). Only `true` asks the
+   * DESTINATION host (this host when `host` is omitted) to ensure the workspace
+   * exists with one ordinary recursive directory creation before its normal
+   * launch; it is never performed by a requester for a remote path. Absent or
+   * `false` is the noncreating request exactly. A `true` value is never dropped:
+   * it is honored by a handler that declared support or refused.
+   */
+  createWorkspace?: boolean;
+}
+
+/**
+ * The legacy own-host Pi input shape: exactly the three original fields. The
+ * broker passes only this shape to a legacy (Pi-only) spawn handler; a request
+ * carrying any routing selector never reaches such a handler.
+ */
+export type LegacySessionSpawnInput = Omit<SessionSpawnInput, "host" | "kind" | "createWorkspace"> & {
+  host?: never;
+  kind?: never;
+  createWorkspace?: never;
+};
+
+/** True when the input or request carries any routing selector (a present value, even `kind: "pi"`). */
+export function hasSessionSpawnRouting(value: { readonly host?: unknown; readonly kind?: unknown }): boolean {
+  return value.host !== undefined || value.kind !== undefined;
+}
+
+/** True only when the input or request asks for destination workspace creation (an exact `true`). */
+export function hasSessionSpawnCreateWorkspace(value: { readonly createWorkspace?: unknown }): boolean {
+  return value.createWorkspace === true;
+}
+
+/**
+ * True when a request must travel as the routed family: any routing selector,
+ * or a creation request. Older brokers either do not decode that family or route
+ * it only to a handler whose registration declared what it honors.
+ */
+export function requiresRoutedSessionSpawn(
+  value: { readonly host?: unknown; readonly kind?: unknown; readonly createWorkspace?: unknown },
+): boolean {
+  return hasSessionSpawnRouting(value) || hasSessionSpawnCreateWorkspace(value);
+}
+
+/**
+ * Admits an exact host selector: precisely the existing saved paired-destination
+ * id contract ({@link isValidPeerDestinationId}), matched raw with no trimming,
+ * case folding, or other rewriting. Surrounding whitespace is part of an id, so
+ * it is not refused here. Shape-only; it claims nothing about whether such a
+ * host exists. There is no local alias: the caller's own host is selected by
+ * omitting the selector.
+ */
+export function isValidSessionSpawnHost(value: unknown): value is string {
+  return isValidPeerDestinationId(value);
 }
 
 export type SessionSpawnOutcome = SessionHostSpawnAck["outcome"];
 
+/** One paired destination the caller may select with SessionSpawn `host`. */
+export interface SessionHostsEntry {
+  /** Exact existing opaque saved destination id; never an invented local alias. */
+  readonly id: string;
+  /**
+   * The destination's existing saved friendly label, exactly as stored and
+   * bounded by the existing peer label contract ({@link isValidPeerLabel}).
+   * Descriptive only: labels may repeat across destinations and are never
+   * accepted as a SessionSpawn `host` selector.
+   */
+  readonly label: string;
+  /** Current kind observations for that destination, canonical order, no duplicates. */
+  readonly kinds: readonly SessionBackend[];
+}
+
+/**
+ * The canonical structured SessionHosts snapshot. `ownKinds` describes the
+ * caller's own host (selected by omitting SessionSpawn `host`); `hosts` lists
+ * existing paired destination ids eligible for selection. The snapshot is
+ * descriptive only: it is neither a permission grant nor a launch receipt.
+ */
+export interface SessionHostsSnapshot {
+  readonly ownKinds: readonly SessionBackend[];
+  readonly hosts: readonly SessionHostsEntry[];
+}
+
+/** Read-only child-to-host discovery request; carries no user data. */
+export interface SessionHostHostsRequest {
+  version: 1;
+  type: "hosts_request";
+  instanceId: string;
+  generation: string;
+  token: string;
+  requestId: string;
+}
+
+/**
+ * One ordered page of a discovery result. A complete result is `parts` pages
+ * with `part` 0..parts-1 in order; page 0 alone carries `ownKinds`, and every
+ * page carries a nonempty slice of `hosts` when there is more than one page.
+ * An unavailable result is exactly one page with neither field. Each page is
+ * token-authenticated like other host-originated commands.
+ */
+export interface SessionHostHostsResult {
+  version: 1;
+  type: "hosts_result";
+  instanceId: string;
+  generation: string;
+  token: string;
+  requestId: string;
+  outcome: "complete" | "unavailable";
+  part: number;
+  parts: number;
+  ownKinds?: SessionBackend[];
+  hosts?: SessionHostsEntry[];
+}
+
+/** Why an inspection could not produce a complete snapshot; never a claim that no hosts exist. */
+export type SessionHostsUnavailableReason =
+  | "not-connected"
+  | "busy"
+  | "cancelled"
+  | "timeout"
+  | "disconnected"
+  | "host-unavailable"
+  | "protocol";
+
+/** Reporter-side inspection outcome: one complete validated snapshot, or unavailable. */
+export type SessionHostsInspection =
+  | { readonly outcome: "complete"; readonly snapshot: SessionHostsSnapshot }
+  | { readonly outcome: "unavailable"; readonly reason: SessionHostsUnavailableReason };
+
 export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
   | SessionHostShutdownRequest | SessionHostShutdownAck | SessionHostSpawnRequest | SessionHostSpawnAck
-  | SessionHostActivityRequest | SessionHostActivityResult;
+  | SessionHostActivityRequest | SessionHostActivityResult | SessionHostHostsRequest | SessionHostHostsResult;
 
 function isValidId(value: unknown): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= MAX_ID_LENGTH && ID_PATTERN.test(value);
@@ -467,6 +679,15 @@ function parseOwnedCount(value: unknown): number | null {
  */
 export const INPUT_ORIGIN_FRAMING_MODE = 1 as const;
 
+/** The only admitted routed-SessionSpawn bootstrap marker version. */
+export const SESSION_SPAWN_ROUTING_MODE = 1 as const;
+
+/** The only admitted read-only SessionHosts discovery bootstrap marker version. */
+export const SESSION_HOSTS_DISCOVERY_MODE = 1 as const;
+
+/** The only admitted SessionSpawn workspace-creation support bootstrap marker version. */
+export const SESSION_SPAWN_CREATE_WORKSPACE_MODE = 1 as const;
+
 /**
  * Validates a parsed bootstrap value. Returns undefined (never throws) when
  * any field is missing, unbounded, or malformed.
@@ -492,6 +713,16 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
   if (value.inputOriginFraming !== undefined && value.inputOriginFraming !== INPUT_ORIGIN_FRAMING_MODE) {
     return undefined;
   }
+  if (value.spawnRouting !== undefined && value.spawnRouting !== SESSION_SPAWN_ROUTING_MODE) return undefined;
+  // Discovery describes routed-spawn destinations, so it is meaningful (and
+  // admitted) only alongside the routed-spawn marker.
+  if (value.sessionHosts !== undefined
+    && (value.sessionHosts !== SESSION_HOSTS_DISCOVERY_MODE || value.spawnRouting === undefined)) return undefined;
+  // Creation support describes the routed handler, so it is admitted only beside it.
+  if (value.spawnCreateWorkspace !== undefined
+    && (value.spawnCreateWorkspace !== SESSION_SPAWN_CREATE_WORKSPACE_MODE || value.spawnRouting === undefined)) {
+    return undefined;
+  }
   return {
     version: 1,
     socketPath: value.socketPath,
@@ -500,6 +731,9 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
     generation: value.generation,
     ...(value.payloadDir === undefined ? {} : { payloadDir: value.payloadDir }),
     ...(value.inputOriginFraming === undefined ? {} : { inputOriginFraming: INPUT_ORIGIN_FRAMING_MODE }),
+    ...(value.spawnRouting === undefined ? {} : { spawnRouting: SESSION_SPAWN_ROUTING_MODE }),
+    ...(value.sessionHosts === undefined ? {} : { sessionHosts: SESSION_HOSTS_DISCOVERY_MODE }),
+    ...(value.spawnCreateWorkspace === undefined ? {} : { spawnCreateWorkspace: SESSION_SPAWN_CREATE_WORKSPACE_MODE }),
   };
 }
 
@@ -760,7 +994,20 @@ export function parseShutdownAck(value: unknown): SessionHostShutdownAck | undef
 
 /** Validates a bounded host-mediated fresh-session request without normalizing any supplied data. */
 export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | undefined {
-  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "spawn_request") return undefined;
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION
+    || (value.type !== "spawn_request" && value.type !== "spawn_routed_request")) return undefined;
+  // Own-property presence, not truthiness: a present selector key must carry a
+  // valid value, and its presence fixes the frame family.
+  const hasHost = Object.prototype.hasOwnProperty.call(value, "host");
+  const hasKind = Object.prototype.hasOwnProperty.call(value, "kind");
+  if (hasHost && !isValidSessionSpawnHost(value.host)) return undefined;
+  if (hasKind && !isSessionBackend(value.kind)) return undefined;
+  // A present creation flag must be a boolean; only `true` asks for creation, and
+  // it fixes the routed family exactly like a selector does.
+  const hasCreateWorkspace = Object.prototype.hasOwnProperty.call(value, "createWorkspace");
+  if (hasCreateWorkspace && typeof value.createWorkspace !== "boolean") return undefined;
+  const createWorkspace = value.createWorkspace === true;
+  if ((value.type === "spawn_routed_request") !== (hasHost || hasKind || createWorkspace)) return undefined;
   if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)
     || !isValidId(value.requestId)) return undefined;
   if (typeof value.workspace !== "string" || value.workspace.length === 0
@@ -772,7 +1019,7 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
   if (!payload) return undefined;
   const parsed: SessionHostSpawnRequest = {
     version: 1,
-    type: "spawn_request",
+    type: value.type,
     instanceId: value.instanceId,
     generation: value.generation,
     token: value.token,
@@ -780,6 +1027,9 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
     workspace: value.workspace,
     title: value.title,
     payload,
+    ...(hasHost ? { host: value.host as string } : {}),
+    ...(hasKind ? { kind: value.kind as SessionBackend } : {}),
+    ...(createWorkspace ? { createWorkspace: true as const } : {}),
   };
   // The prompt text is out-of-band; the bounded reference and title must still
   // fit the shared raw-frame limit before the reporter attempts a write.
@@ -800,6 +1050,310 @@ export function parseSpawnAck(value: unknown): SessionHostSpawnAck | undefined {
     requestId: value.requestId,
     outcome: value.outcome,
   };
+}
+
+// ---------------------------------------------------------------------------
+// SessionHosts discovery (issue #493)
+// ---------------------------------------------------------------------------
+
+/** Worst-case encoded bytes of one host entry plus its array separator. */
+const WORST_HOSTS_ENTRY_BYTES = Buffer.byteLength(JSON.stringify({
+  // An unpaired surrogate is the costliest admitted code unit once JSON-escaped (6 bytes).
+  id: "\ud800".repeat(MAX_PEER_DESTINATION_ID_CHARS),
+  // The existing label alphabet needs no JSON escaping, so the longest admitted
+  // label costs exactly its existing byte bound.
+  label: "x".repeat(DEFAULT_PEER_TRANSPORT_BOUNDS.maxLabelBytes),
+  kinds: SESSION_BACKENDS,
+}), "utf8") + 1;
+
+/** Worst-case page envelope (largest ids/token/counters, `ownKinds`, empty `hosts`) plus newline. */
+const WORST_HOSTS_ENVELOPE_BYTES = Buffer.byteLength(JSON.stringify({
+  version: PROTOCOL_VERSION,
+  type: "hosts_result",
+  instanceId: "f".repeat(MAX_ID_LENGTH),
+  generation: "f".repeat(MAX_ID_LENGTH),
+  token: "f".repeat(64),
+  requestId: "f".repeat(MAX_ID_LENGTH),
+  outcome: "complete",
+  part: 99,
+  parts: 99,
+  ownKinds: SESSION_BACKENDS,
+  hosts: [],
+}), "utf8") + 1;
+
+/**
+ * Upper bound on discovery pages, derived only from the existing frame cap and
+ * the existing saved-destination bounds (never a separate host limit). Greedy
+ * packing places at least floor(capacity / worst entry) entries on every page
+ * but the last, so a valid snapshot never needs more pages than this.
+ */
+export const MAX_SESSION_HOSTS_RESULT_PARTS = Math.ceil(
+  MAX_PEER_DESTINATIONS / Math.floor((MAX_STATUS_FRAME_BYTES - WORST_HOSTS_ENVELOPE_BYTES) / WORST_HOSTS_ENTRY_BYTES),
+);
+
+/**
+ * Closed kind-list validation: an array of known backends with no duplicates.
+ * Returns the canonical (display-order) list; with `requireCanonical` a list
+ * that is not already canonical is refused instead of reordered.
+ */
+function parseSessionHostKinds(value: unknown, requireCanonical: boolean): SessionBackend[] | undefined {
+  if (!Array.isArray(value) || value.length > SESSION_BACKENDS.length) return undefined;
+  const seen = new Set<SessionBackend>();
+  for (const kind of value) {
+    if (!isSessionBackend(kind) || seen.has(kind)) return undefined;
+    seen.add(kind);
+  }
+  const canonical = SESSION_BACKENDS.filter((kind) => seen.has(kind));
+  if (requireCanonical && canonical.some((kind, index) => value[index] !== kind)) return undefined;
+  return canonical;
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Object.keys(value);
+  return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+/**
+ * Closed `{ id, label, kinds }` entry with an existing saved-destination id
+ * shape and an existing saved-label shape. The label is required and kept
+ * exactly; it is never compared, deduplicated, or used as identity.
+ */
+function parseSessionHostsEntry(value: unknown, requireCanonical: boolean): SessionHostsEntry | undefined {
+  if (!isRecord(value) || !hasExactKeys(value, ["id", "label", "kinds"])) return undefined;
+  if (!isValidPeerDestinationId(value.id) || !isValidPeerLabel(value.label)) return undefined;
+  const kinds = parseSessionHostKinds(value.kinds, requireCanonical);
+  if (!kinds) return undefined;
+  return { id: value.id, label: value.label, kinds };
+}
+
+function parseSessionHostsEntries(
+  value: unknown,
+  requireCanonical: boolean,
+  seen: Set<string> = new Set(),
+): SessionHostsEntry[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_PEER_DESTINATIONS) return undefined;
+  const hosts: SessionHostsEntry[] = [];
+  for (const raw of value) {
+    const entry = parseSessionHostsEntry(raw, requireCanonical);
+    // Ids are compared exactly as stored: no trimming or case folding.
+    if (!entry || seen.has(entry.id)) return undefined;
+    seen.add(entry.id);
+    hosts.push(entry);
+  }
+  return hosts;
+}
+
+/**
+ * The one canonical SessionHosts snapshot validator. Admits exactly
+ * `{ ownKinds, hosts }` with closed kind lists (duplicates refused, order
+ * canonicalized), closed `{ id, label, kinds }` entries whose ids satisfy the
+ * existing saved-destination contract and whose labels satisfy the existing
+ * saved-label contract, unique ids (labels may repeat), and at most the
+ * existing saved destination bound. Returns a fresh frozen canonical copy, or undefined.
+ */
+export function parseSessionHostsSnapshot(value: unknown): SessionHostsSnapshot | undefined {
+  if (!isRecord(value) || !hasExactKeys(value, ["ownKinds", "hosts"])) return undefined;
+  const ownKinds = parseSessionHostKinds(value.ownKinds, false);
+  const hosts = parseSessionHostsEntries(value.hosts, false);
+  if (!ownKinds || !hosts) return undefined;
+  return Object.freeze({
+    ownKinds: Object.freeze(ownKinds),
+    hosts: Object.freeze(hosts.map((entry) => Object.freeze({
+      id: entry.id,
+      label: entry.label,
+      kinds: Object.freeze([...entry.kinds]),
+    }))),
+  });
+}
+
+/** Validates a child-to-host read-only discovery request. */
+export function parseHostsRequest(value: unknown): SessionHostHostsRequest | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "hosts_request") return undefined;
+  if (!hasExactKeys(value, ["version", "type", "instanceId", "generation", "token", "requestId"])) return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)
+    || !isValidId(value.requestId)) return undefined;
+  return {
+    version: 1,
+    type: "hosts_request",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    token: value.token,
+    requestId: value.requestId,
+  };
+}
+
+/**
+ * Validates one discovery result page in isolation: envelope identity shapes,
+ * part/parts counters within the transport-derived bound, outcome-specific
+ * closed fields, canonical kind lists, and unique valid ids within the page.
+ * Cross-page sequence, count, and uniqueness are checked by
+ * {@link SessionHostsResultAssembler}.
+ */
+export function parseHostsResult(value: unknown): SessionHostHostsResult | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "hosts_result") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)
+    || !isValidId(value.requestId)) return undefined;
+  if (!Number.isSafeInteger(value.parts) || (value.parts as number) < 1
+    || (value.parts as number) > MAX_SESSION_HOSTS_RESULT_PARTS) return undefined;
+  if (!Number.isSafeInteger(value.part) || (value.part as number) < 0
+    || (value.part as number) >= (value.parts as number)) return undefined;
+  const envelope = ["version", "type", "instanceId", "generation", "token", "requestId", "outcome", "part", "parts"];
+  const base = {
+    version: 1 as const,
+    type: "hosts_result" as const,
+    instanceId: value.instanceId,
+    generation: value.generation,
+    token: value.token,
+    requestId: value.requestId,
+    part: value.part as number,
+    parts: value.parts as number,
+  };
+  if (value.outcome === "unavailable") {
+    if (!hasExactKeys(value, envelope) || value.parts !== 1) return undefined;
+    return { ...base, outcome: "unavailable" };
+  }
+  if (value.outcome !== "complete") return undefined;
+  const first = value.part === 0;
+  if (!hasExactKeys(value, first ? [...envelope, "ownKinds", "hosts"] : [...envelope, "hosts"])) return undefined;
+  const hosts = parseSessionHostsEntries(value.hosts, true);
+  if (!hosts) return undefined;
+  // A page in a multi-page result always carries hosts; empty filler pages are malformed.
+  if ((value.parts as number) > 1 && hosts.length === 0) return undefined;
+  if (!first) return { ...base, outcome: "complete", hosts };
+  const ownKinds = parseSessionHostKinds(value.ownKinds, true);
+  if (!ownKinds) return undefined;
+  return { ...base, outcome: "complete", ownKinds, hosts };
+}
+
+/** Correlation identity shared by every page of one discovery result. */
+export interface SessionHostsResultIdentity {
+  readonly instanceId: string;
+  readonly generation: string;
+  readonly token: string;
+  readonly requestId: string;
+}
+
+/**
+ * Encodes one discovery reply as ordered newline-terminated wire frames. A
+ * snapshot is canonicalized and validated first; an invalid or absent snapshot
+ * becomes one `unavailable` page, never a partial listing. Hosts are packed
+ * greedily by measured encoded size, so the small common case is one frame and
+ * large Unicode/long-id snapshots split across bounded frames without
+ * truncation or any new total-host limit.
+ */
+export function encodeSessionHostsResultFrames(
+  identity: SessionHostsResultIdentity,
+  snapshot: unknown,
+): string[] {
+  const envelope = {
+    version: 1 as const,
+    type: "hosts_result" as const,
+    instanceId: identity.instanceId,
+    generation: identity.generation,
+    token: identity.token,
+    requestId: identity.requestId,
+  };
+  const unavailable = (): string[] => [encodeFrame({ ...envelope, outcome: "unavailable", part: 0, parts: 1 })];
+  const canonical = parseSessionHostsSnapshot(snapshot);
+  if (!canonical) return unavailable();
+  const pageFrame = (part: number, parts: number, hosts: readonly SessionHostsEntry[]): string => `${JSON.stringify({
+    ...envelope,
+    outcome: "complete",
+    part,
+    parts,
+    ...(part === 0 ? { ownKinds: canonical.ownKinds } : {}),
+    hosts,
+  })}\n`;
+  const fits = (part: number, hosts: readonly SessionHostsEntry[]): boolean =>
+    // Measure with the widest admitted counters so final numbering cannot grow a page.
+    Buffer.byteLength(pageFrame(part === 0 ? 0 : MAX_SESSION_HOSTS_RESULT_PARTS - 1, MAX_SESSION_HOSTS_RESULT_PARTS, hosts), "utf8")
+      <= MAX_STATUS_FRAME_BYTES;
+  const pages: SessionHostsEntry[][] = [[]];
+  for (const entry of canonical.hosts) {
+    const current = pages[pages.length - 1]!;
+    if (current.length > 0 && !fits(pages.length - 1, [...current, entry])) {
+      pages.push([entry]);
+    } else {
+      current.push(entry);
+    }
+    if (!fits(pages.length - 1, pages[pages.length - 1]!)) return unavailable();
+  }
+  if (pages.length > MAX_SESSION_HOSTS_RESULT_PARTS) return unavailable();
+  try {
+    const frames = pages.map((hosts, part) => pageFrame(part, pages.length, hosts));
+    for (const frame of frames) {
+      if (Buffer.byteLength(frame, "utf8") > MAX_STATUS_FRAME_BYTES
+        || !parseHostsResult(JSON.parse(frame.slice(0, -1)))) return unavailable();
+    }
+    return frames;
+  } catch {
+    return unavailable();
+  }
+}
+
+/** One assembler step: more pages expected, a final outcome, or a protocol violation. */
+export type SessionHostsAssemblyStep =
+  | { readonly status: "pending" }
+  | { readonly status: "complete"; readonly snapshot: SessionHostsSnapshot }
+  | { readonly status: "unavailable" }
+  | { readonly status: "invalid" };
+
+/**
+ * Reassembles one discovery result from its ordered pages. The caller has
+ * already authenticated each page's instance, generation, and token and routed
+ * it by request id. Pages must arrive strictly in order with a constant
+ * `parts`/`outcome`; ids must be unique across pages; the final snapshot is
+ * re-validated with {@link parseSessionHostsSnapshot}. Nothing is returned as
+ * complete until every page arrived, and any deviation is `invalid`.
+ */
+export class SessionHostsResultAssembler {
+  readonly #requestId: string;
+  #parts: number | undefined;
+  #ownKinds: SessionBackend[] | undefined;
+  readonly #hosts: SessionHostsEntry[] = [];
+  readonly #ids = new Set<string>();
+  /** Pages accepted so far; the next page must carry exactly this index. */
+  #accepted = 0;
+  #finished = false;
+
+  constructor(requestId: string) {
+    this.#requestId = requestId;
+  }
+
+  accept(page: SessionHostHostsResult): SessionHostsAssemblyStep {
+    if (this.#finished || page.requestId !== this.#requestId) return this.#fail();
+    if (page.outcome === "unavailable") {
+      if (this.#parts !== undefined || page.part !== 0 || page.parts !== 1) return this.#fail();
+      this.#finished = true;
+      return { status: "unavailable" };
+    }
+    if (page.part !== this.#accepted) return this.#fail();
+    if (this.#parts === undefined) {
+      if (page.ownKinds === undefined) return this.#fail();
+      this.#parts = page.parts;
+      this.#ownKinds = [...page.ownKinds];
+    } else if (page.parts !== this.#parts || page.ownKinds !== undefined) {
+      return this.#fail();
+    }
+    if (!page.hosts) return this.#fail();
+    for (const entry of page.hosts) {
+      // Exact-id uniqueness across pages, checked on arrival.
+      if (this.#ids.has(entry.id)) return this.#fail();
+      this.#ids.add(entry.id);
+    }
+    this.#hosts.push(...page.hosts);
+    this.#accepted += 1;
+    if (this.#hosts.length > MAX_PEER_DESTINATIONS) return this.#fail();
+    if (this.#accepted < this.#parts) return { status: "pending" };
+    this.#finished = true;
+    const snapshot = parseSessionHostsSnapshot({ ownKinds: this.#ownKinds, hosts: this.#hosts });
+    return snapshot ? { status: "complete", snapshot } : { status: "invalid" };
+  }
+
+  #fail(): SessionHostsAssemblyStep {
+    this.#finished = true;
+    return { status: "invalid" };
+  }
 }
 
 /**
@@ -824,10 +1378,13 @@ export function decodeFrame(line: string): SessionHostMessage | undefined {
     case "rename_result": return parseRenameAck(parsed);
     case "shutdown_request": return parseShutdownRequest(parsed);
     case "shutdown_result": return parseShutdownAck(parsed);
-    case "spawn_request": return parseSpawnRequest(parsed);
+    case "spawn_request":
+    case "spawn_routed_request": return parseSpawnRequest(parsed);
     case "spawn_result": return parseSpawnAck(parsed);
     case "activity_request": return parseActivityRequest(parsed);
     case "activity_result": return parseActivityResult(parsed);
+    case "hosts_request": return parseHostsRequest(parsed);
+    case "hosts_result": return parseHostsResult(parsed);
     default: return undefined;
   }
 }

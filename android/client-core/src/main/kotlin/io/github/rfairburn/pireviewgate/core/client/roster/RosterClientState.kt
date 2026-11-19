@@ -299,6 +299,25 @@ public data class RosterClientState(
     /** True only when this owner acknowledged the native create/catalog lane. */
     public val supportsNative: Boolean get() = capabilities.contains(RosterWire.NATIVE_CAPABILITY)
 
+    /**
+     * True only when this owner acknowledged that its native catalog is a fresh launch
+     * probe at each publication. Both identifiers are read again so this can never
+     * describe a catalog the native lane does not carry. Observation only: it grants
+     * no target and relaxes no create check.
+     */
+    public val supportsNativeAvailability: Boolean
+        get() = capabilities.contains(RosterWire.NATIVE_CAPABILITY) &&
+            capabilities.contains(RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+
+    /**
+     * True only when this owner acknowledged the request-specific create-workspace
+     * flag beside at least one create lane. Protocol support only, never a grant:
+     * each lane still needs its own create capability.
+     */
+    public val supportsCreateWorkspace: Boolean
+        get() = capabilities.contains(RosterWire.CREATE_WORKSPACE_CAPABILITY) &&
+            (capabilities.contains(RosterWire.CREATE_CAPABILITY) || capabilities.contains(RosterWire.NATIVE_CAPABILITY))
+
     /** True only when this owner acknowledged the SEPARATE native host-caption lane. */
     public val supportsNativeName: Boolean get() = capabilities.contains(RosterWire.NATIVE_NAME_CAPABILITY)
 

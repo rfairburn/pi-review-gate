@@ -70,6 +70,8 @@ public sealed interface RosterSendProof {
         public val hostRunId: String,
         public val workspace: String,
         public val ui: RosterUiProof,
+        /** The create-workspace choice the written form held; must equal the command's. */
+        public val createWorkspace: Boolean = false,
     ) : RosterSendProof
 
     /**
@@ -88,6 +90,8 @@ public sealed interface RosterSendProof {
         /** The catalog observation to which the chosen target belonged. */
         public val catalogScope: NativeCatalogScope,
         public val ui: RosterUiProof,
+        /** The create-workspace choice the written form held; must equal the command's. */
+        public val createWorkspace: Boolean = false,
     ) : RosterSendProof
 
     /**
@@ -151,6 +155,12 @@ public data class RosterCreateCommand(
     /** Canonical workspace text exactly as the form held it. Never trimmed, resolved, or rewritten. */
     public val workspace: String,
     public val proof: RosterSendProof.Form? = null,
+    /**
+     * Ask the owner to create the missing workspace directory before launch. False
+     * (the default) sends the legacy frame unchanged; true is refused as never
+     * submitted unless this owner acknowledged the create-workspace capability.
+     */
+    public val createWorkspace: Boolean = false,
 )
 
 /**
@@ -168,6 +178,8 @@ public data class RosterNativeCreateCommand(
     /** Exact owner-advertised target id; the owner matches it with [backend]. */
     public val targetId: String,
     public val proof: RosterSendProof.NativeForm? = null,
+    /** The same request-specific create-workspace flag as [RosterCreateCommand.createWorkspace]. */
+    public val createWorkspace: Boolean = false,
 )
 
 /** Ask this owner to rename exactly one row, fenced to that row's native conversation tuple. */

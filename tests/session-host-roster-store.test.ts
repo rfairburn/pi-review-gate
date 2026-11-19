@@ -910,17 +910,26 @@ test("the remembered roster keeps one native display name and refuses anything u
   assert.equal(localSlot(named)?.backend, "claude", "a caption never replaces the provider identity");
   assert.equal(localSlot(named)?.name, undefined, "a caption is not the remembered conversation name");
 
-  // A caption the Pi rename path would refuse, and one the sidebar would refuse,
-  // are both malformed: the two rules cannot drift apart silently.
+  // A stored caption follows the shared native caption rule (#493): a manual
+  // caption or an exact Codex SessionSpawn startup title, which may keep its
+  // surrounding spaces and exceed the 80-unit manual INPUT bound up to the
+  // 1024-byte SessionSpawn title bound. Both are remembered exactly.
+  for (const displayName of [" Fleet ", "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS + 1), "y".repeat(1024)]) {
+    assert.equal(localSlot(parseStoredRoster({
+      version: ROSTER_STORE_VERSION,
+      entries: [{ slotId: "s1", workspace: "/srv/app", backend: "claude", displayName }],
+    }))?.displayName, displayName, "an admitted caption is remembered whole, never trimmed or clipped");
+  }
+  // Anything outside that rule is malformed, never a truncated guess.
   for (const displayName of [
     "",
     "   ",
-    " Fleet ",
     "one\nline",
     "line\u2028break",
     "bell\u0007",
     "c1\u0085control",
-    "x".repeat(MAX_NATIVE_DISPLAY_NAME_CHARS + 1),
+    "y".repeat(1025),
+    "\u00e9".repeat(513),
     null,
     1,
     true,

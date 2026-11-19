@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
-import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveExistingDirectory } from "./profiles";
+import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveWorkspaceDirectory } from "./profiles";
 import {
   NODE_OPTIONS_RESTORE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
@@ -61,6 +61,7 @@ import {
 	isValidNativeSessionFile,
 	isValidRenameName,
 	type SessionHostNativeSession,
+	type SessionHostsSnapshot,
 	type SessionSpawnInput,
 	type SessionSpawnOutcome,
 } from "./protocol";
@@ -86,6 +87,7 @@ import {
 import type {
 	NativeHookRegistration,
 	NativeHookSourceHandlers,
+	SessionHostsRequestContext,
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
 	StatusRenameResult,
@@ -106,6 +108,8 @@ import {
 	type NativeCodexOwnedLaunchPlan,
 } from "./native-cli-launch";
 import { isNativeConversationId } from "./native-conversation";
+import { isNativeCaption, projectNativeCaptionLabel } from "./native-caption";
+import { prepareNativeInitialPrompt, type NativeInitialPromptLease } from "./native-initial-prompt";
 import type {
 	OwnedCodexBackendLaunchIdentity,
 	OwnedCodexBackendLease,
@@ -756,6 +760,27 @@ export interface InstanceStatusHandlers {
 	onReconnect?(): void;
 	/** An authenticated model request routed through this exact child registration. */
 	onSpawnRequest?(request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
+	/**
+	 * An authenticated ROUTED request (`host` and/or `kind` present) on this exact
+	 * child registration. Supplied only when the manager was given a routed
+	 * handler, so a registration advertises routed support only when it is real.
+	 */
+	onRoutedSpawnRequest?(request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
+	/**
+	 * Present (only as `true`, and only beside {@link onRoutedSpawnRequest}) when
+	 * that routed handler honors SessionSpawn `createWorkspace`. It is the
+	 * registration's declared implementation support behind the bootstrap's
+	 * `spawnCreateWorkspace` marker, never a permission.
+	 */
+	routedSpawnCreateWorkspace?: boolean;
+	/**
+	 * An authenticated read-only SessionHosts inspection on this exact child
+	 * registration. Supplied only together with {@link onRoutedSpawnRequest} and
+	 * only when the manager was given a discovery handler, so a registration
+	 * advertises discovery only when it is real. A rejection is an unavailable
+	 * inspection, never an empty listing.
+	 */
+	onSessionHostsRequest?(context: SessionHostsRequestContext): Promise<SessionHostsSnapshot>;
 }
 
 export interface InstanceStatusBootstrap {
@@ -772,6 +797,10 @@ export interface InstanceStatusBootstrap {
 	 * bootstrap it received carries exactly mode version 1.
 	 */
 	readonly inputOriginFraming?: 1;
+	/** Routed SessionSpawn support marker actually recorded in THIS registration's bootstrap. */
+	readonly spawnRouting?: 1;
+	/** Read-only SessionHosts discovery marker actually recorded in THIS registration's bootstrap. */
+	readonly sessionHosts?: 1;
 }
 
 export interface InstanceStatusRegistration {
@@ -899,7 +928,15 @@ export interface CreateInstanceOptions {
 	 * passed verbatim to prepareNativeLaunch.
 	 */
 	savedSession?: SavedSessionAdmission;
-	/** Fresh model-request child only: the exact title and prompt to deliver at native session start. */
+	/**
+	 * Fresh model-request child only: the exact title and prompt to deliver at
+	 * session start. A Pi row receives them through its existing staged startup
+	 * request. A native CLI row (issue #493) receives the prompt through one owned
+	 * file-backed startup instruction (see ./native-initial-prompt) and the title
+	 * through its provider's own native title option where one exists (Claude), or
+	 * otherwise as this row's stored caption (Codex). Neither ever travels through
+	 * argv or the environment verbatim except the Claude title option itself.
+	 */
 	initialRequest?: { readonly title: string; readonly prompt: string };
 	/**
 	 * Which backend this row belongs to. Absence means `pi` (every existing caller
@@ -929,6 +966,20 @@ export interface CreateInstanceOptions {
 	 * posted.
 	 */
 	nativeResumeConversationId?: string;
+	/**
+	 * Opt-in destination workspace creation (issue #493). Only an exact `true`
+	 * makes this row's own launch preparation ensure its workspace exists with one
+	 * ordinary recursive directory creation (the shared workspace resolver's
+	 * `createWorkspace`), on this host, after every existing admission, and before
+	 * the same canonical resolution and launch any row gets. The same option means
+	 * the same thing for a Pi row and a native CLI row. An existing directory is
+	 * reused unchanged; a creation failure is an ordinary launch preparation
+	 * failure; created directories remain if a later step fails (no cleanup,
+	 * rollback, retry, or permission change). Absent or `false` is exactly the
+	 * noncreating launch. It is refused beside a saved conversation or a native
+	 * resume, whose workspace is already recorded.
+	 */
+	createWorkspace?: boolean;
 }
 
 /**
@@ -966,6 +1017,21 @@ export interface NativeCliLaunchRequest {
 	 * fresh launch, exactly as before.
 	 */
 	readonly resumeConversationId?: string;
+	/**
+	 * Fresh SessionSpawn launch only (issue #493): the generated one-line startup
+	 * instruction that points at this manager's owned staged prompt file, plus the
+	 * exact requested title for a provider with a native title option. The original
+	 * prompt is never part of this request. Absence is every other launch, exactly
+	 * as before.
+	 */
+	readonly initialPrompt?: NativeCliInitialPrompt;
+}
+
+/** The provider-facing half of one native startup request; never the prompt text. */
+export interface NativeCliInitialPrompt {
+	readonly instruction: string;
+	/** Present only for a backend whose provider takes a native title option (Claude). */
+	readonly title?: string;
 }
 
 /**
@@ -1297,6 +1363,42 @@ export interface InstanceManagerOptions {
 	onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+	/**
+	 * Host-owned routing for ROUTED reporter requests (`host`/`kind` selectors).
+	 * Supplying it is what makes each new registration advertise routed support.
+	 * The parent id comes from the manager, and `parentStillCurrent` re-proves on
+	 * every call that this exact parent registration is still live and current,
+	 * so a host can fence a submission it is about to send.
+	 */
+	onRoutedSpawnRequest?: (
+		parentInstanceId: string,
+		request: SessionSpawnInput,
+		parentStillCurrent: () => boolean,
+	) => Promise<SessionSpawnOutcome>;
+	/**
+	 * The host's explicit declaration that {@link onRoutedSpawnRequest} honors the
+	 * SessionSpawn `createWorkspace` option (issue #493). Only `true`, and only
+	 * beside a routed handler, makes each registration declare it, so a child's
+	 * bootstrap advertises creation support only when it is real. Absent or
+	 * `false`: a creation request is refused before anything is staged or sent.
+	 */
+	routedSpawnCreateWorkspace?: boolean;
+	/**
+	 * Host-owned read-only SessionHosts discovery for one child registration.
+	 * Forwarded to a registration ONLY together with
+	 * {@link onRoutedSpawnRequest} (discovery without routed spawn would describe
+	 * choices the child could never use), which is what makes that registration's
+	 * bootstrap advertise discovery. The parent id comes from the manager, and
+	 * `parentStillCurrent` re-proves on every call that this exact parent
+	 * registration is still live and current; a parent that is not is refused
+	 * before the handler runs. The handler only observes: it must not connect,
+	 * pair, regrant, spawn, select, or focus anything.
+	 */
+	onSessionHostsRequest?: (
+		parentInstanceId: string,
+		context: SessionHostsRequestContext,
+		parentStillCurrent: () => boolean,
+	) => Promise<SessionHostsSnapshot>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
 	getSidebarTitleColumns?: () => number;
 	/** PTY factory; defaults to the pinned real @lydell/node-pty (lazily loaded). */
@@ -1449,8 +1551,21 @@ interface ManagedInstance {
 	 * This is the durable half of the row's name: the host core remembers it as the
 	 * slot's display name. It is never written to a provider, never a conversation
 	 * rename, and never derived from provider text.
+	 *
+	 * A Codex SessionSpawn startup title (issue #493) is stored here too, exactly as
+	 * requested and under the SessionSpawn title bound; the row's published `label`
+	 * is then its bounded display projection, never a second stored copy.
 	 */
 	nativeCaption?: string;
+	/**
+	 * Native CLI rows only: this launch's owned file-backed startup prompt (issue
+	 * #493). Created synchronously by this manager before the provider runs, so it
+	 * is never hidden inside a pending provider promise. Its files stay until no
+	 * child of this launch can still read them: the launch was abandoned before any
+	 * child existed, or the child actually exited (and any required owned reader
+	 * positively settled) and no owned Codex backend of this launch is unsettled.
+	 */
+	nativeInitialPrompt?: OwnedNativeInitialPrompt;
 	/**
 	 * Native CLI rows only: the one actual provider conversation title this row's own
 	 * live source positively proved for its CURRENT proved conversation. EPHEMERAL by
@@ -1815,6 +1930,17 @@ function readNativeHookLaunchOutcome(value: unknown): NativeHookLaunchOutcome | 
 		return hook as unknown as NativeHookLaunchOutcome;
 	}
 	return undefined;
+}
+
+/** One launch's owned startup prompt lease and the facts its release depends on. */
+interface OwnedNativeInitialPrompt {
+	readonly lease: NativeInitialPromptLease;
+	/** True once no child of this launch can ever exist. */
+	abandoned: boolean;
+	/** True once release was decided; the lease's own cleanup runs at most once. */
+	released: boolean;
+	/** The spawned handle's required owned reader, recorded in the spawn stretch. */
+	readerSettlement?: OwnedConptyReaderSettlement;
 }
 
 /**
@@ -2599,6 +2725,14 @@ function validateLabel(label: unknown): string {
 	return label;
 }
 
+/** A native row's explicit caption: admitted whole by the shared caption rule, never clipped. */
+function validateNativeCaption(caption: unknown): string {
+	if (!isNativeCaption(caption)) {
+		throw new Error("session-host: a native row caption must be a bounded single-line name");
+	}
+	return caption;
+}
+
 function validateInitialRequest(value: unknown): { title: string; prompt: string } {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new Error("session-host: initial request requires exact title and prompt strings");
@@ -2651,7 +2785,7 @@ function validateNativeCliTarget(value: unknown): string {
  * here or anywhere else on this path.
  *
  * The resolution IS the host's shared Pi workspace resolution
- * ({@linkcode resolveExistingDirectory}): a leading bare `~`/`~/` expands
+ * ({@linkcode resolveWorkspaceDirectory}): a leading bare `~`/`~/` expands
  * against the home directory, a relative spelling resolves against this
  * process's working directory, and the result is the canonical real path. A
  * native row therefore accepts exactly the spellings a Pi row accepts, because
@@ -2659,8 +2793,8 @@ function validateNativeCliTarget(value: unknown): string {
  * never asks a shell to expand anything. No environment-variable or
  * `~otheruser` form is expanded here any more than it is for Pi.
  */
-function canonicalNativeWorkspace(workspace: string): string {
-	return resolveExistingDirectory(workspace, "the native CLI workspace");
+function canonicalNativeWorkspace(workspace: string, createWorkspace = false): string {
+	return resolveWorkspaceDirectory(workspace, "the native CLI workspace", { createWorkspace });
 }
 
 /**
@@ -2754,6 +2888,9 @@ export class InstanceManager {
 	readonly #onNativeClipboard?: (instanceId: string, event: NativeClipboardEvent) => void;
 	readonly #onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+	readonly #onRoutedSpawnRequest?: InstanceManagerOptions["onRoutedSpawnRequest"];
+	readonly #routedSpawnCreateWorkspace: boolean;
+	readonly #onSessionHostsRequest?: InstanceManagerOptions["onSessionHostsRequest"];
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
 	readonly #nativeCliLaunch?: NativeCliLaunch;
@@ -2834,6 +2971,19 @@ export class InstanceManager {
 		this.#onNativeClipboard = options.onNativeClipboard;
 		this.#onNativeCliClipboard = options.onNativeCliClipboard;
 		this.#onSpawnRequest = options.onSpawnRequest;
+		if (options.onRoutedSpawnRequest !== undefined && typeof options.onRoutedSpawnRequest !== "function") {
+			throw new Error("session-host: onRoutedSpawnRequest must be a function or absent");
+		}
+		this.#onRoutedSpawnRequest = options.onRoutedSpawnRequest;
+		if (options.routedSpawnCreateWorkspace !== undefined && typeof options.routedSpawnCreateWorkspace !== "boolean") {
+			throw new Error("session-host: routedSpawnCreateWorkspace must be a boolean or absent");
+		}
+		this.#routedSpawnCreateWorkspace = options.routedSpawnCreateWorkspace === true
+			&& options.onRoutedSpawnRequest !== undefined;
+		if (options.onSessionHostsRequest !== undefined && typeof options.onSessionHostsRequest !== "function") {
+			throw new Error("session-host: onSessionHostsRequest must be a function or absent");
+		}
+		this.#onSessionHostsRequest = options.onSessionHostsRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
 		if (options.nativeCliLaunch !== undefined && typeof options.nativeCliLaunch !== "function") {
@@ -3092,6 +3242,7 @@ export class InstanceManager {
 		// latch, so a resource can never outlive the row that owns it.
 		this.#retireOwnedCodexBackend(record.nativeCodexBackend);
 		this.#releaseNativeStatusArtifacts(record, statusRun);
+		this.#releaseNativeInitialPrompt(record);
 		this.#safeChanged(record.id);
 	}
 
@@ -3201,10 +3352,16 @@ export class InstanceManager {
 			: validateNativeCliTarget(options.nativeCliTarget);
 		// A native CLI row starts from its stable provider label: a provider's own
 		// conversation title, like an operator's caption, is only ever known once the
-		// row exists, so nothing here waits for a name or invents one.
-		const label = options?.label === undefined
+		// row exists, so nothing here waits for a name or invents one. An explicit
+		// label on a native row is its stored CAPTION (a remembered slot restores
+		// exactly this way): it is admitted whole by the caption rule and published
+		// through the bounded label projection, never clipped in storage.
+		const explicitCaption = options?.label !== undefined && isNativeCliBackend(backend)
+			? validateNativeCaption(options.label)
+			: undefined;
+		let label = options?.label === undefined
 			? (isNativeCliBackend(backend) ? sessionBackendDisplayLabel(backend) : "(session starting)")
-			: validateLabel(options.label);
+			: (explicitCaption !== undefined ? projectNativeCaptionLabel(explicitCaption) : validateLabel(options.label));
 		if (typeof options?.workspace !== "string" || options.workspace === "") {
 			throw new Error("session-host: create requires an explicit workspace directory");
 		}
@@ -3222,6 +3379,19 @@ export class InstanceManager {
 			throw new Error("session-host: a saved-session selection uses the conversation's recorded workspace");
 		}
 		const initialRequest = options.initialRequest === undefined ? undefined : validateInitialRequest(options.initialRequest);
+		// Opt-in workspace creation is an exact boolean; only `true` creates anything.
+		// A recorded workspace (saved conversation or native resume) is never created.
+		const createWorkspaceOption: unknown = options.createWorkspace;
+		if (createWorkspaceOption !== undefined && typeof createWorkspaceOption !== "boolean") {
+			throw new Error("session-host: the create-workspace option must be a boolean");
+		}
+		const createWorkspace = createWorkspaceOption === true;
+		if (createWorkspace && savedSession !== undefined) {
+			throw new Error("session-host: a saved conversation uses its recorded workspace; it cannot be combined with workspace creation");
+		}
+		if (createWorkspace && options.nativeResumeConversationId !== undefined) {
+			throw new Error("session-host: a native conversation resume cannot be combined with workspace creation");
+		}
 		if (initialRequest !== undefined && savedSession !== undefined) {
 			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
@@ -3240,8 +3410,15 @@ export class InstanceManager {
 			if (savedSession !== undefined) {
 				throw new Error("session-host: a native CLI row never opens a Pi saved conversation");
 			}
-			if (initialRequest !== undefined) {
-				throw new Error("session-host: a native CLI row never receives a Pi startup request");
+			// A native startup request (issue #493) is a FRESH conversation with its own
+			// exact title: it can never be combined with a restoration, which resumes an
+			// existing conversation, or with a configured caption, which would leave two
+			// competing names for one row.
+			if (initialRequest !== undefined && options.nativeResumeConversationId !== undefined) {
+				throw new Error("session-host: a native startup request cannot be combined with a conversation resume");
+			}
+			if (initialRequest !== undefined && options.label !== undefined) {
+				throw new Error("session-host: a native startup request carries its own title; no separate label is accepted");
 			}
 		} else if (nativeCliTarget !== undefined) {
 			throw new Error("session-host: a native CLI launch target is only valid for a native CLI backend");
@@ -3257,6 +3434,12 @@ export class InstanceManager {
 				throw new Error("session-host: the native conversation resume id must be an exact provider conversation id");
 			}
 		}
+		// A Codex startup title has no native provider option, so it is honored as this
+		// row's stored caption, exactly as requested (issue #493). The published label is
+		// that caption's bounded display projection; the stored caption stays whole.
+		const startupCaption = backend === "codex" && initialRequest !== undefined ? initialRequest.title : undefined;
+		const nativeCaption = explicitCaption ?? startupCaption;
+		if (startupCaption !== undefined) label = projectNativeCaptionLabel(startupCaption);
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
 		// cannot both spawn, including pending creations of siblings.
@@ -3282,9 +3465,10 @@ export class InstanceManager {
 					nativeConversationConfirmed: false,
 					nativeConversationLive: false,
 					// An explicit initial label on a native row is a CONFIGURED caption
-					// (a remembered slot restores exactly this way), so it latches manual
-					// intent from the start and no automatic provider title can displace it.
-					...(options.label === undefined ? {} : { nativeCaption: label }),
+					// (a remembered slot restores exactly this way), and a Codex startup
+					// title is the caption the requester asked for, so either latches from
+					// the start and no automatic provider title can displace it.
+					...(nativeCaption === undefined ? {} : { nativeCaption }),
 				}
 				: {}),
 			busy: null,
@@ -3331,6 +3515,7 @@ export class InstanceManager {
 			savedSession,
 			initialRequest,
 			...(nativeCliTarget === undefined ? {} : { nativeCliTarget }),
+			...(createWorkspace ? { createWorkspace: true } : {}),
 		});
 		this.#inflightCreates.add(launch);
 		try {
@@ -4882,7 +5067,12 @@ export class InstanceManager {
 	 * owner's own roster projection only and is never part of a public, peer, or
 	 * network view.
 	 */
-	readNativeConversationIdentity(instanceId: string): { readonly targetId: string; readonly conversationId?: string } | undefined {
+	readNativeConversationIdentity(instanceId: string): {
+		readonly targetId: string;
+		readonly conversationId?: string;
+		/** The row's own stored caption (operator caption or Codex startup title), when it has one. */
+		readonly caption?: string;
+	} | undefined {
 		const record = this.#records.get(instanceId);
 		if (record === undefined || !isNativeCliBackend(record.backend) || record.nativeCliTarget === undefined) {
 			return undefined;
@@ -4890,6 +5080,7 @@ export class InstanceManager {
 		return Object.freeze({
 			targetId: record.nativeCliTarget,
 			...(record.nativeConversationId === undefined ? {} : { conversationId: record.nativeConversationId }),
+			...(record.nativeCaption === undefined ? {} : { caption: record.nativeCaption }),
 		});
 	}
 
@@ -5175,6 +5366,54 @@ export class InstanceManager {
 		this.#releaseNativeStatusArtifacts(record, run);
 	}
 
+	/**
+	 * Declare that no child of this launch can ever exist, and release its owned
+	 * startup prompt file under the same settlement rule as every other release.
+	 */
+	#abandonNativeInitialPrompt(record: ManagedInstance): void {
+		const owned = record.nativeInitialPrompt;
+		if (owned === undefined) return;
+		owned.abandoned = true;
+		this.#releaseNativeInitialPrompt(record);
+	}
+
+	/**
+	 * Release this row's owned startup prompt file — at most once, and only when no
+	 * child of its launch can still read it. It follows the same settlement facts as
+	 * the hook artifacts: an abandoned launch (no child ever existed) or an actually
+	 * exited child, never an unsettled owned Codex backend (the TUI's exit says
+	 * nothing about the backend that carries the conversation), and never before a
+	 * required owned reader positively settled. A child still starting or waiting on
+	 * its provider's own trust prompt keeps the file. The lease itself removes only
+	 * the exact file and root it staged, so nothing foreign is ever deleted.
+	 */
+	#releaseNativeInitialPrompt(record: ManagedInstance): void {
+		const owned = record.nativeInitialPrompt;
+		if (owned === undefined || owned.released) return;
+		if (!owned.abandoned && (record.pty === undefined || !record.ptyExited)) return;
+		if (ownsUnsettledCodexBackend(record)) return;
+		owned.released = true;
+		const settlement = owned.readerSettlement;
+		const cleanup = (): void => {
+			try {
+				void Promise.resolve(owned.lease.cleanup()).catch(() => undefined);
+			} catch {
+				// The lease reports its own refusals; a cleanup failure is never a row failure.
+			}
+		};
+		if (settlement !== undefined && !settlement.settled) {
+			void settlement.confirmSettlement().then(
+				(confirmed) => {
+					if (confirmed) cleanup();
+					// An unconfirmed settlement preserves the file instead of pretending.
+				},
+				() => undefined,
+			);
+			return;
+		}
+		cleanup();
+	}
+
 	/** The one call that actually removes this run's own staged files. */
 	#cleanupNativeStatusLease(lease: NativeHookArtifactLease): void {
 		try {
@@ -5410,6 +5649,7 @@ export class InstanceManager {
 		// The backend is one of the children this launch was told to give its hook files
 		// to, so its settlement is what can finally make that release safe.
 		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
+		this.#releaseNativeInitialPrompt(record);
 		if (this.#records.get(record.id) === record) {
 			if (this.#disposed && record.nativeCodexBackend === resource
 				&& (record.pty === undefined || record.ptyExited)) {
@@ -6110,7 +6350,7 @@ export class InstanceManager {
 	 */
 	async #launchNativeCliInstance(
 			record: ManagedInstance,
-			options: { workspace: string; backend: NativeCliBackend; targetId?: string },
+			options: { workspace: string; backend: NativeCliBackend; targetId?: string; initialRequest?: { title: string; prompt: string }; createWorkspace?: boolean },
 		): Promise<void> {
 		// The OPTIONAL native status source of this launch, armed below before the provider
 		// runs. Declared outside the try so every failure path can retire it.
@@ -6123,11 +6363,26 @@ export class InstanceManager {
 		try {
 			// 1. The selected workspace is the only setup fact this row needs: an
 			// existing absolute directory, canonicalized. No provider configuration,
-			// agent directory, profile, or skill work happens on this path.
-			const workspace = canonicalNativeWorkspace(options.workspace);
+			// agent directory, profile, or skill work happens on this path. An opted-in
+			// row first ensures the directory exists through the same shared resolver.
+			const workspace = canonicalNativeWorkspace(options.workspace, options.createWorkspace === true);
 			record.workspace = workspace;
 			record.agentDir = this.#hostAgentDir();
 			this.#safeChanged(record.id);
+			// 1b. A fresh SessionSpawn startup request (issue #493): the exact prompt is
+			// staged in this manager's own private file BEFORE the provider runs, and the
+			// row owns the lease from this instant. The provider only ever sees the short
+			// generated instruction (and, for Claude, the exact title). A staging refusal
+			// is an ordinary preparation failure: no child of this launch can exist.
+			let initialPrompt: NativeCliInitialPrompt | undefined;
+			if (options.initialRequest !== undefined) {
+				const lease = prepareNativeInitialPrompt(options.initialRequest.prompt);
+				record.nativeInitialPrompt = { lease, abandoned: false, released: false };
+				initialPrompt = {
+					instruction: lease.instruction,
+					...(options.backend === "claude" ? { title: options.initialRequest.title } : {}),
+				};
+			}
 
 			await yieldCheckpoint();
 			if (this.#stopping) {
@@ -6170,6 +6425,7 @@ export class InstanceManager {
 				...(record.nativeResumeConversationId === undefined
 					? {}
 					: { resumeConversationId: record.nativeResumeConversationId }),
+				...(initialPrompt === undefined ? {} : { initialPrompt }),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator
@@ -6324,6 +6580,9 @@ export class InstanceManager {
 				if (statusRun !== undefined) {
 					statusRun.readerSettlement = ownedReader?.settlement;
 				}
+				if (record.nativeInitialPrompt !== undefined) {
+					record.nativeInitialPrompt.readerSettlement = ownedReader?.settlement;
+				}
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
 				if (record.ptyExited) {
 					this.#disposeExitListener(record);
@@ -6408,6 +6667,7 @@ export class InstanceManager {
 				// THIS launch is outside that decision: its unsettled record keeps those files,
 				// and only its own settlement releases them.
 				this.#abandonNativeStatusLaunch(record, statusRun);
+				this.#abandonNativeInitialPrompt(record);
 				record.error = publicInstanceError("ptySetup");
 				record.lifecycle = "error";
 				this.#releaseRegistration(record);
@@ -6435,6 +6695,7 @@ export class InstanceManager {
 			// row's resources and its liveness until that backend's own settlement arrives.
 			this.#retireOwnedCodexBackend(ownedBackend);
 			this.#abandonNativeStatusLaunch(record, statusRun);
+			this.#abandonNativeInitialPrompt(record);
 			record.error = publicInstanceError("launchPreparation");
 			record.lifecycle = "error";
 			this.#releaseRegistration(record);
@@ -6458,7 +6719,7 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string; createWorkspace?: boolean },
 		): Promise<void> {
 		const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
 		if (nativeBackend !== undefined) {
@@ -6469,6 +6730,8 @@ export class InstanceManager {
 				workspace: options.workspace,
 				backend: nativeBackend,
 				...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
+				...(options.initialRequest === undefined ? {} : { initialRequest: options.initialRequest }),
+				...(options.createWorkspace === true ? { createWorkspace: true } : {}),
 			});
 			return;
 		}
@@ -6480,6 +6743,8 @@ export class InstanceManager {
 			const profile = this.#profilePreparer.prepare({
 				workspace: options.workspace,
 				profile: options.profile === "" ? undefined : options.profile,
+				// Workspace-only: the preparer never creates a profile or config directory for it.
+				...(options.createWorkspace === true ? { createWorkspace: true } : {}),
 			});
 			record.profile = profile;
 			record.agentDir = profile.agentDir;
@@ -6532,6 +6797,32 @@ export class InstanceManager {
 					}
 					return this.#onSpawnRequest?.(record.id, request) ?? Promise.resolve("failed");
 				},
+				// Routed support is advertised only when this host actually routes. The
+				// parent proof is re-evaluated on every call: this exact record, its exact
+				// current registration, a live unexited child, and no stop or shutdown.
+				...(this.#onRoutedSpawnRequest === undefined ? {} : {
+					onRoutedSpawnRequest: (request: SessionSpawnInput): Promise<SessionSpawnOutcome> => {
+						const routed = this.#onRoutedSpawnRequest;
+						const parentStillCurrent = this.#parentRegistrationProof(record, registration);
+						if (routed === undefined || !parentStillCurrent()) return Promise.resolve("failed");
+						return routed(record.id, request, parentStillCurrent);
+					},
+					// Declared only when this host's routed handler really honors it.
+					...(this.#routedSpawnCreateWorkspace ? { routedSpawnCreateWorkspace: true } : {}),
+				}),
+				// Read-only discovery is forwarded only beside routed spawn, with the SAME
+				// per-call parent proof. A parent that is no longer current is an
+				// unavailable inspection (a rejection), never an empty listing.
+				...(this.#onRoutedSpawnRequest === undefined || this.#onSessionHostsRequest === undefined ? {} : {
+					onSessionHostsRequest: (context: SessionHostsRequestContext): Promise<SessionHostsSnapshot> => {
+						const inspect = this.#onSessionHostsRequest;
+						const parentStillCurrent = this.#parentRegistrationProof(record, registration);
+						if (inspect === undefined || !parentStillCurrent()) {
+							return Promise.reject(new Error("session-host: the requesting session is no longer current"));
+						}
+						return inspect(record.id, context, parentStillCurrent);
+					},
+				}),
 			}, this.#inputOriginFraming ? { inputOriginFraming: true } : undefined);
 			registration.current = handle;
 			record.registration = handle;
@@ -6839,6 +7130,7 @@ export class InstanceManager {
 		// known to have exited, so they may be released — still only once a required owned
 		// reader has positively settled, and never under an unsettled one.
 		this.#releaseNativeStatusArtifacts(record, statusRun);
+		this.#releaseNativeInitialPrompt(record);
 		record.savedReservation = undefined;
 		this.#resolveExitWaiters(record);
 		this.#safeChanged(record.id);
@@ -7026,6 +7318,21 @@ export class InstanceManager {
 	}
 
 	/** A valid reconnect is a new episode: discard the exhausted budget and request once. */
+	/**
+	 * The per-call proof that one reporter request still comes from this exact
+	 * parent: this record, its exact current registration, a live unexited child,
+	 * and no stop or shutdown. Re-evaluated on every call, never cached.
+	 */
+	#parentRegistrationProof(
+		record: ManagedInstance,
+		registration: { current?: InstanceStatusRegistration },
+	): () => boolean {
+		return (): boolean => this.#records.get(record.id) === record
+			&& registration.current !== undefined && record.registration === registration.current
+			&& record.pty !== undefined && !record.ptyExited && !record.stopAdmissionClosed
+			&& !this.#stopping && !this.#disposed;
+	}
+
 	#onReconnect(record: ManagedInstance, registration: { current?: InstanceStatusRegistration }): void {
 		if (!this.#currentRegistration(record, registration) || record.ptyExited) return;
 		// A reconnect means the child's reporter already installed a session, so the

@@ -1911,6 +1911,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   const compiledProtocol = join(process.cwd(), "dist-test", "src", "session-host", "protocol.js");
   const compiledNativeHookProtocol = join(process.cwd(), "dist-test", "src", "session-host", "native-hook-protocol.js");
   const compiledSessionBackend = join(process.cwd(), "dist-test", "src", "session-host", "session-backend.js");
+  const compiledPeerDestinationId = join(process.cwd(), "dist-test", "src", "session-host", "peer-destination-id.js");
+  const compiledPeerLabelContract = join(process.cwd(), "dist-test", "src", "session-host", "network", "protocol.js");
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
   assert.ok(existsSync(compiledRecordGuard), "the compiled record guard must exist");
@@ -1922,6 +1924,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.ok(existsSync(compiledProtocol), "the compiled session-host protocol module must exist");
   assert.ok(existsSync(compiledNativeHookProtocol), "the compiled native hook protocol module must exist");
   assert.ok(existsSync(compiledSessionBackend), "the compiled session backend identity module must exist");
+  assert.ok(existsSync(compiledPeerDestinationId), "the compiled saved destination id contract module must exist");
+  assert.ok(existsSync(compiledPeerLabelContract), "the compiled saved destination label contract module must exist");
 
   // Tree A: the own package scripts/ is missing, but a MALICIOUS ancestor
   // scripts/ helper exists. The loader must reject fail-closed without ever
@@ -1938,11 +1942,14 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-hook-protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "session-backend.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "peer-destination-id.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
   ], [
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src"),
     join(rootA, "node_modules", "pi-review-gate", "dist"),
@@ -1963,6 +1970,9 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledProtocol, join(distA, "protocol.js"));
   await cp(compiledNativeHookProtocol, join(distA, "native-hook-protocol.js"));
   await cp(compiledSessionBackend, join(distA, "session-backend.js"));
+  await cp(compiledPeerDestinationId, join(distA, "peer-destination-id.js"));
+  await mkdir(join(distA, "network"), { recursive: true });
+  await cp(compiledPeerLabelContract, join(distA, "network", "protocol.js"));
   await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
   await cp(compiledRecordGuard, join(pkgA, "dist", "src", "record-guard.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
@@ -1994,10 +2004,13 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-hook-protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "session-backend.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "peer-destination-id.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src"),
     join(rootB, "node_modules", "pi-review-gate", "dist"),
@@ -2018,6 +2031,9 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledProtocol, join(distB, "protocol.js"));
   await cp(compiledNativeHookProtocol, join(distB, "native-hook-protocol.js"));
   await cp(compiledSessionBackend, join(distB, "session-backend.js"));
+  await cp(compiledPeerDestinationId, join(distB, "peer-destination-id.js"));
+  await mkdir(join(distB, "network"), { recursive: true });
+  await cp(compiledPeerLabelContract, join(distB, "network", "protocol.js"));
   await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
   await cp(compiledRecordGuard, join(pkgB, "dist", "src", "record-guard.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });

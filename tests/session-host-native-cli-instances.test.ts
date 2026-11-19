@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import test from "node:test";
@@ -702,7 +702,14 @@ test("unsupported Pi inputs, an unknown backend, and a host without a provider a
   try {
     const refusals: CreateInstanceOptions[] = [
       { workspace: harness.workspace, backend: "claude", savedSession: admission },
-      { workspace: harness.workspace, backend: "claude", initialRequest: { title: "t", prompt: "do the thing" } },
+      // A native startup request is admitted since #493 (see the native spawn tests),
+      // but never combined with a resume or a separate caption.
+      {
+        workspace: harness.workspace, backend: "claude", nativeCliTarget: "claude",
+        nativeResumeConversationId: "0190a5c8-2b4e-7f00-8a00-000000000001",
+        initialRequest: { title: "t", prompt: "do the thing" },
+      },
+      { workspace: harness.workspace, backend: "codex", label: "caption", initialRequest: { title: "t", prompt: "do the thing" } },
       { workspace: harness.workspace, backend: "codex", profile: join(harness.root, "legacy-profile") },
       { workspace: harness.workspace, backend: "kittens" as never },
       { workspace: harness.workspace, backend: "" as never },
@@ -1059,6 +1066,141 @@ test("a native row's display name replaces its one label field and never invents
     const piLabel = viewOf(harness.manager, piId).label;
     assert.equal(harness.manager.setNativeDisplayName(piId, "not my caption"), "not-native");
     assert.equal(viewOf(harness.manager, piId).label, piLabel, "the Pi row's label is untouched");
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Opt-in destination workspace creation (issue #493): one ordinary recursive
+// mkdir inside this host's own launch preparation, through the SAME shared
+// resolver, for Pi and native rows alike. Absence and `false` never create.
+// ---------------------------------------------------------------------------
+
+test("createWorkspace creates nested missing directories and launches Pi, Claude, and Codex normally", async () => {
+  const harness = makeNativeHarness("create-workspace-kinds");
+  try {
+    for (const backend of [undefined, "claude", "codex"] as const) {
+      const label = backend ?? "pi";
+      const target = join(harness.root, `fresh-${label}`, "nested", "deeper");
+      assert.equal(existsSync(join(harness.root, `fresh-${label}`)), false);
+      const id = await withTimeout(
+        harness.manager.create({ workspace: target, createWorkspace: true, ...(backend === undefined ? {} : { backend }) }),
+        5000,
+        `${label} creating create`,
+      );
+      assert.ok(statSync(target).isDirectory(), `${label}: the nested workspace now exists`);
+      assert.deepEqual(readdirSync(target), [], `${label}: the created workspace is empty (no config, agent, or Git entry)`);
+      const canonical = realpathSync(target);
+      assert.equal(viewOf(harness.manager, id).workspace, canonical, `${label}: the row records the canonical directory`);
+      assert.equal(harness.spawned.at(-1)?.spawnDescriptor.cwd, canonical, `${label}: the child is anchored there`);
+      assert.notEqual(viewOf(harness.manager, id).lifecycle, "error", `${label}: the launch proceeds normally`);
+    }
+    assert.equal(harness.spawned.length, 3);
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("createWorkspace reuses an existing directory unchanged and keeps relative/tilde spellings on the shared resolver", async () => {
+  const harness = makeNativeHarness("create-workspace-existing");
+  try {
+    const marker = join(harness.workspace, "keep.txt");
+    writeFileSync(marker, "unchanged\n", "utf8");
+    const before = statSync(harness.workspace);
+    for (const backend of [undefined, "claude"] as const) {
+      await withTimeout(harness.manager.create({
+        workspace: harness.workspace, createWorkspace: true, ...(backend === undefined ? {} : { backend }),
+      }), 5000, "existing create");
+    }
+    const after = statSync(harness.workspace);
+    assert.equal(after.ino, before.ino, "the same directory is reused");
+    assert.equal(after.mode, before.mode, "no permission change");
+    assert.deepEqual(readdirSync(harness.workspace), ["keep.txt"]);
+    assert.equal(readFileSync(marker, "utf8"), "unchanged\n");
+
+    // A relative spelling creates under this process's working directory for both kinds.
+    for (const backend of [undefined, "claude"] as const) {
+      const absolute = join(harness.root, `relative-${backend ?? "pi"}`, "child");
+      const relativeSpelling = relative(process.cwd(), absolute);
+      assert.ok(!isAbsolute(relativeSpelling));
+      await withTimeout(harness.manager.create({
+        workspace: relativeSpelling, createWorkspace: true, ...(backend === undefined ? {} : { backend }),
+      }), 5000, "relative create");
+      assert.equal(harness.spawned.at(-1)?.spawnDescriptor.cwd, realpathSync(absolute));
+    }
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("without createWorkspace (absent or false) a missing workspace fails for every kind and nothing is created", async () => {
+  const harness = makeNativeHarness("create-workspace-default-off");
+  try {
+    for (const backend of [undefined, "claude", "codex"] as const) {
+      for (const createWorkspace of [undefined, false] as const) {
+        const parent = join(harness.root, `absent-${backend ?? "pi"}-${String(createWorkspace)}`);
+        const id = await withTimeout(harness.manager.create({
+          workspace: join(parent, "nested"),
+          ...(createWorkspace === undefined ? {} : { createWorkspace }),
+          ...(backend === undefined ? {} : { backend }),
+        }), 5000, "default-off create");
+        assert.equal(viewOf(harness.manager, id).lifecycle, "error");
+        assert.equal(existsSync(parent), false, "no directory or parent was created");
+      }
+    }
+    assert.equal(harness.spawned.length, 0, "no child for a missing workspace");
+    assert.equal(harness.providerCalls.length, 0, "the native provider was never asked");
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("createWorkspace onto a regular file, or under one, is an ordinary launch failure with no child and no change", async () => {
+  const harness = makeNativeHarness("create-workspace-file");
+  try {
+    const file = join(harness.root, "regular-file");
+    writeFileSync(file, "a file, never a workspace\n", "utf8");
+    for (const backend of [undefined, "claude", "codex"] as const) {
+      for (const workspace of [file, join(file, "under")]) {
+        const id = await withTimeout(harness.manager.create({
+          workspace, createWorkspace: true, ...(backend === undefined ? {} : { backend }),
+        }), 5000, "file create");
+        assert.equal(viewOf(harness.manager, id).lifecycle, "error");
+        assert.equal(viewOf(harness.manager, id).error, "session-host: instance launch preparation failed");
+      }
+    }
+    assert.equal(readFileSync(file, "utf8"), "a file, never a workspace\n", "the file is untouched");
+    assert.equal(harness.spawned.length, 0);
+    assert.equal(harness.providerCalls.length, 0);
+    assert.equal(harness.registrar.requests.length, 0, "no status registration exists for a failed preparation");
+    await harness.manager.dispose();
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("createWorkspace must be an exact boolean and is refused beside a native resume, before any row exists", async () => {
+  const harness = makeNativeHarness("create-workspace-validation");
+  try {
+    const target = join(harness.root, "never-created");
+    await assert.rejects(
+      harness.manager.create({ workspace: target, createWorkspace: "yes" as unknown as boolean }),
+      /create-workspace option must be a boolean/,
+    );
+    await assert.rejects(
+      harness.manager.create({
+        workspace: target, backend: "claude", createWorkspace: true,
+        nativeResumeConversationId: randomUUID(),
+      }),
+      /native conversation resume cannot be combined with workspace creation/,
+    );
+    assert.equal(existsSync(target), false);
+    assert.deepEqual(harness.manager.list(), [], "no row was posted for a refused option");
     await harness.manager.dispose();
   } finally {
     rmSync(harness.root, { recursive: true, force: true });

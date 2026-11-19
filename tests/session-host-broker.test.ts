@@ -29,6 +29,11 @@ import {
   type SessionSpawnOutcome,
 } from "../src/session-host/protocol";
 import { __test as payloadTest, stageSessionHostPayload, type StagedSessionHostPayload } from "../src/session-host/payload";
+import {
+  SessionHostsResultAssembler,
+  type SessionHostHostsResult,
+  type SessionHostsSnapshot,
+} from "../src/session-host/protocol";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
@@ -2035,6 +2040,191 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
   await disposeBroker(broker);
 });
 
+/** Collects decoded replies from one test client. */
+function collectReplies(client: net.Socket): Record<string, unknown>[] {
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  return replies;
+}
+
+test("routed SessionSpawn without an installed routed handler is refused before any read and never reaches the Pi-only handler", async (t) => {
+  // Exercise Windows-style linked ownership on every platform.
+  payloadTest.setOwnershipPinForTests(false);
+  t.after(() => payloadTest.setOwnershipPinForTests(undefined));
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let legacyCalls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { legacyCalls += 1; return Promise.resolve("started"); },
+  });
+  assert.equal(Object.hasOwn(registration.bootstrap, "spawnRouting"), false,
+    "a registration without a routed handler keeps the legacy bootstrap");
+  const payloadDir = registration.bootstrap.payloadDir as string;
+  const routedStage = stageSessionHostPayload(payloadDir, JSON.stringify("Routed prompt."));
+  stagedPayloadOwnership.push(routedStage);
+  const client = await connectClient(broker.socketPath);
+  const replies = collectReplies(client);
+  const routed = {
+    version: 1,
+    type: "spawn_routed_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    workspace: "/existing workspace",
+    title: "Routed child",
+    payload: routedStage.descriptor,
+    kind: "codex",
+  };
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(routed as never));
+  await waitFor(() => replies.length === 1);
+  assert.equal(replies[0]!.type, "spawn_result");
+  assert.equal(replies[0]!.requestId, routed.requestId);
+  assert.equal(replies[0]!.outcome, "failed", "a definite refusal: no host operation was invoked");
+  // The broker consumes its verified payload name, not the producer's Windows
+  // continuity pin. A definite refusal lets the producer release its own lease.
+  await waitFor(() => !fs.existsSync(path.join(payloadDir, routed.payload.name)));
+  routedStage.discard();
+  assert.deepEqual(fs.readdirSync(payloadDir), []);
+  assert.equal(legacyCalls, 0, "the selector is never dropped to launch a local Pi child");
+
+  // A legacy-family frame smuggling a selector is malformed: the connection
+  // closes and still nothing is invoked.
+  const smuggledStage = stageSessionHostPayload(payloadDir, JSON.stringify("Smuggled prompt."));
+  stagedPayloadOwnership.push(smuggledStage);
+  const smuggledEntries = fs.readdirSync(payloadDir).sort();
+  const smuggled = {
+    ...routed,
+    type: "spawn_request",
+    requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    payload: smuggledStage.descriptor,
+  };
+  await expectClientClose(client, () => client.write(`${JSON.stringify(smuggled)}\n`));
+  assert.equal(legacyCalls, 0);
+  // The broker never accepted that frame, so the sender still owns its file.
+  assert.deepEqual(fs.readdirSync(payloadDir).sort(), smuggledEntries,
+    "a malformed frame preserves the payload and every producer-owned continuity entry");
+  assert.equal(fs.readFileSync(path.join(payloadDir, smuggled.payload.name), "utf8"), JSON.stringify("Smuggled prompt."));
+  smuggledStage.discard();
+
+  // The unchanged three-field legacy request still reaches the Pi-only handler.
+  const next = await connectClient(broker.socketPath);
+  const nextReplies = collectReplies(next);
+  const legacyStage = stageSessionHostPayload(payloadDir, JSON.stringify("Legacy prompt."));
+  stagedPayloadOwnership.push(legacyStage);
+  const legacy = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    workspace: "/existing workspace",
+    title: "Legacy child",
+    payload: legacyStage.descriptor,
+  };
+  next.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(legacy as never));
+  await waitFor(() => nextReplies.length === 1);
+  assert.equal(nextReplies[0]!.outcome, "started");
+  assert.equal(legacyCalls, 1);
+  await waitFor(() => !fs.existsSync(path.join(payloadDir, legacy.payload.name)));
+  legacyStage.discard();
+  assert.deepEqual(fs.readdirSync(payloadDir), [], "all producer leases are released before broker disposal");
+  await disposeBroker(broker);
+});
+
+test("an installed routed handler alone receives exact selectors and an exact >128 KiB prompt", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const legacyReceived: SessionSpawnInput[] = [];
+  const routedReceived: SessionSpawnInput[] = [];
+  let resolveRouted!: (outcome: SessionSpawnOutcome) => void;
+  const routedOperation = new Promise<SessionSpawnOutcome>((resolve) => { resolveRouted = resolve; });
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: (input) => { legacyReceived.push(input); return Promise.resolve("started"); },
+    onRoutedSpawnRequest: (input) => { routedReceived.push(input); return routedOperation; },
+  });
+  assert.equal(registration.bootstrap.spawnRouting, 1, "routed support is advertised only from an installed handler");
+  assert.ok(parseBootstrap(JSON.parse(JSON.stringify(registration.bootstrap))), "the marker round-trips through the env");
+  const client = await connectClient(broker.socketPath);
+  const replies = collectReplies(client);
+  const prompt = [
+    "BEGIN broker routed prompt",
+    "--host elsewhere --kind pi is prompt data",
+    "日本語 — café — 🚀",
+    "MIDDLE line\r\n".repeat(12_000),
+    "END",
+    "",
+  ].join("\n");
+  assert.ok(Buffer.byteLength(prompt, "utf8") > 128 * 1024);
+  const host = "Büro laptop (2)";
+  const routed = {
+    version: 1,
+    type: "spawn_routed_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "abababab-abab-4bab-8bab-abababababab",
+    workspace: "/existing workspace",
+    title: "Routed child",
+    payload: spawnPayload(registration.bootstrap, prompt),
+    host,
+    kind: "claude",
+  };
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(routed as never));
+  await waitFor(() => routedReceived.length === 1);
+  assert.deepEqual(routedReceived, [{ workspace: routed.workspace, title: routed.title, prompt, host, kind: "claude" }]);
+  assert.equal(legacyReceived.length, 0, "the Pi-only handler never sees a routed request");
+
+  // Same request id with a different selector is not an exact replay.
+  const altered = await connectClient(broker.socketPath);
+  await expectClientClose(altered, () => altered.write(
+    encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame({ ...routed, kind: "codex" } as never),
+  ));
+  assert.equal(routedReceived.length, 1, "a selector-altered replay never invokes the host again");
+
+  const current = await connectClient(broker.socketPath);
+  const currentReplies = collectReplies(current);
+  resolveRouted("unknown");
+  // An exact replay on the current connection gets the same truthful outcome
+  // and never invokes the host a second time.
+  current.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(routed as never));
+  await waitFor(() => currentReplies.some((reply) => reply.requestId === routed.requestId));
+  assert.equal(currentReplies.find((reply) => reply.requestId === routed.requestId)!.outcome, "unknown");
+  assert.equal(routedReceived.length, 1);
+  const legacy = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+    workspace: "/existing workspace",
+    title: "Legacy child",
+    payload: spawnPayload(registration.bootstrap, "Legacy prompt."),
+  };
+  current.write(encodeFrame(legacy as never));
+  await waitFor(() => legacyReceived.length === 1);
+  assert.deepEqual(Object.keys(legacyReceived[0]!).sort(), ["prompt", "title", "workspace"],
+    "the legacy handler receives exactly the three legacy fields");
+  assert.equal(routedReceived.length, 1, "a legacy request never reaches the routed handler");
+  await waitFor(() => currentReplies.some((reply) => reply.requestId === legacy.requestId));
+  assert.equal([...replies, ...currentReplies].some((reply) => reply.requestId === routed.requestId && reply.outcome !== "unknown"), false,
+    "an unknown routed outcome is never upgraded");
+  await disposeBroker(broker);
+});
+
 test("missing, tampered, or NUL payloads fail without invoking the host and replay without re-reading", async () => {
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   let calls = 0;
@@ -2521,4 +2711,251 @@ test("a late complete reply never disturbs the coalesced follow-up still in flig
   } finally {
     brokerTest.setActivityTimeoutForTests(undefined);
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// Read-only SessionHosts discovery (issue #493)
+// ---------------------------------------------------------------------------
+
+/** Byte-safe frame collector: multibyte ids may straddle socket chunks. */
+function collectRawFrames(client: net.Socket): { frames: string[]; bytes: number[] } {
+  const frames: string[] = [];
+  const bytes: number[] = [];
+  let buffered = Buffer.alloc(0);
+  client.on("data", (chunk: Buffer) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    let newline: number;
+    while ((newline = buffered.indexOf(0x0a)) >= 0) {
+      const line = buffered.subarray(0, newline + 1);
+      buffered = buffered.subarray(newline + 1);
+      bytes.push(line.length);
+      frames.push(new TextDecoder("utf-8", { fatal: true }).decode(line));
+    }
+  });
+  return { frames, bytes };
+}
+
+function hostsRequestFrame(bootstrap: SessionHostBootstrap, requestId: string, token = bootstrap.token): string {
+  return encodeFrame({
+    version: 1,
+    type: "hosts_request",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    token,
+    requestId,
+  } as never);
+}
+
+function maxHostsSnapshot(): SessionHostsSnapshot {
+  return {
+    ownKinds: ["pi", "claude", "codex"],
+    hosts: Array.from({ length: 64 }, (_, index) => ({
+      id: `${String(index).padStart(2, "0")}${index % 2 === 0 ? "\udc00".repeat(126) : "日".repeat(125) + " "}`,
+      // Legal 64-byte saved labels; every eighth repeats one descriptive label.
+      label: index % 8 === 0 ? "ai-inference-machine" : `host ${String(index).padStart(2, "0")} ${"x".repeat(56)}`,
+      kinds: index % 3 === 0 ? ["pi", "claude", "codex"] as const : index % 3 === 1 ? ["claude"] as const : ["codex"] as const,
+    })),
+  };
+}
+
+function discoveryHandlers(onSessionHostsRequest: NonNullable<Parameters<StatusBroker["register"]>[1]["onSessionHostsRequest"]>, calls: { spawn: number }) {
+  return {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { calls.spawn += 1; return Promise.resolve("failed" as const); },
+    onRoutedSpawnRequest: () => { calls.spawn += 1; return Promise.resolve("failed" as const); },
+    onSessionHostsRequest,
+  };
+}
+
+test("SessionHosts discovery is advertised only with installed discovery and routed-spawn handlers", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const snapshot = async () => ({ ownKinds: ["pi" as const], hosts: [] });
+  const none = broker.register(INSTANCE_A, { onStatus: () => undefined, onDisconnect: () => undefined });
+  const discoveryOnly = broker.register(INSTANCE_B, {
+    onStatus: () => undefined, onDisconnect: () => undefined, onSessionHostsRequest: snapshot,
+  });
+  const both = broker.register(INSTANCE_C, discoveryHandlers(snapshot, { spawn: 0 }));
+  assert.equal(Object.hasOwn(none.bootstrap, "sessionHosts"), false);
+  assert.equal(Object.hasOwn(discoveryOnly.bootstrap, "sessionHosts"), false, "discovery describes routed destinations only");
+  assert.equal(both.bootstrap.sessionHosts, 1);
+  assert.equal(both.bootstrap.spawnRouting, 1);
+  assert.deepEqual(parseBootstrap(JSON.parse(JSON.stringify(both.bootstrap))), both.bootstrap);
+
+  // A request on a registration without the advertised capability gets one
+  // definite read-only unavailable page and the connection stays usable.
+  const client = await connectClient(broker.socketPath);
+  const raw = collectRawFrames(client);
+  client.write(encodeFrame(helloFrame(discoveryOnly.bootstrap) as never)
+    + hostsRequestFrame(discoveryOnly.bootstrap, "aaaaaaaa-0000-4000-8000-000000000001"));
+  await waitFor(() => raw.frames.length === 1);
+  const page = decodeFrame(raw.frames[0]!) as SessionHostHostsResult;
+  assert.equal(page.outcome, "unavailable");
+  assert.equal(client.destroyed, false);
+  await disposeBroker(broker);
+});
+
+test("SessionHosts returns a complete authenticated multi-frame snapshot of 64 long Unicode ids and max labels without spawning", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const snapshot = maxHostsSnapshot();
+  const calls = { spawn: 0, hosts: 0 };
+  const registration = broker.register(INSTANCE_A, discoveryHandlers(async ({ signal }) => {
+    calls.hosts += 1;
+    assert.equal(signal.aborted, false);
+    return snapshot;
+  }, calls));
+  const payloadDir = registration.bootstrap.payloadDir as string;
+  const client = await connectClient(broker.socketPath);
+  const raw = collectRawFrames(client);
+  const requestId = "bbbbbbbb-0000-4000-8000-000000000001";
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + hostsRequestFrame(registration.bootstrap, requestId));
+  const assembler = new SessionHostsResultAssembler(requestId);
+  let step: ReturnType<SessionHostsResultAssembler["accept"]> = { status: "pending" };
+  await waitFor(() => {
+    while (raw.frames.length > 0 && step.status === "pending") {
+      const page = decodeFrame(raw.frames.shift()!) as SessionHostHostsResult;
+      assert.equal(page.type, "hosts_result");
+      assert.equal(page.token, registration.bootstrap.token, "every page is authenticated with the registration token");
+      assert.equal(page.generation, registration.bootstrap.generation);
+      step = assembler.accept(page);
+    }
+    return step.status !== "pending";
+  });
+  assert.equal(step.status, "complete");
+  assert.deepEqual((step as { snapshot: SessionHostsSnapshot }).snapshot, snapshot);
+  assert.ok(raw.bytes.length > 1, "the snapshot needed more than one frame");
+  assert.ok(raw.bytes.every((length) => length <= MAX_STATUS_FRAME_BYTES), "each page fits the existing frame cap");
+  assert.equal(calls.hosts, 1);
+  assert.equal(calls.spawn, 0, "discovery never reaches a spawn handler");
+  assert.deepEqual(fs.readdirSync(payloadDir), [], "discovery stages and reads no payload");
+  await disposeBroker(broker);
+});
+
+test("SessionHosts reports unavailable for throwing, malformed, or late handlers and closes on bad auth or reused ids", async () => {
+  brokerTest.setHostsTimeoutForTests(30);
+  try {
+    const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+    let mode: "throw" | "malformed" | "unlabeled" | "hang" = "throw";
+    const signals: AbortSignal[] = [];
+    const calls = { spawn: 0 };
+    const registration = broker.register(INSTANCE_A, discoveryHandlers(({ signal }) => {
+      signals.push(signal);
+      if (mode === "throw") throw new Error("projection unavailable");
+      if (mode === "malformed") return { ownKinds: ["pi"], hosts: [{ id: "a", label: "A", kinds: ["pi"] }, { id: "a", label: "A", kinds: [] }] } as never;
+      if (mode === "unlabeled") return { ownKinds: ["pi"], hosts: [{ id: "a", kinds: ["pi"] }] } as never;
+      return new Promise<never>(() => undefined);
+    }, calls));
+    const client = await connectClient(broker.socketPath);
+    const raw = collectRawFrames(client);
+    client.write(encodeFrame(helloFrame(registration.bootstrap) as never));
+    for (const [index, next] of (["throw", "malformed", "unlabeled", "hang"] as const).entries()) {
+      mode = next;
+      client.write(hostsRequestFrame(registration.bootstrap, `cccccccc-0000-4000-8000-00000000000${index}`));
+      await waitFor(() => raw.frames.length === index + 1);
+      const page = decodeFrame(raw.frames[index]!) as SessionHostHostsResult;
+      assert.equal(page.outcome, "unavailable", `${next} handler is reported unavailable, never as an empty listing`);
+      assert.equal(Object.hasOwn(page, "hosts"), false);
+    }
+    assert.equal(signals[3]!.aborted, true, "the deadline aborts the handler signal");
+
+    // Reusing a request id is a protocol violation.
+    await expectClientClose(client, () => client.write(hostsRequestFrame(registration.bootstrap, "cccccccc-0000-4000-8000-000000000000")));
+
+    // A wrong token closes the connection before the handler runs.
+    const before = signals.length;
+    const intruder = await connectClient(broker.socketPath);
+    intruder.write(encodeFrame(helloFrame(registration.bootstrap) as never));
+    await expectClientClose(intruder, () => intruder.write(
+      hostsRequestFrame(registration.bootstrap, "cccccccc-0000-4000-8000-000000000009", "f".repeat(64)),
+    ));
+    assert.equal(signals.length, before, "an unauthenticated request never reaches the discovery handler");
+
+    // Disconnect while pending aborts the handler without a reply or spawn.
+    mode = "hang";
+    const last = await connectClient(broker.socketPath);
+    last.write(encodeFrame(helloFrame(registration.bootstrap) as never)
+      + hostsRequestFrame(registration.bootstrap, "cccccccc-0000-4000-8000-00000000000a"));
+    await waitFor(() => signals.length === before + 1);
+    last.destroy();
+    await waitFor(() => signals[before]!.aborted);
+    assert.equal(calls.spawn, 0);
+    await disposeBroker(broker);
+  } finally {
+    brokerTest.setHostsTimeoutForTests(undefined);
+  }
+});
+
+test("workspace creation is advertised only from an explicit declaration and an undeclared request is refused before any read", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const routedReceived: SessionSpawnInput[] = [];
+  const declaredReceived: SessionSpawnInput[] = [];
+  const undeclared = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onRoutedSpawnRequest: (input) => { routedReceived.push(input); return Promise.resolve("started"); },
+  });
+  assert.equal(undeclared.bootstrap.spawnRouting, 1);
+  assert.equal(Object.hasOwn(undeclared.bootstrap, "spawnCreateWorkspace"), false,
+    "a routed handler alone never advertises workspace creation");
+  const declarationOnly = broker.register("22222222-2222-4222-8222-222222222222", {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    routedSpawnCreateWorkspace: true,
+  });
+  assert.equal(Object.hasOwn(declarationOnly.bootstrap, "spawnCreateWorkspace"), false,
+    "a declaration without the routed handler it describes advertises nothing");
+  const declared = broker.register("33333333-3333-4333-8333-333333333333", {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onRoutedSpawnRequest: (input) => { declaredReceived.push(input); return Promise.resolve("started"); },
+    routedSpawnCreateWorkspace: true,
+  });
+  assert.equal(declared.bootstrap.spawnCreateWorkspace, 1);
+  assert.deepEqual(parseBootstrap(JSON.parse(JSON.stringify(declared.bootstrap)))?.spawnCreateWorkspace, 1,
+    "the marker round-trips through the env");
+
+  const base = (bootstrap: SessionHostBootstrap, requestId: string) => ({
+    version: 1,
+    type: "spawn_routed_request",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    token: bootstrap.token,
+    requestId,
+    workspace: "/destination/new workspace",
+    title: "Creating child",
+    payload: spawnPayload(bootstrap, "Create prompt."),
+    createWorkspace: true,
+  });
+
+  // Undeclared: a definite failure and the routed handler is never invoked.
+  const client = await connectClient(broker.socketPath);
+  const replies = collectReplies(client);
+  const refused = base(undeclared.bootstrap, "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1");
+  client.write(encodeFrame(helloFrame(undeclared.bootstrap) as never) + encodeFrame(refused as never));
+  await waitFor(() => replies.length === 1);
+  assert.equal(replies[0]!.outcome, "failed");
+  assert.deepEqual(routedReceived, [], "an old routed handler can never silently ignore creation");
+
+  // Declared: the exact intent reaches the handler once.
+  const declaredClient = await connectClient(broker.socketPath);
+  const declaredReplies = collectReplies(declaredClient);
+  const accepted = { ...base(declared.bootstrap, "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"), kind: "pi" };
+  declaredClient.write(encodeFrame(helloFrame(declared.bootstrap) as never) + encodeFrame(accepted as never));
+  await waitFor(() => declaredReplies.length === 1);
+  assert.equal(declaredReplies[0]!.outcome, "started");
+  assert.deepEqual(declaredReceived, [{
+    workspace: accepted.workspace, title: accepted.title, prompt: "Create prompt.", kind: "pi", createWorkspace: true,
+  }]);
+
+  // The creation intent is part of the replay fingerprint: the same request id
+  // with only the flag removed (the selector keeps the routed family) is not a replay.
+  const altered = await connectClient(broker.socketPath);
+  const { createWorkspace: _dropped, ...withoutCreate } = accepted;
+  void _dropped;
+  await expectClientClose(altered, () => altered.write(
+    encodeFrame(helloFrame(declared.bootstrap) as never) + encodeFrame(withoutCreate as never),
+  ));
+  assert.equal(declaredReceived.length, 1, "a creation-altered replay never invokes the host again");
+  await disposeBroker(broker);
 });

@@ -27,12 +27,13 @@ import test from "node:test";
 import type { OwningHostService } from "../src/session-host/owning-host-service";
 import type {
   OwnerCreateFacts,
-  OwnerNativeCliTargetProvider,
+  OwnerNativeCliTargetSource,
   OwnerNativeCreateHandler,
   PeerCreateController,
   PeerCreateOptions,
   PeerCreateResult,
   PeerCreateTarget,
+  PeerNativeTargetsRefreshResult,
   RemoteNativeCliTarget,
 } from "../src/session-host/network/peer-create";
 import type {
@@ -51,6 +52,7 @@ import {
 
 const ENTER = "\r";
 const DOWN = "\x1b[B";
+const UP = "\x1b[A";
 const TAB = "\t";
 const SHIFT_TAB = "\x1b[Z";
 
@@ -133,15 +135,20 @@ test("the owner's native create reuses the one manager seam in the exact run, se
   assert.ok(sidebar);
   try {
     const create = provider<OwnerNativeCreateHandler>(peer, "nativeCreateOwnedSession");
-    const catalog = provider<OwnerNativeCliTargetProvider>(peer, "nativeCliTargets");
+    const catalog = provider<OwnerNativeCliTargetSource>(peer, "nativeCliTargets");
     const runId = ownerRunId(peer);
     const focusBefore = sidebar.focus;
     const selectedBefore = sidebar.selectedId;
     assert.deepEqual(manager.views, [], "an owner with no rows is exactly the first-child case");
 
-    const advertised: readonly RemoteNativeCliTarget[] = catalog();
+    calls.length = 0;
+    const advertised: readonly RemoteNativeCliTarget[] = await catalog();
     assert.deepEqual(advertised.map((target) => target.id), ["claude"],
-      "the owner advertises only its OWN current native targets");
+      "the owner advertises only its OWN native targets its fresh probe found launchable");
+    assert.deepEqual(calls, [{ backend: "claude", workspace: process.cwd(), targetId: "claude" }],
+      "the catalog read is one fresh pure descriptor probe of the real launcher at the startup cwd");
+    assert.equal(peer.options?.nativeCliAvailability, true,
+      "and the owner declares that its catalog is a fresh availability probe");
 
     const facts: OwnerCreateFacts = await create({
       hostRunId: runId,
@@ -178,6 +185,41 @@ test("the owner's native create refuses a target it does not advertise, without 
       assert.equal(facts.kind, "refused", `${JSON.stringify(request)} is refused`);
     }
     assert.deepEqual(manager.createOptions, [], "nothing was started for any of them");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a configured named worker profile is never advertised or launched as a remote NEW session (#493)", async (t) => {
+  const calls: LaunchCall[] = [];
+  const configured: readonly SidebarNativeCliTarget[] = [
+    { id: "claude", backend: "claude", label: "Claude Code (default)" },
+    { id: "codex", backend: "codex", label: "Codex CLI (default)" },
+    { id: "external:workhorse", backend: "codex", label: "workhorse (Codex CLI)" },
+  ];
+  const hosting = () => ({ ...recordingHosting(calls)(), targets: configured });
+  const { harness, peer } = await peerMainHarness(t, undefined, { nativeCliHosting: hosting });
+  const manager = harness.manager as FakeManager;
+  try {
+    const create = provider<OwnerNativeCreateHandler>(peer, "nativeCreateOwnedSession");
+    const catalog = provider<OwnerNativeCliTargetSource>(peer, "nativeCliTargets");
+    const runId = ownerRunId(peer);
+    assert.deepEqual((await catalog()).map((target) => target.id), ["claude", "codex"],
+      "the owner advertises only the backend defaults, never the named profile");
+    const refused = await create(
+      { hostRunId: runId, workspace: "/srv/a", backend: "codex", targetId: "external:workhorse" },
+      () => true,
+    );
+    assert.equal(refused.kind, "refused", "a NEW request naming the profile is refused, not defaulted");
+    assert.deepEqual(manager.createOptions, [], "nothing was started for it");
+    const started = await create(
+      { hostRunId: runId, workspace: "/srv/b", backend: "codex", targetId: "codex" },
+      () => true,
+    );
+    assert.equal(started.kind, "started");
+    assert.deepEqual(manager.createOptions, [
+      { workspace: "/srv/b", backend: "codex", nativeCliTarget: "codex" } as CreateInstanceOptions,
+    ]);
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }
@@ -225,9 +267,18 @@ test("the owner's host-name provider reports its own persistence truth and never
 class CreatePeer extends FakePeerCoordinator {
   readonly piCreates: PeerCreateTarget[] = [];
   readonly nativeCreates: unknown[] = [];
+  readonly refreshes: string[] = [];
+  refreshResult: PeerNativeTargetsRefreshResult = { kind: "refreshed", hostRunId: "run-owner-a" };
   piResult: PeerCreateResult = { kind: "unknown" };
   nativeResult: PeerCreateResult = { kind: "unknown" };
+  /** Negotiated workspace-creation support this fake reports (#493); off by default. */
+  createWorkspaceSupported = false;
   readonly ownerCreate: PeerCreateController = {
+    supportsCreateWorkspace: () => this.createWorkspaceSupported,
+    refreshNativeTargets: async (hostId: string) => {
+      this.refreshes.push(hostId);
+      return this.refreshResult;
+    },
     createSession: async (request: PeerCreateTarget, _options: PeerCreateOptions) => {
       this.piCreates.push(request);
       return this.piResult;
@@ -250,7 +301,9 @@ function nativeOwnerHost(): ReturnType<typeof remotePeerHost> {
     nativeCli: {
       supported: true,
       targets: [{ id: "claude", backend: "claude", label: "Claude (owner)" }],
+      availability: "probed",
     },
+    createSupported: true,
   };
 }
 
@@ -347,6 +400,39 @@ test("a native provider choice on a remote destination reaches the native create
   }
 });
 
+test("a checked workspace-creation box rides the native create lane and is never dropped (#493)", async (t) => {
+  const peer = new CreatePeer();
+  peer.createWorkspaceSupported = true;
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  try {
+    peer.publish({ hosts: [{ ...nativeOwnerHost(), createWorkspaceSupported: true }] });
+    await nextTurn();
+    await openNativeNewOnPeer(harness, "/srv/new-app");
+    // Workspace -> Provider -> Host -> the checkbox drawn below the editor, check
+    // it, and step back up into the editor; Main writes a frame between keys.
+    for (const key of [SHIFT_TAB, SHIFT_TAB, SHIFT_TAB, " ", SHIFT_TAB]) {
+      harness.terminal.emitInput(key);
+      await nextTurn();
+    }
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("[x] Create missing workspace directory"), true,
+      "the written native New form draws the checked box");
+    await settleNewForm(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.piCreates, [], "the Pi create lane was never used");
+    assert.deepEqual(peer.nativeCreates, [{
+      hostId: "owner-a",
+      hostRunId: "run-owner-a",
+      workspace: "/srv/new-app",
+      backend: "claude",
+      targetId: "claude",
+      createWorkspace: true,
+    }], "the native lane receives the checked intent with the exact drawn target");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
 test("an unchanged remote New submission keeps the exact Pi create shape", async (t) => {
   const peer = new CreatePeer();
   const { harness } = await peerMainHarness(t, undefined, {}, peer);
@@ -423,6 +509,7 @@ class HeldNativePeer extends FakePeerCoordinator {
     this.releasePending!();
   }
   readonly ownerCreate: PeerCreateController = {
+    refreshNativeTargets: async () => ({ kind: "refreshed", hostRunId: "run-owner-a" }),
     createSession: () => {
       this.piRequests.push(1);
       return Promise.resolve({ kind: "unknown" } satisfies PeerCreateResult);
@@ -468,6 +555,91 @@ test("a native create whose provider scope moved while its write was held is ref
     assert.equal(peer.proofAtWrite, false,
       "a held native write is refused once its provider scope has moved");
     assert.deepEqual(peer.piRequests, [], "and it is never answered by a Pi create");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+/** The drawn Provider line of the New form, or "" when none is drawn. */
+function drawnProviderLine(harness: Harness): string {
+  const lines = harness.writer.frames.at(-1)?.frame.lines
+    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "")) ?? [];
+  for (const line of lines) {
+    for (const part of line.split("\u2502")) {
+      if (part.includes("Provider:")) return part.trim();
+    }
+  }
+  return "";
+}
+
+test("a remote New offers native choices only after its owner refresh, and only from a probing owner (#493)", async (t) => {
+  const peer = new CreatePeer();
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  try {
+    // A legacy owner (no availability negotiated) still lists a catalog: it is unverified.
+    const legacy = { ...nativeOwnerHost(), nativeCli: { supported: true, targets: nativeOwnerHost().nativeCli!.targets } };
+    peer.publish({ hosts: [legacy] });
+    peer.refreshResult = { kind: "not-sent", reason: "capability-unsupported" };
+    await nextTurn();
+    await openNewForm(harness);
+    await focusSelector(harness, "Host");
+    harness.terminal.emitInput(DOWN); // -> owner-a
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(peer.refreshes, ["owner-a"], "the actual Host change asks that owner for one fresh observation");
+    assert.equal(drawnProviderLine(harness), "", "an availability-unknown owner offers no unverified native choice");
+
+    // A busy refresh of a probing owner is not fresh availability either.
+    peer.publish({ hosts: [nativeOwnerHost()] });
+    peer.refreshResult = { kind: "not-sent", reason: "busy" };
+    await nextTurn();
+    assert.equal(drawnProviderLine(harness), "", "a probed catalog is not offered before this form's refresh completes");
+    await focusSelector(harness, "Host");
+    harness.terminal.emitInput(UP); // -> Local
+    await nextTurn();
+    harness.terminal.emitInput(DOWN); // -> owner-a again
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(peer.refreshes, ["owner-a", "owner-a"]);
+    assert.equal(drawnProviderLine(harness), "", "a busy refresh offers nothing and falls back to nothing");
+
+    // A completed refresh for the exact observed run offers the current probed projection.
+    peer.refreshResult = { kind: "refreshed", hostRunId: "run-owner-a" };
+    harness.terminal.emitInput(UP);
+    await nextTurn();
+    harness.terminal.emitInput(DOWN);
+    await nextTurn();
+    await nextTurn();
+    assert.match(drawnProviderLine(harness), /Provider: \[ Pi \]/, "Pi stays the default once native choices appear");
+    assert.equal(harness.sidebar!.focus, "form", "no refresh moved the form's focus");
+    assert.deepEqual(peer.piCreates, []);
+    assert.deepEqual(peer.nativeCreates, []);
+    assert.deepEqual(peer.commands, [], "no refresh connects, pairs, or retries");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a remote owner that did not negotiate the blank create is never offered or sent a Pi create", async (t) => {
+  const peer = new CreatePeer();
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  try {
+    const noCreate = { ...remotePeerHost({ id: "owner-c", label: "owner-c", hostRunId: "run-c", rows: [] }), createSupported: false };
+    peer.publish({ hosts: [noCreate] });
+    await nextTurn();
+    await openNewForm(harness);
+    await focusSelector(harness, "Host");
+    harness.terminal.emitInput(DOWN); // -> owner-c
+    await nextTurn();
+    harness.terminal.emitInput(TAB);
+    harness.terminal.emitInput("/srv/app");
+    await nextTurn();
+    await settleNewForm(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.piCreates, [], "no Pi create is sent to an owner that cannot create one");
+    assert.deepEqual(peer.nativeCreates, [], "and it is never turned into a native create");
+    assert.match(plain(harness.writer.frames.at(-1)?.frame), /cannot start a Pi session/);
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

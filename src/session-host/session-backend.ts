@@ -48,6 +48,82 @@ export function isNativeCliTargetId(value: unknown): value is string {
     && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
 }
 
+/**
+ * The reserved default native launch-target id, one per native backend. This
+ * is the ONE canonical source of those ids: the native CLI launcher derives its
+ * default records from it, the manager defaults an untargeted native row to it,
+ * and {@linkcode isNativeCliNewSessionTarget} derives the NEW-session choice
+ * rule from it. No surface keeps its own copy.
+ */
+export const NATIVE_CLI_DEFAULT_TARGET_IDS: Readonly<Record<NativeCliBackend, string>> = Object.freeze({
+  claude: "claude",
+  codex: "codex",
+});
+
+/**
+ * The id prefix of a configured shared external-agent CLI launch target
+ * (`external:<id>`), so a configured id that reads `claude` never collides
+ * with a default target. The native CLI launcher builds those ids with it, and
+ * {@linkcode nativeCliRestoreTargetId} recognizes a remembered legacy one by it.
+ */
+export const NATIVE_CLI_EXTERNAL_TARGET_PREFIX = "external:";
+
+/**
+ * True only for the one native target a NEW session may launch for its
+ * backend: that backend's reserved default id (issue #493). A NEW session's
+ * choices are the three backend kinds — Pi (the ordinary create) and the
+ * Claude and Codex defaults — never a configured named external worker profile
+ * (`external:<id>`), so a profile configured for delegated review or execution
+ * can never become a NEW interactive session choice.
+ *
+ * It is derived from {@linkcode NATIVE_CLI_DEFAULT_TARGET_IDS} rather than
+ * stored beside any target list. The wire and remembered-identity parsers keep
+ * accepting every well-formed target id; restoration maps a remembered id with
+ * {@linkcode nativeCliRestoreTargetId}.
+ */
+export function isNativeCliNewSessionTarget(backend: unknown, targetId: unknown): boolean {
+  return isNativeCliBackend(backend) && targetId === NATIVE_CLI_DEFAULT_TARGET_IDS[backend];
+}
+
+/**
+ * The launch target a remembered native row restores with (issue #493), or
+ * `undefined` when its remembered target id names no restorable target.
+ *
+ * Restoration uses the same normal backend defaults a NEW session does. A row
+ * remembered with its backend's default id restores with that default
+ * unchanged. A row remembered with a legacy configured external target
+ * (`external:<id>`, whatever its id, configured now or not) is deliberately
+ * restored with its BACKEND's default target — base Claude or base Codex —
+ * never with that worker profile's command, args, or environment, and with no
+ * lookup of the old entry. That is an approved compatibility decision, not a
+ * fallback: the remembered provider conversation, workspace, and caption are
+ * still the exact ones resumed, and a row whose identity cannot be restored is
+ * still refused rather than started fresh. Any other id — another backend's
+ * default, or a form no host ever produced — is not mapped and stays refused.
+ */
+export function nativeCliRestoreTargetId(backend: unknown, rememberedTargetId: unknown): string | undefined {
+  if (!isNativeCliBackend(backend) || !isNativeCliTargetId(rememberedTargetId)) return undefined;
+  const defaultId = NATIVE_CLI_DEFAULT_TARGET_IDS[backend];
+  if (rememberedTargetId === defaultId) return defaultId;
+  if (rememberedTargetId.startsWith(NATIVE_CLI_EXTERNAL_TARGET_PREFIX)
+    && rememberedTargetId.length > NATIVE_CLI_EXTERNAL_TARGET_PREFIX.length) {
+    return defaultId;
+  }
+  return undefined;
+}
+
+/**
+ * The NEW-session projection of one native target list: exactly its entries
+ * that {@linkcode isNativeCliNewSessionTarget} admits, in their original order,
+ * as a fresh frozen array. It is a read-time view of a list some other owner
+ * holds, never a second stored catalog.
+ */
+export function projectNativeCliNewSessionTargets<T extends { readonly id: string; readonly backend: NativeCliBackend }>(
+  targets: readonly T[],
+): readonly T[] {
+  return Object.freeze(targets.filter((target) => isNativeCliNewSessionTarget(target.backend, target.id)));
+}
+
 /** True only for a value from the closed {@linkcode SessionBackend} set. */
 export function isSessionBackend(value: unknown): value is SessionBackend {
   return value === "pi" || value === "claude" || value === "codex";

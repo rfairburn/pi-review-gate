@@ -70,6 +70,34 @@ class AcceptedCreateActivationTest {
         assertNull(activation.returnedRow)
     }
 
+    @Test fun createWorkspaceChoiceIsPartOfTheCapturedAndStartedFormIdentity() {
+        // Capture requires the submitted flag to equal the form's own choice.
+        val checked = dialog().copy(createWorkspace = true)
+        val frozenChecked = assertNotNull(FrozenAction.capture(checked.proof))
+        assertNull(AcceptedCreateActivation.capture(host, 9, run, workspace, checked, frozenChecked,
+            ClientRoute.Sessions), "an unchecked submit can never capture a checked form")
+        val unchecked = dialog()
+        val frozenUnchecked = assertNotNull(FrozenAction.capture(unchecked.proof))
+        assertNull(AcceptedCreateActivation.capture(host, 9, run, workspace, unchecked, frozenUnchecked,
+            ClientRoute.Sessions, createWorkspace = true), "a checked submit can never capture an unchecked form")
+
+        val activation = assertNotNull(AcceptedCreateActivation.capture(host, 9, run, workspace, checked,
+            frozenChecked, ClientRoute.Sessions, createWorkspace = true))
+        assertTrue(activation.createWorkspace)
+        admitted(activation)
+        // The same receipt with the choice flipped afterwards is a newer intent: cancelled.
+        assertNull(activation.started(settled(), checked.copy(createWorkspace = false)))
+        assertNull(activation.returnedRow)
+        assertFalse(activation.mayActivate)
+
+        // The exact submitted checked form is accepted as before.
+        val exact = dialog().copy(createWorkspace = true)
+        val exactActivation = assertNotNull(AcceptedCreateActivation.capture(host, 9, run, workspace, exact,
+            assertNotNull(FrozenAction.capture(exact.proof)), ClientRoute.Sessions, createWorkspace = true))
+        admitted(exactActivation)
+        assertEquals(AcceptedCreateActivation.StartedRow(run, "row-new"), exactActivation.started(settled(), exact))
+    }
+
     @Test fun acceptedReturnedRowAdmitsOneNavigationFromSessionsOrHostsOrigin() {
         for (origin in listOf<ClientRoute>(ClientRoute.Sessions, ClientRoute.Hosts)) {
             val form = dialog(proof = newProof())

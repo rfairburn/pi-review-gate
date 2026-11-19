@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import {
+  appendFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -13,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import { SidebarController } from "../src/session-host/sidebar";
 import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
@@ -63,6 +64,7 @@ import {
   type NativeJournalRecord,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-launcher";
+import { ChangeSignal, DURABLE_JOURNAL_RECHECK_INTERVAL_MS } from "./helpers/change-signal";
 import { frameHeader, frameHeaderMatches, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 import { WINDOWS_NATIVE_COLS, isWindowsMainOwnerFrame } from "./helpers/session-host-native-windows-harness";
 
@@ -525,6 +527,237 @@ test("launcher frame-wait diagnostics carry bounded exit and journal evidence, n
   assert.match(minimal.message, /exit=false/);
   assert.doesNotMatch(minimal.message, /outerExitCode=|entry=|module=|summary=/);
   assert.doesNotMatch(minimal.message, new RegExp(sensitive));
+});
+
+// ---------------------------------------------------------------------------
+// Native observer-journal readiness (synthetic controls, every host).
+//
+// These bind the real `LauncherPtyDriver.waitForNative` to the state it reads:
+// a real task-created observer journal and launcher PTY journal read by the
+// driver's own readers, its own shared `ChangeSignal`, and a real `LegDeadline`.
+// A real driver needs an owned Windows ConPTY, so — exactly as the shared
+// journal-signal controls bind other drivers' prototype methods — nothing else
+// is synthesized, and no watcher callback is ever invoked unless a control says
+// so: that is precisely the dropped/coalesced `fs.watch` condition. Virtual
+// time makes the unchanged deadline and the leg fences exact assertions. None
+// of this is Windows host proof; only the opted-in real legs above are.
+// ---------------------------------------------------------------------------
+
+const JOURNAL_WORKSPACE = "C:\\prg-journal-control\\workspace";
+const JOURNAL_STAGE = "real public session_start";
+
+interface LauncherJournalControl {
+  readonly driver: LauncherPtyDriver;
+  readonly signal: ChangeSignal;
+  readonly observerFile: string;
+  readonly ptyJournal: string;
+}
+
+function launcherJournalControl(t: TestContext, deadline: LegDeadline, fields: Record<string, unknown> = {}): LauncherJournalControl {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "prg-windows-launcher-journal-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const observerFile = join(root, "native-main.jsonl");
+  const ptyJournal = join(root, "pty-events.jsonl");
+  writeFileSync(observerFile, "");
+  writeFileSync(ptyJournal, "");
+  const signal = new ChangeSignal();
+  const driver = Object.create(LauncherPtyDriver.prototype) as LauncherPtyDriver;
+  Object.assign(driver, {
+    journalSignal: signal,
+    observerFile,
+    ptyJournal,
+    deadline,
+    exitEvent: undefined,
+    frameRevision: 7,
+    ...fields,
+  });
+  return { driver, signal, observerFile, ptyJournal };
+}
+
+function enableJournalClock(t: TestContext): void {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+}
+
+function openLegDeadline(t: TestContext, budgetMs = LAUNCHER_BODY_DEADLINE_MS, external?: AbortSignal): LegDeadline {
+  const deadline = new LegDeadline(budgetMs, external);
+  t.after(() => deadline.dispose());
+  return deadline;
+}
+
+/** The same session_start predicate shape `createNativeSession` waits on. */
+function journalSessionStartReady(records: readonly NativeJournalRecord[]): boolean {
+  return records.some((record) => record.type === "session_start"
+    && (record.cwd ?? "").toLocaleLowerCase("en-US") === JOURNAL_WORKSPACE.toLocaleLowerCase("en-US")
+    && typeof record.sessionId === "string" && record.sessionId.length > 0);
+}
+
+function appendJournal(path: string, record: Record<string, unknown>): void {
+  appendFileSync(path, `${JSON.stringify(record)}\n`);
+}
+
+async function journalRejection(waiter: Promise<unknown>): Promise<string> {
+  return await waiter.then(() => "", (error: unknown) => (error instanceof Error ? error.message : String(error)));
+}
+
+async function flushJournalMicrotasks(): Promise<void> {
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+}
+
+test("launcher native journal wait observes a durable session_start whose notification was dropped", async (t) => {
+  enableJournalClock(t);
+  const control = launcherJournalControl(t, openLegDeadline(t));
+  let evaluations = 0;
+  const durableWait = control.driver.waitForNative((records) => {
+    evaluations += 1;
+    return journalSessionStartReady(records);
+  }, JOURNAL_STAGE);
+  // The pre-change notification-only path, with the same predicate and bound.
+  const baselineWait = control.signal.waitFor(() => journalSessionStartReady(control.driver.records()),
+    LAUNCHER_EVENT_TIMEOUT_MS, "pre-change notification-only launcher journal readiness");
+  assert.equal(evaluations, 1, "the unchanged predicate is evaluated once immediately");
+  assert.equal(control.signal.pendingWaiterCount, 2);
+
+  // The observer appends session_start exactly once and no watcher event arrives.
+  appendJournal(control.observerFile, { type: "session_start", pid: 4_242, cwd: JOURNAL_WORKSPACE, sessionId: "s-1", tty: true });
+  let durableSettled = false;
+  durableWait.then(() => { durableSettled = true; }, () => { durableSettled = true; });
+  t.mock.timers.tick(DURABLE_JOURNAL_RECHECK_INTERVAL_MS);
+  await flushJournalMicrotasks();
+  // Asserted before awaiting: a notification-only regression fails here instead
+  // of awaiting forever on a virtual clock that never advances.
+  assert.equal(durableSettled, true, "one bounded re-evaluation observed the record before any deadline");
+  const records = await durableWait;
+  assert.equal(journalSessionStartReady(records), true, "the returned journal really carries the awaited record");
+  assert.equal(evaluations, 2, "one bounded re-evaluation, not the deadline, observed the durable record");
+  assert.equal(control.signal.pendingWaiterCount, 1, "only the notification-only baseline is still waiting");
+
+  t.mock.timers.tick(LAUNCHER_EVENT_TIMEOUT_MS);
+  assert.equal(await journalRejection(baselineWait), "pre-change notification-only launcher journal readiness: deadline exceeded",
+    "the notification-only path still misses the same durable record within the same bound");
+  assert.equal(control.signal.pendingWaiterCount, 0);
+
+  // The watcher notification remains the synchronous fast path.
+  const notified = launcherJournalControl(t, openLegDeadline(t));
+  const notifiedWait = notified.driver.waitForNative(journalSessionStartReady, JOURNAL_STAGE);
+  appendJournal(notified.observerFile, { type: "session_start", pid: 4_243, cwd: JOURNAL_WORKSPACE, sessionId: "s-2", tty: true });
+  notified.signal.notify(); // exactly what the driver's fs.watch callback does
+  assert.equal(journalSessionStartReady(await notifiedWait), true);
+  assert.equal(notified.signal.pendingWaiterCount, 0);
+});
+
+test("launcher native journal wait keeps its unchanged 30-second deadline and fabricates no readiness", async (t) => {
+  enableJournalClock(t);
+  assert.equal(LAUNCHER_EVENT_TIMEOUT_MS, 30_000, "the launcher event deadline is unchanged");
+  const control = launcherJournalControl(t, openLegDeadline(t));
+  // A non-matching durable record: a different workspace and an empty session id.
+  appendJournal(control.observerFile, { type: "session_start", pid: 4_244, cwd: "C:\\other", sessionId: "s-3" });
+  appendJournal(control.observerFile, { type: "session_start", pid: 4_245, cwd: JOURNAL_WORKSPACE, sessionId: "" });
+  let evaluations = 0;
+  let settled = false;
+  const pending = control.driver.waitForNative((records) => {
+    evaluations += 1;
+    return journalSessionStartReady(records);
+  }, JOURNAL_STAGE);
+  pending.then(() => { settled = true; }, () => { settled = true; });
+
+  t.mock.timers.tick(LAUNCHER_EVENT_TIMEOUT_MS - 1);
+  await flushJournalMicrotasks();
+  assert.equal(settled, false, "the bounded re-evaluation neither shortens nor satisfies the unchanged deadline");
+  t.mock.timers.tick(1);
+  const message = await journalRejection(pending);
+  assert.ok(message.startsWith(`${JOURNAL_STAGE}: deadline exceeded (bounded journal evidence: `),
+    `the original stage and outcome lead the bounded diagnostic: ${message}`);
+  assert.match(message, /native=2, session_start=2,/);
+  assert.ok(evaluations > 2, "the unchanged predicate was re-examined while pending and still failed");
+  assert.equal(control.signal.pendingWaiterCount, 0, "the failed wait cleared its listener and interval");
+
+  // A throwing predicate keeps its typed bounded failure.
+  const thrown = await journalRejection(control.driver.waitForNative(() => {
+    throw new Error("PRIVATE predicate detail");
+  }, JOURNAL_STAGE));
+  assert.ok(thrown.startsWith(`${JOURNAL_STAGE}: bounded event predicate failed (bounded journal evidence: `), thrown);
+  assert.doesNotMatch(thrown, /PRIVATE/);
+  assert.equal(control.signal.pendingWaiterCount, 0);
+});
+
+test("launcher native journal wait keeps the leg abort fences verbatim", async (t) => {
+  enableJournalClock(t);
+
+  // Cancellation mid-wait settles promptly with the original, unchanged error.
+  const controller = new AbortController();
+  const cancelled = launcherJournalControl(t, openLegDeadline(t, LAUNCHER_BODY_DEADLINE_MS, controller.signal));
+  const cancelledWait = cancelled.driver.waitForNative(journalSessionStartReady, JOURNAL_STAGE);
+  controller.abort();
+  assert.equal(await journalRejection(cancelledWait), `${JOURNAL_STAGE}: cancelled before completion`);
+  assert.equal(cancelled.signal.pendingWaiterCount, 0);
+
+  // The enforced leg deadline expiring before the event deadline cancels the wait.
+  const expiring = launcherJournalControl(t, openLegDeadline(t, 10));
+  const expiringWait = expiring.driver.waitForNative(journalSessionStartReady, JOURNAL_STAGE);
+  t.mock.timers.tick(10);
+  assert.equal(await journalRejection(expiringWait), `${JOURNAL_STAGE}: cancelled before completion`);
+  assert.equal(expiring.signal.pendingWaiterCount, 0);
+
+  // An already-cancelled leg never evaluates the predicate, even over a ready journal.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const refused = launcherJournalControl(t, openLegDeadline(t, LAUNCHER_BODY_DEADLINE_MS, preAborted.signal));
+  appendJournal(refused.observerFile, { type: "session_start", pid: 4_246, cwd: JOURNAL_WORKSPACE, sessionId: "s-4" });
+  let evaluations = 0;
+  const refusedWait = refused.driver.waitForNative((records) => {
+    evaluations += 1;
+    return journalSessionStartReady(records);
+  }, JOURNAL_STAGE);
+  assert.equal(await journalRejection(refusedWait), `${JOURNAL_STAGE}: cancelled before completion`);
+  assert.equal(evaluations, 0, "a cancelled leg authorizes no readiness");
+  assert.equal(refused.signal.pendingWaiterCount, 0);
+});
+
+test("launcher native journal wait diagnostics are bounded counts that never carry journal content", async (t) => {
+  enableJournalClock(t);
+  const secret = "PRIVATE-JOURNAL-session-host-secret";
+  const huge = `${secret}-${"x".repeat(64 * 1024)}`;
+  const control = launcherJournalControl(t, openLegDeadline(t), { exitEvent: { exitCode: 3, signal: 0 } });
+  appendJournal(control.observerFile, {
+    type: "session_start", pid: 4_247, cwd: `C:\\${secret}\\workspace`, sessionId: secret,
+    sessionFile: `C:\\Users\\${secret}\\session.jsonl`, displayName: huge, tty: true,
+  });
+  appendJournal(control.observerFile, { type: "native_session_name", pid: 4_247, storedName: huge, displayName: secret });
+  appendJournal(control.observerFile, { type: "tool_call", toolName: secret, prompt: huge });
+  appendJournal(control.observerFile, { type: `${secret}-unlisted-type`, argv: ["--api-key", secret], env: { TOKEN: secret } });
+  appendJournal(control.observerFile, { type: huge });
+  appendJournal(control.ptyJournal, { type: "launcher_entry", argv: [secret], cwd: `/${secret}` });
+  appendJournal(control.ptyJournal, { type: "pty_module", path: `C:\\${secret}\\node-pty` });
+  appendJournal(control.ptyJournal, { type: "pty_spawn", pid: 4_247, cwd: `C:\\${secret}`, file: huge });
+  appendJournal(control.ptyJournal, {
+    type: "launcher_summary", exitCode: secret, forceAttempted: false, journalFailed: secret,
+    unresolvedSpawns: 0, unexitedSpawns: 1, note: huge,
+  });
+
+  const pending = control.driver.waitForNative(journalSessionStartReady, JOURNAL_STAGE);
+  t.mock.timers.tick(LAUNCHER_EVENT_TIMEOUT_MS);
+  const message = await journalRejection(pending);
+  assert.equal(message,
+    `${JOURNAL_STAGE}: deadline exceeded (bounded journal evidence: revision=7, exit=true, aborted=false, `
+    + "outerExitCode=3, outerExitSignal=0, entry=yes, module=yes, summary=yes, summaryExitCode=unreported, "
+    + "summaryForce=no, summaryJournalFailed=unreported, summaryUnresolved=0, summaryUnexited=1, "
+    + "native=5, session_start=1, native_session_name=1, session_shutdown=0, agent_start=0, agent_settled=0, "
+    + "tool_call=1, resize=0, otherTypes=2, ptySpawns=1, ptyExits=0)",
+    "only fixed identifiers, allowlisted type names, counts, and typed summary fields reach the diagnostic");
+  assert.ok(message.length < 1_024, `the diagnostic stays bounded regardless of journal size (${message.length} chars)`);
+  assert.doesNotMatch(message, new RegExp(secret), "no journal value reaches the diagnostic");
+  assert.doesNotMatch(message, /[\\/]|--api-key|TOKEN|xxxx/, "no path, argument, environment, or unbounded value reaches it");
+
+  // A malformed (unreadable) observer journal fails the predicate with its typed
+  // outcome and is reported as unreadable, never as an empty journal, and the
+  // malformed line's content never reaches the diagnostic.
+  const unreadable = launcherJournalControl(t, openLegDeadline(t));
+  writeFileSync(unreadable.observerFile, `{"type":"session_start","cwd":"${secret}"\n`);
+  const unreadableMessage = await journalRejection(unreadable.driver.waitForNative(journalSessionStartReady, JOURNAL_STAGE));
+  assert.equal(unreadableMessage,
+    `${JOURNAL_STAGE}: bounded event predicate failed (bounded journal evidence: revision=7, exit=false, aborted=false, `
+    + "entry=no, module=no, summary=no, native=unreadable, ptySpawns=0, ptyExits=0)");
+  assert.doesNotMatch(unreadableMessage, new RegExp(secret));
 });
 
 test("launcher failure cleanup reserves every step inside the original budget", () => {

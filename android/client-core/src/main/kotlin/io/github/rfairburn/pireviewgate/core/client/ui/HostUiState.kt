@@ -71,6 +71,17 @@ public data class HostCapabilities(
     public val rosterSlot: CapabilityStatus = CapabilityStatus.UNKNOWN,
     public val native: CapabilityStatus = CapabilityStatus.UNKNOWN,
     public val nativeName: CapabilityStatus = CapabilityStatus.UNKNOWN,
+    /**
+     * Whether the owner described its native catalog as a fresh launch probe. Without
+     * it (or without the native lane beside it) native availability is unknown and is
+     * claimed neither way; see [HostUiState.canCreateNativeSession].
+     */
+    public val nativeAvailability: CapabilityStatus = CapabilityStatus.UNKNOWN,
+    /**
+     * Whether the owner honours the request-specific create-workspace flag on its
+     * create lanes. Protocol support only; see [HostUiState.canCreateWorkspace].
+     */
+    public val createWorkspace: CapabilityStatus = CapabilityStatus.UNKNOWN,
 ) {
     /** Support for one identifier, or [CapabilityStatus.UNKNOWN] before negotiation. */
     public fun statusOf(capability: String): CapabilityStatus = when (capability) {
@@ -81,6 +92,8 @@ public data class HostCapabilities(
         RosterWire.ROSTER_SLOT_CAPABILITY -> rosterSlot
         RosterWire.NATIVE_CAPABILITY -> native
         RosterWire.NATIVE_NAME_CAPABILITY -> nativeName
+        RosterWire.NATIVE_AVAILABILITY_CAPABILITY -> nativeAvailability
+        RosterWire.CREATE_WORKSPACE_CAPABILITY -> createWorkspace
         else -> CapabilityStatus.UNKNOWN
     }
 
@@ -109,6 +122,16 @@ public data class HostCapabilities(
                 rosterSlot = status(capabilities, RosterWire.ROSTER_SLOT_CAPABILITY),
                 native = status(capabilities, RosterWire.NATIVE_CAPABILITY),
                 nativeName = status(capabilities, RosterWire.NATIVE_NAME_CAPABILITY),
+                nativeAvailability = if (RosterWire.nativeAvailabilityDependencyHolds(capabilities)) {
+                    status(capabilities, RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+                } else {
+                    CapabilityStatus.UNSUPPORTED
+                },
+                createWorkspace = if (RosterWire.createWorkspaceDependencyHolds(capabilities)) {
+                    status(capabilities, RosterWire.CREATE_WORKSPACE_CAPABILITY)
+                } else {
+                    CapabilityStatus.UNSUPPORTED
+                },
             )
 
         private fun status(capabilities: List<String>, capability: String): CapabilityStatus =
@@ -196,20 +219,37 @@ public data class HostUiState(
         get() = connection == HostConnectionState.CONNECTED &&
             capabilities.supports(RosterWire.CREATE_CAPABILITY)
 
+    /**
+     * True only when this owner may be asked to create a missing workspace directory
+     * now: live connection, the flag positively acknowledged, and at least one create
+     * lane it can ride on. It grants nothing and is never inferred from history; the
+     * chosen lane's own eligibility still decides whether a create can be sent.
+     */
+    public val canCreateWorkspace: Boolean
+        get() = connection == HostConnectionState.CONNECTED &&
+            capabilities.supports(RosterWire.CREATE_WORKSPACE_CAPABILITY) &&
+            (capabilities.supports(RosterWire.CREATE_CAPABILITY) || capabilities.supports(RosterWire.NATIVE_CAPABILITY))
+
     /** True only when this owner can serve a Saved listing now, by the same rule. */
     public val canBrowseSaved: Boolean
         get() = connection == HostConnectionState.CONNECTED &&
             capabilities.supports(RosterWire.SAVED_CAPABILITY)
 
     /**
-     * True only when this owner can take a native create now: live connection, the
-     * native lane positively acknowledged, and a non-empty CURRENT advertised
-     * catalog. An empty or absent catalog keeps the form Pi-only; a stale one is
-     * never eligible.
+     * True only when this client may OFFER a native create for this owner now: live
+     * connection, the native lane positively acknowledged together with its
+     * availability description (#493), and a non-empty CURRENT advertised catalog.
+     * With the description, that catalog is the owner's fresh launch probe; without
+     * it (a legacy owner) native availability is UNKNOWN, so no unverified native
+     * choice is offered — this is never a claim that the targets are unavailable.
+     * An empty or absent catalog keeps the form Pi-only; a stale one is never
+     * eligible. Availability is an observation, never a grant: the owner still
+     * re-proves every native create against its own live catalog.
      */
     public val canCreateNativeSession: Boolean
         get() = connection == HostConnectionState.CONNECTED &&
             capabilities.supports(RosterWire.NATIVE_CAPABILITY) &&
+            capabilities.supports(RosterWire.NATIVE_AVAILABILITY_CAPABILITY) &&
             roster?.freshness == RosterFreshness.CURRENT &&
             nativeCatalogScope != null &&
             !nativeCliTargets.isNullOrEmpty()

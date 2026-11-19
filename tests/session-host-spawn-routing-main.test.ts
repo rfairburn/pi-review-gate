@@ -792,3 +792,129 @@ test("SessionHosts shows each destination's saved label beside its id so a named
     assert.equal(await closeWithSignal(harness), 0);
   }
 });
+
+// --- Opt-in destination workspace creation (issue #493). ---
+//
+// Main only forwards the exact boolean into the one owner/own-host create; the
+// manager (a fake here) owns the actual recursive mkdir. These tests pin that
+// the intent is never dropped, never acted on by a requester for a remote path,
+// and that `false`/omission keep the exact legacy create options.
+
+test("Main declares routed workspace-creation support beside its routed handler and forwards it through the registrar", (t) => {
+  const forwarded: StatusBrokerStatusHandlers[] = [];
+  const broker = {
+    register(_instanceId: string, handlers: StatusBrokerStatusHandlers) {
+      forwarded.push(handlers);
+      return { bootstrap: {}, rename: async () => ({}), shutdown: async () => ({}), release: () => undefined };
+    },
+  } as unknown as StatusBroker;
+  const registrar = mainTest.statusRegistrar(broker);
+  const noop = { onStatus: () => undefined, onDisconnect: () => undefined };
+  const routedHandler = async (): Promise<SessionSpawnOutcome> => "failed";
+  registrar.register("a", { ...noop, onRoutedSpawnRequest: routedHandler, routedSpawnCreateWorkspace: true });
+  registrar.register("b", { ...noop, onRoutedSpawnRequest: routedHandler });
+  registrar.register("c", { ...noop, routedSpawnCreateWorkspace: true });
+  assert.equal(forwarded[0]!.routedSpawnCreateWorkspace, true, "the declaration rides beside the routed handler");
+  assert.equal(Object.hasOwn(forwarded[1]!, "routedSpawnCreateWorkspace"), false, "no declaration is invented");
+  assert.equal(Object.hasOwn(forwarded[2]!, "routedSpawnCreateWorkspace"), false,
+    "a declaration without the routed handler it describes is never forwarded");
+  void t;
+});
+
+test("an own-host routed createWorkspace request reaches the one local create for Pi, Claude, and Codex; false is legacy", async (t) => {
+  const { harness, peer, manager } = await spawnHarness(t);
+  try {
+    assert.equal(manager.options.routedSpawnCreateWorkspace, true, "Main declares that its routed handler honors creation");
+    const parent = await localParent(harness, manager);
+    const prompt = bigPrompt();
+    const workspace = "/local/new/nested/workspace";
+    for (const kind of ["pi", "claude", "codex"] as const) {
+      const outcome = await routed(manager)(parent, { workspace, title: TITLE, prompt, kind, createWorkspace: true }, () => true);
+      assert.equal(outcome, "started");
+      assert.deepEqual(manager.createOptions.at(-1), {
+        workspace,
+        initialRequest: { title: TITLE, prompt },
+        ...(kind === "pi" ? {} : { backend: kind, nativeCliTarget: kind }),
+        createWorkspace: true,
+      } as CreateInstanceOptions, `${kind}: the exact creation intent reaches the one manager create`);
+      const legacyOutcome = await routed(manager)(parent, { workspace, title: TITLE, prompt, kind, createWorkspace: false }, () => true);
+      assert.equal(legacyOutcome, "started");
+      assert.deepEqual(manager.createOptions.at(-1), {
+        workspace,
+        initialRequest: { title: TITLE, prompt },
+        ...(kind === "pi" ? {} : { backend: kind, nativeCliTarget: kind }),
+      } as CreateInstanceOptions, `${kind}: false is exactly the noncreating create options`);
+    }
+    assert.deepEqual(peer.spawns, [], "nothing was routed to a paired host");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a paired createWorkspace request is sent only to a destination that negotiated it and is never acted on locally", async (t) => {
+  const { harness, peer, manager } = await spawnHarness(t);
+  try {
+    const parent = await localParent(harness, manager);
+    const createsBefore = manager.createOptions.length;
+    const prompt = bigPrompt();
+    const workspace = "/only/on/the/destination/new";
+    // Older controller without the method, then an explicit `false` answer: refused before anything is sent.
+    const outcome = await routed(manager)(parent,
+      { workspace, title: TITLE, prompt, host: "lab-b", kind: "codex", createWorkspace: true }, () => true);
+    assert.equal(outcome, "failed", "an unsupported destination is refused, never sent without the intent");
+    const controller = peer.ownerCreate as PeerCreateController & { supportsCreateWorkspace?: (hostId: string) => boolean };
+    controller.supportsCreateWorkspace = () => false;
+    assert.equal(await routed(manager)(parent,
+      { workspace, title: TITLE, prompt, host: "lab-b", createWorkspace: true }, () => true), "failed");
+    assert.deepEqual(peer.spawns, [], "nothing was submitted to the owner");
+    controller.supportsCreateWorkspace = (hostId) => hostId === "lab-b";
+    for (const kind of ["pi", "claude", "codex"] as const) {
+      assert.equal(await routed(manager)(parent,
+        { workspace, title: TITLE, prompt, host: "lab-b", kind, createWorkspace: true }, () => true), "started");
+      assert.deepEqual(peer.spawns.at(-1), {
+        hostId: "lab-b", hostRunId: "run-b", kind, workspace, title: TITLE, prompt, createWorkspace: true,
+      }, `${kind}: the exact intent rides the one prompted owner lane`);
+    }
+    assert.equal(await routed(manager)(parent,
+      { workspace, title: TITLE, prompt, host: "lab-b", createWorkspace: false }, () => true), "started");
+    assert.deepEqual(peer.spawns.at(-1), { hostId: "lab-b", hostRunId: "run-b", kind: "pi", workspace, title: TITLE, prompt },
+      "false is the exact legacy paired submission");
+    assert.equal(manager.createOptions.length, createsBefore, "the requester never creates anything for a remote request");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("each owner creation provider forwards createWorkspace into the one admitted create, and declares support", async (t) => {
+  const { harness, peer, manager } = await spawnHarness(t);
+  try {
+    const options = peer.options as unknown as Record<string, unknown>;
+    assert.equal(options["createWorkspaceSupported"], true, "Main declares owner workspace-creation support");
+    const runId = ownerRun(peer);
+    const spawn = ownerSpawn(peer);
+    const prompt = bigPrompt();
+    for (const kind of ["pi", "claude", "codex"] as const) {
+      const facts = await spawn({ hostRunId: runId, kind, workspace: "/owner/new", title: TITLE, prompt, createWorkspace: true }, () => true);
+      assert.equal(facts.kind, "started");
+      assert.equal(manager.createOptions.at(-1)?.createWorkspace, true, `${kind}: prompted owner create carries the intent`);
+    }
+    const blank = options["createOwnedSession"] as (request: unknown, guard: () => boolean) => Promise<{ kind: string }>;
+    assert.equal((await blank({ hostRunId: runId, workspace: "/owner/blank", createWorkspace: true }, () => true)).kind, "started");
+    assert.deepEqual(manager.createOptions.at(-1), { workspace: "/owner/blank", createWorkspace: true } as CreateInstanceOptions);
+    assert.equal((await blank({ hostRunId: runId, workspace: "/owner/blank" }, () => true)).kind, "started");
+    assert.deepEqual(manager.createOptions.at(-1), { workspace: "/owner/blank" } as CreateInstanceOptions,
+      "omission keeps the exact legacy blank create options");
+    const native = options["nativeCreateOwnedSession"] as (request: unknown, guard: () => boolean) => Promise<{ kind: string }>;
+    assert.equal((await native({ hostRunId: runId, workspace: "/owner/native", backend: "claude", targetId: "claude", createWorkspace: true }, () => true)).kind, "started");
+    assert.deepEqual(manager.createOptions.at(-1), {
+      workspace: "/owner/native", backend: "claude", nativeCliTarget: "claude", createWorkspace: true,
+    } as CreateInstanceOptions);
+    // Admission still comes first: a refused request never reaches the create (and so never a mkdir).
+    const before = manager.createOptions.length;
+    assert.deepEqual(await spawn({ hostRunId: "other-run", kind: "pi", workspace: "/owner/x", title: "t", prompt: "p", createWorkspace: true }, () => true), { kind: "refused" });
+    assert.deepEqual(await blank({ hostRunId: runId, workspace: "/owner/x", createWorkspace: true }, () => false), { kind: "refused" });
+    assert.equal(manager.createOptions.length, before, "unauthorized or stale creation requests start nothing");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});

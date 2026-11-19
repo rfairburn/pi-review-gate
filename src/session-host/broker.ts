@@ -41,6 +41,10 @@
  * `onRoutedSpawnRequest`; a routed request is delivered only to that handler
  * and is otherwise refused with a definite `failed` before any payload read.
  * The legacy Pi-only `onSpawnRequest` never receives a routed request.
+ * A routed request carrying `createWorkspace: true` additionally requires the
+ * registration's explicit `routedSpawnCreateWorkspace` declaration (advertised
+ * as bootstrap `spawnCreateWorkspace`); without it the request is refused with a
+ * definite `failed` before any payload read and no handler is invoked.
  *
  * Read-only SessionHosts discovery (issue #493) is advertised in the bootstrap
  * (`sessionHosts`) only when the caller installed BOTH `onSessionHostsRequest`
@@ -131,8 +135,10 @@ import {
   INPUT_ORIGIN_FRAMING_MODE,
   SESSION_SPAWN_ROUTING_MODE,
   SESSION_HOSTS_DISCOVERY_MODE,
+  SESSION_SPAWN_CREATE_WORKSPACE_MODE,
   encodeSessionHostsResultFrames,
-  hasSessionSpawnRouting,
+  hasSessionSpawnCreateWorkspace,
+  requiresRoutedSessionSpawn,
   type LegacySessionSpawnInput,
   type SessionHostActivityRequest,
   type SessionHostActivityResult,
@@ -224,6 +230,15 @@ export interface StatusBrokerStatusHandlers {
    */
   onRoutedSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
   /**
+   * Declared support (issue #493): `true` only when {@link onRoutedSpawnRequest}
+   * honors `createWorkspace`. Only then, and only beside that handler, does the
+   * bootstrap advertise `spawnCreateWorkspace`; a creation request on a
+   * registration without the declaration is refused with a definite `failed`
+   * before any payload read, so no handler can silently ignore it. It is
+   * implementation support only, never a permission.
+   */
+  routedSpawnCreateWorkspace?: boolean;
+  /**
    * Optional read-only SessionHosts discovery source for this registration's
    * own child. Supplying it together with {@link onRoutedSpawnRequest} is the
    * registration's actual inspection capability: only then does the bootstrap
@@ -247,6 +262,11 @@ export interface SessionHostsRequestContext {
 /** True when a handler set carries the actual discovery capability the bootstrap may advertise. */
 export function hasSessionHostsDiscoveryHandlers(handlers: StatusBrokerStatusHandlers): boolean {
   return typeof handlers.onSessionHostsRequest === "function" && typeof handlers.onRoutedSpawnRequest === "function";
+}
+
+/** True when a handler set carries the declared routed workspace-creation support the bootstrap may advertise. */
+export function hasSessionSpawnCreateWorkspaceHandlers(handlers: StatusBrokerStatusHandlers): boolean {
+  return typeof handlers.onRoutedSpawnRequest === "function" && handlers.routedSpawnCreateWorkspace === true;
 }
 
 /**
@@ -1114,6 +1134,11 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       // handler on a routed-spawn registration; otherwise the child exposes no
       // SessionHosts inspection at all.
       ...(hasSessionHostsDiscoveryHandlers(handlers) ? { sessionHosts: SESSION_HOSTS_DISCOVERY_MODE } : {}),
+      // Workspace-creation support is advertised only from an explicit declaration
+      // beside an installed routed handler; otherwise the reporter refuses it.
+      ...(hasSessionSpawnCreateWorkspaceHandlers(handlers)
+        ? { spawnCreateWorkspace: SESSION_SPAWN_CREATE_WORKSPACE_MODE }
+        : {}),
     };
     return {
       bootstrap,
@@ -2230,6 +2255,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         request.payload.sha256,
         request.host ?? null,
         request.kind ?? null,
+        request.createWorkspace === true,
       ]), "utf8")
       .digest("hex");
     const completed = record.completedSpawns.get(request.requestId);
@@ -2288,14 +2314,19 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     // handler receives exactly the input shape it accepts, values unchanged.
     const legacyHandler = record.handlers.onSpawnRequest;
     const routedHandler = record.handlers.onRoutedSpawnRequest;
-    const invokeHost: ((prompt: string) => Promise<SessionSpawnOutcome>) | undefined = hasSessionSpawnRouting(request)
+    // A creation request reaches only a routed handler whose registration declared
+    // that it honors it; otherwise it is refused here, before any payload read.
+    const createWorkspace = hasSessionSpawnCreateWorkspace(request);
+    const invokeHost: ((prompt: string) => Promise<SessionSpawnOutcome>) | undefined = requiresRoutedSessionSpawn(request)
       ? typeof routedHandler === "function"
+        && (!createWorkspace || hasSessionSpawnCreateWorkspaceHandlers(record.handlers))
         ? (prompt) => routedHandler({
           workspace: request.workspace,
           title: request.title,
           prompt,
           ...(request.host === undefined ? {} : { host: request.host }),
           ...(request.kind === undefined ? {} : { kind: request.kind }),
+          ...(createWorkspace ? { createWorkspace: true } : {}),
         })
         : undefined
       : typeof legacyHandler === "function"

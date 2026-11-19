@@ -149,6 +149,8 @@ import { isNativeCliBackend, isNativeCliTargetId } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_LANES,
   ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
   SESSION_SPAWN_FRAGMENT_BYTES,
   type RosterBridgeSessionSpawnResultFrame,
@@ -438,6 +440,14 @@ export interface RosterBridgeViewer {
     options?: { readonly stillCurrent?: () => boolean },
   ): Promise<PeerCreateResult>;
   readonly supportsSessionSpawn?: boolean;
+  /**
+   * True only when this owner acknowledged destination workspace creation
+   * (`roster-create-workspace-v1`) beside at least one acknowledged creation lane.
+   * It applies to every acknowledged creation lane; descriptive only, never a
+   * grant. Optional so older or fake viewers stay representable; absence means
+   * unsupported, and a creation request is then never sent.
+   */
+  readonly supportsCreateWorkspace?: boolean;
   spawnSession?(
     request: OwnerSessionSpawnRequest,
     options?: { readonly stillCurrent?: () => boolean },
@@ -671,7 +681,15 @@ function isCreateRequest(value: unknown, bounds: RosterBridgeBounds): value is O
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (!isRosterBridgeIdentifier(record.hostRunId, bounds)) return false;
+  if (!isOptionalCreateWorkspaceFlag(record)) return false;
   return isOwnerCreateWorkspace(record.workspace);
+}
+
+/** An absent creation flag, or an exact boolean; anything else is not representable. */
+function isOptionalCreateWorkspaceFlag(record: Record<string, unknown>): boolean {
+  return !Object.prototype.hasOwnProperty.call(record, "createWorkspace")
+    || record.createWorkspace === undefined
+    || typeof record.createWorkspace === "boolean";
 }
 
 /**
@@ -685,6 +703,7 @@ function isNativeCreateRequest(value: unknown, bounds: RosterBridgeBounds): valu
   const record = value as Record<string, unknown>;
   if (!isRosterBridgeIdentifier(record.hostRunId, bounds)) return false;
   if (!isOwnerCreateWorkspace(record.workspace)) return false;
+  if (!isOptionalCreateWorkspaceFlag(record)) return false;
   if (!isNativeCliBackend(record.backend)) return false;
   return isNativeCliTargetId(record.targetId);
 }
@@ -871,6 +890,11 @@ class ViewerBinding implements RosterBridgeViewer {
 
   get supportsCreate(): boolean {
     return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_CAPABILITY);
+  }
+
+  get supportsCreateWorkspace(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY)
+      && this.#capabilities.some((capability) => ROSTER_BRIDGE_CREATE_WORKSPACE_LANES.includes(capability));
   }
 
   get supportsNative(): boolean {
@@ -1106,6 +1130,11 @@ class ViewerBinding implements RosterBridgeViewer {
     if (!isCreateRequest(request, this.#bounds)) {
       return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
     }
+    // Creation intent is sent only where it was negotiated; it is never dropped.
+    const createWorkspace = request.createWorkspace === true;
+    if (createWorkspace && !this.supportsCreateWorkspace) {
+      return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    }
     if (this.#pendingCreate !== null) return Promise.resolve({ kind: "not-sent", reason: "busy" });
     if (this.#createSequence >= Number.MAX_SAFE_INTEGER) {
       // The scalar is exhausted: nothing further may be submitted on this channel.
@@ -1159,6 +1188,8 @@ class ViewerBinding implements RosterBridgeViewer {
       hostRunId: request.hostRunId,
       workspace: request.workspace,
       sequence,
+      // Emitted only as `true`: a noncreating request keeps the legacy bytes.
+      ...(createWorkspace ? { createWorkspace: true } : {}),
     }, gate).then((written) => {
       if (written.ok) return;
       if (!written.sent) {
@@ -1185,8 +1216,18 @@ class ViewerBinding implements RosterBridgeViewer {
     if (refusal !== null) return Promise.resolve(refusal);
     if (!this.supportsSessionSpawn) return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
     // Capture exact immutable values before validation and the first async boundary.
-    const captured = Object.freeze({ ...request });
-    if (!isOwnerSessionSpawnRequest(captured)) return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    const raw = Object.freeze({ ...request });
+    if (!isOwnerSessionSpawnRequest(raw)) return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    // The payload carries creation intent only as `true` (a noncreating request keeps
+    // the legacy five-key payload), and only where it was negotiated.
+    const createWorkspace = raw.createWorkspace === true;
+    if (createWorkspace && !this.supportsCreateWorkspace) {
+      return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    }
+    // The caller's own key order is kept, so a noncreating payload is byte-identical
+    // to the one sent before this field existed; only an explicit `false` is dropped.
+    const captured = Object.freeze(Object.fromEntries(Object.entries(raw)
+      .filter(([key, value]) => key !== "createWorkspace" || value === true))) as OwnerSessionSpawnRequest;
     const runCurrent = (): boolean => this.#projection.state === "current"
       && this.#projection.hostRunId === captured.hostRunId;
     if (!runCurrent()) return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
@@ -1282,6 +1323,10 @@ class ViewerBinding implements RosterBridgeViewer {
     if (!isNativeCreateRequest(request, this.#bounds)) {
       return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
     }
+    const createWorkspace = request.createWorkspace === true;
+    if (createWorkspace && !this.supportsCreateWorkspace) {
+      return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    }
     // The only target this side may ever name is one the owner itself advertised.
     if (!this.#nativeTargetAdvertised(request)) {
       return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
@@ -1339,6 +1384,7 @@ class ViewerBinding implements RosterBridgeViewer {
       backend: request.backend,
       targetId: request.targetId,
       sequence,
+      ...(createWorkspace ? { createWorkspace: true } : {}),
     }, gate).then((written) => {
       if (written.ok) return;
       if (!written.sent) {

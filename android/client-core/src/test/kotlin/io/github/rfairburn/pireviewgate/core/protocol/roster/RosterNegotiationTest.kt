@@ -217,6 +217,7 @@ class RosterNegotiationTest {
                 RosterWire.NATIVE_CAPABILITY,
                 RosterWire.NATIVE_NAME_CAPABILITY,
                 RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+                RosterWire.CREATE_WORKSPACE_CAPABILITY,
             ),
             RosterWire.KNOWN_OPTIONAL_CAPABILITIES,
         )

@@ -271,7 +271,10 @@ class CreatePeer extends FakePeerCoordinator {
   refreshResult: PeerNativeTargetsRefreshResult = { kind: "refreshed", hostRunId: "run-owner-a" };
   piResult: PeerCreateResult = { kind: "unknown" };
   nativeResult: PeerCreateResult = { kind: "unknown" };
+  /** Negotiated workspace-creation support this fake reports (#493); off by default. */
+  createWorkspaceSupported = false;
   readonly ownerCreate: PeerCreateController = {
+    supportsCreateWorkspace: () => this.createWorkspaceSupported,
     refreshNativeTargets: async (hostId: string) => {
       this.refreshes.push(hostId);
       return this.refreshResult;
@@ -392,6 +395,39 @@ test("a native provider choice on a remote destination reaches the native create
       backend: "claude",
       targetId: "claude",
     });
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a checked workspace-creation box rides the native create lane and is never dropped (#493)", async (t) => {
+  const peer = new CreatePeer();
+  peer.createWorkspaceSupported = true;
+  const { harness } = await peerMainHarness(t, undefined, {}, peer);
+  try {
+    peer.publish({ hosts: [{ ...nativeOwnerHost(), createWorkspaceSupported: true }] });
+    await nextTurn();
+    await openNativeNewOnPeer(harness, "/srv/new-app");
+    // Workspace -> Provider -> Host -> the checkbox drawn below the editor, check
+    // it, and step back up into the editor; Main writes a frame between keys.
+    for (const key of [SHIFT_TAB, SHIFT_TAB, SHIFT_TAB, " ", SHIFT_TAB]) {
+      harness.terminal.emitInput(key);
+      await nextTurn();
+    }
+    assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("[x] Create missing workspace directory"), true,
+      "the written native New form draws the checked box");
+    await settleNewForm(harness);
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.deepEqual(peer.piCreates, [], "the Pi create lane was never used");
+    assert.deepEqual(peer.nativeCreates, [{
+      hostId: "owner-a",
+      hostRunId: "run-owner-a",
+      workspace: "/srv/new-app",
+      backend: "claude",
+      targetId: "claude",
+      createWorkspace: true,
+    }], "the native lane receives the checked intent with the exact drawn target");
   } finally {
     assert.equal(await closeWithSignal(harness), 0);
   }

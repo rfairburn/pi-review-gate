@@ -103,6 +103,7 @@ import {
   type OwnerCreateFacts,
   type OwnerCreateHandler,
   type OwnerSessionSpawnHandler,
+  type OwnerSessionSpawnRequest,
   isOwnerSessionSpawnRequest,
   type OwnerCreateRequest,
   copyRemoteNativeCliTargets,
@@ -142,6 +143,8 @@ import type { NativeCliBackend } from "../session-backend";
 import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_LANES,
   ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
   type RosterBridgeSessionSpawnFrame,
   ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
@@ -302,6 +305,20 @@ export interface RosterBridgeHostOptions {
    * non-boolean value, is refused at construction.
    */
   readonly nativeCliAvailability?: boolean;
+  /**
+   * The owner's explicit declaration (#493) that EVERY creation provider supplied
+   * here — {@link RosterBridgeHostOptions.createOwnedSession},
+   * {@link RosterBridgeHostOptions.nativeCreateOwnedSession}, and
+   * {@link RosterBridgeHostOptions.spawnOwnedSession} — honors the optional
+   * `createWorkspace` request field. Only `true` acknowledges
+   * {@link ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY}, and only beside at least one
+   * creation lane acknowledged on the same channel. Absent or `false`: the
+   * capability is never acknowledged and a `createWorkspace: true` request is a
+   * protocol violation that reaches no provider. It is implementation support
+   * only, never a permission or grant. A non-boolean value, or `true` without any
+   * creation provider, is refused at construction.
+   */
+  readonly createWorkspaceSupported?: boolean;
   /**
    * The owner's ONE host-side ROW NAME provider for its native rows, supplied by
    * Main, which already owns the only manager label, stable-slot caption, and
@@ -727,7 +744,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // set in force for this session: the required baseline this owner implements,
     // plus only the optional capabilities both sides offered AND this owner can
     // really honour. Negotiation can only narrow what either side assumes.
-    this.#capabilities = Object.freeze(decision.capabilities.filter((capability) => {
+    const acknowledged = decision.capabilities.filter((capability) => {
+      if (capability === ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY) {
+        // Decided below, once the creation lanes it depends on are known.
+        return false;
+      }
       if (capability === ROSTER_BRIDGE_CLOSE_CAPABILITY) {
         return typeof this.#options.closeOwnedSession === "function";
       }
@@ -786,7 +807,17 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         return true;
       }
       return false;
-    }));
+    });
+    // Destination workspace creation is implementation support honored on EVERY
+    // creation lane this owner acknowledges, so it exists only with the owner's
+    // explicit declaration and beside at least one lane actually acknowledged on
+    // this channel. It never widens a lane and grants nothing.
+    if (decision.capabilities.includes(ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY)
+      && this.#options.createWorkspaceSupported === true
+      && acknowledged.some((capability) => ROSTER_BRIDGE_CREATE_WORKSPACE_LANES.includes(capability))) {
+      acknowledged.push(ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY);
+    }
+    this.#capabilities = Object.freeze(acknowledged);
     this.#sendControl({
       type: "hello_ack",
       service: ROSTER_BRIDGE_SERVICE,
@@ -1018,6 +1049,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#violation();
       return;
     }
+    if (frame.createWorkspace === true && !this.#createWorkspaceNegotiated()) {
+      // A creation request outside the negotiated protocol is never ignored and
+      // never served as a plain create: it is a violation that reaches no provider.
+      this.#violation();
+      return;
+    }
     if (this.#fenced) {
       this.#refuse();
       return;
@@ -1053,6 +1090,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     const request: OwnerCreateRequest = Object.freeze({
       hostRunId: frame.hostRunId,
       workspace: frame.workspace,
+      ...(frame.createWorkspace === true ? { createWorkspace: true } : {}),
     });
     const inflight: InFlightCreate = {
       requestId: frame.requestId,
@@ -1104,6 +1142,12 @@ class OwnerBinding implements RosterBridgeChannelBinding {
    * would otherwise keep the earlier narrowing and treat the comparison as
    * impossible.
    */
+  /** True only when this channel negotiated destination workspace creation. */
+  #createWorkspaceNegotiated(): boolean {
+    return this.#options.createWorkspaceSupported === true
+      && this.#capabilities.includes(ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY);
+  }
+
   #createBindingIsLive(): boolean {
     return this.#state !== "finished" && !this.#fenced;
   }
@@ -1264,7 +1308,19 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     if (!isOwnerSessionSpawnRequest(value) || value.hostRunId !== inflight.hostRunId) {
       this.#violation(); return;
     }
-    const request = Object.freeze({ ...value });
+    // A creation request outside the negotiated protocol is a violation, never
+    // ignored; an explicit `false` is the exact noncreating request and is dropped.
+    if (value.createWorkspace === true && !this.#createWorkspaceNegotiated()) {
+      this.#violation(); return;
+    }
+    const request: OwnerSessionSpawnRequest = Object.freeze({
+      hostRunId: value.hostRunId,
+      kind: value.kind,
+      workspace: value.workspace,
+      title: value.title,
+      prompt: value.prompt,
+      ...(value.createWorkspace === true ? { createWorkspace: true } : {}),
+    });
     const stillAuthorized = (): boolean => this.#nativeCreateStillAuthorized(request.hostRunId);
     this.#diagnostic("create_accepted");
     void Promise.resolve().then(() => {
@@ -1423,6 +1479,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#violation();
       return;
     }
+    if (frame.createWorkspace === true && !this.#createWorkspaceNegotiated()) {
+      // Outside the negotiated protocol: never ignored, never served without it.
+      this.#violation();
+      return;
+    }
     if (this.#fenced) {
       this.#refuse();
       return;
@@ -1486,6 +1547,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       workspace: frame.workspace,
       backend: frame.backend,
       targetId: frame.targetId,
+      ...(frame.createWorkspace === true ? { createWorkspace: true } : {}),
     });
     const descriptor = Object.freeze({ backend: frame.backend, targetId: frame.targetId });
     // The exact subscription lifetime that admitted this request (live: the run
@@ -2961,6 +3023,15 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
   } else if (nativeAvailability === true) {
     // A probing declaration describes a provider; without one it describes nothing.
     throw new TypeError("roster metadata host native availability requires the native provider pair");
+  }
+  // Workspace creation describes the creation providers, so it needs at least one.
+  const createWorkspaceSupported = options.createWorkspaceSupported;
+  if (createWorkspaceSupported !== undefined && typeof createWorkspaceSupported !== "boolean") {
+    throw new TypeError("roster metadata host requires a boolean workspace-creation declaration");
+  }
+  if (createWorkspaceSupported === true && options.createOwnedSession === undefined
+    && options.spawnOwnedSession === undefined && native === null) {
+    throw new TypeError("roster metadata host workspace creation requires a creation provider");
   }
   const bounds = resolveRosterBridgeBounds(options.bounds);
   const bindings = new Set<OwnerBinding>();

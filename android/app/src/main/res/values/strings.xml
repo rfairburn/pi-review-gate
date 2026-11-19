@@ -153,6 +153,8 @@
     <string name="create_provider_stale">The selected provider is no longer advertised by this host. Choose a provider again; nothing was changed and nothing will be created until you do.</string>
     <string name="create_workspace_field">Workspace path</string>
     <string name="create_workspace_note">The path is sent to that host exactly as you type it. This device does not browse or complete its filesystem.</string>
+    <string name="create_workspace_create_missing">Create missing workspace directory</string>
+    <string name="create_workspace_create_missing_unsupported">This host does not support creating a missing workspace directory. Uncheck it or choose another host; nothing will be created until you do.</string>
     <string name="create_submit">Create session</string>
 
     <!-- Rename session -->

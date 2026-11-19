@@ -26,6 +26,10 @@
  * `spawn_routed_request` frame, sent only when the registration's bootstrap
  * advertised routed-spawn support (`spawnRouting`), so an older or
  * not-yet-integrated host can never drop the selectors and launch a local Pi.
+ * A request carrying `createWorkspace: true` also travels as the routed family,
+ * and only when the bootstrap additionally advertised `spawnCreateWorkspace`
+ * (the registration's declared creation support), so an older routed host can
+ * never silently ignore it.
  * A registration whose bootstrap advertises `sessionHosts` (only together
  * with `spawnRouting`) also lets the child send one read-only `hosts_request`;
  * the host answers with one or more bounded, token-authenticated, ordered
@@ -159,6 +163,17 @@ export interface SessionHostBootstrap {
    * whole bootstrap.
    */
   sessionHosts?: 1;
+  /**
+   * Closed SessionSpawn workspace-creation support marker (issue #493). Present
+   * (only as mode version 1, and only together with {@link spawnRouting})
+   * exactly when the host registration declared that its routed spawn handler
+   * honors `createWorkspace`, so the reporter may send a routed request carrying
+   * `createWorkspace: true`. Absence means the reporter refuses such a request
+   * before staging or sending anything, so an older routed host can never
+   * silently ignore it. Implementation support only, never a permission. Any
+   * other value rejects the whole bootstrap.
+   */
+  spawnCreateWorkspace?: 1;
 }
 
 /** First wire frame after connecting: authenticates the reporter to the host. */
@@ -386,6 +401,12 @@ export interface SessionHostSpawnRequest {
   host?: string;
   /** Exact optional child backend (routed requests only); absence means `pi`. */
   kind?: SessionBackend;
+  /**
+   * Opt-in destination workspace creation (routed requests only). Carried only as
+   * `true`; absence (or an admitted explicit `false`, which the parser drops) is
+   * the noncreating request exactly.
+   */
+  createWorkspace?: true;
 }
 
 /** Host acknowledgement is about launch, never model completion or prompt processing. */
@@ -412,6 +433,15 @@ export interface SessionSpawnInput {
   prompt: string;
   host?: string;
   kind?: SessionBackend;
+  /**
+   * Opt-in destination workspace creation (issue #493). Only `true` asks the
+   * DESTINATION host (this host when `host` is omitted) to ensure the workspace
+   * exists with one ordinary recursive directory creation before its normal
+   * launch; it is never performed by a requester for a remote path. Absent or
+   * `false` is the noncreating request exactly. A `true` value is never dropped:
+   * it is honored by a handler that declared support or refused.
+   */
+  createWorkspace?: boolean;
 }
 
 /**
@@ -419,14 +449,31 @@ export interface SessionSpawnInput {
  * broker passes only this shape to a legacy (Pi-only) spawn handler; a request
  * carrying any routing selector never reaches such a handler.
  */
-export type LegacySessionSpawnInput = Omit<SessionSpawnInput, "host" | "kind"> & {
+export type LegacySessionSpawnInput = Omit<SessionSpawnInput, "host" | "kind" | "createWorkspace"> & {
   host?: never;
   kind?: never;
+  createWorkspace?: never;
 };
 
 /** True when the input or request carries any routing selector (a present value, even `kind: "pi"`). */
 export function hasSessionSpawnRouting(value: { readonly host?: unknown; readonly kind?: unknown }): boolean {
   return value.host !== undefined || value.kind !== undefined;
+}
+
+/** True only when the input or request asks for destination workspace creation (an exact `true`). */
+export function hasSessionSpawnCreateWorkspace(value: { readonly createWorkspace?: unknown }): boolean {
+  return value.createWorkspace === true;
+}
+
+/**
+ * True when a request must travel as the routed family: any routing selector,
+ * or a creation request. Older brokers either do not decode that family or route
+ * it only to a handler whose registration declared what it honors.
+ */
+export function requiresRoutedSessionSpawn(
+  value: { readonly host?: unknown; readonly kind?: unknown; readonly createWorkspace?: unknown },
+): boolean {
+  return hasSessionSpawnRouting(value) || hasSessionSpawnCreateWorkspace(value);
 }
 
 /**
@@ -638,6 +685,9 @@ export const SESSION_SPAWN_ROUTING_MODE = 1 as const;
 /** The only admitted read-only SessionHosts discovery bootstrap marker version. */
 export const SESSION_HOSTS_DISCOVERY_MODE = 1 as const;
 
+/** The only admitted SessionSpawn workspace-creation support bootstrap marker version. */
+export const SESSION_SPAWN_CREATE_WORKSPACE_MODE = 1 as const;
+
 /**
  * Validates a parsed bootstrap value. Returns undefined (never throws) when
  * any field is missing, unbounded, or malformed.
@@ -668,6 +718,11 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
   // admitted) only alongside the routed-spawn marker.
   if (value.sessionHosts !== undefined
     && (value.sessionHosts !== SESSION_HOSTS_DISCOVERY_MODE || value.spawnRouting === undefined)) return undefined;
+  // Creation support describes the routed handler, so it is admitted only beside it.
+  if (value.spawnCreateWorkspace !== undefined
+    && (value.spawnCreateWorkspace !== SESSION_SPAWN_CREATE_WORKSPACE_MODE || value.spawnRouting === undefined)) {
+    return undefined;
+  }
   return {
     version: 1,
     socketPath: value.socketPath,
@@ -678,6 +733,7 @@ export function parseBootstrap(value: unknown): SessionHostBootstrap | undefined
     ...(value.inputOriginFraming === undefined ? {} : { inputOriginFraming: INPUT_ORIGIN_FRAMING_MODE }),
     ...(value.spawnRouting === undefined ? {} : { spawnRouting: SESSION_SPAWN_ROUTING_MODE }),
     ...(value.sessionHosts === undefined ? {} : { sessionHosts: SESSION_HOSTS_DISCOVERY_MODE }),
+    ...(value.spawnCreateWorkspace === undefined ? {} : { spawnCreateWorkspace: SESSION_SPAWN_CREATE_WORKSPACE_MODE }),
   };
 }
 
@@ -946,7 +1002,12 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
   const hasKind = Object.prototype.hasOwnProperty.call(value, "kind");
   if (hasHost && !isValidSessionSpawnHost(value.host)) return undefined;
   if (hasKind && !isSessionBackend(value.kind)) return undefined;
-  if ((value.type === "spawn_routed_request") !== (hasHost || hasKind)) return undefined;
+  // A present creation flag must be a boolean; only `true` asks for creation, and
+  // it fixes the routed family exactly like a selector does.
+  const hasCreateWorkspace = Object.prototype.hasOwnProperty.call(value, "createWorkspace");
+  if (hasCreateWorkspace && typeof value.createWorkspace !== "boolean") return undefined;
+  const createWorkspace = value.createWorkspace === true;
+  if ((value.type === "spawn_routed_request") !== (hasHost || hasKind || createWorkspace)) return undefined;
   if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)
     || !isValidId(value.requestId)) return undefined;
   if (typeof value.workspace !== "string" || value.workspace.length === 0
@@ -968,6 +1029,7 @@ export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | und
     payload,
     ...(hasHost ? { host: value.host as string } : {}),
     ...(hasKind ? { kind: value.kind as SessionBackend } : {}),
+    ...(createWorkspace ? { createWorkspace: true as const } : {}),
   };
   // The prompt text is out-of-band; the bounded reference and title must still
   // fit the shared raw-frame limit before the reporter attempts a write.

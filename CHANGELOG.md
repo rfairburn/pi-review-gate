@@ -50,6 +50,20 @@ dates.
   validation. Standalone sessions, delegated executors, and native Claude Code and
   Codex callers get neither selector nor discovery tool. See
   [Session host](docs/session-host-alpha.md#starting-and-owning-sessions).
+- **Optional workspace directory creation (#493)**: `SessionSpawn` accepts
+  `createWorkspace` (default `false`) when the caller's own host declares support;
+  otherwise the schema omits it and an explicit `true` is refused before anything
+  is staged or sent. Terminal/Android New offers a freshly unchecked **Create
+  missing workspace directory** checkbox for that request only, when the selected
+  destination supports it. All three kinds use recursive filesystem directory
+  creation only on the selected destination, never on the requester; existing
+  directories are reused, no Git setup is needed, and permissions and launch errors
+  are unchanged. Partial parents or directories left by a later launch failure are
+  not automatically cleaned up or rolled back. The optional
+  `roster-create-workspace-v1` capability describes implementation support only:
+  an explicit `true` toward an owner without it is refused, never silently dropped;
+  off/omitted requests and `SessionHosts` output are unchanged. See
+  [Session host](docs/session-host-alpha.md#starting-and-owning-sessions).
 - **Native availability description (#493)**: the optional
   `roster-native-availability-v1` roster capability, acknowledged only beside the
   native lane, states that an owner's native catalog comes from a fresh read-only

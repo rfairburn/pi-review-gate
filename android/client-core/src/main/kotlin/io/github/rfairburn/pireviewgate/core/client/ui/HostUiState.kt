@@ -77,6 +77,11 @@ public data class HostCapabilities(
      * claimed neither way; see [HostUiState.canCreateNativeSession].
      */
     public val nativeAvailability: CapabilityStatus = CapabilityStatus.UNKNOWN,
+    /**
+     * Whether the owner honours the request-specific create-workspace flag on its
+     * create lanes. Protocol support only; see [HostUiState.canCreateWorkspace].
+     */
+    public val createWorkspace: CapabilityStatus = CapabilityStatus.UNKNOWN,
 ) {
     /** Support for one identifier, or [CapabilityStatus.UNKNOWN] before negotiation. */
     public fun statusOf(capability: String): CapabilityStatus = when (capability) {
@@ -88,6 +93,7 @@ public data class HostCapabilities(
         RosterWire.NATIVE_CAPABILITY -> native
         RosterWire.NATIVE_NAME_CAPABILITY -> nativeName
         RosterWire.NATIVE_AVAILABILITY_CAPABILITY -> nativeAvailability
+        RosterWire.CREATE_WORKSPACE_CAPABILITY -> createWorkspace
         else -> CapabilityStatus.UNKNOWN
     }
 
@@ -116,8 +122,13 @@ public data class HostCapabilities(
                 rosterSlot = status(capabilities, RosterWire.ROSTER_SLOT_CAPABILITY),
                 native = status(capabilities, RosterWire.NATIVE_CAPABILITY),
                 nativeName = status(capabilities, RosterWire.NATIVE_NAME_CAPABILITY),
-                nativeAvailability = if (RosterWire.dependenciesHold(capabilities)) {
+                nativeAvailability = if (RosterWire.nativeAvailabilityDependencyHolds(capabilities)) {
                     status(capabilities, RosterWire.NATIVE_AVAILABILITY_CAPABILITY)
+                } else {
+                    CapabilityStatus.UNSUPPORTED
+                },
+                createWorkspace = if (RosterWire.createWorkspaceDependencyHolds(capabilities)) {
+                    status(capabilities, RosterWire.CREATE_WORKSPACE_CAPABILITY)
                 } else {
                     CapabilityStatus.UNSUPPORTED
                 },
@@ -207,6 +218,17 @@ public data class HostUiState(
     public val canCreateSession: Boolean
         get() = connection == HostConnectionState.CONNECTED &&
             capabilities.supports(RosterWire.CREATE_CAPABILITY)
+
+    /**
+     * True only when this owner may be asked to create a missing workspace directory
+     * now: live connection, the flag positively acknowledged, and at least one create
+     * lane it can ride on. It grants nothing and is never inferred from history; the
+     * chosen lane's own eligibility still decides whether a create can be sent.
+     */
+    public val canCreateWorkspace: Boolean
+        get() = connection == HostConnectionState.CONNECTED &&
+            capabilities.supports(RosterWire.CREATE_WORKSPACE_CAPABILITY) &&
+            (capabilities.supports(RosterWire.CREATE_CAPABILITY) || capabilities.supports(RosterWire.NATIVE_CAPABILITY))
 
     /** True only when this owner can serve a Saved listing now, by the same rule. */
     public val canBrowseSaved: Boolean

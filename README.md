@@ -76,6 +76,14 @@ told.
   child's `SessionSpawn` on its own or an exact paired host — choose among Pi,
   Claude Code, and Codex CLI as currently available on the destination; configured
   external review/execution workers are not session choices and are unchanged.
+  Workspace directories must already exist unless that request opts into recursive
+  directory creation with `SessionSpawn`'s `createWorkspace: true` (offered only
+  when the caller's own host supports it) or the terminal or Android New checkbox
+  **Create missing workspace directory** (freshly unchecked). An opted-in request
+  to an unsupported destination is refused rather than ignored. The requested
+  workspace is created only on the selected destination and needs no Git repository;
+  directories are not rolled back if creation or launch fails (see
+  [Starting and owning sessions](docs/session-host-alpha.md#starting-and-owning-sessions)).
 - **Android application** — a native Pi Review Gate app for Android 13 (API 33)
   and newer that connects directly to a session host with hosting turned on,
   showing that host's roster, session cards, Saved picker, and terminal; nothing

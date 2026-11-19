@@ -86,6 +86,7 @@ async function start(
 		readonly renameOwnedSession?: PeerCoordinatorOptions["renameOwnedSession"];
 		readonly createOwnedSession?: PeerCoordinatorOptions["createOwnedSession"];
 		readonly spawnOwnedSession?: PeerCoordinatorOptions["spawnOwnedSession"];
+		readonly createWorkspaceSupported?: boolean;
 		readonly wrapClientChannel?: PeerCoordinatorTestHooks["wrapClientChannel"];
 	},
 ): Promise<Started> {
@@ -109,6 +110,7 @@ async function start(
 			? {}
 			: { renameNativeOwnedSession: options.renameNativeOwnedSession }),
 		...(options.renameOwnedSession === undefined ? {} : { renameOwnedSession: options.renameOwnedSession }),
+		...(options.createWorkspaceSupported === undefined ? {} : { createWorkspaceSupported: options.createWorkspaceSupported }),
 	});
 	t.after(async () => {
 		try {
@@ -201,6 +203,8 @@ async function pair(
 		readonly renamePi?: PeerCoordinatorOptions["renameOwnedSession"];
 		readonly createPi?: PeerCoordinatorOptions["createOwnedSession"];
 		readonly spawn?: PeerCoordinatorOptions["spawnOwnedSession"];
+		/** The owner's explicit workspace-creation declaration (#493). */
+		readonly createWorkspace?: boolean;
 		/** Fixture-only wrapper for the REQUESTER's outgoing metadata channel. */
 		readonly requesterWrap?: PeerCoordinatorTestHooks["wrapClientChannel"];
 	} = {},
@@ -217,6 +221,7 @@ async function pair(
 		agentDir: ownerFixture.agentDir,
 		inventory: ownerInventory,
 		...(ownerOptions.spawn === undefined ? {} : { spawnOwnedSession: ownerOptions.spawn }),
+		...(ownerOptions.createWorkspace === undefined ? {} : { createWorkspaceSupported: ownerOptions.createWorkspace }),
 		// The Pi provider is always present, so the Pi create lane stays live and
 		// any native refusal can be shown NOT to fall through to it.
 		createOwnedSession: ownerOptions.createPi ?? (async (request) => {
@@ -979,4 +984,76 @@ test("a refresh whose first fresh snapshot is followed by a terminal owner error
 		STILL_CURRENT,
 	), { kind: "not-sent", reason: "target-unavailable" });
 	assert.deepEqual(p.nativeCalls, []);
+});
+
+// --- Opt-in destination workspace creation over the real paired coordinator (#493). ---
+
+test("a declaring owner negotiates workspace creation on every lane and receives the exact intent; false stays legacy", async t => {
+	const spawnCalls: OwnerSessionSpawnRequest[] = [];
+	const p = await pair(t, [], {
+		native: true,
+		createWorkspace: true,
+		spawn: async (request) => {
+			spawnCalls.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "spawned" };
+		},
+	});
+	const controller = p.requester.coordinator.ownerCreate;
+	assert.equal(hostOf(p.requester.coordinator.read(), p.hostId).createWorkspaceSupported, true,
+		"the canonical PeerUiHost support field is true for a negotiated owner");
+	assert.equal(controller.supportsCreateWorkspace?.(p.hostId), true);
+	const workspace = "/only/on/the/owner/new/nested";
+	const started = (rowId: string) => ({ kind: "owner-result", facts: { kind: "started", hostRunId: p.hostRunId, rowId } });
+
+	assert.deepEqual(await controller.createSession({ hostId: p.hostId, hostRunId: p.hostRunId, workspace, createWorkspace: true }, STILL_CURRENT), started("pi-row-1"));
+	assert.deepEqual(p.piCalls.at(-1), { hostRunId: p.hostRunId, workspace, createWorkspace: true });
+	assert.deepEqual(await controller.createSession({ hostId: p.hostId, hostRunId: p.hostRunId, workspace, createWorkspace: false }, STILL_CURRENT), started("pi-row-1"));
+	assert.deepEqual(p.piCalls.at(-1), { hostRunId: p.hostRunId, workspace }, "false is the exact legacy owner request");
+
+	assert.deepEqual(await controller.createNativeSession?.({
+		hostId: p.hostId, hostRunId: p.hostRunId, workspace, backend: "codex", targetId: "codex", createWorkspace: true,
+	}, STILL_CURRENT), started("native-codex"));
+	assert.deepEqual(p.nativeCalls.at(-1), { hostRunId: p.hostRunId, workspace, backend: "codex", targetId: "codex", createWorkspace: true });
+
+	for (const kind of ["pi", "claude", "codex"] as const) {
+		assert.deepEqual(await controller.spawnSession?.({
+			hostId: p.hostId, hostRunId: p.hostRunId, kind, workspace, title: "T", prompt: "P", createWorkspace: true,
+		}, STILL_CURRENT), started("spawned"));
+		assert.deepEqual(spawnCalls.at(-1), { hostRunId: p.hostRunId, kind, workspace, title: "T", prompt: "P", createWorkspace: true });
+	}
+	assert.deepEqual(await controller.spawnSession?.({
+		hostId: p.hostId, hostRunId: p.hostRunId, kind: "pi", workspace, title: "T", prompt: "P", createWorkspace: false,
+	}, STILL_CURRENT), started("spawned"));
+	assert.equal(Object.hasOwn(spawnCalls.at(-1)!, "createWorkspace"), false, "false never reaches the owner");
+	// Requester-side validation never coerces a non-boolean.
+	assert.deepEqual(await controller.createSession({
+		hostId: p.hostId, hostRunId: p.hostRunId, workspace, createWorkspace: "yes" as unknown as boolean,
+	}, STILL_CURRENT), { kind: "not-sent", reason: "invalid-request" });
+});
+
+test("a non-declaring owner never receives creation intent: true is not sent, and default requests are unchanged", async t => {
+	const spawnCalls: OwnerSessionSpawnRequest[] = [];
+	const p = await pair(t, [], {
+		native: true,
+		spawn: async (request) => {
+			spawnCalls.push(request);
+			return { kind: "started", hostRunId: request.hostRunId, rowId: "spawned" };
+		},
+	});
+	const controller = p.requester.coordinator.ownerCreate;
+	assert.equal(hostOf(p.requester.coordinator.read(), p.hostId).createWorkspaceSupported, false);
+	assert.equal(controller.supportsCreateWorkspace?.(p.hostId), false);
+	const workspace = "/owner/new";
+	const unsupported = { kind: "not-sent", reason: "capability-unsupported" };
+	assert.deepEqual(await controller.createSession({ hostId: p.hostId, hostRunId: p.hostRunId, workspace, createWorkspace: true }, STILL_CURRENT), unsupported);
+	assert.deepEqual(await controller.createNativeSession?.({
+		hostId: p.hostId, hostRunId: p.hostRunId, workspace, backend: "claude", targetId: "claude", createWorkspace: true,
+	}, STILL_CURRENT), unsupported);
+	assert.deepEqual(await controller.spawnSession?.({
+		hostId: p.hostId, hostRunId: p.hostRunId, kind: "codex", workspace, title: "T", prompt: "P", createWorkspace: true,
+	}, STILL_CURRENT), unsupported);
+	assert.equal(p.piCalls.length + p.nativeCalls.length + spawnCalls.length, 0, "no owner provider was reached");
+	// Default-off requests keep working exactly as before.
+	assert.equal((await controller.createSession({ hostId: p.hostId, hostRunId: p.hostRunId, workspace }, STILL_CURRENT)).kind, "owner-result");
+	assert.deepEqual(p.piCalls, [{ hostRunId: p.hostRunId, workspace }]);
 });

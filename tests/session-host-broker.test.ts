@@ -2885,3 +2885,77 @@ test("SessionHosts reports unavailable for throwing, malformed, or late handlers
     brokerTest.setHostsTimeoutForTests(undefined);
   }
 });
+
+test("workspace creation is advertised only from an explicit declaration and an undeclared request is refused before any read", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const routedReceived: SessionSpawnInput[] = [];
+  const declaredReceived: SessionSpawnInput[] = [];
+  const undeclared = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onRoutedSpawnRequest: (input) => { routedReceived.push(input); return Promise.resolve("started"); },
+  });
+  assert.equal(undeclared.bootstrap.spawnRouting, 1);
+  assert.equal(Object.hasOwn(undeclared.bootstrap, "spawnCreateWorkspace"), false,
+    "a routed handler alone never advertises workspace creation");
+  const declarationOnly = broker.register("22222222-2222-4222-8222-222222222222", {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    routedSpawnCreateWorkspace: true,
+  });
+  assert.equal(Object.hasOwn(declarationOnly.bootstrap, "spawnCreateWorkspace"), false,
+    "a declaration without the routed handler it describes advertises nothing");
+  const declared = broker.register("33333333-3333-4333-8333-333333333333", {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onRoutedSpawnRequest: (input) => { declaredReceived.push(input); return Promise.resolve("started"); },
+    routedSpawnCreateWorkspace: true,
+  });
+  assert.equal(declared.bootstrap.spawnCreateWorkspace, 1);
+  assert.deepEqual(parseBootstrap(JSON.parse(JSON.stringify(declared.bootstrap)))?.spawnCreateWorkspace, 1,
+    "the marker round-trips through the env");
+
+  const base = (bootstrap: SessionHostBootstrap, requestId: string) => ({
+    version: 1,
+    type: "spawn_routed_request",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    token: bootstrap.token,
+    requestId,
+    workspace: "/destination/new workspace",
+    title: "Creating child",
+    payload: spawnPayload(bootstrap, "Create prompt."),
+    createWorkspace: true,
+  });
+
+  // Undeclared: a definite failure and the routed handler is never invoked.
+  const client = await connectClient(broker.socketPath);
+  const replies = collectReplies(client);
+  const refused = base(undeclared.bootstrap, "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1");
+  client.write(encodeFrame(helloFrame(undeclared.bootstrap) as never) + encodeFrame(refused as never));
+  await waitFor(() => replies.length === 1);
+  assert.equal(replies[0]!.outcome, "failed");
+  assert.deepEqual(routedReceived, [], "an old routed handler can never silently ignore creation");
+
+  // Declared: the exact intent reaches the handler once.
+  const declaredClient = await connectClient(broker.socketPath);
+  const declaredReplies = collectReplies(declaredClient);
+  const accepted = { ...base(declared.bootstrap, "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"), kind: "pi" };
+  declaredClient.write(encodeFrame(helloFrame(declared.bootstrap) as never) + encodeFrame(accepted as never));
+  await waitFor(() => declaredReplies.length === 1);
+  assert.equal(declaredReplies[0]!.outcome, "started");
+  assert.deepEqual(declaredReceived, [{
+    workspace: accepted.workspace, title: accepted.title, prompt: "Create prompt.", kind: "pi", createWorkspace: true,
+  }]);
+
+  // The creation intent is part of the replay fingerprint: the same request id
+  // with only the flag removed (the selector keeps the routed family) is not a replay.
+  const altered = await connectClient(broker.socketPath);
+  const { createWorkspace: _dropped, ...withoutCreate } = accepted;
+  void _dropped;
+  await expectClientClose(altered, () => altered.write(
+    encodeFrame(helloFrame(declared.bootstrap) as never) + encodeFrame(withoutCreate as never),
+  ));
+  assert.equal(declaredReceived.length, 1, "a creation-altered replay never invokes the host again");
+  await disposeBroker(broker);
+});

@@ -58,6 +58,7 @@ class ClientProjection {
                     native = capability(roster, roster?.supportsNative),
                     nativeName = capability(roster, roster?.supportsNativeName),
                     nativeAvailability = capability(roster, roster?.supportsNativeAvailability),
+                    createWorkspace = capability(roster, roster?.supportsCreateWorkspace),
                 ),
                 // A catalog is offered only with the CURRENT snapshot it committed
                 // with. Retained/STALE rows never carry a selectable provider.

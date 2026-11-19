@@ -375,6 +375,13 @@ const MAX_CONTENT_DIMENSION = 1000;
  */
 const CREATE_ON_PEER_UNSUPPORTED_MESSAGE =
   "This host cannot ask another host to create a session";
+/**
+ * A creating New request (#493) whose destination does not (or no longer)
+ * reports workspace-creation support: nothing was sent, and the request is never
+ * quietly re-sent without its creation intent.
+ */
+const CREATE_ON_PEER_CREATE_WORKSPACE_UNSUPPORTED_MESSAGE =
+  "That destination cannot create a missing workspace directory; nothing was sent";
 const CREATE_ON_PEER_BUSY_MESSAGE =
   "Another remote create is already in progress; nothing was sent";
 const CREATE_ON_PEER_GONE_MESSAGE =
@@ -757,6 +764,12 @@ interface CreateOnPeerAttempt {
   readonly backend?: NativeCliBackend;
   /** The exact owner-advertised target id this attempt was built for. */
   readonly targetId?: string;
+  /**
+   * Present (only ever `true`) when the written form drew a CHECKED "Create
+   * missing workspace directory" box (#493). Forwarded to whichever lane this
+   * attempt uses, re-proved by every `stillCurrent`, and never dropped.
+   */
+  readonly createWorkspace?: true;
 }
 
 /** One bounded remote Close attempt, frozen for its notices and its marker. */
@@ -1457,6 +1470,11 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
         // Forwarded only when the manager installed it, so the broker advertises
         // routed SessionSpawn in a bootstrap only when this host really routes.
         ...(handlers.onRoutedSpawnRequest ? { onRoutedSpawnRequest: handlers.onRoutedSpawnRequest } : {}),
+        // The creation-support declaration rides only beside the routed handler it
+        // describes, so the broker advertises it only when this host honors it.
+        ...(handlers.onRoutedSpawnRequest && handlers.routedSpawnCreateWorkspace === true
+          ? { routedSpawnCreateWorkspace: true }
+          : {}),
         // Forwarded only beside routed spawn, exactly as the manager installed it,
         // so the broker advertises SessionHosts only when this host really answers.
         ...(handlers.onRoutedSpawnRequest && handlers.onSessionHostsRequest
@@ -1920,6 +1938,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const rowReadinessWaiters = new Map<string, Set<(forced: RowResumeReadiness | undefined) => void>>();
   const deferredRowResumes = new Map<number, { readonly requestId: number; readonly id: string }>();
   const deferredCreates = new Map<number, Extract<SidebarAction, { type: "create" }>>();
+  /**
+   * The frozen written-frame geometry of each checked Local create (#493) whose
+   * one-shot receipt was consumed, keyed by request id until it launches or is
+   * refused. A request queued for negotiation keeps the exact terminal size, form
+   * pane size, and geometry epoch its receipt belonged to, so a resize (even one
+   * that returns to the same size) retires it before anything is created.
+   */
+  const createWorkspaceFrameProofs = new Map<number, {
+    readonly terminalCols: number;
+    readonly terminalRows: number;
+    readonly paneCols: number;
+    readonly paneRows: number;
+    readonly epoch: number;
+  }>();
   // Deliberate saved-conversation picker (issue 323): the last accepted
   // catalog mints admissions; listing controllers are aborted on dismiss and
   // shutdown so late completions never contribute.
@@ -2562,6 +2594,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           nativeCliTargets: probeNativeCliTargets,
           nativeCliAvailability: true,
         }),
+        // Every creation provider above (blank, native, prompted) forwards an opt-in
+        // `createWorkspace: true` into the one owner create, which creates this host's
+        // workspace only after all existing admission; so this owner declares support
+        // and the bridge acknowledges it beside each creation lane it serves.
+        createWorkspaceSupported: true,
         // Rename uses this same host's existing verified native-name operation.
         renameOwnedSession,
         // The owner-side native HOST ROW NAME provider, on its OWN separately
@@ -3189,6 +3226,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && previous.hostId === createFormPresentation.hostId
             && previous.hostRunId === createFormPresentation.hostRunId
             && previous.workspace === createFormPresentation.workspace
+            && previous.providerKey === createFormPresentation.providerKey
+            // The drawn workspace-creation checkbox (#493) is part of the frame.
+            && previous.createWorkspace === createFormPresentation.createWorkspace
             && previous.cols === createFormPresentation.cols
             && previous.rows === createFormPresentation.rows
             && previous.terminalCols === cols
@@ -5644,8 +5684,94 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       );
   }
 
+  /**
+   * The written-frame proof for one LOCAL New submission that carried a checked
+   * "Create missing workspace directory" box (#493). The sidebar's action names
+   * the form generation and render token of the frame it captured; this side
+   * requires that exact frame to be the one the actual writer committed, still
+   * current, for the Local host, the exact workspace, the drawn provider, and a
+   * CHECKED drawn box — and then consumes the one-shot receipt so the same
+   * submission can never be launched twice. Anything else fails the request
+   * without creating anything and without falling back to an ordinary create.
+   */
+  function proveLocalCreateWorkspaceFrame(action: Extract<SidebarAction, { type: "create" }>): boolean {
+    const activeSidebar = sidebar;
+    if (activeSidebar === undefined || shutdownRequested) return false;
+    const frame = createFormFrame;
+    const expectedProvider = action.backend === undefined ? "pi" : `native:${action.nativeCliTarget ?? ""}`;
+    if (frame === undefined || !frame.settled
+      || typeof action.renderToken !== "number" || typeof action.formGeneration !== "number"
+      || frame.renderToken !== action.renderToken
+      || frame.formGeneration !== action.formGeneration
+      || frame.hostKind !== "local"
+      || frame.workspace !== action.workspace
+      || frame.createWorkspace !== true
+      || (frame.providerKey === undefined ? action.backend !== undefined : frame.providerKey !== expectedProvider)
+      || !isCurrentCreateFormFrame(frame)) {
+      activeSidebar.failCreate(action.requestId, CREATE_ON_PEER_UNWRITTEN_NOTICE);
+      return false;
+    }
+    createFormFrame = undefined;
+    // Keep the consumed receipt's geometry with the request: the launch re-proves
+    // it, so a request queued for negotiation can never outlive a reflow.
+    createWorkspaceFrameProofs.set(action.requestId, {
+      terminalCols: frame.terminalCols,
+      terminalRows: frame.terminalRows,
+      paneCols: frame.cols,
+      paneRows: frame.rows,
+      epoch: frame.epoch,
+    });
+    return true;
+  }
+
+  /**
+   * True only while the frozen written-frame geometry of one checked Local create
+   * is still the current geometry: the same outer terminal size, the same
+   * geometry epoch (a resize that returned to the same size still retires it),
+   * no external-editor handoff, and the form pane drawn at the same rectangle.
+   */
+  function createWorkspaceFrameStillCurrent(requestId: number): boolean {
+    const proof = createWorkspaceFrameProofs.get(requestId);
+    if (proof === undefined || shutdownRequested || externalEditorActive) return false;
+    if (terminal === undefined || !terminalStarted) return false;
+    if (clampDimension(terminal.columns, 80) !== proof.terminalCols
+      || clampDimension(terminal.rows, 24) !== proof.terminalRows) return false;
+    if (proof.epoch !== createFormEpoch) return false;
+    const pane = currentCreateFormPane(proof.terminalCols, proof.terminalRows);
+    return pane !== undefined && pane.cols === proof.paneCols && pane.rows === proof.paneRows;
+  }
+
   function launchCreate(action: Extract<SidebarAction, { type: "create" }>): void {
     if (!manager || shutdownRequested || !negotiationReady) return;
+    if (action.createWorkspace === true) {
+      // The last-instant proof for a creating Local request, immediately before
+      // the manager is asked — including a request that waited for negotiation:
+      // its written frame's frozen terminal/pane geometry and geometry epoch must
+      // still be current, and this exact request must still own the still-open
+      // Local form with the same generation, workspace, and CHECKED box. Otherwise
+      // nothing is created and the request is never launched as an ordinary
+      // create instead.
+      let current = false;
+      try {
+        current = typeof action.formGeneration === "number"
+          && createWorkspaceFrameStillCurrent(action.requestId)
+          && sidebar?.createStillCurrent({
+          requestId: action.requestId,
+          formGeneration: action.formGeneration,
+          workspace: action.workspace,
+          createWorkspace: true,
+        }) === true;
+      } catch {
+        current = false;
+      }
+      // The frozen proof is one-shot either way: it is never reused by a retry.
+      createWorkspaceFrameProofs.delete(action.requestId);
+      if (!current) {
+        sidebar?.failCreate(action.requestId, CREATE_ON_PEER_FORM_CHANGED_MESSAGE);
+        scheduleRedraw();
+        return;
+      }
+    }
     // The host's NEW provider gate (#493): a NEW native session names only its
     // backend's default target. A named external worker profile — even one this
     // host still has configured for review or execution — is refused here before
@@ -5666,6 +5792,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       workspace: action.workspace,
       ...(action.backend === undefined ? {} : { backend: action.backend }),
       ...(action.nativeCliTarget === undefined ? {} : { nativeCliTarget: action.nativeCliTarget }),
+      // The operator's checked box only; an unchecked create keeps its exact options.
+      ...(action.createWorkspace === true ? { createWorkspace: true } : {}),
     };
     let task!: Promise<void>;
     task = (async () => {
@@ -6472,7 +6600,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // A blank create has no saved-conversation duplicate fence: the canonical form
     // text is forwarded verbatim and the manager applies its own existing launch
     // semantics.
-    return startOwnedCreate(request.hostRunId, stillAuthorized, { workspace: request.workspace });
+    return startOwnedCreate(request.hostRunId, stillAuthorized, {
+      workspace: request.workspace,
+      // Opt-in creation of THIS owner's workspace inside the same one create, after
+      // every admission above and in startOwnedCreate; absent keeps the exact options.
+      ...(request.createWorkspace === true ? { createWorkspace: true } : {}),
+    });
   }
 
   /**
@@ -6675,6 +6808,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       workspace: request.workspace,
       backend: request.backend,
       nativeCliTarget: request.targetId,
+      ...(request.createWorkspace === true ? { createWorkspace: true } : {}),
     }, () => findRemoteNativeCliTarget(definedNativeCliTargets(), request.backend, request.targetId) !== null);
   }
 
@@ -6700,8 +6834,15 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
   ): Promise<OwnerCreateFacts> {
     const kind = request.kind;
     const initialRequest = { title: request.title, prompt: request.prompt };
+    // Opt-in creation of THIS owner's workspace, performed only inside the one
+    // admitted create below; the requester never touched this host's filesystem.
+    const createWorkspace = request.createWorkspace === true ? { createWorkspace: true } : {};
     if (kind === "pi") {
-      return startOwnedCreate(request.hostRunId, stillAuthorized, { workspace: request.workspace, initialRequest });
+      return startOwnedCreate(request.hostRunId, stillAuthorized, {
+        workspace: request.workspace,
+        initialRequest,
+        ...createWorkspace,
+      });
     }
     if (!isNativeCliBackend(kind) || nativeCliLaunch === undefined) return { kind: "refused" };
     const targetId = NATIVE_CLI_DEFAULT_TARGET_IDS[kind];
@@ -6714,6 +6855,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       backend: kind,
       nativeCliTarget: targetId,
       initialRequest,
+      ...createWorkspace,
     }, () => findRemoteNativeCliTarget(definedNativeCliTargets(), kind, targetId) !== null);
   }
 
@@ -6784,6 +6926,18 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       supported = false;
     }
     if (!supported) return "failed";
+    // Creation intent goes only to a destination that negotiated it; it is never
+    // dropped, and this requester never stats or creates the remote path itself.
+    const createWorkspace = request.createWorkspace === true;
+    if (createWorkspace) {
+      let creationSupported = false;
+      try {
+        creationSupported = controller.supportsCreateWorkspace?.(hostId) === true;
+      } catch {
+        creationSupported = false;
+      }
+      if (!creationSupported) return "failed";
+    }
     const destination = peerUiSnapshot?.hosts?.find((candidate) => candidate.id === hostId);
     const hostRunId = destination?.roster.hostRunId;
     if (destination === undefined || typeof hostRunId !== "string" || hostRunId.length === 0) return "failed";
@@ -6805,6 +6959,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         workspace: request.workspace,
         title: request.title,
         prompt: request.prompt,
+        ...(createWorkspace ? { createWorkspace: true } : {}),
       }, { stillCurrent });
     } catch {
       return "unknown";
@@ -7963,7 +8118,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
   }
 
   /** The fixed notice for one settled owner/not-sent Create result. */
-  function createOnPeerResultNotice(result: PeerCreateResult): string {
+  function createOnPeerResultNotice(result: PeerCreateResult, createWorkspace = false): string {
     if (result.kind === "owner-result") {
       const facts: OwnerCreateFacts | undefined = isOwnerCreateFacts(result.facts) ? result.facts : undefined;
       if (facts === undefined) return CREATE_ON_PEER_UNKNOWN_MESSAGE;
@@ -7983,7 +8138,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     if (result.kind === "not-sent") {
       switch (result.reason) {
         case "capability-unsupported":
-          return CREATE_ON_PEER_UNSUPPORTED_MESSAGE;
+          // A creating request is refused by name, never described as a missing
+          // create lane the destination may well have.
+          return createWorkspace
+            ? CREATE_ON_PEER_CREATE_WORKSPACE_UNSUPPORTED_MESSAGE
+            : CREATE_ON_PEER_UNSUPPORTED_MESSAGE;
         case "not-ready":
         case "target-unavailable":
           return CREATE_ON_PEER_GONE_MESSAGE;
@@ -8034,7 +8193,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       });
       return;
     }
-    activeSidebar.failCreateOnPeer(attempt.requestId, createOnPeerResultNotice(result));
+    activeSidebar.failCreateOnPeer(attempt.requestId, createOnPeerResultNotice(result, attempt.createWorkspace === true));
   }
 
   /**
@@ -8067,8 +8226,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         hostId: attempt.hostId,
         hostRunId: attempt.hostRunId,
         workspace: attempt.workspace,
+        // The frozen creation intent is re-proved with everything else, so a
+        // queued write can never be sent for the other intent.
+        ...(attempt.createWorkspace === true ? { createWorkspace: true } : {}),
       });
     };
+    // Present only when checked; an ordinary request keeps its exact shape.
+    const createWorkspace = attempt.createWorkspace === true ? { createWorkspace: true } : {};
     void (async () => {
       let result: PeerCreateResult;
       try {
@@ -8077,6 +8241,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
             hostId: attempt.hostId,
             hostRunId: attempt.hostRunId,
             workspace: attempt.workspace,
+            ...createWorkspace,
           }, { stillCurrent })
           // An explicit native choice goes to the owner's NATIVE lane and nowhere
           // else: the optional method is feature-detected at the call, and its
@@ -8087,6 +8252,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
             workspace: attempt.workspace,
             backend: attempt.backend,
             targetId: attempt.targetId,
+            ...createWorkspace,
           }, { stillCurrent }) ?? { kind: "not-sent", reason: "capability-unsupported" };
         if (typeof result !== "object" || result === null
           || (result.kind !== "owner-result" && result.kind !== "not-sent" && result.kind !== "unknown")) {
@@ -8132,6 +8298,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       || (native
         ? frame.providerKey !== `native:${action.targetId}`
         : frame.providerKey !== undefined && frame.providerKey !== "pi")
+      // The drawn workspace-creation checkbox is part of the written form too
+      // (#493): a creating submission needs a frame that drew it CHECKED, and an
+      // ordinary submission can never ride a frame that showed it checked.
+      || (frame.createWorkspace === true) !== (action.createWorkspace === true)
       || !isCurrentCreateFormFrame(frame)) {
       // A forged, stale, superseded, resized, queued, held, or unwritten DTO can
       // never send anything: the exact written form is the only authority.
@@ -8174,6 +8344,23 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       scheduleRedraw();
       return;
     }
+    if (action.createWorkspace === true) {
+      // A creating request goes only to a destination whose current channel
+      // negotiated workspace creation. Without it nothing is sent, and the
+      // request is never sent without its creation intent instead.
+      let creationSupported = false;
+      try {
+        creationSupported = controller.supportsCreateWorkspace?.(action.hostId) === true;
+      } catch {
+        creationSupported = false;
+      }
+      if (!creationSupported) {
+        activeSidebar.failCreateOnPeer(action.requestId, CREATE_ON_PEER_CREATE_WORKSPACE_UNSUPPORTED_MESSAGE);
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      }
+    }
     startCreateOnPeer({
       requestId: action.requestId,
       hostId: action.hostId,
@@ -8189,6 +8376,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       ...(native
         ? { backend: action.backend, targetId: action.targetId }
         : {}),
+      ...(action.createWorkspace === true ? { createWorkspace: true as const } : {}),
     }, controller);
   }
 
@@ -9055,6 +9243,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         return;
       }
       case "create":
+        // A CHECKED workspace-creation box (#493) must be proved against the exact
+        // written Local frame that drew it before anything is launched or queued;
+        // an ordinary unchecked create keeps its unchanged path.
+        if (action.createWorkspace === true && !proveLocalCreateWorkspaceFrame(action)) {
+          reconcileLayout(true);
+          scheduleRedraw();
+          return;
+        }
         if (negotiationReady) launchCreate(action);
         else deferredCreates.set(action.requestId, action);
         reconcileLayout(true);
@@ -9507,6 +9703,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     remoteContentStatus = undefined;
     contentStreamRequested = false;
     deferredCreates.clear();
+    createWorkspaceFrameProofs.clear();
     deferredSavedOpens.clear();
     deferredRowResumes.clear();
     // Abort an in-flight startup roster restoration; nothing it has not already
@@ -9997,6 +10194,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // Routed requests (`host`/`kind`) go to the one routed handler; installing it
       // is what makes each child's bootstrap advertise routed SessionSpawn.
       onRoutedSpawnRequest: routeSpawnRequest,
+      // That routed handler honors SessionSpawn `createWorkspace` on every route it
+      // serves (own host and paired hosts that negotiated support), so each child's
+      // bootstrap may advertise it. Creation happens only on the destination owner.
+      routedSpawnCreateWorkspace: true,
       // Read-only SessionHosts discovery for the same children. Installed beside
       // the routed handler, it is what makes each child's bootstrap advertise the
       // SessionHosts tool; the parent proof is the manager's own registration fact.

@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
-import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveExistingDirectory } from "./profiles";
+import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveWorkspaceDirectory } from "./profiles";
 import {
   NODE_OPTIONS_RESTORE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
@@ -767,6 +767,13 @@ export interface InstanceStatusHandlers {
 	 */
 	onRoutedSpawnRequest?(request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
 	/**
+	 * Present (only as `true`, and only beside {@link onRoutedSpawnRequest}) when
+	 * that routed handler honors SessionSpawn `createWorkspace`. It is the
+	 * registration's declared implementation support behind the bootstrap's
+	 * `spawnCreateWorkspace` marker, never a permission.
+	 */
+	routedSpawnCreateWorkspace?: boolean;
+	/**
 	 * An authenticated read-only SessionHosts inspection on this exact child
 	 * registration. Supplied only together with {@link onRoutedSpawnRequest} and
 	 * only when the manager was given a discovery handler, so a registration
@@ -959,6 +966,20 @@ export interface CreateInstanceOptions {
 	 * posted.
 	 */
 	nativeResumeConversationId?: string;
+	/**
+	 * Opt-in destination workspace creation (issue #493). Only an exact `true`
+	 * makes this row's own launch preparation ensure its workspace exists with one
+	 * ordinary recursive directory creation (the shared workspace resolver's
+	 * `createWorkspace`), on this host, after every existing admission, and before
+	 * the same canonical resolution and launch any row gets. The same option means
+	 * the same thing for a Pi row and a native CLI row. An existing directory is
+	 * reused unchanged; a creation failure is an ordinary launch preparation
+	 * failure; created directories remain if a later step fails (no cleanup,
+	 * rollback, retry, or permission change). Absent or `false` is exactly the
+	 * noncreating launch. It is refused beside a saved conversation or a native
+	 * resume, whose workspace is already recorded.
+	 */
+	createWorkspace?: boolean;
 }
 
 /**
@@ -1354,6 +1375,14 @@ export interface InstanceManagerOptions {
 		request: SessionSpawnInput,
 		parentStillCurrent: () => boolean,
 	) => Promise<SessionSpawnOutcome>;
+	/**
+	 * The host's explicit declaration that {@link onRoutedSpawnRequest} honors the
+	 * SessionSpawn `createWorkspace` option (issue #493). Only `true`, and only
+	 * beside a routed handler, makes each registration declare it, so a child's
+	 * bootstrap advertises creation support only when it is real. Absent or
+	 * `false`: a creation request is refused before anything is staged or sent.
+	 */
+	routedSpawnCreateWorkspace?: boolean;
 	/**
 	 * Host-owned read-only SessionHosts discovery for one child registration.
 	 * Forwarded to a registration ONLY together with
@@ -2756,7 +2785,7 @@ function validateNativeCliTarget(value: unknown): string {
  * here or anywhere else on this path.
  *
  * The resolution IS the host's shared Pi workspace resolution
- * ({@linkcode resolveExistingDirectory}): a leading bare `~`/`~/` expands
+ * ({@linkcode resolveWorkspaceDirectory}): a leading bare `~`/`~/` expands
  * against the home directory, a relative spelling resolves against this
  * process's working directory, and the result is the canonical real path. A
  * native row therefore accepts exactly the spellings a Pi row accepts, because
@@ -2764,8 +2793,8 @@ function validateNativeCliTarget(value: unknown): string {
  * never asks a shell to expand anything. No environment-variable or
  * `~otheruser` form is expanded here any more than it is for Pi.
  */
-function canonicalNativeWorkspace(workspace: string): string {
-	return resolveExistingDirectory(workspace, "the native CLI workspace");
+function canonicalNativeWorkspace(workspace: string, createWorkspace = false): string {
+	return resolveWorkspaceDirectory(workspace, "the native CLI workspace", { createWorkspace });
 }
 
 /**
@@ -2860,6 +2889,7 @@ export class InstanceManager {
 	readonly #onNativeCliClipboard?: (instanceId: string, event: NativeCliClipboardEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #onRoutedSpawnRequest?: InstanceManagerOptions["onRoutedSpawnRequest"];
+	readonly #routedSpawnCreateWorkspace: boolean;
 	readonly #onSessionHostsRequest?: InstanceManagerOptions["onSessionHostsRequest"];
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -2945,6 +2975,11 @@ export class InstanceManager {
 			throw new Error("session-host: onRoutedSpawnRequest must be a function or absent");
 		}
 		this.#onRoutedSpawnRequest = options.onRoutedSpawnRequest;
+		if (options.routedSpawnCreateWorkspace !== undefined && typeof options.routedSpawnCreateWorkspace !== "boolean") {
+			throw new Error("session-host: routedSpawnCreateWorkspace must be a boolean or absent");
+		}
+		this.#routedSpawnCreateWorkspace = options.routedSpawnCreateWorkspace === true
+			&& options.onRoutedSpawnRequest !== undefined;
 		if (options.onSessionHostsRequest !== undefined && typeof options.onSessionHostsRequest !== "function") {
 			throw new Error("session-host: onSessionHostsRequest must be a function or absent");
 		}
@@ -3344,6 +3379,19 @@ export class InstanceManager {
 			throw new Error("session-host: a saved-session selection uses the conversation's recorded workspace");
 		}
 		const initialRequest = options.initialRequest === undefined ? undefined : validateInitialRequest(options.initialRequest);
+		// Opt-in workspace creation is an exact boolean; only `true` creates anything.
+		// A recorded workspace (saved conversation or native resume) is never created.
+		const createWorkspaceOption: unknown = options.createWorkspace;
+		if (createWorkspaceOption !== undefined && typeof createWorkspaceOption !== "boolean") {
+			throw new Error("session-host: the create-workspace option must be a boolean");
+		}
+		const createWorkspace = createWorkspaceOption === true;
+		if (createWorkspace && savedSession !== undefined) {
+			throw new Error("session-host: a saved conversation uses its recorded workspace; it cannot be combined with workspace creation");
+		}
+		if (createWorkspace && options.nativeResumeConversationId !== undefined) {
+			throw new Error("session-host: a native conversation resume cannot be combined with workspace creation");
+		}
 		if (initialRequest !== undefined && savedSession !== undefined) {
 			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
@@ -3467,6 +3515,7 @@ export class InstanceManager {
 			savedSession,
 			initialRequest,
 			...(nativeCliTarget === undefined ? {} : { nativeCliTarget }),
+			...(createWorkspace ? { createWorkspace: true } : {}),
 		});
 		this.#inflightCreates.add(launch);
 		try {
@@ -6301,7 +6350,7 @@ export class InstanceManager {
 	 */
 	async #launchNativeCliInstance(
 			record: ManagedInstance,
-			options: { workspace: string; backend: NativeCliBackend; targetId?: string; initialRequest?: { title: string; prompt: string } },
+			options: { workspace: string; backend: NativeCliBackend; targetId?: string; initialRequest?: { title: string; prompt: string }; createWorkspace?: boolean },
 		): Promise<void> {
 		// The OPTIONAL native status source of this launch, armed below before the provider
 		// runs. Declared outside the try so every failure path can retire it.
@@ -6314,8 +6363,9 @@ export class InstanceManager {
 		try {
 			// 1. The selected workspace is the only setup fact this row needs: an
 			// existing absolute directory, canonicalized. No provider configuration,
-			// agent directory, profile, or skill work happens on this path.
-			const workspace = canonicalNativeWorkspace(options.workspace);
+			// agent directory, profile, or skill work happens on this path. An opted-in
+			// row first ensures the directory exists through the same shared resolver.
+			const workspace = canonicalNativeWorkspace(options.workspace, options.createWorkspace === true);
 			record.workspace = workspace;
 			record.agentDir = this.#hostAgentDir();
 			this.#safeChanged(record.id);
@@ -6669,7 +6719,7 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string }; nativeCliTarget?: string; createWorkspace?: boolean },
 		): Promise<void> {
 		const nativeBackend = isNativeCliBackend(record.backend) ? record.backend : undefined;
 		if (nativeBackend !== undefined) {
@@ -6681,6 +6731,7 @@ export class InstanceManager {
 				backend: nativeBackend,
 				...(options.nativeCliTarget === undefined ? {} : { targetId: options.nativeCliTarget }),
 				...(options.initialRequest === undefined ? {} : { initialRequest: options.initialRequest }),
+				...(options.createWorkspace === true ? { createWorkspace: true } : {}),
 			});
 			return;
 		}
@@ -6692,6 +6743,8 @@ export class InstanceManager {
 			const profile = this.#profilePreparer.prepare({
 				workspace: options.workspace,
 				profile: options.profile === "" ? undefined : options.profile,
+				// Workspace-only: the preparer never creates a profile or config directory for it.
+				...(options.createWorkspace === true ? { createWorkspace: true } : {}),
 			});
 			record.profile = profile;
 			record.agentDir = profile.agentDir;
@@ -6754,6 +6807,8 @@ export class InstanceManager {
 						if (routed === undefined || !parentStillCurrent()) return Promise.resolve("failed");
 						return routed(record.id, request, parentStillCurrent);
 					},
+					// Declared only when this host's routed handler really honors it.
+					...(this.#routedSpawnCreateWorkspace ? { routedSpawnCreateWorkspace: true } : {}),
 				}),
 				// Read-only discovery is forwarded only beside routed spawn, with the SAME
 				// per-call parent proof. A parent that is no longer current is an

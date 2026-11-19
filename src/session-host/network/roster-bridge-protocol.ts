@@ -272,6 +272,35 @@ export const ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY = "roster-native-status-v1";
  */
 export const ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY = "roster-native-availability-v1";
 /**
+ * Optional capability for opt-in DESTINATION WORKSPACE CREATION (#493). It states
+ * only that this owner explicitly declared that every creation lane it
+ * acknowledges on this channel — blank create, native create, and (TypeScript
+ * owners) prompted SessionSpawn — honors the optional boolean `createWorkspace`
+ * field: with `true` the owner's own launch ensures the workspace directory exists
+ * (one ordinary recursive directory creation on the owner's machine, after every
+ * existing admission) and then launches normally. It is implementation support
+ * only, never authority, never a grant, and never a per-lane registry.
+ *
+ * It depends on a creation lane: an owner acknowledges it only beside at least one
+ * acknowledged create, native, or session-spawn lane, and a viewer treats an
+ * acknowledgement without one as a protocol violation. On a channel that did not
+ * negotiate it, `createWorkspace: true` is outside the protocol (an owner refuses
+ * the frame as a violation rather than ignoring the field), while an omitted or
+ * explicit `false` field is the exact legacy request. Encoders omit `false`, so
+ * the legacy frame bytes are unchanged.
+ */
+export const ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY = "roster-create-workspace-v1";
+/**
+ * The creation lanes {@link ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY} may ride
+ * beside. Acknowledged, the capability applies to EVERY one of these that is also
+ * acknowledged on the channel; there is no per-lane flag.
+ */
+export const ROSTER_BRIDGE_CREATE_WORKSPACE_LANES: readonly string[] = Object.freeze([
+  ROSTER_BRIDGE_CREATE_CAPABILITY,
+  ROSTER_BRIDGE_NATIVE_CAPABILITY,
+  ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
+]);
+/**
  * Optional capabilities this implementation knows. An identifier offered by a
  * peer is recorded only when it appears here and is otherwise ignored; an
  * acknowledgement additionally narrows to what the owner can really honour.
@@ -287,6 +316,7 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
+  ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -586,6 +616,12 @@ export interface RosterBridgeCreateRequestFrame {
   readonly workspace: string;
   /** Strictly increasing, positive per-channel attempt number. */
   readonly sequence: number;
+  /**
+   * Opt-in destination workspace creation. Emitted only as `true`, and only on a
+   * channel that negotiated {@link ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY}; a
+   * decoded explicit `false` is dropped, so absence is the legacy request.
+   */
+  readonly createWorkspace?: true;
 }
 
 /** One fixed owner answer for exactly one request id. */
@@ -621,6 +657,8 @@ export interface RosterBridgeNativeCreateRequestFrame {
   readonly targetId: string;
   /** Strictly increasing, positive per-channel attempt number. */
   readonly sequence: number;
+  /** Opt-in destination workspace creation; same rules as the Pi create's field. */
+  readonly createWorkspace?: true;
 }
 
 /**
@@ -907,10 +945,10 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   unsubscribed: new Set(["type", "subscriptionId"]),
   close_request: new Set(["type", "requestId", "hostRunId", "rowId", "confirmed"]),
   close_result: new Set(["type", "requestId", "outcome"]),
-  create_request: new Set(["type", "requestId", "hostRunId", "workspace", "sequence"]),
+  create_request: new Set(["type", "requestId", "hostRunId", "workspace", "sequence", "createWorkspace"]),
   create_result: new Set(["type", "requestId", "outcome"]),
   create_native_request: new Set([
-    "type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence",
+    "type", "requestId", "hostRunId", "workspace", "backend", "targetId", "sequence", "createWorkspace",
   ]),
   create_native_result: new Set(["type", "requestId", "outcome"]),
   rename_request: new Set([
@@ -1184,6 +1222,23 @@ function readSavedQuery(value: unknown): string {
 function readBoolean(value: unknown): boolean {
   if (typeof value !== "boolean") fail("bad_frame");
   return value;
+}
+
+/**
+ * Decode the optional creation flag of a create frame: a present field must be a
+ * boolean (anything else is a bad frame); only `true` survives, so an explicit
+ * `false` decodes to the exact legacy request.
+ */
+function readCreateWorkspace(record: Record<string, unknown>): { readonly createWorkspace?: true } {
+  if (!Object.prototype.hasOwnProperty.call(record, "createWorkspace")) return {};
+  return readBoolean(record.createWorkspace) ? { createWorkspace: true } : {};
+}
+
+/** This side emits the creation flag only as `true`; `false` must be omitted, never encoded. */
+function validateEncodedCreateWorkspace(frame: { readonly createWorkspace?: unknown }): void {
+  if (Object.prototype.hasOwnProperty.call(frame, "createWorkspace") && frame.createWorkspace !== true) {
+    fail("invalid_frame");
+  }
 }
 
 const SAVED_ENTRY_KEYS: ReadonlySet<string> = new Set(OWNER_SAVED_ENTRY_KEYS);
@@ -1565,6 +1620,7 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       // The anti-replay scalar must be a positive safe integer; the per-channel
       // high-water comparison itself belongs to the two endpoints.
       if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      validateEncodedCreateWorkspace(frame);
       return frame;
     }
     case "spawn_result":
@@ -1592,6 +1648,7 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
       // The anti-replay scalar is the SAME channel-wide counter the Pi create
       // uses; the high-water comparison itself belongs to the two endpoints.
       if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      validateEncodedCreateWorkspace(frame);
       return frame;
     }
     case "create_native_result": {
@@ -1801,6 +1858,7 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
         hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
         workspace: readWorkspace(ownField(record, "workspace")),
         sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+        ...readCreateWorkspace(record),
       });
     }
     case "spawn_result":
@@ -1837,6 +1895,7 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
         backend,
         targetId,
         sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+        ...readCreateWorkspace(record),
       });
     }
     case "create_native_result": {
@@ -2027,6 +2086,12 @@ export function reviewRosterBridgeHelloAck(
   // acknowledged on its own: that would describe a catalog that cannot exist here.
   if (ack.capabilities.includes(ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY)
     && !ack.capabilities.includes(ROSTER_BRIDGE_NATIVE_CAPABILITY)) {
+    return { ok: false, code: "protocol_violation" };
+  }
+  // Workspace creation describes creation lanes, so it can never be acknowledged
+  // without at least one acknowledged create, native, or session-spawn lane.
+  if (ack.capabilities.includes(ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY)
+    && !ack.capabilities.some((capability) => ROSTER_BRIDGE_CREATE_WORKSPACE_LANES.includes(capability))) {
     return { ok: false, code: "protocol_violation" };
   }
   return Object.freeze({ ok: true, minor: ack.minor, capabilities: Object.freeze([...ack.capabilities]) });

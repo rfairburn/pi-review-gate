@@ -322,7 +322,8 @@ class ClientApplicationController private constructor(
                 val provider = CreateProviderSelection.reconcile(previousOwner, selected, form.provider)
                 val nextProof = selected?.let {
                     proof(listOf("create-binding", it.hostId, it.hostRunId, generation(it.hostId), currentRun(it.hostId),
-                        it.label, it.endpointDisplayText, form.workspaceDraft, CreateProviderSelection.key(provider)),
+                        it.label, it.endpointDisplayText, form.workspaceDraft, CreateProviderSelection.key(provider),
+                        form.createWorkspace),
                         UiProofScreen.SESSION_CREATE, it.hostId, currentRun(it.hostId))
                 } ?: form.proof
                 if (nextProof !== form.proof) (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
@@ -949,7 +950,8 @@ class ClientApplicationController private constructor(
                 }
                 dialogs = dialogs.copy(createSession = form.copy(selectedHostId = intent.hostId, provider = provider,
                     proof = proof(listOf("create", intent.hostId, form.workspaceDraft, CreateProviderSelection.key(provider),
-                        ++proofGeneration), UiProofScreen.SESSION_CREATE, intent.hostId, currentRun(intent.hostId))))
+                        form.createWorkspace, ++proofGeneration), UiProofScreen.SESSION_CREATE, intent.hostId,
+                        currentRun(intent.hostId))))
                 // A newly selected destination gets one fresh native-availability
                 // observation through the existing resync/re-subscribe. Reselecting the
                 // same owner keeps its observation (and its exact provider choice). It
@@ -964,20 +966,41 @@ class ClientApplicationController private constructor(
                 (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
                 dialogs = dialogs.copy(createSession = form.copy(provider = intent.provider,
                     proof = proof(listOf("create-provider", owner.hostId, owner.hostRunId, form.workspaceDraft,
-                        CreateProviderSelection.key(intent.provider), ++proofGeneration), UiProofScreen.SESSION_CREATE,
-                        owner.hostId, owner.hostRunId)))
+                        CreateProviderSelection.key(intent.provider), form.createWorkspace, ++proofGeneration),
+                        UiProofScreen.SESSION_CREATE, owner.hostId, owner.hostRunId)))
+            }
+            is ClientIntent.SetCreateWorkspace -> dialogs.createSession?.let { form ->
+                // The same busy guard as every other form edit: a form whose submit is
+                // admitting keeps its exact frozen receipt. The choice is request-specific
+                // and is never persisted; it is kept even when the selected owner does not
+                // support it, so the operator can see and clear it rather than lose it.
+                if (form.proof in busyForms || form.createWorkspace == intent.createWorkspace) return
+                (form.proof as? MutableUiActionProof)?.invalidate(UiProofInvalidationReason.TARGET_CHANGE)
+                val host = form.selectedHostId
+                dialogs = dialogs.copy(createSession = form.copy(createWorkspace = intent.createWorkspace,
+                    proof = proof(listOf("create-workspace", host, form.workspaceDraft,
+                        CreateProviderSelection.key(form.provider), intent.createWorkspace, ++proofGeneration),
+                        UiProofScreen.SESSION_CREATE, host ?: localFormHost, host?.let { currentRun(it) })))
             }
             is ClientIntent.SubmitSessionCreate -> {
                 val form = dialogs.createSession ?: return
                 if (form.proof !== intent.proof || form.selectedHostId != intent.hostId ||
-                    form.workspaceDraft != intent.workspace || form.provider != intent.provider) return
+                    form.workspaceDraft != intent.workspace || form.provider != intent.provider ||
+                    form.createWorkspace != intent.createWorkspace) return
                 val provider = form.provider ?: run {
                     report("Create not submitted: provider is no longer available")
                     return
                 }
                 val host = state.value.hostState(intent.hostId) ?: return
-                if (!CreateProviderSelection.admits(OwnerChoice.of(host), provider)) {
+                val owner = OwnerChoice.of(host)
+                if (!CreateProviderSelection.admits(owner, provider)) {
                     report("Create not submitted: provider is no longer available")
+                    return
+                }
+                // A checked choice is never dropped or sent to an owner that cannot honour
+                // it; the operator unchecks it or chooses a supporting owner.
+                if (intent.createWorkspace && !owner.createWorkspaceEligible) {
+                    report("Create not submitted: this host does not support creating a missing workspace directory")
                     return
                 }
                 val run = currentRun(intent.hostId) ?: run { report("Create not submitted: owner roster is not current"); return }
@@ -986,7 +1009,8 @@ class ClientApplicationController private constructor(
                 val frozen = FrozenAction.capture(intent.proof) ?: return
                 val inFlight = submittedCreate
                 if (inFlight != null && inFlight.formProof === form.proof && inFlight.hostId == intent.hostId &&
-                    inFlight.hostRunId == run && inFlight.workspace == intent.workspace) {
+                    inFlight.hostRunId == run && inFlight.workspace == intent.workspace &&
+                    inFlight.createWorkspace == intent.createWorkspace) {
                     // Same deliberate submit is already in flight; keep its one receipt.
                     report("Operation not submitted: busy")
                     return
@@ -998,17 +1022,19 @@ class ClientApplicationController private constructor(
                 // from. Only the exact owner-returned row may later be activated, even
                 // when the form was opened from Hosts rather than Sessions.
                 val activation = AcceptedCreateActivation.capture(intent.hostId, gen, run, intent.workspace,
-                    form, frozen, route) ?: return
+                    form, frozen, route, intent.createWorkspace) ?: return
                 submittedCreate = activation
                 operation(OperationContext(intent.hostId, gen, intent.proof, created = activation)) {
                     when (provider) {
                         CreateProviderChoice.Pi -> runtime.createSession(intent.hostId,
                             RosterCreateCommand(run, intent.workspace,
-                                RosterSendProof.Form(gen, run, intent.workspace, frozen)))
+                                RosterSendProof.Form(gen, run, intent.workspace, frozen, intent.createWorkspace),
+                                intent.createWorkspace))
                         is CreateProviderChoice.Native -> runtime.createNativeSession(intent.hostId,
                             RosterNativeCreateCommand(run, intent.workspace, provider.backend, provider.targetId,
                                 RosterSendProof.NativeForm(gen, run, intent.workspace, provider.backend,
-                                    provider.targetId, provider.catalogScope, frozen)))
+                                    provider.targetId, provider.catalogScope, frozen, intent.createWorkspace),
+                                intent.createWorkspace))
                     }
                 }
             }
@@ -1289,7 +1315,8 @@ class ClientApplicationController private constructor(
                 if (form.proof in busyForms) return
                 dialogs = dialogs.copy(createSession = form.copy(workspaceDraft = draft.value,
                     proof = proof(listOf("create-draft", form.selectedHostId, draft,
-                        CreateProviderSelection.key(form.provider), ++proofGeneration), UiProofScreen.SESSION_CREATE,
+                        CreateProviderSelection.key(form.provider), form.createWorkspace, ++proofGeneration),
+                        UiProofScreen.SESSION_CREATE,
                         form.selectedHostId ?: localFormHost, form.selectedHostId?.let { currentRun(it) })))
             }
             is ClientDraft.Rename -> dialogs.renameSession?.let { form ->

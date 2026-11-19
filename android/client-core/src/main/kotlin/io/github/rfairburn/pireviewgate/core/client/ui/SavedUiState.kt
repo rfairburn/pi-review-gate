@@ -42,6 +42,12 @@ public data class OwnerChoice(
     public val nativeCatalogScope: NativeCatalogScope? = null,
     /** True only when this owner can take a native create now with a NEW-session target. */
     public val nativeCreateEligible: Boolean = false,
+    /**
+     * True only when this owner acknowledged the request-specific create-workspace
+     * flag on a live connection ([HostUiState.canCreateWorkspace]). Presentation and
+     * submit gate only; the flag is never a permission.
+     */
+    public val createWorkspaceEligible: Boolean = false,
 ) {
     public companion object {
         /**
@@ -69,6 +75,7 @@ public data class OwnerChoice(
                 nativeTargets = newSessionTargets,
                 nativeCatalogScope = if (nativeEligible) host.nativeCatalogScope else null,
                 nativeCreateEligible = nativeEligible,
+                createWorkspaceEligible = host.canCreateWorkspace,
             )
         }
     }

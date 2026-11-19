@@ -108,6 +108,17 @@ export interface PeerUiHost {
 	 */
 	readonly createSupported?: boolean;
 	/**
+	 * Optional descriptive destination WORKSPACE CREATION support (#493): the owner
+	 * negotiated `roster-create-workspace-v1` beside at least one creation lane, so
+	 * every create/native/prompted lane it acknowledged honors an opt-in
+	 * `createWorkspace: true` (the owner itself creates the missing directory and
+	 * parents, then launches normally). Absent (an older coordinator or fake) or
+	 * `false` means NOT supported: a UI must not offer creation for this
+	 * destination, and a creation request is never sent to it. Descriptive only —
+	 * never a permission; the owner re-proves everything per request.
+	 */
+	readonly createWorkspaceSupported?: boolean;
+	/**
 	 * Optional native-lane capability and the owner's advertised launch targets.
 	 * Absent (an older coordinator, a fake, or a destination with no current
 	 * native observation) means NOT supported and no choices: the New form offers

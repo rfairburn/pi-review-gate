@@ -351,6 +351,26 @@ launch receipt, and every spawn is validated again. The optional `roster-native-
 only describes whether an owner's native catalog came from a fresh launch probe; it
 grants nothing, and a catalog without it has unknown availability.
 
+Workspace directory creation is explicitly request-scoped: `createWorkspace`
+defaults to `false`, and terminal/Android New opens with **Create missing workspace
+directory** unchecked. A child's `SessionSpawn` schema offers the field only when
+its own host declares that its routed spawn handler honors it; elsewhere an
+explicit `true` is refused before anything is staged or sent. Opting in uses
+recursive filesystem directory creation only on the selected destination, for any
+of the three session kinds; the requester never creates or resolves the requested
+workspace (a remote `SessionSpawn` still stages its existing private prompt payload
+locally as before), and creation runs no shell command, Git operation, or
+provisioning. Existing directories are reused and OS
+permissions are unchanged; file and permission errors use the existing
+workspace/launch error path. Creation is not transactional: partial parents may remain after
+failure, and created directories remain after a later launch failure, with no
+automatic cleanup, rollback, or retry; a failed or refused launch is not evidence
+that no directories changed. The optional `roster-create-workspace-v1`
+capability describes implementation support, not authority: a `true` request
+toward an owner without it is refused, never silently ignored, while off/omitted
+requests are unchanged.
+It adds no `SessionHosts` fields or authorization, native, or review settings.
+
 One deliberate local selection may instead display one exact owner row's native
 viewport, on the additive content lane of the same TLS/WSS listener and `/app`
 path, under the same exact TLS-proved peer key, current remembered pin, and

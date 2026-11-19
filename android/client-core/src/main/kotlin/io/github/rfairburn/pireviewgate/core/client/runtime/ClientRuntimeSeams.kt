@@ -161,7 +161,7 @@ data class ClientRuntimeConfig(
             "roster capability is not implementable"
         }
         require(RosterWire.dependenciesHold(rosterCapabilities)) {
-            "roster native availability requires the native capability"
+            "roster native availability requires the native capability, and create-workspace requires a create lane"
         }
         require(
             contentCapabilities.distinct().all { ContentProtocol.IMPLEMENTABLE_OPTIONAL_CAPABILITIES.contains(it) },
@@ -195,6 +195,7 @@ data class ClientRuntimeConfig(
             RosterWire.NATIVE_CAPABILITY,
             RosterWire.NATIVE_NAME_CAPABILITY,
             RosterWire.NATIVE_AVAILABILITY_CAPABILITY,
+            RosterWire.CREATE_WORKSPACE_CAPABILITY,
         )
 
         /**

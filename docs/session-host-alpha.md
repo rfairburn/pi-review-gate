@@ -591,9 +591,9 @@ presentation currently drawn. The **Provider** line appears only while that host
 offers native targets and the pane has one row to spare that displaces neither the
 Workspace field's budget, a pending or error status, nor the hint footer; when it is
 not drawn, keyboard focus and pointer activation skip it entirely. The Host line names
-**Local** every time the form opens: a Local submission asks only for an explicit
-existing workspace directory, keeps the
-native path editor and its completion, and immediately makes the created child the
+**Local** every time the form opens: a Local submission asks for an explicit
+workspace directory (already existing unless directory creation is checked), keeps
+the native path editor and its completion, and immediately makes the created child the
 active Main input owner
 without a second row Enter, with the sidebar still visible. A previous remote
 choice is never carried forward, an actual Host change clears the Workspace
@@ -608,8 +608,9 @@ connection, pin, or grant.
 
 An authenticated top-level session-host child with the review-gate reporter also
 exposes `SessionSpawn`; delegated executor children, standalone sessions, and
-native Claude Code/Codex rows do not. `SessionSpawn` requires an existing
-workspace, a title, and a nonempty prompt. When the child's host advertises routed
+native Claude Code/Codex rows do not. `SessionSpawn` requires a workspace path,
+a title, and a nonempty prompt; the directory must exist unless `createWorkspace`
+is `true`. When the child's host advertises routed
 spawning, it also accepts two optional selectors:
 
 - `kind` — `pi`, `claude`, or `codex`. Omitting it starts a Pi child.
@@ -621,9 +622,66 @@ spawning, it also accepts two optional selectors:
 
 A legacy call with only the workspace, title, and prompt behaves exactly as before:
 one fresh Pi child on the caller's own host. In a session whose host does not
-advertise routed spawning, the schema shows only those three fields, and a call
-that names `host` or `kind` is refused with nothing started rather than having the
+advertise routed spawning, the `host` and `kind` selectors are unavailable, and a
+call that names either is refused with nothing started rather than having the
 selectors dropped.
+
+**Optional workspace directory creation.** `SessionSpawn` can accept the optional
+boolean `createWorkspace`, defaulting to `false`. The model-visible schema offers it
+only when the calling child's own host advertises routed spawning and declares that
+its routed spawn handler honors workspace creation; not every host offers it. A
+call with `createWorkspace: true` in a session without that support is refused
+before anything is staged or sent, never downgraded to a noncreating request.
+Terminal and Android New offer the equivalent **Create missing workspace
+directory** checkbox when the selected destination (Local or a connected owner)
+supports creation. Every fresh form opens unchecked; this is a request-scoped
+choice, not a saved global setting. With `false`, omitted, or unchecked, the workspace must already be
+a directory, exactly as before. With `true` or checked, the selected destination
+uses filesystem APIs to create the directory recursively, including missing
+parents; an existing directory is reused. The same flag applies to Pi, Claude Code,
+and Codex CLI, locally or on a paired owner. The requested workspace is created and
+resolved only on that destination, never on the requester: a remote request
+carries the workspace text and the flag, and the requester creates or resolves no
+workspace directory. A remote `SessionSpawn` still stages its existing private
+prompt payload on the caller's host exactly as before. This is directory
+creation only, not a shell command, Git initialization, worktree, clone, branch,
+or provisioning operation; no Git repository is required.
+
+Operating-system permissions are unchanged. A regular file at the workspace path
+or a permission failure follows the existing workspace/launch error path.
+Recursive creation is not transactional: a failure may leave some parent
+directories behind, and created directories remain if launching the child later
+fails. There is no automatic cleanup, rollback, or retry. A failed or refused
+result describes the child launch only; it is not evidence that no directories
+were changed.
+
+The optional `roster-create-workspace-v1` wire capability describes implementation
+support only, not permission to create or launch. A request with
+`createWorkspace: true` (or a checked New form) to an older or unsupported owner is
+refused without sending anything to that owner rather than silently ignoring the
+flag, even if the directory already exists. Off/omitted requests keep their
+existing behavior. This adds no host-discovery fields: `SessionHosts` still
+returns `{ ownKinds, hosts: [{ id, label, kinds }] }`. Host/kind defaults, exact id
+and label handling, authorization, native settings, and review configuration are
+unchanged, as are native initial-prompt files and remembered legacy-target
+restoration.
+
+For example, suppose the synthetic destination path `/srv/example/new-project`
+does not exist. This request opts into creating it before starting a fresh Pi
+conversation on the caller's own host, with no Git setup:
+
+```json
+{
+  "workspace": "/srv/example/new-project",
+  "title": "Example session",
+  "prompt": "Describe this workspace.",
+  "createWorkspace": true
+}
+```
+
+The same request with `createWorkspace` omitted or `false` fails workspace
+validation while that path is missing. This is an illustrative example, not a
+manual-test result; ordinary permissions and launch requirements still apply.
 
 The same child also exposes the read-only `SessionHosts` tool when its host
 supplies the matching inspection capability. It takes no arguments and returns one
@@ -1735,14 +1793,19 @@ and sends nothing. The current TLS-proved peer key, remembered pin, and
 directional receiving grant still gate every request and reply, and capability
 negotiation grants no authority.
 
-One request names only this owner's exact run, one canonical workspace, a fresh
-correlation id, and a per-channel monotonic attempt number. It carries no row id, native
-conversation tuple, epoch, input mode, viewer, selected stream, displayed row, or path
-decision, so an owner whose current roster is empty is a valid first target. The owner's
+One request names this owner's exact run, one canonical workspace, the optional
+`createWorkspace` flag, a fresh correlation id, and a per-channel monotonic attempt
+number. It carries no row id, native conversation tuple, epoch, input mode, viewer,
+selected stream, displayed row, or requester-resolved path; the creation flag is
+only explicit intent for the owner's own launch, so an owner whose current roster
+is empty is a valid first target. The owner's
 provider reuses the same one manager, run identity, and launch path as its own local New,
-with only the workspace: no duplicate fence, workspace deduplication, path resolution,
-trimming, activation, or focus change. The owner's own local Main owner, selection, and
-drafts stay exactly as they were. No new creation prompt or extra creation notice is
+with the workspace and optional directory-creation flag: no duplicate fence,
+workspace deduplication, transport-side path resolution,
+trimming, activation, or focus change. Only an owner that acknowledged
+`roster-create-workspace-v1` receives the flag; the requester refuses a checked
+request to any other owner and sends that owner nothing. The owner's own local
+Main owner, selection, and drafts stay exactly as they were. No new creation prompt or extra creation notice is
 shown to the owner; normal roster updates and runtime/persistence warnings are unchanged.
 
 Requester-side facts are checked independently of the owner's. Admission and the
@@ -1815,10 +1878,10 @@ profiles offers the Pi-only form. The choice is part of the written form the wri
 submission requires that exact frame — its host identity, owner run, canonical
 workspace, pane geometry, and the drawn provider identity — and one request receipt
 consumed before dispatch. The request then names the exact owner run, that one
-backend, that one advertised target id, and the workspace, and the owner reuses the
-same manager, run identity, and native launch path as its own local New with only
-the workspace. No target is ever selected, activated, or focused, and a native
-remote create never becomes a Pi create.
+backend, that one advertised target id, the workspace, and the optional
+`createWorkspace` flag, and the owner reuses the same manager, run identity, and
+native launch path as its own local New. No target is ever selected, activated, or
+focused, and a native remote create never becomes a Pi create.
 
 A native choice never survives into a destination it was not made for. Changing the
 **Host** line, reconnecting, a replacement owner run, or a target the owner withdrew
@@ -2024,8 +2087,10 @@ acceptance is not established, and no full parity with the desktop sidebar or
 daily-use certification is claimed. It includes the Saved delete refresh above.
 
 **New session.** The Android New-session form is a first-class peer of the
-terminal sidebar's New form and follows the same rules. Its provider choices are
-only **Pi**, **Claude Code**, and **Codex CLI**, scoped to the selected connected
+terminal sidebar's New form and follows the same rules, including the freshly
+unchecked, request-scoped **Create missing workspace directory** checkbox described
+in [Starting and owning sessions](#starting-and-owning-sessions). Its provider
+choices are only **Pi**, **Claude Code**, and **Codex CLI**, scoped to the selected connected
 owner: Pi, which reaches that owner only when it supports its existing create,
 and a native kind only while that owner's current catalog was produced by a fresh launch probe
 (`roster-native-availability-v1`) and lists that kind as that owner's normal native

@@ -824,7 +824,9 @@ export interface OwningHostService {
    * unchanged legacy Pi create; an explicit native kind launches that backend's
    * default target only, through the same one manager create. A request naming
    * a `host` is never served here: routing to another host belongs to the
-   * caller, and this boundary refuses it rather than launching locally.
+   * caller, and this boundary refuses it rather than launching locally. An
+   * exact `createWorkspace: true` is forwarded to that one create, which ensures
+   * the workspace exists on THIS host during its own launch preparation.
    */
   spawnRequestedChild(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
   /**
@@ -1377,6 +1379,9 @@ class LocalOwningHostService implements OwningHostService {
         ...(kind === undefined || kind === "pi"
           ? {}
           : { backend: kind, nativeCliTarget: NATIVE_CLI_DEFAULT_TARGET_IDS[kind] }),
+        // Opt-in creation of this host's own workspace, inside the same one create;
+        // absence and `false` keep the exact noncreating create options.
+        ...(request.createWorkspace === true ? { createWorkspace: true } : {}),
       });
     } catch {
       return "failed";

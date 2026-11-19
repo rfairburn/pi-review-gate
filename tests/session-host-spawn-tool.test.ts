@@ -90,7 +90,7 @@ describe("SessionSpawn tool registration and contract", () => {
   it("rejects extra, empty, unsafe, and over-bound workspace/title arguments without invoking a host", () => {
     const valid = { workspace: "/existing", title: "Title", prompt: "Start." };
     assert.deepEqual(parseSessionSpawnInput(valid), valid);
-    assert.throws(() => parseSessionSpawnInput({ ...valid, other: "field" }), /exactly workspace, title, and prompt, plus optional host and kind/);
+    assert.throws(() => parseSessionSpawnInput({ ...valid, other: "field" }), /exactly workspace, title, and prompt, plus optional host, kind, and createWorkspace/);
     assert.throws(() => parseSessionSpawnInput({ workspace: "/existing", title: "Title", kind: "pi" }), /exactly workspace/);
     assert.throws(() => parseSessionSpawnInput({ ...valid, workspace: "" }), /workspace/);
     assert.throws(() => parseSessionSpawnInput({ ...valid, workspace: "/tmp/\0bad" }), /workspace/);

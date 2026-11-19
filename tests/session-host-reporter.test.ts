@@ -1342,6 +1342,57 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
+  it("refuses createWorkspace locally against a routed host that did not declare creation support", async () => {
+    // Routing alone (an older routed host) never receives a creation request.
+    const legacyServer = await startTestServer();
+    const legacy = await startSession({ server: legacyServer, bootstrap: makeBootstrap(legacyServer.socketPath, { spawnRouting: 1 }) });
+    await legacyServer.waitForFrame((frame) => frame.message.type === "hello");
+    const routingOnly = getSessionHostSpawnCapability();
+    assert.ok(routingOnly);
+    assert.equal(routingOnly.routing, true);
+    assert.equal(routingOnly.createWorkspace, undefined, "creation support is never inferred from routing");
+    for (const request of [
+      { workspace: "/new", title: "Child", prompt: "Start.", createWorkspace: true },
+      { workspace: "/new", title: "Child", prompt: "Start.", kind: "codex" as const, createWorkspace: true },
+      { workspace: "/new", title: "Child", prompt: "Start.", createWorkspace: "yes" as unknown as boolean },
+    ]) {
+      assert.equal(await routingOnly.spawn(request), "failed", "a definite refusal: nothing was sent");
+    }
+    assert.deepEqual(readdirSync(legacy.bootstrap.payloadDir as string), [], "nothing was staged");
+    assert.equal(legacyServer.frames.some((frame) => frame.message.type === "spawn_request" || frame.message.type === "spawn_routed_request"), false);
+    await legacy.testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("sends createWorkspace only as true in the routed family when the host declared the marker", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({
+      server,
+      bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1, spawnCreateWorkspace: 1 }),
+    });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    assert.equal(capability.createWorkspace, true, "the capability mirrors the declared marker");
+    const answer = (requestId: unknown, outcome: string): void => server.sendToClients(encodeFrame({
+      version: 1, type: "spawn_result", instanceId: bootstrap.instanceId, generation: bootstrap.generation, requestId, outcome,
+    } as never));
+
+    const creating = capability.spawn({ workspace: "/destination/new", title: "Child", prompt: "Start.", createWorkspace: true });
+    const routed = await server.waitForFrame((frame) => frame.message.type === "spawn_routed_request");
+    assert.equal(routed.message.createWorkspace, true, "a host-omitted creation request still uses the routed family");
+    assert.equal(Object.hasOwn(routed.message, "host"), false);
+    assert.equal(Object.hasOwn(routed.message, "kind"), false);
+    answer(routed.message.requestId, "started");
+    assert.equal(await creating, "started");
+
+    const plain = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Start.", createWorkspace: false });
+    const legacyFrame = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    assert.equal(Object.hasOwn(legacyFrame.message, "createWorkspace"), false, "false is omitted: the legacy frame is unchanged");
+    answer(legacyFrame.message.requestId, "failed");
+    assert.equal(await plain, "failed");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
   it("exposes SessionHosts inspection only when the host bootstrap advertised discovery with routing", async () => {
     const server = await startTestServer();
     const { testPi } = await startSession({ server, bootstrap: makeBootstrap(server.socketPath, { spawnRouting: 1 }) });

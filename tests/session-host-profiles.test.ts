@@ -12,6 +12,8 @@ import {
   defaultProfileStateRoot,
   initializeProfileDirectory,
   nativePiAgentDir,
+  resolveExistingDirectory,
+  resolveWorkspaceDirectory,
 } from "../src/session-host/profiles";
 import { PI_AGENT_DIR_ENV, piAgentDir } from "../src/config-path";
 
@@ -1264,6 +1266,142 @@ test("FIFO config pathnames are rejected without blocking via the nonblocking bo
       "is not a regular file",
     );
     assert.ok(fs.lstatSync(join(profile, "review-gate.json")).isFIFO());
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Opt-in workspace creation (issue #493) on the ONE shared workspace resolver.
+// ---------------------------------------------------------------------------
+
+test("resolveWorkspaceDirectory creates nested directories only on an exact true, reusing existing ones unchanged", () => {
+  const root = makeTestRoot("create-workspace");
+  try {
+    const nested = join(root, "a dir space", "nested", "deeper");
+    assert.equal(resolveWorkspaceDirectory(nested, "workspace", { createWorkspace: true }), realpathSync(nested));
+    assert.deepEqual(readdirSync(nested), [], "the created directory is empty");
+
+    const existing = join(root, "existing");
+    mkdirSync(existing);
+    writeFileSync(join(existing, "keep.txt"), "kept\n", "utf8");
+    const before = statSync(existing);
+    assert.equal(resolveWorkspaceDirectory(existing, "workspace", { createWorkspace: true }), realpathSync(existing));
+    const after = statSync(existing);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mode, before.mode, "no permission change on reuse");
+    assert.deepEqual(readdirSync(existing), ["keep.txt"]);
+
+    // Default-off: absence, false, and the legacy resolver never create anything.
+    for (const call of [
+      () => resolveWorkspaceDirectory(join(root, "off-absent", "x"), "workspace"),
+      () => resolveWorkspaceDirectory(join(root, "off-false", "x"), "workspace", { createWorkspace: false }),
+      () => resolveExistingDirectory(join(root, "off-legacy", "x"), "workspace"),
+    ]) {
+      expectError(call, "does not exist or is not accessible (ENOENT)");
+    }
+    for (const name of ["off-absent", "off-false", "off-legacy"]) {
+      assert.equal(fs.existsSync(join(root, name)), false, `${name}: nothing was created`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkspaceDirectory creation keeps the shared tilde, relative, and symlink meanings", () => {
+  const root = makeTestRoot("create-workspace-spellings");
+  const priorHome = process.env.HOME;
+  const priorUserProfile = process.env.USERPROFILE;
+  try {
+    const relativeTarget = join(root, "relative", "child");
+    assert.equal(
+      resolveWorkspaceDirectory(relative(process.cwd(), relativeTarget), "workspace", { createWorkspace: true }),
+      realpathSync(relativeTarget),
+      "a relative spelling is created against the process working directory",
+    );
+    const home = join(root, "synthetic-home");
+    mkdirSync(home);
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    assert.equal(
+      resolveWorkspaceDirectory("~/made/by/tilde", "workspace", { createWorkspace: true }),
+      realpathSync(join(home, "made", "by", "tilde")),
+      "a leading ~/ expands against the home directory before creation",
+    );
+    const real = join(root, "real");
+    mkdirSync(real);
+    const link = join(root, "link");
+    symlinkSync(real, link, "dir");
+    assert.equal(resolveWorkspaceDirectory(join(link, "inside"), "workspace", { createWorkspace: true }), realpathSync(join(real, "inside")));
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = priorUserProfile;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorkspaceDirectory creation failures stay on the workspace error path without cleanup or retry", (t) => {
+  const root = makeTestRoot("create-workspace-errors");
+  try {
+    const file = join(root, "regular-file");
+    writeFileSync(file, "file\n", "utf8");
+    // An existing regular file keeps the ordinary refusal.
+    expectError(() => resolveWorkspaceDirectory(file, "workspace", { createWorkspace: true }), "is not a directory", file);
+    // A path under a regular file cannot be created (deterministic even as root).
+    expectError(
+      () => resolveWorkspaceDirectory(join(file, "under"), "workspace", { createWorkspace: true }),
+      "could not be created",
+      join(file, "under"),
+    );
+    assert.equal(readFileSync(file, "utf8"), "file\n");
+
+    // A permission refusal for one exact synthetic target, without chmod or root
+    // assumptions: the real mkdir is delegated for everything else. This proves the
+    // error path, not native OS ACL enforcement.
+    const denied = join(root, "denied", "child");
+    const originalMkdirSync = fs.mkdirSync.bind(fs) as typeof fs.mkdirSync;
+    let deniedCalls = 0;
+    t.mock.method(fs, "mkdirSync", ((path: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+      if (path === denied) {
+        deniedCalls += 1;
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return originalMkdirSync(path, options);
+    }) as unknown as typeof fs.mkdirSync);
+    expectError(() => resolveWorkspaceDirectory(denied, "workspace", { createWorkspace: true }), "could not be created (EACCES)", denied);
+    assert.equal(deniedCalls, 1, "exactly one creation attempt, never a retry");
+    assert.equal(fs.existsSync(denied), false);
+    t.mock.restoreAll();
+
+    // A later failure leaves directories that ordinary recursive creation made.
+    const kept = join(root, "kept", "parent");
+    const registry = new ProfileRegistry({ stateRoot: join(root, "state") });
+    expectError(() => registry.prepare({ workspace: kept, profile: join(root, "no-such-profile"), createWorkspace: true }), "does not exist");
+    assert.ok(statSync(kept).isDirectory(), "created directories remain after a later admission failure (no rollback)");
+  } finally {
+    t.mock.restoreAll();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("NativeAgentRegistry creates only the opted-in workspace, never a config or agent directory", () => {
+  const root = makeTestRoot("create-workspace-native");
+  try {
+    const home = join(root, "home");
+    const agentDir = join(home, ".pi", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeConfig(agentDir, enabledConfig());
+    const registry = new NativeAgentRegistry({ env: { HOME: home } });
+    const missing = join(root, "missing-workspace", "nested");
+    expectError(() => registry.prepare({ workspace: missing }), "does not exist");
+    assert.equal(fs.existsSync(join(root, "missing-workspace")), false, "default-off admission creates nothing");
+    const prepared = registry.prepare({ workspace: missing, createWorkspace: true });
+    assert.equal(prepared.workspace, realpathSync(missing));
+    assert.deepEqual(readdirSync(missing), [], "only the empty workspace was created");
+    assert.deepEqual(readdirSync(agentDir), ["review-gate.json"], "the agent directory is unchanged");
+    prepared.release();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

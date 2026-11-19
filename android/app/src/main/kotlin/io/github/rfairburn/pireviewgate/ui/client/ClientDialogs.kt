@@ -5,9 +5,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.AlertDialogDefaults
 import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -27,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import android.os.SystemClock
 import kotlinx.coroutines.delay
@@ -478,6 +481,8 @@ private fun CreateSessionDialogView(
             selected?.hostRunId,
             dialog.provider,
             dialog.workspaceDraft,
+            dialog.createWorkspace,
+            selected?.createWorkspaceEligible,
         ),
     ) { gate ->
         gate.Body {
@@ -568,6 +573,36 @@ private fun CreateSessionDialogView(
                 modifier = Modifier.fillMaxWidth(),
             )
             NoticeText(stringResource(R.string.create_workspace_note))
+
+            // Request-specific and unchecked on every fresh form. Drawn for an owner
+            // that supports it, and kept visible and clearable while checked even
+            // after switching to an owner that does not, so the choice is never
+            // silently dropped. Only the destination owner creates the directory.
+            if (dialog.showsCreateWorkspace) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = dialog.createWorkspace,
+                            role = Role.Checkbox,
+                            onValueChange = { checked ->
+                                gate.retireForEdit()
+                                onIntent(ClientIntent.SetCreateWorkspace(checked))
+                            },
+                        ),
+                ) {
+                    Checkbox(checked = dialog.createWorkspace, onCheckedChange = null)
+                    Text(
+                        text = stringResource(R.string.create_workspace_create_missing),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+                if (dialog.createWorkspaceBlocked) {
+                    NoticeText(stringResource(R.string.create_workspace_create_missing_unsupported))
+                }
+            }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             DismissButton { onIntent(ClientIntent.DismissDialog(ClientDialogKind.CREATE_SESSION)) }
@@ -577,11 +612,13 @@ private fun CreateSessionDialogView(
                         selected?.let {
                             onIntent(ClientIntent.SubmitSessionCreate(
                                 it.hostId, dialog.workspaceDraft, dialog.proof, provider ?: return@let,
+                                dialog.createWorkspace,
                             ))
                         }
                     }
                 },
-                enabled = eligible && provider != null && dialog.workspaceDraft.isNotBlank(),
+                enabled = eligible && provider != null && dialog.workspaceDraft.isNotBlank() &&
+                    !dialog.createWorkspaceBlocked,
             ) { Text(stringResource(R.string.create_submit)) }
         }
     }

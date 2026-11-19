@@ -77,12 +77,14 @@ import {
   isValidNativeSessionFile,
   isValidRenameName,
   hasCompleteSessionIdle,
-  hasSessionSpawnRouting,
+  hasSessionSpawnCreateWorkspace,
+  requiresRoutedSessionSpawn,
   parseBootstrap,
   parseHostsRequest,
   parseSpawnRequest,
   SESSION_HOSTS_DISCOVERY_MODE,
   SESSION_SPAWN_ROUTING_MODE,
+  SESSION_SPAWN_CREATE_WORKSPACE_MODE,
   SessionHostsResultAssembler,
   type SessionHostHostsResult,
   type SessionHostsInspection,
@@ -993,17 +995,34 @@ function createReporter(
       return Promise.resolve("failed");
     }
 
-    let fields: { workspace: unknown; title: unknown; prompt: unknown; host: unknown; kind: unknown };
+    let fields: {
+      workspace: unknown; title: unknown; prompt: unknown; host: unknown; kind: unknown; createWorkspace: unknown;
+    };
     try {
       const raw = input as unknown as Record<string, unknown>;
-      fields = { workspace: raw.workspace, title: raw.title, prompt: raw.prompt, host: raw.host, kind: raw.kind };
+      fields = {
+        workspace: raw.workspace, title: raw.title, prompt: raw.prompt, host: raw.host, kind: raw.kind,
+        createWorkspace: raw.createWorkspace,
+      };
     } catch {
       return Promise.resolve("failed");
     }
     if (typeof fields.prompt !== "string" || fields.prompt.length === 0 || fields.prompt.includes("\0")) {
       return Promise.resolve("failed");
     }
-    const routed = hasSessionSpawnRouting(fields);
+    // A present creation flag must be an exact boolean; `false` is the noncreating
+    // request and is never put on the wire.
+    if (fields.createWorkspace !== undefined && typeof fields.createWorkspace !== "boolean") {
+      return Promise.resolve("failed");
+    }
+    const createWorkspace = hasSessionSpawnCreateWorkspace(fields);
+    if (createWorkspace && (bootstrap.spawnRouting !== SESSION_SPAWN_ROUTING_MODE
+      || bootstrap.spawnCreateWorkspace !== SESSION_SPAWN_CREATE_WORKSPACE_MODE)) {
+      // The host registration did not declare workspace-creation support. Never
+      // send a request it could ignore: definitely not sent, nothing staged.
+      return Promise.resolve("failed");
+    }
+    const routed = requiresRoutedSessionSpawn(fields);
     if (routed && bootstrap.spawnRouting !== SESSION_SPAWN_ROUTING_MODE) {
       // The host registration did not advertise routed-spawn support (an older
       // or not-yet-integrated host). Never send selectors it could drop, and
@@ -1031,6 +1050,7 @@ function createReporter(
       payload: staged.descriptor,
       ...(fields.host === undefined ? {} : { host: fields.host }),
       ...(fields.kind === undefined ? {} : { kind: fields.kind }),
+      ...(createWorkspace ? { createWorkspace: true } : {}),
     };
     const validated = parseSpawnRequest(requestCandidate);
     if (!validated) {
@@ -2515,6 +2535,12 @@ function createReporter(
       // Derived only from the immutable host-issued bootstrap marker; the same
       // marker gates requestSessionSpawn, so the two can never disagree.
       routing: bootstrap.spawnRouting === SESSION_SPAWN_ROUTING_MODE,
+      // Workspace creation is offered only from the host's declared marker (which
+      // the protocol admits only with routing); the same marker gates the request.
+      ...(bootstrap.spawnRouting === SESSION_SPAWN_ROUTING_MODE
+        && bootstrap.spawnCreateWorkspace === SESSION_SPAWN_CREATE_WORKSPACE_MODE
+        ? { createWorkspace: true }
+        : {}),
       // Read-only discovery exists only when the host advertised an actual
       // inspection handler (which the protocol admits only with routing).
       ...(bootstrap.sessionHosts === SESSION_HOSTS_DISCOVERY_MODE && bootstrap.spawnRouting === SESSION_SPAWN_ROUTING_MODE

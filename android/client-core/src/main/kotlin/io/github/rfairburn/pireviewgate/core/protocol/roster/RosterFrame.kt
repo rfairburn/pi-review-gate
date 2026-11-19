@@ -132,6 +132,12 @@ sealed interface RosterFrame {
         val hostRunId: String,
         val workspace: String,
         val sequence: Long,
+        /**
+         * Ask the owner to create the missing workspace directory (plain recursive
+         * mkdir) before launch. Only sent when true and only to an owner that
+         * acknowledged [RosterWire.CREATE_WORKSPACE_CAPABILITY]; false is omitted.
+         */
+        val createWorkspace: Boolean = false,
     ) : RosterFrame {
         override val type: String get() = "create_request"
     }
@@ -182,6 +188,8 @@ sealed interface RosterFrame {
         val backend: NativeCliBackend,
         val targetId: String,
         val sequence: Long,
+        /** The same optional create-workspace flag as [CreateRequest.createWorkspace]. */
+        val createWorkspace: Boolean = false,
     ) : RosterFrame {
         override val type: String get() = "create_native_request"
     }

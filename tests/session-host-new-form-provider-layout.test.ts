@@ -210,16 +210,19 @@ test("the Provider line is drawn between Host and Workspace and costs the pane o
 
   // The one row the Provider line costs comes out of the pane's spare filler, not
   // out of the field's budget: every row the pre-native form drew above the field
-  // stays put, the field block shifts by exactly one row, and everything below it
-  // — the reserved spacer row, the blank filler, and the hint footer — keeps its
-  // exact index and the pane keeps its exact height.
+  // stays put, the field block — and the default-off workspace-creation checkbox
+  // (#493) drawn directly below it — shifts by exactly one row, and everything
+  // below them, the blank filler and the hint footer, keeps its exact index and
+  // the pane keeps its exact height.
   assert.equal(provider.length, plain.length);
   assert.equal(provider.at(-1), plain.at(-1), "the hint footer stays on the last row");
-  for (const index of [2, 3, 4]) {
+  for (const index of [2, 3, 4, 5]) {
     assert.equal(provider[index + 1], plain[index],
       `field row ${index} moved: ${JSON.stringify({ plain: plain[index], provider: provider[index + 1] })}`);
   }
-  for (let index = 6; index < plain.length; index += 1) {
+  assert.equal(plain[5], "  [ ] Create missing workspace directory",
+    `the checkbox is not directly below the field: ${JSON.stringify(plain.slice(2, 7))}`);
+  for (let index = 7; index < plain.length; index += 1) {
     assert.equal(provider[index], plain[index],
       `row ${index} moved: ${JSON.stringify({ plain: plain[index], provider: provider[index] })}`);
   }

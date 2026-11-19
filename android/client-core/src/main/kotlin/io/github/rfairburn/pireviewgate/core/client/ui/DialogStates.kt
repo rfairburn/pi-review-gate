@@ -77,6 +77,12 @@ public data class RemoveHostDialog(
  * state shown rather than being replaced by another host. [workspaceDraft] is the
  * operator's own text, sent verbatim; this client performs no local filesystem
  * completion, validation, or path resolution of it.
+ *
+ * [createWorkspace] is the request-specific "Create missing workspace directory"
+ * choice. A fresh form starts unchecked and nothing about it is persisted. When
+ * checked it is honoured only by the destination owner; this client never creates a
+ * directory itself, and a checked form addressed to an owner that does not support
+ * the flag keeps the choice visible and refuses to submit rather than dropping it.
  */
 public data class CreateSessionDialog(
     public val owners: List<OwnerChoice>,
@@ -90,6 +96,8 @@ public data class CreateSessionDialog(
      * Pi on the operator's behalf.
      */
     public val provider: CreateProviderChoice? = CreateProviderChoice.Pi,
+    /** Ask the chosen owner to create the missing workspace directory. Fresh forms: false. */
+    public val createWorkspace: Boolean = false,
 ) {
     /** The explicitly chosen owner, or `null` when nothing is chosen yet. */
     public val selectedOwner: OwnerChoice?
@@ -105,6 +113,22 @@ public data class CreateSessionDialog(
      */
     public val shownProvider: CreateProviderChoice?
         get() = CreateProviderSelection.shown(selectedOwner, provider)
+
+    /**
+     * True when the create-workspace checkbox is drawn: the selected owner supports
+     * the flag, or the form already holds a checked choice that must stay visible and
+     * clearable (for example after switching to an owner that does not support it).
+     */
+    public val showsCreateWorkspace: Boolean
+        get() = createWorkspace || selectedOwner?.createWorkspaceEligible == true
+
+    /**
+     * True when the checked choice cannot be honoured by the selected owner. Submit is
+     * refused until the operator unchecks it or chooses a supporting owner; the choice
+     * is never cleared on the operator's behalf and never sent to that owner.
+     */
+    public val createWorkspaceBlocked: Boolean
+        get() = createWorkspace && selectedOwner?.createWorkspaceEligible != true
 }
 
 /** Rename one row, fenced to the native conversation tuple frozen in [target]. */

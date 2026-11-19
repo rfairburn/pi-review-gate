@@ -65,8 +65,10 @@ import {
  * Exact prompted launch data on the wire: the canonical local {@link SessionSpawnInput}
  * workspace/title/prompt triple (its model-facing `host` selector is never carried —
  * the owner IS the host), plus the exact owner run and a REQUIRED backend kind.
- * The key set stays closed at exactly these five, enforced by
- * {@link isOwnerSessionSpawnRequest}.
+ * The key set stays closed at exactly these five, plus the optional boolean
+ * `createWorkspace` (issue #493), enforced by {@link isOwnerSessionSpawnRequest}.
+ * A requester emits `createWorkspace` only as `true`, and only on a channel that
+ * negotiated the workspace-creation capability.
  */
 export type OwnerSessionSpawnRequest = Readonly<
 	Omit<SessionSpawnInput, "host" | "kind"> & { hostRunId: string; kind: SessionBackend }
@@ -89,8 +91,11 @@ export function isOwnerSessionSpawnRequest(value: unknown): value is OwnerSessio
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record);
-	if (keys.length !== 5 || !["hostRunId", "kind", "workspace", "title", "prompt"].every(key => keys.includes(key))
+	const hasCreateWorkspace = keys.includes("createWorkspace");
+	if (keys.length !== (hasCreateWorkspace ? 6 : 5)
+		|| !["hostRunId", "kind", "workspace", "title", "prompt"].every(key => keys.includes(key))
 		|| !isFactIdentifier(record.hostRunId) || !isSessionBackend(record.kind)) return false;
+	if (hasCreateWorkspace && typeof record.createWorkspace !== "boolean") return false;
 	try {
 		parseSessionSpawnInput({ workspace: record.workspace, title: record.title, prompt: record.prompt });
 		return true;
@@ -109,11 +114,25 @@ export interface OwnerCreateRequest {
 	 * substitutes a cwd, and the owner applies its own existing launch semantics.
 	 */
 	readonly workspace: string;
+	/**
+	 * Opt-in destination workspace creation (issue #493). Only `true` asks the
+	 * owner's own launch to ensure the workspace exists (one ordinary recursive
+	 * directory creation) after every existing admission; absent or `false` is the
+	 * exact noncreating create. It never reaches an owner that did not negotiate
+	 * the workspace-creation capability.
+	 */
+	readonly createWorkspace?: boolean;
 }
 
 /**
  * The fixed facts one owner create established. Exactly one of these is ever
  * reported, and none of them is a retry, reconnect, or resubmit instruction.
+ *
+ * Every fact is about the launched child only. For a `createWorkspace: true`
+ * request, `refused`, `unconfirmed`, or `unknown` is never proof that no
+ * directory changed: ordinary recursive creation may already have created the
+ * workspace or some of its parents before a later launch step failed, and
+ * nothing is cleaned up or rolled back.
  */
 export type OwnerCreateFacts
 	/** This owner's manager created a row in THIS run that is alive with a live
@@ -265,6 +284,12 @@ export interface PeerCreateTarget {
 	readonly hostRunId: string;
 	/** Canonical workspace text exactly as the form held it. */
 	readonly workspace: string;
+	/**
+	 * Opt-in destination workspace creation. Only `true` is sent, and only when the
+	 * owner negotiated the workspace-creation capability; otherwise the request is
+	 * `not-sent` with `capability-unsupported`. Never acted on by this requester.
+	 */
+	readonly createWorkspace?: boolean;
 }
 
 /**
@@ -352,6 +377,14 @@ export interface PeerCreateController {
 	supportsSessionSpawn?(hostId: string): boolean;
 	/** Exact prompted launch on the same one-in-flight owner-create lane. No fallback. */
 	spawnSession?(target: PeerSpawnTarget, options: PeerCreateOptions): Promise<PeerCreateResult>;
+	/**
+	 * Negotiated destination workspace-creation support only (issue #493): `true`
+	 * while the destination's current metadata viewer negotiated
+	 * `roster-create-workspace-v1` beside at least one creation lane. Optional so
+	 * older or fake controllers stay representable; absence means unsupported.
+	 * Admission still re-proves everything per request.
+	 */
+	supportsCreateWorkspace?(hostId: string): boolean;
 	createSession(target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult>;
 	/**
 	 * Ask the same owner to create one NATIVE child in exactly one of its runs,
@@ -573,6 +606,8 @@ export interface OwnerNativeCreateRequest {
 	readonly backend: NativeCliBackend;
 	/** Exact owner-advertised target id; never a requester-side configured id. */
 	readonly targetId: string;
+	/** Opt-in destination workspace creation; same meaning as {@link OwnerCreateRequest.createWorkspace}. */
+	readonly createWorkspace?: boolean;
 }
 
 /**
@@ -638,4 +673,6 @@ export interface PeerNativeCreateTarget {
 	readonly backend: NativeCliBackend;
 	/** Exact owner-advertised target id. */
 	readonly targetId: string;
+	/** Opt-in destination workspace creation; same meaning as {@link PeerCreateTarget.createWorkspace}. */
+	readonly createWorkspace?: boolean;
 }

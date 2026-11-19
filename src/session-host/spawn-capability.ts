@@ -14,6 +14,14 @@ export interface SessionHostSpawnCapability {
    * sending anything.
    */
   readonly routing?: boolean;
+  /**
+   * True only when this reporter's authenticated host registration declared
+   * routed workspace-creation support (bootstrap `spawnCreateWorkspace`, which
+   * requires `spawnRouting`). Absent or false: `spawn` refuses an input with
+   * `createWorkspace: true` with a definite "failed" before staging or sending
+   * anything, so the request can never be silently ignored.
+   */
+  readonly createWorkspace?: boolean;
   /** Carries the one exact {@link SessionSpawnInput}; never retries and never drops routing selectors. */
   spawn(input: SessionSpawnInput, signal?: AbortSignal): Promise<SessionSpawnOutcome>;
   /**

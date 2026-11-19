@@ -301,6 +301,7 @@ import { isValidNativeSessionId, isValidRenameName } from "../protocol";
 import {
 	isRosterBridgeIdentifier,
 	ROSTER_BRIDGE_CREATE_CAPABILITY,
+	ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
 	ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_CAPABILITY,
@@ -569,6 +570,16 @@ export interface PeerCoordinatorOptions {
 	 * without the native pair, is refused at construction.
 	 */
 	readonly nativeCliAvailability?: boolean;
+	/**
+	 * OWNER side (#493): the explicit declaration that EVERY creation provider
+	 * supplied here (blank create, native create, prompted spawn) honors the
+	 * optional `createWorkspace` request field. Only `true` lets the owner bridge
+	 * acknowledge `roster-create-workspace-v1`, and only beside a creation lane it
+	 * acknowledges on that channel. It is implementation support, never a
+	 * permission or grant. A non-boolean value, or `true` without any creation
+	 * provider, is refused at construction.
+	 */
+	readonly createWorkspaceSupported?: boolean;
 	/**
 	 * The host's ONE owner-side native HOST ROW NAME provider, supplied by Main,
 	 * which already owns the only manager label, stable-slot caption, and roster
@@ -928,11 +939,13 @@ function normalizeCloseTarget(value: unknown): PeerCloseTarget | null {
  */
 function normalizeCreateTarget(value: unknown): PeerCreateTarget | null {
 	if (!isRecord(value)) return null;
-	const { hostId, hostRunId, workspace } = value;
+	const { hostId, hostRunId, workspace, createWorkspace } = value;
 	if (typeof hostId !== "string" || hostId.length === 0) return null;
 	if (!isRosterBridgeIdentifier(hostRunId)) return null;
 	if (!isOwnerCreateWorkspace(workspace)) return null;
-	return Object.freeze({ hostId, hostRunId, workspace });
+	if (createWorkspace !== undefined && typeof createWorkspace !== "boolean") return null;
+	// Only an exact `true` carries creation intent; `false` is the legacy request.
+	return Object.freeze({ hostId, hostRunId, workspace, ...(createWorkspace === true ? { createWorkspace: true } : {}) });
 }
 
 /**
@@ -947,13 +960,17 @@ function normalizeCreateTarget(value: unknown): PeerCreateTarget | null {
  */
 function normalizeNativeCreateTarget(value: unknown): PeerNativeCreateTarget | null {
 	if (!isRecord(value)) return null;
-	const { hostId, hostRunId, workspace, backend, targetId } = value;
+	const { hostId, hostRunId, workspace, backend, targetId, createWorkspace } = value;
 	if (typeof hostId !== "string" || hostId.length === 0) return null;
 	if (!isRosterBridgeIdentifier(hostRunId)) return null;
 	if (!isOwnerCreateWorkspace(workspace)) return null;
 	if (!isNativeCliBackend(backend)) return null;
 	if (!isNativeCliTargetId(targetId)) return null;
-	return Object.freeze({ hostId, hostRunId, workspace, backend, targetId });
+	if (createWorkspace !== undefined && typeof createWorkspace !== "boolean") return null;
+	return Object.freeze({
+		hostId, hostRunId, workspace, backend, targetId,
+		...(createWorkspace === true ? { createWorkspace: true } : {}),
+	});
 }
 
 /**
@@ -1631,6 +1648,9 @@ class OwnedPeerCoordinator implements
 	 */
 	readonly #ownerCreateController: PeerCreateController = {
 		supportsSessionSpawn: (hostId) => this.#runtime.get(hostId)?.viewer?.supportsSessionSpawn === true,
+		// Descriptive negotiated support, read live from the same viewer as the
+		// PeerUiHost field; every request still re-proves it at admission.
+		supportsCreateWorkspace: (hostId) => this.#createWorkspaceHostSupport(this.#runtime.get(hostId)),
 		spawnSession: (target, options) => this.#spawnSession(target, options),
 		createSession: (target: PeerCreateTarget, options: PeerCreateOptions): Promise<PeerCreateResult> =>
 			this.#createSession(target, options),
@@ -1993,6 +2013,9 @@ class OwnedPeerCoordinator implements
 						// describes, and only as an exact `true`; nothing else claims probing.
 						...(this.#options.nativeCliAvailability === true ? { nativeCliAvailability: true } : {}),
 					}),
+				// The owner's workspace-creation declaration is handed over only as an exact
+				// `true`; the bridge acknowledges it only beside a creation lane it serves.
+				...(this.#options.createWorkspaceSupported === true ? { createWorkspaceSupported: true } : {}),
 				// The native HOST ROW NAME provider is handed over exactly like the other
 				// owner providers: never wrapped, never called here, and passed only when the
 				// caller really supplied it alongside the validated native pair, so an owner
@@ -3269,6 +3292,11 @@ class OwnedPeerCoordinator implements
 					// only — an owner acknowledges it solely when it can answer honestly, and an
 					// owner that never declares anything keeps sending the exact rows it sent before.
 					ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
+					// Destination workspace creation is offered because this side knows the
+					// optional request field. An owner acknowledges it only with its explicit
+					// declaration and beside a creation lane; otherwise this side never sends
+					// a creation request and every create keeps its legacy bytes.
+					ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
 					...(this.#savedViewer
 						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]
 						: [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]),
@@ -3521,9 +3549,18 @@ class OwnedPeerCoordinator implements
 			: viewer.supportsSessionSpawn !== true || typeof viewer.spawnSession !== "function") {
 			return { kind: "not-sent", reason: "capability-unsupported" };
 		}
+		// Creation intent is never dropped: without negotiated support nothing is sent.
+		const createWorkspace = (spawnRequest ?? request).createWorkspace === true;
+		if (createWorkspace && !this.#createWorkspaceHostSupport(runtime)) {
+			return { kind: "not-sent", reason: "capability-unsupported" };
+		}
 		const destinationEpoch = runtime.epoch;
 		const submit = (sendOptions: { readonly stillCurrent: () => boolean }) => spawnRequest === undefined
-			? viewer.createSession({ hostRunId: request.hostRunId, workspace: request.workspace }, sendOptions)
+			? viewer.createSession({
+				hostRunId: request.hostRunId,
+				workspace: request.workspace,
+				...(createWorkspace ? { createWorkspace: true } : {}),
+			}, sendOptions)
 			: viewer.spawnSession!(spawnRequest, sendOptions);
 		const result = await submit(
 			{
@@ -3625,6 +3662,11 @@ class OwnedPeerCoordinator implements
 			supported = false;
 		}
 		if (!supported) return { kind: "not-sent", reason: "capability-unsupported" };
+		// Creation intent is never dropped: without negotiated support nothing is sent.
+		const createWorkspace = request.createWorkspace === true;
+		if (createWorkspace && !this.#createWorkspaceHostSupport(runtime)) {
+			return { kind: "not-sent", reason: "capability-unsupported" };
+		}
 		// Only a CURRENT complete observation of this exact run can authorize a
 		// target, and only one the owner itself advertised.
 		if (roster.state !== "current" || roster.rows === null) {
@@ -3642,6 +3684,7 @@ class OwnedPeerCoordinator implements
 				workspace: request.workspace,
 				backend: request.backend,
 				targetId: request.targetId,
+				...(createWorkspace ? { createWorkspace: true } : {}),
 			},
 			{
 				stillCurrent: () => {
@@ -6264,6 +6307,10 @@ class OwnedPeerCoordinator implements
 			renameSupported: this.#renameHostSupport(runtime),
 			// The owner's negotiated blank Pi create, read live from the same viewer.
 			createSupported: this.#createHostSupport(runtime),
+			// Descriptive destination workspace-creation support (#493), read live from
+			// the same viewer: the owner negotiated it beside a creation lane. Never
+			// authority; every request is re-proved and the owner decides.
+			createWorkspaceSupported: this.#createWorkspaceHostSupport(runtime),
 			// Descriptive native-lane facts, also read live from the current viewer and
 			// this destination's current complete observation. Always present on this
 			// coordinator's own DTO (an absent field would be an older coordinator), and
@@ -6310,6 +6357,24 @@ class OwnedPeerCoordinator implements
 		if (runtime.client === null) return false;
 		try {
 			return runtime.viewer.supportsCreate === true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Descriptive destination workspace-creation capability for one destination;
+	 * never authority. True only while this destination is connected over a live
+	 * metadata viewer whose owner acknowledged `roster-create-workspace-v1` beside at
+	 * least one creation lane, with a live channel and borrowed client. It applies to
+	 * every creation lane that owner acknowledged on the channel.
+	 */
+	#createWorkspaceHostSupport(runtime: DestinationRuntime | undefined): boolean {
+		if (runtime === undefined || this.#closed || this.#tearingDown) return false;
+		if (runtime.state !== "connected" || runtime.viewer === null || runtime.channel === null) return false;
+		if (runtime.client === null) return false;
+		try {
+			return runtime.viewer.supportsCreateWorkspace === true;
 		} catch {
 			return false;
 		}
@@ -6608,6 +6673,17 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		}
 		if (options.nativeCliAvailability && nativeCreateProvider === undefined) {
 			throw new TypeError("peer coordinator native availability requires the native create provider and target catalog");
+		}
+	}
+	if (options.createWorkspaceSupported !== undefined) {
+		// A real boolean or absent; and creation support describes creation providers,
+		// so a declaration without any of them would describe nothing and is refused.
+		if (typeof options.createWorkspaceSupported !== "boolean") {
+			throw new TypeError("peer coordinator workspace-creation declaration is invalid");
+		}
+		if (options.createWorkspaceSupported && options.createOwnedSession === undefined
+			&& options.spawnOwnedSession === undefined && nativeCreateProvider === undefined) {
+			throw new TypeError("peer coordinator workspace creation requires a creation provider");
 		}
 	}
 	if (options.savedCatalogViewFactory !== undefined && typeof options.savedCatalogViewFactory !== "function") {

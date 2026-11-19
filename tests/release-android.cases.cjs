@@ -138,22 +138,28 @@ test("Gradle release properties fail closed on CI without changing ordinary debu
   assert.match(gradle, /versionCode = releaseNumber \?: 1/);
   assert.match(gradle, /versionName = releaseNumber\?\.let \{ "0\.1\.0\+\$it" \} \?: "0\.1\.0"/);
   assert.doesNotMatch(gradle, /applicationIdSuffix|signingConfig|keystore/);
-  assert.equal(android.TOOLCHAIN.jdk, "21.0.9+10");
+  assert.equal(android.TOOLCHAIN.jdk, "21.0.13.1+2");
   assert.equal(android.TOOLCHAIN.buildTools, "37.0.0");
 });
 
-// actions/setup-java compares a requested version carrying build metadata with
-// semver.compareBuild, so the canonical `21.0.9+10` label is never satisfied by the
-// vendor's `21.0.9+10.0.LTS` release. The workflow must therefore name the full
-// vendor selector while provenance keeps recording the canonical label.
-test("every release-job JDK selection names the full Temurin vendor selector for the pinned build", () => {
+// Adoptium's official release metadata for `jdk-21.0.13.1+2` (openjdk_version
+// `21.0.13.1+2-LTS`, patch 1, build 2) publishes the semver
+// `21.0.13+100000002.0.LTS` for that same build. The pinned actions/setup-java
+// rejects the four-component canonical label and compares build metadata with
+// semver.compareBuild, so the workflow must quote that exact published semver
+// while provenance keeps recording the canonical label. This pairing is copied
+// from the vendor metadata; it is not derived by any version conversion rule.
+const TEMURIN_JDK = Object.freeze({ canonical: "21.0.13.1+2", selector: "21.0.13+100000002.0.LTS" });
+
+test("every release-job JDK selection names Temurin's exact published semver for the pinned build", () => {
   const workflow = fs.readFileSync(path.join(process.cwd(), ".github", "workflows", "release.yml"), "utf8");
   const selectors = [...workflow.matchAll(/^\s*java-version: (\S+)$/gm)].map((match) => match[1].replace(/'/g, ""));
   assert.ok(selectors.length > 0, "the release workflow must provision the pinned JDK");
+  assert.equal(android.TOOLCHAIN.jdk, TEMURIN_JDK.canonical,
+    "provenance records the canonical label of the build the workflow selects");
   for (const selector of selectors) {
-    assert.equal(selector, "21.0.9+10.0.LTS", "no floating major, latest, or short-label JDK selection is allowed");
-    assert.equal(selector.replace(/\.0\.LTS$/, ""), android.TOOLCHAIN.jdk,
-      "the vendor selector and the canonical toolchain label must name the same JDK 21.0.9 build 10");
+    assert.equal(selector, TEMURIN_JDK.selector,
+      "no floating major, latest, canonical-label, or other-build JDK selection is allowed");
   }
 });
 

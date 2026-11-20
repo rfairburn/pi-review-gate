@@ -128,6 +128,7 @@
 import type { FieldEditorInstance } from "../native-editor-bridge";
 import { safeMarkdownDisplaySource } from "../markdown-safety";
 import { visibleTerminalText } from "../tool-result-text";
+import { nativeMouseHandled, routeNativeTextFieldMouse } from "../text-field-mouse";
 import type { QuestionMarkdownComponent, QuestionTuiHost } from "./pi-tui-host";
 import type { PendingNotice, PendingQuestion, PendingUserInput, SubmitResult, UserQuestionController } from "./controller";
 
@@ -306,6 +307,30 @@ interface PopupFrame {
   /** Live terminal size when this frame was produced ("unprobed" without a probe). */
   terminal: string;
   rows: ReadonlyArray<PopupFrameRow | undefined>;
+  /**
+   * The native editor box rows this frame actually wrote (#714): for each frame
+   * row, the editor's own box row drawn there (after scrolling and clipping),
+   * plus the box's column origin, render width, full height, and the question
+   * record it was drawn for. Absent when no editor box was written.
+   */
+  editor?: PopupEditorFrame;
+}
+
+interface PopupEditorFrame {
+  rows: ReadonlyArray<number | undefined>;
+  left: number;
+  width: number;
+  height: number;
+  record: PendingQuestion;
+}
+
+/** The native editor box one content render drew, in content coordinates. */
+interface PopupEditorBox {
+  /** Column of the box inside a content line (its indent). */
+  indent: number;
+  width: number;
+  height: number;
+  record: PendingQuestion;
 }
 
 interface RenderedMarkdown {
@@ -327,6 +352,9 @@ interface PopupContent {
   hint?: string;
   /** Shorter hint for tight budgets: the keys needed to reach hidden content. */
   compactHint?: string;
+  /** The native editor box row each body line shows (aligned with `lines`). */
+  editorRows?: ReadonlyArray<number | undefined>;
+  editorBox?: PopupEditorBox;
 }
 
 const TYPE_ROW = Symbol("type-answer");
@@ -370,6 +398,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   // raw line coordinates, before content wrapping, scrolling, and framing
   // remap them.
   let renderedItemRanges: Array<{ start: number; end: number; ref: PopupItemRef }> = [];
+  // The native editor box recorded by the answer renderer, in raw line
+  // coordinates, remapped like the item ranges.
+  let renderedEditorBox: (PopupEditorBox & { start: number }) | undefined;
   // Mouse gesture state: the frame last returned to the compositor, the item a
   // left press resolved in it, the same press once released (consumed by the
   // native click that immediately follows a stationary release), and the
@@ -998,6 +1029,39 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     confirmAnswerRow(ref.record.id, answerRows()[ref.row]);
   }
 
+  /**
+   * Forward one of Pi's own pointer events over a WRITTEN native editor box row
+   * to that same native field (#714), unchanged in type and translated to the
+   * box's own row and columns (after scrolling, clipping, and the box indent).
+   * The native Editor positions its caret on a completed click and leaves
+   * presses, drags, and releases unhandled, so those stay Pi's native
+   * selection. Nothing is forwarded outside an open editing episode on the
+   * live question the box was drawn for, for a stale or resized frame, or
+   * outside the box cells.
+   */
+  function forwardNativeFieldMouse(event: QuestionMouseEvent): QuestionMouseResult | undefined {
+    const field = options.nativeField;
+    const frame = lastFrame;
+    if (!field || !editing || mode !== "answer" || field.fieldActive !== true) return undefined;
+    if (!frame || !frameIsCurrent(frame) || !frameUnderPointer(frame, event)) return undefined;
+    const box = frame.editor;
+    const boxRow = box?.rows[event.y];
+    if (!box || boxRow === undefined) return undefined;
+    if (selectedId !== box.record.id || controller.getPending(box.record.id) !== box.record) return undefined;
+    const result = routeNativeTextFieldMouse(field, { ...event }, {
+      left: box.left,
+      top: event.y,
+      width: box.width,
+      rows: 1,
+      firstRow: boxRow,
+      height: box.height,
+    });
+    if (!nativeMouseHandled(result)) return undefined;
+    // The caret moved inside the cached box rendering: redraw it.
+    invalidateContent();
+    return { handled: true, render: result?.render !== false };
+  }
+
   const handleMouse = (event: QuestionMouseEvent): QuestionMouseResult | undefined => {
     // A closed popup intercepts nothing: ordinary routing resumes at once.
     if (closed || typeof event !== "object" || event === null) return undefined;
@@ -1047,7 +1111,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       // Not a live actionable entry (body text, hint, rules, padding, blank
       // cells, or stale geometry): leave the press to the host so Pi's native
       // text selection can anchor on the visible popup rows (#436).
-      if (!ref || !frame || !isLiveItem(ref)) return undefined;
+      if (!ref || !frame || !isLiveItem(ref)) return forwardNativeFieldMouse(event);
       pressedItem = { ref, frame };
       highlightItem(ref);
       return { handled: true, render: true };
@@ -1060,15 +1124,18 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       pressHighlight = undefined;
       if (hadHighlight) invalidateContent();
       // Only a release that completes a claimed item press is ours; every
-      // other release belongs to the host's native selection.
-      if (!candidate) return undefined;
+      // other release belongs to the host's native selection (or, over the
+      // native editor box, to that native field first).
+      if (!candidate) return forwardNativeFieldMouse(event);
       return { handled: true, render: hadHighlight };
     }
     if (event.type === "click") {
       const candidate = releasedItem;
       releasedItem = undefined;
-      // A click with no claimed press is the host's own selection click.
-      if (event.button !== "left" || !candidate) return undefined;
+      // A click with no claimed press is the host's own selection click; over
+      // the written native editor box it is that native field's caret click.
+      if (!candidate) return forwardNativeFieldMouse(event);
+      if (event.button !== "left") return undefined;
       // Only a stationary left press-release on one live item activates; the
       // click count is ignored like the native SelectList. The release/click
       // carry press-time bounds; a resize since then (even one the host has
@@ -1083,7 +1150,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     // Motion without a claimed item press belongs to the host's native
     // selection (and to whatever the surrounding layout does with it).
-    if (!pressedItem) return undefined;
+    if (!pressedItem) return forwardNativeFieldMouse(event);
     return { handled: true, render: false };
   };
 
@@ -1104,6 +1171,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (closed) return { lines: [] }; // A closed component never renders live controller state.
     if (cachedContent?.width === width) return cachedContent.content;
     renderedItemRanges = [];
+    renderedEditorBox = undefined;
     const raw = mode === "list"
       ? renderList(width)
       : mode === "answer"
@@ -1114,16 +1182,38 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       for (let line = range.start; line < range.end && line < rawOwners.length; line += 1) rawOwners[line] = range.ref;
     }
     renderedItemRanges = [];
+    // Assigned by the answer renderer called above (TypeScript cannot see it).
+    const editorBox = renderedEditorBox as (PopupEditorBox & { start: number }) | undefined;
+    renderedEditorBox = undefined;
     const lineCounts: number[] = [];
     const owners: Array<PopupItemRef | undefined> = [];
+    const editorRows: Array<number | undefined> = [];
     const lines = raw.lines.flatMap((line, index) => {
       const fitted = visibleWidth(line) <= width ? [line] : wrapNoticeLine(line, width);
       lineCounts.push(fitted.length);
-      for (let count = 0; count < fitted.length; count += 1) owners.push(rawOwners[index]);
+      // An editor row that had to be re-wrapped no longer sits at the box's
+      // own columns, so it carries no editor row at all.
+      const boxRow = editorBox !== undefined && fitted.length === 1
+        && index >= editorBox.start && index < editorBox.start + editorBox.height
+        ? index - editorBox.start
+        : undefined;
+      for (let count = 0; count < fitted.length; count += 1) {
+        owners.push(rawOwners[index]);
+        editorRows.push(boxRow);
+      }
       return fitted;
     });
     if (lineCounts.some((count) => count !== 1)) viewportFocus = remapViewportFocus(viewportFocus, lineCounts);
-    const content = { lines, owners, hint: raw.hint, compactHint: raw.compactHint };
+    const content: PopupContent = {
+      lines,
+      owners,
+      hint: raw.hint,
+      compactHint: raw.compactHint,
+      ...(editorBox === undefined ? {} : {
+        editorRows,
+        editorBox: { indent: editorBox.indent, width: editorBox.width, height: editorBox.height, record: editorBox.record },
+      }),
+    };
     cachedContent = { width, content };
     return content;
   };
@@ -1175,13 +1265,24 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     padded = true,
     ruled = true,
     owners: ReadonlyArray<PopupItemRef | undefined> = [],
-  ): { lines: string[]; rows: Array<PopupFrameRow | undefined> } {
+    editorRowsIn: ReadonlyArray<number | undefined> = [],
+  ): {
+    lines: string[];
+    rows: Array<PopupFrameRow | undefined>;
+    editorRows: Array<number | undefined>;
+    contentLeft: number;
+  } {
     const boundedWidth = Math.max(1, Math.floor(width));
     const padding = boundedWidth >= 3 ? POPUP_HORIZONTAL_PADDING : 0;
     const innerWidth = popupContentWidth(boundedWidth);
-    const framedContent = content.flatMap((line, index) =>
-      (visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth))
-        .map((fitted) => ({ line: fitted, owner: owners[index] })));
+    const framedContent = content.flatMap((line, index) => {
+      const fitted = visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth);
+      return fitted.map((part) => ({
+        line: part,
+        owner: owners[index],
+        editorRow: fitted.length === 1 ? editorRowsIn[index] : undefined,
+      }));
+    });
     const height = maxHeight === undefined ? undefined : Math.max(1, Math.floor(maxHeight));
     const verticalPadding = padded && (height === undefined || height >= 4) ? POPUP_VERTICAL_PADDING : 0;
     const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height, padded, ruled);
@@ -1201,37 +1302,67 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return {
         lines: visible.map(({ line }) => row(line)),
         rows: visible.map(({ line, owner }) => itemCells(line, owner)),
+        editorRows: visible.map(({ editorRow }) => editorRow),
+        contentLeft: padding,
       };
     }
-    if (height === 1) return { lines: [rule], rows: [undefined] };
-    if (height === 2) return { lines: [rule, rule], rows: [undefined, undefined] };
+    if (height === 1) return { lines: [rule], rows: [undefined], editorRows: [undefined], contentLeft: padding };
+    if (height === 2) {
+      return { lines: [rule, rule], rows: [undefined, undefined], editorRows: [undefined, undefined], contentLeft: padding };
+    }
     const output = [rule];
     const rows: Array<PopupFrameRow | undefined> = [undefined];
+    const editorRows: Array<number | undefined> = [undefined];
     if (verticalPadding > 0) {
       output.push(row(""));
       rows.push(undefined);
+      editorRows.push(undefined);
     }
-    for (const { line, owner } of visible) {
+    for (const { line, owner, editorRow } of visible) {
       output.push(row(line));
       rows.push(itemCells(line, owner));
+      editorRows.push(editorRow);
     }
     if (verticalPadding > 0) {
       output.push(row(""));
       rows.push(undefined);
+      editorRows.push(undefined);
     }
     output.push(rule);
     rows.push(undefined);
+    editorRows.push(undefined);
     return height === undefined
-      ? { lines: output, rows }
-      : { lines: output.slice(0, height), rows: rows.slice(0, height) };
+      ? { lines: output, rows, editorRows, contentLeft: padding }
+      : {
+        lines: output.slice(0, height),
+        rows: rows.slice(0, height),
+        editorRows: editorRows.slice(0, height),
+        contentLeft: padding,
+      };
   }
 
   /** Record the frame just returned to the compositor as the only clickable geometry. */
   function publishFrame(
-    framed: { lines: string[]; rows: Array<PopupFrameRow | undefined> },
+    framed: {
+      lines: string[];
+      rows: Array<PopupFrameRow | undefined>;
+      editorRows: Array<number | undefined>;
+      contentLeft: number;
+    },
     width: number,
     viewportRows: number | undefined,
+    editorBox: PopupEditorBox | undefined,
   ): string[] {
+    const editor: PopupEditorFrame | undefined = editorBox !== undefined
+      && framed.editorRows.some((row) => row !== undefined)
+      ? {
+        rows: framed.editorRows,
+        left: framed.contentLeft + editorBox.indent,
+        width: editorBox.width,
+        height: editorBox.height,
+        record: editorBox.record,
+      }
+      : undefined;
     lastFrame = closed
       ? undefined
       : {
@@ -1240,6 +1371,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
           viewportRows,
           terminal: liveTerminalSize(),
           rows: framed.rows,
+          ...(editor === undefined ? {} : { editor }),
         };
     return framed.lines;
   }
@@ -1321,7 +1453,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (height === undefined) {
       // Unbounded (no row budget): the complete content and hint, framed.
       const hint = content.hint === undefined ? [] : ["", ...wrapNoticeLine(theme.fg("dim", content.hint), contentWidth)];
-      return publishFrame(framePopup([...content.lines, ...hint], width, undefined, true, true, owners), width, undefined);
+      return publishFrame(
+        framePopup([...content.lines, ...hint], width, undefined, true, true, owners, content.editorRows ?? []),
+        width,
+        undefined,
+        content.editorBox,
+      );
     }
     // Tiny budgets give up the blank vertical padding rows before the fixed
     // hint, and below three rows the rules too, so at least one content row
@@ -1346,10 +1483,14 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // so a scrolled row maps to exactly the item it shows; the fixed hint rows
     // below the body own no item.
     const bodyOwners = owners.slice(scrollOffset, scrollOffset + bodyRows);
+    // The editor box rows are sliced by the same offset (#714), so a scrolled or
+    // clipped box maps every written row to exactly the box row it shows.
+    const bodyEditorRows = (content.editorRows ?? []).slice(scrollOffset, scrollOffset + bodyRows);
     return publishFrame(
-      framePopup([...body, ...hint], width, height, padded, ruled, bodyOwners),
+      framePopup([...body, ...hint], width, height, padded, ruled, bodyOwners, bodyEditorRows),
       width,
       height,
+      content.editorBox,
     );
   };
 
@@ -1489,6 +1630,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
           ?? options.nativeField.render(editorWidth);
         lines.push(`  ${box[0] ?? ""}`);
         for (const rest of box.slice(1)) lines.push(`  ${rest}`);
+        if (box.length > 0) {
+          renderedEditorBox = { start: rowStart, indent: 2, width: editorWidth, height: box.length, record };
+        }
         if (selected) {
           const cursorRow = rowStart + nativeFieldCursorBoxRow(options.nativeField, editorWidth, box.length);
           viewportFocus = {

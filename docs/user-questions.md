@@ -303,7 +303,10 @@ arrows select · Enter confirm · Esc back
   resizing, and never passes through to the conversation underneath. After the
   popup closes, normal native mouse routing resumes. In regular mode the
   terminal retains mouse ownership; use the existing keyboard controls. While
-  the free-form editor is active, clicking its box never submits the draft;
+  the free-form editor is active, clicking its box never submits the draft:
+  clicking a visible completion suggestion applies it to the draft, and
+  clicking inside its text places the insertion caret where you clicked (see
+  [Clicking editable text places the caret](session-host-alpha.md#clicking-editable-text-places-the-caret));
   still-visible choice and Decline rows remain clickable. Clicking one leaves
   editing and invokes that menu action. Merely leaving editing without resolving
   the question keeps the draft. The wheel is pointer-owned the same way: a wheel

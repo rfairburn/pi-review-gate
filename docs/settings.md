@@ -194,8 +194,14 @@ root. Field titles and key hints truncate to the available terminal-cell width,
 including styled and wide text; fitting text stays unchanged. This affects only
 those display rows, never the full editable value. Enter submits the field's own
 text (never a chat message); Esc first dismisses a visible completion list, then
-cancels the field, leaving the staged value unchanged. Every editable field
-shares the same native absolute-path behavior (no per-field opt-in remains): a
+cancels the field, leaving the staged value unchanged. In Pi's fullscreen mode a
+click inside any of these fields places the insertion caret where you clicked, so
+the next typed or pasted edit lands there; it changes no text and submits nothing.
+Clicking a visible completion suggestion applies it without submitting the field
+(see
+[Clicking editable text places the caret](session-host-alpha.md#clicking-editable-text-places-the-caret)).
+Every editable field shares the same native absolute-path behavior (no per-field
+opt-in remains): a
 first-line token that starts with `/` and contains no space (`/`, `/se`, `/var`,
 a nested absolute path) gets the host provider's own filesystem suggestions in
 its ordinary file-list layout — never slash-command items, so a nonexistent

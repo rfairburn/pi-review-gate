@@ -121,6 +121,12 @@ import { truncateToWidth } from "pi-session-host-tui";
 import { loadHostPeerModule } from "./host-peer-loader";
 import { pointHostEditorModuleAtLiveKeybindings, type HostEditorProvider } from "./host-editor";
 import { isRecord } from "./record-guard";
+import {
+  routeNativeTextFieldMouse,
+  type NativeTextFieldRegion,
+  type TextFieldMouseEvent,
+  type TextFieldMouseResult,
+} from "./text-field-mouse";
 
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
@@ -249,6 +255,13 @@ export interface NativeEditorBaseInstance {
   isShowingAutocomplete?(): boolean;
   /** Public insertion seam the host's paste handlers use. */
   insertTextAtCursor?(text: string): void;
+  /**
+   * Public pi-tui Editor mouse handler (#714): positions the caret on a
+   * completed left click through the Editor's own wrapped/grapheme/paste-marker
+   * map and leaves presses, drags, and releases to native selection. Optional:
+   * a host editor without it keeps the field keyboard-only.
+   */
+  handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
 }
 
 /** The captured instance plus the bridge-owned field state. */
@@ -1129,6 +1142,9 @@ function buildFieldComponent(
   const titleLines = options.title.split("\n").map((line) => styled.title(line));
   const hintLine = [styled.hint(options.hint ?? NATIVE_EDITOR_FIELD_HINT)];
   let focused = false;
+  // Where the native editor's rows were written by the last render (#714):
+  // geometry only, never a copy of the editor's text or caret.
+  let editorRegion: NativeTextFieldRegion | undefined;
   return {
     get focused(): boolean {
       return focused;
@@ -1144,14 +1160,35 @@ function buildFieldComponent(
     render(width: number): string[] {
       const w = Math.max(1, width);
       // Fit only bridge-owned display rows; the native editor owns its value and layout.
+      const titles = titleLines.map((line) => truncateToWidth(line, w, "…"));
+      const editorRows = captured.render(w);
+      editorRegion = editorRows.length > 0
+        ? { left: 0, top: titles.length, width: w, rows: editorRows.length, firstRow: 0, height: editorRows.length }
+        : undefined;
       return [
-        ...titleLines.map((line) => truncateToWidth(line, w, "…")),
-        ...captured.render(w),
+        ...titles,
+        ...editorRows,
         ...hintLine.map((line) => truncateToWidth(line, w, "…")),
       ];
     },
     handleInput(data: string): void {
       if (!session.settled) captured.handleInput(data);
+    },
+    /**
+     * Pi's own normalized mouse events over the editor rows reach the captured
+     * native Editor unchanged in type, translated to its local rows (#714), so
+     * a click places the caret exactly as in the main prompt and every press,
+     * drag, or release the Editor leaves unhandled stays Pi's native selection.
+     * Title/hint rows, a settled field, and a width the last render did not
+     * use are left to Pi untouched.
+     */
+    handleMouse(event: TextFieldMouseEvent): TextFieldMouseResult | undefined {
+      if (session.settled || !captured.fieldActive) return undefined;
+      const region = editorRegion;
+      if (region === undefined || typeof event !== "object" || event === null || event.width !== region.width) {
+        return undefined;
+      }
+      return routeNativeTextFieldMouse(captured, event, region);
     },
     invalidate(): void {
       try {

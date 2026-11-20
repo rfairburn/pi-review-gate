@@ -26,7 +26,9 @@
  * their list follows the rows the pane measured for the screen. A confirm's
  * message is the screen's mandatory `disclosure` metadata: the pane shows it
  * whole as the screen's one notice and accepts Yes only from a written frame
- * that shows it.
+ * that shows it. A confirmation the native flow precedes with a separate
+ * warning arrives through the explicit `settingsWarningConfirm` port instead,
+ * and its disclosure is that warning followed by the message.
  */
 import {
   Container,
@@ -134,13 +136,20 @@ export function createSidebarReviewSettingsUi(ports: SidebarReviewSettingsUiPort
       title,
       rows: options.map((option) => ({ value: option, label: option })),
     }),
-    confirm: async (title, message) => await listScreen(ui, ports.menuTuiHost, {
-      title,
-      message,
-      rows: [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }],
-      initialValue: "no",
-    }) === "yes",
+    confirm: (title, message) => confirmScreen(title, message),
+    // The pane has ONE notice slot, so a warning emitted before a confirmation
+    // would be displaced by the confirmation's own disclosure: the explicit
+    // port makes both canonical texts that one disclosure, warning first.
+    settingsWarningConfirm: {
+      confirm: (title, warning, message) => confirmScreen(title, `${warning} ${message}`),
+    },
   };
+  const confirmScreen = async (title: string, message: string): Promise<boolean> => await listScreen(ui, ports.menuTuiHost, {
+    title,
+    message,
+    rows: [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }],
+    initialValue: "no",
+  }) === "yes";
   return ui;
 }
 

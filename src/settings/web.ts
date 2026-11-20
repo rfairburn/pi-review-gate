@@ -276,7 +276,7 @@ const BROWSER_PERMISSION_ROWS: ReadonlyArray<{
 
 const YOLO_PERMISSION_LABEL = "YOLO / allow everything";
 
-const YOLO_ENABLE_WARNING =
+export const YOLO_ENABLE_WARNING =
   "YOLO enables every browser permission — model credential entry and submission, uploads, download saving, " +
   "clipboard read/write, camera, microphone, geolocation, service workers, popup restriction override, and local " +
   "network access including loopback, private, link-local, and cloud metadata addresses — and bypasses per-action " +
@@ -284,7 +284,7 @@ const YOLO_ENABLE_WARNING =
   "full capability, and page content remains untrusted. This persists until you explicitly disable it; only a human " +
   "can enable or disable it.";
 
-const YOLO_CONFIRM_MESSAGE =
+export const YOLO_CONFIRM_MESSAGE =
   "Confirm enabling YOLO / allow everything for the managed browser. It stays enabled across restarts until you " +
   "disable it here; disabling is immediate and restores your saved individual permissions as the effective policy.";
 
@@ -362,14 +362,29 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
   }
 }
 
-/** Prominent warning plus explicit human confirmation for YOLO OFF → ON. */
+/**
+ * Prominent warning plus explicit human confirmation for YOLO OFF → ON.
+ *
+ * A single-notice host (the session-host sidebar) supplies the explicit
+ * warning-confirm port, so the warning and the confirmation message are one
+ * mandatory disclosure of the confirmation screen rather than a separate
+ * notice the confirmation would displace (issue #653). Every other host keeps
+ * the separate warning notice, then the confirmation dialog.
+ */
 async function confirmYoloEnablement(ui: UiContext): Promise<boolean> {
-  await notify(ui, YOLO_ENABLE_WARNING, "warning");
-  if (!ui.confirm) {
-    await notify(ui, "YOLO requires an interactive confirmation dialog to enable; it stays Off.", "error");
-    return false;
+  const title = "Enable YOLO / allow everything?";
+  const port = ui.settingsWarningConfirm;
+  let confirmed: boolean;
+  if (typeof port?.confirm === "function") {
+    confirmed = await port.confirm(title, YOLO_ENABLE_WARNING, YOLO_CONFIRM_MESSAGE);
+  } else {
+    await notify(ui, YOLO_ENABLE_WARNING, "warning");
+    if (!ui.confirm) {
+      await notify(ui, "YOLO requires an interactive confirmation dialog to enable; it stays Off.", "error");
+      return false;
+    }
+    confirmed = await ui.confirm(title, YOLO_CONFIRM_MESSAGE);
   }
-  const confirmed = await ui.confirm("Enable YOLO / allow everything?", YOLO_CONFIRM_MESSAGE);
   if (!confirmed) {
     await notify(ui, "YOLO stays Off.", "info");
     return false;

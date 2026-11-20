@@ -32,6 +32,7 @@ import { openLocalReviewSettings, type LocalReviewSettingsInput } from "../src/s
 import type { ReviewSettingsCatalog } from "../src/session-host/review-settings-catalog";
 import type { SidebarReviewSettingsHost } from "../src/session-host/review-settings-ui";
 import type { UiContext } from "../src/settings/ui";
+import { YOLO_CONFIRM_MESSAGE, YOLO_ENABLE_WARNING } from "../src/settings/web";
 import {
   ALT_LEFT,
   ENTER,
@@ -820,6 +821,100 @@ test("one contextual notice: a confirmation's disclosure replaces the section no
   d.sidebar.cancelReviewSettings();
   await Promise.all(d.settled);
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "a staged confirmation saves nothing");
+});
+
+const YOLO_CONFIRM_TITLE = "Enable YOLO / allow everything?";
+const YOLO_WARNING_START = "YOLO enables every browser permission";
+
+/** The frame's text as one whitespace-normalized run, so a wrapped notice reads whole. */
+function flowed(shown: readonly string[]): string {
+  return shown.join(" ").replace(/\s+/g, " ");
+}
+
+async function openYoloConfirmation(d: Driven): Promise<void> {
+  moveToMenuRow(d, "YOLO / allow everything");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes(YOLO_CONFIRM_TITLE) && text.includes("→ No"), "the YOLO confirmation");
+}
+
+test("one contextual notice: the browser YOLO confirmation discloses the whole risk warning with its message and gates Yes", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Top-level tools");
+  await chooseMenuRow(d, "Web", "Maximum download");
+  await chooseMenuRow(d, "Browser permissions", "YOLO / allow everything");
+  await openYoloConfirmation(d);
+
+  // The one notice is the explicit disclosure: the full approval and network
+  // risk warning, then the confirmation message — both canonical texts whole.
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`), `the whole combined disclosure:\n${text}`);
+  assert.match(YOLO_ENABLE_WARNING, /bypasses per-action approval prompts/);
+  assert.match(YOLO_ENABLE_WARNING, /cloud metadata addresses/);
+  assert.equal(shown.filter((line) => line.includes(YOLO_WARNING_START)).length, 1, "drawn once");
+  assert.ok(!text.includes("every capability is enforced"), `the disclosure replaces the submenu notice:\n${text}`);
+  assert.ok(!shown.some((line) => line.startsWith("! ")), `no other notice shares the slot:\n${text}`);
+  assert.ok(shown.some((line) => line.trimStart().startsWith("Yes")) && shown.some((line) => line.trimStart().startsWith("→ No")), text);
+
+  // Cancel answers No: YOLO stays Off with the existing notice.
+  d.key(ESC);
+  await waitFor(d, (shownText) => /→ YOLO \/ allow everything\s+Off/.test(shownText) && shownText.includes("YOLO stays Off."), "the declined YOLO");
+  await openYoloConfirmation(d);
+
+  // A pane too short for the whole disclosure confirms nothing.
+  d.rows = 12;
+  assert.match(d.text(), /too small/);
+  d.key(UP);
+  d.key(ENTER);
+  await turns();
+  d.rows = 30;
+  text = d.text();
+  assert.ok(text.includes(YOLO_CONFIRM_TITLE), `still confirming:\n${text}`);
+  assert.match(text, /not completely shown/);
+  assert.ok(!text.includes(YOLO_WARNING_START), `the refusal takes the slot:\n${text}`);
+  // Yes on a written frame without the disclosure is refused and restores it.
+  d.key(ENTER);
+  await turns();
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.ok(text.includes(YOLO_CONFIRM_TITLE), "Yes was not accepted without the disclosure");
+  assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`) && !/not completely shown/.test(text), text);
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Yes")), text);
+
+  // A complete fresh frame that was drawn but never written confirms nothing either.
+  d.writes = false;
+  d.key(DOWN);
+  d.key(UP);
+  shown = d.frame();
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Yes")), shown.join("\n"));
+  assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`), "the unwritten frame draws the whole disclosure");
+  d.key(ENTER);
+  await turns();
+  d.writes = true;
+  text = d.text();
+  assert.ok(text.includes(YOLO_CONFIRM_TITLE) && !/YOLO \/ allow everything\s+On/.test(text), `the unwritten frame staged nothing:\n${text}`);
+  assert.match(text, /not completely shown/);
+  d.key(ENTER);
+  await turns();
+  shown = d.frame();
+  assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`) && shown.join("\n").includes(YOLO_CONFIRM_TITLE), shown.join("\n"));
+
+  // Now Yes is written with its whole disclosure and stages YOLO On — nothing is saved.
+  d.key(ENTER);
+  await waitFor(d, (shownText) => /→ YOLO \/ allow everything\s+On/.test(shownText), "YOLO staged On");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "staging writes nothing");
+  // Cancel at the root discards the staged override.
+  await chooseMenuRow(d, "Back", "Maximum download");
+  await chooseMenuRow(d, "Back", "Top-level tools");
+  await chooseMenuRow(d, "Back", "Save changes");
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (shownText) => shownText.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "Cancel leaves the disk unchanged");
 });
 
 for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] as const) test(`one contextual notice: an oversized disclosure refuses confirmation and provides a way back with Cancel on ${cancelKey}`, async (t) => {

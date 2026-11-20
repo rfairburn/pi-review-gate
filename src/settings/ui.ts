@@ -46,6 +46,13 @@ export interface UiContext {
    * `notify` on entry, exactly as before. See {@link withSettingsSectionHelp}.
    */
   settingsSectionHelp?: SettingsSectionHelpPort;
+  /**
+   * Optional host-only confirmation for a confirmation that the native flow
+   * precedes with a separate warning notice (issue #653). Pi hosts never
+   * supply it: they keep the warning `notify` followed by `confirm`, exactly
+   * as before. See {@link SettingsWarningConfirmPort}.
+   */
+  settingsWarningConfirm?: SettingsWarningConfirmPort;
 }
 
 /**
@@ -56,6 +63,18 @@ export interface UiContext {
  */
 export interface SettingsSectionHelpPort {
   section<T>(summary: string, run: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * A host whose settings notices share ONE slot (the session-host sidebar)
+ * would otherwise let a confirmation's own message displace the separately
+ * emitted warning before it. `confirm` receives both canonical texts
+ * explicitly and presents them together as the confirmation's mandatory
+ * disclosure, warning first; it resolves true only for an explicit Yes and
+ * false for No, cancel, or a closed screen.
+ */
+export interface SettingsWarningConfirmPort {
+  confirm(title: string, warning: string, message: string): Promise<boolean>;
 }
 
 /** One settings section's help: the full native description and its concise summary. */

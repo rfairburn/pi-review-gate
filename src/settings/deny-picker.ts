@@ -49,6 +49,7 @@
 
 import { isKeyRelease, isKeyRepeat } from "pi-session-host-tui";
 import { filterBySavedSearch } from "../session-host/saved-search";
+import { routeNativeTextFieldMouse, type NativeTextFieldRegion, type TextFieldMouseEvent, type TextFieldMouseResult } from "../text-field-mouse";
 import {
   claimMenuAction,
   consumeMenuActionFence,
@@ -338,6 +339,9 @@ function customDenySelect(
     };
 
     let focused = false;
+    // Where the native query Input's row was written by the last render
+    // (#714): geometry only, never a copy of the query or caret.
+    let queryRegion: NativeTextFieldRegion | undefined;
     return {
       // Focusable: the host focuses this component when it shows it, and the
       // focus is propagated to the embedded Input so the hardware cursor and
@@ -353,7 +357,12 @@ function customDenySelect(
         const lines: string[] = [];
         if (border) lines.push(...renderComponent(border, width));
         lines.push(...renderComponent(titleLine, width));
-        lines.push(...renderComponent(queryInput, width));
+        const queryTop = lines.length;
+        const queryRows = renderComponent(queryInput, width);
+        queryRegion = queryRows.length === 1
+          ? { left: 0, top: queryTop, width: Math.max(1, width), rows: 1, firstRow: 0, height: 1 }
+          : undefined;
+        lines.push(...queryRows);
         lines.push("");
         if (filter.matches.length === 0 && view.query.trim().length > 0) {
           // A query that hides every tool row renders a truthful no-match
@@ -368,6 +377,22 @@ function customDenySelect(
       },
       invalidate: (): void => {
         for (const component of [border, titleLine, queryInput, noMatchLine, list, hintLine]) invalidateComponent(component);
+      },
+      /**
+       * Pi's own pointer events over the written query row reach the native
+       * Input unchanged in type (#714); its own press convention places the
+       * caret through its horizontal scroll window. Nothing else in the picker
+       * gains pointer behavior, and nothing is forwarded once the picker
+       * answered, during a bracketed paste, or for a width the last render did
+       * not use.
+       */
+      handleMouse: (event: TextFieldMouseEvent): TextFieldMouseResult | undefined => {
+        if (closed || pasteActive || pasteCarry.length > 0) return undefined;
+        const region = queryRegion;
+        if (region === undefined || typeof event !== "object" || event === null || event.width !== region.width) {
+          return undefined;
+        }
+        return routeNativeTextFieldMouse(queryInput, event, region);
       },
       handleInput: (data: string): void => {
         if (closed) return;

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.302]
+## [0.1.0-dev.303]
 
 ### Added
 
@@ -29,7 +29,9 @@ dates.
   existing guarded initializer; an existing primary or compatibility fallback is never initialized
   over, and an explicit `PI_REVIEW_GATE_CONFIG` naming a missing file stays an error. A save is what
   later new local instances load (**New session** or a `SessionSpawn` child), never a running
-  session, which keeps its current effective configuration, and the editor is local-host only. See
+  session, which keeps its current effective configuration, and the editor is local-host only. Its
+  text values and tool-deny search field place the caret on click through the shared sidebar
+  field route (#714). See
   [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
 - **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
   sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking
@@ -46,6 +48,20 @@ dates.
   host startup against the host's startup directory (warning, never a refused start) and passed
   absolute to every managed child, including a `SessionSpawn` child in another workspace. See
   [Config discovery](docs/configuration.md#config-discovery); unrelated behavior is unchanged.
+
+## [0.1.0-dev.302]
+
+### Fixed
+
+- **Mouse caret placement across extension text fields (#714)**: clicking an
+  editable position in sidebar fields, search inputs, settings, and question
+  free text places the caret there for the next edit. Shared Pi editor/input
+  handling preserves Unicode positioning, keyboard controls, paste, completion,
+  validation, and input ownership. Clicking a visible completion suggestion in a
+  field hosted inside Pi applies it without submitting; sidebar fields never apply
+  one on click. In-Pi pointer input remains fullscreen-only;
+  native/provider controls and session-spawn behavior are unchanged. See the
+  [field inventory and example](docs/session-host-alpha.md#clicking-editable-text-places-the-caret).
 
 ## [0.1.0-dev.301]
 

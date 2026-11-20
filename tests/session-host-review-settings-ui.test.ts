@@ -865,6 +865,132 @@ test("an external worker ID edits single-line in the shared field: an ordinary C
 });
 
 // ---------------------------------------------------------------------------
+// Mouse caret placement on the shared #714 route
+// ---------------------------------------------------------------------------
+
+test("a settings text value places its caret through the shared written-frame route; stale, resized, clipped, pasting, settled, and hidden frames refuse", async () => {
+  let captured: UiContext | undefined;
+  let finish!: () => void;
+  const sidebar = new SidebarController({
+    settingsAvailable: false,
+    reviewSettings: {
+      open: (ui) => {
+        captured = ui;
+        return new Promise<void>((resolve) => { finish = resolve; });
+      },
+    },
+  });
+  const COLS = 60;
+  const ROWS = 20;
+  const lines = (rows = ROWS): string[] => sidebar.render(COLS, rows).lines.map(strip);
+  const rowOf = (shown: readonly string[], prefix: string): number => {
+    const row = shown.findIndex((line) => line.startsWith(prefix));
+    assert.ok(row >= 0, `no row starting ${JSON.stringify(prefix)}:\n${shown.join("\n")}`);
+    return row;
+  };
+  for (let step = 0; step < 10 && !lines().some((line) => line.startsWith("> Settings")); step += 1) sidebar.handleInput(DOWN);
+  sidebar.handleInput(ENTER);
+  lines();
+  sidebar.handleInput(ENTER); // the only Settings row: Review settings
+  await turns();
+  const ui = captured!;
+
+  const edit = ui.editText!({ title: "Scheduled instructions", currentValue: "first line\nsecond line", options: {} });
+  await turns();
+  let shown = lines();
+  const secondRow = rowOf(shown, "second line");
+  const firstRow = rowOf(shown, "first line");
+  let written = sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(0, rowOf(shown, "Scheduled instructions"), COLS, ROWS), false, "the title is not editable text");
+  assert.equal(written.activateFormRowAt(7, secondRow, COLS + 1, ROWS), false, "geometry the frame did not use");
+  assert.equal(written.activateFormRowAt(7, firstRow - 1, COLS, ROWS), false, "the Editor's own top border");
+  assert.equal(written.activateFormRowAt(7, secondRow, COLS, ROWS), true, "a press on the second drawn line is accepted");
+  sidebar.handleInput("X");
+  assert.equal(written.activateFormRowAt(0, firstRow, COLS, ROWS), false, "an edit typed after the written frame refuses it");
+  shown = lines();
+  assert.ok(shown.some((line) => line.startsWith("second Xline")), shown.join("\n"));
+  const fresh = sidebar.captureMousePresentation();
+  assert.notEqual(fresh.authorizationKey, written.authorizationKey, "the field frame is part of the authorization");
+  assert.equal(written.activateFormRowAt(0, firstRow, COLS, ROWS), false, "the old capture stays refused after a redraw");
+
+  lines(4); // too small: no field is drawn, so nothing is retained
+  assert.equal(sidebar.captureMousePresentation().activateFormRowAt(0, firstRow, COLS, ROWS), false, "a too-small frame keeps no caret target");
+
+  shown = lines();
+  sidebar.handleInput(PASTE_START);
+  lines();
+  assert.equal(sidebar.captureMousePresentation().activateFormRowAt(0, firstRow, COLS, ROWS), false, "a bracketed paste in flight refuses");
+  sidebar.handleInput(PASTE_END);
+
+  shown = lines();
+  written = sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(0, rowOf(shown, "first line"), COLS, ROWS), true);
+  sidebar.handleInput("Y");
+  sidebar.handleInput(ENTER);
+  assert.equal(await edit, "Yfirst line\nsecond Xline", "each press moved only the caret; the typed edits landed there");
+  assert.equal(written.activateFormRowAt(1, firstRow, COLS, ROWS), false, "a settled edit's frame refuses");
+
+  const hidden = ui.editText!({ title: "Blocked URL patterns", currentValue: "keep", options: {} });
+  await turns();
+  shown = lines();
+  written = sidebar.captureMousePresentation();
+  sidebar.cancelReviewSettings();
+  assert.equal(await hidden, undefined, "leaving the pane cancels the edit");
+  assert.equal(written.activateFormRowAt(1, rowOf(shown, "keep"), COLS, ROWS), false, "a hidden/cancelled open refuses");
+  finish();
+  await turns();
+});
+
+test("the deny picker's query places its caret in the sidebar screen; list rows, stale views, and unwritten frames refuse", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Top-level tools");
+  moveToMenuRow(d, "Top-level tools");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Top-level tools —") && text.includes("bash"), "the deny picker");
+  d.key("b");
+  d.key("a");
+  const queryRow = (shown: readonly string[], value: string): number => shown.findIndex((line) => line.trimEnd().endsWith(`> ${value}`) || line.trimEnd() === `> ${value}`);
+  let shown = d.frame();
+  let row = queryRow(shown, "ba");
+  assert.ok(row >= 0, shown.join("\n"));
+  const promptColumn = (shown[row] ?? "").indexOf("> ba");
+  let written = d.sidebar.captureMousePresentation();
+  const bashRow = shown.findIndex((line, index) => index > row && line.includes("bash"));
+  assert.ok(bashRow > row, shown.join("\n"));
+  assert.equal(written.activateFormRowAt(promptColumn + 2, bashRow, d.cols, d.rows), false, "a list row is never toggled or confirmed");
+  assert.deepEqual(d.frame(), shown, "the refused press changed nothing");
+  assert.equal(written.activateFormRowAt(promptColumn + 2, row, d.cols, d.rows + 1), false, "geometry the frame did not use");
+
+  assert.equal(written.activateFormRowAt(promptColumn + 2, row, d.cols, d.rows), true, "a press before 'b' is accepted");
+  d.key("x");
+  assert.equal(written.activateFormRowAt(promptColumn + 3, row, d.cols, d.rows), false, "a key after the written frame refuses it");
+  shown = d.frame();
+  row = queryRow(shown, "xba");
+  assert.ok(row >= 0, `the typed key landed at the clicked caret:\n${shown.join("\n")}`);
+
+  d.writes = false;
+  shown = d.frame();
+  d.key("\x1b[D"); // a view change the writer has not reported
+  d.frame();
+  written = d.sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(promptColumn + 2, row, d.cols, d.rows), false, "an unwritten frame keeps no caret authority");
+  d.writes = true;
+  shown = d.frame();
+  written = d.sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(promptColumn + 5, row, d.cols, d.rows), true, "a press after 'xba' is accepted once written");
+  d.key("!");
+  assert.ok(queryRow(d.frame(), "xba!") >= 0, d.text());
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("Top-level tools") && text.includes("Executor tools"), "Tools");
+  assert.equal(written.activateFormRowAt(promptColumn + 2, row, d.cols, d.rows), false, "a closed picker's frame refuses");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+// ---------------------------------------------------------------------------
 // Main composition
 // ---------------------------------------------------------------------------
 

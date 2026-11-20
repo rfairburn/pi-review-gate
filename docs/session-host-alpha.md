@@ -602,8 +602,11 @@ moves **Workspace** → **Provider** → **Host** — or **Workspace** → **Hos
 when no Provider line is drawn — and `Tab` steps back down through **Provider** to
 **Workspace**; `Up`/`Down` cycle the displayed choice on the focused line; a click
 on the **Provider** label focuses it, and a click on its value cycles from the
-presentation currently drawn. The **Provider** line appears only while that host
-offers native targets and the pane has one row to spare that displaces neither the
+presentation currently drawn. Clicking inside the **Workspace** field's own text
+places the insertion caret there (see
+[Clicking editable text places the caret](#clicking-editable-text-places-the-caret)).
+The **Provider** line appears only while that host offers native targets and the
+pane has one row to spare that displaces neither the
 Workspace field's budget, a pending or error status, nor the hint footer; when it is
 not drawn, keyboard focus and pointer activation skip it entirely. The Host line names
 **Local** every time the form opens: a Local submission asks for an explicit
@@ -2818,6 +2821,68 @@ keeps its ordinary path. Bracketed-paste bodies stay byte-for-byte opaque: paste
 content is never rewritten. Unrelated control keys, focus and owner routing, and
 session lifecycle and shutdown are unchanged, and a terminal outside the sidebar
 keeps its own job-control behavior.
+
+### Clicking editable text places the caret
+
+Every extension-owned text field places the insertion caret where you click
+inside its drawn text, and the next typed or pasted edit lands there. In the New
+session form's **Workspace** field, for example, typing `/srv/example` and then
+clicking between `/srv/` and `example` puts the caret at that boundary, so
+typing `X` leaves `/srv/Xexample` instead of editing at the previous caret
+position.
+
+The audited surface is every field the extension owns, not only the field where
+this was reported:
+
+- The New session form's **Workspace** field — the native path editor with
+  completion for a **Local** destination, and the plain bounded text for a
+  connected owner — and the **New name** field that renames a native row
+  locally, on a remote owner, or for a remote-native row.
+- The two **Host shortcut** fields in **Settings → Host shortcuts**; the entry
+  the pane is not editing stays the display-only row it already was.
+- The **Network** pane's **Listen address** and **Listen port** fields and the
+  editable rows of the **Add destination** and **Edit address** field menus.
+- The **Saved** picker's search bar.
+- **Settings → Review settings**: each settings text value it edits and the
+  search field of its tool-deny pickers (see
+  [Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only)).
+  A click there moves only the caret; menu rows keep their keyboard actions.
+- The fields hosted inside Pi: every `/review-settings` text field, the staged
+  subtask form (title, instructions, acceptance criteria, relevant context,
+  target workspace), the no-argument steering instruction, the private reviewer
+  answer editor, the `AskUserQuestion` free-text answer box, and the search
+  fields of the two scoped tool-deny pickers (see
+  [Settings menu](settings.md) and
+  [User questions and notices](user-questions.md)).
+
+None of these fields gained a private text buffer or a mirrored caret. They
+already edit through Pi's own editor or input component, and a click is handed to
+that same component's own caret handling, so wide characters, grapheme
+boundaries, wrapped and scrolled text, and the caret's display semantics remain
+Pi's. A click on a field's editable text moves the caret only: it changes no
+text, validates nothing, and submits or confirms nothing. Typing, keyboard
+navigation and keybindings, paste, path completion, and each field's length and
+safety checks are unchanged, and the keyboard paths keep their existing guards.
+
+Completion lists are the one difference between the two field families. In a
+field hosted inside Pi, a visible completion list belongs to Pi's own editor, so
+clicking one of its suggestions applies it the way accepting the selected item
+from the keyboard does: the field's text changes and the list closes, but the
+field is not submitted, no chat message is sent, and no question is answered. A
+sidebar field takes clicks only on its editable text rows, so a click on a
+visible completion row never applies a suggestion; choose suggestions there with
+the keyboard.
+
+Pointer ownership is unchanged too. A sidebar click is honored only against the
+frame the host actually wrote, with its existing pane, geometry, and ownership
+checks, and a sidebar-target click is never forwarded to a child session. Only a
+field's drawn text is a caret target: a click elsewhere keeps whatever it does
+today — focusing a label, activating a drawn row, or nothing. The fields hosted
+inside Pi receive pointer input only in Pi's fullscreen mode; in ordinary mode
+the terminal keeps mouse ownership over its own scrollback and selection, so the
+keyboard remains the way in there, exactly as before. Android's separate native
+UI and the provider-owned Pi, Claude Code, and Codex controls are outside this
+behavior.
 
 ### Per-session content geometry
 

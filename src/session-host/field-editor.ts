@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { decodePrintableKey } from "pi-session-host-tui/dist/keys.js";
 import { MAX_RENAME_NAME_BYTES } from "./protocol";
 import { MAX_NATIVE_CONFIG_BYTES } from "./launch";
+import { completeNativeMouseEvent, type TextFieldMouseEvent, type TextFieldMouseResult } from "../text-field-mouse";
 import {
   CombinedAutocompleteProvider,
   CURSOR_MARKER,
@@ -36,6 +37,14 @@ const NATIVE_FAKE_CURSOR_WRAPPERS = nativeFakeCursorWrappers();
  * body therefore always starts at row 1, independently of the caret position.
  */
 const NATIVE_EDITOR_CONTENT_ROW = 1;
+/**
+ * A zero-width APC string the field's Editor subclass prepends to the row its
+ * PROTECTED `renderBottomBorder` hook returns (see `BodyBoundaryEditor`). The
+ * row that carries it is the Editor's own bottom border, so every row between
+ * the top border and it is editable body and every row after it belongs to the
+ * native completion list. The marker never survives into pane text.
+ */
+const NATIVE_EDITOR_BODY_END_MARKER = "\x1b_pi-review-gate:editor-body-end\x07";
 const PATH_MAX_CODE_POINTS = 2048;
 /**
  * The UTF-8-byte bound of one generic `text` field (issue #653).
@@ -224,6 +233,21 @@ export class SessionHostFieldTUI extends TuiMainScreen {
 }
 
 /**
+ * The pinned public Editor with one PROTECTED render hook observed: its bottom
+ * border row is tagged with {@link NATIVE_EDITOR_BODY_END_MARKER}. Nothing else
+ * changes — the border text, the body, the completion rows, and every editing,
+ * caret, and mouse rule are the Editor's own — and no private member is read.
+ * The host uses the tagged row only to tell drawn body rows from drawn
+ * completion rows, so a host-synthesized caret click can never land on (and so
+ * never apply or confirm) a completion item while the list is visible.
+ */
+class BodyBoundaryEditor extends Editor {
+  protected override renderBottomBorder(width: number, hiddenLineCount: number): string {
+    return NATIVE_EDITOR_BODY_END_MARKER + super.renderBottomBorder(width, hiddenLineCount);
+  }
+}
+
+/**
  * Reusable text-field adapter backed by the pinned public pi-tui Editor. The
  * wrapper adds field limits, single-line paste/control safety and app actions;
  * all cursor, word, kill/yank, undo, grapheme, paste, and completion editing
@@ -264,6 +288,21 @@ export class SessionHostTextField {
   private lastAutocompleteMaxVisible = -1;
   private revision = 0;
   private nativeJumpTargetPending = false;
+  /**
+   * Geometry of the last bounded native render, used only to fence mouse
+   * input to the frame the host actually drew. It holds no text or caret of
+   * its own: the Editor stays the single source of truth for both.
+   */
+  private mouseFrame?: {
+    readonly cols: number;
+    readonly drawnRows: number;
+    readonly renderedRows: number;
+    /** The Editor's own bottom-border row in that render, or -1 when it was not identified exactly once. */
+    readonly bottomBorderRow: number;
+    readonly key: string;
+  };
+  /** True once anything may have changed the Editor's layout since that render. */
+  private mouseFrameDirty = true;
 
   constructor(options: SessionHostFieldOptions) {
     const requestedNameLimit = options.kind === "name" ? options.maxNameBytes : undefined;
@@ -320,10 +359,13 @@ export class SessionHostTextField {
 
     const port = new FieldTerminalPort();
     this.tui = new SessionHostFieldTUI(port, () => {
+      // Any native redraw request (typing, async completion, setText) means the
+      // last drawn frame no longer proves where the Editor's rows are.
+      this.mouseFrameDirty = true;
       if (!this.disposed && !this.settled) options.onInvalidate?.();
     });
     try {
-      this.editor = new Editor(this.tui, IDENTITY_EDITOR_THEME);
+      this.editor = new BodyBoundaryEditor(this.tui, IDENTITY_EDITOR_THEME);
       this.editor.focused = true;
       this.editor.disableSubmit = true;
       this.editor.onChange = (text) => this.handleNativeChange(text);
@@ -419,6 +461,7 @@ export class SessionHostTextField {
   /** Route one key/paste packet to the real Editor, with app-level actions handled explicitly. */
   handleInput(data: string): void {
     if (this.disposed || this.settled || typeof data !== "string" || data.length === 0) return;
+    this.mouseFrameDirty = true;
     if (this.pasteParts !== undefined) {
       this.consumePaste(data);
       return;
@@ -450,6 +493,19 @@ export class SessionHostTextField {
     }
 
     const rendered = this.editor.render(cols);
+    // The one row the protected bottom-border hook tagged. Anything other than
+    // exactly one tagged row leaves no trustworthy body boundary, so the frame
+    // then accepts no caret click at all (keyboard editing is unaffected).
+    let bottomBorderRow = -1;
+    let bottomBorderTags = 0;
+    for (let row = 0; row < rendered.length; row += 1) {
+      const source = rendered[row] ?? "";
+      if (!source.includes(NATIVE_EDITOR_BODY_END_MARKER)) continue;
+      bottomBorderTags += source.split(NATIVE_EDITOR_BODY_END_MARKER).length - 1;
+      bottomBorderRow = row;
+      rendered[row] = source.split(NATIVE_EDITOR_BODY_END_MARKER).join("");
+    }
+    if (bottomBorderTags !== 1 || bottomBorderRow < NATIVE_EDITOR_CONTENT_ROW) bottomBorderRow = -1;
     const lines: string[] = [];
     let cursor: SessionHostFieldRender["cursor"] = { column: 0, row: 0, visible: false };
     for (let row = 0; row < rendered.length && row < rows; row += 1) {
@@ -469,13 +525,91 @@ export class SessionHostTextField {
       const used = Math.min(visibleWidth(clipped), cols);
       lines.push(clipped + " ".repeat(cols - used));
     }
+    this.mouseFrame = {
+      cols,
+      drawnRows: lines.length,
+      renderedRows: rendered.length,
+      bottomBorderRow,
+      key: JSON.stringify([cols, rows, rendered.length, bottomBorderRow, lines, cursor]),
+    };
+    this.mouseFrameDirty = false;
     return { lines, cursor, contentRow: NATIVE_EDITOR_CONTENT_ROW };
+  }
+
+  /**
+   * Identity of the last bounded render while it still describes the Editor's
+   * layout exactly, or undefined once any input, redraw request, settle, or
+   * disposal happened after it. A host that captured this key beside a written
+   * frame compares it at press time, so a caret click can only ever act on the
+   * frame the operator actually saw.
+   */
+  mouseFrameKey(): string | undefined {
+    if (this.disposed || this.settled || this.mouseFrameDirty) return undefined;
+    return this.mouseFrame?.key;
+  }
+
+  /**
+   * Optional native caret placement (#714) for a HOST-OWNED, already authorized
+   * press, delivered as the pinned Editor's own completed left `click` in this
+   * field's frame coordinates (see `hostCaretEvent`). All caret mapping —
+   * wrapped visual lines, graphemes, wide/combining/emoji cells, paste markers,
+   * padding, and the scroll window — is the public `Editor.handleMouse` itself.
+   *
+   * Fail closed: nothing happens (undefined) unless the field is live, the last
+   * render is still current, the event is a left click at that render's width
+   * on a drawn editable body row, and no bracketed paste is being assembled.
+   * Body rows are exactly the rows between the Editor's top border and the
+   * bottom border its protected render hook tagged in that render, so a click
+   * works on the editable text while a native completion list is visible, yet a
+   * host-synthesized click can never reach a completion row (it never applies,
+   * selects, or confirms an item). As in Pi's own prompt, the Editor refreshes a
+   * visible list for the new caret itself. A caret click never edits text; if
+   * the Editor ever reported a change it is reconciled through the field's
+   * ordinary change path.
+   */
+  handleMouse(event: TextFieldMouseEvent): TextFieldMouseResult | undefined {
+    if (this.disposed || this.settled || this.mouseFrameDirty) return undefined;
+    const frame = this.mouseFrame;
+    if (frame === undefined || typeof event !== "object" || event === null) return undefined;
+    if (event.type !== "click" || event.button !== "left" || event.width !== frame.cols) return undefined;
+    if (this.pasteParts !== undefined || this.pasteStartCarry.length > 0 || this.pasteEndCarry.length > 0) return undefined;
+    if (frame.bottomBorderRow < 0) return undefined;
+    const { x, y } = event;
+    if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < 0 || x >= frame.cols) return undefined;
+    // Editable body rows are between the Editor's own borders (never a
+    // completion row below the bottom border), and only the rows the bounded
+    // frame actually drew.
+    const lastBodyRow = Math.min(frame.bottomBorderRow - 1, frame.drawnRows - 1);
+    if (y < NATIVE_EDITOR_CONTENT_ROW || y > lastBodyRow) return undefined;
+    const previousStoredText = this.editor.getText();
+    let result: TextFieldMouseResult | undefined;
+    try {
+      result = this.editor.handleMouse(completeNativeMouseEvent({
+        ...event,
+        x,
+        y,
+        width: frame.cols,
+        height: frame.renderedRows,
+        clickCount: typeof event.clickCount === "number" ? event.clickCount : 1,
+      }));
+    } catch {
+      return undefined;
+    }
+    this.reconcileEditorChange(previousStoredText);
+    if (this.editor.getText() === this.acceptedStoredText && this.expandedEditorText() === this.acceptedText) {
+      // The clicked caret is the accepted caret a later rejected edit rolls back to.
+      this.acceptedCursor = this.editor.getCursor();
+    }
+    this.tui.requestRender();
+    return result;
   }
 
   /** Release host redraw and keybinding ownership; no TUI or terminal stop/start is performed. */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.mouseFrame = undefined;
+    this.mouseFrameDirty = true;
     this.cancelNativeAutocomplete();
     this.pasteParts = undefined;
     this.pasteStartCarry = "";

@@ -14,10 +14,19 @@
  * free-text editor (the installed CustomEditor through the shared bridge) take
  * the same real path.
  *
+ * The native editor bridge field (#714) is driven the same way at the end of
+ * this file: the installed InteractiveMode's own `custom()`/editor-slot seams
+ * mount the bridge around the installed CustomEditor on a real TuiAltScreen,
+ * and SGR bytes prove the title-offset caret click, the following edit, and
+ * that a drag stays the host's native selection. Both the bridge field and the
+ * popup's free-text box also prove that clicking a visible native completion
+ * row applies that suggestion without submitting (the installed
+ * CombinedAutocompleteProvider over a throwaway directory).
+ *
  * Evidence boundary: this is headless. It proves the dispatch the installed
  * runtime performs for given terminal bytes; it does not prove which bytes a
  * particular physical terminal emits, and it does not exercise the
- * session-host pane forwarding or InteractiveMode itself.
+ * session-host pane forwarding or a full InteractiveMode process.
  *
  * Installed-runtime discovery follows the established helpers
  * (PI_REVIEW_GATE_INSTALLED_AGENT, else ambient global installs); without a
@@ -25,13 +34,15 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { registerUserQuestions, userQuestionsBeginSession, type UserQuestionSurface } from "../src/user-question";
 import { QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
 import { setUserQuestionTuiHost, setUserQuestionTuiHostEntryProvider } from "../src/user-question/pi-tui-host";
-import { __resetActiveNativeEditorFieldForTest, setNativeEditorHost } from "../src/native-editor-bridge";
+import { __resetActiveNativeEditorFieldForTest, editTextWithNativeEditor, setNativeEditorHost } from "../src/native-editor-bridge";
 import {
   REAL_IDENTITY_THEME,
   createRealKeybindingsManager,
@@ -201,6 +212,8 @@ interface Harness {
   /** Raw input observed by a later extension listener (the popup's Escape router position). */
   extensionListenerInput: string[];
   chatDraft: { text: string };
+  /** Read-only view of the editor slot's current native editor text. */
+  editorText(): string;
   /** Opens the popup; `closed` settles when the production shortcut handler returns. */
   open(): Promise<{ closed: Promise<void> }>;
   frame(): string[];
@@ -225,6 +238,12 @@ interface HarnessOptions {
    * background gestures, as the other dispatch tests need.
    */
   transcriptHandlesMouse?: boolean;
+  /**
+   * When set, the editor slot attaches the installed pi-tui
+   * CombinedAutocompleteProvider over this root to the editor it creates, as
+   * InteractiveMode.setCustomEditorComponent does with the host's provider.
+   */
+  autocompleteRoot?: string;
 }
 
 async function createHarness(
@@ -313,6 +332,11 @@ async function createHarness(
       created.onChange = () => {};
       if (!created.onEscape) created.onEscape = () => {};
       if (!created.onCtrlD) created.onCtrlD = () => {};
+      if (options.autocompleteRoot !== undefined && typeof created.setAutocompleteProvider === "function") {
+        const Provider = tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string, fdPath: string | null) => unknown;
+        (created.setAutocompleteProvider as (provider: unknown) => void)(
+          new Provider([], options.autocompleteRoot, process.env.PI_REVIEW_GATE_FD ?? null));
+      }
       (created.setText as (text: string) => void)(currentText);
       editor = created as unknown as typeof editor;
     },
@@ -380,6 +404,7 @@ async function createHarness(
     copied,
     extensionListenerInput,
     chatDraft,
+    editorText: () => editor.getText(),
     async open() {
       const shortcut = shortcuts.get(QUESTION_LIST_SHORTCUT_KEY);
       assert.ok(shortcut, "the popup shortcut is registered");
@@ -610,7 +635,7 @@ test("native fullscreen dispatch: drag-off, a shifted centered origin, resize, a
   assert.deepEqual(harness.backgroundEvents, []);
 });
 
-test("native fullscreen dispatch: the native editor box is inert; a clicked menu row leaves editing and runs its action", async (t) => {
+test("native fullscreen dispatch: a click in the native editor box places its caret (drag stays selection); a clicked menu row leaves editing and runs its action", async (t) => {
   const harness = await createHarness(t);
   if (!harness) return;
   registerQuestion(harness, "Which database?", ["SQLite", "Postgres"]);
@@ -623,28 +648,42 @@ test("native fullscreen dispatch: the native editor box is inert; a clicked menu
   const draftCell = harness.cell("my draft");
   assert.ok(!harness.frame().some((row) => row.includes("Type something…")), "the native editor box replaced the type row");
 
-  // Pointer input inside the editor box never submits the draft.
+  // A completed click inside the editor box places the native caret at the
+  // clicked text position (#714): between "m" and "y". The click itself edits
+  // nothing and never submits the draft; the next key lands at that caret.
   await harness.click({ x: draftCell.x + 1, y: draftCell.y });
+  assert.equal(harness.sent.length, 0, "no draft was submitted by the caret click");
+  assert.ok(harness.frame().some((row) => row.includes("my draft")), "the caret click left the draft unchanged and still editing");
+  harness.terminal.input("X");
+  await harness.draw();
+  assert.ok(harness.frame().some((row) => row.includes("mXy draft")), `the next key landed at the clicked caret:\n${harness.frame().join("\n")}`);
+
+  // A press-drag-release inside the box is Pi's native text selection, never a
+  // caret move, a submit, or an edit.
   harness.terminal.input(sgr.press(draftCell.x + 3, draftCell.y));
   harness.terminal.input(sgr.drag(draftCell.x + 5, draftCell.y));
+  await harness.draw();
+  assert.equal(harness.screen.hasActiveSelection(), true, "the drag inside the editor box is Pi's native selection");
   harness.terminal.input(sgr.release(draftCell.x + 5, draftCell.y));
   await harness.draw();
   assert.equal(harness.sent.length, 0, "no draft was submitted by pointer input");
-  assert.ok(harness.frame().some((row) => row.includes("my draft")), "the draft is unchanged and still editing");
+  assert.ok(harness.frame().some((row) => row.includes("mXy draft")), "the draft is unchanged by the drag and still editing");
 
   // A press on a visible choice highlights it while the editor stays in place.
   const postgres = harness.cell("2. Postgres");
   harness.terminal.input(sgr.press(postgres.x, postgres.y));
   await harness.draw();
   assert.match(harness.frame()[postgres.y]!, /> 2\. Postgres/);
-  assert.ok(harness.frame().some((row) => row.includes("my draft")));
-  // Drag-off clears it; typing still goes to the native editor.
+  assert.ok(harness.frame().some((row) => row.includes("mXy draft")));
+  // Drag-off clears it; typing still goes to the native editor, at the caret
+  // the earlier click placed (neither drag moved it).
   harness.terminal.input(sgr.drag(postgres.x, postgres.y - 1));
   harness.terminal.input(sgr.release(postgres.x, postgres.y - 1));
   harness.terminal.input("!");
   await harness.draw();
   assert.doesNotMatch(harness.frame()[postgres.y]!, /> 2\. Postgres/);
-  assert.ok(harness.frame().some((row) => row.includes("my draft!")), "native keyboard editing is unchanged");
+  assert.ok(harness.frame().some((row) => row.includes("mX!y draft")),
+    `native keyboard editing continues at the clicked caret:\n${harness.frame().join("\n")}`);
   assert.equal(harness.sent.length, 0);
 
   // The completed click leaves editing and submits the choice, never the draft.
@@ -655,6 +694,77 @@ test("native fullscreen dispatch: the native editor box is inert; a clicked menu
   assert.equal(harness.surface.controller.listPending().length, 1);
   assert.ok(harness.frame().some((row) => row.includes("Pending input (1)")), "the list returns with the other question");
 
+  harness.terminal.input(ESCAPE);
+  await opened;
+  assert.equal(harness.chatDraft.text, "chat draft", "the displaced chat draft is restored after close");
+  assert.deepEqual(harness.backgroundEvents, []);
+});
+
+/**
+ * A throwaway workspace with `docs/one.md` and `docs/two.md`, so the installed
+ * CombinedAutocompleteProvider's own file branch lists exactly two items for
+ * `docs/`. Removed after the test.
+ */
+async function completionWorkspace(t: { after(fn: () => Promise<void>): void }): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "pi-completion-click-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "docs"));
+  await writeFile(join(root, "docs", "one.md"), "one");
+  await writeFile(join(root, "docs", "two.md"), "two");
+  return root;
+}
+
+test("native fullscreen dispatch: clicking a visible native completion row in the popup editor applies it and never submits", async (t) => {
+  const root = await completionWorkspace(t);
+  const harness = await createHarness(t, { autocompleteRoot: root });
+  if (!harness) return;
+  registerQuestion(harness, "Which file?", ["skip"]);
+  registerQuestion(harness, "Another?", ["x"]);
+  const { closed: opened } = await harness.open();
+  await harness.click(harness.cell("q1: Which file?"));
+  await harness.click(harness.cell("Type something…"));
+  for (const char of "docs/") harness.terminal.input(char);
+  await harness.draw();
+  const pendingBefore = harness.surface.controller.listPending().map((entry) => entry.id);
+
+  // Tab is Pi's own forced file completion: the native list is drawn inside
+  // the popup's editor box, below the editor's bottom border.
+  harness.terminal.input("\t");
+  await until(() => onScreen(harness, "two.md") && onScreen(harness, "one.md"));
+  await harness.draw();
+  const two = harness.cell("two.md");
+  assert.ok(two.y > harness.cell("docs/").y, "the completion rows sit below the editable row");
+
+  // A stationary press/release over the visible row: the installed host
+  // synthesizes the click, the popup forwards it through the shared native
+  // text-field seam, and the native Editor applies exactly that suggestion.
+  await harness.click(two);
+  assert.equal(harness.editorText(), "docs/two.md", "the click left exactly the clicked suggestion in the native editor");
+  assert.ok(onScreen(harness, "docs/two.md"), `the clicked suggestion was applied:\n${harness.frame().join("\n")}`);
+  assert.ok(!onScreen(harness, "one.md"), "the completion list closed after the click");
+  assert.equal(harness.sent.length, 0, "the completion click submitted no answer");
+  assert.deepEqual(harness.surface.controller.listPending().map((entry) => entry.id), pendingBefore,
+    "the completion click resolved no pending question");
+  assert.ok(!onScreen(harness, "Type something…"), "editing continues in the native editor box");
+  assert.equal(harness.chatDraft.text, "chat draft", "the completion click never reached the displaced chat draft");
+
+  // Keyboard completion is unchanged: Tab reopens the list, the selection keys
+  // move it, and Enter on a visible list applies the selected item, never submits.
+  for (let index = 0; index < "two.md".length; index += 1) harness.terminal.input("\x7f");
+  harness.terminal.input("\t");
+  await until(() => onScreen(harness, "two.md") && onScreen(harness, "one.md"));
+  harness.terminal.input(DOWN);
+  harness.terminal.input(UP);
+  harness.terminal.input(ENTER);
+  await harness.draw();
+  assert.ok(onScreen(harness, "docs/one.md"), `keyboard confirm applied the selected suggestion:\n${harness.frame().join("\n")}`);
+  assert.equal(harness.sent.length, 0, "Enter on a visible completion list applies, never submits");
+
+  // Enter with no list submits the whole answer through the popup's own path.
+  harness.terminal.input(ENTER);
+  await settle();
+  assert.deepEqual(harness.sent.map((entry) => entry.message), [`Answer to pending question "Which file?": docs/one.md`]);
+  assert.equal(harness.surface.controller.listPending().length, 1, "only the answered question resolved");
   harness.terminal.input(ESCAPE);
   await opened;
   assert.equal(harness.chatDraft.text, "chat draft", "the displaced chat draft is restored after close");
@@ -1016,7 +1126,7 @@ test("native fullscreen dispatch: after a resize and re-scroll, the visible type
   const draft = harness.cell("scrolled draft");
   assert.ok(!onScreen(harness, "Type something…"), `the native editor box replaced the type row:\n${harness.frame().join("\n")}`);
 
-  // The editor box stays inert; the draft is never submitted by pointer input.
+  // A click in the editor box only places the native caret; the draft is never submitted by pointer input.
   await harness.click({ x: draft.x + 2, y: draft.y });
   await settle();
   assert.equal(harness.sent.length, 0);
@@ -1947,4 +2057,226 @@ test("native fullscreen dispatch: a wheel inside the popup retires a held press 
   assert.equal(harness.screen.hasActiveSelection(), false, "the retired gesture fabricated no native selection");
   harness.terminal.input(ESCAPE);
   await closed;
+});
+
+// ---------------------------------------------------------------------------
+// The native editor bridge field (#714) on the installed host's own dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * The installed InteractiveMode's own extension-UI seams around the installed
+ * CustomEditor on a real TuiAltScreen with mouse reporting (#714). When
+ * `autocompleteRoot` is set, the host's autocomplete provider slot holds the
+ * installed CombinedAutocompleteProvider over that root.
+ */
+async function mountInstalledBridgeHost(
+  t: Parameters<typeof skipOrFail>[0] & { after(fn: () => void): void },
+  autocompleteRoot?: string,
+) {
+  const runtime = await runtimePromise;
+  if (!runtime) {
+    skipOrFail(t, SKIP_REASON);
+    return undefined;
+  }
+  const bridge = await loadRealBridgeHost();
+  if (!bridge) {
+    skipOrFail(t, "installed Pi CustomEditor not resolvable for the native editor bridge");
+    return undefined;
+  }
+  const requireHost = createRequire(join(runtime.agentDir, "package.json"));
+  let InteractiveMode: { prototype: object };
+  let themeModule: { getEditorTheme(): unknown };
+  let KeybindingsManager: new (bindings: Record<string, unknown>) => unknown;
+  let agent: { CustomEditor: new (tui: unknown, theme: unknown, keys: unknown) => Record<string, any> };
+  try {
+    ({ InteractiveMode } = requireHost("./dist/modes/interactive/interactive-mode.js"));
+    themeModule = requireHost("./dist/modes/interactive/theme/theme.js");
+    ({ KeybindingsManager } = requireHost("./dist/core/keybindings.js"));
+    agent = requireHost("./dist/index.js");
+  } catch {
+    skipOrFail(t, "the installed Pi InteractiveMode host modules are not resolvable");
+    return undefined;
+  }
+  const { tui } = runtime;
+  // The installed host's own alt screen with mouse reporting, over the
+  // virtual terminal: SGR bytes go through TuiAltScreen's parser, hit testing,
+  // press capture, drag tracking, and click synthesis.
+  const terminal = new VirtualTerminal(80, 24);
+  const TuiAltScreen = tui.TuiAltScreen as new (terminal: unknown, showHardwareCursor?: boolean, logDirectory?: string, options?: unknown) => TuiScreen & {
+    setFocus(component: unknown): void;
+  };
+  const screen = new TuiAltScreen(terminal, false, undefined, { mouse: true, copyOnSelect: false, copySelection: async () => true });
+  const keybindings = new KeybindingsManager({});
+  const previousKeybindings = (tui.getKeybindings as () => unknown)();
+  (tui.setKeybindings as (manager: unknown) => void)(keybindings);
+  // InteractiveMode's real extension-UI seams (custom, setEditorComponent,
+  // getEditorComponent, and the dialog stack that mounts a non-overlay custom
+  // component in the editor slot) over a stand-in that holds only the
+  // constructor-owned state those paths read.
+  const mode = Object.create(InteractiveMode.prototype) as Record<string, any>;
+  mode.ui = screen;
+  mode.keybindings = keybindings;
+  mode.extensionDialogs = [];
+  mode.extensionOverlays = new Map();
+  mode.nextBlockingOverlayId = 0;
+  mode.extensionTerminalInputSubscriptions = new Set();
+  mode.programStatus = { setBlocked: () => {} };
+  mode.editorContainer = new (tui.Container as new () => unknown)();
+  mode.defaultEditor = new agent.CustomEditor(screen, themeModule.getEditorTheme(), keybindings);
+  mode.editor = mode.defaultEditor;
+  if (autocompleteRoot !== undefined) {
+    // InteractiveMode.setupAutocompleteProvider's own provider type over a
+    // throwaway root; setCustomEditorComponent attaches it to the field editor.
+    const Provider = tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string, fdPath: string | null) => unknown;
+    mode.autocompleteProvider = new Provider([], autocompleteRoot, process.env.PI_REVIEW_GATE_FD ?? null);
+    mode.defaultEditor.setAutocompleteProvider(mode.autocompleteProvider);
+  }
+  // Any chat submission would be a leak: the host copies this callback onto
+  // the editor it creates, and the bridge must have taken it over.
+  const chatSubmits: string[] = [];
+  mode.defaultEditor.onSubmit = (text: string) => { chatSubmits.push(text); };
+  mode.defaultEditor.setText("independent chat draft");
+  const Text = tui.Text as new (text: string, paddingX?: number, paddingY?: number) => unknown;
+  screen.addChild(new Text("transcript line 01\ntranscript line 02", 0, 0));
+  screen.addChild(mode.editorContainer);
+  mode.editorContainer.addChild(mode.editor);
+  screen.setFocus(mode.editor);
+  screen.start();
+  setNativeEditorHost(bridge.host);
+  t.after(() => {
+    try { screen.stop(); } catch { /* already stopped */ }
+    (tui.setKeybindings as (manager: unknown) => void)(previousKeybindings);
+    setNativeEditorHost(undefined);
+    __resetActiveNativeEditorFieldForTest();
+  });
+
+  const frame = (): string[] => screen.getScreenLines().map(plain);
+  const draw = async (): Promise<void> => {
+    await settle();
+    screen.renderNow();
+  };
+  const cellOf = (text: string): { x: number; y: number } => {
+    const visibleWidth = tui.visibleWidth as (text: string) => number;
+    for (const [y, row] of frame().entries()) {
+      const index = row.indexOf(text);
+      if (index >= 0) return { x: visibleWidth(row.slice(0, index)), y };
+    }
+    throw new Error(`"${text}" is not on screen:\n${frame().join("\n")}`);
+  };
+
+  return {
+    terminal,
+    screen,
+    mode,
+    chatSubmits,
+    frame,
+    draw,
+    cellOf,
+    ui: mode.createExtensionUIContext() as Parameters<typeof editTextWithNativeEditor>[0],
+  };
+}
+
+test("installed bridge field: SGR click under a two-row title places the CustomEditor caret; drag stays selection", async (t) => {
+  const host = await mountInstalledBridgeHost(t);
+  if (!host) return;
+  const { terminal, screen, mode, frame, draw, cellOf, ui } = host;
+  const pending = editTextWithNativeEditor(ui, { title: "Workspace\nChoose the session directory", prefill: "/srv/example" });
+  for (let attempt = 0; attempt < 200 && !frame().some((row) => row.includes("/srv/example")); attempt += 1) await draw();
+  const titleRow = cellOf("Choose the session directory").y;
+  const text = cellOf("/srv/example");
+  assert.equal(cellOf("Workspace").y, titleRow - 1, "the bridge draws both title rows above the editor");
+  assert.ok(text.y >= titleRow + 2, "the editable row sits below the title rows and the editor's top border");
+
+  // A stationary press/release over the editable row: the host synthesizes
+  // the click, the bridge forwards it unchanged in type and offset by the
+  // title rows, and the actual CustomEditor places its caret after "/srv/".
+  terminal.input(sgr.press(text.x + 5, text.y));
+  await draw();
+  terminal.input(sgr.release(text.x + 5, text.y));
+  await draw();
+  terminal.input("X");
+  await draw();
+  assert.ok(frame().some((row) => row.includes("/srv/Xexample")), `the next key landed at the clicked caret:\n${frame().join("\n")}`);
+
+  // Title rows are bridge display text: a stationary click there is never
+  // forwarded to the editor (proven by where the next key lands below).
+  terminal.input(sgr.press(3, titleRow));
+  await draw();
+  terminal.input(sgr.release(3, titleRow));
+  await draw();
+
+  // A press-drag-release over the same row is the host's native selection: it
+  // neither moves the caret nor edits the text.
+  terminal.input(sgr.press(text.x + 1, text.y));
+  terminal.input(sgr.drag(text.x + 9, text.y));
+  await draw();
+  assert.equal(screen.hasActiveSelection(), true, "the drag over the editor row is Pi's native selection");
+  terminal.input(sgr.release(text.x + 9, text.y));
+  await draw();
+  assert.ok(frame().some((row) => row.includes("/srv/Xexample")), "the drag changed no text");
+  terminal.input("Y");
+  await draw();
+  assert.ok(frame().some((row) => row.includes("/srv/XYexample")), "neither the title click nor the drag moved the clicked caret");
+
+  terminal.input(ENTER);
+  assert.deepEqual(await pending, { kind: "value", value: "/srv/XYexample" });
+  await draw();
+  assert.equal(mode.editor.getText(), "independent chat draft", "the chat draft is restored after the field closes");
+  assert.deepEqual(host.chatSubmits, [], "nothing reached the chat submitter");
+});
+
+test("installed bridge field: SGR click on a visible native completion row applies it without submitting the field", async (t) => {
+  const root = await completionWorkspace(t);
+  const host = await mountInstalledBridgeHost(t, root);
+  if (!host) return;
+  const { terminal, mode, chatSubmits, frame, draw, cellOf, ui } = host;
+  const onFrame = (text: string): boolean => frame().some((row) => row.includes(text));
+  let settled = false;
+  const pending = editTextWithNativeEditor(ui, { title: "Workspace", prefill: "docs/" });
+  void pending.then(() => { settled = true; });
+  for (let attempt = 0; attempt < 200 && !onFrame("docs/"); attempt += 1) await draw();
+  const editable = cellOf("docs/");
+
+  // Tab is Pi's own forced file completion: the installed provider's list is
+  // drawn by the native Editor below its bottom border, inside the bridge's
+  // production wrapper (title + editor + completion rows + hint).
+  terminal.input("\t");
+  for (let attempt = 0; attempt < 200 && !(onFrame("one.md") && onFrame("two.md")); attempt += 1) await draw();
+  await draw();
+  const two = cellOf("two.md");
+  assert.ok(two.y > editable.y + 1, `the completion row sits below the editor's bottom border:\n${frame().join("\n")}`);
+
+  // A stationary press/release over the visible row: the installed host
+  // synthesizes the click, the bridge wrapper forwards it through the shared
+  // text-field seam, and the native Editor applies exactly that suggestion.
+  terminal.input(sgr.press(two.x, two.y));
+  await draw();
+  terminal.input(sgr.release(two.x, two.y));
+  await draw();
+  assert.equal(mode.editor.getText(), "docs/two.md", "the click left exactly the clicked suggestion in the native field editor");
+  assert.ok(onFrame("docs/two.md"), `the clicked suggestion was applied:\n${frame().join("\n")}`);
+  assert.ok(!onFrame("one.md"), "the completion list closed after the click");
+  await settle();
+  assert.equal(settled, false, "the completion click did not submit or cancel the field");
+  assert.deepEqual(chatSubmits, [], "the completion click reached no chat submitter");
+
+  // Keyboard completion is unchanged: Tab reopens the list, the selection keys
+  // move it, and Enter on a visible list applies the selected item, never submits.
+  for (let index = 0; index < "two.md".length; index += 1) terminal.input("\x7f");
+  terminal.input("\t");
+  for (let attempt = 0; attempt < 200 && !(onFrame("one.md") && onFrame("two.md")); attempt += 1) await draw();
+  terminal.input(DOWN);
+  terminal.input(UP);
+  terminal.input(ENTER);
+  await draw();
+  assert.ok(onFrame("docs/one.md"), `keyboard confirm applied the selected suggestion:\n${frame().join("\n")}`);
+  await settle();
+  assert.equal(settled, false, "Enter on a visible completion list applies, never submits");
+
+  // Enter with no list submits the field value through the bridge, never chat.
+  terminal.input(ENTER);
+  assert.deepEqual(await pending, { kind: "value", value: "docs/one.md" });
+  await draw();
+  assert.equal(mode.editor.getText(), "independent chat draft", "the chat draft is restored after the field closes");
+  assert.deepEqual(chatSubmits, [], "nothing reached the chat submitter");
 });

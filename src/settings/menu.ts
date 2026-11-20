@@ -51,6 +51,7 @@
 
 import { loadHostPeerModule } from "../host-peer-loader";
 import { isRecord } from "../record-guard";
+import type { TextFieldMouseEvent, TextFieldMouseResult } from "../text-field-mouse";
 import { isKeyRelease, isKeyRepeat, matchesKey } from "pi-session-host-tui";
 
 /** One selectable row: a stable logical key plus its rendered label. */
@@ -235,6 +236,12 @@ export interface MenuInput {
   render(width: number): string[];
   invalidate(): void;
   focused: boolean;
+  /**
+   * Public pi-tui Input mouse handler (#714): a left press on its row places
+   * the caret through its own horizontal scroll window. Optional: a host Input
+   * without it keeps the query keyboard-only.
+   */
+  handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
 }
 
 /** The pi-tui Container surface this adapter builds into. */

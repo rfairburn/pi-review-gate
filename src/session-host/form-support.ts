@@ -26,6 +26,7 @@ import {
 
 import { SESSION_HOST_BOOTSTRAP_ENV, MAX_NATIVE_CONFIG_BYTES } from "./launch";
 import type { SessionHostFieldKeybindings } from "./field-editor";
+import { completeNativeMouseEvent, type TextFieldMouseEvent, type TextFieldMouseResult } from "../text-field-mouse";
 import { PI_AGENT_DIR_ENV, normalizeWindowsShellPath } from "../config-path";
 import { defaultProfileStateRoot, nativePiAgentDir } from "./profiles";
 
@@ -54,6 +55,8 @@ export interface NativeSavedQueryInput {
   render(width: number): string[];
   matches(data: string, action: SavedPickerAction): boolean;
   keys(action: SavedPickerAction): readonly string[];
+  /** Optional native caret placement through the pinned Input's own public handleMouse (#714). */
+  handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
   dispose(): void;
   readonly notice?: string;
 }
@@ -73,6 +76,9 @@ export function createNativeSavedQueryInput(agentDir: string): NativeSavedQueryI
   return {
     getValue: () => input.getValue(),
     handleInput: (data) => { withManager(() => input.handleInput(data)); },
+    // Caret placement reads no keybinding; the native press maps through the
+    // Input's own horizontal scroll window of its last render.
+    handleMouse: (event) => input.handleMouse(completeNativeMouseEvent(event)),
     render: (width) => withManager(() => input.render(width)),
     matches: (data, action) => loaded.manager.matches(data, action),
     keys: (action) => manager.getKeys?.(action) ?? [],

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { createStatusBroker } from "../src/session-host/broker";
@@ -150,7 +151,9 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-saved-copy-"));
+    // The configured OS temporary root, never a literal filesystem path: with
+    // TMPDIR set, this root and every child temp beneath it stay under TMPDIR.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-saved-copy-")));
     const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");

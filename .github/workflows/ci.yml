@@ -569,6 +569,34 @@ jobs:
           echo "PI_REVIEW_GATE_INSTALLED_AGENT=$RUNNER_TEMP/pi-ui-runtime/node_modules/@earendil-works/pi-coding-agent" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_INSTALLED_PI_BIN=$RUNNER_TEMP/pi-ui-runtime/node_modules/.bin" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.6.0" >> "$GITHUB_ENV"
+      - name: Provision the short owned native temporary root
+        id: native-temp-root
+        # Issue #721: the native Main/Saved harnesses allocate their private
+        # scratch directly under the configured OS temporary directory
+        # (node:os tmpdir()), and the production broker fails closed when a
+        # broker socket path exceeds the 103-byte POSIX sun_path bound. The
+        # hosted macOS default TMPDIR is a long per-user /var/folders path, so
+        # the real-PTY legs below receive one fresh, exclusive, private root
+        # directly under the short canonical /tmp. The fixtures still select the
+        # root through node:os, so no test code falls back to a literal /tmp;
+        # the harnesses' own path-byte budget checks stay in force and this step
+        # only fails earlier and more legibly when a root cannot fit them.
+        # Nothing here changes the runner machine configuration or the pinned
+        # runtime layout: the Pi runtime stays in RUNNER_TEMP.
+        run: |
+          test "$(uname -s)" = "Darwin"
+          root=$(mktemp -d /tmp/prg-nci-XXXXXXXX)
+          chmod 700 "$root"
+          root=$(realpath "$root")
+          test -d "$root"
+          test ! -L "$root"
+          test "$(stat -f '%Lp' "$root")" = "700"
+          test "$(stat -f '%Su' "$root")" = "$(id -un)"
+          # Fail at provisioning rather than mid-leg: the deepest broker socket
+          # path the harness derives under this root must fit the OS bound.
+          derived="$root/shm-XXXXXX/tmp/prg-st-XXXXXX/s.sock"
+          test "$(printf %s "$derived" | LC_ALL=C wc -c | tr -d '[:space:]')" -le 103
+          echo "root=$root" >> "$GITHUB_OUTPUT"
       - name: Build test bundle
         run: npm run build:test
       # The 14 existing macOS-only real-Main/PTY legs, in three bounded serial
@@ -579,10 +607,15 @@ jobs:
       # no other workflow sets, without which those two legs would still skip.
       # The harness's non-darwin platform skip is deliberately untouched: it is
       # what keeps the Linux and Windows legs skipping honestly.
+      # Each of the three legs also receives the short owned temporary root
+      # provisioned above as TMPDIR, because these suites allocate their scratch
+      # (and the broker sockets beneath it) under the configured OS temporary
+      # directory. The ACL and chflags legs deliberately keep the runner default.
       - name: Native Main lifecycle family (real PTY, real Pi)
         timeout-minutes: 12
         env:
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+          TMPDIR: ${{ steps.native-temp-root.outputs.root }}
         run: >-
           node --test --test-concurrency=1
           dist-test/tests/session-host-native-main.test.js
@@ -594,6 +627,7 @@ jobs:
         env:
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
           PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST: "1"
+          TMPDIR: ${{ steps.native-temp-root.outputs.root }}
         run: >-
           node --test --test-concurrency=1
           dist-test/tests/session-host-native-saved-main.test.js
@@ -602,6 +636,7 @@ jobs:
         timeout-minutes: 10
         env:
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+          TMPDIR: ${{ steps.native-temp-root.outputs.root }}
         run: >-
           node --test --test-concurrency=1
           dist-test/tests/session-host-native-cli-main-pty.test.js

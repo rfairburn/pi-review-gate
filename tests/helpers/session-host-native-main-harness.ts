@@ -48,6 +48,7 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
@@ -475,8 +476,12 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
 
 export function createOwnedScratchRoot(): string {
   // Source stays in the checkout; private runtime artifacts need a short
-  // macOS Unix-socket path, independently of checkout-path length.
-  const parent = realpathSync("/tmp");
+  // Unix-socket path, independently of checkout-path length. The parent is the
+  // configured OS temporary root (node:os tmpdir(), so an exported TMPDIR
+  // relocates every scratch tree and its child tempdirs), never a literal
+  // filesystem path. The socket-path budget below fails closed when the
+  // configured root is too long for the broker's bound.
+  const parent = realpathSync(tmpdir());
   const parentStats = lstatSync(parent);
   if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
     throw new Error("the canonical temporary parent is not a real directory");

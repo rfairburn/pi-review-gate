@@ -1721,6 +1721,7 @@ const MACOS_NATIVE_MAIN_STEPS: [string, string[]][] = [
 
 const MACOS_ACL_STEP = "Native extended-ACL storage and peer-state proofs";
 const MACOS_CHFLAGS_STEP = "Native chflags temp-file cleanup legs";
+const MACOS_TMPROOT_STEP = "Provision the short owned native temporary root";
 
 /** The step's folded `run: >-` value as one command line. */
 function foldedRunOf(stepBlock: string): string {
@@ -1833,6 +1834,47 @@ test("the native macOS job reuses the canonical locked Pi runtime and exports on
     "the agent-core fixture and the fd picker belong to the Linux full suite, not this job");
 });
 
+test("the native macOS job provisions one short owned temporary root for the native legs", () => {
+  const job = macosJobBlock();
+  const step = stepOf(job, MACOS_TMPROOT_STEP);
+  const run = stepRunOf(step);
+  // Issue #721: the native harnesses allocate their private scratch beneath the
+  // configured OS temporary directory (node:os tmpdir()), so an exported TMPDIR
+  // relocates those trees and every child tempdir beneath them. The hosted
+  // per-user default is long relative to the broker's bounded socket path, so
+  // the legs are handed one short, private, canonical root instead.
+  assert.match(step, /^        id: native-temp-root$/m,
+    "the provisioned root must be published as a step output the native legs consume");
+  assert.match(run, /test "\$\(uname -s\)" = "Darwin"/, "the root is provisioned only on the native host");
+  assert.match(run, /mktemp -d \/tmp\/prg-nci-XXXXXXXX/,
+    "the root is one fresh exclusive allocation directly under the short canonical /tmp");
+  assert.match(run, /chmod 700 "\$root"/, "the root must be private to the runner user");
+  assert.match(run, /root=\$\(realpath "\$root"\)/,
+    "the exported root is canonical, so CI and the fixtures observe the same path");
+  assert.match(run, /test ! -L "\$root"/, "a symlinked root is refused");
+  assert.match(run, /stat -f '%Lp'/, "the private mode is re-verified after allocation");
+  assert.match(run, /stat -f '%Su'/, "the runner user must own the root");
+  // The broker's socket-path bound stays enforced rather than relaxed: the step
+  // bounds the deepest path the harness derives under this root, and it fails
+  // here instead of silently relocating the scratch elsewhere.
+  assert.match(run, /shm-XXXXXX\/tmp\/prg-st-XXXXXX\/s\.sock/,
+    "the step bounds the deepest broker socket path the harness derives under this root");
+  assert.match(run, /-le 103/, "the bound is the production broker's 103-byte POSIX socket limit");
+  assert.match(run, /echo "root=\$root" >> "\$GITHUB_OUTPUT"/, "only the allocated path is published");
+  assert.doesNotMatch(step, /^        (if|continue-on-error):/m, "the provisioning step is unconditional and unforgiving");
+  assert.doesNotMatch(run, /\|\| *true|\|\| *exit 0/, "a provisioning failure fails the job");
+  assert.ok(job.indexOf(`- name: ${MACOS_TMPROOT_STEP}`) < job.indexOf("run: npm run build:test"),
+    "the root must be provisioned before the legs that consume it run");
+  // Scoped deliberately: the legs that create no broker socket keep the runner
+  // default temporary directory, so their existing coverage is byte-identical.
+  for (const stepName of [MACOS_ACL_STEP, MACOS_CHFLAGS_STEP]) {
+    assert.doesNotMatch(stepEnvOf(stepOf(job, stepName)), /TMPDIR/,
+      `${stepName} keeps the runner's default temporary directory: it runs no broker-socket leg`);
+  }
+  assert.doesNotMatch(withoutComments(step), /RUNNER_TEMP|apt-get|brew |sudo /,
+    "the temporary root stays separate from the pinned Pi runtime install and changes no machine configuration");
+});
+
 test("the native macOS job runs every existing real-Main suite in bounded serial steps that cannot silently skip", () => {
   const job = macosJobBlock();
   assert.match(job, /run: npm run build:test/, "the job compiles the suites it runs");
@@ -1863,8 +1905,15 @@ test("the native macOS job runs every existing real-Main suite in bounded serial
         "the Saved gate belongs only to the steps that run the Saved harness");
     }
     assert.notEqual(env.trim(), "", `${stepName} declares its required-host env`);
-    assert.doesNotMatch(env.replace(/PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"|PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST: "1"/g, "").trim(),
-      /\S/, "the native test steps add no configuration beyond the required-host gates");
+    // Issue #721: these suites allocate their private scratch beneath the
+    // configured OS temporary root, so every leg that runs them receives the
+    // one short owned root the job provisioned. A leg may not hard-code a
+    // temporary path, and it may not omit the root and inherit the long
+    // per-user hosted default.
+    assert.match(env, /^          TMPDIR: \$\{\{ steps\.native-temp-root\.outputs\.root \}\}$/m,
+      `${stepName} must receive the job's short owned temporary root as TMPDIR`);
+    assert.doesNotMatch(env.replace(/PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"|PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST: "1"|TMPDIR: \$\{\{ steps\.native-temp-root\.outputs\.root \}\}/g, "").trim(),
+      /\S/, "the native test steps add no configuration beyond the required-host gates and the scoped temporary root");
     assert.match(step, /^        timeout-minutes: \d+$/m, `${stepName} carries its own finite cap`);
     assert.doesNotMatch(step, /^        (if|continue-on-error):/m, `${stepName} stays unconditional and unforgiving`);
     assert.doesNotMatch(command, /--test-name-pattern|--test-only|--test-timeout|skip/,

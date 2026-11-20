@@ -37,6 +37,7 @@ import {
   watch,
   type FSWatcher,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
@@ -471,15 +472,17 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
 }
 
 /**
- * One fresh per-leg confined layout. The root is a short `/tmp` child so the
- * production Unix-socket path stays bounded; no production profile, auth,
- * cache, or credential material is copied.
+ * One fresh per-leg confined layout. The root is a short child of the
+ * configured OS temporary root (node:os tmpdir(), so an exported TMPDIR
+ * relocates the layout and every child tempdir beneath it) so the production
+ * Unix-socket path stays bounded; no production profile, auth, cache, or
+ * credential material is copied.
  */
 export function createLauncherLegLayout(): PosixLauncherLegLayout {
   // Refuse original role/catalog markers (including case aliases) before the
   // very first mkdir, then build the confined per-leg layout.
   assertAdmissibleOriginalEnvironment();
-  const root = createOwnedDirectory(realpathSync("/tmp"), `prg-lx-${randomDigits(10)}`);
+  const root = createOwnedDirectory(realpathSync(tmpdir()), `prg-lx-${randomDigits(10)}`);
   const workspaces = createOwnedDirectory(root, "workspaces");
   const layout: PosixLauncherLegLayout = {
     root,

@@ -16,6 +16,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, sep } from "node:path";
 import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
@@ -297,7 +298,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     // ---------------------------------------------------------------------
     // One positively owned root for every file, socket, key, and HOME.
     // ---------------------------------------------------------------------
-    const root = realpathSync(mkdtempSync("/tmp/prg-nsm-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nsm-")));
     const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
     const ownerBase = join(root, "ow ü");
     const requesterBase = join(root, "rq");

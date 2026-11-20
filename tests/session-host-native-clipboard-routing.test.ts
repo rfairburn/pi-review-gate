@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, watch, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
@@ -409,7 +410,9 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   assert.equal(tuiManifest.version, "1.6.0");
   const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
-  const root = realpathSync(mkdtempSync("/tmp/prg-copy-"));
+  // The configured OS temporary root, never a literal filesystem path: with
+  // TMPDIR set, this root and every child temp beneath it stay under TMPDIR.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-")));
   const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
   for (const name of ["bin", "home", "tmp", "work", "broker", "provider"]) mkdirSync(join(root, name), { mode: 0o700 });
   const agentDir = makeNativeAgentRoot(root, { deferredPiTools: false });

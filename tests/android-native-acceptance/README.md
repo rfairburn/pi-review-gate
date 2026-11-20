@@ -172,7 +172,33 @@ node tests/android-native-acceptance/run-device-suite.cjs --serial emulator-5554
 Useful flags: `--phase happy|policy|both` (default `both`), `--skip-install` when
 the APKs are already current, `--artifacts <dir>` to choose where the owner log,
 per-child journals, and the final report JSON are kept (default
-`/tmp/prg-android-acceptance-<run>`).
+`<os-temp>/prg-android-acceptance-<run>`).
+
+Both this runner and the owner fixture take their default roots from the configured
+OS temporary directory, so pointing `TMPDIR` at a root you create privately relocates
+the whole run — the fixture roots, the directories derived from them, and the artifacts
+— onto whichever filesystem you own, with no literal fallback root and no per-fixture
+setting left to override:
+
+```sh
+acceptance_tmp=$(mktemp -d /var/tmp/prg-acc.XXXXXX) &&
+  TMPDIR="$acceptance_tmp" node tests/android-native-acceptance/run-device-suite.cjs \
+    --serial emulator-5554 --api 37
+```
+
+Create the root privately rather than exporting a predictable shared name: `mktemp -d`
+makes a 0700 directory with a unique suffix and refuses an existing path, so the run
+cannot land under a root another user created.
+
+Keep the temporary root you select short and owned. The owner's status socket lands
+under `<os-temp>/prg-XXXXXX/`, and a Unix-socket path is capped at 103 bytes, so the
+configured root has to leave room for the 32 bytes the fixture and broker add below it.
+A root that is too long fails the run with the broker's own
+`the session-host status socket path exceeds the 103-byte OS Unix-socket limit`
+message; it never silently relocates the socket. A configured root that cannot be
+allocated at all fails the same way; the fixture removes the run directory it had
+already made and leaves the run parent alone. `--artifacts <dir>` and the owner
+fixture's `--root <dir>` remain explicit per-run overrides of those defaults.
 
 The runner prints `OWNED_AVD`, `RUN`, `FIXTURE_READY`, `PAIRING_APPROVED`, each
 `DEVICE_EVENT` (one per complete instrumentation status bundle), each
@@ -202,20 +228,31 @@ evidence directory.
 
 ## Focused checks
 
-The runner's instrumentation-status reader and the owner fixture's startup cleanup
-each have their own focused test:
+The runner's instrumentation-status reader, the owner fixture's startup cleanup, and
+the temporary roots both the runner and the owner fixture create each have their own
+focused test:
 
 ```sh
 npm run build:test
 node --test dist-test/tests/android-native-acceptance-runner.test.js
 node --test dist-test/tests/android-native-acceptance-owner-fixture.test.js
+node --test dist-test/tests/android-native-acceptance-temp-roots.test.js
 ```
 
 The status test proves one status bundle becomes one record with every field intact.
 The startup test occupies the listener port and proves the fixture rejects, settles
 every resource it acquired (watcher, broker, manager, coordinator) with no teardown
 problem, and preserves the children's journals and control files before removing
-the owned root.
+the owned root. The temp-root test runs both entry points as subprocesses with a
+controlled `TMPDIR` and asserts on the directories they really create: the default
+owner root and the evidence directory derived from it land under the configured
+temporary root, the runner's default artifacts directory does too, an explicit `--root`
+still wins over the configured root, a configured root that cannot host an allocation
+fails the start without stranding its run directory or touching a run parent it did not
+allocate, and a configured root too long for the socket bound fails with the broker's
+own limit rather than relocating the socket. Those cases cover owner data roots and
+runner artifacts; the live socket path in a working run, and the owner the runner
+spawns, are what the no-device self-check and the device run trace.
 
 ## No-device self-check
 
@@ -226,6 +263,10 @@ without a phone:
 ```sh
 node dist-test/tests/android-native-acceptance/node-viewer-selfcheck.js
 ```
+
+Its roots come from the same configured OS temporary directory, so the short-root
+note above applies here too. It keeps that base directory when anything failed or did
+not settle, and removes it only on a clean pass.
 
 This is a manual tool. It is not part of `npm run test:run` and adds nothing to
 the suite.

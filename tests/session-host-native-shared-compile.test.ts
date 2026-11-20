@@ -19,6 +19,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 
@@ -40,7 +41,8 @@ function writeCompiledTree(compiledRoot: string): void {
 }
 
 function caseRoot(name: string): string {
-  return track(realpathSync(mkdtempSync(join("/tmp", name))));
+  // The configured OS temporary root, never a literal filesystem path.
+  return track(realpathSync(mkdtempSync(join(tmpdir(), name))));
 }
 
 /** Every root this file created, removed after the focused run. */

@@ -14,7 +14,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -246,6 +246,38 @@ interface LabFields {
   oldGlobals: Map<PropertyKey, PropertyDescriptor | undefined>;
 }
 
+/** The broker's conservative POSIX Unix-socket bound (macOS sun_path is smaller than Linux's). */
+const MAX_SOCKET_PATH_BYTES = 103;
+
+/**
+ * One fresh exclusive socket root for this lab's status transport, allocated
+ * only beneath the configured OS temporary directory (node:os tmpdir()). For a
+ * scenario subprocess that is exactly the per-scenario TMPDIR its caller
+ * exported, so the whole socket tree follows the caller's configured root.
+ *
+ * mkdtempSync appends six random characters to the prefix (it does not
+ * substitute a trailing X run, which Node also warns is non-portable), and the
+ * broker canonicalizes this root and appends its private transport directory
+ * and socket filename, so `socketPath` below is the exact canonical path the
+ * transport will have. An over-long configured root fails here, naming the
+ * offending root: the socket tree is never relocated somewhere else.
+ */
+function createConfiguredSocketRoot(): string {
+  const parent = realpathSync(tmpdir());
+  const parentStats = lstatSync(parent);
+  if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
+    throw new Error("the configured temporary parent is not a real directory");
+  }
+  const socketPath = join(parent, "prg412sock-XXXXXX", "prg-st-XXXXXX", "s.sock");
+  if (Buffer.byteLength(socketPath, "utf8") > MAX_SOCKET_PATH_BYTES) {
+    throw new Error(
+      `the configured temporary root ${parent} would put this lab's status socket path past the `
+      + `${MAX_SOCKET_PATH_BYTES}-byte OS Unix-socket limit; run this fixture with a shorter TMPDIR`,
+    );
+  }
+  return realpathSync(mkdtempSync(join(parent, "prg412sock-")));
+}
+
 /**
  * One isolated production-wiring fixture: real broker + real manager + real
  * reporter + synthetic native host. The caller decides whether to activate the
@@ -306,8 +338,9 @@ export class HostLab {
     const stateRoot = join(root, "state");
     // The authenticated status transport must fit the OS Unix-socket path bound
     // (103 bytes). This isolated run-time IPC endpoint is the only scratch path
-    // outside the fixture root; it is created and removed by this lab alone.
-    const socketRoot = realpathSync(mkdtempSync(join("/tmp", "prg412sock-")));
+    // outside the fixture root; it is created and removed by this lab alone,
+    // directly beneath the configured temporary root.
+    const socketRoot = createConfiguredSocketRoot();
     for (const directory of [agentDir, workspace, stateRoot]) mkdirSync(directory, { recursive: true, mode: 0o700 });
     writeFileSync(join(workspace, "base.txt"), "base\n", "utf8");
     execFileSync("git", ["init", "-q"], { cwd: workspace });

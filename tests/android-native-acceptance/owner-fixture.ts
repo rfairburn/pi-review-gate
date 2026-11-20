@@ -227,12 +227,15 @@ function preserveEvidence(journalDir: string, evidenceDirectory: string): void {
 }
 
 /**
- * Where fixture roots live. A per-user `os.tmpdir()` on macOS is already most of
- * the Unix-socket length budget and is a poor place for watched files, so POSIX
- * runs default to a short path directly under `/tmp`.
+ * Where fixture roots live when `--root` names none: the configured OS temporary
+ * directory (`os.tmpdir()`, so an exported `TMPDIR` is honored). There is no
+ * literal fallback root and no relocation when a configured root is long — the
+ * status broker's own unchanged Unix-socket path bound fails the run clearly
+ * instead. `--root` still overrides this, and the acceptance README explains how
+ * to pick an appropriately short owned root.
  */
 function defaultRootParent(): string {
-  return process.platform === "win32" ? join(tmpdir(), "prg-android-owner-acceptance") : "/tmp/prg-android-owner-acceptance";
+  return join(tmpdir(), "prg-android-owner-acceptance");
 }
 
 function optionValue(name: string): string | undefined {
@@ -436,6 +439,50 @@ export interface OwnerFixtureHooks {
 }
 
 /**
+ * Allocate the two private per-run directories this fixture owns: the run root under
+ * `options.rootParent`, and the status-socket root under the configured OS temporary
+ * directory. Neither parent is claimed as this invocation's — the run parent in
+ * particular is a configured location other runs may use — so cleanup is limited to the
+ * unique `mkdtempSync` results, each recorded before it is canonicalized.
+ *
+ * Socket allocation now depends on the configured root, so it can fail for reasons that
+ * have nothing to do with the run itself: the configured root names a regular file, is
+ * missing, or is too long for the broker's unchanged Unix-socket bound. Both attempted
+ * allocations are still cleaned up, the original startup error is preserved, and any
+ * cleanup failure is reported alongside it. Nothing falls back to another root.
+ */
+function allocateOwnedRoots(options: FixtureOptions): { readonly root: string; readonly socketRoot: string } {
+  const allocated: string[] = [];
+  const allocate = (prefix: string): string => {
+    const directory = mkdtempSync(prefix);
+    allocated.push(directory);
+    return realpathSync(directory);
+  };
+  try {
+    mkdirSync(options.rootParent, { recursive: true, mode: 0o700 });
+    const root = allocate(join(options.rootParent, `owner-${options.run}-`));
+    // Keep the socket separate from the potentially long explicit run root. The broker
+    // enforces its existing 103-byte Unix-socket path bound; there is no fallback.
+    const socketRoot = allocate(join(tmpdir(), "prg-"));
+    chmodSync(root, 0o700);
+    return { root, socketRoot };
+  } catch (error) {
+    const problems: string[] = [];
+    // Reverse allocation order, and only the unique directories this call created.
+    for (const directory of allocated.reverse()) {
+      try {
+        rmSync(directory, { recursive: true, force: true });
+      } catch (cleanupError) {
+        problems.push(`${directory}: ${describe(cleanupError)}`);
+      }
+    }
+    throw new Error(
+      `the owner fixture failed to start: ${describe(error)}${problems.length > 0 ? `; teardown: ${problems.join("; ")}` : ""}`,
+    );
+  }
+}
+
+/**
  * Start the owner process, and guarantee that a failed start leaves nothing owned
  * behind: every PTY child this fixture spawned is confirmed gone, and the journals
  * that prove what happened are preserved outside the deleted root.
@@ -444,13 +491,7 @@ export async function startOwnerFixture(
   options: FixtureOptions,
   hooks: OwnerFixtureHooks = {},
 ): Promise<OwnerFixture> {
-  mkdirSync(options.rootParent, { recursive: true, mode: 0o700 });
-  const root = realpathSync(mkdtempSync(join(options.rootParent, `owner-${options.run}-`)));
-  // The status broker's Unix socket has a hard 103-byte path bound, and a
-  // per-user TMPDIR can already be most of that. The socket therefore gets its own
-  // short fixture-owned directory, which this fixture also removes on the way out.
-  const socketRoot = realpathSync(mkdtempSync("/tmp/prg-"));
-  chmodSync(root, 0o700);
+  const { root, socketRoot } = allocateOwnedRoots(options);
   const children: OwnedChild[] = [];
   // Held in an object so the assignment made inside the build is visible here.
   const lifecycle: { teardown: ((reason: TeardownReason) => Promise<OwnerTeardown>) | null } = { teardown: null };

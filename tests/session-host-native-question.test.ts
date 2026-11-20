@@ -405,39 +405,36 @@ function staticPrerequisites(t: { skip(message?: string): void }): StaticPrerequ
 
 function makeSyntheticRoot(): string {
   // The broker canonicalizes socketRoot and appends its private transport
-  // directory and socket filename; choose the shortest canonical POSIX temp
-  // directory (not the often very long workspace or TMPDIR alias).
-  const candidates = [...new Set([tmpdir(), "/tmp"])]
-    .map((path) => {
-      try {
-        const canonical = realpathSync(path);
-        return lstatSync(canonical).isDirectory() ? canonical : undefined;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((path): path is string => path !== undefined)
-    .sort((left, right) => Buffer.byteLength(left) - Buffer.byteLength(right));
-  for (const parent of candidates) {
-    let root: string | undefined;
-    try {
-      root = mkdtempSync(join(parent, "shq-"));
-      chmodSync(root, 0o700);
-      return root;
-    } catch {
-      if (root) {
-        try { rmdirSync(root); } catch { /* no owned root remains to remove */ }
-      }
-    }
+  // directory and socket filename, so this root lives under the configured OS
+  // temporary directory (node:os tmpdir()) and nowhere else: never a literal
+  // filesystem root, and never an alternative chosen for being shorter. An
+  // over-long configured root fails in assertBrokerSocketPathBudget below with
+  // the production broker's 103-byte bound instead of relocating the tree.
+  const parent = realpathSync(tmpdir());
+  const parentStats = lstatSync(parent);
+  if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
+    throw new Error("the configured temporary parent is not a real directory");
   }
-  throw new Error("a writable canonical POSIX temporary directory is unavailable for the native question test");
+  let root: string | undefined;
+  try {
+    root = mkdtempSync(join(parent, "shq-"));
+    chmodSync(root, 0o700);
+  } catch (error) {
+    // A root that was created but could not be made private is removed before
+    // the failure surfaces; nothing is retried under another parent.
+    if (root) {
+      try { rmdirSync(root); } catch { /* no owned root remains to remove */ }
+    }
+    throw new Error(`a writable private temporary directory under ${parent} is unavailable for the native question test: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return root;
 }
 
 function assertBrokerSocketPathBudget(root: string): void {
   const brokerRoot = realpathSync(join(root, "broker"));
   const longestSocketPath = join(brokerRoot, "prg-st-XXXXXX", "s.sock");
   if (Buffer.byteLength(longestSocketPath, "utf8") > 103) {
-    throw new Error("the canonical synthetic root cannot fit the production broker's bounded POSIX socket path");
+    throw new Error(`the canonical synthetic root ${root} cannot fit the production broker's bounded 103-byte POSIX socket path; run this case with a shorter TMPDIR`);
   }
 }
 

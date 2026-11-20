@@ -22,7 +22,8 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -90,9 +91,15 @@ interface ScenarioResult {
 function runScenario(name: string): Record<string, any> {
   // A dedicated per-scenario temp root keeps capture pruning and wave artifacts
   // isolated from unrelated suites (the shared OS temp can hold thousands of
-  // wave roots mid-CI). It is ignored scratch under dist-test, removed on
-  // success and retained as evidence on failure.
-  const scenarioTmp = mkdtempSync(join(process.cwd(), "dist-test", `tmp-412-${name}-`));
+  // wave roots mid-CI). It is a short unique child of the caller's configured OS
+  // temporary directory, because the scenario inherits it as TMPDIR and the lab's
+  // Unix-socket transport is allocated beneath it inside the OS socket-length
+  // bound. The configured parent is resolved to its canonical absolute path
+  // first: the scenario exports this directory as TMPDIR, and a relative TMPDIR
+  // would resolve differently for the worker the scenario launches from another
+  // working directory. It is ignored scratch, removed on success and retained as
+  // evidence on failure.
+  const scenarioTmp = mkdtempSync(join(realpathSync(tmpdir()), `prg-412-${name}-`));
   let output: string;
   try {
     output = execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
@@ -118,7 +125,7 @@ function runScenarioFailure(
   name: string,
   extraEnv: Record<string, string>,
 ): { status: number | undefined; stdout: string; stderr: string; scenarioTmp: string } {
-  const scenarioTmp = mkdtempSync(join(process.cwd(), "dist-test", `tmp-412-fail-${name}-`));
+  const scenarioTmp = mkdtempSync(join(realpathSync(tmpdir()), `prg-412-fail-${name}-`));
   try {
     execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
       cwd: process.cwd(),

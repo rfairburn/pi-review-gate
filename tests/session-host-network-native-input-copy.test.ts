@@ -16,6 +16,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -606,7 +607,9 @@ test("network viewer native input and copy stay bound to the pinned native child
     assert.equal(ASSISTANT_ENCODED.length, NATIVE_COPY_MAX_ENCODED_CHARS);
     assert.equal(Buffer.byteLength(BIG_BODY, "utf8"), NATIVE_TEXT_PASTE_MAX_BYTES);
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-net-native-"));
+    // The configured OS temporary root, never a literal filesystem path: with
+    // TMPDIR set, this root and every child temp beneath it stay under TMPDIR.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-net-native-")));
     const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
@@ -1936,7 +1939,7 @@ const inputFrameCount = (wire: RecordingChannel): number =>
 test("network viewer input answers the real native startup project-trust selector before any conversation tuple",
   { timeout: 120_000 }, async (t) => {
     if (process.platform === "win32") {
-      t.skip("this proof is POSIX-only (owned POSIX PTY, /tmp roots, and shell clipboard shims)");
+      t.skip("this proof is POSIX-only (owned POSIX PTY, configured temporary roots, and shell clipboard shims)");
       return;
     }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
@@ -1950,7 +1953,7 @@ test("network viewer input answers the real native startup project-trust selecto
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as OwnedPtyModule;
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-net-trust-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-net-trust-")));
     const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
     assert.equal(sharedCompile.builds, 1,
       "one owned production compile served both pinned native cases in this file");

@@ -223,9 +223,156 @@ export interface MenuSelectList {
   setSelectedIndex(index: number): void;
   onSelect?: (item: MenuSelectItem) => void;
   onCancel?: () => void;
+  onSelectionChange?: (item: MenuSelectItem) => void;
   handleInput(data: string): void;
   render(width: number): string[];
   invalidate(): void;
+  /** Public pi-tui accessor; a list without it is never resized (#653). */
+  getSelectedItem?(): MenuSelectItem | null;
+}
+
+/** The visible-row limit of every native in-Pi settings list. */
+export const MENU_NATIVE_MAX_VISIBLE = 10;
+
+/**
+ * The validated host-bounded row count of one bounded render (#653), or
+ * undefined for an ordinary native render. Only a host that measured its own
+ * pane (the session-host sidebar) passes a bound; a Pi popup never does.
+ */
+export function menuRenderBound(maxRows: unknown): number | undefined {
+  return typeof maxRows === "number" && Number.isFinite(maxRows) && maxRows >= 0 ? Math.floor(maxRows) : undefined;
+}
+
+/**
+ * The visible-row limit of a list given `rowBudget` rows for the list and its
+ * scroll cue (#653). A complete list uses exactly its own rows and draws no
+ * cue; a longer one leaves one row for the native scroll cue. At least one
+ * item stays visible, so an impossible budget renders taller than the bound
+ * and the host shows its truthful too-small pane instead. A one- or two-item
+ * list is always complete: its rows never exceed one item plus a cue.
+ */
+export function boundedMenuListLimit(itemCount: number, rowBudget: number): number {
+  const count = Math.max(0, Math.floor(itemCount));
+  if (count === 0) return 0;
+  if (count <= 2 || count <= rowBudget) return count;
+  return Math.max(1, Math.floor(rowBudget) - 1);
+}
+
+/**
+ * One settings list whose visible-row count may follow a host-bounded
+ * viewport (#653), on the host's own public SelectList API.
+ *
+ * Unbounded (every Pi popup) it is exactly the native list constructed with
+ * the consumer's own native limit and never rebuilt. A bounded render calls
+ * {@link fit}; because the pinned SelectList's limit (and its page size) is
+ * fixed at construction, a changed limit REPLACES the list with a new one that
+ * carries the same items, the same selected item, and the same handlers. A
+ * stable limit and item set never rebuild. The list (or, for an owner-selected
+ * picker, the owner) stays the only selection authority.
+ */
+export interface MenuListViewport {
+  /** The current native list. */
+  readonly list: MenuSelectList;
+  /** A stable child component that always renders the current list. */
+  readonly component: { render(width: number): string[]; invalidate(): void };
+  /** Size the list for `rowBudget` rows (items plus any scroll cue). */
+  fit(rowBudget: number): void;
+  /** Replace the items, highlighting `selectedIndex`, at the current sizing. */
+  replace(items: MenuSelectItem[], selectedIndex: number): void;
+}
+
+export interface MenuListViewportInput {
+  host: MenuTuiHost;
+  theme: MenuSelectListTheme;
+  items: MenuSelectItem[];
+  /** The consumer's unchanged native limit for an unbounded list. */
+  nativeLimit(itemCount: number): number;
+  /** Owner-held selection (a picker that routes navigation itself). */
+  selectedIndex?(): number;
+}
+
+export function createMenuListViewport(input: MenuListViewportInput): MenuListViewport {
+  let items = input.items;
+  let limit = input.nativeLimit(items.length);
+  let bound: number | undefined;
+  let list = new input.host.SelectList(items, limit, input.theme);
+  const rebuild = (nextItems: MenuSelectItem[], nextLimit: number, index: number): void => {
+    const previous = list;
+    const next = new input.host.SelectList(nextItems, nextLimit, input.theme);
+    if (nextItems.length > 0) next.setSelectedIndex(Math.min(Math.max(index, 0), nextItems.length - 1));
+    if (previous.onSelect !== undefined) next.onSelect = previous.onSelect;
+    if (previous.onCancel !== undefined) next.onCancel = previous.onCancel;
+    if (previous.onSelectionChange !== undefined) next.onSelectionChange = previous.onSelectionChange;
+    list = next;
+    items = nextItems;
+    limit = nextLimit;
+  };
+  const currentIndex = (): number | undefined => {
+    if (input.selectedIndex !== undefined) return input.selectedIndex();
+    if (typeof list.getSelectedItem !== "function") return undefined;
+    const item = list.getSelectedItem();
+    if (item === null || item === undefined) return items.length === 0 ? 0 : undefined;
+    // Reference identity: duplicate labels or values still carry the exact row.
+    const index = items.indexOf(item);
+    return index >= 0 ? index : undefined;
+  };
+  return {
+    get list(): MenuSelectList {
+      return list;
+    },
+    component: {
+      render: (width: number): string[] => list.render(width),
+      invalidate: (): void => list.invalidate(),
+    },
+    fit(rowBudget: number): void {
+      if (!Number.isFinite(rowBudget)) return;
+      bound = rowBudget;
+      const next = boundedMenuListLimit(items.length, rowBudget);
+      if (next === limit) return;
+      const index = currentIndex();
+      // A list that cannot report its selection keeps its native size rather
+      // than risk moving the highlight.
+      if (index === undefined) return;
+      rebuild(items, next, index);
+    },
+    replace(nextItems: MenuSelectItem[], selectedIndex: number): void {
+      rebuild(
+        nextItems,
+        bound === undefined ? input.nativeLimit(nextItems.length) : boundedMenuListLimit(nextItems.length, bound),
+        selectedIndex,
+      );
+    },
+  };
+}
+
+/**
+ * Fit a menu's list to a host-bounded render (#653): the list receives the
+ * bound minus the rows its other parts actually render at this width (wrapped
+ * title, message, query, hints, borders). An unbounded render changes nothing.
+ */
+export function fitMenuListViewport(
+  viewport: MenuListViewport,
+  width: number,
+  maxRows: unknown,
+  chrome: readonly unknown[],
+): void {
+  const bound = menuRenderBound(maxRows);
+  if (bound === undefined) return;
+  let used = 0;
+  for (const part of chrome) used += menuPartRows(part, width).length;
+  viewport.fit(bound - used);
+}
+
+/** Rendered rows of one menu part, tolerating a part that cannot render. */
+export function menuPartRows(component: unknown, width: number): string[] {
+  const render = (component as { render?: (width: number) => string[] } | undefined)?.render;
+  if (typeof render !== "function") return [];
+  try {
+    const lines = render.call(component, width);
+    return Array.isArray(lines) ? lines : [];
+  } catch {
+    return [];
+  }
 }
 
 /** The pi-tui Input surface the search-capable picker drives (issue #463). */
@@ -540,27 +687,44 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
     const confirmMatch = resolveMenuActionMatcher(keybindings, "tui.select.confirm");
     const cancelMatch = resolveMenuActionMatcher(keybindings, "tui.select.cancel");
     const container = new host.Container();
-    if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
-    container.addChild(new host.Text(titleText(theme, input.title), 1, 0));
+    // Every part except the list, in order: a bounded host render measures
+    // their actual rows at its width (#653).
+    const chrome: unknown[] = [];
+    const add = (part: unknown, isChrome = true): void => {
+      container.addChild(part);
+      if (isChrome) chrome.push(part);
+    };
+    if (host.DynamicBorder) add(new host.DynamicBorder(borderColor(theme)));
+    add(new host.Text(titleText(theme, input.title), 1, 0));
 
     const items: MenuSelectItem[] = input.rows.map((row) => ({ value: row.key, label: row.label }));
-    const selectList = new host.SelectList(items, Math.min(items.length, 10), selectListTheme(host, theme));
+    const viewport = createMenuListViewport({
+      host,
+      theme: selectListTheme(host, theme),
+      items,
+      nativeLimit: (count) => Math.min(count, MENU_NATIVE_MAX_VISIBLE),
+    });
     if (input.initialKey !== undefined) {
       const index = items.findIndex((item) => item.value === input.initialKey);
       // A key no longer present in the rows keeps the default first row.
-      if (index >= 0) selectList.setSelectedIndex(index);
+      if (index >= 0) viewport.list.setSelectedIndex(index);
     }
-    selectList.onSelect = (item) => done(item.value);
-    selectList.onCancel = () => done(undefined);
-    container.addChild(selectList);
+    viewport.list.onSelect = (item) => done(item.value);
+    viewport.list.onCancel = () => done(undefined);
+    add(viewport.component, false);
     const saveHintAvailable = ui.saveControl !== undefined
       && ui.saveControl.suspended === 0
       && host.matchesCtrlS !== undefined;
-    container.addChild(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
-    if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
+    add(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
+    if (host.DynamicBorder) add(new host.DynamicBorder(borderColor(theme)));
 
     return {
-      render: (width: number): string[] => container.render(width),
+      // `maxRows` is supplied only by a host that measured its own pane (the
+      // session-host sidebar, #653); a Pi popup renders natively.
+      render: (width: number, maxRows?: number): string[] => {
+        fitMenuListViewport(viewport, width, maxRows, chrome);
+        return container.render(width);
+      },
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
         // A held-key event that replays an action this transaction already
@@ -589,7 +753,7 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
         } else if (cancelMatch(data)) {
           claimMenuAction(ui.saveControl, cancelMatch);
         }
-        selectList.handleInput(data);
+        viewport.list.handleInput(data);
         tui.requestRender?.();
       },
     };

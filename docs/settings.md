@@ -671,3 +671,8 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
   forms already use, so its host-owned behavior — including Ctrl+G external editing through the
   host's configured editor command — applies here. Behaviors needing Pi's own editor callbacks
   (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
+- **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
+  fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
+  short pane — after notices take up to half of the rows below the header. Selection, keys, the
+  tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
+  and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.

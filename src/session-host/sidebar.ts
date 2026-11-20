@@ -2219,7 +2219,11 @@ type SidebarFormKind =
 
 /** One rendered screen of the shared settings transaction (a pi-tui component). */
 interface ReviewSettingsComponent {
-  render(width: number): string[];
+  /**
+   * `maxRows` is the pane's measured screen area (#653): the shared settings
+   * lists size themselves to it; any other component ignores it.
+   */
+  render(width: number, maxRows?: number): string[];
   handleInput(data: string): void;
   invalidate?(): void;
   focused?: boolean;
@@ -11943,6 +11947,12 @@ export class SidebarController {
    * component renders it, sanitized to generated SGR and clipped to the pane.
    * A screen that does not completely fit falls back to the truthful too-small
    * pane and keeps no action authority.
+   *
+   * The screen is rendered for the rows the pane can give it (#653), so the
+   * shared lists use the pane's height instead of the popup's ten rows. Notices
+   * first keep up to half of that area (whole notices, newest first); the
+   * screen gets the rest, and any rows a shorter screen leaves go back to
+   * notices under the unchanged whole-notice policy.
    */
   private renderReviewSettingsPane(
     cols: number,
@@ -11961,6 +11971,8 @@ export class SidebarController {
     const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
     if (footerLines === undefined || errorLines === undefined) return this.renderTooSmall(cols, rows);
     const screen = session.screen;
+    // Rows for the screen and the notices between the header, any error, and the footer.
+    const area = rows - 1 - errorLines.length - footerLines.length;
     let body: string[];
     let drawable = false;
     // True only when sanitizing kept every visible cell of every screen row, so
@@ -11970,7 +11982,9 @@ export class SidebarController {
       body = [session.screenSequence === 0 ? "Loading local review settings..." : "Working..."];
     } else {
       try {
-        const rendered = session.keybindings.run(() => screen.component.render(cols));
+        const reserved = area <= 0 ? 0 : this.reviewSettingsNoticeLines(session, cols, Math.floor(area / 2)).length;
+        const maxRows = Math.max(0, area - reserved);
+        const rendered = session.keybindings.run(() => screen.component.render(cols, maxRows));
         body = rendered.map((line) => sanitizeReviewSettingsLine(typeof line === "string" ? line : ""));
         columnsPreserved = rendered.every((line, index) => typeof line === "string"
           && visibleWidth(line) <= cols && visibleWidth(body[index] ?? "") === visibleWidth(line));

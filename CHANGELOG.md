@@ -33,7 +33,9 @@ dates.
   text values and tool-deny search field place the caret on click through the shared sidebar
   field route (#714). Scoped Pi model choices include models from Pi's own saved provider catalog
   in the same agent directory (for example newer Codex models absent from `models.json`),
-  without writing to the catalog, contacting the network, or using credentials. See
+  without writing to the catalog, contacting the network, or using credentials. Its menus and
+  pickers size their lists to the sidebar pane's height (more than ten rows when there is room,
+  fewer with scrolling in a short pane); in-Pi `/review-settings` popups keep ten rows. See
   [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
 - **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
   sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking

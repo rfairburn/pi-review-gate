@@ -21,7 +21,8 @@
  *
  * `select` and `confirm` are small list screens on the same `custom` host and
  * the same pinned SelectList. They never latch a save; a confirm defaults to
- * No, and a cancel (or an aborted pane) is always No.
+ * No, and a cancel (or an aborted pane) is always No. Like the shared menus,
+ * their list follows the rows the pane measured for the screen.
  */
 import {
   Container,
@@ -36,6 +37,9 @@ import {
 import {
   claimMenuAction,
   consumeMenuActionFence,
+  createMenuListViewport,
+  fitMenuListViewport,
+  MENU_NATIVE_MAX_VISIBLE,
   menuRenderTheme,
   resolveMenuActionMatcher,
   type MenuCustomFactory,
@@ -148,13 +152,24 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
     const confirmMatch = resolveMenuActionMatcher(keybindings, "tui.select.confirm");
     const cancelMatch = resolveMenuActionMatcher(keybindings, "tui.select.cancel");
     const container = new host.Container();
-    container.addChild(new host.Text(menuRenderTheme.titleText(theme, input.title), 1, 0));
-    if (input.message !== undefined && input.message.length > 0) container.addChild(new host.Text(input.message, 1, 0));
+    // Every part except the list: the pane's bounded render measures them (#653).
+    const chrome: unknown[] = [];
+    const add = (part: unknown, isChrome = true): void => {
+      container.addChild(part);
+      if (isChrome) chrome.push(part);
+    };
+    add(new host.Text(menuRenderTheme.titleText(theme, input.title), 1, 0));
+    if (input.message !== undefined && input.message.length > 0) add(new host.Text(input.message, 1, 0));
     const items = [...input.rows];
-    const list = new host.SelectList(items, Math.min(Math.max(items.length, 1), 10), menuRenderTheme.selectListTheme(host, theme));
+    const viewport = createMenuListViewport({
+      host,
+      theme: menuRenderTheme.selectListTheme(host, theme),
+      items,
+      nativeLimit: (count) => Math.min(Math.max(count, 1), MENU_NATIVE_MAX_VISIBLE),
+    });
     if (input.initialValue !== undefined) {
       const index = items.findIndex((item) => item.value === input.initialValue);
-      if (index >= 0) list.setSelectedIndex(index);
+      if (index >= 0) viewport.list.setSelectedIndex(index);
     }
     let closed = false;
     const close = (value: string | undefined): void => {
@@ -162,12 +177,16 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
       closed = true;
       done(value);
     };
-    list.onSelect = (item) => close(item.value);
-    list.onCancel = () => close(undefined);
-    container.addChild(list);
-    container.addChild(new host.Text(`${host.rawKeyHint?.("↑↓", "navigate") ?? "↑↓ navigate"} · ${host.keyHint?.("tui.select.confirm", "select") ?? "enter select"} · ${host.keyHint?.("tui.select.cancel", "cancel") ?? "esc cancel"}`, 1, 0));
+    viewport.list.onSelect = (item) => close(item.value);
+    viewport.list.onCancel = () => close(undefined);
+    add(viewport.component, false);
+    add(new host.Text(`${host.rawKeyHint?.("↑↓", "navigate") ?? "↑↓ navigate"} · ${host.keyHint?.("tui.select.confirm", "select") ?? "enter select"} · ${host.keyHint?.("tui.select.cancel", "cancel") ?? "esc cancel"}`, 1, 0));
     return {
-      render: (width: number): string[] => container.render(width),
+      // The sidebar pane passes the rows it measured for this screen (#653).
+      render: (width: number, maxRows?: number): string[] => {
+        fitMenuListViewport(viewport, width, maxRows, chrome);
+        return container.render(width);
+      },
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
         if (closed) return;
@@ -180,7 +199,7 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
         if (host.matchesCtrlS?.(data) === true) return;
         if (confirmMatch(data)) claimMenuAction(ui.saveControl, confirmMatch);
         else if (cancelMatch(data)) claimMenuAction(ui.saveControl, cancelMatch);
-        list.handleInput(data);
+        viewport.list.handleInput(data);
         tui.requestRender?.();
       },
     };

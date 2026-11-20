@@ -514,7 +514,8 @@ test("a too-small or not-yet-drawn screen keeps no action authority; a complete 
   const d = driven(l);
   await openReviewSettings(d);
   moveToMenuRow(d, "Save changes");
-  d.rows = 8;
+  // Below the header, one list row with its scroll cue, the hint, and the footer.
+  d.rows = 5;
   assert.match(d.text(), /too small/);
   d.key(ENTER);
   await turns();
@@ -530,6 +531,107 @@ test("a too-small or not-yet-drawn screen keeps no action authority; a complete 
   await waitFor(d, (text) => text.includes("> Review settings"), "Settings");
   await Promise.all(d.settled);
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+/** The shared root rows one frame draws (19 entries: 17 sections, Save changes, Cancel). */
+const ROOT_ENTRIES = [...ROOT_SECTIONS, "Save changes", "Cancel"];
+function rootRows(shown: readonly string[]): string[] {
+  return shown
+    .map((line) => line.replace(/^\s*(→\s*)?/, ""))
+    .filter((line) => ROOT_ENTRIES.some((label) => line === label || line.startsWith(`${label} `)));
+}
+const SCROLL_CUE = /^\s*\(\d+\/\d+\)\s*$/;
+
+test("the shared root list uses the sidebar pane height: tall shows every row, short scrolls, resizing keeps the choice", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  d.rows = 40;
+  await openReviewSettings(d);
+  let shown = d.frame();
+  assert.equal(rootRows(shown).length, ROOT_ENTRIES.length, `more than ten rows, every row in one frame:\n${shown.join("\n")}`);
+  assert.ok(!shown.some((line) => SCROLL_CUE.test(line)), "a complete list has no scroll cue");
+  assert.ok(shown.join("").replace(/\s+/g, "").includes(l.canonical.replace(/\s+/g, "")), "the LOCAL target notice stays whole");
+
+  // A short pane well below ten rows plus chrome: a smaller list that scrolls.
+  d.rows = 12;
+  shown = d.frame();
+  assert.equal(shown.length, 12);
+  assert.doesNotMatch(shown.join("\n"), /too small/);
+  const visible = rootRows(shown).length;
+  assert.ok(visible >= 1 && visible < 10, shown.join("\n"));
+  assert.ok(shown.some((line) => SCROLL_CUE.test(line)), "the native scroll cue is drawn");
+  assert.ok(shown.some((line) => line.includes("Editing LOCAL")), "the newest notice keeps room");
+
+  moveToMenuRow(d, "Cancel");
+  d.rows = 40;
+  shown = d.frame();
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Cancel")), "growing keeps the bottom choice");
+  assert.equal(rootRows(shown).length, ROOT_ENTRIES.length);
+  d.rows = 12;
+  shown = d.frame();
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Cancel")), "shrinking keeps it too");
+  assert.deepEqual(d.frame(), shown, "a stable pane redraws the same frame");
+
+  // Page navigation uses the list's current visible size.
+  d.key("\x1b[5~");
+  shown = d.frame();
+  const expected = ROOT_ENTRIES[ROOT_ENTRIES.length - 1 - visible]!;
+  assert.ok(shown.some((line) => line.trimStart().startsWith(`→ ${expected}`)), `page up moved by ${visible}:\n${shown.join("\n")}`);
+
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("a short sidebar shows both choices of a two-item list instead of one choice and a scroll cue", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Subtask notifications", "Quiet — terminal and recovery events");
+  d.cols = 80;
+  d.rows = 7;
+  const shown = d.frame();
+  assert.equal(shown.length, 7);
+  assert.doesNotMatch(shown.join("\n"), /too small/);
+  assert.ok(shown.some((line) => line.includes("Quiet — terminal and recovery events")), shown.join("\n"));
+  assert.ok(shown.some((line) => line.includes("Noisy — include running and reviewing")), shown.join("\n"));
+  assert.ok(!shown.some((line) => SCROLL_CUE.test(line)), "a complete two-item list draws no scroll cue");
+  assert.ok(shown.some((line) => line.includes("Editing LOCAL")), "the LOCAL notice stays visible");
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("→ Subtask notifications"), "root after Back");
+  d.rows = 30;
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("a narrow sidebar measures wrapped notices, hints, and footer before sizing the list", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  d.cols = 36;
+  d.rows = 18;
+  const shown = d.frame();
+  assert.equal(shown.length, 18);
+  assert.doesNotMatch(shown.join("\n"), /too small/);
+  assert.ok(shown.some((line) => line.includes("Editing LOCAL")), shown.join("\n"));
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ ")), "an actionable row is drawn");
+  assert.ok(shown.some((line) => SCROLL_CUE.test(line)));
+  const hintRows = shown.filter((line) => /navigate|discard|Ctrl\+S save|enter select/.test(line)).length;
+  assert.ok(hintRows >= 2, `the key hints wrap at this width:\n${shown.join("\n")}`);
+  for (const line of shown) assert.ok(line.length <= d.cols, line);
+  // The screen keeps its action authority on this complete frame.
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
 });
 
 test("navigation then Enter before a redraw, an unwritten frame, or a revoked frame never confirms or saves", async (t) => {
@@ -986,6 +1088,52 @@ test("the deny picker's query places its caret in the sidebar screen; list rows,
   d.key(ESC);
   await waitFor(d, (text) => text.includes("Top-level tools") && text.includes("Executor tools"), "Tools");
   assert.equal(written.activateFormRowAt(promptColumn + 2, row, d.cols, d.rows), false, "a closed picker's frame refuses");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("a long deny picker fills a tall sidebar and scrolls in a short one; its query, caret, and selection survive resizing", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const many = (): ReviewSettingsCatalog => ({
+    ...fakeCatalog(),
+    tools: Array.from({ length: 30 }, (_, index) => ({ name: `tool_${String(index).padStart(2, "0")}` })),
+  });
+  const d = driven(l, {}, many);
+  d.rows = 44;
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Top-level tools");
+  moveToMenuRow(d, "Top-level tools");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Top-level tools —") && text.includes("tool_00"), "the deny picker");
+  const toolRows = (shown: readonly string[]): number => shown.filter((line) => /(✓ denied|✗ allowed)\s*$/.test(line)).length;
+  let shown = d.frame();
+  assert.equal(toolRows(shown), 30, `every tool fits:\n${shown.join("\n")}`);
+  assert.ok(!shown.some((line) => SCROLL_CUE.test(line)));
+
+  for (const key of ["t", "o", "o", "l", "_", "1"]) d.key(key);
+  d.key(DOWN);
+  d.key(DOWN);
+  shown = d.frame();
+  const highlightedRow = (lines: readonly string[]): string | undefined => lines.find((line) => line.trimStart().startsWith("→ "))?.trim();
+  const target = highlightedRow(shown);
+  assert.ok(target !== undefined && target.includes("tool_"), shown.join("\n"));
+
+  d.rows = 14;
+  shown = d.frame();
+  assert.doesNotMatch(shown.join("\n"), /too small/);
+  assert.ok(toolRows(shown) >= 1 && toolRows(shown) < 10, shown.join("\n"));
+  assert.ok(shown.some((line) => SCROLL_CUE.test(line)));
+  assert.equal(highlightedRow(shown), target, "the picker's selection survives the resize");
+  const row = shown.findIndex((line) => line.trimEnd().endsWith("> tool_1"));
+  assert.ok(row >= 0, `the query survives the resize:\n${shown.join("\n")}`);
+  const column = (shown[row] ?? "").indexOf("> tool_1");
+  const written = d.sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(column + 2, row, d.cols, d.rows), true, "the caret maps to the written short frame");
+  d.key("x");
+  assert.ok(d.frame().some((line) => line.trimEnd().endsWith("> xtool_1")), d.text());
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("Executor tools"), "Tools");
   d.sidebar.cancelReviewSettings();
   await Promise.all(d.settled);
 });

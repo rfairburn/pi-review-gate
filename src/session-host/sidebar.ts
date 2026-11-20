@@ -190,6 +190,15 @@ import {
 } from "./field-editor";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
 import {
+  completeNativeMouseEvent,
+  hostCaretEvent,
+  nativeMouseHandled,
+  routeNativeTextFieldMouse,
+  type NativeTextFieldRegion,
+  type TextFieldMouseEvent,
+  type TextFieldMouseResult,
+} from "../text-field-mouse";
+import {
   isNativeCategoryUnsupported,
   readNativeStatusSupport,
   NATIVE_STATUS_NOT_APPLICABLE_TEXT,
@@ -397,6 +406,12 @@ export interface SidebarSavedQueryInput {
   render(width: number): string[];
   matches(data: string, action: SidebarSavedPickerAction): boolean;
   keys?(action: SidebarSavedPickerAction): readonly string[];
+  /**
+   * Optional native caret placement (#714): the pinned Input's own public
+   * `handleMouse`, which maps a left press on its single row through its own
+   * horizontal scroll window. Absent: the query stays keyboard-only.
+   */
+  handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
   dispose(): void;
   readonly notice?: string;
 }
@@ -1980,6 +1995,40 @@ interface DisplayedFormCreateWorkspaceRow {
   readonly formGeneration: number;
 }
 
+/**
+ * The one session-host text field a complete form-slot render actually drew
+ * (#714): which form and slot held it, the live field instance it rendered (an
+ * identity, never a copy of its text or caret), the pane geometry, the written
+ * region of the field's own rows, and the field's own render key. A press may
+ * place the native caret only while every part of this still describes the
+ * current form and the field's last render is still this exact frame.
+ */
+interface DisplayedFormTextField {
+  readonly formKind: "new" | "edit" | "shortcuts" | "peer-field";
+  readonly formGeneration: number;
+  /** Which editor slot was active (shortcut index or network purpose). */
+  readonly slot: string;
+  readonly field: SessionHostTextField;
+  readonly cols: number;
+  readonly rows: number;
+  readonly region: NativeTextFieldRegion;
+  readonly frameKey: string;
+}
+
+/**
+ * The Saved picker's native query Input exactly as one complete render wrote
+ * it (#714): the picker and Input instance it belonged to, the pane geometry,
+ * the written row, and the Input's own rendered row.
+ */
+interface DisplayedSavedQuery {
+  readonly pickerId: number;
+  readonly input: SidebarSavedQueryInput;
+  readonly cols: number;
+  readonly rows: number;
+  readonly region: NativeTextFieldRegion;
+  readonly source: string;
+}
+
 /** One remote roster row exactly as the coordinator projected it (display only). */
 type PeerRosterRow = SidebarRemoteRosterRow;
 
@@ -2267,6 +2316,8 @@ function mouseAuthorizationKey(
   settings: DisplayedSettingsRows | undefined,
   theme: DisplayedSettingsRows | undefined,
   formCreateWorkspace?: DisplayedFormCreateWorkspaceRow,
+  formTextField?: DisplayedFormTextField,
+  savedQuery?: DisplayedSavedQuery,
 ): string {
   return JSON.stringify({
     roster: roster === undefined ? null : [roster.cols, roster.rows,
@@ -2330,7 +2381,22 @@ function mouseAuthorizationKey(
       settings.entries.map((entry) => [entry.paneRow, entry.row.key, entry.row.text])],
     theme: theme === undefined ? null : [theme.cols, theme.rows, theme.signature,
       theme.entries.map((entry) => [entry.paneRow, entry.row.key, entry.row.text])],
+    // The drawn editable text field and Saved query are written pointer targets
+    // too (#714): their geometry and the native component's own rendered frame
+    // belong to this identity, so typing, scrolling, wrapping, completion, or a
+    // resize needs its own written boundary before a press can place a caret.
+    formTextField: formTextField === undefined ? null : [
+      formTextField.formKind, formTextField.formGeneration, formTextField.slot,
+      formTextField.cols, formTextField.rows, regionIdentity(formTextField.region), formTextField.frameKey,
+    ],
+    savedQuery: savedQuery === undefined ? null : [
+      savedQuery.pickerId, savedQuery.cols, savedQuery.rows, regionIdentity(savedQuery.region), savedQuery.source,
+    ],
   });
+}
+
+function regionIdentity(region: NativeTextFieldRegion): readonly number[] {
+  return [region.left, region.top, region.width, region.rows, region.firstRow, region.height];
 }
 
 const DEFAULT_SAVED_ACTION_KEYS: Readonly<Record<SidebarSavedPickerAction, readonly string[]>> = {
@@ -2360,6 +2426,7 @@ function createDefaultSavedQueryInput(): SidebarSavedQueryInput {
   return {
     getValue: () => input.getValue(),
     handleInput: (data) => input.handleInput(data),
+    handleMouse: (event) => input.handleMouse(completeNativeMouseEvent(event)),
     render: (width) => input.render(width),
     matches: defaultSavedActionMatch,
     keys: (action) => {
@@ -3938,6 +4005,10 @@ export class SidebarController {
   private peerRepairLocalNotice: string | undefined;
   private savedQueryInput?: SidebarSavedQueryInput;
   private formField?: SessionHostTextField;
+  /** The form field's drawn region from the last complete form render (#714). */
+  private formTextFieldDisplay: DisplayedFormTextField | undefined;
+  /** The Saved query's drawn row from the last complete picker render (#714). */
+  private savedQueryDisplay: DisplayedSavedQuery | undefined;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
   /** Effective native submit-key matcher for the current form field. */
   private formMatchesSubmit: (data: string) => boolean = (data) => matchesKey(data, "enter");
@@ -4860,6 +4931,7 @@ export class SidebarController {
   /** Forget the drawn remote picker frame (covered, resized, hidden, or replaced). */
   invalidateSavedPickerPresentation(): void {
     this.savedPickerCandidate = undefined;
+    this.savedQueryDisplay = undefined;
   }
 
   /**
@@ -5898,6 +5970,8 @@ export class SidebarController {
     const displayedFormCreateWorkspace = this.formCreateWorkspaceDisplay;
     const displayedSettingsRows = this.settingsDisplay;
     const displayedThemeRows = this.themeDisplay;
+    const displayedFormTextField = this.formTextFieldDisplay;
+    const displayedSavedQuery = this.savedQueryDisplay;
     return Object.freeze({
       authorizationKey: mouseAuthorizationKey(
         displayedRoster,
@@ -5910,6 +5984,8 @@ export class SidebarController {
         displayedSettingsRows,
         displayedThemeRows,
         displayedFormCreateWorkspace,
+        displayedFormTextField,
+        displayedSavedQuery,
       ),
       remoteClose: this.remoteCloseRowFrom(displayedRoster),
       remoteEdit: this.remoteEditRowFrom(displayedRoster),
@@ -5961,8 +6037,141 @@ export class SidebarController {
             ? this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows)
             : this.activatePeerAtFrom(displayedPeerRows, column, row, cols, rows))
           || this.activateSettingsAtFrom(displayedSettingsRows, column, row, cols, rows)
-          || this.activateThemeAtFrom(displayedThemeRows, column, row, cols, rows),
+          || this.activateThemeAtFrom(displayedThemeRows, column, row, cols, rows)
+          // A press on the drawn editable text places the native caret (#714)
+          // through the same written-frame press route; it activates nothing.
+          || this.placeFormFieldCaretFrom(displayedFormTextField, column, row, cols, rows)
+          || this.placeSavedQueryCaretFrom(displayedSavedQuery, column, row, cols, rows),
     });
+  }
+
+  /** Which editor slot the open form's single field currently holds. */
+  private formTextFieldSlot(): string {
+    if (this.formKind === "shortcuts") return `shortcut:${this.shortcutFieldIndex}`;
+    if (this.formKind === "peer-field") return `peer:${this.peerFieldTarget?.purpose ?? ""}`;
+    return this.formKind ?? "";
+  }
+
+  /**
+   * Retain the region one complete form render wrote for the active field. A
+   * label wider than its reserved gutter (clipped by the row writer) leaves no
+   * trustworthy column origin, so no region is retained for it.
+   */
+  private captureFormTextFieldDisplay(
+    field: SessionHostTextField,
+    frame: SessionHostFieldRender,
+    prefix: string,
+    prefixWidth: number,
+    top: number,
+    drawnRows: number,
+    cols: number,
+    rows: number,
+  ): void {
+    this.formTextFieldDisplay = undefined;
+    const formKind = this.formKind;
+    if (formKind !== "new" && formKind !== "edit" && formKind !== "shortcuts" && formKind !== "peer-field") return;
+    if (visibleWidth(prefix) !== prefixWidth || drawnRows < 1 || frame.lines.length < drawnRows) return;
+    // The mouse methods are optional: a field without them stays keyboard-only.
+    if (typeof field.mouseFrameKey !== "function" || typeof field.handleMouse !== "function") return;
+    const frameKey = field.mouseFrameKey();
+    if (frameKey === undefined) return;
+    this.formTextFieldDisplay = Object.freeze({
+      formKind,
+      formGeneration: this.formGeneration,
+      slot: this.formTextFieldSlot(),
+      field,
+      cols,
+      rows,
+      region: Object.freeze({
+        left: prefixWidth,
+        top,
+        width: Math.max(1, cols - prefixWidth),
+        rows: drawnRows,
+        firstRow: 0,
+        height: frame.lines.length,
+      }),
+      frameKey,
+    });
+  }
+
+  /**
+   * Places the native caret for a press on the editable text of the field the
+   * captured, WRITTEN render drew (#714). The press is host-owned and already
+   * authorized by Main; it becomes the pinned Editor's own completed click, so
+   * every caret rule stays native. Refused (false, nothing changes) for any
+   * other target, a stale or replaced field, a different form or slot, a
+   * pending save/create/rename, a bracketed paste in flight, or a field whose
+   * last render is no longer that written frame.
+   *
+   * A sibling New-form control (Host, Provider, or the workspace-creation
+   * checkbox) holding the form's focus does not refuse: the drawn editable text
+   * is part of the same visible form, so an accepted press hands the form's one
+   * focus back to the field — exactly the state Escape/Tab leave behind — and
+   * changes no Host, Provider, or create choice and runs no control action.
+   */
+  private placeFormFieldCaretFrom(
+    shown: DisplayedFormTextField | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (shown === undefined || !this._visible || this._focus !== "form"
+      || !validHitGeometry(column, row, cols, rows) || shown.cols !== cols || shown.rows !== rows) return false;
+    const field = this.formField;
+    if (field === undefined || field !== shown.field || this.formKind !== shown.formKind
+      || this.formGeneration !== shown.formGeneration || this.formTextFieldSlot() !== shown.slot) return false;
+    if (this.pendingCreate !== undefined || this.pendingRename !== undefined
+      || this.pendingShortcutSave !== undefined) return false;
+    if (this.formPasteActive || this.formPasteCarry.length > 0) return false;
+    if (this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) return false;
+    if (typeof field.mouseFrameKey !== "function" || field.mouseFrameKey() !== shown.frameKey) return false;
+    const result = routeNativeTextFieldMouse(field, hostCaretEvent("editor", column, row, cols, rows), shown.region);
+    if (!nativeMouseHandled(result)) return false;
+    // Focus only: the same mutual exclusion the keyboard ring keeps, with every
+    // selection and intent left exactly as it was.
+    this.formHostFocused = false;
+    this.formProviderFocused = false;
+    this.formCreateWorkspaceFocused = false;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * Places the native Input caret for a press on the Saved query row the
+   * captured, WRITTEN picker render drew (#714): the pinned Input's own press
+   * convention and horizontal scroll window, nothing else. Refused during a
+   * pending open/delete, during a bracketed paste, or when the Input's current
+   * render is not the written row. While the picker's Host line owns focus an
+   * accepted press returns that focus to the query (as Tab/Escape do) without
+   * cycling or otherwise changing the Host choice.
+   */
+  private placeSavedQueryCaretFrom(
+    shown: DisplayedSavedQuery | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (shown === undefined || !this._visible || this._focus !== "form" || this.formKind !== "saved"
+      || !validHitGeometry(column, row, cols, rows) || shown.cols !== cols || shown.rows !== rows) return false;
+    const input = this.savedQueryInput;
+    if (input === undefined || input !== shown.input || this.savedPickerId !== shown.pickerId
+      || typeof input.handleMouse !== "function") return false;
+    if (this.formPasteActive || this.formPasteCarry.length > 0) return false;
+    if (this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) return false;
+    if (this.pendingSavedOpen !== undefined || this.pendingSavedDeleteCheck !== undefined
+      || this.savedDeleteTarget !== undefined || this.savedDeleteOperation !== undefined
+      || this.pendingRemoteSavedResume !== undefined || this.pendingRemoteSavedDeleteCheck !== undefined
+      || this.remoteSavedDeleteTarget !== undefined || this.remoteSavedDeleteOperation !== undefined) return false;
+    let current: string | undefined;
+    try { current = input.render(cols)[0]; } catch { return false; }
+    if (current !== shown.source) return false;
+    const result = routeNativeTextFieldMouse(input, hostCaretEvent("input", column, row, cols, rows), shown.region);
+    if (!nativeMouseHandled(result)) return false;
+    this.savedHostFocused = false;
+    this.onInvalidate?.();
+    return true;
   }
 
   /**
@@ -7283,6 +7492,7 @@ export class SidebarController {
     this.remoteCloseRendered = false;
     this.invalidateSavedDeleteConfirmationDisplay();
     this.displayedSavedRows = undefined;
+    this.savedQueryDisplay = undefined;
     // Only the network pane owns the displayed peer-row mapping; every other
     // form-slot pane forgets it so a stale map can never authorize an action.
     if (this.formKind !== "peer") this.peerDisplay = undefined;
@@ -9087,6 +9297,7 @@ export class SidebarController {
   private disposeSavedQueryInput(): void {
     const input = this.savedQueryInput;
     this.savedQueryInput = undefined;
+    this.savedQueryDisplay = undefined;
     try { input?.dispose(); } catch { /* private query text is discarded even if UI cleanup fails */ }
   }
 
@@ -10427,6 +10638,7 @@ export class SidebarController {
   /** Forget the drawn New form (a covering pane, a resize, or a dismissal). */
   invalidateCreateFormPresentation(): void {
     this.createFormCandidate = undefined;
+    this.formTextFieldDisplay = undefined;
     this.formHostDisplay = undefined;
     this.formProviderDisplay = undefined;
     this.formCreateWorkspaceDisplay = undefined;
@@ -11452,6 +11664,7 @@ export class SidebarController {
     this.formGeneration += 1;
     try { this.formField?.dispose(); } catch { /* independent field cleanup */ }
     this.formField = undefined;
+    this.formTextFieldDisplay = undefined;
     this.formMatchesCancel = (data) => matchesKey(data, "escape");
     this.formMatchesSubmit = (data) => matchesKey(data, "enter");
     this.formPasteActive = false;
@@ -13886,6 +14099,7 @@ export class SidebarController {
     for (const line of contextLines) lines.push(wrapRow(line, cols));
     const fieldTopRow = lines.length;
     lines.push(...labeledRows);
+    this.captureFormTextFieldDisplay(field, fieldFrame, prefix, prefixWidth, fieldTopRow, labeledRows.length, cols, rows);
     lines.push(wrapRow(errorLines[0] ?? "", cols));
     for (const line of errorLines.slice(1)) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
@@ -14855,6 +15069,7 @@ export class SidebarController {
     // Provider row authorizable, nor claim a control the operator cannot see.
     this.formProviderDisplay = undefined;
     this.formCreateWorkspaceDisplay = undefined;
+    this.formTextFieldDisplay = undefined;
     // The New form's one Host line takes the single spacer row the form has
     // always reserved below the editor, so the editable body keeps exactly its
     // previous row budget at every geometry; Edit is untouched. The Provider
@@ -14975,6 +15190,9 @@ export class SidebarController {
     let createWorkspaceValueEnd = 0;
     const fieldTopRow = lines.length;
     lines.push(...labeledRows);
+    this.captureFormTextFieldDisplay(
+      this.formField, fieldFrame, prefix, prefixWidth, fieldTopRow, labeledRows.length, cols, rows,
+    );
     if (createWorkspaceRows === 1) {
       // One fixed checkbox row directly below the workspace field it qualifies, in
       // the same ordinary marker style, so the drawn order is Header, Host,
@@ -15275,6 +15493,16 @@ export class SidebarController {
     const toggleRows = this.shortcutFieldIndex === 0 ? activeRowsToDraw : inactiveRows;
     const returnRows = this.shortcutFieldIndex === 1 ? activeRowsToDraw : inactiveRows;
     lines.push(...toggleRows, ...returnRows);
+    this.captureFormTextFieldDisplay(
+      this.formField,
+      fieldFrame,
+      activePrefix,
+      activePrefixWidth,
+      1 + contextLines.length + (this.shortcutFieldIndex === 0 ? 0 : toggleRows.length),
+      activeRowsToDraw.length,
+      cols,
+      rows,
+    );
     const savePending = this.pendingShortcutSave !== undefined;
     const status = savePending
       ? " Saving host shortcuts... "
@@ -15304,6 +15532,7 @@ export class SidebarController {
     // A fresh render starts with no displayed rows; a too-small fallback never
     // establishes a displayable selection, so the saved-open guard stays closed.
     this.displayedSavedRows = undefined;
+    this.savedQueryDisplay = undefined;
     // Only a complete remote render below may re-establish a picker frame.
     const previousCandidate = this.savedPickerCandidate;
     this.savedPickerCandidate = undefined;
@@ -15388,6 +15617,18 @@ export class SidebarController {
       }
     }
     lines.push(queryLine.line);
+    const savedInput = this.savedQueryInput;
+    this.savedQueryDisplay = savedInput !== undefined && this.savedPickerId !== undefined
+      && queryLine.mouseSource !== undefined
+      ? Object.freeze({
+        pickerId: this.savedPickerId,
+        input: savedInput,
+        cols,
+        rows,
+        region: Object.freeze({ left: 0, top: lines.length - 1, width: cols, rows: 1, firstRow: 0, height: 1 }),
+        source: queryLine.mouseSource,
+      })
+      : undefined;
     let y = 0;
     if (remote !== undefined && chosenHost.kind === "remote") {
       // `chosenHost` is the captured choice above, so `remote !== undefined`
@@ -15578,7 +15819,12 @@ export class SidebarController {
   private renderSavedQueryLine(
     cols: number,
     row = 1,
-  ): { readonly line: string; readonly cursor: { column: number; row: number } } {
+  ): {
+    readonly line: string;
+    readonly cursor: { column: number; row: number };
+    /** The native Input row exactly as rendered, when its columns survived display sanitizing unchanged. */
+    readonly mouseSource?: string;
+  } {
     let rendered: string[];
     try { rendered = this.savedQueryInput?.render(cols) ?? []; } catch { rendered = []; }
     const source = rendered[0] ?? "";
@@ -15587,7 +15833,12 @@ export class SidebarController {
     const safeBefore = sanitizeBounded(beforeMarker, MAX_SAVED_QUERY_DISPLAY_CODEPOINTS);
     const withoutMarker = source.split(CURSOR_MARKER).join("");
     const safeLine = sanitizeBounded(withoutMarker, MAX_SAVED_QUERY_DISPLAY_CODEPOINTS);
+    // A pointer column means the same cell to the native Input only when
+    // display sanitizing removed no visible cell from its single row.
+    const columnsPreserved = rendered.length === 1 && visibleWidth(safeLine) === visibleWidth(withoutMarker)
+      && visibleWidth(safeLine) <= cols;
     return {
+      ...(columnsPreserved ? { mouseSource: source } : {}),
       line: wrapRow(safeLine, cols),
       cursor: {
         column: Math.min(visibleWidth(safeBefore), cols - 1),

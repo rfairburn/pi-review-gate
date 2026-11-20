@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.302]
+
+### Fixed
+
+- **Mouse caret placement across extension text fields (#714)**: clicking an
+  editable position in sidebar fields, search inputs, settings, and question
+  free text places the caret there for the next edit. Shared Pi editor/input
+  handling preserves Unicode positioning, keyboard controls, paste, completion,
+  validation, and input ownership. Clicking a visible completion suggestion in a
+  field hosted inside Pi applies it without submitting; sidebar fields never apply
+  one on click. In-Pi pointer input remains fullscreen-only;
+  native/provider controls and session-spawn behavior are unchanged. See the
+  [field inventory and example](docs/session-host-alpha.md#clicking-editable-text-places-the-caret).
+
 ## [0.1.0-dev.301]
 
 ### Added

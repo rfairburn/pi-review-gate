@@ -2218,7 +2218,7 @@ test("mouse: keyboard input cancels a pending gesture and keyboard parity holds 
   assert.equal(fixture.sent[0]?.message, `Answer to pending question "First?": two`);
 });
 
-test("mouse: while editing, the editor box is inert and a clicked menu row leaves editing then runs its action", async () => {
+test("mouse: while editing, an editor-box click never submits the draft and a clicked menu row leaves editing then runs its action", async () => {
   const fixture = makeFixture();
   register(fixture, "Which database?", { choices: ["SQLite", "Postgres"] });
   register(fixture, "Another?", { choices: ["x"] });

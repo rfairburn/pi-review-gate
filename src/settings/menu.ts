@@ -234,7 +234,12 @@ export interface MenuInput {
 /** The pi-tui Container surface this adapter builds into. */
 export interface MenuContainer {
   addChild(component: unknown): void;
-  render(width: number): string[];
+  /**
+   * Pi's Container keeps one cached array across frames and declares it
+   * read-only, so this adapter treats it as borrowed: the render slot below
+   * hands it through unchanged and never rewrites a row.
+   */
+  render(width: number): readonly string[];
   invalidate(): void;
 }
 
@@ -532,7 +537,7 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
     if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
 
     return {
-      render: (width: number): string[] => container.render(width),
+      render: (width: number): readonly string[] => container.render(width),
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
         // A held-key event that replays an action this transaction already

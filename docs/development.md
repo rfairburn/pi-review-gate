@@ -128,7 +128,7 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
 - **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi
   agent-core 1.0.0-or-newer `dist/index.js` enables
   `tests/browser-native-error.test.ts` (CI uses the exact
-  `@earendil-works/pi-agent-core@1.5.2`; the model stream is mocked, with no
+  `@earendil-works/pi-agent-core@1.6.0`; the model stream is mocked, with no
   live model calls). Without it the test skips itself. See
   [Browser guide](browser.md#interactive-browser).
 - **Optional: an installed Pi** (`@earendil-works/pi-coding-agent` plus its
@@ -144,13 +144,13 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   no finder is resolvable.
 - **Test-only explicit paths (never shipped, never user-specific in tracked
   files):** Linux's full suite and the native Windows launcher job freshly
-  install a locked `@earendil-works/pi-coding-agent@1.5.2` full runtime
+  install a locked `@earendil-works/pi-coding-agent@1.6.0` full runtime
   (manifests: `scripts/ci/pi-ui-runtime/`) into runner temp. This sits above the
   session host's minimum stable Pi CLI version (1.0.4); the Windows tier still
   covers its existing standalone command/RPC and child-launch behavior, not that
   helper. They export `PI_REVIEW_GATE_INSTALLED_AGENT` (the package root),
   `PI_REVIEW_GATE_INSTALLED_PI_BIN` (the installed executable directory),
-  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.5.2`, and
+  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.6.0`, and
   `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` for required host coverage. The
   command-path smoke runs the installed `pi`/`pi.cmd`, checks its exact version,
   and verifies RPC and candidate registration without a provider call. Missing
@@ -164,9 +164,9 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   Locally, set `PI_REVIEW_GATE_INSTALLED_AGENT` to any installed pi-coding-agent
   package root and `PI_REVIEW_GATE_CANDIDATE_ENTRY` to a built
   `dist/src/index.js` to enable the TUI smoke. For
-  `tests/pi-installed-launch.test.ts`, use the matching Pi 1.5.2 install, set
+  `tests/pi-installed-launch.test.ts`, use the matching Pi 1.6.0 install, set
   `PI_REVIEW_GATE_INSTALLED_PI_BIN` to its executable directory and
-  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.5.2`; set the required-host gate to make
+  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.6.0`; set the required-host gate to make
   missing prerequisites fail locally too.
 - **Live PTY smoke (`tests/pi-tui-live-settings-smoke.test.ts`):** drives the
   built candidate inside a real Pi TUI on a real PTY through the public
@@ -260,7 +260,7 @@ cases on a native hosted macOS runner in one job, `macos-native`, reported as
 assertions and changes no product behavior or live machine configuration.
 
 The job reuses the existing commands, assertions, and prerequisites: the exact
-locked `@earendil-works/pi-coding-agent@1.5.2` runtime from
+locked `@earendil-works/pi-coding-agent@1.6.0` runtime from
 `scripts/ci/pi-ui-runtime/` installed into runner temp (the same canonical
 manifest and convention as the Linux full suite — never a second version
 manifest), the exported `PI_REVIEW_GATE_INSTALLED_AGENT`,
@@ -512,7 +512,7 @@ node --test dist-test/tests/session-host-native-clipboard.test.js \
   dist-test/tests/user-question-mouse-host.test.js
 ```
 
-The native routing test uses the installed package's declared **bundled** Pi 1.5.2
+The native routing test uses the installed package's declared **bundled** Pi 1.6.0
 CLI on owned POSIX PTYs and an inactive scratch build. Native OS
 clipboard-module loading is blocked in the child; all clipboard commands resolve
 to owned recording helpers. No user's clipboard or private session is
@@ -643,7 +643,7 @@ case. It covers real transport and endpoint semantics, not a real native child
 or a physical Main.
 
 `session-host-network-native-input-copy.test.ts` is the real-child tier. It uses
-the installed pinned public Pi 1.5.2 bundled CLI on an owned POSIX PTY, a saved
+the installed pinned public Pi 1.6.0 bundled CLI on an owned POSIX PTY, a saved
 conversation admitted through the real public catalog, the real native copy
 producer, the same real TLS/pin/grant/service/manager stack, and the full-copy
 path. Its input legs cover Unicode and a whole paste of exactly 1 MiB checked by
@@ -660,7 +660,7 @@ the case, not a physical Main, terminal, or UI certificate.
 
 Before any copy gesture, that real-child file requires a per-child, pid- and
 nonce-scoped attestation. The child's own `session_start` handler imports the
-exact resolved public `@earendil-works/pi-tui` 1.5.2 entry and calls only the
+exact resolved public `@earendil-works/pi-tui` 1.6.0 entry and calls only the
 public load-only `getNativeClipboard()` probe; it never calls `getText`,
 `getImage`, `getFilePaths`, or `setText`. That probe uses the repository's
 pinned public TUI alias; the producer still runs in its separately pinned
@@ -761,7 +761,7 @@ hosted Pi child instead reaches the endpoint through Pi's own `app.suspend`
 binding: the running child puts its tty in raw mode, which clears `ISIG`, so the
 control byte would arrive as a keystroke rather than a line-discipline signal.
 The shared refusal sits upstream of both routes; the synthetic fixture is not
-evidence about that binding, which is established from the pinned public Pi 1.5.2
+evidence about that binding, which is established from the pinned public Pi 1.6.0
 sources.
 
 ### Network owner Saved conversations (#389)
@@ -1139,7 +1139,7 @@ launcher check never execute or report it. It runs exactly five predetermined
 fresh invocations of the existing
 `executor compaction recovery launches the default pi child through the same resolver`
 case — selected by a `--test-name-pattern` anchored to that exact title, each in
-its own `node --test` process, against the same pinned installed Pi 1.5.2
+its own `node --test` process, against the same pinned installed Pi 1.6.0
 environment as the required child-launch step — so each sample starts its own
 owned `cmd.exe`-rooted children and the unmodified production lineage query
 verifies each fresh child once. The case, its assertions, and its disposable
@@ -1354,6 +1354,12 @@ launch proceeds while older bootstrap directories are actually reclaimed.
 
 - Pi is independently installed and upgradeable; this project consumes its
   public extension and CLI/RPC surfaces rather than patching or bundling Pi.
+- Pi 1.6.0 types extension `render()` output as `readonly string[]`, and a
+  `Container` can hand back its cached array while its children are unchanged.
+  Where this extension strips its own markers out of native render output — the
+  sidebar text-field adapter's body-boundary and caret markers — it does that on
+  a copy of the returned rows, so nothing writes into a component-owned cached
+  array and the drawn frame, caret, and completion rows stay exactly as before.
 - The `run-as-binary` executor protocol (`pi-review-executor-jsonl-v1`) is documented in
   [Delegated execution](delegated-execution.md#external-harness-protocol).
 - Pre-cutover configuration fields (`decider`, `reviewers`,

@@ -409,7 +409,7 @@ test("real continuation completion snapshot includes fallback in Quiet model del
     assert.match(delivered.content as string, /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     assert.equal(ui.filter(message => /^WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/.test(message)).length, 1);
     setPiTuiHost({ wrapTextWithAnsi: (text: string) => text.split("\n") });
-    const card = renderSubtaskEventCollapsed(delivered, {}, { bold: (text: string) => text, fg: (_color: string, text: string) => text }) as { render(width: number): string[] };
+    const card = renderSubtaskEventCollapsed(delivered, {}, { bold: (text: string) => text, fg: (_color: string, text: string) => text });
     assert.match(card.render(1000).join("\n"), /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);
     assert.match(await readFile(join(f.source, "SCRIPT"), "utf8"), /CONTINUED-SCRIPT/);
     assert.match(controller.inspect(started.executionId, id).tasks[0]!.summary ?? "", /WARNING: Isolated worktree.*Tools only \(snapshot-failure fallback\)/);

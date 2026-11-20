@@ -39,10 +39,10 @@ operator, or platform readiness for the cross-machine features. macOS and Linux
 are the intended POSIX host platforms; intended platform scope is not evidence
 that end-to-end runtime compatibility has been proven. Windows is not an
 unsupported validation target: the host's generic Windows Pi runtime path has
-passed real runtime acceptance on native Windows runners on the pinned Pi 1.5.2.
-The genuine
-native Main case (startup, two live Pi sessions, the public Quit confirmation,
-original-process and outer-PTY settlement, and full terminal restoration) and
+passed real runtime acceptance on native Windows runners on the Pi 1.5.2 that
+was pinned for that run. The genuine native Main case (startup, two live Pi
+sessions, the public Quit confirmation, original-process and outer-PTY
+settlement, and full terminal restoration) and
 both cold hosted-source wrapper legs (cmd and direct PowerShell) ran to
 completion with no skip, as did the owned bundled-ConPTY reader settlement
 case, and the mouse-tracking/SGR and device-attributes protocol witnesses that
@@ -81,9 +81,9 @@ limitations below are unchanged.
 ## Known limitation: Windows runtime acceptance
 
 The host's generic Windows Pi runtime path is accepted by evidence rather than
-deferral. On native Windows runners with the pinned Pi 1.5.2, the real public
-Main case with two live Pi sessions and the
-public Quit confirmation, both cold hosted-source wrapper legs (cmd and direct
+deferral. On native Windows runners with the Pi 1.5.2 pinned for that run, the
+real public Main case with two live Pi sessions and the public Quit
+confirmation, both cold hosted-source wrapper legs (cmd and direct
 PowerShell), and the owned bundled-ConPTY reader settlement case each passed
 with zero skips, keeping their original-process and outer-PTY exit and full
 terminal-restoration assertions. Complete graceful shutdown is therefore
@@ -120,9 +120,9 @@ https://github.com/rfairburn/pi-review-gate/issues/345.
 
 - **Host platform:** same-machine POSIX macOS or Linux remains the documented
   POSIX runtime scope. Windows now has real runtime evidence on the patched
-  Node 22 and 24 lines: on native Windows runners with the pinned Pi 1.5.2, the
-  real public Main case with two live Pi sessions and the public Quit
-  confirmation, both cold hosted-source wrapper legs (cmd and direct
+  Node 22 and 24 lines: on native Windows runners with the Pi 1.5.2 pinned for
+  that run, the real public Main case with two live Pi sessions and the public
+  Quit confirmation, both cold hosted-source wrapper legs (cmd and direct
   PowerShell), and the owned bundled-ConPTY reader settlement case all passed
   with no skip, with every missing prerequisite a hard failure. That is the
   measured scope: it
@@ -140,8 +140,8 @@ https://github.com/rfairburn/pi-review-gate/issues/345.
   archive. Updating this requirement does not update or restart a running host
   or its sessions. Update Node.js, then restart them.
 - **Pi:** stable Pi 1.0.4 or newer; the managed fallback the launcher provisions
-  and the native UI acceptance fixture are pinned to **1.5.2**, with the
-  matching 1.5.2 TUI dependency. An explicit `--pi-executable` (which never
+  and the native UI acceptance fixture are pinned to **1.6.0**, with the
+  matching 1.6.0 TUI dependency. An explicit `--pi-executable` (which never
   falls back), an npm-global, or a `PATH` Pi still runs that installation under
   the same 1.0.4 floor and the existing precedence. That pin covers only the
   session host's own resolution: the ordinary `pi-review-gate` and
@@ -749,7 +749,7 @@ retries automatically.
 inherited launch options remain shared, but the parent's conversation name and
 startup message/file inputs are not inherited. The supplied title is forwarded
 unchanged to Pi's native session-name API; Pi applies its own persistence
-semantics, including trimming surrounding whitespace on the pinned 1.5.2 runtime.
+semantics, including trimming surrounding whitespace on the pinned 1.6.0 runtime.
 The host does not crop or shorten titles to fit the sidebar, and titles longer than
 the recommendation remain stored in full after Pi's native normalization. The
 prompt is handed unchanged to Pi's public user-message API with prompt-template
@@ -920,7 +920,7 @@ successful open makes the restored child the active Main input owner and focuses
 Main without a second Enter, with the pane still visible. A late listing or
 creation result never takes over a later-opened or dismissed pane.
 
-Type in the Saved search bar to filter this global catalog with the native Pi 1.5.2
+Type in the Saved search bar to filter this global catalog with the native Pi 1.6.0
 `/resume` query grammar: whitespace-separated fuzzy tokens, quoted phrases such
 as `"node cve"`, and case-insensitive regular expressions such as
 `re:node.*cve`. Every token and phrase must match, and different tokens may
@@ -2931,9 +2931,9 @@ before generating its own outer-terminal OSC 52 command. Stale, hidden, covered,
 sibling, or shutting-down owners cannot write the client clipboard. Ordinary
 local helper-only copying is unchanged.
 
-This provenance adapter recognizes the audited bundled **Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
-and 1.5.2** runtimes. A changed runtime or unavailable native provenance fails
-closed rather than admitting arbitrary output. This is not a sandbox against
+This provenance adapter recognizes the audited bundled **Pi 1.3.0, 1.4.0, 1.5.0,
+1.5.1, 1.5.2, and 1.6.0** runtimes. A changed runtime or unavailable native
+provenance fails closed rather than admitting arbitrary output. This is not a sandbox against
 trusted executable extensions running with the user's operating-system
 authority. Clipboard payloads are transient authenticated transport, not
 encrypted storage or a sync service.
@@ -2956,8 +2956,8 @@ produce a record.
 A successful copy records nothing. It means only that bytes were submitted, not
 that Ghostty or another terminal acknowledged an OS clipboard write; only a
 paste on the client verifies delivery. Existing terminal permissions,
-multiplexers, and native size limits still apply (Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
-and 1.5.2 bound the encoded OSC 52 payload to 100,000 characters). No
+multiplexers, and native size limits still apply (the audited Pi versions above
+bound the encoded OSC 52 payload to 100,000 characters). No
 terminal/SSH configuration or multiplexer passthrough is forced. A terminal or
 multiplexer that disables/does not implement clipboard writes may discard the
 request. There is no clipboard read, paste, synchronization, image transfer, or
@@ -3291,7 +3291,7 @@ under
 #### Isolated manual SSH clipboard comparison
 
 Run these source-checkout steps **on the SSH host**, from the checkout root, in
-the same client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.5.2
+the same client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.6.0
 package directory, not its launcher shim. This creates a disposable home, agent
 directory, workspaces, and an inactive candidate build; it does not use the live
 roster, credentials, or installation. Dependencies must already be installed in
@@ -3395,7 +3395,7 @@ passing result. Synthetic PTY tests do not replace these operator-driven paste c
 ### Inline images and compatibility
 
 Ghostty is the concrete image-display target, not a blanket terminal-graphics
-compatibility promise. The native protocol fixture uses Pi and pi-tui **1.5.2**.
+compatibility promise. The native protocol fixture uses Pi and pi-tui **1.6.0**.
 The hosted Kitty path requires `TERM_PROGRAM=ghostty` and `TERM=xterm-ghostty`,
 with no `TMUX`, `TMUX_PANE`, or `STY` marker. A customized terminal environment
 that does not meet this narrow gate uses text fallback, even if standalone Pi's

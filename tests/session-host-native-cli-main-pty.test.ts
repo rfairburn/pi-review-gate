@@ -7,7 +7,7 @@
  * driven with real keystrokes, exactly like the existing native Main proofs:
  *
  * 1. one ordinary Pi row created through the Workspace-only New form, running
- *    the pinned real Pi 1.5.2 offline with `--no-tools --no-context-files
+ *    the pinned real Pi 1.6.0 offline with `--no-tools --no-context-files
  *    --no-themes` (no model call, no prompt, no context file read);
  * 2. two native provider rows created through the SAME New form's actual
  *    Provider control (Shift+Tab to Host, Shift+Tab to Provider, arrow-cycled,

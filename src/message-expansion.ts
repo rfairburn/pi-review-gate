@@ -147,7 +147,12 @@ export interface MessageRenderOptions {
 
 /** A renderable TUI component (the structural subset this module drives). */
 export interface MessageComponent {
-  render(width: number): string[];
+  /**
+   * Pi declares component render output read-only: a component may hand back
+   * the same cached array while nothing changed, so every wrapper here treats
+   * it as borrowed and copies only where it actually changes a row.
+   */
+  render(width: number): readonly string[];
   invalidate(): void;
   handleMouse?(event: unknown): unknown;
 }
@@ -326,7 +331,7 @@ function nativeCard(row: MessageComponent, theme: unknown): MessageComponent {
   const bgFn = themedCardBgFn(bg);
   const box = new BoxCtor(1, 1, bgFn);
   box.addChild({
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
       const w = Math.max(0, Math.floor(width));
       const lines = row.render(w);
       return w > 0 && truncateToWidth
@@ -343,7 +348,7 @@ function nativeCard(row: MessageComponent, theme: unknown): MessageComponent {
   // truncator so a wide grapheme can never push a row past the width.
   const narrowBox = new BoxCtor(0, 1, bgFn);
   narrowBox.addChild({
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
       const w = Math.max(0, Math.floor(width));
       if (w <= 0 || !truncateToWidth) return row.render(w);
       return row.render(w).map((line) => truncateToWidth(line, w, ""));
@@ -353,7 +358,7 @@ function nativeCard(row: MessageComponent, theme: unknown): MessageComponent {
     },
   });
   return {
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
       const w = Math.max(0, Math.floor(width));
       // Keep native padding from three cells up. Both paths clip oversized
       // graphemes before Box adds padding; clusters can exceed two cells.
@@ -548,7 +553,7 @@ export function createExpandableMessageRenderer(
     let collapsedRow: unknown;
     let expandedRow: unknown;
     const inner: MessageComponent = {
-      render(width: number): string[] {
+      render(width: number): readonly string[] {
         const base = isRecord(options) ? options : {};
         const effectiveOptions = { ...base, expanded: state.expanded };
         let row = state.expanded ? expandedRow : collapsedRow;

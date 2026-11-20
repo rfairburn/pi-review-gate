@@ -16,7 +16,7 @@ import { findInstalledAgentDirs } from "./menu-tui-fakes";
 /**
  * Process evidence for the owned external-editor PTY handoff (issue #499).
  *
- * This drives the REAL production launcher module of an installed Pi 1.3/1.4
+ * This drives the REAL production launcher module of an installed audited Pi
  * runtime — `dist/modes/interactive/external-editor.js`, copied byte-for-byte out
  * of that installation into scratch and never modified — inside a real owned PTY,
  * with THIS working tree's compiled strict framed child preload installed before
@@ -60,7 +60,7 @@ const nodePty = nodeRequire("@lydell/node-pty") as {
  * additive: an unlisted installed runtime is never used, and the launcher's own source
  * must still state the inherited-stdio launch this adapter recognizes.
  */
-const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"];
+const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"];
 
 function installedRuntimeRoot(): string | undefined {
   for (const dir of findInstalledAgentDirs()) {
@@ -333,8 +333,12 @@ function alive(pid: number): boolean {
 }
 
 const runtime = installedRuntimeRoot();
-const skip = available() ? false : "no installed Pi 1.3/1.4/1.5 runtime with the external-editor launcher";
-function available(): boolean { return runtime !== undefined && process.platform !== "win32"; }
+/** Two distinct reasons, so a platform skip never reads as a missing pinned runtime. */
+const skip = process.platform === "win32"
+  ? "native Windows editor handoff stays experimental"
+  : runtime === undefined
+    ? `no installed Pi ${AUDITED_PI_VERSIONS.join("/")} runtime with the external-editor launcher`
+    : false;
 
 test("handoff: a real editor launched by the production Pi launcher edits and returns through its own terminal", { skip }, async (t) => {
   const child = await startChild(runtime!, [{ command: "vim -u NONE -i NONE", content: "seed\n" }]);

@@ -43,7 +43,8 @@ const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 /** Structural subset of pi-tui's native Markdown component. */
 export interface QuestionMarkdownComponent {
-  render(width: number): string[];
+  /** Pi declares Markdown render output read-only and caches it across frames. */
+  render(width: number): readonly string[];
   invalidate(): void;
 }
 

@@ -673,6 +673,26 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
   (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
 - **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
   fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
-  short pane — after notices take up to half of the rows below the header. Selection, keys, the
+  short pane — after the notice takes up to half of the rows below the header. Selection, keys, the
   tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
   and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.
+- **One notice at a time.** Below the **Review settings (local)** header the pane shows a single
+  notice, never a growing history. Outside a section with its own help it is the LOCAL target notice
+  (including the first-use **Save** creates / **Cancel** leaves it absent wording). **Reviewers** →
+  **Review** and its **Evidence methods** show a short summary instead of the in-Pi description;
+  the full details are under **Reviewers** in [`/review-settings`](#review-settings), in
+  [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import), and in
+  [Evidence methods](#evidence-methods). The result of the latest action — a warning, an error such
+  as a failed **Save** validation, or an informational result — replaces it on the next screen,
+  error over warning over info, and clears once a later action opens another screen; opening
+  diagnostics are the first screen's result in the same way, so saved tool-protection settings
+  that do not load (an error: protected calls stay blocked) outrank a config-load warning, which
+  outranks routine model-catalog guidance. A confirmation's disclosure (such as **Save auditor
+  sessions**) is that screen's one notice, always shown whole: a pane too short for it is too
+  small, and **Yes** is accepted only from a frame that shows it. A disclosure too long for the
+  sidebar to show whole (for example an auditor confirmation listing a very long selected tool-name
+  scope) is never confirmed there. The pane says so and shows Escape, which answers No without
+  closing the editor; configured Cancel keys that reach the pane also answer No. A result that ends the editor is
+  shown as its one notice in **Settings**. Text fields show the same single result or their own
+  field message; a rejected input's error clears once the field accepts a changed value. In-Pi `/review-settings` keeps its full
+  section descriptions as ordinary notifications.

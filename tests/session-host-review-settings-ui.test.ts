@@ -586,6 +586,413 @@ test("the shared root list uses the sidebar pane height: tall shows every row, s
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
 });
 
+// ---------------------------------------------------------------------------
+// One contextual notice at a time (#653)
+// ---------------------------------------------------------------------------
+
+/** The notice phrases a frame may show; each starts its notice's first row at this width. */
+const NOTICE_PHRASES = {
+  target: "Editing LOCAL review-gate settings",
+  review: "Review: automatic primary/subtask review toggles",
+  evidence: "Evidence methods: Enter cycles",
+  nativeReview: "Automatic primary review covers",
+  nativeEvidence: "Evidence methods only",
+  primaryWarning: "! WARNING: Applying Primary",
+  landedInactive: "Reviewing landed changes is inactive",
+  notDrawn: "! Review settings changed or are not completely shown",
+} as const;
+type NoticeKey = keyof typeof NOTICE_PHRASES;
+
+/** Exactly the one expected notice is shown, once, and the header stays local. */
+function assertOnlyNotice(d: Driven, expected: NoticeKey | undefined, what: string): string[] {
+  const shown = d.frame();
+  const text = shown.join("\n");
+  assert.ok(shown[0]?.includes("Review settings (local)"), `${what}: the header stays local\n${text}`);
+  for (const [key, phrase] of Object.entries(NOTICE_PHRASES) as Array<[NoticeKey, string]>) {
+    const count = shown.filter((line) => line.includes(phrase)).length;
+    assert.equal(count, key === expected ? 1 : 0, `${what}: ${key} ${key === expected ? "once" : "absent"}\n${text}`);
+  }
+  return shown;
+}
+
+test("one contextual notice: root -> Review -> deeper -> Back -> root -> Review restores each slot without stacking", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  assertOnlyNotice(d, "target", "root");
+
+  for (let visit = 0; visit < 3; visit += 1) {
+    await chooseMenuRow(d, "Reviewers", "→ Automatic primary review");
+    assertOnlyNotice(d, "review", `Review visit ${visit}`);
+    // A toggle re-shows the same menu as a new screen: the help stays, once.
+    moveToMenuRow(d, "Automatic subtask review");
+    d.key(ENTER);
+    await waitFor(d, (text) => /→ Automatic subtask review\s+(On|Off)/.test(text) && text.includes(NOTICE_PHRASES.review), "re-shown Review");
+    assertOnlyNotice(d, "review", `Review after a toggle ${visit}`);
+
+    // Deeper: Evidence methods replaces the Review help with its own.
+    await chooseMenuRow(d, "Evidence methods", "Primary / top-level");
+    assertOnlyNotice(d, "evidence", `Evidence ${visit}`);
+    if (visit === 0) {
+      // A staged warning takes the slot on the next screen and survives navigation
+      // within it, then is not pinned once the next action re-shows the menu.
+      moveToMenuRow(d, "Primary / top-level");
+      d.key(ENTER);
+      await waitFor(d, (text) => /→ Primary \/ top-level\s+Tools only/.test(text), "the staged evidence warning");
+      assertOnlyNotice(d, "primaryWarning", "evidence warning");
+      d.key(DOWN);
+      assertOnlyNotice(d, "primaryWarning", "evidence warning after moving");
+      moveToMenuRow(d, "Isolated worktree");
+      d.key(ENTER);
+      await waitFor(d, (text) => /→ Isolated worktree\s+Tools only/.test(text), "evidence help again");
+      assertOnlyNotice(d, "evidence", "evidence after the next action");
+    }
+    d.key(ESC); // Back to Review
+    await waitFor(d, (text) => text.includes("→ Evidence methods") && text.includes(NOTICE_PHRASES.review), `Review after Back ${visit}`);
+    assertOnlyNotice(d, "review", `Review after Back ${visit}`);
+
+    // A reviewer picker inherits the Review help; Back keeps it.
+    await chooseMenuRow(d, "Primary reviewers", "Enable all");
+    assertOnlyNotice(d, "review", `reviewer picker ${visit}`);
+    d.key(ESC);
+    await waitFor(d, (text) => text.includes("→ Primary reviewers"), "Review after the picker");
+    assertOnlyNotice(d, "review", `Review after the picker ${visit}`);
+
+    d.key(ESC); // Back to the root
+    await waitFor(d, (text) => text.includes("→ Reviewers") && text.includes(NOTICE_PHRASES.target), "root after Back");
+    assertOnlyNotice(d, "target", `root after visit ${visit}`);
+  }
+
+  // An info result of an action replaces the help on its next screen only.
+  await chooseMenuRow(d, "Reviewers", "→ Automatic primary review");
+  moveToMenuRow(d, "Automatic primary review");
+  d.key(ENTER);
+  await waitFor(d, (text) => /→ Automatic primary review\s+Off/.test(text), "primary review Off");
+  moveToMenuRow(d, "Review landed changes");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("→ Review landed changes"), "the inactive notice");
+  assertOnlyNotice(d, "landedInactive", "landed inactive result");
+  moveToMenuRow(d, "Automatic primary review");
+  d.key(ENTER);
+  await waitFor(d, (text) => /→ Automatic primary review\s+On/.test(text) && text.includes(NOTICE_PHRASES.review), "help after the next action");
+  assertOnlyNotice(d, "review", "Review after the inactive result");
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("→ Reviewers"), "root");
+
+  // The pane's own refusal is the one notice while it stands; a fresh key clears it.
+  moveToMenuRow(d, "Cancel");
+  d.writes = false;
+  d.key(UP);
+  d.frame();
+  d.key(ENTER);
+  await turns();
+  d.writes = true;
+  assertOnlyNotice(d, "notDrawn", "the refused action");
+  d.key(DOWN);
+  assertOnlyNotice(d, "target", "root after the refusal clears");
+
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "navigation saved nothing");
+});
+
+test("one contextual notice: opening diagnostics take the slot once, the LOCAL target returns, and a failed Save reports its error", async (t) => {
+  const l = local(t);
+  const catalogWarning = "no Pi models are scoped yet";
+  const first = driven(l, {}, () => ({ ...fakeCatalog(), warnings: [catalogWarning] }));
+  first.rows = 40;
+  await openReviewSettings(first);
+  // First use with a catalog diagnostic: the diagnostic is the first screen's notice.
+  let shown = first.text();
+  assert.ok(shown.includes(`! review gate: settings catalog: ${catalogWarning}`), shown);
+  assert.ok(!shown.includes("No config exists yet"), `one notice at a time:\n${shown}`);
+  first.key(DOWN);
+  assert.ok(first.text().includes(catalogWarning), "the diagnostic stays while the screen does");
+  // After an action the root restores the first-use target notice; the diagnostic is not pinned.
+  await chooseMenuRow(first, "Reviewers", "→ Automatic primary review");
+  first.key(ESC);
+  await waitFor(first, (text) => text.includes("→ Reviewers") && text.includes("No config exists yet"), "the first-use target");
+  shown = first.text();
+  assert.ok(!shown.includes(catalogWarning), shown);
+  assert.ok(shown.includes("Save creates"), "the first-use Save semantics are shown");
+  first.key(ESC);
+  await waitFor(first, (text) => text.includes("> Review settings"), "Settings");
+  await Promise.all(first.settled);
+  assert.equal(existsSync(l.canonical), false);
+
+  // An unparseable config: its load warning opens; a failed Save is the next root's one error.
+  const bytes = "{ \"secretMarker-7f3a\": ";
+  writeFileSync(l.canonical, bytes, "utf8");
+  const broken = driven(l);
+  broken.rows = 40;
+  await openReviewSettings(broken);
+  shown = broken.text();
+  assert.match(shown, /could not be read or parsed/);
+  assert.ok(!shown.includes(NOTICE_PHRASES.target), shown);
+  // Navigating away and back restores the target: the opening warning is not pinned.
+  await chooseMenuRow(broken, "Reviewers", "→ Automatic primary review");
+  assertOnlyNotice(broken, "review", "Review in the unparseable config");
+  broken.key(ESC);
+  await waitFor(broken, (text) => text.includes("→ Reviewers"), "root again");
+  assertOnlyNotice(broken, "target", "root after the opening warning");
+  // A failed Save ends the open truthfully: its one error is the Settings result.
+  broken.key(CTRL_S);
+  await waitFor(broken, (text) => text.includes("> Review settings"), "Settings after the failed Save");
+  shown = broken.text();
+  assert.match(shown, /! review gate: local review settings failed: .*not valid/);
+  assert.ok(!shown.includes("secretMarker"));
+  assert.ok(!shown.includes(NOTICE_PHRASES.target), shown);
+  await Promise.all(broken.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytes, "the broken file is untouched");
+});
+
+const RETENTION_DISCLOSURE_START = "Turning this on saves every auditor invocation";
+const RETENTION_DISCLOSURE_END = "Save/Ctrl+S (disk).";
+
+async function openRetentionConfirmation(d: Driven): Promise<void> {
+  await chooseMenuRow(d, "Tools", "Tool protection");
+  await chooseMenuRow(d, "Tool protection", "Save auditor sessions");
+  moveToMenuRow(d, "Save auditor sessions");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Save every auditor session?") && text.includes("→ No"), "the retention confirmation");
+}
+
+test("one contextual notice: a confirmation's disclosure replaces the section notice, stays whole, and gates Yes", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  await openRetentionConfirmation(d);
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.ok(text.includes(RETENTION_DISCLOSURE_START) && text.includes(RETENTION_DISCLOSURE_END), `the whole disclosure:\n${text}`);
+  assert.equal(shown.filter((line) => line.includes(RETENTION_DISCLOSURE_START)).length, 1, "drawn once");
+  assert.ok(!text.includes(NOTICE_PHRASES.target), `the disclosure is the one notice:\n${text}`);
+  assert.ok(shown.some((line) => line.trimStart().startsWith("Yes")) && shown.some((line) => line.trimStart().startsWith("→ No")), text);
+
+  // A pane too short for the whole disclosure is too small and confirms nothing.
+  d.rows = 12;
+  assert.match(d.text(), /too small/);
+  d.key(UP);
+  d.key(ENTER);
+  await turns();
+  d.rows = 30;
+  text = d.text();
+  assert.match(text, /Save every auditor session\?/, "still confirming");
+  assert.ok(!text.includes(RETENTION_DISCLOSURE_START), `the refusal error takes the slot:\n${text}`);
+  assert.match(text, /not completely shown/);
+  // Yes on a written frame without the disclosure is refused and restores it.
+  d.key(ENTER);
+  await turns();
+  text = d.text();
+  assert.match(text, /Save every auditor session\?/, "Yes was not accepted without the disclosure");
+  assert.ok(text.includes(RETENTION_DISCLOSURE_START) && !/not completely shown/.test(text), `the disclosure is back alone:\n${text}`);
+  assert.ok(d.frame().some((line) => line.trimStart().startsWith("→ Yes")));
+
+  // Restoring the disclosure never hides a later refusal on the same screen.
+  d.sidebar.invalidateReviewSettingsPresentation(); // e.g. a terminal handoff
+  d.key(ENTER);
+  await turns();
+  text = d.text();
+  assert.match(text, /Save every auditor session\?/, "the revoked frame confirmed nothing");
+  assert.match(text, /not completely shown/, `the new refusal is shown:\n${text}`);
+  assert.ok(!text.includes(RETENTION_DISCLOSURE_START), text);
+  // A newer error replaces the older refusal; it authorizes nothing.
+  d.opens[0]!.notify?.("review gate: a newer settings error", "error");
+  text = d.text();
+  assert.match(text, /a newer settings error/);
+  assert.doesNotMatch(text, /not completely shown/);
+  assert.ok(!text.includes(RETENTION_DISCLOSURE_START), text);
+  d.key(ENTER);
+  await turns();
+  text = d.text();
+  assert.match(text, /Save every auditor session\?/, "Yes was again refused without the disclosure");
+  assert.ok(text.includes(RETENTION_DISCLOSURE_START) && !/a newer settings error|not completely shown/.test(text), text);
+
+  // Now Yes is shown with its disclosure and confirms.
+  d.key(ENTER);
+  await waitFor(d, (shownText) => /→ Save auditor sessions\s+On/.test(shownText), "retention staged On");
+  moveToMenuRow(d, "Back");
+  d.key(ESC);
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "a staged confirmation saves nothing");
+});
+
+for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] as const) test(`one contextual notice: an oversized disclosure refuses confirmation and provides a way back with Cancel on ${cancelKey}`, async (t) => {
+  const l = local(t);
+  // Alt+Right and Alt+Left are the default host shortcuts; legacy Tab is the same byte as a Ctrl+I Toggle.
+  const shadowed = cancelKey === "alt+right" || cancelKey === "alt+left" || cancelKey === "tab";
+  // The remapped Cancel still wins when it is also bound to Confirm.
+  write(join(l.agentDir, "keybindings.json"), {
+    // A long Cancel list must not make the fallback unrenderable.
+    "tui.select.cancel": cancelKey === "backspace"
+      ? [cancelKey, "ctrl+shift+alt+super+pageUp", "ctrl+shift+alt+super+pageDown", "ctrl+shift+alt+super+left"]
+      : [cancelKey],
+    "tui.select.confirm": ["enter", cancelKey],
+  });
+  const toolNames = Array.from({ length: 120 }, (_, index) => `audited_tool_name_${String(index).padStart(3, "0")}`);
+  const bytesA = write(l.canonical, { ...DISK_A, toolProtection: { level: "off", scope: "selected", toolNames } });
+  const d = driven(l, cancelKey === "tab" ? { toggleKey: "ctrl+i" } : {});
+  d.rows = 80; // room for far more than a truncated prefix
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Tool protection");
+  await chooseMenuRow(d, "Tool protection", "Auditor");
+  moveToMenuRow(d, "Auditor");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Tool protection auditor"), "the auditor picker");
+  moveToMenuRow(d, "acme/deep");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("exceeds the display limit"), "the oversized confirmation");
+  const shown = d.frame();
+  const text = shown.join("\n");
+  assert.match(text, /escape go back/i, `Escape is the advertised way back:\n${text}`);
+  assert.equal(shown.filter((line) => line.startsWith("! ")).length, 1, text);
+  assert.ok(!text.includes("Choosing acme/deep") && !text.includes("audited_tool_name_000"), `no prefix is shown as the disclosure:\n${text}`);
+  assert.ok(!shown.some((line) => /^\s*(→ )?(Yes|No)\s*$/.test(line)), `no choice is offered:\n${text}`);
+  assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, "no frame can authorize Yes");
+  d.key(UP); // toward Yes
+  d.key(ENTER);
+  await turns();
+  assert.match(d.text(), /exceeds the display limit/, "Yes/Enter did nothing");
+  d.key(shadowed ? ESC : cancelKey === "backspace" ? "\x7f" : CTRL_S);
+  await waitFor(d, (shownText) => shownText.includes("Auditor unchanged"), "Cancel answered No");
+  assert.equal(d.sidebar.focus, "form", "the editor stays open");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("one contextual notice: the fail-closed tool-protection diagnostic outranks routine catalog guidance", async (t) => {
+  const l = local(t);
+  write(l.canonical, { ...DISK_A, toolProtection: { level: "not-a-level" } });
+  const d = driven(l, {}, () => ({ ...fakeCatalog(), warnings: ["no Pi models are scoped yet"] }));
+  d.rows = 40;
+  await openReviewSettings(d);
+  const text = d.text();
+  assert.match(text, /! review gate: saved tool-protection settings are invalid/);
+  assert.ok(!text.includes("no Pi models are scoped yet"), `one notice at a time:\n${text}`);
+  assert.ok(!text.includes(NOTICE_PHRASES.target), text);
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("one contextual notice: a notice arriving after a written frame revokes its authority until a fresh frame is written", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  moveToMenuRow(d, "Cancel");
+  d.frame(); // written
+  d.opens[0]!.notify?.("review gate: a late warning", "warning");
+  d.key(ENTER);
+  d.key(CTRL_S);
+  await turns();
+  assert.equal(d.sidebar.focus, "form", "neither Cancel nor Save acted");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+  // The refusal is now the one notice; a fresh written frame restores authority.
+  assert.match(d.text(), /not completely shown/);
+  d.frame();
+  d.key(CTRL_S);
+  await waitFor(d, (text) => text.includes("> Review settings") && /saved to disk/.test(text), "saved from the fresh frame");
+  await Promise.all(d.settled);
+});
+
+test("one contextual notice: a field rejection outranks the field warning and clears after an accepted edit", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const fieldWarning = "Native keybindings.json is unavailable; using Pi's default form keys";
+  // Ctrl+G replacements, applied asynchronously like the real host editor's.
+  const externalResults = ["unsafe\x07text", "^https://corrected"];
+  const d = driven(l, {
+    createTextField: (options) => ({
+      field: createSessionHostTextField({
+        kind: "text",
+        multiline: options.multiline === true,
+        initialText: options.initialText,
+        onInvalidate: options.onInvalidate,
+        onSubmit: options.onSubmit,
+        onCancel: options.onCancel,
+        onReject: options.onReject,
+        onChange: options.onChange,
+        onExternalEditor: async () => {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          return externalResults.shift();
+        },
+      }),
+      notice: fieldWarning,
+    }),
+  });
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Web");
+  await chooseMenuRow(d, "Web", "URL blocklist");
+  moveToMenuRow(d, "URL blocklist");
+  d.key(ENTER);
+  await waitFor(d, (shown) => shown.includes("Blocked URL patterns"), "the shared text field");
+  const notices = (): string[] => d.frame().filter((line) => line.startsWith("! ")).map((line) => line.trimEnd());
+  assert.deepEqual(notices(), [`! ${fieldWarning}`], d.text());
+  d.key(`${PASTE_START}${"z".repeat(9000)}${PASTE_END}`);
+  assert.deepEqual(notices(), ["! Pasted text exceeds the field limit"], `the error wins:\n${d.text()}`);
+  d.key("\x1b[D"); // cursor-only movement keeps it
+  assert.deepEqual(notices(), ["! Pasted text exceeds the field limit"], d.text());
+  d.key("a"); // an accepted value change clears it without leaving the editor
+  assert.deepEqual(notices(), [`! ${fieldWarning}`], d.text());
+  assert.match(d.text(), /Blocked URL patterns/);
+
+  // Another rejection keeps the error; a rejected external replacement replaces it
+  // with its own; an accepted changed external replacement clears it with no keystroke.
+  d.key(`${PASTE_START}${"z".repeat(9000)}${PASTE_END}`);
+  d.key(`${PASTE_START}${"z".repeat(9000)}${PASTE_END}`);
+  assert.deepEqual(notices(), ["! Pasted text exceeds the field limit"], d.text());
+  d.key(CTRL_G);
+  await turns();
+  assert.deepEqual(notices(), ["! Unsafe terminal text was rejected"], `a rejected replacement:\n${d.text()}`);
+  d.key(CTRL_G);
+  await turns();
+  assert.deepEqual(notices(), [`! ${fieldWarning}`], `the accepted replacement cleared it:\n${d.text()}`);
+  assert.match(d.text(), /\^https:\/\/corrected/);
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("one contextual notice: a screen that cannot be drawn shows only its failure and keeps no authority", async () => {
+  let settledWith: string | undefined | null = null;
+  let finish!: () => void;
+  const sidebar = new SidebarController({
+    settingsAvailable: false,
+    reviewSettings: {
+      open: async (ui) => {
+        await ui.settingsSectionHelp?.section("Section help that must not stack", async () => {
+          settledWith = await ui.custom!(() => ({
+            render: (): string[] => { throw new Error("boom"); },
+            handleInput: (): void => undefined,
+          }));
+        });
+        await new Promise<void>((resolve) => { finish = resolve; });
+      },
+    },
+  });
+  for (let step = 0; step < 10 && !sidebar.render(80, 30).lines.map(strip).some((line) => line.startsWith("> Settings")); step += 1) sidebar.handleInput(DOWN);
+  sidebar.handleInput(ENTER);
+  sidebar.render(80, 30);
+  sidebar.handleInput(ENTER);
+  await turns();
+  const lines = sidebar.render(80, 30).lines.map(strip);
+  const text = lines.join("\n");
+  assert.equal(lines.filter((line) => line.startsWith("! ")).length, 1, text);
+  assert.match(text, /! This settings screen could not be drawn/);
+  assert.ok(!text.includes("Section help that must not stack"), text);
+  assert.equal(sidebar.captureReviewSettingsPresentation(), undefined, "an undrawable screen offers no frame to authorize");
+  sidebar.handleInput(ENTER);
+  await turns();
+  assert.equal(settledWith, null, "Enter never reached the undrawable screen");
+  sidebar.cancelReviewSettings();
+  finish?.();
+});
+
 test("a short sidebar shows both choices of a two-item list instead of one choice and a scroll cue", async (t) => {
   const l = local(t);
   const bytesA = write(l.canonical, DISK_A);
@@ -637,12 +1044,19 @@ test("a narrow sidebar measures wrapped notices, hints, and footer before sizing
 test("navigation then Enter before a redraw, an unwritten frame, or a revoked frame never confirms or saves", async (t) => {
   const l = local(t);
   const bytesA = write(l.canonical, DISK_A);
+  // A key bound to both Cancel and Confirm confirms on an ordinary list, so it
+  // needs the same written frame as Enter.
+  write(join(l.agentDir, "keybindings.json"), {
+    "tui.select.cancel": ["escape", "backspace"],
+    "tui.select.confirm": ["enter", "backspace"],
+  });
   const d = driven(l);
   await openReviewSettings(d);
   moveToMenuRow(d, "Cancel");
-  // Up moves the selection to Save changes; Enter arrives before any redraw.
+  // Up selects Save changes; Enter, a shared Confirm/Cancel key, and Ctrl+S arrive before the redraw.
   d.key(UP);
   d.key(ENTER);
+  d.key("\x7f");
   d.key(CTRL_S);
   await turns();
   assert.equal(d.sidebar.focus, "form");
@@ -666,9 +1080,9 @@ test("navigation then Enter before a redraw, an unwritten frame, or a revoked fr
   await turns();
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "a revoked frame never saves");
 
-  // The current, written frame does.
+  // The current, written frame does, through the shared key too.
   d.frame();
-  d.key(ENTER);
+  d.key("\x7f");
   await waitFor(d, (text) => text.includes("> Review settings") && /saved to disk/.test(text), "saved");
   await Promise.all(d.settled);
   assert.notEqual(readFileSync(l.canonical, "utf8"), bytesA);
@@ -1024,9 +1438,19 @@ test("a settings text value places its caret through the shared written-frame ro
   assert.equal(sidebar.captureMousePresentation().activateFormRowAt(0, firstRow, COLS, ROWS), false, "a bracketed paste in flight refuses");
   sidebar.handleInput(PASTE_END);
 
+  // #653: a late notice takes the pane's one slot above the field and moves it.
   shown = lines();
   written = sidebar.captureMousePresentation();
-  assert.equal(written.activateFormRowAt(0, rowOf(shown, "first line"), COLS, ROWS), true);
+  const rowBeforeWarning = rowOf(shown, "first line");
+  ui.notify!("review gate: a late warning", "warning");
+  assert.equal(written.activateFormRowAt(0, rowBeforeWarning, COLS, ROWS), false, "a capture from before the warning refuses before the redraw");
+  shown = lines();
+  assert.ok(shown.some((line) => line.startsWith("! review gate: a late warning")), shown.join("\n"));
+  assert.notEqual(rowOf(shown, "first line"), rowBeforeWarning, "the warning moved the field");
+  assert.equal(written.activateFormRowAt(0, rowBeforeWarning, COLS, ROWS), false, "and stays refused after it");
+
+  written = sidebar.captureMousePresentation();
+  assert.equal(written.activateFormRowAt(0, rowOf(shown, "first line"), COLS, ROWS), true, "the newly written field row is accepted");
   sidebar.handleInput("Y");
   sidebar.handleInput(ENTER);
   assert.equal(await edit, "Yfirst line\nsecond Xline", "each press moved only the caret; the typed edits landed there");

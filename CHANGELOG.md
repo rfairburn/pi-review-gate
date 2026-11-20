@@ -35,7 +35,11 @@ dates.
   in the same agent directory (for example newer Codex models absent from `models.json`),
   without writing to the catalog, contacting the network, or using credentials. Its menus and
   pickers size their lists to the sidebar pane's height (more than ten rows when there is room,
-  fewer with scrolling in a short pane); in-Pi `/review-settings` popups keep ten rows. See
+  fewer with scrolling in a short pane); in-Pi `/review-settings` popups keep ten rows. The pane
+  shows one notice at a time instead of accumulating them: the LOCAL target at the root, a concise
+  summary in Review and Evidence methods that points to these docs for the full description, or the
+  latest action's warning or error in their place, with a confirmation's disclosure shown whole as
+  its screen's notice; in-Pi section help is unchanged. See
   [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
 - **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
   sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking

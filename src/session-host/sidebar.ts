@@ -1220,6 +1220,12 @@ export interface SidebarFieldFactoryOptions {
   readonly onSubmit: (submission: SessionHostFieldSubmission) => void;
   readonly onCancel: () => void;
   readonly onReject: (reason: SessionHostFieldRejection) => void;
+  /**
+   * Called after the field ACCEPTED a changed value (typed, pasted, completed,
+   * or an asynchronous external-editor replacement) — never for a rejected
+   * replacement or cursor-only movement.
+   */
+  readonly onChange?: (value: string) => void;
 }
 
 export interface SidebarFieldFactoryResult {
@@ -2042,6 +2048,8 @@ interface DisplayedFormCreateWorkspaceRow {
 interface DisplayedFormTextField {
   readonly formKind: "new" | "edit" | "shortcuts" | "peer-field" | "review-settings";
   readonly formGeneration: number;
+  /** A review-settings edit's view revision (#653): a notice reflowing the pane revokes the frame. */
+  readonly reviewSettingsViewRevision?: number;
   /** Which editor slot was active (shortcut index, network purpose, or review-settings open). */
   readonly slot: string;
   readonly field: SessionHostTextField;
@@ -2229,6 +2237,12 @@ interface ReviewSettingsComponent {
   focused?: boolean;
   /** Optional native pointer seam of a screen with an editable query (#714). */
   handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
+  /**
+   * Optional mandatory disclosure of a confirming screen (#653): the pane
+   * shows it whole as the screen's one notice, and the screen's confirming
+   * action is accepted only from a written frame that shows it.
+   */
+  readonly disclosure?: string;
 }
 
 /** One bounded notice the shared settings transaction reported. */
@@ -2242,6 +2256,16 @@ interface ReviewSettingsNotice {
  * only the current screen, the pending text edit, and bounded notices — never
  * a settings value, option list, or saved config. Closing it settles every
  * outstanding screen/edit promise as a cancel.
+ *
+ * The pane shows ONE notice at a time, chosen from explicit scopes rather
+ * than a history: the result of the latest action wins — the notices reported
+ * since the previous screen or edit opened (for the first screen, the opening
+ * diagnostics), carried to the next one, plus any pane error — error over
+ * warning over info and newest within a type; otherwise the help of the
+ * innermost settings section the screen belongs to (the outermost being the
+ * service's LOCAL target notice). A screen's mandatory disclosure replaces
+ * all of these except an error, and is restored whenever a confirming action
+ * is refused because the frame did not show it.
  */
 interface ReviewSettingsSession {
   readonly id: number;
@@ -2251,15 +2275,32 @@ interface ReviewSettingsSession {
   /** The live `tui.select.confirm` binding: a screen's confirming action. */
   readonly matchesConfirm: (data: string) => boolean;
   screenSequence: number;
-  screen: { readonly id: number; readonly component: ReviewSettingsComponent; readonly settle: (result: string | undefined) => void } | undefined;
+  screen: {
+    readonly id: number;
+    readonly component: ReviewSettingsComponent;
+    readonly settle: (result: string | undefined) => void;
+    /** Notices of the action that opened this screen (reported since the previous screen or edit). */
+    readonly carried: readonly ReviewSettingsNotice[];
+    /** The help of the innermost section running when this screen opened. */
+    readonly context: ReviewSettingsNotice | undefined;
+    /** The screen's mandatory disclosure (a confirming screen's message). */
+    readonly disclosure: ReviewSettingsNotice | undefined;
+    /** The disclosure exceeds what the pane may show whole: the screen is never drawn or confirmed. */
+    readonly disclosureTooLong: boolean;
+    /** Set when a refused confirming action restored the disclosure over an error. */
+    revealed: boolean;
+  } | undefined;
   text: {
     readonly title: string;
     /** Ephemeral UI line shape of this edit (the request's host hint; default multi-line). */
     readonly multiline: boolean;
     fieldGeneration: number;
     readonly settle: (result: string | undefined) => void;
+    /** Notices of the action that opened this edit. */
+    readonly carried: readonly ReviewSettingsNotice[];
   } | undefined;
-  readonly notices: ReviewSettingsNotice[];
+  /** Concise help of the running settings sections, innermost last. */
+  readonly sections: ReviewSettingsNotice[];
   /** Notices reported after the latest screen opened (the result of its action). */
   noticesSinceScreen: ReviewSettingsNotice[];
 }
@@ -2281,6 +2322,8 @@ interface ReviewSettingsCandidate {
   readonly signature: string;
   readonly token: number;
   written: boolean;
+  /** True when this frame shows the screen's mandatory disclosure (or the screen has none). */
+  readonly disclosed: boolean;
 }
 
 /** The drawn review-settings frame Main pairs with its writer receipt. */
@@ -2291,6 +2334,10 @@ export interface SidebarReviewSettingsPresentation {
 }
 
 const REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS = 600;
+/** A confirmation's disclosure is shown whole, never shortened: a larger, still bounded, budget. */
+const REVIEW_SETTINGS_DISCLOSURE_MAX_CODEPOINTS = 2000;
+const REVIEW_SETTINGS_DRAW_FAILED_NOTICE = "This settings screen could not be drawn";
+const REVIEW_SETTINGS_DISCLOSURE_TOO_LONG_NOTICE = "This confirmation's disclosure exceeds the display limit and cannot be confirmed here";
 const REVIEW_SETTINGS_MAX_NOTICES = 6;
 const REVIEW_SETTINGS_NOT_DRAWN_NOTICE = "Review settings changed or are not completely shown; review the current screen before acting";
 const REVIEW_SETTINGS_SAVE_MATCH = (data: string): boolean => matchesKey(data, "ctrl+s");
@@ -2532,7 +2579,7 @@ function mouseAuthorizationKey(
     // belong to this identity, so typing, scrolling, wrapping, completion, or a
     // resize needs its own written boundary before a press can place a caret.
     formTextField: formTextField === undefined ? null : [
-      formTextField.formKind, formTextField.formGeneration, formTextField.slot,
+      formTextField.formKind, formTextField.formGeneration, formTextField.slot, formTextField.reviewSettingsViewRevision ?? null,
       formTextField.cols, formTextField.rows, regionIdentity(formTextField.region), formTextField.frameKey,
     ],
     savedQuery: savedQuery === undefined ? null : [
@@ -6267,6 +6314,7 @@ export class SidebarController {
     this.formTextFieldDisplay = Object.freeze({
       formKind,
       formGeneration: this.formGeneration,
+      ...(formKind === "review-settings" ? { reviewSettingsViewRevision: this.reviewSettingsViewRevision } : {}),
       slot: this.formTextFieldSlot(),
       field,
       cols,
@@ -6314,7 +6362,8 @@ export class SidebarController {
       || this.pendingShortcutSave !== undefined) return false;
     // A review-settings value (#653) is a caret target only while its own open
     // edit still owns this exact field generation.
-    if (shown.formKind === "review-settings" && !this.reviewSettingsTextOwnsField()) return false;
+    if (shown.formKind === "review-settings" && (!this.reviewSettingsTextOwnsField()
+      || shown.reviewSettingsViewRevision !== this.reviewSettingsViewRevision)) return false;
     if (this.formPasteActive || this.formPasteCarry.length > 0) return false;
     if (this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) return false;
     if (typeof field.mouseFrameKey !== "function" || field.mouseFrameKey() !== shown.frameKey) return false;
@@ -11598,6 +11647,7 @@ export class SidebarController {
     } catch {
       keybindings = defaultReviewSettingsKeybindings("Native keybindings are unavailable; using Pi's default keys");
     }
+    const menuTuiHost = createSidebarMenuTuiHost(keybindings.manager);
     const session: ReviewSettingsSession = {
       id: ++this.reviewSettingsSequence,
       closed: false,
@@ -11607,7 +11657,7 @@ export class SidebarController {
       screenSequence: 0,
       screen: undefined,
       text: undefined,
-      notices: [],
+      sections: [],
       noticesSinceScreen: [],
     };
     this.formKind = "review-settings";
@@ -11622,7 +11672,8 @@ export class SidebarController {
       custom: (factory) => this.reviewSettingsCustom(session, factory),
       editText: (request) => this.reviewSettingsEditText(session, request),
       notify: (message, type) => this.reviewSettingsNotify(session, message, type),
-      menuTuiHost: createSidebarMenuTuiHost(keybindings.manager),
+      sectionHelp: { section: (summary, run) => this.reviewSettingsSection(session, summary, run) },
+      menuTuiHost,
     });
     this.onInvalidate?.();
     let opened: Promise<void>;
@@ -11685,7 +11736,8 @@ export class SidebarController {
     const previous = session.screen;
     session.screen = undefined;
     previous?.settle(undefined);
-    session.noticesSinceScreen = [];
+    const carried = this.takeReviewSettingsCarried(session);
+    const context = session.sections.at(-1);
     return new Promise<string | undefined>((resolve, reject) => {
       const id = ++session.screenSequence;
       let settled = false;
@@ -11723,7 +11775,16 @@ export class SidebarController {
         settle(undefined);
         return;
       }
-      session.screen = { id, component: produced, settle };
+      // A disclosure is shown whole or not at all: a prefix is never presented as complete.
+      const boundedDisclosure = typeof produced.disclosure === "string"
+        ? sanitizeBounded(produced.disclosure, REVIEW_SETTINGS_DISCLOSURE_MAX_CODEPOINTS + 1)
+        : "";
+      const disclosureTooLong = countCodePoints(boundedDisclosure) > REVIEW_SETTINGS_DISCLOSURE_MAX_CODEPOINTS;
+      const disclosureText = boundedDisclosure.trim();
+      const disclosure: ReviewSettingsNotice | undefined = !disclosureTooLong && disclosureText.length > 0
+        ? { text: disclosureText, type: "warning" }
+        : undefined;
+      session.screen = { id, component: produced, settle, carried, context, disclosure, disclosureTooLong, revealed: false };
       this.reviewSettingsViewRevision += 1;
       try {
         if ("focused" in produced) produced.focused = true;
@@ -11743,7 +11804,7 @@ export class SidebarController {
     const previous = session.screen;
     session.screen = undefined;
     previous?.settle(undefined);
-    session.noticesSinceScreen = [];
+    const carried = this.takeReviewSettingsCarried(session);
     return new Promise<string | undefined>((resolve) => {
       let settled = false;
       const settle = (value: string | undefined): void => {
@@ -11761,6 +11822,7 @@ export class SidebarController {
         multiline: request?.options?.multiline !== false,
         fieldGeneration: -1,
         settle,
+        carried,
       };
       session.text = text;
       this.createFormField(typeof request?.currentValue === "string" ? request.currentValue : "");
@@ -11797,13 +11859,75 @@ export class SidebarController {
     const text = sanitizeBounded(typeof message === "string" ? message : "", REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS).trim();
     if (text.length === 0) return;
     const notice: ReviewSettingsNotice = { text, type: type === "warning" || type === "error" ? type : "info" };
-    session.notices.push(notice);
-    if (session.notices.length > REVIEW_SETTINGS_MAX_NOTICES) session.notices.splice(0, session.notices.length - REVIEW_SETTINGS_MAX_NOTICES);
-    session.noticesSinceScreen.push(notice);
-    if (session.noticesSinceScreen.length > REVIEW_SETTINGS_MAX_NOTICES) {
-      session.noticesSinceScreen.splice(0, session.noticesSinceScreen.length - REVIEW_SETTINGS_MAX_NOTICES);
+    pushBoundedNotice(session.noticesSinceScreen, notice);
+    // A restored disclosure set aside only the error that blocked it: a new
+    // error takes the slot again.
+    if (notice.type === "error" && session.screen !== undefined) {
+      session.screen.revealed = false;
+      // The menu's own stale-frame refusal predates this error: it must not win the tie.
+      this.formError = undefined;
     }
+    // The notice may take the pane's one slot and change the screen's or the
+    // field's rows or offsets: no frame drawn before it may authorize an
+    // action or a caret.
+    if (session.screen !== undefined || session.text !== undefined) this.reviewSettingsViewRevision += 1;
     this.onInvalidate?.();
+  }
+
+  /**
+   * The shared section-help port: `summary` is the contextual notice of every
+   * screen opened while `run` runs; settling it restores the enclosing
+   * section's help. Never stacks or replays a notice.
+   */
+  private async reviewSettingsSection<T>(session: ReviewSettingsSession, summary: unknown, run: () => Promise<T>): Promise<T> {
+    const text = sanitizeBounded(typeof summary === "string" ? summary : "", REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS).trim();
+    if (session.closed || this.reviewSettingsSession !== session || text.length === 0) return await run();
+    const frame: ReviewSettingsNotice = { text, type: "info" };
+    session.sections.push(frame);
+    try {
+      return await run();
+    } finally {
+      const index = session.sections.lastIndexOf(frame);
+      if (index >= 0) session.sections.splice(index);
+    }
+  }
+
+  /**
+   * Opens the next screen or edit's action scope: the notices reported since
+   * the previous one (or since the open, for the first) become its carried
+   * result, and a fresh scope starts.
+   */
+  private takeReviewSettingsCarried(session: ReviewSettingsSession): readonly ReviewSettingsNotice[] {
+    const carried = session.noticesSinceScreen;
+    session.noticesSinceScreen = [];
+    return carried;
+  }
+
+  /**
+   * The ONE notice the pane shows: the latest action's result or pane error
+   * first, then the section help. A screen's disclosure replaces everything
+   * but an error (and that too once revealed). `whole` marks the pane's own
+   * error and a disclosure, which are never shortened.
+   */
+  private reviewSettingsSlot(
+    session: ReviewSettingsSession,
+    screen: ReviewSettingsSession["screen"],
+    paneMessages: readonly ReviewSettingsNotice[],
+  ): ReviewSettingsSlot | undefined {
+    const result = pickReviewSettingsNotice([...(screen?.carried ?? []), ...session.noticesSinceScreen, ...paneMessages]);
+    const disclosure = screen?.disclosure;
+    if (disclosure !== undefined && (screen?.revealed === true || result?.type !== "error")) {
+      return { notice: disclosure, whole: true, disclosure: true };
+    }
+    if (result !== undefined) return { notice: result, whole: paneMessages.includes(result), disclosure: false };
+    // A screen keeps the section help it opened under; between screens the running section's.
+    const context = screen === undefined ? session.sections.at(-1) : screen.context;
+    return context === undefined ? undefined : { notice: context, whole: false, disclosure: false };
+  }
+
+  /** The rows of a slot notice that is never shortened, or undefined when it cannot wrap. */
+  private reviewSettingsWholeLines(slot: ReviewSettingsSlot, cols: number): string[] | undefined {
+    return slot.disclosure ? wrapNoticeLines(slot.notice.text, cols) : wrapHintLines([`! ${slot.notice.text}`], cols);
   }
 
   /** The closed sidebar palette as the settings screens' theme: generated SGR only. */
@@ -11905,13 +12029,43 @@ export class SidebarController {
       }
       return;
     }
-    const save = matchesKey(data, "ctrl+s");
-    const confirm = !cancel && session.matchesConfirm(data);
+    // An oversized disclosure has no No row: Escape always answers No here
+    // (configured Cancel keys that reach the pane still do too), so a way back
+    // never depends on which keys a terminal or host shortcut may shadow.
+    if (screen.disclosureTooLong && matchesKey(data, "escape")) {
+      if (fresh) {
+        this.formEscapeClaimed = true;
+        this.formError = undefined;
+        screen.settle(undefined);
+      }
+      return;
+    }
+    // A confirming (disclosure) screen settles a key bound to Cancel as Cancel
+    // before anything else, Ctrl+S included; every other list gives Confirm
+    // precedence on a shared binding, so that key still needs a written frame.
+    const disclosureCancel = cancel && (screen.disclosure !== undefined || screen.disclosureTooLong);
+    const save = !disclosureCancel && matchesKey(data, "ctrl+s");
+    const confirm = !disclosureCancel && session.matchesConfirm(data);
     if ((save || confirm) && !this.reviewSettingsScreenDrawn(session, screen.id)) {
       // No confirm or save from a frame the operator was not shown: it must be
-      // the current view, completely drawn, and actually written by Main.
-      if (fresh) {
+      // the current view, completely drawn, and actually written by Main. A
+      // new refusal takes the slot again (even over a restored disclosure),
+      // and the frame it replaces can no longer authorize anything.
+      if (fresh && (this.formError !== REVIEW_SETTINGS_NOT_DRAWN_NOTICE || screen.revealed)) {
         this.formError = REVIEW_SETTINGS_NOT_DRAWN_NOTICE;
+        screen.revealed = false;
+        this.reviewSettingsViewRevision += 1;
+        this.onInvalidate?.();
+      }
+      return;
+    }
+    if (confirm && screen.disclosure !== undefined && this.reviewSettingsCandidate?.disclosed !== true) {
+      // A confirming screen's disclosure must be on the written frame: an error
+      // shown in its place is set aside so the next frame shows it again.
+      if (fresh) {
+        screen.revealed = true;
+        this.formError = undefined;
+        this.reviewSettingsViewRevision += 1;
         this.onInvalidate?.();
       }
       return;
@@ -11919,7 +12073,7 @@ export class SidebarController {
     // A fresh Escape is claimed so its held repeat/release cannot also leave
     // the Settings menu or reach the child after this screen closes; a fresh
     // confirm or save is claimed on the cross-focus held-action fence.
-    if (fresh && cancel && matchesKey(data, "escape")) this.formEscapeClaimed = true;
+    if (fresh && cancel && !confirm && matchesKey(data, "escape")) this.formEscapeClaimed = true;
     if (fresh && save) this.reviewSettingsHeldActions.claim(REVIEW_SETTINGS_SAVE_MATCH);
     else if (fresh && confirm) this.reviewSettingsHeldActions.claim(session.matchesConfirm);
     if (fresh) this.formError = undefined;
@@ -11949,10 +12103,11 @@ export class SidebarController {
    * pane and keeps no action authority.
    *
    * The screen is rendered for the rows the pane can give it (#653), so the
-   * shared lists use the pane's height instead of the popup's ten rows. Notices
-   * first keep up to half of that area (whole notices, newest first); the
-   * screen gets the rest, and any rows a shorter screen leaves go back to
-   * notices under the unchanged whole-notice policy.
+   * shared lists use the pane's height instead of the popup's ten rows. The
+   * ONE selected notice (see {@link ReviewSettingsSession}) first keeps up to
+   * half of that area; the screen gets the rest, and any rows a shorter
+   * screen leaves go back to that notice. The pane's own error is never
+   * shortened: it takes its whole rows or the pane is too small.
    */
   private renderReviewSettingsPane(
     cols: number,
@@ -11965,14 +12120,24 @@ export class SidebarController {
     const header = " Review settings (local) ";
     if (session === undefined || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
     if (session.text !== undefined && this.formField !== undefined) {
-      return this.renderReviewSettingsTextPane(session.text.title, session.text.multiline, header, cols, rows);
+      return this.renderReviewSettingsTextPane(session, session.text, header, cols, rows);
     }
-    const footerLines = wrapHintLines([`${this.toggleLabel} toggle`, "nothing is saved until Save"], cols);
-    const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
-    if (footerLines === undefined || errorLines === undefined) return this.renderTooSmall(cols, rows);
     const screen = session.screen;
-    // Rows for the screen and the notices between the header, any error, and the footer.
-    const area = rows - 1 - errorLines.length - footerLines.length;
+    const footerLines = wrapHintLines([
+      `${this.toggleLabel} toggle`,
+      // An oversized disclosure draws no list or key hints: name the key that answers No.
+      ...(screen?.disclosureTooLong === true ? ["escape go back"] : []),
+      "nothing is saved until Save",
+    ], cols);
+    if (footerLines === undefined) return this.renderTooSmall(cols, rows);
+    const paneError: ReviewSettingsNotice[] = this.formError === undefined ? [] : [{ text: this.formError, type: "error" }];
+    let slot: ReviewSettingsSlot | undefined = screen?.disclosureTooLong === true
+      ? { notice: { text: REVIEW_SETTINGS_DISCLOSURE_TOO_LONG_NOTICE, type: "error" }, whole: true, disclosure: false }
+      : this.reviewSettingsSlot(session, screen, paneError);
+    let wholeLines = slot?.whole === true ? this.reviewSettingsWholeLines(slot, cols) : [];
+    if (wholeLines === undefined) return this.renderTooSmall(cols, rows);
+    // Rows for the screen and the notice between the header and the footer.
+    const area = rows - 1 - wholeLines.length - footerLines.length;
     let body: string[];
     let drawable = false;
     // True only when sanitizing kept every visible cell of every screen row, so
@@ -11980,9 +12145,14 @@ export class SidebarController {
     let columnsPreserved = false;
     if (screen === undefined) {
       body = [session.screenSequence === 0 ? "Loading local review settings..." : "Working..."];
+    } else if (screen.disclosureTooLong) {
+      // Nothing to authorize: no list, no candidate; Cancel answers No.
+      body = [];
     } else {
       try {
-        const reserved = area <= 0 ? 0 : this.reviewSettingsNoticeLines(session, cols, Math.floor(area / 2)).length;
+        const reserved = area <= 0 || slot === undefined || slot.whole
+          ? 0
+          : this.reviewSettingsNoticeLines(slot.notice, cols, Math.floor(area / 2)).length;
         const maxRows = Math.max(0, area - reserved);
         const rendered = session.keybindings.run(() => screen.component.render(cols, maxRows));
         body = rendered.map((line) => sanitizeReviewSettingsLine(typeof line === "string" ? line : ""));
@@ -11990,17 +12160,19 @@ export class SidebarController {
           && visibleWidth(line) <= cols && visibleWidth(body[index] ?? "") === visibleWidth(line));
         drawable = true;
       } catch {
-        body = ["! This settings screen could not be drawn"];
+        // The failure is the pane's one notice; the screen keeps no authority.
+        body = [];
+        slot = { notice: { text: REVIEW_SETTINGS_DRAW_FAILED_NOTICE, type: "error" }, whole: true, disclosure: false };
+        wholeLines = this.reviewSettingsWholeLines(slot, cols);
+        if (wholeLines === undefined) return this.renderTooSmall(cols, rows);
       }
     }
-    const fixed = 1 + errorLines.length + body.length + footerLines.length;
+    const fixed = 1 + wholeLines.length + body.length + footerLines.length;
     if (fixed > rows) return this.renderTooSmall(cols, rows);
-    const noticeLines = this.reviewSettingsNoticeLines(session, cols, rows - fixed);
+    const noticeLines = slot === undefined ? [] : slot.whole ? wholeLines : this.reviewSettingsNoticeLines(slot.notice, cols, rows - fixed);
     const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
-    for (const notice of noticeLines) {
-      lines.push(wrapRow(notice.line, cols, this.paint(notice.type === "info" ? "secondary" : "error")));
-    }
-    for (const line of errorLines) lines.push(wrapRow(line, cols, this.paint("error")));
+    const noticeRole = slot?.disclosure === true ? undefined : slot?.notice.type === "info" ? "secondary" : "error";
+    for (const line of noticeLines) lines.push(noticeRole === undefined ? wrapRow(line, cols) : wrapRow(line, cols, this.paint(noticeRole)));
     const bodyTop = lines.length;
     for (const line of body) lines.push(wrapRow(line, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
@@ -12021,6 +12193,7 @@ export class SidebarController {
           signature,
           token: this.reviewSettingsTokenSequence++,
           written: false,
+          disclosed: screen.disclosure === undefined || slot?.disclosure === true,
         };
       // The screen's drawn rows, retained only for a component with the
       // optional native pointer seam (#714) and an unaltered column origin.
@@ -12040,41 +12213,34 @@ export class SidebarController {
     return { lines };
   }
 
-  /** Newest notices first, whole notices only, within the rows the screen leaves. */
-  private reviewSettingsNoticeLines(
-    session: ReviewSettingsSession,
-    cols: number,
-    budget: number,
-  ): Array<{ readonly line: string; readonly type: ReviewSettingsNotice["type"] }> {
-    const picked: Array<Array<{ readonly line: string; readonly type: ReviewSettingsNotice["type"] }>> = [];
-    let used = 0;
-    for (let index = session.notices.length - 1; index >= 0 && used < budget; index -= 1) {
-      const notice = session.notices[index]!;
-      const wrapped = wrapNoticeLines(`${notice.type === "info" ? "" : "! "}${notice.text}`, cols);
-      if (used + wrapped.length > budget) {
-        // The newest notice is never dropped entirely: it keeps as many leading
-        // rows as fit, and its last kept row says that it continues.
-        if (picked.length === 0) {
-          const kept = wrapped.slice(0, budget);
-          kept[kept.length - 1] = truncateToWidth(`${kept[kept.length - 1]}...`, cols, "...");
-          picked.unshift(kept.map((line) => ({ line, type: notice.type })));
-        }
-        break;
-      }
-      picked.unshift(wrapped.map((line) => ({ line, type: notice.type })));
-      used += wrapped.length;
-    }
-    return picked.flat();
+  /**
+   * The selected notice within the rows the screen leaves: whole when it fits,
+   * otherwise as many leading rows as fit, the last saying that it continues.
+   */
+  private reviewSettingsNoticeLines(notice: ReviewSettingsNotice, cols: number, budget: number): string[] {
+    if (budget <= 0) return [];
+    const wrapped = wrapNoticeLines(`${notice.type === "info" ? "" : "! "}${notice.text}`, cols);
+    if (wrapped.length <= budget) return wrapped;
+    const kept = wrapped.slice(0, budget);
+    kept[kept.length - 1] = truncateToWidth(`${kept[kept.length - 1]}...`, cols, "...");
+    return kept;
   }
 
-  /** One settings text edit in the shared field, unclipped in value; multi-line unless hinted one line. */
+  /**
+   * One settings text edit in the shared field, unclipped in value; multi-line
+   * unless hinted one line. Its ONE notice is the latest action's result or the
+   * field's own warning/error (error over warning over info, newest within a
+   * type); the field's own messages are never shortened, and a carried result
+   * keeps the field its minimum rows. No section help repeats here.
+   */
   private renderReviewSettingsTextPane(
-    title: string,
-    multiline: boolean,
+    session: ReviewSettingsSession,
+    text: NonNullable<ReviewSettingsSession["text"]>,
     header: string,
     cols: number,
     rows: number,
   ): { lines: string[]; cursor?: { column: number; row: number } } {
+    const { title, multiline } = text;
     const field = this.formField;
     if (field === undefined) return this.renderTooSmall(cols, rows);
     const titleLines = wrapNoticeLines(title, cols);
@@ -12086,10 +12252,25 @@ export class SidebarController {
       `${this.formHints.externalEditor} external editor`,
       `${this.formHints.clear} clear`,
     ], cols);
-    const messages = [this.formNotice, this.formError]
-      .filter((message): message is string => typeof message === "string" && message.trim().length > 0);
-    const noticeLines = messages.flatMap((message) => wrapNoticeLines(`! ${message}`, cols));
     if (footerLines === undefined) return this.renderTooSmall(cols, rows);
+    // The field's own messages, as fresh objects so the pick below can tell them apart.
+    const fieldNotice: ReviewSettingsNotice | undefined = typeof this.formNotice === "string" && this.formNotice.trim().length > 0
+      ? { text: this.formNotice, type: "warning" }
+      : undefined;
+    const fieldError: ReviewSettingsNotice | undefined = typeof this.formError === "string" && this.formError.trim().length > 0
+      ? { text: this.formError, type: "error" }
+      : undefined;
+    // Oldest first: the carried result, the field's notice, later results, the field's error.
+    const picked = pickReviewSettingsNotice([
+      ...text.carried,
+      ...(fieldNotice === undefined ? [] : [fieldNotice]),
+      ...session.noticesSinceScreen,
+      ...(fieldError === undefined ? [] : [fieldError]),
+    ]);
+    const fieldOwned = picked !== undefined && (picked === fieldNotice || picked === fieldError);
+    const noticeLines = picked === undefined ? []
+      : fieldOwned ? wrapNoticeLines(`! ${picked.text}`, cols)
+        : this.reviewSettingsNoticeLines(picked, cols, rows - 1 - titleLines.length - footerLines.length - 3);
     const fieldRows = rows - 1 - titleLines.length - noticeLines.length - footerLines.length;
     if (fieldRows < 3) return this.renderTooSmall(cols, rows);
     const frame = field.render(cols, fieldRows);
@@ -12098,7 +12279,8 @@ export class SidebarController {
     if (fieldLines === undefined) return this.renderTooSmall(cols, rows);
     const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     for (const line of titleLines) lines.push(wrapRow(line, cols, this.paint("accent")));
-    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("error")));
+    const noticeRole = picked?.type === "info" && !fieldOwned ? "secondary" : "error";
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint(noticeRole)));
     const fieldTop = lines.length;
     lines.push(...fieldLines);
     // The shared #714 caret route: this complete render's field region.
@@ -12445,9 +12627,20 @@ export class SidebarController {
         if (this.formKind === "review-settings") this.settleReviewSettingsText(undefined);
         else this.escapeFromForm();
       },
+      onChange: () => {
+        // #653: a review-settings field's rejection is that pane's one error;
+        // an accepted changed value supersedes it, and the reflowed pane
+        // revokes any frame drawn before.
+        if (generation !== this.formGeneration || !this.reviewSettingsTextOwnsField()) return;
+        this.reviewSettingsViewRevision += 1;
+        if (this.formError === undefined) return;
+        this.formError = undefined;
+        this.onInvalidate?.();
+      },
       onReject: (reason) => {
         if (generation === this.formGeneration) {
           this.formError = fieldRejectionNotice(reason);
+          if (this.formKind === "review-settings") this.reviewSettingsViewRevision += 1;
           this.onInvalidate?.();
         }
       },
@@ -12473,6 +12666,7 @@ export class SidebarController {
                   kind: "text", multiline: fieldOptions.multiline === true, initialText,
                   onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
                   onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
+                  onChange: fieldOptions.onChange,
                 })
                 : createSessionHostTextField({
                 kind: "name", initialText, onInvalidate: fieldOptions.onInvalidate,
@@ -17101,6 +17295,32 @@ const REVIEW_SETTINGS_THEME_ROLES: ReadonlyMap<string, SidebarThemeRole> = new M
 ]);
 
 /** The pinned default keybindings when Main supplies no native reader. */
+const REVIEW_SETTINGS_NOTICE_RANK: Readonly<Record<ReviewSettingsNotice["type"], number>> = { info: 0, warning: 1, error: 2 };
+
+/** The review-settings pane's one notice and how it is drawn. */
+interface ReviewSettingsSlot {
+  readonly notice: ReviewSettingsNotice;
+  /** Never shortened: the rows it needs, or the pane is too small. */
+  readonly whole: boolean;
+  /** The screen's mandatory disclosure. */
+  readonly disclosure: boolean;
+}
+
+/** Error over warning over info; the newest (last) of the highest type. */
+function pickReviewSettingsNotice(notices: readonly ReviewSettingsNotice[]): ReviewSettingsNotice | undefined {
+  let picked: ReviewSettingsNotice | undefined;
+  for (const notice of notices) {
+    if (picked === undefined || REVIEW_SETTINGS_NOTICE_RANK[notice.type] >= REVIEW_SETTINGS_NOTICE_RANK[picked.type]) picked = notice;
+  }
+  return picked;
+}
+
+/** Append within the per-scope bound, dropping the oldest. */
+function pushBoundedNotice(notices: ReviewSettingsNotice[], notice: ReviewSettingsNotice): void {
+  notices.push(notice);
+  if (notices.length > REVIEW_SETTINGS_MAX_NOTICES) notices.splice(0, notices.length - REVIEW_SETTINGS_MAX_NOTICES);
+}
+
 function defaultReviewSettingsKeybindings(notice?: string): SidebarMenuKeybindings {
   const manager = getKeybindings() as unknown as SidebarMenuKeybindings["manager"];
   return { manager, run: (operation) => operation(), ...(notice === undefined ? {} : { notice }) };

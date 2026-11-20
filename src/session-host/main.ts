@@ -10157,6 +10157,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         onSubmit: options.onSubmit,
         onCancel: options.onCancel,
         onReject: options.onReject,
+        onChange: options.onChange,
         onExternalEditor: startExternalEditor,
       };
       // `plain` is a REMOTE New form's workspace: canonical owner text with the

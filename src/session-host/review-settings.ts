@@ -125,27 +125,46 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
   });
 
   const target = resolve(configPath);
-  notify(ui, beforePersist
+  const targetNotice = beforePersist
     ? `Editing LOCAL review-gate settings for this host. No config exists yet; showing defaults. Save creates ${target}; Cancel leaves it absent. Running sessions are not changed.`
-    : `Editing LOCAL review-gate settings for this host: ${target}. Saving changes this file for every session that loads it; running sessions are not changed.`, "info");
-  for (const warning of loaded.warnings ?? []) notify(ui, `review gate: ${bounded(warning)}`, "warning");
-  if (loaded.toolProtectionError !== undefined) {
-    notify(ui, `review gate: saved tool-protection settings are invalid: ${bounded(loaded.toolProtectionError)}`, "warning");
-  }
-  for (const warning of catalog.warnings) notify(ui, `review gate: settings catalog: ${bounded(warning)}`, "warning");
+    : `Editing LOCAL review-gate settings for this host: ${target}. Saving changes this file for every session that loads it; running sessions are not changed.`;
+  // The LOCAL target is the base section of the whole open: a host without the
+  // section-help port receives it as the same first (guarded) info notice as
+  // before; the sidebar keeps it as the notice every screen outside a deeper
+  // section returns to, while the opening diagnostics below are the first
+  // screen's result.
+  const section = ui.settingsSectionHelp;
+  const withTarget = typeof section?.section === "function"
+    ? (run: () => Promise<void>) => section.section(targetNotice, run)
+    : async (run: () => Promise<void>) => {
+      notify(ui, targetNotice, "info");
+      await run();
+    };
+  await withTarget(async () => {
+    // Opening diagnostics, ranked by consequence through their explicit type
+    // and order (a single-notice host shows the most severe, newest last):
+    // routine catalog guidance first, then config-load warnings, then the
+    // fail-closed tool-protection error — saved protection that does not load
+    // blocks protected calls until a valid apply, so it is an error.
+    for (const warning of catalog.warnings) notify(ui, `review gate: settings catalog: ${bounded(warning)}`, "warning");
+    for (const warning of loaded.warnings ?? []) notify(ui, `review gate: ${bounded(warning)}`, "warning");
+    if (loaded.toolProtectionError !== undefined) {
+      notify(ui, `review gate: saved tool-protection settings are invalid: ${bounded(loaded.toolProtectionError)}`, "error");
+    }
 
-  ui.cwd = input.cwd;
-  const tools = catalog.tools;
-  // The outcome (and any saved config) is intentionally dropped: the next
-  // open re-reads the disk.
-  await runPersistedReviewSettings({
-    config,
-    configPath,
-    ui,
-    scoped: catalog.scoped,
-    getToolChoices: () => tools,
-    getAuditedToolChoices: () => tools,
-    ...(beforePersist ? { beforePersist } : {}),
+    ui.cwd = input.cwd;
+    const tools = catalog.tools;
+    // The outcome (and any saved config) is intentionally dropped: the next
+    // open re-reads the disk.
+    await runPersistedReviewSettings({
+      config,
+      configPath,
+      ui,
+      scoped: catalog.scoped,
+      getToolChoices: () => tools,
+      getAuditedToolChoices: () => tools,
+      ...(beforePersist ? { beforePersist } : {}),
+    });
   });
 }
 

@@ -13,9 +13,25 @@ import {
 } from "../config";
 import { evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../review-evidence";
 import type { ScopedModelChoice } from "./models";
-import { alignedSettingsRows, notify, type UiContext } from "./ui";
+import { alignedSettingsRows, notify, withSettingsSectionHelp, type SettingsSectionHelp, type UiContext } from "./ui";
 import { effectiveThinkingLevel, selectThinkingLevel, thinkingLevelLabel } from "./thinking";
 import { retainedSelect } from "./menu";
+
+/**
+ * The Review submenu's help (issue #653): the full native description Pi
+ * shows on entry, and the concise summary a single-notice host (the sidebar)
+ * shows instead, pointing to the canonical docs that carry every detail.
+ */
+const REVIEW_SECTION_HELP: SettingsSectionHelp = {
+  full: "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.",
+  summary: "Review: automatic primary/subtask review toggles, landed-change inclusion, and one reviewer set per layer. The toggles affect automatic review only. Details: docs/settings.md#review-settings (Reviewers).",
+};
+
+/** The Evidence methods help: full native text and its concise single-notice summary. */
+const EVIDENCE_SECTION_HELP: SettingsSectionHelp = {
+  full: `Evidence methods only — the three scope choices do not disable review, change operating mode, or select reviewers. Each scope is independent. ${WORKSPACE_CHANGES_LABEL} adds whole-workspace snapshot/diff review evidence; ${TOOLS_ONLY_LABEL} omits that whole-workspace evidence. Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access. Mandatory construction, checkpoint, and landing verification is unchanged. Enter cycles the method. Snapshot-failure fallback defaults On and uses ${TOOLS_ONLY_LABEL} when an eligible snapshot capture fails; Off warns that review is disabled for an eligible Primary baseline failure and blocks other failures. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.`,
+  summary: "Evidence methods: Enter cycles each scope's review evidence; these choices never disable review or select reviewers. Details: docs/settings.md#evidence-methods.",
+};
 
 /** Staged state of the Review submenu (issue #175); draft-only until Save. */
 export interface ReviewSectionState {
@@ -56,67 +72,64 @@ export async function selectReviewSection(
     ...(initial.evidence !== undefined ? { evidence: { ...initial.evidence } } : {}),
   };
   const totalChoices = scoped.length + agents.filter(externalAgentSupportsReview).length;
-  await notify(
-    ui,
-    "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.",
-    "info",
-  );
-  // Caller-local last selection for this loop only (issue #140).
-  let lastKey: string | undefined;
-  while (true) {
-    const [primaryRow, subtaskRow, landedRow, primaryReviewersRow, subtaskReviewersRow] = alignedSettingsRows([
-      ["Automatic primary review", state.primaryEnabled ? "On" : "Off"],
-      ["Automatic subtask review", state.subtaskEnabled ? "On" : "Off"],
-      ["Review landed changes", state.reviewLandedChanges
-        ? state.primaryEnabled ? "On" : "On · inactive (automatic primary review is off)"
-        : "Off"],
-      ["Primary reviewers", `${state.primaryReviewers.length}/${totalChoices} selected`],
-      ["Subtask reviewers", `${state.subtaskReviewers.length}/${totalChoices} selected`],
-    ]);
-    const choice = await retainedSelect(ui, {
-      title: "Review",
-      rows: [
-        { key: "primaryToggle", label: primaryRow },
-        { key: "subtaskToggle", label: subtaskRow },
-        { key: "landed", label: landedRow },
-        { key: "primaryReviewers", label: primaryReviewersRow },
-        { key: "subtaskReviewers", label: subtaskReviewersRow },
-        { key: "evidence", label: "Evidence methods" },
-        { key: "back", label: "Back" },
-      ],
-      initialKey: lastKey,
-    });
-    if (!choice || choice === "back") return state;
-    lastKey = choice;
-    if (choice === "evidence") {
-      state.evidence = await selectReviewEvidence(ui, state.evidence ?? effectiveReviewEvidenceSettings({}));
-      continue;
-    }
-    if (choice === "primaryToggle") {
-      state.primaryEnabled = !state.primaryEnabled;
-      continue;
-    }
-    if (choice === "subtaskToggle") {
-      state.subtaskEnabled = !state.subtaskEnabled;
-      continue;
-    }
-    if (choice === "landed") {
-      if (!state.primaryEnabled) {
-        await notify(ui, "Reviewing landed changes is inactive while automatic primary review is off; turn on automatic primary review first.", "info");
+  return await withSettingsSectionHelp(ui, REVIEW_SECTION_HELP, async () => {
+    // Caller-local last selection for this loop only (issue #140).
+    let lastKey: string | undefined;
+    while (true) {
+      const [primaryRow, subtaskRow, landedRow, primaryReviewersRow, subtaskReviewersRow] = alignedSettingsRows([
+        ["Automatic primary review", state.primaryEnabled ? "On" : "Off"],
+        ["Automatic subtask review", state.subtaskEnabled ? "On" : "Off"],
+        ["Review landed changes", state.reviewLandedChanges
+          ? state.primaryEnabled ? "On" : "On · inactive (automatic primary review is off)"
+          : "Off"],
+        ["Primary reviewers", `${state.primaryReviewers.length}/${totalChoices} selected`],
+        ["Subtask reviewers", `${state.subtaskReviewers.length}/${totalChoices} selected`],
+      ]);
+      const choice = await retainedSelect(ui, {
+        title: "Review",
+        rows: [
+          { key: "primaryToggle", label: primaryRow },
+          { key: "subtaskToggle", label: subtaskRow },
+          { key: "landed", label: landedRow },
+          { key: "primaryReviewers", label: primaryReviewersRow },
+          { key: "subtaskReviewers", label: subtaskReviewersRow },
+          { key: "evidence", label: "Evidence methods" },
+          { key: "back", label: "Back" },
+        ],
+        initialKey: lastKey,
+      });
+      if (!choice || choice === "back") return state;
+      lastKey = choice;
+      if (choice === "evidence") {
+        state.evidence = await selectReviewEvidence(ui, state.evidence ?? effectiveReviewEvidenceSettings({}));
         continue;
       }
-      state.reviewLandedChanges = !state.reviewLandedChanges;
-      continue;
+      if (choice === "primaryToggle") {
+        state.primaryEnabled = !state.primaryEnabled;
+        continue;
+      }
+      if (choice === "subtaskToggle") {
+        state.subtaskEnabled = !state.subtaskEnabled;
+        continue;
+      }
+      if (choice === "landed") {
+        if (!state.primaryEnabled) {
+          await notify(ui, "Reviewing landed changes is inactive while automatic primary review is off; turn on automatic primary review first.", "info");
+          continue;
+        }
+        state.reviewLandedChanges = !state.reviewLandedChanges;
+        continue;
+      }
+      if (choice === "primaryReviewers") {
+        state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped);
+        continue;
+      }
+      if (choice === "subtaskReviewers") {
+        state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
+        continue;
+      }
     }
-    if (choice === "primaryReviewers") {
-      state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped);
-      continue;
-    }
-    if (choice === "subtaskReviewers") {
-      state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
-      continue;
-    }
-  }
+  });
 }
 
 /** Draft-only evidence controls; runtime effects belong to the root apply boundary. */
@@ -125,36 +138,35 @@ async function selectReviewEvidence(
   initial: EffectiveReviewEvidenceSettings,
 ): Promise<EffectiveReviewEvidenceSettings> {
   const evidence = { ...initial };
-  await notify(ui,
-    `Evidence methods only — the three scope choices do not disable review, change operating mode, or select reviewers. Each scope is independent. ${WORKSPACE_CHANGES_LABEL} adds whole-workspace snapshot/diff review evidence; ${TOOLS_ONLY_LABEL} omits that whole-workspace evidence. Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access. Mandatory construction, checkpoint, and landing verification is unchanged. Enter cycles the method. Snapshot-failure fallback defaults On and uses ${TOOLS_ONLY_LABEL} when an eligible snapshot capture fails; Off warns that review is disabled for an eligible Primary baseline failure and blocks other failures. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.`,
-    "info");
-  let lastKey: string | undefined;
-  while (true) {
-    const fields = [
-      ["primaryToolOnly", "Primary / top-level"],
-      ["worktreeToolOnly", "Isolated worktree"],
-      ["inplaceToolOnly", "InPlace"],
-      ["snapshotFailureFallback", "Snapshot-failure fallback"],
-    ] as const;
-    const labels = alignedSettingsRows(fields.map(([field, label]) => [label,
-      field === "snapshotFailureFallback" ? evidence[field] ? "On" : "Off" : evidenceMethodLabel(evidence[field]),
-    ] as const));
-    const choice = await retainedSelect(ui, {
-      title: "Review evidence methods",
-      rows: [...fields.map(([key], index) => ({ key, label: labels[index]! })), { key: "back", label: "Back" }],
-      initialKey: lastKey,
-    });
-    if (!choice || choice === "back") return evidence;
-    const field = fields.find(([key]) => key === choice)?.[0];
-    if (!field) continue;
-    lastKey = field;
-    evidence[field] = !evidence[field];
-    if (field === "primaryToolOnly" && evidence.primaryToolOnly) {
-      await notify(ui,
-        `WARNING: Applying Primary / top-level ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL} clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} retains evidence and establishes a new snapshot baseline.`,
-        "warning");
+  return await withSettingsSectionHelp(ui, EVIDENCE_SECTION_HELP, async () => {
+    let lastKey: string | undefined;
+    while (true) {
+      const fields = [
+        ["primaryToolOnly", "Primary / top-level"],
+        ["worktreeToolOnly", "Isolated worktree"],
+        ["inplaceToolOnly", "InPlace"],
+        ["snapshotFailureFallback", "Snapshot-failure fallback"],
+      ] as const;
+      const labels = alignedSettingsRows(fields.map(([field, label]) => [label,
+        field === "snapshotFailureFallback" ? evidence[field] ? "On" : "Off" : evidenceMethodLabel(evidence[field]),
+      ] as const));
+      const choice = await retainedSelect(ui, {
+        title: "Review evidence methods",
+        rows: [...fields.map(([key], index) => ({ key, label: labels[index]! })), { key: "back", label: "Back" }],
+        initialKey: lastKey,
+      });
+      if (!choice || choice === "back") return evidence;
+      const field = fields.find(([key]) => key === choice)?.[0];
+      if (!field) continue;
+      lastKey = field;
+      evidence[field] = !evidence[field];
+      if (field === "primaryToolOnly" && evidence.primaryToolOnly) {
+        await notify(ui,
+          `WARNING: Applying Primary / top-level ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL} clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} retains evidence and establishes a new snapshot baseline.`,
+          "warning");
+      }
     }
-  }
+  });
 }
 
 export async function selectReviewers(

@@ -40,6 +40,30 @@ export interface UiContext {
   cwd?: string;
   /** Optional root-owned save signal shared with settings menu selectors. */
   saveControl?: SettingsSaveControl;
+  /**
+   * Optional host-only presentation of a section's contextual help (issue
+   * #653). Pi hosts never supply it: they keep the full help as one ordinary
+   * `notify` on entry, exactly as before. See {@link withSettingsSectionHelp}.
+   */
+  settingsSectionHelp?: SettingsSectionHelpPort;
+}
+
+/**
+ * A host whose settings notices share ONE slot (the session-host sidebar)
+ * shows `summary` as the contextual notice of every screen `run` opens and
+ * restores its previous notice once `run` settles. It never stores or
+ * replays settings values.
+ */
+export interface SettingsSectionHelpPort {
+  section<T>(summary: string, run: () => Promise<T>): Promise<T>;
+}
+
+/** One settings section's help: the full native description and its concise summary. */
+export interface SettingsSectionHelp {
+  /** Shown through `notify` on entry by every host without the port (Pi). */
+  readonly full: string;
+  /** Shown instead by a host with the port; points to the canonical docs for the details. */
+  readonly summary: string;
 }
 
 export function alignedSettingsRows(entries: ReadonlyArray<readonly [label: string, value: string]>): string[] {
@@ -61,4 +85,22 @@ export function formatByteSize(bytes: number): string {
 
 export async function notify(ui: UiContext, message: string, type: "info" | "warning" | "error"): Promise<void> {
   ui.notify?.(message, type);
+}
+
+/**
+ * Run one settings section with its contextual help. Without the host port
+ * this is the unchanged native flow: one `notify` of the full help, then the
+ * section.
+ */
+export async function withSettingsSectionHelp<T>(
+  ui: UiContext,
+  help: SettingsSectionHelp,
+  run: () => Promise<T>,
+): Promise<T> {
+  const port = ui.settingsSectionHelp;
+  if (typeof port?.section !== "function") {
+    await notify(ui, help.full, "info");
+    return await run();
+  }
+  return await port.section(help.summary, run);
 }

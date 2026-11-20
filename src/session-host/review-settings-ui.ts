@@ -7,7 +7,8 @@
  * list, no menu definition, and no IO. It composes the structural
  * {@link UiContext} that transaction takes from three primitives the sidebar
  * supplies — its own in-pane `custom` screen host, its shared
- * SessionHostTextField (`editText`), and a bounded notice sink — plus a
+ * SessionHostTextField (`editText`), and a bounded notice sink with its
+ * optional single-slot section help — plus a
  * {@link MenuTuiHost} built from this project's pinned `pi-session-host-tui`
  * components, supplied per UI (never through the process-global
  * `setMenuTuiHost` test seam).
@@ -22,7 +23,10 @@
  * `select` and `confirm` are small list screens on the same `custom` host and
  * the same pinned SelectList. They never latch a save; a confirm defaults to
  * No, and a cancel (or an aborted pane) is always No. Like the shared menus,
- * their list follows the rows the pane measured for the screen.
+ * their list follows the rows the pane measured for the screen. A confirm's
+ * message is the screen's mandatory `disclosure` metadata: the pane shows it
+ * whole as the screen's one notice and accepts Yes only from a written frame
+ * that shows it.
  */
 import {
   Container,
@@ -47,7 +51,7 @@ import {
   type MenuTuiHost,
 } from "../settings/menu";
 import type { SettingTextEditor } from "../settings/text-input";
-import type { UiContext } from "../settings/ui";
+import type { SettingsSectionHelpPort, UiContext } from "../settings/ui";
 
 /** The live native keybinding manager surface the sidebar's settings screens use. */
 export interface SidebarMenuKeybindingsManager {
@@ -85,6 +89,8 @@ export interface SidebarReviewSettingsUiPorts {
   custom(factory: MenuCustomFactory): Promise<string | undefined>;
   editText: SettingTextEditor;
   notify(message: string, type?: "info" | "warning" | "error"): void;
+  /** The pane's single contextual-notice slot for a running settings section (#653). */
+  sectionHelp?: SettingsSectionHelpPort;
   menuTuiHost: MenuTuiHost;
 }
 
@@ -123,6 +129,7 @@ export function createSidebarReviewSettingsUi(ports: SidebarReviewSettingsUiPort
     custom: (factory) => ports.custom(factory),
     editText: (request) => ports.editText(request),
     notify: (message, type) => ports.notify(message, type),
+    ...(ports.sectionHelp !== undefined ? { settingsSectionHelp: ports.sectionHelp } : {}),
     select: (title, options) => listScreen(ui, ports.menuTuiHost, {
       title,
       rows: options.map((option) => ({ value: option, label: option })),
@@ -159,7 +166,8 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
       if (isChrome) chrome.push(part);
     };
     add(new host.Text(menuRenderTheme.titleText(theme, input.title), 1, 0));
-    if (input.message !== undefined && input.message.length > 0) add(new host.Text(input.message, 1, 0));
+    // The message is not drawn here: it is the pane's single notice (#653).
+    const disclosure = input.message !== undefined && input.message.length > 0 ? input.message : undefined;
     const items = [...input.rows];
     const viewport = createMenuListViewport({
       host,
@@ -182,6 +190,7 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
     add(viewport.component, false);
     add(new host.Text(`${host.rawKeyHint?.("↑↓", "navigate") ?? "↑↓ navigate"} · ${host.keyHint?.("tui.select.confirm", "select") ?? "enter select"} · ${host.keyHint?.("tui.select.cancel", "cancel") ?? "esc cancel"}`, 1, 0));
     return {
+      ...(disclosure !== undefined ? { disclosure } : {}),
       // The sidebar pane passes the rows it measured for this screen (#653).
       render: (width: number, maxRows?: number): string[] => {
         fitMenuListViewport(viewport, width, maxRows, chrome);
@@ -195,7 +204,16 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
         if (consumeMenuActionFence(ui.saveControl, data)) return;
         if (isKeyRelease(data)) return;
         if (isKeyRepeat(data) && (confirmMatch(data) || cancelMatch(data))) return;
-        // A list screen never saves: the save chord is inert here.
+        // The pane forwards Cancel without requiring a written disclosure and
+        // treats a key bound to both as Cancel; SelectList would check Confirm
+        // first, so a disclosure screen settles that key as Cancel (No) here —
+        // before the save chord, which may itself be the configured Cancel.
+        if (disclosure !== undefined && cancelMatch(data)) {
+          claimMenuAction(ui.saveControl, cancelMatch);
+          close(undefined);
+          return;
+        }
+        // A list screen never saves: Ctrl+S is inert unless it answered No above.
         if (host.matchesCtrlS?.(data) === true) return;
         if (confirmMatch(data)) claimMenuAction(ui.saveControl, confirmMatch);
         else if (cancelMatch(data)) claimMenuAction(ui.saveControl, cancelMatch);

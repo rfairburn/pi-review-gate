@@ -2230,9 +2230,10 @@ type SidebarFormKind =
 interface ReviewSettingsComponent {
   /**
    * `maxRows` is the pane's measured screen area (#653): the shared settings
-   * lists size themselves to it; any other component ignores it.
+   * lists size themselves to it; any other component ignores it. The rows
+   * may be the component's own cached array: the pane only reads them.
    */
-  render(width: number, maxRows?: number): string[];
+  render(width: number, maxRows?: number): readonly string[];
   handleInput(data: string): void;
   invalidate?(): void;
   focused?: boolean;
@@ -12737,7 +12738,7 @@ export class SidebarController {
       body = [session.screenSequence === 0 ? "Loading local review settings..." : "Working..."];
     } else {
       try {
-        let rendered: unknown[] | undefined;
+        let rendered: readonly unknown[] | undefined;
         // First the whole notice beside the screen at the smallest size it
         // renders completely in: when both fit, nothing is clipped and the
         // screen's list takes every remaining row.

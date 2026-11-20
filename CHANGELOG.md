@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.303]
+## [0.1.0-dev.304]
 
 ### Added
 
@@ -71,6 +71,20 @@ dates.
   press, motion, and release are never forwarded, and no selection, subscription, permission, or
   Remote input/copy setting changes. Later input keeps the existing remote input/copy rules. See
   [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+
+## [0.1.0-dev.303]
+
+### Changed
+
+- **Support Pi 1.6.0 as the managed default (#725)**: the launcher's provisioned
+  fallback, shipped TUI dependency, and locked native test runtimes move from
+  Pi 1.5.2 to 1.6.0. Pi and Node support floors, explicit older selections,
+  and installed-runtime precedence are unchanged. Sidebar text fields no longer
+  write into editor-owned render arrays, preserving caret behavior when a
+  component reuses its output. The clipboard adapter recognizes bundled Pi
+  1.6.0 after verifying its native copy producer, provenance, and encoded size
+  bound; previously audited releases stay supported and unverified releases
+  still fail closed.
 
 ## [0.1.0-dev.302]
 

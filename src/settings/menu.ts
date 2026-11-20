@@ -363,9 +363,13 @@ export function fitMenuListViewport(
   viewport.fit(bound - used);
 }
 
-/** Rendered rows of one menu part, tolerating a part that cannot render. */
-export function menuPartRows(component: unknown, width: number): string[] {
-  const render = (component as { render?: (width: number) => string[] } | undefined)?.render;
+/**
+ * Rendered rows of one menu part, tolerating a part that cannot render. A Pi
+ * component may return its own cached array, so the rows are borrowed: callers
+ * only measure or copy them and never rewrite a row.
+ */
+export function menuPartRows(component: unknown, width: number): readonly string[] {
+  const render = (component as { render?: (width: number) => readonly string[] } | undefined)?.render;
   if (typeof render !== "function") return [];
   try {
     const lines = render.call(component, width);
@@ -394,7 +398,12 @@ export interface MenuInput {
 /** The pi-tui Container surface this adapter builds into. */
 export interface MenuContainer {
   addChild(component: unknown): void;
-  render(width: number): string[];
+  /**
+   * Pi's Container keeps one cached array across frames and declares it
+   * read-only, so this adapter treats it as borrowed: the render slot below
+   * hands it through unchanged and never rewrites a row.
+   */
+  render(width: number): readonly string[];
   invalidate(): void;
 }
 
@@ -720,8 +729,9 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
 
     return {
       // `maxRows` is supplied only by a host that measured its own pane (the
-      // session-host sidebar, #653); a Pi popup renders natively.
-      render: (width: number, maxRows?: number): string[] => {
+      // session-host sidebar, #653); a Pi popup renders natively. The
+      // container's array is borrowed and handed through unchanged.
+      render: (width: number, maxRows?: number): readonly string[] => {
         fitMenuListViewport(viewport, width, maxRows, chrome);
         return container.render(width);
       },

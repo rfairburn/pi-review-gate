@@ -714,14 +714,14 @@ function installedPi(t: TestContext): { packageDir: string; cli: string } | unde
     try {
       const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as { version?: string; bin?: Record<string, string> };
       const bin = manifest.bin?.pi;
-      if (manifest.version === "1.5.2" && typeof bin === "string" && existsSync(join(packageDir, bin))) {
+      if (manifest.version === "1.6.0" && typeof bin === "string" && existsSync(join(packageDir, bin))) {
         return { packageDir, cli: join(packageDir, bin) };
       }
     } catch {
       // try the next install
     }
   }
-  skipOrFail(t, "no installed Pi 1.5.2 for the standalone settings catalog");
+  skipOrFail(t, "no installed Pi 1.6.0 for the standalone settings catalog");
   return undefined;
 }
 

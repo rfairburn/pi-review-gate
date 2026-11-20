@@ -492,7 +492,12 @@ export class SessionHostTextField {
       this.lastAutocompleteMaxVisible = maxVisible;
     }
 
-    const rendered = this.editor.render(cols);
+    // The rows belong to the Editor, not to this adapter. Pi's public Component
+    // contract documents render output as read-only — a component may hand back
+    // the same cached array while nothing changed, and callers must copy before
+    // modifying — so this seam only ever reads it. The body-boundary tag is
+    // removed where each row is consumed below, never written back.
+    const rendered: readonly string[] = this.editor.render(cols);
     // The one row the protected bottom-border hook tagged. Anything other than
     // exactly one tagged row leaves no trustworthy body boundary, so the frame
     // then accepts no caret click at all (keyboard editing is unaffected).
@@ -503,13 +508,12 @@ export class SessionHostTextField {
       if (!source.includes(NATIVE_EDITOR_BODY_END_MARKER)) continue;
       bottomBorderTags += source.split(NATIVE_EDITOR_BODY_END_MARKER).length - 1;
       bottomBorderRow = row;
-      rendered[row] = source.split(NATIVE_EDITOR_BODY_END_MARKER).join("");
     }
     if (bottomBorderTags !== 1 || bottomBorderRow < NATIVE_EDITOR_CONTENT_ROW) bottomBorderRow = -1;
     const lines: string[] = [];
     let cursor: SessionHostFieldRender["cursor"] = { column: 0, row: 0, visible: false };
     for (let row = 0; row < rendered.length && row < rows; row += 1) {
-      const source = rendered[row] ?? "";
+      const source = stripBodyBoundaryMarker(rendered[row] ?? "");
       const markerIndex = source.indexOf(CURSOR_MARKER);
       if (markerIndex >= 0 && !cursor.visible) {
         const beforeMarker = sanitizeSingleLine(stripNativeFakeCursor(source.slice(0, markerIndex)));
@@ -1468,6 +1472,13 @@ function nativeFakeCursorWrappers(): readonly string[] {
   const parts = renderFakeCursor(sentinel).split(sentinel);
   if (parts.length !== 2) return [];
   return parts.filter((part) => part.length > 0 && part.startsWith("\x1b") && part !== CURSOR_MARKER);
+}
+
+/** Remove every body-boundary tag from one borrowed Editor row; the row object itself is never rewritten. */
+function stripBodyBoundaryMarker(source: string): string {
+  return source.includes(NATIVE_EDITOR_BODY_END_MARKER)
+    ? source.split(NATIVE_EDITOR_BODY_END_MARKER).join("")
+    : source;
 }
 
 function stripNativeFakeCursor(source: string): string {

@@ -536,7 +536,7 @@ Raw child OSC 52 is still default-denied on every surface that did not explicitl
 opt into the one hosted provider text-copy sink described below; that sink is the
 only exception, it is scoped to a single owned hosted provider row, and it changes
 nothing about the Pi path below. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
-and 1.5.2 runtimes, the owned Node stdio adapter distinguishes native
+1.5.2, and 1.6.0 runtimes, the owned Node stdio adapter distinguishes native
 clipboard-producer/copy-surface provenance from arbitrary rendered or PTY
 output, without changing Pi's selection or copy callbacks. Input delivery
 captures the reporter's current native session tuple; an asynchronous request

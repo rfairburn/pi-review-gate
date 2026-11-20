@@ -387,8 +387,14 @@ function readManifest(path: string): Record<string, unknown> | null | undefined 
  * frames, the same `_InteractiveMode.handleCopyCommand` bundle alias, and the same
  * 100,000-character encoded OSC 52 bound. Any version outside this set stays
  * `supported: false` and fails closed.
+ *
+ * 1.6.0 was audited against its own published tarball and the upstream `v1.6.0`
+ * tag: its `dist/utils/clipboard.js`, `clipboard-command.js` and `wsl.js`, the
+ * pi-tui selection-copy path, and the external-editor launcher are byte-identical
+ * to 1.5.2, and its own producer and selection frames pass this gate in an owned
+ * Linux child. Its render-caching changes touch none of these entry points.
  */
-const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2"]);
+const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"]);
 
 /** Bounded inspection of the actual CLI's package, never an ambient SDK instance. */
 export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRuntime | undefined {
@@ -458,7 +464,7 @@ export function isNativeClipboardOrigin(
       return path !== undefined && (nativeSource(runtime, frame.scriptName)
         || (runtime.tuiRoot !== undefined && path === join(runtime.tuiRoot, "dist", "tui-alt-screen.js")));
     });
-  // The shipped 1.3.0, 1.4.0, 1.5.0, 1.5.1, and 1.5.2 bundles name their self-referencing class _InteractiveMode;
+  // The shipped 1.3.0, 1.4.0, 1.5.0, 1.5.1, 1.5.2, and 1.6.0 bundles name their self-referencing class _InteractiveMode;
   // the unbundled public SDK uses InteractiveMode. Both were source-verified.
   const mainCopy = frames.some((frame) => (frame.functionName === "InteractiveMode.handleCopyCommand"
     || frame.functionName === "_InteractiveMode.handleCopyCommand") && nativeSource(runtime, frame.scriptName));

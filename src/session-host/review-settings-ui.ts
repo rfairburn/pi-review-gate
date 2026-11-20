@@ -201,7 +201,7 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
     return {
       ...(disclosure !== undefined ? { disclosure } : {}),
       // The sidebar pane passes the rows it measured for this screen (#653).
-      render: (width: number, maxRows?: number): string[] => {
+      render: (width: number, maxRows?: number): readonly string[] => {
         fitMenuListViewport(viewport, width, maxRows, chrome);
         return container.render(width);
       },

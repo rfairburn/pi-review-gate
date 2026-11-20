@@ -86,8 +86,8 @@ import type { NativeClipboardRuntime } from "./native-clipboard";
 
 /**
  * The one launcher this adapter knows: Pi's generic external-editor entry point,
- * present under that exact name in the shipped 1.3.0/1.4.0/1.5.0/1.5.1/1.5.2 bundle chunks and in
- * the unbundled `dist/modes/interactive/external-editor.js`, and always launching
+ * present under that exact name in the shipped 1.3.0/1.4.0/1.5.0/1.5.1/1.5.2/1.6.0
+ * bundle chunks and in the unbundled `dist/modes/interactive/external-editor.js`, and always launching
  * `spawn(command, [...args, file], { stdio: "inherit", shell: <platform shape> })`.
  * It is a Pi function name, never an editor name: whatever `VISUAL`/`EDITOR`/setting
  * resolves to stays opaque. Pi 1.5.0 only added its own user-facing failure message to

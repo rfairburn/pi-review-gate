@@ -334,7 +334,8 @@ interface PopupEditorBox {
 }
 
 interface RenderedMarkdown {
-  lines: string[];
+  /** Borrowed from the native Markdown component's cached rows, or freshly wrapped plain text. */
+  readonly lines: readonly string[];
   native: boolean;
 }
 

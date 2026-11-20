@@ -445,6 +445,7 @@ export async function activateRemoteRosterRow(harness: Harness, hostLabel: strin
  */
 export async function remoteNativeInputHarness(
   t: { after(callback: () => void): void },
+  dependencies: MainTestDependencies = {},
 ): Promise<{
   harness: Harness;
   peer: FakePeerCoordinatorWithContent;
@@ -461,7 +462,7 @@ export async function remoteNativeInputHarness(
       hostRunId: "run-a",
       rows: [remoteRosterRow({ id: "row-a", label: "Alpha remote" })],
     }),
-  ]);
+  ], dependencies);
   const manager = harnessManager(harness);
   fillForm(harness.terminal, "/local/workspace");
   await nextTurn();

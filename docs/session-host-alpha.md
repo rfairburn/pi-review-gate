@@ -2345,14 +2345,19 @@ New still opens its form, Saved its picker, Quit follows its existing
 confirmation rules, and Settings opens the grouped settings menu. These sidebar
 clicks are handled by the host, not forwarded to a native child; existing
 keyboard controls remain available. With the roster focused, a single left click
-inside a currently displayed native Main pane returns keyboard focus to the
-unchanged active Main owner and consumes that first click, including its
+on content currently displayed in the Main pane — a local session or a
+deliberately selected remote viewport alike — returns keyboard focus to that
+unchanged Main owner and consumes that first click, including its motion and
 release. It does not change the sidebar's visibility or selection, activate a
-row, or change any sibling; subsequent typing goes to the same Main owner. This
-applies only when the visible native pane still belongs to the current live
-owner at the displayed geometry. A deliberately selected remote viewport is not
-a local Main owner, so a roster-focused click in that pane is dropped instead of
-becoming a local focus gesture (see
+row, re-select or re-subscribe a remote row, or change any sibling, and no part
+of that click reaches a local child or a remote owner. This applies only when
+the frame actually written to the screen drew that same current source,
+uncovered, at the current geometry, and the click lands on its drawn content
+rather than padding; a remote pane that shows only a host status line is not a
+target. Focus is all the click grants: subsequent typing and pointer input go to
+the same owner under that owner's ordinary rules, so for a remote viewport they
+still pass the [native I/O bridge](#native-input-and-copy)'s written-frame and
+**Remote input/copy** fences and are not forwarded while that setting is off (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)).
 Forms, confirmations, and the narrow sidebar overlay are not native Main click
 targets. Once Main already has focus, mouse input keeps its existing native
@@ -3633,13 +3638,14 @@ native Pi menu will remain readable.
 The native Main mouse path is cell-based and applies only to the active
 native frame; events outside that frame are dropped before coordinate
 translation, never clamped to the pane edge. Sidebar-target clicks are handled
-by the host and are not forwarded to a native child. For a locally displayed
-owner, the first left click in the visible native pane while the roster owns
-focus is consumed to return focus to that active Main owner; subsequent mouse
-input is forwarded normally. A deliberately selected remote viewport never
-focuses or feeds a local child. Its canonical mouse packets reach the remote
-owner only through the [native I/O bridge](#native-input-and-copy), under that
-bridge's written-frame and Remote input/copy fences, and are otherwise dropped.
+by the host and are not forwarded to a native child. For a local owner or a
+selected remote viewport alike, the first left click on the drawn Main content
+while the roster owns focus is consumed to return focus to that same Main owner;
+subsequent mouse input follows that owner's ordinary path. A deliberately
+selected remote viewport never feeds a local child. Its canonical mouse packets
+reach the remote owner only through the [native I/O bridge](#native-input-and-copy),
+under that bridge's written-frame and Remote input/copy fences, and are
+otherwise dropped.
 Only the frame the writer actually committed decides whether the drawn source is
 remote. This does not add conversation wheel/trackpad scrolling (#332). On
 Windows, bundled-ConPTY protocol observations do not certify physical mouse

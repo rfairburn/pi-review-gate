@@ -472,6 +472,16 @@ interface MouseFramePresentation {
    * padded, so positional authority ends where this rectangle ends.
    */
   readonly nativeContent: HostPaneRect | undefined;
+  /**
+   * The uncovered rectangle the selected REMOTE viewport filled in this frame and
+   * the exact subscription that viewport was drawn from, only when the compositor
+   * actually drew that remote source in Main: never for a form-replaced or
+   * overlay-covered pane, a status-only (no-surface) remote frame, or a local row.
+   * It is the remote counterpart of `nativeContent` for the host-owned roster
+   * focus-only click, and never input or copy authority. The publish sequence is
+   * deliberately absent, so ordinary output never revokes it.
+   */
+  readonly remoteContent: RemoteDrawnContent | undefined;
   /** Canonical size/revision the drawn content came from, when the manager reported one. */
   readonly nativeGeometry: CanonicalSessionGeometry | undefined;
   /**
@@ -507,6 +517,26 @@ interface MouseFramePresentation {
    * current fact on each protected attempt.
    */
   readonly nativeInput: WrittenRemoteNativeInput | undefined;
+}
+
+/**
+ * What one frame drew of the selected remote viewport: its rectangle, the
+ * subscription, and the owner's canonical geometry revision. An owner-side
+ * reflow back to the same size is a new revision even when nothing on this
+ * viewer moved.
+ */
+interface RemoteDrawnContent {
+  readonly rect: HostPaneRect;
+  readonly subscriptionId: string;
+  readonly geometryRevision: number;
+}
+
+function sameRemoteDrawnContent(a: RemoteDrawnContent | undefined, b: RemoteDrawnContent | undefined): boolean {
+  return a === undefined
+    ? b === undefined
+    : b !== undefined && a.subscriptionId === b.subscriptionId
+      && a.geometryRevision === b.geometryRevision
+      && samePaneGeometry(a.rect, b.rect);
 }
 
 /**
@@ -830,6 +860,7 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
     ? ""
     : `${value.cols}x${value.rows}@${value.revision}`;
   if (rect(a.nativeContent) !== rect(b.nativeContent)
+    || !sameRemoteDrawnContent(a.remoteContent, b.remoteContent)
     || geometry(a.nativeGeometry) !== geometry(b.nativeGeometry)) return false;
   // The drawn source itself is part of authorization: a different local row, a
   // different remote host/run/row/selection, or a new native conversation epoch
@@ -915,10 +946,18 @@ function sameNativePaneGeometry(a: HostLayout, b: HostLayout): boolean {
     && samePaneGeometry(a.sidebar, b.sidebar);
 }
 
-function sameNativeMouseTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
+/**
+ * The roster-focused frame drew the same ONE Main content source (a live local
+ * owner or the selected remote viewport) in the same uncovered rectangle and pane
+ * geometry as `b`. Shared by the local and remote focus-only click; each source
+ * still proves its own current target separately.
+ */
+function sameMainFocusClickTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   return a.focus === "sidebar" && b.focus === "sidebar"
-    && a.nativeOwnerId !== undefined && a.nativeOwnerId === b.nativeOwnerId
+    && a.contentKey !== undefined && a.contentKey === b.contentKey
+    && a.nativeOwnerId === b.nativeOwnerId
     && samePaneGeometry(a.nativeContent, b.nativeContent)
+    && sameRemoteDrawnContent(a.remoteContent, b.remoteContent)
     && sameNativePaneGeometry(a.layout, b.layout);
 }
 
@@ -1202,18 +1241,33 @@ function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): num
  * abandoned-press fence for that gesture. Both retired fences outlive their
  * gesture only until that button's matching release, a replacement press, or
  * teardown, so a release can never reach a child without its press.
+ *
+ * `"main-focus"` is the roster focus-only click on Main content (local or remote).
+ * Its press was consumed by the host, and the focus change can raise outer
+ * reporting to the owner's own drag/any mode, so unlike ordinary `"host"` press
+ * bookkeeping it is never discarded by the mouse-mode rules: it fences that
+ * button's motion and release until the matching release, a replacement press,
+ * or teardown. `"main-focus-legacy"` is the same fence for a press received in
+ * legacy X10 encoding, whose release never names its button: it also ends once
+ * the anonymous legacy releases account for every button reported down.
  */
 type MouseButtonOwnership =
   | "host"
+  | "main-focus"
+  | "main-focus-legacy"
   | "session"
   | "retired-session"
   | "scrollbar"
   | "retired-scrollbar";
 
-function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
+function mouseButtonId(mouse: ParsedMouseInput, legacyMouse = false): number | undefined {
   if (mouse.wheel) return undefined;
-  const id = mouse.button & 3;
-  return id === 3 ? undefined : id;
+  // Keep the extended-button bit (SGR buttons 8-11) so a side button never
+  // aliases the left/middle/right button it shares low bits with; strip only the
+  // modifier and motion flags. Button code 3 is the unidentified release; only a
+  // legacy packet uses low bits 3 alone (an extended legacy release) for it.
+  const id = mouse.button & 0x83;
+  return id === 3 || (legacyMouse && (id & 3) === 3) ? undefined : id;
 }
 
 function isMouseButtonPress(mouse: ParsedMouseInput): boolean {
@@ -1901,11 +1955,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    *   can reach a local or remote session. The lane moves only the roster's own
    *   list window; it activates nothing.
    * Because a button has exactly one state, a release consumes one entry and no
-   * consumer has to keep overlapping holders synchronized. Only the three
+   * consumer has to keep overlapping holders synchronized. Only the bounded
    * terminal button ids can ever be present, so the derived reads below scan a
    * bounded map rather than maintaining a second session-button mirror.
    */
   const mouseButtonOwnership = new Map<number, MouseButtonOwnership>();
+  // Legacy releases do not name a button. Every observed press is noted (owned
+  // or not) so a legacy focus fence retires only when the anonymous releases
+  // account for all reported buttons, never when an unrelated button might have
+  // ended. This only resolves anonymous releases; it never authorizes routing.
+  const reportedDownButtons = new Set<number>();
+  let anonymousMouseReleases = 0;
+
+  /** True while a legacy-encoded focus-only press still waits for its release. */
+  function hasLegacyMainFocusFence(): boolean {
+    return [...mouseButtonOwnership.values()].includes("main-focus-legacy");
+  }
   /** Main's ONE edge-hold timer for a captured session drag; re-armed only by written frames. */
   let sessionPointerEdgeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -2874,7 +2939,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       useSgr = true;
     }
 
+    // Mode 9 and disabled tracking cannot report releases. While a legacy focus
+    // press still waits for its release, keep release-capable reporting so Main
+    // can retire that fence, then restore the ordinary mode. Capture only: no
+    // packet is forwarded or authorized by this.
+    if ((desiredTracking === undefined || desiredTracking === 9) && hasLegacyMainFocusFence()) {
+      desiredTracking = 1000;
+      useSgr = true;
+    }
+
     if (mouseTrackingMode !== desiredTracking) {
+      // A button reported down before entering a release-less mode can go up
+      // unreported; it must not count against a later legacy focus gesture.
+      if (desiredTracking === undefined || desiredTracking === 9) {
+        reportedDownButtons.clear();
+        anonymousMouseReleases = 0;
+      }
       if (mouseTrackingMode !== undefined) {
         if (!writeOwnedMouseSequence(`\x1b[?${mouseTrackingMode}l`)) return;
         mouseTrackingMode = undefined;
@@ -3097,6 +3177,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           sidebar: sidebar.captureMousePresentation(),
           nativeOwnerId,
           nativeContent: nativeOwnerId === undefined ? undefined : nativeContent,
+          remoteContent: remoteDrawn === undefined
+            ? undefined
+            : {
+              rect: remoteDrawn.rect,
+              subscriptionId: remoteDrawn.view.subscriptionId,
+              geometryRevision: remoteDrawn.view.geometry.revision,
+            },
           nativeGeometry: nativeOwnerId === undefined ? undefined : nativeGeometry,
           contentKey: remoteView !== undefined
             ? remoteDrawn?.view.contentKey
@@ -4971,27 +5058,66 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     }
   }
 
-  function canFocusMainFromNativeClick(
+  /**
+   * The ONE roster focus-only click gate for Main content, local or remote. The
+   * written frame and the latest candidate must agree on the same drawn source,
+   * uncovered rectangle, and pane geometry, the click must land on content that
+   * frame actually drew (padding belongs to the host, #474), and then the drawn
+   * source must still be the current target. This grants focus only: it never
+   * selects, writes, forwards, or proves input authority for either source.
+   */
+  function canFocusMainFromContentClick(
     mouse: ParsedMouseInput,
     presentation: MouseFramePresentation | undefined,
   ): boolean {
     const latest = latestMousePresentation;
-    if (!sidebar || !manager || !presentation || !latest || !layout
+    const currentLayout = layout;
+    if (!sidebar || !presentation || !latest || !currentLayout
       || !sidebar.visible || sidebar.focus !== "sidebar"
-      || !sameNativeMouseTarget(presentation, latest)
-      || !sameNativePaneGeometry(presentation.layout, layout)
-      || localActiveId() !== presentation.nativeOwnerId) return false;
-    // A padded cell belongs to the host, not the child: only a click on content
-    // this row actually drew is a focus gesture (#474).
-    const drawn = presentation.nativeContent;
+      || !sameMainFocusClickTarget(presentation, latest)
+      || !sameNativePaneGeometry(presentation.layout, currentLayout)) return false;
+    const localOwnerId = presentation.nativeOwnerId;
+    const remote = presentation.remoteContent;
+    const drawn = localOwnerId !== undefined ? presentation.nativeContent : remote?.rect;
     if (drawn === undefined || !containsHostPoint(drawn, mouse.x, mouse.y)) return false;
+    if (localOwnerId !== undefined) return localFocusClickTargetIsCurrent(localOwnerId);
+    return remote !== undefined && remoteFocusClickTargetIsCurrent(presentation, remote, currentLayout);
+  }
+
+  /** The drawn local owner is still the active, live row with a surface. */
+  function localFocusClickTargetIsCurrent(ownerId: string): boolean {
+    if (!manager || localActiveId() !== ownerId) return false;
     const view = findActiveView();
-    if (!view || view.id !== presentation.nativeOwnerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
+    if (!view || view.id !== ownerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
     try {
       return manager.surface(view.id) !== undefined;
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The drawn remote viewport is still the deliberately selected one. Proven from
+   * the compositor's own written presentation and the current accepted viewport —
+   * never from the native IO receipt, which depends on Main focus and on this
+   * viewer's Remote input/copy preference: focusing is UI-only and needs neither.
+   * The written frame must post-date any reflow (even a same-size roundtrip), and
+   * the current accepted viewport must be the same host/run/row/selection/
+   * conversation source on the same subscription and canonical geometry revision
+   * and still fill exactly the rectangle that frame drew.
+   */
+  function remoteFocusClickTargetIsCurrent(
+    presentation: MouseFramePresentation,
+    drawn: RemoteDrawnContent,
+    currentLayout: HostLayout,
+  ): boolean {
+    if (presentation.contentSource?.startsWith("remote|") !== true) return false;
+    if (pointerMapsWrittenGeneration !== pointerGeometryGeneration) return false;
+    const view = currentRemoteContentView();
+    if (view === undefined || view.contentKey !== presentation.contentKey
+      || view.subscriptionId !== drawn.subscriptionId
+      || view.geometry.revision !== drawn.geometryRevision) return false;
+    return samePaneGeometry(nativeContentRect(currentLayout.native, view.frame), drawn.rect);
   }
 
   /** Stops Main's ONE edge-hold timer without touching the Sidebar's own state. */
@@ -5278,14 +5404,33 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     const hitLayout = presentation?.layout ?? layout;
     const hitMapPending = presentation === undefined || latestMousePresentation === undefined
       || !sameMouseAuthorization(presentation, latestMousePresentation);
-    const buttonId = mouseButtonId(mouse);
+    const legacyMouse = data.startsWith("\x1b[M");
+    const buttonId = mouseButtonId(mouse, legacyMouse);
+    const press = isMouseButtonPress(mouse);
+    // Press-only mode 9 never reports a release, so its presses are not listed.
+    if (press && buttonId !== undefined && mouseTrackingMode !== 9) {
+      // A new press of a still-listed button accounts for an earlier anonymous release.
+      if (reportedDownButtons.has(buttonId) && anonymousMouseReleases > 0) anonymousMouseReleases -= 1;
+      reportedDownButtons.add(buttonId);
+    } else if (mouse.release && !mouse.wheel) {
+      if (buttonId !== undefined) reportedDownButtons.delete(buttonId);
+      else if (legacyMouse) anonymousMouseReleases += 1;
+      if (anonymousMouseReleases >= reportedDownButtons.size) {
+        reportedDownButtons.clear();
+        anonymousMouseReleases = 0;
+      }
+    }
     // A replacement press of a button whose captured gesture Main already
-    // abandoned ends that stale fence; the new press belongs to whichever route
-    // takes it below.
-    if (isMouseButtonPress(mouse) && buttonId !== undefined
+    // abandoned (or whose focus-only click never reported its release) ends that
+    // stale fence; the new press belongs to whichever route takes it below.
+    if (press && buttonId !== undefined
       && (mouseButtonOwnership.get(buttonId) === "retired-session"
-        || mouseButtonOwnership.get(buttonId) === "retired-scrollbar")) {
+        || mouseButtonOwnership.get(buttonId) === "retired-scrollbar"
+        || mouseButtonOwnership.get(buttonId) === "main-focus"
+        || mouseButtonOwnership.get(buttonId) === "main-focus-legacy")) {
+      const wasLegacyFocus = mouseButtonOwnership.get(buttonId) === "main-focus-legacy";
       mouseButtonOwnership.delete(buttonId);
+      if (wasLegacyFocus) syncOuterMouseModes();
     }
     // A session-card press Main is holding owns its button's motion and release
     // for the whole gesture, wherever the pointer travelled: no fragment of it
@@ -5319,13 +5464,38 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         return;
       }
     }
+    // Legacy releases cannot distinguish an overlapping button from the focus
+    // button. While a focus fence is held, an overlapping legacy press stays
+    // host-owned too, rather than forwarding a press whose release could never be
+    // forwarded safely. Named SGR buttons keep their own route.
+    if (legacyMouse && press && buttonId !== undefined
+      && [...mouseButtonOwnership.values()].some((owner) => owner === "main-focus" || owner === "main-focus-legacy")) {
+      mouseButtonOwnership.set(buttonId, "main-focus-legacy");
+      syncOuterMouseModes();
+      return;
+    }
     if (mouse.release) {
-      if (buttonId !== undefined && mouseButtonOwnership.delete(buttonId)) return;
+      if (buttonId !== undefined) {
+        const wasLegacyFocus = mouseButtonOwnership.get(buttonId) === "main-focus-legacy";
+        if (mouseButtonOwnership.delete(buttonId)) {
+          if (wasLegacyFocus) syncOuterMouseModes();
+          return;
+        }
+      }
       // Legacy X10 release reports button 3 without identifying which button
       // ended; the host can only own this ambiguous release if it owns a press.
-      // A wheel report is not that release, so it never drops a host fence.
+      // A wheel report is not that release, so it never drops a host fence. A
+      // named (SGR) focus press still needs its named release, and a fresh press
+      // of that button clears a stale fence. A legacy focus press ends once the
+      // legacy releases account for every button reported down.
       if (buttonId === undefined && !mouse.wheel && mouseButtonOwnership.size > 0) {
-        mouseButtonOwnership.clear();
+        const hadLegacyFocus = hasLegacyMainFocusFence();
+        for (const [button, owner] of [...mouseButtonOwnership]) {
+          if (owner === "main-focus"
+            || (owner === "main-focus-legacy" && (!legacyMouse || reportedDownButtons.size !== 0))) continue;
+          mouseButtonOwnership.delete(button);
+        }
+        if (hadLegacyFocus && !hasLegacyMainFocusFence()) syncOuterMouseModes();
         return;
       }
     }
@@ -5476,24 +5646,19 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // activate a draw-derived row.
       return;
     }
-    // A written remote viewport is display-only under the explicit-false legacy
-    // seam or while this viewer's remote input/copy preference is Off; otherwise a
-    // Main-focused pointer packet is submitted as one canonical content-space SGR
-    // report for the exact written source. A deliberately selected remote target whose new viewport is not
-    // written yet has no pointer authority either — its packet is refused rather
-    // than reinterpreted as keyboard input or forwarded to a local row. A
-    // roster-focused packet keeps the existing non-activating drop.
-    if (writtenSourceIsRemote() || contentTarget?.kind === "remote") {
-      if (sidebar.focus === "main") routeRemoteMouseInput(mouse);
-      return;
-    }
-    // With the roster focused, a left click in the actually displayed, current
-    // native pane is a focus gesture only. The activation press and its matching
-    // release/motion stay host-owned; no part of that first click reaches Pi.
+    // With the roster focused, a left click on the actually displayed, current
+    // Main content — a live local owner or the selected remote viewport — is a
+    // focus gesture only. The activation press and its matching release/motion
+    // stay host-owned; no part of that first click reaches Pi or the peer, and
+    // selection, owner, and visibility are unchanged.
     if (isLeftMousePress(mouse) && buttonId !== undefined
-      && canFocusMainFromNativeClick(mouse, presentation)) {
+      && canFocusMainFromContentClick(mouse, presentation)) {
+      // Its own fence, not ordinary host-pane bookkeeping: a later layout or
+      // reporting change (for example narrow Main restoring the owner's drag
+      // capture) must not release this press's motion or release to the owner.
+      // Set before the focus change, so any capture sync it triggers sees it.
+      mouseButtonOwnership.set(buttonId, legacyMouse ? "main-focus-legacy" : "main-focus");
       const focused = sidebar.focusMainFromNativeClick();
-      mouseButtonOwnership.set(buttonId, "host");
       if (focused) {
         deliberateActionGeneration += 1;
         reconcileLayout(false);
@@ -5501,6 +5666,17 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       }
       // Even if the focus recheck refuses a raced state change, never replay
       // the click that was evaluated as a host-owned focus gesture.
+      return;
+    }
+    // A written remote viewport is display-only under the explicit-false legacy
+    // seam or while this viewer's remote input/copy preference is Off; otherwise a
+    // Main-focused pointer packet is submitted as one canonical content-space SGR
+    // report for the exact written source. A deliberately selected remote target whose new viewport is not
+    // written yet has no pointer authority either — its packet is refused rather
+    // than reinterpreted as keyboard input or forwarded to a local row. Any other
+    // roster-focused packet keeps the existing non-activating drop.
+    if (writtenSourceIsRemote() || contentTarget?.kind === "remote") {
+      if (sidebar.focus === "main") routeRemoteMouseInput(mouse);
       return;
     }
     // Native mouse packets never reach Pi while a host form, dialog, or roster

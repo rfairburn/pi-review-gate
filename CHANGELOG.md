@@ -62,6 +62,16 @@ dates.
   absolute to every managed child, including a `SessionSpawn` child in another workspace. See
   [Config discovery](docs/configuration.md#config-discovery); unrelated behavior is unchanged.
 
+### Fixed
+
+- **Click-to-focus on a selected remote Main pane (#653)**: with the roster focused (for example
+  after leaving Settings -> Review settings with Escape), a left click on the drawn content of the
+  selected remote viewport now returns focus to that same remote session, exactly as it already did
+  for a local session; it previously required re-activating the card. The click is focus-only: its
+  press, motion, and release are never forwarded, and no selection, subscription, permission, or
+  Remote input/copy setting changes. Later input keeps the existing remote input/copy rules. See
+  [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+
 ## [0.1.0-dev.302]
 
 ### Fixed

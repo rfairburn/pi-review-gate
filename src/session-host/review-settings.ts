@@ -63,9 +63,7 @@ export interface LocalReviewSettingsDependencies {
   loadChoices?: (input: ReviewSettingsCatalogInput) => Promise<ReviewSettingsCatalog>;
 }
 
-const MAX_NOTICE_CHARS = 400;
-
-/** Open the LOCAL review settings once. Never rejects: failures become bounded UI errors. */
+/** Open the LOCAL review settings once. Never rejects: failures become UI errors. */
 export async function openLocalReviewSettings(
   input: LocalReviewSettingsInput,
   dependencies: LocalReviewSettingsDependencies = {},
@@ -74,7 +72,7 @@ export async function openLocalReviewSettings(
   try {
     await openOnce(input, dependencies);
   } catch (error) {
-    notify(ui, `review gate: local review settings failed: ${boundedErrorMessage(error)}`, "error");
+    notify(ui, `review gate: local review settings failed: ${errorMessage(error)}`, "error");
   }
 }
 
@@ -146,10 +144,10 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
     // routine catalog guidance first, then config-load warnings, then the
     // fail-closed tool-protection error — saved protection that does not load
     // blocks protected calls until a valid apply, so it is an error.
-    for (const warning of catalog.warnings) notify(ui, `review gate: settings catalog: ${bounded(warning)}`, "warning");
-    for (const warning of loaded.warnings ?? []) notify(ui, `review gate: ${bounded(warning)}`, "warning");
+    for (const warning of catalog.warnings) notify(ui, `review gate: settings catalog: ${singleLine(warning)}`, "warning");
+    for (const warning of loaded.warnings ?? []) notify(ui, `review gate: ${singleLine(warning)}`, "warning");
     if (loaded.toolProtectionError !== undefined) {
-      notify(ui, `review gate: saved tool-protection settings are invalid: ${bounded(loaded.toolProtectionError)}`, "error");
+      notify(ui, `review gate: saved tool-protection settings are invalid: ${singleLine(loaded.toolProtectionError)}`, "error");
     }
 
     ui.cwd = input.cwd;
@@ -185,13 +183,17 @@ function notify(ui: UiContext, message: string, type: "info" | "warning" | "erro
   }
 }
 
-function bounded(text: string): string {
-  const single = text.replace(/\s+/g, " ").trim();
-  return single.length > MAX_NOTICE_CHARS ? `${single.slice(0, MAX_NOTICE_CHARS - 1)}…` : single;
+/**
+ * One display line of a diagnostic, never shortened (#653): the sidebar wraps
+ * a long notice and offers it whole in its read-only notice reader, and it
+ * sanitizes terminal text itself.
+ */
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /** A JSON parser message can quote file bytes; never surface it. */
-function boundedErrorMessage(error: unknown): string {
+function errorMessage(error: unknown): string {
   if (error instanceof SyntaxError) return "the review-gate config is not valid JSON; nothing was saved.";
-  return bounded(error instanceof Error ? error.message : String(error));
+  return singleLine(error instanceof Error ? error.message : String(error));
 }

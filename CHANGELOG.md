@@ -39,7 +39,12 @@ dates.
   shows one notice at a time instead of accumulating them: the LOCAL target at the root, a concise
   summary in Review and Evidence methods that points to these docs for the full description, or the
   latest action's warning or error in their place, with a confirmation's disclosure shown whole as
-  its screen's notice; in-Pi section help is unchanged. See
+  its screen's notice; in-Pi section help is unchanged. Notices and disclosures are never cut to a
+  character limit. A notice too long for a short pane, such as the Browser permissions or URL
+  blocklist description, ends with a `ctrl+o read all` cue (another free key when Ctrl+O is taken)
+  that opens a read-only reader of the whole text in the same pane; Escape returns, and no key
+  acts until the screen is drawn again. A confirmation too long to show with its choices offers no
+  **Yes** until the pane is large enough. See
   [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
 - **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
   sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking

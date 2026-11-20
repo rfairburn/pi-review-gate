@@ -32,7 +32,7 @@ import { openLocalReviewSettings, type LocalReviewSettingsInput } from "../src/s
 import type { ReviewSettingsCatalog } from "../src/session-host/review-settings-catalog";
 import type { SidebarReviewSettingsHost } from "../src/session-host/review-settings-ui";
 import type { UiContext } from "../src/settings/ui";
-import { YOLO_CONFIRM_MESSAGE, YOLO_ENABLE_WARNING } from "../src/settings/web";
+import { BROWSER_PERMISSIONS_NOTICE, URL_BLOCKLIST_NOTICE, YOLO_CONFIRM_MESSAGE, YOLO_ENABLE_WARNING } from "../src/settings/web";
 import {
   ALT_LEFT,
   ENTER,
@@ -750,6 +750,24 @@ test("one contextual notice: opening diagnostics take the slot once, the LOCAL t
   assert.equal(readFileSync(l.canonical, "utf8"), bytes, "the broken file is untouched");
 });
 
+/**
+ * A confirmation whose disclosure and choices do not fit together: the
+ * disclosure's leading rows, the cue naming why no choice is drawn, Escape as
+ * the way back, and no choice or frame that could authorize Yes.
+ */
+function assertDisclosureOverflow(d: Driven, start: string, what: string): string[] {
+  const shown = d.frame();
+  const text = shown.join("\n");
+  assert.equal(shown.length, d.rows, what);
+  assert.doesNotMatch(text, /too small/, `${what}: the disclosure stays readable\n${text}`);
+  assert.equal(shown.filter((line) => line.includes(start)).length, 1, `${what}: the disclosure starts once\n${text}`);
+  assert.match(text, /enlarge the pane to answer/, `${what}: says why no choice is drawn\n${text}`);
+  assert.match(text, /escape go back/i, `${what}: Escape is the advertised way back\n${text}`);
+  assert.ok(!shown.some((line) => /^\s*(→ )?(Yes|No)\s*$/.test(line)), `${what}: no choice is offered\n${text}`);
+  assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, `${what}: no frame can authorize Yes`);
+  return shown;
+}
+
 const RETENTION_DISCLOSURE_START = "Turning this on saves every auditor invocation";
 const RETENTION_DISCLOSURE_END = "Save/Ctrl+S (disk).";
 
@@ -774,23 +792,22 @@ test("one contextual notice: a confirmation's disclosure replaces the section no
   assert.ok(!text.includes(NOTICE_PHRASES.target), `the disclosure is the one notice:\n${text}`);
   assert.ok(shown.some((line) => line.trimStart().startsWith("Yes")) && shown.some((line) => line.trimStart().startsWith("→ No")), text);
 
-  // A pane too short for the whole disclosure is too small and confirms nothing.
+  // A pane too short for the whole disclosure with its choices draws no choice and confirms nothing.
   d.rows = 12;
-  assert.match(d.text(), /too small/);
+  assertDisclosureOverflow(d, RETENTION_DISCLOSURE_START, "the short retention confirmation");
   d.key(UP);
   d.key(ENTER);
+  d.key(CTRL_S);
   await turns();
+  // The refused Enter and Ctrl+S keep the read-only overflow frame: no refusal replaces the disclosure.
+  text = assertDisclosureOverflow(d, RETENTION_DISCLOSURE_START, "after the refused Enter and Ctrl+S").join("\n");
+  assert.doesNotMatch(text, /not completely shown/);
   d.rows = 30;
   text = d.text();
-  assert.match(text, /Save every auditor session\?/, "still confirming");
-  assert.ok(!text.includes(RETENTION_DISCLOSURE_START), `the refusal error takes the slot:\n${text}`);
-  assert.match(text, /not completely shown/);
-  // Yes on a written frame without the disclosure is refused and restores it.
-  d.key(ENTER);
-  await turns();
-  text = d.text();
-  assert.match(text, /Save every auditor session\?/, "Yes was not accepted without the disclosure");
-  assert.ok(text.includes(RETENTION_DISCLOSURE_START) && !/not completely shown/.test(text), `the disclosure is back alone:\n${text}`);
+  assert.match(text, /Save every auditor session\?/, "still confirming: nothing was accepted in the short pane");
+  assert.ok(text.includes(RETENTION_DISCLOSURE_START) && text.includes(RETENTION_DISCLOSURE_END) && !/not completely shown/.test(text), `the whole disclosure with its choices:\n${text}`);
+  assert.ok(d.frame().some((line) => line.trimStart().startsWith("→ No")), "Up on the clipped pane did not move the hidden selection");
+  d.key(UP); // Yes is chosen on the full pane
   assert.ok(d.frame().some((line) => line.trimStart().startsWith("→ Yes")));
 
   // Restoring the disclosure never hides a later refusal on the same screen.
@@ -844,7 +861,8 @@ test("one contextual notice: the browser YOLO confirmation discloses the whole r
   await openReviewSettings(d);
   await chooseMenuRow(d, "Tools", "Top-level tools");
   await chooseMenuRow(d, "Web", "Maximum download");
-  await chooseMenuRow(d, "Browser permissions", "YOLO / allow everything");
+  // The whole Browser permissions notice keeps half of the pane; the list scrolls to YOLO.
+  await chooseMenuRow(d, "Browser permissions", "Model credential entry");
   await openYoloConfirmation(d);
 
   // The one notice is the explicit disclosure: the full approval and network
@@ -864,30 +882,72 @@ test("one contextual notice: the browser YOLO confirmation discloses the whole r
   await waitFor(d, (shownText) => /→ YOLO \/ allow everything\s+Off/.test(shownText) && shownText.includes("YOLO stays Off."), "the declined YOLO");
   await openYoloConfirmation(d);
 
-  // A pane too short for the whole disclosure confirms nothing.
+  // A narrow, short pane still reads the whole disclosure through its advertised reader,
+  // even after Enter is refused between the resize and its repaint.
+  d.cols = 28;
+  d.rows = 6;
+  d.sidebar.invalidateReviewSettingsPresentation();
+  d.key(ENTER); // the resize revoked the old frame, and the new one is not drawn yet
+  await turns();
+  assert.match(flowed(d.frame()), /ctrl\+o read all/);
+  assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, "the narrow overflow offers no frame to authorize");
+  d.key(CTRL_O);
+  assert.match(flowed(d.frame()), /esc back/, "the compact reader footer keeps the way back");
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), `${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`, "every character at 28x6");
+  d.key(ESC);
+  assert.match(flowed(d.frame()), /ctrl\+o read all/, "back on the read-only overflow");
+  assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, "reading acquired no frame to authorize");
+
+  // Shrinking the pane while reading: Back lands on a too-small fallback that
+  // advertises Escape; only a fresh Escape after that fallback is written cancels.
+  d.key(CTRL_O);
+  assert.ok(readerPosition(d.frame()) !== undefined, "the reader opens");
+  d.cols = 80;
+  d.rows = 5;
+  d.sidebar.invalidateReviewSettingsPresentation();
+  d.key(ESC); // Back to a confirmation that now cannot be drawn even in overflow
+  d.writes = false;
+  assert.match(flowed(d.frame()), /too small.*esc back/, "the fallback advertises Escape");
+  d.key(ESC); // no action from a composed but unwritten fallback
+  d.writes = true;
+  d.frame();
+  d.key(ESC_REPEAT);
+  d.key(UP);
+  d.key(ENTER);
+  d.key(CTRL_S);
+  await turns();
   d.rows = 12;
-  assert.match(d.text(), /too small/);
+  assertDisclosureOverflow(d, YOLO_WARNING_START, "the unwritten fallback and held or other keys did not answer");
+  d.rows = 5;
+  d.sidebar.invalidateReviewSettingsPresentation();
+  assert.match(flowed(d.frame()), /too small.*esc back/);
+  d.key(ESC);
+  d.rows = 30;
+  await waitFor(d, (shownText) => /→ YOLO \/ allow everything\s+Off/.test(shownText) && shownText.includes("YOLO stays Off."), "a fresh Escape cancelled from the written fallback");
+  await openYoloConfirmation(d);
+
+  // A pane too short for the whole disclosure with its choices draws no choice and confirms nothing.
+  d.rows = 12;
+  d.sidebar.invalidateReviewSettingsPresentation();
+  d.key(UP); // queued after the resize, before the overflow is drawn: the choice stays No
+  assertDisclosureOverflow(d, YOLO_WARNING_START, "the short YOLO confirmation");
   d.key(UP);
   d.key(ENTER);
   await turns();
+  // The refused Enter keeps the read-only overflow frame and its reader cue.
+  text = assertDisclosureOverflow(d, YOLO_WARNING_START, "after the refused Enter").join("\n");
+  assert.match(text, /\.\.\. ctrl\+o read all; enlarge the pane to answer/, text);
+  assert.doesNotMatch(text, /not completely shown/);
   d.rows = 30;
-  text = d.text();
-  assert.ok(text.includes(YOLO_CONFIRM_TITLE), `still confirming:\n${text}`);
-  assert.match(text, /not completely shown/);
-  assert.ok(!text.includes(YOLO_WARNING_START), `the refusal takes the slot:\n${text}`);
-  // Yes on a written frame without the disclosure is refused and restores it.
-  d.key(ENTER);
-  await turns();
   shown = d.frame();
   text = shown.join("\n");
   assert.ok(text.includes(YOLO_CONFIRM_TITLE), "Yes was not accepted without the disclosure");
   assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`) && !/not completely shown/.test(text), text);
-  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Yes")), text);
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ No")), `Up on the clipped pane did not move the hidden selection:\n${text}`);
 
   // A complete fresh frame that was drawn but never written confirms nothing either.
   d.writes = false;
-  d.key(DOWN);
-  d.key(UP);
+  d.key(UP); // Yes is chosen on the full pane, where the operator sees it
   shown = d.frame();
   assert.ok(shown.some((line) => line.trimStart().startsWith("→ Yes")), shown.join("\n"));
   assert.ok(flowed(shown).includes(`${YOLO_ENABLE_WARNING} ${YOLO_CONFIRM_MESSAGE}`), "the unwritten frame draws the whole disclosure");
@@ -917,7 +977,44 @@ test("one contextual notice: the browser YOLO confirmation discloses the whole r
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "Cancel leaves the disk unchanged");
 });
 
-for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] as const) test(`one contextual notice: an oversized disclosure refuses confirmation and provides a way back with Cancel on ${cancelKey}`, async (t) => {
+const CTRL_O = "\x0f";
+const RIGHT = "\x1b[C";
+const ALT_RIGHT = "\x1b[1;3C";
+const F3 = "\x1bOR";
+const PAGE_DOWN = "\x1b[6~";
+const END = "\x1b[F";
+const HOME = "\x1b[H";
+
+/** The reader's position line, e.g. "lines 1-24 of 57". */
+function readerPosition(shown: readonly string[]): { first: number; last: number; total: number } | undefined {
+  const match = /lines (\d+)-(\d+) of (\d+)/.exec(shown.join(" "));
+  return match === null ? undefined : { first: Number(match[1]), last: Number(match[2]), total: Number(match[3]) };
+}
+
+/**
+ * Pages the open notice reader from its top to its end and returns the notice
+ * rows it drew, in order, without the header and footer.
+ */
+function readWholeNotice(d: Driven, header: string): string[] {
+  d.key(HOME);
+  const rows: string[] = [];
+  for (let page = 0; page < 200; page += 1) {
+    const shown = d.frame();
+    const position = readerPosition(shown);
+    assert.ok(position !== undefined, `the reader shows its position:\n${shown.join("\n")}`);
+    assert.ok(shown[0]?.includes(header), shown.join("\n"));
+    assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, "the reader never offers a frame to authorize");
+    const count = position.last - position.first + 1;
+    // Rows the previous page already drew are not collected twice.
+    const fresh = shown.slice(1, 1 + count).slice(Math.max(0, rows.length - (position.first - 1)));
+    rows.push(...fresh);
+    if (position.last >= position.total) return rows;
+    d.key(PAGE_DOWN);
+  }
+  assert.fail("the reader never reached the end");
+}
+
+for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] as const) test(`one contextual notice: a disclosure longer than the old cap is shown whole when it fits; a short pane offers no choice, reads it whole, and Cancel on ${cancelKey} answers No`, async (t) => {
   const l = local(t);
   // Alt+Right and Alt+Left are the default host shortcuts; legacy Tab is the same byte as a Ctrl+I Toggle.
   const shadowed = cancelKey === "alt+right" || cancelKey === "alt+left" || cancelKey === "tab";
@@ -932,7 +1029,7 @@ for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] 
   const toolNames = Array.from({ length: 120 }, (_, index) => `audited_tool_name_${String(index).padStart(3, "0")}`);
   const bytesA = write(l.canonical, { ...DISK_A, toolProtection: { level: "off", scope: "selected", toolNames } });
   const d = driven(l, cancelKey === "tab" ? { toggleKey: "ctrl+i" } : {});
-  d.rows = 80; // room for far more than a truncated prefix
+  d.rows = 80; // room for the whole disclosure and its choices
   await openReviewSettings(d);
   await chooseMenuRow(d, "Tools", "Tool protection");
   await chooseMenuRow(d, "Tool protection", "Auditor");
@@ -941,21 +1038,102 @@ for (const cancelKey of ["backspace", "ctrl+s", "alt+right", "alt+left", "tab"] 
   await waitFor(d, (text) => text.includes("Tool protection auditor"), "the auditor picker");
   moveToMenuRow(d, "acme/deep");
   d.key(ENTER);
-  await waitFor(d, (text) => text.includes("exceeds the display limit"), "the oversized confirmation");
-  const shown = d.frame();
-  const text = shown.join("\n");
-  assert.match(text, /escape go back/i, `Escape is the advertised way back:\n${text}`);
-  assert.equal(shown.filter((line) => line.startsWith("! ")).length, 1, text);
-  assert.ok(!text.includes("Choosing acme/deep") && !text.includes("audited_tool_name_000"), `no prefix is shown as the disclosure:\n${text}`);
-  assert.ok(!shown.some((line) => /^\s*(→ )?(Yes|No)\s*$/.test(line)), `no choice is offered:\n${text}`);
-  assert.equal(d.sidebar.captureReviewSettingsPresentation(), undefined, "no frame can authorize Yes");
+  await waitFor(d, (text) => text.includes("Choosing acme/deep") && text.includes("→ No"), "the whole long confirmation");
+
+  // No hard cap: the whole disclosure (well over 2000 characters) is drawn with its choices.
+  let shown = d.frame();
+  let text = shown.join("\n");
+  const wholeFrame = shown;
+  const choiceRow = shown.findIndex((line) => /^\s*(→ )?(Yes|No)\s*$/.test(line));
+  assert.ok(choiceRow > 0, text);
+  assert.ok(shown[1]?.includes("Choosing acme/deep"), `the disclosure is the first notice row:\n${text}`);
+  const above = flowed(shown.slice(1, choiceRow));
+  assert.ok(above.includes("audited_tool_name_000") && above.includes("audited_tool_name_119"), `the whole disclosure:\n${text}`);
+  assert.equal(shown.filter((line) => line.startsWith("! ")).length, 0, `the disclosure is the one notice:\n${text}`);
+  assert.doesNotMatch(text, /read all|escape go back/, "nothing is clipped");
+
+  // A direct resize to the plain too-small fallback: no key reaches the hidden choices.
+  d.rows = 5;
+  assert.match(d.text(), /too small/);
+  d.key(UP);
+  d.key(ENTER);
+  if (cancelKey !== "ctrl+s") d.key(CTRL_S); // (Ctrl+S is this variant's Cancel, which may answer No)
+  await turns();
+  d.rows = 80;
+  text = d.text();
+  assert.match(text, /→ No/, `Up on the plain fallback did not move the hidden choice:\n${text}`);
+  assert.ok(!text.includes("Auditor unchanged") && !/Auditor\s+acme\/deep/.test(text), "nothing was answered on the fallback");
+
+  // A shorter pane: the disclosure's leading rows, no choice, and Escape back.
+  d.rows = 30;
+  shown = assertDisclosureOverflow(d, "Choosing acme/deep", "the short long confirmation");
+  text = shown.join("\n");
+  assert.ok(!text.includes("audited_tool_name_119"), "the drawn rows are a clipped prefix");
+  assert.match(text, /\.\.\. ctrl\+o read all; enlarge the pane to answer/, `the reader cue:\n${text}`);
   d.key(UP); // toward Yes
   d.key(ENTER);
   await turns();
-  assert.match(d.text(), /exceeds the display limit/, "Yes/Enter did nothing");
+  // The first redraw after the refused Enter is still the read-only overflow with its reader cue.
+  text = assertDisclosureOverflow(d, "Choosing acme/deep", "after the refused Enter").join("\n");
+  assert.match(text, /\.\.\. ctrl\+o read all; enlarge the pane to answer/, text);
+  assert.doesNotMatch(text, /not completely shown/);
+  assert.ok(!text.includes("Auditor unchanged") && !/Auditor\s+acme\/deep/.test(text), "Yes/Enter staged nothing");
+  if (cancelKey !== "ctrl+s") {
+    // Ctrl+S (Cancel itself in the ctrl+s case) is refused the same way.
+    d.key(CTRL_S);
+    await turns();
+    text = assertDisclosureOverflow(d, "Choosing acme/deep", "after the refused Ctrl+S").join("\n");
+    assert.match(text, /\.\.\. ctrl\+o read all/, text);
+  }
+
+  // The reader shows every character of it; none of its keys acts on the screen.
+  d.key(CTRL_O);
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.match(text, /esc or ctrl\+o back/, `the reader's way back:\n${text}`);
+  assert.match(text, /read only: answer on the screen/, text);
+  assert.ok(!shown.some((line) => /^\s*(→ )?(Yes|No)\s*$/.test(line)), "the reader draws no choice");
+  for (const inert of [ENTER, CTRL_S, ENTER_REPEAT, `${PASTE_START}\r${PASTE_END}`, cancelKey === "backspace" ? "\x7f" : CTRL_S]) {
+    d.key(inert);
+    await turns();
+    assert.ok(readerPosition(d.frame()) !== undefined, `the reader stays open on ${JSON.stringify(inert)}`);
+  }
+  const read = readWholeNotice(d, "Review settings (local)");
+  assert.deepEqual(read, wholeFrame.slice(1, 1 + read.length), "the reader draws exactly the rows the tall pane drew whole");
+  const disclosure = flowed(read);
+  assert.ok(disclosure.includes("audited_tool_name_000") && disclosure.includes("audited_tool_name_119"), disclosure);
+  assert.ok(disclosure.replace(/\s+/g, "").length > 2000, "longer than the former 2000-character cap");
+  d.key(END);
+  assert.ok(flowed(d.frame()).includes("audited_tool_name_119"), "End reaches the last row");
+  d.key(ESC);
+  await turns();
+  shown = assertDisclosureOverflow(d, "Choosing acme/deep", "back from the reader");
+  d.key(ESC_REPEAT); // the held Escape that closed the reader answers nothing
+  await turns();
+  assertDisclosureOverflow(d, "Choosing acme/deep", "after the held Escape");
+  d.key(ESC_RELEASE);
+  await turns();
+  assert.ok(!d.text().includes("Auditor unchanged"), "the reader's Escape answered nothing");
+
+  // The configured Cancel (or Escape where a host chord shadows it) answers No.
   d.key(shadowed ? ESC : cancelKey === "backspace" ? "\x7f" : CTRL_S);
   await waitFor(d, (shownText) => shownText.includes("Auditor unchanged"), "Cancel answered No");
   assert.equal(d.sidebar.focus, "form", "the editor stays open");
+  if (cancelKey === "backspace") {
+    // Cancel remapped off Escape: a fresh Escape on the plain too-small fallback still answers No.
+    d.rows = 80;
+    moveToMenuRow(d, "Auditor");
+    d.key(ENTER);
+    await waitFor(d, (shownText) => shownText.includes("Tool protection auditor"), "the auditor picker again");
+    moveToMenuRow(d, "acme/deep");
+    d.key(ENTER);
+    await waitFor(d, (shownText) => shownText.includes("Choosing acme/deep") && shownText.includes("→ No"), "the whole confirmation again");
+    d.rows = 5;
+    assert.match(d.text(), /too small/);
+    d.key(ESC);
+    d.rows = 80;
+    await waitFor(d, (shownText) => shownText.includes("Auditor unchanged") && !shownText.includes("Choosing acme/deep"), "Escape answered No on the plain fallback");
+  }
   d.sidebar.cancelReviewSettings();
   await Promise.all(d.settled);
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
@@ -1086,6 +1264,518 @@ test("one contextual notice: a screen that cannot be drawn shows only its failur
   assert.equal(settledWith, null, "Enter never reached the undrawable screen");
   sidebar.cancelReviewSettings();
   finish?.();
+});
+
+// ---------------------------------------------------------------------------
+// Long settings notices are never shortened (#653)
+// ---------------------------------------------------------------------------
+
+/** The former ingestion cap: no notice text past it ever reached the pane. */
+const FORMER_NOTICE_CAP = 600;
+
+function pastFormerCap(notice: string): string {
+  return [...notice].slice(FORMER_NOTICE_CAP).join("").trim();
+}
+
+async function openBrowserPermissions(d: Driven): Promise<void> {
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Top-level tools");
+  await chooseMenuRow(d, "Web", "Maximum download");
+  // The whole notice keeps up to half of the pane; the list scrolls in the rest.
+  await chooseMenuRow(d, "Browser permissions", "Model credential entry");
+}
+
+test("long notice: the Browser permissions notice is drawn whole with room; a short pane reads it to the end and Back keeps the selection", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  d.rows = 40;
+  await openBrowserPermissions(d);
+  assert.ok([...BROWSER_PERMISSIONS_NOTICE].length > FORMER_NOTICE_CAP, "the notice is longer than the former cap");
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.ok(flowed(shown).includes(BROWSER_PERMISSIONS_NOTICE), `the whole canonical notice:\n${text}`);
+  assert.ok(flowed(shown).includes(pastFormerCap(BROWSER_PERMISSIONS_NOTICE)), "the text past the former cap is drawn");
+  assert.equal(shown.filter((line) => line.includes("These stage the issue #27")).length, 1, "drawn once");
+  assert.ok(!shown.some((line) => line.startsWith("! ")), `the one notice:\n${text}`);
+  assert.doesNotMatch(text, /read all/, "nothing is clipped");
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Model credential entry")), text);
+
+  // 80x24: the whole notice still fits beside a smaller, scrolling list, so nothing is clipped.
+  d.rows = 24;
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.ok(flowed(shown).includes(BROWSER_PERMISSIONS_NOTICE), `the whole notice at 80x24:\n${text}`);
+  assert.doesNotMatch(text, /read all|too small/, text);
+  assert.ok(shown.some((line) => line.trimStart().startsWith("→ Model credential entry")), `the list stays usable:\n${text}`);
+  assert.ok(shown.some((line) => SCROLL_CUE.test(line)), `the list scrolls in the rows left:\n${text}`);
+
+  moveToMenuRow(d, "Model uploads");
+  // A short pane: the list stays usable, and the notice's leading rows end with the reader cue.
+  d.rows = 16;
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.equal(shown.length, 16);
+  assert.doesNotMatch(text, /too small/);
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), `the selection survives:\n${text}`);
+  assert.equal(shown.filter((line) => line.includes("These stage the issue #27")).length, 1, text);
+  assert.equal(shown.filter((line) => line.includes("... ctrl+o read all")).length, 1, `the reader cue:\n${text}`);
+  assert.ok(!flowed(shown).includes("Saved changes apply to the live session immediately"), "a clipped prefix");
+
+  // The reader: every character, and none of its keys acts.
+  d.key(CTRL_O);
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.match(text, /esc or ctrl\+o back/, text);
+  assert.ok(!text.includes("Model uploads"), "the reader covers the list");
+  for (const inert of [ENTER, CTRL_S, ENTER_REPEAT, "y", `${PASTE_START}\r\x13\x1b${PASTE_END}`]) {
+    d.key(inert);
+    await turns();
+    assert.ok(readerPosition(d.frame()) !== undefined, `the reader stays open on ${JSON.stringify(inert)}`);
+  }
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), BROWSER_PERMISSIONS_NOTICE, "the reader shows the exact notice");
+
+  // Back: the same screen and selection; the reader's Escape answers nothing.
+  d.key(ESC);
+  d.key(ESC_REPEAT);
+  // Reading never authorizes: before the screen is drawn again (the terminal
+  // may still show the reader) no key acts on it.
+  d.key(ENTER);
+  d.key(DOWN);
+  await turns();
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), `still Browser permissions, unchanged:\n${text}`);
+  assert.doesNotMatch(text, /not completely shown/, "nothing reached the screen to refuse");
+  assert.equal(readerPosition(shown), undefined, "back on the screen");
+  d.key(DOWN);
+  d.key(UP);
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), text);
+  assert.equal(shown.filter((line) => line.includes("These stage the issue #27")).length, 1, `one notice again:\n${text}`);
+  assert.doesNotMatch(text, /not completely shown/);
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "reading saved nothing");
+});
+
+test("long notice: the URL blocklist notice is drawn whole above the field with room; a short pane reads it to the end and Back keeps the edit", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  d.rows = 40;
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Tools", "Web");
+  await chooseMenuRow(d, "Web", "URL blocklist");
+  moveToMenuRow(d, "URL blocklist");
+  d.key(ENTER);
+  await waitFor(d, (shownText) => shownText.includes("Blocked URL patterns"), "the shared text field");
+  assert.ok([...URL_BLOCKLIST_NOTICE].length > FORMER_NOTICE_CAP, "the notice is longer than the former cap");
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.ok(flowed(shown).includes(URL_BLOCKLIST_NOTICE), `the whole canonical notice:\n${text}`);
+  assert.ok(flowed(shown).includes(pastFormerCap(URL_BLOCKLIST_NOTICE)), "the text past the former cap is drawn");
+  assert.doesNotMatch(text, /read all/, "nothing is clipped");
+  d.key("abc");
+  assert.match(d.text(), /abc/);
+
+  d.rows = 14;
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.doesNotMatch(text, /too small/);
+  assert.match(text, /Blocked URL patterns/, "the field stays open");
+  assert.equal(shown.filter((line) => line.includes("... ctrl+o read all")).length, 1, `the reader cue:\n${text}`);
+  assert.ok(d.sidebar.render(d.cols, d.rows).cursor !== undefined, "the field keeps its caret");
+
+  d.key(CTRL_O);
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.ok(!text.includes("Blocked URL patterns") && !text.includes("abc"), `the reader covers the field:\n${text}`);
+  assert.equal(d.sidebar.render(d.cols, d.rows).cursor, undefined, "the reader draws no caret");
+  for (const inert of [ENTER, CTRL_S, "z", CTRL_J, `${PASTE_START}pasted\r${PASTE_END}`]) {
+    d.key(inert);
+    await turns();
+    assert.ok(readerPosition(d.frame()) !== undefined, `the reader stays open on ${JSON.stringify(inert)}`);
+  }
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), URL_BLOCKLIST_NOTICE, "the reader shows the exact notice");
+
+  // Back to the same edit: an Enter pressed and held in the reader never
+  // submits it, whatever unrelated key is pressed before or after the redraw.
+  const fieldLine = (): string => d.frame().filter((line) => line.includes("abc")).join("");
+  d.key(ENTER); // pressed (and held) in the reader: inert there
+  d.key(ESC);
+  d.key(ESC_REPEAT); // the held Escape that closed the reader never cancels the edit
+  d.key(RIGHT); // an unrelated fresh key before the field is drawn again
+  d.key(ENTER_REPEAT); // the held Enter, before the redraw
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `the held Enter did not submit:\n${text}`);
+  d.key(RIGHT); // an unrelated fresh key on the drawn field (the caret is already at the end)
+  d.key(ENTER_REPEAT); // the Enter still held from the reader
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `the held Enter still did not submit:\n${text}`);
+  assert.ok(fieldLine().includes("abc") && !/z|pasted/.test(fieldLine()), `the value is untouched:\n${text}`);
+
+  // A fresh Enter or a paste before the field is drawn again (the terminal may still show the reader) does nothing.
+  d.key(CTRL_O);
+  assert.ok(readerPosition(d.frame()) !== undefined, "the reader opens again");
+  d.key(ESC);
+  d.key(ENTER);
+  d.key(PASTE_START.slice(0, 1)); // a paste opener split across the redraw
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `Enter before the repaint did not submit:\n${text}`);
+  d.key(`${PASTE_START.slice(1)}late-paste`);
+  d.key(ENTER); // still inside the discarded paste, not a field submission
+  d.key(`-rest${PASTE_END}`); // the rest of a paste begun before the redraw is discarded too
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `the pasted Enter did not submit:\n${text}`);
+  assert.ok(!/late-paste|-rest/.test(text), `the paste begun before the redraw changed nothing:\n${text}`);
+
+  // A return frame that was composed but never written keeps the field fenced:
+  // typing, paste, and Enter all wait for the writer's receipt.
+  d.key(CTRL_O);
+  assert.ok(readerPosition(d.frame()) !== undefined, "the reader opens again");
+  d.key(ESC);
+  d.writes = false;
+  assert.match(d.text(), /Blocked URL patterns/, "the return frame is composed but unwritten");
+  d.key("z");
+  d.key(`${PASTE_START}unwritten-paste${PASTE_END}`);
+  d.key(ENTER);
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `Enter did not submit an unwritten field:\n${text}`);
+  assert.doesNotMatch(fieldLine(), /abcz|unwritten-paste/, "nothing reached the unwritten field");
+  d.writes = true;
+  d.frame();
+
+  // A paste opener whose first byte arrives inside the reader (where it also
+  // means Back) stays opaque across Back: nothing of it reaches the field.
+  d.key(CTRL_O);
+  assert.ok(readerPosition(d.frame()) !== undefined, "the reader opens once more");
+  d.key(PASTE_START.slice(0, 1));
+  assert.match(d.text(), /Blocked URL patterns/, "the byte closed the reader");
+  d.key(`${PASTE_START.slice(1)}]reader-paste`);
+  d.key(ENTER);
+  d.key(PASTE_END);
+  await turns();
+  text = d.text();
+  assert.match(text, /Blocked URL patterns/, `the paste from the reader did not submit:\n${text}`);
+  assert.doesNotMatch(fieldLine(), /reader-paste/, "the paste from the reader changed nothing");
+  d.key("d");
+  assert.match(fieldLine(), /abcd/, "the field takes keys again");
+  d.key(`${PASTE_START}e${PASTE_END}`); // a paste on the drawn field is ordinary text
+  assert.match(fieldLine(), /abcde/, "a later paste reaches the drawn field");
+  // A fresh Enter on the drawn field submits as usual.
+  d.key(ENTER);
+  await waitFor(d, (shownText) => !shownText.includes("Blocked URL patterns") && shownText.includes("→ URL blocklist"), "the submitted edit");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "reading and staging saved nothing");
+});
+
+test("long notice: a long result returned to the Settings menu keeps every entry and reads whole", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  await openReviewSettings(d);
+  const long = `review gate: a long settings failure ${"detail ".repeat(120)}end-of-failure`;
+  d.opens[0]!.notify?.(long, "error");
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  let shown = d.frame();
+  assert.ok(flowed(shown).includes(`! ${long}`), `the whole result:\n${shown.join("\n")}`);
+  const entries = shown.filter((line) => /^[> ] \S/.test(line)).length;
+
+  d.rows = 10;
+  shown = d.frame();
+  let text = shown.join("\n");
+  assert.doesNotMatch(text, /too small/);
+  assert.equal(shown.filter((line) => /^[> ] \S/.test(line)).length, entries, `every entry stays drawn:\n${text}`);
+  assert.ok(shown.some((line) => line.startsWith("> Review settings")), text);
+  assert.equal(shown.filter((line) => line.includes("... ctrl+o read all")).length, 1, `the reader cue:\n${text}`);
+  d.key(CTRL_O);
+  for (const inert of [ENTER, UP]) d.key(inert);
+  assert.equal(flowed(readWholeNotice(d, "Settings")).trim(), `! ${long}`, "the reader shows the exact result");
+  d.key(ESC);
+  d.key(ESC_REPEAT);
+  shown = d.frame();
+  text = shown.join("\n");
+  assert.equal(d.sidebar.focus, "form", "the reader's Escape left only the reader");
+  assert.ok(shown.some((line) => line.startsWith("> Review settings")), `the Settings selection survives:\n${text}`);
+  // A paste opener split across Back's repaint stays opaque: its Enter opens nothing.
+  d.key(CTRL_O);
+  assert.ok(readerPosition(d.frame()) !== undefined, "the reader opens again");
+  d.key(CTRL_O); // Back without a lone Escape carried from the reader
+  d.key(PASTE_START.slice(0, 1)); // the opener starts before the return frame is written
+  assert.match(d.text(), /> Review settings/);
+  d.key(PASTE_START.slice(1));
+  d.key(ENTER);
+  d.key(PASTE_END);
+  await turns();
+  assert.equal(d.opens.length, 1, "the pasted Enter did not reopen Review settings");
+  assert.match(d.text(), /> Review settings/);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("long notice: with Ctrl+O and F2 taken by host shortcuts the reader key is F3, and a long notice still reads to the end", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l, { toggleKey: "ctrl+o", returnToMainKey: "f2" });
+  d.rows = 40;
+  await openBrowserPermissions(d);
+  d.rows = 16;
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.equal(shown.filter((line) => line.includes("... f3 read all")).length, 1, `the free reader key is advertised:\n${text}`);
+  assert.doesNotMatch(text, /ctrl\+o read all|f2 read all|too small/, text);
+  d.key(F3);
+  shown = d.frame();
+  assert.match(shown.join("\n"), /esc or f3 back/, shown.join("\n"));
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), BROWSER_PERMISSIONS_NOTICE, "the reader shows the exact notice");
+  d.key(F3); // the same key returns
+  await turns();
+  shown = d.frame();
+  assert.equal(readerPosition(shown), undefined, "back on the screen");
+  assert.ok(shown.some((line) => /→ Model credential entry\s+Off/.test(line)), shown.join("\n"));
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+
+  // The Settings menu's long result reads with the same free key, keeping every entry.
+  const settings = driven(l, { toggleKey: "ctrl+o", returnToMainKey: "f2" });
+  await openReviewSettings(settings);
+  const long = `review gate: a long settings failure ${"detail ".repeat(120)}end-of-failure`;
+  settings.opens[0]!.notify?.(long, "error");
+  moveToMenuRow(settings, "Cancel");
+  settings.key(ENTER);
+  await waitFor(settings, (shownText) => shownText.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(settings.settled);
+  settings.rows = 10;
+  text = settings.text();
+  assert.doesNotMatch(text, /too small/, text);
+  assert.match(text, /\.\.\. f3 read all/, text);
+  settings.key(F3);
+  assert.equal(flowed(readWholeNotice(settings, "Settings")).trim(), `! ${long}`);
+  settings.key(ESC);
+  assert.ok(settings.frame().some((line) => line.startsWith("> Review settings")));
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("long notice: a long opening diagnostic reaches the sidebar whole, and its end is readable in a short pane", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const diagnostic = `Pi reported a very long scope diagnostic ${"segment ".repeat(90)}unique-diagnostic-tail-5c1e`;
+  const d = driven(l, {}, () => ({ ...fakeCatalog(), warnings: [diagnostic] }));
+  d.rows = 40;
+  await openReviewSettings(d);
+  let shown = d.frame();
+  const expected = `! review gate: settings catalog: ${diagnostic}`;
+  assert.ok(diagnostic.length > 400, "longer than the former diagnostic cap");
+  assert.ok(flowed(shown).includes(expected), `the whole diagnostic:\n${shown.join("\n")}`);
+  d.rows = 12;
+  shown = d.frame();
+  assert.ok(!flowed(shown).includes("unique-diagnostic-tail-5c1e"), "clipped in the short pane");
+  d.key(CTRL_O);
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), expected, "the reader reaches its end");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("long notice: with no notice row left the reader cue joins the chrome: 80x6 Browser permissions, 80x6 Settings, and a minimum-height URL edit", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  d.rows = 40;
+  await openBrowserPermissions(d);
+  moveToMenuRow(d, "Model uploads");
+  d.rows = 6;
+  // Enter between the resize and its repaint is refused; that transient
+  // refusal must not turn the usable 80x6 menu into a too-small pane.
+  d.sidebar.invalidateReviewSettingsPresentation();
+  d.key(ENTER);
+  await turns();
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.equal(shown.length, 6);
+  assert.doesNotMatch(text, /too small/, text);
+  assert.match(shown[0] ?? "", /Review settings \(local\) \| ctrl\+o read all/, `the cue joins the header:\n${text}`);
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), `the menu stays usable:\n${text}`);
+  d.key(CTRL_O);
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), BROWSER_PERMISSIONS_NOTICE, "the exact notice at 80x6");
+  d.key(ESC);
+  shown = d.frame();
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), `Back keeps the selection:\n${shown.join("\n")}`);
+  // A second, genuine Escape on the returned screen is its ordinary Back.
+  d.key(ESC);
+  d.rows = 40;
+  await waitFor(d, (shownText) => shownText.includes("→ Browser permissions") && shownText.includes("Maximum download"), "Web settings after Back");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+
+  // The URL edit at the smallest height that still draws its field.
+  const edit = driven(l);
+  await openReviewSettings(edit);
+  await chooseMenuRow(edit, "Tools", "Web");
+  await chooseMenuRow(edit, "Web", "URL blocklist");
+  moveToMenuRow(edit, "URL blocklist");
+  edit.key(ENTER);
+  await waitFor(edit, (shownText) => shownText.includes("Blocked URL patterns"), "the shared text field");
+  edit.key("abc");
+  let minimum = 0;
+  for (let rows = 4; rows <= 30 && minimum === 0; rows += 1) {
+    edit.rows = rows;
+    if (!/too small/.test(edit.text())) minimum = rows;
+  }
+  assert.ok(minimum > 0);
+  edit.rows = minimum;
+  shown = edit.frame();
+  text = shown.join("\n");
+  assert.match(text, /Blocked URL patterns/, text);
+  assert.ok(shown.some((line) => line.includes("abc")), `the field is drawn:\n${text}`);
+  assert.match(text, /ctrl\+o read all/, `the cue is drawn at the minimum height:\n${text}`);
+  assert.ok(!shown.some((line) => line.includes("Each line is one JavaScript")), `no notice row is left at the minimum height:\n${text}`);
+  edit.key(CTRL_O);
+  edit.rows = 20; // the reader pages at any usable height
+  assert.equal(flowed(readWholeNotice(edit, "Review settings (local)")).trim(), URL_BLOCKLIST_NOTICE, "the exact URL notice");
+  edit.key(ESC);
+  edit.rows = minimum;
+  shown = edit.frame();
+  assert.ok(shown.some((line) => line.includes("abc")) && shown.join("\n").includes("Blocked URL patterns"), `Back keeps the text:\n${shown.join("\n")}`);
+  // A second, genuine Escape on the returned field cancels the edit as usual.
+  edit.key(ESC);
+  edit.rows = 40;
+  await waitFor(edit, (shownText) => !shownText.includes("Blocked URL patterns") && shownText.includes("→ URL blocklist"), "Web settings after the cancelled edit");
+  edit.sidebar.cancelReviewSettings();
+  await Promise.all(edit.settled);
+
+  // A long Settings result at 80x6: every entry stays drawn and selectable.
+  const settings = driven(l);
+  moveToHostRow(settings, "Settings");
+  settings.key(ENTER);
+  const entries = settings.frame().filter((line) => /^[> ] \S/.test(line)).length;
+  moveToHostRow(settings, "Review settings");
+  settings.key(ENTER);
+  await waitFor(settings, (shownText) => shownText.includes("→ Operating mode"), "the shared root menu");
+  const long = `review gate: a long settings failure ${"detail ".repeat(120)}end-of-failure`;
+  settings.opens[0]!.notify?.(long, "error");
+  moveToMenuRow(settings, "Cancel");
+  settings.key(ENTER);
+  // The open finishes, but the returned Settings menu is not drawn yet.
+  await Promise.all(settings.settled);
+  await turns();
+  settings.rows = 3 + entries;
+  // Before that first repaint, a stale Enter opens nothing and adds no second
+  // notice, and a queued arrow cannot move the selection or dismiss the result.
+  settings.key(ENTER);
+  settings.key(DOWN);
+  await turns();
+  shown = settings.frame();
+  text = shown.join("\n");
+  assert.equal(settings.opens.length, 1, "the stale Enter opened nothing");
+  assert.ok(shown.some((line) => line.startsWith("> Review settings")), `the stale arrow did not move the selection:\n${text}`);
+  assert.doesNotMatch(text, /too small|Settings menu changed/, text);
+  assert.equal(shown.filter((line) => /^[> ] \S/.test(line)).length, entries, `every entry:\n${text}`);
+  assert.match(shown[0] ?? "", /Settings \| ctrl\+o read all/, `the cue joins the header:\n${text}`);
+  settings.key(CTRL_O);
+  settings.rows = 12;
+  assert.equal(flowed(readWholeNotice(settings, "Settings")).trim(), `! ${long}`);
+  settings.key(ESC);
+  settings.rows = 3 + entries;
+  assert.ok(settings.frame().some((line) => line.startsWith("> Review settings")), "Back keeps the selection");
+  // Shrunk below its usable height while reading: Back lands on a written
+  // too-small fallback whose advertised Escape still leaves the menu.
+  settings.key(CTRL_O);
+  assert.ok(readerPosition(settings.frame()) !== undefined, "the reader opens");
+  settings.rows = 4;
+  settings.sidebar.invalidateReviewSettingsPresentation();
+  settings.key(ESC);
+  assert.match(flowed(settings.frame()), /too small.*esc back/, "the fallback advertises Escape");
+  settings.key(DOWN); // nothing but Escape acts on the fallback
+  assert.equal(settings.sidebar.focus, "form");
+  settings.key(ESC);
+  assert.equal(settings.sidebar.focus, "sidebar", "the fallback's Escape left the Settings menu");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+});
+
+test("long notice: with Ctrl+O and F2-F8 all bound to a field action the return-to-Main chord reads the notice, without that action", async (t) => {
+  const l = local(t);
+  write(join(l.agentDir, "keybindings.json"), {
+    "tui.editor.deleteToLineStart": ["ctrl+u", "ctrl+o", "f2", "f3", "f4", "f5", "f6", "f7", "f8"],
+  });
+  const bytesA = write(l.canonical, DISK_A);
+  const d = driven(l);
+  d.rows = 40;
+  await openBrowserPermissions(d);
+  moveToMenuRow(d, "Model uploads");
+  d.rows = 16;
+  let shown = d.frame();
+  let text = shown.join("\n");
+  assert.equal(shown.filter((line) => line.includes("... alt+right read all")).length, 1, `the fallback is advertised:\n${text}`);
+  assert.doesNotMatch(text, /(ctrl\+o|f[2-8]) read all/, text);
+  d.key(ALT_RIGHT);
+  shown = d.frame();
+  assert.match(shown.join("\n"), /esc or alt\+right back/, shown.join("\n"));
+  assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), BROWSER_PERMISSIONS_NOTICE);
+  d.key(ALT_RIGHT);
+  await turns();
+  shown = d.frame();
+  assert.equal(readerPosition(shown), undefined, "the same chord returns");
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), `Back keeps the selection:\n${shown.join("\n")}`);
+  assert.equal(d.sidebar.focus, "form", "the chord never left the settings");
+  // Without a drawn offer the chord stays inert.
+  d.rows = 40;
+  d.frame();
+  d.key(ALT_RIGHT);
+  shown = d.frame();
+  assert.equal(readerPosition(shown), undefined, "no offer, no reader");
+  assert.ok(shown.some((line) => /→ Model uploads\s+Off/.test(line)), shown.join("\n"));
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+
+  // A long fallback chord stays wholly advertised in a narrow usable pane.
+  const narrow = driven(l, { returnToMainKey: "ctrl+shift+alt+super+pageDown" });
+  narrow.rows = 40;
+  await openBrowserPermissions(narrow);
+  narrow.cols = 25;
+  narrow.rows = 24;
+  text = narrow.text();
+  assert.doesNotMatch(text, /too small/, text);
+  assert.match(text, /C-S-A-Win-PgDn read all/, `the complete compact cue:\n${text}`);
+  narrow.key("\x1b[6;16~");
+  assert.equal(flowed(readWholeNotice(narrow, "Review settings (local)")).trim(), BROWSER_PERMISSIONS_NOTICE, "the exact notice at 25 columns");
+  narrow.key(ESC);
+  // (The list clips its own rows at this width; the highlighted row is the first.)
+  const back = narrow.frame();
+  assert.ok(back.some((line) => line.includes("→ Model credential en")), `Back keeps the selection:\n${back.join("\n")}`);
+  narrow.sidebar.cancelReviewSettings();
+  await Promise.all(narrow.settled);
+
+  // The URL edit: the fallback reads the notice and the bound field action never runs.
+  const edit = driven(l);
+  edit.rows = 40;
+  await openReviewSettings(edit);
+  await chooseMenuRow(edit, "Tools", "Web");
+  await chooseMenuRow(edit, "Web", "URL blocklist");
+  moveToMenuRow(edit, "URL blocklist");
+  edit.key(ENTER);
+  await waitFor(edit, (shownText) => shownText.includes("Blocked URL patterns"), "the shared text field");
+  edit.key("abc");
+  edit.rows = 14;
+  text = edit.text();
+  assert.match(text, /alt\+right read all/, text);
+  edit.key(ALT_RIGHT);
+  assert.equal(flowed(readWholeNotice(edit, "Review settings (local)")).trim(), URL_BLOCKLIST_NOTICE);
+  edit.key(ESC);
+  shown = edit.frame();
+  assert.ok(shown.some((line) => line.includes("abc")) && shown.join("\n").includes("Blocked URL patterns"), `the text is untouched:\n${shown.join("\n")}`);
+  edit.sidebar.cancelReviewSettings();
+  await Promise.all(edit.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
 });
 
 test("a short sidebar shows both choices of a two-item list instead of one choice and a scroll cue", async (t) => {

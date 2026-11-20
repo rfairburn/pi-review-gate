@@ -160,7 +160,7 @@ function urlBlocklistSummary(sources: readonly string[]): string {
 }
 
 /** What the shared URL blocklist does, stated before it is edited. */
-const URL_BLOCKLIST_NOTICE =
+export const URL_BLOCKLIST_NOTICE =
   "Each line is one JavaScript regular-expression source matched anywhere in the URL \u2014 no /.../ delimiters, "
   + "no flags, and nothing is implicitly anchored, so aliyuncs also matches https://bucket.example.aliyuncs.com/object. "
   + "Surrounding whitespace is trimmed from every line, since a leading or trailing space in a URL pattern is almost "
@@ -288,6 +288,10 @@ export const YOLO_CONFIRM_MESSAGE =
   "Confirm enabling YOLO / allow everything for the managed browser. It stays enabled across restarts until you " +
   "disable it here; disabling is immediate and restores your saved individual permissions as the effective policy.";
 
+/** What the browser permissions submenu stages and how each capability is enforced, stated on entry. */
+export const BROWSER_PERMISSIONS_NOTICE =
+  "These stage the issue #27 browser permissions, and every capability is enforced. Credential entry/submission, uploads, download saving, and clipboard read/write are enforced by interactive-browser tool actions; camera, microphone, and geolocation apply as per-origin device permission grants issued when a tab commits to an origin (and cleared from live sessions when disabled — an unconfirmable engine clear closes the affected browser session instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants); service workers apply at browser launch, so a saved change replaces the live browser in a controlled way that restores tabs, storage state, and granted permissions best-effort; the popup restriction override lifts the four-tab limit for page-created popups while enabled; local networks (including YOLO's local-network effect) is enforced at the interactive egress broker. Saved changes apply to the live session immediately.";
+
 /**
  * The Browser permissions submenu (issue #27): independently selectable
  * capability toggles plus the YOLO master override, staged like every other
@@ -317,11 +321,7 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
   // controlled replacement of a live browser when the saved policy changes;
   // the popup restriction override while it is enabled; local networks (and
   // YOLO's local-network effect) at the interactive egress broker.
-  await notify(
-    ui,
-    "These stage the issue #27 browser permissions, and every capability is enforced. Credential entry/submission, uploads, download saving, and clipboard read/write are enforced by interactive-browser tool actions; camera, microphone, and geolocation apply as per-origin device permission grants issued when a tab commits to an origin (and cleared from live sessions when disabled — an unconfirmable engine clear closes the affected browser session instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants); service workers apply at browser launch, so a saved change replaces the live browser in a controlled way that restores tabs, storage state, and granted permissions best-effort; the popup restriction override lifts the four-tab limit for page-created popups while enabled; local networks (including YOLO's local-network effect) is enforced at the interactive egress broker. Saved changes apply to the live session immediately.",
-    "info",
-  );
+  await notify(ui, BROWSER_PERMISSIONS_NOTICE, "info");
   // Caller-local last selection for this loop only: keys are the permission
   // field names (plus yolo/back), stable across the On/Off label flips, so a
   // toggled row stays highlighted on the re-show (issue #140).

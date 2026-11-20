@@ -673,7 +673,8 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
   (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
 - **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
   fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
-  short pane — after the notice takes up to half of the rows below the header. Selection, keys, the
+  short pane — below the notice, which is drawn whole when the list still fits beside it and
+  otherwise takes up to half of the rows below the header. Selection, keys, the
   tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
   and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.
 - **One notice at a time.** Below the **Review settings (local)** header the pane shows a single
@@ -687,12 +688,33 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
   error over warning over info, and clears once a later action opens another screen; opening
   diagnostics are the first screen's result in the same way, so saved tool-protection settings
   that do not load (an error: protected calls stay blocked) outrank a config-load warning, which
-  outranks routine model-catalog guidance. A confirmation's disclosure (such as **Save auditor
-  sessions**) is that screen's one notice, always shown whole: a pane too short for it is too
-  small, and **Yes** is accepted only from a frame that shows it. A disclosure too long for the
-  sidebar to show whole (for example an auditor confirmation listing a very long selected tool-name
-  scope) is never confirmed there. The pane says so and shows Escape, which answers No without
-  closing the editor; configured Cancel keys that reach the pane also answer No. A result that ends the editor is
-  shown as its one notice in **Settings**. Text fields show the same single result or their own
-  field message; a rejected input's error clears once the field accepts a changed value. In-Pi `/review-settings` keeps its full
-  section descriptions as ordinary notifications.
+  outranks routine model-catalog guidance. Notices, including long opening diagnostics, are never
+  shortened: when the pane has room a
+  notice such as the **Browser permissions** or **URL blocklist** description is drawn whole. In a
+  pane too short for it beside a usable list or field, its first rows end with
+  `... ctrl+o read all`; when no notice row is left, the cue joins the pane's header (or footer)
+  so no menu entry or field row is lost. When Ctrl+O is a host shortcut or bound to a settings key,
+  the cue names the first free key of F2 through F8 instead, so it never takes a configured action;
+  if all of them are bound, it names the return-to-Main chord (Alt+Right by default), which does
+  nothing else in these panes and reads the notice only while the cue is shown. That key
+  opens a read-only reader of the whole notice in the same pane: up/down and Page Up/Page Down
+  scroll it, it shows which lines are in view, and Escape (or the same key) returns to the
+  unchanged screen or field. The reader takes no other action, so Enter, Ctrl+S, typed text, and
+  pasted text do nothing while it is open. After it closes, no key or paste (including one begun
+  inside the reader) acts until the screen or field has actually been written to the terminal again, a key still held from the reader (such as a held Enter) never repeats
+  into it until that key is pressed afresh, and a confirming action still needs a freshly written
+  screen. If the pane became too small while the reader was open, Back shows the too-small pane
+  with `esc back`; once that is written, Escape there cancels as it would on the screen or field,
+  and no other key acts. A confirmation's disclosure (such as **Save auditor sessions**) is that screen's
+  one notice, drawn whole with its choices regardless of length, and **Yes** is accepted only from
+  a frame that shows it whole. When the pane is too short for both (for example an auditor
+  confirmation listing a very long selected tool-name scope), the pane draws no choice: it shows
+  the start of the disclosure, says to enlarge the pane to answer, and the reader shows the rest.
+  Reading it there (or seeing a too-small pane) never accepts **Yes**, and Enter, Ctrl+S, or arrow keys there change nothing:
+  the pane keeps showing the disclosure and its reader cue, and the choice shown once the pane is
+  large enough is the one that was selected before. Escape answers No without closing the editor, and so do
+  configured Cancel keys that reach the pane. A result that ends the editor is shown as its one
+  notice in **Settings**, which always keeps every entry and offers the same reader when the
+  result does not fit. Text fields show the same single result or their own field message; a
+  rejected input's error clears once the field accepts a changed value. In-Pi `/review-settings`
+  keeps its full section descriptions as ordinary notifications.

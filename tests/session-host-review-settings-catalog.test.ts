@@ -254,6 +254,15 @@ test("first launch: an unset or empty Pi scope is one informational notice, neve
   assert.ok(NO_SCOPED_MODELS_GUIDANCE.length <= 360, "the sidebar notice prefix must not truncate it");
 });
 
+test("a long native scope diagnostic is passed on whole, never cut to a character limit", async (t) => {
+  const agentDir = scratchDir(t);
+  const pattern = `acme/${"ghost-".repeat(120)}unique-pattern-tail-7d2a`;
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: [pattern] }));
+  const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, { loadSdk: () => fakeSdk(newLog()) });
+  assert.ok(pattern.length > 400, "longer than the former diagnostic cap");
+  assert.deepEqual(catalog.warnings, [`No models match pattern "${pattern}"`]);
+});
+
 test("a nonempty scope still restricts: no first-launch notice, native diagnostics unchanged", async (t) => {
   const agentDir = scratchDir(t);
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/ghost"] }));

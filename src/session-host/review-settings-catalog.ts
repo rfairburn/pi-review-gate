@@ -214,7 +214,7 @@ export async function loadReviewSettingsChoices(
     sdk = loadSdk(piExecutable);
   } catch (error) {
     throw new ReviewSettingsCatalogUnavailableError(
-      `pi-review-gate: the installed Pi SDK is unavailable for the settings catalog: ${boundedMessage(error)}`,
+      `pi-review-gate: the installed Pi SDK is unavailable for the settings catalog: ${errorLine(error)}`,
     );
   }
   if (!isRecord(sdk)) {
@@ -259,7 +259,7 @@ function readScopePatterns(
     try {
       parsed = (parseArgs as (args: string[]) => unknown)([...args]);
     } catch (error) {
-      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not parse the forwarded host arguments: ${boundedMessage(error)}`);
+      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not parse the forwarded host arguments: ${errorLine(error)}`);
     }
     const models = isRecord(parsed) ? parsed.models : undefined;
     if (Array.isArray(models)) {
@@ -676,7 +676,7 @@ async function resolveScopedChoices(
     result = await resolveWithCatalog(resolveScope, patterns, runtime, fallbackModels);
   } catch (error) {
     if (!restored) {
-      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${boundedMessage(error)}`);
+      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${errorLine(error)}`);
     }
     // The restored saved catalogs made Pi's resolver fail: drop them all and
     // resolve again over a fresh built-in + models.json runtime, never
@@ -686,7 +686,7 @@ async function resolveScopedChoices(
       result = await resolveWithCatalog(resolveScope, patterns, await createRuntime());
     } catch (retryError) {
       if (retryError instanceof ReviewSettingsCatalogUnavailableError) throw retryError;
-      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${boundedMessage(retryError)}`);
+      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${errorLine(retryError)}`);
     }
   }
   if (!isRecord(result) || !Array.isArray(result.scopedModels)) {
@@ -695,7 +695,7 @@ async function resolveScopedChoices(
   if (Array.isArray(result.diagnostics)) {
     for (const diagnostic of result.diagnostics) {
       if (isRecord(diagnostic) && typeof diagnostic.message === "string" && diagnostic.message.length > 0) {
-        warnings.push(boundedText(diagnostic.message));
+        warnings.push(singleLine(diagnostic.message));
       }
     }
   }
@@ -756,13 +756,14 @@ function collectToolCandidates(sdk: Record<string, unknown>, cwd: string, warnin
   return [...byName.values()].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 }
 
-const MAX_DIAGNOSTIC_CHARS = 400;
-
-function boundedText(text: string): string {
-  const single = text.replace(/\s+/g, " ").trim();
-  return single.length > MAX_DIAGNOSTIC_CHARS ? `${single.slice(0, MAX_DIAGNOSTIC_CHARS - 1)}…` : single;
+/**
+ * One display line of a diagnostic, never shortened (#653): the sidebar wraps
+ * a long notice and offers it whole in its read-only notice reader.
+ */
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
-function boundedMessage(error: unknown): string {
-  return boundedText(error instanceof Error ? error.message : String(error));
+function errorLine(error: unknown): string {
+  return singleLine(error instanceof Error ? error.message : String(error));
 }

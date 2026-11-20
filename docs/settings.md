@@ -622,8 +622,15 @@ protections. The **Scheduler runtime** switch stays out: it is live, process-onl
   **Back** only navigates and keeps this visit's draft staged.
 - **Pi model choices need models already scoped in Pi.** The model, reasoning, reviewer, and
   worker-resource pickers list only the models Pi itself scopes — the host's forwarded
-  `--models` when present, otherwise Pi's global `enabledModels`. This editor never scopes a
-  model and never writes Pi's own configuration, so on a host with nothing scoped yet it offers
+  `--models` when present, otherwise Pi's global `enabledModels`. Patterns match Pi's built-in
+  models, `models.json`, and the provider catalogs Pi has already saved in the same agent
+  directory (`models-store.json`, such as newer Codex models). When the model scope is nonempty,
+  the editor reads that catalog read-only on each open, without network refresh, sign-in, or
+  credential use. Models available only from a saved catalog are omitted when Pi has not saved a
+  usable entry for them; a real Pi session may refresh a missing or stale catalog (older than
+  Pi's bundled data), but the editor also requires `models-store.json` itself to be a readable,
+  well-formed regular file — a symlink is declined however fresh its target. This editor never
+  scopes a model and never writes Pi's own configuration, so on a host with nothing scoped yet it offers
   no Pi model choices and says so in one non-blocking notice. The way to get choices is Pi's own
   setup: start a real Pi session — the sidebar's **New session** works, and review and subtasks
   may stay unset for that setup session — configure Pi's base settings and scoped models there,

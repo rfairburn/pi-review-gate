@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
   loadReviewSettingsChoices,
+  MAX_SAVED_PROVIDER_CATALOG_BYTES,
   nativeBuiltinToolEntries,
   ReviewSettingsCatalogUnavailableError,
   shippedReviewGateToolNames,
@@ -238,6 +239,8 @@ test("first launch: an unset or empty Pi scope is one informational notice, neve
   assert.ok(names.includes("read") && names.includes(DEFERRED_TOOL_SEARCH_NAME));
 
   // Empty: an explicit --models list with no entries.
+  // A corrupt saved catalog is irrelevant without a scope and is never read.
+  writeFileSync(join(agentDir, "models-store.json"), "{ invalid JSON");
   const empty = await loadReviewSettingsChoices(
     { piExecutable: PI_EXECUTABLE, agentDir, args: ["--models", ""] },
     { loadSdk: () => fakeSdk(newLog(), { parseArgs: () => ({ models: [] }) }) },
@@ -304,6 +307,299 @@ test("the default SDK loader keeps the shared role guards (no SDK load inside a 
     loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }),
     (error: unknown) => error instanceof ReviewSettingsCatalogUnavailableError && /PI_REVIEW_GATE_RUNTIME_ROLE/.test(error.message),
   );
+});
+
+interface SavedCatalogProviderLog {
+  contexts: Array<Record<string, any>>;
+  persistRefused: boolean[];
+}
+
+/** A complete synthetic saved record in Pi's native model shape. */
+function savedModel(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id,
+    name: id,
+    provider: "acme",
+    api: "openai-completions",
+    baseUrl: "https://example.invalid",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1000,
+    maxTokens: 100,
+    ...overrides,
+  };
+}
+
+/**
+ * A structural fake of a registered dynamic provider following pi-ai's public
+ * `refreshModels` contract: restore `context.stored` through `publish`, and
+ * (to probe the boundary) also request persistence of a rewritten entry.
+ */
+function dynamicProvider(id: string, log: SavedCatalogProviderLog, options: { refreshThrows?: boolean; composeThrowsOn?: string } = {}) {
+  let dynamic: FakeModel[] = [];
+  return {
+    id,
+    baseUrl: "https://example.invalid",
+    getModels: () => {
+      if (options.composeThrowsOn && dynamic.some((model) => model.id === options.composeThrowsOn)) {
+        throw new Error("composition failed on \"SENTINEL-SECRET-BYTES\"");
+      }
+      return [...MODELS.filter((model) => model.provider === id), ...dynamic];
+    },
+    async refreshModels(context: Record<string, any>) {
+      log.contexts.push(context);
+      if (options.refreshThrows) throw new Error(`restore failed "SENTINEL-SECRET-BYTES"`);
+      const restored = (context.stored?.models ?? []).filter((model: FakeModel) => model.provider === id);
+      if (!(await context.publish({ update: () => { dynamic = restored; } }))) return;
+      // Persisting is never this catalog's job: the coupled update must not apply.
+      const applied = await context.publish({ persist: { models: [] }, update: () => { dynamic = []; } });
+      log.persistRefused.push(applied === false);
+    },
+  };
+}
+
+function fakeSdkWithProviders(log: FakeSdkLog, providers: unknown[]): Record<string, unknown> {
+  return fakeSdk(log, {
+    ModelRuntime: {
+      async create(options: Record<string, any>) {
+        log.createOptions = options;
+        return {
+          getProviders: () => providers,
+          // Like pi-ai's collection accessor: per provider, a throwing provider yields nothing.
+          getModels: (providerId?: string) => providers
+            .filter((provider) => providerId === undefined || (provider as { id: string }).id === providerId)
+            .flatMap((provider) => {
+              try {
+                return (provider as { getModels(): FakeModel[] }).getModels();
+              } catch {
+                return [];
+              }
+            }),
+          getAvailable: async () => { log.realGetAvailableCalls += 1; throw new Error("real getAvailable must never be called"); },
+          refresh: async () => { throw new Error("ModelRuntime.refresh must never be called"); },
+          checkAuth: async () => { throw new Error("checkAuth must never be called"); },
+          getError: () => undefined,
+        };
+      },
+    },
+  });
+}
+
+test("saved provider catalog: offline restore through the public provider hook, read-only, scoped-only", async (t) => {
+  const agentDir = scratchDir(t);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/cached:low", "acme/flat"] }));
+  const storeBytes = `﻿${JSON.stringify({
+    acme: {
+      models: [
+        savedModel("cached", { reasoning: true }),
+        savedModel("unscoped"),
+        savedModel("future-kind", { type: "hologram" }),
+        savedModel("foreign", { provider: "elsewhere" }),
+      ],
+      lastModified: 1,
+      checkedAt: 2,
+    },
+    unregistered: { models: [{ provider: "unregistered", id: "x" }] },
+  })}`;
+  writeFileSync(join(agentDir, "models-store.json"), storeBytes);
+  const providerLog: SavedCatalogProviderLog = { contexts: [], persistRefused: [] };
+  const log = newLog();
+  const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, {
+    loadSdk: () => fakeSdkWithProviders(log, [dynamicProvider("acme", providerLog), { id: "static-only", getModels: () => [] }]),
+  });
+
+  assert.equal(log.createOptions!.refreshOnCreate, false, "the runtime itself is never refreshed");
+  assert.equal(await log.createOptions!.modelsStore.read("acme"), undefined, "the runtime's own store stays empty");
+  assert.equal(log.realGetAvailableCalls, 0);
+  assert.equal(providerLog.contexts.length, 1, "only the registered provider with a saved entry is restored");
+  const context = providerLog.contexts[0]!;
+  assert.equal(context.allowNetwork, false);
+  assert.equal(context.credential, undefined, "no credential is read or handed over");
+  assert.equal(context.force, undefined);
+  assert.equal(context.baseUrl, "https://example.invalid");
+  assert.ok(context.signal instanceof AbortSignal);
+  assert.ok(Object.isFrozen(context.stored) && Object.isFrozen(context.stored.models), "the stored snapshot is immutable");
+  assert.deepEqual(context.stored.models.map((model: FakeModel) => model.id), ["cached", "unscoped", "foreign"],
+    "unknown model types are dropped as pi-ai drops them before restore");
+  assert.equal(context.stored.lastModified, 1, "freshness metadata reaches the provider unchanged");
+  assert.deepEqual(providerLog.persistRefused, [true], "a persisting publication is refused and its update not applied");
+
+  assert.deepEqual(catalog.scoped.map((choice) => [choice.model, choice.pinnedThinkingLevel]), [["acme/cached", "low"], ["acme/flat", undefined]]);
+  assert.ok(!catalog.scoped.some((choice) => choice.model === "acme/unscoped"), "unscoped saved models are never offered");
+  assert.deepEqual(catalog.warnings, []);
+  assert.equal(readFileSync(join(agentDir, "models-store.json"), "utf8"), storeBytes, "the saved catalog is unchanged");
+  assert.deepEqual(readdirSync(agentDir).sort(), ["models-store.json", "settings.json"], "no lock or other file is created");
+
+  // Each open re-reads the file: removing a saved model removes the choice.
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({ acme: { models: [] } }));
+  const reopened = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, {
+    loadSdk: () => fakeSdkWithProviders(newLog(), [dynamicProvider("acme", { contexts: [], persistRefused: [] })]),
+  });
+  assert.deepEqual(reopened.scoped.map((choice) => choice.model), ["acme/flat"]);
+  assert.deepEqual(reopened.warnings, ['No models match pattern "acme/cached:low"']);
+});
+
+test("saved provider catalog: absent, unusable, or failing entries never block the static catalog", async (t) => {
+  const agentDir = scratchDir(t);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/flat", "acme/cached"] }));
+  const open = async (providerOptions: { refreshThrows?: boolean } = {}) => {
+    const providerLog: SavedCatalogProviderLog = { contexts: [], persistRefused: [] };
+    const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, {
+      loadSdk: () => fakeSdkWithProviders(newLog(), [dynamicProvider("acme", providerLog, providerOptions)]),
+    });
+    assert.deepEqual(catalog.scoped.map((choice) => choice.model), ["acme/flat"], "static choices stay offered");
+    assert.ok(!JSON.stringify(catalog).includes("SENTINEL-SECRET-BYTES"), "no file or error bytes are quoted");
+    return { catalog, providerLog };
+  };
+  const noMatch = 'No models match pattern "acme/cached"';
+
+  const absent = await open();
+  assert.deepEqual(absent.catalog.warnings, [noMatch], "an absent saved catalog is silent");
+  assert.equal(absent.providerLog.contexts.length, 0);
+
+  writeFileSync(join(agentDir, "models-store.json"), `{"acme": SENTINEL-SECRET-BYTES`);
+  const corrupt = await open();
+  assert.equal(corrupt.providerLog.contexts.length, 0);
+  assert.deepEqual(corrupt.catalog.warnings.filter((warning) => warning !== noMatch).length, 1);
+  assert.ok(corrupt.catalog.warnings.some((warning) => /saved provider catalog could not be read/.test(warning)));
+
+  for (const bytes of ["[]", "\"SENTINEL-SECRET-BYTES\""]) {
+    writeFileSync(join(agentDir, "models-store.json"), bytes);
+    const malformed = await open();
+    assert.ok(malformed.catalog.warnings.some((warning) => /saved provider catalog is malformed/.test(warning)));
+  }
+
+  for (const entry of [{ models: "SENTINEL-SECRET-BYTES" }, { models: [], lastModified: "soon" }, ["SENTINEL-SECRET-BYTES"]]) {
+    writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({ acme: entry }));
+    const badEntry = await open();
+    assert.equal(badEntry.providerLog.contexts.length, 0, "a malformed entry is never handed to the provider");
+    assert.ok(badEntry.catalog.warnings.some((warning) => /entries in Pi's saved provider catalog are malformed/.test(warning)));
+  }
+
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({ acme: { models: [savedModel("cached")] } }));
+  const failing = await open({ refreshThrows: true });
+  assert.ok(failing.catalog.warnings.some((warning) => /could not restore some saved provider catalogs/.test(warning)));
+
+  rmSync(join(agentDir, "models-store.json"));
+  mkdirSync(join(agentDir, "models-store.json"));
+  const directory = await open();
+  assert.ok(directory.catalog.warnings.some((warning) => /not a regular file/.test(warning)));
+});
+
+test("saved provider catalog: symlinked or oversized files are refused before any read; static choices stay", async (t) => {
+  const agentDir = scratchDir(t);
+  const external = scratchDir(t);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/flat", "acme/cached"] }));
+  const externalCatalog = join(external, "synthetic-catalog.json");
+  writeFileSync(externalCatalog, JSON.stringify({ acme: { models: [savedModel("cached")] } }));
+  symlinkSync(externalCatalog, join(agentDir, "models-store.json"));
+  const open = async () => {
+    const providerLog: SavedCatalogProviderLog = { contexts: [], persistRefused: [] };
+    const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, {
+      loadSdk: () => fakeSdkWithProviders(newLog(), [dynamicProvider("acme", providerLog)]),
+    });
+    assert.equal(providerLog.contexts.length, 0, "nothing reaches the provider");
+    assert.deepEqual(catalog.scoped.map((choice) => choice.model), ["acme/flat"]);
+    return catalog;
+  };
+  const linked = await open();
+  assert.ok(linked.warnings.some((warning) => /saved provider catalog is not a regular file/.test(warning)), "a symlink is never followed");
+
+  rmSync(join(agentDir, "models-store.json"));
+  // A sparse file past the bound: refused from its size, never read.
+  const fd = openSync(join(agentDir, "models-store.json"), "w");
+  try {
+    ftruncateSync(fd, MAX_SAVED_PROVIDER_CATALOG_BYTES + 1);
+  } finally {
+    closeSync(fd);
+  }
+  const oversized = await open();
+  assert.ok(oversized.warnings.some((warning) => /exceeds the catalog read bound/.test(warning)));
+});
+
+test("saved provider catalog: malformed records skip the entry; non-chat models never become choices; resolver failures fall back", async (t) => {
+  const agentDir = scratchDir(t);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/flat", "acme/cached", "acme/picture"] }));
+  const open = async (resolverOverride?: Record<string, unknown>) => {
+    const providerLog: SavedCatalogProviderLog = { contexts: [], persistRefused: [] };
+    let creations = 0;
+    const base = fakeSdkWithProviders(newLog(), [dynamicProvider("acme", providerLog)]);
+    const sdk = {
+      ...base,
+      ModelRuntime: {
+        async create(options: Record<string, any>) {
+          creations += 1;
+          // A fallback runtime gets fresh, unrestored providers.
+          if (creations > 1) {
+            const fresh = [dynamicProvider("acme", { contexts: [], persistRefused: [] })];
+            return { getProviders: () => fresh, getModels: () => fresh.flatMap((provider) => provider.getModels()), getError: () => undefined };
+          }
+          return (base.ModelRuntime as { create(options: unknown): Promise<unknown> }).create(options);
+        },
+      },
+      ...resolverOverride,
+    };
+    const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, { loadSdk: () => sdk });
+    assert.ok(!JSON.stringify(catalog).includes("SENTINEL-SECRET-BYTES"));
+    return { catalog, providerLog, creations };
+  };
+
+  const incomplete = [{ name: undefined }, { api: undefined }, { baseUrl: undefined }, { reasoning: undefined }, { cost: undefined },
+    { cost: { input: 0 } }, { input: undefined }, { contextWindow: undefined }, { maxTokens: undefined }];
+  for (const bad of [{ name: 7 }, { reasoning: "yes" }, { thinkingLevelMap: { high: 3 } }, { cost: "free" }, { input: "text" }, { id: "" }, ...incomplete]) {
+    writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+      acme: { models: [savedModel("cached"), savedModel("other", { ...bad, note: "SENTINEL-SECRET-BYTES" })] },
+    }));
+    const { catalog, providerLog } = await open();
+    assert.equal(providerLog.contexts.length, 0, `a malformed record (${Object.keys(bad)[0]}) is never published`);
+    assert.deepEqual(catalog.scoped.map((choice) => choice.model), ["acme/flat"]);
+    assert.ok(catalog.warnings.some((warning) => /entries in Pi's saved provider catalog are malformed/.test(warning)));
+  }
+
+  // A provider whose restored list is not chat-only: only chat entries reach Pi's resolver.
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    // Image records natively carry no reasoning/contextWindow/maxTokens and stay well-formed.
+    acme: { models: [
+      savedModel("cached", { type: "chat" }),
+      savedModel("picture", { type: "image", reasoning: undefined, contextWindow: undefined, maxTokens: undefined }),
+    ] },
+  }));
+  const chatOnly = await open();
+  assert.deepEqual(chatOnly.catalog.scoped.map((choice) => choice.model), ["acme/flat", "acme/cached"]);
+  assert.ok(chatOnly.catalog.warnings.includes('No models match pattern "acme/picture"'));
+
+  // A restored catalog the native resolver still rejects: resolve again without it.
+  const rejecting = await open({
+    async resolveModelScopeWithDiagnostics(patterns: string[], runtime: { getAvailable(): Promise<FakeModel[]> }) {
+      const available = await runtime.getAvailable();
+      if (available.some((model) => model.id === "cached")) throw new Error("matcher failed on \"SENTINEL-SECRET-BYTES\"");
+      return { scopedModels: available.filter((model) => patterns.includes(`${model.provider}/${model.id}`)).map((model) => ({ model })), diagnostics: [] };
+    },
+  });
+  assert.equal(rejecting.creations, 2, "a fresh unrestored runtime is built for the fallback");
+  assert.deepEqual(rejecting.catalog.scoped.map((choice) => choice.model), ["acme/flat"]);
+  assert.ok(rejecting.catalog.warnings.some((warning) => /could not use its saved provider catalogs/.test(warning)));
+});
+
+test("saved provider catalog: a restore that breaks one provider's composition keeps its pre-restore list only", async (t) => {
+  const agentDir = scratchDir(t);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["acme/flat", "acme/cached", "beta/fresh"] }));
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    acme: { models: [savedModel("cached")] },
+    beta: { models: [savedModel("fresh", { provider: "beta" })] },
+  }));
+  const catalog = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir }, {
+    loadSdk: () => fakeSdkWithProviders(newLog(), [
+      dynamicProvider("acme", { contexts: [], persistRefused: [] }, { composeThrowsOn: "cached" }),
+      dynamicProvider("beta", { contexts: [], persistRefused: [] }),
+    ]),
+  });
+  assert.deepEqual(catalog.scoped.map((choice) => choice.model), ["acme/flat", "beta/fresh"],
+    "the broken provider keeps its static choices; the other provider keeps its restore");
+  assert.ok(catalog.warnings.some((warning) => /could not restore some saved provider catalogs/.test(warning)));
+  assert.ok(catalog.warnings.includes('No models match pattern "acme/cached"'));
+  assert.ok(!JSON.stringify(catalog).includes("SENTINEL-SECRET-BYTES"));
 });
 
 /** Every name the real registrars register, captured through fake hosts. */
@@ -481,4 +777,212 @@ test("installed Pi SDK: native scope grammar and reasoning metadata, no session,
   const explicit = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir, args: ["--models", "catalog-test/plain"] });
   assert.deepEqual(explicit.scoped.map((choice) => choice.model), ["catalog-test/plain"]);
   assert.deepEqual(explicit.modelScope, { source: "args", patterns: ["catalog-test/plain"] });
+});
+
+/** A synthetic Codex chat model in Pi's native saved-catalog shape (never a real provider id). */
+function syntheticCodexModel(id: string): Record<string, unknown> {
+  return {
+    id,
+    name: `Synthetic ${id}`,
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.invalid/backend-api",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1000,
+    maxTokens: 100,
+    thinkingLevelMap: { minimal: "low", xhigh: "xhigh", max: "max" },
+    type: "chat",
+  };
+}
+
+test("installed Pi SDK: a scoped Codex model only in Pi's saved provider catalog is offered, offline and read-only", async (t) => {
+  const pi = installedPi(t);
+  if (!pi) return;
+  const agentDir = scratchDir(t);
+  const tripwireDir = scratchDir(t);
+  const tripwire = join(tripwireDir, "shell-ran");
+  const secret = "SENTINEL_SECRET_KEY_BYTES";
+  // Command-backed keys on a custom provider AND on a models.json overlay of
+  // the Codex provider itself: any auth resolution would run the shell.
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      "catalog-test": {
+        baseUrl: "http://127.0.0.1:9/v1",
+        api: "openai-completions",
+        apiKey: `!touch ${tripwire} && echo ${secret}`,
+        models: [{ id: "plain" }],
+      },
+      "openai-codex": {
+        apiKey: `!touch ${tripwire} && echo ${secret}`,
+        // models.json overrides stay the topmost layer over a restored model.
+        modelOverrides: { "gpt-synthetic-cache-sol": { thinkingLevelMap: { max: null } } },
+      },
+    },
+  }));
+  const cachedId = "gpt-synthetic-cache-sol";
+  const settingsBytes = JSON.stringify({ enabledModels: [`openai-codex/${cachedId}:high`, "catalog-test/plain"] });
+  writeFileSync(join(agentDir, "settings.json"), settingsBytes);
+  const writeStore = (lastModified: number) => {
+    const bytes = JSON.stringify({
+      "openai-codex": {
+        models: [syntheticCodexModel(cachedId), syntheticCodexModel("gpt-synthetic-unscoped")],
+        lastModified,
+        checkedAt: lastModified,
+        etag: "\"synthetic\"",
+      },
+      "never-registered": { models: [{ id: "x", provider: "never-registered" }] },
+    }, null, 2);
+    writeFileSync(join(agentDir, "models-store.json"), bytes);
+    return bytes;
+  };
+  const storeBytes = writeStore(Date.now());
+  const storeMtime = statSync(join(agentDir, "models-store.json")).mtimeMs;
+
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => { fetchCalls += 1; throw new Error("the settings catalog must never fetch"); }) as typeof fetch;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const ambient = scratchDir(t);
+  process.env.PI_CODING_AGENT_DIR = ambient;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
+
+  const catalog = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(catalog.scoped, [
+    {
+      model: `openai-codex/${cachedId}`,
+      label: `${cachedId} [openai-codex]`,
+      pinnedThinkingLevel: "high",
+      // Native reasoning metadata from the saved entry, minus the overridden `max`.
+      supportedThinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+    },
+    { model: "catalog-test/plain", label: "plain [catalog-test]", pinnedThinkingLevel: undefined, supportedThinkingLevels: ["off"] },
+  ]);
+  assert.ok(!catalog.scoped.some((choice) => choice.model.includes("unscoped")), "unscoped saved models are never offered");
+  assert.deepEqual(catalog.warnings, []);
+  assert.equal(fetchCalls, 0, "no network request");
+  assert.equal(existsSync(tripwire), false, "no auth command ran");
+  assert.ok(!JSON.stringify(catalog).includes(secret));
+  assert.equal(readFileSync(join(agentDir, "models-store.json"), "utf8"), storeBytes, "the saved catalog is unchanged");
+  assert.equal(statSync(join(agentDir, "models-store.json")).mtimeMs, storeMtime);
+  assert.equal(readFileSync(join(agentDir, "settings.json"), "utf8"), settingsBytes);
+  assert.deepEqual(readdirSync(agentDir).sort(), ["models-store.json", "models.json", "settings.json"], "no auth, lock, or new store file");
+  assert.deepEqual(readdirSync(ambient), [], "the ambient agent dir is never consulted or written");
+
+  // Pi's native freshness: an overlay not newer than the bundled data is ignored.
+  writeStore(0);
+  const stale = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(stale.scoped.map((choice) => choice.model), ["catalog-test/plain"]);
+  assert.ok(stale.warnings.some((warning) => warning.includes(`openai-codex/${cachedId}`)), "the native no-match diagnostic stays truthful");
+
+  // Absent and unusable saved catalogs fall back to the static catalog.
+  rmSync(join(agentDir, "models-store.json"));
+  const absent = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(absent.scoped.map((choice) => choice.model), ["catalog-test/plain"]);
+  assert.deepEqual(readdirSync(agentDir).sort(), ["models.json", "settings.json"], "no store file is created when absent");
+  writeFileSync(join(agentDir, "models-store.json"), "{ not json");
+  const corrupt = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(corrupt.scoped.map((choice) => choice.model), ["catalog-test/plain"]);
+  assert.ok(corrupt.warnings.some((warning) => /saved provider catalog could not be read/.test(warning)));
+  assert.equal(fetchCalls, 0);
+  assert.equal(existsSync(tripwire), false);
+});
+
+test("installed Pi SDK: malformed saved records and non-chat saved models never break or pollute the choices", async (t) => {
+  const pi = installedPi(t);
+  if (!pi) return;
+  const agentDir = scratchDir(t);
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      "catalog-test": { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: "literal-unused", models: [{ id: "plain" }] },
+      "openai-codex": { modelOverrides: { "gpt-synthetic-no-cost": { cost: { input: 1 } } } },
+    },
+  }));
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => { fetchCalls += 1; throw new Error("the settings catalog must never fetch"); }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  // A fresh Codex record whose `name` is not text, plus a fuzzy pattern ("pla")
+  // that makes Pi's matcher read every candidate's name.
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["pla", "openai-codex/gpt-synthetic-cache-sol"] }));
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    "openai-codex": {
+      models: [syntheticCodexModel("gpt-synthetic-cache-sol"), { ...syntheticCodexModel("gpt-synthetic-bad"), name: 42, note: "SENTINEL_CACHE_BYTES" }],
+      lastModified: Date.now(),
+      checkedAt: Date.now(),
+    },
+  }));
+  const malformed = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(malformed.scoped.map((choice) => choice.model), ["catalog-test/plain"], "the valid custom choice survives");
+  assert.ok(malformed.warnings.some((warning) => /entries in Pi's saved provider catalog are malformed/.test(warning)));
+  assert.ok(malformed.warnings.some((warning) => warning.includes("openai-codex/gpt-synthetic-cache-sol")), "the skipped entry's model is honestly unmatched");
+  assert.ok(!JSON.stringify(malformed).includes("SENTINEL_CACHE_BYTES"), "cache contents are never quoted");
+
+  // A fresh saved record missing `cost` while models.json overrides its cost:
+  // publishing it would make Pi's composed Codex provider throw, and pi-ai
+  // would silently drop every built-in Codex model with it.
+  const incomplete = syntheticCodexModel("gpt-synthetic-no-cost");
+  delete incomplete.cost;
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+    enabledModels: ["openai-codex/gpt-6.1-sol", "openai-codex/gpt-synthetic-no-cost", "catalog-test/plain"],
+  }));
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    "openai-codex": { models: [incomplete], lastModified: Date.now() },
+  }));
+  const missingCost = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(missingCost.scoped.map((choice) => choice.model), ["openai-codex/gpt-6.1-sol", "catalog-test/plain"],
+    "the built-in Codex and unrelated custom choices survive");
+  assert.ok(missingCost.warnings.some((warning) => /entries in Pi's saved provider catalog are malformed/.test(warning)));
+
+  // Radius returns its restored list as-is: a saved image model must not become a chat choice.
+  const radiusModel = (id: string, type: string) => ({
+    id,
+    name: id,
+    api: "pi-messages",
+    provider: "radius",
+    baseUrl: "https://radius.invalid/v1",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1000,
+    maxTokens: 100,
+    type,
+  });
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["radius/synthetic-radius-chat", "radius/synthetic-radius-image"] }));
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    radius: { models: [radiusModel("synthetic-radius-chat", "chat"), radiusModel("synthetic-radius-image", "image")], checkedAt: Date.now() },
+  }));
+  const radius = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(radius.scoped.map((choice) => choice.model), ["radius/synthetic-radius-chat"]);
+  assert.ok(radius.warnings.some((warning) => warning.includes("radius/synthetic-radius-image")), "the non-chat model is unmatched, not offered");
+
+  // A well-typed saved record (empty baseUrl) that makes Pi's models.json
+  // composition throw: Pi's collection accessor would silently drop the whole
+  // Codex provider. Only that provider falls back to its pre-restore list;
+  // the Radius restore is kept.
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+    providers: { "openai-codex": { models: [{ id: "gpt-6.1-sol" }, { id: "custom-codex" }] } },
+  }));
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+    enabledModels: ["openai-codex/gpt-6.1-sol", "openai-codex/custom-codex", "radius/synthetic-radius-chat"],
+  }));
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify({
+    "openai-codex": { models: [{ ...syntheticCodexModel("gpt-6.1-sol"), baseUrl: "" }], lastModified: Date.now() },
+    radius: { models: [radiusModel("synthetic-radius-chat", "chat")] },
+  }));
+  const brokenComposition = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir });
+  assert.deepEqual(brokenComposition.scoped.map((choice) => choice.model), [
+    "openai-codex/gpt-6.1-sol",
+    "openai-codex/custom-codex",
+    "radius/synthetic-radius-chat",
+  ]);
+  assert.ok(brokenComposition.warnings.some((warning) => /could not restore some saved provider catalogs/.test(warning)));
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(readdirSync(agentDir).sort(), ["models-store.json", "models.json", "settings.json"]);
 });

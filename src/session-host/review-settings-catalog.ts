@@ -15,14 +15,32 @@
  *   `refreshOnCreate: false` and `allowModelNetwork: false`, an explicit
  *   `modelsPath` inside the caller's canonical agent directory, an EMPTY
  *   read-only credential store (no `auth.json` read, no credential write, no
- *   key or env bytes ever surfaced), and an empty in-memory model store (no
- *   cached catalog file is opened or rewritten). Scope patterns come from
+ *   key or env bytes ever surfaced), and an empty runtime model store that
+ *   refuses every write. Pi's own saved provider catalog in the SAME agent
+ *   directory (`models-store.json`, the file Pi's native runtime uses for
+ *   dynamic provider catalogs such as the pi.dev overlay) is then restored
+ *   offline: the file is read once through a no-follow descriptor (symlinks
+ *   and special files refused), bounded, without locks or writes; each entry
+ *   whose records carry the field types Pi's resolver and composition assume
+ *   is handed to that registered provider's public
+ *   cache-only `refreshModels` hook (`allowNetwork: false`, no credential),
+ *   exactly the restore phase Pi runs before any auth or network step. The
+ *   provider keeps every native rule — freshness against its bundled data,
+ *   provider identity, chat-only listing, models.json overrides — and any
+ *   publication that asks to persist is refused without applying. A missing
+ *   file contributes nothing; an unreadable, oversized, or malformed file or
+ *   entry is skipped with one bounded content-free warning and the static
+ *   and models.json catalog stays usable; if Pi's resolver still rejects the
+ *   restored catalog, the scope is resolved again without any saved catalog.
+ *   `ModelRuntime.refresh`, the real
+ *   availability pass, and auth checks are never called. Scope patterns come from
  *   explicit host `--models` args when present, else the GLOBAL
  *   `enabledModels` read through a read-only storage port — exactly Pi's own
  *   `parsed.models ?? settingsManager.getEnabledModels()` precedence. Project
  *   settings are never read and no trust is granted. The native resolver
- *   receives a narrow port whose `getAvailable` returns the static
- *   `getModels()` metadata: that is CATALOG ELIGIBILITY, deliberately not
+ *   receives a narrow port whose `getAvailable` returns the runtime's
+ *   chat-only `getModels()` metadata (static, models.json, and restored
+ *   saved catalogs): that is CATALOG ELIGIBILITY, deliberately not
  *   authenticated runtime availability (the real `getAvailable`, auth checks,
  *   and refreshes are never called). The resolved `ScopedModel` entries are
  *   converted by the existing {@link scopedModelChoices}, so model ids, pinned
@@ -51,7 +69,7 @@
  * real Pi session; it is informational only — nothing is blocked, created,
  * enrolled, or written.
  */
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { scopedModelChoices, type ScopedModelChoice } from "../settings/models";
 import { CODEMODE_TOOL_NAME, DEFERRED_TOOL_SEARCH_NAME, type ToolInventoryEntry } from "../tool-inventory";
@@ -69,6 +87,15 @@ import { isRecord } from "../record-guard";
 
 /** Upper bound for the global settings file read through the read-only port. */
 export const MAX_GLOBAL_SETTINGS_BYTES = 4 * 1024 * 1024;
+
+/** Upper bound for Pi's saved provider catalog (`models-store.json`) snapshot. */
+export const MAX_SAVED_PROVIDER_CATALOG_BYTES = 32 * 1024 * 1024;
+
+/** Elapsed bound for the offline restore of every saved provider catalog. */
+export const SAVED_PROVIDER_CATALOG_RESTORE_TIMEOUT_MS = 5_000;
+
+/** Pi's native per-agent saved provider catalog file name (beside models.json). */
+export const SAVED_PROVIDER_CATALOG_FILE = "models-store.json";
 
 /** Inputs: the actual resolved Pi executable, its canonical agent dir, and forwarded host args. */
 export interface ReviewSettingsCatalogInput {
@@ -326,7 +353,11 @@ const EMPTY_READ_ONLY_CREDENTIALS = Object.freeze({
   },
 });
 
-/** Narrow model store: no cached catalog is read, nothing is persisted. */
+/**
+ * The runtime's own model store: never read through and never persisted to.
+ * Pi's saved provider catalog is restored separately, read-only, by
+ * {@link restoreSavedProviderCatalogs}.
+ */
 const EMPTY_MODELS_STORE = Object.freeze({
   read: async (): Promise<undefined> => undefined,
   write: async (): Promise<never> => {
@@ -336,6 +367,254 @@ const EMPTY_MODELS_STORE = Object.freeze({
     throw new Error("the settings catalog never deletes model catalogs");
   },
 });
+
+/**
+ * Model types the pinned Pi SDK knows. Mirrors pi-ai's own restore filter
+ * (`withKnownModelTypes`: a missing type is a legacy chat model), so a saved
+ * entry written by a newer Pi with a type this SDK cannot use is dropped the
+ * same way the native runtime drops it.
+ */
+const KNOWN_SAVED_MODEL_TYPES: ReadonlySet<string> = new Set(["chat", "image", "classifier"]);
+
+const SAVED_CATALOG_FALLBACK = "only built-in and models.json models are offered";
+
+/**
+ * Read Pi's saved provider catalog once, descriptor-based like the SDK
+ * manifest read: a symlink or special file is refused (lstat, then an
+ * O_NOFOLLOW non-blocking read-only open whose fstat identity must match),
+ * at most the byte cap plus one detection byte is read from that same
+ * descriptor, and nothing is locked or written. A BOM is stripped like Pi's
+ * store. Returns undefined when absent or unusable (unusable is reported
+ * once, content-free).
+ */
+function readSavedProviderCatalog(agentDir: string, warnings: string[]): Record<string, unknown> | undefined {
+  const path = join(agentDir, SAVED_PROVIDER_CATALOG_FILE);
+  const unusable = (reason: string): undefined => {
+    warnings.push(`Pi's saved provider catalog ${reason}; ${SAVED_CATALOG_FALLBACK}`);
+    return undefined;
+  };
+  let preStats;
+  try {
+    preStats = lstatSync(path, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    return unusable("could not be inspected");
+  }
+  if (preStats.isSymbolicLink() || !preStats.isFile()) return unusable("is not a regular file");
+  if (preStats.size > BigInt(MAX_SAVED_PROVIDER_CATALOG_BYTES)) return unusable("exceeds the catalog read bound");
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    return unusable("could not be read");
+  }
+  let content: string;
+  try {
+    const stats = fstatSync(fd, { bigint: true });
+    if (stats.dev !== preStats.dev || stats.ino !== preStats.ino || !stats.isFile()) return unusable("changed while it was read");
+    // Sized from the descriptor, plus one byte that detects growth past it.
+    const buffer = Buffer.alloc(Math.min(Number(stats.size), MAX_SAVED_PROVIDER_CATALOG_BYTES) + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+    }
+    if (offset > MAX_SAVED_PROVIDER_CATALOG_BYTES) return unusable("exceeds the catalog read bound");
+    if (offset > Number(stats.size)) return unusable("changed while it was read");
+    content = buffer.subarray(0, offset).toString("utf8");
+  } catch {
+    return unusable("could not be read");
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // A close failure must not mask the bounded read result.
+    }
+  }
+  let parsed: unknown;
+  try {
+    parsed = content.length === 0 ? {} : JSON.parse(content.charCodeAt(0) === 0xfeff ? content.slice(1) : content);
+  } catch {
+    // Never quote the parser message: it can contain file bytes.
+    return unusable("could not be read");
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed)) return unusable("is malformed");
+  return parsed;
+}
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => isRecord(value) && !Array.isArray(value);
+const optional = (value: unknown, check: (value: unknown) => boolean): boolean => value === undefined || check(value);
+const isText = (value: unknown): boolean => typeof value === "string";
+const isFiniteNumber = (value: unknown): boolean => typeof value === "number" && Number.isFinite(value);
+
+/**
+ * The model fields Pi's scope resolver, models.json override composition,
+ * and the canonical choice conversion read, checked for the types they
+ * assume. A record failing this would make Pi's matcher or composition throw
+ * and take valid static choices down with it.
+ */
+function isWellFormedSavedModel(model: unknown): boolean {
+  if (!isPlainRecord(model)) return false;
+  if (typeof model.id !== "string" || model.id.length === 0) return false;
+  if (typeof model.provider !== "string" || model.provider.length === 0) return false;
+  // Core fields every native record carries (pi-ai's model types; image and
+  // classifier models have no reasoning/maxTokens, images no contextWindow).
+  // A missing one is never defaulted: e.g. a models.json cost override
+  // dereferences `cost`, and the throwing composed provider would silently
+  // drop its built-in and custom models too.
+  if (!isText(model.name) || !isText(model.baseUrl) || typeof model.api !== "string" || model.api.length === 0) return false;
+  const chat = model.type === undefined || model.type === "chat";
+  if (chat && (typeof model.reasoning !== "boolean"
+    || !isFiniteNumber(model.contextWindow) || !isFiniteNumber(model.maxTokens))) return false;
+  if (!optional(model.reasoning, (value) => typeof value === "boolean")) return false;
+  if (!optional(model.contextWindow, isFiniteNumber) || !optional(model.maxTokens, isFiniteNumber)) return false;
+  if (!optional(model.thinkingLevelMap, (map) => isPlainRecord(map)
+    && Object.values(map).every((level) => level === null || typeof level === "string"))) return false;
+  if (!Array.isArray(model.input) || !model.input.every(isText)) return false;
+  const { cost } = model;
+  if (!isPlainRecord(cost) || !["input", "output", "cacheRead", "cacheWrite"].every((key) => isFiniteNumber(cost[key]))) return false;
+  for (const key of ["compat", "headers", "inputLimits", "promptCache", "samplingParams", "samplingParamsByThinkingLevel"]) {
+    if (!optional(model[key], isPlainRecord)) return false;
+  }
+  return true;
+}
+
+/**
+ * A saved entry in Pi's native `ModelsStoreEntry` shape, normalized the way
+ * pi-ai normalizes it before restore (unknown model types dropped), or
+ * undefined when it is not that shape or any remaining record is malformed
+ * (the whole provider entry is then skipped, never partially published).
+ */
+function savedProviderEntry(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainRecord(value) || !Array.isArray(value.models)) return undefined;
+  for (const key of ["lastModified", "checkedAt"] as const) {
+    if (!optional(value[key], isFiniteNumber)) return undefined;
+  }
+  if (!optional(value.etag, isText)) return undefined;
+  const models = value.models.filter((model) => !isPlainRecord(model)
+    || model.type === undefined
+    || (typeof model.type === "string" && KNOWN_SAVED_MODEL_TYPES.has(model.type)));
+  if (!models.every(isWellFormedSavedModel)) return undefined;
+  return deepFreeze(structuredClone({ ...value, models }));
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  }
+  return value;
+}
+
+/**
+ * Restore Pi's saved provider catalogs into the runtime's registered
+ * providers through their public offline `refreshModels` hook, the same
+ * cache-only phase Pi itself runs before any credential or network step:
+ * `allowNetwork: false`, no credential, the immutable stored entry, and a
+ * publication port that applies only in-memory updates. A publication that
+ * asks to persist (or delete) the saved catalog is refused and not applied,
+ * per the hook's contract that an update runs only after its persistence.
+ * Only providers the runtime already registered are touched; saved entries
+ * for unknown providers are ignored, exactly as Pi ignores them. After a
+ * restore, the provider's own public `getModels()` is called directly: Pi's
+ * collection accessor would swallow a composition error (for example a
+ * models.json entry composed over a restored model) and silently drop the
+ * whole provider. On any restore or composition failure that provider's
+ * pre-restore model list is recorded in `fallbackModels`, so its static and
+ * models.json choices stay while other providers keep their restores.
+ */
+async function restoreSavedProviderCatalogs(
+  runtime: Record<string, unknown>,
+  agentDir: string,
+  warnings: string[],
+  fallbackModels: Map<string, unknown[]>,
+): Promise<boolean> {
+  const saved = readSavedProviderCatalog(agentDir, warnings);
+  if (saved === undefined) return false;
+  const getProviders = runtime.getProviders;
+  if (typeof getProviders !== "function") {
+    warnings.push("the installed Pi SDK model runtime does not list providers; Pi's saved provider catalog is not restored");
+    return false;
+  }
+  let providers: unknown;
+  try {
+    providers = (getProviders as () => unknown).call(runtime);
+  } catch {
+    providers = undefined;
+  }
+  if (!Array.isArray(providers)) {
+    warnings.push("the installed Pi SDK model runtime does not list providers; Pi's saved provider catalog is not restored");
+    return false;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SAVED_PROVIDER_CATALOG_RESTORE_TIMEOUT_MS);
+  const { signal } = controller;
+  let malformed = 0;
+  let failed = 0;
+  let restored = false;
+  try {
+    const restores = providers.map(async (provider: unknown) => {
+      if (!isRecord(provider) || typeof provider.id !== "string" || typeof provider.refreshModels !== "function") return;
+      if (!Object.prototype.hasOwnProperty.call(saved, provider.id)) return;
+      let stored: Record<string, unknown> | undefined;
+      try {
+        stored = savedProviderEntry(saved[provider.id]);
+      } catch {
+        stored = undefined;
+      }
+      if (stored === undefined) {
+        malformed += 1;
+        return;
+      }
+      const publish = async (publication: unknown): Promise<boolean> => {
+        if (signal.aborted || !isRecord(publication)) return false;
+        // Persistence stays Pi's: this catalog never writes or deletes it, so
+        // the coupled update is not applied either.
+        if (publication.persist !== undefined) return false;
+        if (publication.update !== undefined) {
+          if (typeof publication.update !== "function") return false;
+          (publication.update as () => void)();
+          restored = true;
+        }
+        return true;
+      };
+      let baseline: unknown;
+      try {
+        baseline = (runtime.getModels as (providerId: string) => unknown).call(runtime, provider.id);
+      } catch {
+        baseline = undefined;
+      }
+      try {
+        await (provider.refreshModels as (context: unknown) => Promise<void>).call(provider, {
+          credential: undefined,
+          stored,
+          publish,
+          allowNetwork: false,
+          signal,
+          baseUrl: typeof provider.baseUrl === "string" ? provider.baseUrl : undefined,
+        });
+        // Surface a composition error the collection accessor would suppress.
+        if (typeof provider.getModels === "function") (provider.getModels as () => unknown).call(provider);
+      } catch {
+        fallbackModels.set(provider.id, Array.isArray(baseline) ? [...baseline] : []);
+        failed += 1;
+      }
+    });
+    const timedOut = new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    await Promise.race([Promise.all(restores), timedOut]);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+  if (malformed > 0) {
+    warnings.push("some entries in Pi's saved provider catalog are malformed; those providers offer only built-in and models.json models");
+  }
+  if (failed > 0) {
+    warnings.push("Pi could not restore some saved provider catalogs; those providers offer only built-in and models.json models");
+  }
+  return restored;
+}
 
 async function resolveScopedChoices(
   sdk: Record<string, unknown>,
@@ -351,22 +630,26 @@ async function resolveScopedChoices(
   if (typeof create !== "function" || typeof resolveScope !== "function") {
     throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: the installed Pi SDK does not export ModelRuntime.create and resolveModelScopeWithDiagnostics for the settings catalog");
   }
-  let runtime: unknown;
-  try {
-    runtime = await (create as (options: unknown) => Promise<unknown>).call(ModelRuntime, {
-      credentials: EMPTY_READ_ONLY_CREDENTIALS,
-      modelsPath: join(agentDir, "models.json"),
-      modelsStore: EMPTY_MODELS_STORE,
-      allowModelNetwork: false,
-      refreshOnCreate: false,
-    });
-  } catch {
-    // The SDK's message is not quoted: it may echo configuration bytes.
-    throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: Pi could not build the model metadata catalog");
-  }
-  if (!isRecord(runtime) || typeof runtime.getModels !== "function") {
-    throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: the installed Pi SDK model runtime lacks getModels for the settings catalog");
-  }
+  const createRuntime = async (): Promise<Record<string, unknown>> => {
+    let runtime: unknown;
+    try {
+      runtime = await (create as (options: unknown) => Promise<unknown>).call(ModelRuntime, {
+        credentials: EMPTY_READ_ONLY_CREDENTIALS,
+        modelsPath: join(agentDir, "models.json"),
+        modelsStore: EMPTY_MODELS_STORE,
+        allowModelNetwork: false,
+        refreshOnCreate: false,
+      });
+    } catch {
+      // The SDK's message is not quoted: it may echo configuration bytes.
+      throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: Pi could not build the model metadata catalog");
+    }
+    if (!isRecord(runtime) || typeof runtime.getModels !== "function") {
+      throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: the installed Pi SDK model runtime lacks getModels for the settings catalog");
+    }
+    return runtime;
+  };
+  const runtime = await createRuntime();
   const getError = runtime.getError;
   const runtimeError = typeof getError === "function" ? (getError as () => unknown).call(runtime) : undefined;
   if (typeof runtimeError === "string" && runtimeError.length > 0) {
@@ -384,19 +667,27 @@ async function resolveScopedChoices(
     warnings.push(NO_SCOPED_PI_MODELS_WARNING);
     return [];
   }
-  const getModels = runtime.getModels as () => unknown;
-  // Catalog-eligibility port: the native scope grammar only calls
-  // `getAvailable`, answered here from static metadata. This is NOT
-  // authenticated availability, and the runtime's real getAvailable is never
-  // called.
-  const catalogEligibility = {
-    getAvailable: async (): Promise<unknown> => getModels.call(runtime),
-  };
+  // Saved catalogs only matter for resolving a nonempty scope; an empty scope
+  // never reads them (no irrelevant cache notice beside the guidance).
+  const fallbackModels = new Map<string, unknown[]>();
+  const restored = await restoreSavedProviderCatalogs(runtime, agentDir, warnings, fallbackModels);
   let result: unknown;
   try {
-    result = await (resolveScope as (patterns: string[], runtime: unknown) => Promise<unknown>)([...patterns], catalogEligibility);
+    result = await resolveWithCatalog(resolveScope, patterns, runtime, fallbackModels);
   } catch (error) {
-    throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${boundedMessage(error)}`);
+    if (!restored) {
+      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${boundedMessage(error)}`);
+    }
+    // The restored saved catalogs made Pi's resolver fail: drop them all and
+    // resolve again over a fresh built-in + models.json runtime, never
+    // quoting the failure (it can echo saved catalog bytes).
+    warnings.push(`Pi could not use its saved provider catalogs; ${SAVED_CATALOG_FALLBACK}`);
+    try {
+      result = await resolveWithCatalog(resolveScope, patterns, await createRuntime());
+    } catch (retryError) {
+      if (retryError instanceof ReviewSettingsCatalogUnavailableError) throw retryError;
+      throw new ReviewSettingsCatalogUnavailableError(`pi-review-gate: Pi could not resolve the model scope for the settings catalog: ${boundedMessage(retryError)}`);
+    }
   }
   if (!isRecord(result) || !Array.isArray(result.scopedModels)) {
     throw new ReviewSettingsCatalogUnavailableError("pi-review-gate: Pi returned a malformed model scope for the settings catalog");
@@ -409,6 +700,47 @@ async function resolveScopedChoices(
     }
   }
   return scopedModelChoices({ scopedModels: result.scopedModels }) ?? [];
+}
+
+/**
+ * Run Pi's native scope resolver over a catalog-eligibility port. The native
+ * grammar only calls `getAvailable`, answered here from the runtime's catalog
+ * metadata (static, models.json, and restored saved provider catalogs),
+ * restricted to chat models (an explicit `chat` type or a legacy record
+ * without one): a restored provider list is not guaranteed chat-only by
+ * every provider, and image or classifier models are never Pi model choices.
+ * This is NOT authenticated availability; the runtime's real getAvailable is
+ * never called.
+ */
+async function resolveWithCatalog(
+  resolveScope: unknown,
+  patterns: string[],
+  runtime: Record<string, unknown>,
+  fallbackModels?: ReadonlyMap<string, unknown[]>,
+): Promise<unknown> {
+  const getModels = runtime.getModels as (providerId?: string) => unknown;
+  // Provider by provider in the runtime's own order when a restore failed, so
+  // only the failed providers use their recorded pre-restore lists.
+  const catalogModels = (): unknown => {
+    if (!fallbackModels || fallbackModels.size === 0 || typeof runtime.getProviders !== "function") return getModels.call(runtime);
+    const providers = (runtime.getProviders as () => unknown).call(runtime);
+    if (!Array.isArray(providers)) return getModels.call(runtime);
+    return providers.flatMap((provider: unknown) => {
+      if (!isRecord(provider) || typeof provider.id !== "string") return [];
+      const fallback = fallbackModels.get(provider.id);
+      if (fallback) return fallback;
+      const models = getModels.call(runtime, provider.id);
+      return Array.isArray(models) ? models : [];
+    });
+  };
+  const catalogEligibility = {
+    getAvailable: async (): Promise<unknown> => {
+      const models = catalogModels();
+      if (!Array.isArray(models)) return models;
+      return models.filter((model) => isRecord(model) && (model.type === undefined || model.type === "chat"));
+    },
+  };
+  return (resolveScope as (patterns: string[], runtime: unknown) => Promise<unknown>)([...patterns], catalogEligibility);
 }
 
 function collectToolCandidates(sdk: Record<string, unknown>, cwd: string, warnings: string[]): ToolInventoryEntry[] {

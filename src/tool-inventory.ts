@@ -11,6 +11,16 @@
  */
 export const DEFERRED_TOOL_SEARCH_NAME = "tool_search";
 
+/**
+ * The native Pi codemode tool name (Pi 1.0 `builtin:codemode`). Pi registers
+ * it; this extension never does. Its canonical binding lives here, beside the
+ * loader name, so configuration-only consumers (the standalone
+ * review-settings catalog, issue #653) can reference it without the deferred
+ * tool manager's import graph; `deferred-tools.ts` re-exports it for its
+ * established callers and documents its discovery semantics.
+ */
+export const CODEMODE_TOOL_NAME = "codemode";
+
 export interface ToolInventoryEntry {
   name: string;
   /** Canonical host metadata description; only a compact purpose is rendered. */

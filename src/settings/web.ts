@@ -160,7 +160,7 @@ function urlBlocklistSummary(sources: readonly string[]): string {
 }
 
 /** What the shared URL blocklist does, stated before it is edited. */
-const URL_BLOCKLIST_NOTICE =
+export const URL_BLOCKLIST_NOTICE =
   "Each line is one JavaScript regular-expression source matched anywhere in the URL \u2014 no /.../ delimiters, "
   + "no flags, and nothing is implicitly anchored, so aliyuncs also matches https://bucket.example.aliyuncs.com/object. "
   + "Surrounding whitespace is trimmed from every line, since a leading or trailing space in a URL pattern is almost "
@@ -276,7 +276,7 @@ const BROWSER_PERMISSION_ROWS: ReadonlyArray<{
 
 const YOLO_PERMISSION_LABEL = "YOLO / allow everything";
 
-const YOLO_ENABLE_WARNING =
+export const YOLO_ENABLE_WARNING =
   "YOLO enables every browser permission — model credential entry and submission, uploads, download saving, " +
   "clipboard read/write, camera, microphone, geolocation, service workers, popup restriction override, and local " +
   "network access including loopback, private, link-local, and cloud metadata addresses — and bypasses per-action " +
@@ -284,9 +284,13 @@ const YOLO_ENABLE_WARNING =
   "full capability, and page content remains untrusted. This persists until you explicitly disable it; only a human " +
   "can enable or disable it.";
 
-const YOLO_CONFIRM_MESSAGE =
+export const YOLO_CONFIRM_MESSAGE =
   "Confirm enabling YOLO / allow everything for the managed browser. It stays enabled across restarts until you " +
   "disable it here; disabling is immediate and restores your saved individual permissions as the effective policy.";
+
+/** What the browser permissions submenu stages and how each capability is enforced, stated on entry. */
+export const BROWSER_PERMISSIONS_NOTICE =
+  "These stage the issue #27 browser permissions, and every capability is enforced. Credential entry/submission, uploads, download saving, and clipboard read/write are enforced by interactive-browser tool actions; camera, microphone, and geolocation apply as per-origin device permission grants issued when a tab commits to an origin (and cleared from live sessions when disabled — an unconfirmable engine clear closes the affected browser session instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants); service workers apply at browser launch, so a saved change replaces the live browser in a controlled way that restores tabs, storage state, and granted permissions best-effort; the popup restriction override lifts the four-tab limit for page-created popups while enabled; local networks (including YOLO's local-network effect) is enforced at the interactive egress broker. Saved changes apply to the live session immediately.";
 
 /**
  * The Browser permissions submenu (issue #27): independently selectable
@@ -317,11 +321,7 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
   // controlled replacement of a live browser when the saved policy changes;
   // the popup restriction override while it is enabled; local networks (and
   // YOLO's local-network effect) at the interactive egress broker.
-  await notify(
-    ui,
-    "These stage the issue #27 browser permissions, and every capability is enforced. Credential entry/submission, uploads, download saving, and clipboard read/write are enforced by interactive-browser tool actions; camera, microphone, and geolocation apply as per-origin device permission grants issued when a tab commits to an origin (and cleared from live sessions when disabled — an unconfirmable engine clear closes the affected browser session instead of being claimed applied, and a clear that does not settle within the cleanup deadline is reported as still in flight and the affected session is closed to contain any retained grants); service workers apply at browser launch, so a saved change replaces the live browser in a controlled way that restores tabs, storage state, and granted permissions best-effort; the popup restriction override lifts the four-tab limit for page-created popups while enabled; local networks (including YOLO's local-network effect) is enforced at the interactive egress broker. Saved changes apply to the live session immediately.",
-    "info",
-  );
+  await notify(ui, BROWSER_PERMISSIONS_NOTICE, "info");
   // Caller-local last selection for this loop only: keys are the permission
   // field names (plus yolo/back), stable across the On/Off label flips, so a
   // toggled row stays highlighted on the re-show (issue #140).
@@ -362,14 +362,29 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
   }
 }
 
-/** Prominent warning plus explicit human confirmation for YOLO OFF → ON. */
+/**
+ * Prominent warning plus explicit human confirmation for YOLO OFF → ON.
+ *
+ * A single-notice host (the session-host sidebar) supplies the explicit
+ * warning-confirm port, so the warning and the confirmation message are one
+ * mandatory disclosure of the confirmation screen rather than a separate
+ * notice the confirmation would displace (issue #653). Every other host keeps
+ * the separate warning notice, then the confirmation dialog.
+ */
 async function confirmYoloEnablement(ui: UiContext): Promise<boolean> {
-  await notify(ui, YOLO_ENABLE_WARNING, "warning");
-  if (!ui.confirm) {
-    await notify(ui, "YOLO requires an interactive confirmation dialog to enable; it stays Off.", "error");
-    return false;
+  const title = "Enable YOLO / allow everything?";
+  const port = ui.settingsWarningConfirm;
+  let confirmed: boolean;
+  if (typeof port?.confirm === "function") {
+    confirmed = await port.confirm(title, YOLO_ENABLE_WARNING, YOLO_CONFIRM_MESSAGE);
+  } else {
+    await notify(ui, YOLO_ENABLE_WARNING, "warning");
+    if (!ui.confirm) {
+      await notify(ui, "YOLO requires an interactive confirmation dialog to enable; it stays Off.", "error");
+      return false;
+    }
+    confirmed = await ui.confirm(title, YOLO_CONFIRM_MESSAGE);
   }
-  const confirmed = await ui.confirm("Enable YOLO / allow everything?", YOLO_CONFIRM_MESSAGE);
   if (!confirmed) {
     await notify(ui, "YOLO stays Off.", "info");
     return false;

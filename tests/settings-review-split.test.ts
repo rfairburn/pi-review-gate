@@ -22,6 +22,7 @@ import {
 } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { persistReviewSettings, type ReviewSettingsSelection } from "../src/settings/persistence";
+import { TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../src/review-evidence";
 
 const REVIEW_SETTING_LABELS = [
   "Automatic primary review",
@@ -54,7 +55,8 @@ async function splitWorkspace(name: string, json: Record<string, unknown>): Prom
 
 interface MenuRunResult {
   lists: string[][];
-  notes: Array<{ message: string; type?: string }>;
+  /** `lists` is how many selector lists had been shown when the notice arrived. */
+  notes: Array<{ message: string; type?: string; lists: number }>;
 }
 
 function menuHarness(config: ReviewGateConfig, configPath: string): {
@@ -73,7 +75,7 @@ function menuHarness(config: ReviewGateConfig, configPath: string): {
     async run(selections) {
       let index = 0;
       const lists: string[][] = [];
-      const notes: Array<{ message: string; type?: string }> = [];
+      const notes: MenuRunResult["notes"] = [];
       assert.ok(handler);
       await handler("", {
         scopedModels: [],
@@ -88,7 +90,7 @@ function menuHarness(config: ReviewGateConfig, configPath: string): {
             return undefined;
           },
           notify(message: string, type?: string) {
-            notes.push({ message, type: type ?? "info" });
+            notes.push({ message, type: type ?? "info", lists: lists.length });
           },
         },
       });
@@ -500,6 +502,35 @@ test("materializeReviewConfig keeps freezing the primary layer for live configs"
   assert.deepEqual(materialized.review?.activeReviewers, [LEGACY_ONE]);
   assert.equal(automaticReviewEnabled(materialized), true);
   assert.deepEqual(resolveReviewers(materialized, []).reviewers.map((r) => r.id), ["one"]);
+});
+
+// Issue #653: the sidebar's single-notice section help is host-only. In Pi the
+// Review and Evidence methods sections keep their exact full description as
+// one ordinary info notice on each entry, before the section's first list.
+const NATIVE_REVIEW_HELP = "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.";
+const NATIVE_EVIDENCE_HELP = `Evidence methods only — the three scope choices do not disable review, change operating mode, or select reviewers. Each scope is independent. ${WORKSPACE_CHANGES_LABEL} adds whole-workspace snapshot/diff review evidence; ${TOOLS_ONLY_LABEL} omits that whole-workspace evidence. Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access. Mandatory construction, checkpoint, and landing verification is unchanged. Enter cycles the method. Snapshot-failure fallback defaults On and uses ${TOOLS_ONLY_LABEL} when an eligible snapshot capture fails; Off warns that review is disabled for an eligible Primary baseline failure and blocks other failures. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.`;
+
+test("native /review-settings keeps the exact full Review and Evidence help as one notice per entry", async () => {
+  const { configPath, config, original } = await splitWorkspace("native-help", { enabled: true });
+  const registered = menuHarness(config, configPath);
+  const run = await registered.run([
+    rootReviewersRow("primary 0/0 selected · auto off (no reviewers) · subtask 0/0 selected · auto off (no reviewers)"),
+    "Evidence methods",
+    "Back",
+    "Back",
+    rootReviewersRow("primary 0/0 selected · auto off (no reviewers) · subtask 0/0 selected · auto off (no reviewers)"),
+    "Back",
+    undefined,
+  ]);
+  assert.equal(await readFile(configPath, "utf8"), original);
+  const help = run.notes.filter((note) => note.message === NATIVE_REVIEW_HELP || note.message === NATIVE_EVIDENCE_HELP);
+  // Lists: 0 root, 1 Review, 2 Evidence, 3 Review, 4 root, 5 Review, 6 root.
+  assert.deepEqual(help, [
+    { message: NATIVE_REVIEW_HELP, type: "info", lists: 1 },
+    { message: NATIVE_EVIDENCE_HELP, type: "info", lists: 2 },
+    { message: NATIVE_REVIEW_HELP, type: "info", lists: 5 },
+  ], JSON.stringify(run.notes));
+  assert.ok(!run.notes.some((note) => note.message.includes("docs/settings.md")), "no sidebar summary reaches Pi");
 });
 
 function runNotes(run: MenuRunResult): MenuRunResult["notes"] {

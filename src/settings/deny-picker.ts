@@ -53,8 +53,12 @@ import { routeNativeTextFieldMouse, type NativeTextFieldRegion, type TextFieldMo
 import {
   claimMenuAction,
   consumeMenuActionFence,
+  createMenuListViewport,
   isLiveMenuKeybindingsManager,
+  MENU_NATIVE_MAX_VISIBLE,
   menuMatchesCtrlS,
+  menuPartRows,
+  menuRenderBound,
   menuRenderTheme,
   menuSaveIsRequested,
   resolveMenuActionMatcher,
@@ -62,7 +66,6 @@ import {
   retainedSelect,
   type MenuInput,
   type MenuSelectItem,
-  type MenuSelectList,
   type MenuTuiHost,
   type RetainedUi,
 } from "./menu";
@@ -165,7 +168,7 @@ export async function retainedDenySelect(
   // cancellation return path, preserving the caller's staged fields.
   if (menuSaveIsRequested(ui.saveControl)) return { key: undefined, query: initialQuery };
   if (ui.mode === "tui" && typeof ui.custom === "function") {
-    const host = await resolveMenuTuiHostForRenderers();
+    const host = await resolveMenuTuiHostForRenderers(ui);
     if (host !== undefined && host.Input !== undefined) {
       const view = { query: initialQuery };
       try {
@@ -253,14 +256,20 @@ function customDenySelect(
 
     // The result list only renders the visible rows; navigation and
     // activation are routed by this picker, never by the list itself, so the
-    // query field and the result list cannot both consume one key.
-    const buildList = (): MenuSelectList => {
-      const items: MenuSelectItem[] = filter.visible.map((row) => ({ value: row.key, label: row.label }));
-      const created = new host.SelectList(items, Math.min(items.length, 10), listTheme);
-      if (items.length > 0) created.setSelectedIndex(Math.min(Math.max(selectedIndex, 0), items.length - 1));
-      return created;
-    };
-    let list: MenuSelectList = buildList();
+    // query field and the result list cannot both consume one key. The
+    // picker's own index stays the only selection authority, including when a
+    // bounded host render resizes the list (#653).
+    const visibleItems = (): MenuSelectItem[] => filter.visible.map((row) => ({ value: row.key, label: row.label }));
+    const viewport = createMenuListViewport({
+      host,
+      theme: listTheme,
+      items: visibleItems(),
+      nativeLimit: (count) => Math.min(count, MENU_NATIVE_MAX_VISIBLE),
+      selectedIndex: () => selectedIndex,
+    });
+    if (filter.visible.length > 0) {
+      viewport.list.setSelectedIndex(Math.min(Math.max(selectedIndex, 0), filter.visible.length - 1));
+    }
 
     const applyQuery = (query: string): void => {
       view.query = query;
@@ -282,7 +291,7 @@ function customDenySelect(
       // SelectList's own filter is prefix-only and resets the selection, so
       // rebuilding keeps the shared saved-conversation semantics and the
       // retained highlighted identity.
-      list = buildList();
+      viewport.replace(visibleItems(), selectedIndex);
     };
 
     // Every non-action key edits the query through the native Input; the
@@ -304,7 +313,7 @@ function customDenySelect(
       if (count === 0) return;
       selectedIndex = (selectedIndex + delta + count) % count;
       try {
-        list.setSelectedIndex(selectedIndex);
+        viewport.list.setSelectedIndex(selectedIndex);
       } catch {
         // A list that refuses the index keeps its own selection; the
         // picker's identity tracking stays authoritative.
@@ -353,12 +362,14 @@ function customDenySelect(
         focused = value === true;
         queryInput.focused = focused;
       },
-      render: (width: number): string[] => {
+      // `maxRows` is supplied only by a host that measured its own pane (the
+      // session-host sidebar, #653); a Pi popup renders natively.
+      render: (width: number, maxRows?: number): string[] => {
         const lines: string[] = [];
-        if (border) lines.push(...renderComponent(border, width));
-        lines.push(...renderComponent(titleLine, width));
+        if (border) lines.push(...menuPartRows(border, width));
+        lines.push(...menuPartRows(titleLine, width));
         const queryTop = lines.length;
-        const queryRows = renderComponent(queryInput, width);
+        const queryRows = menuPartRows(queryInput, width);
         queryRegion = queryRows.length === 1
           ? { left: 0, top: queryTop, width: Math.max(1, width), rows: 1, firstRow: 0, height: 1 }
           : undefined;
@@ -368,15 +379,19 @@ function customDenySelect(
           // A query that hides every tool row renders a truthful no-match
           // line instead of an empty list, and the picker stays open and
           // editable (the Back row is still offered below it).
-          lines.push(...renderComponent(noMatchLine, width));
+          lines.push(...menuPartRows(noMatchLine, width));
         }
-        lines.push(...renderComponent(list, width));
-        lines.push(...renderComponent(hintLine, width));
-        if (border) lines.push(...renderComponent(border, width));
+        const footer = [...menuPartRows(hintLine, width), ...(border ? menuPartRows(border, width) : [])];
+        // The rows actually rendered above and below the list are measured,
+        // never assumed, before the list takes the rest of a bounded render.
+        const bound = menuRenderBound(maxRows);
+        if (bound !== undefined) viewport.fit(bound - lines.length - footer.length);
+        lines.push(...menuPartRows(viewport.list, width));
+        lines.push(...footer);
         return lines;
       },
       invalidate: (): void => {
-        for (const component of [border, titleLine, queryInput, noMatchLine, list, hintLine]) invalidateComponent(component);
+        for (const component of [border, titleLine, queryInput, noMatchLine, viewport.list, hintLine]) invalidateComponent(component);
       },
       /**
        * Pi's own pointer events over the written query row reach the native
@@ -469,18 +484,6 @@ function restoreQuery(input: MenuInput, value: string): void {
   for (const character of value) input.handleInput(character);
   if (input.getValue() === value) return;
   input.setValue(value);
-}
-
-/** Renders one host component, tolerating a component that cannot render. */
-function renderComponent(component: unknown, width: number): string[] {
-  const render = (component as { render?: (width: number) => string[] }).render;
-  if (typeof render !== "function") return [];
-  try {
-    const lines = render.call(component, width);
-    return Array.isArray(lines) ? lines : [];
-  } catch {
-    return [];
-  }
 }
 
 /** Invalidates one host component, tolerating a component that cannot. */

@@ -6,6 +6,7 @@ import test from "node:test";
 import { executorEntryId, normalizeConfig, resolvedWorkerRoute, type ReviewGateConfig } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { scopedModelChoices } from "../src/settings/models";
+import { YOLO_CONFIRM_MESSAGE, YOLO_ENABLE_WARNING } from "../src/settings/web";
 
 test("/review-settings stages executor and reviewer changes and saves them together", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-"));
@@ -1108,6 +1109,8 @@ test("YOLO requires confirmation to enable, persists with saved values beneath i
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const notices: Array<{ message: string; type?: string }> = [];
   let confirmTitle: string | undefined;
+  // One ordered log of the native warning notice and the confirmation dialog.
+  const events: string[] = [];
   const enableCtx = contextWithSelections([
     ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "1 of 11 enabled"),
@@ -1117,11 +1120,24 @@ test("YOLO requires confirmation to enable, persists with saved values beneath i
     "Back",
     "Save changes",
   ], [], [], [true]) as { ui: { confirm: (title: string, message: string) => Promise<boolean>; notify: (message: string, type?: string) => void } };
-  enableCtx.ui.confirm = async (title) => { confirmTitle = title; return true; };
-  enableCtx.ui.notify = (message, type) => notices.push({ message, type });
+  enableCtx.ui.confirm = async (title, message) => {
+    confirmTitle = title;
+    events.push(`confirm:${message}`);
+    return true;
+  };
+  enableCtx.ui.notify = (message, type) => {
+    notices.push({ message, type });
+    if (type === "warning") events.push(`warning:${message}`);
+  };
   await registered.handler("", enableCtx);
 
   assert.equal(confirmTitle, "Enable YOLO / allow everything?");
+  // Issue #653: the native host keeps the separate, unchanged warning notice
+  // and then the short dialog — only a single-notice host combines them.
+  assert.equal("settingsWarningConfirm" in enableCtx.ui, false, "a Pi host supplies no warning-confirm port");
+  assert.deepEqual(events, [`warning:${YOLO_ENABLE_WARNING}`, `confirm:${YOLO_CONFIRM_MESSAGE}`],
+    "the full warning notice precedes the unchanged confirmation message");
+  assert.ok(!YOLO_CONFIRM_MESSAGE.includes(YOLO_ENABLE_WARNING), "the dialog message stays the short confirmation");
   const warnings = notices.filter((notice) => notice.type === "warning");
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0]!.message.includes("cloud metadata addresses"));

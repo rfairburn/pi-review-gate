@@ -15,6 +15,63 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.304]
+
+### Added
+
+- **Disk-only review-gate settings in the sidebar (#653)**: the `pi-review-sessions` sidebar now
+  edits the local host's saved review-gate configuration through the shared `/review-settings`
+  menu, validation, and persistence path — no hidden Pi or review-gate session. Each open re-reads
+  disk, edits stay a menu-local draft, and only an explicit **Save** (or Ctrl+S) writes; **Cancel**,
+  root Escape, and closing discard it, unlike the Pi-session menu, where root Escape still applies
+  session-only and **Save changes** still persists and applies. With no file present the menu shows
+  the ordinary zero-model defaults and creates none until that first **Save**, which uses the
+  existing guarded initializer; an existing primary or compatibility fallback is never initialized
+  over, and an explicit `PI_REVIEW_GATE_CONFIG` naming a missing file stays an error. A save is what
+  later new local instances load (**New session** or a `SessionSpawn` child), never a running
+  session, which keeps its current effective configuration, and the editor is local-host only. Its
+  text values and tool-deny search field place the caret on click through the shared sidebar
+  field route (#714). Scoped Pi model choices include models from Pi's own saved provider catalog
+  in the same agent directory (for example newer Codex models absent from `models.json`),
+  without writing to the catalog, contacting the network, or using credentials. Its menus and
+  pickers size their lists to the sidebar pane's height (more than ten rows when there is room,
+  fewer with scrolling in a short pane); in-Pi `/review-settings` popups keep ten rows. The pane
+  shows one notice at a time instead of accumulating them: the LOCAL target at the root, a concise
+  summary in Review and Evidence methods that points to these docs for the full description, or the
+  latest action's warning or error in their place, with a confirmation's disclosure shown whole as
+  its screen's notice; in-Pi section help is unchanged. Notices and disclosures are never cut to a
+  character limit. A notice too long for a short pane, such as the Browser permissions or URL
+  blocklist description, ends with a `ctrl+o read all` cue (another free key when Ctrl+O is taken)
+  that opens a read-only reader of the whole text in the same pane; Escape returns, and no key
+  acts until the screen is drawn again. A confirmation too long to show with its choices offers no
+  **Yes** until the pane is large enough. See
+  [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
+- **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
+  sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking
+  notice — scope models in a real Pi session (a **New session** with review and subtasks left unset
+  is enough) and reopen. Nothing else is blocked, no Pi configuration is written, no session or
+  model is created, and a sidebar first-run setup flow stays separate future work
+  ([#719](https://github.com/rfairburn/pi-review-gate/issues/719)). See
+  [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
+
+### Changed
+
+- **`PI_REVIEW_GATE_CONFIG` is absolute for managed sidebar children (#653)**: for the managed
+  sidebar only, a nonempty relative value in the host's startup environment is resolved once at
+  host startup against the host's startup directory (warning, never a refused start) and passed
+  absolute to every managed child, including a `SessionSpawn` child in another workspace. See
+  [Config discovery](docs/configuration.md#config-discovery); unrelated behavior is unchanged.
+
+### Fixed
+
+- **Click-to-focus on a selected remote Main pane (#653)**: with the roster focused (for example
+  after leaving Settings -> Review settings with Escape), a left click on the drawn content of the
+  selected remote viewport now returns focus to that same remote session, exactly as it already did
+  for a local session; it previously required re-activating the card. The click is focus-only: its
+  press, motion, and release are never forwarded, and no selection, subscription, permission, or
+  Remote input/copy setting changes. Later input keeps the existing remote input/copy rules. See
+  [Focus, display, and status](docs/session-host-alpha.md#focus-display-and-status).
+
 ## [0.1.0-dev.303]
 
 ### Changed

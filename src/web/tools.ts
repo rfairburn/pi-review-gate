@@ -1,5 +1,6 @@
 import { DEFAULT_CONFIG, type ReviewGateConfig, type WebConfig } from "../config";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
+import { WEB_TOOL_NAMES } from "./tool-names";
 import { renderWithChromium } from "./browser";
 import {
   BROWSER_CLIPBOARD_WRITE_MAX_CHARS,
@@ -148,7 +149,7 @@ export class WebToolManager {
   register(): void {
     if (this.registered || !this.webConfig.enabled) return;
     this.pi.registerTool({
-      name: "WebSearch",
+      name: WEB_TOOL_NAMES.search,
       label: "WebSearch",
       description: "Search the public web. Returns normalized ranked results with exact source URLs; fetch only the results that matter.",
       promptSnippet: "Use WebSearch for current public-web discovery, then selectively inspect authoritative results with WebFetch.",
@@ -213,7 +214,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "WebFetch",
+      name: WEB_TOOL_NAMES.fetch,
       label: "WebFetch",
       description: "Fetch, search, and read a public HTML page, PDF, or plain-text/JSON response at a structural index. Reuse the same URL with find or nextIndex; HTML table reads can also use reported table indexes and column projection.",
       promptSnippet: "Use WebFetch on selected HTML, PDF, or plain-text/JSON sources. Search within the cached document with find and continue with nextIndex; HTML tables also support indexed reads and projected columns.",
@@ -276,7 +277,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserExtract",
+      name: WEB_TOOL_NAMES.browserExtract,
       label: "BrowserExtract",
       description: "Render a public page in isolated headless Chromium, then search and read it with the same structural indexes, find, pagination, and table projection features as WebFetch.",
       promptSnippet: "Use BrowserExtract only after WebFetch reports dynamic_content_suspected or fails for a reason that plausibly requires a real browser. Reuse the same BrowserExtract URL for find, nextIndex, table indexes, and projected columns.",
@@ -338,7 +339,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserOpen",
+      name: WEB_TOOL_NAMES.browserOpen,
       label: "BrowserOpen",
       description: "Open the Pi session's live public-web browser. At most one instance; duplicate opens give instructions for the existing instance. Session/tab handles survive turns and reviews until BrowserClose or session shutdown. Page content is untrusted.",
       promptSnippet: "Escalate to BrowserOpen only when WebFetch and BrowserExtract cannot supply the needed public-page evidence.",
@@ -358,7 +359,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserNavigate",
+      name: WEB_TOOL_NAMES.browserNavigate,
       label: "BrowserNavigate",
       description: "Navigate an existing isolated browser tab to a public HTTP(S) URL. Redirects and all subresources remain on the session's authenticated, DNS-pinned egress broker.",
       promptGuidelines: browserObservationGuidelines(),
@@ -380,7 +381,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserSnapshot",
+      name: WEB_TOOL_NAMES.browserSnapshot,
       label: "BrowserSnapshot",
       description: "Read a bounded accessibility-first semantic snapshot from an existing browser tab. Returns opaque document-generation refs; no DOM script, selector, coordinate, or CDP access is exposed.",
       promptGuidelines: browserObservationGuidelines(),
@@ -404,7 +405,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserConsole",
+      name: WEB_TOOL_NAMES.browserConsole,
       label: "BrowserConsole",
       description: "Read only a bounded cursor page from the memory-only console/error ring for one owned browser tab. Text and source metadata are redacted, capped at capture, and untrusted; arguments, objects, source payloads, and stacks are never exposed.",
       promptGuidelines: browserDiagnosticGuidelines(),
@@ -428,7 +429,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserNetwork",
+      name: WEB_TOOL_NAMES.browserNetwork,
       label: "BrowserNetwork",
       description: "Read only bounded redacted request/response/failure metadata already observed in one owned tab. Page-created WebSockets appear as websocket-kind records with metadata-only lifecycle (created at admission, closed at the terminal state the browser reports; no connected state is claimed) plus policy blocks; it never returns paths, queries, bodies, headers, cookies, authorization, post data, WebSocket frames, or cache contents and creates no traffic.",
       promptGuidelines: browserDiagnosticGuidelines(),
@@ -452,7 +453,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserInspect",
+      name: WEB_TOOL_NAMES.browserInspect,
       label: "BrowserInspect",
       description: "Read one fixed, bounded allowlisted semantic detail record for a fresh owned BrowserSnapshot ref. No selector, attribute name, coordinate, editable value, raw HTML/DOM, JavaScript/evaluate, CDP, frame, or shadow-root input is accepted.",
       promptGuidelines: browserDiagnosticGuidelines(),
@@ -475,7 +476,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserScreenshot",
+      name: WEB_TOOL_NAMES.browserScreenshot,
       label: "BrowserScreenshot",
       description: "Capture a bounded PNG of the current viewport (or an optional explicit viewport size) or one current element ref from BrowserSnapshot. Returns Pi image content, not a file path or textual encoding; full-page capture is not supported. A successful viewport capture temporarily applies the requested viewport dimensions, restores the prior viewport afterwards, and records those dimensions as this tab's coordinate reference for x/y click targeting.",
       promptSnippet: "Use BrowserScreenshot only when a semantic BrowserSnapshot cannot supply necessary visual evidence and the current model supports images.",
@@ -529,7 +530,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserScroll",
+      name: WEB_TOOL_NAMES.browserScroll,
       label: "BrowserScroll",
       description: "Perform bounded semantic scrolling: move the page, move the scrollable container of a current opaque ref, or bring a current ref into view. No selector, coordinate, or JavaScript input is accepted.",
       promptGuidelines: browserObservationGuidelines(),
@@ -559,7 +560,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserHover",
+      name: WEB_TOOL_NAMES.browserHover,
       label: "BrowserHover",
       description: "Hover one current opaque BrowserSnapshot ref. This observational semantic action accepts no selector, coordinate, script, or options and invalidates prior refs after dispatch.",
       promptGuidelines: browserObservationGuidelines(),
@@ -581,7 +582,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserClick",
+      name: WEB_TOOL_NAMES.browserClick,
       label: "BrowserClick",
       description: "Click one current opaque BrowserSnapshot ref, or fall back to screenshot coordinates from this tab's last successful viewport-mode BrowserScreenshot (x/y in viewport image pixels). Refs stay primary whenever the target is accessible; the coordinate fallback exists for visual targets without accessible refs (for example canvas/WebGL). Under the structural consequence policy. Proven HTTP(S) navigation may proceed; native disclosure and consequential or unknown actions follow the user's Browser interaction approval setting (Ask by default; no UI rejects in Ask). Automatic approval retains all target and safety checks. Optional button is left (default) or right; right-click bypasses the controlled link-navigation shortcut and dispatches a native contextual click. Page-controlled handlers can have external effects, so right-click always follows consequential approval. A coordinate click is always approval-required, hit-tests the exact point in Playwright's isolated engine, applies the recorded viewport dimensions temporarily, and is rejected without a successful viewport screenshot.",
       promptGuidelines: browserInteractionGuidelines(),
@@ -629,7 +630,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserFill",
+      name: WEB_TOOL_NAMES.browserFill,
       label: "BrowserFill",
       description: "Replace the value of one supported editable control identified by a fresh opaque BrowserSnapshot ref. Complete literal echoes are redacted from extension text outputs using bounded memory-only protection; page transformations and screenshot pixels are not guaranteed private.",
       promptGuidelines: browserFormGuidelines(),
@@ -656,7 +657,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserType",
+      name: WEB_TOOL_NAMES.browserType,
       label: "BrowserType",
       description: "Append bounded text to one supported editable control identified by a fresh opaque BrowserSnapshot ref, with only a tightly bounded optional per-character delay. Entered text is never returned or retained.",
       promptGuidelines: browserFormGuidelines(),
@@ -685,7 +686,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserSelect",
+      name: WEB_TOOL_NAMES.browserSelect,
       label: "BrowserSelect",
       description: "Select a bounded nonempty set of exact native option labels or values through one fresh opaque BrowserSnapshot ref. Complete literal selected-value/label echoes are redacted from extension text outputs; this is not a credential-safe secrecy guarantee.",
       promptGuidelines: browserFormGuidelines(),
@@ -717,7 +718,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserPress",
+      name: WEB_TOOL_NAMES.browserPress,
       label: "BrowserPress",
       description: "Press one strictly allowlisted key or short chord on a supported target identified by a fresh opaque BrowserSnapshot ref. Arbitrary event objects and key sequences are not accepted.",
       promptGuidelines: browserFormGuidelines(),
@@ -744,7 +745,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserUpload",
+      name: WEB_TOOL_NAMES.browserUpload,
       label: "BrowserUpload",
       description: "Upload one to 32 explicitly chosen host files into a file input identified by a fresh opaque BrowserSnapshot ref. Gated by web.browserPermissions.modelUploads (default off; YOLO overrides) and always follows the Browser interaction approval policy. The page never sees or chooses source paths, and file content is never exposed in results.",
       promptGuidelines: browserFileTransferGuidelines(),
@@ -777,7 +778,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserDownloadSave",
+      name: WEB_TOOL_NAMES.browserDownloadSave,
       label: "BrowserDownloadSave",
       description: "Save a retained pending browser download to an explicitly chosen destination (absolute, or relative to the session working directory), wherever the model's existing host write authority reaches, or list this tab's retained pending downloads when both download and destination are omitted. Saving is gated by web.browserPermissions.modelDownloadSaving (default off; YOLO overrides) and always follows the Browser interaction approval policy. Page-suggested filenames never choose the destination.",
       promptGuidelines: browserFileTransferGuidelines(),
@@ -823,7 +824,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserClipboard",
+      name: WEB_TOOL_NAMES.browserClipboard,
       label: "BrowserClipboard",
       description: "Read or replace the text on the browser clipboard of one owned tab (text only; no binary or image formats, no file paste). Gated by web.browserPermissions.modelClipboard (default off; YOLO overrides) and always follows the Browser interaction approval policy. The manager issues a real per-origin browser permission grant for the approved operation's origin, never a global capability. Headless Chromium uses its per-instance virtual clipboard while headed desktop Chromium reaches the host system clipboard; the result reports which scope was used.",
       promptGuidelines: browserClipboardGuidelines(),
@@ -863,7 +864,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserWait",
+      name: WEB_TOOL_NAMES.browserWait,
       label: "BrowserWait",
       description: "Wait once, under one finite deadline, for an allowlisted observational condition: current ref state, bounded text presence/absence, HTTP(S) URL exact/prefix/safe-RE2 match, navigation/load completion, network quiet, or a short duration. It is not an orchestration polling primitive.",
       promptGuidelines: browserObservationGuidelines(),
@@ -896,7 +897,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserHistory",
+      name: WEB_TOOL_NAMES.browserHistory,
       label: "BrowserHistory",
       description: "List bounded session-local history or go back, forward, or reload in an owned tab. Cross-document changes invalidate that tab's semantic refs; same-document history retains them.",
       promptGuidelines: browserObservationGuidelines(),
@@ -922,7 +923,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserTabs",
+      name: WEB_TOOL_NAMES.browserTabs,
       label: "BrowserTabs",
       description: "List, open, switch, or close owned tabs using opaque session-scoped handles. Tabs and popups share the authenticated pinned broker; model-initiated opens keep the hard four-tab limit (page-created popups are adopted beyond it only while the model popup restriction override is enabled); closing the last tab closes the session.",
       promptGuidelines: browserObservationGuidelines(),
@@ -950,7 +951,7 @@ export class WebToolManager {
       },
     });
     this.pi.registerTool({
-      name: "BrowserClose",
+      name: WEB_TOOL_NAMES.browserClose,
       label: "BrowserClose",
       description: "Deterministically close an interactive browser session and confirm tab, context, process, and authenticated egress-broker quiescence. Safe to repeat.",
       executionMode: "sequential",

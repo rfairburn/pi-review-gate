@@ -56,6 +56,17 @@
  * for that exact synthetic trigger; other inputs receive the stop marker,
  * preventing a spawned child from repeating its parent's launch step.
  *
+ * Opt-in provider-request effect proof (issue #653): when
+ * PRG_FIXTURE_JOURNAL_MODE_SEGMENT_DIR names a directory holding the three
+ * shipped operating-mode segment files, every model_request record also
+ * carries `modeSegments` — the closed list of mode names whose EXACT shipped
+ * segment text occurs in the system prompt this provider actually received
+ * (replayed from the request transcript) — plus `toolProbes`, presence
+ * booleans for the bounded exact tool names in PRG_FIXTURE_JOURNAL_TOOL_PROBES
+ * (comma separated) among the tool declarations of that same request, and the
+ * process id. It never journals prompt text, tool descriptions, or schemas.
+ * Unset, every existing consumer's records are unchanged.
+ *
  * Pure test seams: `module.exports.startedShellResults` / `.shellResultHandle`
  * / `.selectStopHandle` expose the same selection used by the step so
  * tests/session-host-native-background-counts.test.ts can prove the negative
@@ -204,6 +215,34 @@ function shellListStatuses(messages) {
 		.map(([id, status]) => ({ id, status }));
 }
 
+/** The shipped segment files, keyed by persisted operating-mode name. */
+const MODE_SEGMENT_FILES = {
+	execute: 'execution-system-prompt.md',
+	orchestrate: 'orchestrator-system-prompt.md',
+	'plan-research': 'planning-system-prompt.md',
+};
+const TOOL_PROBE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/**
+ * Load the opt-in mode-segment/tool-probe observation, or undefined when it is
+ * not requested. A requested but unreadable segment or malformed probe list
+ * fails loudly instead of silently journaling nothing.
+ */
+function loadEffectProbe() {
+	const dir = process.env.PRG_FIXTURE_JOURNAL_MODE_SEGMENT_DIR;
+	if (!dir) return undefined;
+	const segments = Object.entries(MODE_SEGMENT_FILES).map(([mode, file]) => {
+		const text = fs.readFileSync(path.join(dir, file), 'utf8');
+		if (text.trim().length === 0) throw new Error(`session-host-native-provider: empty ${mode} segment`);
+		return { mode, text };
+	});
+	const tools = (process.env.PRG_FIXTURE_JOURNAL_TOOL_PROBES ?? '').split(',').filter(Boolean);
+	if (tools.length > 16 || !tools.every((name) => TOOL_PROBE_PATTERN.test(name))) {
+		throw new Error('session-host-native-provider: tool probe list refused');
+	}
+	return { segments, tools };
+}
+
 function statePath(kind) {
 	const dir = process.env.PRG_FIXTURE_STATE_DIR;
 	if (!dir) return undefined;
@@ -293,6 +332,33 @@ module.exports = async function (pi) {
 			maxTokens: 16_384,
 		}],
 	});
+
+	let effectProbe;
+	try {
+		effectProbe = loadEffectProbe();
+	} catch (error) {
+		journal('effect-probe-unavailable', { error: String(error) });
+		throw error;
+	}
+
+	/** Closed, prompt-free description of what this exact request carried. */
+	function requestEffect(messages) {
+		const systemPrompt = typeof faux.getCurrentSystemPrompt === 'function'
+			? faux.getCurrentSystemPrompt(messages)
+			: undefined;
+		const declared = typeof faux.getCurrentTools === 'function'
+			? new Set(faux.getCurrentTools(messages).map((tool) => tool && tool.name))
+			: undefined;
+		return {
+			modeSegments: typeof systemPrompt === 'string'
+				? effectProbe.segments.filter((segment) => systemPrompt.includes(segment.text)).map((segment) => segment.mode)
+				: null,
+			toolProbes: declared
+				? Object.fromEntries(effectProbe.tools.map((name) => [name, declared.has(name)]))
+				: null,
+			pid: process.pid,
+		};
+	}
 
 	function readTurnScript() {
 		const target = statePath('turn-script.json');
@@ -384,6 +450,7 @@ module.exports = async function (pi) {
 				userMessageCount: contextMessages.filter((message) => message.role === 'user').length,
 				pid: process.pid,
 			} : {}),
+			...(effectProbe ? requestEffect(contextMessages) : {}),
 		});
 		if (metadataOnly) {
 			const shellStatuses = shellListStatuses(contextMessages);

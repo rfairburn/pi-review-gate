@@ -9,6 +9,7 @@ import { onExit } from "signal-exit";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { spawnBackgroundJob } from "./shell";
+import { BACKGROUND_SHELL_TOOL_NAMES } from "./tool-names";
 import {
   requestWindowsOwnershipStop,
   ownershipVerdict,
@@ -1083,7 +1084,7 @@ export function registerBackgroundShell(
   };
 
   registerTool({
-    name: "ShellStart",
+    name: BACKGROUND_SHELL_TOOL_NAMES.start,
     label: "ShellStart",
     description:
       "Start a long-running command in the background and return immediately. The command runs in " +
@@ -1222,7 +1223,7 @@ export function registerBackgroundShell(
   });
 
   registerTool({
-    name: "ShellList",
+    name: BACKGROUND_SHELL_TOOL_NAMES.list,
     label: "ShellList",
     description: "List background jobs with their status, runtime, and what they are watched for.",
     parameters: objectSchema({}),
@@ -1258,7 +1259,7 @@ export function registerBackgroundShell(
   });
 
   registerTool({
-    name: "ShellLog",
+    name: BACKGROUND_SHELL_TOOL_NAMES.log,
     label: "ShellLog",
     description:
       "Read a slice of a background job's output. Defaults to the last 60 lines. Use offset to page " +
@@ -1319,7 +1320,7 @@ export function registerBackgroundShell(
   });
 
   registerTool({
-    name: "ShellSend",
+    name: BACKGROUND_SHELL_TOOL_NAMES.send,
     label: "ShellSend",
     description:
       "Write a line to a running background job's stdin — for a REPL, or an installer that asks a " +
@@ -1420,7 +1421,7 @@ export function registerBackgroundShell(
   });
 
   registerTool({
-    name: "ShellStop",
+    name: BACKGROUND_SHELL_TOOL_NAMES.stop,
     label: "ShellStop",
     description:
       "Stop a background job by exact job ID or unique label. Terminates the job's whole process tree " +

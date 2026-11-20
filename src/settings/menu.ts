@@ -178,8 +178,21 @@ export type MenuCustomFactory = (
   done: (result: string | undefined) => void,
 ) => unknown;
 
+/**
+ * The narrow menu-host injection surface (issue #653).
+ *
+ * A standalone host that owns its own TUI components — the session-host
+ * sidebar builds a pinned pi-tui {@link MenuTuiHost} — supplies it here, one
+ * per UI, so every settings menu of that UI renders through the host's own
+ * live components with no Pi peer load and no hidden Pi session. Two UIs can
+ * carry different hosts without interfering, and Pi hosts never supply one.
+ */
+export interface MenuTuiHostUi {
+  menuTuiHost?: MenuTuiHost;
+}
+
 /** The UI surface retainedSelect needs (host ctx.ui or a structural mock). */
-export interface RetainedUi {
+export interface RetainedUi extends MenuTuiHostUi {
   select(title: string, options: string[]): Promise<string | undefined>;
   /** Host custom TUI component (Pi hosts only); guarded by `mode === "tui"`. */
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
@@ -210,9 +223,160 @@ export interface MenuSelectList {
   setSelectedIndex(index: number): void;
   onSelect?: (item: MenuSelectItem) => void;
   onCancel?: () => void;
+  onSelectionChange?: (item: MenuSelectItem) => void;
   handleInput(data: string): void;
   render(width: number): string[];
   invalidate(): void;
+  /** Public pi-tui accessor; a list without it is never resized (#653). */
+  getSelectedItem?(): MenuSelectItem | null;
+}
+
+/** The visible-row limit of every native in-Pi settings list. */
+export const MENU_NATIVE_MAX_VISIBLE = 10;
+
+/**
+ * The validated host-bounded row count of one bounded render (#653), or
+ * undefined for an ordinary native render. Only a host that measured its own
+ * pane (the session-host sidebar) passes a bound; a Pi popup never does.
+ */
+export function menuRenderBound(maxRows: unknown): number | undefined {
+  return typeof maxRows === "number" && Number.isFinite(maxRows) && maxRows >= 0 ? Math.floor(maxRows) : undefined;
+}
+
+/**
+ * The visible-row limit of a list given `rowBudget` rows for the list and its
+ * scroll cue (#653). A complete list uses exactly its own rows and draws no
+ * cue; a longer one leaves one row for the native scroll cue. At least one
+ * item stays visible, so an impossible budget renders taller than the bound
+ * and the host shows its truthful too-small pane instead. A one- or two-item
+ * list is always complete: its rows never exceed one item plus a cue.
+ */
+export function boundedMenuListLimit(itemCount: number, rowBudget: number): number {
+  const count = Math.max(0, Math.floor(itemCount));
+  if (count === 0) return 0;
+  if (count <= 2 || count <= rowBudget) return count;
+  return Math.max(1, Math.floor(rowBudget) - 1);
+}
+
+/**
+ * One settings list whose visible-row count may follow a host-bounded
+ * viewport (#653), on the host's own public SelectList API.
+ *
+ * Unbounded (every Pi popup) it is exactly the native list constructed with
+ * the consumer's own native limit and never rebuilt. A bounded render calls
+ * {@link fit}; because the pinned SelectList's limit (and its page size) is
+ * fixed at construction, a changed limit REPLACES the list with a new one that
+ * carries the same items, the same selected item, and the same handlers. A
+ * stable limit and item set never rebuild. The list (or, for an owner-selected
+ * picker, the owner) stays the only selection authority.
+ */
+export interface MenuListViewport {
+  /** The current native list. */
+  readonly list: MenuSelectList;
+  /** A stable child component that always renders the current list. */
+  readonly component: { render(width: number): string[]; invalidate(): void };
+  /** Size the list for `rowBudget` rows (items plus any scroll cue). */
+  fit(rowBudget: number): void;
+  /** Replace the items, highlighting `selectedIndex`, at the current sizing. */
+  replace(items: MenuSelectItem[], selectedIndex: number): void;
+}
+
+export interface MenuListViewportInput {
+  host: MenuTuiHost;
+  theme: MenuSelectListTheme;
+  items: MenuSelectItem[];
+  /** The consumer's unchanged native limit for an unbounded list. */
+  nativeLimit(itemCount: number): number;
+  /** Owner-held selection (a picker that routes navigation itself). */
+  selectedIndex?(): number;
+}
+
+export function createMenuListViewport(input: MenuListViewportInput): MenuListViewport {
+  let items = input.items;
+  let limit = input.nativeLimit(items.length);
+  let bound: number | undefined;
+  let list = new input.host.SelectList(items, limit, input.theme);
+  const rebuild = (nextItems: MenuSelectItem[], nextLimit: number, index: number): void => {
+    const previous = list;
+    const next = new input.host.SelectList(nextItems, nextLimit, input.theme);
+    if (nextItems.length > 0) next.setSelectedIndex(Math.min(Math.max(index, 0), nextItems.length - 1));
+    if (previous.onSelect !== undefined) next.onSelect = previous.onSelect;
+    if (previous.onCancel !== undefined) next.onCancel = previous.onCancel;
+    if (previous.onSelectionChange !== undefined) next.onSelectionChange = previous.onSelectionChange;
+    list = next;
+    items = nextItems;
+    limit = nextLimit;
+  };
+  const currentIndex = (): number | undefined => {
+    if (input.selectedIndex !== undefined) return input.selectedIndex();
+    if (typeof list.getSelectedItem !== "function") return undefined;
+    const item = list.getSelectedItem();
+    if (item === null || item === undefined) return items.length === 0 ? 0 : undefined;
+    // Reference identity: duplicate labels or values still carry the exact row.
+    const index = items.indexOf(item);
+    return index >= 0 ? index : undefined;
+  };
+  return {
+    get list(): MenuSelectList {
+      return list;
+    },
+    component: {
+      render: (width: number): string[] => list.render(width),
+      invalidate: (): void => list.invalidate(),
+    },
+    fit(rowBudget: number): void {
+      if (!Number.isFinite(rowBudget)) return;
+      bound = rowBudget;
+      const next = boundedMenuListLimit(items.length, rowBudget);
+      if (next === limit) return;
+      const index = currentIndex();
+      // A list that cannot report its selection keeps its native size rather
+      // than risk moving the highlight.
+      if (index === undefined) return;
+      rebuild(items, next, index);
+    },
+    replace(nextItems: MenuSelectItem[], selectedIndex: number): void {
+      rebuild(
+        nextItems,
+        bound === undefined ? input.nativeLimit(nextItems.length) : boundedMenuListLimit(nextItems.length, bound),
+        selectedIndex,
+      );
+    },
+  };
+}
+
+/**
+ * Fit a menu's list to a host-bounded render (#653): the list receives the
+ * bound minus the rows its other parts actually render at this width (wrapped
+ * title, message, query, hints, borders). An unbounded render changes nothing.
+ */
+export function fitMenuListViewport(
+  viewport: MenuListViewport,
+  width: number,
+  maxRows: unknown,
+  chrome: readonly unknown[],
+): void {
+  const bound = menuRenderBound(maxRows);
+  if (bound === undefined) return;
+  let used = 0;
+  for (const part of chrome) used += menuPartRows(part, width).length;
+  viewport.fit(bound - used);
+}
+
+/**
+ * Rendered rows of one menu part, tolerating a part that cannot render. A Pi
+ * component may return its own cached array, so the rows are borrowed: callers
+ * only measure or copy them and never rewrite a row.
+ */
+export function menuPartRows(component: unknown, width: number): readonly string[] {
+  const render = (component as { render?: (width: number) => readonly string[] } | undefined)?.render;
+  if (typeof render !== "function") return [];
+  try {
+    const lines = render.call(component, width);
+    return Array.isArray(lines) ? lines : [];
+  } catch {
+    return [];
+  }
 }
 
 /** The pi-tui Input surface the search-capable picker drives (issue #463). */
@@ -244,9 +408,11 @@ export interface MenuContainer {
 }
 
 /**
- * The host TUI surface the adapter needs. Injectable through
- * {@link setMenuTuiHost} for tests; loaded from the running Pi's own modules
- * (host alias first, then host-relative resolution) otherwise.
+ * The host TUI surface the adapter needs. Supplied per UI by a standalone
+ * host that owns its own TUI components (`ui.menuTuiHost`, issue #653);
+ * injectable process-globally through {@link setMenuTuiHost} for tests; and
+ * loaded from the running Pi's own modules (host alias first, then
+ * host-relative resolution) otherwise.
  */
 export interface MenuTuiHost {
   SelectList: new (items: MenuSelectItem[], maxVisible: number, theme: MenuSelectListTheme) => MenuSelectList;
@@ -282,7 +448,12 @@ const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 let hostOverride: MenuTuiHost | undefined;
 let hostLoadPromise: Promise<MenuTuiHost | undefined> | undefined;
 let hostEntryProvider: (() => string | undefined) | undefined;
-/** Test seam: inject a fake TUI host, or clear the override with undefined. */
+/**
+ * Test seam: inject a fake TUI host process-globally, or clear the override
+ * with undefined. A standalone host that owns its own TUI components never
+ * uses this seam — it supplies its host per UI through `ui.menuTuiHost`
+ * (issue #653), so separate UIs never share one global override.
+ */
 export function setMenuTuiHost(host: MenuTuiHost | undefined): void {
   hostOverride = host;
   hostLoadPromise = undefined;
@@ -304,15 +475,23 @@ function resolveMenuTuiHost(): Promise<MenuTuiHost | undefined> {
 }
 
 /**
- * The shared host resolution for the settings renderers (issue #463).
+ * The shared host resolution for the settings renderers (issue #463, #653).
  *
- * The deny picker's search-capable renderer resolves the SAME host through
- * this seam, so an injected fake or the running Pi's own modules are used
- * identically by every settings menu, and the load failure mode stays the
- * same: a rejecting or unloadable peer resolves to undefined and the caller
- * degrades to the plain selector.
+ * An explicit per-UI host (`ui.menuTuiHost`, supplied by a standalone host
+ * that owns its own TUI components) wins outright: the renderers drive that
+ * host's own SelectList, Input, Container, keybinding sync, and theme seams,
+ * with no Pi peer load and no hidden Pi session. Each UI resolves only its
+ * own host, so two UIs with different hosts never interfere.
+ *
+ * Without an injected host the resolution is exactly what it was before the
+ * seam existed — the {@link setMenuTuiHost} test override first, then the
+ * running Pi's own peer modules — so every settings menu keeps its current
+ * path, including the failure mode: a rejecting or unloadable peer resolves
+ * to undefined and the caller degrades to the plain selector.
  */
-export function resolveMenuTuiHostForRenderers(): Promise<MenuTuiHost | undefined> {
+export function resolveMenuTuiHostForRenderers(ui?: MenuTuiHostUi): Promise<MenuTuiHost | undefined> {
+  const injected = ui?.menuTuiHost;
+  if (injected !== undefined) return Promise.resolve(injected);
   return resolveMenuTuiHost().catch(() => undefined);
 }
 
@@ -464,7 +643,7 @@ export async function retainedSelect(ui: RetainedUi, input: RetainedSelectInput)
   if (ui.mode === "tui" && typeof ui.custom === "function") {
     // Resolution must stay fail-safe at the call site: any future loader
     // rejection degrades to the plain selector instead of breaking the menu.
-    const host = await resolveMenuTuiHost().catch(() => undefined);
+    const host = await resolveMenuTuiHostForRenderers(ui);
     if (host !== undefined) {
       try {
         return await customSelect(ui, host, input);
@@ -517,27 +696,45 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
     const confirmMatch = resolveMenuActionMatcher(keybindings, "tui.select.confirm");
     const cancelMatch = resolveMenuActionMatcher(keybindings, "tui.select.cancel");
     const container = new host.Container();
-    if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
-    container.addChild(new host.Text(titleText(theme, input.title), 1, 0));
+    // Every part except the list, in order: a bounded host render measures
+    // their actual rows at its width (#653).
+    const chrome: unknown[] = [];
+    const add = (part: unknown, isChrome = true): void => {
+      container.addChild(part);
+      if (isChrome) chrome.push(part);
+    };
+    if (host.DynamicBorder) add(new host.DynamicBorder(borderColor(theme)));
+    add(new host.Text(titleText(theme, input.title), 1, 0));
 
     const items: MenuSelectItem[] = input.rows.map((row) => ({ value: row.key, label: row.label }));
-    const selectList = new host.SelectList(items, Math.min(items.length, 10), selectListTheme(host, theme));
+    const viewport = createMenuListViewport({
+      host,
+      theme: selectListTheme(host, theme),
+      items,
+      nativeLimit: (count) => Math.min(count, MENU_NATIVE_MAX_VISIBLE),
+    });
     if (input.initialKey !== undefined) {
       const index = items.findIndex((item) => item.value === input.initialKey);
       // A key no longer present in the rows keeps the default first row.
-      if (index >= 0) selectList.setSelectedIndex(index);
+      if (index >= 0) viewport.list.setSelectedIndex(index);
     }
-    selectList.onSelect = (item) => done(item.value);
-    selectList.onCancel = () => done(undefined);
-    container.addChild(selectList);
+    viewport.list.onSelect = (item) => done(item.value);
+    viewport.list.onCancel = () => done(undefined);
+    add(viewport.component, false);
     const saveHintAvailable = ui.saveControl !== undefined
       && ui.saveControl.suspended === 0
       && host.matchesCtrlS !== undefined;
-    container.addChild(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
-    if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
+    add(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
+    if (host.DynamicBorder) add(new host.DynamicBorder(borderColor(theme)));
 
     return {
-      render: (width: number): readonly string[] => container.render(width),
+      // `maxRows` is supplied only by a host that measured its own pane (the
+      // session-host sidebar, #653); a Pi popup renders natively. The
+      // container's array is borrowed and handed through unchanged.
+      render: (width: number, maxRows?: number): readonly string[] => {
+        fitMenuListViewport(viewport, width, maxRows, chrome);
+        return container.render(width);
+      },
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
         // A held-key event that replays an action this transaction already
@@ -566,7 +763,7 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
         } else if (cancelMatch(data)) {
           claimMenuAction(ui.saveControl, cancelMatch);
         }
-        selectList.handleInput(data);
+        viewport.list.handleInput(data);
         tui.requestRender?.();
       },
     };

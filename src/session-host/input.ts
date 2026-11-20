@@ -732,7 +732,8 @@ export function parseMouseInput(data: string): ParsedMouseInput | undefined | nu
 		if (button === undefined || x === undefined || y === undefined || x < 1 || y < 1) return null;
 		const motion = (button & 32) !== 0;
 		const wheel = (button & 64) !== 0;
-		const release = sgr[4] === "m" || (!motion && !wheel && (button & 3) === 3);
+		// Only button code 3 is the anonymous release; SGR button 11 (131) is a named press.
+		const release = sgr[4] === "m" || (!motion && !wheel && (button & 0x83) === 3);
 		return { button, x: x - 1, y: y - 1, release, motion, wheel };
 	}
 

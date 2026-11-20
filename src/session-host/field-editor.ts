@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { decodePrintableKey } from "pi-session-host-tui/dist/keys.js";
 import { MAX_RENAME_NAME_BYTES } from "./protocol";
+import { MAX_NATIVE_CONFIG_BYTES } from "./launch";
 import { completeNativeMouseEvent, type TextFieldMouseEvent, type TextFieldMouseResult } from "../text-field-mouse";
 import {
   CombinedAutocompleteProvider,
@@ -45,6 +46,21 @@ const NATIVE_EDITOR_CONTENT_ROW = 1;
  */
 const NATIVE_EDITOR_BODY_END_MARKER = "\x1b_pi-review-gate:editor-body-end\x07";
 const PATH_MAX_CODE_POINTS = 2048;
+/**
+ * The UTF-8-byte bound of one generic `text` field (issue #653).
+ *
+ * This is not a new product limit: it IS the existing size bound of the
+ * persisted review-gate config file (`MAX_NATIVE_CONFIG_BYTES`) that every
+ * settings text value lives in, so no currently valid config value — a long
+ * scheduled instruction or a long shared URL blocklist — can ever be refused,
+ * trimmed, or truncated by the field. The field keeps the shared fail-closed
+ * rule (over-limit input is rejected, never truncated), and the existing
+ * single-line name/path bounds and the paste/input-chunk bound are untouched.
+ *
+ * It is exported so a host can name the same bound when it sizes its external
+ * editor's temporary file (`runNativeExternalEditor({ maxTextBytes })`).
+ */
+export const MAX_TEXT_FIELD_BYTES = MAX_NATIVE_CONFIG_BYTES;
 const MAX_PASTE_BYTES = 8192;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
@@ -56,8 +72,8 @@ const SUBMIT_ACTION = "tui.input.submit";
 const CANCEL_ACTION = "tui.select.cancel";
 const EXTERNAL_EDITOR_ACTION = "app.editor.external";
 
-type FieldKind = "name" | "path";
-type ForcedNativeAction = "tui.select.confirm" | "tui.select.cancel" | "tui.editor.undo" | "tui.editor.cursorLineStart" | "tui.editor.cursorRight";
+type FieldKind = "name" | "path" | "text";
+type ForcedNativeAction = "tui.select.confirm" | "tui.select.cancel" | "tui.editor.undo" | "tui.editor.cursorLineStart" | "tui.editor.cursorRight" | "tui.input.newLine";
 
 /** The live public pi-tui keybinding manager supplied by the native host. */
 export interface SessionHostFieldKeybindings {
@@ -100,8 +116,28 @@ interface CommonFieldOptions {
   readonly onSubmit?: (submission: SessionHostFieldSubmission) => void;
   readonly onCancel?: () => void;
   readonly onClear?: () => void;
-  /** The host owns external-editor process execution; returned text is safely applied via Editor.setText. */
-  readonly onExternalEditor?: (text: string) => string | undefined | Promise<string | undefined>;
+  /**
+   * The host owns external-editor process execution; returned text is safely
+   * applied via Editor.setText.
+   *
+   * For a generic `text` field only, the field also reports its own effective
+   * UTF-8-byte bound (issue #653), so a host can size the external editor's
+   * temporary-file bound to the value it is actually editing instead of
+   * raising one global limit for every field. Name and path fields keep the
+   * original single-argument call exactly as it was.
+   *
+   * That same `text`-only call also reports whether the value is multi-line,
+   * which is the host's signal to ask the external editor to preserve a final
+   * line terminator (`runNativeExternalEditor({ preserveFinalLineTerminator })`).
+   * Only the field knows its own line shape, and a trailing newline is real
+   * content in a multi-line value, so without this report a host's unchanged
+   * open-and-save round trip would silently drop it.
+   */
+  readonly onExternalEditor?: (
+    text: string,
+    maxTextBytes?: number,
+    preserveFinalLineTerminator?: boolean,
+  ) => string | undefined | Promise<string | undefined>;
   readonly onReject?: (reason: SessionHostFieldRejection) => void;
 }
 
@@ -113,10 +149,32 @@ export type SessionHostFieldOptions = CommonFieldOptions & (
     readonly maxNameBytes?: number;
   }
   | { readonly kind: "path"; readonly workspaceBasePath: string; readonly maxNameBytes?: never }
+  | {
+    readonly kind: "text";
+    readonly workspaceBasePath?: never;
+    readonly maxNameBytes?: never;
+    /**
+     * Allow line breaks inside the value (issue #653: the persisted-settings
+     * scheduled instructions and the shared URL blocklist are multi-line).
+     * Absent or false keeps the field exactly as strict a single line as the
+     * existing kinds: every control byte, every terminal sequence, and every
+     * line break is stripped or rejected, and Enter stays the submit chord.
+     * Either way a TAB is stored as the native Editor stores it — four spaces
+     * — rather than refused or deleted.
+     */
+    readonly multiline?: boolean;
+    /**
+     * Optional explicit UTF-8-byte bound, 1 through the persisted review-gate
+     * config file's own size bound (`MAX_NATIVE_CONFIG_BYTES`). Absent, the
+     * field accepts any value that file could ever hold, so an existing long
+     * scheduled instruction or URL blocklist is never refused or truncated.
+     */
+    readonly maxTextBytes?: number;
+  }
 );
 
 export interface SessionHostFieldRender {
-  /** Sanitized, single-line-safe text rows clipped and padded to `cols`. */
+  /** Sanitized text rows (single-line-safe for every kind except a multi-line `text` field), clipped and padded to `cols`. */
   readonly lines: string[];
   /** Zero-based cursor position. It is hidden if the native marker is outside the bounded frame. */
   readonly cursor: { readonly column: number; readonly row: number; readonly visible: boolean };
@@ -210,6 +268,10 @@ export class SessionHostTextField {
   private readonly liveKeybindings?: SessionHostFieldKeybindings;
   private readonly restoreKeybindings?: () => void;
   private readonly maxNameBytes: number;
+  /** Effective UTF-8-byte bound of a generic `text` field; unused by other kinds. */
+  private readonly maxTextBytes: number;
+  /** True only for an explicitly multi-line generic `text` field. */
+  private readonly multiline: boolean;
   private acceptedText = "";
   private acceptedStoredText = "";
   private acceptedCursor = { line: 0, col: 0 };
@@ -248,11 +310,28 @@ export class SessionHostTextField {
     if (!Number.isSafeInteger(this.maxNameBytes) || this.maxNameBytes < 1 || this.maxNameBytes > DEFAULT_NAME_MAX_BYTES) {
       throw new Error(`Session host field maxNameBytes must be an integer between 1 and ${DEFAULT_NAME_MAX_BYTES}`);
     }
+    this.multiline = options.kind === "text" && options.multiline === true;
+    const requestedTextLimit = options.kind === "text" ? options.maxTextBytes : undefined;
+    this.maxTextBytes = requestedTextLimit === undefined ? MAX_TEXT_FIELD_BYTES : requestedTextLimit;
+    if (!Number.isSafeInteger(this.maxTextBytes)
+      || this.maxTextBytes < 1
+      || this.maxTextBytes > MAX_TEXT_FIELD_BYTES) {
+      throw new Error(`Session host field maxTextBytes must be an integer between 1 and ${MAX_TEXT_FIELD_BYTES}`);
+    }
 
-    const initialText = options.initialText ?? "";
-    const safeInitial = sanitizeSingleLine(initialText);
+    // The one input boundary of a field value. A generic `text` field applies
+    // the pinned native Editor's own storage normalization (TAB to four
+    // spaces; CR and CRLF to LF when multi-line) BEFORE the safety
+    // comparison, the limit check, and the Editor write below, so a valid
+    // value spelled with tabs or Windows line endings opens instead of being
+    // refused for the very normalization the Editor performs. Name and path
+    // fields get their input verbatim.
+    const initialText = normalizeFieldInput(options.kind, this.multiline, options.initialText ?? "");
+    const safeInitial = sanitizeForKind(options.kind, this.multiline, initialText);
     if (safeInitial !== initialText) {
-      throw new Error("Session host field initial text must be safe single-line text");
+      throw new Error(this.multiline
+        ? "Session host field initial text must be safe text without terminal controls"
+        : "Session host field initial text must be safe single-line text");
     }
     if (!this.isWithinLimit(options.kind, initialText)) {
       throw new Error(`Session host field initial text exceeds its ${options.kind} limit`);
@@ -344,30 +423,36 @@ export class SessionHostTextField {
   /** Replace the complete field value through the public native Editor API. Over-limit input is rejected, never truncated. */
   setText(text: string): boolean {
     if (this.disposed || this.settled || typeof text !== "string") return false;
-    const safe = sanitizeSingleLine(text);
-    if (safe !== text) {
+    // Same boundary rule as construction: an external editor (or any host)
+    // returning tabs or CR/CRLF line endings to a generic `text` field has
+    // them normalized exactly as the native Editor stores them before the
+    // comparison, the limit check, and the Editor write, so an ordinary
+    // editor result is applied rather than silently refused.
+    const input = normalizeFieldInput(this.options.kind, this.multiline, text);
+    const safe = sanitizeForKind(this.options.kind, this.multiline, input);
+    if (safe !== input) {
       this.reject("unsafe-text");
       return false;
     }
-    if (!this.isWithinLimit(this.options.kind, text)) {
+    if (!this.isWithinLimit(this.options.kind, input)) {
       this.reject("text-limit");
       return false;
     }
-    const changed = this.expandedEditorText() !== text;
+    const changed = this.expandedEditorText() !== input;
     this.suppressNativeChange = true;
     try {
-      this.editor.setText(text);
+      this.editor.setText(input);
     } finally {
       this.suppressNativeChange = false;
     }
-    this.acceptedText = text;
+    this.acceptedText = input;
     this.acceptedStoredText = this.editor.getText();
     this.acceptedCursor = this.editor.getCursor();
     this.pendingCompletion = undefined;
     this.activeCompletion = undefined;
     if (changed) {
       this.revision += 1;
-      this.safeCallback(() => this.options.onChange?.(text));
+      this.safeCallback(() => this.options.onChange?.(input));
     }
     this.invalidate();
     return true;
@@ -523,6 +608,18 @@ export class SessionHostTextField {
     return result;
   }
 
+  /**
+   * True when this field's own input routing takes the packet as its clear or
+   * external-editor action, through the same effective binding and fallback
+   * resolution it routes with, whether or not an external editor is
+   * available. A host offering a shortcut of its own over the field checks
+   * this so its shortcut never shadows either action.
+   */
+  claimsClearOrExternalEditor(data: string): boolean {
+    return this.matchesAction(data, this.actionBindings.clear, TUI_COPY_ACTION)
+      || this.matchesAction(data, this.actionBindings.externalEditor);
+  }
+
   /** Release host redraw and keybinding ownership; no TUI or terminal stop/start is performed. */
   dispose(): void {
     if (this.disposed) return;
@@ -564,6 +661,15 @@ export class SessionHostTextField {
     }
 
     if (this.pasteStartCarry.length === 0 && this.matchesAction(data, this.actionBindings.submit)) {
+      if (this.multiline && data === "\n") {
+        // A bare LF is ctrl+J: Pi's other published `tui.input.newLine` chord,
+        // and the one newline keystroke every terminal can actually deliver. In
+        // an explicitly multi-line field it inserts the break instead of
+        // submitting. Enter stays the submit chord, and no single-line kind can
+        // reach here, so every existing field keeps its exact behaviour.
+        this.forwardToEditor(data, "tui.input.newLine");
+        return;
+      }
       if (this.editor.isShowingAutocomplete()) {
         this.forwardToEditor(data, "tui.select.confirm"); // Native Enter/action accepts the highlighted completion.
       } else {
@@ -609,7 +715,13 @@ export class SessionHostTextField {
     if (this.pasteOverflow) {
       this.reject("paste-limit");
     } else {
-      const safePaste = sanitizeSingleLine((this.pasteParts ?? []).join(""));
+      // A generic `text` field expands pasted tabs (and, when multi-line,
+      // CR/CRLF) the way the native Editor's own paste does BEFORE the
+      // control sanitizer runs, so a tab joining two words becomes the
+      // native four spaces instead of being silently deleted. Name and path
+      // pastes reach the unchanged sanitizer verbatim.
+      const pasted = normalizeFieldInput(this.options.kind, this.multiline, (this.pasteParts ?? []).join(""));
+      const safePaste = sanitizeForKind(this.options.kind, this.multiline, pasted);
       if (this.preflightInsertion(safePaste)) {
         this.forwardToEditor(`${BRACKETED_PASTE_START}${safePaste}${BRACKETED_PASTE_END}`);
       }
@@ -700,7 +812,10 @@ export class SessionHostTextField {
   }
 
   private preflightInput(data: string): boolean {
-    if (data.includes("\n") || data.includes("\r")) {
+    // A bare LF is the native `tui.input.newLine` chord (ctrl+j). It reaches
+    // the Editor only for an explicitly multi-line field; every other control
+    // byte, and every CR, keeps the existing single-line refusal.
+    if (data.includes("\r") || (data.includes("\n") && !(this.multiline && data === "\n"))) {
       this.reject("unsafe-text");
       return false;
     }
@@ -796,7 +911,7 @@ export class SessionHostTextField {
   private handleNativeChange(_storedText: string): void {
     if (this.suppressNativeChange || this.disposed || this.settled) return;
     const expanded = this.expandedEditorText();
-    const safe = sanitizeSingleLine(expanded);
+    const safe = sanitizeForKind(this.options.kind, this.multiline, expanded);
     if (safe !== expanded) {
       this.reject("unsafe-text");
       this.restoreAcceptedText();
@@ -857,7 +972,8 @@ export class SessionHostTextField {
 
     // A fallback setter is safe only after Undo removed the rejected state and left valid text.
     const currentText = this.expandedEditorText();
-    if (sanitizeSingleLine(currentText) === currentText && this.isWithinLimit(this.options.kind, currentText)) {
+    if (sanitizeForKind(this.options.kind, this.multiline, currentText) === currentText
+      && this.isWithinLimit(this.options.kind, currentText)) {
       this.suppressNativeChange = true;
       try {
         this.editor.setText(this.acceptedText);
@@ -905,7 +1021,13 @@ export class SessionHostTextField {
     const startingRevision = this.revision;
     let result: string | undefined | Promise<string | undefined>;
     try {
-      result = handler(text);
+      // Only a generic `text` field reports a bound: it is the one field whose
+      // value can legitimately be larger than the shared 8192-byte editor
+      // limit, and the host needs the number to size its temporary file.
+      // Every existing kind keeps the original one-argument call.
+      result = this.options.kind === "text"
+        ? handler(text, this.maxTextBytes, this.multiline)
+        : handler(text);
     } catch {
       this.reject("external-editor-failed");
       return;
@@ -976,9 +1098,9 @@ export class SessionHostTextField {
   }
 
   private isWithinLimit(kind: FieldKind, value: string): boolean {
-    return kind === "name"
-      ? Buffer.byteLength(value, "utf8") <= this.maxNameBytes
-      : codePointLength(value) <= PATH_MAX_CODE_POINTS;
+    if (kind === "name") return Buffer.byteLength(value, "utf8") <= this.maxNameBytes;
+    if (kind === "text") return Buffer.byteLength(value, "utf8") <= this.maxTextBytes;
+    return codePointLength(value) <= PATH_MAX_CODE_POINTS;
   }
 
   private reject(reason: SessionHostFieldRejection): void {
@@ -1366,6 +1488,20 @@ function stripNativeFakeCursor(source: string): string {
 }
 
 function sanitizeSingleLine(source: string): string {
+  return sanitizeControls(source, false);
+}
+
+/**
+ * The one field sanitizer. It strips every terminal control sequence and
+ * control byte, so no rendered field row can carry an escape payload.
+ *
+ * `keepNewline` is set only for an explicitly multi-line generic `text` field:
+ * line breaks survive, and a lone CR or a CRLF pair becomes one LF. Every
+ * other character decision — ESC/CSI/OSC consumption, the C0/C1 and
+ * line-separator ranges, and the surrogate rejection — is byte-for-byte the
+ * existing single-line rule, so the name and path fields cannot change.
+ */
+function sanitizeControls(source: string, keepNewline: boolean): string {
   let result = "";
   let index = 0;
   while (index < source.length) {
@@ -1392,6 +1528,11 @@ function sanitizeSingleLine(source: string): string {
       index = consumeStringControl(source, index + length, code === 0x9d);
       continue;
     }
+    if (code === 0x0a && keepNewline) {
+      result += "\n";
+      index += 1;
+      continue;
+    }
     if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)
       || code === 0x2028 || code === 0x2029 || (code >= 0xd800 && code <= 0xdfff)) {
       index += length;
@@ -1401,6 +1542,44 @@ function sanitizeSingleLine(source: string): string {
     index += length;
   }
   return result;
+}
+
+/**
+ * Sanitizes one field value under its kind's own rule: the generic multi-line
+ * `text` field keeps line breaks (normalizing CR and CRLF to LF), and every
+ * other field — including a single-line `text` field — gets the unchanged
+ * single-line sanitizer.
+ */
+function sanitizeForKind(kind: FieldKind, multiline: boolean, source: string): string {
+  if (kind !== "text" || !multiline) return sanitizeSingleLine(source);
+  return sanitizeControls(source.replace(/\r\n?/g, "\n"), true);
+}
+
+/**
+ * The pinned native Editor's TAB expansion: `Editor.normalizeText` stores every
+ * TAB as four spaces when text is set, pasted, or inserted.
+ */
+const NATIVE_TAB_EXPANSION = "    ";
+
+/**
+ * The value one field actually stores, before any safety comparison.
+ *
+ * A generic `text` field (single- or multi-line) applies the pinned native
+ * Editor's own storage normalization: every TAB becomes four spaces, and an
+ * explicitly multi-line field also normalizes CR and CRLF to LF. A single-line
+ * `text` field keeps CR/LF verbatim, so its existing strict line-break refusal
+ * is unchanged. Name and path fields are returned verbatim, so their strict
+ * comparison and rules cannot change. Normalizing here (rather than only
+ * inside the sanitizer) is what makes the comparison meaningful: the sanitizer
+ * is idempotent on the result, so a tab-spelled, Windows-prefilled, or
+ * externally-edited value passes the safety check instead of tripping it for
+ * the Editor's own normalization. No other control byte is admitted: ANSI,
+ * C0, and C1 content still fails the comparison exactly as before.
+ */
+function normalizeFieldInput(kind: FieldKind, multiline: boolean, source: string): string {
+  if (kind !== "text") return source;
+  const expanded = source.replace(/\t/g, NATIVE_TAB_EXPANSION);
+  return multiline ? expanded.replace(/\r\n?/g, "\n") : expanded;
 }
 
 function consumeCsi(source: string, start: number): number {

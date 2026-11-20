@@ -1214,3 +1214,431 @@ test("a refused remote input notice stays visible when no sidebar pane is drawn"
     assert.equal(await closeWithSignal(harness), 0);
   }
 });
+
+/** Plain text of the latest frame the writer actually wrote. */
+function writtenText(harness: Awaited<ReturnType<typeof remoteNativeInputHarness>>["harness"]): string {
+  return plain(harness.writer.frames.at(-1)?.frame);
+}
+
+/** Moves the focused roster or settings menu highlight to a drawn row with real Down presses. */
+async function highlightRow(
+  harness: Awaited<ReturnType<typeof remoteNativeInputHarness>>["harness"],
+  pattern: RegExp,
+  what: string,
+): Promise<void> {
+  for (let step = 0; step < 40; step += 1) {
+    if (writtenText(harness).split("\n").some((line) => pattern.test(line))) return;
+    harness.terminal.emitInput("\x1b[B");
+    await nextTurn();
+  }
+  assert.fail(`never highlighted ${what}:\n${writtenText(harness)}`);
+}
+
+/** One complete left-button gesture: press, held motion, and release on content cells. */
+function emitLeftGesture(
+  harness: Awaited<ReturnType<typeof remoteNativeInputHarness>>["harness"],
+  column: number,
+  row: number,
+): void {
+  emitMouse(harness.terminal, column, row);
+  emitMouse(harness.terminal, column + 1, row, 32);
+  emitMouse(harness.terminal, column + 1, row, 0, "m");
+}
+
+test("Settings -> Review settings -> Escape twice: the first click on the same remote viewport is the shared focus-only gesture", async (t) => {
+  let reviewOpens = 0;
+  const { harness, peer, content, manager, generation, rect } = await remoteNativeInputHarness(t, {
+    // A synthetic one-screen editor: root Escape ends it like the real menu does.
+    openLocalReviewSettings: async ({ ui }) => {
+      reviewOpens += 1;
+      await ui.select("Synthetic review settings", ["Operating mode"]);
+    },
+  });
+  try {
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    await highlightRow(harness, /> Settings/, "Settings");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await highlightRow(harness, /> Review settings/, "Review settings");
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await nextTurn();
+    assert.equal(reviewOpens, 1);
+    assert.equal(harness.sidebar!.focus, "form");
+    assert.ok(writtenText(harness).includes("Synthetic review settings"), writtenText(harness));
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    await nextTurn();
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "two Escapes return to the roster");
+    assert.ok(writtenText(harness).includes("REMOTE-NATIVE-IO"), "the same remote viewport is back in Main");
+
+    const selectedBefore = harness.sidebar!.selectedId;
+    const selections = content.selections.length;
+    const viewports = content.viewports.length;
+    const requests = content.inputRequests.length;
+    const commands = peer.commands.length;
+    const localWrites = manager.writes.length;
+    // No left-card reactivation, no Enter: one click on the drawn remote content.
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "the first eligible click refocuses the same remote session");
+    assert.equal(harness.sidebar!.visible, true);
+    assert.equal(harness.sidebar!.selectedId, selectedBefore, "the roster highlight is unchanged");
+    assert.equal(content.selections.length, selections, "no remote selection or re-subscribe");
+    assert.equal(content.currentTarget().selectionGeneration, generation, "the same selection generation");
+    assert.equal(content.viewports.length, viewports, "a focus change asks for no new viewport");
+    assert.equal(content.inputRequests.length, requests, "no part of the activation gesture reaches the peer");
+    assert.equal(peer.commands.length, commands, "no coordinator command, permission, or grant");
+    assert.equal(manager.writes.length, localWrites, "nothing reaches a local row");
+
+    // Once the Main-focused frame is written, ordinary remote input resumes under
+    // the existing gates for the same source.
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    harness.terminal.emitInput("x");
+    await nextTurn();
+    assert.deepEqual(content.deliveredInputs.slice(requests).map((request) => [request.kind, request.text]),
+      [["mouse", `${ESC}[<0;3;4M`], ["keyboard", "x"]]);
+    assert.equal(content.deliveredInputs.at(-1)!.selectionGeneration, generation);
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the remote focus-only click needs the current written, unshifted content cell and never gains input authority", async (t) => {
+  const { harness, peer, content, manager, source, generation, rect } = await remoteNativeInputHarness(t);
+  try {
+    const nativeSession = source.nativeSession;
+    const requests = content.inputRequests.length;
+    const localWrites = manager.writes.length;
+    // Roster focus not yet written: the frame on screen is still Main-focused.
+    harness.writer.holdWrites = true;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "an unwritten roster-focused frame is no focus target");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+
+    // Host padding and a non-left button are never the gesture.
+    emitMouse(harness.terminal, rect.column + rect.cols + 1, rect.row + 1);
+    emitMouse(harness.terminal, rect.column + rect.cols + 1, rect.row + 1, 0, "m");
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3, 2);
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3, 2, "m");
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "padding and a right press keep the roster focused");
+
+    // 80 -> 70 -> 80 before any replacement frame is written: the rectangles match
+    // again, but the reflowed screen needs its own written frame first.
+    harness.writer.holdWrites = true;
+    harness.terminal.setSize(70, 24);
+    harness.terminal.setSize(80, 24);
+    await nextTurn();
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "a same-size reflow roundtrip is no focus target until repainted");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+
+    // A shifted viewport still queued behind the writer: the old rectangle on
+    // screen and the new candidate disagree, so neither authorizes the click.
+    harness.writer.holdWrites = true;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 30, rows: 12, marker: "REMOTE-SHIFTED", nativeSession, inputSource: remoteNativeSource({
+        hostRunId: "run-a", sessionId: "row-a", nativeSession, cols: 30, rows: 12,
+      }),
+    }));
+    await nextTurn();
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "a shifted, unwritten viewport is no focus target");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    assert.ok(writtenText(harness).includes("REMOTE-SHIFTED"));
+    // Cells the old 40x20 frame drew are padding of the written 30x12 frame.
+    emitLeftGesture(harness, rect.column + 35, rect.row + 15);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "the new frame's padding is host space");
+    // A newer accepted viewport that changes geometry before its frame is even
+    // composed: the current source no longer fills the drawn rectangle.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO", nativeSession, inputSource: source,
+    }));
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    assert.equal(harness.sidebar!.focus, "sidebar", "a changed current source is no focus target for the old frame");
+    await nextTurn();
+
+    // Remote input/copy Off: focusing stays a UI-only action, and the existing Off
+    // fence refuses everything afterwards.
+    content.setViewerInput(false);
+    peer.publish({ settings: { ...peer.snapshot.settings!, viewerNativeInputEnabled: false } });
+    await nextTurn();
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "Off still lets the click focus the same remote viewport");
+    assert.equal(content.currentTarget().selectionGeneration, generation);
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3);
+    harness.terminal.emitInput("y");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, requests, "Off forwards no pointer or keyboard input");
+    assert.ok(sidebarNoticeRows(writtenText(harness), REMOTE_INPUT_VIEWER_OFF_NOTICE) !== undefined,
+      "the ordinary Off notice, not a focus-specific path");
+    assert.equal(manager.writes.length, localWrites, "nothing reaches a local row");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("a status-only remote pane is no focus target, and the legacy display-only seam focuses without forwarding", async (t) => {
+  const { harness, content, dispatch } = await remoteContentMainHarness(t, [
+    remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
+  ], { nativeInputOriginFraming: false });
+  try {
+    dispatch({ type: "select-remote", hostId: "lab-a", hostRunId: "run-a", rowId: "row-a" });
+    await nextTurn();
+    if (harness.sidebar!.focus === "main") {
+      harness.terminal.emitInput(ALT_LEFT);
+      await nextTurn();
+    }
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    // Nothing accepted yet: the host's own status line owns the pane.
+    emitLeftGesture(harness, 38, 2);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "a metadata/status-only remote pane never gains focus authority");
+
+    const nativeSession = { sessionId: "conversation-a", epoch: 3 };
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 40, rows: 20, marker: "REMOTE-LEGACY-FOCUS", nativeSession,
+      inputSource: remoteNativeSource({ hostRunId: "run-a", sessionId: "row-a", nativeSession, cols: 40, rows: 20 }),
+    }));
+    await nextTurn();
+    assert.ok(writtenText(harness).includes("REMOTE-LEGACY-FOCUS"));
+    // The owner reflowed back to 40x20 (a new canonical revision) without this
+    // viewer resizing; the identical-pixel frame is still queued behind the writer.
+    harness.writer.holdWrites = true;
+    const invalidations = harness.writer.invalidateCalls;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-a", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, revision: 3, marker: "REMOTE-LEGACY-FOCUS", nativeSession,
+    }));
+    await nextTurn();
+    emitLeftGesture(harness, 38, 2);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "an unwritten owner geometry revision is no focus target");
+    assert.ok(harness.writer.invalidateCalls > invalidations,
+      "a new owner geometry revision crosses a real writer boundary even with identical pixels");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.writer.holdWrites = false;
+    emitLeftGesture(harness, 38, 2);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "the drawn remote viewport takes the same focus-only click");
+    emitMouse(harness.terminal, 38, 2);
+    harness.terminal.emitInput("z");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, 0, "the legacy seam stays display-only after focusing");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
+test("the remote focus-only click needs the written subscription and fences its own motion and release across a resize", async (t) => {
+  const { harness, content, manager, source, generation, rect } = await remoteNativeInputHarness(t);
+  try {
+    const nativeSession = source.nativeSession;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+
+    // The same row and selection restored on a replacement subscription with
+    // identical pixels, still queued behind the writer.
+    harness.writer.holdWrites = true;
+    const invalidations = harness.writer.invalidateCalls;
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-a", sequence: 1,
+      cols: 40, rows: 20, marker: "REMOTE-NATIVE-IO", nativeSession, inputSource: source,
+    }));
+    await nextTurn();
+    assert.ok(harness.writer.invalidateCalls > invalidations,
+      "an identical-looking replacement subscription crosses a real writer boundary");
+    emitLeftGesture(harness, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar", "an unwritten replacement subscription is no focus target");
+    harness.writer.drainHeldWrites();
+    await nextTurn();
+    harness.writer.holdWrites = false;
+
+    // The written replacement now uses drag reporting. A focus press, then a
+    // resize to narrow Main that restores the owner's drag capture before the
+    // press's own motion and release arrive.
+    const dragModes: TerminalInputModes = { ...REMOTE_INPUT_MODES, mouseTracking: "drag", mouseEncoding: "sgr" };
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-a", sequence: 2,
+      cols: 40, rows: 20, marker: "REMOTE-FENCED-DRAG", nativeSession, inputSource: source, inputModes: dragModes,
+    }));
+    await nextTurn();
+    const requests = content.inputRequests.length;
+    emitMouse(harness.terminal, rect.column + 2, rect.row + 3);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "the written replacement takes the focus-only click");
+    harness.terminal.setSize(50, 24);
+    await nextTurn();
+    assert.equal(harness.terminal.writes.filter((write) => /^\x1b\[\?100[0-3]h$/.test(write)).at(-1), `${ESC}[?1002h`,
+      "narrow Main keeps the owner's own drag capture, so held motion is reported");
+    assert.ok(writtenText(harness).includes("REMOTE-FENCED-DRAG"));
+    // An unidentified legacy release does not prove the left button ended.
+    harness.terminal.emitInput(`${ESC}[M${String.fromCharCode(35, 37, 38)}`);
+    emitMouse(harness.terminal, 4, 5, 32);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, requests, "an unidentified release does not lift the focus fence");
+    // Neither SGR button 8 nor button 11 aliases the held left button or an
+    // anonymous release: both clicks follow the ordinary remote path whole.
+    for (const button of [128, 131]) {
+      emitMouse(harness.terminal, 4, 5, button);
+      emitMouse(harness.terminal, 4, 5, button, "m");
+    }
+    await nextTurn();
+    const afterSideButton = content.inputRequests.length;
+    assert.deepEqual(content.deliveredInputs.slice(requests).map((request) => request.text), [
+      `${ESC}[<128;5;5M`, `${ESC}[<128;5;5m`,
+      `${ESC}[<131;5;5M`, `${ESC}[<131;5;5m`,
+    ], "both side-button clicks follow the ordinary remote path");
+    emitMouse(harness.terminal, 4, 5, 32);
+    emitMouse(harness.terminal, 5, 5, 32);
+    emitMouse(harness.terminal, 5, 5, 0, "m");
+    await nextTurn();
+    assert.equal(content.inputRequests.length, afterSideButton,
+      "neither the focus press nor its motion or release reaches the peer");
+
+    // A fresh gesture after the fence ends follows the ordinary written-source path.
+    emitMouse(harness.terminal, 4, 5);
+    emitMouse(harness.terminal, 5, 5, 32);
+    emitMouse(harness.terminal, 5, 5, 0, "m");
+    await nextTurn();
+    assert.deepEqual(content.deliveredInputs.slice(afterSideButton).map((request) => request.kind),
+      ["mouse", "mouse", "mouse"], "a fresh press, drag, and release are forwarded normally");
+    assert.equal(content.deliveredInputs.at(-1)!.selectionGeneration, generation);
+    assert.equal(content.deliveredInputs.at(-1)!.subscriptionId, "sub-b");
+
+    // A legacy-encoded focus click: its anonymous release ends the legacy fence,
+    // so the next ordinary legacy right click forwards both halves.
+    harness.terminal.setSize(80, 24);
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    const emitLegacy = (button: number): void => {
+      harness.terminal.emitInput(`${ESC}[M${String.fromCharCode(32 + button, rect.column + 35, rect.row + 36)}`);
+    };
+    const beforeLegacy = content.inputRequests.length;
+    emitLegacy(0);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main", "a legacy left press is the same focus-only gesture");
+    emitLegacy(3);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, beforeLegacy, "the legacy focus gesture stays host-owned");
+    emitLegacy(2);
+    emitLegacy(3);
+    await nextTurn();
+    assert.deepEqual(content.deliveredInputs.slice(beforeLegacy).map((request) => request.text),
+      [`${ESC}[<2;3;4M`, `${ESC}[<3;3;4m`], "the next legacy right click forwards both halves");
+
+    // Overlapping legacy buttons stay host-owned: their anonymous releases cannot
+    // distinguish the focus button from the overlapping button.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    const beforeOverlap = content.inputRequests.length;
+    emitLegacy(0);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    emitLegacy(2);
+    emitLegacy(3);
+    emitLegacy(32);
+    emitLegacy(34);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, beforeOverlap,
+      "neither the focus gesture nor the overlapping legacy gesture reaches the peer");
+    emitLegacy(3);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, beforeOverlap, "the final anonymous release is host-owned");
+    emitLegacy(2);
+    emitLegacy(3);
+    await nextTurn();
+    assert.deepEqual(content.deliveredInputs.slice(beforeOverlap).map((request) => request.text),
+      [`${ESC}[<2;3;4M`, `${ESC}[<3;3;4m`], "a fresh legacy click forwards both halves after the overlap ends");
+
+    // A remote owner requesting press-only X10 tracking: the legacy focus click
+    // keeps release-capable capture until its release retires the fence.
+    emitLegacy(2); // Pressed in drag mode; its release after the switch to mode 9 is unreported.
+    await nextTurn();
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-a", sequence: 3,
+      cols: 40, rows: 20, marker: "REMOTE-X10", nativeSession, inputSource: source,
+      inputModes: { ...REMOTE_INPUT_MODES, mouseTracking: "x10" },
+    }));
+    await nextTurn();
+    const tracking = (): string | undefined =>
+      harness.terminal.writes.filter((write) => /^\x1b\[\?(?:9|100[0-3])h$/.test(write)).at(-1);
+    assert.equal(tracking(), `${ESC}[?9h`);
+    emitLegacy(1); // Mode 9 never reports this press's release.
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    const beforeX10Focus = content.inputRequests.length;
+    emitLegacy(0);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    assert.equal(tracking(), `${ESC}[?1000h`, "the focus click can still report its release");
+    emitLegacy(3);
+    await nextTurn();
+    assert.equal(content.inputRequests.length, beforeX10Focus, "the entire focus click is host-owned");
+    assert.equal(tracking(), `${ESC}[?9h`, "the release restores the owner's press-only tracking");
+    emitLegacy(2);
+    await nextTurn();
+    assert.deepEqual(content.inputRequests.slice(beforeX10Focus).map((request) => request.text),
+      [`${ESC}[<2;3;4M`], "the next ordinary legacy press is forwarded");
+
+    // Narrow Main with no owner tracking would disable capture; the held legacy
+    // focus press still needs its release first.
+    content.publish(remoteViewport({
+      subscriptionId: "sub-b", hostRunId: "run-a", sessionId: "row-a", sequence: 4,
+      cols: 40, rows: 20, marker: "REMOTE-NO-MOUSE", nativeSession, inputSource: source,
+      inputModes: { ...REMOTE_INPUT_MODES, mouseTracking: "none" },
+    }));
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "sidebar");
+    const beforeNoModeFocus = content.inputRequests.length;
+    emitLegacy(0);
+    await nextTurn();
+    assert.equal(harness.sidebar!.focus, "main");
+    const beforeNoModeNarrow = harness.terminal.writes.length;
+    harness.terminal.setSize(50, 24);
+    await nextTurn();
+    assert.equal(harness.terminal.writes.slice(beforeNoModeNarrow).includes(`${ESC}[?1000l`), false,
+      "narrow Main retains capture until the legacy focus release");
+    emitLegacy(3);
+    await nextTurn();
+    assert.ok(harness.terminal.writes.slice(beforeNoModeNarrow).includes(`${ESC}[?1000l`),
+      "the release restores disabled tracking");
+    assert.equal(content.inputRequests.length, beforeNoModeFocus, "the focus click stays host-owned");
+    assert.equal(manager.writes.length, 0, "nothing reaches a local row");
+  } finally {
+    harness.writer.holdWrites = false;
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});

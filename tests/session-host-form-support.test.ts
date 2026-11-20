@@ -5,8 +5,8 @@ import { join } from "node:path";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import test from "node:test";
 
-import { EXECUTOR_TOOL_CATALOG_ENV, RUNTIME_ROLE_ENV, SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
-import { loadNativeFieldKeybindings, runNativeExternalEditor } from "../src/session-host/form-support";
+import { EXECUTOR_TOOL_CATALOG_ENV, MAX_NATIVE_CONFIG_BYTES, RUNTIME_ROLE_ENV, SESSION_HOST_BOOTSTRAP_ENV } from "../src/session-host/launch";
+import { loadNativeFieldKeybindings, MAX_EDITOR_TEXT_BYTES, runNativeExternalEditor } from "../src/session-host/form-support";
 import { PI_AGENT_DIR_ENV } from "../src/config-path";
 
 const FORM_TEST_SCRATCH_ROOT = join(process.cwd(), "node_modules", ".cache", "session-host-form-support-tests");
@@ -743,6 +743,149 @@ test("aborting the external-editor handoff escalates only its owned child", asyn
     assertionsSucceeded = true;
   } finally {
     controller.abort();
+    if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The explicit per-call external-editor text bound (issue #653 groundwork).
+//
+// The default stays exactly what every existing session-host field gets, and
+// a caller that owns a genuinely larger value can name a bound up to the
+// persisted review-gate config file's own existing size limit. No global
+// increase: a call that does not name a bound behaves as before.
+// ---------------------------------------------------------------------------
+
+/** A multi-line value past the unchanged 8192-byte default, inside the config cap. */
+function oversizedSettingsValue(): string {
+  return Array.from(
+    { length: 200 },
+    (_unused, index) => `${index + 1}. sweep the nightly integration report and file any regression found`,
+  ).join("\n");
+}
+
+test("an explicit external-editor bound round-trips a long multi-line settings value", async () => {
+  const root = makeFormTestDirectory("external-editor-long");
+  const edited = oversizedSettingsValue();
+  let assertionsSucceeded = false;
+  try {
+    const { agentDir, tempRoot } = makeEditorDirectories(root);
+    assert.ok(Buffer.byteLength(edited, "utf8") > 8_192, "the fixture is genuinely past the unchanged default bound");
+    const fakeSpawn = completingEditorSpawn((_command, args) => {
+      writeFileSync(args.at(-1)!, edited, "utf8");
+    });
+    const result = await runNativeExternalEditor("short start", {
+      env: editorEnv(agentDir, { VISUAL: "synthetic-editor --wait" }),
+      cwd: root,
+      tempRoot,
+      spawn: fakeSpawn,
+      maxTextBytes: MAX_NATIVE_CONFIG_BYTES,
+    });
+    assert.equal(result, edited, "the whole multi-line value returns, with no trimming or truncation");
+    assert.deepEqual(readdirSync(tempRoot), [], "the owned temporary directory is removed after completion");
+    assertionsSucceeded = true;
+  } finally {
+    if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
+  }
+});
+
+test("the unchanged default external-editor bound still refuses a larger result", async () => {
+  const root = makeFormTestDirectory("external-editor-default-bound");
+  const edited = oversizedSettingsValue();
+  let assertionsSucceeded = false;
+  try {
+    const { agentDir, tempRoot } = makeEditorDirectories(root);
+    assert.equal(MAX_EDITOR_TEXT_BYTES, 8_192, "the default external-editor bound is the unchanged 8192 bytes");
+    const fakeSpawn = completingEditorSpawn((_command, args) => {
+      writeFileSync(args.at(-1)!, edited, "utf8");
+    });
+    await assert.rejects(
+      runNativeExternalEditor("short start", {
+        env: editorEnv(agentDir, { VISUAL: "synthetic-editor --wait" }),
+        cwd: root,
+        tempRoot,
+        spawn: fakeSpawn,
+      }),
+      /external editor result is not a bounded regular file/,
+      "a call that names no bound keeps the original 8192-byte limit",
+    );
+    assert.deepEqual(readdirSync(tempRoot), [], "the refusal still removes only the owned temporary file and directory");
+    assertionsSucceeded = true;
+  } finally {
+    if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
+  }
+});
+
+test("an out-of-range explicit external-editor bound is refused before any process starts", async () => {
+  const root = makeFormTestDirectory("external-editor-bound-argument");
+  let spawned = 0;
+  let assertionsSucceeded = false;
+  try {
+    const { agentDir, tempRoot } = makeEditorDirectories(root);
+    const fakeSpawn = completingEditorSpawn(() => { spawned += 1; });
+    for (const maxTextBytes of [0, -1, 1.5, MAX_NATIVE_CONFIG_BYTES + 1]) {
+      await assert.rejects(
+        runNativeExternalEditor("short start", {
+          env: editorEnv(agentDir, { VISUAL: "synthetic-editor --wait" }),
+          cwd: root,
+          tempRoot,
+          spawn: fakeSpawn,
+          maxTextBytes,
+        }),
+        /maxTextBytes must be an integer/,
+      );
+    }
+    assert.equal(spawned, 0, "no editor process is started for an unusable bound");
+    assert.deepEqual(readdirSync(tempRoot), [], "a refused call leaves no temporary artifact behind");
+    assertionsSucceeded = true;
+  } finally {
+    if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
+  }
+});
+
+test("a multi-line caller can preserve the final line terminator while defaults stay unchanged", async () => {
+  const root = makeFormTestDirectory("external-editor-final-newline");
+  let assertionsSucceeded = false;
+  try {
+    const { agentDir, tempRoot } = makeEditorDirectories(root);
+    const baseOptions = {
+      env: editorEnv(agentDir, { VISUAL: "synthetic-editor --wait" }),
+      cwd: root,
+      tempRoot,
+      // A no-op editor: the temporary file keeps exactly the bytes it was given.
+      spawn: completingEditorSpawn(() => {}),
+    };
+
+    for (const ending of ["\n", "\r\n", "\r"] as const) {
+      // A long multi-line settings value opened and saved unchanged must come
+      // back unchanged, closing line break included.
+      const value = oversizedSettingsValue() + ending;
+      assert.ok(Buffer.byteLength(value, "utf8") > 8_192, "the fixture is past the unchanged default bound");
+      const preserved = await runNativeExternalEditor(value, {
+        ...baseOptions,
+        maxTextBytes: MAX_NATIVE_CONFIG_BYTES,
+        preserveFinalLineTerminator: true,
+      });
+      assert.equal(preserved, value, `an unchanged long multi-line value round-trips exactly for a ${JSON.stringify(ending)} ending`);
+
+      // Every existing caller keeps the closing-newline removal it always had.
+      const trimmed = await runNativeExternalEditor(`short${ending}`, baseOptions);
+      assert.equal(trimmed, "short", `the default still removes a ${JSON.stringify(ending)} terminator`);
+    }
+
+    // The flag alone does not raise the bound: the long value still needs an explicit one.
+    await assert.rejects(
+      runNativeExternalEditor(oversizedSettingsValue() + "\n", {
+        ...baseOptions,
+        preserveFinalLineTerminator: true,
+      }),
+      /bounded field limit/,
+      "preservation never widens the default bound",
+    );
+
+    assert.deepEqual(readdirSync(tempRoot), [], "the owned temporary directory is removed either way");
+    assertionsSucceeded = true;
+  } finally {
     if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
   }
 });

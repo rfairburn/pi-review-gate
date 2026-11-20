@@ -153,7 +153,13 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
     if (choice === "delete" && originalId !== undefined) return { kind: "delete", id: originalId };
     lastKey = choice;
     if (choice === "id") {
-      const value = await editSettingText(ui, "Unique identifier (letters, numbers, underscores, periods, hyphens)", draft.id);
+      // The identifier is one strict line by schema: a host-owned field
+      // presents it single-line so an unchanged external-editor save does not
+      // append a final newline the unchanged validator below would reject.
+      const value = await editSettingText(
+        ui, "Unique identifier (letters, numbers, underscores, periods, hyphens)", draft.id,
+        undefined, { multiline: false },
+      );
       if (value !== undefined) {
         try {
           normalizeConfig({ externalAgents: Object.fromEntries([[value, { adapter, execution: {} }]]) });

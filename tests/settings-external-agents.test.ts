@@ -195,3 +195,51 @@ test("catalog records release verification provenance without runtime discovery"
     assert.ok(catalog.models.length > 0);
   }
 });
+
+test("a host-owned field is told the identifier is one strict line; other fields and validation are unchanged", async () => {
+  const config = normalizeConfig({ externalAgents: { "worker-id": { adapter: "codex-cli", execution: {} } } });
+  const requests: Array<{ title: string; currentValue: string; options: Record<string, unknown> }> = [];
+  const answers = ["worker-id", "60000"];
+  const selects = ["Identifier:", "Advanced execution overrides", "Timeout (ms):", "Back", "Apply edit"];
+  const notices: string[] = [];
+  const ui: UiContext = {
+    async select(_title, options) {
+      const next = selects.shift();
+      assert.ok(next !== undefined, "unexpected menu");
+      return options.find((option) => option.startsWith(next)) ?? next;
+    },
+    editText: async (request) => {
+      requests.push({ title: request.title, currentValue: request.currentValue, options: { ...request.options } });
+      return answers.shift();
+    },
+    async editor() { throw new Error("the host-owned field must be used"); },
+    notify(message) { notices.push(message); },
+  };
+  const result = await selectExternalAgentEdit(ui, config, resolvedExternalAgent(config, "worker-id")!);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.id, "worker-id", "the unchanged identifier is accepted as-is");
+  assert.equal(result.agent.execution?.timeoutMs, 60000);
+  assert.deepEqual(notices, []);
+  assert.equal(requests.length, 2);
+  assert.match(requests[0]!.title, /Unique identifier/);
+  assert.equal(requests[0]!.currentValue, "worker-id");
+  assert.deepEqual(requests[0]!.options, { multiline: false }, "only the identifier carries the single-line hint");
+  assert.deepEqual(requests[1]!.options, {}, "other fields keep the host's existing presentation");
+
+  // The validator itself is unchanged: an identifier with a trailing newline is
+  // still refused, never trimmed.
+  const strictNotices: string[] = [];
+  const strictSelects = ["Identifier:", "Cancel"];
+  const strict: UiContext = {
+    async select(_title, options) {
+      const next = strictSelects.shift();
+      assert.ok(next !== undefined, "unexpected menu");
+      return options.find((option) => option.startsWith(next)) ?? next;
+    },
+    editText: async () => "worker-id\n",
+    notify(message) { strictNotices.push(message); },
+  };
+  assert.equal(await selectExternalAgentEdit(strict, config, resolvedExternalAgent(config, "worker-id")!), undefined);
+  assert.equal(strictNotices.length, 1);
+  assert.match(strictNotices[0]!, /Identifier must be unique/);
+});

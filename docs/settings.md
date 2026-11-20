@@ -2,9 +2,12 @@
 
 This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
 the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
-persistence semantics, and the shared native text-field behavior. Raw field values and
-defaults are owned by the [Configuration](configuration.md) reference, and scheduled-task
-semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
+persistence semantics, and the shared native text-field behavior. It also owns the
+sidebar's disk-only review-gate settings editor and how its exits differ from the
+Pi-session menu's ([Sidebar review-gate settings](#sidebar-review-gate-settings-disk-only)).
+Raw field values and defaults are owned by the [Configuration](configuration.md)
+reference, and scheduled-task semantics are documented on
+[Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
 
 ## `/review-settings`
 
@@ -585,3 +588,133 @@ their location and the root **Tools** row summary change.
   [Web fields](configuration.md#web-fields). The row is reached through
   `/review-settings` → **Tools** → **Web**; its stored `web.*` keys, defaults,
   and behavior are unchanged by the move.
+
+## Sidebar review-gate settings (disk-only)
+
+The `pi-review-sessions` sidebar carries its own review-gate settings editor for the **local
+host's saved configuration**: the same file a local Pi session loads at startup, through the
+same field definitions, validation, and persistence path as `/review-settings` — no second
+format, and no separate file that local launches ignore. Raw keys and defaults stay owned by
+[Configuration](configuration.md). It is configuration-only, not a second live review-gate
+instance: opening it starts no hidden Pi session and holds no effective in-memory configuration.
+
+It covers the **seventeen persisted sections** enumerated at the top of this page, with the same
+shared menu behavior and validation — searchable tool pickers and external-worker Create/Edit
+forms included — and existing model, reasoning, worker, route, reviewer, and scheduled-task
+entries survive a save under the shared path's existing normalization and unrelated-key
+protections. The **Scheduler runtime** switch stays out: it is live, process-only, never persisted.
+
+- **Every open re-reads disk** — never a selected session's live settings and never a stale
+  sidebar snapshot — so another legitimate editor's change (a Pi session's **Save changes**,
+  or a direct edit of that file) shows up on the next open.
+- **Edits stay a menu-local draft**: toggling, typing, adding, deleting, or reordering stages
+  values inside that one open menu, writing nothing and applying nothing to any running
+  session, so reopening shows the on-disk values again rather than a discarded draft.
+- **Save** (or Ctrl+S) is the only write: it validates the whole draft with the shared rules, then
+  atomically persists every section, preserving unrelated JSON keys and existing protections.
+- **First use creates nothing.** With no configuration file present the menu shows the ordinary
+  zero-model defaults, and opening or cancelling leaves no file behind; that first explicit
+  **Save** creates the canonical implicit file through the existing guarded initializer. An
+  existing primary or compatibility fallback is never initialized over, and an explicit
+  `PI_REVIEW_GATE_CONFIG` naming a missing file stays an error and is never created.
+- **Cancel, root Escape, and closing the editor discard the draft.** The sidebar's root
+  Escape applies nothing: the file and every running session stay as they were; nested
+  **Back** only navigates and keeps this visit's draft staged.
+- **Pi model choices need models already scoped in Pi.** The model, reasoning, reviewer, and
+  worker-resource pickers list only the models Pi itself scopes — the host's forwarded
+  `--models` when present, otherwise Pi's global `enabledModels`. Patterns match Pi's built-in
+  models, `models.json`, and the provider catalogs Pi has already saved in the same agent
+  directory (`models-store.json`, such as newer Codex models). When the model scope is nonempty,
+  the editor reads that catalog read-only on each open, without network refresh, sign-in, or
+  credential use. Models available only from a saved catalog are omitted when Pi has not saved a
+  usable entry for them; a real Pi session may refresh a missing or stale catalog (older than
+  Pi's bundled data), but the editor also requires `models-store.json` itself to be a readable,
+  well-formed regular file — a symlink is declined however fresh its target. This editor never
+  scopes a model and never writes Pi's own configuration, so on a host with nothing scoped yet it offers
+  no Pi model choices and says so in one non-blocking notice. The way to get choices is Pi's own
+  setup: start a real Pi session — the sidebar's **New session** works, and review and subtasks
+  may stay unset for that setup session — configure Pi's base settings and scoped models there,
+  then reopen this editor. A sidebar first-run flow that did all of that without a Pi session is
+  separate future work ([#719](https://github.com/rfairburn/pi-review-gate/issues/719)), not
+  implemented and not implied by anything here.
+
+The Pi-session exits above are unchanged: root Escape there still applies the draft to the
+running session in memory only, **Cancel** still restores the values live when that menu opened,
+and **Save changes**/Ctrl+S still persists and applies.
+
+### What a sidebar Save affects
+
+Saved values are what **new local Pi instances** load at their own startup — a sidebar **New
+session** or a `SessionSpawn` child, another workspace included — and that saved file is the
+child's default, never a running parent's live in-memory settings. Nothing already running is
+reconfigured or restarted: every running instance, delegated executor, and reviewer keeps its
+**current effective configuration** — including session-only values an earlier root Escape
+applied — plus its active review and pending work. Explicit launch arguments and each session's
+role and authorization boundaries are unchanged, reading the saved defaults grants nothing, and
+native **Claude Code** and **Codex CLI** rows keep reading their own provider configuration.
+
+### Scope and boundaries
+
+- **Local host only.** The editor reads and writes this host's own configuration file even
+  while a remote sidebar row is selected or viewed, and never writes another machine's
+  settings; editing a remote host's configuration is separate follow-up work.
+- **Persisted settings only.** Process-only controls are neither offered nor saved here, so they
+  never become saved defaults or live controls; Pi's own settings, authentication, models,
+  keybindings, and extensions and the sidebar's own Theme, Network, and Host shortcuts are
+  untouched.
+- **Tool-name lists are configuration-only metadata.** The deny and audit pickers build their
+  inventory from the shared registration constants and known local Pi tool metadata, never from
+  a live session: a listed name proves nothing about provider authentication, availability, or
+  permission; registrations that exist only inside a live session (custom or MCP tools) are not
+  discovered; and an unknown saved name stays a retained `[not currently available]` row.
+- **Text fields use the sidebar's own shared host text field**, the one its New-session and rename
+  forms already use, so its host-owned behavior — including Ctrl+G external editing through the
+  host's configured editor command — applies here. Behaviors needing Pi's own editor callbacks
+  (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
+- **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
+  fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
+  short pane — below the notice, which is drawn whole when the list still fits beside it and
+  otherwise takes up to half of the rows below the header. Selection, keys, the
+  tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
+  and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.
+- **One notice at a time.** Below the **Review settings (local)** header the pane shows a single
+  notice, never a growing history. Outside a section with its own help it is the LOCAL target notice
+  (including the first-use **Save** creates / **Cancel** leaves it absent wording). **Reviewers** →
+  **Review** and its **Evidence methods** show a short summary instead of the in-Pi description;
+  the full details are under **Reviewers** in [`/review-settings`](#review-settings), in
+  [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import), and in
+  [Evidence methods](#evidence-methods). The result of the latest action — a warning, an error such
+  as a failed **Save** validation, or an informational result — replaces it on the next screen,
+  error over warning over info, and clears once a later action opens another screen; opening
+  diagnostics are the first screen's result in the same way, so saved tool-protection settings
+  that do not load (an error: protected calls stay blocked) outrank a config-load warning, which
+  outranks routine model-catalog guidance. Notices, including long opening diagnostics, are never
+  shortened: when the pane has room a
+  notice such as the **Browser permissions** or **URL blocklist** description is drawn whole. In a
+  pane too short for it beside a usable list or field, its first rows end with
+  `... ctrl+o read all`; when no notice row is left, the cue joins the pane's header (or footer)
+  so no menu entry or field row is lost. When Ctrl+O is a host shortcut or bound to a settings key,
+  the cue names the first free key of F2 through F8 instead, so it never takes a configured action;
+  if all of them are bound, it names the return-to-Main chord (Alt+Right by default), which does
+  nothing else in these panes and reads the notice only while the cue is shown. That key
+  opens a read-only reader of the whole notice in the same pane: up/down and Page Up/Page Down
+  scroll it, it shows which lines are in view, and Escape (or the same key) returns to the
+  unchanged screen or field. The reader takes no other action, so Enter, Ctrl+S, typed text, and
+  pasted text do nothing while it is open. After it closes, no key or paste (including one begun
+  inside the reader) acts until the screen or field has actually been written to the terminal again, a key still held from the reader (such as a held Enter) never repeats
+  into it until that key is pressed afresh, and a confirming action still needs a freshly written
+  screen. If the pane became too small while the reader was open, Back shows the too-small pane
+  with `esc back`; once that is written, Escape there cancels as it would on the screen or field,
+  and no other key acts. A confirmation's disclosure (such as **Save auditor sessions**) is that screen's
+  one notice, drawn whole with its choices regardless of length, and **Yes** is accepted only from
+  a frame that shows it whole. When the pane is too short for both (for example an auditor
+  confirmation listing a very long selected tool-name scope), the pane draws no choice: it shows
+  the start of the disclosure, says to enlarge the pane to answer, and the reader shows the rest.
+  Reading it there (or seeing a too-small pane) never accepts **Yes**, and Enter, Ctrl+S, or arrow keys there change nothing:
+  the pane keeps showing the disclosure and its reader cue, and the choice shown once the pane is
+  large enough is the one that was selected before. Escape answers No without closing the editor, and so do
+  configured Cancel keys that reach the pane. A result that ends the editor is shown as its one
+  notice in **Settings**, which always keeps every entry and offers the same reader when the
+  result does not fit. Text fields show the same single result or their own field message; a
+  rejected input's error clears once the field accepts a changed value. In-Pi `/review-settings`
+  keeps its full section descriptions as ordinary notifications.

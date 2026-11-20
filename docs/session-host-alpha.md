@@ -325,6 +325,21 @@ does not force a black or white pane background. The host never queries the
 terminal for its palette, follows a custom or adaptive theme, or adds a colour
 setting: the operator's explicit Dark/Light choice is the only input.
 
+### Review-gate settings (disk-only)
+
+The sidebar also edits this host's saved review-gate configuration — the same file every local
+Pi instance on this host loads at startup — through a disk-only menu over the persisted
+`/review-settings` sections. It re-reads that file on **each** open, keeps edits as a menu-local
+draft, writes only on an explicit **Save** (or Ctrl+S), and discards on Cancel, root Escape, or
+close; nothing it stages reaches a running session, and no hidden Pi or review-gate session is
+started. A Save is what later new local instances load, never a running session, which keeps its
+current effective configuration, its active review, and its pending work. It always targets this
+host's own configuration even while a remote row is selected. Its Pi model pickers list only
+models Pi already scopes, so on a host with nothing scoped yet they offer no Pi models and the
+editor says so in one non-blocking notice — the scope is set in a real Pi session, not here.
+Coverage, exit semantics, tool-inventory limits, and boundaries are owned by
+[Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only).
+
 ### Host shortcut configuration
 
 The host's two existing keyboard actions have independent bindings. Their
@@ -983,6 +998,15 @@ continues to configure the shared native setup, not one window in isolation.
 Shared setup is not account isolation or a sandbox: every child has the same
 operating-system permissions and can use the same provider credentials and
 native resources.
+
+Each new local child loads that shared configuration at its own startup, so a saved change —
+from a Pi session's **Save changes** or the sidebar's
+[disk-only settings editor](#review-gate-settings-disk-only) — is what a later **New session**
+or `SessionSpawn` child reads, never a running parent's live in-memory settings. Neither editor
+reconfigures an already-running instance other than its own; see
+[Settings menu](settings.md#review-settings). An explicit `PI_REVIEW_GATE_CONFIG` is pinned to
+an absolute path once at host startup and passed to every managed child; see
+[Config discovery](configuration.md#config-discovery).
 
 The host itself does not require Git merely to start a session. It adds no
 question-only, no-worktree, or capture-bypass mode: the normal review,
@@ -2321,14 +2345,19 @@ New still opens its form, Saved its picker, Quit follows its existing
 confirmation rules, and Settings opens the grouped settings menu. These sidebar
 clicks are handled by the host, not forwarded to a native child; existing
 keyboard controls remain available. With the roster focused, a single left click
-inside a currently displayed native Main pane returns keyboard focus to the
-unchanged active Main owner and consumes that first click, including its
+on content currently displayed in the Main pane — a local session or a
+deliberately selected remote viewport alike — returns keyboard focus to that
+unchanged Main owner and consumes that first click, including its motion and
 release. It does not change the sidebar's visibility or selection, activate a
-row, or change any sibling; subsequent typing goes to the same Main owner. This
-applies only when the visible native pane still belongs to the current live
-owner at the displayed geometry. A deliberately selected remote viewport is not
-a local Main owner, so a roster-focused click in that pane is dropped instead of
-becoming a local focus gesture (see
+row, re-select or re-subscribe a remote row, or change any sibling, and no part
+of that click reaches a local child or a remote owner. This applies only when
+the frame actually written to the screen drew that same current source,
+uncovered, at the current geometry, and the click lands on its drawn content
+rather than padding; a remote pane that shows only a host status line is not a
+target. Focus is all the click grants: subsequent typing and pointer input go to
+the same owner under that owner's ordinary rules, so for a remote viewport they
+still pass the [native I/O bridge](#native-input-and-copy)'s written-frame and
+**Remote input/copy** fences and are not forwarded while that setting is off (see
 [Selected native viewport](#selected-native-viewport-interim-display-scope)).
 Forms, confirmations, and the narrow sidebar overlay are not native Main click
 targets. Once Main already has focus, mouse input keeps its existing native
@@ -2819,6 +2848,10 @@ this was reported:
 - The **Network** pane's **Listen address** and **Listen port** fields and the
   editable rows of the **Add destination** and **Edit address** field menus.
 - The **Saved** picker's search bar.
+- **Settings → Review settings**: each settings text value it edits and the
+  search field of its tool-deny pickers (see
+  [Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only)).
+  A click there moves only the caret; menu rows keep their keyboard actions.
 - The fields hosted inside Pi: every `/review-settings` text field, the staged
   subtask form (title, instructions, acceptance criteria, relevant context,
   target workspace), the no-argument steering instruction, the private reviewer
@@ -3605,13 +3638,14 @@ native Pi menu will remain readable.
 The native Main mouse path is cell-based and applies only to the active
 native frame; events outside that frame are dropped before coordinate
 translation, never clamped to the pane edge. Sidebar-target clicks are handled
-by the host and are not forwarded to a native child. For a locally displayed
-owner, the first left click in the visible native pane while the roster owns
-focus is consumed to return focus to that active Main owner; subsequent mouse
-input is forwarded normally. A deliberately selected remote viewport never
-focuses or feeds a local child. Its canonical mouse packets reach the remote
-owner only through the [native I/O bridge](#native-input-and-copy), under that
-bridge's written-frame and Remote input/copy fences, and are otherwise dropped.
+by the host and are not forwarded to a native child. For a local owner or a
+selected remote viewport alike, the first left click on the drawn Main content
+while the roster owns focus is consumed to return focus to that same Main owner;
+subsequent mouse input follows that owner's ordinary path. A deliberately
+selected remote viewport never feeds a local child. Its canonical mouse packets
+reach the remote owner only through the [native I/O bridge](#native-input-and-copy),
+under that bridge's written-frame and Remote input/copy fences, and are
+otherwise dropped.
 Only the frame the writer actually committed decides whether the drawn source is
 remote. This does not add conversation wheel/trackpad scrolling (#332). On
 Windows, bundled-ConPTY protocol observations do not certify physical mouse

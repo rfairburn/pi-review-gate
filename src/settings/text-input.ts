@@ -23,6 +23,14 @@
  *   then the legacy single-line `ui.input`, which only shows the current
  *   value as placeholder text.
  *
+ * - A host that owns its own text field (issue #653: the session-host sidebar,
+ *   which supplies its shared SessionHostTextField) passes it explicitly as
+ *   the {@link SettingTextInputUi.editText} member. That seam wins over every
+ *   path above and receives the same title, current value, and options
+ *   (including the observation-only paste callback); it is never a second
+ *   editor implementation here, never routed as RPC, and never a hidden Pi
+ *   session. Pi hosts do not supply it, so their path is unchanged.
+ *
  * `undefined` always means cancel: the caller leaves the staged value
  * unchanged, exactly as with the old input seam. A host with no usable seam
  * fails closed with an error notice — nothing is ever staged from a missing
@@ -32,8 +40,36 @@
 import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 
+/**
+ * One host-owned settings text edit request (issue #653). It carries exactly
+ * what {@link editSettingText} received: the field title, the current staged
+ * value (the editable prefill), and the per-field options — including the
+ * observation-only native paste callback, which a host field invokes with the
+ * exact text its own paste handling inserted (for an image paste: the temp
+ * file path). It never carries a staged draft, config, or menu state.
+ */
+export interface SettingTextEditRequest {
+  readonly title: string;
+  readonly currentValue: string;
+  readonly options: Readonly<SettingTextInputOptions>;
+}
+
+/**
+ * An explicit host-owned settings text field (issue #653). Resolves the edited
+ * text, or `undefined` to cancel (the caller then leaves the staged value
+ * unchanged). Whatever the host's own field reports is returned as-is; this
+ * seam performs no fallback, validation, or retry of its own.
+ */
+export type SettingTextEditor = (request: SettingTextEditRequest) => Promise<string | undefined>;
+
 /** The structural UI surface the text seam needs (host ctx.ui or a mock). */
 export interface SettingTextInputUi {
+  /**
+   * Explicit host-owned text field (issue #653). When present it is used for
+   * every settings text field instead of the Pi native bridge and the
+   * editor/input chain. Pi hosts never supply it.
+   */
+  editText?: SettingTextEditor;
   /** Legacy single-line input; the current value is passed as placeholder. */
   input?(title: string, placeholder?: string): Promise<string | undefined>;
   /** Pi's public multi-line editor with editable prefill. */
@@ -61,6 +97,17 @@ export interface SettingTextInputOptions {
    * reports inserts.
    */
   onHostInsert?: (text: string) => void;
+  /**
+   * Host-only line-shape hint (issue #653) for a host-owned field
+   * ({@link SettingTextInputUi.editText}). `false` marks a value the settings
+   * schema already requires to be one strict line (an external agent
+   * identifier), so the host presents a single-line field whose external
+   * editor round trip does not keep a final line terminator. Absent keeps the
+   * host's existing presentation. It never validates, trims, or rewrites the
+   * value, and the Pi native bridge and editor/input chain ignore it, so the
+   * Pi path is unchanged.
+   */
+  multiline?: boolean;
 }
 
 /**
@@ -82,6 +129,9 @@ export async function editSettingText(
   unavailableMessage = "This UI does not support text input.",
   options: SettingTextInputOptions = {},
 ): Promise<string | undefined> {
+  if (typeof ui.editText === "function") {
+    return ui.editText({ title, currentValue, options: { ...options } });
+  }
   return editNativeTextField(ui, title, currentValue, {
     ...(options.onHostInsert ? { onHostInsert: options.onHostInsert } : {}),
     // The per-field unavailableMessage describes a missing input capability;

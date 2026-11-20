@@ -6807,7 +6807,7 @@ test("layout changes forward one deduped viewport and a lost stream is reported 
   }
 });
 
-test("a frame the writer has not committed is never the displayed source, and a committed one is display-only", async (t) => {
+test("a frame the writer has not committed is never the displayed source, and a committed one takes only the focus-only click", async (t) => {
   const { harness, content, dispatch } = await remoteContentMainHarness(t, [
     remotePeerHost({ id: "lab-a", label: "Lab Alpha", hostRunId: "run-a", rows: [remoteRosterRow({ id: "row-a" })] }),
   ]);
@@ -6843,8 +6843,9 @@ test("a frame the writer has not committed is never the displayed source, and a 
     emitMouse(harness.terminal, 40, 5);
     emitMouse(harness.terminal, 40, 5, 0, "m");
     await nextTurn();
-    assert.equal(harness.sidebar!.focus, "sidebar",
-      "a written remote viewport is display-only: a native-pane press never focuses or forwards");
+    assert.equal(harness.sidebar!.focus, "main",
+      "a written remote viewport takes the same roster focus-only click as a local pane");
+    assert.equal(content.inputRequests.length, 0, "the focus gesture's press and release never reach the peer");
     assert.equal(manager.writes.length, 0, "the written remote source forwards nothing to a local child");
   } finally {
     harness.writer.holdWrites = false;

@@ -325,6 +325,21 @@ does not force a black or white pane background. The host never queries the
 terminal for its palette, follows a custom or adaptive theme, or adds a colour
 setting: the operator's explicit Dark/Light choice is the only input.
 
+### Review-gate settings (disk-only)
+
+The sidebar also edits this host's saved review-gate configuration — the same file every local
+Pi instance on this host loads at startup — through a disk-only menu over the persisted
+`/review-settings` sections. It re-reads that file on **each** open, keeps edits as a menu-local
+draft, writes only on an explicit **Save** (or Ctrl+S), and discards on Cancel, root Escape, or
+close; nothing it stages reaches a running session, and no hidden Pi or review-gate session is
+started. A Save is what later new local instances load, never a running session, which keeps its
+current effective configuration, its active review, and its pending work. It always targets this
+host's own configuration even while a remote row is selected. Its Pi model pickers list only
+models Pi already scopes, so on a host with nothing scoped yet they offer no Pi models and the
+editor says so in one non-blocking notice — the scope is set in a real Pi session, not here.
+Coverage, exit semantics, tool-inventory limits, and boundaries are owned by
+[Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only).
+
 ### Host shortcut configuration
 
 The host's two existing keyboard actions have independent bindings. Their
@@ -980,6 +995,15 @@ continues to configure the shared native setup, not one window in isolation.
 Shared setup is not account isolation or a sandbox: every child has the same
 operating-system permissions and can use the same provider credentials and
 native resources.
+
+Each new local child loads that shared configuration at its own startup, so a saved change —
+from a Pi session's **Save changes** or the sidebar's
+[disk-only settings editor](#review-gate-settings-disk-only) — is what a later **New session**
+or `SessionSpawn` child reads, never a running parent's live in-memory settings. Neither editor
+reconfigures an already-running instance other than its own; see
+[Settings menu](settings.md#review-settings). An explicit `PI_REVIEW_GATE_CONFIG` is pinned to
+an absolute path once at host startup and passed to every managed child; see
+[Config discovery](configuration.md#config-discovery).
 
 The host itself does not require Git merely to start a session. It adds no
 question-only, no-worktree, or capture-bypass mode: the normal review,

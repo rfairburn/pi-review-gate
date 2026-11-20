@@ -152,6 +152,16 @@
  * written confirmation. Delete hints and acceptance follow the OWNER's live
  * delete exposure only. This module still performs no IO: Main transports.
  *
+ * Settings -> Review settings (issue #653) is a configuration vessel only: the
+ * pane renders the screens of the ONE shared persisted settings transaction
+ * that Main's `reviewSettings` port runs, through this module's own in-pane
+ * custom-screen host, the pinned pi-tui menu host, and the shared text field.
+ * The pane keeps only ephemeral screen/field/notice state; it performs no
+ * config IO and holds no settings value. Leaving the pane by any route (root
+ * Cancel/Escape, the toggle, hiding, another pane, or Main's shutdown seam)
+ * settles every outstanding screen and edit as a cancel, and a screen acts only
+ * after a complete render drew it.
+ *
  * `renderPeerAlert` is the one extra notification surface, for a host-owned
  * alert band that the compositor places when the normal sidebar cannot show a
  * pending request (hidden pane, or narrow layout while Main has focus). It is
@@ -260,6 +270,19 @@ import {
   type SidebarThemeId,
   type SidebarThemeRole,
 } from "./sidebar-theme";
+import {
+  createSidebarMenuTuiHost,
+  createSidebarReviewSettingsUi,
+  type SidebarMenuKeybindings,
+  type SidebarReviewSettingsHost,
+} from "./review-settings-ui";
+import {
+  createMenuActionFence,
+  resolveMenuActionMatcher,
+  type MenuCustomFactory,
+  type MenuTheme,
+} from "../settings/menu";
+import type { SettingTextEditRequest } from "../settings/text-input";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -868,6 +891,14 @@ export interface SidebarControllerOptions {
    * and diagnostic rows always stay after every session card.
    */
   readonly getSessionOrder?: () => readonly SidebarMainOwnerKey[];
+  /**
+   * Main's LOCAL review-settings port (#653). When present, Settings offers a
+   * "Review settings" row that renders the ONE shared persisted settings
+   * transaction Main opens over this sidebar's own screen host and shared text
+   * field. The sidebar keeps only ephemeral screen/field/notice state for one
+   * open; it never holds a settings representation of its own.
+   */
+  readonly reviewSettings?: SidebarReviewSettingsHost;
 }
 
 export interface SidebarMousePresentation {
@@ -1162,8 +1193,13 @@ export interface SidebarFieldFactoryOptions {
    * filesystem completion at all. It exists so a remote workspace can be typed
    * as canonical raw text for the OWNER's filesystem without the rename field's
    * tighter name bound and without this machine reading any path.
+   *
+   * `text` is one generic settings value (#653): the shared field's `text`
+   * kind with its own default bound, multi-line when `multiline` is true.
    */
-  readonly kind: "name" | "path" | "plain";
+  readonly kind: "name" | "path" | "plain" | "text";
+  /** Only for `text`: allow line breaks inside the value. */
+  readonly multiline?: boolean;
   readonly initialText: string;
   readonly onInvalidate: () => void;
   readonly onSubmit: (submission: SessionHostFieldSubmission) => void;
@@ -2100,7 +2136,92 @@ interface DisplayedSettingsRows {
 }
 
 /** The three grouped Settings entry points; each reuses an existing pane. */
-type SettingsRowKey = "theme" | "network" | "shortcuts";
+type SettingsRowKey = "theme" | "network" | "shortcuts" | "reviewSettings";
+
+/** The form-slot panes. */
+type SidebarFormKind =
+  | "new"
+  | "edit"
+  | "saved"
+  | "shortcuts"
+  | "peer"
+  | "peer-field"
+  | "settings"
+  | "theme"
+  | "review-settings";
+
+/** One rendered screen of the shared settings transaction (a pi-tui component). */
+interface ReviewSettingsComponent {
+  render(width: number): string[];
+  handleInput(data: string): void;
+  invalidate?(): void;
+  focused?: boolean;
+}
+
+/** One bounded notice the shared settings transaction reported. */
+interface ReviewSettingsNotice {
+  readonly text: string;
+  readonly type: "info" | "warning" | "error";
+}
+
+/**
+ * Ephemeral UI state of ONE open of the LOCAL review settings (#653). It holds
+ * only the current screen, the pending text edit, and bounded notices — never
+ * a settings value, option list, or saved config. Closing it settles every
+ * outstanding screen/edit promise as a cancel.
+ */
+interface ReviewSettingsSession {
+  readonly id: number;
+  closed: boolean;
+  readonly keybindings: SidebarMenuKeybindings;
+  readonly matchesCancel: (data: string) => boolean;
+  /** The live `tui.select.confirm` binding: a screen's confirming action. */
+  readonly matchesConfirm: (data: string) => boolean;
+  screenSequence: number;
+  screen: { readonly id: number; readonly component: ReviewSettingsComponent; readonly settle: (result: string | undefined) => void } | undefined;
+  text: {
+    readonly title: string;
+    /** Ephemeral UI line shape of this edit (the request's host hint; default multi-line). */
+    readonly multiline: boolean;
+    fieldGeneration: number;
+    readonly settle: (result: string | undefined) => void;
+  } | undefined;
+  readonly notices: ReviewSettingsNotice[];
+  /** Notices reported after the latest screen opened (the result of its action). */
+  noticesSinceScreen: ReviewSettingsNotice[];
+}
+
+/**
+ * The review-settings frame the last complete render drew: the exact open,
+ * screen, component view revision, pane geometry, and drawn bytes. Its token is
+ * kept across identical redraws, so a repaint never revokes an earned receipt;
+ * anything else mints a new token that starts unwritten. Only Main's actual
+ * writer receipt for THIS token (`settleReviewSettingsRender`) authorizes a
+ * screen's confirming or saving action.
+ */
+interface ReviewSettingsCandidate {
+  readonly sessionId: number;
+  readonly screenId: number;
+  readonly viewRevision: number;
+  readonly cols: number;
+  readonly rows: number;
+  readonly signature: string;
+  readonly token: number;
+  written: boolean;
+}
+
+/** The drawn review-settings frame Main pairs with its writer receipt. */
+export interface SidebarReviewSettingsPresentation {
+  readonly renderToken: number;
+  readonly cols: number;
+  readonly rows: number;
+}
+
+const REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS = 600;
+const REVIEW_SETTINGS_MAX_NOTICES = 6;
+const REVIEW_SETTINGS_NOT_DRAWN_NOTICE = "Review settings changed or are not completely shown; review the current screen before acting";
+const REVIEW_SETTINGS_SAVE_MATCH = (data: string): boolean => matchesKey(data, "ctrl+s");
+const REVIEW_SETTINGS_SGR = /\x1b\[([0-9;]*)m/g;
 
 /** Immutable, latched consent identity: snapshot reordering never retargets it. */
 interface PeerConsentLatch {
@@ -3866,6 +3987,29 @@ export class SidebarController {
   private readonly workspaceBasePath: string;
   private readonly createTextField?: SidebarControllerOptions["createTextField"];
   private readonly createSavedQueryInput?: SidebarControllerOptions["createSavedQueryInput"];
+  /** Main's LOCAL review-settings port; absent means no Review settings row. */
+  private readonly reviewSettingsHost?: SidebarReviewSettingsHost;
+  private reviewSettingsSequence = 0;
+  /** The ONE open of the LOCAL review settings, while its pane is open. */
+  private reviewSettingsSession: ReviewSettingsSession | undefined;
+  /** The frame the last complete review-settings render drew; with a writer receipt, the only action authority. */
+  private reviewSettingsCandidate: ReviewSettingsCandidate | undefined;
+  private reviewSettingsTokenSequence = 1;
+  /**
+   * Advances whenever a screen's own view may have changed (forwarded input, a
+   * component redraw request, a new screen), so an action can never use a frame
+   * drawn before that change.
+   */
+  private reviewSettingsViewRevision = 0;
+  /**
+   * Cross-focus held-action fence for confirming/saving presses a review
+   * screen or its text field performed: their held repeat/release is consumed
+   * in every focus domain (settings, roster, Main) until released or pressed
+   * afresh, so it can never act again or reach a child.
+   */
+  private readonly reviewSettingsHeldActions = createMenuActionFence();
+  /** Bounded result notice carried back to the Settings submenu (never a value). */
+  private settingsReturnNotice: ReviewSettingsNotice | undefined;
   /** Clock for the bounded human consent window only; never used for IO. */
   private readonly now: () => number;
   /**
@@ -3953,16 +4097,21 @@ export class SidebarController {
   private formHints = DEFAULT_FORM_HINTS;
   private formNotice: string | undefined;
   private formGeneration = 0;
-  private formKind:
-    | "new"
-    | "edit"
-    | "saved"
-    | "shortcuts"
-    | "peer"
-    | "peer-field"
-    | "settings"
-    | "theme"
-    | undefined;
+  private formKindValue: SidebarFormKind | undefined;
+  /** The open form-slot pane. */
+  private get formKind(): SidebarFormKind | undefined {
+    return this.formKindValue;
+  }
+  /**
+   * Leaving the review-settings pane for ANY other pane (or none) ends its open
+   * (#653): every outstanding screen/edit promise settles as a cancel, so the
+   * shared transaction discards its draft and nothing late can act.
+   */
+  private set formKind(next: SidebarFormKind | undefined) {
+    const previous = this.formKindValue;
+    this.formKindValue = next;
+    if (previous === "review-settings" && next !== "review-settings") this.abortReviewSettings();
+  }
   /**
    * The New form's one Host choice. It is Local at every form opening and is
    * never carried across forms; `label` is a bounded display copy remembered
@@ -4353,6 +4502,7 @@ export class SidebarController {
     this.freshNativeTargets = options.freshNativeTargets === true;
     this.createTextField = options.createTextField;
     this.createSavedQueryInput = options.createSavedQueryInput;
+    this.reviewSettingsHost = options.reviewSettings;
     this.now = options.now ?? (() => Date.now());
     this.getSessionOrder = typeof options.getSessionOrder === "function"
       ? options.getSessionOrder
@@ -7175,6 +7325,10 @@ export class SidebarController {
     if (typeof data !== "string" || data.length === 0) {
       return;
     }
+    // #653: a held confirm/save key whose press a review-settings screen acted
+    // on never replays, in any focus domain; a pasted body is never consulted.
+    if (!this.formPasteActive && this.formPasteCarry.length === 0
+      && this.reviewSettingsHeldActions.consume(data)) return;
     switch (this._focus) {
       case "main":
         this.handleMainInput(data);
@@ -7289,6 +7443,9 @@ export class SidebarController {
     // The same rule for the grouped Settings submenu and the Theme pane.
     if (this.formKind !== "settings") this.settingsDisplay = undefined;
     if (this.formKind !== "theme") this.themeDisplay = undefined;
+    // Only a complete review-settings render may keep its drawn frame (#653).
+    const previousReviewSettings = this.reviewSettingsCandidate;
+    this.reviewSettingsCandidate = undefined;
     // Likewise only an uncovered Saved picker render may keep its drawn frame.
     if (this.formKind !== "saved" || this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) {
       this.invalidateSavedPickerPresentation();
@@ -7347,6 +7504,10 @@ export class SidebarController {
     if (this.formKind === "theme") {
       this.invalidateFormPanePresentations();
       return this.renderThemePane(cols, rows);
+    }
+    if (this.formKind === "review-settings") {
+      this.invalidateFormPanePresentations();
+      return this.renderReviewSettingsPane(cols, rows, previousReviewSettings);
     }
     // The New/Edit pane is the only render that re-establishes (or, for an
     // absent/covered/Edit/Local form, retires) the drawn New-form candidate.
@@ -8533,6 +8694,9 @@ export class SidebarController {
       this.handleThemePaneInput(data);
       return;
     }
+    // #653: the review-settings screens own their input; its text edits use the
+    // ordinary shared field path below.
+    if (this.formKind === "review-settings" && this.handleReviewSettingsInput(data)) return;
     // Standard Shift+Tab is recognized BEFORE the bracketed-paste carry: the
     // canonical back-tab packet ends with a lone ESC[ prefix, which that fence
     // would otherwise park as a possible paste opener and consume. Nothing is
@@ -10851,7 +11015,7 @@ export class SidebarController {
 
   /** True when at least one grouped Settings entry point is available. */
   private settingsEntryAvailable(): boolean {
-    return this.settingsAvailable || this.peerUiSnapshot !== undefined;
+    return this.settingsAvailable || this.peerUiSnapshot !== undefined || this.reviewSettingsHost !== undefined;
   }
 
   /**
@@ -10875,6 +11039,9 @@ export class SidebarController {
       });
     }
     if (this.settingsAvailable) rows.push({ key: "shortcuts", text: "Host shortcuts" });
+    // #653: the LOCAL review settings follow Main's port alone — never a
+    // selected session, a remote row, or a child count.
+    if (this.reviewSettingsHost !== undefined) rows.push({ key: "reviewSettings", text: "Review settings" });
     return rows;
   }
 
@@ -10907,6 +11074,7 @@ export class SidebarController {
       : (current + delta + rows.length) % rows.length;
     this.settingsSelectedKey = rows[next]?.key;
     this.formError = undefined;
+    this.settingsReturnNotice = undefined;
   }
 
   /** Opens the grouped Settings submenu. Nothing is emitted and nothing runs. */
@@ -10929,6 +11097,7 @@ export class SidebarController {
     this.settingsPaneReturn = false;
     this.formKind = "settings";
     this.formError = undefined;
+    this.settingsReturnNotice = undefined;
     this.noticeError = undefined;
     this._focus = "form";
     this.onInvalidate?.();
@@ -10943,6 +11112,7 @@ export class SidebarController {
     this.settingsPaneReturn = false;
     this.formKind = undefined;
     this.formError = undefined;
+    this.settingsReturnNotice = undefined;
   }
 
   /** Returns from a sub-pane to the Settings submenu that opened it. */
@@ -11066,6 +11236,9 @@ export class SidebarController {
         this.settingsPaneReturn = true;
         this.onInvalidate?.();
         return;
+      case "reviewSettings":
+        this.openReviewSettingsPane();
+        return;
       default:
         return;
     }
@@ -11079,6 +11252,516 @@ export class SidebarController {
       return;
     }
     this.openSettingsRowPane(row);
+  }
+
+  // --- LOCAL review settings (#653): a configuration vessel only. ---
+
+  /**
+   * Ends any open LOCAL review settings (Main's shutdown seam). The unsaved
+   * draft is discarded: every outstanding screen/edit settles as a cancel and
+   * nothing late can save, notify, or take focus.
+   */
+  cancelReviewSettings(): void {
+    if (this.formKind !== "review-settings") {
+      this.abortReviewSettings();
+      return;
+    }
+    this.formKind = undefined;
+    if (this._focus === "form") this._focus = "sidebar";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Opens the review-settings pane and asks Main to run the ONE shared
+   * persisted settings transaction over this pane's own UI. Entered only from
+   * a drawn Settings row; its Back routing returns through Settings.
+   */
+  private openReviewSettingsPane(): void {
+    const host = this.reviewSettingsHost;
+    if (host === undefined) return;
+    this.settingsDisplay = undefined;
+    this.disposeFormField();
+    let keybindings: SidebarMenuKeybindings;
+    try {
+      keybindings = host.loadKeybindings?.() ?? defaultReviewSettingsKeybindings();
+    } catch {
+      keybindings = defaultReviewSettingsKeybindings("Native keybindings are unavailable; using Pi's default keys");
+    }
+    const session: ReviewSettingsSession = {
+      id: ++this.reviewSettingsSequence,
+      closed: false,
+      keybindings,
+      matchesCancel: resolveMenuActionMatcher(keybindings.manager, "tui.select.cancel"),
+      matchesConfirm: resolveMenuActionMatcher(keybindings.manager, "tui.select.confirm"),
+      screenSequence: 0,
+      screen: undefined,
+      text: undefined,
+      notices: [],
+      noticesSinceScreen: [],
+    };
+    this.formKind = "review-settings";
+    this.reviewSettingsSession = session;
+    this.reviewSettingsCandidate = undefined;
+    this.settingsPaneReturn = true;
+    this.formError = undefined;
+    this.settingsReturnNotice = undefined;
+    this._focus = "form";
+    if (keybindings.notice !== undefined) this.reviewSettingsNotify(session, keybindings.notice, "warning");
+    const ui = createSidebarReviewSettingsUi({
+      custom: (factory) => this.reviewSettingsCustom(session, factory),
+      editText: (request) => this.reviewSettingsEditText(session, request),
+      notify: (message, type) => this.reviewSettingsNotify(session, message, type),
+      menuTuiHost: createSidebarMenuTuiHost(keybindings.manager),
+    });
+    this.onInvalidate?.();
+    let opened: Promise<void>;
+    try {
+      opened = Promise.resolve(host.open(ui));
+    } catch (error) {
+      opened = Promise.reject(error);
+    }
+    void opened.then(
+      () => this.finishReviewSettings(session),
+      () => {
+        this.reviewSettingsNotify(session, "Review settings could not be opened", "error");
+        this.finishReviewSettings(session);
+      },
+    );
+  }
+
+  /** The transaction ended on its own (Save, Cancel, root Escape, or failure). */
+  private finishReviewSettings(session: ReviewSettingsSession): void {
+    // An open that was already closed (hidden, toggled, superseded, shut down)
+    // never returns focus or shows a late result.
+    if (this.reviewSettingsSession !== session) return;
+    const results = session.noticesSinceScreen;
+    const result = [...results].reverse().find((notice) => notice.type === "error") ?? results.at(-1);
+    const owned = this._visible && this._focus === "form" && this.formKind === "review-settings";
+    this.abortReviewSettings();
+    if (!owned) {
+      if (this.formKind === "review-settings") this.formKind = undefined;
+      return;
+    }
+    this.returnToSettingsMenu();
+    this.settingsReturnNotice = result;
+    this.onInvalidate?.();
+  }
+
+  /** Close the open: settle everything outstanding as a cancel. Idempotent. */
+  private abortReviewSettings(): void {
+    const session = this.reviewSettingsSession;
+    if (session === undefined) return;
+    this.reviewSettingsSession = undefined;
+    this.reviewSettingsCandidate = undefined;
+    session.closed = true;
+    const text = session.text;
+    session.text = undefined;
+    if (text !== undefined) {
+      if (text.fieldGeneration === this.formGeneration) this.disposeFormField();
+      text.settle(undefined);
+    }
+    const screen = session.screen;
+    session.screen = undefined;
+    screen?.settle(undefined);
+    this.formPasteActive = false;
+    this.formPasteCarry = "";
+  }
+
+  /** The sidebar's in-pane custom-screen host: ONE screen at a time, rendered by this pane. */
+  private reviewSettingsCustom(session: ReviewSettingsSession, factory: MenuCustomFactory): Promise<string | undefined> {
+    if (session.closed || this.reviewSettingsSession !== session) return Promise.resolve(undefined);
+    const previous = session.screen;
+    session.screen = undefined;
+    previous?.settle(undefined);
+    session.noticesSinceScreen = [];
+    return new Promise<string | undefined>((resolve, reject) => {
+      const id = ++session.screenSequence;
+      let settled = false;
+      const settle = (result: string | undefined): void => {
+        if (settled) return;
+        settled = true;
+        if (session.screen?.id === id) session.screen = undefined;
+        if (this.reviewSettingsCandidate?.screenId === id) this.reviewSettingsCandidate = undefined;
+        resolve(result);
+        if (this.reviewSettingsSession === session) this.onInvalidate?.();
+      };
+      const tui = {
+        requestRender: (): void => {
+          if (settled || this.reviewSettingsSession !== session) return;
+          this.reviewSettingsViewRevision += 1;
+          this.onInvalidate?.();
+        },
+      };
+      let produced: unknown;
+      try {
+        produced = session.keybindings.run(() => factory(tui, this.reviewSettingsTheme(), session.keybindings.manager, settle));
+      } catch (error) {
+        settled = true;
+        reject(error);
+        return;
+      }
+      if (settled) return;
+      if (!isReviewSettingsComponent(produced)) {
+        settled = true;
+        reject(new Error("unsupported settings screen"));
+        return;
+      }
+      if (session.closed || this.reviewSettingsSession !== session) {
+        settle(undefined);
+        return;
+      }
+      session.screen = { id, component: produced, settle };
+      this.reviewSettingsViewRevision += 1;
+      try {
+        if ("focused" in produced) produced.focused = true;
+      } catch {
+        // Focus is presentation only.
+      }
+      this.reviewSettingsCandidate = undefined;
+      this.onInvalidate?.();
+    });
+  }
+
+  /** The shared settings text seam: one shared SessionHostTextField per edit. */
+  private reviewSettingsEditText(session: ReviewSettingsSession, request: SettingTextEditRequest): Promise<string | undefined> {
+    if (session.closed || this.reviewSettingsSession !== session || this.formKind !== "review-settings") {
+      return Promise.resolve(undefined);
+    }
+    const previous = session.screen;
+    session.screen = undefined;
+    previous?.settle(undefined);
+    session.noticesSinceScreen = [];
+    return new Promise<string | undefined>((resolve) => {
+      let settled = false;
+      const settle = (value: string | undefined): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      this.disposeFormField();
+      this.formError = undefined;
+      this.reviewSettingsCandidate = undefined;
+      const text = {
+        title: sanitizeBounded(typeof request?.title === "string" ? request.title : "", REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS),
+        // Only an explicit `false` hint narrows the field to one line; every
+        // other settings value keeps the existing multi-line presentation.
+        multiline: request?.options?.multiline !== false,
+        fieldGeneration: -1,
+        settle,
+      };
+      session.text = text;
+      this.createFormField(typeof request?.currentValue === "string" ? request.currentValue : "");
+      if (session.text !== text) return;
+      if (this.formField === undefined) {
+        session.text = undefined;
+        this.reviewSettingsNotify(session, this.formError ?? "Session host field could not be opened", "error");
+        this.formError = undefined;
+        settle(undefined);
+        this.onInvalidate?.();
+        return;
+      }
+      text.fieldGeneration = this.formGeneration;
+    });
+  }
+
+  /** Submit (`value`) or cancel (`undefined`) the open settings text edit. */
+  private settleReviewSettingsText(value: string | undefined): void {
+    const session = this.reviewSettingsSession;
+    const text = session?.text;
+    if (session === undefined || text === undefined || text.fieldGeneration !== this.formGeneration) return;
+    // A submitted value is a performed action: its held submit key never
+    // replays into the re-shown menu, the roster, or Main.
+    if (value !== undefined) this.reviewSettingsHeldActions.claim(this.formMatchesSubmit);
+    session.text = undefined;
+    this.disposeFormField();
+    this.formError = undefined;
+    text.settle(value);
+    this.onInvalidate?.();
+  }
+
+  private reviewSettingsNotify(session: ReviewSettingsSession, message: unknown, type: unknown): void {
+    if (session.closed || this.reviewSettingsSession !== session) return;
+    const text = sanitizeBounded(typeof message === "string" ? message : "", REVIEW_SETTINGS_NOTICE_MAX_CODEPOINTS).trim();
+    if (text.length === 0) return;
+    const notice: ReviewSettingsNotice = { text, type: type === "warning" || type === "error" ? type : "info" };
+    session.notices.push(notice);
+    if (session.notices.length > REVIEW_SETTINGS_MAX_NOTICES) session.notices.splice(0, session.notices.length - REVIEW_SETTINGS_MAX_NOTICES);
+    session.noticesSinceScreen.push(notice);
+    if (session.noticesSinceScreen.length > REVIEW_SETTINGS_MAX_NOTICES) {
+      session.noticesSinceScreen.splice(0, session.noticesSinceScreen.length - REVIEW_SETTINGS_MAX_NOTICES);
+    }
+    this.onInvalidate?.();
+  }
+
+  /** The closed sidebar palette as the settings screens' theme: generated SGR only. */
+  private reviewSettingsTheme(): MenuTheme {
+    return {
+      fg: (color: string, text: string): string => {
+        const role = REVIEW_SETTINGS_THEME_ROLES.get(color);
+        return role === undefined ? text : `${this.paint(role)}${text}\x1b[0m`;
+      },
+      bold: (text: string): string => `\x1b[1m${text}\x1b[0m`,
+    };
+  }
+
+  /**
+   * True only when Main reported the actual write of the CURRENT frame of this
+   * screen: same open, same screen, no view change since it was drawn, and the
+   * writer's receipt for exactly that token.
+   */
+  private reviewSettingsScreenDrawn(session: ReviewSettingsSession, screenId: number): boolean {
+    const shown = this.reviewSettingsCandidate;
+    return shown !== undefined && shown.written && shown.sessionId === session.id && shown.screenId === screenId
+      && shown.viewRevision === this.reviewSettingsViewRevision
+      && this._visible && this._focus === "form" && this.formKind === "review-settings";
+  }
+
+  /** Main's capture of the drawn review-settings frame, beside its composed frame. */
+  captureReviewSettingsPresentation(): SidebarReviewSettingsPresentation | undefined {
+    const candidate = this.reviewSettingsCandidate;
+    if (candidate === undefined) return undefined;
+    return Object.freeze({ renderToken: candidate.token, cols: candidate.cols, rows: candidate.rows });
+  }
+
+  /** True while this token is still the renderer's current complete review-settings frame. */
+  isReviewSettingsRenderCurrent(renderToken: number): boolean {
+    return this.reviewSettingsCandidate?.token === renderToken;
+  }
+
+  /** Main's actual-writer receipt for the exact review-settings frame it captured. */
+  settleReviewSettingsRender(renderToken: number): boolean {
+    const candidate = this.reviewSettingsCandidate;
+    if (candidate === undefined || candidate.token !== renderToken) return false;
+    candidate.written = true;
+    return true;
+  }
+
+  /** Forget the drawn review-settings frame (a resize, a terminal handoff, or a covering pane). */
+  invalidateReviewSettingsPresentation(): void {
+    this.reviewSettingsCandidate = undefined;
+  }
+
+  /**
+   * Input for the review-settings pane. Returns false only for a text edit,
+   * which continues through the ordinary shared field path.
+   */
+  private handleReviewSettingsInput(data: string): boolean {
+    const session = this.reviewSettingsSession;
+    if (session === undefined) {
+      this.returnToSettingsMenu();
+      return true;
+    }
+    if (session.text !== undefined && this.formField !== undefined) {
+      // A typed field is finished (submit) or cancelled before Ctrl+S: the
+      // save chord is inert while it is open, and a pasted chord stays text.
+      return !this.formPasteActive && this.formPasteCarry.length === 0 && matchesKey(data, "ctrl+s");
+    }
+    this.handleReviewSettingsScreenInput(session, data);
+    return true;
+  }
+
+  private handleReviewSettingsScreenInput(session: ReviewSettingsSession, data: string): void {
+    this.unblockLoneEscape(data);
+    if (this.routeBracketedPaste(data)) {
+      // A pasted body is opaque: it never saves, closes, toggles, or confirms.
+      // Only a text-owning (focusable) screen, which keeps its own paste fence,
+      // receives it.
+      const screen = session.screen;
+      if (screen !== undefined && "focused" in screen.component && this.reviewSettingsScreenDrawn(session, screen.id)) {
+        this.runReviewSettingsScreen(session, screen, data);
+      }
+      return;
+    }
+    if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
+    if (this.handleReservedToggle(data, () => { this.formKind = undefined; })) return;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
+      return;
+    }
+    const fresh = !isKeyRelease(data) && !isKeyRepeat(data);
+    const cancel = session.matchesCancel(data);
+    const screen = session.screen;
+    if (screen === undefined) {
+      // Loading or between screens: only a fresh cancel leaves, discarding.
+      if (fresh && cancel) {
+        if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
+        this.returnToSettingsMenu();
+      }
+      return;
+    }
+    const save = matchesKey(data, "ctrl+s");
+    const confirm = !cancel && session.matchesConfirm(data);
+    if ((save || confirm) && !this.reviewSettingsScreenDrawn(session, screen.id)) {
+      // No confirm or save from a frame the operator was not shown: it must be
+      // the current view, completely drawn, and actually written by Main.
+      if (fresh) {
+        this.formError = REVIEW_SETTINGS_NOT_DRAWN_NOTICE;
+        this.onInvalidate?.();
+      }
+      return;
+    }
+    // A fresh Escape is claimed so its held repeat/release cannot also leave
+    // the Settings menu or reach the child after this screen closes; a fresh
+    // confirm or save is claimed on the cross-focus held-action fence.
+    if (fresh && cancel && matchesKey(data, "escape")) this.formEscapeClaimed = true;
+    if (fresh && save) this.reviewSettingsHeldActions.claim(REVIEW_SETTINGS_SAVE_MATCH);
+    else if (fresh && confirm) this.reviewSettingsHeldActions.claim(session.matchesConfirm);
+    if (fresh) this.formError = undefined;
+    this.runReviewSettingsScreen(session, screen, data);
+  }
+
+  private runReviewSettingsScreen(
+    session: ReviewSettingsSession,
+    screen: NonNullable<ReviewSettingsSession["screen"]>,
+    data: string,
+  ): void {
+    try {
+      session.keybindings.run(() => screen.component.handleInput(data));
+    } catch {
+      screen.settle(undefined);
+    }
+    // Any forwarded input may have changed the screen's own view (selection,
+    // query, scroll): no earlier frame may authorize the next action.
+    this.reviewSettingsViewRevision += 1;
+    if (this.reviewSettingsSession === session) this.onInvalidate?.();
+  }
+
+  /**
+   * The review-settings pane: the current shared screen exactly as its own
+   * component renders it, sanitized to generated SGR and clipped to the pane.
+   * A screen that does not completely fit falls back to the truthful too-small
+   * pane and keeps no action authority.
+   */
+  private renderReviewSettingsPane(
+    cols: number,
+    rows: number,
+    previous?: ReviewSettingsCandidate,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    this.reviewSettingsCandidate = undefined;
+    const session = this.reviewSettingsSession;
+    const header = " Review settings (local) ";
+    if (session === undefined || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+    if (session.text !== undefined && this.formField !== undefined) {
+      return this.renderReviewSettingsTextPane(session.text.title, session.text.multiline, header, cols, rows);
+    }
+    const footerLines = wrapHintLines([`${this.toggleLabel} toggle`, "nothing is saved until Save"], cols);
+    const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
+    if (footerLines === undefined || errorLines === undefined) return this.renderTooSmall(cols, rows);
+    const screen = session.screen;
+    let body: string[];
+    let drawable = false;
+    if (screen === undefined) {
+      body = [session.screenSequence === 0 ? "Loading local review settings..." : "Working..."];
+    } else {
+      try {
+        const rendered = session.keybindings.run(() => screen.component.render(cols));
+        body = rendered.map((line) => sanitizeReviewSettingsLine(typeof line === "string" ? line : ""));
+        drawable = true;
+      } catch {
+        body = ["! This settings screen could not be drawn"];
+      }
+    }
+    const fixed = 1 + errorLines.length + body.length + footerLines.length;
+    if (fixed > rows) return this.renderTooSmall(cols, rows);
+    const noticeLines = this.reviewSettingsNoticeLines(session, cols, rows - fixed);
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    for (const notice of noticeLines) {
+      lines.push(wrapRow(notice.line, cols, this.paint(notice.type === "info" ? "secondary" : "error")));
+    }
+    for (const line of errorLines) lines.push(wrapRow(line, cols, this.paint("error")));
+    for (const line of body) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols, this.paint("hint")));
+    if (drawable && screen !== undefined) {
+      const signature = lines.join("\n");
+      const viewRevision = this.reviewSettingsViewRevision;
+      this.reviewSettingsCandidate = previous !== undefined && previous.sessionId === session.id
+        && previous.screenId === screen.id && previous.viewRevision === viewRevision
+        && previous.cols === cols && previous.rows === rows && previous.signature === signature
+        ? previous
+        : {
+          sessionId: session.id,
+          screenId: screen.id,
+          viewRevision,
+          cols,
+          rows,
+          signature,
+          token: this.reviewSettingsTokenSequence++,
+          written: false,
+        };
+    }
+    return { lines };
+  }
+
+  /** Newest notices first, whole notices only, within the rows the screen leaves. */
+  private reviewSettingsNoticeLines(
+    session: ReviewSettingsSession,
+    cols: number,
+    budget: number,
+  ): Array<{ readonly line: string; readonly type: ReviewSettingsNotice["type"] }> {
+    const picked: Array<Array<{ readonly line: string; readonly type: ReviewSettingsNotice["type"] }>> = [];
+    let used = 0;
+    for (let index = session.notices.length - 1; index >= 0 && used < budget; index -= 1) {
+      const notice = session.notices[index]!;
+      const wrapped = wrapNoticeLines(`${notice.type === "info" ? "" : "! "}${notice.text}`, cols);
+      if (used + wrapped.length > budget) {
+        // The newest notice is never dropped entirely: it keeps as many leading
+        // rows as fit, and its last kept row says that it continues.
+        if (picked.length === 0) {
+          const kept = wrapped.slice(0, budget);
+          kept[kept.length - 1] = truncateToWidth(`${kept[kept.length - 1]}...`, cols, "...");
+          picked.unshift(kept.map((line) => ({ line, type: notice.type })));
+        }
+        break;
+      }
+      picked.unshift(wrapped.map((line) => ({ line, type: notice.type })));
+      used += wrapped.length;
+    }
+    return picked.flat();
+  }
+
+  /** One settings text edit in the shared field, unclipped in value; multi-line unless hinted one line. */
+  private renderReviewSettingsTextPane(
+    title: string,
+    multiline: boolean,
+    header: string,
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    const field = this.formField;
+    if (field === undefined) return this.renderTooSmall(cols, rows);
+    const titleLines = wrapNoticeLines(title, cols);
+    const footerLines = wrapHintLines([
+      `${this.formHints.submit} done`,
+      `${this.formHints.cancel} cancel`,
+      // A single-line value has no newline chord to advertise.
+      ...(multiline ? ["ctrl+j newline"] : []),
+      `${this.formHints.externalEditor} external editor`,
+      `${this.formHints.clear} clear`,
+    ], cols);
+    const messages = [this.formNotice, this.formError]
+      .filter((message): message is string => typeof message === "string" && message.trim().length > 0);
+    const noticeLines = messages.flatMap((message) => wrapNoticeLines(`! ${message}`, cols));
+    if (footerLines === undefined) return this.renderTooSmall(cols, rows);
+    const fieldRows = rows - 1 - titleLines.length - noticeLines.length - footerLines.length;
+    if (fieldRows < 3) return this.renderTooSmall(cols, rows);
+    const frame = field.render(cols, fieldRows);
+    if (!frame.cursor.visible || frame.lines.length === 0) return this.renderTooSmall(cols, rows);
+    const fieldLines = labeledFieldRows(frame, Math.min(fieldRows, frame.lines.length), "", 0, cols);
+    if (fieldLines === undefined) return this.renderTooSmall(cols, rows);
+    const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
+    for (const line of titleLines) lines.push(wrapRow(line, cols, this.paint("accent")));
+    for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("error")));
+    const fieldTop = lines.length;
+    lines.push(...fieldLines);
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const line of footerLines) lines.push(wrapRow(line, cols, this.paint("hint")));
+    return {
+      lines,
+      cursor: { column: Math.min(frame.cursor.column, cols - 1), row: fieldTop + frame.cursor.row },
+    };
   }
 
   /** Pointer activation inside the drawn Settings submenu. */
@@ -11382,15 +12065,22 @@ export class SidebarController {
     // text bound and installs NO local completer at all — this machine neither
     // reads nor lists anything on its behalf. Only the LOCAL New form keeps the
     // ordinary path editor and its startup-cwd completion base.
-    const kind: SidebarFieldFactoryOptions["kind"] = this.formKind === "edit"
-      || this.formKind === "shortcuts" || this.formKind === "peer-field"
-      ? "name"
-      : this.formKind === "new" && this.newFormHostIsRemote()
-        ? "plain"
-        : "path";
+    //
+    // A review-settings value (#653) is one generic settings text: every
+    // settings field edits through it, with the shared field's own bound. It
+    // is multi-line unless the open edit's request hinted one strict line.
+    const kind: SidebarFieldFactoryOptions["kind"] = this.formKind === "review-settings"
+      ? "text"
+      : this.formKind === "edit"
+        || this.formKind === "shortcuts" || this.formKind === "peer-field"
+        ? "name"
+        : this.formKind === "new" && this.newFormHostIsRemote()
+          ? "plain"
+          : "path";
     const generation = this.formGeneration;
     const fieldOptions: SidebarFieldFactoryOptions = {
       kind,
+      ...(kind === "text" ? { multiline: this.reviewSettingsSession?.text?.multiline ?? true } : {}),
       initialText,
       onInvalidate: () => {
         if (generation === this.formGeneration) this.onInvalidate?.();
@@ -11401,9 +12091,12 @@ export class SidebarController {
         else if (this.formKind === "new") this.submitCreate(submission);
         else if (this.formKind === "shortcuts") this.submitHostShortcutForm();
         else if (this.formKind === "peer-field") this.submitPeerField(submission);
+        else if (this.formKind === "review-settings") this.settleReviewSettingsText(submission.value);
       },
       onCancel: () => {
-        if (generation === this.formGeneration) this.escapeFromForm();
+        if (generation !== this.formGeneration) return;
+        if (this.formKind === "review-settings") this.settleReviewSettingsText(undefined);
+        else this.escapeFromForm();
       },
       onReject: (reason) => {
         if (generation === this.formGeneration) {
@@ -11428,7 +12121,13 @@ export class SidebarController {
                 onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
                 onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
               })
-              : createSessionHostTextField({
+              : kind === "text"
+                ? createSessionHostTextField({
+                  kind: "text", multiline: fieldOptions.multiline === true, initialText,
+                  onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
+                  onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
+                })
+                : createSessionHostTextField({
                 kind: "name", initialText, onInvalidate: fieldOptions.onInvalidate,
                 onSubmit: fieldOptions.onSubmit, onCancel: fieldOptions.onCancel,
                 onReject: fieldOptions.onReject,
@@ -13944,6 +14643,9 @@ export class SidebarController {
     this.themeDisplay = undefined;
     this.pendingThemeSave = undefined;
     this.settingsPaneReturn = false;
+    // #653: a hidden pane holds no review-settings open; its unsaved draft is
+    // discarded and every outstanding screen/edit settles as a cancel.
+    if (this.formKind === "review-settings") this.formKind = undefined;
     this._visible = false;
     this._focus = "main";
     this.emit({ type: "visibility", visible: false });
@@ -15111,10 +15813,15 @@ export class SidebarController {
       "esc back",
     ], cols);
     const noticeLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
+    // #653: the bounded result notice of a finished review-settings open.
+    const returnNotice = this.settingsReturnNotice;
+    const returnLines = returnNotice === undefined
+      ? []
+      : wrapHintLines([`${returnNotice.type === "info" ? "" : "! "}${returnNotice.text}`], cols);
     if (contextLines === undefined || footerLines === undefined || noticeLines === undefined
-      || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+      || returnLines === undefined || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
     const paneRows = this.settingsRows();
-    const listRows = rows - 1 - contextLines.length - noticeLines.length - footerLines.length;
+    const listRows = rows - 1 - contextLines.length - noticeLines.length - returnLines.length - footerLines.length;
     // The grouped menu has no scrolling: it always draws from the first entry,
     // so a pane that cannot show EVERY entry would let navigation highlight a
     // row that is never drawn and can therefore never be activated. Exactly as
@@ -15125,6 +15832,9 @@ export class SidebarController {
     const lines: string[] = [wrapRow(header, cols, this.paint("header"))];
     for (const line of contextLines) lines.push(wrapRow(line, cols, this.paint("secondary")));
     for (const line of noticeLines) lines.push(wrapRow(line, cols, this.paint("notice")));
+    for (const line of returnLines) {
+      lines.push(wrapRow(line, cols, this.paint(returnNotice?.type === "info" ? "secondary" : "error")));
+    }
     const drawn: DisplayedSettingsRow[] = [];
     for (let index = 0; index < paneRows.length && drawn.length < listRows; index += 1) {
       const row = paneRows[index];
@@ -15988,6 +16698,72 @@ function renderActivityLines(activity: readonly string[], cols: number): string[
     .map((line) =>
       wrapRow(`    ${sanitizeBounded(line, ACTIVITY_INPUT_MAX_CODEPOINTS)}`, cols),
     );
+}
+
+/**
+ * The review-settings screens' theme colors onto closed sidebar palette roles
+ * (#653). Unknown colors stay unstyled; nothing outside this map is emitted.
+ */
+const REVIEW_SETTINGS_THEME_ROLES: ReadonlyMap<string, SidebarThemeRole> = new Map<string, SidebarThemeRole>([
+  ["accent", "selected"],
+  ["muted", "secondary"],
+  ["dim", "secondary"],
+  ["border", "hint"],
+  ["warning", "error"],
+  ["error", "error"],
+  ["success", "accent"],
+]);
+
+/** The pinned default keybindings when Main supplies no native reader. */
+function defaultReviewSettingsKeybindings(notice?: string): SidebarMenuKeybindings {
+  const manager = getKeybindings() as unknown as SidebarMenuKeybindings["manager"];
+  return { manager, run: (operation) => operation(), ...(notice === undefined ? {} : { notice }) };
+}
+
+function isReviewSettingsComponent(value: unknown): value is ReviewSettingsComponent {
+  return typeof value === "object" && value !== null
+    && typeof (value as { render?: unknown }).render === "function"
+    && typeof (value as { handleInput?: unknown }).handleInput === "function";
+}
+
+/**
+ * One rendered settings-screen line with ONLY this renderer's own generated
+ * SGR kept (#653): every other terminal sequence and control — including any
+ * escape carried inside configuration text — is removed before the line can
+ * reach a frame.
+ */
+function sanitizeReviewSettingsLine(line: string): string {
+  let out = "";
+  let last = 0;
+  for (const match of line.matchAll(REVIEW_SETTINGS_SGR)) {
+    const index = match.index ?? 0;
+    out += sanitizeCellText(line.slice(last, index));
+    if (SIDEBAR_GENERATED_SGR_ALLOWLIST.has(match[1] ?? "")) out += match[0];
+    last = index + match[0].length;
+  }
+  return out + sanitizeCellText(line.slice(last));
+}
+
+/**
+ * Wraps bounded notice text to the pane width: words first, then a hard break
+ * for a single word (an absolute path) wider than the pane. Never truncates.
+ */
+function wrapNoticeLines(text: string, cols: number): string[] {
+  const words = wrapHintLines([text], cols);
+  if (words !== undefined) return words;
+  const lines: string[] = [];
+  let current = "";
+  for (const character of text) {
+    const candidate = current + character;
+    if (current !== "" && visibleWidth(candidate) > cols) {
+      lines.push(current);
+      current = character === " " ? "" : character;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current !== "" || lines.length === 0) lines.push(current);
+  return lines;
 }
 
 function fieldRejectionNotice(reason: SessionHostFieldRejection): string {

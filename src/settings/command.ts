@@ -123,7 +123,17 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
       }
       const scoped = scopedModelChoices(ctx) ?? [];
       input.onScopedModels?.(scoped.map((choice) => choice.model));
-      await runSettingsMenu({ ...input, ui, scoped }, initialSection);
+      await runSettingsMenu({
+        config: input.config,
+        configPath: input.configPath,
+        ui,
+        scoped,
+        getToolChoices: input.getToolChoices,
+        getAuditedToolChoices: input.getAuditedToolChoices,
+        // The live session transaction reads its host effects from the
+        // registration input itself, exactly as before (issue #653).
+        transaction: { kind: "session", host: input },
+      }, initialSection);
     };
   input.pi.registerCommand("review-settings", {
     description: "Configure delegated execution, tool denials and deferred Pi tools, YouShouldKnow notices and completion guidance, reviewers, review policy, scheduled tasks, web tools, and retention.",
@@ -143,14 +153,132 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
 /** Where an opened settings menu shows first (issue #190). */
 type SettingsMenuInitialSection = "root" | "scheduled";
 
+/**
+ * The live-session host effects of the /review-settings transaction: the
+ * effective config's install callback and the process-local scheduler switch.
+ * Read from the registration input at the moment each effect runs.
+ */
+type SessionSettingsHost = Pick<RegisterSettingsInput, "onSaved" | "schedulerRuntime">;
+
+/**
+ * Which transaction one settings menu run belongs to (issue #653). Both kinds
+ * share the one menu, staged selection, section handlers, validation, and
+ * persistence boundary; only the root exits and their effects differ:
+ *
+ * - `session` — the live /review-settings transaction over the EFFECTIVE
+ *   config: root Escape validates and applies session-only (pending delta),
+ *   Save persists then installs through replaceConfig/onSaved, and the
+ *   Scheduler runtime row flips the process switch.
+ * - `persisted` — the disk-only transaction over a menu-local config the caller
+ *   loaded from disk: root Escape and Cancel discard before any validation or
+ *   image copy, and only Save/Ctrl+S validates, prepares images, and persists.
+ *   It never installs into a live config, calls onSaved, reads or records a
+ *   pending session delta, or touches a scheduler runtime.
+ */
+type SettingsTransaction =
+  | { kind: "session"; host: SessionSettingsHost }
+  | { kind: "persisted"; beforePersist?: PersistedReviewSettingsInput["beforePersist"] };
+
+/** The shared settings menu input: the menu-local config plus its transaction. */
+interface SettingsMenuInput {
+  /**
+   * Session: the live effective config (installed into on apply/Save).
+   * Persisted: the caller's fresh disk-loaded config, read-only here.
+   */
+  config: ReviewGateConfig;
+  configPath: string;
+  ui: UiContext;
+  scoped: ScopedModelChoice[];
+  getToolChoices?: RegisterSettingsInput["getToolChoices"];
+  getAuditedToolChoices?: RegisterSettingsInput["getAuditedToolChoices"];
+  transaction: SettingsTransaction;
+}
+
+/** How one settings menu run ended. */
+type SettingsMenuOutcome =
+  | { kind: "saved"; config: ReviewGateConfig }
+  | { kind: "applied" }
+  | { kind: "discarded" };
+
+/**
+ * Input for the disk-only settings transaction (issue #653). The caller owns
+ * config path resolution and the fresh disk read; `config` is menu-local
+ * loaded data, never an effective/live session config, and this transaction
+ * never mutates it.
+ */
+export interface PersistedReviewSettingsInput {
+  /** A fresh config loaded from `configPath` by the caller. */
+  config: ReviewGateConfig;
+  /** The explicit persistent config file the Save writes (and image assets anchor to). */
+  configPath: string;
+  /**
+   * The host settings UI. Supply `editText` for a host-owned text field. The
+   * run attaches its own Ctrl+S save control as `ui.saveControl` while open.
+   */
+  ui: UiContext;
+  /** The scoped model choices offered to model/reasoning selectors. */
+  scoped: ScopedModelChoice[];
+  /** Display-only deny-picker inventory (see RegisterSettingsInput). */
+  getToolChoices?: () => readonly { name: string; description?: string }[];
+  /** Display-only loader-inclusive audit inventory (see RegisterSettingsInput). */
+  getAuditedToolChoices?: () => readonly { name: string; description?: string }[];
+  /**
+   * Optional caller step run only on an explicit Save (row or Ctrl+S), after
+   * the staged selection validated and scheduled images were prepared, and
+   * immediately before the shared persistence boundary writes `configPath`.
+   * Never run on open, root Escape, or Cancel. A rejection follows the shared
+   * Save failure policy (prepared image copies are rolled back and nothing is
+   * written). Used by the session host to publish an absent canonical config
+   * through its existing guarded initializer on first Save (issue #653).
+   */
+  beforePersist?: () => void | Promise<void>;
+}
+
+/**
+ * Result of the disk-only settings transaction: `saved` carries the config the
+ * Save wrote (as normalized by the persistence boundary); `discarded` means
+ * root Escape or Cancel ended the run and nothing was validated, copied, or
+ * written.
+ */
+export type PersistedReviewSettingsOutcome =
+  | { kind: "saved"; config: ReviewGateConfig }
+  | { kind: "discarded" };
+
+/**
+ * Opens the shared settings menu as a disk-only transaction (issue #653): the
+ * same staged menu, section handlers, validation, image preparation, and
+ * persistence guards as /review-settings, without any live-session effect.
+ * Root Escape and Cancel discard; Save and Ctrl+S persist to `configPath`.
+ * Running sessions are untouched — only configs loaded from disk afterwards
+ * see the saved result. A persistence failure follows the shared Save policy
+ * (an external-worker conflict keeps the menu open with an error notice; any
+ * other failure rejects).
+ */
+export async function runPersistedReviewSettings(input: PersistedReviewSettingsInput): Promise<PersistedReviewSettingsOutcome> {
+  const outcome = await runSettingsMenu({
+    config: input.config,
+    configPath: input.configPath,
+    ui: input.ui,
+    scoped: input.scoped,
+    getToolChoices: input.getToolChoices,
+    getAuditedToolChoices: input.getAuditedToolChoices,
+    transaction: { kind: "persisted", beforePersist: input.beforePersist },
+  });
+  // The persisted transaction has no session-only apply.
+  return outcome.kind === "saved" ? outcome : { kind: "discarded" };
+}
+
 async function runSettingsMenu(
-  input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] },
+  input: SettingsMenuInput,
   initialSection: SettingsMenuInitialSection = "root",
-): Promise<void> {
+): Promise<SettingsMenuOutcome> {
+  const transaction = input.transaction;
   // #306/#294: the already-run baseline at menu opening, so a root Escape can
   // preserve consumption AND re-arms that land while this menu is open (the
   // bidirectional protection), not only live-true consumption.
-  const scheduledTasksAlreadyRunBeforeMenu = captureScheduledAlreadyRun(input.config);
+  // Session transactions only: the persisted transaction never installs into
+  // its menu-local config, so it has no already-run install baseline.
+  const scheduledTasksAlreadyRunBeforeMenu = transaction.kind === "session" ? captureScheduledAlreadyRun(input.config) : undefined;
   // Derived list for menu enumeration only; identity lookups go straight to
   // the canonical keyed catalog via resolvedExternalAgent.
   const draftConfig: ReviewGateConfig = {
@@ -163,7 +291,8 @@ async function runSettingsMenu(
   // persisting them, and a later Save must carry them through. The delta is
   // baseline metadata only — the live config remains the single active store,
   // so menu-local operation definitions are reconstructed from it on reopen.
-  const pendingDelta = getPendingSessionDelta(input.config);
+  // Issue #653: the disk-only transaction never reads a pending session delta.
+  const pendingDelta = transaction.kind === "session" ? getPendingSessionDelta(input.config) : undefined;
   const externalAgentOperations: ExternalAgentOperation[] = (pendingDelta?.agentOperations ?? []).map((operation) => {
     const stagedOperation: ExternalAgentOperation = structuredClone(operation);
     if (operation.nextId !== undefined) {
@@ -363,7 +492,7 @@ async function runSettingsMenu(
     let prepared: PreparedScheduledImageAssets | undefined;
     let catalogForApply = unservable.catalog;
     try {
-      prepared = await prepareScheduledImageAssets(input.configPath!, catalogForApply, scheduledImageProvenance);
+      prepared = await prepareScheduledImageAssets(input.configPath, catalogForApply, scheduledImageProvenance);
       catalogForApply = prepared.catalog;
     } catch (error) {
       await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -387,6 +516,7 @@ async function runSettingsMenu(
     scheduleDisableWarnings: string[];
     toolProtectionWarnings: string[];
   }): Promise<boolean> => {
+    if (transaction.kind !== "session") throw new Error("Session-only apply is not available in a disk-only settings transaction.");
     let next: ReviewGateConfig;
     try {
       next = assembleStagedSelectionConfig(input.config, stagedSelection(staged.catalogForApply), {
@@ -421,7 +551,7 @@ async function runSettingsMenu(
     // on-disk catalog. Availability probes never launch the application.
     staged.warnings.clear();
     await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
-    await input.onSaved?.(input.config, previousMode, { ui: input.ui });
+    await transaction.host.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings applied for this session (not saved to disk).", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
     for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
@@ -531,8 +661,9 @@ async function runSettingsMenu(
       { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
       { key: "subtaskTaskIds", label: "Subtask task IDs", value: showSubtaskTaskIds ? "Shown" : "Hidden" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
-      ...(input.schedulerRuntime
-        ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
+      // Issue #653: a disk-only transaction has no process scheduler row.
+      ...(transaction.kind === "session" && transaction.host.schedulerRuntime
+        ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: transaction.host.schedulerRuntime.enabled ? "On" : "Off" }]
         : []),
     ];
     const renderedRootRows = alignedSettingsRows(rootSections.map((section) => [section.label, section.value] as const));
@@ -540,7 +671,7 @@ async function runSettingsMenu(
     // staged state, but the key never changes (issue #140).
     let choice: string | undefined = await retainedSelect(input.ui, {
       title: "Review settings",
-      cancelHint: "apply for session",
+      cancelHint: transaction.kind === "session" ? "apply for session" : "discard changes",
       rows: [
         ...rootSections.map((section, index) => ({ key: section.key, label: renderedRootRows[index]! })),
         { key: "save", label: "Save changes" },
@@ -561,16 +692,19 @@ async function runSettingsMenu(
     if (choice === "cancel") {
       // Explicit Cancel (issue #294): preserve the prior session state
       // exactly — no live apply, no managed copies, no pending-delta change.
-      return;
+      return { kind: "discarded" };
     }
     if (!choice) {
+      // Issue #653: the disk-only transaction's root Escape discards exactly
+      // like Cancel — before any validation or managed image copy.
+      if (transaction.kind === "persisted") return { kind: "discarded" };
       // Root Escape (issue #294): validate and apply the staged settings to
       // the live config only — no persistent config write. Nested menus keep
       // their existing Back semantics; this is the root exit only.
       const staged = await prepareStagedApply();
       if (staged === undefined) continue;
       if (!await applyStagedToLive(staged)) continue;
-      return;
+      return { kind: "applied" };
     }
     rootLastKey = choice;
     if (choice === "mode") {
@@ -753,7 +887,9 @@ async function runSettingsMenu(
       // cancelling other changes does not revert it.
       // Real setter contract: the runtime reacts synchronously by stopping
       // or starting its timers; nothing polls the flag afterwards.
-      if (input.schedulerRuntime) input.schedulerRuntime.setEnabled(!input.schedulerRuntime.enabled);
+      if (transaction.kind === "session" && transaction.host.schedulerRuntime) {
+        transaction.host.schedulerRuntime.setEnabled(!transaction.host.schedulerRuntime.enabled);
+      }
       continue;
     }
     // choice === "save": the persistent save boundary (issue #294) — the same
@@ -777,10 +913,23 @@ async function runSettingsMenu(
     }
     // #306: capture the live already-run state before this asynchronous save
     // so a later install can preserve changes made while it was in flight.
-    const scheduledTasksAlreadyRunBeforeSave = captureScheduledAlreadyRun(input.config);
+    // Session transactions only (issue #653): the persisted transaction never
+    // installs the result into its menu-local config.
+    const scheduledTasksAlreadyRunBeforeSave = transaction.kind === "session" ? captureScheduledAlreadyRun(input.config) : undefined;
     let next: ReviewGateConfig;
+    if (transaction.kind === "persisted" && transaction.beforePersist) {
+      try {
+        await transaction.beforePersist();
+      } catch (error) {
+        // Nothing was written: every copy this Save prepared is unreferenced.
+        if (staged.prepared) await rollbackScheduledImageAssets(staged.prepared);
+        if (externalAgentOperations.length === 0) throw error;
+        await notify(input.ui, `Cannot save external worker changes: ${error instanceof Error ? error.message : "persistence conflict"}`, "error");
+        continue;
+      }
+    }
     try {
-      next = await persistReviewSettings(input.configPath!, {
+      next = await persistReviewSettings(input.configPath, {
         ...stagedSelection(staged.catalogForApply),
         // Issue #294: carry the pending session-only delta through this Save:
         // earlier Escape-applied deletions and explicit alreadyRun edits stay
@@ -798,7 +947,7 @@ async function runSettingsMenu(
       // the persisted text references (and everything when the config cannot
       // be read); the staged catalog keeps the original temporary paths so a
       // later Save can retry either way.
-      if (staged.prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath!, staged.prepared);
+      if (staged.prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath, staged.prepared);
       if (externalAgentOperations.length === 0) throw error;
       await notify(input.ui, `Cannot save external worker changes: ${error instanceof Error ? error.message : "persistence conflict"}`, "error");
       continue;
@@ -809,6 +958,16 @@ async function runSettingsMenu(
     // Announce availability of the saved catalog, not stale draft warnings.
     staged.warnings.clear();
     await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
+    if (transaction.kind === "persisted") {
+      // Issue #653: the disk-only Save ends here — no live install, no
+      // onSaved, and no pending-delta bookkeeping. Running sessions keep their
+      // own effective settings; configs loaded from disk afterwards see this.
+      await notify(input.ui, "Review settings saved to disk. Running sessions keep their current settings; newly launched sessions use the saved settings.", "info");
+      for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
+      for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
+      for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
+      return { kind: "saved", config: next };
+    }
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
     // #306: a scheduler-recorded alreadyRun=true in the live catalog must
@@ -822,7 +981,7 @@ async function runSettingsMenu(
       scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
       scheduledTasksAlreadyRunBeforeSave,
     });
-    await input.onSaved?.(input.config, previousMode, { ui: input.ui });
+    await transaction.host.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
     for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
     for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
@@ -835,7 +994,7 @@ async function runSettingsMenu(
     }
     // Issue #294: the pending session-only choices are durable now.
     clearPendingSessionDelta(input.config);
-    return;
+    return { kind: "saved", config: input.config };
   }
 }
 

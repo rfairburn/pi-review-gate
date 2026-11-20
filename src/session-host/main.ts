@@ -15,7 +15,10 @@ import {
   type SessionHostFrameWriter,
 } from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
-import { createNativeSavedQueryInput, loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
+import { createNativeSavedQueryInput, loadNativeFieldKeybindings, runNativeExternalEditor, withNativeFieldKeybindings } from "./form-support";
+import { openLocalReviewSettings, type LocalReviewSettingsInput } from "./review-settings";
+import type { SidebarReviewSettingsHost } from "./review-settings-ui";
+import type { SidebarReviewSettingsPresentation } from "./sidebar";
 import { normalizeNativeSourceInput, parseMouseInput, translateInput, KeyboardCapabilityObserver, type ParsedMouseInput } from "./input";
 import {
   InstanceManager,
@@ -242,6 +245,7 @@ import {
   type SessionBackend,
 } from "./session-backend";
 import { loadConfig } from "../config";
+import { managedConfigOverrideWarning, resolveManagedConfigOverride, type ManagedConfigOverrideRelativeResolution } from "./startup-config-override";
 import {
   HostClipboardDiagnosticCollector,
   TerminalDiagnosticsWarning,
@@ -705,6 +709,13 @@ interface RemoteCloseConfirmationFrame {
  * native caption action against a Pi frame (or invent a tuple for a native row),
  * because the two shapes are not interchangeable.
  */
+type ReviewSettingsFrame = SidebarReviewSettingsPresentation & {
+  readonly terminalCols: number;
+  readonly terminalRows: number;
+  readonly epoch: number;
+  settled: boolean;
+};
+
 type EditFormFrame =
   | (Extract<SidebarEditFormPresentation, { readonly kind: "pi" }> & {
       readonly terminalCols: number;
@@ -1032,6 +1043,14 @@ interface MainDependencies {
    */
   readonly nativeInputOriginFraming?: boolean;
   readonly runExternalEditor: typeof runNativeExternalEditor;
+  /**
+   * The LOCAL review-settings service (#653) the sidebar's Settings -> Review
+   * settings row runs. Production is `openLocalReviewSettings` itself; focused
+   * tests may wrap it (for example to inject its metadata catalog seam) without
+   * changing what Main passes: this host's startup snapshot env/args/cwd, its
+   * canonical native agent directory, and the resolved Pi executable.
+   */
+  readonly openLocalReviewSettings?: (input: LocalReviewSettingsInput) => Promise<void>;
   /**
    * Private bounded terminal diagnostics log under the canonical native agent
    * directory (#428). Focused tests may inject small rotation limits.
@@ -1594,6 +1613,7 @@ export async function runSessionHost(options: SessionHostOptions): Promise<numbe
 
 async function runSessionHostController(snapshot: HostSnapshot, dependencies: MainDependencies): Promise<number> {
   let packageRoot: string;
+  let relativeConfigOverride: ManagedConfigOverrideRelativeResolution | undefined;
   try {
     // Windows environment names are case-insensitive. Normalize and reject
     // ambiguous ordinary aliases before startup storage/role checks, resolver
@@ -1602,6 +1622,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       ...snapshot,
       env: snapshotNativeEnvironment(snapshot.env, dependencies.platform),
     };
+    // Issue #653: a nonempty relative PI_REVIEW_GATE_CONFIG is resolved ONCE
+    // against this host's startup directory, so every managed session (New,
+    // SessionSpawn, and every other create from this snapshot) reads the same
+    // absolute file instead of one per workspace. The resolution is total and
+    // never refuses; every later consumer reads this one snapshot env.
+    const configOverride = resolveManagedConfigOverride(snapshot.env, snapshot.startupCwd, dependencies.platform);
+    snapshot = { ...snapshot, env: configOverride.env };
+    relativeConfigOverride = configOverride.relative;
     packageRoot = assertStartupOptions(snapshot);
     assertPreflight(snapshot, dependencies);
   } catch (error) {
@@ -1609,6 +1637,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       ? "Session host startup options were rejected."
       : "Session host preflight failed.");
     return 1;
+  }
+  if (relativeConfigOverride !== undefined) {
+    safeReport(dependencies, managedConfigOverrideWarning(relativeConfigOverride));
   }
 
   let pi: { file: string; version: string } | undefined;
@@ -1769,6 +1800,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   let createFormFrame: CreateFormFrame | undefined;
   let editFormFrame: EditFormFrame | undefined;
+  /**
+   * The review-settings frame (#653) Main composed and is waiting to see
+   * written: its sidebar token plus the outer geometry/epoch it belongs to.
+   * Only an actual write of THIS frame settles the sidebar's action receipt.
+   */
+  let reviewSettingsFrame: ReviewSettingsFrame | undefined;
   /** Consumed UI frame tokens never authorize another send, including redraws. */
   let consumedRemoteRenameToken = 0;
   /**
@@ -3022,6 +3059,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // writer's receipt for THIS frame rather than a later render.
         const createFormPresentation = sidebar.captureCreateFormPresentation();
         const editFormPresentation = sidebar.captureEditFormPresentation();
+        const reviewSettingsPresentation = sidebar.captureReviewSettingsPresentation();
         // The remote Saved picker's own drawn frame (Local pickers have none),
         // captured the same way beside this exact composition.
         const savedPickerPresentation = sidebar.captureSavedPickerPresentation();
@@ -3264,6 +3302,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           }
         }
         editFormFrame = nextEditFormFrame;
+        let nextReviewSettingsFrame: ReviewSettingsFrame | undefined;
+        if (reviewSettingsPresentation !== undefined) {
+          const previous = reviewSettingsFrame;
+          if (previous !== undefined && previous.renderToken === reviewSettingsPresentation.renderToken
+            && previous.terminalCols === cols && previous.terminalRows === rows
+            && previous.epoch === createFormEpoch) {
+            nextReviewSettingsFrame = previous;
+          } else {
+            nextReviewSettingsFrame = { ...reviewSettingsPresentation, terminalCols: cols, terminalRows: rows,
+              epoch: createFormEpoch, settled: false };
+            // A changed selection can compose identical bytes elsewhere in the
+            // frame: only an ACTUAL write may become this frame's receipt.
+            writer.invalidate?.();
+          }
+        }
+        reviewSettingsFrame = nextReviewSettingsFrame;
         let nextSavedPickerFrame: RemoteSavedPickerFrame | undefined;
         if (savedPickerPresentation !== undefined && formSlot !== undefined
           && formSlot.cols === savedPickerPresentation.cols && formSlot.rows === savedPickerPresentation.rows) {
@@ -3349,6 +3403,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             && isCurrentEditFormFrame(nextEditFormFrame)
             && (disposition === "written" || (disposition === "unchanged" && nextEditFormFrame.settled))) {
             if (activeSidebar.settleEditFormRender(nextEditFormFrame.renderToken)) nextEditFormFrame.settled = true;
+          }
+          if (nextReviewSettingsFrame !== undefined && reviewSettingsFrame === nextReviewSettingsFrame
+            && isCurrentReviewSettingsFrame(nextReviewSettingsFrame)
+            && (disposition === "written" || (disposition === "unchanged" && nextReviewSettingsFrame.settled))) {
+            if (activeSidebar.settleReviewSettingsRender(nextReviewSettingsFrame.renderToken)) {
+              nextReviewSettingsFrame.settled = true;
+            }
           }
           // The remote Saved picker receipt: ONLY an actual write of this exact
           // frame, or an unchanged repaint of this same already-settled frame.
@@ -5506,6 +5567,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // last-instant proof) until a replacement frame in this new epoch is written,
     // including a resize that returns to the previous size before repainting.
     createFormEpoch += 1;
+    // The review-settings action receipt (#653) is geometry-bound the same way.
+    reviewSettingsFrame = undefined;
+    sidebar?.invalidateReviewSettingsPresentation();
     // Physical reflow revokes every remote native IO receipt until a post-resize
     // frame is actually written, including a resize that returns to the previous
     // size before anything is repainted. Remote input/copy only; Close and
@@ -5531,7 +5595,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     reconcileLayout(true);
   }
 
-  async function handoffExternalEditor(text: string): Promise<string | undefined> {
+  async function handoffExternalEditor(
+    text: string,
+    maxTextBytes?: number,
+    preserveFinalLineTerminator?: boolean,
+  ): Promise<string | undefined> {
     if (externalEditorActive || shutdownRequested || !terminal || !terminalStarted) {
       throw new Error("external editor handoff is unavailable");
     }
@@ -5539,6 +5607,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // The handoff retires every geometry-bound receipt: the terminal is handed to
     // the editor and repainted, so a remote New receipt composed before it is dead.
     createFormEpoch += 1;
+    reviewSettingsFrame = undefined;
+    sidebar?.invalidateReviewSettingsPresentation();
     remoteSavedEpoch += 1;
     remoteSavedPickerFrame = undefined;
     // No ordinary host-pane ownership survives a TTY handoff. The abandoned
@@ -5595,10 +5665,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       }
       terminalStarted = false;
       terminalPaused = true;
+      // Only a generic text field reports its own bound and line shape (#653);
+      // every existing field keeps the original call shape exactly.
       const result = await dependencies.runExternalEditor(text, {
         env: snapshot.env,
         cwd: snapshot.startupCwd,
         signal: controller.signal,
+        ...(maxTextBytes === undefined ? {} : { maxTextBytes }),
+        ...(preserveFinalLineTerminator === undefined ? {} : { preserveFinalLineTerminator }),
       });
       if (shutdownRequested || controller.signal.aborted) return undefined;
       return result;
@@ -5625,8 +5699,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     }
   }
 
-  function startExternalEditor(text: string): Promise<string | undefined> {
-    const task = handoffExternalEditor(text);
+  function startExternalEditor(
+    text: string,
+    maxTextBytes?: number,
+    preserveFinalLineTerminator?: boolean,
+  ): Promise<string | undefined> {
+    const task = handoffExternalEditor(text, maxTextBytes, preserveFinalLineTerminator);
     externalEditorTask = task;
     void task.then(
       () => { if (externalEditorTask === task) externalEditorTask = undefined; },
@@ -7989,6 +8067,16 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     })();
   }
 
+  function isCurrentReviewSettingsFrame(frame: ReviewSettingsFrame): boolean {
+    if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted
+      || sidebar === undefined || !sidebar.visible || sidebar.focus !== "form") return false;
+    if (clampDimension(terminal.columns, 80) !== frame.terminalCols
+      || clampDimension(terminal.rows, 24) !== frame.terminalRows || frame.epoch !== createFormEpoch) return false;
+    const pane = currentCreateFormPane(frame.terminalCols, frame.terminalRows);
+    return pane !== undefined && pane.cols === frame.cols && pane.rows === frame.rows
+      && sidebar.isReviewSettingsRenderCurrent(frame.renderToken);
+  }
+
   function isCurrentEditFormFrame(frame: EditFormFrame): boolean {
     if (shutdownRequested || externalEditorActive || terminal === undefined || !terminalStarted
       || sidebar === undefined || !sidebar.visible || sidebar.focus !== "form") return false;
@@ -9681,6 +9769,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     sidebar?.invalidateCreateFormPresentation();
     editFormFrame = undefined;
     sidebar?.invalidateEditFormPresentation();
+    // An open LOCAL review settings never survives teardown: its unsaved draft
+    // is discarded and its outstanding screens/edits settle as cancels (#653).
+    try { sidebar?.cancelReviewSettings(); } catch { /* teardown continues */ }
     // Ephemeral per-target reminders never outlive this host run. An in-flight
     // close already handed to the owner is never re-sent or cancelled here.
     remoteCloseMarkers.clear();
@@ -10081,7 +10172,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
             ...common,
             workspaceBasePath: snapshot.startupCwd,
           })
-          : createSessionHostTextField({ ...common, kind: "name" });
+          // A generic settings value (#653): the shared field's own bound, and
+          // multi-line only when asked; Ctrl+G reports both to the editor call.
+          : options.kind === "text"
+            ? createSessionHostTextField({ ...common, kind: "text", multiline: options.multiline === true })
+            : createSessionHostTextField({ ...common, kind: "name" });
       return {
         field,
         matchesCancel: (data: string) =>
@@ -10113,6 +10208,40 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         },
       };
     };
+    // #653: the LOCAL review settings. Every open is a fresh disk load by the
+    // shared service over this host's startup snapshot (whose explicit
+    // PI_REVIEW_GATE_CONFIG is already absolute), its canonical native agent
+    // directory, and the actually resolved Pi executable. No selected-session or
+    // remote-row data reaches it, and nothing it saves changes a running session.
+    const reviewSettingsAgentDir = activeSessionSetup.nativeAgentDir;
+    const reviewSettingsPiExecutable = pi.file;
+    const reviewSettings: SidebarReviewSettingsHost | undefined =
+      typeof reviewSettingsAgentDir === "string" && reviewSettingsAgentDir !== ""
+        ? {
+          open: (ui) => {
+            if (shutdownRequested) return Promise.resolve();
+            const open = dependencies.openLocalReviewSettings ?? openLocalReviewSettings;
+            return open({
+              env: snapshot.env,
+              agentDir: reviewSettingsAgentDir,
+              piExecutable: reviewSettingsPiExecutable,
+              args: snapshot.args,
+              cwd: snapshot.startupCwd,
+              ui,
+            });
+          },
+          // The same safe native keybindings reader the host forms use, fresh per
+          // open; the manager is only scoped around each component operation.
+          loadKeybindings: () => {
+            const loaded = loadNativeFieldKeybindings(reviewSettingsAgentDir);
+            return {
+              manager: loaded.manager,
+              run: <T>(operation: () => T): T => withNativeFieldKeybindings(loaded.manager, operation),
+              ...(loaded.notice === undefined ? {} : { notice: loaded.notice }),
+            };
+          },
+        }
+        : undefined;
     sidebar = dependencies.createSidebar({
       toggleKey: effectiveHostShortcuts.toggle,
       returnToMainKey: effectiveHostShortcuts.returnToMain,
@@ -10141,6 +10270,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // it and owns no order of its own; a committed move comes back to Main as
       // one reorder action and is revalidated here.
       getSessionOrder: currentSessionOrderView,
+      ...(reviewSettings === undefined ? {} : { reviewSettings }),
       onInvalidate: () => {
         invalidateSavedDeleteConfirmationDisplay();
         invalidateRemoteCloseConfirmationDisplay();

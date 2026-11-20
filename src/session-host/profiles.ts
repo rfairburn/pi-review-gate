@@ -170,7 +170,7 @@ export interface NativeAgentRegistryOptions {
 }
 
 /** Use the parent's home-related environment snapshot for Pi's native path helpers. */
-function configResolutionForEnv(env: NodeJS.ProcessEnv): ReturnType<typeof resolveConfigPathResolution> {
+export function configResolutionForEnv(env: NodeJS.ProcessEnv): ReturnType<typeof resolveConfigPathResolution> {
   const homeDir = process.platform === "win32"
     ? env.USERPROFILE ?? env.HOME
     : env.HOME;
@@ -741,9 +741,11 @@ export class NativeAgentRegistry implements ProfilePreparer {
  * Ensure ordinary launcher config setup without changing existing native
  * configuration. Explicit overrides and the XDG fallback retain normal
  * precedence; only when every candidate is genuinely absent is the ordinary
- * zero-model default atomically published at the native agent root.
+ * zero-model default atomically published at the native agent root. Also the
+ * first-Save publication step of the standalone local settings editor
+ * (src/session-host/review-settings.ts, issue #653).
  */
-function ensureNativeReviewGateConfig(agentDir: string, workspace: string, env: NodeJS.ProcessEnv): void {
+export function ensureNativeReviewGateConfig(agentDir: string, workspace: string, env: NodeJS.ProcessEnv): void {
   const resolution = configResolutionForEnv(env);
   const explicit = env.PI_REVIEW_GATE_CONFIG;
   if (explicit) {

@@ -53,24 +53,17 @@ import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { SESSION_SPAWN_TOOL_NAME } from "../session-host/spawn-tool";
 import { SESSION_HOSTS_TOOL_NAME } from "../session-host/hosts-tool";
+import { EXECUTION_TOOL_ACTIONS, EXECUTION_TOOL_NAMES, type ExecutionToolAction } from "./tool-names";
 
 /** Per-call batch bound, independent of worker concurrency and group admission. */
 const MAX_TASKS_PER_SUBMISSION = 128;
 
-const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
-type Action = typeof ACTIONS[number];
+const ACTIONS = EXECUTION_TOOL_ACTIONS;
+type Action = ExecutionToolAction;
 
-export const EXECUTION_TOOL_NAMES: Record<Action, string> = {
-  start: "SubtasksStart",
-  add: "SubtasksAdd",
-  inspect: "SubtasksInspect",
-  watch: "SubtasksWatch",
-  continue: "SubtasksContinue",
-  steer: "SubtasksSteer",
-  interrupt: "SubtasksInterrupt",
-  force_merge: "SubtasksForceMerge",
-  mark_clean: "SubtasksMarkClean",
-};
+// The canonical registration names live in the dependency-free ./tool-names
+// module (issue #653); re-exported here for the established callers.
+export { EXECUTION_TOOL_NAMES };
 
 const EXECUTION_TOOL_NAME_LIST = ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]);
 

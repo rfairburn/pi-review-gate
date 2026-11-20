@@ -13,6 +13,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmdirSync,
   statSync,
   unlinkSync,
@@ -33,6 +34,13 @@ import { createStatusBroker, type StatusBroker, type StatusRegistration } from "
 import { HOST_BOOTSTRAP_ENV, type SessionHostStatus } from "../src/session-host/protocol";
 import { NativeAgentRegistry, ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
 import { InstanceManager, type InstancePty, type InstanceSpawnDescriptor } from "../src/session-host/instances";
+import { __test as mainTest } from "../src/session-host/main";
+import { createLocalOwningHostService } from "../src/session-host/owning-host-service";
+import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
+import type { SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
+import { loadConfig } from "../src/config";
+import { runPersistedReviewSettings } from "../src/settings/command";
+import type { UiContext } from "../src/settings/ui";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { ChangeSignal as DurableChangeSignal } from "./helpers/session-host-native-windows-harness";
 import { skipOrFail } from "./bridge-fakes";
@@ -2045,6 +2053,355 @@ module.exports = (pi) => {
     assert.equal(turns[0]!.lastUserSha256, expectedDigest(prompt));
     assert.equal(turns[0]!.userMessageCount, 1, "no parent history or startup context is inherited");
   }
+});
+
+// Issue #653 native consumer evidence: a disk-only settings Save becomes the
+// ACTUAL candidate behavior of later managed children (a plain local New and a
+// registered SessionSpawn), while the live parent keeps the snapshot it started
+// with. Effects are observed where the model would see them: the opt-in fixture
+// provider journals which exact shipped operating-mode segment and which probe
+// tool declarations reached each real provider request (closed names only).
+test("a disk-only saved default reaches later New and registered SessionSpawn native Pi children while the live parent keeps its startup snapshot", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = staticPrerequisites(t, true);
+  if (!prerequisites) return;
+  const ptyModule = require("@lydell/node-pty") as NativePtyModule;
+  const root = makeSyntheticRoot();
+  type OwnedChild = {
+    handle: InstancePty;
+    descriptor: InstanceSpawnDescriptor;
+    exit?: { exitCode: number; signal?: number };
+    subscription?: Disposable;
+  };
+  const owned: OwnedChild[] = [];
+  const signal = new DurableChangeSignal();
+  let manager: InstanceManager | undefined;
+  let broker: StatusBroker | undefined;
+  let watcher: ReturnType<typeof watch> | undefined;
+  let completed = false;
+  t.after(async () => {
+    let cleanupError: unknown;
+    try {
+      if (manager) {
+        const stopped = await manager.shutdown({ graceMs: CHILD_EXIT_TIMEOUT_MS, killMs: 5_000 });
+        if (stopped.remainingIds.length > 0) cleanupError = new Error("an owned native manager child did not positively exit");
+      }
+    } catch (error) { cleanupError = error; }
+    for (const entry of owned) {
+      if (!entry.exit) {
+        try { entry.handle.kill("SIGKILL"); } catch { /* this exact owned handle only */ }
+        try {
+          await signal.waitFor(() => entry.exit !== undefined, 5_000, "owned #653 native child exit");
+        } catch (error) { cleanupError ??= error; }
+      }
+      if (!entry.exit || processIsAlive(entry.handle.pid)) cleanupError ??= new Error("owned native child settlement unconfirmed; retain fixture");
+    }
+    watcher?.close();
+    const settled = owned.every((entry) => entry.exit !== undefined && !processIsAlive(entry.handle.pid));
+    if (settled) {
+      try { await manager?.dispose(); } catch (error) { cleanupError ??= error; }
+      try { await broker?.dispose(); } catch (error) { cleanupError ??= error; }
+    }
+    for (const entry of owned) entry.subscription?.dispose();
+    if (settled && cleanupError === undefined && completed) {
+      if (!removeOwnedTree(root)) cleanupError = new Error("the synthetic root could not be fully removed by bounded cleanup");
+    } else if (settled && cleanupError === undefined) {
+      // A failed or skipped body keeps its owned evidence (journals, configs,
+      // native session files) once every owned process has positively exited.
+      t.diagnostic(`native #653 evidence retained at ${root}`);
+    } else if (cleanupError !== undefined) {
+      const message = cleanupError instanceof Error ? cleanupError.message : "native #653 cleanup failed";
+      throw new Error(`${message}; synthetic root retained at ${root}`);
+    }
+    if (cleanupError !== undefined) throw cleanupError;
+  });
+  initializeSyntheticDirectories(root);
+  assertBrokerSocketPathBudget(root);
+  const pi = resolvePiExecutable(prerequisites, root, t);
+  if (!pi) return;
+  const candidate = stageCandidate(root, prerequisites);
+
+  // Default synthetic <owned home>/.pi/agent layout with the ordinary implicit
+  // canonical config (no PI_REVIEW_GATE_CONFIG / PI_CODING_AGENT_DIR override).
+  const home = join(root, "home");
+  const agentDir = join(home, ".pi", "agent");
+  const canonical = join(agentDir, "review-gate.json");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const document = (operatingMode: string, youShouldKnowEnabled: boolean): string => `${JSON.stringify({
+    enabled: true,
+    operatingMode,
+    youShouldKnow: { enabled: youShouldKnowEnabled, completionGuidance: false },
+    review: { activeReviewers: [] },
+    execution: { deferredPiTools: false, workerResources: {}, routes: { execute: [], research: [] } },
+    externalAgents: {},
+  }, null, 2)}\n`;
+  // Distinct observable tuples (mode segment, YouShouldKnow declaration):
+  // B = (orchestrate, on) parent startup; A = (execute, on) other writer;
+  // canceled draft C = (orchestrate, off); saved D = (plan-research, ...).
+  const diskB = document("orchestrate", true);
+  const diskA = document("execute", true);
+  writeFileSync(canonical, diskB, { mode: 0o600 });
+
+  const providerState = join(root, "provider-state");
+  mkdirSync(providerState, { mode: 0o700 });
+  const parentFirst = "SYNTHETIC_653_PARENT_FIRST_TURN";
+  const parentSpawn = "SYNTHETIC_653_PARENT_SPAWN_TURN";
+  const spawnWorkspace = createWorkspace(root, "spawn-after-save");
+  const spawnTitle = "Spawned after disk-only save";
+  const spawnPrompt = "SYNTHETIC_653_SPAWNED_CHILD_TURN";
+  // Request ordinals are per process. Children each make exactly one request
+  // whose last user text is never a parent trigger, so they get the stop
+  // marker; only the parent advances through its scripted turns. SessionSpawn
+  // is a deferred tool for the primary, so — like a real model — the parent
+  // activates it through the candidate's tool_search before calling it.
+  writeFileSync(join(providerState, "turn-script.json"), JSON.stringify({ steps: [
+    { whenLastUser: parentFirst, text: "synthetic-653-parent-first-turn-complete" },
+    { whenLastUser: parentSpawn, toolCalls: [{ toolName: "tool_search", arguments: { query: "SessionSpawn" } }] },
+    { whenLastUser: parentSpawn, toolCalls: [{ toolName: "SessionSpawn", arguments: { workspace: spawnWorkspace, title: spawnTitle, prompt: spawnPrompt } }] },
+    { text: "synthetic-653-parent-spawn-turn-complete" },
+  ] }), { mode: 0o600 });
+  const providerJournal = join(providerState, "provider-journal.jsonl");
+  const journal = (): Array<Record<string, unknown>> => existsSync(providerJournal)
+    ? readFileSync(providerJournal, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) : [];
+  const requestsOf = (pid: number): Array<Record<string, unknown>> =>
+    journal().filter((record) => record.event === "model_request" && record.pid === pid);
+  watcher = watch(providerState, () => signal.notify());
+
+  // SessionSpawn stays a deferred (tool_search) tool here, so it is not a
+  // declaration probe; its registration is proven by the parent's real call.
+  const probes = ["YouShouldKnow", "GitRead", "write", "edit"];
+  const env = {
+    ...makeSyntheticEnvironment(root, candidate.nodePath),
+    PRG_FIXTURE_AGENT_DIR: realpathSync(resolve(process.env.PI_REVIEW_GATE_INSTALLED_AGENT!)),
+    PRG_FIXTURE_STATE_DIR: providerState,
+    PRG_FIXTURE_JOURNAL_PROMPT_DIGEST: "1",
+    // The exact segments the staged candidate itself loads.
+    PRG_FIXTURE_JOURNAL_MODE_SEGMENT_DIR: join(candidate.packageRoot, "scripts"),
+    PRG_FIXTURE_JOURNAL_TOOL_PROBES: probes.join(","),
+    PRG_653_RESULT_LOG: join(root, "observer", "spawn-results.jsonl"),
+  };
+  // Test-owned observer: the parent's actual SessionSpawn tool result (closed
+  // outcome/error fields only, never content).
+  const resultLog = join(root, "observer", "spawn-results.jsonl");
+  const resultExtension = join(root, "observer", "spawn-results.cjs");
+  writeFileSync(resultExtension, String.raw`'use strict';
+const fs = require('node:fs');
+module.exports = (pi) => {
+  pi.on('message_end', (event) => {
+    const message = event && event.message;
+    if (message && message.role === 'toolResult' && message.toolName === 'SessionSpawn') {
+      fs.appendFileSync(process.env.PRG_653_RESULT_LOG, JSON.stringify({ pid: process.pid, isError: message.isError,
+        outcome: message.details && message.details.outcome }) + '\n');
+    }
+  });
+};
+`, { mode: 0o600 });
+  const spawnResults = (): Array<Record<string, unknown>> => observerRecords(resultLog);
+  const managerArgs = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
+    "--extension", join(repositoryRoot(), "tests", "fixtures", "session-host-native-provider.cjs"),
+    "--extension", resultExtension,
+    "--provider", "prg-native-question", "--model", "driven"];
+  broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+  const hostService = createLocalOwningHostService({
+    createManager: (options) => new InstanceManager(options),
+    teardownRequested: () => false,
+  });
+  const spawnCalls: Array<{ parentId: string; request: SessionSpawnInput; outcome?: SessionSpawnOutcome }> = [];
+  manager = hostService.openManager({
+    packageRoot: candidate.packageRoot, piExecutable: pi.file,
+    statusRegistrar: mainTest.statusRegistrar(broker), profileRegistry: new NativeAgentRegistry({ env }),
+    nativeSetup: true, env, cols: PTY_COLS, rows: PTY_ROWS, args: managerArgs,
+    // Main supplies its sidebar title width; it is what publishes the
+    // reporter's SessionSpawn capability to each top-level child.
+    getSidebarTitleColumns: () => 47,
+    onChange: () => signal.notify(),
+    // Exactly Main's local wiring: the owning-host service admits the
+    // authenticated child request with the manager-supplied parent id.
+    onSpawnRequest: async (parentId, request) => {
+      const call: (typeof spawnCalls)[number] = { parentId, request };
+      spawnCalls.push(call);
+      call.outcome = await hostService.spawnRequestedChild(parentId, request);
+      return call.outcome;
+    },
+    ptyFactory: (descriptor) => {
+      const handle = ptyModule.spawn(descriptor.file, descriptor.args, {
+        name: "xterm-256color", cols: descriptor.cols, rows: descriptor.rows,
+        cwd: descriptor.cwd, env: descriptor.env, encoding: "utf8",
+      }) as unknown as InstancePty;
+      const entry: OwnedChild = { handle, descriptor };
+      owned.push(entry); // ownership precedes every callback/await
+      entry.subscription = handle.onExit((event) => { entry.exit = event; signal.notify(); });
+      return handle;
+    },
+  }) as InstanceManager;
+
+  const row = (id: string) => manager!.list().find((view) => view.id === id);
+  const ownedAt = (workspace: string): OwnedChild[] => owned.filter((entry) => entry.descriptor.cwd === realpathSync(workspace));
+  const frameText = (id: string): string => (manager!.surface(id)?.frame().lines ?? []).map(stripGeneratedSgr).join("\n");
+  const waitIdle = (id: string, what: string, extra: () => boolean = () => true): Promise<void> => signal.waitForRecheck(() => {
+    const view = row(id);
+    return view?.lifecycle === "alive" && view.busy === false && view.nativeSession !== null && extra();
+  }, EVENT_TIMEOUT_MS, what);
+  const submit = async (id: string, pid: number, prompt: string, what: string): Promise<Record<string, unknown>> => {
+    const before = requestsOf(pid).length;
+    manager!.write(id, prompt);
+    await signal.waitForRecheck(() => frameText(id).includes(prompt), EVENT_TIMEOUT_MS, `${what}: typed draft is in the native editor`);
+    manager!.write(id, "\r");
+    await signal.waitForRecheck(() => requestsOf(pid).length > before, EVENT_TIMEOUT_MS, `${what}: the real provider receives the turn`);
+    return requestsOf(pid)[before]!;
+  };
+  // A plain sidebar-style New: no initial request, then the operator types.
+  const startNew = async (name: string, prompt: string): Promise<{ id: string; child: OwnedChild; request: Record<string, unknown> }> => {
+    const workspace = createWorkspace(root, name);
+    const outcome = await hostService.startSession({ workspace });
+    assert.equal(outcome.status, "started", `${name}: the local New create starts a real native child`);
+    const id = (outcome as { id: string }).id;
+    const [child, ...extra] = ownedAt(workspace);
+    assert.ok(child && extra.length === 0, `${name}: exactly one owned native child runs in its workspace`);
+    await waitIdle(id, `${name}: native session ready`);
+    return { id, child, request: await submit(id, child.handle.pid, prompt, name) };
+  };
+  const assertEffect = (request: Record<string, unknown>, mode: string, tools: Record<string, boolean>, what: string): void => {
+    assert.deepEqual(request.modeSegments, [mode], `${what}: exactly the shipped ${mode} segment reached the provider request`);
+    const observed = request.toolProbes as Record<string, boolean>;
+    for (const [name, present] of Object.entries(tools)) {
+      assert.equal(observed?.[name], present, `${what}: ${name} ${present ? "is" : "is not"} declared to the provider`);
+    }
+  };
+  const assertManagedChild = (child: OwnedChild): void => {
+    assert.equal(child.descriptor.env.PI_CODING_AGENT_DIR, agentDir, "native setup supplies the one default agent root");
+    assert.equal(child.descriptor.env.PI_REVIEW_GATE_CONFIG, undefined, "no config override is invented: ordinary implicit discovery");
+    assert.equal(child.descriptor.env.PI_REVIEW_GATE_RUNTIME_ROLE, undefined, "no role authorization reaches a managed child");
+    assert.equal(child.descriptor.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG, undefined);
+    for (const arg of managerArgs) assert.ok(child.descriptor.args.includes(arg), "explicit managed launch args are preserved");
+  };
+
+  // 1. The parent starts while disk holds B and its real turn carries B.
+  const parent = await startNew("parent", parentFirst);
+  assertManagedChild(parent.child);
+  assertEffect(parent.request, "orchestrate", { YouShouldKnow: true, GitRead: false, write: true, edit: true }, "parent startup turn (B)");
+  await waitIdle(parent.id, "parent first turn settles", () => frameText(parent.id).includes("synthetic-653-parent-first-turn-complete"));
+  const parentSession = row(parent.id)!.nativeSession!;
+
+  // 2. Another writer replaces the disk with A.
+  writeFileSync(`${canonical}.other-writer`, diskA, { mode: 0o600 });
+  renameSync(`${canonical}.other-writer`, canonical);
+
+  // 3. The landed disk-only core opens over a FRESH load of A, stages C, Cancels.
+  type Step = string | undefined;
+  const scripted = (steps: Step[]): { ui: UiContext; shown: string[][]; remaining(): number } => {
+    const shown: string[][] = [];
+    let index = 0;
+    const ui: UiContext = {
+      select: async (_title, options) => {
+        shown.push(options);
+        assert.ok(index < steps.length, `unexpected extra settings selection: ${options.join(" | ")}`);
+        const step = steps[index++];
+        if (step === undefined) return undefined;
+        const match = options.find((option) => option === step) ?? options.find((option) => option.startsWith(step));
+        assert.ok(match !== undefined, `missing settings selection ${step}: ${options.join(" | ")}`);
+        return match;
+      },
+      confirm: async () => false,
+      notify: (message, kind) => { assert.notEqual(kind, "error", message); },
+    };
+    return { ui, shown, remaining: () => steps.length - index };
+  };
+  const freshDisk = () => {
+    const loaded = loadConfig({ HOME: home }, { homeDir: home, platform: process.platform });
+    assert.equal(loaded.path, canonical, "the menu loader resolves the ordinary implicit canonical config");
+    return loaded.config;
+  };
+  const modeRow = (options: string[]): string => options.find((option) => option.startsWith("Operating mode")) ?? "";
+  const cancelRun = scripted(["Operating mode", "Prefer orchestration", "Tools", "YouShouldKnow notices", undefined, "Cancel"]);
+  assert.deepEqual(
+    await runPersistedReviewSettings({ config: freshDisk(), configPath: canonical, ui: cancelRun.ui, scoped: [] }),
+    { kind: "discarded" },
+  );
+  assert.equal(cancelRun.remaining(), 0);
+  assert.match(modeRow(cancelRun.shown[0]!), /Prefer execution/, "the disk-only menu opens on disk A, not the parent's live B");
+  assert.match(modeRow(cancelRun.shown[2]!), /Prefer orchestration/, "draft C was staged in the menu");
+  assert.equal(readFileSync(canonical, "utf8"), diskA, "Cancel writes nothing: disk keeps A byte-for-byte");
+  const afterCancel = await startNew("after-cancel", "SYNTHETIC_653_AFTER_CANCEL_TURN");
+  assertManagedChild(afterCancel.child);
+  assertEffect(afterCancel.request, "execute", { YouShouldKnow: true, GitRead: false, write: true, edit: true }, "New child after Cancel consumes A, never C");
+
+  // 4. Save D through the same core over a fresh load.
+  const inodeBefore = statSync(canonical).ino;
+  const saveRun = scripted(["Operating mode", "Plan/research", "Save changes"]);
+  const saved = await runPersistedReviewSettings({ config: freshDisk(), configPath: canonical, ui: saveRun.ui, scoped: [] });
+  assert.equal(saved.kind, "saved");
+  assert.equal(saveRun.remaining(), 0);
+  assert.notEqual(statSync(canonical).ino, inodeBefore, "Save replaced the canonical file atomically");
+  const written = JSON.parse(readFileSync(canonical, "utf8")) as { operatingMode?: string; youShouldKnow?: unknown };
+  assert.equal(written.operatingMode, "plan-research");
+  assert.deepEqual(written.youShouldKnow, { enabled: true, completionGuidance: false }, "the canceled C notice change never reached disk");
+  const diskD = readFileSync(canonical, "utf8");
+
+  // 5. A later plain New child consumes D in actual candidate behavior.
+  const newD = await startNew("new-after-save", "SYNTHETIC_653_NEW_AFTER_SAVE_TURN");
+  assertManagedChild(newD.child);
+  assertEffect(newD.request, "plan-research", { GitRead: true, write: false, edit: false }, "New child after Save consumes D");
+
+  // 6. The live parent runs another turn: still B, same process and conversation,
+  //    and its registered SessionSpawn starts a child that consumes D.
+  const parentSpawnRequest = await submit(parent.id, parent.child.handle.pid, parentSpawn, "parent turn after Save");
+  assertEffect(parentSpawnRequest, "orchestrate", { YouShouldKnow: true, GitRead: false, write: true, edit: true }, "parent turn after Save keeps B");
+  await signal.waitForRecheck(() => requestsOf(parent.child.handle.pid).length >= 4, EVENT_TIMEOUT_MS,
+    "parent activates SessionSpawn, receives its result, and continues its turn");
+  for (const ordinal of [2, 3]) {
+    assertEffect(requestsOf(parent.child.handle.pid)[ordinal]!, "orchestrate", { YouShouldKnow: true, GitRead: false, write: true, edit: true },
+      `parent follow-up request ${ordinal} keeps B`);
+  }
+  assert.equal(requestsOf(parent.child.handle.pid).length, 4, "the parent made exactly its four scripted requests");
+  assert.deepEqual(spawnResults(), [{ pid: parent.child.handle.pid, isError: false, outcome: "started" }],
+    "the parent's actual registered SessionSpawn tool confirmed exactly one launch");
+  assert.equal(spawnCalls.length, 1, "exactly one authenticated SessionSpawn request reached the owning host");
+  assert.equal(spawnCalls[0]!.parentId, parent.id, "the manager attributes the request to the live parent row");
+  assert.deepEqual(
+    { workspace: spawnCalls[0]!.request.workspace, title: spawnCalls[0]!.request.title, prompt: spawnCalls[0]!.request.prompt },
+    { workspace: spawnWorkspace, title: spawnTitle, prompt: spawnPrompt },
+  );
+  assert.equal(spawnCalls[0]!.outcome, "started");
+  const [spawned, ...extraSpawned] = ownedAt(spawnWorkspace);
+  assert.ok(spawned && extraSpawned.length === 0, "exactly one SessionSpawn child runs in its workspace");
+  assertManagedChild(spawned);
+  assert.deepEqual(spawned.descriptor.args.slice(-2), ["--name", spawnTitle], "the fresh SessionSpawn argv composition is preserved");
+  await signal.waitForRecheck(() => requestsOf(spawned.handle.pid).length > 0, EVENT_TIMEOUT_MS, "SessionSpawn child's initial turn reaches the provider");
+  const [spawnedRequest, ...extraSpawnedRequests] = requestsOf(spawned.handle.pid);
+  assert.equal(extraSpawnedRequests.length, 0);
+  assert.equal(spawnedRequest!.userMessageCount, 1, "the spawned child inherits no parent history");
+  assertEffect(spawnedRequest!, "plan-research", { GitRead: true, write: false, edit: false }, "registered SessionSpawn child consumes D");
+
+  assert.equal(ownedAt(join(root, "workspaces", "parent")).length, 1, "the parent was never restarted or relaunched");
+  assert.equal(parent.child.exit, undefined);
+  assert.equal(processIsAlive(parent.child.handle.pid), true, "the parent is the same live process");
+  for (const request of requestsOf(parent.child.handle.pid)) assert.deepEqual(request.modeSegments, ["orchestrate"]);
+  assert.equal(row(parent.id)?.lifecycle, "alive");
+  assert.equal(row(parent.id)?.nativeSession?.sessionId, parentSession.sessionId, "the parent keeps the same native conversation");
+  for (const request of journal().filter((record) => record.event === "model_request")) {
+    assert.notDeepEqual(request.modeSegments, [], "every request carried exactly one observed mode segment");
+    assert.equal(Object.hasOwn(request, "lastUserPreview"), false, "the journal never records prompt text");
+  }
+  assert.equal(readFileSync(canonical, "utf8"), diskD, "child launches never rewrite the saved defaults");
+
+  // 7. A legitimate other editor writes E; reopening the core shows E.
+  writeFileSync(canonical, document("execute", false));
+  const reopen = scripted(["Tools", undefined, "Cancel"]);
+  await runPersistedReviewSettings({ config: freshDisk(), configPath: canonical, ui: reopen.ui, scoped: [] });
+  assert.match(modeRow(reopen.shown[0]!), /Prefer execution/, "the reopened menu shows the other editor's E");
+  assert.ok(reopen.shown[1]!.some((option) => option.startsWith("YouShouldKnow notices") && /Off/.test(option)), reopen.shown[1]!.join(" | "));
+
+  // 8. Positive teardown: every owned real Pi child exits normally.
+  const stopped = await manager.shutdown({ graceMs: CHILD_EXIT_TIMEOUT_MS, killMs: 5_000 });
+  assert.deepEqual(stopped.remainingIds, [], "every owned native manager child positively exits");
+  assert.equal(owned.length, 4, "parent, after-Cancel New, after-Save New, and one SessionSpawn child");
+  for (const entry of owned) {
+    await signal.waitFor(() => entry.exit !== undefined, 5_000, "owned native child exit event");
+    assert.deepEqual({ exitCode: entry.exit!.exitCode, signal: entry.exit!.signal ?? 0 }, { exitCode: 0, signal: 0 },
+      "native Pi exits normally on the manager's graceful shutdown");
+    assert.equal(processIsAlive(entry.handle.pid), false);
+  }
+  completed = true;
 });
 
 test("bounded handoff failure diagnostics retain the owned evidence root without weakening the exact fidelity predicate", { timeout: 30_000 }, async (t) => {

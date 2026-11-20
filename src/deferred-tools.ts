@@ -9,7 +9,7 @@ import { loadHostPeerModule, resolveHostPeerFile } from "./host-peer-loader";
 import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
 import { GIT_READ_TOOL_NAME } from "./git-read/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
-import { renderAuthorizedToolInventory } from "./tool-inventory";
+import { CODEMODE_TOOL_NAME, renderAuthorizedToolInventory } from "./tool-inventory";
 import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
 import { isNativePowerShellBuiltinEntry, probeNativePowerShellHostSupport } from "./native-powershell-support";
 
@@ -31,8 +31,12 @@ const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
  * permitted tools normally when off. Plan/research disables it, explicit
  * native registry restrictions remove it, and no builtin is ever
  * re-registered by this extension.
+ *
+ * The canonical binding lives in the dependency-free ./tool-inventory module
+ * (issue #653) so configuration-only consumers can reference it without this
+ * manager's import graph; re-exported here for the established callers.
  */
-export const CODEMODE_TOOL_NAME = "codemode";
+export { CODEMODE_TOOL_NAME };
 
 /**
  * Canonical ToolExposure values Pi 1.0 reports in `getAllTools()` metadata.

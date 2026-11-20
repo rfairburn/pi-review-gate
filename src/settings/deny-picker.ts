@@ -164,7 +164,7 @@ export async function retainedDenySelect(
   // cancellation return path, preserving the caller's staged fields.
   if (menuSaveIsRequested(ui.saveControl)) return { key: undefined, query: initialQuery };
   if (ui.mode === "tui" && typeof ui.custom === "function") {
-    const host = await resolveMenuTuiHostForRenderers();
+    const host = await resolveMenuTuiHostForRenderers(ui);
     if (host !== undefined && host.Input !== undefined) {
       const view = { query: initialQuery };
       try {

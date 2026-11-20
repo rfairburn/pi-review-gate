@@ -20,7 +20,7 @@ pages link to each other instead of duplicating detail.
 | [Session host](session-host-alpha.md) | The recommended `pi-review-sessions` sidebar host: requirements and launch entry points, roster and session lifecycle, network pairing, saved conversations, shortcuts, and platform/input limits. |
 | [Native Pi tools](native-pi-tools.md) | Pi's native MCP and codemode surfaces: role-based loading and the deferred-tools toggle, live registry reconciliation, the delegated-worker ceiling, and scoped tool denial. |
 | [Configuration](configuration.md) | Config discovery, core JSON fields and defaults, operating modes, reviewer catalogs/layers, legacy compatibility, and web settings. |
-| [Settings menu](settings.md) | `/review-settings` sections, staged edits, Escape/Cancel/Save/Ctrl+S apply and persistence semantics, reload requirements, and separate live runtime actions. |
+| [Settings menu](settings.md) | `/review-settings` sections, staged edits, Escape/Cancel/Save/Ctrl+S apply and persistence semantics, reload requirements, separate live runtime actions, and the sidebar's disk-only review-gate settings editor. |
 | [Tool protection](tool-protection.md) | The optional pre-execution auditor, policy levels and limits, saved auditor settings, and the inert fixture tester. |
 | [Scheduled tasks](scheduled-tasks.md) | Schedule catalog, destinations, worker/review overrides, instruction images, local time/DST, and runtime dispatch. |
 | [Review workflow](review-workflow.md) | Review windows, evidence bundles, reviewer adapters, corrections, transmission, commands, cancellation. |

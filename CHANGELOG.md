@@ -15,6 +15,38 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.302]
+
+### Added
+
+- **Disk-only review-gate settings in the sidebar (#653)**: the `pi-review-sessions` sidebar now
+  edits the local host's saved review-gate configuration through the shared `/review-settings`
+  menu, validation, and persistence path — no hidden Pi or review-gate session. Each open re-reads
+  disk, edits stay a menu-local draft, and only an explicit **Save** (or Ctrl+S) writes; **Cancel**,
+  root Escape, and closing discard it, unlike the Pi-session menu, where root Escape still applies
+  session-only and **Save changes** still persists and applies. With no file present the menu shows
+  the ordinary zero-model defaults and creates none until that first **Save**, which uses the
+  existing guarded initializer; an existing primary or compatibility fallback is never initialized
+  over, and an explicit `PI_REVIEW_GATE_CONFIG` naming a missing file stays an error. A save is what
+  later new local instances load (**New session** or a `SessionSpawn` child), never a running
+  session, which keeps its current effective configuration, and the editor is local-host only. See
+  [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
+- **First-launch Pi model scope guidance (#653)**: when no Pi model scope is configured, the
+  sidebar editor's Pi model pickers offer no choices and now state why in one bounded, non-blocking
+  notice — scope models in a real Pi session (a **New session** with review and subtasks left unset
+  is enough) and reopen. Nothing else is blocked, no Pi configuration is written, no session or
+  model is created, and a sidebar first-run setup flow stays separate future work
+  ([#719](https://github.com/rfairburn/pi-review-gate/issues/719)). See
+  [Sidebar review-gate settings](docs/settings.md#sidebar-review-gate-settings-disk-only).
+
+### Changed
+
+- **`PI_REVIEW_GATE_CONFIG` is absolute for managed sidebar children (#653)**: for the managed
+  sidebar only, a nonempty relative value in the host's startup environment is resolved once at
+  host startup against the host's startup directory (warning, never a refused start) and passed
+  absolute to every managed child, including a `SessionSpawn` child in another workspace. See
+  [Config discovery](docs/configuration.md#config-discovery); unrelated behavior is unchanged.
+
 ## [0.1.0-dev.301]
 
 ### Added

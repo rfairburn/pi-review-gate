@@ -13,6 +13,22 @@ described only briefly here is owned by the linked page.
 ## Config discovery
 
 - `PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json` selects the config file explicitly.
+- For the managed sidebar (`pi-review-sessions`) that explicit selection is always an
+  **absolute** path: a nonempty relative `PI_REVIEW_GATE_CONFIG` in the host's startup
+  environment is resolved once at host startup against the host's startup directory — warning
+  before the host's terminal starts, never refusing the start — and that absolute value is what
+  every managed child receives, a sidebar **New session** and a `SessionSpawn` child alike,
+  including a child whose workspace is another directory. A relative value is never re-resolved
+  per child, so relative config-per-session paths are not supported and already-running sessions
+  are not retrofitted. An already-absolute value passes through unchanged, the canonical
+  primary/compatibility fallback order and its fail-closed presence protections stay as described
+  here, and standalone `pi-review-gate` and `pi-review-gate-cmd` launches and direct `pi -e`
+  loads are unchanged.
+- The sidebar's
+  [disk-only settings editor](settings.md#sidebar-review-gate-settings-disk-only) reads and
+  writes the file these rules select — the explicit override when set, otherwise the first
+  existing implicit candidate below — so a saved sidebar change is what a later local instance
+  loads; that section owns the no-file first-use and guarded-creation rules.
 - Without an explicit selection, two fixed implicit candidates are checked in order:
   1. `review-gate.json` in the Pi agent directory —
      `~/.pi/agent/review-gate.json` by default

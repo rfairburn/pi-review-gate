@@ -24,7 +24,7 @@ import {
   type KeybindingsManager as KeybindingsManagerType,
 } from "pi-session-host-tui";
 
-import { SESSION_HOST_BOOTSTRAP_ENV } from "./launch";
+import { SESSION_HOST_BOOTSTRAP_ENV, MAX_NATIVE_CONFIG_BYTES } from "./launch";
 import type { SessionHostFieldKeybindings } from "./field-editor";
 import { PI_AGENT_DIR_ENV, normalizeWindowsShellPath } from "../config-path";
 import { defaultProfileStateRoot, nativePiAgentDir } from "./profiles";
@@ -106,7 +106,12 @@ export function withNativeFieldKeybindings<T>(manager: SessionHostFieldKeybindin
 
 const MAX_KEYBINDINGS_BYTES = 256 * 1024;
 const MAX_NATIVE_SETTINGS_BYTES = 256 * 1024;
-const MAX_EDITOR_TEXT_BYTES = 8192;
+/**
+ * The unchanged external-editor text bound of every existing session-host
+ * field. It is exported so a caller can name it explicitly; requesting a
+ * different bound is always an explicit per-call choice (issue #653).
+ */
+export const MAX_EDITOR_TEXT_BYTES = 8192;
 const NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const NONBLOCK = fsConstants.O_NONBLOCK ?? 0;
 
@@ -202,10 +207,39 @@ export async function runNativeExternalEditor(
     readonly spawn?: typeof nodeSpawn;
     /** @internal Parser/default test seam only; production always uses the actual platform. */
     readonly platform?: NodeJS.Platform;
+    /**
+     * Explicit per-call text bound (issue #653).
+     *
+     * Absent, it is the unchanged {@link MAX_EDITOR_TEXT_BYTES} every existing
+     * caller already gets. A caller that owns a genuinely larger value — the
+     * generic settings text field, whose value lives inside the persisted
+     * review-gate config file — may ask for at most that file's own existing
+     * size bound (`MAX_NATIVE_CONFIG_BYTES`), so a long scheduled instruction
+     * or the shared URL blocklist can round-trip through Ctrl+G without the
+     * temporary file ever being read unbounded. There is no global increase:
+     * a call that does not name a bound behaves byte-for-byte as before.
+     */
+    readonly maxTextBytes?: number;
+    /**
+     * Preserve the value's final line terminator exactly (issue #653).
+     *
+     * Absent, the unchanged behavior applies: one trailing CRLF, LF, or CR is
+     * removed. That is right for every existing caller, whose field is a
+     * single line and for which the temporary file's conventional closing
+     * newline is not part of the value. A caller that owns multi-line content
+     * must set this, because for such a value the closing newline IS content:
+     * without it, opening a value that ends in a line break and saving it
+     * unchanged would silently delete that break.
+     */
+    readonly preserveFinalLineTerminator?: boolean;
   },
 ): Promise<string> {
+  const maxTextBytes = options.maxTextBytes ?? MAX_EDITOR_TEXT_BYTES;
+  if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_NATIVE_CONFIG_BYTES) {
+    throw new Error(`external editor maxTextBytes must be an integer between 1 and ${MAX_NATIVE_CONFIG_BYTES}`);
+  }
   const input = Buffer.from(text, "utf8");
-  if (input.byteLength > MAX_EDITOR_TEXT_BYTES || text.includes("\0")) {
+  if (input.byteLength > maxTextBytes || text.includes("\0")) {
     throw new Error("external editor input is outside the bounded field limit");
   }
   const platform = options.platform ?? process.platform;
@@ -271,24 +305,29 @@ export async function runNativeExternalEditor(
         || confirmedPathStats.isSymbolicLink()
         || !sameIdentity(pathIdentity, identity(openedStats))
         || !sameIdentity(pathIdentity, identity(confirmedPathStats))
-        || openedStats.size > BigInt(MAX_EDITOR_TEXT_BYTES)) {
+        || openedStats.size > BigInt(maxTextBytes)) {
         throw new Error("external editor result is not a bounded regular file");
       }
-      const bytes = Buffer.allocUnsafe(MAX_EDITOR_TEXT_BYTES + 1);
+      const bytes = Buffer.allocUnsafe(maxTextBytes + 1);
       let offset = 0;
       while (offset < bytes.length) {
         const count = readSync(readDescriptor, bytes, offset, bytes.length - offset, offset);
         if (count <= 0) break;
         offset += count;
       }
-      if (offset > MAX_EDITOR_TEXT_BYTES) throw new Error("external editor result exceeds the field limit");
+      if (offset > maxTextBytes) throw new Error("external editor result exceeds the field limit");
       const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset));
       assertOwnedDirectory(directory, directoryIdentity);
       assertOwnedRegularFile(filePath, pathIdentity);
       closeSync(readDescriptor);
       readDescriptorClosed = true;
       cleanupIdentity = pathIdentity;
-      return removeFinalLineTerminator(decoded);
+      // The only place a returned value is reshaped. Existing callers keep the
+      // exact closing-newline removal they always had; a multi-line caller asks
+      // for its content back untouched, so a no-op round trip is a no-op.
+      return options.preserveFinalLineTerminator === true
+        ? decoded
+        : removeFinalLineTerminator(decoded);
     } finally {
       if (!readDescriptorClosed) {
         try { closeSync(readDescriptor); } catch { /* descriptor is already closed or validation failed */ }

@@ -177,8 +177,21 @@ export type MenuCustomFactory = (
   done: (result: string | undefined) => void,
 ) => unknown;
 
+/**
+ * The narrow menu-host injection surface (issue #653).
+ *
+ * A standalone host that owns its own TUI components — the session-host
+ * sidebar builds a pinned pi-tui {@link MenuTuiHost} — supplies it here, one
+ * per UI, so every settings menu of that UI renders through the host's own
+ * live components with no Pi peer load and no hidden Pi session. Two UIs can
+ * carry different hosts without interfering, and Pi hosts never supply one.
+ */
+export interface MenuTuiHostUi {
+  menuTuiHost?: MenuTuiHost;
+}
+
 /** The UI surface retainedSelect needs (host ctx.ui or a structural mock). */
-export interface RetainedUi {
+export interface RetainedUi extends MenuTuiHostUi {
   select(title: string, options: string[]): Promise<string | undefined>;
   /** Host custom TUI component (Pi hosts only); guarded by `mode === "tui"`. */
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
@@ -232,9 +245,11 @@ export interface MenuContainer {
 }
 
 /**
- * The host TUI surface the adapter needs. Injectable through
- * {@link setMenuTuiHost} for tests; loaded from the running Pi's own modules
- * (host alias first, then host-relative resolution) otherwise.
+ * The host TUI surface the adapter needs. Supplied per UI by a standalone
+ * host that owns its own TUI components (`ui.menuTuiHost`, issue #653);
+ * injectable process-globally through {@link setMenuTuiHost} for tests; and
+ * loaded from the running Pi's own modules (host alias first, then
+ * host-relative resolution) otherwise.
  */
 export interface MenuTuiHost {
   SelectList: new (items: MenuSelectItem[], maxVisible: number, theme: MenuSelectListTheme) => MenuSelectList;
@@ -270,7 +285,12 @@ const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 let hostOverride: MenuTuiHost | undefined;
 let hostLoadPromise: Promise<MenuTuiHost | undefined> | undefined;
 let hostEntryProvider: (() => string | undefined) | undefined;
-/** Test seam: inject a fake TUI host, or clear the override with undefined. */
+/**
+ * Test seam: inject a fake TUI host process-globally, or clear the override
+ * with undefined. A standalone host that owns its own TUI components never
+ * uses this seam — it supplies its host per UI through `ui.menuTuiHost`
+ * (issue #653), so separate UIs never share one global override.
+ */
 export function setMenuTuiHost(host: MenuTuiHost | undefined): void {
   hostOverride = host;
   hostLoadPromise = undefined;
@@ -292,15 +312,23 @@ function resolveMenuTuiHost(): Promise<MenuTuiHost | undefined> {
 }
 
 /**
- * The shared host resolution for the settings renderers (issue #463).
+ * The shared host resolution for the settings renderers (issue #463, #653).
  *
- * The deny picker's search-capable renderer resolves the SAME host through
- * this seam, so an injected fake or the running Pi's own modules are used
- * identically by every settings menu, and the load failure mode stays the
- * same: a rejecting or unloadable peer resolves to undefined and the caller
- * degrades to the plain selector.
+ * An explicit per-UI host (`ui.menuTuiHost`, supplied by a standalone host
+ * that owns its own TUI components) wins outright: the renderers drive that
+ * host's own SelectList, Input, Container, keybinding sync, and theme seams,
+ * with no Pi peer load and no hidden Pi session. Each UI resolves only its
+ * own host, so two UIs with different hosts never interfere.
+ *
+ * Without an injected host the resolution is exactly what it was before the
+ * seam existed — the {@link setMenuTuiHost} test override first, then the
+ * running Pi's own peer modules — so every settings menu keeps its current
+ * path, including the failure mode: a rejecting or unloadable peer resolves
+ * to undefined and the caller degrades to the plain selector.
  */
-export function resolveMenuTuiHostForRenderers(): Promise<MenuTuiHost | undefined> {
+export function resolveMenuTuiHostForRenderers(ui?: MenuTuiHostUi): Promise<MenuTuiHost | undefined> {
+  const injected = ui?.menuTuiHost;
+  if (injected !== undefined) return Promise.resolve(injected);
   return resolveMenuTuiHost().catch(() => undefined);
 }
 
@@ -452,7 +480,7 @@ export async function retainedSelect(ui: RetainedUi, input: RetainedSelectInput)
   if (ui.mode === "tui" && typeof ui.custom === "function") {
     // Resolution must stay fail-safe at the call site: any future loader
     // rejection degrades to the plain selector instead of breaking the menu.
-    const host = await resolveMenuTuiHost().catch(() => undefined);
+    const host = await resolveMenuTuiHostForRenderers(ui);
     if (host !== undefined) {
       try {
         return await customSelect(ui, host, input);

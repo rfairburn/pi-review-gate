@@ -212,6 +212,8 @@ interface Harness {
   /** Raw input observed by a later extension listener (the popup's Escape router position). */
   extensionListenerInput: string[];
   chatDraft: { text: string };
+  /** Read-only view of the editor slot's current native editor text. */
+  editorText(): string;
   /** Opens the popup; `closed` settles when the production shortcut handler returns. */
   open(): Promise<{ closed: Promise<void> }>;
   frame(): string[];
@@ -402,6 +404,7 @@ async function createHarness(
     copied,
     extensionListenerInput,
     chatDraft,
+    editorText: () => editor.getText(),
     async open() {
       const shortcut = shortcuts.get(QUESTION_LIST_SHORTCUT_KEY);
       assert.ok(shortcut, "the popup shortcut is registered");
@@ -736,6 +739,7 @@ test("native fullscreen dispatch: clicking a visible native completion row in th
   // synthesizes the click, the popup forwards it through the shared native
   // text-field seam, and the native Editor applies exactly that suggestion.
   await harness.click(two);
+  assert.equal(harness.editorText(), "docs/two.md", "the click left exactly the clicked suggestion in the native editor");
   assert.ok(onScreen(harness, "docs/two.md"), `the clicked suggestion was applied:\n${harness.frame().join("\n")}`);
   assert.ok(!onScreen(harness, "one.md"), "the completion list closed after the click");
   assert.equal(harness.sent.length, 0, "the completion click submitted no answer");
@@ -2249,6 +2253,7 @@ test("installed bridge field: SGR click on a visible native completion row appli
   await draw();
   terminal.input(sgr.release(two.x, two.y));
   await draw();
+  assert.equal(mode.editor.getText(), "docs/two.md", "the click left exactly the clicked suggestion in the native field editor");
   assert.ok(onFrame("docs/two.md"), `the clicked suggestion was applied:\n${frame().join("\n")}`);
   assert.ok(!onFrame("one.md"), "the completion list closed after the click");
   await settle();

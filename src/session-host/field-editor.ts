@@ -604,6 +604,18 @@ export class SessionHostTextField {
     return result;
   }
 
+  /**
+   * True when this field's own input routing takes the packet as its clear or
+   * external-editor action, through the same effective binding and fallback
+   * resolution it routes with, whether or not an external editor is
+   * available. A host offering a shortcut of its own over the field checks
+   * this so its shortcut never shadows either action.
+   */
+  claimsClearOrExternalEditor(data: string): boolean {
+    return this.matchesAction(data, this.actionBindings.clear, TUI_COPY_ACTION)
+      || this.matchesAction(data, this.actionBindings.externalEditor);
+  }
+
   /** Release host redraw and keybinding ownership; no TUI or terminal stop/start is performed. */
   dispose(): void {
     if (this.disposed) return;

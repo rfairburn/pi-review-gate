@@ -1778,6 +1778,105 @@ test("long notice: with Ctrl+O and F2-F8 all bound to a field action the return-
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
 });
 
+const F2 = "\x1bOQ";
+
+/**
+ * The shared text field over the owned native keybindings, configured with
+ * the same app-level action IDs Main gives every host field; its external
+ * editor is a synthetic callback that only records the text it was given.
+ * Every field it opens is recorded so a test can read its exact text.
+ */
+function nativeKeybindingField(
+  l: Local,
+  editorCalls: string[],
+  fields: Array<ReturnType<typeof createSessionHostTextField>>,
+): NonNullable<SidebarControllerOptions["createTextField"]> {
+  return (options) => {
+    const keybindings = loadNativeFieldKeybindings(l.agentDir);
+    const field = createSessionHostTextField({
+      kind: "text",
+      multiline: options.multiline === true,
+      initialText: options.initialText,
+      keybindings: keybindings.manager,
+      actionBindings: { clear: "app.clear", submit: "tui.input.submit", cancel: "app.interrupt", externalEditor: "app.editor.external" },
+      onInvalidate: options.onInvalidate,
+      onSubmit: options.onSubmit,
+      onCancel: options.onCancel,
+      onReject: options.onReject,
+      onChange: options.onChange,
+      onExternalEditor: (text) => {
+        editorCalls.push(text);
+        return undefined;
+      },
+    });
+    fields.push(field);
+    return { field };
+  };
+}
+
+for (const action of ["app.editor.external", "app.clear"] as const) {
+  test(`long notice: with ${action} remapped to Ctrl+O the URL edit keeps that action, and the advertised fallback reads the notice`, async (t) => {
+    const l = local(t);
+    write(join(l.agentDir, "keybindings.json"), { [action]: "ctrl+o" });
+    const bytesA = write(l.canonical, DISK_A);
+    const editorCalls: string[] = [];
+    const fields: Array<ReturnType<typeof createSessionHostTextField>> = [];
+    const d = driven(l, { createTextField: nativeKeybindingField(l, editorCalls, fields) });
+    d.rows = 40;
+    await openReviewSettings(d);
+    await chooseMenuRow(d, "Tools", "Web");
+    await chooseMenuRow(d, "Web", "URL blocklist");
+    moveToMenuRow(d, "URL blocklist");
+    d.key(ENTER);
+    await waitFor(d, (shownText) => shownText.includes("Blocked URL patterns"), "the shared text field");
+    assert.equal(fields.length, 1, "the URL edit opened one shared field");
+    const fieldText = (): string => fields[0]!.getText();
+    d.key("abc");
+    assert.equal(fieldText(), "abc");
+
+    d.rows = 14;
+    let shown = d.frame();
+    let text = shown.join("\n");
+    assert.match(text, /Blocked URL patterns/, "the field stays open");
+    assert.equal(shown.filter((line) => line.includes("... f2 read all")).length, 1, `the fallback is advertised:\n${text}`);
+    assert.doesNotMatch(text, /ctrl\+o read all/, text);
+
+    // Ctrl+O is the field's own action, never the reader.
+    d.key(CTRL_O);
+    await turns();
+    shown = d.frame();
+    text = shown.join("\n");
+    assert.equal(readerPosition(shown), undefined, `Ctrl+O opened no reader:\n${text}`);
+    assert.match(text, /Blocked URL patterns/, "the field stays open");
+    if (action === "app.editor.external") {
+      assert.deepEqual(editorCalls, ["abc"], "Ctrl+O invoked the external editor with the draft");
+      assert.equal(fieldText(), "abc", "the editor returned nothing, so the draft stands");
+    } else {
+      assert.deepEqual(editorCalls, []);
+      assert.equal(fieldText(), "", `Ctrl+O cleared the field:\n${text}`);
+      d.key("abc");
+      assert.equal(fieldText(), "abc");
+    }
+
+    // The advertised fallback reads the whole notice, and Escape returns to the same draft.
+    d.key(F2);
+    shown = d.frame();
+    assert.ok(!shown.join("\n").includes("Blocked URL patterns"), `the reader covers the field:\n${shown.join("\n")}`);
+    assert.equal(flowed(readWholeNotice(d, "Review settings (local)")).trim(), URL_BLOCKLIST_NOTICE, "the reader shows the exact notice");
+    d.key(ESC);
+    await turns();
+    text = d.text();
+    assert.match(text, /Blocked URL patterns/, `Escape from the reader kept the edit open:\n${text}`);
+    assert.equal(fields.length, 1, "the reader round trip kept the same field");
+    assert.equal(fieldText(), "abc", `the draft is untouched:\n${text}`);
+    assert.ok(d.frame().some((line) => line.includes("abc")), `the draft is drawn again:\n${text}`);
+    assert.deepEqual(editorCalls, action === "app.editor.external" ? ["abc"] : [], "nothing else reached the editor");
+    d.sidebar.cancelReviewSettings();
+    await Promise.all(d.settled);
+    assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "reading saved nothing");
+  });
+}
+
 test("a short sidebar shows both choices of a two-item list instead of one choice and a scroll cue", async (t) => {
   const l = local(t);
   const bytesA = write(l.canonical, DISK_A);

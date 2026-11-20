@@ -12160,9 +12160,10 @@ export class SidebarController {
 
   /**
    * The reader key the pane advertises: the first candidate that no host
-   * chord, no configured `tui.*` binding of the open, and no Save, Confirm,
-   * Cancel, or field submit/cancel binding claims, so taking it never shadows
-   * a configured action. The Settings submenu's own keys are fixed and use
+   * chord, no configured `tui.*` binding of the open, no Save, Confirm, or
+   * Cancel, no field submit/cancel binding, and no open field's own effective
+   * clear or external-editor binding claims, so taking it never shadows a
+   * configured action. The Settings submenu's own keys are fixed and use
    * none of the candidates. When every candidate is claimed, the configured
    * return-to-Main chord — reserved and inert in every settings pane — is the
    * reader key, and only while a drawn reader offer advertises it.
@@ -12177,10 +12178,22 @@ export class SidebarController {
         if (session.matchesConfirm(packet) || session.matchesCancel(packet) || matchesKey(packet, "ctrl+s")) continue;
         if (reviewSettingsBindingClaims(session.keybindings.manager, packet)) continue;
       }
-      if (editing && (this.formMatchesSubmit(packet) || this.formMatchesCancel(packet))) continue;
+      if (editing && (this.formMatchesSubmit(packet) || this.formMatchesCancel(packet)
+        || this.formFieldClaimsClearOrExternalEditor(packet))) continue;
       return candidate.key;
     }
     return this.returnToMainKey;
+  }
+
+  /** The open field's own clear/external-editor claim on a packet; a failing check claims it. */
+  private formFieldClaimsClearOrExternalEditor(packet: string): boolean {
+    const field = this.formField;
+    if (field === undefined || typeof field.claimsClearOrExternalEditor !== "function") return false;
+    try {
+      return field.claimsClearOrExternalEditor(packet);
+    } catch {
+      return true;
+    }
   }
 
   /** Consume the held reader key's repeat/release after it opened or closed the reader. */
@@ -18070,9 +18083,11 @@ interface SettingsNoticeReader extends SettingsNoticeAnchor {
 
 /**
  * The reader key, in preference order, with the packet a terminal sends for
- * it: the first that neither host chord (toggle, return to Main) nor any of
- * the open's configured `tui.*` bindings claims is advertised, so it never
- * shadows a configured action. None is bound by default in the settings
+ * it: the first that no host chord (toggle, return to Main), configured
+ * `tui.*` binding of the open, or other action listed at
+ * `SidebarController.noticeReaderKey` (including an open field's own clear
+ * and external-editor bindings) claims is advertised, so it never shadows a
+ * configured action. None is bound by default in the settings
  * screens or the shared field, and the two host chords can never claim all
  * of them; the key is taken only while a clipped notice is advertised.
  */

@@ -448,7 +448,13 @@ export function expansionHint(
 
 /** Structural component shape the wrapper can wrap (host render slots). */
 export interface PresentationViewComponent {
-  render(width: number): string[];
+  /**
+   * Pi declares component render output read-only and may hand back the same
+   * cached array while nothing changed, so a wrapped view's rows are borrowed:
+   * the wrapper returns them unchanged when it has nothing to decorate and
+   * builds a new array whenever it changes a row.
+   */
+  render(width: number): readonly string[];
   invalidate?(): void;
   handleInput?(data: string): void;
   handleMouse?(event: unknown): unknown;
@@ -469,17 +475,18 @@ export interface PresentationViewComponent {
  * forwarded, optional `handleMouse`/`handleInput`/`wantsKeyRelease` are
  * forwarded verbatim, and any event the inner does not handle falls through
  * to the host's per-card MouseRegion (fullscreen click toggle) or the host's
- * global `app.tools.expand` keybinding.
+ * global `app.tools.expand` keybinding. It hands back the shared view shape,
+ * never the inner subtype: only the view methods are forwarded.
  */
-export function withExpansionHint<T extends PresentationViewComponent>(
-  inner: T,
+export function withExpansionHint(
+  inner: PresentationViewComponent,
   expanded: boolean,
   fg?: (color: string, text: string) => string,
-): T {
+): PresentationViewComponent {
   const hint = expansionHint(expanded, fg);
   if (hint === undefined) return inner;
   const hinted: PresentationViewComponent = {
-    render(width: number): string[] {
+    render(width: number): readonly string[] {
       const lines = inner.render(width);
       if (lines.length === 0) return lines;
       const header = lines[0];
@@ -516,7 +523,7 @@ export function withExpansionHint<T extends PresentationViewComponent>(
   if (inner.wantsKeyRelease === true) {
     hinted.wantsKeyRelease = true;
   }
-  return hinted as T;
+  return hinted;
 }
 
 /**

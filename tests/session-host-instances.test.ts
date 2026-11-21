@@ -97,6 +97,9 @@ import activateReporter, {
 import { __test as brokerTest, createStatusBroker } from "../src/session-host/broker";
 import { SidebarController } from "../src/session-host/sidebar";
 import { __test as mainTest } from "../src/session-host/main";
+import { computeHostLayout } from "../src/session-host/compositor";
+import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
+import { visibleWidth } from "pi-session-host-tui";
 import {
   ACTIVITY_CENSUS_CAPABILITY,
   HOST_BOOTSTRAP_ENV,
@@ -4324,6 +4327,81 @@ test("status updates publish activity intent independently of the ownership coun
 
     harness.registrar.emitDisconnect(entry);
     assert.deepEqual([view().activeTasks, view().activeShells], [null, null], "a reporter disconnect collapses intent to unknown");
+    harness.spawned[0]!.emitExit(0);
+  } finally {
+    cleanup(harness);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #662 on the REAL registration path: one session registers, reports both
+// activity counts, then loses one axis and finally both. The MANAGER's own view
+// (never a handcrafted DTO) is drawn by the shared card at the width the host's
+// own compositor resolves, and every row stays whole with its two-cell indent.
+// ---------------------------------------------------------------------------
+
+test("a registered session's known-to-unknown count transition stays whole at the host's resolved sidebar width", async () => {
+  const harness = makeHarness("registered-count-unknown-row-fit");
+  try {
+    const id = await harness.manager.create({ label: "fit", workspace: harness.workspace });
+    const entry = harness.registrar.entryFor(id);
+    // The width comes from the host's own layout, never a hardcoded number: a wide
+    // outer terminal gives the roster its fixed pane rather than an overlay.
+    const layout = computeHostLayout(120, 40, { sidebarVisible: true, focus: "sidebar" });
+    assert.equal(layout.sidebarOverlay, false, "a 120-column terminal draws the fixed sidebar, not an overlay");
+    const sidebarCols = layout.sidebar?.cols;
+    const sidebarRows = layout.sidebar?.rows;
+    assert.equal(sidebarCols, 35, "the session host resolves its own sidebar pane to 35 columns");
+    assert.ok(typeof sidebarCols === "number" && typeof sidebarRows === "number",
+      "the fixed roster pane carries real geometry");
+
+    const sidebar = new SidebarController({ theme: "dark", onAction: () => undefined });
+    /** The registered card's actual count row, painted by the shared card. */
+    const countRow = (): string => {
+      sidebar.updateItems([mainTest.toSidebarItem(viewFor(harness.manager, id))]);
+      const row = sidebar.renderRoster(sidebarCols, sidebarRows).lines
+        .find((line) => stripSgr(line).includes("bg tasks")) ?? "";
+      assert.notEqual(row, "", "the registered card draws its count row");
+      return row;
+    };
+
+    // Each step's exact row — two-cell indent included — and its exact width.
+    const steps: readonly {
+      readonly tasks: number | null;
+      readonly shells: number | null;
+      readonly row: string;
+      readonly width: number;
+    }[] = [
+      { tasks: 2, shells: 3, row: "  bg tasks 2 | shells 3", width: 23 },
+      { tasks: null, shells: 3, row: "  bg tasks unknown | shells 3", width: 29 },
+      { tasks: 4, shells: null, row: "  bg tasks 4 | shells unknown", width: 29 },
+      { tasks: null, shells: null, row: "  bg tasks unknown | shells unknown", width: 35 },
+    ];
+    const dim = `\x1b[${sidebarPaletteFor("dark").statusUnknown}m`;
+    for (const step of steps) {
+      harness.registrar.emitStatus(entry, {
+        busy: false,
+        pendingInput: false,
+        inputSurface: false,
+        activity: [],
+        activeTasks: step.tasks,
+        activeShells: step.shells,
+      });
+      const view = viewFor(harness.manager, id);
+      // The facts really moved through the host, so a stale retained count or an
+      // unknown-to-zero collapse fails here.
+      assert.deepEqual([view.activeTasks, view.activeShells], [step.tasks, step.shells]);
+      const raw = countRow();
+      const text = stripSgr(raw).trimEnd();
+      assert.equal(text, step.row, `both labels, both values, and the indent stay whole: ${text}`);
+      assert.ok(!text.includes("..."), `nothing is ellipsized away: ${text}`);
+      assert.equal(visibleWidth(text), step.width, `${step.row} draws exactly ${step.width} columns`);
+      assert.ok(step.width <= sidebarCols, `${step.width} columns fit the ${sidebarCols}-column pane`);
+      // Only the unknown VALUE words take the shared dim role on this path; the
+      // palette's exact colours are the effective-cell colour tests' job.
+      const unknowns = (step.tasks === null ? 1 : 0) + (step.shells === null ? 1 : 0);
+      assert.equal(raw.split(dim).length - 1, unknowns, `only the unknown values are dim: ${raw}`);
+    }
     harness.spawned[0]!.emitExit(0);
   } finally {
     cleanup(harness);

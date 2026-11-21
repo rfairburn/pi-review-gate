@@ -308,11 +308,12 @@ error red (bold), uncapped, so a session with more intended work reads hotter.
 That red is activity intensity only — it never reclassifies the row's status,
 notice, or lifecycle, and a busy card never reads as a failed one. The
 `bg tasks` and `shells` label words, the spaces, and the `|` separator stay in
-the pane's normal text colour, and an `unknown` count stays ordinary text: only
-an observed number is painted, and the row's wording and honest unknown handling
-are unchanged. The sidebar's own title, the navigation highlight, the active
-conversation's title, and the scrollbar roles likewise take Pi's accent, link,
-body-text, track, and thumb colours for the chosen appearance.
+the pane's normal text colour, and an `unknown` count takes the same dim colour
+an unknown agent status uses: only the value words are painted, and the row's
+wording and honest unknown handling are unchanged. The sidebar's own title, the
+navigation highlight, the active conversation's title, and the scrollbar roles
+likewise take Pi's accent, link, body-text, track, and thumb colours for the
+chosen appearance.
 
 This is colour only: the wording, the state classification, and which facts are
 shown never change. The sidebar works with only remote sessions and no local Pi
@@ -2663,8 +2664,9 @@ text colour. The words and the observed/unknown classification remain unchanged;
 never substitutes for status text. The two background
 activity numbers are coloured
 independently by how much work each reports (0 muted, 1-2 success, 3-6 warning, 7 or
-more error red, uncapped), while their labels, the separator, and any `unknown` value
-stay ordinary text; the error-family red is activity intensity only and never means the session
+more error red, uncapped), while their labels and the separator stay ordinary text
+and any `unknown` value takes the same dim colour an unknown agent status uses;
+the error-family red is activity intensity only and never means the session
 failed.
 
 The actual active Main conversation keeps its own title colour while its card is

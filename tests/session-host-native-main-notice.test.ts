@@ -291,6 +291,36 @@ function noticeBodyStartVisible(frame: string): boolean {
   return titleRow >= 0 && headingRow > titleRow;
 }
 
+/** The Main harness's short frame-quiet window, applied to the popup rows only. */
+const POPUP_SETTLE_QUIET_MS = 300;
+
+/**
+ * Return the current frame once the ruled shared popup has stopped changing.
+ *
+ * Main's frame writer repaints changed rows top-down with no atomic frame
+ * marker, so a PTY read can end mid-repaint: a row shifted up by a scroll step
+ * can be drawn while the rows below it still show the previous page. Only the
+ * popup's rows are compared, because A's still-running native turn may keep
+ * repainting rows outside it. The popup must stay unchanged for one quiet
+ * window within the bounded event deadline; a settled frame is returned as
+ * observed, so nothing is waited away.
+ */
+async function settledPopupFrame(driver: MainPtyDriver, description: string): Promise<string> {
+  const deadline = Date.now() + EVENT_TIMEOUT_MS;
+  for (;;) {
+    const baseline = nativeSharedPopupText(driver.currentText());
+    try {
+      await driver.frameSignal.waitForQuiet(() => nativeSharedPopupText(driver.currentText()) !== baseline,
+        POPUP_SETTLE_QUIET_MS, description);
+      return driver.currentText();
+    } catch (error) {
+      // waitForQuiet rejects with this suffix only when the popup changed.
+      if (!(error instanceof Error) || !error.message.endsWith(": unexpected owned event")) throw error;
+      if (Date.now() >= deadline) throw new Error(`${description}: the shared popup did not settle before the deadline`);
+    }
+  }
+}
+
 async function revealFullMarkdownBody(
   driver: MainPtyDriver,
   shortcutPair: "ctrlAltPage" | "shiftAltArrow",
@@ -333,7 +363,6 @@ async function revealFullMarkdownBody(
       ? direction === "PageUp" ? KEY_CTRL_ALT_PAGE_UP : KEY_CTRL_ALT_PAGE_DOWN
       : direction === "PageUp" ? KEY_SHIFT_ALT_UP : KEY_SHIFT_ALT_DOWN;
     driver.pty.write(key);
-    let observedFrame: string | undefined;
     let observedRevision = -1;
     const description = `the native detail body advances through ${direction} (${page})`;
     try {
@@ -345,7 +374,6 @@ async function revealFullMarkdownBody(
         // marker. The complete read below separately requires every marker.
         const nextContentMarkers = visibleNoticeMarkers(next, scrollMarkers);
         if (!nextContentMarkers.some((marker) => beforeContentMarkers.has(marker))) return false;
-        observedFrame = next;
         observedRevision = driver.frameRevision;
         return true;
       }, description, beforeRevision);
@@ -355,8 +383,10 @@ async function revealFullMarkdownBody(
         + `Bounded full-pane popup frames:\n${pageDiagnostics.join("\n\n--- next captured page ---\n\n")}`,
       { cause: error });
     }
-    const nextFrame = observedFrame ?? driver.currentText();
-    recordPage(`${direction} ${page}`, observedRevision, nextFrame);
+    // The first progressed frame can be a partial repaint of this scroll step,
+    // so the next scroll decision and every content read use the settled popup.
+    const nextFrame = await settledPopupFrame(driver, `${description} finishes repainting the shared popup`);
+    recordPage(`${direction} ${page} (first progress at frame ${observedRevision})`, driver.frameRevision, nextFrame);
     return nextFrame;
   };
 
@@ -391,6 +421,11 @@ async function revealFullMarkdownBody(
     && actionRows(frame).length === 2); page += 1) {
     frame = await scrollNoticePage("PageDown", page + 1);
   }
+  // Every scroll step above already returned a settled popup; settling once
+  // more also covers a body that needed no PageDown. The exact assertions
+  // below read only this settled end page, so a settled duplicate still fails.
+  frame = await settledPopupFrame(driver, "the native Markdown end page finishes repainting the shared popup");
+  recordPage("end (settled)", driver.frameRevision, frame);
 
   assert.ok(sharedPopupContains(frame, BODY_SENTINEL),
     "the distant notice-body sentinel is readable after bounded popup-local scrolling");

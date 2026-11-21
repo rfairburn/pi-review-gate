@@ -800,11 +800,11 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const observerFile = join(scratch, "observer", "native-main.jsonl");
   const editorLog = createEditorLog(scratch);
   const editor = createEditorExecutable(scratch, workspaceEditTarget, editorLog);
-  // The host lexes externalEditor into argv, so the owned executable's pathname
-  // is stored as one quoted POSIX word: a temporary root containing spaces must
-  // still resolve to the one executable that both Ctrl+G checks witness.
-  const externalEditor = `'${editor.replaceAll("'", "'\\''")}'`;
-  writeFileSync(join(nativeAgentDir, "settings.json"), JSON.stringify({ externalEditor }) + "\n", {
+  // Both Ctrl+G checks read this one setting: the host lexes it into argv, while
+  // pinned Pi splits it on spaces with no shell and runs the first word verbatim
+  // on the owned editor PTY. Quote characters would reach Pi's exec as part of
+  // the pathname, so the owned executable is stored as its plain pathname.
+  writeFileSync(join(nativeAgentDir, "settings.json"), JSON.stringify({ externalEditor: editor }) + "\n", {
     flag: "wx", mode: 0o600,
   });
   const candidate = compileAndStageCandidate(scratch);

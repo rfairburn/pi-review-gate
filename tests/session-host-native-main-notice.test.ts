@@ -565,6 +565,20 @@ function questionOnlyListVisible(frame: string): boolean {
     && !sharedPopupContains(frame, REMAINING_NOTICE_TITLE);
 }
 
+/**
+ * Readiness for the short Close candidate's detail view. The notice renders
+ * its title, body, and action rows in one pass, but Main repaints rows
+ * top-down, so a PTY read can end after the body while the rows below still
+ * show the previous list. Requiring an action row fences out that partial
+ * repaint; the caller then settles the popup so the exact action assertion
+ * reads a complete frame and a settled missing/duplicate row still fails.
+ */
+function closeNoticeDetailsReady(frame: string): boolean {
+  return sharedPopupContains(frame, CLOSE_NOTICE_TITLE)
+    && sharedPopupContains(frame, "Close must remove only this selected notice")
+    && actionRows(frame).length > 0;
+}
+
 async function selectAction(driver: MainPtyDriver, target: "More details" | "Close"): Promise<void> {
   assert.deepEqual(actionRows(driver.currentText()).sort(), ["Close", "More details"],
     "the notice detail surface exposes exactly More details and Close");
@@ -617,6 +631,37 @@ test("short shared-popup matcher rejects answer/body sentinels outside the actua
     "answer-like transcript text above the popup cannot satisfy an overlay assertion");
   assert.equal(sharedPopupContains(frame, belowBody), false,
     "body-like chat text below the popup cannot satisfy an overlay assertion");
+});
+
+test("short Close notice readiness rejects a partial repaint over the previous list", () => {
+  const rule = "─".repeat(NATIVE_PANE_COLUMNS);
+  const content = (text: string): string => ` ${text}`.padEnd(NATIVE_PANE_COLUMNS, " ");
+  const frameOf = (popupRows: readonly string[]): string => {
+    const outerRows = Array.from({ length: OUTER_ROWS + 1 }, () => " ".repeat(OUTER_COLS));
+    popupRows.forEach((row, index) => {
+      outerRows[20 + index + 1] = " ".repeat(NATIVE_PANE_START) + row;
+    });
+    return outerRows.join("\n");
+  };
+  const detailHead = [rule, content(""), content(`n2: ${CLOSE_NOTICE_TITLE}`), content(""),
+    content("Close must remove only this selected notice and send no request."), content("")];
+  // Top-down repaint stopped after the body: the old list rows and bottom rule remain below.
+  const partial = frameOf([...detailHead, content(`  ${REMAINING_NOTICE_TITLE}`),
+    content(`  ${QUESTION_MARKER}`), content(""), rule]);
+  const complete = frameOf([...detailHead, content("  More details"), content("> Close"), content(""), rule]);
+  const duplicate = frameOf([...detailHead, content("  Close"), content("> Close"), content(""), rule]);
+
+  assert.ok(sharedPopupContains(partial, CLOSE_NOTICE_TITLE)
+    && sharedPopupContains(partial, "Close must remove only this selected notice"),
+  "the partial repaint satisfies the former title/body-only predicate");
+  assert.deepEqual(actionRows(partial), [], "the partial repaint reproduces the observed empty action rows");
+  assert.equal(closeNoticeDetailsReady(partial), false, "readiness does not accept the partial repaint");
+  assert.equal(closeNoticeDetailsReady(complete), true, "readiness accepts the complete detail view");
+  assert.deepEqual(actionRows(complete).sort(), ["Close", "More details"]);
+  assert.equal(selectedAction(complete), "Close");
+  assert.equal(closeNoticeDetailsReady(duplicate), true, "readiness alone does not judge action identity");
+  assert.notDeepEqual(actionRows(duplicate).sort(), ["Close", "More details"],
+    "a settled duplicate row still fails the exact action assertion");
 });
 
 test("real public Main shares native pending notice/question details and preserves origin/status ownership", {
@@ -780,9 +825,9 @@ test("real public Main shares native pending notice/question details and preserv
     "the shared list selects the separate Close candidate without disturbing the original notice or question", beforeCloseCandidate);
   const beforeCloseCandidateDetails = driver.frameRevision;
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((frame) => sharedPopupContains(frame, CLOSE_NOTICE_TITLE)
-    && sharedPopupContains(frame, "Close must remove only this selected notice"),
-  "the selected Close candidate opens its own native details", beforeCloseCandidateDetails);
+  await driver.waitFrame(closeNoticeDetailsReady,
+    "the selected Close candidate opens its own native details", beforeCloseCandidateDetails);
+  await settledPopupFrame(driver, "the selected Close candidate's details finish repainting the shared popup");
   await selectAction(driver, "Close");
   const beforeCloseConfirm = driver.frameRevision;
   driver.pty.write(KEYS.enter);

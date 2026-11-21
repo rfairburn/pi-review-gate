@@ -72,7 +72,7 @@
     <string name="session_activity_lines">Activity</string>
     <string name="action_open_terminal">Open terminal</string>
     <string name="action_rename">Rename</string>
-    <string name="action_rename_native">Rename native row</string>
+    <string name="action_rename_native">Rename</string>
     <string name="action_close">Close</string>
     <string name="action_saved">Saved conversations</string>
     <string name="action_move_up">Move up</string>
@@ -166,7 +166,7 @@
     <string name="rename_submit">Rename</string>
 
     <!-- Native host caption -->
-    <string name="native_rename_title">Rename native row</string>
+    <string name="native_rename_title">Rename</string>
     <string name="native_rename_caption_field">Current caption</string>
     <string name="native_rename_backend_field">Provider</string>
     <string name="native_rename_note">This caption is a host-side row label only. It is never sent to the provider or typed into its session. If the row or its provider has changed, the rename is refused rather than applied elsewhere.</string>

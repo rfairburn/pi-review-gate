@@ -15,6 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.307]
+
+### Changed
+
+- Android: the session-title rename action and dialog now say **Rename** instead of **Rename native row** (#715).
+
 ## [0.1.0-dev.306]
 
 No notable changes.

@@ -222,10 +222,8 @@ const ROOT_SETTING_LABELS = [
   "Retention",
   "Global concurrency",
   "Retry policy",
-  "Subtask notifications",
+  "Subtasks",
   "Tools",
-  "Subtasks view",
-  "Subtask task IDs",
   "Scheduled tasks",
 ] as const;
 

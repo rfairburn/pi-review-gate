@@ -238,7 +238,7 @@ test("disk A under live parent B: shows A through the shared root, labels LOCAL 
   // Complete persisted root inventory, without the process scheduler switch.
   for (const label of ["Operating mode", "Mode cycle hotkey", "Worker resources", "External workers", "Execution priority",
     "Research priority", "Reviewers", "Timeouts", "Review policy", "Retention", "Global concurrency", "Retry policy",
-    "Subtask notifications", "Tools", "Subtasks view", "Subtask task IDs", "Scheduled tasks", "Save changes", "Cancel"]) {
+    "Subtasks", "Tools", "Scheduled tasks", "Save changes", "Cancel"]) {
     assert.ok(root.some((option) => option.startsWith(label)), `root row ${label}`);
   }
   assert.ok(!root.some((option) => option.startsWith("Scheduler runtime")));

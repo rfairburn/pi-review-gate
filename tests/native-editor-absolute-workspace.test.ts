@@ -598,7 +598,7 @@ test("real host: full flow stages a completed existing absolute directory throug
   const providerCtor = loaded.tui.CombinedAutocompleteProvider as HostProviderCtor;
 
   const harness = flowHarness([
-    keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -650,7 +650,7 @@ for (const target of ["missing", "file"] as const) {
     const providerCtor = loaded.tui.CombinedAutocompleteProvider as HostProviderCtor;
 
     const harness = flowHarness([
-      keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
@@ -673,7 +673,7 @@ for (const target of ["missing", "file"] as const) {
       keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_ENTER), // root re-show (Scheduled tasks) → Save changes (one row below)
-      keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (19); explicit Cancel (20) — issue #294: root Escape would retry the same failing apply
+      keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (15); explicit Cancel (16) — issue #294: root Escape would retry the same failing apply
     ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
 
     await run(harness.ctx);

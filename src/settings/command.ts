@@ -54,8 +54,9 @@ import {
   selectOperatingMode,
   selectReviewPolicy,
   selectRetryPolicy,
-  selectSubtaskNotifications,
+  selectSubtaskSettings,
   selectTimeouts,
+  subtasksRootSummary,
 } from "./controls";
 import { stagedToolProtectionSettings } from "./tool-protection";
 import { collectExternalAgentAvailabilityWarnings, validateSelection, validateToolProtectionSelection, type SettingsValidationPolicy } from "./validation";
@@ -656,10 +657,11 @@ async function runSettingsMenu(
       { key: "retention", label: "Retention", value: retentionSummary(retainBundles, deleteSpawnedPiSessions) },
       { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
       { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
-      { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
+      // Issue #659: the three subtask notification/display controls are
+      // grouped under one row, placed at the first replaced row so every
+      // other section keeps its relative order.
+      { key: "subtasks", label: "Subtasks", value: subtasksRootSummary({ subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds }) },
       { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions, urlBlocklist: webUrlBlocklist } }) },
-      { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
-      { key: "subtaskTaskIds", label: "Subtask task IDs", value: showSubtaskTaskIds ? "Shown" : "Hidden" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
       // Issue #653: a disk-only transaction has no process scheduler row.
       ...(transaction.kind === "session" && transaction.host.schedulerRuntime
@@ -817,8 +819,15 @@ async function runSettingsMenu(
       retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
       continue;
     }
-    if (choice === "notifications") {
-      subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
+    if (choice === "subtasks") {
+      // Issue #659: the grouped submenu. It stages into this same canonical
+      // transaction through the root's own locals and returns on Back or
+      // Escape, so Save, root Escape, and Cancel stay the root's alone.
+      ({ subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds } = await selectSubtaskSettings(input.ui, {
+        subtaskNotifications,
+        subtasksViewExpanded,
+        showSubtaskTaskIds,
+      }));
       continue;
     }
     if (choice === "tools") {
@@ -867,14 +876,6 @@ async function runSettingsMenu(
       browserVisible = tools.web.browserVisible;
       browserPermissions = tools.web.browserPermissions;
       webUrlBlocklist = tools.web.urlBlocklist;
-      continue;
-    }
-    if (choice === "subtasksView") {
-      subtasksViewExpanded = !subtasksViewExpanded;
-      continue;
-    }
-    if (choice === "subtaskTaskIds") {
-      showSubtaskTaskIds = !showSubtaskTaskIds;
       continue;
     }
     if (choice === "scheduled") {

@@ -29,6 +29,8 @@ import {
   makeRuntimeEnvironment,
   makeNativeAgentRoot,
   makeWorkspace,
+  nativeMenuSelection,
+  nativeMenuSelectionMovedDown,
   nativePathCompletionInput,
   processIsAlive,
   removeOwnedScratchTree,
@@ -232,14 +234,14 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   await driver.waitFrame((text) => text.includes("Review settings") && text.includes("Operating mode"),
     "the production review-gate root settings menu opens in A's native process");
 
-  // Root rows ahead of Scheduled tasks include the Tools controls and the
-  // #229 Subtask task IDs row (src/settings/command.ts), putting it at
-  // zero-based index 16; keep the prior tolerance bound on that search.
-  await driver.moveNativeMenuTo("Scheduled tasks", 18);
+  // Root rows ahead of Scheduled tasks include the grouped Subtasks row and
+  // the Tools controls (src/settings/command.ts), putting Scheduled tasks at
+  // zero-based index 14; keep the prior tolerance bound on that search.
+  await driver.moveNativeMenuTo("Scheduled tasks", 16);
   await driver.writeKeys(KEYS.enter, "the actual Scheduled tasks gate submenu opens");
   await driver.waitFrame((text) => text.includes("Scheduled tasks") && text.includes("Add scheduled task"),
     "the actual scheduled-task settings list renders");
-  await driver.moveNativeMenuTo("Add scheduled task", 3);
+  await driver.moveNativeMenuTo("Add scheduled task", 3, "short");
   await driver.writeKeys(KEYS.enter, "the actual scheduled-task name field opens");
   await driver.waitFrame((text) => text.includes("Scheduled task name") && text.includes("Ctrl+G external editor"),
     "the real host-wired native editor renders for a gate settings field");
@@ -293,7 +295,7 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   await driver.moveNativeMenuTo("Back", 6);
   await driver.writeKeys(KEYS.enter, "the task detail menu returns to the task list");
   await driver.waitFrame((text) => text.includes("Add scheduled task"), "the real task list returns");
-  await driver.moveNativeMenuTo("Back", 3);
+  await driver.moveNativeMenuTo("Back", 3, "short");
   await driver.writeKeys(KEYS.enter, "the scheduled-task list returns to the staged root settings menu");
   await driver.waitFrame((text) => text.includes("Review settings") && driver.nativeMenuSelected(text, "Scheduled tasks"),
     "the same root settings transaction is restored after editing the scheduled task");
@@ -733,6 +735,257 @@ test("roster navigation sends no key when its fresh complete frame already selec
   await driver.moveRosterTo("New session");
   assert.equal(waits, 1);
   assert.deepEqual(keys, [], "a newly observed destination is not navigated away from");
+});
+
+/** The real `/review-settings` root rows in their product order (src/settings/command.ts). */
+const NATIVE_ROOT_SETTINGS_ROWS = [
+  "Operating mode", "Mode cycle hotkey", "Worker resources", "External workers",
+  "Execution priority", "Research priority", "Reviewers", "Timeouts", "Review policy",
+  "Retention", "Global concurrency", "Retry policy", "Subtasks", "Tools",
+  "Scheduled tasks", "Scheduler runtime", "Save changes", "Cancel",
+];
+/** The visible-row count the real native settings smoke renders at its verified pane size. */
+const NATIVE_MENU_WINDOW_ROWS = 7;
+const NATIVE_MENU_HINT = "   ↑↓ navigate  enter select  escape/ctrl+c apply for session · Ctrl+S save";
+/** An unrelated arrow-like row elsewhere in the native pane, as a row scraper sees it. */
+const NATIVE_MENU_PHANTOM_ROW = "  → Pi is thinking";
+
+function nativeRootSettingsLines(selectedIndex: number): string[] {
+  const start = Math.max(0, Math.min(selectedIndex - Math.floor(NATIVE_MENU_WINDOW_ROWS / 2),
+    NATIVE_ROOT_SETTINGS_ROWS.length - NATIVE_MENU_WINDOW_ROWS));
+  const lines: string[] = [];
+  for (let index = start; index < start + NATIVE_MENU_WINDOW_ROWS; index += 1) {
+    lines.push(`  ${index === selectedIndex ? "→" : " "} ${NATIVE_ROOT_SETTINGS_ROWS[index]}     None`.padEnd(120));
+  }
+  lines.push(`    (${selectedIndex + 1}/${NATIVE_ROOT_SETTINGS_ROWS.length})`.padEnd(120));
+  return lines;
+}
+
+function nativeRootSettingsFrame(selectedIndex: number, paneRowAboveMenu?: string): string {
+  return ["Session host", ...(paneRowAboveMenu === undefined ? [] : [paneRowAboveMenu]),
+    ...nativeRootSettingsLines(selectedIndex), NATIVE_MENU_HINT].join("\n");
+}
+
+/**
+ * One logical row diff of the scrolling move `from` → `to`, cut after
+ * `deliveredRows` list rows. `SessionHostFrameWriter` emits only the rows that
+ * changed since the frame it last wrote, in increasing screen-row order and in
+ * bounded chunks, so the owned outer emulator can only ever be read with the
+ * upper rows already repainted and everything below — the list's scroll cue
+ * included — still showing the previous frame.
+ */
+function nativeRootSettingsTornFrame(from: number, to: number, deliveredRows: number): string {
+  const next = nativeRootSettingsLines(to);
+  const previous = nativeRootSettingsLines(from);
+  return ["Session host", ...next.slice(0, deliveredRows), ...previous.slice(deliveredRows), NATIVE_MENU_HINT]
+    .join("\n");
+}
+
+/**
+ * The menu's opening paint, cut before its cue row: the highlighted row is
+ * already drawn while the rows below it — the cue row included — are still the
+ * pane's previous content. This is what the readiness witness for the root menu
+ * accepts (`Review settings` plus `Operating mode`, both painted above the cue),
+ * so a baseline read here must never authorize a navigation key.
+ */
+function nativeRootSettingsOpeningFrame(selectedIndex: number, deliveredRows: number): string {
+  const painted = nativeRootSettingsLines(selectedIndex).slice(0, deliveredRows);
+  const pending = Array.from({ length: NATIVE_MENU_WINDOW_ROWS + 1 - deliveredRows }, () => "");
+  return ["Session host", ...painted, ...pending].join("\n");
+}
+
+/**
+ * The real `moveNativeMenuTo` prototype method on a controlled frame source (a
+ * real `MainPtyDriver` needs an owned PTY): the same `ChangeSignal`,
+ * frame-revision, pane-geometry, and `currentText()` state the fence reads.
+ * Every navigation key is recorded together with whether the list reported its
+ * own position on screen at that moment. The modelled list advances one row per
+ * key and repaints 10 ms later, and a further key inside that render cycle
+ * replaces the pending repaint — two queued key events produce one rendered
+ * frame, so the intermediate row is never drawn at all. `openingTorn` starts on
+ * the menu's incomplete opening paint and completes it after the old 300 ms quiet window, and
+ * `phantomOnPresses` delivers a pane-wide repaint of an unrelated arrow-like row
+ * immediately after the given 1-based presses, which is what a row-scraping
+ * selection witness accepts as a move the list never reported.
+ */
+function nativeMenuNavigationDriver(options: {
+  readonly selectedIndex: number;
+  readonly openingTorn?: boolean;
+  readonly phantomOnPresses?: readonly number[];
+}): {
+  readonly driver: MainPtyDriver;
+  readonly presses: string[];
+  readonly cuedAtPress: readonly boolean[];
+} {
+  const presses: string[] = [];
+  const cuedAtPress: boolean[] = [];
+  const driver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  const rows = nativeRootSettingsFrame(options.selectedIndex, NATIVE_MENU_PHANTOM_ROW).split("\n").length;
+  let listed = options.selectedIndex;
+  let pending: ReturnType<typeof setTimeout> | undefined;
+  const deliver = (frame: string, delayMs: number): ReturnType<typeof setTimeout> => setTimeout(() => {
+    Object.assign(driver, { currentFrame: frame, frameRevision: driver.frameRevision + 1 });
+    driver.frameSignal.notify();
+  }, delayMs);
+  Object.assign(driver, {
+    frameSignal: new ChangeSignal(),
+    currentFrame: options.openingTorn === true
+      ? nativeRootSettingsOpeningFrame(options.selectedIndex, 4)
+      : nativeRootSettingsFrame(options.selectedIndex),
+    frameRevision: 1,
+    parserError: undefined,
+    exitEvent: undefined,
+    sidebarVisible: false,
+    surface: { frame: () => ({ cols: OUTER_COLS, rows }) },
+    pty: {
+      write: (data: string) => {
+        presses.push(data);
+        cuedAtPress.push(nativeMenuSelection(driver.currentText(), 0, rows)?.position !== undefined);
+        if (options.phantomOnPresses?.includes(presses.length) === true) {
+          deliver(nativeRootSettingsFrame(listed, NATIVE_MENU_PHANTOM_ROW), 0);
+        }
+        listed = Math.min(NATIVE_ROOT_SETTINGS_ROWS.length - 1, listed + 1);
+        if (pending !== undefined) clearTimeout(pending);
+        pending = deliver(nativeRootSettingsFrame(listed), 10);
+      },
+    },
+  });
+  if (options.openingTorn === true) deliver(nativeRootSettingsFrame(options.selectedIndex), 350);
+  return { driver, presses, cuedAtPress };
+}
+
+test("the native settings menu fence advances on the list's own position cue instead of a scraped row repaint", async () => {
+  // Reproduction of the observed macOS failure in the real native settings
+  // smoke, where the driver moved toward "Scheduled tasks" and ended with
+  // "→ Save changes  (17/18)" selected and "Scheduled tasks" still visible two
+  // rows above it. The fence used to authorize each navigation key on "the first
+  // arrow-like row in the pane changed text". A scrolling move repaints every
+  // visible row and the scroll cue below them, the owned outer emulator can be
+  // read inside that one logical frame, and an unrelated `→`/`>` row elsewhere
+  // in the native pane changes the scraped row too. Any advance the list never
+  // reported lets a second key into the same render cycle, so the row the menu
+  // actually selected is never drawn and the bounded key budget steps past it.
+  // The list's own "(N/M)" cue is the authority instead: it is written under the
+  // list rows, so it reports a new position only once every row above it does.
+  const scanRows = nativeRootSettingsFrame(13).split("\n").length;
+  const atTools = nativeMenuSelection(nativeRootSettingsFrame(13), 0, scanRows);
+  const atScheduled = nativeMenuSelection(nativeRootSettingsFrame(14), 0, scanRows);
+  const torn = nativeMenuSelection(nativeRootSettingsTornFrame(13, 14, 4), 0, scanRows);
+  assert.ok(atTools && atScheduled && torn, "the modelled frames all carry a complete selection witness");
+  assert.deepEqual([atTools.position, atTools.total], [14, 18], "the settled frame witnesses the list's own position");
+  assert.equal(atTools.selectedRow.includes("Tools"), true);
+  assert.deepEqual([atScheduled.position, atScheduled.total], [15, 18]);
+  assert.equal(atScheduled.selectedRow.includes("Scheduled tasks"), true);
+
+  // The torn frame already draws the destination row — exactly what the old
+  // row-text fence accepted as an advance — while the list still reports the
+  // previous position, so it is never a witnessed move.
+  assert.equal(torn.selectedRow.includes("Scheduled tasks"), true,
+    "a torn scroll repaint shows the destination row before the list reports it");
+  assert.notEqual(torn.selectedRow, atTools.selectedRow,
+    "the torn repaint changes the scraped row text, which is all the old fence required");
+  assert.deepEqual([torn.position, torn.total], [14, 18], "the torn frame's cue is still the previous position");
+  assert.equal(nativeMenuSelectionMovedDown(atTools, torn), false,
+    "the fence waits past a repaint the list has not reported instead of pressing on");
+  assert.equal(nativeMenuSelectionMovedDown(atTools, atScheduled), true,
+    "the settled frame is the one witnessed single-row advance");
+  assert.equal(nativeMenuSelectionMovedDown(atTools, nativeMenuSelection(nativeRootSettingsFrame(15), 0, scanRows)), false,
+    "a two-row jump is never an authorized single advance, so the destination cannot be stepped over");
+  assert.equal(nativeMenuSelectionMovedDown(atTools, undefined), false);
+
+  // The cue also anchors the selected-row search, so an unrelated arrow-like row
+  // above the menu (Pi's own message or status area) can never be the highlight.
+  const phantom = nativeMenuSelection(nativeRootSettingsFrame(14, NATIVE_MENU_PHANTOM_ROW), 0, scanRows);
+  assert.equal(phantom?.selectedRow.includes("Scheduled tasks"), true,
+    "the selected row is read from the list block above its own cue, not from the first arrow-like row");
+  assert.equal(phantom?.position, 15);
+
+  // A torn opening paint looks like a short list until its cue arrives.
+  const opening = nativeMenuSelection(nativeRootSettingsOpeningFrame(0, 4), 0, scanRows);
+  assert.ok(opening, "the opening paint still shows the highlighted row");
+  assert.equal(opening.position, undefined, "the opening prefix has no position cue yet");
+  assert.equal(opening.selectedRow.includes("Operating mode"), true);
+  assert.equal(nativeMenuSelectionMovedDown(opening, nativeMenuSelection(nativeRootSettingsFrame(1), 0, scanRows)), false,
+    "a mixed cueless/cued pair does not witness one move");
+
+  // Driver-level proof on the real method: from the menu head the destination is
+  // reached by exactly its 14 witnessed single-row advances, and it stays there
+  // even when one unrelated pane repaint lands during the decisive press. Under
+  // the old row-text fence that same repaint is accepted as an advance, the next
+  // key coalesces with it into one render, "Scheduled tasks" is never observed,
+  // and all 16 keys burn while "Save changes (17/18)" ends up selected.
+  const clean = nativeMenuNavigationDriver({ selectedIndex: 0 });
+  await clean.driver.moveNativeMenuTo("Scheduled tasks", 16);
+  assert.deepEqual(clean.presses, Array.from({ length: 14 }, () => KEYS.down),
+    "the destination is reached by 14 witnessed advances, never by 16 unverified presses");
+  assert.deepEqual(clean.cuedAtPress, Array.from({ length: 14 }, () => true),
+    "every key was authorized against a list that had reported its own position");
+
+  const raced = nativeMenuNavigationDriver({ selectedIndex: 0, phantomOnPresses: [14] });
+  await raced.driver.moveNativeMenuTo("Scheduled tasks", 16);
+  assert.deepEqual(raced.presses, Array.from({ length: 14 }, () => KEYS.down),
+    "one unrelated pane repaint never buys an extra navigation key");
+  const arrived = nativeMenuSelection(raced.driver.currentText(), 0, scanRows);
+  assert.deepEqual([arrived?.position, arrived?.selectedRow.includes("Scheduled tasks")], [15, true],
+    "the menu itself reports the destination row as selected");
+
+  // Entering on the incomplete opening paint sends no key until the list reports
+  // its position — the cue arriving past the old quiet window included — and then
+  // navigates one witnessed row per key.
+  const openingEntry = nativeMenuNavigationDriver({ selectedIndex: 0, openingTorn: true });
+  await openingEntry.driver.moveNativeMenuTo("Scheduled tasks", 16);
+  assert.deepEqual(openingEntry.presses, Array.from({ length: 14 }, () => KEYS.down),
+    "the torn opening paint is not navigated from");
+  assert.deepEqual(openingEntry.cuedAtPress, Array.from({ length: 14 }, () => true),
+    "no navigation key is authorized while the list has not reported its own position");
+
+  // A list that fits its pane draws no cue and cannot scroll: its two-row
+  // repaint keeps the row-text witness complete, so those menus navigate exactly
+  // as they did before.
+  const shortLabels = ["Add scheduled task", "native-main-task", "Back"];
+  const shortFrame = (selectedIndex: number): string => ["Session host",
+    ...shortLabels.map((label, index) => `  ${index === selectedIndex ? "→" : " "} ${label}`.padEnd(60))].join("\n");
+  const shortScan = shortFrame(0).split("\n").length;
+  assert.equal(nativeMenuSelection(shortFrame(1), 0, shortScan)?.position, undefined,
+    "a complete list renders no position cue");
+  assert.equal(nativeMenuSelectionMovedDown(
+    nativeMenuSelection(shortFrame(1), 0, shortScan)!,
+    nativeMenuSelection(shortFrame(2), 0, shortScan),
+  ), true, "the cueless list still advances on its row-text witness");
+
+  // Returning from the 13-row task detail menu, the repaint can already show the
+  // short list's rows while that menu's own "(13/13)" cue still stands lower in
+  // the pane. Entry waits for the short list's cueless highlight instead of
+  // assuming the previous cue disappears inside a quiet interval: the stale cue
+  // here outlasts the old 300 ms window, and no key may be sent against it.
+  const staleDetailCue = `${shortFrame(0)}\n    (13/13)`;
+  const shortDriver = Object.create(MainPtyDriver.prototype) as MainPtyDriver;
+  const shortPresses: string[] = [];
+  const paintShort = (frame: string): void => {
+    Object.assign(shortDriver, { currentFrame: frame, frameRevision: shortDriver.frameRevision + 1 });
+    shortDriver.frameSignal.notify();
+  };
+  Object.assign(shortDriver, {
+    frameSignal: new ChangeSignal(),
+    currentFrame: staleDetailCue,
+    frameRevision: 1,
+    sidebarVisible: false,
+    surface: { frame: () => ({ cols: OUTER_COLS, rows: shortScan + 1 }) },
+    pty: {
+      write: (key: string) => {
+        assert.equal(shortDriver.currentText(), shortFrame(0), "no key while the previous menu's cue remains");
+        shortPresses.push(key);
+        paintShort(shortFrame(2));
+      },
+    },
+  });
+  const clearStaleCue = setTimeout(() => paintShort(shortFrame(0)), 350);
+  try {
+    await shortDriver.moveNativeMenuTo("Back", 3, "short");
+    assert.deepEqual(shortPresses, [KEYS.down], "one key per witnessed row once the short list stands alone");
+  } finally {
+    clearTimeout(clearStaleCue);
+  }
 });
 
 const FORBIDDEN_SESSION_ARGS = new Set([

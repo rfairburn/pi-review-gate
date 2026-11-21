@@ -151,7 +151,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
     const before = await readFile(configPath, "utf8");
     const run = await registerFlowHandler(configPath);
     const harness = flowHarness([
-      keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
@@ -164,7 +164,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
       keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_ENTER), // root re-show (Scheduled tasks) → Save changes (one row below)
-      keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (19); explicit Cancel (20) — issue #294: root Escape would retry the same failing apply
+      keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (15); explicit Cancel (16) — issue #294: root Escape would retry the same failing apply
     ], { cwd: dir });
 
     await run(harness.ctx);
@@ -196,7 +196,7 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
   const run = await registerFlowHandler(configPath);
 
   const harness = flowHarness([
-    keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -231,7 +231,7 @@ test("full TUI flow: cancel in the workspace field leaves the staged value uncha
   const run = await registerFlowHandler(configPath);
 
   const harness = flowHarness([
-    keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -289,7 +289,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
   setNativeEditorHost(loaded.host);
   const providerCtor = loaded.tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string) => unknown;
   const harness = flowHarness([
-    keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {

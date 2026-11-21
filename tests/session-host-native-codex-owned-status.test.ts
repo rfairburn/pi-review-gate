@@ -459,7 +459,12 @@ test("a duplicate or different capability never adopts again or dials a second t
   try {
     bindFreshRoot(h.facts);
     h.deliverCap();
-    await until(() => h.server.upgradeCount >= 1, "the first transport");
+    // The upgrade only says the transport opened: the census that first replaces the
+    // switch snapshot's unknown axes publishes later, so a baseline taken on the dial
+    // can still count that census as a new publication. Wait for the published census
+    // itself — unlike the switch snapshot, which keeps `activeTasks` null — before
+    // snapshotting and before either duplicate is offered.
+    await until(() => h.observations.some((o) => o.activeTasks !== null), "the first census to publish");
     const observations = h.observations.length;
 
     h.deliverCap({ leaseId: "lease-owned-2", generation: 4 });

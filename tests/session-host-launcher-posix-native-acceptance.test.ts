@@ -37,6 +37,7 @@ import {
   POSIX_LAUNCHER_CLEANUP_BUDGET_MS,
   POSIX_LAUNCHER_EXPECT_PI_VERSION,
   POSIX_LAUNCHER_LEG_DEADLINE_MS,
+  POSIX_LAUNCHER_OUTER_COLS,
   POSIX_LAUNCHER_REQUIRE_ENV,
   POSIX_LAUNCHER_STARTUP_TIMEOUT_MS,
   POSIX_LAUNCHER_TEST_TIMEOUT_MS,
@@ -187,7 +188,8 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   assert.equal(session.record.contextCwd, session.workspace, "the native context independently confirms the workspace");
   assert.equal(session.record.agentDir, layout.nativeAgentDir, "the native child uses the ordinary per-leg shared native agent root");
   assert.equal(session.record.tty, true, "the native child is a real Pi TTY process");
-  assert.equal(session.record.columns, 84, "the native child receives the actual 84-column pane geometry");
+  assert.equal(session.record.columns, POSIX_LAUNCHER_OUTER_COLS - SIDEBAR_COLUMNS - 1,
+    "the native child receives the exact pane width beside the roster and divider");
   assert.equal(session.record.rows, 49, "the native child receives the actual 49-row pane geometry");
   const sessionRel = relative(layout.nativeAgentDir, session.record.sessionFile!);
   assert.ok(sessionRel !== ".." && !sessionRel.startsWith(`..${sep}`) && !isAbsolute(sessionRel),

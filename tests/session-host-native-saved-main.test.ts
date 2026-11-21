@@ -34,6 +34,8 @@ import {
   isSidebarFocusedFrame,
   hasQuitConfirmationContents,
   nativeFormFieldIsEmpty,
+  nativePathCompletionDisplay,
+  nativePathCompletionInput,
   latestDimensions,
   originalNodeOptions,
   processIsAlive,
@@ -211,7 +213,8 @@ async function openSavedPane(driver: SavedMainDriver, savedName: string, recorde
   driver.pty.write(KEYS.enter);
   await driver.waitFrame(isSavedPane,
     "the genuine host Saved conversations action opens its right-hand public picker", beforeOpen.frameRevision);
-  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, recordedWorkspace),
+  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, recordedWorkspace,
+    driver.surface.frame().cols - NATIVE_PANE_START),
     "fresh native catalog completely paints one selected caption/path summary and exact recorded workspace in its bottom details", beforeOpen.frameRevision);
   assert.equal(isSavedPane(driver.currentText()), true);
 }
@@ -287,22 +290,26 @@ async function submitWorkspaceOnlyNew(
   assert.equal(isEmptyWorkspaceField(driver.currentText()), true,
     "the exact native bordered Workspace field body is initially empty");
 
-  const prefix = join(scratch, "saved-main-workspace-");
+  const prefix = nativePathCompletionInput(join(scratch, "saved-main-workspace-"));
+  const accepted = nativePathCompletionDisplay(`${workspace}/`);
   const beforePrefix = driver.snapshot();
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the canonical workspace prefix is typed through Pi's real native Editor");
   const basename = workspace.slice(workspace.lastIndexOf(sep) + 1);
-  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
+  // Only the plain prefix is the slash context the Editor auto-requests a list on;
+  // a quoted one completes on the explicit keystroke below instead.
+  const quoted = prefix.includes('"');
+  await driver.waitFrame((text) => quoted || workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
     "the native filesystem provider displays the owned workspace completion", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix,
     "the bordered New field contains the literal typed prefix before accepting completion");
 
   const beforeCompletionEnter = driver.snapshot();
-  driver.pty.write(KEYS.enter);
+  driver.pty.write(quoted ? KEYS.tab : KEYS.enter);
   await driver.waitFrame((text) => workspaceOnlyNewFrame(text)
-    && getWorkspaceFieldValue(text) === `${workspace}/`,
-  "the first genuine Enter accepts the exact owned folder while New remains open", beforeCompletionEnter.frameRevision);
-  assert.equal(getWorkspaceFieldValue(driver.currentText()), `${workspace}/`,
+    && getWorkspaceFieldValue(text) === accepted,
+  "the first genuine keystroke accepts the exact owned folder while New remains open", beforeCompletionEnter.frameRevision);
+  assert.equal(getWorkspaceFieldValue(driver.currentText()), accepted,
     "the bordered field body confirms the accepted canonical workspace, including its native trailing slash");
 
   const beforeSubmit = driver.snapshot();
@@ -994,7 +1001,8 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await moveRosterToAction(driver, "Saved conversations");
   const beforeSavedPane = driver.snapshot();
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, workspace),
+  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, workspace,
+    driver.surface.frame().cols - NATIVE_PANE_START),
     "the host picker freshly paints the original persisted summary and recorded workspace details after /new released its binding", beforeSavedPane.frameRevision);
   const beforeSuccessfulOpen = driver.snapshot();
   driver.pty.write(KEYS.enter);
@@ -1295,7 +1303,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(existsSync(newBinding.sessionFile), false,
     "the unsent /new conversation remained a genuinely empty absent native file");
   assert.equal(shortBaselineFitsTwentyFourColumns(), true);
-  assert.equal(OUTER_COLS, 120);
+  assert.equal(OUTER_COLS, 160);
   assert.equal(OUTER_ROWS, 50);
   assert.equal(OUTER_RESTORATION_BASELINE, "PRG-SAVED-MAIN");
   assert.equal(runtime.version, "1.6.0");

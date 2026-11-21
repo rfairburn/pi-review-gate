@@ -21,6 +21,7 @@
 
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createStatusBroker, type StatusBroker } from "../../src/session-host/broker";
@@ -91,7 +92,7 @@ async function makeViewerInventory(root: string): Promise<{
   mkdirSync(join(piExecutable, ".."), { recursive: true });
   writeFileSync(piExecutable, "#!/usr/bin/env node\n\"use strict\";\n// Synthetic inert Pi executable fixture; this viewer spawns nothing.\n", "utf8");
   chmodSync(piExecutable, 0o755);
-  const broker = await createStatusBroker({ socketRoot: realpathSync(mkdtempSync("/tmp/prg-")) });
+  const broker = await createStatusBroker({ socketRoot: realpathSync(mkdtempSync(join(tmpdir(), "prg-"))) });
   const refuseRegistrar = {
     register(): never { throw new Error("the self-check viewer hosts no rows; a status registration is a fixture bug"); },
   } as unknown as StatusRegistrar;
@@ -117,7 +118,7 @@ type OwnerSettled = {
 };
 
 async function main(): Promise<void> {
-  const base = realpathSync(mkdtempSync("/tmp/prg-selfcheck-"));
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "prg-selfcheck-")));
   const root = join(base, "run");
   mkdirSync(root, { mode: 0o700 });
   const ownerWake = { current: null as (() => void) | null };

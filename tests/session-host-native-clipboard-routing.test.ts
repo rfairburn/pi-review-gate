@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, watch, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
@@ -21,6 +22,7 @@ import {
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
+import { nodeOptionsRequire } from "./helpers/native-node-options-require";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { NATIVE_PANE_START, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 import { skipOrFail } from "./bridge-fakes";
@@ -409,7 +411,7 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
   assert.equal(tuiManifest.version, "1.6.0");
   const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
-  const root = realpathSync(mkdtempSync("/tmp/prg-copy-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-")));
   const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
   for (const name of ["bin", "home", "tmp", "work", "broker", "provider"]) mkdirSync(join(root, name), { mode: 0o700 });
   const agentDir = makeNativeAgentRoot(root, { deferredPiTools: false });
@@ -482,7 +484,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
     PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
     TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-    SSH_CONNECTION: "synthetic-client 1234 synthetic-host 22", NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog,
+    SSH_CONNECTION: "synthetic-client 1234 synthetic-host 22", NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog,
     PRG_COPY_ISOLATION: isolationStem, PRG_COPY_STARTUP: startupStem, PRG_COPY_BIN: join(root, "bin"),
   };
   const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions", "--extension", fixture, "--tui-mode", "fullscreen"];

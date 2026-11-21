@@ -3,6 +3,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -45,6 +46,8 @@ import {
   makeRuntimeEnvironment,
   makeWorkspace,
   nativeFormFieldIsEmpty,
+  nativePathCompletionDisplay,
+  nativePathCompletionInput,
   processIsAlive,
   resolveRuntimePin,
   sessionFileHasStoredName,
@@ -60,7 +63,11 @@ import {
 export { TEST_TIMEOUT_MS, EVENT_TIMEOUT_MS, OwnedPidExitWatcher };
 export type { CandidatePackage, NativePtyHandle, NativePtyModule, RuntimePin, SessionRecord };
 
-export const OUTER_COLS = 120;
+// Wide enough for the longest socket-safe fixture path: the broker-socket budget
+// caps the configured temporary root at 67 bytes, so the deepest owned workspace
+// plus the provider's quoted completion is 111 columns, which is exactly what
+// the field's one labelled body row has at this outer width.
+export const OUTER_COLS = 160;
 export const OUTER_ROWS = 50;
 export const OUTER_RESTORATION_BASELINE = "PRG-SAVED-MAIN";
 export const OBSERVER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-main-observer.cjs");
@@ -71,6 +78,7 @@ export const KEYS = {
   up: "\x1b[A",
   down: "\x1b[B",
   enter: "\r",
+  tab: "\t",
   escape: "\x1b",
   f8: "\x1b[19~",
   delete: "\x1b[3~",
@@ -388,16 +396,20 @@ export function savedRowsVisible(text: string): string[] {
  * Complete single-entry native Saved witness for the pinned ASCII fixtures.
  * Requires the one-line selected summary AND the selection-synchronous three
  * bottom detail rows immediately before the complete keyboard footer. The
- * bounded workspace must fit these fixture rows; longer production paths may
+ * footer is the exact hint set drawn for `paneColumns`: the two hints share one
+ * row once the pane is wide enough for them, and occupy two rows below that.
+ * The bounded workspace must fit these fixture rows; longer production paths may
  * be visibly ellipsized and are covered by frontend contracts, not guessed here.
  */
-export function isCompleteSavedSelection(text: string, caption: string, cwd: string): boolean {
+export function isCompleteSavedSelection(text: string, caption: string, cwd: string, paneColumns = 84): boolean {
   if (!isSavedConversationsPane(text)) return false;
   const pane = rightPaneText(text).split("\n").map((line) => line.trimEnd());
   const footerLines = [
     "F8 toggle / up/down select | enter open / esc/ctrl+c back",
     "ctrl+d delete / ctrl+backspace empty",
   ];
+  const combinedFooter = footerLines.join(" | ");
+  if (combinedFooter.length <= paneColumns) footerLines.splice(0, footerLines.length, combinedFooter);
   const footer = pane.findIndex((line) => line.trim() === footerLines[0]);
   if (footer < 3 || footerLines.some((line, index) => pane[footer + index]?.trim() !== line)
     || pane.slice(footer + footerLines.length).some((line) => line.trim() !== "")) return false;
@@ -524,8 +536,8 @@ export class SavedMainDriver {
       throw new Error("Saved Main run label must be a bounded lowercase path component");
     }
     const stem = `saved-main${runLabel ? `-${runLabel}` : ""}`;
-    const stateRoot = join(options.scratchRoot, `${stem}-state`);
-    mkdirSync(stateRoot, { mode: 0o700 });
+    // Main also uses stateRoot for its Unix socket; keep the diagnostic run label out of that path.
+    const stateRoot = mkdtempSync(join(options.scratchRoot, "s"));
     const resultFile = join(options.scratchRoot, `${stem}-result.json`);
     const ptyJournalFile = join(options.scratchRoot, `${stem}-pty-journal.jsonl`);
     const controlFile = join(options.scratchRoot, `${stem}-control.json`);
@@ -1405,6 +1417,8 @@ export {
   makeRuntimeEnvironment,
   makeWorkspace,
   nativeFormFieldIsEmpty,
+  nativePathCompletionDisplay,
+  nativePathCompletionInput,
   processIsAlive,
   sessionFileHasStoredName,
   sha256,

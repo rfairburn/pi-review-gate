@@ -566,6 +566,14 @@ physical clipboard, or live user draft is used. Vim is a test consumer only:
 production handoff follows Pi's generic configured external-editor action, not
 an editor executable name.
 
+Editor paths containing spaces are a pinned Pi limitation. Pi 1.6.0's POSIX
+Ctrl+G handler splits `EDITOR` on spaces and does not honor quotes or
+backslashes, so an editor executable whose path contains a space is
+unsupported; this is not a review-gate parser bug (evidence:
+[earendil-works/pi#7875](https://github.com/earendil-works/pi/issues/7875)).
+The real Vim leg passes its fixture wrapper path as configured, so this leg
+needs a short, private, space-free temporary root.
+
 The shared real-Main harness is macOS-only and uses exact owned-process exit
 observation; this case skips on other platforms. It is same-host PTY evidence,
 not a physical terminal, Linux-over-SSH, or remote-viewer certification. Keep

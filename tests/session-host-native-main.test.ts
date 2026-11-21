@@ -29,6 +29,7 @@ import {
   makeRuntimeEnvironment,
   makeNativeAgentRoot,
   makeWorkspace,
+  nativePathCompletionInput,
   processIsAlive,
   removeOwnedScratchTree,
   resolveRuntimePin,
@@ -799,6 +800,10 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const observerFile = join(scratch, "observer", "native-main.jsonl");
   const editorLog = createEditorLog(scratch);
   const editor = createEditorExecutable(scratch, workspaceEditTarget, editorLog);
+  // Both Ctrl+G checks read this one setting: the host lexes it into argv, while
+  // pinned Pi splits it on spaces with no shell and runs the first word verbatim
+  // on the owned editor PTY. Quote characters would reach Pi's exec as part of
+  // the pathname, so the owned executable is stored as its plain pathname.
   writeFileSync(join(nativeAgentDir, "settings.json"), JSON.stringify({ externalEditor: editor }) + "\n", {
     flag: "wx", mode: 0o600,
   });
@@ -915,7 +920,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(afterUnselectedBGuard.includes(labelB), "B's active native surface remains visible while the roster owns focus");
   const initialSessions = [sessionA, sessionB];
   for (const session of initialSessions) {
-    assert.equal(session.record.columns, 84, "the outer wide sidebar rectangle determines the initial native child width");
+    assert.equal(session.record.columns, OUTER_COLS - NATIVE_PANE_START,
+      "the outer wide sidebar rectangle determines the initial native child width");
     assert.equal(session.record.rows, 49, "the native child excludes the outer header row");
     assert.equal(processIsAlive(session.record.pid), true, "the native child remains independently alive while another row is selected");
   }
@@ -1028,25 +1034,31 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     "the real New form paints its bounded tiny-pane message without fabricating a field");
   await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
   assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
-    "three outer resizes of the displayed row leave the unviewed A on its original 84x49 pane");
+    "three outer resizes of the displayed row leave the unviewed A on its original wide pane");
   assert.deepEqual(driver.paneGeometry(sessionB), { cols: 52, rows: 29 },
     "the displayed row tracks the current pane exactly");
+  await driver.setOuterSize(OUTER_COLS, 30, { viewed: sessionB, retained: [sessionA] }, OUTER_COLS - NATIVE_PANE_START, 29);
   await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
   await driver.clearWorkspaceField("the native clear binding empties B's retained workspace before filesystem completion");
-  const partialWorkspace = join(scratch, "workspace-new-");
-  await driver.writeAndWait(partialWorkspace, (text) => text.includes(partialWorkspace.slice(-18)),
+  const partialWorkspace = nativePathCompletionInput(join(scratch, "workspace-new-"));
+  await driver.writeAndWait(partialWorkspace, (text) => text.includes(`> Workspace: ${partialWorkspace}`),
     "the New form's real workspace Editor accepts an absolute fixture-only completion prefix");
-  await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
-    "typing the native path prefix automatically displays both owned folder suggestions");
-  // Native Tab accepts an already visible selection. Dismiss that list first
-  // so this separate Tab action tests opening completion, not accepting alpha.
-  const beforeAutomaticDismiss = driver.frameRevision;
-  driver.pty.write(KEYS.escape);
+  // Only the plain prefix auto-opens the list; Tab on a visible list would accept it.
+  if (!partialWorkspace.startsWith('"')) {
+    await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
+      "typing the native path prefix automatically displays both owned folder suggestions");
+    const beforeAutomaticDismiss = driver.frameRevision;
+    driver.pty.write(KEYS.escape);
+    await driver.waitFrame((text) => text.includes("Workspace:")
+      && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
+    "native Escape dismisses the automatically opened completion while retaining New", beforeAutomaticDismiss);
+  }
+  await driver.setOuterSize(52, 30, { viewed: sessionB, retained: [sessionA] }, 52, 29);
   await driver.waitFrame((text) => text.includes("Workspace:")
     && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
-  "native Escape dismisses the automatically opened completion while retaining New", beforeAutomaticDismiss);
+  "the narrow New form is ready for explicit Tab completion");
   const beforeCompletion = driver.frameRevision;
-  driver.pty.write("\t");
+  driver.pty.write(KEYS.tab);
   await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
     "the native filesystem provider displays both fixture-owned matching workspace completions", beforeCompletion);
   const beforeCompletionEscape = driver.frameRevision;
@@ -1129,21 +1141,21 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // Only the row this host displays follows the pane (#474): hiding the wide
   // sidebar reflows B to the full outer width while unviewed A stays put.
   await driver.waitForRecords((records) => records.slice(recordCountBeforeWideHide).some((record) => record.type === "resize"
-    && record.pid === sessionB.record.pid && record.columns === 120 && record.rows === 49),
-  "hiding the wide sidebar creates a fresh full-width 120x49 resize for the displayed row B");
+    && record.pid === sessionB.record.pid && record.columns === OUTER_COLS && record.rows === 49),
+  "hiding the wide sidebar creates a fresh full-width resize for the displayed row B");
   await driver.assertPanesUnchanged([sessionA], recordCountBeforeWideHide,
     "hiding the wide sidebar does not resize the row this host does not display");
   assert.equal(processIsAlive(bPid), true, "hiding the sidebar does not pause its native owner");
   const recordCountBeforeWideShow = driver.records().length;
   await driver.toggleSidebar();
   await driver.waitForRecords((records) => records.slice(recordCountBeforeWideShow).some((record) => record.type === "resize"
-    && record.pid === sessionB.record.pid && record.columns === 84 && record.rows === 49),
-  "showing the wide sidebar creates a fresh 84x49 resize for the displayed row B");
+    && record.pid === sessionB.record.pid && record.columns === OUTER_COLS - NATIVE_PANE_START && record.rows === 49),
+  "showing the wide sidebar creates a fresh sidebar-width resize for the displayed row B");
   await driver.assertPanesUnchanged([sessionA], recordCountBeforeWideShow,
     "showing the wide sidebar does not resize the row this host does not display");
   assert.deepEqual(driver.paneGeometry(sessionA), { cols: OUTER_COLS - SIDEBAR_COLUMNS - 1, rows: 49 },
-    "the unviewed row still reports its original 84x49 pane after both hide and show transitions");
-  // Reopening reflows B's native child back to the 84-column pane while the
+    "the unviewed row still reports its original sidebar-width pane after both hide and show transitions");
+  // Reopening reflows B's native child back to the sidebar-width pane while the
   // sidebar owns focus, so its repaint is asynchronous. Require the complete
   // restored sidebar-focused frame for B before reading the draft, exactly as
   // for A's show transition: a mid-redraw right pane can never pass.
@@ -1184,7 +1196,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(driver.records().filter((record) => record.type === "resize").length, resizeCountBeforeFocus,
     "the focus-first press does not resize any native child");
   await driver.toggleSidebar();
-  // Hiding the sidebar reflows A's native child from the 84-column pane to the
+  // Hiding the sidebar reflows A's native child from the sidebar-width pane to the
   // full outer width; its repaint is asynchronous and the focus/hide fence in
   // toggleSidebar observes only the sidebar pane. Require the genuinely
   // complete hidden-layout redraw — A's exact owner header, no roster remnant,
@@ -1198,7 +1210,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(driver.currentText().includes(draftA), "A's draft remains intact when the second press hides the sidebar");
   assert.equal(processIsAlive(sessionA.record.pid), true, "the actual second F8 press leaves A's child alive");
   await driver.toggleSidebar();
-  // Reopening reflows the child back to the 84-column pane, again with an
+  // Reopening reflows the child back to the sidebar-width pane, again with an
   // asynchronous repaint; the sidebar fence alone can pass while the right pane
   // is still mid-redraw. Require the complete restored sidebar-focused frame:
   // A's exact owner header, the full roster with its sidebar-only footer, and
@@ -1305,7 +1317,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     `switching to A preserves the separate B draft\nActual settled owned Main frame:\n${settledNarrowA}`);
 
   // Restore enough width for the real nested gate menu/editor interaction.
-  // A is the displayed row now, so only A takes the restored 84x49 pane; B
+  // A is the displayed row now, so only A takes the restored sidebar-width pane; B
   // stays on the 52x19 pane it last reported (#474).
   const resizeOutputBefore = driver.outputRevision;
   const resizeRecordCountBeforeRestore = driver.records().length;
@@ -1313,8 +1325,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.surface.resize(OUTER_COLS, OUTER_ROWS);
   await driver.waitForOuterOutput(resizeOutputBefore, "the real Main redraws after restoring wide outer geometry");
   await driver.waitForRecords((records) => records.slice(resizeRecordCountBeforeRestore).some((record) =>
-    record.type === "resize" && record.pid === sessionA.record.pid && record.columns === 84 && record.rows === 49),
-  "A receives a fresh restored 84x49 native geometry record as the displayed row");
+    record.type === "resize" && record.pid === sessionA.record.pid && record.columns === OUTER_COLS - NATIVE_PANE_START && record.rows === 49),
+  "A receives a fresh restored wide native geometry record as the displayed row");
   await driver.assertPanesUnchanged([sessionB], resizeRecordCountBeforeRestore,
     "restoring the wide outer geometry does not resize the row this host does not display");
   assert.deepEqual(driver.paneGeometry(sessionB), bPaneBeforeNarrowSelect,
@@ -1326,8 +1338,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.pty.write(KEYS.ctrlC);
   await driver.waitFrame((text) => !text.includes(draftA), "native Ctrl+C clears A's draft before issuing a slash command", afterCtrlC);
   assert.equal(processIsAlive(sessionA.record.pid), true, "native Ctrl+C remains an editor action, not a host quit");
-  // The native field's complete help line is wider than the 84-column pane.
-  // Two explicit presses provide the verified full 120-column native surface:
+  // The native field's complete help line is wider than the sidebar-width pane.
+  // Two explicit presses provide the verified full outer native surface:
   // the first only focuses the visible sidebar, the second deliberately hides
   // it. Never bundle presses that could silently hide a visible Main frame.
   await driver.toggleSidebar();

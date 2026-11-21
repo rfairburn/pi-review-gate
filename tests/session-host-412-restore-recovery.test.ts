@@ -23,6 +23,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -88,11 +89,11 @@ interface ScenarioResult {
 }
 
 function runScenario(name: string): Record<string, any> {
-  // A dedicated per-scenario temp root keeps capture pruning and wave artifacts
-  // isolated from unrelated suites (the shared OS temp can hold thousands of
-  // wave roots mid-CI). It is ignored scratch under dist-test, removed on
-  // success and retained as evidence on failure.
-  const scenarioTmp = mkdtempSync(join(process.cwd(), "dist-test", `tmp-412-${name}-`));
+  // A dedicated per-scenario temp root keeps the scenario's scratch isolated from
+  // unrelated suites. Its prefix stays short, together with the lab's own socket
+  // prefix: the status socket is created beneath this TMPDIR, and a 56-byte
+  // canonical temp parent leaves the broker exactly 97 bytes of its 103-byte bound.
+  const scenarioTmp = mkdtempSync(join(tmpdir(), "412-"));
   let output: string;
   try {
     output = execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
@@ -118,7 +119,7 @@ function runScenarioFailure(
   name: string,
   extraEnv: Record<string, string>,
 ): { status: number | undefined; stdout: string; stderr: string; scenarioTmp: string } {
-  const scenarioTmp = mkdtempSync(join(process.cwd(), "dist-test", `tmp-412-fail-${name}-`));
+  const scenarioTmp = mkdtempSync(join(tmpdir(), "412f-"));
   try {
     execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
       cwd: process.cwd(),

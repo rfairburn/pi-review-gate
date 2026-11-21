@@ -37,6 +37,7 @@ import {
   watch,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
@@ -50,9 +51,9 @@ import {
   ChangeSignal,
   EVENT_TIMEOUT_MS,
   KEYS,
+  nativePathCompletionDisplay,
+  nativePathCompletionInput,
   OBSERVER_FIXTURE,
-  OUTER_COLS,
-  OUTER_ROWS,
   TEST_TIMEOUT_MS,
 } from "./helpers/session-host-native-main-harness";
 import {
@@ -84,6 +85,8 @@ import {
   sessionFileHasStoredName,
   sidebarRosterHidden,
   waitForJsonl,
+  OUTER_COLS,
+  OUTER_ROWS,
   workspaceOnlyNewCompletionFrame,
   workspaceOnlyNewFrame,
   type ProcessIncarnation,
@@ -462,19 +465,23 @@ async function submitWorkspaceOnlyNew(
   assert.equal(nativeFormFieldIsEmpty(driver.currentText(), "> Workspace:"), true,
     "the actual New Workspace Editor starts empty");
 
-  const prefix = join(scratch, "resume-workspace-");
+  const prefix = nativePathCompletionInput(join(scratch, "resume-workspace-"));
+  const accepted = nativePathCompletionDisplay(`${workspace}/`);
   const beforePrefix = driver.snapshot();
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the synthetic workspace path is typed through Pi's real native Editor");
   const workspaceName = workspace.slice(workspace.lastIndexOf(sep) + 1);
-  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${workspaceName}/` }),
+  // Only the plain prefix is the slash context the Editor auto-requests a list on;
+  // a quoted one completes on the explicit keystroke below instead.
+  const quoted = prefix.includes('"');
+  await driver.waitFrame((text) => quoted || workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${workspaceName}/` }),
     "native filesystem completion displays the exact owned workspace", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix);
   const beforeCompletion = driver.snapshot();
-  driver.pty.write(KEYS.enter);
+  driver.pty.write(quoted ? KEYS.tab : KEYS.enter);
   await driver.waitFrame((text) => workspaceOnlyNewFrame(text)
-    && getWorkspaceFieldValue(text) === `${workspace}/`,
-  "the first Enter accepts the exact native workspace completion", beforeCompletion.frameRevision);
+    && getWorkspaceFieldValue(text) === accepted,
+  "the first genuine keystroke accepts the exact native workspace completion", beforeCompletion.frameRevision);
 
   const beforeSubmit = driver.snapshot();
   driver.pty.write(KEYS.enter);
@@ -620,8 +627,8 @@ test("real native Main restores a saved conversation with known-zero current act
   if (!runtime) return;
   requirePublicRuntimeDependencies(runtime);
   assert.equal(runtime.version, "1.6.0");
-  assert.equal(Buffer.byteLength(join("/tmp", "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
-    "the harness's short /tmp-owned broker socket path remains within the macOS limit");
+  assert.equal(Buffer.byteLength(join(realpathSync(tmpdir()), "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
+    "the harness's short configured-temp-owned broker socket path remains within the macOS limit");
 
   const scratch = createSavedMainScratchRoot();
   const workspace = canonicalWorkspace(createSavedMainWorkspace(scratch, `resume-workspace-${randomUUID().slice(0, 8)}`));

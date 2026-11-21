@@ -172,7 +172,7 @@ node tests/android-native-acceptance/run-device-suite.cjs --serial emulator-5554
 Useful flags: `--phase happy|policy|both` (default `both`), `--skip-install` when
 the APKs are already current, `--artifacts <dir>` to choose where the owner log,
 per-child journals, and the final report JSON are kept (default
-`/tmp/prg-android-acceptance-<run>`).
+`prg-android-acceptance-<run>` under the OS temporary directory).
 
 The runner prints `OWNED_AVD`, `RUN`, `FIXTURE_READY`, `PAIRING_APPROVED`, each
 `DEVICE_EVENT` (one per complete instrumentation status bundle), each

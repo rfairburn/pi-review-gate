@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -32,7 +33,7 @@ import { createLocalOwningHostService, type OwningHostManager } from "../src/ses
 
 function makeRoot(label: string): string {
   // Evidence stays outside the repository tree.
-  return realpathSync(mkdtempSync(join(realpathSync(process.env.TMPDIR ?? "/tmp"), `prg-474-${label}-`)));
+  return realpathSync(mkdtempSync(join(tmpdir(), `prg-474-${label}-`)));
 }
 
 function makePackageFixture(root: string): { packageRoot: string; piExecutable: string } {

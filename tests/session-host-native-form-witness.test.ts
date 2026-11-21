@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
-import { nativeFormFieldIsEmpty, OUTER_RESTORATION_BASELINE } from "./helpers/session-host-native-main-harness";
+import { nativeFormFieldIsEmpty, nativeFormFieldValue, OUTER_RESTORATION_BASELINE } from "./helpers/session-host-native-main-harness";
 import {
   getWorkspaceFieldValue,
   isEmptyWorkspaceField,
@@ -43,6 +43,67 @@ test("native form witness rejects missing borders/content rather than assuming e
   assert.equal(nativeFormFieldIsEmpty(frame("> Workspace:", "").replace(/─/g, " "), "> Workspace:"), false);
   assert.equal(nativeFormFieldIsEmpty("Session host\n> Workspace: ─────\n", "> Workspace:"), false);
   assert.equal(nativeFormFieldIsEmpty("Session host\n> Workspace: \n", "> Workspace:"), false);
+});
+
+// The 52-column narrow New form: a 13-column label gutter, a 39-column Editor
+// rule, and body rows the pinned Editor lays out at 38 columns.
+const NARROW_RULE = `             ${"─".repeat(39)}`;
+const NARROW_GUTTER = " ".repeat(13);
+const ONE_ROW_PREFIX = "/private/tmp/shm-AbC123/workspace-new-";
+const WRAPPED_PREFIX = "/private/tmp/prg-nci-AbCdEfGh/shm-AbC123/workspace-new-";
+
+function narrowField(body: readonly string[], below: readonly string[] = []): string {
+  return [
+    " New session",
+    "  Host: [ Local ]",
+    NARROW_RULE,
+    ...body.map((segment, index) => `${index === 0 ? "> Workspace: " : NARROW_GUTTER}${segment}`.padEnd(52)),
+    NARROW_RULE,
+    ...below,
+  ].join("\n");
+}
+
+test("native field value witness reads one-row and wrapped values within the Editor's rules", () => {
+  assert.equal(nativeFormFieldValue(narrowField([ONE_ROW_PREFIX]), "> Workspace:"), ONE_ROW_PREFIX);
+  const wrapped = [WRAPPED_PREFIX.slice(0, 38), WRAPPED_PREFIX.slice(38)];
+  assert.equal(nativeFormFieldValue(narrowField(wrapped), "> Workspace:"), WRAPPED_PREFIX);
+  assert.equal(nativeFormFieldValue(narrowField(wrapped, [`${NARROW_GUTTER}→ workspace-new-alpha/`,
+    `${NARROW_GUTTER}  workspace-new-beta/`]), "> Workspace:"), WRAPPED_PREFIX,
+  "the completion list below the bottom rule is never part of the value");
+  assert.equal(nativeFormFieldValue(narrowField([""]), "> Workspace:"), "");
+  const unicodePrefix = "/private/tmp/øabcdefghijklmnop/shm-AbC123/workspace-new-";
+  assert.equal(nativeFormFieldValue(narrowField([unicodePrefix.slice(0, 38), unicodePrefix.slice(38)]), "> Workspace:"),
+    unicodePrefix, "a non-ASCII configured root is read by the Editor's display widths");
+});
+
+test("native field value witness refuses partial, altered, or unbounded fields", () => {
+  const wrapped = [WRAPPED_PREFIX.slice(0, 38), WRAPPED_PREFIX.slice(38)];
+  assert.equal(nativeFormFieldValue(narrowField([wrapped[0]!]), "> Workspace:"), WRAPPED_PREFIX.slice(0, 38),
+    "the first wrapped row alone is not the typed value");
+  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(`${NARROW_RULE}\n`, ""), "> Workspace:"), undefined,
+    "a missing top rule is refused");
+  assert.equal(nativeFormFieldValue(narrowField(wrapped).split("\n").slice(0, -1).join("\n"), "> Workspace:"), undefined,
+    "an unpainted bottom rule is refused");
+  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(`${NARROW_GUTTER}${wrapped[1]}`, `stray        ${wrapped[1]}`),
+    "> Workspace:"), undefined, "text in the label gutter is refused");
+  assert.equal(nativeFormFieldValue(narrowField([wrapped[0]!, "", wrapped[1]!]), "> Workspace:"), undefined,
+    "a blank row inside the body is refused");
+  assert.equal(nativeFormFieldValue(narrowField(["/a b ", "c"]), "> Workspace:"), undefined,
+    "a wrapped value whose whitespace break is ambiguous is refused");
+  // The pinned Editor wraps `<37 chars> <rest>` after the space, so its first
+  // row is 38 columns ending in a space that the padded text cannot show.
+  const spaced = [`${WRAPPED_PREFIX.slice(0, 37)} `, WRAPPED_PREFIX.slice(37)];
+  assert.notEqual(nativeFormFieldValue(narrowField(spaced), "> Workspace:"), WRAPPED_PREFIX,
+    "a space dropped at the wrap boundary never reconstructs the unaltered prefix");
+  assert.equal(nativeFormFieldValue(narrowField(spaced), "> Workspace:"), undefined,
+    "a short non-final row is refused rather than joined");
+  assert.equal(nativeFormFieldValue(narrowField([WRAPPED_PREFIX.slice(0, 39), WRAPPED_PREFIX.slice(39)]), "> Workspace:"),
+    undefined, "a non-final row wider than the layout width is refused");
+  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(/─{39}$/u, "─".repeat(38)), "> Workspace:"), undefined,
+    "a bottom rule narrower than the top rule is refused");
+  assert.equal(nativeFormFieldValue(`${narrowField([ONE_ROW_PREFIX])}\n${narrowField([ONE_ROW_PREFIX])}`, "> Workspace:"), undefined,
+    "two labelled rows are refused");
+  assert.equal(nativeFormFieldValue(narrowField([ONE_ROW_PREFIX]), "> New name:"), undefined);
 });
 
 // --- The shared native New-open witness uses the actual approved New-form geometry.

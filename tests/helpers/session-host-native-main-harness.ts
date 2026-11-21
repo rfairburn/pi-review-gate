@@ -51,6 +51,8 @@ import { watch, type FSWatcher } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { wordWrapLine } from "pi-session-host-tui/dist/components/editor.js";
+
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import { ChangeSignal } from "./change-signal";
 import {
@@ -1533,6 +1535,64 @@ export function nativeFormFieldIsEmpty(text: string, marker: "> Workspace:" | ">
   const bottom = rows[index + 1]?.slice(start).trim();
   return top !== undefined && /^─+$/.test(top) && content.trim() === ""
     && bottom !== undefined && /^─+$/.test(bottom);
+}
+
+/**
+ * The exact value drawn in one labelled native form field, read across every
+ * row the pinned Editor wrapped it onto. The host labels only the Editor's
+ * first body row; later body rows sit in the unlabelled gutter beneath the
+ * label, and the Editor's own rules bound the body above and below. A
+ * single-line value wider than the field's layout width (the field width less
+ * the Editor's reserved caret column) therefore continues on the next gutter
+ * row, so a fixed-width substring of the frame is not evidence of the typed
+ * value at every pane width.
+ *
+ * Requires exactly one labelled row, the Editor's top rule directly above it,
+ * and an equally wide bottom rule after the last body row; any label or text in
+ * the gutter, blank body row, or missing or mismatched rule is refused. Rows
+ * beyond the bottom rule (the native completion list) are never part of the
+ * value.
+ *
+ * The reconstructed value is accepted only if the pinned Editor's own
+ * `wordWrapLine`, at the layout width (the rule width less the reserved caret
+ * column), breaks it into exactly the observed rows. That uses the Editor's
+ * display widths rather than character counts, so any path text is read, and a
+ * space hidden in a row's padding that changed where the Editor wrapped can
+ * never be silently dropped: the joined text then wraps differently and is
+ * refused. As for every padded single-row reader, whitespace after the value's
+ * final character is not observable in the text.
+ */
+export function nativeFormFieldValue(text: string, marker: "> Workspace:" | "> New name:"): string | undefined {
+  const rows = text.split("\n");
+  const labelled = rows.flatMap((line, index) => line.includes(marker) ? [index] : []);
+  if (labelled.length !== 1) return undefined;
+  const index = labelled[0]!;
+  const column = rows[index]!.indexOf(marker);
+  const start = column + marker.length + 1;
+  const ruleAt = (row: number): string | undefined => {
+    const rule = rows[row]?.slice(start).trim() ?? "";
+    return /^─+$/u.test(rule) ? rule : undefined;
+  };
+  const topRule = ruleAt(index - 1);
+  if (topRule === undefined) return undefined;
+  const layoutWidth = Math.max(1, topRule.length - 1);
+  const segments = [rows[index]!.slice(start).trimEnd()];
+  for (let row = index + 1; row < rows.length; row += 1) {
+    const bottomRule = ruleAt(row);
+    if (bottomRule !== undefined) {
+      if (bottomRule !== topRule) return undefined;
+      const value = segments.join("");
+      const reflowed = wordWrapLine(value, layoutWidth);
+      return reflowed.length === segments.length && reflowed.every(({ text }, position) => text === segments[position])
+        ? value
+        : undefined;
+    }
+    const line = rows[row]!;
+    const segment = line.slice(start).trimEnd();
+    if (line.slice(column, start).trim() !== "" || segment === "") return undefined;
+    segments.push(segment);
+  }
+  return undefined;
 }
 
 function workspaceFieldIsEmpty(text: string): boolean {

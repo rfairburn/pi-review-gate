@@ -29,6 +29,7 @@ import {
   makeRuntimeEnvironment,
   makeNativeAgentRoot,
   makeWorkspace,
+  nativeFormFieldValue,
   processIsAlive,
   removeOwnedScratchTree,
   resolveRuntimePin,
@@ -1034,8 +1035,11 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
   await driver.clearWorkspaceField("the native clear binding empties B's retained workspace before filesystem completion");
   const partialWorkspace = join(scratch, "workspace-new-");
-  await driver.writeAndWait(partialWorkspace, (text) => text.includes(partialWorkspace.slice(-18)),
-    "the New form's real workspace Editor accepts an absolute fixture-only completion prefix");
+  // The whole typed prefix must be the field's value. At this narrow width a
+  // longer configured temporary root wraps it onto the Editor's next body row,
+  // so it is read across the field's own rows, not as one frame substring.
+  await driver.writeAndWait(partialWorkspace, (text) => nativeFormFieldValue(text, "> Workspace:") === partialWorkspace,
+    "the New form's real workspace Editor holds the exact absolute fixture-only completion prefix");
   await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
     "typing the native path prefix automatically displays both owned folder suggestions");
   // Native Tab accepts an already visible selection. Dismiss that list first

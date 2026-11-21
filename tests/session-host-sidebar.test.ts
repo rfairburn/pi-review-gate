@@ -32,6 +32,7 @@ import {
 import { createSessionHostTextField } from "../src/session-host/field-editor";
 import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
 import { withoutScrollbarLane } from "./helpers/session-host-native-roster-witness";
+import { nativeFormFieldValue } from "./helpers/session-host-native-main-harness";
 import type { PeerUiHost, PeerUiSettings, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
@@ -2521,6 +2522,50 @@ test("exact-width form text reserves a visible end-of-value caret", () => {
   assert.equal(texts[frame.cursor!.row]?.slice(13, frame.cursor!.column), "k", "cursor is at the insertion cell after the wrapped character");
   assert.notEqual(frame.cursor?.row, 3,
     "the caret wrapped to a later row while the label stayed on the field's first editable row");
+});
+
+test("the native field value witness reads an absolute prefix across the real 52-column New form's wrapped rows", () => {
+  // The native Main leg types `<canonical tmpdir>/shm-XXXXXX/workspace-new-` at
+  // a 52-column pane: a 39-column field whose pinned Editor lays text out at 38
+  // columns. The canonical `/private/tmp` default parent fills exactly one row;
+  // any owned child root (here the CI shape `/private/tmp/prg-nci-XXXXXXXX`)
+  // wraps the same prefix onto the next gutter row.
+  const cases = [
+    { prefix: "/private/tmp/shm-AbC123/workspace-new-", rows: 1, oldSuffixVisible: true },
+    { prefix: "/private/tmp/prg-nci-AbCdEfGh/shm-AbC123/workspace-new-", rows: 2, oldSuffixVisible: false },
+    // A non-ASCII configured root is read by display width, not character count.
+    { prefix: "/private/tmp/øabcdefghijklmnop/shm-AbC123/workspace-new-", rows: 2, oldSuffixVisible: true },
+  ];
+  for (const { prefix, rows, oldSuffixVisible } of cases) {
+    const harness = formWith({ cols: 52, rows: 29 });
+    for (const char of prefix) harness.send(char);
+    const texts = assertPaneSafe(harness.controller.render(52, 29).lines, 52, 29);
+    const label = texts.findIndex((line) => line.startsWith("> Workspace: "));
+    assert.ok(label > 0, JSON.stringify(texts));
+    const body = texts.slice(label, label + rows).map((line) => line.slice(13).trimEnd());
+    assert.equal(body.join(""), prefix, `${rows} native body row(s) carry the prefix\n${texts.join("\n")}`);
+    assert.ok(body.every((segment) => visibleWidth(segment) <= 38), "the Editor reserves its caret column");
+    assert.match(texts[label + rows]!.slice(13).trim(), /^─+$/u, "the Editor's bottom rule ends the body");
+    assert.equal(nativeFormFieldValue(texts.join("\n"), "> Workspace:"), prefix,
+      "the witness returns the exact typed prefix from the real rendered form");
+    // Only the CI-shaped prefix's final 18 characters straddle the Editor's
+    // row break, which is why the old fixed-suffix substring missed it.
+    assert.equal(texts.join("\n").includes(prefix.slice(-18)), oldSuffixVisible);
+  }
+  // A space typed at the wrap boundary: the real Editor breaks after it, so its
+  // first row ends in a space the padded text cannot show. The witness refuses
+  // that layout instead of reconstructing the unaltered prefix.
+  const wrappedPrefix = cases[1]!.prefix;
+  const spaced = `${wrappedPrefix.slice(0, 37)} ${wrappedPrefix.slice(37)}`;
+  const harness = formWith({ cols: 52, rows: 29 });
+  for (const char of spaced) harness.send(char);
+  const spacedRows = assertPaneSafe(harness.controller.render(52, 29).lines, 52, 29);
+  const spacedText = spacedRows.join("\n");
+  const spacedLabel = spacedRows.findIndex((line) => line.startsWith("> Workspace: "));
+  assert.deepEqual(spacedRows.slice(spacedLabel, spacedLabel + 2).map((line) => line.slice(13).trimEnd()),
+    [wrappedPrefix.slice(0, 37), wrappedPrefix.slice(37)], `the real Editor wraps after the boundary space\n${spacedText}`);
+  assert.equal(nativeFormFieldValue(spacedText, "> Workspace:"), undefined,
+    "the real wrapped field with a boundary space is refused, never read as the unaltered prefix");
 });
 
 test("a wrapped value keeps its label on the field's first editable row as the caret moves", () => {

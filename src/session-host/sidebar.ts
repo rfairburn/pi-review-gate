@@ -3506,12 +3506,13 @@ function countEmphasisRole(count: number): SidebarThemeRole {
 /**
  * The count row's exact text and semantic roles, classified once for every
  * renderer. A missing/invalid count stays `unknown` in its existing exact
- * plaintext and stays ordinary pane text: only an OBSERVED NUMBER is painted, and
- * each of the two counts is banded independently. A category the row's observer
- * declared unreportable renders the shared not-applicable word instead, also
- * ordinary pane text and never a zero. Both labeled cells are always drawn,
- * including when neither category was observed; there is no combined fallback
- * row.
+ * plaintext and takes the shared dim `statusUnknown` role, the same one
+ * `agent unknown` and `input unknown` use; only an OBSERVED NUMBER takes an
+ * activity band, and each of the two counts is banded independently. A category
+ * the row's observer declared unreportable renders the shared not-applicable word
+ * instead, also ordinary pane text and never a zero. Both labeled cells are always
+ * drawn, including when neither category was observed; there is no combined
+ * fallback row, and no role changes the row's text, width, or layout.
  */
 function cardBackgroundSegments(item: SessionStatusFacts): CardBackgroundSegment[] {
   const tasksReportable = !isNativeCategoryUnsupported(item.statusSupport, "tasks");
@@ -3520,10 +3521,18 @@ function cardBackgroundSegments(item: SessionStatusFacts): CardBackgroundSegment
   const shells = shellsReportable ? sanitizeCount(item.activeShells) : null;
   return [
     tasks === null
-      ? { label: "bg tasks ", value: tasksReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
+      ? {
+        label: "bg tasks ",
+        value: tasksReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT,
+        role: tasksReportable ? "statusUnknown" : null,
+      }
       : { label: "bg tasks ", value: String(tasks), role: countEmphasisRole(tasks) },
     shells === null
-      ? { label: "shells ", value: shellsReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }
+      ? {
+        label: "shells ",
+        value: shellsReportable ? "unknown" : NATIVE_STATUS_NOT_APPLICABLE_TEXT,
+        role: shellsReportable ? "statusUnknown" : null,
+      }
       : { label: "shells ", value: String(shells), role: countEmphasisRole(shells) },
   ];
 }
@@ -11355,11 +11364,12 @@ export class SidebarController {
   }
 
   /**
-   * The same honest count facts as `cardBackgroundText`, with ONLY the numeric
-   * VALUE painted. The `bg tasks ` / `shells ` labels and the ` | ` separator
-   * carry no generated sequence of their own, and an `unknown` value stays on
-   * the neutral canvas exactly as it was before this styling existed. Stripping
-   * the finite palette sequences reproduces `cardBackgroundText` byte for byte.
+   * The same honest count facts as `cardBackgroundText`, with ONLY the VALUE
+   * painted. The `bg tasks ` / `shells ` labels and the ` | ` separator carry no
+   * generated sequence of their own; an observed number takes its activity band,
+   * an `unknown` value the shared dim `statusUnknown` role, and a declared
+   * not-applicable word stays on the neutral canvas. Stripping the finite palette
+   * sequences reproduces `cardBackgroundText` byte for byte.
    */
   private cardBackgroundRuns(item: SessionStatusFacts): string {
     return cardBackgroundSegments(item)

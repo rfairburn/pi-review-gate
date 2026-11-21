@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.308]
+
+### Fixed
+
+- **Unknown sidebar activity counts use the shared dim unknown colour (#662)**: an
+  `unknown` `bg tasks` or `shells` value on a session card's activity row now takes the
+  palette's existing dim `statusUnknown` foreground — the role `agent unknown` and `input
+  unknown` already use — in both appearances, instead of ordinary pane text. Only value
+  words are painted: labels, separator, wording, indent, width, activity bands, the
+  zero-versus-unknown distinction, the not-applicable word, and the ANSI-free Network
+  summary are unchanged. See [Session host](docs/session-host-alpha.md).
+
 ## [0.1.0-dev.307]
 
 ### Changed

@@ -9,9 +9,11 @@
  *    status roles. The bands are RPM-style ACTIVITY intensity, never an error:
  *    a red number never reclassifies the row's status, notice, or lifecycle,
  *    and the number is never capped (128 and larger safe integers render whole).
- * 2. ONLY the numeric VALUE is painted. The `bg tasks ` / `shells ` labels and
- *    the ` | ` separator stay ordinary pane text, and an `unknown` value stays
- *    ordinary pane text exactly as it was before this styling existed.
+ * 2. ONLY the VALUE is painted. The `bg tasks ` / `shells ` labels and the ` | `
+ *    separator stay ordinary pane text; an observed number takes its activity band,
+ *    an `unknown` value the shared dim `statusUnknown` role the `agent unknown` /
+ *    `input unknown` values already use (#662), and a declared-unreportable category
+ *    keeps its not-applicable word on the ordinary canvas.
  * 3. The plaintext is byte-identical to the pre-colour row for every input,
  *    including the both-unknown special case, mixed known/unknown, and every
  *    invalid count — the same facts also feed the ANSI-free Network summary.
@@ -42,6 +44,7 @@ import {
 } from "../src/session-host/sidebar";
 import { sidebarPaletteFor, type SidebarThemeId } from "../src/session-host/sidebar-theme";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
+import { NATIVE_STATUS_NOT_APPLICABLE_TEXT } from "../src/session-host/native-status";
 import type { RemoteSessionMetadata } from "../src/session-host/network/roster-metadata";
 import type { PeerUiHost, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
@@ -192,20 +195,22 @@ function assertCountRow(
   assert.equal(plainText(raw), expectedPlaintext,
     `${where}: the painted row's plaintext is the exact expected text`);
   // Both labeled cells are always on the row, including when both are unknown:
-  // there is no combined row to special-case. The labels and separator never
-  // borrow a colour: the sequence for a value
+  // there is no combined row to special-case. The indent, the labels, and the
+  // separator never borrow a colour: the sequence for a value
   // begins immediately after its own label, and the separator follows a reset.
-  assert.ok(raw.includes("  bg tasks "), `${where}: the tasks label stays ordinary pane text`);
+  assert.ok(raw.includes("  bg tasks "), `${where}: the indent and the tasks label stay ordinary pane text`);
   assert.ok(raw.includes("| shells "), `${where}: the shells label stays ordinary pane text`);
   for (const [label, part] of [["tasks", tasks], ["shells", shells]] as const) {
+    const prefix = label === "tasks" ? "bg tasks " : "shells ";
     if (part.role === null) {
-      assert.ok(raw.includes(`${label === "tasks" ? "bg tasks " : "shells "}${part.text}`),
-        `${where}: an unknown ${label} value stays ordinary pane text`);
-      assert.ok(!raw.includes(`${label === "tasks" ? "bg tasks " : "shells "}\x1b[`),
-        `${where}: an unknown ${label} value carries no generated sequence`);
+      // Only a declared-unreportable category is unroled: `unknown` always takes a role.
+      assert.ok(raw.includes(`${prefix}${part.text}`),
+        `${where}: the unroled ${label} value ${part.text} stays ordinary pane text`);
+      assert.ok(!raw.includes(`${prefix}\x1b[`),
+        `${where}: the unroled ${label} value carries no generated sequence`);
       continue;
     }
-    assert.ok(raw.includes(`${label === "tasks" ? "bg tasks " : "shells "}\x1b[${palette[part.role as keyof typeof palette]}m${part.text}\x1b[0m`),
+    assert.ok(raw.includes(`${prefix}\x1b[${palette[part.role as keyof typeof palette]}m${part.text}\x1b[0m`),
       `${where}: the ${label} value ${part.text} uses the ${part.role} role and closes its own run`);
   }
 }
@@ -283,20 +288,22 @@ test("an unknown count keeps the other axis's observed 2 visible beside it", () 
     const lines = drawnRows(harness.controller, 60, 16);
 
     // Neither unknown hides the other cell's observed number, and the number keeps
-    // its own band: the example shape `bg tasks unknown | shells 2` is drawn whole.
+    // its own band: the example shape `bg tasks unknown | shells 2` is drawn whole,
+    // with the unknown word dim and the observed number in its own band.
     assertCountRow(rowBelow(lines, "UnknownTasksTwo", 2), countText("unknown", "2"),
-      { text: "unknown", role: null }, { text: "2", role: "statusRunning" }, palette, `${theme} unknown/2`);
+      { text: "unknown", role: "statusUnknown" }, { text: "2", role: "statusRunning" }, palette, `${theme} unknown/2`);
     assertCountRow(rowBelow(lines, "UnknownShellsTwo", 2), countText("2", "unknown"),
-      { text: "2", role: "statusRunning" }, { text: "unknown", role: null }, palette, `${theme} 2/unknown`);
+      { text: "2", role: "statusRunning" }, { text: "unknown", role: "statusUnknown" }, palette, `${theme} 2/unknown`);
   }
 });
 
 // ---------------------------------------------------------------------------
-// 2. Unknown, mixed, and invalid counts keep their exact per-cell text and stay
-//    ordinary pane text — no combined row, no new dim colour, no invented zero.
+// 2. Unknown, mixed, and invalid counts keep their exact per-cell text and take
+//    only the shared dim unknown role — no combined row, no invented zero, and
+//    the declared not-applicable word stays on the ordinary canvas.
 // ---------------------------------------------------------------------------
 
-test("unknown, mixed, and invalid counts keep their exact text and stay unpainted", () => {
+test("unknown, mixed, and invalid counts keep their exact text and take only the shared dim unknown role", () => {
   const invalid: readonly { readonly label: string; readonly tasks: unknown; readonly shells: unknown }[] = [
     { label: "Bogus", tasks: -1, shells: 1.5 },
     { label: "Hostile", tasks: "3", shells: Number.MAX_SAFE_INTEGER + 1 },
@@ -308,6 +315,15 @@ test("unknown, mixed, and invalid counts keep their exact text and stay unpainte
       makeItem({ id: "both", label: "BothUnknown" }),
       makeItem({ id: "mixed", label: "Mixed", activeTasks: null, activeShells: 3 }),
       makeItem({ id: "mixed2", label: "Mixed2", activeTasks: 4, activeShells: null }),
+      // A declared-unreportable category is a DIFFERENT fact from `unknown`: its
+      // not-applicable word keeps the neutral canvas it always had.
+      makeItem({
+        id: "na",
+        label: "NotApplicable",
+        activeTasks: null,
+        activeShells: null,
+        statusSupport: { tasks: "unsupported", shells: "supported" },
+      }),
       ...invalid.map((entry, index) => makeItem({
         id: `bad${index}`,
         label: entry.label,
@@ -318,14 +334,18 @@ test("unknown, mixed, and invalid counts keep their exact text and stay unpainte
     const lines = drawnRows(harness.controller, 60, 44);
 
     assertCountRow(rowBelow(lines, "BothUnknown", 2), countText("unknown", "unknown"),
-      { text: "unknown", role: null }, { text: "unknown", role: null }, palette, `${theme} both unknown`);
+      { text: "unknown", role: "statusUnknown" }, { text: "unknown", role: "statusUnknown" }, palette, `${theme} both unknown`);
     assertCountRow(rowBelow(lines, "Mixed", 2), countText("unknown", "3"),
-      { text: "unknown", role: null }, { text: "3", role: "statusWaiting" }, palette, `${theme} mixed`);
+      { text: "unknown", role: "statusUnknown" }, { text: "3", role: "statusWaiting" }, palette, `${theme} mixed`);
     assertCountRow(rowBelow(lines, "Mixed2", 2), countText("4", "unknown"),
-      { text: "4", role: "statusWaiting" }, { text: "unknown", role: null }, palette, `${theme} mixed2`);
+      { text: "4", role: "statusWaiting" }, { text: "unknown", role: "statusUnknown" }, palette, `${theme} mixed2`);
+    assertCountRow(rowBelow(lines, "NotApplicable", 2),
+      `  bg tasks ${NATIVE_STATUS_NOT_APPLICABLE_TEXT} | shells unknown`,
+      { text: NATIVE_STATUS_NOT_APPLICABLE_TEXT, role: null }, { text: "unknown", role: "statusUnknown" },
+      palette, `${theme} not-applicable beside unknown`);
     for (const entry of invalid) {
       assertCountRow(rowBelow(lines, entry.label, 2), countText("unknown", "unknown"),
-        { text: "unknown", role: null }, { text: "unknown", role: null }, palette, `${theme} ${entry.label}`);
+        { text: "unknown", role: "statusUnknown" }, { text: "unknown", role: "statusUnknown" }, palette, `${theme} ${entry.label}`);
     }
   }
 });
@@ -387,6 +407,32 @@ test("the remote card's counts use the same bands as the local card", () => {
     assert.equal(plainText(rowBelow(lines, "Remote build", 1)), "  host studio");
     assert.equal(plainText(rowBelow(lines, "Remote build", 2)), "  agent running | input none",
       "the activity counts keep the remote card honestly running, exactly as before");
+  }
+});
+
+test("the Network activity summary stays plain text: no palette role reaches it, the dim unknown included", () => {
+  for (const theme of THEMES) {
+    const palette = sidebarPaletteFor(theme);
+    const harness = remoteHarness(theme, makeHost({
+      id: "h1",
+      label: "studio",
+      rows: [makeRemoteRow({ id: "r1", label: "Remote build" })],
+    }));
+    // The host draws its Network summary rows OUTSIDE the card palette, from the
+    // SAME count facts: open that pane and inspect the raw row.
+    harness.controller.openPeerMenu();
+    const summary = harness.controller.renderForm(140, 30).lines
+      .find((line) => line.replace(SGR_PATTERN, "").includes("bg tasks")) ?? "";
+    assert.notEqual(summary, "", `${theme}: the Network summary still states both counts`);
+    // Raw inspection BEFORE any stripping: only the pane canvas and its resets are
+    // on the row, so no card role — the dim unknown included — reached it.
+    assert.deepEqual([...new Set(summary.match(SGR_PATTERN) ?? [])], ["\x1b[0m", `\x1b[${palette.canvas}m`],
+      `${theme}: the summary row carries only the pane canvas and its resets:\n${summary}`);
+    // With exactly those removed, the row IS the unchanged plain text: exact
+    // equality also means no non-SGR escape byte survives anywhere on it.
+    assert.equal(summary.replace(SGR_PATTERN, "").trimEnd(),
+      "  - studio: Remote build | agent unknown | input none | bg tasks unknown | shells unknown | /remote/ws/r1",
+      `${theme}: the plain summary text is unchanged:\n${summary}`);
   }
 });
 
@@ -548,7 +594,7 @@ async function cellsOf(controller: SidebarController, cols: number, rows: number
   return { surface, lines };
 }
 
-test("the terminal's effective cells band each activity count and leave labels, separators, and unknown on the canvas", async () => {
+test("the terminal's effective cells band each activity count and dim only the unknown values", async () => {
   const cases: readonly {
     readonly label: string;
     readonly tasks: number | null;
@@ -568,9 +614,9 @@ test("the terminal's effective cells band each activity count and leave labels, 
     { label: "MaxSafe", tasks: 9_007_199_254_740_991, shells: 9_007_199_254_740_991, painted: [{ text: "9007199254740991", role: "statusError", bold: true }, { text: "9007199254740991", role: "statusError", bold: true }] },
     { label: "TwoSeven", tasks: 2, shells: 7, painted: [{ text: "2", role: "statusRunning", bold: true }, { text: "7", role: "statusError", bold: true }] },
     { label: "SixSeven", tasks: 6, shells: 7, painted: [{ text: "6", role: "statusWaiting", bold: true }, { text: "7", role: "statusError", bold: true }] },
-    { label: "UnknownTasks", tasks: null, shells: 3, painted: [{ text: "3", role: "statusWaiting", bold: true }] },
-    { label: "UnknownShells", tasks: 4, shells: null, painted: [{ text: "4", role: "statusWaiting", bold: true }] },
-    { label: "BothUnknown", tasks: null, shells: null, painted: [] },
+    { label: "UnknownTasks", tasks: null, shells: 3, painted: [{ text: "unknown", role: "statusUnknown", bold: false }, { text: "3", role: "statusWaiting", bold: true }] },
+    { label: "UnknownShells", tasks: 4, shells: null, painted: [{ text: "4", role: "statusWaiting", bold: true }, { text: "unknown", role: "statusUnknown", bold: false }] },
+    { label: "BothUnknown", tasks: null, shells: null, painted: [{ text: "unknown", role: "statusUnknown", bold: false }, { text: "unknown", role: "statusUnknown", bold: false }] },
   ];
   const cols = 60;
   const rows = 92;
@@ -598,13 +644,13 @@ test("the terminal's effective cells band each activity count and leave labels, 
           assert.equal(run.fg?.mode, "rgb", `${where}: every cell keeps an exact 24-bit foreground`);
           assert.equal(run.bg, undefined, `${where}: every cell keeps the terminal-default background`);
         }
-        // Exactly the numbers carry colour, each in its own band and emphasis;
-        // nothing else on the row — label, spaces, separator, or `unknown` — is
-        // pulled into any of them by a preceding style.
+        // Exactly the two VALUE words carry colour, each in its own band and
+        // emphasis; nothing else on the row — indent, label, spaces, or separator —
+        // is pulled into any of them by a preceding style.
         const painted = runs.filter((run) => run.fg?.value !== canvasRgb);
         assert.deepEqual(painted.map((run) => ({ text: run.text, bold: run.bold === true })),
           testCase.painted.map((part) => ({ text: part.text, bold: part.bold })),
-          `${where}: only the numbers are painted, with the agreed emphasis`);
+          `${where}: only the values are painted, with the agreed emphasis`);
         painted.forEach((run, index) => {
           const part = testCase.painted[index];
           assert.ok(part, `${where}: a painted cell has an agreed band`);

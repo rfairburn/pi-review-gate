@@ -227,12 +227,43 @@ interface NormalizedInput {
 }
 
 /**
- * #682: actions a trusted second adapter may bind through
- * `ExecutionToolManager.sharedManagedTool`. Every other action stays reachable
- * only through Pi registration.
+ * #682: canonical actions deliberately left unbound at the shared boundary,
+ * each with the specific reason. They stay fully available through Pi. Both
+ * depend on the process-wide source-mutation coordinator, which keys conflict
+ * blocks by workspace root rather than by owner, so this slice cannot enforce
+ * owner scoping for them without changing the controller or coordinator:
+ * - MarkClean: when two owners hold gates on overlapping roots, the
+ *   coordinator returns the first gate's release handle to both stores, so
+ *   clearing one owner's resolved gate can unblock a root that another
+ *   owner's unresolved gate still holds.
+ * - ForceMerge: its refusal for a blocked workspace persists and returns the
+ *   coordinator's raw blocker reason, which can name another owner's task and
+ *   conflict paths. (Interrupt's `interrupt_with_merge` mode reaches the same
+ *   path and is refused at the shared boundary; see sharedOwnershipRefusal.)
  */
-export const SHARED_MANAGED_TOOL_ACTIONS = ["start", "inspect"] as const satisfies readonly ExecutionToolAction[];
-export type SharedManagedToolAction = typeof SHARED_MANAGED_TOOL_ACTIONS[number];
+const SHARED_UNBOUND_ACTIONS = {
+  force_merge: "its blocked-workspace refusal persists and returns the process-wide conflict blocker's reason, which can belong to another owner",
+  mark_clean: "conflict blocks are keyed by workspace root, not owner, so clearing this owner's gate could release a block another owner's unresolved gate still holds",
+} as const satisfies Partial<Record<ExecutionToolAction, string>>;
+
+/** A canonical action that a trusted second adapter may bind (#682). */
+export type SharedManagedToolAction = Exclude<ExecutionToolAction, keyof typeof SHARED_UNBOUND_ACTIONS>;
+
+/**
+ * #682: actions a trusted second adapter may bind through
+ * `ExecutionToolManager.sharedManagedTool`: the canonical action inventory
+ * (./tool-names) minus the documented `SHARED_UNBOUND_ACTIONS`, so Pi
+ * registration and the shared boundary cannot drift. Binding is not exposure:
+ * an action is invocable only when the owner explicitly binds it and the call
+ * passes the owner's admission and live call policy (see sharedManagedTool).
+ *
+ * Watch arms the same controller one-shot subscription as Pi; its later
+ * checkpoint is delivered by the controller's existing notification path, not
+ * through the shared invocation result.
+ */
+export const SHARED_MANAGED_TOOL_ACTIONS: readonly SharedManagedToolAction[] = ACTIONS.filter(
+  (action): action is SharedManagedToolAction => !Object.hasOwn(SHARED_UNBOUND_ACTIONS, action),
+);
 
 /**
  * Call inputs for the canonical handler. Pi builds them from its own tool call.
@@ -245,6 +276,12 @@ interface ManagedHandlerBinding {
   admittedFingerprint: () => string | undefined;
   /** Host tool context (Pi `ctx`). When present it sets UI context and scoped models. */
   host?: { ctx: unknown };
+  /**
+   * Whether validated inputs that can reach work or state outside this
+   * owner's associations are admitted (see sharedOwnershipRefusal). Pi admits
+   * them unchanged; the shared boundary refuses them before the controller.
+   */
+  ownerScopedInputsOnly: boolean;
 }
 
 /**
@@ -919,6 +956,7 @@ export class ExecutionToolManager {
           const result = await this.executeAction(action, name, params, {
             toolCallId,
             host: { ctx },
+            ownerScopedInputsOnly: false,
             // Pi keeps its existing identity source: the preflight-admitted raw
             // fingerprint, or the submitted params only when no resolver is wired.
             admittedFingerprint: () => this.input.submittedFingerprintFor
@@ -958,7 +996,7 @@ export class ExecutionToolManager {
    * Assumptions:
    * - The caller is owner-side code that has already authenticated the
    *   caller. `admission` is installed by that owner when it binds the tool.
-   *   Both actions run only the request admitted for (call id, tool name);
+   *   Every shared action runs only the request admitted for (call id, tool name);
    *   the caller passes no params. Start persists that request's original raw
    *   identity and never rehashes the params it actually runs.
    * - The call must pass the owner's live call policy
@@ -973,9 +1011,31 @@ export class ExecutionToolManager {
    *   preflight returned-error observer. Duplicate and liveness preflight and
    *   protection audits belong to the owner admission that issues the
    *   identity.
+   * - Watch returns only the arm acknowledgement. The one-shot subscription is
+   *   the controller's single per-execution watch, shared with Pi: arming from
+   *   either path replaces the other, and the same actionable events cancel
+   *   it. The later checkpoint goes through the owner's existing notification
+   *   delivery. This boundary adds no callback transport for it.
+   * - Owner scoping for Add, Continue, Steer, and Interrupt is the
+   *   controller's own: task and execution ids resolve only within this
+   *   manager's associated groups (or their authenticated archives). Two
+   *   validated inputs can reach beyond them, and the shared path refuses both
+   *   before the controller runs (sharedOwnershipRefusal): Continue's explicit
+   *   reattachment bundle, which on an unknown task reaches operation
+   *   adoption, and Interrupt's `interrupt_with_merge`, which reaches
+   *   ForceMerge. ForceMerge and MarkClean are not bound at all
+   *   (SHARED_UNBOUND_ACTIONS). The recovery engine and controller are
+   *   unchanged, and all of it stays reachable through Pi.
+   * - Mutating actions keep Pi's actor ("model") and default their instruction
+   *   id to the owner call id, so an owner retrying the same call id gets the
+   *   controller's existing duplicate-instruction handling.
    */
   sharedManagedTool(action: SharedManagedToolAction, admission: ManagedToolAdmission): ManagedToolDefinition {
-    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly string[]).includes(action)) {
+    if (typeof action === "string" && Object.hasOwn(SHARED_UNBOUND_ACTIONS, action)) {
+      const unbound = action as keyof typeof SHARED_UNBOUND_ACTIONS;
+      throw new Error(`${EXECUTION_TOOL_NAMES[unbound]} is not available through the shared managed boundary: ${SHARED_UNBOUND_ACTIONS[unbound]}. It remains available through Pi.`);
+    }
+    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly unknown[]).includes(action)) {
       throw new Error(`${String(action)} is not a shared managed tool action.`);
     }
     if (!isRecord(admission) || typeof admission.resolveCall !== "function") {
@@ -1011,6 +1071,7 @@ export class ExecutionToolManager {
         return this.executeAction(action, name, params, {
           toolCallId,
           admittedFingerprint: () => startCallFingerprint,
+          ownerScopedInputsOnly: true,
         });
       },
     };
@@ -1139,6 +1200,14 @@ export class ExecutionToolManager {
       normalized = normalizeInput(action, params);
     } catch (error) {
       return result(`Invalid ${toolName} request: ${messageOf(error)}`, { diagnostic: messageOf(error) }, true);
+    }
+    const ownershipRefusal = binding.ownerScopedInputsOnly ? sharedOwnershipRefusal(normalized) : undefined;
+    if (ownershipRefusal) {
+      return result(
+        `${toolName} failed closed: ${ownershipRefusal.text}`,
+        { action: normalized.action, diagnostic: ownershipRefusal.diagnostic },
+        true,
+      );
     }
     const instructionId = normalized.instructionId ?? toolCallId;
     try {
@@ -1639,6 +1708,27 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     throw new Error("inspect requires an explicit taskId; use a stable task handle returned by SubtasksStart/SubtasksAdd or shown in prior inspection results");
   }
   return normalized;
+}
+
+/**
+ * #682: validated inputs the shared boundary refuses because an authorized
+ * call cannot prove they stay within this owner's work. Pi admits both
+ * unchanged.
+ */
+function sharedOwnershipRefusal(normalized: NormalizedInput): { text: string; diagnostic: string } | undefined {
+  if (normalized.bundle) {
+    return {
+      text: "an explicit reattachment bundle is not admitted through the shared managed boundary, because an authorized call does not prove the bundle's operation belongs to this owner; nothing was continued, adopted, or changed. Continue a task this owner already holds by its executionId and taskId without a bundle.",
+      diagnostic: "explicit reattachment bundle refused at the shared managed boundary",
+    };
+  }
+  if (normalized.action === "interrupt" && normalized.interruptMode === "interrupt_with_merge") {
+    return {
+      text: "interrupt_with_merge is not admitted through the shared managed boundary, because its merge reports the process-wide workspace conflict blocker, which can belong to another owner; nothing was interrupted, merged, or changed. interrupt_as_failure remains available.",
+      diagnostic: "interrupt_with_merge refused at the shared managed boundary",
+    };
+  }
+  return undefined;
 }
 
 function allowedKeys(action: Action): Set<string> {

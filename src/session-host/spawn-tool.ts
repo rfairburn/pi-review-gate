@@ -155,21 +155,47 @@ export function sessionSpawnToolSchema(
   };
 }
 
-/** Register only when the top-level hosted child has reporter-published authority. */
-export function registerSessionSpawnTool(
-  pi: unknown,
+/**
+ * Canonical SessionSpawn tool (#682): the one definition and handler that Pi
+ * registration consumes and that a later trusted owner-side adapter can bind.
+ * Advertised selectors, workspace creation, title guidance, and the spawn call
+ * all derive from the owner's actual capability; caller data cannot enable a
+ * selector the capability lacks, and there is no fallback launch.
+ */
+export interface SessionSpawnToolDefinition {
+  readonly name: typeof SESSION_SPAWN_TOOL_NAME;
+  readonly label: string;
+  readonly description: string;
+  readonly promptSnippet: string;
+  readonly promptGuidelines: readonly string[];
+  readonly executionMode: "sequential";
+  /** Descriptive schema. The handler parses and gates input itself, so a schema never widens what it accepts. */
+  readonly parameters: Record<string, unknown>;
+  /**
+   * Canonical handler. Resolves with {@link sessionSpawnResult} for the
+   * capability's launch outcome ("started" confirms launch only). Rejects with
+   * the model-facing Error, before anything is started, for invalid input or
+   * for host/kind/createWorkspace the capability does not declare.
+   */
+  execute(params: unknown, signal?: AbortSignal): Promise<Record<string, unknown>>;
+}
+
+/**
+ * Build the canonical definition from the owner's capability. Undefined unless
+ * that capability exists with a valid title-space snapshot.
+ */
+export function sessionSpawnToolDefinition(
   capability: SessionHostSpawnCapability | undefined,
-): boolean {
+): SessionSpawnToolDefinition | undefined {
   if (!capability || !Number.isSafeInteger(capability.titleColumns) || capability.titleColumns < 1
-    || capability.titleColumns > 1000 || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
-  const host = pi as unknown as SessionSpawnToolHost;
+    || capability.titleColumns > 1000) return undefined;
   const routing = capability.routing === true;
   // Discovery guidance is static text and appears only with the actual
   // reporter-published inspection capability, never as a dynamic roster.
   const discovery = routing && hasSessionHostsInspection(capability);
   // Workspace creation is advertised only with the declared routed capability.
   const createWorkspace = routing && capability.createWorkspace === true;
-  host.registerTool({
+  return Object.freeze({
     name: SESSION_SPAWN_TOOL_NAME,
     label: SESSION_SPAWN_TOOL_NAME,
     description:
@@ -184,7 +210,7 @@ export function registerSessionSpawnTool(
     promptSnippet: createWorkspace
       ? "Use SessionSpawn only to add a fresh independent session-host sidebar child. Supply a workspace (existing, or created as a plain directory when createWorkspace is true), friendly title, and exact initial prompt; no worktree, clone, branch, focus change, or prompt-completion claim is involved."
       : "Use SessionSpawn only to add a fresh independent session-host sidebar child. Supply an existing workspace, friendly title, and exact initial prompt; no worktree, clone, branch, focus change, or prompt-completion claim is involved.",
-    promptGuidelines: [
+    promptGuidelines: Object.freeze([
       createWorkspace
         ? "The requested workspace must already exist unless createWorkspace is true. SessionSpawn never creates worktrees, clones, or branches."
         : "The requested workspace must already exist. SessionSpawn never creates worktrees, clones, or branches.",
@@ -198,14 +224,14 @@ export function registerSessionSpawnTool(
       ] : []),
       ...(discovery ? [`SessionSpawn: ${SESSION_SPAWN_DISCOVERY_GUIDANCE}`] : []),
       ...(createWorkspace ? [`SessionSpawn createWorkspace: ${SESSION_SPAWN_CREATE_WORKSPACE_GUIDANCE}`] : []),
-    ],
+    ]),
     executionMode: "sequential",
     parameters: sessionSpawnToolSchema(capability.titleColumns, {
       routing,
       discovery,
       ...(createWorkspace ? { createWorkspace: true } : {}),
     }),
-    execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) => {
+    execute: async (params: unknown, signal?: AbortSignal) => {
       const input = parseSessionSpawnInput(params);
       if (!routing && hasSessionSpawnRouting(input)) {
         // Never drop explicit selectors and launch a local Pi child instead.
@@ -218,6 +244,27 @@ export function registerSessionSpawnTool(
       const outcome = await capability.spawn(input, signal);
       return sessionSpawnResult(outcome);
     },
+  });
+}
+
+/** Register only when the top-level hosted child has reporter-published authority. */
+export function registerSessionSpawnTool(
+  pi: unknown,
+  capability: SessionHostSpawnCapability | undefined,
+): boolean {
+  const definition = sessionSpawnToolDefinition(capability);
+  if (!definition || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
+  const host = pi as unknown as SessionSpawnToolHost;
+  host.registerTool({
+    name: definition.name,
+    label: definition.label,
+    description: definition.description,
+    promptSnippet: definition.promptSnippet,
+    promptGuidelines: [...definition.promptGuidelines],
+    executionMode: definition.executionMode,
+    parameters: definition.parameters,
+    // Pi's own tool call id is not an input to the launch; the shared handler runs unchanged.
+    execute: (_toolCallId: string, params: unknown, signal?: AbortSignal) => definition.execute(params, signal),
   });
   return true;
 }

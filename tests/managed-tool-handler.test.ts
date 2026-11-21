@@ -77,11 +77,14 @@ test("Pi registration is unchanged and shares schema and description with the sh
     }
     assert.deepEqual(Object.keys(fixture.piTool("SubtasksStart").parameters.properties), ["kind", "workspace", "tasks"]);
     assert.deepEqual(Object.keys(fixture.piTool("SubtasksInspect").parameters.properties), ["executionId", "taskId", "offset", "lines", "evidence"]);
-    for (const action of ["add", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"]) {
+    // The remaining lifecycle actions bind through the same boundary; see
+    // ./managed-tool-lifecycle-parity.test.ts. Names outside the canonical
+    // action inventory never bind.
+    for (const action of ["bogus", "SubtasksStart", undefined]) {
       assert.throws(
         () => fixture.manager.sharedManagedTool(action as never, fixture.admission),
         /is not a shared managed tool action/,
-        `${action} stays Pi-only`,
+        `${String(action)} is not an action`,
       );
     }
     assert.throws(() => fixture.manager.sharedManagedTool("start", undefined as never), /requires an owner admission resolver/);

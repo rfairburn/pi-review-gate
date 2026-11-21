@@ -696,7 +696,7 @@ export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
   resolution: Partial<ConfigPathResolution> = {},
 ): LoadedConfig {
-  const disabledVar = firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED"]);
+  const disabledVar = reviewGateGlobalDisableEnv(env);
   if (disabledVar) {
     return {
       config: { ...DEFAULT_CONFIG, enabled: false },
@@ -1662,19 +1662,23 @@ function findConfigPath(
     return env.PI_REVIEW_GATE_CONFIG;
   }
   const candidates = reviewGateConfigCandidates(env, resolveConfigPathResolution(resolution));
-  // Fail-closed precedence: a candidate counts as present when it exists in
-  // any form, including dangling symlinks. A dangling or unreadable primary
-  // is therefore returned for loadConfig to handle (its existing unreadable-
-  // config recovery) instead of being bypassed in favor of a lower-priority
-  // candidate; only true absence selects the next candidate.
-  return candidates.find((candidate) => {
-    try {
-      lstatSync(candidate);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== "ENOENT";
-    }
-  });
+  return candidates.find(reviewGateConfigCandidatePresent);
+}
+
+/**
+ * Fail-closed discovery precedence shared by `loadConfig` and strict readers:
+ * a candidate counts as present when it exists in any form, including
+ * dangling symlinks. A dangling or unreadable primary is therefore selected
+ * (for the reader to handle) instead of being bypassed in favor of a
+ * lower-priority candidate; only true absence selects the next candidate.
+ */
+export function reviewGateConfigCandidatePresent(candidate: string): boolean {
+  try {
+    lstatSync(candidate);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
 }
 
 function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
@@ -2344,6 +2348,14 @@ function normalizeMaxWorkers(value: unknown): number | undefined {
 // two in sync.
 function isTruthy(value: string | undefined): boolean {
   return value === "1" || value === "true" || value === "yes";
+}
+
+/**
+ * Name of the set global kill switch (`PI_REVIEW_GATE_DISABLED`), or
+ * undefined. The single source for `loadConfig` and strict readers.
+ */
+export function reviewGateGlobalDisableEnv(env: NodeJS.ProcessEnv): string | undefined {
+  return firstTruthyEnv(env, ["PI_REVIEW_GATE_DISABLED"]);
 }
 
 function firstTruthyEnv(env: NodeJS.ProcessEnv, names: string[]): string | undefined {

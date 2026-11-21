@@ -1656,6 +1656,99 @@ export function restoredNativeEditorFrame(
   return false;
 }
 
+/** The host list's selected-row marker, exactly as its renderer emits it. */
+const NATIVE_MENU_ARROW = /^\s*[→>] /;
+/** The host list's own scroll cue, `  (17/18)`, alone on the row under its rows. */
+const NATIVE_MENU_CUE = /^\s*\((\d+)\/(\d+)\)\s*$/;
+
+/**
+ * One complete witness of a native settings menu's selection state: the
+ * arrow-prefixed selected row plus the list's own reported position when the
+ * list is long enough to render its scroll cue.
+ */
+export interface NativeMenuSelection {
+  /** The selected row exactly as the native pane renders it, arrow included. */
+  readonly selectedRow: string;
+  /** The list's reported one-based selected position, present with `total`. */
+  readonly position?: number;
+  /** The list's reported row count, present with `position`. */
+  readonly total?: number;
+}
+
+/**
+ * Complete selection witness of one frame's native menu, or undefined while the
+ * frame carries no usable witness. `nativeLeft` is the native pane's first
+ * column, so the roster's independent highlight never enters the witness, and
+ * `scanRows` bounds the row search to the frame's own height.
+ *
+ * When the list scrolls it renders its `  (N/M)` cue directly below its visible
+ * rows, so the selected row is searched from that cue upward: the rows between
+ * them are the list's own rows, and an unrelated `→`/`>` line elsewhere in the
+ * pane (Pi's message area or footer) can never be mistaken for the highlight.
+ * The cue is also the list's own authority for which row is selected, which a
+ * scraped row cannot be: a scrolling move repaints every visible row, so a
+ * frame captured mid repaint shows a new arrow row whose real menu position is
+ * only known from the cue. Both the child renderer and Main's outer frame
+ * writer emit a row diff in increasing screen-row order, so a partially
+ * delivered repaint is always a top-down prefix: the cue can only report the
+ * new position once every list row above it already does.
+ *
+ * A list that fits its pane draws no cue and cannot scroll. Its two-row
+ * repaint only ever lifts the arrow before landing it on the next row, so the
+ * first arrow row in the pane stays the complete witness there — for a list
+ * known to be short. A menu that scrolls must never be navigated from a frame
+ * with no cue: its opening prefix shows the highlighted rows before the cue row
+ * is painted at all.
+ */
+export function nativeMenuSelection(
+  text: string,
+  nativeLeft: number,
+  scanRows: number,
+): NativeMenuSelection | undefined {
+  const lines = text.split("\n").slice(1).map((line) => line.slice(nativeLeft));
+  const cueIndex = lines.findIndex((line) => NATIVE_MENU_CUE.test(line));
+  const cue = cueIndex === -1 ? undefined : NATIVE_MENU_CUE.exec(lines[cueIndex]!) ?? undefined;
+  const position = cue === undefined ? Number.NaN : Number(cue[1]);
+  const total = cue === undefined ? Number.NaN : Number(cue[2]);
+  if (cue === undefined || !Number.isSafeInteger(position) || !Number.isSafeInteger(total)
+    || position < 1 || total < position) {
+    const row = lines.find((line) => NATIVE_MENU_ARROW.test(line));
+    return row === undefined ? undefined : { selectedRow: row };
+  }
+  for (let offset = 1; offset <= scanRows; offset += 1) {
+    const line = lines[cueIndex - offset];
+    if (line === undefined) break;
+    if (NATIVE_MENU_ARROW.test(line)) return { selectedRow: line, position, total };
+  }
+  return undefined;
+}
+
+/**
+ * Whether `next` witnesses exactly one downward move from `before` — the fence
+ * that authorizes the next navigation key in `moveNativeMenuTo`.
+ *
+ * While the list renders its cue, that cue is the authority: the same row count
+ * and exactly one further position. The row text alone is not, because a
+ * scrolling move repaints the whole visible block, and a frame captured inside
+ * that repaint (or an unrelated arrow-like line elsewhere in the pane) changes
+ * the scraped row without proving which row the list actually selected. That
+ * false advance is what let the driver step off "Scheduled tasks" while its own
+ * key budget kept running. Only a list known to be short and complete falls
+ * back to the row-text change; a cueless frame against a cued one (or the
+ * reverse) witnesses nothing at all, because the two frames describe different
+ * viewports and no position difference is provable between them.
+ */
+export function nativeMenuSelectionMovedDown(
+  before: NativeMenuSelection,
+  next: NativeMenuSelection | undefined,
+): boolean {
+  if (next === undefined) return false;
+  if (before.position !== undefined) {
+    return next.position !== undefined && next.total === before.total && next.position === before.position + 1;
+  }
+  return next.position === undefined && next.selectedRow !== before.selectedRow;
+}
+
 export class MainPtyDriver {
   readonly pty: NativePtyHandle;
   readonly surface: TerminalSurface;
@@ -2313,33 +2406,77 @@ export class MainPtyDriver {
     throw new Error(`the real Main sidebar did not select the expected ${label} row; ${this.currentText().slice(0, 2_000)}`);
   }
 
-  private nativeSelectedMenuRow(text: string): string | undefined {
+  /** The current verified frame's native-pane geometry, shared by both witnesses. */
+  private nativeMenuScan(): { readonly nativeLeft: number; readonly scanRows: number } {
     // This flow is exercised after restoring the verified wide layout. Ignore
     // the independent roster's highlight when that pane is visible.
     assert.equal(this.surface.frame().cols, OUTER_COLS);
     const nativeLeft = this.sidebarVisible && this.surface.frame().cols >= SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS
       ? NATIVE_PANE_START
       : 0;
-    return text.split("\n").slice(1).map((line) => line.slice(nativeLeft))
-      .find((line) => /^\s*[→>] /.test(line));
+    // The list block is inside the pane, so the frame's own row count bounds it.
+    return { nativeLeft, scanRows: this.surface.frame().rows };
+  }
+
+  private nativeMenuSelection(text: string): NativeMenuSelection | undefined {
+    const { nativeLeft, scanRows } = this.nativeMenuScan();
+    return nativeMenuSelection(text, nativeLeft, scanRows);
   }
 
   nativeMenuSelected(text: string, label: string): boolean {
-    return this.nativeSelectedMenuRow(text)?.includes(label) === true;
+    const selection = this.nativeMenuSelection(text);
+    return selection?.position !== undefined && selection.selectedRow.includes(label);
   }
 
-  async moveNativeMenuTo(label: string, maximumDowns: number): Promise<void> {
-    if (this.nativeMenuSelected(this.currentText(), label)) return;
+  /**
+   * Navigate the real native settings menu with one witnessed row per key.
+   *
+   * `"scrolling"` menus (the root settings menu and the task detail selector)
+   * are longer than their pane and always report their own position cue, so no
+   * key is authorized until a frame that reports it is on screen: an opening
+   * prefix shows the highlighted rows before the cue row beneath them is painted
+   * at all, and a quiet interval proves only that nothing arrived during that
+   * interval, not that the repaint finished. `"short"` menus are the known lists
+   * that fit their pane, draw no cue, and cannot scroll. The caller identifies
+   * the short list before entry; wait for its highlight without a stale cue
+   * before using the row-text witness, because the menu it replaced can still be
+   * repainted above or below it with that menu's own cue row standing.
+   */
+  async moveNativeMenuTo(
+    label: string,
+    maximumDowns: number,
+    menu: "scrolling" | "short" = "scrolling",
+  ): Promise<void> {
+    const short = menu === "short";
+    if (short) {
+      await this.waitFrame((text) => {
+        const selection = this.nativeMenuSelection(text);
+        return selection !== undefined && selection.position === undefined;
+      }, `the short native menu highlights a row without a scroll cue before navigating to ${label}`);
+    } else {
+      // An opening prefix can show a highlight before the scroll cue arrives.
+      await this.waitFrame((text) => this.nativeMenuSelection(text)?.position !== undefined,
+        `the native menu reports its selection position before navigating to ${label}`);
+    }
+    let current = this.nativeMenuSelection(this.currentText());
+    assert.ok(current !== undefined && (current.position === undefined) === short,
+      "the native menu has an observed selection in the expected viewport before navigation");
+    if (current.selectedRow.includes(label)) return;
     for (let count = 0; count < maximumDowns; count += 1) {
-      const beforeRow = this.nativeSelectedMenuRow(this.currentText());
-      assert.ok(beforeRow, "the native menu has an observed selected row before navigation");
+      const before: NativeMenuSelection = current;
       const after = this.frameRevision;
       this.pty.write(KEYS.down);
+      let advanced: NativeMenuSelection | undefined;
       await this.waitFrame((text) => {
-        const row = this.nativeSelectedMenuRow(text);
-        return row !== undefined && row !== beforeRow;
-      }, `native menu selection changes toward ${label}`, after);
-      if (this.nativeMenuSelected(this.currentText(), label)) return;
+        const next = this.nativeMenuSelection(text);
+        if (!nativeMenuSelectionMovedDown(before, next)) return false;
+        advanced = next;
+        return true;
+      }, `native menu selection advances one witnessed row toward ${label}`, after);
+      const moved = advanced;
+      assert.ok(moved, "the native menu reported its advanced selected row");
+      current = moved;
+      if (moved.selectedRow.includes(label)) return;
     }
     throw new Error(`the actual native Pi menu did not select ${label}; ${this.currentText().slice(-2_000)}`);
   }

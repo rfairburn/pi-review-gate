@@ -52,6 +52,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { wordWrapLine } from "pi-session-host-tui/dist/components/editor.js";
+import { getGraphemeSegmenter, visibleWidth } from "pi-session-host-tui/dist/utils.js";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import { ChangeSignal } from "./change-signal";
@@ -1538,61 +1539,89 @@ export function nativeFormFieldIsEmpty(text: string, marker: "> Workspace:" | ">
 }
 
 /**
- * The exact value drawn in one labelled native form field, read across every
- * row the pinned Editor wrapped it onto. The host labels only the Editor's
- * first body row; later body rows sit in the unlabelled gutter beneath the
- * label, and the Editor's own rules bound the body above and below. A
- * single-line value wider than the field's layout width (the field width less
- * the Editor's reserved caret column) therefore continues on the next gutter
- * row, so a fixed-width substring of the frame is not evidence of the typed
- * value at every pane width.
+ * Whether one labelled native form field draws exactly `expected`, compared
+ * across every row the pinned Editor wraps it onto. The host labels only the
+ * Editor's first body row; later body rows sit in the unlabelled gutter beneath
+ * the label, and the Editor's own rules bound the body above and below. A
+ * single-line value wider than the field's layout width (the rule width less
+ * the Editor's reserved caret column, as the pinned Editor computes it without
+ * horizontal padding) continues on the next gutter row, so a fixed-width
+ * substring of the frame is not evidence of the typed value at every pane width.
  *
- * Requires exactly one labelled row, the Editor's top rule directly above it,
- * and an equally wide bottom rule after the last body row; any label or text in
- * the gutter, blank body row, or missing or mismatched rule is refused. Rows
- * beyond the bottom rule (the native completion list) are never part of the
- * value.
+ * The expected value is laid out with the pinned Editor's own `wordWrapLine` at
+ * that layout width, and each expected row must equal the observed body row in
+ * the same position. The value is never reconstructed from the frame: the
+ * Editor can end a non-final row with the whitespace it broke after (a space
+ * at the wrap boundary), which the padded text cannot show, so joining observed
+ * rows would drop it. Trailing padding is therefore normalized on both sides:
+ * each expected and observed row is compared without its trailing ASCII spaces,
+ * the only character the Editor pads with. Any other drawn character, such as
+ * a no-break space, stays significant. A space at a wrap boundary is still
+ * witnessed by where the Editor broke the rows. An ASCII space after the
+ * value's final character is not observable at all, so an `expected` that ends
+ * in one (or holds a line break or control character a single-line field
+ * cannot draw) is refused rather than claimed.
  *
- * The reconstructed value is accepted only if the pinned Editor's own
- * `wordWrapLine`, at the layout width (the rule width less the reserved caret
- * column), breaks it into exactly the observed rows. That uses the Editor's
- * display widths rather than character counts, so any path text is read, and a
- * space hidden in a row's padding that changed where the Editor wrapped can
- * never be silently dropped: the joined text then wraps differently and is
- * refused. As for every padded single-row reader, whitespace after the value's
- * final character is not observable in the text.
+ * `paneColumns` is the known width of the pane whose first column holds the
+ * label (only a row starting with the marker is a label); the complete rule
+ * spans the rest of it, and the layout width derives
+ * from that, never from the frame's own rules.
+ *
+ * Requires exactly one labelled row, the Editor's complete top rule directly
+ * above it (each rule starting at the value column beside a blank label gutter),
+ * exactly as many body rows as the expected layout with only blank gutter
+ * beside the continuation rows, and an equally wide bottom rule directly after
+ * the last expected row. A missing, extra, blank, or altered body row, text in
+ * the gutter, or a missing or mismatched rule (such as a scroll indicator from
+ * a truncated viewport) is refused. Rows beyond the bottom rule (the native
+ * completion list) are never compared as part of the value.
  */
-export function nativeFormFieldValue(text: string, marker: "> Workspace:" | "> New name:"): string | undefined {
+export function nativeFormFieldShowsValue(
+  text: string,
+  marker: "> Workspace:" | "> New name:",
+  expected: string,
+  paneColumns: number,
+): boolean {
+  if (!Number.isSafeInteger(paneColumns) || paneColumns <= 0) return false;
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(expected) || expected.endsWith(" ")) return false;
+  // Only the Editor's own ASCII-space padding is normalized; never other text.
+  const withoutPadding = (segment: string): string => segment.replace(/ +$/u, "");
   const rows = text.split("\n");
-  const labelled = rows.flatMap((line, index) => line.includes(marker) ? [index] : []);
-  if (labelled.length !== 1) return undefined;
+  // The label starts the form pane's first column; marker-like text elsewhere
+  // (inside a wrapped value or a completion row) is never another label.
+  const column = 0;
+  const labelled = rows.flatMap((line, index) => line.startsWith(marker, column) ? [index] : []);
+  if (labelled.length !== 1) return false;
   const index = labelled[0]!;
-  const column = rows[index]!.indexOf(marker);
   const start = column + marker.length + 1;
+  // The Editor draws each rule from the value column, beside a blank label gutter.
+  const gutter = " ".repeat(start - column);
   const ruleAt = (row: number): string | undefined => {
-    const rule = rows[row]?.slice(start).trim() ?? "";
+    const line = rows[row];
+    if (line === undefined || line.slice(column, start) !== gutter) return undefined;
+    const rule = withoutPadding(line.slice(start));
     return /^─+$/u.test(rule) ? rule : undefined;
   };
   const topRule = ruleAt(index - 1);
-  if (topRule === undefined) return undefined;
-  const layoutWidth = Math.max(1, topRule.length - 1);
-  const segments = [rows[index]!.slice(start).trimEnd()];
-  for (let row = index + 1; row < rows.length; row += 1) {
-    const bottomRule = ruleAt(row);
-    if (bottomRule !== undefined) {
-      if (bottomRule !== topRule) return undefined;
-      const value = segments.join("");
-      const reflowed = wordWrapLine(value, layoutWidth);
-      return reflowed.length === segments.length && reflowed.every(({ text }, position) => text === segments[position])
-        ? value
-        : undefined;
-    }
-    const line = rows[row]!;
-    const segment = line.slice(start).trimEnd();
-    if (line.slice(column, start).trim() !== "" || segment === "") return undefined;
-    segments.push(segment);
+  // The label starts the pane's first column, so the Editor's complete rule
+  // spans the rest of the known pane width. The frame never supplies its own
+  // width: equally clipped or partial rules cannot establish the field.
+  const ruleWidth = paneColumns - gutter.length;
+  if (ruleWidth < 3 || topRule?.length !== ruleWidth || rows[index]!.slice(column, start) !== `${marker} `) return false;
+  const layoutWidth = ruleWidth - 1;
+  // The pinned wrapper recursively retries any grapheme wider than the layout
+  // width without end, so a value that cannot fit the layout is refused
+  // before wrapping, by the pinned segmenter and width function.
+  for (const { segment } of getGraphemeSegmenter().segment(expected)) {
+    if (visibleWidth(segment) > layoutWidth) return false;
   }
-  return undefined;
+  const expectedRows = wordWrapLine(expected, layoutWidth).map(({ text: segment }) => withoutPadding(segment));
+  if (ruleAt(index + expectedRows.length) !== topRule) return false;
+  return expectedRows.every((segment, position) => {
+    const line = rows[index + position]!;
+    if (position > 0 && !/^ *$/u.test(line.slice(column, start))) return false;
+    return withoutPadding(line.slice(start)) === segment;
+  });
 }
 
 function workspaceFieldIsEmpty(text: string): boolean {

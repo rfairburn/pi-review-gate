@@ -90,6 +90,7 @@ import { stripGeneratedSgr, type TerminalSurface } from "../src/session-host/ter
 import { skipOrFail } from "./bridge-fakes";
 import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
 import { ChangeSignal, createSharedProductionCompile, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
+import { nodeOptionsRequire } from "./helpers/node-options-require";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import {
   deferred,
@@ -770,14 +771,21 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
       PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce,
     };
     // A generic non-Node configured editor: accept a fixed synthetic byte count
     // into Pi's own filename argument, recording the same bytes before exit. No
     // Node input shim can mask framing leakage, and no editor executable name is
     // part of the product handoff. Existing test cleanup owns the native child.
-    const externalEditor = join(root, "network-owned-editor");
+    // Pi splits the configured command on literal spaces and spawns without a
+    // shell, so the setting is a single space-free basename resolved through the
+    // owned first PATH entry; the temp root's own path may contain spaces.
+    const externalEditorName = "network-owned-editor";
+    const externalEditor = join(binDir, externalEditorName);
+    assert.equal(common.PATH?.split(delimiter)[0], binDir, "the owned bin directory is the first PATH entry");
+    assert.equal(common.PATH?.split(delimiter).slice(1).some((dir) => existsSync(join(dir, externalEditorName))), false,
+      "no later PATH entry provides an ambient editor of the owned basename");
     const externalReceipt = join(root, "external-editor-bytes");
     const externalBody = "NETEDIT499-λ-雪";
     const externalDraft = `/input-proof ${externalBody}`;
@@ -810,7 +818,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy
     // anything implicitly; the only copy gestures are keystrokes and the command.
     writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
-      fullscreenCopyOnSelect: false, externalEditor,
+      fullscreenCopyOnSelect: false, externalEditor: externalEditorName,
     }), { mode: 0o600 });
     const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
       "--extension", fixture, "--tui-mode", "fullscreen"];
@@ -2006,7 +2014,7 @@ module.exports=()=>{};
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
       PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce,
     };
     // No project-trust default. Mark this pinned version's changelog already seen

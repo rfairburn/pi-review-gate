@@ -25,6 +25,7 @@ import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./h
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { NATIVE_PANE_START, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
 import { skipOrFail } from "./bridge-fakes";
+import { nodeOptionsRequire } from "./helpers/node-options-require";
 
 /**
  * Bounded, pure diagnostic formatting for this file's failure-evidence path.
@@ -485,7 +486,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
     PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
     TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-    SSH_CONNECTION: "synthetic-client 1234 synthetic-host 22", NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog,
+    SSH_CONNECTION: "synthetic-client 1234 synthetic-host 22", NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog,
     PRG_COPY_ISOLATION: isolationStem, PRG_COPY_STARTUP: startupStem, PRG_COPY_BIN: join(root, "bin"),
   };
   const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions", "--extension", fixture, "--tui-mode", "fullscreen"];

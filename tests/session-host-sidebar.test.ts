@@ -11,7 +11,8 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import {
@@ -32,7 +33,8 @@ import {
 import { createSessionHostTextField } from "../src/session-host/field-editor";
 import { sidebarPaletteFor } from "../src/session-host/sidebar-theme";
 import { withoutScrollbarLane } from "./helpers/session-host-native-roster-witness";
-import { nativeFormFieldValue } from "./helpers/session-host-native-main-harness";
+import { nativeFormFieldShowsValue } from "./helpers/session-host-native-main-harness";
+import { wordWrapLine } from "pi-session-host-tui/dist/components/editor.js";
 import type { PeerUiHost, PeerUiSettings, PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
 
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
@@ -2546,15 +2548,17 @@ test("the native field value witness reads an absolute prefix across the real 52
     assert.equal(body.join(""), prefix, `${rows} native body row(s) carry the prefix\n${texts.join("\n")}`);
     assert.ok(body.every((segment) => visibleWidth(segment) <= 38), "the Editor reserves its caret column");
     assert.match(texts[label + rows]!.slice(13).trim(), /^─+$/u, "the Editor's bottom rule ends the body");
-    assert.equal(nativeFormFieldValue(texts.join("\n"), "> Workspace:"), prefix,
-      "the witness returns the exact typed prefix from the real rendered form");
+    assert.equal(nativeFormFieldShowsValue(texts.join("\n"), "> Workspace:", prefix, 52), true,
+      "the witness matches the exact typed prefix in the real rendered form");
     // Only the CI-shaped prefix's final 18 characters straddle the Editor's
     // row break, which is why the old fixed-suffix substring missed it.
     assert.equal(texts.join("\n").includes(prefix.slice(-18)), oldSuffixVisible);
   }
-  // A space typed at the wrap boundary: the real Editor breaks after it, so its
-  // first row ends in a space the padded text cannot show. The witness refuses
-  // that layout instead of reconstructing the unaltered prefix.
+  // A space typed at the wrap boundary (a configured root containing a space):
+  // the real Editor breaks after it, so its first row ends in a space the
+  // padded text cannot show. The exact spaced value still matches, because
+  // the expected value is laid out by the Editor rather than reconstructed;
+  // the same render never matches the value with that space dropped.
   const wrappedPrefix = cases[1]!.prefix;
   const spaced = `${wrappedPrefix.slice(0, 37)} ${wrappedPrefix.slice(37)}`;
   const harness = formWith({ cols: 52, rows: 29 });
@@ -2564,8 +2568,88 @@ test("the native field value witness reads an absolute prefix across the real 52
   const spacedLabel = spacedRows.findIndex((line) => line.startsWith("> Workspace: "));
   assert.deepEqual(spacedRows.slice(spacedLabel, spacedLabel + 2).map((line) => line.slice(13).trimEnd()),
     [wrappedPrefix.slice(0, 37), wrappedPrefix.slice(37)], `the real Editor wraps after the boundary space\n${spacedText}`);
-  assert.equal(nativeFormFieldValue(spacedText, "> Workspace:"), undefined,
-    "the real wrapped field with a boundary space is refused, never read as the unaltered prefix");
+  assert.match(spacedRows[spacedLabel + 2]!.slice(13).trim(), /^─{39}$/u, "the Editor's bottom rule ends the two-row body");
+  assert.equal(nativeFormFieldShowsValue(spacedText, "> Workspace:", spaced, 52), true,
+    "the real wrapped field with a boundary space matches the exact spaced value");
+  assert.equal(nativeFormFieldShowsValue(spacedText, "> Workspace:", wrappedPrefix, 52), false,
+    "the boundary-space render is never read as the prefix with its space dropped");
+  assert.equal(nativeFormFieldShowsValue(spacedText, "> Workspace:", `${spaced} `, 52), false,
+    "unobservable whitespace after the final character is never claimed");
+});
+
+/**
+ * Drives the real 52x29 New form's path field and native filesystem provider
+ * over one fixture-owned directory holding two matching folders. The pinned
+ * provider ends an unquoted path token at whitespace, so a prefix containing
+ * whitespace (such as one under a spaced temporary root) uses its supported
+ * quoted spelling, which the provider completes in the same owned directory and
+ * the field submits unquoted. The Editor opens completion automatically only
+ * for the unquoted leading `/`; the quoted spelling opens it with native Tab.
+ */
+async function assertNarrowNativeCompletion(root: string, directory: string): Promise<string> {
+  for (const name of ["workspace-new-alpha", "workspace-new-beta"]) mkdirSync(join(directory, name), { recursive: true });
+  const prefix = join(directory, "workspace-new-");
+  const quoted = /\s/u.test(prefix);
+  const typed = quoted ? `"${prefix}` : prefix;
+  const layout = wordWrapLine(typed, 38);
+  assert.ok(layout.length >= 2, "the fixture prefix wraps onto the Editor's next body row at 52 columns");
+  const harness = formWith({ cols: 52, rows: 29, options: { workspaceBasePath: root } });
+  for (const char of typed) harness.send(char);
+  if (quoted) harness.send("\t");
+  const showsBoth = (rows: readonly string[]): boolean => rows.some((line) => line.includes("workspace-new-alpha/"))
+    && rows.some((line) => line.includes("workspace-new-beta/"));
+  const deadline = Date.now() + 2_000;
+  let texts = assertPaneSafe(harness.controller.render(52, 29).lines, 52, 29);
+  while (!showsBoth(texts) && Date.now() < deadline) {
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    texts = assertPaneSafe(harness.controller.render(52, 29).lines, 52, 29);
+  }
+  const text = texts.join("\n");
+  const label = texts.findIndex((line) => line.startsWith("> Workspace: "));
+  assert.ok(label > 0, text);
+  const bottom = label + layout.length;
+  assert.match(texts[label - 1]!.slice(13).trim(), /^─{39}$/u, `the actual narrow field's top rule\n${text}`);
+  assert.match(texts[bottom]!.slice(13).trim(), /^─{39}$/u, `the Editor's bottom rule ends the wrapped body\n${text}`);
+  assert.ok(showsBoth(texts.slice(bottom + 1)), `both owned folder suggestions are displayed below the field\n${text}`);
+  assert.equal(nativeFormFieldShowsValue(text, "> Workspace:", typed, 52), true,
+    `the exact wrapped prefix matches while both native suggestions remain displayed\n${text}`);
+  assert.equal(nativeFormFieldShowsValue(text, "> Workspace:", `${typed}alpha`, 52), false,
+    "a suggestion row is never borrowed into the field's value");
+  assert.equal(nativeFormFieldShowsValue(text, "> Workspace:", typed.slice(0, -1), 52), false,
+    "a truncated expectation never matches the drawn prefix");
+
+  // Native Tab accepts the visible selection; the completed path is still the
+  // field's exact drawn value, and Enter creates exactly that workspace.
+  harness.send("\t");
+  const completed = `${join(directory, "workspace-new-alpha")}/`;
+  const completedText = assertPaneSafe(harness.controller.render(52, 29).lines, 52, 29).join("\n");
+  assert.equal(nativeFormFieldShowsValue(completedText, "> Workspace:", quoted ? `"${completed}"` : completed, 52), true,
+    `native Tab completes the selected owned folder\n${completedText}`);
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().filter((action) => action.type === "create"),
+    [{ type: "create", requestId: 1, workspace: completed }], "Enter creates the exact completed owned workspace");
+  return typed;
+}
+
+test("the native field witness matches real wrapped 52-column prefixes, including a boundary space, with both native filesystem suggestions", {
+  skip: process.platform === "win32" ? "the fixture spells POSIX absolute paths with a leading `/`" : false,
+}, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-session-host-wrap-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // The configured temporary root as it is (spaced or not).
+  await assertNarrowNativeCompletion(root, join(root, "owned-fixture-folder"));
+  // An owned spaced folder whose space lands exactly on one of the Editor's
+  // 38-column wrap boundaries, so the drawn row hides the space it broke after.
+  let spacedDirectory: string | undefined;
+  for (let pad = 0; pad < 76 && spacedDirectory === undefined; pad += 1) {
+    const candidate = join(root, `${"s".repeat(pad)} space`);
+    const layout = wordWrapLine(`"${join(candidate, "workspace-new-")}`, 38);
+    if (layout.slice(0, -1).some(({ text }) => text.endsWith(" ") && visibleWidth(text) === 38)) spacedDirectory = candidate;
+  }
+  assert.ok(spacedDirectory !== undefined, "a boundary-space fixture layout exists for this root");
+  const typed = await assertNarrowNativeCompletion(root, spacedDirectory);
+  assert.ok(typed.startsWith("\"") && wordWrapLine(typed, 38).slice(0, -1).some(({ text }) => text.endsWith(" ")),
+    "the spaced prefix used the quoted spelling and wrapped after its boundary space");
 });
 
 test("a wrapped value keeps its label on the field's first editable row as the caret moves", () => {

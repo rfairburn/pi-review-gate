@@ -27,6 +27,7 @@ import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
+import { nodeOptionsRequire } from "./helpers/node-options-require";
 
 /**
  * Real bundled CLI/PTY proof for one narrow question: does a copy of the LAST
@@ -298,7 +299,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog,
       PRG_OWNED_BIN: binDir,
     };
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy

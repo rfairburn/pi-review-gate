@@ -29,7 +29,7 @@ import {
   makeRuntimeEnvironment,
   makeNativeAgentRoot,
   makeWorkspace,
-  nativeFormFieldValue,
+  nativeFormFieldShowsValue,
   processIsAlive,
   removeOwnedScratchTree,
   resolveRuntimePin,
@@ -1035,20 +1035,29 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
   await driver.clearWorkspaceField("the native clear binding empties B's retained workspace before filesystem completion");
   const partialWorkspace = join(scratch, "workspace-new-");
+  // The pinned provider ends an unquoted path token at whitespace, so a scratch
+  // prefix under a spaced temporary root uses the provider's supported quoted
+  // spelling, which completes in the same owned scratch directory. The Editor
+  // opens completion automatically only for the unquoted leading `/`.
+  const quotedWorkspace = /\s/u.test(partialWorkspace);
+  const typedWorkspace = quotedWorkspace ? `"${partialWorkspace}` : partialWorkspace;
   // The whole typed prefix must be the field's value. At this narrow width a
-  // longer configured temporary root wraps it onto the Editor's next body row,
-  // so it is read across the field's own rows, not as one frame substring.
-  await driver.writeAndWait(partialWorkspace, (text) => nativeFormFieldValue(text, "> Workspace:") === partialWorkspace,
+  // longer configured temporary root wraps it onto the Editor's next body row
+  // (possibly after a space in that root), so the exact prefix's own Editor
+  // layout is compared with the field's rows, not found as one frame substring.
+  await driver.writeAndWait(typedWorkspace, (text) => nativeFormFieldShowsValue(text, "> Workspace:", typedWorkspace, 52),
     "the New form's real workspace Editor holds the exact absolute fixture-only completion prefix");
-  await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
-    "typing the native path prefix automatically displays both owned folder suggestions");
-  // Native Tab accepts an already visible selection. Dismiss that list first
-  // so this separate Tab action tests opening completion, not accepting alpha.
-  const beforeAutomaticDismiss = driver.frameRevision;
-  driver.pty.write(KEYS.escape);
-  await driver.waitFrame((text) => text.includes("Workspace:")
-    && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
-  "native Escape dismisses the automatically opened completion while retaining New", beforeAutomaticDismiss);
+  if (!quotedWorkspace) {
+    await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
+      "typing the native path prefix automatically displays both owned folder suggestions");
+    // Native Tab accepts an already visible selection. Dismiss that list first
+    // so this separate Tab action tests opening completion, not accepting alpha.
+    const beforeAutomaticDismiss = driver.frameRevision;
+    driver.pty.write(KEYS.escape);
+    await driver.waitFrame((text) => text.includes("Workspace:")
+      && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
+    "native Escape dismisses the automatically opened completion while retaining New", beforeAutomaticDismiss);
+  }
   const beforeCompletion = driver.frameRevision;
   driver.pty.write("\t");
   await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),

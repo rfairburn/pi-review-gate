@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
-import { nativeFormFieldIsEmpty, nativeFormFieldValue, OUTER_RESTORATION_BASELINE } from "./helpers/session-host-native-main-harness";
+import { nativeFormFieldIsEmpty, nativeFormFieldShowsValue, OUTER_RESTORATION_BASELINE } from "./helpers/session-host-native-main-harness";
 import {
   getWorkspaceFieldValue,
   isEmptyWorkspaceField,
@@ -63,47 +63,125 @@ function narrowField(body: readonly string[], below: readonly string[] = []): st
   ].join("\n");
 }
 
-test("native field value witness reads one-row and wrapped values within the Editor's rules", () => {
-  assert.equal(nativeFormFieldValue(narrowField([ONE_ROW_PREFIX]), "> Workspace:"), ONE_ROW_PREFIX);
+const shows = (text: string, expected: string): boolean => nativeFormFieldShowsValue(text, "> Workspace:", expected, 52);
+// The pinned Editor wraps `<37 chars> <rest>` after the space, so its first row
+// is 38 columns ending in a space that the padded text cannot show.
+const BOUNDARY_SPACED = `${WRAPPED_PREFIX.slice(0, 37)} ${WRAPPED_PREFIX.slice(37)}`;
+const BOUNDARY_SPACED_ROWS = [`${WRAPPED_PREFIX.slice(0, 37)} `, WRAPPED_PREFIX.slice(37)];
+
+test("native field value witness matches the expected value's one-row and wrapped Editor layout", () => {
+  assert.equal(shows(narrowField([ONE_ROW_PREFIX]), ONE_ROW_PREFIX), true);
   const wrapped = [WRAPPED_PREFIX.slice(0, 38), WRAPPED_PREFIX.slice(38)];
-  assert.equal(nativeFormFieldValue(narrowField(wrapped), "> Workspace:"), WRAPPED_PREFIX);
-  assert.equal(nativeFormFieldValue(narrowField(wrapped, [`${NARROW_GUTTER}→ workspace-new-alpha/`,
-    `${NARROW_GUTTER}  workspace-new-beta/`]), "> Workspace:"), WRAPPED_PREFIX,
+  assert.equal(shows(narrowField(wrapped), WRAPPED_PREFIX), true);
+  const markerPathHead = `/tmp/${"a".repeat(33)}`;
+  const markerPathTail = "> Workspace: fixture";
+  assert.equal(shows(narrowField([markerPathHead, markerPathTail]), markerPathHead + markerPathTail), true,
+    "label text inside a wrapped path is field content, not another label");
+  assert.equal(shows(narrowField([ONE_ROW_PREFIX], [`${NARROW_GUTTER}> Workspace: suggestion/`]), ONE_ROW_PREFIX), true,
+    "label-like completion text below the field is never another label");
+  assert.equal(shows(narrowField(wrapped, [`${NARROW_GUTTER}→ workspace-new-alpha/`,
+    `${NARROW_GUTTER}  workspace-new-beta/`]), WRAPPED_PREFIX), true,
   "the completion list below the bottom rule is never part of the value");
-  assert.equal(nativeFormFieldValue(narrowField([""]), "> Workspace:"), "");
+  assert.equal(shows(narrowField([""]), ""), true);
   const unicodePrefix = "/private/tmp/øabcdefghijklmnop/shm-AbC123/workspace-new-";
-  assert.equal(nativeFormFieldValue(narrowField([unicodePrefix.slice(0, 38), unicodePrefix.slice(38)]), "> Workspace:"),
-    unicodePrefix, "a non-ASCII configured root is read by the Editor's display widths");
+  assert.equal(shows(narrowField([unicodePrefix.slice(0, 38), unicodePrefix.slice(38)]), unicodePrefix), true,
+    "a non-ASCII configured root is laid out by the Editor's display widths");
+  assert.equal(shows(narrowField(BOUNDARY_SPACED_ROWS), BOUNDARY_SPACED), true,
+    "a correct render that wraps after a boundary space matches the exact spaced value");
+  assert.equal(shows(narrowField(BOUNDARY_SPACED_ROWS, [`${NARROW_GUTTER}→ workspace-new-alpha/`,
+    `${NARROW_GUTTER}  workspace-new-beta/`]), BOUNDARY_SPACED), true,
+  "the boundary-space render still matches with the native completion list below it");
+  const midSpaced = "/private/tmp/My Temp/shm-AbC123/workspace-new-";
+  assert.equal(shows(narrowField(["/private/tmp/My Temp/shm-AbC123/", "workspace-new-"]), midSpaced), false,
+    "rows that do not follow the Editor's layout are refused");
+  assert.equal(shows(narrowField(["/private/tmp/My ", "Temp/shm-AbC123/workspace-new-"]), midSpaced), true,
+    "the Editor's word wrap at an earlier space in a configured root is matched exactly");
+  assert.equal(shows(narrowField(["/private/tmp/My Temp/shm-AbC123/workspace-", "new-"]), midSpaced), false,
+    "a non-final row wider than the layout width is refused");
 });
 
-test("native field value witness refuses partial, altered, or unbounded fields", () => {
+test("native field value witness refuses partial, altered, borrowed, or unbounded fields", () => {
   const wrapped = [WRAPPED_PREFIX.slice(0, 38), WRAPPED_PREFIX.slice(38)];
-  assert.equal(nativeFormFieldValue(narrowField([wrapped[0]!]), "> Workspace:"), WRAPPED_PREFIX.slice(0, 38),
+  assert.equal(shows(narrowField([wrapped[0]!]), WRAPPED_PREFIX), false,
     "the first wrapped row alone is not the typed value");
-  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(`${NARROW_RULE}\n`, ""), "> Workspace:"), undefined,
+  assert.equal(shows(narrowField([wrapped[0]!]), WRAPPED_PREFIX.slice(0, 38)), true,
+    "the drawn first row is only evidence of its own text");
+  assert.equal(shows(narrowField(wrapped), WRAPPED_PREFIX.slice(0, 38)), false,
+    "a truncated expected value never matches the longer drawn value");
+  assert.equal(shows(narrowField(wrapped, [`${NARROW_GUTTER}${WRAPPED_PREFIX.slice(38)}alpha/`]), `${WRAPPED_PREFIX}alpha/`),
+    false, "a completion row below the bottom rule is never borrowed as a body row");
+  assert.equal(shows(narrowField(wrapped).replace(`${NARROW_RULE}\n`, ""), WRAPPED_PREFIX), false,
     "a missing top rule is refused");
-  assert.equal(nativeFormFieldValue(narrowField(wrapped).split("\n").slice(0, -1).join("\n"), "> Workspace:"), undefined,
+  const widePrefix = "/tmp/界";
+  assert.equal(shows(narrowField([widePrefix]).replace(NARROW_RULE, `${NARROW_GUTTER}──`), widePrefix), false,
+    "a partial top rule is refused without trying to wrap a wide character into one cell");
+  assert.equal(shows(narrowField([widePrefix]).replace(NARROW_RULE, `${NARROW_GUTTER}─`), widePrefix), false,
+    "a one-cell top rule is refused");
+  assert.equal(shows(narrowField(["/tmp/exact"]).replaceAll(NARROW_RULE, `${NARROW_GUTTER}${"─".repeat(38)}`), "/tmp/exact"), false,
+    "equally clipped rules cannot establish the 52-column field even when the path fits");
+  assert.equal(shows(narrowField(["/tmp/exact"]), "/tmp/exact"), true, "the complete 52-column field matches");
+  assert.equal(nativeFormFieldShowsValue(narrowField(["/tmp/exact"]), "> Workspace:", "/tmp/exact", 53), false,
+    "rules narrower than the known pane width are refused");
+  assert.equal(nativeFormFieldShowsValue(narrowField(["/tmp/exact"]), "> Workspace:", "/tmp/exact", 51), false,
+    "rules wider than the known pane width are refused");
+  assert.equal(shows(narrowField([widePrefix]), widePrefix), true, "the complete field draws the wide character");
+  const threeCellPrefix = "/tmp/a\u093e\u093e";
+  assert.equal(shows(narrowField([threeCellPrefix]).replace(NARROW_RULE, `${NARROW_GUTTER}───`), threeCellPrefix), false,
+    "a partial rule cannot fit the three-cell grapheme and is refused without throwing");
+  assert.equal(shows(narrowField([threeCellPrefix]), threeCellPrefix), true, "the complete field draws the same grapheme");
+  assert.equal(shows(narrowField(wrapped).replace(NARROW_RULE, ` ${NARROW_RULE}`), WRAPPED_PREFIX), false,
+    "a rule displaced from the field's value column is refused");
+  assert.equal(shows(narrowField(wrapped).replace(/ {13}─{39}$/u, `!${NARROW_RULE.slice(1)}`), WRAPPED_PREFIX), false,
+    "text in the bottom rule's label gutter is refused");
+  assert.equal(shows(narrowField(wrapped).replace(NARROW_RULE, `!${NARROW_RULE.slice(1)}`), WRAPPED_PREFIX), false,
+    "text in the top rule's label gutter is refused");
+  assert.equal(shows(narrowField(wrapped).split("\n").slice(0, -1).join("\n"), WRAPPED_PREFIX), false,
     "an unpainted bottom rule is refused");
-  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(`${NARROW_GUTTER}${wrapped[1]}`, `stray        ${wrapped[1]}`),
-    "> Workspace:"), undefined, "text in the label gutter is refused");
-  assert.equal(nativeFormFieldValue(narrowField([wrapped[0]!, "", wrapped[1]!]), "> Workspace:"), undefined,
+  assert.equal(shows(narrowField(wrapped).replace(`${NARROW_GUTTER}${wrapped[1]}`, `stray        ${wrapped[1]}`),
+    WRAPPED_PREFIX), false, "text in the label gutter is refused");
+  assert.equal(shows(narrowField([wrapped[0]!, "", wrapped[1]!]), WRAPPED_PREFIX), false,
     "a blank row inside the body is refused");
-  assert.equal(nativeFormFieldValue(narrowField(["/a b ", "c"]), "> Workspace:"), undefined,
-    "a wrapped value whose whitespace break is ambiguous is refused");
-  // The pinned Editor wraps `<37 chars> <rest>` after the space, so its first
-  // row is 38 columns ending in a space that the padded text cannot show.
-  const spaced = [`${WRAPPED_PREFIX.slice(0, 37)} `, WRAPPED_PREFIX.slice(37)];
-  assert.notEqual(nativeFormFieldValue(narrowField(spaced), "> Workspace:"), WRAPPED_PREFIX,
-    "a space dropped at the wrap boundary never reconstructs the unaltered prefix");
-  assert.equal(nativeFormFieldValue(narrowField(spaced), "> Workspace:"), undefined,
-    "a short non-final row is refused rather than joined");
-  assert.equal(nativeFormFieldValue(narrowField([WRAPPED_PREFIX.slice(0, 39), WRAPPED_PREFIX.slice(39)]), "> Workspace:"),
-    undefined, "a non-final row wider than the layout width is refused");
-  assert.equal(nativeFormFieldValue(narrowField(wrapped).replace(/─{39}$/u, "─".repeat(38)), "> Workspace:"), undefined,
+  assert.equal(shows(narrowField([...wrapped, "extra"]), WRAPPED_PREFIX), false,
+    "an extra body row before the bottom rule is refused");
+  assert.equal(shows(narrowField(wrapped).replace(/─{39}$/u, `${"─".repeat(17)} ↓ 1 more ${"─".repeat(12)}`),
+    WRAPPED_PREFIX), false, "a scrolled, truncated viewport's indicator rule is refused");
+  assert.equal(shows(narrowField(["/a b ", "c"]), "/a b c"), false,
+    "rows the Editor would not have broken that way are refused");
+  // The pre-fix reader joined the visible rows of a boundary-space render and
+  // returned the prefix with its space dropped; neither reading is accepted.
+  assert.equal(shows(narrowField(BOUNDARY_SPACED_ROWS), WRAPPED_PREFIX), false,
+    "a boundary-space render never matches the value with that space dropped");
+  assert.equal(shows(narrowField([WRAPPED_PREFIX.slice(0, 37), WRAPPED_PREFIX.slice(37)]), WRAPPED_PREFIX), false,
+    "a short non-final row of an unspaced value is refused");
+  assert.equal(shows(narrowField(wrapped), BOUNDARY_SPACED), false,
+    "the unspaced render never matches the spaced value");
+  assert.equal(shows(narrowField(BOUNDARY_SPACED_ROWS), `${WRAPPED_PREFIX.slice(0, 37)}  ${WRAPPED_PREFIX.slice(37)}`),
+    false, "a different whitespace run at the boundary is laid out differently and refused");
+  // The Editor breaks after a no-break space exactly as after U+0020, but the
+  // frame still draws it: only ASCII-space padding is ever normalized away.
+  const noBreakSpaced = `${WRAPPED_PREFIX.slice(0, 37)}\u00a0${WRAPPED_PREFIX.slice(37)}`;
+  const noBreakRows = [`${WRAPPED_PREFIX.slice(0, 37)}\u00a0`, WRAPPED_PREFIX.slice(37)];
+  assert.equal(shows(narrowField(noBreakRows), noBreakSpaced), true, "a drawn no-break space matches itself");
+  assert.equal(shows(narrowField(noBreakRows), BOUNDARY_SPACED), false,
+    "a drawn no-break space at the boundary never matches an expected ASCII space");
+  assert.equal(shows(narrowField(BOUNDARY_SPACED_ROWS), noBreakSpaced), false,
+    "an expected no-break space is never satisfied by invisible ASCII padding");
+  assert.equal(shows(narrowField([`${ONE_ROW_PREFIX}\u00a0`]), ONE_ROW_PREFIX), false,
+    "a drawn trailing no-break space is not padding");
+  assert.equal(shows(narrowField(wrapped).replace(`${NARROW_GUTTER}${wrapped[1]}`, `${" ".repeat(12)}\u00a0${wrapped[1]}`),
+    WRAPPED_PREFIX), false, "a no-break space in the label gutter is not blank");
+  assert.equal(shows(narrowField([WRAPPED_PREFIX.slice(0, 39), WRAPPED_PREFIX.slice(39)]), WRAPPED_PREFIX), false,
+    "a non-final row wider than the layout width is refused");
+  assert.equal(shows(narrowField(wrapped).replace(/─{39}$/u, "─".repeat(38)), WRAPPED_PREFIX), false,
     "a bottom rule narrower than the top rule is refused");
-  assert.equal(nativeFormFieldValue(`${narrowField([ONE_ROW_PREFIX])}\n${narrowField([ONE_ROW_PREFIX])}`, "> Workspace:"), undefined,
+  assert.equal(shows(`${narrowField([ONE_ROW_PREFIX])}\n${narrowField([ONE_ROW_PREFIX])}`, ONE_ROW_PREFIX), false,
     "two labelled rows are refused");
-  assert.equal(nativeFormFieldValue(narrowField([ONE_ROW_PREFIX]), "> New name:"), undefined);
+  assert.equal(nativeFormFieldShowsValue(narrowField([ONE_ROW_PREFIX]), "> New name:", ONE_ROW_PREFIX, 52), false);
+  // Whitespace after the final character is invisible padding: never claimed.
+  assert.equal(shows(narrowField([ONE_ROW_PREFIX]), `${ONE_ROW_PREFIX} `), false,
+    "an expected value ending in unobservable whitespace is refused");
+  assert.equal(shows(narrowField([ONE_ROW_PREFIX]), `${ONE_ROW_PREFIX}\n`), false,
+    "a line break a single-line field cannot draw is refused");
 });
 
 // --- The shared native New-open witness uses the actual approved New-form geometry.

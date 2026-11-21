@@ -177,6 +177,12 @@ interface ExecutionToolManagerInput {
   submittedFingerprintFor?: SubmittedToolCallFingerprint;
   /** Internal outcome signal for explicit returned errors from owned native tools. */
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
+  /**
+   * #682: the owner's live top-level call policy, e.g. Pi's
+   * `DeferredToolManager.toolCallAllowed(name, false)`. Only sharedManagedTool
+   * reads it. If it is absent, every shared invocation is refused.
+   */
+  liveToolCallAllowed?: (toolName: string) => boolean;
 }
 
 interface CommandUi {
@@ -220,6 +226,62 @@ interface NormalizedInput {
   afterMs?: number;
 }
 
+/**
+ * #682: actions a trusted second adapter may bind through
+ * `ExecutionToolManager.sharedManagedTool`. Every other action stays reachable
+ * only through Pi registration.
+ */
+export const SHARED_MANAGED_TOOL_ACTIONS = ["start", "inspect"] as const satisfies readonly ExecutionToolAction[];
+export type SharedManagedToolAction = typeof SHARED_MANAGED_TOOL_ACTIONS[number];
+
+/**
+ * Call inputs for the canonical handler. Pi builds them from its own tool call.
+ * `sharedManagedTool` builds them from its owner admission.
+ */
+interface ManagedHandlerBinding {
+  /** Call id assigned by the owner. Default instruction id and failure-scope correlation key. */
+  toolCallId: string;
+  /** Admitted raw Start identity. Read only for Start, after validation. A non-fingerprint fails closed. */
+  admittedFingerprint: () => string | undefined;
+  /** Host tool context (Pi `ctx`). When present it sets UI context and scoped models. */
+  host?: { ctx: unknown };
+}
+
+/**
+ * Owner admission installed when a shared tool is bound (#682). Admission is
+ * the owner's job; this boundary only consumes it.
+ */
+export interface ManagedToolAdmission {
+  /**
+   * Return the owner-held request for exactly this admitted call id and tool
+   * name, otherwise undefined. `params` must be the owner's own snapshot, not
+   * a mutable reference held by the caller. For Start,
+   * `startCallFingerprint` is the original raw, pre-coercion fingerprint of
+   * that same request, as in Pi preflight's `admittedSubmittedFingerprint`.
+   */
+  resolveCall(toolCallId: string, toolName: string): ManagedToolAdmittedCall | undefined;
+}
+
+export interface ManagedToolAdmittedCall {
+  readonly params: unknown;
+  readonly startCallFingerprint?: string;
+}
+
+/** One call through a shared tool. The call id must be one the owner's admission issued. */
+export interface ManagedToolInvocation {
+  toolCallId: string;
+}
+
+/** One shared managed tool: the Pi schema and description plus the canonical handler. */
+export interface ManagedToolDefinition {
+  readonly action: SharedManagedToolAction;
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Record<string, unknown>;
+  /** Resolves to the same result/error envelope Pi returns. Never rejects for request errors. */
+  invoke(invocation: ManagedToolInvocation): Promise<Record<string, unknown>>;
+}
+
 export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
@@ -227,6 +289,16 @@ export class ExecutionToolManager {
    * feedback is never queued after its owner session ended. */
   private ownerGeneration = 0;
   private launchAllowedExecutionTools: Set<string> | undefined;
+  /** Latest sync() verdict that drives Pi activation; read only by sharedManagedTool. */
+  private executionToolsResolvable = false;
+  /**
+   * #682 live owner scope for shared invocations. Opened when an association
+   * restore completes and closed when a restore, detach, or shutdown starts.
+   * The epoch stops a restore that finishes late from reopening a scope that
+   * a later boundary already closed.
+   */
+  private sharedOwnerScope: object | undefined;
+  private sharedOwnerEpoch = 0;
   /**
    * Per-row dispatch subscription ownership, keyed by the renderer context's
    * per-row `state` object. Registry callbacks reference this owner weakly;
@@ -248,7 +320,14 @@ export class ExecutionToolManager {
     options?: BackgroundControllerRestoreOptions,
     notify?: (message: string) => void | Promise<void>,
   ): Promise<void> {
+    const epoch = this.closeSharedOwnerScope();
     await this.controller.restore(value, options, notify);
+    if (epoch === this.sharedOwnerEpoch) this.sharedOwnerScope = {};
+  }
+
+  private closeSharedOwnerScope(): number {
+    this.sharedOwnerScope = undefined;
+    return ++this.sharedOwnerEpoch;
   }
 
   setScopedModels(models: readonly string[]): void {
@@ -385,11 +464,13 @@ export class ExecutionToolManager {
   }
 
   async shutdown(): Promise<void> {
+    this.closeSharedOwnerScope();
     this.ownerGeneration += 1;
     await this.controller.shutdown();
   }
 
   async detach(): Promise<void> {
+    this.closeSharedOwnerScope();
     this.ownerGeneration += 1;
     await this.controller.detach();
   }
@@ -402,6 +483,7 @@ export class ExecutionToolManager {
     const resolvable = pool.length > 0 && pool.every(({ selection }) =>
       selection.source === "pi"
       || agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
+    this.executionToolsResolvable = resolvable;
     if (resolvable && !this.registered) {
       this.register();
       const activeAtRegistration = activeToolSnapshot(this.input.pi);
@@ -834,7 +916,15 @@ export class ExecutionToolManager {
         executionMode: "sequential",
         parameters: toolSchema(action),
         execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) => {
-          const result = await this.executeAction(action, name, toolCallId, params, ctx);
+          const result = await this.executeAction(action, name, params, {
+            toolCallId,
+            host: { ctx },
+            // Pi keeps its existing identity source: the preflight-admitted raw
+            // fingerprint, or the submitted params only when no resolver is wired.
+            admittedFingerprint: () => this.input.submittedFingerprintFor
+              ? this.input.submittedFingerprintFor(toolCallId, name)
+              : toolCallFingerprint(name, params),
+          });
           if (result.isError === true) this.input.onNativeToolError?.(toolCallId, name);
           return result;
         },
@@ -857,6 +947,90 @@ export class ExecutionToolManager {
       });
     }
     this.registered = true;
+  }
+
+  /**
+   * #682: canonical managed-tool boundary for a trusted second adapter.
+   * `invoke` runs the same `executeAction` as Pi registration, so validation,
+   * parent-tool authorization, controller admission, results, and failure
+   * shaping are not repeated anywhere.
+   *
+   * Assumptions:
+   * - The caller is owner-side code that has already authenticated the
+   *   caller. `admission` is installed by that owner when it binds the tool.
+   *   Both actions run only the request admitted for (call id, tool name);
+   *   the caller passes no params. Start persists that request's original raw
+   *   identity and never rehashes the params it actually runs.
+   * - The call must pass the owner's live call policy
+   *   (`liveToolCallAllowed`), not merely appear in the parent catalog that
+   *   `withParentTools` uses. It also stands in for Pi activation: the tool
+   *   must be registered, allowed at launch, and the executor pool must be
+   *   resolvable. It grants nothing beyond Pi.
+   * - Binding needs a live owner scope, meaning restored associations with no
+   *   detach or shutdown since. A definition bound in one scope is refused
+   *   after that scope closes, including across a later restore.
+   * - Pi-only concerns stay on the Pi path: rendering, activation, and the
+   *   preflight returned-error observer. Duplicate and liveness preflight and
+   *   protection audits belong to the owner admission that issues the
+   *   identity.
+   */
+  sharedManagedTool(action: SharedManagedToolAction, admission: ManagedToolAdmission): ManagedToolDefinition {
+    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly string[]).includes(action)) {
+      throw new Error(`${String(action)} is not a shared managed tool action.`);
+    }
+    if (!isRecord(admission) || typeof admission.resolveCall !== "function") {
+      throw new Error("A shared managed tool requires an owner admission resolver.");
+    }
+    const scope = this.sharedOwnerScope;
+    if (!scope) throw new Error("A shared managed tool can be bound only while its owner session is live.");
+    const name = EXECUTION_TOOL_NAMES[action];
+    const resolve = admission.resolveCall.bind(admission);
+    return {
+      action,
+      name,
+      description: toolDescription(action),
+      parameters: toolSchema(action),
+      invoke: async (invocation) => {
+        const refuse = (diagnostic: string) => result(
+          `${name} failed closed: ${diagnostic}; nothing was started or read.`,
+          { action, diagnostic },
+          true,
+        );
+        const refusal = this.sharedInvocationRefusal(name, scope, invocation);
+        if (refusal) return refuse(refusal);
+        const { toolCallId } = invocation;
+        let admitted: ManagedToolAdmittedCall | undefined;
+        try {
+          admitted = resolve(toolCallId, name);
+        } catch {
+          return refuse("owner call admission could not be verified");
+        }
+        if (scope !== this.sharedOwnerScope) return refuse("the owner session that bound this tool is no longer live");
+        if (!isRecord(admitted) || !("params" in admitted)) return refuse("no owner admission for this call and tool");
+        const { params, startCallFingerprint } = admitted;
+        return this.executeAction(action, name, params, {
+          toolCallId,
+          admittedFingerprint: () => startCallFingerprint,
+        });
+      },
+    };
+  }
+
+  private sharedInvocationRefusal(name: string, scope: object, invocation: ManagedToolInvocation): string | undefined {
+    if (scope !== this.sharedOwnerScope) return "the owner session that bound this tool is no longer live";
+    if (!isRecord(invocation) || typeof invocation.toolCallId !== "string" || invocation.toolCallId.length === 0) {
+      return "missing owner-assigned call id";
+    }
+    if (!this.registered || !this.executionToolsResolvable || this.launchAllowedExecutionTools?.has(name) !== true) {
+      return `${name} is not currently exposed by this owner`;
+    }
+    let allowed = false;
+    try {
+      allowed = this.input.liveToolCallAllowed?.(name) === true;
+    } catch {
+      allowed = false;
+    }
+    return allowed ? undefined : `${name} is not allowed by this owner's live call policy`;
   }
 
   /**
@@ -952,10 +1126,14 @@ export class ExecutionToolManager {
     return { value: { ...valueRecord, details: { ...details, dispatchView: live } }, context };
   }
 
-  private async executeAction(action: Action, toolName: string, toolCallId: string, params: unknown, ctx: unknown): Promise<Record<string, unknown>> {
-    this.controller.setUiContext(ctx);
-    const models = scopedModelChoices(ctx)?.map((choice) => choice.model);
-    if (models) this.controller.setScopedModels(models);
+  /** Canonical handler for every managed action (Pi registration and sharedManagedTool). */
+  private async executeAction(action: Action, toolName: string, params: unknown, binding: ManagedHandlerBinding): Promise<Record<string, unknown>> {
+    const { toolCallId } = binding;
+    if (binding.host) {
+      this.controller.setUiContext(binding.host.ctx);
+      const models = scopedModelChoices(binding.host.ctx)?.map((choice) => choice.model);
+      if (models) this.controller.setScopedModels(models);
+    }
     let normalized: NormalizedInput;
     try {
       normalized = normalizeInput(action, params);
@@ -967,9 +1145,7 @@ export class ExecutionToolManager {
       switch (normalized.action) {
         case "start": {
           const kind = normalized.kind ?? "execute";
-          const startCallFingerprint = this.input.submittedFingerprintFor
-            ? this.input.submittedFingerprintFor(toolCallId, toolName)
-            : toolCallFingerprint(toolName, params);
+          const startCallFingerprint = binding.admittedFingerprint();
           if (!isToolCallFingerprint(startCallFingerprint)) {
             return result(
               "SubtasksStart failed closed: the submitted native call identity could not be verified; no group or tasks were created.",
